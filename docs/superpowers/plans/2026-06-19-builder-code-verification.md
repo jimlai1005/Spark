@@ -703,7 +703,7 @@ git commit -m "feat: pluggable keystore interface + macOS Keychain backend"
 - Create: `src/spark/exchange/csv_fills.py`
 - Test: `tests/test_csv_fills.py`, `tests/fixtures/builder_fills_sample.csv`
 
-> 欄位對應以 Task 0 findings 為準。本 task 用 alias map 容錯，並以 fixture 做黃金測試。
+> **Task 0 findings 註記**：`stats-data` S3 對假地址一律回 403（S3 對「不存在 key 且無 ListBucket 權限」的標準行為，非 bucket 私有），所以真實 CSV 表頭**尚未確認**，留待 Task 14 用我們自己有成交的 builder 地址驗證。本 task 因此用 **alias map 容錯** 的 header-driven parser + fixture 黃金測試先把解析邏輯做對；真實表頭與假設不同時，Task 14 只需擴充 alias map。即時驗證主判定走 Task 10/12 的 `query_builder_accrued`（referral state），不依賴 CSV。
 
 - [ ] **Step 1: 建立 fixture（明文 CSV；表頭以 findings 為準，先用合理欄位名）**
 
@@ -1246,12 +1246,18 @@ from spark.exchange.hyperliquid import HyperliquidAdapter
 
 
 class FakeInfo:
+    def __init__(self):
+        self.posts = []
     def user_state(self, address):
         return {"marginSummary": {"accountValue": "150.5"}}
-    def max_builder_fee(self, user, builder):
+    def post(self, url_path, payload=None):
+        # Task 0 findings: 無 max_builder_fee wrapper，需 raw post {"type":"maxBuilderFee",...}
+        self.posts.append((url_path, payload))
+        assert payload["type"] == "maxBuilderFee"
         return 100
-    def query_builder_accrued(self, builder):  # 視 findings 可能改名/改實作
-        return Decimal("0.008")
+    def query_referral_state(self, address):
+        # Task 0 findings: 累計 builder fee 來自 referral state 的 builderRewards
+        return {"builderRewards": "0.008"}
 
 
 class FakeExchange:
@@ -1277,8 +1283,16 @@ def test_get_account_value_parses_margin_summary():
     assert _adapter().get_account_value("0xuser") == Decimal("150.5")
 
 
-def test_query_max_builder_fee_passthrough():
-    assert _adapter().query_max_builder_fee("0xuser", "0xbuilder") == 100
+def test_query_max_builder_fee_via_raw_post():
+    ad = _adapter()
+    assert ad.query_max_builder_fee("0xuser", "0xbuilder") == 100
+    url_path, payload = ad._info.posts[-1]
+    assert url_path == "/info"
+    assert payload == {"type": "maxBuilderFee", "user": "0xuser", "builder": "0xbuilder"}
+
+
+def test_query_builder_accrued_from_referral_state():
+    assert _adapter().query_builder_accrued("0xbuilder") == Decimal("0.008")
 
 
 def test_place_order_passes_builder_dict_and_ioc():
@@ -1324,11 +1338,14 @@ class HyperliquidAdapter(ExchangeAdapter):
         return Decimal(state["marginSummary"]["accountValue"])
 
     def query_max_builder_fee(self, user: str, builder: str) -> int:
-        return int(self._info.max_builder_fee(user, builder))
+        # Task 0 findings: SDK 無 wrapper，需 raw post（回傳 int，十分之一 bp）
+        return int(self._info.post("/info", {"type": "maxBuilderFee",
+                                             "user": user, "builder": builder}))
 
     def query_builder_accrued(self, builder: str) -> Decimal:
-        # findings 決定確切來源（referral/builder state）；此處委派給 info。
-        return Decimal(self._info.query_builder_accrued(builder))
+        # Task 0 findings: 累計 builder fee = referral state 的 builderRewards
+        state = self._info.query_referral_state(builder)
+        return Decimal(str(state["builderRewards"]))
 
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]:
         url = f"{CSV_BASE_URLS[self._network]}/{builder}/{day:%Y%m%d}.csv.lz4"
