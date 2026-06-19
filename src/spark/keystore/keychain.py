@@ -19,7 +19,7 @@ class MacKeychainBackend(KeyStore):
 
     def _load(self, account_id: str, role: str):
         pk = keyring.get_password(self._service, self._entry(account_id, role))
-        if not pk:
+        if pk is None:
             raise KeyError(f"no {role} key for account {account_id}")
         return Account.from_key(pk)
 
