@@ -1,7 +1,7 @@
 """解析 builder_fills CSV（LZ4）。header-driven + alias map 容錯。"""
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import lz4.frame
@@ -21,24 +21,23 @@ ALIASES = {
 
 def _pick(row: dict, names: list[str]) -> str:
     for n in names:
-        if n in row and row[n] != "":
+        if n in row and row[n] not in (None, ""):
             return row[n]
     raise KeyError(f"none of {names} in CSV header {list(row)}")
 
 
 def _parse_time(v: str) -> datetime:
+    # HL 時間戳為 UTC；兩個分支都回 tz-aware（避免跨機器本機時區位移）
     try:
-        return datetime.fromisoformat(v)
+        dt = datetime.fromisoformat(v)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except ValueError:
-        return datetime.fromtimestamp(int(v) / 1000)  # epoch ms 後備
+        return datetime.fromtimestamp(int(v) / 1000, tz=timezone.utc)  # epoch ms 後備
 
 
 def parse_builder_fills(data: bytes, compressed: bool = True) -> list[Fill]:
-    text = (
-        lz4.frame.decompress(data).decode()
-        if compressed
-        else data.decode()
-    )
+    raw = lz4.frame.decompress(data) if compressed else data
+    text = raw.decode("utf-8-sig")  # utf-8-sig 去除可能的 BOM
     reader = csv.DictReader(io.StringIO(text))
     out: list[Fill] = []
     for row in reader:

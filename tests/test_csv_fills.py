@@ -1,5 +1,5 @@
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 import lz4.frame
 from pathlib import Path
 from spark.exchange.csv_fills import parse_builder_fills
@@ -14,7 +14,7 @@ def test_parse_plain_csv_bytes():
     assert fills[0].px == Decimal("4000.5")
     assert fills[0].sz == Decimal("0.01")
     assert fills[0].builder_fee == Decimal("0.008")
-    assert fills[0].time == datetime.fromisoformat("2026-06-18T10:00:00")
+    assert fills[0].time == datetime(2026, 6, 18, 10, 0, 0, tzinfo=timezone.utc)
 
 
 def test_parse_lz4_roundtrip():
