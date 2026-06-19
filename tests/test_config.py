@@ -25,3 +25,19 @@ def test_rejects_unknown_network():
 def test_fee_validated_against_cap():
     with pytest.raises(ValueError):
         Settings(builder_address="0xb", account_id="a", network="testnet", f=200)
+
+
+def test_url_properties_resolve_by_network():
+    assert Settings(builder_address="0xb", account_id="a",
+                    network="mainnet").api_url == "https://api.hyperliquid.xyz"
+    assert "Testnet" in Settings(builder_address="0xb", account_id="a",
+                                 network="testnet").csv_base_url
+
+
+def test_charged_fee_must_not_exceed_approved_ceiling():
+    # 預設 f=20 (0.02%) <= max_rate 0.1% → ok
+    Settings(builder_address="0xb", account_id="a", network="testnet")
+    # f=50 (0.05%) 但只授權 0.02% → 應 raise
+    with pytest.raises(ValueError):
+        Settings(builder_address="0xb", account_id="a", network="testnet",
+                 f=50, max_rate="0.02%")
