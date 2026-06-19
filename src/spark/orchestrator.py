@@ -13,6 +13,8 @@ def place_marketable_order(adapter: ExchangeAdapter, settings: Settings, agent_s
         limit_px = best_opposite_px * (Decimal("1") + CROSS_BPS)
     else:
         limit_px = best_opposite_px * (Decimal("1") - CROSS_BPS)
+    # 注意：穿價計算會產生多位小數的意圖價；HL 的價格格式化（5 位有效數字四捨五入）
+    # 由 HyperliquidAdapter._round_px 在送單邊界處理，orchestrator 保持與交易所無關。
     order = Order(coin=settings.coin, is_buy=is_buy, size=settings.order_size,
                   limit_px=limit_px, tif="Ioc")
     builder = BuilderCode(b=settings.builder_address, f=settings.f)
