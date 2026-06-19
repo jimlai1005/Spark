@@ -1303,6 +1303,13 @@ def test_place_order_passes_builder_dict_and_ioc():
     name, coin, is_buy, sz, px, otype, builder = ad._exchange.calls[-1]
     assert otype == {"limit": {"tif": "Ioc"}}
     assert builder == {"b": "0xbuilder", "f": 20}
+
+
+def test_round_px_to_5_sig_figs():
+    # HL 拒絕超過 5 位有效數字的價格；穿價計算常產生多位小數，送單前需 rounding
+    ad = _adapter()
+    assert ad._round_px(Decimal("3530.9274")) == 3530.9
+    assert ad._round_px(Decimal("4000")) == 4000.0
 ```
 
 - [ ] **Step 2: 跑測試確認失敗**
@@ -1318,7 +1325,7 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'spark.exchange.hyperliqu
 方法名以 Task 0 findings 為準；下方為基準實作。"""
 import urllib.request
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, Context, ROUND_HALF_EVEN
 from spark.config import API_URLS, CSV_BASE_URLS
 from spark.exchange.base import (
     ExchangeAdapter, Order, BuilderCode, Fill, TxResult, OrderResult, Signer,
@@ -1327,10 +1334,18 @@ from spark.exchange.csv_fills import parse_builder_fills
 
 
 class HyperliquidAdapter(ExchangeAdapter):
+    # HL perp 價格規則：最多 5 位有效數字。送單前必須四捨五入，否則交易所拒單。
+    # （Phase 1 ETH ~數千元，5 sig figs 同時滿足小數位上限；極低價幣種的 tick 細則延後。）
+    _PX_CTX = Context(prec=5, rounding=ROUND_HALF_EVEN)
+
     def __init__(self, network: str, info=None, exchange=None):
         self._network = network
         self._info = info        # hyperliquid.info.Info
         self._exchange = exchange  # hyperliquid.exchange.Exchange（已綁 agent 錢包）
+
+    def _round_px(self, px: Decimal) -> float:
+        """把 orchestrator 算出的意圖價四捨五入到 HL 接受的格式（5 位有效數字）。"""
+        return float(self._PX_CTX.create_decimal(px))
 
     # --- reads ---
     def get_account_value(self, address: str) -> Decimal:
@@ -1363,7 +1378,7 @@ class HyperliquidAdapter(ExchangeAdapter):
 
     def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult:
         res = self._exchange.order(
-            order.coin, order.is_buy, float(order.size), float(order.limit_px),
+            order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
             {"limit": {"tif": order.tif}}, reduce_only=False,
             builder={"b": builder.b, "f": builder.f},
         )
