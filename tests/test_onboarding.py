@@ -1,6 +1,7 @@
 from decimal import Decimal
 import pytest
 from spark.exchange.fakes import FakeAdapter
+from spark.exchange.base import TxResult
 from spark.config import Settings
 from spark.onboarding import onboard, OnboardingState, InsufficientFunds
 
@@ -31,3 +32,10 @@ def test_onboard_idempotent_when_already_approved():
     onboard(fake, _settings(), "MAIN", "0xagent", "0xuser")  # 再跑一次
     # 已授權則不重複送 approve_builder_fee
     assert len(fake.calls["approve_builder_fee"]) == 1
+
+
+def test_onboard_raises_when_agent_approval_fails():
+    fake = FakeAdapter(account_value=Decimal("150"))
+    fake.approve_agent = lambda main_signer, agent_address: TxResult(ok=False, raw={"status": "err"})
+    with pytest.raises(RuntimeError):
+        onboard(fake, _settings(), "MAIN", "0xagent", "0xuser")
