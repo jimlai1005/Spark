@@ -17,7 +17,8 @@ def test_fake_place_order_accrues_builder_fee():
     res = fake.place_order("AGENT", Order("ETH", True, Decimal("0.01"), Decimal("4000"), "Ioc"),
                            BuilderCode(b="0xbuilder", f=20))
     assert res.ok and res.filled_size == Decimal("0.01")
-    assert fake.query_builder_accrued("0xbuilder") > 0
+    # notional 40 * f(20)/100000 = 0.008
+    assert fake.query_builder_accrued("0xbuilder") == Decimal("0.008")
 
 
 def test_fake_fetch_fills_returns_seeded():
