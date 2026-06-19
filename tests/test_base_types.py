@@ -1,12 +1,13 @@
 from decimal import Decimal
 from datetime import datetime
+from dataclasses import FrozenInstanceError
 import pytest
-from spark.exchange.base import BuilderCode, Order, Fill, ExchangeAdapter
+from spark.exchange.base import BuilderCode, Order, Fill, ExchangeAdapter, TxResult, OrderResult
 
 
 def test_builder_code_is_frozen():
     bc = BuilderCode(b="0xabc", f=20)
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         bc.f = 30  # frozen dataclass
 
 
@@ -28,3 +29,14 @@ def test_adapter_is_abstract_and_has_no_withdraw():
     assert not hasattr(ExchangeAdapter, "transfer")
     with pytest.raises(TypeError):
         ExchangeAdapter()  # ABC 不可實例化
+
+
+def test_result_types_construct():
+    tx = TxResult(ok=True, raw={"status": "ok"})
+    assert tx.ok is True
+    assert tx.raw == {"status": "ok"}
+    od = OrderResult(ok=True, filled_size=Decimal("0.01"), avg_px=Decimal("4000"),
+                     raw={"status": "filled"})
+    assert od.ok is True
+    assert od.filled_size == Decimal("0.01")
+    assert od.avg_px == Decimal("4000")
