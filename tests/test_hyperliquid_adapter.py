@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 from spark.exchange.base import Order, BuilderCode
 from spark.exchange.hyperliquid import HyperliquidAdapter
@@ -65,3 +66,25 @@ def test_round_px_to_5_sig_figs():
     ad = _adapter()
     assert ad._round_px(Decimal("3530.9274")) == 3530.9
     assert ad._round_px(Decimal("4000")) == 4000.0
+
+
+def test_place_order_rejected_returns_not_ok():
+    class RejectingExchange(FakeExchange):
+        def order(self, *a, **k):
+            return {"status": "err", "response": "Insufficient margin"}
+    ad = HyperliquidAdapter(network="testnet", info=FakeInfo(), exchange=RejectingExchange())
+    res = ad.place_order(agent_signer=None,
+                         order=Order("ETH", True, Decimal("0.01"), Decimal("4000"), "Ioc"),
+                         builder=BuilderCode(b="0xbuilder", f=20))
+    assert res.ok is False
+    assert res.filled_size == Decimal("0")
+    assert res.raw == {"status": "err", "response": "Insufficient margin"}
+
+
+def test_fetch_builder_fills_empty_on_404(monkeypatch):
+    import urllib.error
+    def raise_404(url, timeout=30):
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+    monkeypatch.setattr("spark.exchange.hyperliquid.urllib.request.urlopen", raise_404)
+    ad = _adapter()
+    assert ad.fetch_builder_fills("0xbuilder", date(2026, 6, 18)) == []

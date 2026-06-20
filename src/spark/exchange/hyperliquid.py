@@ -1,6 +1,7 @@
 """hyperliquid-python-sdk 實作。Info/Exchange 可注入以便測試。
 方法名以 Task 0 findings 為準。"""
 import urllib.request
+import urllib.error
 from datetime import date
 from decimal import Decimal, Context, ROUND_HALF_EVEN
 from spark.config import CSV_BASE_URLS
@@ -41,7 +42,14 @@ class HyperliquidAdapter(ExchangeAdapter):
 
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]:
         url = f"{CSV_BASE_URLS[self._network]}/{builder}/{day:%Y%m%d}.csv.lz4"
-        raw = urllib.request.urlopen(url, timeout=30).read()
+        try:
+            raw = urllib.request.urlopen(url, timeout=30).read()
+        except urllib.error.HTTPError as e:
+            # 該日無成交 → S3 回 403/404（無此 key）。視為「無 fills」回空清單，
+            # 讓 reconcile 產出 matched=False 的誠實報告，而非拋例外。
+            if e.code in (403, 404):
+                return []
+            raise
         return parse_builder_fills(raw, compressed=True)
 
     # --- writes ---
@@ -59,6 +67,10 @@ class HyperliquidAdapter(ExchangeAdapter):
             {"limit": {"tif": order.tif}}, reduce_only=False,
             builder={"b": builder.b, "f": builder.f},
         )
+        # 被拒單（IOC 未成交、保證金不足等）是正常結果而非例外：HL 回 {"status":"err",...}，
+        # 直接挖 response.data 會 TypeError。先檢查 status，非 ok 則回 ok=False（原始回應留 raw）。
+        if res.get("status") != "ok":
+            return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
         status = res["response"]["data"]["statuses"][0].get("filled", {})
         return OrderResult(
             ok=bool(status),
