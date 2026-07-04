@@ -1,6 +1,6 @@
 """核心型別與 ExchangeAdapter 抽象介面。刻意不含任何 withdraw/transfer（非託管不變量）。"""
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -38,6 +38,8 @@ class Fill:
 class TxResult:
     ok: bool
     raw: dict
+    # approve_agent 生成的 agent 私鑰（僅該動作使用）。repr=False：絕不出現在 log/repr。
+    agent_key: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,6 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     def approve_builder_fee(self, main_signer: Signer, builder: str, max_rate: str) -> TxResult: ...
     @abstractmethod
-    def approve_agent(self, main_signer: Signer, agent_address: str) -> TxResult: ...
+    def approve_agent(self, main_signer: Signer, agent_name: str) -> TxResult: ...
     @abstractmethod
     def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult: ...

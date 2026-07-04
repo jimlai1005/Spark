@@ -81,6 +81,14 @@ def test_place_order_rejected_returns_not_ok():
     assert res.raw == {"status": "err", "response": "Insufficient margin"}
 
 
+def test_approve_agent_returns_generated_key_and_never_reprs_it():
+    ad = _adapter()
+    res = ad.approve_agent(main_signer=None, agent_name="spark-agent")
+    assert res.ok is True
+    assert res.agent_key == "0xagentkey"
+    assert "0xagentkey" not in repr(res)  # repr=False：key 不得出現在 repr/log
+
+
 def test_fetch_builder_fills_empty_on_404(monkeypatch):
     import urllib.error
     def raise_404(url, timeout=30):

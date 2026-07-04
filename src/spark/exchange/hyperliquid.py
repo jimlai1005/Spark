@@ -57,9 +57,11 @@ class HyperliquidAdapter(ExchangeAdapter):
         res = self._exchange.approve_builder_fee(builder, max_rate)
         return TxResult(ok=res.get("status") == "ok", raw=res)
 
-    def approve_agent(self, main_signer: Signer, agent_address: str) -> TxResult:
-        res, _agent_key = self._exchange.approve_agent()
-        return TxResult(ok=res.get("status") == "ok", raw=res)
+    def approve_agent(self, main_signer: Signer, agent_name: str) -> TxResult:
+        # SDK 語意：生成一把新 agent key 並以 main 錢包簽名授權（named agent）。
+        # 重複呼叫會 rotate key —— 是否呼叫由 onboarding 依「是否已有 key」決定。
+        res, agent_key = self._exchange.approve_agent(agent_name)
+        return TxResult(ok=res.get("status") == "ok", raw=res, agent_key=agent_key)
 
     def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult:
         res = self._exchange.order(

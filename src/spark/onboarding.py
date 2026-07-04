@@ -1,6 +1,6 @@
 """onboarding 狀態機：FUNDED→BUILDER_APPROVED→AGENT_AUTHORIZED→READY。
 狀態靠 API 查詢判定 → 冪等可重跑。只有此模組使用 main_signer（test harness）。"""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from spark.config import Settings, MIN_BUILDER_BALANCE
 from spark.exchange.base import ExchangeAdapter, Signer
@@ -22,10 +22,21 @@ class InsufficientFunds(Exception):
 @dataclass
 class OnboardingResult:
     state: OnboardingState
+    # 新生成的 agent 私鑰（僅在本次 onboard 執行了 approve_agent 時非 None）。
+    # 呼叫者（CLI/integration 層）負責立刻存入 Keychain。repr=False：絕不落 log。
+    agent_key: str | None = field(default=None, repr=False)
 
 
 def onboard(adapter: ExchangeAdapter, settings: Settings, main_signer: Signer,
-            agent_address: str, user_address: str) -> OnboardingResult:
+            user_address: str, agent_name: str = "spark-agent",
+            skip_agent_approval: bool = False) -> OnboardingResult:
+    """FUNDED→BUILDER_APPROVED→AGENT_AUTHORIZED→READY（狀態靠查詢，冪等可重跑）。
+
+    agent 語意（HL）：approve_agent 會「生成新 key 並 rotate 舊 key」，不是冪等授權。
+    因此由呼叫者判斷：Keychain 已有可用 agent key → skip_agent_approval=True（跳過，
+    避免把既有 key 轉失效）；否則本函式執行 approve 並把新 key 放進回傳值，
+    呼叫者必須立刻存入 Keychain。
+    """
     # FUNDED gate（builder 啟用門檻 ≥ 100 USDC）
     if adapter.get_account_value(user_address) < MIN_BUILDER_BALANCE:
         raise InsufficientFunds(
@@ -38,10 +49,11 @@ def onboard(adapter: ExchangeAdapter, settings: Settings, main_signer: Signer,
         if adapter.query_max_builder_fee(user_address, settings.builder_address) == 0:
             raise RuntimeError("approve_builder_fee 後 maxBuilderFee 仍為 0")
 
-    # ApproveAgent（每次重跑都送；HL approve 同 agent 為冪等動作）。
-    # 介面沒有 agent 授權的 read-back 查詢，故以 TxResult.ok 確認，避免失敗無聲通過
-    # 導致 orchestrator 下單時才在遠處爆炸。
-    res = adapter.approve_agent(main_signer, agent_address)
-    if not res.ok:
-        raise RuntimeError(f"approve_agent 失敗: {res.raw}")
-    return OnboardingResult(state=OnboardingState.READY)
+    agent_key = None
+    if not skip_agent_approval:
+        # 無 read-back 查詢可用，以 TxResult.ok 確認，失敗大聲丟出。
+        res = adapter.approve_agent(main_signer, agent_name)
+        if not res.ok:
+            raise RuntimeError(f"approve_agent 失敗: {res.raw}")
+        agent_key = res.agent_key
+    return OnboardingResult(state=OnboardingState.READY, agent_key=agent_key)

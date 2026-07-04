@@ -40,3 +40,9 @@ def test_result_types_construct():
     assert od.ok is True
     assert od.filled_size == Decimal("0.01")
     assert od.avg_px == Decimal("4000")
+
+
+def test_tx_result_agent_key_never_in_repr():
+    tx = TxResult(ok=True, raw={"status": "ok"}, agent_key="0xsecret")
+    assert tx.agent_key == "0xsecret"
+    assert "0xsecret" not in repr(tx)

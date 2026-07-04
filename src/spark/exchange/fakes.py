@@ -40,10 +40,10 @@ class FakeAdapter(ExchangeAdapter):
         self._max_fee = 100  # 固定代表 0.1%；不解析 max_rate（見 class docstring）
         return TxResult(ok=True, raw={"status": "ok"})
 
-    def approve_agent(self, main_signer, agent_address) -> TxResult:
+    def approve_agent(self, main_signer, agent_name) -> TxResult:
         self.calls["approve_agent"].append(
-            {"main_signer": main_signer, "agent_address": agent_address})
-        return TxResult(ok=True, raw={"status": "ok"})
+            {"main_signer": main_signer, "agent_name": agent_name})
+        return TxResult(ok=True, raw={"status": "ok"}, agent_key="0x" + "ab" * 32)
 
     def place_order(self, agent_signer, order: Order, builder: BuilderCode) -> OrderResult:
         self.calls["place_order"].append(
