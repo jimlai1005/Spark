@@ -4,7 +4,8 @@ from decimal import Decimal
 from spark.config import Settings
 from spark.exchange.base import ExchangeAdapter, Order, BuilderCode, OrderResult, Signer
 
-CROSS_BPS = Decimal("0.001")  # 穿價 buffer：0.1% 確保吃到對手盤
+CROSS_BPS = Decimal("0.005")  # 穿價 cap：0.5%。Ioc 成交在盤口價，此值是「最壞情況上限」
+# 而非實付滑價；testnet 盤薄、半價差可能超過 0.1%，取 0.5% 確保能穿過對手盤。
 
 
 def place_marketable_order(adapter: ExchangeAdapter, settings: Settings, agent_signer: Signer,

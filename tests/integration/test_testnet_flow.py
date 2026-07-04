@@ -63,11 +63,13 @@ def test_end_to_end_testnet():
     agent = ks.get_agent_signer(ACCOUNT_ID)
     agent_adapter, _ = _mk_adapter(settings, agent, user_address=USER_ADDR)
     best_px = Decimal(str(info.all_mids()[settings.coin]))
+    baseline = main_adapter.query_builder_accrued(BUILDER_ADDR)
     order_res = place_marketable_order(agent_adapter, settings, agent_signer=agent,
                                        is_buy=True, best_opposite_px=best_px)
     # 診斷輔助：raw 不含私鑰（已審查確認），失敗時印出以診斷 szDecimals/tick 問題
     assert order_res.ok and order_res.filled_size > 0, f"下單未成交: {order_res.raw}"
 
-    accrued = wait_for_accrual(main_adapter, BUILDER_ADDR, attempts=10, sleep_s=3)
-    assert accrued > 0
-    print(f"✅ testnet 即時累計 builder fee = {accrued}")
+    accrued = wait_for_accrual(main_adapter, BUILDER_ADDR, attempts=10, sleep_s=3,
+                              baseline=baseline)
+    assert accrued > baseline
+    print(f"✅ testnet 累計 builder fee {baseline} → {accrued}（增量 {accrued - baseline}）")

@@ -96,3 +96,15 @@ def test_fetch_builder_fills_empty_on_404(monkeypatch):
     monkeypatch.setattr("spark.exchange.hyperliquid.urllib.request.urlopen", raise_404)
     ad = _adapter()
     assert ad.fetch_builder_fills("0xbuilder", date(2026, 6, 18)) == []
+
+
+def test_fetch_builder_fills_lowercases_address_in_url(monkeypatch):
+    import urllib.error
+    captured = {}
+    def fake_urlopen(url, timeout=30):
+        captured["url"] = url
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+    monkeypatch.setattr("spark.exchange.hyperliquid.urllib.request.urlopen", fake_urlopen)
+    ad = _adapter()
+    ad.fetch_builder_fills("0xABCdef", date(2026, 6, 18))
+    assert "/0xabcdef/" in captured["url"]

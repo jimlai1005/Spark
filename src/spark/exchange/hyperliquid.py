@@ -41,7 +41,8 @@ class HyperliquidAdapter(ExchangeAdapter):
         return Decimal(str(state["builderRewards"]))
 
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]:
-        url = f"{CSV_BASE_URLS[self._network]}/{builder}/{day:%Y%m%d}.csv.lz4"
+        # stats-data S3 key 為小寫；checksum（mixed-case）地址在 URL 上會 403 → 誤判無 fills。
+        url = f"{CSV_BASE_URLS[self._network]}/{builder.lower()}/{day:%Y%m%d}.csv.lz4"
         try:
             raw = urllib.request.urlopen(url, timeout=30).read()
         except urllib.error.HTTPError as e:
@@ -53,6 +54,9 @@ class HyperliquidAdapter(ExchangeAdapter):
         return parse_builder_fills(raw, compressed=True)
 
     # --- writes ---
+    # 以下 main_signer / agent_signer 參數為介面文件性質；實際簽章者 = 建構時綁定
+    # self._exchange 的錢包。onboarding 必須注入 main-bound Exchange 呼叫
+    # approve_builder_fee/approve_agent（協議層亦會拒絕 agent 代簽 approve）。
     def approve_builder_fee(self, main_signer: Signer, builder: str, max_rate: str) -> TxResult:
         res = self._exchange.approve_builder_fee(builder, max_rate)
         return TxResult(ok=res.get("status") == "ok", raw=res)

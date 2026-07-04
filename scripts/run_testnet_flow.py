@@ -43,14 +43,15 @@ def main():
         network, info=info,
         exchange=Exchange(agent, settings.api_url, account_address=user_addr))
     best_px = Decimal(str(info.all_mids()[settings.coin]))
+    baseline = main_adapter.query_builder_accrued(settings.builder_address)
     res = place_marketable_order(agent_adapter, settings, agent_signer=agent,
                                  is_buy=True, best_opposite_px=best_px)
     if not res.ok:
         raise SystemExit(f"下單未成交: {res.raw}")
     print(f"order filled_size={res.filled_size} avg_px={res.avg_px}")
 
-    accrued = wait_for_accrual(main_adapter, settings.builder_address)
-    print(f"✅ 即時累計 builder fee = {accrued}")
+    accrued = wait_for_accrual(main_adapter, settings.builder_address, baseline=baseline)
+    print(f"✅ 累計 builder fee {baseline} → {accrued}（增量 {accrued - baseline}）")
 
 
 if __name__ == "__main__":
