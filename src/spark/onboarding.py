@@ -20,6 +20,10 @@ class InsufficientFunds(Exception):
     pass
 
 
+class BuilderNotEligible(Exception):
+    pass
+
+
 @dataclass
 class OnboardingResult:
     # 不再帶 agent_key：唯一出口是 on_agent_key callback（持久化即發生在授權當下），
@@ -48,6 +52,13 @@ def onboard(adapter: ExchangeAdapter, settings: Settings, main_signer: Signer,
     if adapter.get_account_value(user_address) < MIN_BUILDER_BALANCE:
         raise InsufficientFunds(
             f"account value < {MIN_BUILDER_BALANCE} USDC builder 門檻")
+
+    # Builder 啟用門檻（spec §4）：builder 地址本身需 ≥ 100 USDC，否則 builder code
+    # 不生效 —— 症狀是「下單成交但 fee 永不累計」，必須在這裡大聲擋下。
+    if adapter.get_account_value(settings.builder_address) < MIN_BUILDER_BALANCE:
+        raise BuilderNotEligible(
+            f"builder 地址 {settings.builder_address} 餘額 < {MIN_BUILDER_BALANCE} USDC，"
+            "builder code 不會生效")
 
     # ApproveBuilderFee（冪等：已授權則跳過）。
     # 刻意不檢查 TxResult.ok：下面的 re-query 直接讀回鏈上 maxBuilderFee，是更強的確認。

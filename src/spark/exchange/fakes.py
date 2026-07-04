@@ -12,18 +12,22 @@ class FakeAdapter(ExchangeAdapter):
 
     刻意用單一狀態槽，非 per-builder/per-user map —— Phase 1 範圍只有一個 builder
     與一個帳號（多客戶為 non-goal）。多情境測試請各自 new 一個 FakeAdapter。
+    需要 builder／user 帳號餘額不同的測試，用 `account_values`（address→Decimal 的
+    明確 escape hatch）覆蓋個別地址；未列在 `account_values` 裡的地址回退到單一槽
+    `account_value`。
     `approve_builder_fee` 不解析 max_rate，固定把 _max_fee 設為 100（代表 0.1% 上限）；
     max_rate 原值仍記錄在 self.calls 供斷言。
     """
-    def __init__(self, account_value=Decimal("0"), seeded_fills=None):
+    def __init__(self, account_value=Decimal("0"), seeded_fills=None, account_values=None):
         self._account_value = Decimal(account_value)
+        self._account_values = dict(account_values or {})
         self._max_fee = 0
         self._accrued = Decimal("0")
         self._seeded_fills = list(seeded_fills or [])
         self.calls = defaultdict(list)
 
     def get_account_value(self, address: str) -> Decimal:
-        return self._account_value
+        return self._account_values.get(address, self._account_value)
 
     def query_max_builder_fee(self, user: str, builder: str) -> int:
         return self._max_fee

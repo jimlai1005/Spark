@@ -2,7 +2,7 @@ from decimal import Decimal
 import pytest
 from spark.exchange.fakes import FakeAdapter
 from spark.config import Settings
-from spark.onboarding import onboard, OnboardingState, InsufficientFunds
+from spark.onboarding import onboard, OnboardingState, InsufficientFunds, BuilderNotEligible
 
 
 def _settings():
@@ -29,6 +29,13 @@ def test_onboard_requires_persistence_plan_before_rotation():
 def test_onboard_rejects_below_min_balance():
     fake = FakeAdapter(account_value=Decimal("50"))
     with pytest.raises(InsufficientFunds):
+        onboard(fake, _settings(), "MAIN", "0xuser", skip_agent_approval=True)
+
+
+def test_onboard_rejects_ineligible_builder():
+    fake = FakeAdapter(account_value=Decimal("150"),
+                       account_values={"0xbuilder": Decimal("50")})
+    with pytest.raises(BuilderNotEligible):
         onboard(fake, _settings(), "MAIN", "0xuser", skip_agent_approval=True)
 
 
