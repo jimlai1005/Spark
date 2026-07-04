@@ -16,6 +16,14 @@ Spec：[docs/superpowers/specs/2026-06-19-builder-code-verification-design.md](.
 
 關鍵決定：D1 可成交 `Ioc` 限價單；D2 兩段式驗證；D3 uv/pytest/ruff/py3.11；D4 可抽換 keystore + MacKeychain；D5 testnet 主錢包 key 只活在 test harness；D6 `f=20`（2bp）、`maxRate="0.1%"`。
 
+## 執行期偏離記錄（實作以此為準，覆蓋下方 task 原稿）
+
+<!-- 2026-06-20: 執行中發現的計畫修正，依 review 證據落地 -->
+1. **SDK API delta（Task 0 findings）**：`info.max_builder_fee` 不存在 → raw post `{"type":"maxBuilderFee",...}`；累計費 = `info.query_referral_state(builder)["builderRewards"]`。
+2. **價格 rounding（Task 9 review 發現）**：HL perp 價格上限 5 位有效數字，穿價計算的意圖價必須在 adapter 邊界 `_round_px`（`Context(prec=5)`）後送單，否則拒單。
+3. **交易所邊界穩健性（Task 12 review 發現）**：拒單（`{"status":"err"}`）回 `ok=False` 而非 TypeError；`fetch_builder_fills` 403/404（該日無成交）回 `[]` 而非拋例外。
+4. **Agent key 生命週期（Task 13.5，接手審視發現）**：SDK `approve_agent(name)` 是「生成新 key + rotate 舊 key」，非冪等授權。故：`TxResult.agent_key`（`repr=False`）帶回生成的 key；`onboard(..., skip_agent_approval=)` 由呼叫者依「Keychain 是否已有 key」決定是否 approve；CLI 層負責把新 key 存入 Keychain。**Task 14/15 原稿的單 adapter 寫法作廢**：approve 類動作實際簽章者 = 注入的 `Exchange` 綁定的錢包，故 onboarding 需 main-bound Exchange、下單需 agent-bound Exchange，兩個 adapter 實例。
+
 ## 檔案結構（責任邊界）
 
 | 檔案 | 責任 |
