@@ -15,15 +15,22 @@ class FakeInfo:
 
 
 class FakeExchange:
-    """記錄 (method, args, kwargs) —— 供斷言每一筆 order-creating write 都帶 builder。"""
-    def __init__(self):
+    """記錄 (method, args, kwargs) —— 供斷言每一筆 order-creating write 都帶 builder。
+
+    回應形狀忠於真實 HL API（頂層 ok、內層 statuses[0] 帶 filled/resting/error/
+    "success"）；order_response/modify_response/cancel_response 可注入覆蓋回應，
+    供拒單形態測試。"""
+    def __init__(self, order_response=None, modify_response=None, cancel_response=None):
         self.calls = []
+        self.order_response = order_response
+        self.modify_response = modify_response
+        self.cancel_response = cancel_response
 
     def order(self, coin, is_buy, sz, limit_px, order_type, reduce_only=False,
               cloid=None, builder=None):
         self.calls.append(("order", (coin, is_buy, sz, limit_px, order_type),
                            {"reduce_only": reduce_only, "cloid": cloid, "builder": builder}))
-        return {"status": "ok", "response": {"data": {"statuses": [
+        return self.order_response or {"status": "ok", "response": {"data": {"statuses": [
             {"filled": {"totalSz": str(sz), "avgPx": str(limit_px)}}]}}}
 
     def market_open(self, name, is_buy, sz, px=None, slippage=0.05, cloid=None, builder=None):
@@ -36,11 +43,13 @@ class FakeExchange:
                      cloid=None):
         self.calls.append(("modify_order", (oid, name, is_buy, sz, limit_px, order_type),
                            {"reduce_only": reduce_only, "cloid": cloid}))
-        return {"status": "ok", "response": {"data": {"statuses": ["success"]}}}
+        return self.modify_response or {"status": "ok", "response": {"data": {"statuses": [
+            {"resting": {"oid": oid}}]}}}
 
     def cancel(self, name, oid):
         self.calls.append(("cancel", (name, oid), {}))
-        return {"status": "ok"}
+        return self.cancel_response or {"status": "ok", "response": {
+            "type": "cancel", "data": {"statuses": ["success"]}}}
 
     def update_leverage(self, leverage, name, is_cross=True):
         self.calls.append(("update_leverage", (leverage, name, is_cross), {}))
@@ -141,6 +150,46 @@ def test_cancel_and_update_leverage_map_correctly():
     method, args, kwargs = ex.calls[-1]
     assert method == "update_leverage"
     assert args == (5, "ETH", True)  # SDK: update_leverage(leverage, name, is_cross)
+
+
+def test_modify_order_per_item_rejection_returns_false(caplog):
+    """HL 拒單雙形態之二：頂層 status=="ok" 但 statuses[0] 帶 "error"（參照
+    hl-copytrader instrument.py:50-65 的記載）——絕不能因頂層 ok 判改單成功。"""
+    ex = FakeExchange(modify_response={"status": "ok", "response": {"data": {"statuses": [
+        {"error": "Order was never placed, already canceled, or filled."}]}}})
+    ad = _adapter(exchange=ex)
+    with caplog.at_level("WARNING"):
+        ok = ad.modify_order(agent_signer=None, oid=123,
+                             order=Order("ETH", True, Decimal("0.01"), Decimal("4000"), "Ioc"))
+    assert ok is False
+    assert "modify_order rejected" in caplog.text  # 工程原則 3：失敗要大聲記錄
+
+
+def test_cancel_order_per_item_rejection_returns_false(caplog):
+    """cancel 同雙形態：頂層 ok 但單筆 error → False（= 未確認撤單，訂單可能仍掛著；
+    真相由上層 settle 重抓掛單為準）。"""
+    ex = FakeExchange(cancel_response={"status": "ok", "response": {"data": {"statuses": [
+        {"error": "Order was never placed, already canceled, or filled."}]}}})
+    ad = _adapter(exchange=ex)
+    with caplog.at_level("WARNING"):
+        ok = ad.cancel_order(agent_signer=None, coin="ETH", oid=123)
+    assert ok is False
+    assert "cancel_order rejected" in caplog.text
+
+
+def test_parse_order_response_accepts_resting_as_success():
+    """resting（GTC 掛上訂單簿）是合法成功終態（Task 8 mirror 掛單會走 GTC）：
+    ok=True 但 filled_size/avg_px 為 0。Ioc 路徑不受影響（Ioc 不會 resting）。"""
+    ex = FakeExchange(order_response={"status": "ok", "response": {"data": {"statuses": [
+        {"resting": {"oid": 777}}]}}})
+    ad = _adapter(exchange=ex)
+    res = ad.place_order(agent_signer=None,
+                         order=Order("ETH", True, Decimal("0.01"), Decimal("4000"), "Gtc"),
+                         builder=BUILDER)
+    assert res.ok is True
+    assert res.filled_size == Decimal("0")
+    assert res.avg_px == Decimal("0")
+    assert res.raw["response"]["data"]["statuses"][0] == {"resting": {"oid": 777}}
 
 
 def test_cancel_and_update_leverage_report_failure():

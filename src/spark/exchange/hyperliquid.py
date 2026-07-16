@@ -1,5 +1,6 @@
 """hyperliquid-python-sdk 實作。Info/Exchange 可注入以便測試。
 方法名以 Task 0 findings 為準。"""
+import logging
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timedelta, timezone
@@ -10,6 +11,8 @@ from spark.exchange.base import (
     OpenOrder, Position, AccountSnapshot, EquityView, UserFill,
 )
 from spark.exchange.csv_fills import parse_builder_fills
+
+logger = logging.getLogger(__name__)
 
 
 class HyperliquidAdapter(ExchangeAdapter):
@@ -221,15 +224,25 @@ class HyperliquidAdapter(ExchangeAdapter):
 
     def _parse_order_response(self, res: dict) -> OrderResult:
         """order()/market_open() 共用的回應解析。被拒單（IOC 未成交、保證金不足等）是
-        正常結果而非例外：HL 回 {"status":"err",...}，直接挖 response.data 會 TypeError。
-        先檢查 status，非 ok 則回 ok=False（原始回應留 raw）。"""
+        正常結果而非例外，且 HL 有兩種錯誤形態（記載參照 hl-copytrader
+        instrument.py:50-65，唯讀參考）：
+        - 頂層錯誤（限流、簽名等）：{"status":"err","response":"<字串>"} —— response 是
+          str，直接挖 data 會 TypeError，故先檢查 status。
+        - 單筆委託錯誤：{"status":"ok",...,"statuses":[{"error":...}]} —— 頂層 ok
+          不代表成功，statuses[0] 帶 "error" 鍵才是真相。
+        成功終態兩種：filled（IOC 立即成交，有量有價）與 resting（GTC 掛上訂單簿，
+        尚無成交 → ok=True 但 filled_size/avg_px 為 0）。Ioc 路徑不會出現 resting。"""
         if res.get("status") != "ok":
             return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
-        status = res["response"]["data"]["statuses"][0].get("filled", {})
+        status = res["response"]["data"]["statuses"][0]
+        if "resting" in status:
+            return OrderResult(ok=True, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
+        # 帶 "error" 鍵或其他未知形態 → filled 為空 dict → ok=False（原始回應留 raw）。
+        filled = status.get("filled", {})
         return OrderResult(
-            ok=bool(status),
-            filled_size=Decimal(status.get("totalSz", "0")),
-            avg_px=Decimal(status.get("avgPx", "0")),
+            ok=bool(filled),
+            filled_size=Decimal(filled.get("totalSz", "0")),
+            avg_px=Decimal(filled.get("avgPx", "0")),
             raw=res,
         )
 
@@ -242,8 +255,19 @@ class HyperliquidAdapter(ExchangeAdapter):
         return self._parse_order_response(res)
 
     def cancel_order(self, agent_signer: Signer, coin: str, oid: int) -> bool:
+        """撤單。回傳語意：False = **未確認撤單**——頂層 err 或單筆 error（如 oid 已成交/
+        已撤/不存在）皆回 False，此時訂單可能仍掛在簿上；真相由上層 settle 重抓
+        get_open_orders 驗證為準，本方法不代做對帳。"""
         res = self._exchange.cancel(coin, oid)
-        return res.get("status") == "ok"
+        if res.get("status") != "ok":
+            return False
+        # 單筆委託錯誤形態（同 _parse_order_response docstring）：頂層 ok 但
+        # statuses[0] 是 {"error": ...}；成功時 statuses[0] 是字串 "success"。
+        status = res["response"]["data"]["statuses"][0]
+        if isinstance(status, dict) and "error" in status:
+            logger.warning("cancel_order rejected: %s", status["error"])
+            return False
+        return True
 
     def modify_order(self, agent_signer: Signer, oid: int, order: Order) -> bool:
         # ⭐ SDK 0.24.0 modify_order() 無 builder 參數（結構限制，見 ABC docstring 的
@@ -252,9 +276,18 @@ class HyperliquidAdapter(ExchangeAdapter):
             oid, order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
             {"limit": {"tif": order.tif}}, reduce_only=order.reduce_only,
         )
-        # 掛單（resting）與成交（filled）皆算改單成功；只有 status!="ok"（rejected/error）算失敗。
+        # HL 拒單雙形態（同 _parse_order_response docstring）：頂層 err，或頂層 ok 但
+        # statuses[0] 帶 "error"（如 "Order was never placed, already canceled, or filled."）
+        # ——後者絕不能判成功，要大聲記錄後回 False（工程原則 3：失敗不得靜默）。
+        # resting（改價後仍掛簿）與 filled（改價後立即成交）皆為合法成功終態 → True。
         # 連線層例外（timeout、connection reset 等）不在此攔截，向上拋交由 resilience boundary 分類。
-        return res.get("status") == "ok"
+        if res.get("status") != "ok":
+            return False
+        status = res["response"]["data"]["statuses"][0]
+        if isinstance(status, dict) and "error" in status:
+            logger.warning("modify_order rejected: %s", status["error"])
+            return False
+        return True
 
     def market_open(self, agent_signer: Signer, coin: str, is_buy: bool, size: Decimal,
                     slippage: Decimal, builder: BuilderCode) -> OrderResult:
