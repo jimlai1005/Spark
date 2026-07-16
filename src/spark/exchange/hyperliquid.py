@@ -11,6 +11,7 @@ from spark.exchange.base import (
     OpenOrder, Position, AccountSnapshot, EquityView, UserFill,
 )
 from spark.exchange.csv_fills import parse_builder_fills
+from spark.resilience import ResilientExchange
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,11 @@ class HyperliquidAdapter(ExchangeAdapter):
     def __init__(self, network: str, info=None, exchange=None):
         self._network = network
         self._info = info        # hyperliquid.info.Info
-        self._exchange = exchange  # hyperliquid.exchange.Exchange（已綁 agent 錢包）
+        # 所有交易寫入經 resilience 邊界（src/spark/resilience.py）分類重試；
+        # 僅當尚未包裝時才包，避免重複呼叫本建構子造成雙層包裝。
+        if exchange is not None and not isinstance(exchange, ResilientExchange):
+            exchange = ResilientExchange(exchange)
+        self._exchange = exchange  # ResilientExchange 包住 hyperliquid.exchange.Exchange
         # get_size_decimals 的 per-coin 快取：None 代表尚未打過 meta()；打過之後即便
         # 查無某 coin 也不重打（避免對不存在的 coin 反覆打 API）。
         self._sz_decimals_cache: dict[str, int] | None = None
