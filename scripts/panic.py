@@ -19,7 +19,7 @@ from pathlib import Path
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
-from spark.copytrade.killswitch import check_drawdown, is_tripped, trip
+from spark.copytrade.killswitch import evaluate, is_tripped, plan_close_actions, trip
 from spark.copytrade.notifier import Notifier
 from spark.exchange.base import BuilderCode, OpenOrder, OrderResult, Position, Signer
 
@@ -33,15 +33,19 @@ USAGE = (
 
 
 def _plan_actions(open_orders: list[OpenOrder], positions: list[Position]) -> list[str]:
-    """純函式：由讀側狀態產生「將執行的動作」清單（dry-run 輸出）。零副作用。"""
+    """純函式：由讀側狀態產生「將執行的動作」清單（dry-run 輸出）。零副作用。
+
+    平倉動作**共用** killswitch.plan_close_actions——與 trip() 實際執行同一份規劃，
+    預覽與實際不得雙實作（雙審 finding：漂移＝預覽騙人）。
+    """
     lines = [f"將撤銷 {len(open_orders)} 張掛單:"]
     for o in open_orders:
         lines.append(f"  cancel {o.coin} oid={o.oid}")
-    live = [p for p in positions if p.szi != 0]
-    lines.append(f"將平倉 {len(live)} 個部位（reduce-only 全量）:")
-    for p in live:
-        side = "buy" if p.szi < 0 else "sell"  # 平空 → 買回；平多 → 賣出
-        lines.append(f"  close {p.coin} {side} size={abs(p.szi)}")
+    actions = plan_close_actions(positions)
+    lines.append(f"將平倉 {len(actions)} 個部位（reduce-only 全量）:")
+    for a in actions:
+        side = "buy" if a.is_buy else "sell"  # 平空 → 買回；平多 → 賣出
+        lines.append(f"  close {a.coin} {side} size={a.size}")
     return lines
 
 
@@ -143,9 +147,9 @@ def main(argv: list[str] | None = None) -> None:
     notifier = _StdoutNotifier()
 
     ev = adapter.get_equity_view(user_addr)  # current/peak 同源（工程原則 1）
-    status = check_drawdown(ev, copy_settings.max_drawdown_pct)
-    if status.peak <= 0:
-        notifier.warn("panic", "peak<=0（無權益歷史）——回撤數字以 0 記錄，照常執行手動平倉")
+    # evaluate（非直呼 check_drawdown）：peak<=0 的 degenerate warn 結構性內建。
+    # 手動 panic 不看 breached——照常執行；status 數字如實寫進 ARM_FILE。
+    status = evaluate(ev, copy_settings, notifier)
     positions = {p.coin: p for p in adapter.get_positions(user_addr)}
 
     print(f"network={network} user={user_addr} 開始執行 kill switch trip ...")
