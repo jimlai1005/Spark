@@ -85,6 +85,7 @@ class HyperliquidAdapter(ExchangeAdapter):
         orders = []
         for o in raw:
             is_trigger = bool(o.get("isTrigger", False))
+            order_type_name = o.get("orderType", "Limit")
             orders.append(OpenOrder(
                 oid=o["oid"],
                 coin=o["coin"],
@@ -95,7 +96,11 @@ class HyperliquidAdapter(ExchangeAdapter):
                 is_trigger=is_trigger,
                 # 非 trigger 一律映射 None（即便 raw 是 "0.0" 或缺鍵）。
                 trigger_px=Decimal(str(o.get("triggerPx", "0"))) if is_trigger else None,
-                tpsl=self._tpsl_from_order_type(o.get("orderType", "")) if is_trigger else None,
+                tpsl=self._tpsl_from_order_type(order_type_name) if is_trigger else None,
+                # 1:1 hl monitor.py:184-186——非 trigger 恆 False；trigger 看 orderType 字串。
+                is_market=("Market" in order_type_name) if is_trigger else False,
+                # 1:1 hl monitor.py:205——API tif 欄位，缺鍵/None → "Gtc"。
+                tif=o.get("tif") or "Gtc",
             ))
         return orders
 

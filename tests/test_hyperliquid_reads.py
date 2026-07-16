@@ -75,6 +75,33 @@ def test_get_open_orders_maps_limit_order():
     assert o.is_trigger is False
     assert o.trigger_px is None  # 非 trigger 一律映射 None，即便 raw 是 "0.0"
     assert o.tpsl is None
+    assert o.is_market is False  # 非 trigger 恆 False（hl monitor.py:184-186）
+    assert o.tif == "Gtc"
+
+
+def test_get_open_orders_alo_tif_passes_through():
+    # maker 單（Alo = add liquidity only）的 tif 必須原樣傳遞，不得被壓成 Gtc——
+    # 否則鏡射會把 leader 的 post-only 單變成可吃單的 Gtc 單。
+    orders_raw = [{
+        "coin": "ETH", "oid": 321, "side": "B", "limitPx": "3900", "sz": "1.0",
+        "reduceOnly": False, "isTrigger": False, "orderType": "Limit",
+        "triggerPx": "0.0", "tif": "Alo", "timestamp": 1750000003000,
+    }]
+    ad = _adapter(frontend_orders=orders_raw)
+    o = ad.get_open_orders("0xuser")[0]
+    assert o.tif == "Alo"
+    assert o.is_market is False
+
+
+def test_get_open_orders_null_tif_defaults_gtc():
+    # trigger 單的 tif 常為 None（API 回 null）→ 1:1 hl monitor.py:205 的 `or "Gtc"`。
+    orders_raw = [{
+        "coin": "ETH", "oid": 322, "side": "B", "limitPx": "3900", "sz": "1.0",
+        "reduceOnly": False, "isTrigger": False, "orderType": "Limit",
+        "triggerPx": "0.0", "tif": None, "timestamp": 1750000004000,
+    }]
+    ad = _adapter(frontend_orders=orders_raw)
+    assert ad.get_open_orders("0xuser")[0].tif == "Gtc"
 
 
 def test_get_open_orders_trigger_stop_loss_missing_reduce_only_defaults_false():
@@ -93,6 +120,10 @@ def test_get_open_orders_trigger_stop_loss_missing_reduce_only_defaults_false():
     assert isinstance(o.trigger_px, Decimal)
     assert o.tpsl == "sl"
     assert o.is_buy is False  # side "A" = 賣
+    # "Stop Market" → trigger 市價單（hl monitor.py:186 "Market" in orderType）；
+    # 漏掉這個旗標會把 leader 的止損市價單鏡射成止損限價單。
+    assert o.is_market is True
+    assert o.tif == "Gtc"  # tif 缺鍵 → 預設 "Gtc"
 
 
 def test_get_open_orders_trigger_take_profit_tpsl_tp():
@@ -105,6 +136,7 @@ def test_get_open_orders_trigger_take_profit_tpsl_tp():
     o = ad.get_open_orders("0xuser")[0]
     assert o.tpsl == "tp"
     assert o.reduce_only is True
+    assert o.is_market is False  # "Take Profit Limit" 不含 "Market" → 觸發限價單
 
 
 def test_tpsl_faithful_port_covers_tp_prefix_and_sl_substring():

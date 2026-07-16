@@ -16,12 +16,8 @@
   - `_plan` 回傳型別改為 frozen dataclass `ReconcilePlan`，`matched` 欄位從 hl 的
     「相符張數」(int) 升級為「相符 oid 的 frozenset[int]」——語意更精確（呼叫端可知道
     具體哪些單被跳過不動），資訊量涵蓋 hl 原本的 `len(matched)`。
-  - `spec_from_open_order` 轉換時 `is_market` 恆為 `False`：spark 的 `OpenOrder`
-    （exchange/base.py）沒有攜帶此欄位（讀側 HyperliquidAdapter.get_open_orders 的既有
-    設計，非本任務引入）。由於 `_build_desired` 的輸入 `leader_orders` 型別同樣是
-    `OpenOrder`，desired spec 的 `is_market` 也恆為 `False`——`_orders_match` 對
-    `is_market` 的比較因此兩側恆相等、實質不生效，是已知的資訊損失但不影響現有測試
-    可觀測的行為（trigger 單的 market/limit 區分需等 OpenOrder 型別擴充後才能還原）。
+  - `OrderSpec` 不攜帶 hl 的 `order_type_name`（人類可讀字串，hl 只在解析階段用它衍生
+    tpsl/is_market，衍生結果已是獨立欄位）——對比對與下單語意零影響。
   - `_build_desired` 的 reduce-only-無部位案例（hl 的 G4，hl:103-104）在 hl 原始碼裡是
     「靜默跳過」（continue，不記錄進任何 skipped 清單）；spark 版本明確記錄為
     `SkippedOrder(reason="reduce_only_no_pos")`，可觀測性優於 hl（呼叫端這裡要求要能
@@ -50,6 +46,7 @@ class OrderSpec:
     tpsl: str | None = None
     trigger_px: Decimal | None = None
     is_market: bool = False
+    tif: str = "Gtc"  # 限價單 time-in-force；hl monitor.py:205 預設 "Gtc"
 
 
 @dataclass(frozen=True)
@@ -72,7 +69,7 @@ class ReconcilePlan:
 
 
 def spec_from_open_order(o: OpenOrder) -> OrderSpec:
-    """exchange 型別 → 引擎型別轉換。`is_market` 恆為 False，見模組 docstring「結構差異」。"""
+    """exchange 型別 → 引擎型別轉換（欄位 1:1 直通，含 is_market/tif）。"""
     return OrderSpec(
         coin=o.coin,
         is_buy=o.is_buy,
@@ -82,7 +79,8 @@ def spec_from_open_order(o: OpenOrder) -> OrderSpec:
         is_trigger=o.is_trigger,
         tpsl=o.tpsl,
         trigger_px=o.trigger_px,
-        is_market=False,
+        is_market=o.is_market,
+        tif=o.tif,
     )
 
 
@@ -96,7 +94,12 @@ def _prices_equal(a: Decimal, b: Decimal, rel: Decimal) -> bool:
 def _orders_match(
     desired: OrderSpec, mine: OrderSpec, *, px_rel_tol: Decimal, size_tol: Decimal
 ) -> bool:
-    """判斷我的一張掛單是否等同於某個目標縮放後的掛單。1:1 port 自 hl orders.py:46-76。"""
+    """判斷我的一張掛單是否等同於某個目標縮放後的掛單。1:1 port 自 hl orders.py:46-76。
+
+    注意：**不比較 tif**——hl 原始碼的 `_orders_match` 沒有 tif 比較項（已對照確認），
+    照抄此行為；tif 只在下單時經 `_order_type_and_px` 傳遞，不參與相符判定。
+    `is_market` 僅在雙方皆為 trigger 單時比較（同 hl:65）。
+    """
     if desired.coin != mine.coin:
         return False
     if desired.is_buy != mine.is_buy:
@@ -260,7 +263,8 @@ def _build_desired(
                 is_trigger=o.is_trigger,
                 tpsl=o.tpsl,
                 trigger_px=o.trigger_px,
-                is_market=False,
+                is_market=o.is_market,  # 1:1 hl orders.py:123——取 leader 掛單實際值
+                tif=o.tif,              # 1:1 hl orders.py:124
             )
         )
     return desired, skipped

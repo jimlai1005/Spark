@@ -62,6 +62,9 @@ class OpenOrder:
     is_trigger: bool
     trigger_px: Decimal | None
     tpsl: str | None      # "tp" / "sl" / None
+    # 帶預設值加在尾端（既有建構點不壞）。語意 1:1 對照 hl-copytrader monitor.py:184-186/205。
+    is_market: bool = False   # 僅 trigger 單有意義："Market" in orderType；非 trigger 恆 False
+    tif: str = "Gtc"          # API 回應 tif 欄位；缺鍵/None → "Gtc"
 
 
 @dataclass(frozen=True)

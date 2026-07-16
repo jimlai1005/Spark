@@ -49,11 +49,19 @@ class TestRoundSize:
 
 
 class TestOrderTypeAndPx:
-    def test_limit_order_uses_limit_px_and_gtc(self):
+    def test_limit_order_uses_limit_px_and_default_gtc(self):
         spec = OrderSpec(coin="BTC", is_buy=True, sz=Decimal("1"), limit_px=Decimal("50000"))
         px, order_type = _order_type_and_px(spec)
         assert px == Decimal("50000")
         assert order_type == {"limit": {"tif": "Gtc"}}
+
+    def test_limit_order_alo_tif_passes_through(self):
+        # 1:1 hl instrument.py:46——tif 取自 spec，post-only（Alo）不得被壓成 Gtc。
+        spec = OrderSpec(
+            coin="BTC", is_buy=True, sz=Decimal("1"), limit_px=Decimal("50000"), tif="Alo"
+        )
+        _px, order_type = _order_type_and_px(spec)
+        assert order_type == {"limit": {"tif": "Alo"}}
 
     def test_trigger_limit_order_uses_limit_px_as_px(self):
         spec = OrderSpec(

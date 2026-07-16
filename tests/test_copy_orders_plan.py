@@ -7,6 +7,7 @@ from spark.copytrade.orders import (
     OrderSpec,
     SkippedOrder,
     _build_desired,
+    _orders_match,
     _plan,
     spec_from_open_order,
 )
@@ -17,7 +18,7 @@ SIZE_TOL = Decimal("0.02")
 
 
 def _spec(coin="ETH", is_buy=True, sz="1.0", limit_px="2000", reduce_only=False,
-          is_trigger=False, tpsl=None, trigger_px=None, is_market=False) -> OrderSpec:
+          is_trigger=False, tpsl=None, trigger_px=None, is_market=False, tif="Gtc") -> OrderSpec:
     return OrderSpec(
         coin=coin,
         is_buy=is_buy,
@@ -28,11 +29,13 @@ def _spec(coin="ETH", is_buy=True, sz="1.0", limit_px="2000", reduce_only=False,
         tpsl=tpsl,
         trigger_px=Decimal(trigger_px) if trigger_px is not None else None,
         is_market=is_market,
+        tif=tif,
     )
 
 
 def _open_order(coin="ETH", is_buy=True, sz="1.0", limit_px="2000", reduce_only=False,
-                 is_trigger=False, tpsl=None, trigger_px=None, oid=1) -> OpenOrder:
+                 is_trigger=False, tpsl=None, trigger_px=None, oid=1,
+                 is_market=False, tif="Gtc") -> OpenOrder:
     return OpenOrder(
         oid=oid,
         coin=coin,
@@ -43,6 +46,8 @@ def _open_order(coin="ETH", is_buy=True, sz="1.0", limit_px="2000", reduce_only=
         is_trigger=is_trigger,
         trigger_px=Decimal(trigger_px) if trigger_px is not None else None,
         tpsl=tpsl,
+        is_market=is_market,
+        tif=tif,
     )
 
 
@@ -171,6 +176,42 @@ def test_different_slot_reduce_only_mismatch_never_modifies():
     assert plan.to_cancel == (7,)
 
 
+# ── 6b. _orders_match 的 is_market 分支（hl orders.py:65-68 語意）────
+def test_orders_match_is_market_mismatch_on_triggers_never_matches():
+    """雙方皆 trigger、僅 is_market 不同 → 不 match（止損市價 vs 止損限價是不同單型）。"""
+    d = _spec(is_buy=False, is_trigger=True, tpsl="sl", trigger_px="1900",
+              limit_px="1890", is_market=True)
+    m = _spec(is_buy=False, is_trigger=True, tpsl="sl", trigger_px="1900",
+              limit_px="1890", is_market=False)
+    assert _orders_match(d, m, px_rel_tol=PX_TOL, size_tol=SIZE_TOL) is False
+
+
+def test_orders_match_is_market_true_skips_limit_px_comparison():
+    """雙方皆 trigger 市價單 → 不比較 limit_px（hl orders.py:68 只在非 market 時比限價）。
+    limit_px 差很遠仍應 match，因為 trigger 市價單成交不看 limit_px。"""
+    d = _spec(is_buy=False, is_trigger=True, tpsl="sl", trigger_px="1900",
+              limit_px="1700", is_market=True)
+    m = _spec(is_buy=False, is_trigger=True, tpsl="sl", trigger_px="1900",
+              limit_px="2100", is_market=True)
+    assert _orders_match(d, m, px_rel_tol=PX_TOL, size_tol=SIZE_TOL) is True
+
+
+def test_orders_match_trigger_limit_compares_limit_px():
+    """對照組：雙方皆 trigger 限價單（is_market=False）→ limit_px 差超過容忍 → 不 match。"""
+    d = _spec(is_buy=False, is_trigger=True, tpsl="sl", trigger_px="1900",
+              limit_px="1700", is_market=False)
+    m = _spec(is_buy=False, is_trigger=True, tpsl="sl", trigger_px="1900",
+              limit_px="2100", is_market=False)
+    assert _orders_match(d, m, px_rel_tol=PX_TOL, size_tol=SIZE_TOL) is False
+
+
+def test_orders_match_ignores_tif():
+    """hl _orders_match 不比較 tif（原始碼對照確認）→ Alo vs Gtc 其他全同仍 match。"""
+    d = _spec(limit_px="2000", tif="Alo")
+    m = _spec(limit_px="2000", tif="Gtc")
+    assert _orders_match(d, m, px_rel_tol=PX_TOL, size_tol=SIZE_TOL) is True
+
+
 # ── 7. trigger 單與限價單不同 slot；tpsl 不同 → 不同 slot ────────────
 def test_trigger_and_limit_order_are_different_slots():
     mine_limit = _spec(limit_px="2000")
@@ -270,15 +311,45 @@ def test_build_desired_size_rounded_down_by_sz_decimals():
     assert desired[0].sz == Decimal("1.234")
 
 
+def test_build_desired_carries_is_market_and_tif_from_leader_order():
+    """leader 的止損市價單/Alo maker 單鏡射時，is_market 與 tif 必須原樣帶到 desired spec
+    （1:1 hl orders.py:123-124），不得硬編預設值。"""
+    leader = [
+        _open_order(coin="ETH", is_buy=False, reduce_only=True, is_trigger=True, tpsl="sl",
+                    trigger_px="1900", limit_px="1900", sz="1", is_market=True, oid=1),
+        _open_order(coin="BTC", limit_px="50000", sz="1", tif="Alo", oid=2),
+    ]
+    desired, skipped = _build_desired(
+        leader, scale=Decimal("1"), min_notional=Decimal("10"),
+        size_decimals=lambda coin: 4, my_positions={"ETH": _position("ETH")}, protected=set(),
+    )
+    assert skipped == []
+    by_coin = {d.coin: d for d in desired}
+    assert by_coin["ETH"].is_market is True
+    assert by_coin["BTC"].tif == "Alo"
+    assert by_coin["BTC"].is_market is False
+
+
 # ── 9. spec_from_open_order 欄位映射 ──────────────────────────────────
 def test_spec_from_open_order_field_mapping():
     o = OpenOrder(
         oid=42, coin="ETH", is_buy=True, limit_px=Decimal("2000"), sz=Decimal("1.5"),
         reduce_only=True, is_trigger=True, trigger_px=Decimal("1990"), tpsl="sl",
+        is_market=True, tif="Gtc",
     )
     spec = spec_from_open_order(o)
     assert spec == OrderSpec(
         coin="ETH", is_buy=True, sz=Decimal("1.5"), limit_px=Decimal("2000"),
         reduce_only=True, is_trigger=True, tpsl="sl", trigger_px=Decimal("1990"),
-        is_market=False,
+        is_market=True, tif="Gtc",
     )
+
+
+def test_spec_from_open_order_maps_alo_tif():
+    o = OpenOrder(
+        oid=43, coin="BTC", is_buy=True, limit_px=Decimal("50000"), sz=Decimal("0.1"),
+        reduce_only=False, is_trigger=False, trigger_px=None, tpsl=None, tif="Alo",
+    )
+    spec = spec_from_open_order(o)
+    assert spec.tif == "Alo"
+    assert spec.is_market is False

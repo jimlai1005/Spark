@@ -9,10 +9,9 @@ Decimal 化、拿掉 xyz 專屬分支，坐標型別改用 spark 的 OrderSpec�
     `ExchangeAdapter.get_size_decimals` 等方法承接，此處不重複。
 
 結構差異：
-  - spark 的 `OrderSpec`（copytrade/orders.py）不攜帶 hl 原本的 `tif`/`order_type_name`
-    欄位。`_order_type_and_px` 對限價單一律回傳 tif="Gtc"——跟單目標永遠是 leader
-    掛著的 resting order（見 hl monitor.py `_parse_orders` 的 `tif` 預設值同為 "Gtc"），
-    不會是 IOC/ALO，故省略此欄位不影響語意。
+  - spark 的 `OrderSpec`（copytrade/orders.py）不攜帶 hl 原本的 `order_type_name` 欄位
+    （人類可讀字串，只在解析階段用來衍生 tpsl/is_market，衍生結果已是獨立欄位）。
+    `tif` 則完整攜帶並由 `_order_type_and_px` 使用（1:1 對照 hl instrument.py:46）。
 """
 from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING
@@ -47,9 +46,9 @@ def _coin_dex(coin: str) -> str:
 
 
 def _order_type_and_px(spec: "OrderSpec") -> tuple[Decimal, dict]:
-    """由 spec 算出下單價與 SDK order_type dict。port 自 hl instrument.py:33-47。
+    """由 spec 算出下單價與 SDK order_type dict。1:1 port 自 hl instrument.py:33-47。
 
-    回傳 (px, order_type)。見模組 docstring「結構差異」：限價單 tif 固定 "Gtc"。
+    回傳 (px, order_type)。限價單 tif 取自 spec.tif（hl instrument.py:46）。
     """
     if spec.is_trigger:
         px = spec.limit_px or spec.trigger_px or Decimal("0")
@@ -62,7 +61,7 @@ def _order_type_and_px(spec: "OrderSpec") -> tuple[Decimal, dict]:
         }
     else:
         px = spec.limit_px
-        order_type = {"limit": {"tif": "Gtc"}}
+        order_type = {"limit": {"tif": spec.tif}}
     return px, order_type
 
 
