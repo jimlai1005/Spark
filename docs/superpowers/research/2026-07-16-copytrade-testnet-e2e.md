@@ -30,10 +30,14 @@
    輪詢確認真的成交（`modify_order()` 只回傳 bool，不足以區分「沒成交」與「成交但
    歸屬遺失」）→ `wait_for_accrual(baseline_1)`。**若逾時（增量為 0），測試不 fail**，
    只印警告——這是 T1.3 的政策資料點，見第 3 節判讀指南。
-4. **place 路徑 accrual**：`baseline_2` = 步驟 3 後的當前 accrued → marketable `Ioc`
-   單（沿 `orchestrator.place_marketable_order`，builder 走 `"order"` action，已知
-   歸屬正確）→ `wait_for_accrual(baseline_2)`，**斷言增量 > 0**（此路徑不允許逾時，
-   逾時代表 builder 完全未生效或注資/授權有問題，屬測試前提失效，應讓例外照常炸開）。
+4. **place 路徑 accrual**：重取 mid（步驟 3 的輪詢最多耗 70 秒以上，沿用舊 mid 若
+   行情已動 >0.5% 會使 `Ioc` 假性「未成交」）→ `baseline_2` = 步驟 3 後的當前
+   accrued → marketable `Ioc` 單（沿 `orchestrator.place_marketable_order`，builder
+   走 `"order"` action，已知歸屬正確）→ `wait_for_accrual(baseline_2)`，**斷言增量
+   > 0**（此路徑不允許逾時，逾時代表 builder 完全未生效或注資/授權有問題，屬測試
+   前提失效，應讓例外照常炸開）。
+   步驟 3-5 全程包 `try/finally`：中途失敗時對步驟 3 殘留的 GTC 掛單 best-effort
+   撤單（cancel 失敗只印警告，不改變測試結果），見 §3.3 第 3 條。
 5. **reduce-only 平倉**：對步驟 3+4 累積的殘留部位（兩次皆 `is_buy=True`，故為多頭）
    全量 `close_reduce_only`，斷言平倉後 `get_positions` 查無該 coin 部位。
 6. 全程只印數字與 `oid`，不印私鑰／簽章物件。
@@ -131,6 +135,11 @@ ratio < 0.1   → 支持假說 (b)：modify 後訂單 builder 歸屬遺失
 2. 先用 `get_open_orders` / 交易所 testnet 前端人工確認實際部位狀態，再決定是否手動
    平倉或調整測試的 `slippage` 參數（預設 `Decimal("0.01")`，thin testnet 流動性下
    可能不足以確保 reduce-only IOC 單完全成交）。
+3. **任何步驟中途失敗後，須確認步驟 3 的 `mid×0.7` GTC 掛單已撤**（測試的 `finally`
+   已自動嘗試 best-effort `cancel_order`，成功則無殘留；若印出「殘留掛單清理失敗」
+   警告，須人工以 `get_open_orders` 確認並手動撤掉）。該掛單帶 builder、價位遠低於
+   市價，若殘留簿上、日後行情下探成交，會在**未來執行**的 accrual baseline 之後產生
+   非本次下單造成的增量（假陽性），污染 place/modify 兩路徑的分開驗證。
 
 ---
 
