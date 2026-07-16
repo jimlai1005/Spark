@@ -219,14 +219,10 @@ class HyperliquidAdapter(ExchangeAdapter):
         res, agent_key = self._exchange.approve_agent(agent_name)
         return TxResult(ok=res.get("status") == "ok", raw=res, agent_key=agent_key)
 
-    def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult:
-        res = self._exchange.order(
-            order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
-            {"limit": {"tif": order.tif}}, reduce_only=False,
-            builder={"b": builder.b, "f": builder.f},
-        )
-        # 被拒單（IOC 未成交、保證金不足等）是正常結果而非例外：HL 回 {"status":"err",...}，
-        # 直接挖 response.data 會 TypeError。先檢查 status，非 ok 則回 ok=False（原始回應留 raw）。
+    def _parse_order_response(self, res: dict) -> OrderResult:
+        """order()/market_open() 共用的回應解析。被拒單（IOC 未成交、保證金不足等）是
+        正常結果而非例外：HL 回 {"status":"err",...}，直接挖 response.data 會 TypeError。
+        先檢查 status，非 ok 則回 ok=False（原始回應留 raw）。"""
         if res.get("status") != "ok":
             return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
         status = res["response"]["data"]["statuses"][0].get("filled", {})
@@ -236,3 +232,56 @@ class HyperliquidAdapter(ExchangeAdapter):
             avg_px=Decimal(status.get("avgPx", "0")),
             raw=res,
         )
+
+    def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult:
+        res = self._exchange.order(
+            order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
+            {"limit": {"tif": order.tif}}, reduce_only=False,
+            builder={"b": builder.b, "f": builder.f},
+        )
+        return self._parse_order_response(res)
+
+    def cancel_order(self, agent_signer: Signer, coin: str, oid: int) -> bool:
+        res = self._exchange.cancel(coin, oid)
+        return res.get("status") == "ok"
+
+    def modify_order(self, agent_signer: Signer, oid: int, order: Order) -> bool:
+        # ⭐ SDK 0.24.0 modify_order() 無 builder 參數（結構限制，見 ABC docstring 的
+        # 紅線例外說明）——此呼叫刻意不帶 builder kwarg。
+        res = self._exchange.modify_order(
+            oid, order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
+            {"limit": {"tif": order.tif}}, reduce_only=order.reduce_only,
+        )
+        # 掛單（resting）與成交（filled）皆算改單成功；只有 status!="ok"（rejected/error）算失敗。
+        # 連線層例外（timeout、connection reset 等）不在此攔截，向上拋交由 resilience boundary 分類。
+        return res.get("status") == "ok"
+
+    def market_open(self, agent_signer: Signer, coin: str, is_buy: bool, size: Decimal,
+                    slippage: Decimal, builder: BuilderCode) -> OrderResult:
+        res = self._exchange.market_open(
+            coin, is_buy, float(size), None, float(slippage),
+            builder={"b": builder.b, "f": builder.f},
+        )
+        return self._parse_order_response(res)
+
+    def close_reduce_only(self, agent_signer: Signer, coin: str, is_buy: bool, size: Decimal,
+                          slippage: Decimal, builder: BuilderCode) -> OrderResult:
+        # 語意見 ABC docstring：is_buy 是平倉下單方向，呼叫端已算好 not position_is_long，
+        # 這裡不做任何反轉。mid 來源固定 get_all_mids()（主 perp DEX）。
+        mids = self.get_all_mids()
+        if coin not in mids:
+            return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"),
+                               raw={"error": f"no mid for {coin}"})
+        mid = mids[coin]
+        px = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+        res = self._exchange.order(
+            coin, is_buy, float(size), self._round_px(px),
+            {"limit": {"tif": "Ioc"}}, reduce_only=True,
+            builder={"b": builder.b, "f": builder.f},
+        )
+        return self._parse_order_response(res)
+
+    def update_leverage(self, agent_signer: Signer, coin: str, leverage: int,
+                        is_cross: bool) -> bool:
+        res = self._exchange.update_leverage(leverage, coin, is_cross)
+        return res.get("status") == "ok"

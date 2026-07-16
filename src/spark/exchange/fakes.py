@@ -27,7 +27,9 @@ class FakeAdapter(ExchangeAdapter):
     """
     def __init__(self, account_value=Decimal("0"), seeded_fills=None, account_values=None,
                  open_orders=(), positions=(), account=None, equity=None, fills=(),
-                 mids=None, sz_decimals=None):
+                 mids=None, sz_decimals=None,
+                 cancel_ok=True, modify_ok=True, market_open_ok=True,
+                 close_reduce_only_ok=True, update_leverage_ok=True):
         self._account_value = Decimal(account_value)
         self._account_values = dict(account_values or {})
         self._max_fee = 0
@@ -43,6 +45,12 @@ class FakeAdapter(ExchangeAdapter):
         self._fills = list(fills)
         self._mids = dict(mids or {})
         self._sz_decimals = dict(sz_decimals or {})
+        # writes（M1 補齊）：可注入的成功/失敗結果，預設成功。
+        self._cancel_ok = cancel_ok
+        self._modify_ok = modify_ok
+        self._market_open_ok = market_open_ok
+        self._close_reduce_only_ok = close_reduce_only_ok
+        self._update_leverage_ok = update_leverage_ok
 
     def get_account_value(self, address: str) -> Decimal:
         return self._account_values.get(address, self._account_value)
@@ -74,6 +82,41 @@ class FakeAdapter(ExchangeAdapter):
         self._accrued += notional * Decimal(builder.f) / Decimal(100000)  # f/1000 % = f/100000
         return OrderResult(ok=True, filled_size=order.size, avg_px=order.limit_px,
                            raw={"status": "filled"})
+
+    def cancel_order(self, agent_signer, coin: str, oid: int) -> bool:
+        self.calls["cancel_order"].append({"agent_signer": agent_signer, "coin": coin, "oid": oid})
+        return self._cancel_ok
+
+    def modify_order(self, agent_signer, oid: int, order: Order) -> bool:
+        self.calls["modify_order"].append({"agent_signer": agent_signer, "oid": oid, "order": order})
+        return self._modify_ok
+
+    def market_open(self, agent_signer, coin: str, is_buy: bool, size: Decimal,
+                    slippage: Decimal, builder: BuilderCode) -> OrderResult:
+        self.calls["market_open"].append({
+            "agent_signer": agent_signer, "coin": coin, "is_buy": is_buy, "size": size,
+            "slippage": slippage, "builder": builder})
+        mid = self._mids.get(coin, Decimal("0"))
+        ok = self._market_open_ok
+        return OrderResult(ok=ok, filled_size=size if ok else Decimal("0"),
+                           avg_px=mid, raw={"status": "ok" if ok else "err"})
+
+    def close_reduce_only(self, agent_signer, coin: str, is_buy: bool, size: Decimal,
+                          slippage: Decimal, builder: BuilderCode) -> OrderResult:
+        self.calls["close_reduce_only"].append({
+            "agent_signer": agent_signer, "coin": coin, "is_buy": is_buy, "size": size,
+            "slippage": slippage, "builder": builder})
+        if coin not in self._mids:
+            return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"),
+                               raw={"error": f"no mid for {coin}"})
+        ok = self._close_reduce_only_ok
+        return OrderResult(ok=ok, filled_size=size if ok else Decimal("0"),
+                           avg_px=self._mids[coin], raw={"status": "ok" if ok else "err"})
+
+    def update_leverage(self, agent_signer, coin: str, leverage: int, is_cross: bool) -> bool:
+        self.calls["update_leverage"].append({
+            "agent_signer": agent_signer, "coin": coin, "leverage": leverage, "is_cross": is_cross})
+        return self._update_leverage_ok
 
     # --- reads（copytrade M1）---
     def get_open_orders(self, address: str) -> list[OpenOrder]:

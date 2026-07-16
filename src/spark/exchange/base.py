@@ -22,6 +22,7 @@ class Order:
     size: Decimal
     limit_px: Decimal
     tif: str  # "Ioc"
+    reduce_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -133,3 +134,37 @@ class ExchangeAdapter(ABC):
     def approve_agent(self, main_signer: Signer, agent_name: str) -> TxResult: ...
     @abstractmethod
     def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult: ...
+    @abstractmethod
+    def cancel_order(self, agent_signer: Signer, coin: str, oid: int) -> bool: ...
+    @abstractmethod
+    def modify_order(self, agent_signer: Signer, oid: int, order: Order) -> bool:
+        """改單。⭐ 已知例外：hyperliquid-python-sdk 0.24.0 的 modify_order() 簽章無 builder
+        參數（結構限制，非本專案疏漏）——改單走 batchModify action，SDK 該層未接 builder
+        欄位。故本方法**不帶** builder，紅線「order-creating writes 全帶 builder」在此不適用
+        （改單本身不建立新訂單意圖，只調整既有掛單的價格/數量）。"""
+        ...
+    @abstractmethod
+    def market_open(self, agent_signer: Signer, coin: str, is_buy: bool, size: Decimal,
+                    slippage: Decimal, builder: BuilderCode) -> OrderResult: ...
+    @abstractmethod
+    def close_reduce_only(self, agent_signer: Signer, coin: str, is_buy: bool, size: Decimal,
+                          slippage: Decimal, builder: BuilderCode) -> OrderResult:
+        """Reduce-only IOC 平倉單。
+
+        語意鎖死（呼叫端責任，adapter 不反轉方向）：
+        - `is_buy` = 平倉**下單方向**，不是持倉方向。呼叫端自行算好
+          `is_buy = not position_is_long`（平多倉 → is_buy=False；平空倉 → is_buy=True）
+          再傳入；adapter 原樣傳給 SDK，不做任何反轉。
+        - mid 來源固定為 `get_all_mids()`（主 perp DEX 的當前 mid）。
+        - 價格：`px = mid * (1 + slippage)`（is_buy=True）或 `mid * (1 - slippage)`
+          （is_buy=False），全程 Decimal 運算後才用 `_round_px` 轉 float。
+        - 送 SDK：`order(coin, is_buy, float(size), px, {"limit": {"tif": "Ioc"}},
+          reduce_only=True, builder={"b":..., "f":...})`。
+        - 取不到 mid（coin 不在 `get_all_mids()` 回傳的 dict 內）→ 回
+          `OrderResult(ok=False, filled_size=0, avg_px=0, raw={"error": "no mid for <coin>"})`，
+          **不 raise**；呼叫端負責看到 ok=False 後告警。
+        """
+        ...
+    @abstractmethod
+    def update_leverage(self, agent_signer: Signer, coin: str, leverage: int,
+                        is_cross: bool) -> bool: ...
