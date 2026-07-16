@@ -57,24 +57,35 @@ def _check_env() -> tuple[str, str, str, str]:
             os.environ["SPARK_BUILDER_ADDR"], network)
 
 
-def _confirm_fill(adapter, user_addr: str, oid: int, coin: str,
-                  attempts: int = 10, sleep_s: float = 2.0):
-    """輪詢 get_user_fills 直到查到指定 oid 的成交紀錄，回傳該筆 UserFill；逾時回傳 None。
+def _confirm_fills(adapter, user_addr: str, oid: int, coin: str,
+                   attempts: int = 10, sleep_s: float = 2.0) -> list:
+    """輪詢 get_user_fills 直到查到指定 oid 的成交紀錄，回傳**全部**符合 oid+coin 的
+    UserFill 清單；逾時回傳空清單。
 
     modify_order() 只回傳 bool，需要另外確認「改單後是否真的成交」——不能只靠 builder
     累計費的增量反推：增量為 0 可能是「根本沒成交」，也可能是「成交但歸屬遺失」，兩者
     對應完全不同的政策意涵（前者是腳本/流動性問題，後者才是 T1.3 要驗證的風險），
     必須分開觀察，不能混為一談。
+
+    必須蒐集全部而非第一筆：thin testnet 流動性下，同一 oid 的 IOC 單可能分批成交
+    多筆（partial fills）。只取第一筆會低估 notional（ratio 分母），使 ratio 系統性
+    偏高——可能把本應人工深查的部分歸屬異常誤判為假說 (a)。故首次查到成交後再多等
+    一輪重抓，補齊稍晚入帳的分批成交，回傳完整清單由呼叫端加總 Σ(sz×px)。
     """
     window_start = datetime.now(timezone.utc) - timedelta(minutes=10)
     for _ in range(attempts):
         fills = adapter.get_user_fills(user_addr, window_start, datetime.now(timezone.utc))
-        for f in fills:
-            if f.oid == oid and f.coin == coin:
-                return f
+        matched = [f for f in fills if f.oid == oid and f.coin == coin]
+        if matched:
+            # 已有成交：多等一輪再重抓一次，蒐集可能稍晚入帳的分批成交。
+            if sleep_s:
+                time.sleep(sleep_s)
+            fills = adapter.get_user_fills(user_addr, window_start,
+                                           datetime.now(timezone.utc))
+            return [f for f in fills if f.oid == oid and f.coin == coin]
         if sleep_s:
             time.sleep(sleep_s)
-    return None
+    return []
 
 
 def _expected_fee(notional: Decimal, f: int) -> Decimal:
@@ -128,6 +139,8 @@ def main():
             f"[對照組 A] 下單未成交，已完成步驟：onboarding、baseline_a 查詢。raw={res_a.raw}")
     accrued_a = wait_for_accrual(main_adapter, settings.builder_address, baseline=baseline_a)
     delta_a = accrued_a - baseline_a
+    # filled_size/avg_px 出自 HL 回應的 totalSz/avgPx（_parse_order_response），
+    # 本身已是跨分批成交的聚合值——不需另行加總 fills（對照實驗組 B 的 Σ(sz×px)）。
     notional_a = res_a.filled_size * res_a.avg_px
     expected_a = _expected_fee(notional_a, settings.f)
     _print_group("A(place)", res_a.filled_size, notional_a, expected_a, delta_a)
@@ -144,8 +157,19 @@ def main():
             f"[實驗組 B] 遠端掛單失敗，已完成步驟：對照組 A 全部完成（Δ_place={delta_a}）。"
             f"raw={res_resting.raw}")
     try:
-        oid = res_resting.raw["response"]["data"]["statuses"][0]["resting"]["oid"]
+        status0 = res_resting.raw["response"]["data"]["statuses"][0]
     except (KeyError, IndexError) as e:
+        raise SystemExit(
+            f"[實驗組 B] 掛單成功但回應無 statuses[0]，已完成步驟：對照組 A 全部完成"
+            f"（Δ_place={delta_a}）。raw={res_resting.raw}") from e
+    if isinstance(status0, dict) and "filled" in status0:
+        raise SystemExit(
+            f"[實驗組 B] 遠端掛單意外立即成交（mid×0.7 竟成交，流動性異常），"
+            f"實驗組作廢本輪。已完成步驟：對照組 A 全部完成（Δ_place={delta_a}）。"
+            f"statuses[0]={status0}")
+    try:
+        oid = status0["resting"]["oid"]
+    except (KeyError, TypeError) as e:
         raise SystemExit(
             f"[實驗組 B] 掛單成功但回應無 resting.oid，已完成步驟：對照組 A 全部完成"
             f"（Δ_place={delta_a}）。raw={res_resting.raw}") from e
@@ -159,15 +183,22 @@ def main():
             f"[實驗組 B] modify_order 被拒絕（oid={oid}），已完成步驟：對照組 A 全部完成"
             f"（Δ_place={delta_a}）、遠端掛單成功。")
 
-    fill = _confirm_fill(agent_adapter, user_addr, oid, settings.coin)
-    if fill is None:
+    fills = _confirm_fills(agent_adapter, user_addr, oid, settings.coin)
+    if not fills:
         print(f"警告：[實驗組 B] modify 後於輪詢時間窗內查無 oid={oid} 的成交紀錄——"
              "下面的 Δ_modify 若為 0，無法單靠此腳本區分「根本沒成交」與「成交但歸屬遺失」，"
              "須人工核對 get_open_orders / 交易所前端後再解讀。")
         notional_b = settings.order_size * modify_target.limit_px  # 估計值：無實際成交價可用
     else:
-        notional_b = fill.sz * fill.px
-        print(f"[實驗組 B] 確認成交 sz={fill.sz} px={fill.px} oid={fill.oid}")
+        # thin testnet 流動性下同一 oid 可能分批成交：notional = Σ(sz×px)，
+        # 各筆 fee 一併加總輸出作為佐證（fee 是 taker fee，非 builder fee，僅供對照）。
+        notional_b = sum((f.sz * f.px for f in fills), Decimal("0"))
+        total_sz = sum((f.sz for f in fills), Decimal("0"))
+        total_fee = sum((f.fee for f in fills), Decimal("0"))
+        print(f"[實驗組 B] 確認成交 fills={len(fills)} 筆 total_sz={total_sz} "
+             f"notional={notional_b} total_fee={total_fee} oid={oid}")
+        for f in fills:
+            print(f"  - sz={f.sz} px={f.px} fee={f.fee} time={f.time.isoformat()}")
 
     try:
         accrued_b = wait_for_accrual(main_adapter, settings.builder_address, baseline=baseline_b)
