@@ -1,8 +1,6 @@
 """Notifier ABC——通知介面。"""
 import os
 import time
-import urllib.request
-import json
 from abc import ABC, abstractmethod
 from typing import Callable
 
@@ -128,14 +126,19 @@ class TelegramNotifier(Notifier):
         )
         return cls(token=token, chat_id=chat_id, muted_categories=muted_categories)
 
+    _LEVEL_PREFIXES = {"info": "INFO", "warn": "WARN", "critical": "CRIT"}
+
     def _format_message(self, level: str, category: str, text: str) -> str:
-        """格式化通知訊息。"""
-        level_upper = level.upper()
-        return f"[{level_upper}] {category} | {text}"
+        """格式化通知訊息。前綴依 spec：INFO/WARN/CRIT。"""
+        prefix = self._LEVEL_PREFIXES[level]
+        return f"[{prefix}] {category} | {text}"
 
     def _http_send(self, text: str) -> bool:
         """預設 HTTP 實作（lazy import urllib）。成功回 True，否則 False。"""
         try:
+            import json
+            import urllib.request
+
             api_url = f"https://api.telegram.org/bot{self._token}/sendMessage"
             data = json.dumps(
                 {"chat_id": self._chat_id, "text": text, "parse_mode": "HTML"}
@@ -169,6 +172,9 @@ class TelegramNotifier(Notifier):
         # Dedup 檢查
         if dedup_key is not None:
             now = self._clock()
+            # 順手清掉過期項，避免字典無限成長（照 hl telegram.py 模式）
+            for k in [k for k, ts in self._dedup_times.items() if now - ts > self.DEDUP_TTL]:
+                self._dedup_times.pop(k, None)
             if dedup_key in self._dedup_times:
                 last_sent = self._dedup_times[dedup_key]
                 if now - last_sent < self.DEDUP_TTL:
@@ -190,7 +196,7 @@ class TelegramNotifier(Notifier):
         if result and dedup_key is not None:
             self._dedup_times[dedup_key] = self._clock()
 
-        return result
+        return bool(result)
 
     def info(self, category: str, text: str, dedup_key: str | None = None) -> bool:
         """發送 info 級通知。"""

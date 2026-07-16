@@ -70,7 +70,7 @@ class TestTelegramNotifierBasic:
 
         notifier = TelegramNotifier(token="test", chat_id="123", send_fn=fake_send)
         notifier.critical("risk", "Critical alert")
-        assert "[CRITICAL]" in sent_messages[0]
+        assert "[CRIT]" in sent_messages[0]
         assert "risk" in sent_messages[0]
 
 
@@ -149,6 +149,29 @@ class TestTelegramNotifierDedup:
         notifier.info("orders", "msg2")
         notifier.info("orders", "msg3")
         assert call_count == 3
+
+    def test_dedup_expired_keys_swept_on_send(self):
+        """過期 key 在下次發送時被清掉（防字典無限成長）。"""
+        fake_time = [0.0]
+
+        def fake_clock() -> float:
+            return fake_time[0]
+
+        def fake_send(text: str) -> bool:
+            return True
+
+        notifier = TelegramNotifier(
+            token="test", chat_id="123", send_fn=fake_send, clock=fake_clock
+        )
+        # t=0：送出 stale_key，時間戳記錄為 0
+        assert notifier.info("orders", "msg1", dedup_key="stale_key") is True
+        assert "stale_key" in notifier._dedup_times
+
+        # t=301：TTL 已過，用另一個 key 觸發一次發送 → 清掃應移除 stale_key
+        fake_time[0] = 301.0
+        assert notifier.info("orders", "msg2", dedup_key="fresh_key") is True
+        assert "stale_key" not in notifier._dedup_times
+        assert "fresh_key" in notifier._dedup_times
 
 
 class TestTelegramNotifierMute:
@@ -251,6 +274,18 @@ class TestTelegramNotifierFailure:
         result2 = notifier.info("orders", "msg2", dedup_key="order_1")
         assert result2 is False
         assert call_count == 2
+
+    def test_send_fn_returns_none_coerced_to_false(self):
+        """send_fn 回 None → 回 False（bool 強制轉型，不外洩 None）。"""
+
+        def none_send(text: str):
+            return None
+
+        notifier = TelegramNotifier(token="test", chat_id="123", send_fn=none_send)
+        result = notifier.info("test", "msg", dedup_key="k1")
+        assert result is False
+        # None 視同失敗，dedup 時間戳不前進
+        assert "k1" not in notifier._dedup_times
 
 
 class TestTelegramNotifierFromEnv:
