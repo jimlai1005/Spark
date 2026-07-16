@@ -219,7 +219,7 @@ uv run python -m scripts.run_copytrade
 
 ```bash
 # 查最新 N 行日誌，搜尋 "sync_failed" 或 "reconcile_error"
-tail -100 <copytrade.log> | grep -E "(sync_failed|reconcile_error|CRITICAL)"
+tail -100 <copytrade.log> | grep -E "(sync_failed|reconcile_error|CRIT)"
 ```
 
 **門檻**：連續監控期間內 `sync_failed` 告警計數 = 0
@@ -328,7 +328,8 @@ uv run python -m scripts.run_copytrade --once
 3. **自動 2**：reduce-only 全平所有持倉
 4. **自動 3**：寫入 `var/copytrade/killswitch.tripped`（ARM 檔，含時間戳＋狀態＋失敗清單；
    **部分失敗也會寫**——鎖死交易優先）
-5. **自動 4**：發送 critical 級 Telegram 通知（格式 `[CRITICAL] killswitch | ...`）
+5. **自動 4**：發送 critical 級 Telegram 通知（格式 `[CRIT] killswitch | ...`，
+   前綴見 notifier.py `_LEVEL_PREFIXES`）
 
 之後每輪 cycle 開頭 `is_tripped` 為 True → 只讀報狀態，不再交易，直到人工 re-arm。
 
@@ -356,12 +357,12 @@ uv run python -m scripts.run_copytrade --once
 
 - [ ] **日誌記錄完整**：
   ```bash
-  tail -20 <copytrade.log> | grep -E "(CRITICAL|flatten|tripped)"
+  tail -20 <copytrade.log> | grep -E "(CRIT|flatten|tripped)"
   ```
-  應包含 `[CRITICAL]` 及 flatten 動作記錄
+  應包含 `[CRIT]` 及 flatten 動作記錄
 
 - [ ] **Telegram 通知已收**：
-  應收到 `[CRITICAL] killswitch | ...` 開頭的總結消息（含回撤數字與各步結果）
+  應收到 `[CRIT] killswitch | ...` 開頭的總結消息（含回撤數字與各步結果）
 
 ### 5.4 故意失敗場景：斷網驗證告警升級 [人工模擬]
 
@@ -373,7 +374,7 @@ uv run python -m scripts.run_copytrade --once
 **實際語意**（`killswitch.py` trip 步驟 2）：resilience 層的重試在 adapter 內已耗盡，
 trip 這一層**不再重試**（絕不靜默重試是刻意設計）；單一 coin 平倉失敗會：
 1. 記入 `failures` 清單，**繼續平下一個 coin**（一個失敗不擋其他部位）
-2. 逐 coin 發 critical：`[CRITICAL] killswitch | 平倉失敗 <coin> size=... ——殘留暴險，需人工處置`
+2. 逐 coin 發 critical：`[CRIT] killswitch | 平倉失敗 <coin> size=... ——殘留暴險，需人工處置`
 3. ARM 檔照寫（**部分失敗也寫**——鎖死交易優先於完美平倉），`failures` 欄位記錄殘留
 4. 總結 critical：`KILL SWITCH TRIPPED：...｜平倉失敗 [<coin>...]｜已鎖死 ...`
 
@@ -538,7 +539,7 @@ COPY_LIVE_TRADING=false
 2. 對比 builder accrual 端的官方數據
 3. 檢查修改訂單的日誌，確認 builder 欄位未遺漏
 
-### 症狀 D：`CRITICAL Drawdown exceeded` 但持倉未清
+### 症狀 D：收到 `[CRIT] killswitch | ...` 回撤告警但持倉未清
 
 **可能原因**：
 - 全平訂單被 reject（不足保證金 / 網絡中斷）
