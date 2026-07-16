@@ -82,6 +82,26 @@ def test_all_order_creating_writes_carry_builder():
             f"{method} 呼叫缺少或錯誤的 builder 參數：{kwargs}")
 
 
+def test_place_order_passes_reduce_only_through():
+    """place_order 不得把 reduce_only 寫死 False——leader 的 reduce-only 掛單鏡射
+    必須原樣傳遞，否則會變成可開新倉的普通掛單（方向錯誤的風險放大）。"""
+    ex = FakeExchange()
+    ad = _adapter(exchange=ex)
+    ad.place_order(agent_signer=None,
+                   order=Order("ETH", False, Decimal("0.01"), Decimal("4000"), "Gtc",
+                               reduce_only=True),
+                   builder=BUILDER)
+    method, args, kwargs = ex.calls[-1]
+    assert method == "order"
+    assert kwargs["reduce_only"] is True
+    assert kwargs["builder"] == {"b": BUILDER.b, "f": BUILDER.f}
+    # 預設仍為 False（不帶 reduce_only 的 Order 不受影響）
+    ad.place_order(agent_signer=None,
+                   order=Order("ETH", True, Decimal("0.01"), Decimal("4000"), "Ioc"),
+                   builder=BUILDER)
+    assert ex.calls[-1][2]["reduce_only"] is False
+
+
 def test_modify_has_no_builder_kwarg_by_sdk_constraint():
     """SDK 0.24.0 modify_order() 簽章無 builder（T1.3 實測歸屬）——這是紅線
     「order-creating writes 全帶 builder」的唯一已知例外，因為改單不建立新訂單意圖。"""

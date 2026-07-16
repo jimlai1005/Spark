@@ -129,6 +129,11 @@ class ExchangeAdapter(ABC):
     def get_all_mids(self) -> dict[str, Decimal]: ...
     @abstractmethod
     def get_size_decimals(self, coin: str) -> int: ...
+    @abstractmethod
+    def get_daily_abs_pnl(self, address: str) -> list[Decimal]:
+        """帳戶每日 |PnL| 數列，時間升冪、最後一筆為今日。供 sizing.compute_volatility_stats
+        的呼叫端注入使用（Task 12 loop.py）。"""
+        ...
 
     # --- writes（approve_* 概念上屬主錢包；Phase 1 testnet 由 test harness 簽）---
     @abstractmethod

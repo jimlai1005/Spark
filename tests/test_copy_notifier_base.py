@@ -112,6 +112,9 @@ class TestExecutorPortProtocol:
             def get_open_orders(self):
                 return []
 
+            def get_size_decimals(self, coin):
+                return 4
+
         fake = FakeExecutor()
         assert isinstance(fake, ExecutorPort)
 

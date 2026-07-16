@@ -27,7 +27,7 @@ class FakeAdapter(ExchangeAdapter):
     """
     def __init__(self, account_value=Decimal("0"), seeded_fills=None, account_values=None,
                  open_orders=(), positions=(), account=None, equity=None, fills=(),
-                 mids=None, sz_decimals=None,
+                 mids=None, sz_decimals=None, daily_abs_pnl=(),
                  cancel_ok=True, modify_ok=True, market_open_ok=True,
                  close_reduce_only_ok=True, update_leverage_ok=True):
         self._account_value = Decimal(account_value)
@@ -45,6 +45,7 @@ class FakeAdapter(ExchangeAdapter):
         self._fills = list(fills)
         self._mids = dict(mids or {})
         self._sz_decimals = dict(sz_decimals or {})
+        self._daily_abs_pnl = list(daily_abs_pnl or [])
         # writes（M1 補齊）：可注入的成功/失敗結果，預設成功。
         self._cancel_ok = cancel_ok
         self._modify_ok = modify_ok
@@ -146,3 +147,7 @@ class FakeAdapter(ExchangeAdapter):
     def get_size_decimals(self, coin: str) -> int:
         self.calls["get_size_decimals"].append({"coin": coin})
         return self._sz_decimals.get(coin, _DEFAULT_SIZE_DECIMALS)
+
+    def get_daily_abs_pnl(self, address: str) -> list[Decimal]:
+        self.calls["get_daily_abs_pnl"].append({"address": address})
+        return list(self._daily_abs_pnl)

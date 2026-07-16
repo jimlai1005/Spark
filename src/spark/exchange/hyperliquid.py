@@ -200,6 +200,31 @@ class HyperliquidAdapter(ExchangeAdapter):
             ))
         return fills
 
+    def get_daily_abs_pnl(self, address: str) -> list[Decimal]:
+        """帳戶每日 |PnL| 數列（時間升冪，最後一筆＝今日）。唯讀對照 hl-copytrader
+        weight.py:82-98（`_daily_abs_pnl`）：從 portfolio 回應的 "month" 時間窗
+        `pnlHistory`（累積 PnL 序列）推每日 |PnL| = 相鄰累積值之差的絕對值。
+
+        分桶依 ts（毫秒）轉整數天（`_EPOCH` + `timedelta(milliseconds=...)`，與
+        `get_user_fills` 同一套「無 float 中間值」慣例）；同日多筆取最後一筆
+        （1:1 hl 版 `OrderedDict` 覆寫語意，依賴來源已按 ts 升冪排列）。
+        查無 "month" 列或 pnlHistory 為空 → 回空清單（hl weight.py:90-91 同語意）。
+        """
+        rows = self._info.portfolio(address)
+        pnl_hist = None
+        for row in rows:
+            if isinstance(row, list) and len(row) == 2 and row[0] == "month":
+                pnl_hist = row[1].get("pnlHistory", [])
+                break
+        if not pnl_hist:
+            return []
+        by_day: dict = {}
+        for ts, val in pnl_hist:
+            day = (self._EPOCH + timedelta(milliseconds=int(ts))).date()
+            by_day[day] = Decimal(str(val))
+        cum = list(by_day.values())
+        return [abs(cum[i] - cum[i - 1]) for i in range(1, len(cum))]
+
     def get_all_mids(self) -> dict[str, Decimal]:
         raw = self._info.all_mids()
         # "@" 開頭的 key 是 spot/index 內部標記（非 perp 幣名），M1 只要 perp 幣名。
@@ -262,9 +287,11 @@ class HyperliquidAdapter(ExchangeAdapter):
         )
 
     def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult:
+        # reduce_only 取自 Order 欄位（勿寫死 False——跟單鏡射的 leader reduce-only 掛單
+        # 必須原樣傳遞，否則會變成可開新倉的普通掛單）。
         res = self._exchange.order(
             order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
-            {"limit": {"tif": order.tif}}, reduce_only=False,
+            {"limit": {"tif": order.tif}}, reduce_only=order.reduce_only,
             builder={"b": builder.b, "f": builder.f},
         )
         return self._parse_order_response(res)
