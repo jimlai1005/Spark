@@ -2,11 +2,12 @@
 方法名以 Task 0 findings 為準。"""
 import urllib.request
 import urllib.error
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, Context, ROUND_HALF_EVEN
 from spark.config import CSV_BASE_URLS
 from spark.exchange.base import (
     ExchangeAdapter, Order, BuilderCode, Fill, TxResult, OrderResult, Signer,
+    OpenOrder, Position, AccountSnapshot, EquityView, UserFill,
 )
 from spark.exchange.csv_fills import parse_builder_fills
 
@@ -52,6 +53,28 @@ class HyperliquidAdapter(ExchangeAdapter):
                 return []
             raise
         return parse_builder_fills(raw, compressed=True)
+
+    # --- reads（copytrade M1；Task 2 實作，此處僅提供最小 stub 讓 ABC 可實例化）---
+    def get_open_orders(self, address: str) -> list[OpenOrder]:
+        raise NotImplementedError("Task 2 實作")
+
+    def get_positions(self, address: str) -> list[Position]:
+        raise NotImplementedError("Task 2 實作")
+
+    def get_account_state(self, address: str) -> AccountSnapshot:
+        raise NotImplementedError("Task 2 實作")
+
+    def get_equity_view(self, address: str) -> EquityView:
+        raise NotImplementedError("Task 2 實作")
+
+    def get_user_fills(self, address: str, start: datetime, end: datetime) -> list[UserFill]:
+        raise NotImplementedError("Task 2 實作")
+
+    def get_all_mids(self) -> dict[str, Decimal]:
+        raise NotImplementedError("Task 2 實作")
+
+    def get_size_decimals(self, coin: str) -> int:
+        raise NotImplementedError("Task 2 實作")
 
     # --- writes ---
     # 以下 main_signer / agent_signer 參數為介面文件性質；實際簽章者 = 建構時綁定
