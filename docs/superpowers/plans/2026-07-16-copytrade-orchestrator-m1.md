@@ -10,6 +10,23 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-16-copytrade-orchestrator-m1-spec.md`（紅線 1–7、驗收 gate 表以該檔為準）。
 
+## 執行狀態（2026-07-16 過夜執行完畢）
+
+**Task 0–18 全部完成**，每任務經 fresh-context 雙階段審查（T8/T13 加 opus 第二意見），全部 APPROVED。
+整合驗證：`uv run pytest -q` = **453 passed, 2 deselected**；`uv run ruff check src tests scripts` 乾淨。
+主線 commit 對照：T0=14151d2、T1=7ae30e4、T2=40f739f+c87ab6c、T3=fcbba54+285be23、T4=21a4257+269639c、
+T5=cde11f2+22973b9、T6=14f2716+218be00、T7=e5898dc+89bd160、T8=e097d59+4fa1bf8、T9=d27f9b0+5aa1a35、
+T10=09df513、T11=c57ac12+eb1ad68、T12=bc870a5+8670234、T13=9e3ff99+e45d612、T14=f76f410+e61695d、
+T15=2151fb2、T16=d7280b4、T17=c6b675e+aa109ed、T18=edb1f9b+99d6ae3。
+
+**未完成（非 code）**：T5/T17 的 testnet 實跑 BLOCKED 待注資（follower `0x5579b5Ab953d59fc4d40fDA3199a13E91b680B5d` ≥500、
+builder `0x63e64A1c73b28Ca4FdFAC409DeE3e2BeE4B84847` ≥100 testnet USDC）；shadow 3 交易日對照屬日曆時間；
+主網 dogfood 屬人工關卡（見 runbook）。
+
+**待使用者裁決（晨間檢查點更新版）**：①T1.3 modify 政策（探針就緒待注資實測）②kill switch 緊急平倉 slippage 5% 是否加寬
+③hl-copytrader 線上機 user@IP（shadow differ 校準用）④trigger 單 M1 不支援（executor 記 skip_trigger，
+leader 若掛 trigger 會在 shadow 浮現——煙霧 3 輪未見）⑤sync_failed critical 每輪必發（無 dedup）是否改長 TTL 去重。
+
 ---
 
 ## 全域紅線（每個任務的實作者與 reviewer 都必須先讀）
