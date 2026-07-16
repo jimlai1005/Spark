@@ -236,7 +236,12 @@ class HyperliquidAdapter(ExchangeAdapter):
         - 單筆委託錯誤：{"status":"ok",...,"statuses":[{"error":...}]} —— 頂層 ok
           不代表成功，statuses[0] 帶 "error" 鍵才是真相。
         成功終態兩種：filled（IOC 立即成交，有量有價）與 resting（GTC 掛上訂單簿，
-        尚無成交 → ok=True 但 filled_size/avg_px 為 0）。Ioc 路徑不會出現 resting。"""
+        尚無成交 → ok=True 但 filled_size/avg_px 為 0）。Ioc 路徑不會出現 resting。
+        第三種成功終態：resilience 邊界的 VERIFIED_OK 哨兵（連線中斷但 verify 確認
+        已送達）——原始 SDK 回應已隨斷線遺失，無 statuses 可挖，必須先短路，
+        否則會 KeyError（ok=True 但無成交明細；真相由下一輪對帳補齊）。"""
+        if res.get("_resilience") == "verified":
+            return OrderResult(ok=True, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
         if res.get("status") != "ok":
             return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
         status = res["response"]["data"]["statuses"][0]

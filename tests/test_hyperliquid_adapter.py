@@ -81,6 +81,35 @@ def test_place_order_rejected_returns_not_ok():
     assert res.raw == {"status": "err", "response": "Insufficient margin"}
 
 
+def test_parse_order_response_accepts_verified_ok_sentinel():
+    """resilience 邊界的 VERIFIED_OK（連線中斷但 verify 確認已送達）是第三種成功終態：
+    無 statuses 可挖，必須短路成 ok=True、成交明細為 0——否則 KeyError。"""
+    from spark.resilience import VERIFIED_OK
+    res = _adapter()._parse_order_response(dict(VERIFIED_OK))
+    assert res.ok is True
+    assert res.filled_size == Decimal("0")
+    assert res.avg_px == Decimal("0")
+    assert res.raw == VERIFIED_OK
+
+
+def test_place_order_treats_verified_ok_sentinel_as_success():
+    """走完整 place_order 路徑：內層 exchange 回 VERIFIED_OK（模擬 ResilientExchange
+    verify-then-skip-resend 的回傳）→ OrderResult.ok=True 而非 KeyError。"""
+    from spark.resilience import VERIFIED_OK
+
+    class SentinelExchange(FakeExchange):
+        def order(self, *a, **k):
+            return dict(VERIFIED_OK)
+
+    ad = HyperliquidAdapter(network="testnet", info=FakeInfo(), exchange=SentinelExchange())
+    res = ad.place_order(agent_signer=None,
+                         order=Order("ETH", True, Decimal("0.01"), Decimal("4000"), "Ioc"),
+                         builder=BuilderCode(b="0xbuilder", f=20))
+    assert res.ok is True
+    assert res.filled_size == Decimal("0")
+    assert res.raw.get("_resilience") == "verified"
+
+
 def test_approve_agent_returns_generated_key_and_never_reprs_it():
     ad = _adapter()
     res = ad.approve_agent(main_signer=None, agent_name="spark-agent")

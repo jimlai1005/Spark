@@ -61,15 +61,25 @@ def run(fn, *, what, idempotent, verify=None, attempts=None,
         try:
             return fn()
         except Exception as e:
-            if not _is_transient_error(e) or i == attempts or not can_retry:
+            if not _is_transient_error(e) or not can_retry:
+                raise
+            if i == attempts:
+                # 重試耗盡有專屬告警：監控端得以區分「語意錯誤直接上拋」與
+                # 「暫時性錯誤重試打光」兩種失敗（bare raise 保留原例外鏈）。
+                logger.warning("%s：重試 %d 次仍失敗，放棄並上拋", what, attempts)
                 raise
             if not idempotent:  # 非冪等但有 verify → 驗證後決定是否重送
                 try:
                     landed = verify()
-                except Exception:
-                    landed = True  # 查不出來 → 假設已送達
+                except Exception as verify_exc:
+                    # 兩種信心層級分開記：這一句是「查不出來、保守假設已送達」，
+                    # 不是「已真實驗證」——監控端不得把它當成已確認送達。
+                    logger.warning(
+                        "%s：連線中斷且 verify 查詢失敗（%s），"
+                        "保守假設已送達（未真實驗證，不重送）", what, verify_exc)
+                    return VERIFIED_OK
                 if landed:
-                    logger.warning(f"{what}：連線中斷但已驗證送達，視為成功（不重送）")
+                    logger.warning("%s：連線中斷但已驗證送達，視為成功（不重送）", what)
                     return VERIFIED_OK
             delay = base_delay * (2 ** (i - 1))
             logger.warning(

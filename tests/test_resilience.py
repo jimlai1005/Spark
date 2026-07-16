@@ -129,6 +129,58 @@ def test_verify_read_failure_assumes_landed():
     assert fn.n == 1
 
 
+# --- log 語意：verify 兩種信心層級分開記；重試耗盡有專屬告警 ---
+
+def test_verify_true_logs_verified_delivery(caplog):
+    fn = Counter(fail_times=99, exc=CONN)
+    with caplog.at_level("WARNING"):
+        result = run(fn, what="開倉", idempotent=False, verify=lambda: True,
+                     sleep_fn=RecordingSleep())
+    assert result == VERIFIED_OK
+    assert "已驗證送達" in caplog.text            # 真的查過、確認送達
+    assert "verify 查詢失敗" not in caplog.text
+
+
+def test_verify_exception_logs_conservative_assumption(caplog):
+    fn = Counter(fail_times=99, exc=CONN)
+
+    def boom():
+        raise RuntimeError("read failed")
+
+    with caplog.at_level("WARNING"):
+        result = run(fn, what="開倉", idempotent=False, verify=boom,
+                     sleep_fn=RecordingSleep())
+    assert result == VERIFIED_OK
+    assert "verify 查詢失敗" in caplog.text       # 查不出來、保守假設——非真實驗證
+    assert "read failed" in caplog.text           # verify 例外內容要進 log
+    assert "未真實驗證" in caplog.text
+    assert "已驗證送達" not in caplog.text
+
+
+def test_retry_exhaustion_logs_before_raise(caplog):
+    fn = Counter(fail_times=99, exc=CONN)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ConnectionError):
+            run(fn, what="平倉", idempotent=True, sleep_fn=RecordingSleep())
+    assert f"重試 {RETRY_ATTEMPTS} 次仍失敗，放棄並上拋" in caplog.text
+
+
+def test_semantic_error_has_no_exhaustion_log(caplog):
+    fn = Counter(fail_times=99, exc=ValueError("rejected"))
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ValueError):
+            run(fn, what="平倉", idempotent=True, sleep_fn=RecordingSleep())
+    assert "仍失敗" not in caplog.text            # 語意錯誤 ≠ 重試打光，不得混用告警
+
+
+def test_single_run_transient_has_no_exhaustion_log(caplog):
+    fn = Counter(fail_times=99, exc=CONN)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ConnectionError):
+            run(fn, what="改單", idempotent=False, sleep_fn=RecordingSleep())
+    assert "仍失敗" not in caplog.text            # 單次嘗試（不可重試）≠ 重試打光
+
+
 # --- 指數退避序列 ---
 
 def test_exponential_backoff_sequence_recorded_by_sleep_fn():
