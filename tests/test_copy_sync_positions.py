@@ -53,6 +53,9 @@ class FakeExecutor:
     def get_open_orders(self) -> list:
         return []
 
+    def get_size_decimals(self, coin: str) -> int:
+        return 4
+
 
 def _pos(coin="ETH", szi="1", entry_px="2000", leverage=5, is_cross=True) -> Position:
     return Position(
@@ -207,6 +210,7 @@ def test_direction_flip_closes_full_then_opens_target():
     assert ex.records[1] == ("update_leverage", "ETH", 9, False)
     assert ex.records[2] == ("market_open", "ETH", True, Decimal("1.2000"))
     assert res["adjusted"][0]["kind"] == "flip"
+    assert res["opened"] == []  # 反轉重開只記 adjusted，不重複記入 opened
 
 
 def test_direction_flip_long_to_short():
@@ -301,6 +305,45 @@ def test_close_failure_on_flatten_recorded_and_warned():
 
     assert res["failed"] == [{"coin": "ETH", "action": "close_reduce_only"}]
     assert res["flattened"] == []
+    assert len(_warns(notifier)) == 1
+
+
+def test_increase_open_failure_not_recorded_as_adjusted():
+    # adjusted 只在執行成功才記錄——失敗只出現在 failed，不得兩處並存
+    leader = {"ETH": _pos(szi="15")}
+    mine = {"ETH": _pos(szi="1.0")}
+    ex, notifier, res = _sync(leader, mine, fail_ops={"market_open"})
+
+    assert _ops(ex) == ["update_leverage", "market_open"]
+    assert res["adjusted"] == []
+    assert res["failed"] == [{"coin": "ETH", "action": "market_open"}]
+    assert len(_warns(notifier)) == 1
+
+
+def test_decrease_close_failure_not_recorded_as_adjusted():
+    leader = {"ETH": _pos(szi="8")}
+    mine = {"ETH": _pos(szi="1.0")}
+    ex, notifier, res = _sync(leader, mine, fail_ops={"close_reduce_only"})
+
+    assert _ops(ex) == ["close_reduce_only"]
+    assert res["adjusted"] == []
+    assert res["failed"] == [{"coin": "ETH", "action": "close_reduce_only"}]
+    assert len(_warns(notifier)) == 1
+
+
+def test_flip_close_fails_open_succeeds_best_effort_pinned():
+    # 釘死設計決定：flip 兩腿皆 best-effort 嘗試（close 失敗仍重開，同 hl
+    # trader.py:269-279 不檢查 close 回傳值）；但 adjusted 只在兩腿皆成功
+    # 才記錄——此案 close 失敗 → adjusted 空、failed 記 close、opened 也空
+    # （反轉重開不算新開）。
+    leader = {"ETH": _pos(szi="12")}
+    mine = {"ETH": _pos(szi="-1.0")}
+    ex, notifier, res = _sync(leader, mine, fail_ops={"close_reduce_only"})
+
+    assert _ops(ex) == ["close_reduce_only", "update_leverage", "market_open"]
+    assert res["adjusted"] == []
+    assert res["opened"] == []
+    assert res["failed"] == [{"coin": "ETH", "action": "close_reduce_only"}]
     assert len(_warns(notifier)) == 1
 
 

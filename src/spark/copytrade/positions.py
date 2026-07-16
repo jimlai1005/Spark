@@ -13,12 +13,18 @@
     executor 範疇，此處不做快取。）
 
 刻意偏離 hl 之處（皆為本 port 的簡化取捨，逐一記錄）：
-  1. **size 先捨入再算名目**：hl `sync.py:92-102` 用未捨入的
-     `target_size = size*scale` 算 notional 再過濾，捨入延後到
+  1. **size 先捨入再算名目（單向保守）**：hl `sync.py:92-102` 用未捨入
+     的 `target_size = size*scale` 算 notional 再過濾，捨入延後到
      `trader.open_position` 內部（`trader.py:148`）。本 port 為了讓
      「開倉/調整/名目過濾」共用同一個 target_size，改成先呼叫
-     `_round_size` 再算 notional——多數情況下差異可忽略（sz_decimals
-     通常遠小於名目金額的量級），但兩者理論上可能在門檻邊界差 1 檔。
+     `_round_size` 再算 notional。方向性：`_round_size` 是 ROUND_DOWN，
+     故恆有 `notional_spark ≤ notional_hl`——差異**只會**使 spark
+     「少開/不開」，絕不會「多開」；且過濾與下單用同一個數字，順帶
+     修正了 hl「過濾基準（未捨入）≠ 下單基準（已捨入）」的原始不一致。
+     Shadow 對照（T4.1 diff 分類）預期差異形態：僅出現在 min_notional
+     門檻邊界附近——hl 開了、spark 記 skipped(min_notional)；或兩邊都
+     開但 spark size 少最後一檔。反向差異（spark 開了 hl 沒開、或
+     spark size 較大）不應出現，出現即為 bug。
   2. **leverage/is_cross 直接取 leader 部位欄位**，不像 hl
      `trader.entry_leverage`/`entry_is_cross` 那樣依「我方帳戶」的
      max leverage／onlyIsolated 動態計算——那層邏輯需要查我方 exchange
@@ -42,8 +48,9 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from decimal import Decimal
-from typing import Callable, Mapping
 
 from spark.copytrade.config import CopySettings
 from spark.copytrade.executor import ExecutorPort
@@ -55,7 +62,11 @@ _EPS = Decimal("1e-8")
 
 
 def _side_of(szi: Decimal) -> str:
-    """有號 size 轉方向字串。假設呼叫端只傳入非零部位（上游 adapter 不回傳零部位）。"""
+    """有號 size 轉方向字串。
+
+    szi != 0 由上游 adapter 保證：HyperliquidAdapter.get_positions 對
+    szi == 0 的項目直接過濾不回傳（hyperliquid.py:113）。
+    """
     return "long" if szi > 0 else "short"
 
 
@@ -108,22 +119,26 @@ def _try_close_reduce_only(
     return True
 
 
-def _open_new(
+def _leverage_and_open(
     ex: ExecutorPort, notifier: Notifier, result: dict, coin: str,
-    target_side: str, target_size: Decimal, leverage: int, is_cross: bool,
-) -> None:
-    """新開倉：先設槓桿（照 hl trader.py:163 時機）再市價開倉。"""
+    target_side: str, size: Decimal, leverage: int, is_cross: bool,
+) -> bool:
+    """先設槓桿（照 hl trader.py:163 時機）再市價開倉，回傳開倉是否成功。
+
+    新開/反轉重開/加倉共用。成功與否的記錄（opened/adjusted）由呼叫端
+    依回傳值決定——失敗已由 _try_* 記入 failed，同一動作絕不同時出現在
+    成功清單與 failed 兩處。
+    """
     _try_update_leverage(ex, notifier, result, coin, leverage, is_cross)
     is_buy = target_side == "long"
-    if _try_market_open(ex, notifier, result, coin, is_buy, target_size):
-        result["opened"].append({"coin": coin, "side": target_side, "size": target_size})
+    return _try_market_open(ex, notifier, result, coin, is_buy, size)
 
 
 def sync_positions(
     ex: ExecutorPort, leader_positions: dict[str, Position],
     my_positions: dict[str, Position], scale: Decimal, *,
     settings: CopySettings, notifier: Notifier,
-    protected: set[str] = frozenset(),
+    protected: AbstractSet[str] = frozenset(),
     size_decimals: Callable[[str], int],
     mids: Mapping[str, Decimal],
 ) -> dict:
@@ -164,8 +179,10 @@ def sync_positions(
                     dedup_key=f"protected_open:{coin}",
                 )
                 continue
-            _open_new(ex, notifier, result, coin, target_side, target_size,
-                      tgt.leverage, tgt.is_cross)
+            if _leverage_and_open(ex, notifier, result, coin, target_side, target_size,
+                                  tgt.leverage, tgt.is_cross):
+                result["opened"].append(
+                    {"coin": coin, "side": target_side, "size": target_size})
             continue
 
         # ── 兩邊都有部位：調整（hl sync.py:121-151 / trader.py:254-300）──
@@ -187,15 +204,19 @@ def sync_positions(
         if my_side != target_side:
             # ── 方向反轉：全平再開（trader.py:269-279）──
             # 平倉下單方向 = 持倉反向：平多賣（is_buy=False）、平空買（is_buy=True）。
+            # 兩腿皆 best-effort 嘗試（hl 不檢查 close 回傳值、照樣重開）；
+            # 但 adjusted 只在兩腿皆成功才記錄——任一腿失敗已記入 failed，
+            # 下游依 adjusted 判定「已同步」，不得與 failed 並存。
             is_buy_close = my_side == "short"
-            _try_close_reduce_only(ex, notifier, result, coin, is_buy_close, my_size)
-            _open_new(ex, notifier, result, coin, target_side, target_size,
-                      tgt.leverage, tgt.is_cross)
-            result["adjusted"].append({
-                "coin": coin, "kind": "flip",
-                "from_side": my_side, "to_side": target_side,
-                "from_size": my_size, "to_size": target_size,
-            })
+            close_ok = _try_close_reduce_only(ex, notifier, result, coin, is_buy_close, my_size)
+            open_ok = _leverage_and_open(ex, notifier, result, coin, target_side, target_size,
+                                         tgt.leverage, tgt.is_cross)
+            if close_ok and open_ok:
+                result["adjusted"].append({
+                    "coin": coin, "kind": "flip",
+                    "from_side": my_side, "to_side": target_side,
+                    "from_size": my_size, "to_size": target_size,
+                })
             continue
 
         size_diff_pct = abs(target_size - my_size) / max(my_size, _EPS)
@@ -204,22 +225,22 @@ def sync_positions(
             if diff > 0:
                 # ── 同向加倉（trader.py:285-292；經 open_position → set_leverage
                 # trader.py:163，故加倉前同樣先設槓桿）──
-                is_buy = target_side == "long"
-                _try_update_leverage(ex, notifier, result, coin, tgt.leverage, tgt.is_cross)
-                _try_market_open(ex, notifier, result, coin, is_buy, diff)
-                result["adjusted"].append({
-                    "coin": coin, "kind": "increase",
-                    "from_size": my_size, "to_size": target_size, "diff": diff,
-                })
+                if _leverage_and_open(ex, notifier, result, coin, target_side, diff,
+                                      tgt.leverage, tgt.is_cross):
+                    result["adjusted"].append({
+                        "coin": coin, "kind": "increase",
+                        "from_size": my_size, "to_size": target_size, "diff": diff,
+                    })
             else:
                 # ── 同向減倉（trader.py:293-300，reduce-only）──
                 reduce_size = abs(diff)
                 is_buy_to_close = my_side == "short"
-                _try_close_reduce_only(ex, notifier, result, coin, is_buy_to_close, reduce_size)
-                result["adjusted"].append({
-                    "coin": coin, "kind": "decrease",
-                    "from_size": my_size, "to_size": target_size, "diff": diff,
-                })
+                if _try_close_reduce_only(ex, notifier, result, coin, is_buy_to_close,
+                                          reduce_size):
+                    result["adjusted"].append({
+                        "coin": coin, "kind": "decrease",
+                        "from_size": my_size, "to_size": target_size, "diff": diff,
+                    })
         # else: 容忍帶內，零動作（hl sync.py:150-151，只 debug log）。
 
     # ── 2. 我有但 leader 已平的標的 → 跟著平（hl sync.py:154-167）──────
