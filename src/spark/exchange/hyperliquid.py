@@ -99,16 +99,19 @@ class HyperliquidAdapter(ExchangeAdapter):
             szi = Decimal(str(pos["szi"]))
             if szi == 0:
                 continue
-            leverage = pos.get("leverage") or {}
-            entry_px_raw = pos.get("entryPx")
+            # SDK 保證存在的欄位一律直接下標：schema 漂移時大聲 KeyError，
+            # 絕不靜默給預設值（工程原則 3：財務資料寧可炸不可給錯值）。
+            # entryPx 例外——文件記載可為 None（合法值），顯式映射 Decimal("0")。
+            leverage = pos["leverage"]
+            entry_px_raw = pos["entryPx"]
             positions.append(Position(
                 coin=pos["coin"],
                 szi=szi,
                 entry_px=Decimal(str(entry_px_raw)) if entry_px_raw is not None else Decimal("0"),
-                leverage=int(leverage.get("value", 1)),
-                is_cross=(leverage.get("type") == "cross"),
-                unrealized_pnl=Decimal(str(pos.get("unrealizedPnl", "0"))),
-                margin_used=Decimal(str(pos.get("marginUsed", "0"))),
+                leverage=int(leverage["value"]),
+                is_cross=(leverage["type"] == "cross"),
+                unrealized_pnl=Decimal(str(pos["unrealizedPnl"])),
+                margin_used=Decimal(str(pos["marginUsed"])),
             ))
         return positions
 
@@ -172,7 +175,8 @@ class HyperliquidAdapter(ExchangeAdapter):
         fills = []
         for f in raw:
             fills.append(UserFill(
-                time=datetime.fromtimestamp(f["time"] / 1000, tz=timezone.utc),
+                # 純整數 ms→datetime（與 _to_ms_utc 鏡像一致），不走 float 除法。
+                time=self._EPOCH + timedelta(milliseconds=f["time"]),
                 coin=f["coin"],
                 px=Decimal(str(f["px"])),
                 sz=Decimal(str(f["sz"])),
@@ -189,7 +193,10 @@ class HyperliquidAdapter(ExchangeAdapter):
         return {k: Decimal(str(v)) for k, v in raw.items() if not k.startswith("@")}
 
     def get_size_decimals(self, coin: str) -> int:
-        if self._sz_decimals_cache is None:
+        # 自癒快取：已知 coin 走快取不重打；cache miss（含首次與新上市幣）重打一次
+        # meta() 更新整包快取，更新後仍查無才 raise。失敗不入快取——下次同 coin
+        # 呼叫會再重試 meta，新幣上市後無需重啟即可查到。
+        if self._sz_decimals_cache is None or coin not in self._sz_decimals_cache:
             meta = self._info.meta()
             self._sz_decimals_cache = {
                 u["name"]: int(u["szDecimals"]) for u in meta["universe"]

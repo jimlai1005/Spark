@@ -169,6 +169,26 @@ def test_get_positions_none_entry_px_maps_to_zero_and_isolated_not_cross():
     assert sol.szi == Decimal("-10")  # 空單為負
 
 
+def test_get_positions_missing_guaranteed_field_raises_loudly():
+    # SDK 保證存在的欄位（如 marginUsed）缺鍵 = schema 漂移 → 必須大聲 KeyError，
+    # 不得靜默給預設值（工程原則 3：財務資料寧可炸不可給錯值）。
+    broken_state = {
+        "assetPositions": [
+            {"position": {
+                "coin": "ETH", "szi": "1", "entryPx": "3000",
+                "leverage": {"type": "cross", "value": 5},
+                "unrealizedPnl": "10",
+                # marginUsed 缺鍵
+            }, "type": "oneWay"},
+        ],
+        "marginSummary": {"accountValue": "0", "totalMarginUsed": "0", "totalNtlPos": "0"},
+        "withdrawable": "0",
+    }
+    ad = _adapter(user_state_resp=broken_state)
+    with pytest.raises(KeyError):
+        ad.get_positions("0xuser")
+
+
 # --- 3. get_account_state ---
 
 def test_get_account_state_maps_margin_summary_and_withdrawable():
@@ -248,7 +268,9 @@ def test_get_user_fills_maps_and_converts_datetime_to_ms():
     assert f.crossed is True
     assert f.oid == 111
     assert f.fee == Decimal("0.008")
-    assert f.time == datetime.fromtimestamp(1750000000000 / 1000, tz=timezone.utc)
+    # expected 用字面值寫死（1750000000000 ms 經 calendar.timegm 獨立驗算），
+    # 不得用 float 除法算 expected（那是拿實作驗自己）。
+    assert f.time == datetime(2025, 6, 15, 15, 6, 40, tzinfo=timezone.utc)
     # start/end 必須轉為毫秒 epoch（UTC）餵給 SDK
     _address, start_ms, end_ms = ad._info.user_fills_by_time_calls[-1]
     assert start_ms == int(start.timestamp() * 1000)
@@ -307,11 +329,36 @@ def test_get_size_decimals_found_and_cached_across_same_coin():
     assert ad._info.meta_calls == 1  # 同一 coin 第二次不再呼叫 meta
 
 
-def test_get_size_decimals_cache_covers_other_coins_too_and_unknown_raises():
+def test_get_size_decimals_cache_covers_other_coins_without_refetch():
     ad = _adapter(meta_resp=_META)
     assert ad.get_size_decimals("ETH") == 4
     assert ad.get_size_decimals("BTC") == 5
     assert ad._info.meta_calls == 1  # 首次已快取整個 universe，查其他已知幣種不再呼叫 meta
+
+
+def test_get_size_decimals_cache_self_heals_for_newly_listed_coin():
+    ad = _adapter(meta_resp=_META)
+    assert ad.get_size_decimals("ETH") == 4
+    assert ad._info.meta_calls == 1
+    # 新上市幣：第二次 meta 回應多了 DOGE → cache miss 重打 meta 自癒，無需重啟
+    ad._info._meta_resp = {
+        "universe": _META["universe"] + [{"name": "DOGE", "szDecimals": 0}],
+    }
+    assert ad.get_size_decimals("DOGE") == 0
+    assert ad._info.meta_calls == 2
+    # 已知幣種（含剛自癒進快取的 DOGE）仍走快取，不再重打
+    assert ad.get_size_decimals("ETH") == 4
+    assert ad.get_size_decimals("DOGE") == 0
+    assert ad._info.meta_calls == 2
+
+
+def test_get_size_decimals_unknown_after_refresh_raises_and_retries_next_call():
+    ad = _adapter(meta_resp=_META)
+    assert ad.get_size_decimals("ETH") == 4
+    assert ad._info.meta_calls == 1
     with pytest.raises(ValueError):
-        ad.get_size_decimals("DOGE")
-    assert ad._info.meta_calls == 1  # 找不到也不重打 meta
+        ad.get_size_decimals("XYZ")
+    assert ad._info.meta_calls == 2  # miss 先重打一次 meta，更新後仍查無才 raise
+    with pytest.raises(ValueError):
+        ad.get_size_decimals("XYZ")
+    assert ad._info.meta_calls == 3  # 失敗不入快取：下次同 coin 呼叫再重試 meta
