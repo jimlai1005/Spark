@@ -312,7 +312,7 @@ class CycleReport:
 
 
 def _set_entry_leverage(
-    ex, desired: OrderSpec, leverage_by_coin: Mapping[str, tuple[int, bool]]
+    ex, desired: OrderSpec, leverage_by_coin: Mapping[str, tuple[int, bool]], notifier
 ) -> None:
     """進場單（非 reduce-only）下單前設定名目槓桿。port 自 hl orders.py:187-193。
 
@@ -320,6 +320,10 @@ def _set_entry_leverage(
     （內部查 meta 快取，hl trader.py:81-108）；spark 由呼叫端預算好 `leverage_by_coin`
     （coin -> (leverage, is_cross)）注入。coin 不在 map 內 → 靜默跳過（呼叫端沒給
     就是不設，等同 hl dry-run 無 info 時的降級路徑）。
+
+    失敗處理（比照 positions.py `_try_update_leverage`；hl 在 Trader.set_leverage 內
+    自行 tg.alert，hl trader.py:127）：`ex.update_leverage` 回 False → warn 告警但
+    流程繼續（best-effort：槓桿設定失敗不阻擋下單，交易所會沿用該 coin 既有槓桿）。
     """
     if desired.reduce_only:
         return
@@ -327,7 +331,13 @@ def _set_entry_leverage(
     if pair is None:
         return
     leverage, is_cross = pair
-    ex.update_leverage(desired.coin, leverage, is_cross)
+    ok = ex.update_leverage(desired.coin, leverage, is_cross)
+    if not ok:
+        notifier.warn(
+            "orders",
+            f"槓桿設定失敗 {desired.coin} leverage={leverage}x is_cross={is_cross}",
+            dedup_key=f"lev_fail:{desired.coin}",
+        )
 
 
 def _verify_diff(
@@ -403,6 +413,12 @@ def _reconcile_orders(
       - `modify_policy=="cancel-place"` 是 spark 新增開關（hl 無），全部 modify 直接
         降級為 cancel+place。
       - 回傳 frozen dataclass（`skipped_small` 由上層補入，本函式恆回空 tuple）。
+
+    例外語意：`ex.place/modify/cancel/get_open_orders` 拋出的 transient 例外
+    （ConnectionError 等）**原樣上拋、不在此吞掉**——已執行的動作不回滾（cancel 冪等、
+    place 由下一輪對帳自癒）。runner（Task 12）必須 try/except 本函式並計入
+    `settings.max_consecutive_errors`（工程原則 2：transient 交給上層重試邊界，
+    此處不盲重試非冪等寫入）。
     """
     mine_pairs = [(o.oid, spec_from_open_order(o)) for o in my_orders]
     coin_by_oid = {o.oid: o.coin for o in my_orders}
@@ -558,7 +574,7 @@ def sync_open_orders(
             if d.reduce_only or d.coin in seen:
                 continue
             seen.add(d.coin)
-            _set_entry_leverage(ex, d, leverage_by_coin)
+            _set_entry_leverage(ex, d, leverage_by_coin, notifier)
 
     rec = _reconcile_orders(
         ex,

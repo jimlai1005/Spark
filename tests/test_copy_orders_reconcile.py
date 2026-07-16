@@ -6,6 +6,8 @@
 """
 from decimal import Decimal
 
+import pytest
+
 from spark.copytrade.config import CopySettings
 from spark.copytrade.executor import ExecutorPort
 from spark.copytrade.notifier import RecordingNotifier
@@ -29,17 +31,23 @@ class FakeExecutor:
 
     - modify_results：modify() 依序回傳的 bool 序列，耗盡後回 True。
     - open_orders_seq：get_open_orders() 依序回傳的清單序列，耗盡後回 []。
+    - place_exc：place() 被呼叫時直接 raise 該例外（模擬 transient 失敗）。
+    - update_leverage_ok：update_leverage() 的回傳值（模擬槓桿設定失敗）。
     """
 
     def __init__(self, modify_results=None, open_orders_seq=None,
-                 place_ok=True, cancel_ok=True):
+                 place_ok=True, cancel_ok=True, place_exc=None, update_leverage_ok=True):
         self.records: list = []
         self._modify_results = list(modify_results or [])
         self._open_orders_seq = [list(x) for x in (open_orders_seq or [])]
         self._place_ok = place_ok
         self._cancel_ok = cancel_ok
+        self._place_exc = place_exc
+        self._update_leverage_ok = update_leverage_ok
 
     def place(self, spec) -> bool:
+        if self._place_exc is not None:
+            raise self._place_exc
         self.records.append(("place", spec))
         return self._place_ok
 
@@ -61,7 +69,7 @@ class FakeExecutor:
 
     def update_leverage(self, coin, leverage, is_cross) -> bool:
         self.records.append(("update_leverage", coin, leverage, is_cross))
-        return True
+        return self._update_leverage_ok
 
     def get_open_orders(self) -> list[OpenOrder]:
         self.records.append(("get_open_orders",))
@@ -290,20 +298,95 @@ def test_sleep_fn_receives_settle_seconds_from_settings():
 # ── _set_entry_leverage（hl orders.py:187-193）───────────────────────
 def test_set_entry_leverage_skips_reduce_only():
     ex = FakeExecutor()
-    _set_entry_leverage(ex, _spec(coin="ETH", reduce_only=True), {"ETH": (5, True)})
+    _set_entry_leverage(ex, _spec(coin="ETH", reduce_only=True), {"ETH": (5, True)},
+                        RecordingNotifier())
     assert ex.records == []
 
 
 def test_set_entry_leverage_uses_mapping_values():
     ex = FakeExecutor()
-    _set_entry_leverage(ex, _spec(coin="ETH"), {"ETH": (10, False)})
+    notifier = RecordingNotifier()
+    _set_entry_leverage(ex, _spec(coin="ETH"), {"ETH": (10, False)}, notifier)
     assert ex.records == [("update_leverage", "ETH", 10, False)]
+    assert notifier.records == []  # 成功不告警
 
 
 def test_set_entry_leverage_unknown_coin_is_noop():
     ex = FakeExecutor()
-    _set_entry_leverage(ex, _spec(coin="SOL"), {"ETH": (10, True)})
+    _set_entry_leverage(ex, _spec(coin="SOL"), {"ETH": (10, True)}, RecordingNotifier())
     assert ex.records == []
+
+
+def test_set_entry_leverage_failure_warns_with_dedup_key():
+    """update_leverage 回 False → warn 告警（不吞），流程繼續（best-effort）。"""
+    ex = FakeExecutor(update_leverage_ok=False)
+    notifier = RecordingNotifier()
+    _set_entry_leverage(ex, _spec(coin="ETH"), {"ETH": (10, True)}, notifier)
+    assert ex.records == [("update_leverage", "ETH", 10, True)]
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    assert len(warns) == 1
+    assert warns[0][1] == "orders"
+    assert "ETH" in warns[0][2] and "槓桿" in warns[0][2]
+    assert warns[0][3] == "lev_fail:ETH"
+
+
+def test_sync_leverage_failure_warns_and_reconcile_proceeds():
+    """槓桿設定失敗只告警，對帳照常執行（下單不被阻擋）。"""
+    leader = [_open_order(coin="ETH", limit_px="2000", sz="1", oid=1)]
+    ex = FakeExecutor(update_leverage_ok=False)
+    notifier = RecordingNotifier()
+    report = _run_sync(ex, leader, [], notifier=notifier,
+                       leverage_by_coin={"ETH": (10, True)})
+
+    assert ("warn", "orders",
+            "槓桿設定失敗 ETH leverage=10x is_cross=True", "lev_fail:ETH") in notifier.records
+    assert report.reconcile.placed == 1  # 對帳照常
+    ops = [r[0] for r in ex.records]
+    assert ops == ["update_leverage", "place"]
+
+
+# ── transient 例外傳播（工程原則 2：不吞、上層 runner 計錯）──────────
+def test_place_transient_exception_propagates_without_rollback():
+    """place 拋 ConnectionError → 乾淨上拋（不被吞）；拋出前已執行的 cancel 不回滾；
+    modify_fail_until 只含 modify 失敗的正確登記（無誤登記）。
+    runner（Task 12）必須 try/except 本例外並計入 max_consecutive_errors。"""
+    desired = [_spec(coin="BTC", limit_px="50100", sz="0.5")]
+    my_orders = [_open_order(coin="BTC", limit_px="50000", sz="0.5", oid=2)]
+    ex = FakeExecutor(modify_results=[False], place_exc=ConnectionError("reset"))
+    state = ReconcileState()
+    clock = FakeClock(t=1_000.0)
+
+    with pytest.raises(ConnectionError):
+        _run_reconcile(ex, desired, my_orders, state=state, clock=clock)
+
+    # 已執行的 cancel 不回滾（冪等寫入，交由下一輪對帳自癒）
+    assert ("cancel", "BTC", 2) in ex.records
+    assert all(r[0] != "place" for r in ex.records)  # place 未成功記錄任何動作
+    # TTL 登記只反映 modify 失敗，place 例外不產生誤登記
+    assert state.modify_fail_until == {"BTC": 1_000.0 + SETTINGS.modify_fail_ttl_s}
+
+
+# ── 二驗剩 extra（非 missing）→ sync_failed + critical ───────────────
+def test_settle_extra_only_after_retry_sets_sync_failed_and_criticals():
+    """兩驗皆多出雜單（缺 0、多 1）→ sync_failed=True + critical 含 extra 摘要。"""
+    d1 = _spec(coin="ETH", limit_px="2000")
+    mine = _open_order(coin="ETH", limit_px="2000", oid=1)  # 與 d1 相符 → 零動作
+    stray1 = _open_order(coin="DOGE", limit_px="0.1", sz="100", oid=99)
+    stray2 = _open_order(coin="DOGE", limit_px="0.1", sz="100", oid=100)  # 撤了又冒出來
+    after_first = [_open_order(coin="ETH", limit_px="2000", oid=1), stray1]
+    after_second = [_open_order(coin="ETH", limit_px="2000", oid=1), stray2]
+    ex = FakeExecutor(open_orders_seq=[after_first, after_second])
+    notifier = RecordingNotifier()
+    res = _run_reconcile(ex, [d1], [mine], live=True, notifier=notifier)
+
+    assert res.sync_failed is True
+    assert ("cancel", "DOGE", 99) in ex.records  # 一驗後有撤 extra
+    crits = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crits) == 1
+    _level, category, text, _dedup = crits[0]
+    assert category == "orders"
+    assert "缺少 0" in text and "多餘 1" in text
+    assert "oid=100" in text and "DOGE" in text  # extra 摘要可定位到單
 
 
 # ── sync_open_orders ─────────────────────────────────────────────────
