@@ -2,7 +2,7 @@
 方法名以 Task 0 findings 為準。"""
 import urllib.request
 import urllib.error
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, Context, ROUND_HALF_EVEN
 from spark.config import CSV_BASE_URLS
 from spark.exchange.base import (
@@ -21,6 +21,9 @@ class HyperliquidAdapter(ExchangeAdapter):
         self._network = network
         self._info = info        # hyperliquid.info.Info
         self._exchange = exchange  # hyperliquid.exchange.Exchange（已綁 agent 錢包）
+        # get_size_decimals 的 per-coin 快取：None 代表尚未打過 meta()；打過之後即便
+        # 查無某 coin 也不重打（避免對不存在的 coin 反覆打 API）。
+        self._sz_decimals_cache: dict[str, int] | None = None
 
     def _round_px(self, px: Decimal) -> float:
         """把 orchestrator 算出的意圖價四捨五入到 HL 接受的格式（5 位有效數字）。"""
@@ -54,27 +57,141 @@ class HyperliquidAdapter(ExchangeAdapter):
             raise
         return parse_builder_fills(raw, compressed=True)
 
-    # --- reads（copytrade M1；Task 2 實作，此處僅提供最小 stub 讓 ABC 可實例化）---
+    # --- reads（copytrade M1）---
+    @staticmethod
+    def _tpsl_from_order_type(order_type_name: str) -> str | None:
+        # frontendOpenOrders 回應無字面 "tpsl" 鍵（已與 SDK docstring 及 Hyperliquid 官方文件
+        # 交叉確認：欄位只有 orderType 這種人類可讀字串，如 "Limit"/"Stop Market"/
+        # "Take Profit Limit"）。tpsl 分類需從 orderType 文字判讀衍生，語意移植自
+        # hl-copytrader src/monitor.py:181-191 的 _parse_orders。
+        low = order_type_name.lower()
+        if "take profit" in low:
+            return "tp"
+        if "stop" in low:
+            return "sl"
+        return None
+
     def get_open_orders(self, address: str) -> list[OpenOrder]:
-        raise NotImplementedError("Task 2 實作")
+        raw = self._info.frontend_open_orders(address)
+        orders = []
+        for o in raw:
+            is_trigger = bool(o.get("isTrigger", False))
+            orders.append(OpenOrder(
+                oid=o["oid"],
+                coin=o["coin"],
+                is_buy=o["side"] == "B",
+                limit_px=Decimal(str(o["limitPx"])),
+                sz=Decimal(str(o["sz"])),
+                reduce_only=bool(o.get("reduceOnly", False)),
+                is_trigger=is_trigger,
+                # 非 trigger 一律映射 None（即便 raw 是 "0.0" 或缺鍵）。
+                trigger_px=Decimal(str(o.get("triggerPx", "0"))) if is_trigger else None,
+                tpsl=self._tpsl_from_order_type(o.get("orderType", "")) if is_trigger else None,
+            ))
+        return orders
 
     def get_positions(self, address: str) -> list[Position]:
-        raise NotImplementedError("Task 2 實作")
+        state = self._info.user_state(address)
+        positions = []
+        for item in state.get("assetPositions", []):
+            pos = item["position"]
+            szi = Decimal(str(pos["szi"]))
+            if szi == 0:
+                continue
+            leverage = pos.get("leverage") or {}
+            entry_px_raw = pos.get("entryPx")
+            positions.append(Position(
+                coin=pos["coin"],
+                szi=szi,
+                entry_px=Decimal(str(entry_px_raw)) if entry_px_raw is not None else Decimal("0"),
+                leverage=int(leverage.get("value", 1)),
+                is_cross=(leverage.get("type") == "cross"),
+                unrealized_pnl=Decimal(str(pos.get("unrealizedPnl", "0"))),
+                margin_used=Decimal(str(pos.get("marginUsed", "0"))),
+            ))
+        return positions
 
     def get_account_state(self, address: str) -> AccountSnapshot:
-        raise NotImplementedError("Task 2 實作")
+        state = self._info.user_state(address)
+        ms = state["marginSummary"]
+        return AccountSnapshot(
+            account_value=Decimal(str(ms["accountValue"])),
+            total_margin_used=Decimal(str(ms["totalMarginUsed"])),
+            withdrawable=Decimal(str(state["withdrawable"])),
+            total_ntl_pos=Decimal(str(ms["totalNtlPos"])),
+        )
 
     def get_equity_view(self, address: str) -> EquityView:
-        raise NotImplementedError("Task 2 實作")
+        """回撤判定用 current/recent_peak；同源不變量＝兩者出自單一次 portfolio() 呼叫。
+
+        語意移植自 hl-copytrader src/monitor.py:124-158（get_account_equity），非簡單的
+        「單一時間窗序列的 last/max」：portfolio() 回傳 [period, {accountValueHistory:[[ts,val],...]}]
+        的清單，涵蓋 day/week/month/allTime 四個時間窗。
+        - current = 掃描全部四個時間窗後，時間戳最新那一點的值（不侷限於 day）。
+        - recent_peak = 只在 "week" 時間窗序列中取最大值；查無 week 資料則退回 current
+          （避免把「沒有 peak 資料」誤判成「peak 低於 current」的假回撤）。
+        """
+        rows = self._info.portfolio(address)
+        total_periods = {"day", "week", "month", "allTime"}
+        current = Decimal("0")
+        peak = Decimal("0")
+        latest_ts = Decimal("-1")
+        for row in rows:
+            if not (isinstance(row, list) and len(row) == 2 and row[0] in total_periods):
+                continue
+            period, payload = row
+            for ts, val in payload.get("accountValueHistory", []):
+                v = Decimal(str(val))
+                if period == "week":
+                    peak = max(peak, v)
+                ts_dec = Decimal(str(ts))
+                if ts_dec > latest_ts:
+                    latest_ts = ts_dec
+                    current = v
+        if peak <= 0:
+            peak = current
+        return EquityView(current=current, recent_peak=peak)
+
+    @staticmethod
+    def _to_ms_utc(dt: datetime) -> int:
+        # naive datetime 視為 UTC（本 adapter 的呼叫端慣例）；aware datetime 一律先轉 UTC
+        # 再取 epoch，避免用本機時區誤解讀。
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
 
     def get_user_fills(self, address: str, start: datetime, end: datetime) -> list[UserFill]:
-        raise NotImplementedError("Task 2 實作")
+        raw = self._info.user_fills_by_time(
+            address, self._to_ms_utc(start), self._to_ms_utc(end)
+        )
+        fills = []
+        for f in raw:
+            fills.append(UserFill(
+                time=datetime.fromtimestamp(f["time"] / 1000, tz=timezone.utc),
+                coin=f["coin"],
+                px=Decimal(str(f["px"])),
+                sz=Decimal(str(f["sz"])),
+                side=f["side"],
+                crossed=bool(f["crossed"]),
+                oid=f["oid"],
+                fee=Decimal(str(f.get("fee", "0"))),
+            ))
+        return fills
 
     def get_all_mids(self) -> dict[str, Decimal]:
-        raise NotImplementedError("Task 2 實作")
+        raw = self._info.all_mids()
+        # "@" 開頭的 key 是 spot/index 內部標記（非 perp 幣名），M1 只要 perp 幣名。
+        return {k: Decimal(str(v)) for k, v in raw.items() if not k.startswith("@")}
 
     def get_size_decimals(self, coin: str) -> int:
-        raise NotImplementedError("Task 2 實作")
+        if self._sz_decimals_cache is None:
+            meta = self._info.meta()
+            self._sz_decimals_cache = {
+                u["name"]: int(u["szDecimals"]) for u in meta["universe"]
+            }
+        if coin not in self._sz_decimals_cache:
+            raise ValueError(f"get_size_decimals: 未知幣種 {coin!r}（不在 meta() universe 內）")
+        return self._sz_decimals_cache[coin]
 
     # --- writes ---
     # 以下 main_signer / agent_signer 參數為介面文件性質；實際簽章者 = 建構時綁定
