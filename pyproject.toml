@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "python-dotenv"]
 
 [tool.pytest.ini_options]
 markers = ["integration: 需連 testnet/mainnet，預設跳過"]
