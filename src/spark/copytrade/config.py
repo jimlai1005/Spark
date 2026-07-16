@@ -39,22 +39,32 @@ def _env_bool(key: str, default: str, env: Mapping[str, str] | None = None) -> b
 
 def _env_int(key: str, default: str, env: Mapping[str, str] | None = None) -> int:
     """解析整數型環境變數（去掉行內註解）。
-    優先序：env dict（如有）> os.environ > default。"""
+    優先序：env dict（如有）> os.environ > default。
+    解析失敗時 ValueError 帶 env key 名，方便定位是哪個變數壞了。"""
     if env is not None and key in env:
         val = env[key]
     else:
         val = os.getenv(key)
-    return int(_clean(val if val is not None else default))
+    cleaned = _clean(val if val is not None else default)
+    try:
+        return int(cleaned)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"{key} 解析失敗: {cleaned!r}") from e
 
 
 def _env_decimal(key: str, default: str, env: Mapping[str, str] | None = None) -> Decimal:
     """解析 Decimal 型環境變數（去掉行內註解）。
-    優先序：env dict（如有）> os.environ > default。"""
+    優先序：env dict（如有）> os.environ > default。
+    解析失敗時 ValueError 帶 env key 名，方便定位是哪個變數壞了。"""
     if env is not None and key in env:
         val = env[key]
     else:
         val = os.getenv(key)
-    return Decimal(_clean(val if val is not None else default))
+    cleaned = _clean(val if val is not None else default)
+    try:
+        return Decimal(cleaned)
+    except (ArithmeticError, ValueError, TypeError) as e:
+        raise ValueError(f"{key} 解析失敗: {cleaned!r}") from e
 
 
 @dataclass(frozen=True)
@@ -66,7 +76,8 @@ class CopySettings:
        flatten_on_breach, allocated_capital
     2. 照抄 hl 預設值：capital_utilization, position_weight, max_target_leverage,
        min_order_notional, size_tolerance, max_drawdown_pct, settle_seconds,
-       modify_fail_ttl_s, volatility_weight_enabled, holding_protection_enabled
+       modify_fail_ttl_s, max_consecutive_errors, volatility_weight_enabled,
+       holding_protection_enabled
     3. 函式層預設（硬編）：px_rel_tol, slippage
     """
     # 刻意覆蓋
@@ -86,6 +97,7 @@ class CopySettings:
     max_drawdown_pct: Decimal = Decimal("0.20")  # hl MAX_DRAWDOWN_PCT
     settle_seconds: int = 2  # hl orders.py SETTLE_SECONDS
     modify_fail_ttl_s: int = 120  # hl orders.py _MODIFY_SKIP_TTL
+    max_consecutive_errors: int = 5  # hl main.py:292 MAX_CONSECUTIVE_ERRORS
     volatility_weight_enabled: bool = True  # hl VOLATILITY_WEIGHT_ENABLED
     holding_protection_enabled: bool = False  # hl HOLDING_PROTECTION_ENABLED
 
@@ -125,6 +137,9 @@ class CopySettings:
             max_drawdown_pct=_env_decimal("COPY_MAX_DRAWDOWN_PCT", str(cls.max_drawdown_pct), env),
             settle_seconds=_env_int("COPY_SETTLE_SECONDS", str(cls.settle_seconds), env),
             modify_fail_ttl_s=_env_int("COPY_MODIFY_FAIL_TTL_S", str(cls.modify_fail_ttl_s), env),
+            max_consecutive_errors=_env_int(
+                "COPY_MAX_CONSECUTIVE_ERRORS", str(cls.max_consecutive_errors), env
+            ),
             volatility_weight_enabled=_env_bool(
                 "COPY_VOLATILITY_WEIGHT_ENABLED", str(cls.volatility_weight_enabled).lower(), env
             ),
@@ -137,8 +152,19 @@ class CopySettings:
 
     def __post_init__(self) -> None:
         """驗證配置的不變量。"""
+        if not self.leader_address or not self.leader_address.startswith("0x") \
+                or len(self.leader_address) != 42:
+            raise ValueError(
+                f"leader_address must be a 0x-prefixed 42-char address, got {self.leader_address!r}"
+            )
+
         if self.interval_s <= 0:
             raise ValueError(f"interval_s must be > 0, got {self.interval_s}")
+
+        if self.max_consecutive_errors <= 0:
+            raise ValueError(
+                f"max_consecutive_errors must be > 0, got {self.max_consecutive_errors}"
+            )
 
         if not (0 < self.max_drawdown_pct < 1):
             raise ValueError(

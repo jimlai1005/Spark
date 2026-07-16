@@ -30,6 +30,7 @@ class TestCopySettingsDefaults:
         assert settings.max_drawdown_pct == Decimal("0.20")
         assert settings.settle_seconds == 2
         assert settings.modify_fail_ttl_s == 120
+        assert settings.max_consecutive_errors == 5
         assert settings.volatility_weight_enabled is True
         assert settings.holding_protection_enabled is False
 
@@ -56,10 +57,11 @@ class TestCopySettingsDefaults:
         assert settings.interval_s == 30
 
     def test_env_override_str(self, monkeypatch):
-        """str 型別環境變數覆蓋。"""
-        monkeypatch.setenv("COPY_LEADER_ADDRESS", "0xabcdef1234567890")
+        """str 型別環境變數覆蓋（合法 42 字元地址）。"""
+        addr = "0xabcdef1234567890abcdef1234567890abcdef12"
+        monkeypatch.setenv("COPY_LEADER_ADDRESS", addr)
         settings = CopySettings.from_env({})
-        assert settings.leader_address == "0xabcdef1234567890"
+        assert settings.leader_address == addr
 
     def test_env_override_modify_policy(self, monkeypatch):
         """modify_policy 環境變數覆蓋。"""
@@ -166,3 +168,47 @@ class TestValidation:
         # 合法
         settings = CopySettings.from_env({"COPY_MIN_ORDER_NOTIONAL": "0"})
         assert settings.min_order_notional == Decimal("0")
+
+    def test_max_consecutive_errors_must_be_positive(self):
+        """max_consecutive_errors <= 0 應拋 ValueError。"""
+        with pytest.raises(ValueError, match="max_consecutive_errors"):
+            CopySettings.from_env({"COPY_MAX_CONSECUTIVE_ERRORS": "0"})
+
+        with pytest.raises(ValueError, match="max_consecutive_errors"):
+            CopySettings.from_env({"COPY_MAX_CONSECUTIVE_ERRORS": "-3"})
+
+        # env 覆蓋合法值
+        settings = CopySettings.from_env({"COPY_MAX_CONSECUTIVE_ERRORS": "10"})
+        assert settings.max_consecutive_errors == 10
+
+    def test_leader_address_must_be_valid(self):
+        """leader_address 需非空、0x 前綴、長度 42。"""
+        with pytest.raises(ValueError, match="leader_address"):
+            CopySettings.from_env({"COPY_LEADER_ADDRESS": ""})
+
+        with pytest.raises(ValueError, match="leader_address"):
+            CopySettings.from_env(
+                {"COPY_LEADER_ADDRESS": "f97ad6704baec104d00b88e0c157e2b7b3a1ddd1ab"}
+            )  # 42 字元但無 0x 前綴
+
+        with pytest.raises(ValueError, match="leader_address"):
+            CopySettings.from_env({"COPY_LEADER_ADDRESS": "0xabc"})  # 太短
+
+
+class TestEnvParseErrors:
+    """測試 env 解析失敗時的錯誤訊息含欄位名。"""
+
+    def test_int_parse_error_names_key(self):
+        """int 解析空字串應拋含 env key 名的 ValueError。"""
+        with pytest.raises(ValueError, match="COPY_INTERVAL_S"):
+            CopySettings.from_env({"COPY_INTERVAL_S": ""})
+
+    def test_int_parse_error_garbage_names_key(self):
+        """int 解析非數字應拋含 env key 名的 ValueError。"""
+        with pytest.raises(ValueError, match="COPY_SETTLE_SECONDS"):
+            CopySettings.from_env({"COPY_SETTLE_SECONDS": "abc"})
+
+    def test_decimal_parse_error_names_key(self):
+        """Decimal 解析空字串應拋含 env key 名的 ValueError。"""
+        with pytest.raises(ValueError, match="COPY_MAX_DRAWDOWN_PCT"):
+            CopySettings.from_env({"COPY_MAX_DRAWDOWN_PCT": ""})
