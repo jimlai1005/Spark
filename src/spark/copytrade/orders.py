@@ -3,14 +3,17 @@
 `px_rel_tol`/`size_tolerance`，符合「同一份配置貫穿引擎」的慣例）。
 
 刻意未移植清單（hl-copytrader src/orders.py 原始碼行號對應）：
-  - `_set_entry_leverage`（hl:187-193）——進場單前設槓桿（含 xyz/onlyIsolated 分支），
-    屬 Task 11 範疇，本檔不放。
-  - `_reconcile_orders`/`sync_open_orders`（hl:196-369）——實際呼叫 Trader 下單/改單/
-    撤單、Telegram 告警、驗證重試迴圈，全是 I/O 副作用層，屬 Task 8 範疇。本檔只放
-    無副作用的規劃/比對純函式（`_plan`/`_build_desired` 等），供 Task 8 的
-    `_reconcile_orders` 呼叫。
   - `HOLDING_PROTECTION_ENABLED` 的 Z-Score 異常持倉偵測（hl protection.py）——不在
     本任務範圍；這裡的 `protected: set[str]` 是呼叫端已算好的結果，直接消費。
+  - hl B 段的 `sync_positions`（部位安全網本體）——不在本任務範圍；`sync_open_orders`
+    改吃 `safety_net: Callable[[], dict] | None` callable，呼叫端自行決定安全網實作
+    要不要接、怎麼接。
+  - M1 單 DEX：hl 的 `failed_dexs` 過濾（hl orders.py:328-329）不移植。
+
+Task 8（本次新增，於檔案下半段）：`_set_entry_leverage`（hl:187-193）、
+`_reconcile_orders`（hl:196-274）、`sync_open_orders`（hl:277-368）——含 I/O 副作用
+（呼叫 ExecutorPort 下單/改單/撤單/設槓桿、Notifier 告警）。結構偏差詳見各函式
+docstring。
 
 結構差異（相對 hl 語意的刻意調整，逐項說明）：
   - `_plan` 回傳型別改為 frozen dataclass `ReconcilePlan`，`matched` 欄位從 hl 的
@@ -24,10 +27,11 @@
     看到這個原因，見 Task 7 spec）。size<=0 或 px<=0 的邊界情形則維持 hl 的靜默跳過
     （無 SkippedOrder 記錄），因為 hl 這裡本來就沒有分類原因可記。
 """
+import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Callable
+from typing import Callable, Mapping
 
 from spark.copytrade.instrument import _is_spot_coin, _round_size
 from spark.exchange.base import OpenOrder, Position
@@ -268,3 +272,311 @@ def _build_desired(
             )
         )
     return desired, skipped
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 8：對帳狀態機（I/O 副作用層）。port 自 hl orders.py:187-368。
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class ReconcileState:
+    """跨輪次的對帳狀態。取代 hl 的模組層 `_modify_fail_until`（hl orders.py:37）——
+    模組層全域在測試與多實例下是隱形共享狀態，改為顯式注入。"""
+
+    modify_fail_until: dict[str, float] = field(default_factory=dict)  # coin -> epoch
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """`_reconcile_orders` 的統計結果。對應 hl orders.py:273-274 的回傳 dict，外加
+    `skipped_small`（由 `sync_open_orders` 以 `_build_desired` 的結果補入）。"""
+
+    placed: int
+    cancelled: int
+    modified: int
+    matched: int
+    sync_failed: bool
+    skipped_small: tuple[SkippedOrder, ...]
+
+
+@dataclass(frozen=True)
+class CycleReport:
+    """`sync_open_orders` 單輪報告。對應 hl orders.py:351-361 的回傳 dict。
+    `tripped` 預留給回撤熔斷（Task 13），本層恆為預設 False。"""
+
+    reconcile: ReconcileResult
+    safety_net: dict
+    scale: Decimal
+    tripped: bool = False
+
+
+def _set_entry_leverage(
+    ex, desired: OrderSpec, leverage_by_coin: Mapping[str, tuple[int, bool]]
+) -> None:
+    """進場單（非 reduce-only）下單前設定名目槓桿。port 自 hl orders.py:187-193。
+
+    結構偏差：hl 從 `trader.entry_leverage(coin)`/`trader.entry_is_cross(coin)` 現算
+    （內部查 meta 快取，hl trader.py:81-108）；spark 由呼叫端預算好 `leverage_by_coin`
+    （coin -> (leverage, is_cross)）注入。coin 不在 map 內 → 靜默跳過（呼叫端沒給
+    就是不設，等同 hl dry-run 無 info 時的降級路徑）。
+    """
+    if desired.reduce_only:
+        return
+    pair = leverage_by_coin.get(desired.coin)
+    if pair is None:
+        return
+    leverage, is_cross = pair
+    ex.update_leverage(desired.coin, leverage, is_cross)
+
+
+def _verify_diff(
+    desired: list[OrderSpec],
+    after: list[OpenOrder],
+    *,
+    px_rel_tol: Decimal,
+    size_tol: Decimal,
+) -> tuple[list[OrderSpec], list[OpenOrder]]:
+    """settle 驗證的 missing/extra 計算。1:1 hl orders.py:250-251/266-267——
+    與 `_plan` 用同一個 `_orders_match` 與同一組容忍度（工程原則 1：同源同基準）。"""
+    after_pairs = [(m, spec_from_open_order(m)) for m in after]
+    missing = [
+        d
+        for d in desired
+        if not any(
+            _orders_match(d, s, px_rel_tol=px_rel_tol, size_tol=size_tol)
+            for _m, s in after_pairs
+        )
+    ]
+    extra = [
+        m
+        for m, s in after_pairs
+        if not any(
+            _orders_match(d, s, px_rel_tol=px_rel_tol, size_tol=size_tol) for d in desired
+        )
+    ]
+    return missing, extra
+
+
+def _fmt_missing(missing: list[OrderSpec]) -> str:
+    return ", ".join(
+        f"{d.coin} {'B' if d.is_buy else 'S'} {d.sz}@{_ref_px(d)}" for d in missing
+    )
+
+
+def _fmt_extra(extra: list[OpenOrder]) -> str:
+    return ", ".join(f"oid={m.oid} {m.coin}" for m in extra)
+
+
+def _reconcile_orders(
+    ex,
+    desired: list[OrderSpec],
+    my_orders: list[OpenOrder],
+    *,
+    settings,
+    notifier,
+    state: ReconcileState,
+    live: bool,
+    clock=time.time,
+    sleep_fn=time.sleep,
+) -> ReconcileResult:
+    """掛單對帳狀態機。port 自 hl orders.py:196-274，影響/風險由小到大：
+
+      1. 相同的單保留不動（matched）。
+      2. 同 slot 但價量不同 → 先試 modify 就地改（保留排隊優先權）。
+         TTL 內（近期 modify 失敗過的 coin）或 modify_policy=="cancel-place" → 直接
+         降級；modify 回 False → 登記 TTL（clock()+settings.modify_fail_ttl_s）並降級。
+      3. **先 cancel（降級舊單 + to_cancel，釋放保證金）後 place（to_place + 降級新規格）**
+         ——順序是紅線（hl orders.py:228-243）。
+      4. settle 驗證（僅 live）：sleep → 重抓 → 同容忍度算 missing/extra → 不符則
+         先撤 extra 再補 missing → 再 sleep+重抓再驗 → 仍不符 → sync_failed=True +
+         notifier.critical（工程原則 3：安全關鍵失敗大聲告警，絕不吞掉）。
+
+    結構偏差（相對 hl，逐項）：
+      - `trader.live_trading and my_address`（hl:247）→ 顯式 `live` 參數；
+        my_address 不需要——`ex.get_open_orders()` 已綁定自己帳號。
+      - 模組層 `_modify_fail_until` → 注入的 `ReconcileState`。
+      - `tg.alert_order_sync_failed`（hl:271）→ `notifier.critical("orders", ...)`。
+      - modify/place 前的 `_set_entry_leverage`（hl:219/240/259）不在本函式內——
+        鎖定簽章無 leverage 來源，已由 `sync_open_orders` 於對帳前對全部 desired
+        coin 前置設定（超集覆蓋，語意見該函式 docstring）。
+      - `modify_policy=="cancel-place"` 是 spark 新增開關（hl 無），全部 modify 直接
+        降級為 cancel+place。
+      - 回傳 frozen dataclass（`skipped_small` 由上層補入，本函式恆回空 tuple）。
+    """
+    mine_pairs = [(o.oid, spec_from_open_order(o)) for o in my_orders]
+    coin_by_oid = {o.oid: o.coin for o in my_orders}
+    plan = _plan(
+        desired, mine_pairs, px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance
+    )
+
+    # ── 1. 就地改單；TTL 內/policy 降級/失敗的退回「取消舊單 + 重掛新單」──
+    now = clock()
+    modified = 0
+    fallback: list[tuple[int, str, OrderSpec]] = []  # (舊單 oid, coin, 新單 spec)
+    for oid, spec in plan.modifies:
+        coin = spec.coin
+        if now < state.modify_fail_until.get(coin, 0):
+            fallback.append((oid, coin, spec))  # 近期失敗過 → 直接退回 cancel+place
+            continue
+        if settings.modify_policy == "cancel-place":
+            fallback.append((oid, coin, spec))  # 政策指定：不走 modify
+            continue
+        if ex.modify(oid, spec):
+            modified += 1
+            state.modify_fail_until.pop(coin, None)
+        else:
+            state.modify_fail_until[coin] = now + settings.modify_fail_ttl_s
+            fallback.append((oid, coin, spec))
+
+    # ── 2. 先取消（改單退回的舊單 + 目標已無的舊單）釋放保證金 ──────────
+    cancelled = 0
+    for oid, coin, _spec in fallback:
+        if ex.cancel(coin, oid):
+            cancelled += 1
+    for oid in plan.to_cancel:
+        if ex.cancel(coin_by_oid[oid], oid):
+            cancelled += 1
+
+    # ── 3. 後掛新單（目標新增的 + 改單退回的）保證金已釋放 ──────────────
+    placed = 0
+    for d in list(plan.to_place) + [spec for _oid, _coin, spec in fallback]:
+        if ex.place(d):
+            placed += 1
+
+    # ── 4. 驗證（僅 live）→ 不符先撤多再補缺 → 仍不符發 critical ────────
+    sync_failed = False
+    if live:
+        sleep_fn(settings.settle_seconds)
+        after = ex.get_open_orders()
+        missing, extra = _verify_diff(
+            desired, after, px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance
+        )
+        if missing or extra:
+            for m in extra:  # 先撤多（釋放保證金）
+                if ex.cancel(m.coin, m.oid):
+                    cancelled += 1
+            for d in missing:  # 再補缺
+                if ex.place(d):
+                    placed += 1
+
+            sleep_fn(settings.settle_seconds)
+            after = ex.get_open_orders()
+            missing, extra = _verify_diff(
+                desired, after, px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance
+            )
+            if missing or extra:
+                sync_failed = True
+                notifier.critical(
+                    "orders",
+                    f"掛單重試後仍不符：缺少 {len(missing)}［{_fmt_missing(missing)}］、"
+                    f"多餘 {len(extra)}［{_fmt_extra(extra)}］，需人工介入",
+                )
+
+    return ReconcileResult(
+        placed=placed,
+        cancelled=cancelled,
+        modified=modified,
+        matched=len(plan.matched),
+        sync_failed=sync_failed,
+        skipped_small=(),
+    )
+
+
+def sync_open_orders(
+    ex,
+    leader_orders: list[OpenOrder],
+    my_orders: list[OpenOrder],
+    my_positions: dict[str, Position],
+    scale: Decimal,
+    *,
+    settings,
+    notifier,
+    state,
+    live: bool,
+    protected: set[str] = frozenset(),
+    leverage_by_coin: Mapping[str, tuple[int, bool]] | None = None,
+    safety_net: Callable[[], dict] | None = None,
+    skip_safety_net: bool = False,
+    clock=time.time,
+    sleep_fn=time.sleep,
+) -> CycleReport:
+    """主同步入口：A 段掛單對帳 + B 段部位安全網。port 自 hl orders.py:277-368。
+
+    結構偏差（相對 hl，逐項）：
+      - scale 由呼叫端算好傳入（hl:296-301 在函式內呼叫 `compute_scale_factor`）。
+      - 抗單保護偵測（hl:308-311 的 `get_anti_holding_flags`）由呼叫端做，這裡直接
+        消費 `protected` 集合；被擋的補倉單警告沿用 hl:323-326 語意但無 Z 分數。
+      - B 段 `sync_positions`（hl:333-349）→ `safety_net` callable：None 或
+        `skip_safety_net=True` 時回 `{"skipped": True}`，否則呼叫並把回傳 dict
+        原樣放進 `CycleReport.safety_net`。live 時重抓部位（hl:338-340）是
+        callable 自己的責任。
+      - `_set_entry_leverage` 呼叫點：hl 在每次 modify/place 前逐單呼叫（hl:219/240/
+        259，靠 `Trader.set_leverage` 的 per-coin 快取去重，hl trader.py:116-119）；
+        spark 的 `_reconcile_orders` 鎖定簽章無 leverage 來源，故提前到對帳前對
+        desired 內每個非 reduce-only coin 各設一次（顯式去重，淨效果等價：每個會被
+        下單的 coin 在任何動作前都已設好槓桿；matched coin 多設一次是無風險冪等
+        操作——名目槓桿只影響保證金佔用，不影響倉位大小）。
+      - `failed_dexs` 過濾（hl:328-329）不移植——M1 單 DEX。
+      - 對 hl 的刻意增強：skipped_small 警告帶 `dedup_key=f"skipped_small:{coin}"`
+        （hl:319 無去重；spark 每分鐘一輪 vs hl 每小時一輪，小帳戶會每輪必噴）。
+        protected 警告同理帶 `dedup_key=f"protected:{coin}"`。現貨跳過維持 hl 語意
+        （hl:320-322 僅 logger.info、不進 tg）——不發 notifier。
+      - `_build_desired` 需要 per-coin size decimals（hl:105 `trader._get_sz_decimals`）；
+        鎖定簽章無此參數，故要求 `ex` 額外提供 `get_size_decimals(coin) -> int`
+        （duck-typed，超出 ExecutorPort 最小介面；缺少會在 A 段大聲 AttributeError，
+        不會靜默錯捨入）。
+    """
+    # ── A. 掛單對帳 ──────────────────────────────────────────────────
+    desired, skipped = _build_desired(
+        leader_orders,
+        scale,
+        min_notional=settings.min_order_notional,
+        size_decimals=ex.get_size_decimals,
+        my_positions=my_positions,
+        protected=set(protected),
+    )
+    small = tuple(s for s in skipped if s.reason == "small")
+    for s in small:
+        notifier.warn(
+            "orders",
+            f"[SKIP] {s.coin} 換算名目值 ${s.notional:.2f} < "
+            f"${settings.min_order_notional}，跳過掛單",
+            dedup_key=f"skipped_small:{s.coin}",
+        )
+    protected_coins = sorted({s.coin for s in skipped if s.reason == "protected"})
+    for coin in protected_coins:
+        notifier.warn(
+            "orders",
+            f"[抗單保護] 拒絕複製 {coin} 補倉單",
+            dedup_key=f"protected:{coin}",
+        )
+
+    if leverage_by_coin is not None:
+        seen: set[str] = set()
+        for d in desired:
+            if d.reduce_only or d.coin in seen:
+                continue
+            seen.add(d.coin)
+            _set_entry_leverage(ex, d, leverage_by_coin)
+
+    rec = _reconcile_orders(
+        ex,
+        desired,
+        my_orders,
+        settings=settings,
+        notifier=notifier,
+        state=state,
+        live=live,
+        clock=clock,
+        sleep_fn=sleep_fn,
+    )
+    rec = replace(rec, skipped_small=small)
+
+    # ── B. 部位安全網 ────────────────────────────────────────────────
+    if skip_safety_net or safety_net is None:
+        net: dict = {"skipped": True}
+    else:
+        net = safety_net()
+
+    return CycleReport(reconcile=rec, safety_net=net, scale=scale)
