@@ -32,6 +32,12 @@ USAGE = (
 )
 
 
+def _exit_code(report) -> int:
+    """退出碼＝殘留暴險訊號（純函式，供測試）：平倉失敗**或**掛單清單未知
+    （orders_not_cancelled——一張未撤，殘留掛單可能繼續成交）都算未乾淨收場 → 1。"""
+    return 1 if (report.failures or report.orders_not_cancelled) else 0
+
+
 def _plan_actions(open_orders: list[OpenOrder], positions: list[Position]) -> list[str]:
     """純函式：由讀側狀態產生「將執行的動作」清單（dry-run 輸出）。零副作用。
 
@@ -154,9 +160,11 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"network={network} user={user_addr} 開始執行 kill switch trip ...")
     report = trip(executor, positions, notifier, _REPO_ROOT, status)
-    print(f"完成：撤單 {report.cancelled} 張｜平倉成功 {list(report.closed) or '無'}｜"
+    print(f"完成：撤單 {report.cancelled} 張"
+          f"{'（掛單清單未知，一張未撤）' if report.orders_not_cancelled else ''}｜"
+          f"平倉成功 {list(report.closed) or '無'}｜"
           f"失敗 {list(report.failures) or '無'}｜ARM_FILE={report.arm_file}")
-    raise SystemExit(1 if report.failures else 0)
+    raise SystemExit(_exit_code(report))
 
 
 if __name__ == "__main__":

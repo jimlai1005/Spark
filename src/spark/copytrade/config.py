@@ -85,7 +85,10 @@ class CopySettings:
     live_trading: bool = False  # 紅線 5：刻意覆蓋 hl，預設關
     interval_s: int = 60  # 每分鐘（刻意覆蓋 hl 的 hourly CHECK_MINUTE=55）
     modify_policy: str = "modify-first"  # 或 "cancel-place"；預設不得改（等 T1.3）
-    flatten_on_breach: bool = True  # 拍板 #2：回撤自動全平預設開
+    # 拍板 #2：回撤自動全平預設開。設 False 時為**軟暫停**：breach 的輪次發 critical
+    # ＋不做任何交易動作，equity 回升到未 breach 即自動恢復跟單——不寫 ARM 檔、
+    # 不需人工 re-arm（與 True 的 kill switch 硬鎖死是兩種語意）。
+    flatten_on_breach: bool = True
     allocated_capital: Decimal = Decimal("0")  # 0=用全權益，刻意覆蓋 hl 的 5000
 
     # 照抄 hl 預設值（來自 hl-copytrader config.py:33-115）

@@ -510,6 +510,21 @@ def test_panic_main_yes_close_failure_exits_1_still_armed(panic_env):
     assert (panic_env.root / ARM_FILE_RELPATH).exists(), "失敗也要鎖死"
 
 
+def test_panic_exit_code_reflects_orders_not_cancelled():
+    """orders_not_cancelled=True（掛單清單未知、一張未撤）即使 failures 為空也是
+    未乾淨收場——殘留掛單可能繼續成交，退出碼必須 1 讓外層腳本/人看到。"""
+    from spark.copytrade.killswitch import FlattenReport
+
+    from scripts.panic import _exit_code
+
+    assert _exit_code(FlattenReport(cancelled=0, closed=("ETH",), failures=(),
+                                    arm_file="x", orders_not_cancelled=True)) == 1
+    assert _exit_code(FlattenReport(cancelled=1, closed=("ETH",), failures=("BTC",),
+                                    arm_file="x", orders_not_cancelled=False)) == 1
+    assert _exit_code(FlattenReport(cancelled=1, closed=("ETH",), failures=(),
+                                    arm_file="x", orders_not_cancelled=False)) == 0
+
+
 def test_panic_main_already_tripped_prints_notice(panic_env, capsys):
     arm = panic_env.root / ARM_FILE_RELPATH
     arm.parent.mkdir(parents=True)

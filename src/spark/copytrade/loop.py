@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from spark.copytrade.config import CopySettings
-from spark.copytrade.killswitch import check_drawdown, is_tripped, trip
+from spark.copytrade.killswitch import evaluate, is_tripped, trip
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
     CycleReport,
@@ -69,12 +69,10 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         return _tripped_report()
 
     # ── 2. 回撤判定（同一次 portfolio 回應的 current/peak）─────────────
+    # 必須用 evaluate() 而非直呼 check_drawdown（killswitch.py 主迴圈接入接口）：
+    # degenerate equity（peak<=0）的 warn 在 evaluate 內結構性內建，不靠這裡記得補。
     ev = adapter.get_equity_view(ex.my_address)
-    status = check_drawdown(ev, settings.max_drawdown_pct)
-    if status.peak <= 0:
-        # 「無資料」不是「安全」——check_drawdown docstring 指定呼叫端告警。
-        notifier.warn("killswitch", "權益歷史 peak<=0（新帳戶或 portfolio 異常），"
-                      "回撤保護本輪無法判定", dedup_key="dd_no_data")
+    status = evaluate(ev, settings, notifier)
     if status.breached:
         notifier.critical(
             "killswitch",

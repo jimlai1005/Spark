@@ -122,12 +122,14 @@ def test_breach_without_flatten_skips_trip_but_still_tripped_report(tmp_path, mo
 
 
 def test_peak_zero_warns_no_data_and_continues(tmp_path):
+    """degenerate equity 的 warn 由 killswitch.evaluate() 結構性內建
+    （dedup_key="equity_degenerate"）——run_cycle 不得直呼 check_drawdown 繞過它。"""
     fa = FakeAdapter(equity=EquityView(current=Decimal("0"), recent_peak=Decimal("0")),
                      account=_account())
     report, notifier, _ = _run(fa, tmp_path=tmp_path)
     assert report.tripped is False  # 無資料不是 breach，本輪照常對帳
     warns = [r for r in notifier.records if r[0] == "warn"]
-    assert any(r[3] == "dd_no_data" for r in warns)
+    assert any(r[3] == "equity_degenerate" for r in warns)
 
 
 # ── 3. 正常路徑組裝：sync_open_orders 收到的參數（mock 驗）───────────
