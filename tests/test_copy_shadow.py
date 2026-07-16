@@ -143,11 +143,29 @@ def test_parse_close_long_and_short_direction_inverted():
     assert b == {"kind": "close", "coin": "BNB", "is_buy": True, "sz": Decimal("0.5")}
 
 
+def test_parse_place_price_with_thousands_separator():
+    # 格式來源: hl-copytrader src/trader.py:355 的 `${px:,.4f}`——px>=1000 帶千分位
+    # 逗號（真實 log 例形如 `$1,051.0000`；此處為合成數值）。
+    line = ("2026-01-01 00:00:12,000 [INFO] src.trader: "
+            "[DRY RUN] 掛單 XRP 買 size=21.2376 @ $1,051.0000 Limit")
+    a = parse_hl_log_line(line)
+    assert a["kind"] == "place" and a["coin"] == "XRP"
+    assert a["limit_px"] == Decimal("1051.0000")
+
+
 def test_parse_update_leverage():
     # 格式來源: hl-copytrader src/trader.py:114（dry）
     line = "2026-01-01 00:00:10,000 [INFO] src.trader: [DRY RUN] 設定 BNB 槓桿 10x cross"
     assert parse_hl_log_line(line) == {
         "kind": "update_leverage", "coin": "BNB", "leverage": 10, "is_cross": True}
+
+
+def test_parse_update_leverage_live_with_result_suffix():
+    # 格式來源: hl-copytrader src/trader.py:129（live，含 `: {result}` 後綴）
+    line = ("2026-01-01 00:00:13,000 [INFO] src.trader: "
+            "設定 BNB 槓桿 10x isolated: {'status': 'ok'}")
+    assert parse_hl_log_line(line) == {
+        "kind": "update_leverage", "coin": "BNB", "leverage": 10, "is_cross": False}
 
 
 def test_parse_non_action_line_returns_none():
@@ -176,9 +194,11 @@ def _spark(kind, coin, **payload):
 
 # ── match（2 案）──────────────────────────────────────────────────────
 def test_classify_match_place_within_price_tolerance():
-    spark_actions = [_spark("place", "ETH", is_buy=True, sz="1.0", limit_px="2000.00")]
+    spark_actions = [_spark("place", "ETH", is_buy=True, sz="1.0", limit_px="2000.00",
+                            reduce_only=False)]
     hl_actions = [{"kind": "place", "coin": "ETH", "is_buy": True,
-                  "sz": Decimal("1.0"), "limit_px": Decimal("2000.30")}]  # 差 0.015%
+                  "sz": Decimal("1.0"), "limit_px": Decimal("2000.30"),  # 差 0.015%
+                  "order_type": "Limit", "reduce_only": False}]
     items = classify_diff(spark_actions, hl_actions,
                           px_rel_tol=PX_TOL, size_ratio_tol=SIZE_TOL)
     assert len(items) == 1 and items[0].kind == "match"
@@ -221,6 +241,25 @@ def test_classify_unexplained_structural_kind_mismatch():
                           px_rel_tol=PX_TOL, size_ratio_tol=SIZE_TOL)
     assert len(items) == 2
     assert all(i.kind == "unexplained" for i in items)
+
+
+def test_classify_unexplained_reduce_only_mismatch():
+    """兩側僅 reduce_only 不同（coin/px/sz/is_buy 全同）→ 結構差，不得判 match。
+
+    情境：spark 把 reduce-only 平倉單錯掛成非 reduce-only——下單語意錯誤，
+    若靠 px/sz 對得上而 match，此 bug 會永久隱形。
+    """
+    spark_actions = [_spark("place", "ETH", is_buy=False, sz="1.0",
+                            limit_px="2000.00", reduce_only=False)]
+    hl_actions = [{"kind": "place", "coin": "ETH", "is_buy": False,
+                  "sz": Decimal("1.0"), "limit_px": Decimal("2000.00"),
+                  "order_type": "Limit", "reduce_only": True}]
+    items = classify_diff(spark_actions, hl_actions,
+                          px_rel_tol=PX_TOL, size_ratio_tol=SIZE_TOL)
+    assert len(items) == 2  # 兩組各自單邊多出
+    assert all(i.kind == "unexplained" for i in items), items
+    # hl 側的 detail 應帶 [RO] 標記，讓人一眼看出差在 reduce_only
+    assert any("[RO]" in i.detail for i in items)
 
 
 def test_classify_unexplained_inconsistent_size_ratio():

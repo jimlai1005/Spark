@@ -187,6 +187,7 @@ def _normalize_spark(action: dict) -> dict:
         out["is_buy"] = p["is_buy"]
         out["sz"] = Decimal(p["sz"])
         out["limit_px"] = Decimal(p["limit_px"])
+        out["reduce_only"] = bool(p["reduce_only"])
     elif kind in _SIZE_KINDS:
         out["is_buy"] = p["is_buy"]
         out["sz"] = Decimal(p["sz"])
@@ -208,7 +209,17 @@ def _normalize_spark(action: dict) -> dict:
 
 
 def _key(a: dict) -> tuple:
-    return (a["kind"], a["coin"], a.get("is_buy"))
+    """分組鍵 = 結構維度：kind/coin/is_buy/reduce_only。
+
+    reduce_only 是結構維度而非數值差——spark 若把 reduce-only 平倉單錯掛成
+    非 reduce-only，下單語意就是錯的，不得因 coin/px/sz/is_buy 對得上而判 match。
+    僅 place 可雙側對照：hl 的改單 log 行（trader.py:404/416）不含 reduceOnly
+    資訊，modify 此維度單側缺料、無從比對，視為 wildcard（None）——硬塞進 key
+    會把所有 modify 配對打成永久 unexplained 噪音（毒化 3 交易日 gate），
+    比盲點更糟。此為已知限制，記錄於此。
+    """
+    ro = a.get("reduce_only") if a["kind"] == "place" else None
+    return (a["kind"], a["coin"], a.get("is_buy"), ro)
 
 
 def _sort_key(a: dict):
@@ -225,6 +236,8 @@ def _fmt(a: dict) -> str:
     bits = [kind, coin]
     if "is_buy" in a:
         bits.append("buy" if a["is_buy"] else "sell")
+    if a.get("reduce_only"):
+        bits.append("[RO]")
     if "sz" in a:
         bits.append(f"sz={a['sz']}")
     if "limit_px" in a:
@@ -237,8 +250,9 @@ def classify_diff(spark_actions: list[dict], hl_actions: list[dict], *,
     """逐項分類 spark 意圖動作 vs hl-copytrader 實際動作。
 
     演算法：
-    1. 依 (kind, coin, is_buy) 分組（cancel/update_leverage 的 is_buy 恆為 None，
-       故同 coin 同 kind 即歸一組）；兩邊都有的組內按 price（無 price 則 size）
+    1. 依 (kind, coin, is_buy, reduce_only) 分組（cancel/update_leverage 的
+       is_buy 恆為 None，故同 coin 同 kind 即歸一組；reduce_only 僅 place 進鍵，
+       理由見 `_key` docstring）；兩邊都有的組內按 price（無 price 則 size）
        排序後逐一配對，多出來的（組內任一邊數量較多）直接記 "unexplained"
        （結構差：數量對不上）。只出現在單邊的整組（例如 hl 有 trigger 掛單但
        spark 記了 skip_trigger，kind 字串不同、天生不會配對）也記 "unexplained"。
@@ -267,7 +281,7 @@ def classify_diff(spark_actions: list[dict], hl_actions: list[dict], *,
     pending: list[tuple[DiffItem, Decimal | None]] = []  # (預先建立的 item, size ratio)
 
     all_keys = set(spark_groups) | set(hl_groups)
-    for key in sorted(all_keys, key=lambda k: (k[0], k[1], str(k[2]))):
+    for key in sorted(all_keys, key=lambda k: (k[0], k[1], str(k[2]), str(k[3]))):
         s_list = sorted(spark_groups.get(key, []), key=_sort_key)
         h_list = sorted(hl_groups.get(key, []), key=_sort_key)
         n = min(len(s_list), len(h_list))
