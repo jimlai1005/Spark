@@ -13,7 +13,8 @@ hl-copytrader 為唯讀依賴：只透過 sys.path 注入唯讀 import 其純函
 安全設計：hl 的 `src/config.py` import 時會 `load_dotenv()`，若讀到真實 .env
 可能載入私鑰等敏感值進 os.environ。以下 fixture：
   1. import 完成後立即（不等 teardown）洗掉已知敏感鍵。
-  2. teardown 還原 os.environ 快照，並雙重洗一次快照本來就沒有的殘留鍵。
+  2. teardown 以 clear+update 完整還原 os.environ 快照（快照攝於 load_dotenv 前，
+     本身不含 .env 載入的敏感值）。
   3. teardown 清掉 sys.path 與 sys.modules 裡的 `src`/`src.*`，避免汙染其他測試檔
      的模組命名空間（hl 頂層套件名為 `src`，與 spark 自身無關但仍需清乾淨）。
 所有斷言訊息只印比對用的正規化 tuple 與 oid，不印 os.environ 或 hl config 的
@@ -56,12 +57,10 @@ def hl_funcs():
         for name in list(sys.modules):
             if name == "src" or name.startswith("src."):
                 del sys.modules[name]
+        # clear+update 完整還原快照；快照攝於 load_dotenv 之前，故 .env 載入的
+        # 敏感值不會經由還原重新進入 os.environ
         os.environ.clear()
         os.environ.update(snapshot)
-        # teardown 後再洗一次快照裡本來就沒有的殘留
-        for k in _SENSITIVE_ENV_KEYS:
-            if k not in snapshot:
-                os.environ.pop(k, None)
 
 
 # ─────────────────────────── 場景產生器 ───────────────────────────
@@ -278,7 +277,7 @@ def _assert_plan_matches(
     size_tol: Decimal,
     hl_plan,
     ctx: str,
-) -> None:
+):
     spark_desired = [_to_spark(c) for c in desired_canons]
     spark_mine = [(oid, _to_spark(c)) for oid, c in mine_canons]
     hl_desired = [_to_hl(c) for c in desired_canons]
@@ -308,6 +307,7 @@ def _assert_plan_matches(
     hl_matched_oids = all_mine_oids - set(hl_modifies_norm) - hl_cancel_oids
     assert hl_matched_oids == plan.matched, f"{ctx}: matched 集合分歧 hl={hl_matched_oids} spark={plan.matched}"
     assert len(hl_matched_oids) == h_matched, f"{ctx}: hl matched 計數 {h_matched} 與其自身回傳不符"
+    return plan
 
 
 # ─────────────────────────── 測試 ───────────────────────────
@@ -318,9 +318,18 @@ def test_plan_parity_random_scenarios(hl_funcs):
     size_tol = Decimal(str(hl_config.SIZE_TOLERANCE))
     rng = random.Random(42)
     n_scenarios = 220
+    totals = Counter()
     for i in range(n_scenarios):
         desired, mine = _gen_scenario(rng, PX_TOL, size_tol)
-        _assert_plan_matches(desired, mine, PX_TOL, size_tol, hl_plan, ctx=f"scenario#{i}")
+        plan = _assert_plan_matches(desired, mine, PX_TOL, size_tol, hl_plan, ctx=f"scenario#{i}")
+        totals["matched"] += len(plan.matched)
+        totals["modifies"] += len(plan.modifies)
+        totals["to_place"] += len(plan.to_place)
+        totals["to_cancel"] += len(plan.to_cancel)
+    # 最低覆蓋防呆：任一分支萎縮成（近）零時，parity 斷言會退化成空集合比較而平白通過。
+    # 門檻依 seed=42 實測值（matched 75/modifies 200/to_place 511/to_cancel 588）留大幅餘裕。
+    for branch in ("matched", "modifies", "to_place", "to_cancel"):
+        assert totals[branch] > 10, f"覆蓋防呆：{branch} 累計 {totals[branch]} <= 10，場景產生器已失衡"
 
 
 def test_plan_parity_edge_cases(hl_funcs):
@@ -343,6 +352,7 @@ def test_orders_match_parity_random_pairs(hl_funcs):
     size_tol = Decimal(str(hl_config.SIZE_TOLERANCE))
     rng = random.Random(42)
     n_pairs = 500
+    n_true = n_false = 0
     for i in range(n_pairs):
         d_canon, m_canon = _gen_pair(rng, PX_TOL, size_tol)
         spark_result = spark_match(
@@ -353,6 +363,14 @@ def test_orders_match_parity_random_pairs(hl_funcs):
             f"pair#{i} 分歧：desired={_norm_spark(_to_spark(d_canon))} "
             f"mine={_norm_spark(_to_spark(m_canon))}"
         )
+        if spark_result:
+            n_true += 1
+        else:
+            n_false += 1
+    # 最低覆蓋防呆：全 True 或全 False 的配對集無法檢驗另一半分支。
+    # 門檻依 seed=42 實測值（True 54/False 446）留餘裕。
+    assert n_true > 20, f"覆蓋防呆：相符配對僅 {n_true} 組 <= 20，配對產生器已失衡"
+    assert n_false > 20, f"覆蓋防呆：不相符配對僅 {n_false} 組 <= 20，配對產生器已失衡"
 
 
 def test_hl_size_tolerance_is_default(hl_funcs):
