@@ -2,7 +2,7 @@
 方法名以 Task 0 findings 為準。"""
 import urllib.request
 import urllib.error
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, Context, ROUND_HALF_EVEN
 from spark.config import CSV_BASE_URLS
 from spark.exchange.base import (
@@ -62,12 +62,13 @@ class HyperliquidAdapter(ExchangeAdapter):
     def _tpsl_from_order_type(order_type_name: str) -> str | None:
         # frontendOpenOrders 回應無字面 "tpsl" 鍵（已與 SDK docstring 及 Hyperliquid 官方文件
         # 交叉確認：欄位只有 orderType 這種人類可讀字串，如 "Limit"/"Stop Market"/
-        # "Take Profit Limit"）。tpsl 分類需從 orderType 文字判讀衍生，語意移植自
-        # hl-copytrader src/monitor.py:181-191 的 _parse_orders。
+        # "Take Profit Limit"）。tpsl 分類需從 orderType 文字判讀衍生，1:1 忠實移植自
+        # hl-copytrader src/monitor.py:187-191 的 _parse_orders（含 startswith("tp") 與
+        # "sl" in low 兩個析取項——HL 前端若改字串格式，行為須與線上引擎一致）。
         low = order_type_name.lower()
-        if "take profit" in low:
+        if "take profit" in low or low.startswith("tp"):
             return "tp"
-        if "stop" in low:
+        if "stop" in low or "sl" in low:
             return "sl"
         return None
 
@@ -152,13 +153,17 @@ class HyperliquidAdapter(ExchangeAdapter):
             peak = current
         return EquityView(current=current, recent_peak=peak)
 
+    _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
     @staticmethod
     def _to_ms_utc(dt: datetime) -> int:
         # naive datetime 視為 UTC（本 adapter 的呼叫端慣例）；aware datetime 一律先轉 UTC
         # 再取 epoch，避免用本機時區誤解讀。
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1000)
+        # 純整數運算（timedelta // timedelta 精確）：timestamp()*1000 走 float 會有 ±1ms
+        # 捨入偏差，違反「無 float 中間值」紅線。
+        return (dt - HyperliquidAdapter._EPOCH) // timedelta(milliseconds=1)
 
     def get_user_fills(self, address: str, start: datetime, end: datetime) -> list[UserFill]:
         raw = self._info.user_fills_by_time(

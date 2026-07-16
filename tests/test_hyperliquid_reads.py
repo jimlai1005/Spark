@@ -107,6 +107,16 @@ def test_get_open_orders_trigger_take_profit_tpsl_tp():
     assert o.reduce_only is True
 
 
+def test_tpsl_faithful_port_covers_tp_prefix_and_sl_substring():
+    # 1:1 移植 hl-copytrader monitor.py:187-191 的完整析取項：
+    # "tp..." 開頭 → tp；含 "sl" → sl（即便不含 "stop"/"take profit" 全稱）。
+    assert HyperliquidAdapter._tpsl_from_order_type("TP Market") == "tp"
+    assert HyperliquidAdapter._tpsl_from_order_type("SL Limit") == "sl"
+    assert HyperliquidAdapter._tpsl_from_order_type("Take Profit Market") == "tp"
+    assert HyperliquidAdapter._tpsl_from_order_type("Stop Limit") == "sl"
+    assert HyperliquidAdapter._tpsl_from_order_type("Limit") is None
+
+
 # --- 2. get_positions ---
 
 _USER_STATE = {
@@ -243,6 +253,16 @@ def test_get_user_fills_maps_and_converts_datetime_to_ms():
     _address, start_ms, end_ms = ad._info.user_fills_by_time_calls[-1]
     assert start_ms == int(start.timestamp() * 1000)
     assert end_ms == int(end.timestamp() * 1000)
+
+
+def test_to_ms_utc_integer_exact_with_microseconds():
+    # 純整數轉換釘死精確值：2025-06-15 12:34:56.789123 UTC
+    # epoch 秒 = 1749990896（date -u 可驗），毫秒 = *1000 + 789（微秒截斷至 ms）。
+    dt = datetime(2025, 6, 15, 12, 34, 56, 789123, tzinfo=timezone.utc)
+    assert HyperliquidAdapter._to_ms_utc(dt) == 1749990896789
+    # naive datetime 視為 UTC，結果相同
+    assert HyperliquidAdapter._to_ms_utc(dt.replace(tzinfo=None)) == 1749990896789
+    assert isinstance(HyperliquidAdapter._to_ms_utc(dt), int)
 
 
 def test_get_user_fills_missing_fee_defaults_zero_and_maker_not_crossed():
