@@ -1,0 +1,28 @@
+[Unit]
+Description=Filet daily leaderboard snapshots (global top-N + leader watchlist, read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=filet-api
+Group=filet-api
+WorkingDirectory=/opt/filet/spark
+Environment=SPARK_NETWORK=mainnet
+Environment=FILET_DATA_DIR=/var/lib/filet-api
+# watchlist 未設時用內建預設（M1 leader 0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1）。
+# 擴充清單（逗號分隔）：
+#Environment=FILET_LEADER_WATCHLIST=0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1,0x...
+# 全站快照 best-effort（ExecStart 前綴 "-"）：stats-data 端點未進官方文件、schema
+# 可能無預告變動——它掛掉不擋 watchlist 快照（定案 11）。
+ExecStart=-/opt/filet/spark/.venv/bin/python -m scripts.leaderboard_snapshot
+ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.watchlist_snapshot
+StateDirectory=filet-api
+ReadWritePaths=/var/lib/filet-api
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

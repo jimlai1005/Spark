@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily filet leaderboard snapshots at 00:10 UTC
+
+[Timer]
+# 00:10 UTC：日界後緩衝 10 分鐘（沿 scripts/leaderboard_snapshot.py docstring 的
+# crontab 慣例）；RandomizedDelay 避免整點雪崩。Persistent：關機錯過補跑。
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
