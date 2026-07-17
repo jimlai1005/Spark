@@ -1,0 +1,92 @@
+"""tests/publicapi_helpers.py — Public API 測試共用件（非測試檔）。
+FakeKeysvc / FakeHL 是唯二的外部依賴替身；SIWE 與 EIP-712 簽名用真密碼學。"""
+import secrets
+from decimal import Decimal
+
+from eth_account import Account
+from eth_account.messages import encode_defunct
+
+from spark.keysvc.client import KeysvcError
+from spark.publicapi.app import create_app
+from spark.publicapi.config import ApiConfig
+from spark.publicapi.store import ApiStore
+
+BUILDER = "0x" + "b1" * 20
+
+
+def make_cfg(tmp_path, **over):
+    base = dict(network="testnet", builder_address=BUILDER,
+                siwe_domain="filet.example", siwe_uri="https://filet.example",
+                db_path=str(tmp_path / "api.db"),
+                keysvc_sock=str(tmp_path / "keysvc.sock"),
+                pending_path=str(tmp_path / "pending.json"),
+                admin_addresses=frozenset())
+    base.update(over)
+    return ApiConfig(**base)
+
+
+class FakeKeysvc:
+    """模擬 KeysvcClient：鏡像真 client 的 KeysvcError.code 行為（"exists"/"missing"），
+    generate 一次成功、重呼 code="exists"（O_EXCL 語意）、address 唯讀；可注入失敗。"""
+
+    def __init__(self):
+        self.generated: dict[str, str] = {}
+        self.fail: Exception | None = None          # generate 的注入失敗
+        self.address_fail: Exception | None = None  # address 的注入失敗
+
+    def generate(self, account_id: str) -> str:
+        if self.fail is not None:
+            raise self.fail
+        if account_id in self.generated:
+            raise KeysvcError(f"keysvc 失敗: account {account_id} 已有 agent key",
+                              code="exists")
+        addr = "0x" + secrets.token_hex(20)
+        self.generated[account_id] = addr
+        return addr
+
+    def address(self, account_id: str) -> str:
+        if self.address_fail is not None:
+            raise self.address_fail
+        if account_id not in self.generated:
+            raise KeysvcError(f"keysvc 失敗: account {account_id} 無 agent key",
+                              code="missing")
+        return self.generated[account_id]
+
+
+class FakeHL:
+    """模擬 HLGateway（唯讀）；鏈上狀態由測試直接塞（模擬前端直送 HL 後授權上鏈）。
+    鍵一律小寫（同 normalize 基準）。刻意與真 HLGateway 同面：無任何提交方法。"""
+
+    def __init__(self):
+        self.account_values: dict[str, Decimal] = {}
+        self.max_fees: dict[tuple[str, str], int] = {}
+        self.agents: dict[str, list[str]] = {}
+
+    def get_account_value(self, address: str) -> Decimal:
+        return self.account_values.get(address.lower(), Decimal("0"))
+
+    def max_builder_fee(self, user: str, builder: str) -> int:
+        return self.max_fees.get((user.lower(), builder.lower()), 0)
+
+    def agent_addresses(self, user: str) -> list[str]:
+        return [a.lower() for a in self.agents.get(user.lower(), [])]
+
+
+def make_app(tmp_path, cfg=None):
+    cfg = cfg or make_cfg(tmp_path)
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    return create_app(cfg, store, keysvc, hl), cfg, store, keysvc, hl
+
+
+def login(client, wallet=None):
+    """完整 SIWE 登入（真密碼學）。session cookie 落在 client 的 cookie jar。"""
+    wallet = wallet or Account.create()
+    r = client.get("/api/auth/nonce",
+                   params={"address": wallet.address, "chain_id": 42161})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    sig = wallet.sign_message(encode_defunct(text=body["message"])).signature.hex()
+    r = client.post("/api/auth/verify", json={"nonce": body["nonce"], "signature": sig})
+    assert r.status_code == 200, r.text
+    return wallet
