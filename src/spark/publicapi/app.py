@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
+from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
 
@@ -145,6 +146,28 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time) ->
     @app.get("/api/onboard/status")
     def onboard_status(address: str = Depends(_require_session)):
         return _progress(address)  # 純讀；副作用（寫 pending）只在 POST /api/onboard/verify
+
+    @app.post("/api/onboard/verify")
+    def onboard_verify(address: str = Depends(_require_session)):
+        """檢查全過 → 寫 pending 條目（等管理端人工 CLI 核准；spec：activate 不做成
+        API 端點）。未全過 → 回進度供斷點續走（冪等，可重跑）。"""
+        p = _progress(address)
+        if p["state"] == "READY":
+            # ⭐ user_address 出自 session、builder_address 出自伺服器設定（紅線 6）
+            write_pending_entry(cfg.pending_path, account_id=p["account_id"],
+                                user_address=address,
+                                builder_address=cfg.builder_address,
+                                network=cfg.network,
+                                agent_address=p["agent_address"])
+        return p
+
+    @app.get("/api/admin/pending")
+    def admin_pending(address: str = Depends(_require_session)):
+        """管理端唯讀：檢視 pending 清單（逐筆核對 builder_address 用）。啟用走人工
+        CLI scripts/filet_activate.py，web 層無任何 systemd/寫 manifest 權。"""
+        if address not in cfg.admin_addresses:  # 兩側皆 normalize 過
+            raise HTTPException(status_code=403, detail="非管理員")
+        return {"pending": load_pending(cfg.pending_path)}
 
     # ---------- 待簽 payload（後端建 typed data，不簽；前端簽完直送 HL /exchange） ----------
     @app.post("/api/onboard/payload/approve-agent")
