@@ -1,12 +1,16 @@
 """src/spark/keysvc/server.py
 key-service 的核心處理。generate：生成 agent keypair、寫入 keystore、只回地址。
-私鑰絕不進回應/log。（socket accept 迴圈在 Task 4 加入，與授權器一起。）"""
+私鑰絕不進回應/log。serve_forever：unix socket accept 迴圈，連線先過 SO_PEERCRED 授權。"""
 import logging
+import os
+import socket
+from collections.abc import Callable
+from pathlib import Path
 
 from eth_account import Account
 
 from spark.keystore.envfile import EnvFileKeyStore
-from spark.keysvc.protocol import GenerateRequest, Response
+from spark.keysvc.protocol import GenerateRequest, Response, decode_request, encode_response
 
 logger = logging.getLogger(__name__)
 
@@ -25,3 +29,42 @@ def handle_generate(req: GenerateRequest, ks: EnvFileKeyStore) -> Response:
         logger.exception("keysvc generate 失敗 account=%s", req.account_id)  # 不 log 私鑰
         return Response(ok=False, error="internal error")
     return Response(ok=True, agent_address=acct.address)
+
+
+def serve_forever(sock_path: str, ks: EnvFileKeyStore,
+                  authorize_peer: Callable[[socket.socket], bool],
+                  stop=None) -> None:
+    """監聽 unix socket；每個連線：授權 → 讀一個 request → 處理 → 回一個 response → 關。
+    未授權連線直接關閉不處理。stop（threading.Event）供測試/優雅停止。"""
+    p = Path(sock_path)
+    if p.exists():
+        p.unlink()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    os.chmod(sock_path, 0o660)
+    srv.listen(8)
+    srv.settimeout(0.5)
+    try:
+        while stop is None or not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            with conn:
+                if not authorize_peer(conn):
+                    logger.warning("keysvc 拒絕未授權連線")
+                    continue
+                line = conn.makefile("rb").readline()
+                try:
+                    req = decode_request(line)
+                    resp = handle_generate(req, ks)
+                except ValueError as e:
+                    resp = Response(ok=False, error=str(e))
+                except Exception:
+                    logger.exception("keysvc 處理連線失敗")
+                    resp = Response(ok=False, error="bad request")
+                conn.sendall(encode_response(resp))
+    finally:
+        srv.close()
+        if p.exists():
+            p.unlink()

@@ -23,6 +23,8 @@ def encode_request(req: GenerateRequest) -> bytes:
 
 def decode_request(line: bytes) -> GenerateRequest:
     d = json.loads(line.decode())
+    if not isinstance(d, dict):
+        raise ValueError("request must be a JSON object")
     if d.get("op") != "generate":
         raise ValueError(f"unsupported op: {d.get('op')!r}")
     acct = d.get("account_id")

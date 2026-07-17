@@ -33,3 +33,8 @@ def test_decode_missing_account_rejected():
     import json
     with pytest.raises(ValueError):
         decode_request((json.dumps({"op": "generate"}) + "\n").encode())
+
+
+def test_decode_non_object_rejected():
+    with pytest.raises(ValueError):
+        decode_request(b"[1, 2, 3]\n")
