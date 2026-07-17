@@ -418,11 +418,25 @@ def test_panic_plan_actions_is_pure_and_lists_all_actions():
 def test_panic_resolve_state_dir_env_override_direct(monkeypatch, tmp_path):
     """M2 Task 10（T8 sonnet minor）：panic.resolve_state_dir() 讀 FILET_STATE_DIR
     env 覆寫路徑的直接測試——既有測試（panic_env fixture）都是 monkeypatch
-    panic._REPO_ROOT 繞過 env 分支，這裡直測 env 分支本身。"""
+    panic._REPO_ROOT 繞過 env 分支，這裡直測 env 分支本身。絕對路徑經 .resolve()
+    正規化（冪等），故對已存在的 tmp_path 斷言 == tmp_path.resolve()。"""
     import scripts.panic as panic
 
     monkeypatch.setenv("FILET_STATE_DIR", str(tmp_path))
-    assert panic.resolve_state_dir() == tmp_path
+    assert panic.resolve_state_dir() == tmp_path.resolve()
+
+
+def test_panic_resolve_state_dir_relative_env_becomes_absolute(monkeypatch, tmp_path):
+    """Task 10 fast-follow（T4 reviewer Important）：panic.py 的孿生
+    resolve_state_dir() 也須把相對路徑 FILET_STATE_DIR .resolve() 成絕對——否則
+    同一相對路徑在不同 CWD 下靜默指向不同狀態根，緊急平倉 ARM 檔可能因此失聯。"""
+    import scripts.panic as panic
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FILET_STATE_DIR", "relative/sub")
+    result = panic.resolve_state_dir()
+    assert result.is_absolute()
+    assert result == (tmp_path / "relative" / "sub").resolve()
 
 
 def test_panic_resolve_state_dir_defaults_to_repo_root(monkeypatch):

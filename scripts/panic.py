@@ -56,9 +56,13 @@ def resolve_state_dir() -> Path:
     """狀態根：讀 env FILET_STATE_DIR，缺省回 _REPO_ROOT（與 run_copytrade.py
     resolve_state_dir() 同慣例、保留單實例行為）。本檔持有自己模組層級的
     `_REPO_ROOT`（獨立於 run_copytrade 的同名常數），讓既有測試對
-    `panic._REPO_ROOT` 的 monkeypatch 繼續生效。"""
+    `panic._REPO_ROOT` 的 monkeypatch 繼續生效。
+
+    相對路徑 → .resolve() 成絕對（T4 reviewer minor，與 run_copytrade.py 孿生
+    函式一致）：避免 CWD 依賴——同一相對路徑在不同啟動目錄下會靜默指向不同狀態
+    根，讓緊急平倉的 ARM 檔落錯地方、被引擎下個 cycle 讀不到。"""
     raw = os.environ.get("FILET_STATE_DIR")
-    return Path(raw) if raw else _REPO_ROOT
+    return Path(raw).resolve() if raw else _REPO_ROOT
 
 
 def _exit_code(report: FlattenReport) -> int:

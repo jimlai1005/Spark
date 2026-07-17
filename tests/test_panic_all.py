@@ -420,6 +420,66 @@ def test_panic_all_sibling_misdirection_isolated_from_real_follower(fake_stack, 
     assert _arm_path(fake_stack.state_base, "alice").exists()
 
 
+# ── F1b（Task 10 fast-follow，reviewer Important）：_state_root_for 三道防線直測 ──
+#
+# Task 10 起，account_id 含 `/`／`..` 會先在 manifest load boundary 被
+# validate_account_id 攔下，上面的 F1 整合測試因此不再到達 _state_root_for；但
+# _state_root_for 是給「繞過 followers.py 直呼叫」的第二道縱深防禦（見其 docstring
+# 「不倚賴上游驗證」），這道守錢碼必須有自己的直接單元測試，否則零覆蓋。
+# 三道防線：(1) 輸入含 sep/../空 → 拒；(2) resolve 後 sr.parent 須為 base（擋逃出
+# base）；(3) sr.name 須等於字面 account_id（擋 symlink/互消改指）。第 2/3 道靠
+# symlink 情境獨立行使——不含 `/` 也不含 `..` 故過第 1 道，卻在 resolve 後偏移。
+
+
+def test_state_root_for_normal_account_id_under_base(monkeypatch, tmp_path):
+    """正常路徑：合法 account_id → base/<id>（resolve 正規化後）。"""
+    from scripts.panic_all import _state_root_for
+
+    monkeypatch.setenv("FILET_STATE_BASE", str(tmp_path))
+    assert _state_root_for("alice") == (tmp_path / "alice").resolve()
+
+
+@pytest.mark.parametrize("bad_id", ["a/b", "..", "", "/etc/x"])
+def test_state_root_for_first_line_rejects_bad_input(monkeypatch, tmp_path, bad_id):
+    """第 1 道（輸入形狀）：含路徑分隔 `/`（"a/b"、絕對路徑 "/etc/x"）、含 `..`
+    分段（".."）、或空字串 → 直接 ValueError，不進 resolve。"""
+    from scripts.panic_all import _state_root_for
+
+    monkeypatch.setenv("FILET_STATE_BASE", str(tmp_path))
+    with pytest.raises(ValueError):
+        _state_root_for(bad_id)
+
+
+def test_state_root_for_second_line_rejects_symlink_escaping_base(monkeypatch, tmp_path):
+    """第 2 道（sr.parent==base.resolve()）：account_id 不含 sep/..（過第 1 道），
+    但 base/<id> 是指向 base 外目錄的 symlink → resolve 後 parent 落在 base 外 →
+    ValueError。獨立行使第 2 道（逃出 base）。"""
+    from scripts.panic_all import _state_root_for
+
+    base = tmp_path / "base"
+    base.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (base / "evil").symlink_to(outside)  # base/evil → tmp/outside（base 外）
+    monkeypatch.setenv("FILET_STATE_BASE", str(base))
+    with pytest.raises(ValueError):
+        _state_root_for("evil")
+
+
+def test_state_root_for_third_line_rejects_symlink_sibling_redirect(monkeypatch, tmp_path):
+    """第 3 道（sr.name==account_id）：account_id 不含 sep/..（過第 1 道），
+    base/<id> 是指向 base 內**兄弟目錄**的 symlink → resolve 後 parent 仍是 base
+    （過第 2 道）但 name 變成別人（bob≠alias）→ ValueError。獨立行使第 3 道
+    （symlink/互消改指到別的 follower 目錄，會污染真 follower 的 killswitch.tripped）。"""
+    from scripts.panic_all import _state_root_for
+
+    (tmp_path / "bob").mkdir()
+    (tmp_path / "alias").symlink_to(tmp_path / "bob")  # base/alias → base/bob（兄弟）
+    monkeypatch.setenv("FILET_STATE_BASE", str(tmp_path))
+    with pytest.raises(ValueError):
+        _state_root_for("alias")
+
+
 # ── F2（opus Important）：前置讀取 resilience 重試 + 讀不到時鎖死 degrade ──────
 
 def _run_single(fake_stack, notifier, *, account_id="alice", user_addr=_ALICE_ADDR,
