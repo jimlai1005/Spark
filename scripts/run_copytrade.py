@@ -18,13 +18,18 @@
                     同一份 repo 時務必各自指定不同路徑——否則 follower A 觸發
                     的 kill switch ARM 檔會被 follower B 讀到而連坐停單。
 
+keystore 選擇:
+  FILET_KEYSTORE   缺省／keychain → MacKeychainBackend（Mac 開發）；
+                    envfile → EnvFileKeyStore(FILET_KEYS_DIR，預設 /etc/filet/keys，VPS 用)。
+
 安全設計:
   - live 條件 = COPY_LIVE_TRADING=true 且未加 --dry-run/--shadow/--status；啟動前
     印大字警告並再驗 env 確實存在（紅線 5：live 是人工決策）。
   - dry/shadow/status 完全不碰 Keychain（不取 signer、不需 SPARK_ACCOUNT_ID），
     adapter 以 exchange=None 建構——結構性保證零寫入。
   - import 階段不觸網：hyperliquid/keystore 皆延後到 main() 內 import。
-  - 通知：COPY_TG_BOT_TOKEN 存在 → TelegramNotifier.from_env()，否則 NullNotifier。
+  - 通知：COPY_TG_BOT_TOKEN 存在 → TelegramNotifier.from_env()，否則 NullNotifier；
+    account_id 有值時再包一層 TaggedNotifier（多 follower 共頻道可歸屬告警）。
 """
 import argparse
 import json
@@ -37,9 +42,11 @@ from spark.copytrade.config import CopySettings
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
 from spark.copytrade.killswitch import check_drawdown, is_tripped
 from spark.copytrade.loop import main_loop, run_cycle
-from spark.copytrade.notifier import NullNotifier, TelegramNotifier
+from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
 from spark.exchange.base import BuilderCode
+from spark.filet.tagged_notifier import TaggedNotifier
+from spark.keystore.base import KeyStore
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,6 +56,28 @@ def resolve_state_dir() -> Path:
     kill switch ARM 檔／alerts.log／shadow JSONL 全部掛在此根之下（per-follower 隔離）。"""
     raw = os.environ.get("FILET_STATE_DIR")
     return Path(raw) if raw else _REPO_ROOT
+
+
+def select_keystore() -> KeyStore:
+    """keystore 後端依 env FILET_KEYSTORE 選擇：
+    未設／keychain（預設，Mac 開發）→ MacKeychainBackend；
+    envfile（VPS）→ EnvFileKeyStore(root=FILET_KEYS_DIR，預設 /etc/filet/keys)。
+    import 延後到函式內（保留 import 階段零網路/零 macOS 依賴）。"""
+    backend = os.environ.get("FILET_KEYSTORE", "keychain")
+    if backend == "envfile":
+        from spark.keystore.envfile import EnvFileKeyStore
+        keys_dir = os.environ.get("FILET_KEYS_DIR", "/etc/filet/keys")
+        return EnvFileKeyStore(keys_dir)
+    from spark.keystore.keychain import MacKeychainBackend
+    return MacKeychainBackend()
+
+
+def wrap_notifier(inner: Notifier, account_id: str | None) -> Notifier:
+    """account_id 有值 → 包 TaggedNotifier（多 follower 共頻道時可歸屬告警）；
+    account_id 為 None（dry/shadow 無 account）→ 原樣回傳 inner，不炸。"""
+    if account_id is None:
+        return inner
+    return TaggedNotifier(inner, account_id)
 
 USAGE = (
     "用法: SPARK_USER_ADDR=0x.. SPARK_BUILDER_ADDR=0x.. [SPARK_NETWORK=testnet] \\\n"
@@ -171,8 +200,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(2)
         from hyperliquid.exchange import Exchange
 
-        from spark.keystore.keychain import MacKeychainBackend
-        ks = MacKeychainBackend()
+        ks = select_keystore()
         signer = ks.get_agent_signer(account_id)
         adapter = HyperliquidAdapter(
             network, info=info,
@@ -187,6 +215,7 @@ def main(argv: list[str] | None = None) -> None:
         virtual_book=VirtualBook() if args.shadow else None)
     notifier = (TelegramNotifier.from_env()
                 if os.environ.get("COPY_TG_BOT_TOKEN") else NullNotifier())
+    notifier = wrap_notifier(notifier, account_id)
     state = ReconcileState()
 
     mode = "LIVE" if live else ("SHADOW" if args.shadow else "DRY-RUN")
