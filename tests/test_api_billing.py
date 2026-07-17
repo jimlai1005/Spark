@@ -7,7 +7,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from spark.publicapi.billing import StripeGateway
-from tests.publicapi_helpers import billing_cfg, make_app, stripe_sig
+from spark.publicapi.config import derive_account_id
+from tests.publicapi_helpers import billing_cfg, login, make_app, stripe_sig
 
 _REAL_SOCKET = socket.socket  # import 期捕捉，早於 autouse 斷網 fixture（keysvc 慣例）
 
@@ -115,3 +116,108 @@ def test_webhook_501_when_billing_disabled(tmp_path):
     r = client.post("/api/billing/webhook", content=b"{}",
                     headers={"stripe-signature": "t=1,v1=x"})
     assert r.status_code == 501
+
+
+# ---------- checkout / status（紅線 3：未啟用 501、onboarding 隔離） ----------
+
+def test_checkout_returns_url_bound_to_session(tmp_path):
+    seen = {}
+
+    def create_fn(**p):
+        seen.update(p)
+        return {"id": "cs_1", "url": "https://checkout.example/cs_1"}
+
+    app, cfg, store = _billing_app(tmp_path, create_fn=create_fn)
+    client = TestClient(app, base_url="https://testserver")  # secure cookie 需 https scheme
+    wallet = login(client)
+    r = client.post("/api/billing/checkout")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"checkout_url": "https://checkout.example/cs_1"}
+    # ⭐ account 綁 session（沿紅線「別人不能替你 onboard」精神）：無 body 參數，
+    # client_reference_id 只能來自 session 衍生
+    assert seen["client_reference_id"] == derive_account_id(wallet.address)
+    # success/cancel URL 從 siwe_uri 衍生（設計定案 3）
+    assert seen["success_url"] == f"{cfg.siwe_uri}/billing?checkout=success"
+    assert seen["cancel_url"] == f"{cfg.siwe_uri}/billing?checkout=cancel"
+
+
+def test_checkout_409_when_already_active(tmp_path):
+    app, cfg, store = _billing_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    wallet = login(client)
+    store.upsert_billing(derive_account_id(wallet.address), status="active", now_s=1.0)
+    r = client.post("/api/billing/checkout")
+    assert r.status_code == 409
+
+
+def test_checkout_allows_retry_after_cancel_and_reuses_customer(tmp_path):
+    seen = {}
+
+    def create_fn(**p):
+        seen.update(p)
+        return {"id": "cs_2", "url": "https://checkout.example/cs_2"}
+
+    app, cfg, store = _billing_app(tmp_path, create_fn=create_fn)
+    client = TestClient(app, base_url="https://testserver")
+    wallet = login(client)
+    store.upsert_billing(derive_account_id(wallet.address), status="canceled",
+                         stripe_customer_id="cus_1", now_s=1.0)
+    r = client.post("/api/billing/checkout")
+    assert r.status_code == 200
+    assert seen["customer"] == "cus_1"  # 既有 customer 重用（設計定案 12）
+
+
+def test_checkout_requires_session(tmp_path):
+    app, cfg, store = _billing_app(tmp_path)
+    r = TestClient(app).post("/api/billing/checkout")
+    assert r.status_code == 401
+
+
+def test_checkout_transient_stripe_failure_is_502(tmp_path):
+    def create_fn(**p):
+        raise ConnectionError("stripe 連線失敗")  # gateway 對 transient 轉譯後的形態
+
+    app, cfg, store = _billing_app(tmp_path, create_fn=create_fn)
+    client = TestClient(app, base_url="https://testserver", raise_server_exceptions=False)
+    login(client)
+    r = client.post("/api/billing/checkout")
+    assert r.status_code == 502  # 既有 ConnectionError handler：前端「稍後重試」
+
+
+def test_status_reads_db(tmp_path):
+    app, cfg, store = _billing_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    wallet = login(client)
+    acct = derive_account_id(wallet.address)
+    r = client.get("/api/billing/status")
+    assert r.status_code == 200
+    assert r.json() == {"account_id": acct, "status": "none", "active": False}
+    store.upsert_billing(acct, status="active", now_s=1.0)
+    r = client.get("/api/billing/status")
+    assert r.json() == {"account_id": acct, "status": "active", "active": True}
+
+
+def test_status_requires_session(tmp_path):
+    app, cfg, store = _billing_app(tmp_path)
+    assert TestClient(app).get("/api/billing/status").status_code == 401
+
+
+def test_billing_endpoints_501_when_disabled(tmp_path):
+    """紅線 3：三個 stripe env 未設 → billing 端點 501「計費未啟用」。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+    assert client.post("/api/billing/checkout").status_code == 501
+    assert client.get("/api/billing/status").status_code == 501
+
+
+def test_onboarding_unaffected_when_billing_disabled(tmp_path):
+    """紅線 3 的另一半：billing 未設時 onboarding 全流程行為與 M2 相同（隔離）。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+    r = client.post("/api/onboard/agent")
+    assert r.status_code == 200
+    r = client.get("/api/onboard/status")
+    assert r.status_code == 200
+    assert r.json()["agent_generated"] is True

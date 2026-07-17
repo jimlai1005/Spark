@@ -13,7 +13,8 @@ from pydantic import BaseModel
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.billing import (BillingError, BillingSignatureError,
-                                     apply_webhook_event, verify_webhook_event)
+                                     apply_webhook_event, has_active_subscription,
+                                     verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
@@ -251,5 +252,34 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                       event_created=int(event.get("created", 0)),
                                       now_s=now_fn())
         return {"received": True, "outcome": outcome}
+
+    @app.post("/api/billing/checkout")
+    def billing_checkout(address: str = Depends(_require_session)):
+        """建 Checkout Session、回 URL。session 綁定：account_id 由 session 衍生，
+        端點無輸入參數。冪等擋板：已 active → 409。
+        Stripe 失敗分類（紅線 4）：transient=ConnectionError→502 稍後重試（人肉重試，
+        非冪等寫入不在後端盲重試）；semantic=BillingError→502 專屬 handler。"""
+        _require_billing()
+        account_id = derive_account_id(address)
+        rec = store.get_billing(account_id)
+        if rec is not None and rec.status == "active":
+            raise HTTPException(status_code=409, detail="已有生效訂閱")
+        url = billing.create_checkout_session(
+            account_id=account_id, price_id=cfg.stripe_price_id,
+            success_url=f"{cfg.siwe_uri}/billing?checkout=success",
+            cancel_url=f"{cfg.siwe_uri}/billing?checkout=cancel",
+            customer_id=rec.stripe_customer_id if rec else None)
+        return {"checkout_url": url}
+
+    @app.get("/api/billing/status")
+    def billing_status(address: str = Depends(_require_session)):
+        """讀 DB（webhook 是唯一寫入者）。active 欄位 = entitlement 查詢結果——
+        僅供前端顯示；不接任何自動停用邏輯（紅線 6）。"""
+        _require_billing()
+        account_id = derive_account_id(address)
+        rec = store.get_billing(account_id)
+        return {"account_id": account_id,
+                "status": rec.status if rec else "none",
+                "active": has_active_subscription(store, account_id)}
 
     return app
