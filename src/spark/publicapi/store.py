@@ -27,6 +27,14 @@ CREATE TABLE IF NOT EXISTS onboarding (
     user_address TEXT NOT NULL,
     agent_address TEXT
 );
+CREATE TABLE IF NOT EXISTS billing (
+    account_id TEXT PRIMARY KEY,
+    stripe_customer_id TEXT,
+    stripe_subscription_id TEXT,
+    status TEXT NOT NULL DEFAULT 'none',
+    updated_at REAL NOT NULL DEFAULT 0,
+    last_event_created INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -35,6 +43,19 @@ class NonceRecord:
     address: str
     chain_id: int
     issued_at: str
+
+
+BILLING_STATUSES = frozenset({"none", "active", "past_due", "canceled"})
+
+
+@dataclass(frozen=True)
+class BillingRecord:
+    account_id: str
+    stripe_customer_id: str | None
+    stripe_subscription_id: str | None
+    status: str
+    updated_at: float
+    last_event_created: int  # 已套用的最新 Stripe event.created（亂序守衛水位）
 
 
 class ApiStore:
@@ -110,3 +131,48 @@ class ApiStore:
         with self._lock, self._db:
             self._db.execute("UPDATE onboarding SET agent_address = ? WHERE account_id = ?",
                              (agent_address, account_id))
+
+    # --- billing（M3 計費骨幹；無金額/卡號等敏感資料——紅線 7） ---
+    def get_billing(self, account_id: str) -> BillingRecord | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT account_id, stripe_customer_id, stripe_subscription_id, "
+                "status, updated_at, last_event_created FROM billing "
+                "WHERE account_id = ?", (account_id,)).fetchone()
+        return BillingRecord(*row) if row else None
+
+    def get_billing_by_subscription(self, subscription_id: str) -> BillingRecord | None:
+        """webhook subscription 事件無 metadata 時的 fallback 對應（設計定案 4）。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT account_id, stripe_customer_id, stripe_subscription_id, "
+                "status, updated_at, last_event_created FROM billing "
+                "WHERE stripe_subscription_id = ?", (subscription_id,)).fetchone()
+        return BillingRecord(*row) if row else None
+
+    def upsert_billing(self, account_id: str, *, status: str,
+                       stripe_customer_id: str | None = None,
+                       stripe_subscription_id: str | None = None,
+                       now_s: float, event_created: int = 0) -> None:
+        """upsert：重放（同 event）冪等；**亂序由 event_created 單調守衛擋**（opus 必改 1）
+        ——`WHERE excluded.last_event_created >= billing.last_event_created`，較舊事件
+        整筆 no-op（含 id 欄），已取消訂閱不因晚到的舊 active 事件復活；`>=` 允許同值
+        ＝重放仍冪等。id 欄 None 時 COALESCE 保留既有值。status 白名單強制——
+        webhook 映射層是唯一寫入者，這裡是縱深防禦。"""
+        if status not in BILLING_STATUSES:
+            raise ValueError(f"未知 billing status: {status!r}（須為 {sorted(BILLING_STATUSES)}）")
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO billing (account_id, stripe_customer_id, "
+                "stripe_subscription_id, status, updated_at, last_event_created) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(account_id) DO UPDATE SET "
+                "stripe_customer_id = COALESCE(excluded.stripe_customer_id, "
+                "                              billing.stripe_customer_id), "
+                "stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, "
+                "                                  billing.stripe_subscription_id), "
+                "status = excluded.status, updated_at = excluded.updated_at, "
+                "last_event_created = excluded.last_event_created "
+                "WHERE excluded.last_event_created >= billing.last_event_created",
+                (account_id, stripe_customer_id, stripe_subscription_id, status,
+                 now_s, event_created))
