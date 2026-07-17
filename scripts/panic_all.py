@@ -57,9 +57,21 @@ USAGE = (
 
 def _state_root_for(account_id: str) -> Path:
     """⭐ load-bearing：每個 follower 各自的狀態根，絕不可共用單一根（見模組
-    docstring）。呼叫端須每 follower 各呼叫一次，不得快取共用。"""
-    base = os.environ.get("FILET_STATE_BASE", DEFAULT_STATE_BASE)
-    return Path(base) / account_id
+    docstring）。呼叫端須每 follower 各呼叫一次，不得快取共用。
+
+    F1（opus review, Critical）路徑穿越守衛：account_id 若含 `..`／`/`／絕對路徑，
+    `Path(base) / account_id` 會逃出 base（例：base/"../bob" → 兄弟目錄；
+    base/"/etc/x" → /etc/x），ARM 落錯地方 → 引擎讀自己的 %i 目錄讀不到 →
+    is_tripped=False → 下個 cycle 重新開倉 → 靜默漏平＋假成功。此處 resolve 後
+    斷言 parent 恰為 base，否則 raise ValueError，由呼叫端拒絕該 follower（不寫
+    任何 ARM）＋critical＋計入非 0 退出碼。（account_id 字元集在 Phase C onboarding
+    前無 registry 層強制，故本救命工具自帶此縱深防禦，不倚賴上游驗證。）"""
+    base = Path(os.environ.get("FILET_STATE_BASE", DEFAULT_STATE_BASE))
+    sr = (base / account_id).resolve()
+    if sr.parent != base.resolve():
+        raise ValueError(
+            f"account_id {account_id!r} 會使狀態根逃出 {base}（resolve→{sr}）；拒絕執行")
+    return sr
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -74,20 +86,33 @@ def main(argv: list[str] | None = None) -> None:
         print(f"follower manifest 不存在: {manifest_path}")
         raise SystemExit(2)
 
-    overall_exit = 0
-    for e in errors:
-        print(f"[MANIFEST] 略過壞條目（其餘 follower 照常平倉）: {e}")
-        overall_exit = 1
-
     copy_settings = CopySettings.from_env()
     base_notifier = _StdoutNotifier()
     # keystore 只在真執行時建立——dry-run 完全不碰 Keychain/envfile。
     keystore = select_keystore() if execute else None
 
+    overall_exit = 0
+    # F4（opus review, Important）：壞 manifest 條目可能藏裸露主網活倉卻完全未被平倉，
+    # 只 print 會被以 grep CRITICAL 監控的 operator 漏看 → 升為 critical。
+    for e in errors:
+        base_notifier.critical(
+            "killswitch",
+            f"manifest 壞條目，此帳號**完全未被平倉、可能有裸露暴險**，需人工處置: {e}")
+        overall_exit = 1
+
     for ref in refs:
-        state_root = _state_root_for(ref.account_id)  # ⭐ 每 follower 各自計算，不共用
         notifier = TaggedNotifier(base_notifier, ref.account_id)
         tag = f"[{ref.account_id}]"
+        # ⭐ 每 follower 各自計算狀態根（不共用）；F1 路徑穿越 → 拒絕該 follower。
+        try:
+            state_root = _state_root_for(ref.account_id)
+        except ValueError as e:
+            notifier.critical(
+                "killswitch",
+                f"路徑穿越拒絕執行，此 follower **完全未被平倉、可能有裸露暴險**: {e}")
+            print(f"{tag} 路徑穿越，拒絕執行（未寫任何 ARM）: {e}")
+            overall_exit = 1
+            continue
         try:
             plan_lines, report = run_single_follower(
                 network=ref.network, account_id=ref.account_id,
@@ -95,6 +120,9 @@ def main(argv: list[str] | None = None) -> None:
                 execute=execute, state_root=state_root,
                 copy_settings=copy_settings, notifier=notifier, keystore=keystore)
         except Exception as e:  # noqa: BLE001 — 單一 follower 失敗不得中止其他（工程原則 4）
+            notifier.critical(
+                "killswitch",
+                f"建構/連線例外，此 follower 被跳過、**未平倉**，需人工確認: {e!r}")
             print(f"{tag} 例外，跳過（其餘 follower 照常平倉）: {e!r}")
             overall_exit = 1
             continue

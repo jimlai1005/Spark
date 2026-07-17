@@ -23,12 +23,15 @@
 """
 import os
 import sys
+import time
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
 from spark.copytrade.killswitch import (
+    DrawdownStatus,
     FlattenReport,
     evaluate,
     is_tripped,
@@ -38,6 +41,7 @@ from spark.copytrade.killswitch import (
 from spark.copytrade.notifier import Notifier
 from spark.exchange.base import BuilderCode, OpenOrder, OrderResult, Position, Signer
 from spark.keystore.base import KeyStore
+from spark.resilience import run as resilient_run
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -135,6 +139,7 @@ def run_single_follower(
     copy_settings: CopySettings,
     notifier: Notifier,
     keystore: KeyStore | None = None,
+    sleep_fn=time.sleep,
 ) -> tuple[list[str] | None, FlattenReport | None]:
     """單一帳號 panic 全流程——本檔 main()（單 follower CLI）與 scripts/panic_all.py
     （跨 follower 全域 panic）共用的可複用核心。
@@ -149,6 +154,13 @@ def run_single_follower(
     - panic_all.py 跨 follower：FILET_STATE_BASE/<account_id>（每 follower 各自一份，
       絕不可共用單一根——否則 ARM 落錯地方，引擎下個 cycle is_tripped()=False，
       緊急平倉被一個 cycle 抹掉，違反 killswitch lock-first 設計）。
+
+    前置讀取（get_equity_view/get_positions）經 spark.resilience 邊界重試（讀取
+    冪等、重送安全）；重試耗盡仍失敗 → **degrade 而非跳過該 follower**：仍呼叫
+    trip() 寫 ARM 鎖死該 follower（並撤可讀的掛單），只是該部位未平——鎖死優先於
+    完美平倉（工程原則 3，對齊 killswitch lock-first）。degrade 會 notifier.critical
+    並在回傳 report.failures 加 sentinel（equity_unavailable/positions_unavailable），
+    使 _exit_code 非 0——絕不因讀不到而靜默 exit 0 假成功。
 
     網路依賴（Info/Exchange/HyperliquidAdapter）延後到函式內 import（維持 import
     階段零網路的既有慣例，供 panic_all.py 批次呼叫多次時仍保持該保證）。
@@ -181,12 +193,38 @@ def run_single_follower(
         builder=BuilderCode(b=builder_addr, f=settings.f),
         slippage=copy_settings.slippage)
 
-    ev = adapter.get_equity_view(user_addr)  # current/peak 同源（工程原則 1）
-    # evaluate（非直呼 check_drawdown）：peak<=0 的 degenerate warn 結構性內建。
-    # 手動 panic 不看 breached——照常執行；status 數字如實寫進 ARM_FILE。
-    status = evaluate(ev, copy_settings, notifier)
-    positions = {p.coin: p for p in adapter.get_positions(user_addr)}
-    report = trip(executor, positions, notifier, state_root, status)
+    # 前置讀取經 resilience 邊界（讀取冪等可重試）；耗盡即 degrade——鎖死優先。
+    degraded: list[str] = []
+    try:
+        # current/peak 同源（工程原則 1）。evaluate（非直呼 check_drawdown）：peak<=0 的
+        # degenerate warn 結構性內建。手動 panic 不看 breached——照常執行；數字寫進 ARM。
+        ev = resilient_run(lambda: adapter.get_equity_view(user_addr),
+                           what="panic get_equity_view", idempotent=True, sleep_fn=sleep_fn)
+        status = evaluate(ev, copy_settings, notifier)
+    except Exception as e:  # noqa: BLE001 — 讀失敗也要繼續鎖死；不得跳過該 follower
+        notifier.critical(
+            "killswitch",
+            f"equity 讀取失敗（重試耗盡）: {e!r}——仍寫 ARM 鎖死該 follower，"
+            f"回撤數字未知（degrade）")
+        status = DrawdownStatus(current=Decimal("0"), peak=Decimal("0"),
+                                drawdown_pct=Decimal("0"), breached=False)
+        degraded.append("equity_unavailable")
+    try:
+        positions = {p.coin: p for p in resilient_run(
+            lambda: adapter.get_positions(user_addr),
+            what="panic get_positions", idempotent=True, sleep_fn=sleep_fn)}
+    except Exception as e:  # noqa: BLE001 — 讀失敗仍鎖死＋撤可讀掛單，未平倉需人工確認
+        notifier.critical(
+            "killswitch",
+            f"positions 讀取失敗（重試耗盡）: {e!r}——已鎖死該 follower 但**未平倉**，"
+            f"需人工確認殘留部位（degrade：鎖死優先於完美平倉）")
+        positions = {}
+        degraded.append("positions_unavailable")
+
+    report = trip(executor, positions, notifier, state_root, status, sleep_fn=sleep_fn)
+    if degraded:
+        # degrade 反映進 report.failures → _exit_code 非 0，operator 不會誤判乾淨收場。
+        report = replace(report, failures=report.failures + tuple(degraded))
     return None, report
 
 
