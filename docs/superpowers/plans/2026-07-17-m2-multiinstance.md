@@ -670,6 +670,7 @@ exit $fail
 
 - [ ] **Step 2** 跑到失敗。
 - [ ] **Step 3: 實作** —— 抽 panic.py 單 follower 執行為可複用函式（若尚非），**簽章收 `state_root: Path` 傳給 `trip()`**（取代 panic.py:162 硬編 `_REPO_ROOT`）；`panic_all` 迭代 registry（`load_followers_tolerant`），per-follower try/except 隔離，每 follower 的 `state_root = Path(os.environ.get("FILET_STATE_BASE", "/opt/filet/state")) / ref.account_id`；keystore 走 `select_keystore`（Task 5）；`--yes` 才真平；network 不擋 mainnet；無 manifest → 用法 + exit 2。
+  **附帶（T4 reviewer 指出 panic.py 未隔離）**：panic.py 自己的 `main()`（單 follower）也要 resolve 狀態根——用 `FILET_STATE_DIR` env（與 run_copytrade 同慣例，缺省 `_REPO_ROOT`）傳給抽出的函式，否則 VPS 上對單一 follower 跑 `panic.py` 仍讀共用 repo 根的 ARM。補一案：panic.py main() 用注入 state_root 讀寫該 follower 的 ARM。
 - [ ] **Step 4** 全綠 + ruff。**Step 5** `git commit -m "feat: panic_all — global flatten, per-follower isolation, best-effort on bad manifest entries"`。
 
 ---
@@ -688,6 +689,23 @@ exit $fail
 - [ ] **Step 5** `git commit -m "feat: daily HL leaderboard snapshot for M3 leader selection"`。
 
 ---
+
+### Task 10: 縱深防禦收斂（account_id 路徑安全 + review minor）⭐
+
+**動機**：Task 1 與 Task 2 的兩位 reviewer 獨立指出同一縫——`account_id` 會流進檔案路徑（`EnvFileKeyStore` 的 `<root>/<account_id>/agent.key`、狀態目錄 `/opt/filet/state/<account_id>`、systemd `%i`），但只驗過「非空/不重複」，未驗字元集。含 `..` 或絕對路徑的 account_id 會經 pathlib `/` 逃出 root（路徑穿越）。目前 account_id 由我方 manifest 設定（非攻擊者可控），但 **Phase C onboarding 後端會從使用者輸入生成 account_id**——在該敏感元件（非託管 keystore）上補這道是縱深防禦。順帶收斂 review 的兩個 minor。
+
+**Files:** Modify `src/spark/filet/followers.py`、`src/spark/keystore/envfile.py`、`scripts/run_copytrade.py`、`src/spark/filet/tagged_notifier.py`；Test：對應測試檔補案。
+**執行時機**：**最後做**（觸及多個已 commit 檔案，須待 Task 5/8 對 run_copytrade.py/panic.py 的改動全部落地後）。
+
+- [ ] **Step 1: 失敗測試**
+1. `followers.py`：新增 `validate_account_id(s)`——僅允許 `^[a-zA-Z0-9_-]{1,64}$`（拒 `..`、`/`、`:`、空、超長）。`_parse_one` 呼叫它。測試：`"a/b"`、`".."`、`"a:b"`、`""`、65 字元 → ValueError；`"alice_1-2"` → 通過。
+2. `envfile.py`：`EnvFileKeyStore` 的 `get_agent_signer`/`import_agent_key` 在建路徑前呼叫同一 `validate_account_id`（縱深防禦——即使有人繞過 registry 直接呼叫）。測試：`get_agent_signer("../evil")` → ValueError（非 KeyError），且不觸及檔案系統。
+3. `run_copytrade.py`：`resolve_state_dir()` 對相對路徑 `FILET_STATE_DIR` → `.resolve()` 成絕對路徑（避免 CWD 依賴的靜默不同狀態根，T4 reviewer minor）。測試：相對路徑 env → 回絕對路徑。
+4. `tagged_notifier.py`：`_key` 改 `if k is not None`（T3 reviewer minor：空字串 dedup_key 應命名空間化而非吞掉，與 TelegramNotifier `is not None` 慣例一致）。測試：`dedup_key=""` → `<tag>:`（非 None）。
+5. `followers.py`：補 T2 reviewer 點的容錯 seen-set 迴歸測試（同 account_id「先壞後好再重複」→ 好的留、重複的擋、seen 不被壞條目污染）。
+
+- [ ] **Step 2–4: 紅→實作→綠** —— `validate_account_id` 放 followers.py（單一真相），envfile.py import 它用（或各自定義同 regex——擇一，避免循環 import 就好；建議 followers.py 定義、envfile.py import）。跑各自受影響測試檔 + ruff。
+- [ ] **Step 5: Commit** `git commit -m "harden: account_id path-safety validation; absolute state dir; notifier/registry review minors"`（Co-Authored-By footer）。
 
 ## 收尾（全 Phase A 完成後）
 
