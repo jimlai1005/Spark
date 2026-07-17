@@ -37,13 +37,14 @@ class EnvFileKeyStore(KeyStore):
         return Account.from_key(path.read_text().strip())
 
     def import_agent_key(self, account_id: str, private_key: str) -> None:
-        """寫入 agent key（供 onboarding 後端，Phase C 用）。父目錄 700、檔案 600。"""
+        """寫入 agent key（供 onboarding 後端，Phase C 用）。父目錄 700、檔案 600。
+        O_EXCL：存在即 FileExistsError，絕不覆寫（結構性保證，非 TOCTOU）。"""
         validate_account_id(account_id)  # 縱深防禦：建路徑前先鎖字元集（M2 Task 10）
         d = self._root / account_id
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(d, 0o700)
         path = self._agent_path(account_id)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, private_key.strip().encode())
         finally:

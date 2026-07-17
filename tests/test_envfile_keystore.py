@@ -67,3 +67,14 @@ def test_import_agent_key_rejects_unsafe_account_id_no_filesystem_touch(tmp_path
     with pytest.raises(ValueError):
         ks.import_agent_key("../evil", _PK)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_import_agent_key_refuses_overwrite(tmp_path):
+    """O_EXCL：既有金鑰存在時再 import 同一 account → FileExistsError（絕不覆寫）。"""
+    ks = EnvFileKeyStore(tmp_path)
+    ks.import_agent_key("acct1", _PK)
+    other = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    with pytest.raises(FileExistsError):
+        ks.import_agent_key("acct1", other)
+    # 既有金鑰未被截斷：仍是第一把
+    assert ks.get_agent_signer("acct1").address == _ADDR
