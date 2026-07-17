@@ -41,9 +41,14 @@ class HLGateway:
         return run(lambda: self._post(f"{self._base}/info", body),
                    what=what, idempotent=True, sleep_fn=self._sleep)
 
+    def clearinghouse_state(self, address: str) -> dict:
+        """完整 clearinghouseState（唯讀、冪等 → transient 重試）。
+        M3 watchlist 快照用；get_account_value 亦取道此處（單一查詢來源）。"""
+        return self._info({"type": "clearinghouseState", "user": address},
+                          "HL 帳戶查詢")
+
     def get_account_value(self, address: str) -> Decimal:
-        state = self._info({"type": "clearinghouseState", "user": address}, "HL 帳戶查詢")
-        return Decimal(state["marginSummary"]["accountValue"])
+        return Decimal(self.clearinghouse_state(address)["marginSummary"]["accountValue"])
 
     def max_builder_fee(self, user: str, builder: str) -> int:
         """使用者已核給 builder 的費率上限（十分之一 bp；0 = 未核）。verify/status 用

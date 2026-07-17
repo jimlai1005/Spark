@@ -107,3 +107,20 @@ def test_gateway_only_posts_to_info():
     gw.max_builder_fee("0x" + "ab" * 20, "0x" + "cd" * 20)
     gw.agent_addresses("0x" + "ab" * 20)
     assert all(u == "https://x/info" for u, _ in post.calls)
+
+
+def test_clearinghouse_state_returns_full_state():
+    """M3 watchlist 快照用：回完整 state（get_account_value 只取其中一欄，行為不變）。"""
+    state = {"marginSummary": {"accountValue": "123.5", "totalMarginUsed": "10",
+                               "totalNtlPos": "50"},
+             "withdrawable": "100", "assetPositions": []}
+
+    def fake_post(url, body):
+        assert body == {"type": "clearinghouseState", "user": "0xabc"}
+        return state
+
+    from spark.publicapi.hl import HLGateway
+    gw = HLGateway("https://api.example", post_fn=fake_post, sleep_fn=lambda s: None)
+    assert gw.clearinghouse_state("0xabc") == state
+    from decimal import Decimal
+    assert gw.get_account_value("0xabc") == Decimal("123.5")
