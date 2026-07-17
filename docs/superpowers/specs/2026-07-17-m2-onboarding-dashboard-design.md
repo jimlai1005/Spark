@@ -32,6 +32,8 @@
 
 ## 非託管 onboarding 流程（後端產 payload、瀏覽器簽）
 
+**步驟對照**（opus 審查 m2：釐清使用者 wizard vs 後端序列）：使用者面的 wizard 是**原型 v1 的 4 階段**（01 連接錢包 → 02 風險確認 → 03 簽署授權 → 04 入金啟用）；下面的 1–7 是後端**詳細序列**，其中步驟 7（activate）是**管理端動作、不在使用者 wizard 內**。前端狀態機照 4 階段蓋，斷點續走以 verify 查詢結果為準。
+
 **關鍵差異**：M1 的 `spark.onboarding.onboard()` 用我方持有的 `main_signer` **伺服器端簽** ApproveBuilderFee/ApproveAgent——M2 非託管下主鑰在瀏覽器，**此路徑不沿用**。M2 後端改為**產出待簽 payload**，重用的只有：`EnvFileKeyStore`（存 agent key）、驗證查詢（`query_max_builder_fee`、agent 狀態、`get_account_value`）、HL SDK 的 action 建構。
 
 1. **連錢包 + SIWE 登入**：dashboard 連 MetaMask/Rabby → API 發 nonce → 錢包簽 SIWE 訊息 → API 驗簽 → 建 session（httpOnly, Secure, SameSite=Lax cookie）。地址即身分（免密碼）。
@@ -40,7 +42,7 @@
 4. **產待簽 payload**：`GET /onboard/{account}/approvals` → 後端建兩個 EIP-712 typed-data（ApproveAgent 授權 agent 地址、ApproveBuilderFee maxRate 0.1% 給我方 builder 地址），依 HL SDK 的 action wire 格式建構。回 typed-data。
 5. **瀏覽器簽 + 提交**：前端請錢包簽兩筆 → **前端直送 HL exchange endpoint**（簽好的 action 從瀏覽器直接送 HL，我方後端不經手已簽交易——最貼合非託管，後端只在步驟 6 驗證效果）。
 6. **驗證**：`POST /onboard/{account}/verify` → 後端輪詢 `query_max_builder_fee(user, builder) != 0`＋agent 授權生效＋`get_account_value(user) ≥ 100 USDC`（builder 門檻，重用 spark verification 語意）。全過 → 狀態 READY（pending 核准）。
-7. **啟用（管理端核准，不自動 live）**：verify 通過 → follower entry 寫 pending manifest。管理端（你）在 admin 頁核准 → 觸發拉起 `filet-follower@<account_id>`（COPY_LIVE_TRADING 依 config）。沿 M2 設計「管理端核准後拉起 unit」，M2 closed alpha 不自動 live。
+7. **啟用（管理端核准，不自動 live）**：verify 通過 → follower entry 寫 pending manifest（`user_address` **綁定已驗的 SIWE session 地址、非自由填入**；`builder_address` = **伺服器設定的固定我方 builder 常數、非使用者輸入**——opus 審查 m3，杜絕 web 被打穿後注入 builder 指向攻擊者的合法條目）。管理端（你）在 admin 頁**檢視** pending → **核准動作走人工 CLI**（`scripts/filet_activate.py <account_id>`，拉起 `filet-follower@<account_id>`）。**M2 不做「API 端點直接拉 systemd」**（opus 審查 M2：對外 filet-api 若能觸發 systemd start 需提權，被打穿即取得 unit 控制或提權路徑；比照 key-service，把危險 OS 動作收斂在人工 CLI，不暴露給 web 層）。COPY_LIVE_TRADING 依 config。
 
 ## API 契約（Public API，FastAPI）
 
@@ -54,9 +56,9 @@
 | `GET /onboard/{account}/approvals` | 兩筆待簽 EIP-712 payload | typed_data×2 |
 | `POST /onboard/{account}/verify` | 驗兩筆授權生效＋入金 | state（READY/待補） |
 | `GET /perf/{account}` | 唯讀績效（權益/部位/掛單/心跳/accrued/回撤）| 直查 HL + 引擎狀態快照 |
-| `GET /admin/pending` ⭐ | 管理端：待核准 follower 清單 | list |
-| `POST /admin/{account}/activate` ⭐ | 管理端：核准 → 拉 unit | ok |
+| `GET /admin/pending` ⭐ | 管理端：**檢視**待核准 follower 清單（唯讀）| list |
 
+- **啟用（activate）不做成 API 端點**——走人工 CLI `scripts/filet_activate.py`（opus 審查 M2：不讓對外 web 層握有拉 systemd unit 的特權）。admin 頁只讀 pending 清單供你核對（尤其逐筆核對 builder_address）。
 - 帳戶級端點驗 session 地址 == account 對應地址（授權檢查）。admin 端點限管理員地址白名單。
 - 所有寫入端點（生成 agent、activate）非冪等的要有防重（生成 agent 對已存在者拒絕 rotate，沿 M1 approve_agent 語意——已有 key 就不重生）。
 
@@ -65,12 +67,14 @@
 - 傳輸：本機 unix domain socket（`/run/filet/keysvc.sock`，660，filet-engine:filet-api）。
 - 唯一操作：`{"op":"generate","account_id":"<id>"}` → `{"ok":true,"agent_address":"0x..."}` 或 `{"ok":false,"error":"..."}`。
 - key-service 內部：`validate_account_id` → 若 agent.key 已存在則拒絕（不 rotate，避免作廢既有授權）→ 生成 keypair → `EnvFileKeyStore.import_agent_key` → 回地址。**私鑰永不出此進程**（不回、不 log）。
+- ⭐ **「絕不覆寫」須是寫入原語的結構性保證，非 TOCTOU 檢查**（opus 審查 M1）：`EnvFileKeyStore.import_agent_key` 目前用 `os.open(..., O_CREAT|O_TRUNC)`（無 `O_EXCL`），會靜默截斷既有金鑰——並行 generate 或誤呼會讓 keystore 的 key 與鏈上已 ApproveAgent 的 agent 地址失聯、引擎持一把簽不出有效交易的死 key。**實作時 `import_agent_key` 改用 `O_EXCL`（存在即失敗）**，把不覆寫變成原語保證，不倚賴呼叫端先查。（這是對元件一 envfile.py 的一個小加固，含測試。）
+- socket 除 file mode 660(filet-engine:filet-api) 外，**加 `SO_PEERCRED` 檢查連線者 uid/gid**（縱深防禦，避開 umask race 與 group 混入假設）。
 - 無其他操作（不提供讀金鑰、不提供簽名）——最小攻擊面。
 
 ## 資料模型
 
-- **Session store**：session id → {address, expiry}。M2 用 SQLite（單檔零運維，沿 M2 設計傾向）或後端記憶體+持久化；跨重啟保留。
-- **account_id 衍生（定死）**：由登入地址**確定性衍生**——`"f" + 地址小寫去 0x 的前 16 hex`（如 `f5579b5ab953d59fc`）。恆為 `validate_account_id` 合法（`^[a-zA-Z0-9_-]{1,64}$`），無使用者輸入、無路徑穿越風險（引擎 keystore/狀態目錄/systemd %i 都吃它）。朋友的可讀暱稱另存 `FollowerRef.label`（純顯示，不進路徑）。
+- **Session store**：session id → {address, expiry}。M2 用 SQLite（單檔零運維）。**nonce 單次使用**（用過即消耗，防有效期內重放）＋ **SIWE 訊息綁 domain/URI**（防跨站釣魚重放）——資料模型明列 nonce 表（nonce, address, expiry, consumed）。
+- **account_id 衍生（定死）**：由登入地址**確定性衍生**——`"f" + 地址小寫去 0x 的完整 40 hex`（41 字元，仍 ≤64 過 `validate_account_id`）。**用完整 40 hex 不截斷**（opus 審查 m1：截前 16 hex 只用 64-bit，相異地址前 16 hex 相同即映射同一目錄/碰撞；完整 40 hex 對地址 1:1、零成本）。恆為 `validate_account_id` 合法（`^[a-zA-Z0-9_-]{1,64}$`），無使用者輸入、無路徑穿越（引擎 keystore/狀態目錄/systemd %i 都吃它）。朋友的可讀暱稱另存 `FollowerRef.label`（純顯示，不進路徑；**dashboard 顯示 label 須轉義防 stored XSS**）。
 - **Follower manifest**：沿元件一 `var/filet/followers.json`（`FollowerRef`）。onboarding 完成寫 pending 條目；activate 後轉 active。per-follower 完整跟單參數（allocated_capital 等）走各自 env（元件一慣例）。
 - **Pending 佇列**：manifest 內 `status: pending|active`，或獨立 pending 表。
 
@@ -103,6 +107,18 @@
 2. 律師背書（M0 gate）——真錢上線前置，與本後端並行推進。
 3. admin 核准 UI 的最小形態（M2 可先 CLI + 簡頁）。
 4. HL SDK 對「用外部（瀏覽器）簽名的 ApproveAgent/ApproveBuilderFee action」的建構/送出 API 形態——實作前需查證 SDK 是否有現成的「只建 action typed-data 不簽」路徑，或需自建 EIP-712（`spark/docs/superpowers/research/` 記錄）。
+
+## 實作計畫拆解（給 writing-plans）
+
+opus 審查建議：作為設計文件三塊合併可接受，但作為**實作**應拆成獨立計畫、依安全等級與依賴排序：
+1. **key-service + envfile O_EXCL 加固**（最高安全等級，需獨立權限測試——filet-api user 讀不到 key、O_EXCL 防覆寫、socket SO_PEERCRED）——**先落地**。
+2. **Public API**（SIWE、產 payload、verify、admin 唯讀、activate CLI）——次之，依賴 key-service socket。HL SDK 外部簽名路徑須實作前查證落 research。
+3. **Dashboard 前端**（Next.js，v1 token，wizard 4 階段）——依賴 API 契約。
+4. **部署**（systemd units、反代 TLS、權限驗收）——最後。
+
+## 開工前必查證（research，落 spark docs/superpowers/research/）
+
+- HL SDK 是否有「只建 ApproveAgent/ApproveBuilderFee typed-data 不簽」的路徑，或需自建 EIP-712；agent wallet 無提款/轉帳權的 HL 事實確認；斷點續走時對同一 agent 地址/agentName 重發 ApproveAgent 的 HL 語意（no-op/覆蓋/rotate）。**這是整個非託管流程的 load-bearing 未知，key-service 之後、API 之前必須先查證。**
 
 ## 不在本設計（各自後續）
 
