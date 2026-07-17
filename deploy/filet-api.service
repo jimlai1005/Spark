@@ -17,6 +17,11 @@ Environment=FILET_KEYSVC_SOCK=/run/filet/keysvc.sock
 Environment=FILET_PENDING_PATH=/var/lib/filet-api/pending.json
 Environment=FILET_ADMIN_ADDRESSES=REPLACE_WITH_ADMIN_ADDRESSES
 Environment=FILET_API_PORT=8700
+# M3 計費（測試模式）：要啟用時取消註解並填 Stripe **測試** key（sk_test_ 前綴強制，
+# 非測試 key 會拒啟動）。三個一起設或都不設。正式收費是人工決策（M0 律師條款未結案）。
+#Environment=FILET_STRIPE_SECRET_KEY=sk_test_REPLACE
+#Environment=FILET_STRIPE_WEBHOOK_SECRET=whsec_REPLACE
+#Environment=FILET_STRIPE_PRICE_ID=price_REPLACE
 StateDirectory=filet-api
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_api
 Restart=on-failure
