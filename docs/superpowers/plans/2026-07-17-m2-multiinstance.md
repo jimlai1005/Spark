@@ -13,6 +13,23 @@
 
 **Spec:** `~/projects/obsidian/pandora/filet/M2-closed-alpha-設計.md`（vault，四不變量與元件定義以該檔為準）。本計畫只涵蓋設計的**元件一（引擎多實例）**；元件二（dashboard，待原型 v1 反饋）與元件三（VPS + onboarding 後端，待供應商決策）各自成獨立計畫。
 
+## 執行狀態（2026-07-17 完成）
+
+**Task 0–10 全部完成＋hardening**，每任務經 fresh-context 雙階段審查（⭐ 任務加紅線逐條檢，Task 8 panic_all 加 opus 第二意見）。整合驗證：`uv run pytest -q` = **546 passed, 2 deselected**；`uv run ruff check src tests scripts` 乾淨。
+
+任務→commit 對照：T0=3b5372f｜T1=1700b97｜T2=3f2395a｜T3=3dc1d55｜T4=2578b23｜T5=53cc3ee｜
+T6=ad206a4+54518fc｜T7=5bcbfb7｜T8=3df115d+8afa1fd+402b88c｜T9=68e3dfc+aa13bdb｜T10=57e0628+0eefa11。
+
+**雙審抓掉的實質問題**（開工前 opus 計畫審 2 輪＋執行中逐任務審）：
+1. kill-switch 狀態連坐（多 follower 共用 var/ 根）→ FILET_STATE_DIR per-follower 隔離。
+2. 北極星 builder fee 被 N 倍高估（多 follower 共用 builder，跨 follower 加總）→ builder 層級查一次；大小寫去重（避免同位址不同大小寫重複計）。
+3. **panic_all 路徑穿越 Critical**（opus 第二意見連 2 輪逼出）：`_state_root_for` 對壞 account_id 零防護 → ARM 寫錯地方 → 引擎下 cycle 重開倉 → **靜默漏平＋exit 0 假成功**。第 1 輪抓「逃出 base」，第 2 輪抓「`alice/../bob` 兄弟目錄誤導」。三道防線窮舉 20+ payload 全封＋直接迴歸測試。
+4. panic 前置讀取無 resilience（API 過載逾時→整個 follower 漏平）→ 重試＋lock-degrade（讀不到仍寫 ARM 鎖死）。
+5. leaderboard NaN/Inf pnl 炸整批 → 大聲跳過單列。
+6. account_id 路徑安全（keystore/registry 雙層驗證，防 Phase C onboarding 後端未來從使用者輸入生成）。
+
+**待接續（非本 Phase）**：元件三 VPS + onboarding 後端（主鑰唯一持有者，資安最高，含 opus 第二意見）；元件二 dashboard（原型 v1 已定，待工程計畫）。**Phase C follow-up**：panic degrade 的 alerts.log 持久 forensic（需動 killswitch.py，本 Phase off-limits）。M1 收尾（testnet 實測/shadow/dogfood）並行。
+
 ---
 
 ## 全域紅線（每個任務的實作者與 reviewer 都先讀）
