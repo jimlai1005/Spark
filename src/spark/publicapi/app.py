@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from spark.keysvc.client import KeysvcError
@@ -33,6 +34,16 @@ class ChainIdBody(BaseModel):
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
+
+    # 單一邊界（工程原則 5）：HL resilience 重試耗盡後上拋的 transient 例外，
+    # 統一轉譯成 502（而非通用 500），供前端判斷「稍後重試」。逐端點不再各自 try/except。
+    @app.exception_handler(ConnectionError)
+    async def _hl_conn_error(request, exc):
+        return JSONResponse(status_code=502, content={"detail": "上游服務暫時不可用，請稍後重試"})
+
+    @app.exception_handler(TimeoutError)
+    async def _hl_timeout(request, exc):
+        return JSONResponse(status_code=502, content={"detail": "上游服務逾時，請稍後重試"})
 
     def _require_session(request: Request) -> str:
         sid = request.cookies.get(SESSION_COOKIE)

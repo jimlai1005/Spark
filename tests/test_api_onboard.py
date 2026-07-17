@@ -56,6 +56,34 @@ def test_keysvc_down_502(tmp_path):
     assert client.post("/api/onboard/agent").status_code == 502
 
 
+def test_status_hl_down_502(tmp_path):
+    """HL transient 失敗（resilience 重試耗盡後上拋 ConnectionError）在 status 端點
+    統一轉譯成 502，而非通用 500（app 層 exception handler，工程原則 5）。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    login(client)
+
+    def _boom(*a, **kw):
+        raise ConnectionError("HL unreachable")
+    hl.max_builder_fee = _boom
+    r = client.get("/api/onboard/status")
+    assert r.status_code == 502
+
+
+def test_payload_builder_fee_hl_timeout_502(tmp_path):
+    """同上，TimeoutError 版本，走 payload/approve-builder-fee 端點的
+    builder 餘額門檻查詢路徑。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    login(client)
+
+    def _boom(*a, **kw):
+        raise TimeoutError("HL timeout")
+    hl.get_account_value = _boom
+    r = client.post("/api/onboard/payload/approve-builder-fee", json={"chain_id": 42161})
+    assert r.status_code == 502
+
+
 def test_desync_self_heals_via_address_op(tmp_path):
     """keysvc 有 key 但 DB 無地址（DB 遺失/回應遺失殘局）→ 唯讀 address op 自癒回填
     （設計定案 12），照常 200，回應帶 recovered=true 供觀測。"""
