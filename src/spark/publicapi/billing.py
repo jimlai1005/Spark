@@ -6,7 +6,9 @@ M3 計費骨幹（**全程 Stripe 測試模式**；sk_test_ 強制在 ApiConfig�
   由前端使用者重按，人肉重試天然去重）；semantic → BillingError（502 專屬 handler）。
 - verify_webhook_event：⭐ 驗簽必過才回 Event（偽造 webhook = 免費開通）。本地 HMAC。
 - apply_webhook_event：已驗簽事件 → billing 表 upsert。帳號歸屬由 metadata/DB 雙保險；
-  狀態覆蓋由 event.created 單調守衛防亂序；重放（同 event）冪等。
+  重放冪等靠 event.id；順序守衛靠 event.created 嚴格比較；同秒平手偏向低權益
+  （opus 總審 F1——Stripe event.created 秒級精度、不保證投遞順序，`>=` 同時服務
+  去重與排序會在同秒留下縫：canceled 已套用後同秒晚到的 active 不得覆寫回去）。
 - has_active_subscription：entitlement **只查不動**——不接任何自動停用跟單邏輯
   （停用是政策決策，留使用者人工裁決；紅線 6）。"""
 import logging
@@ -100,15 +102,19 @@ def verify_webhook_event(payload: bytes, sig_header: str, webhook_secret: str):
 def apply_webhook_event(store: ApiStore, event, *, event_created: int,
                         now_s: float) -> str:
     """處理**已驗簽**事件 → billing 表。回傳結果標籤（log/測試用；標籤代表
-    「已處理該類事件」，較舊事件經守衛 no-op 時仍回 "updated"——DB 才是真相）。
+    「已處理該類事件」，較舊事件或同秒被拒經守衛 no-op 時仍回 "updated"——DB 才是真相）。
     - 帳號歸屬：metadata/DB 雙保險（設計定案 4）。
-    - 狀態覆蓋：event.created 單調守衛防亂序（upsert 的 WHERE 條件，opus 必改 1）
-      ——Stripe 不保證事件順序，晚到的舊 active 不得復活已取消訂閱。
-    - 重放（同 event、同 created）：冪等（`>=` 放行）。
+    - 重放冪等：靠 event.id（`upsert_billing(event_id=...)`），同一事件重送整筆 no-op。
+    - 順序守衛：event.created 嚴格比較（opus 總審 F1）——較舊事件整筆 no-op，
+      晚到的舊 active 不得復活已取消訂閱。
+    - 同秒平手：entitlement rank 較高不得覆寫較低（opus 總審 F1）——Stripe
+      event.created 只有秒級精度、不保證投遞順序，同一秒的 canceled 與 active
+      誰先到無法保證，平手時偏向低權益（active 不得覆寫同秒 canceled/past_due）。
     - 未知事件類型 → "ignored"（回 200 ack，不累積 Stripe 重送佇列）。
     event_created 由呼叫端從 event["created"]（epoch 秒）取。"""
     etype = event["type"]
     obj = event["data"]["object"]
+    event_id = event.get("id", "")
     if etype == "checkout.session.completed":
         account_id = obj.get("client_reference_id")
         try:
@@ -122,7 +128,7 @@ def apply_webhook_event(store: ApiStore, event, *, event_created: int,
         store.upsert_billing(account_id, status="active",
                              stripe_customer_id=obj.get("customer"),
                              stripe_subscription_id=obj.get("subscription"),
-                             now_s=now_s, event_created=event_created)
+                             now_s=now_s, event_created=event_created, event_id=event_id)
         logger.info("billing 開通 account=%s", account_id)
         return "activated"
     if etype in ("customer.subscription.updated", "customer.subscription.deleted"):
@@ -149,7 +155,7 @@ def apply_webhook_event(store: ApiStore, event, *, event_created: int,
         store.upsert_billing(account_id, status=status,
                              stripe_customer_id=obj.get("customer"),
                              stripe_subscription_id=obj.get("id"),
-                             now_s=now_s, event_created=event_created)
+                             now_s=now_s, event_created=event_created, event_id=event_id)
         logger.info("billing 狀態更新 account=%s status=%s", account_id, status)
         return "updated"
     return "ignored"

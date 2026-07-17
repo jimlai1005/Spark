@@ -30,8 +30,8 @@ def _sig(payload: bytes, secret: str = WEBHOOK_SECRET, t: int | None = None) -> 
     return f"t={t},v1={mac}"
 
 
-def _event_payload(etype: str, obj: dict) -> bytes:
-    return json.dumps({"id": "evt_1", "object": "event", "type": etype,
+def _event_payload(etype: str, obj: dict, event_id: str = "evt_1") -> bytes:
+    return json.dumps({"id": event_id, "object": "event", "type": etype,
                        "data": {"object": obj}}).encode()
 
 
@@ -165,30 +165,34 @@ def test_checkout_completed_bad_account_id_refused(tmp_path):
 
 
 def test_replayed_event_is_idempotent(tmp_path):
-    """Stripe 可能重送同一事件（同 event.created）：兩次 apply 結果相同（`>=` 放行）。"""
+    """⭐ opus 總審 F1：Stripe 可能重送同一事件（同 event.id）——重放冪等靠
+    event_id，是**整筆** no-op，第二次 apply 連 updated_at 都不動（不是「同結果」而是
+    「原地不動」）。"""
     store = _store(tmp_path)
     payload = _event_payload("checkout.session.completed",
                              {"id": "cs_1", "client_reference_id": ACCT,
                               "customer": "cus_1", "subscription": "sub_1"})
     event = verify_webhook_event(payload, _sig(payload), WEBHOOK_SECRET)
     apply_webhook_event(store, event, event_created=100, now_s=1.0)
-    apply_webhook_event(store, event, event_created=100, now_s=2.0)
+    apply_webhook_event(store, event, event_created=100, now_s=2.0)  # 同 event.id 重放
     rec = store.get_billing(ACCT)
-    assert rec.status == "active" and rec.updated_at == 2.0
+    assert rec.status == "active" and rec.updated_at == 1.0  # 整筆 no-op，非「重新套用同值」
 
 
 def test_out_of_order_stale_active_does_not_resurrect(tmp_path):
     """⭐ opus 必改 1(a)：canceled(created=T2) 已套用後，晚到的 active(created=T1)
-    不得復活權益——status 仍 canceled（event.created 單調守衛）。"""
+    不得復活權益——status 仍 canceled（event.created 單調守衛）。兩個事件是**不同**
+    Stripe event（不同 event.id）——同一帳號的真實生命週期裡每個事件 id 都不同，
+    用相異 id 才不會誤觸重放冪等短路（opus 總審 F1 修復後 event.id 才是去重鍵）。"""
     store = _store(tmp_path)
     p_cancel = _event_payload("customer.subscription.deleted",
                               {"id": "sub_1", "status": "canceled",
-                               "metadata": {"account_id": ACCT}})
+                               "metadata": {"account_id": ACCT}}, event_id="evt_cancel")
     ev = verify_webhook_event(p_cancel, _sig(p_cancel), WEBHOOK_SECRET)
     apply_webhook_event(store, ev, event_created=200, now_s=1.0)
     p_active = _event_payload("customer.subscription.updated",
                               {"id": "sub_1", "status": "active", "customer": "cus_1",
-                               "metadata": {"account_id": ACCT}})
+                               "metadata": {"account_id": ACCT}}, event_id="evt_active_stale")
     ev2 = verify_webhook_event(p_active, _sig(p_active), WEBHOOK_SECRET)
     assert apply_webhook_event(store, ev2, event_created=100, now_s=2.0) == "updated"
     assert store.get_billing(ACCT).status == "canceled"          # 舊事件 no-op
@@ -196,20 +200,42 @@ def test_out_of_order_stale_active_does_not_resurrect(tmp_path):
 
 
 def test_in_order_cancel_after_active(tmp_path):
-    """opus 必改 1(b)：順序正常 active(T1) → canceled(T2) → 最終 canceled。"""
+    """opus 必改 1(b)：順序正常 active(T1) → canceled(T2) → 最終 canceled。
+    不同 event.id（見上一測試註解）。"""
     store = _store(tmp_path)
     p_active = _event_payload("customer.subscription.updated",
                               {"id": "sub_1", "status": "active", "customer": "cus_1",
-                               "metadata": {"account_id": ACCT}})
+                               "metadata": {"account_id": ACCT}}, event_id="evt_active")
     ev1 = verify_webhook_event(p_active, _sig(p_active), WEBHOOK_SECRET)
     apply_webhook_event(store, ev1, event_created=100, now_s=1.0)
     assert store.get_billing(ACCT).status == "active"
     p_cancel = _event_payload("customer.subscription.deleted",
                               {"id": "sub_1", "status": "canceled",
-                               "metadata": {"account_id": ACCT}})
+                               "metadata": {"account_id": ACCT}}, event_id="evt_cancel")
     ev2 = verify_webhook_event(p_cancel, _sig(p_cancel), WEBHOOK_SECRET)
     apply_webhook_event(store, ev2, event_created=200, now_s=2.0)
     assert store.get_billing(ACCT).status == "canceled"
+
+
+def test_same_second_active_after_cancel_does_not_resurrect(tmp_path):
+    """⭐ opus 總審 F1：同秒縫——canceled(created=T) 已套用後，**同一秒**（非更舊）
+    晚到的 active(created=T) 事件不得覆寫回 active。這正是 F1 指出的縫：舊寫法的
+    `WHERE excluded.last_event_created >= billing.last_event_created` 用 `>=` 對同秒
+    事件一律放行，等於平手時偏向「後到者」而非「低權益」。"""
+    store = _store(tmp_path)
+    p_cancel = _event_payload("customer.subscription.deleted",
+                              {"id": "sub_1", "status": "canceled",
+                               "metadata": {"account_id": ACCT}}, event_id="evt_cancel_ts")
+    ev1 = verify_webhook_event(p_cancel, _sig(p_cancel), WEBHOOK_SECRET)
+    apply_webhook_event(store, ev1, event_created=200, now_s=1.0)
+    p_active = _event_payload("customer.subscription.updated",
+                              {"id": "sub_1", "status": "active", "customer": "cus_1",
+                               "metadata": {"account_id": ACCT}},
+                              event_id="evt_active_same_second")
+    ev2 = verify_webhook_event(p_active, _sig(p_active), WEBHOOK_SECRET)
+    assert apply_webhook_event(store, ev2, event_created=200, now_s=2.0) == "updated"
+    assert store.get_billing(ACCT).status == "canceled"          # 同秒不得覆寫
+    assert has_active_subscription(store, ACCT) is False
 
 
 # ---------- StripeGateway（紅線 4：非冪等不盲重試、失敗分類） ----------
@@ -305,9 +331,12 @@ def test_secret_key_not_in_gateway_repr_or_errors(monkeypatch):
 # ---------- entitlement（紅線 6：只查不動） ----------
 
 def test_has_active_subscription_states(tmp_path):
+    """遞增 event_created（真實序列的兩個不同事件）——若都留預設 0，同秒平手偏向
+    低權益（opus 總審 F1）會把第二次的 active 判成同秒 tie 而拒絕套用，非本測試
+    要驗的行為，故顯式給遞增時戳。"""
     store = _store(tmp_path)
     assert has_active_subscription(store, ACCT) is False        # 無紀錄
-    store.upsert_billing(ACCT, status="past_due", now_s=1.0)
+    store.upsert_billing(ACCT, status="past_due", now_s=1.0, event_created=1)
     assert has_active_subscription(store, ACCT) is False
-    store.upsert_billing(ACCT, status="active", now_s=2.0)
+    store.upsert_billing(ACCT, status="active", now_s=2.0, event_created=2)
     assert has_active_subscription(store, ACCT) is True

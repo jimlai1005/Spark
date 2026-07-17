@@ -28,8 +28,9 @@ def _billing_app(tmp_path, create_fn=None):
     return app, cfg, store
 
 
-def _event(etype: str, obj: dict, created: int = 1_700_000_000) -> bytes:
-    return json.dumps({"id": "evt_1", "object": "event", "type": etype,
+def _event(etype: str, obj: dict, created: int = 1_700_000_000,
+          event_id: str = "evt_1") -> bytes:
+    return json.dumps({"id": event_id, "object": "event", "type": etype,
                        "created": created, "data": {"object": obj}}).encode()
 
 
@@ -106,27 +107,32 @@ def test_webhook_needs_no_session(tmp_path):
 
 
 def test_webhook_subscription_lifecycle(tmp_path):
-    """completed → updated(past_due) → deleted：DB 狀態逐步跟進。"""
+    """completed → updated(past_due) → deleted：DB 狀態逐步跟進。三個事件是**不同**
+    Stripe event（不同 event.id）——真實生命週期裡每個事件 id 都不同；用相異 id
+    才不會誤觸 event.id 重放冪等短路（opus 總審 F1：重放冪等靠 event.id）。"""
     app, cfg, store = _billing_app(tmp_path)
     client = TestClient(app)
     acct = "f" + "cd" * 20
 
     p1 = _event("checkout.session.completed",
                 {"id": "cs_1", "client_reference_id": acct,
-                 "customer": "cus_9", "subscription": "sub_9"}, created=1000)
+                 "customer": "cus_9", "subscription": "sub_9"}, created=1000,
+                event_id="evt_completed")
     client.post("/api/billing/webhook", content=p1,
                 headers={"stripe-signature": stripe_sig(p1)})
     assert store.get_billing(acct).status == "active"
 
     p2 = _event("customer.subscription.updated",
                 {"id": "sub_9", "status": "past_due", "customer": "cus_9",
-                 "metadata": {"account_id": acct}}, created=1001)
+                 "metadata": {"account_id": acct}}, created=1001,
+                event_id="evt_past_due")
     client.post("/api/billing/webhook", content=p2,
                 headers={"stripe-signature": stripe_sig(p2)})
     assert store.get_billing(acct).status == "past_due"
 
     p3 = _event("customer.subscription.deleted",
-                {"id": "sub_9", "status": "canceled", "metadata": {}}, created=1002)
+                {"id": "sub_9", "status": "canceled", "metadata": {}}, created=1002,
+                event_id="evt_deleted")
     client.post("/api/billing/webhook", content=p3,
                 headers={"stripe-signature": stripe_sig(p3)})
     assert store.get_billing(acct).status == "canceled"
