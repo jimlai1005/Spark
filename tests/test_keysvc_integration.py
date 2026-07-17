@@ -101,6 +101,30 @@ def test_private_key_never_crosses_socket(tmp_path, monkeypatch):
     assert pk.removeprefix("0x").encode() not in raw  # 保險：即便落檔含 0x 前綴也要涵蓋
 
 
+def test_private_key_never_crosses_socket_on_error(tmp_path, monkeypatch):
+    """⭐ 回歸護欄：私鑰不出現在 socket 傳輸的任何 bytes——含錯誤回應路徑。
+    成功回應已由 test_private_key_never_crosses_socket 涵蓋；本測試補上錯誤分支：
+    對同一帳號第二次 generate 會走 O_EXCL 已存在→ok=False 的錯誤路徑，斷言該錯誤回應
+    的原始 bytes 不含落檔私鑰。今天靠 server.py 各 except 不外洩私鑰，但若未來有人把某個
+    except 改成 error=str(e) 而 e 挾帶 key，這條斷言會抓到。"""
+    monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)  # 見檔頭說明：僅本測試放行 AF_UNIX
+    ks = EnvFileKeyStore(tmp_path / "keys")
+    sock_path, t, stop = _start_server(ks)
+    try:
+        KeysvcClient(str(sock_path)).generate("alice")  # 第一次成功落檔
+        pk = (tmp_path / "keys" / "alice" / "agent.key").read_text().strip()
+        c = _REAL_SOCKET_CTOR(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(str(sock_path))
+        c.sendall(encode_request(GenerateRequest("alice")))  # 第二次 → O_EXCL 錯誤分支
+        raw = c.makefile("rb").readline()  # 錯誤回應的原始 bytes，未經任何 decode
+        c.close()
+    finally:
+        _stop_server(sock_path, t, stop)
+    assert decode_response(raw).ok is False  # 確認確實走到錯誤分支，避免假綠
+    assert pk.encode() not in raw
+    assert pk.removeprefix("0x").encode() not in raw  # 保險：即便落檔含 0x 前綴也涵蓋
+
+
 def test_second_generate_same_account_rejected_key_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)  # 見檔頭說明：僅本測試放行 AF_UNIX
     ks = EnvFileKeyStore(tmp_path / "keys")
