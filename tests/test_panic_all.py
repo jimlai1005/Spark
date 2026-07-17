@@ -356,13 +356,14 @@ def test_panic_all_arm_isolation_between_followers(fake_stack):
     assert not bob_arm.exists(), "bob 不在本次 manifest 中，其目錄不得被寫入任何東西"
 
 
-# ── F1（opus Critical）：account_id 路徑穿越 → 拒絕、非 0、base 外零 ARM ─────
+# ── F1（opus Critical + re-review）：account_id 路徑穿越 → 拒絕、非 0、零 ARM ──
 
-@pytest.mark.parametrize("evil_id", ["../bob", "/etc/x", ".."])
+@pytest.mark.parametrize("evil_id", ["../bob", "/etc/x", "..", "alice/../bob"])
 def test_panic_all_path_traversal_rejected_no_arm_outside_base(fake_stack, capsys, evil_id):
-    """account_id 含 ../、絕對路徑、.. → _state_root_for 會使狀態根逃出 base：
-    必須拒絕該 follower（不寫任何 ARM）、critical、退出碼非 0；同 manifest 的
-    合法 follower（alice）仍照常平倉。base 外不得出現任何 ARM 檔。"""
+    """account_id 含 ../、絕對路徑、..、或 X/../Y 互消（opus re-review 追加的
+    「base 內兄弟目錄誤導」）→ _state_root_for 使狀態根落在 base 外或別的 follower
+    目錄：必須拒絕該 follower（不寫任何 ARM）、critical、退出碼非 0；同 manifest 的
+    合法 follower（alice）仍照常平倉。resolve 目標不得出現任何 ARM 檔。"""
     manifest = _write_manifest(fake_stack.tmp_path, [
         _entry(evil_id, _BOB_ADDR, "mainnet"),
         _entry("alice", _ALICE_ADDR, "mainnet"),
@@ -377,10 +378,35 @@ def test_panic_all_path_traversal_rejected_no_arm_outside_base(fake_stack, capsy
 
     out = capsys.readouterr().out
     assert "[CRITICAL]" in out and "路徑穿越" in out
-    # 逃逸目標（base 的兄弟/絕對路徑）不得被建立任何 ARM。
+    # resolve 目標（base 外的兄弟/絕對路徑，或 base 內被誤導的別人目錄）不得被寫 ARM。
     escaped = (Path(str(fake_stack.state_base)) / evil_id).resolve()
-    assert not (escaped / ARM_FILE_RELPATH).exists(), "穿越目標不得被寫入 ARM"
+    assert not (escaped / ARM_FILE_RELPATH).exists(), "穿越/誤導目標不得被寫入 ARM"
     # 合法 follower 不受連累，照常平倉。
+    assert _arm_path(fake_stack.state_base, "alice").exists()
+
+
+def test_panic_all_sibling_misdirection_isolated_from_real_follower(fake_stack, capsys):
+    """opus re-review 追加：惡意 entry account_id="alice/../bob" resolve 成
+    base/bob，parent 檢查通過但會與**真正的** bob follower 共寫同一 killswitch.tripped。
+    守衛須擋下惡意 entry（此 manifest 無真 bob）→ base/bob 完全不被寫 ARM，證明
+    兄弟目錄誤導無法冒充/污染任何 follower 的狀態；合法 alice 照常平倉、退出碼非 0。"""
+    manifest = _write_manifest(fake_stack.tmp_path, [
+        _entry("alice/../bob", _BOB_ADDR, "mainnet"),  # 惡意：想寫進 base/bob
+        _entry("alice", _ALICE_ADDR, "mainnet"),
+    ])
+    fake_stack.monkeypatch.setenv("FILET_FOLLOWERS", str(manifest))
+    fake_stack.registry[_ALICE_ADDR] = {"close_ok": True}
+    fake_stack.registry[_BOB_ADDR] = {"close_ok": True}
+
+    with pytest.raises(SystemExit) as ei:
+        fake_stack.panic_all.main(["--yes"])
+    assert ei.value.code != 0
+
+    out = capsys.readouterr().out
+    assert "[CRITICAL]" in out and "路徑穿越" in out
+    # base/bob（惡意 entry 的 resolve 目標）不得被建立 ARM——與真 bob 目錄隔離。
+    assert not _arm_path(fake_stack.state_base, "bob").exists(), \
+        "兄弟目錄誤導不得寫進 base/bob（真 bob 若存在也不得被此惡意 entry 污染）"
     assert _arm_path(fake_stack.state_base, "alice").exists()
 
 

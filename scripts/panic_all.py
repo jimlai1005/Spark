@@ -60,17 +60,32 @@ def _state_root_for(account_id: str) -> Path:
     docstring）。呼叫端須每 follower 各呼叫一次，不得快取共用。
 
     F1（opus review, Critical）路徑穿越守衛：account_id 若含 `..`／`/`／絕對路徑，
-    `Path(base) / account_id` 會逃出 base（例：base/"../bob" → 兄弟目錄；
-    base/"/etc/x" → /etc/x），ARM 落錯地方 → 引擎讀自己的 %i 目錄讀不到 →
-    is_tripped=False → 下個 cycle 重新開倉 → 靜默漏平＋假成功。此處 resolve 後
-    斷言 parent 恰為 base，否則 raise ValueError，由呼叫端拒絕該 follower（不寫
-    任何 ARM）＋critical＋計入非 0 退出碼。（account_id 字元集在 Phase C onboarding
-    前無 registry 層強制，故本救命工具自帶此縱深防禦，不倚賴上游驗證。）"""
+    `Path(base) / account_id` 會把 ARM 寫到錯的地方 → 引擎讀自己的 %i 目錄讀不到 →
+    is_tripped=False → 下個 cycle 重新開倉 → 靜默漏平＋假成功。有兩種攻擊面：
+      (a) **逃出 base**：`base/"../bob"` → 兄弟目錄、`base/"/etc/x"` → 絕對路徑；
+      (b) **base 內兄弟目錄誤導**（opus re-review 追加）：`"alice/../bob"` 互消
+          resolve 成 `base/bob`，parent 仍是 base 卻寫進真正 bob follower 的
+          killswitch.tripped（與 bob 共寫同一 ARM）；symlink `base/alice`→`base/bob`
+          同根因。
+
+    三道防線，任一不過即 raise ValueError（呼叫端拒絕該 follower、不寫任何 ARM、
+    critical、計入非 0 退出碼）：
+      1. **對輸入**：account_id 含 `/`（os.sep）、含 `..` 分段、或為空 → 直接拒。
+         這是最清楚的一道——守的是輸入形狀而非 resolve 後的巧合。
+      2. **對 resolve 輸出**：`sr.parent` 必須恰為 base（擋逃出 base）。
+      3. **末段字面比對**：`sr.name` 必須等於字面 account_id（擋 X/../Y 互消與
+         symlink 改指——resolve 後末段變成別人時 name 不再等於原輸入）。
+    （account_id 字元集在 Phase C onboarding 前無 registry 層強制，故本救命工具
+    自帶此縱深防禦，不倚賴上游驗證。）"""
+    if not account_id or "/" in account_id or ".." in account_id.split("/"):
+        raise ValueError(
+            f"account_id {account_id!r} 含路徑分隔/..、或為空；拒絕執行（路徑安全）")
     base = Path(os.environ.get("FILET_STATE_BASE", DEFAULT_STATE_BASE))
     sr = (base / account_id).resolve()
-    if sr.parent != base.resolve():
+    if sr.parent != base.resolve() or sr.name != account_id:
         raise ValueError(
-            f"account_id {account_id!r} 會使狀態根逃出 {base}（resolve→{sr}）；拒絕執行")
+            f"account_id {account_id!r} 使狀態根落在 base 外或別的 follower 目錄"
+            f"（resolve→{sr}）；拒絕執行（路徑安全）")
     return sr
 
 
