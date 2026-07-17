@@ -1,0 +1,25 @@
+[Unit]
+Description=Filet key-service (agent key generation, local socket only)
+After=network.target
+
+[Service]
+Type=simple
+User=filet-engine
+Group=filet-engine
+RuntimeDirectory=filet
+RuntimeDirectoryMode=0750
+Environment=FILET_KEYSVC_SOCK=/run/filet/keysvc.sock
+Environment=FILET_KEYS_DIR=/etc/filet/keys
+# FILET_KEYSVC_ALLOWED_UIDS 由部署填入 filet-api 的實際 uid（見部署文件）
+Environment=FILET_KEYSVC_ALLOWED_UIDS=REPLACE_WITH_FILET_API_UID
+ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_keysvc
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/filet/keys /run/filet
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
