@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from spark.keysvc.client import KeysvcError
+from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
@@ -22,6 +23,10 @@ SESSION_COOKIE = "filet_session"
 class VerifyBody(BaseModel):
     nonce: str
     signature: str
+
+
+class ChainIdBody(BaseModel):
+    chain_id: int
 
 
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time) -> FastAPI:
@@ -140,5 +145,43 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time) ->
     @app.get("/api/onboard/status")
     def onboard_status(address: str = Depends(_require_session)):
         return _progress(address)  # 純讀；副作用（寫 pending）只在 POST /api/onboard/verify
+
+    # ---------- 待簽 payload（後端建 typed data，不簽；前端簽完直送 HL /exchange） ----------
+    @app.post("/api/onboard/payload/approve-agent")
+    def payload_approve_agent(body: ChainIdBody,
+                              address: str = Depends(_require_session)):
+        account_id = derive_account_id(address)
+        agent_address = store.get_agent_address(account_id)
+        if not agent_address:
+            raise HTTPException(status_code=409,
+                                detail="尚未生成 agent，先呼叫 /api/onboard/agent")
+        if body.chain_id <= 0:
+            raise HTTPException(status_code=400, detail="chain_id 不合法")
+        # ⭐ agentAddress/agentName 出自伺服器（keysvc 地址＋設定常數），不收使用者輸入
+        typed_data, _action = build_approve_agent(
+            agent_address=agent_address, agent_name=cfg.agent_name,
+            wallet_chain_id=body.chain_id, is_mainnet=cfg.is_mainnet)
+        # action 不落地：前端持有 typed data 簽完直送 HL，提交結果由 status 鏈上查詢確認
+        return {"typed_data": typed_data}
+
+    @app.post("/api/onboard/payload/approve-builder-fee")
+    def payload_approve_builder_fee(body: ChainIdBody,
+                                    address: str = Depends(_require_session)):
+        account_id = derive_account_id(address)
+        store.ensure_onboarding(account_id, address)
+        if body.chain_id <= 0:
+            raise HTTPException(status_code=400, detail="chain_id 不合法")
+        # builder 啟用門檻（spec 錯誤處理；沿 M1 BuilderNotEligible）：<100 USDC 時
+        # builder code 不生效，症狀是「成交但 fee 不累計」——這裡大聲擋下。
+        if hl.get_account_value(cfg.builder_address) < cfg.min_builder_balance:
+            raise HTTPException(
+                status_code=503,
+                detail=f"builder 地址餘額低於 {cfg.min_builder_balance} USDC 門檻，"
+                       "暫停 onboarding，請聯絡管理員")
+        # ⭐ builder/maxFeeRate 出自伺服器設定常數，不收使用者輸入（紅線 6）
+        typed_data, _action = build_approve_builder_fee(
+            builder=cfg.builder_address, max_fee_rate=cfg.max_fee_rate,
+            wallet_chain_id=body.chain_id, is_mainnet=cfg.is_mainnet)
+        return {"typed_data": typed_data}
 
     return app
