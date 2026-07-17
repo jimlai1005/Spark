@@ -12,6 +12,12 @@
              var/copytrade/shadow/YYYYMMDD.jsonl（Decimal 已存 str）
   --status   只讀報狀態（equity/回撤/部位/掛單/killswitch）後退出，零寫入
 
+狀態根隔離:
+  FILET_STATE_DIR  kill switch ARM 檔／alerts.log／shadow JSONL 的狀態根目錄。
+                    缺省＝repo 根（保留 M1 單實例行為不變）。多 follower 共用
+                    同一份 repo 時務必各自指定不同路徑——否則 follower A 觸發
+                    的 kill switch ARM 檔會被 follower B 讀到而連坐停單。
+
 安全設計:
   - live 條件 = COPY_LIVE_TRADING=true 且未加 --dry-run/--shadow/--status；啟動前
     印大字警告並再驗 env 確實存在（紅線 5：live 是人工決策）。
@@ -36,7 +42,13 @@ from spark.copytrade.orders import ReconcileState
 from spark.exchange.base import BuilderCode
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-SHADOW_DIR = _REPO_ROOT / "var" / "copytrade" / "shadow"
+
+
+def resolve_state_dir() -> Path:
+    """狀態根：讀 env FILET_STATE_DIR，缺省回 _REPO_ROOT（保留 M1 單實例行為）。
+    kill switch ARM 檔／alerts.log／shadow JSONL 全部掛在此根之下（per-follower 隔離）。"""
+    raw = os.environ.get("FILET_STATE_DIR")
+    return Path(raw) if raw else _REPO_ROOT
 
 USAGE = (
     "用法: SPARK_USER_ADDR=0x.. SPARK_BUILDER_ADDR=0x.. [SPARK_NETWORK=testnet] \\\n"
@@ -143,10 +155,11 @@ def main(argv: list[str] | None = None) -> None:
     from spark.exchange.hyperliquid import HyperliquidAdapter
 
     info = Info(settings.api_url, skip_ws=True)
+    state_root = resolve_state_dir()
 
     if args.status:
         adapter = HyperliquidAdapter(network, info=info, exchange=None)
-        _print_status(adapter, user_addr, copy_settings, _REPO_ROOT)
+        _print_status(adapter, user_addr, copy_settings, state_root)
         return
 
     if live:
@@ -180,11 +193,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[{mode}] network={network} leader={copy_settings.leader_address} "
           f"me={user_addr} interval={copy_settings.interval_s}s")
 
+    shadow_dir = state_root / "var" / "copytrade" / "shadow"
+
     def cycle():
         start = len(ex.records)
-        report = run_cycle(adapter, ex, copy_settings, notifier, state, _REPO_ROOT)
+        report = run_cycle(adapter, ex, copy_settings, notifier, state, state_root)
         if args.shadow:
-            _append_shadow(ex.records[start:], SHADOW_DIR)
+            _append_shadow(ex.records[start:], shadow_dir)
         return report
 
     if args.once:
