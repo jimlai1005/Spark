@@ -56,6 +56,17 @@ def test_keysvc_down_502(tmp_path):
     assert client.post("/api/onboard/agent").status_code == 502
 
 
+def test_keysvc_truncated_response_502(tmp_path):
+    """opus 必修 1 的 app 層閉環：keysvc client 把截斷/中斷回應轉譯成 ConnectionError
+    後，app 既有的 except ConnectionError handler（或 onboard_agent 的 except OSError）
+    必須接得住、回 502（而不是通用 500）——證明轉譯後不需要改 app.py。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    keysvc.fail = ConnectionError("keysvc 回應中斷")
+    client = _client(app)
+    login(client)
+    assert client.post("/api/onboard/agent").status_code == 502
+
+
 def test_status_hl_down_502(tmp_path):
     """HL transient 失敗（resilience 重試耗盡後上拋 ConnectionError）在 status 端點
     統一轉譯成 502，而非通用 500（app 層 exception handler，工程原則 5）。"""

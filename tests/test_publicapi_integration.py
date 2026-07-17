@@ -155,6 +155,8 @@ def test_desync_self_heal_contract_with_real_keysvc(tmp_path):
         assert r.json().get("recovered") is True
         assert r.json()["agent_address"] == first          # 同一把 key、同一地址
         assert ks.get_agent_signer(account_id).address.lower() == first  # 與 keystore 一致
+        # 回填已持久落 DB（不是每次靠自癒重演）：直接查 store 本身，不透過 API 再觸發自癒。
+        assert store.get_agent_address(account_id) == first
     finally:
         stop.set()
         t.join(timeout=2)

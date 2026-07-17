@@ -109,6 +109,77 @@ def test_client_address_missing_raises_with_code(tmp_path, monkeypatch):
         sock_path.unlink(missing_ok=True)
 
 
+def test_client_empty_response_raises_connection_error(monkeypatch):
+    """opus 必修 1：server 在 accept 後、sendall 前崩潰（例如 close 掉連線而不回任何
+    位元組）→ client 的 readline() 得到 b"" → 這必須被收斂成 ConnectionError（transient、
+    OSError 子類），而不是 decode_response(b"") 直接爆的 json.JSONDecodeError（ValueError
+    子類，app 層 except KeysvcError/except OSError 都接不住，會被誤判成不可重試的
+    通用 500）。用一個假 server：accept 後立刻關閉連線、不寫任何東西。"""
+    monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)
+    sock_path = Path(f"/tmp/spark-keysvc-cli-test-{uuid.uuid4().hex[:8]}.sock")
+    srv = _REAL_SOCKET_CTOR(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+    stop = threading.Event()
+
+    def _accept_and_close():
+        try:
+            srv.settimeout(2.0)
+            conn, _ = srv.accept()
+            conn.close()  # 崩潰模擬：連線關閉，client 端 readline() 得到 b""
+        except OSError:
+            pass
+        finally:
+            stop.set()
+
+    t = threading.Thread(target=_accept_and_close, daemon=True)
+    t.start()
+    try:
+        client = KeysvcClient(str(sock_path))
+        with pytest.raises(ConnectionError):
+            client.generate("alice")
+        assert stop.wait(timeout=2)
+    finally:
+        srv.close()
+        t.join(timeout=2)
+        sock_path.unlink(missing_ok=True)
+
+
+def test_client_socket_timeout_is_timeout_error(monkeypatch):
+    """opus 必修 2：keysvc wedge（accept 後不回應）必須在有限時間內失敗成 TimeoutError，
+    而不是無限期阻塞（否則 API worker 被卡死、反覆 onboard 可耗盡 threadpool，形成 DoS）。
+    把模組層 _TIMEOUT_S 調小，避免測試真的等 10 秒。"""
+    import spark.keysvc.client as client_mod
+    monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)
+    monkeypatch.setattr(client_mod, "_TIMEOUT_S", 0.2)
+    sock_path = Path(f"/tmp/spark-keysvc-cli-test-{uuid.uuid4().hex[:8]}.sock")
+    srv = _REAL_SOCKET_CTOR(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+
+    def _accept_and_hang():
+        try:
+            srv.settimeout(2.0)
+            conn, _ = srv.accept()
+            # 刻意不回應、不關閉：模擬 keysvc wedge（死鎖/停頓）
+            import time
+            time.sleep(1.0)
+            conn.close()
+        except OSError:
+            pass
+
+    t = threading.Thread(target=_accept_and_hang, daemon=True)
+    t.start()
+    try:
+        client = KeysvcClient(str(sock_path))
+        with pytest.raises(TimeoutError):
+            client.generate("alice")
+    finally:
+        srv.close()
+        t.join(timeout=2)
+        sock_path.unlink(missing_ok=True)
+
+
 def test_client_generate_exists_code(tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)
     sock_path = Path(f"/tmp/spark-keysvc-cli-test-{uuid.uuid4().hex[:8]}.sock")

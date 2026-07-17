@@ -3,8 +3,9 @@
 被打穿即取得 unit 控制；危險 OS 動作收斂在人工 CLI）。
 流程：讀 pending 條目 → 結構性核對 builder_address == FILET_BUILDER_ADDR（杜絕 web 層
 被打穿後注入指向攻擊者的 builder 條目）→ 寫入 followers.json（拒絕重複）→ 以
-load_followers fail-fast 重讀驗證 → 自 pending 移除 → 印出（或 --start 執行）
-systemctl 啟動指令。
+load_followers fail-fast 重讀驗證（驗證但不回滾：os.replace 已提交，重讀失敗時
+manifest 保留新版本、pending 條目也保留以便可重跑排查）→ 自 pending 移除 → 印出
+（或 --start 執行）systemctl 啟動指令。
 用法: FILET_BUILDER_ADDR=0x... uv run python -m scripts.filet_activate <account_id> \\
       [--pending var/filet/pending.json] [--manifest var/filet/followers.json] [--start]
 """
@@ -46,7 +47,8 @@ def activate(account_id: str, pending_path: str, manifest_path: str,
     tmp = manifest.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, manifest)
-    load_followers(manifest)  # fail-fast 重讀：寫壞立刻大聲炸（引擎同一載入路徑）
+    load_followers(manifest)  # fail-fast 重讀驗證（不回滾——os.replace 已提交；寫壞
+                              # 立刻大聲炸，manifest 留新版本、pending 條目留供重跑）
     remove_pending_entry(pending_path, account_id)
     cmd = f"systemctl start filet-follower@{account_id}"
     if start:
