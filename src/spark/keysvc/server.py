@@ -9,8 +9,10 @@ from pathlib import Path
 
 from eth_account import Account
 
+from spark.filet.followers import validate_account_id
 from spark.keystore.envfile import EnvFileKeyStore
-from spark.keysvc.protocol import GenerateRequest, Response, decode_request, encode_response
+from spark.keysvc.protocol import (AddressRequest, GenerateRequest, Response,
+                                   decode_request, encode_response)
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +24,32 @@ def handle_generate(req: GenerateRequest, ks: EnvFileKeyStore) -> Response:
         acct = Account.create()  # os.urandom 亂數；私鑰只存在此區域變數
         ks.import_agent_key(req.account_id, acct.key.hex())  # O_EXCL：存在即 FileExistsError
     except FileExistsError:
-        return Response(ok=False, error=f"account {req.account_id} 已有 agent key，不重生")
+        return Response(ok=False, error=f"account {req.account_id} 已有 agent key，不重生",
+                        code="exists")
     except ValueError as e:  # validate_account_id 等——e 不含私鑰
-        return Response(ok=False, error=str(e))
+        return Response(ok=False, error=str(e), code="invalid")
     except Exception:  # noqa: BLE001 — 不外洩細節（可能含路徑，不含私鑰）
         logger.exception("keysvc generate 失敗 account=%s", req.account_id)  # 不 log 私鑰
-        return Response(ok=False, error="internal error")
+        return Response(ok=False, error="internal error", code="internal")
     return Response(ok=True, agent_address=acct.address)
+
+
+def handle_address(req: AddressRequest, ks: EnvFileKeyStore) -> Response:
+    """唯讀：回既有 agent 的地址（desync 自癒用，設計定案 12）。
+    私鑰只在 signer 區域變數——不進回應、不進 log（紅線同 generate）。"""
+    try:
+        validate_account_id(req.account_id)
+        signer = ks.get_agent_signer(req.account_id)
+    except ValueError as e:
+        return Response(ok=False, error=str(e), code="invalid")
+    except KeyError:
+        # EnvFileKeyStore.get_agent_signer 對缺檔 raise KeyError（非 FileNotFoundError）。
+        return Response(ok=False, error=f"account {req.account_id} 無 agent key",
+                        code="missing")
+    except Exception:  # noqa: BLE001 — 不外洩細節（可能含路徑，不含私鑰）
+        logger.exception("keysvc address 失敗 account=%s", req.account_id)
+        return Response(ok=False, error="internal error", code="internal")
+    return Response(ok=True, agent_address=signer.address)
 
 
 def serve_forever(sock_path: str, ks: EnvFileKeyStore,
@@ -61,7 +82,10 @@ def serve_forever(sock_path: str, ks: EnvFileKeyStore,
                     line = conn.makefile("rb").readline()
                     try:
                         req = decode_request(line)
-                        resp = handle_generate(req, ks)
+                        if isinstance(req, GenerateRequest):
+                            resp = handle_generate(req, ks)
+                        else:
+                            resp = handle_address(req, ks)
                     except ValueError as e:
                         resp = Response(ok=False, error=str(e))
                     except Exception:

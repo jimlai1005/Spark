@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from spark.keysvc.client import KeysvcClient
+from spark.keysvc.client import KeysvcClient, KeysvcError
 from spark.keysvc.server import serve_forever
 from spark.keystore.envfile import EnvFileKeyStore
 
@@ -73,6 +73,53 @@ def test_client_generate_already_exists_raises(tmp_path, monkeypatch):
         client.generate("alice")
         with pytest.raises(RuntimeError):
             client.generate("alice")  # O_EXCL 已存在 → server ok=False → client raise
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        sock_path.unlink(missing_ok=True)
+
+
+def test_client_address_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)
+    sock_path = Path(f"/tmp/spark-keysvc-cli-test-{uuid.uuid4().hex[:8]}.sock")
+    ks = EnvFileKeyStore(tmp_path / "keys")
+    t, stop = _start_server(sock_path, ks)
+    try:
+        client = KeysvcClient(str(sock_path))
+        addr = client.generate("alice")
+        assert client.address("alice") == addr
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        sock_path.unlink(missing_ok=True)
+
+
+def test_client_address_missing_raises_with_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)
+    sock_path = Path(f"/tmp/spark-keysvc-cli-test-{uuid.uuid4().hex[:8]}.sock")
+    ks = EnvFileKeyStore(tmp_path / "keys")
+    t, stop = _start_server(sock_path, ks)
+    try:
+        with pytest.raises(KeysvcError) as ei:
+            KeysvcClient(str(sock_path)).address("ghost")
+        assert ei.value.code == "missing"
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        sock_path.unlink(missing_ok=True)
+
+
+def test_client_generate_exists_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(socket, "socket", _REAL_SOCKET_CTOR)
+    sock_path = Path(f"/tmp/spark-keysvc-cli-test-{uuid.uuid4().hex[:8]}.sock")
+    ks = EnvFileKeyStore(tmp_path / "keys")
+    t, stop = _start_server(sock_path, ks)
+    try:
+        client = KeysvcClient(str(sock_path))
+        client.generate("alice")
+        with pytest.raises(KeysvcError) as ei:
+            client.generate("alice")
+        assert ei.value.code == "exists"
     finally:
         stop.set()
         t.join(timeout=2)

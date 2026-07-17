@@ -10,8 +10,8 @@ socket.socket 還是原生類別）先存一份真身，只在下面兩個 serve
 monkeypatch 換回真身（測試結束自動還原），其餘所有測試完全不受影響、網路仍被擋。"""
 import socket
 
-from spark.keysvc.server import handle_generate
-from spark.keysvc.protocol import GenerateRequest
+from spark.keysvc.server import handle_generate, handle_address
+from spark.keysvc.protocol import GenerateRequest, AddressRequest
 from spark.keystore.envfile import EnvFileKeyStore
 
 _REAL_SOCKET_CTOR = socket.socket  # 捕捉於 import 期，早於 autouse fixture 的 patch
@@ -63,6 +63,40 @@ def test_generate_bad_account_id_rejected(tmp_path):
     ks = EnvFileKeyStore(tmp_path)
     resp = handle_generate(GenerateRequest("../evil"), ks)
     assert resp.ok is False and (tmp_path / "..").resolve().joinpath("evil").exists() is False
+
+
+def test_generate_error_codes(tmp_path):
+    ks = EnvFileKeyStore(tmp_path)
+    handle_generate(GenerateRequest("alice"), ks)
+    assert handle_generate(GenerateRequest("alice"), ks).code == "exists"
+    assert handle_generate(GenerateRequest("../evil"), ks).code == "invalid"
+
+
+def test_address_returns_existing_agent_address(tmp_path):
+    ks = EnvFileKeyStore(tmp_path)
+    gen = handle_generate(GenerateRequest("alice"), ks)
+    resp = handle_address(AddressRequest("alice"), ks)
+    assert resp.ok and resp.agent_address == gen.agent_address and resp.code is None
+
+
+def test_address_missing_key_code(tmp_path):
+    resp = handle_address(AddressRequest("alice"), EnvFileKeyStore(tmp_path))
+    assert resp.ok is False and resp.code == "missing"
+
+
+def test_address_bad_account_id_code(tmp_path):
+    resp = handle_address(AddressRequest("../evil"), EnvFileKeyStore(tmp_path))
+    assert resp.ok is False and resp.code == "invalid"
+
+
+def test_address_private_key_never_in_response(tmp_path):
+    """⭐ 紅線同 generate：address op 讀 keystore，但私鑰不進回應任何欄位。"""
+    ks = EnvFileKeyStore(tmp_path)
+    handle_generate(GenerateRequest("alice"), ks)
+    resp = handle_address(AddressRequest("alice"), ks)
+    pk = (tmp_path / "alice" / "agent.key").read_text().strip()
+    blob = f"{resp.ok}{resp.agent_address}{resp.error}{resp.code}"
+    assert pk not in blob and pk.removeprefix("0x") not in blob
 
 
 def test_serve_one_generates_and_responds(tmp_path, monkeypatch):
