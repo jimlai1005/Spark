@@ -246,7 +246,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             event = verify_webhook_event(payload, sig, cfg.stripe_webhook_secret)
         except BillingSignatureError:
             # 不進 BillingError 的 502 handler：簽名壞是呼叫者的錯（400），
-            # 且刻意不回洩簽名失敗細節
+            # 且刻意不回洩簽名失敗細節。log 為稽核痕跡（偽造探測）：靜態訊息，
+            # 不含 payload/簽名原文，避免可疑內容進 log。
+            logger.warning("billing webhook 驗簽失敗")
             raise HTTPException(status_code=400, detail="webhook 驗簽失敗") from None
         outcome = apply_webhook_event(store, event,
                                       event_created=int(event.get("created", 0)),

@@ -63,6 +63,28 @@ def test_webhook_bad_signature_400_and_no_db_write(tmp_path):
     assert store.get_billing(acct) is None
 
 
+def test_webhook_bad_signature_logs_warning_without_payload(tmp_path, caplog):
+    """reviewer 順手項：驗簽失敗要留稽核痕跡，但 log 只放靜態訊息，不含 payload
+    /簽名原文（不得洩漏使用者可控內容進 log）。"""
+    import logging
+
+    app, cfg, store = _billing_app(tmp_path)
+    client = TestClient(app)
+    acct = "f" + "ab" * 20
+    payload = _event("checkout.session.completed",
+                     {"id": "cs_1", "client_reference_id": acct,
+                      "customer": "cus_1", "subscription": "sub_1"})
+    with caplog.at_level(logging.WARNING):
+        r = client.post("/api/billing/webhook", content=payload,
+                        headers={"stripe-signature": stripe_sig(payload, secret="whsec_WRONG")})
+    assert r.status_code == 400
+    assert "驗簽失敗" in caplog.text
+    blob = " ".join(rec.getMessage() for rec in caplog.records)
+    assert acct not in blob
+    assert "cs_1" not in blob
+    assert payload.decode() not in caplog.text
+
+
 def test_webhook_missing_signature_header_400(tmp_path):
     app, cfg, store = _billing_app(tmp_path)
     client = TestClient(app)

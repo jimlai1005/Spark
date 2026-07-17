@@ -137,17 +137,19 @@ def apply_webhook_event(store: ApiStore, event, *, event_created: int,
                            "可能是外部手建訂閱，忽略", obj.get("id"))
             return "unmatched"
         try:
-            store.upsert_billing(account_id, status=status,
-                                 stripe_customer_id=obj.get("customer"),
-                                 stripe_subscription_id=obj.get("id"),
-                                 now_s=now_s, event_created=event_created)
-        except ValueError:
-            # metadata.account_id 可被 Stripe dashboard 手動塞任意值——store 邊界的
-            # validate_account_id 拒收（account_id 流進檔案路徑）。與歸屬失敗同路徑：
-            # log 留痕、回 200 ack，不炸 webhook 流。
+            validate_account_id(account_id)
+        except ValueError as e:
+            # metadata.account_id 可被 Stripe dashboard 手動塞任意值——縱深防禦，
+            # 在呼叫 upsert 前單獨驗證（收窄 except 範圍，reviewer 觀察：避免寬 except
+            # 連同 upsert_billing 內部真程式錯誤一起吞掉）。與歸屬失敗同路徑：
+            # log 留痕（含例外訊息以利區分成因）、回 200 ack，不炸 webhook 流。
             logger.warning("subscription 事件的 account_id 不合法，拒絕入帳"
-                           "（sub=%s）——視同對不到 account", obj.get("id"))
+                           "（sub=%s）：%s", obj.get("id"), e)
             return "unmatched"
+        store.upsert_billing(account_id, status=status,
+                             stripe_customer_id=obj.get("customer"),
+                             stripe_subscription_id=obj.get("id"),
+                             now_s=now_s, event_created=event_created)
         logger.info("billing 狀態更新 account=%s status=%s", account_id, status)
         return "updated"
     return "ignored"
