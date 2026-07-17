@@ -12,6 +12,8 @@ from pydantic import BaseModel
 
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
+from spark.publicapi.billing import (BillingError, BillingSignatureError,
+                                     apply_webhook_event, verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
@@ -31,7 +33,8 @@ class ChainIdBody(BaseModel):
     chain_id: int
 
 
-def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time) -> FastAPI:
+def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
+               billing=None) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -45,12 +48,23 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time) ->
     async def _hl_timeout(request, exc):
         return JSONResponse(status_code=502, content={"detail": "上游服務逾時，請稍後重試"})
 
+    @app.exception_handler(BillingError)
+    async def _billing_error(request, exc):
+        # semantic 失敗（設定錯/請求被拒）：不重試、大聲留痕（工程原則 3）
+        logger.error("stripe 語意失敗: %s", exc)
+        return JSONResponse(status_code=502,
+                            content={"detail": "計費服務錯誤，請稍後重試或聯絡管理員"})
+
     def _require_session(request: Request) -> str:
         sid = request.cookies.get(SESSION_COOKIE)
         addr = store.get_session_address(sid, now_s=now_fn()) if sid else None
         if addr is None:
             raise HTTPException(status_code=401, detail="未登入或 session 已過期")
         return addr
+
+    def _require_billing() -> None:
+        if billing is None or not cfg.billing_enabled:
+            raise HTTPException(status_code=501, detail="計費未啟用")
 
     # ---------- auth ----------
     @app.get("/api/auth/nonce")
@@ -217,5 +231,25 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time) ->
             builder=cfg.builder_address, max_fee_rate=cfg.max_fee_rate,
             wallet_chain_id=body.chain_id, is_mainnet=cfg.is_mainnet)
         return {"typed_data": typed_data}
+
+    # ---------- billing（M3 計費骨幹；測試模式 only，sk_test_ 由 ApiConfig 強制） ----------
+    @app.post("/api/billing/webhook")
+    async def billing_webhook(request: Request):
+        # ⭐ 全 app 唯一不走 session auth 的端點（紅線 2）：Stripe 伺服器對伺服器
+        # 回呼無 cookie；授權由 Stripe-Signature HMAC 驗簽取代（secret 只有 Stripe
+        # 與本服務知道）。驗簽不過一律 400、不碰 DB。async：需先取 raw body 驗簽。
+        _require_billing()
+        payload = await request.body()
+        sig = request.headers.get("stripe-signature", "")
+        try:
+            event = verify_webhook_event(payload, sig, cfg.stripe_webhook_secret)
+        except BillingSignatureError:
+            # 不進 BillingError 的 502 handler：簽名壞是呼叫者的錯（400），
+            # 且刻意不回洩簽名失敗細節
+            raise HTTPException(status_code=400, detail="webhook 驗簽失敗") from None
+        outcome = apply_webhook_event(store, event,
+                                      event_created=int(event.get("created", 0)),
+                                      now_s=now_fn())
+        return {"received": True, "outcome": outcome}
 
     return app

@@ -72,11 +72,11 @@ class FakeHL:
         return [a.lower() for a in self.agents.get(user.lower(), [])]
 
 
-def make_app(tmp_path, cfg=None):
+def make_app(tmp_path, cfg=None, billing=None):
     cfg = cfg or make_cfg(tmp_path)
     store = ApiStore(cfg.db_path)
     keysvc, hl = FakeKeysvc(), FakeHL()
-    return create_app(cfg, store, keysvc, hl), cfg, store, keysvc, hl
+    return create_app(cfg, store, keysvc, hl, billing=billing), cfg, store, keysvc, hl
 
 
 def login(client, wallet=None):
@@ -90,3 +90,24 @@ def login(client, wallet=None):
     r = client.post("/api/auth/verify", json={"nonce": body["nonce"], "signature": sig})
     assert r.status_code == 200, r.text
     return wallet
+
+
+# ---------- billing 測試共用（M3） ----------
+STRIPE_WEBHOOK_SECRET = "whsec_test_secret"
+
+
+def billing_cfg(tmp_path, **over):
+    return make_cfg(tmp_path, stripe_secret_key="sk_test_abc",
+                    stripe_webhook_secret=STRIPE_WEBHOOK_SECRET,
+                    stripe_price_id="price_test_1", **over)
+
+
+def stripe_sig(payload: bytes, secret: str = STRIPE_WEBHOOK_SECRET,
+               t: int | None = None) -> str:
+    import hashlib
+    import hmac
+    import time as _time
+    t = int(_time.time()) if t is None else t
+    mac = hmac.new(secret.encode(), f"{t}.".encode() + payload,
+                   hashlib.sha256).hexdigest()
+    return f"t={t},v1={mac}"
