@@ -1,0 +1,26 @@
+[Unit]
+Description=Filet dashboard (Next.js, localhost only, behind reverse proxy)
+After=network.target filet-api.service
+Wants=filet-api.service
+
+[Service]
+Type=simple
+User=filet-dashboard
+Group=filet-dashboard
+WorkingDirectory=/opt/filet/spark/web
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+# next start 讀 HOSTNAME/PORT 環境變數；-H/-p 亦保留作為明確覆寫，兩者一致即可。
+ExecStart=/usr/bin/node /opt/filet/spark/web/node_modules/.bin/next start -H 127.0.0.1 -p 3000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# Next.js production server（next start）預設不寫入 .next/ 之外的路徑；若之後啟用 ISR
+# 等執行期快取寫入，於此加 ReadWritePaths=/opt/filet/spark/web/.next/cache 並記錄理由。
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
