@@ -6,7 +6,7 @@ Public API 設定與身分衍生。
 - derive_account_id：spec 資料模型定死——"f" + 地址小寫去 0x 完整 40 hex（41 字元、
   1:1 不截斷、恆過 validate_account_id，無使用者輸入、無路徑穿越）。"""
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 from spark.config import API_URLS, MIN_BUILDER_BALANCE, Settings
@@ -47,6 +47,29 @@ class ApiConfig:
     min_builder_balance: Decimal = MIN_BUILDER_BALANCE  # builder 資格門檻（payload pre-flight）
     session_ttl_s: int = 7 * 24 * 3600
     nonce_ttl_s: int = 300
+    # --- M3 計費骨幹（全 optional；未設＝billing 停用，onboarding 不受影響） ---
+    # ⭐ 紅線 1：只收 Stripe 測試 key（sk_test_）——真實收費是人工決策（M0 律師條款
+    # 未結案），__post_init__ 結構性拒收非測試 key。repr=False：secret 不進 log/repr。
+    stripe_secret_key: str | None = field(default=None, repr=False)
+    stripe_webhook_secret: str | None = field(default=None, repr=False)
+    stripe_price_id: str | None = None
+
+    def __post_init__(self):
+        if self.stripe_secret_key is not None and \
+                not self.stripe_secret_key.startswith("sk_test_"):
+            raise ValueError(
+                "FILET_STRIPE_SECRET_KEY 必須是 Stripe 測試 key（sk_test_ 前綴）——"
+                "真實收費是人工決策（M0 律師條款未結案），結構性拒收非測試 key")
+        # 三元組同設或同缺（opus Finding 2）：不只 from_env——任何建構路徑的半開
+        # 狀態（如漏 webhook secret → 驗簽必失敗）都直接拒，結構性收斂
+        trio = (self.stripe_secret_key, self.stripe_webhook_secret, self.stripe_price_id)
+        if any(v is not None for v in trio) and not all(v is not None for v in trio):
+            raise ValueError("Stripe 設定不完整（secret key / webhook secret / price id "
+                             "三個一起設或都不設）")
+
+    @property
+    def billing_enabled(self) -> bool:
+        return self.stripe_secret_key is not None
 
     @property
     def is_mainnet(self) -> bool:
@@ -71,6 +94,14 @@ class ApiConfig:
         admins = frozenset(normalize_address(a.strip())
                            for a in env.get("FILET_ADMIN_ADDRESSES", "").split(",")
                            if a.strip())
+        stripe_env = {k: (env.get(k) or None)
+                      for k in ("FILET_STRIPE_SECRET_KEY", "FILET_STRIPE_WEBHOOK_SECRET",
+                                "FILET_STRIPE_PRICE_ID")}
+        present = [k for k, v in stripe_env.items() if v]
+        if present and len(present) != 3:
+            missing = sorted(set(stripe_env) - set(present))
+            raise ValueError(
+                f"Stripe 設定不完整（三個一起設或都不設）: 缺少 {', '.join(missing)}")
         return cls(network=network,
                    builder_address=normalize_address(env["FILET_BUILDER_ADDR"]),
                    siwe_domain=env["FILET_SIWE_DOMAIN"],
@@ -78,4 +109,7 @@ class ApiConfig:
                    db_path=env["FILET_API_DB"],
                    keysvc_sock=env["FILET_KEYSVC_SOCK"],
                    pending_path=env["FILET_PENDING_PATH"],
-                   admin_addresses=admins)
+                   admin_addresses=admins,
+                   stripe_secret_key=stripe_env["FILET_STRIPE_SECRET_KEY"],
+                   stripe_webhook_secret=stripe_env["FILET_STRIPE_WEBHOOK_SECRET"],
+                   stripe_price_id=stripe_env["FILET_STRIPE_PRICE_ID"])
