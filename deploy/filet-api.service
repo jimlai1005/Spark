@@ -1,0 +1,31 @@
+[Unit]
+Description=Filet public API (SIWE onboarding backend, localhost only, behind reverse proxy)
+After=network.target filet-keysvc.service
+Wants=filet-keysvc.service
+
+[Service]
+Type=simple
+User=filet-api
+Group=filet-api
+WorkingDirectory=/opt/filet/spark
+Environment=FILET_API_NETWORK=mainnet
+Environment=FILET_BUILDER_ADDR=REPLACE_WITH_BUILDER_ADDRESS
+Environment=FILET_SIWE_DOMAIN=REPLACE_WITH_DASHBOARD_DOMAIN
+Environment=FILET_SIWE_URI=REPLACE_WITH_DASHBOARD_URI
+Environment=FILET_API_DB=/var/lib/filet-api/api.db
+Environment=FILET_KEYSVC_SOCK=/run/filet/keysvc.sock
+Environment=FILET_PENDING_PATH=/var/lib/filet-api/pending.json
+Environment=FILET_ADMIN_ADDRESSES=REPLACE_WITH_ADMIN_ADDRESSES
+Environment=FILET_API_PORT=8700
+StateDirectory=filet-api
+ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_api
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/filet-api /run/filet
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
