@@ -65,42 +65,40 @@ def save_builder_snapshot(day_iso: str, accrued_by_builder: dict[str, Decimal]) 
     }, indent=2))
 
 
-def _adapter_for(network: str, cache: dict[str, HyperliquidAdapter]) -> HyperliquidAdapter:
-    """每網路一個 Info client（Info 綁定單一 API URL，mainnet/testnet 不可共用）。"""
-    if network not in cache:
-        cache[network] = HyperliquidAdapter(
-            network, info=Info(API_URLS[network], skip_ws=True), exchange=None)
-    return cache[network]
+def _mainnet_builders(refs) -> list[str]:
+    """北極星要查的相異 mainnet builder 位址（小寫正規化後去重）。
+
+    以太坊位址大小寫不敏感（checksum 只是顯示層），若不正規化，同一位址的兩種
+    大小寫會被當成兩個 builder 各查一次 `query_builder_accrued`——但兩者回同一個
+    **全域**累積值，加總即北極星重複計，正是本任務要根除的。（先例 c624d2e。）
+    """
+    return sorted({r.builder_address.lower() for r in refs if r.network == "mainnet"})
 
 
-def main():
-    manifest_path = Path(os.environ.get("FILET_FOLLOWERS", str(DEFAULT_MANIFEST)))
-    try:
-        refs, load_errors = load_followers_tolerant(manifest_path)
-    except FileNotFoundError:
-        print(_usage())
-        raise SystemExit(2)
+def generate_report(refs, load_errors, adapter_for, now):
+    """核心 wiring（adapter_for 注入以便離線測試）。回 AggregateReport。
 
-    for e in load_errors:
-        print(f"[WARN] follower manifest 條目跳過: {e}", file=sys.stderr)
-
-    now = datetime.now(timezone.utc)
+    adapter_for: Callable[[str], adapter]——依 network 回一個 exchange adapter。
+    北極星：對每個相異 mainnet builder 查一次 accrued（testnet 不計入），減快照 →
+    builder_fee_delta；per-follower：collect_follower_summary（不查 accrued）。
+    寫報表與快照為副作用。查詢失敗的 builder 大聲告警、其當日增量不計入（低估方向）。
+    """
     day = now.date()
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
 
-    adapters: dict[str, HyperliquidAdapter] = {}
-
     # --- 北極星：mainnet builder 層級查一次（絕不跨 follower 加總）---
-    mainnet_builders = sorted({r.builder_address for r in refs if r.network == "mainnet"})
+    mainnet_builders = _mainnet_builders(refs)
     prev_snapshot = load_builder_snapshot()
     today_accrued: dict[str, Decimal] = {}
+    failed_builders = 0
     north_star_delta = Decimal("0")
     for builder in mainnet_builders:
-        adapter = _adapter_for("mainnet", adapters)
+        adapter = adapter_for("mainnet")
         try:
             accrued_today = adapter.query_builder_accrued(builder)
         except Exception as e:  # noqa: BLE001 — 北極星查詢失敗大聲告警，不吞掉
             print(f"[WARN] builder accrued 查詢失敗 {builder}: {e}", file=sys.stderr)
+            failed_builders += 1
             continue
         prev = prev_snapshot.get(builder, Decimal("0"))
         north_star_delta += builder_fee_delta(accrued_today, prev)
@@ -109,11 +107,14 @@ def main():
     # --- per-follower summary（fills 衍生，不查 accrued）---
     summaries = []
     for ref in refs:
-        adapter = _adapter_for(ref.network, adapters)
+        adapter = adapter_for(ref.network)
         summaries.append(collect_follower_summary(ref, adapter, start, now))
 
     report = aggregate(day, summaries, north_star_fee_delta=north_star_delta)
     text = render_aggregate(report)
+    if failed_builders:
+        text += (f"\n\n> 注意：北極星不含 {failed_builders} 個查詢失敗的 builder，"
+                 "當日增量為低估值。")
     if load_errors:
         text += "\n\n## Manifest 錯誤\n" + "\n".join(f"- {e}" for e in load_errors)
 
@@ -128,6 +129,31 @@ def main():
         merged = {**prev_snapshot, **today_accrued}
         save_builder_snapshot(day.isoformat(), merged)
 
+    return report
+
+
+def main():
+    manifest_path = Path(os.environ.get("FILET_FOLLOWERS", str(DEFAULT_MANIFEST)))
+    try:
+        refs, load_errors = load_followers_tolerant(manifest_path)
+    except FileNotFoundError:
+        print(_usage())
+        raise SystemExit(2)
+
+    for e in load_errors:
+        print(f"[WARN] follower manifest 條目跳過: {e}", file=sys.stderr)
+
+    now = datetime.now(timezone.utc)
+    adapters: dict[str, HyperliquidAdapter] = {}
+
+    def adapter_for(network: str) -> HyperliquidAdapter:
+        """每網路一個 Info client（Info 綁定單一 API URL，mainnet/testnet 不可共用）。"""
+        if network not in adapters:
+            adapters[network] = HyperliquidAdapter(
+                network, info=Info(API_URLS[network], skip_ws=True), exchange=None)
+        return adapters[network]
+
+    generate_report(refs, load_errors, adapter_for, now)
     raise SystemExit(0)
 
 
