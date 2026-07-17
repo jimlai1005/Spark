@@ -1,0 +1,1150 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Filet — M2 Dashboard 原型</title>
+<style>
+/* ---------------------------------------------------------------------
+   Filet M2 Dashboard — 高保真原型
+   單一自包含 HTML：inline CSS/JS，零外部請求。
+   Design tokens 見下方 :root（照設計稿抄錄；--tide-2 修正原稿字元錯字為 #1F3140）。
+--------------------------------------------------------------------- */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  color-scheme: dark;
+  --ink:#101923;      --ink-rgb:16,25,35;
+  --tide:#182634;      --tide-rgb:24,38,52;
+  --tide-2:#1F3140;    --tide-2-rgb:31,49,64;
+  --salmon:#F2917A;    --salmon-rgb:242,145,122;
+  --ice:#EAF2F4;       --ice-rgb:234,242,244;
+  --mist:#8FA3B0;      --mist-rgb:143,163,176;
+  --up:#57C7A4;        --up-rgb:87,199,164;
+  --down:#D96A6A;      --down-rgb:217,106,106;
+
+  --radius: 10px;
+  --border: rgba(var(--ice-rgb), .08);
+  --border-strong: rgba(var(--ice-rgb), .16);
+
+  --font-display: "Avenir Next","Futura","PingFang TC",sans-serif;
+  --font-mono: ui-monospace,"SF Mono",Menlo,monospace;
+  --font-body: -apple-system,"PingFang TC","Noto Sans TC",sans-serif;
+
+  --banner-h: 30px;
+}
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--ice);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  padding-top: var(--banner-h);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3 { margin: 0 0 8px; font-weight: 300; }
+p { margin: 0 0 8px; }
+ol, ul { margin: 0; padding: 0; list-style: none; }
+a { color: inherit; }
+button { font: inherit; color: inherit; }
+table { border-collapse: collapse; width: 100%; }
+
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.nowrap { white-space: nowrap; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
+/* focus ring — 鮭色 2px，全域一致 */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--salmon);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ---------- 頂部固定示意小條 ---------- */
+.proto-banner {
+  position: fixed; inset: 0 0 auto 0; height: var(--banner-h);
+  display: flex; align-items: center; justify-content: center;
+  background: var(--tide-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--mist);
+  font-size: 11px;
+  letter-spacing: .14em;
+  z-index: 100;
+}
+
+/* ---------- Header / Tabs ---------- */
+.app-header {
+  position: sticky; top: var(--banner-h); z-index: 90;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  background: rgba(var(--ink-rgb), .92);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.wordmark-mini {
+  font-family: var(--font-display);
+  font-weight: 300;
+  letter-spacing: .22em;
+  font-size: 15px;
+  color: var(--ice);
+}
+
+.tabs { display: flex; gap: 4px; }
+
+.tab {
+  display: inline-block;
+  padding: 8px 16px;
+  border-radius: 999px;
+  text-decoration: none;
+  color: var(--mist);
+  font-size: 13px;
+  letter-spacing: .04em;
+  border: 1px solid transparent;
+  transition: color .15s ease, border-color .15s ease, background .15s ease;
+}
+
+.tab[aria-current="page"] {
+  color: var(--ice);
+  border-color: var(--border-strong);
+  background: var(--tide);
+}
+
+/* ---------- 版面容器 ---------- */
+main.page {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 40px 20px 80px;
+}
+
+.view[hidden] { display: none; }
+
+.narrow { max-width: 420px; margin: 0 auto; }
+
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: .14em;
+  color: var(--mist);
+  margin: 0 0 6px;
+}
+
+.panel {
+  background: var(--tide);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.panel-title { font-size: 15px; font-weight: 500; color: var(--ice); margin: 0 0 4px; }
+
+/* ---------- 授權絲線／託管邊界（signature element） ---------- */
+.boundary {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+
+.boundary-panel {
+  flex: 1 1 0;
+  min-width: 0;
+  background: var(--tide);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+}
+
+.boundary-panel dl { margin: 0; }
+.boundary-panel dt { font-size: 11px; color: var(--mist); margin-top: 8px; }
+.boundary-panel dt:first-of-type { margin-top: 2px; }
+.boundary-panel dd { margin: 2px 0 0; font-size: 14px; color: var(--ice); }
+
+.boundary-link {
+  position: relative;
+  flex: 0 0 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.boundary-divider {
+  position: absolute;
+  top: 6px; bottom: 6px; left: 50%;
+  border-left: 1px dashed rgba(var(--mist-rgb), .35);
+}
+
+/* 絲線本體：左面板右緣 → 右面板左緣（left/right:0 貼齊面板邊框）。
+   未填滿的部分是灰色虛線（斷線感）；已授權比例以 2px 鮭色實線覆蓋。
+   z-index:1 蓋過中央虛線分隔；膠囊 z-index:2 蓋在線上。 */
+.boundary-thread {
+  position: absolute;
+  left: 0; right: 0; top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+  background: repeating-linear-gradient(90deg,
+    rgba(var(--mist-rgb), .55) 0 6px, transparent 6px 12px);
+  overflow: hidden;
+  z-index: 1;
+}
+
+.boundary-thread-fill {
+  display: block;
+  height: 100%;
+  width: calc(var(--thread-pct, 0) * 1%);
+  background: var(--salmon);
+  transition: width .6s ease;
+}
+
+.boundary-thread.pulse {
+  animation: thread-pulse .6s ease;
+}
+
+@keyframes thread-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(var(--salmon-rgb), .55); }
+  60%  { box-shadow: 0 0 0 8px rgba(var(--salmon-rgb), 0); }
+  100% { box-shadow: 0 0 0 0 rgba(var(--salmon-rgb), 0); }
+}
+
+.boundary-pill {
+  position: relative;
+  z-index: 2;
+  background: var(--ink);
+  border: 1px solid rgba(var(--mist-rgb), .4);
+  color: var(--mist);
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.boundary-pill.is-active {
+  border-color: var(--salmon);
+  color: var(--salmon);
+}
+
+/* ---------- 按鈕 ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 11px 20px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--ice);
+  cursor: pointer;
+  font-size: 14px;
+  letter-spacing: .02em;
+  transition: opacity .15s ease, background .15s ease, border-color .15s ease;
+}
+
+.btn:hover { border-color: rgba(var(--ice-rgb), .3); }
+
+.btn-primary {
+  background: var(--salmon);
+  border-color: var(--salmon);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.btn-primary:hover { opacity: .92; }
+
+.btn-secondary { background: var(--tide-2); }
+
+.btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  text-decoration: underline;
+  padding: 6px 4px;
+  color: var(--mist);
+}
+
+.btn:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+}
+
+.btn[disabled] { pointer-events: none; }
+
+/* ---------- Chips ---------- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.chip-up { color: var(--up); background: rgba(var(--up-rgb), .14); }
+.chip-down { color: var(--down); background: rgba(var(--down-rgb), .14); }
+.chip-neutral { color: var(--mist); background: rgba(var(--mist-rgb), .12); font-family: var(--font-body); }
+
+/* =======================================================================
+   畫面一：登入
+======================================================================= */
+
+#view-login .login-inner {
+  padding-top: 8vh;
+  text-align: center;
+}
+
+.wordmark {
+  font-family: var(--font-display);
+  font-weight: 200;
+  letter-spacing: .3em;
+  font-size: clamp(2.6rem, 9vw, 4.2rem);
+  margin: 0 0 16px;
+  color: var(--ice);
+}
+
+.subtitle {
+  color: var(--mist);
+  font-size: 16px;
+  margin: 0 0 40px;
+}
+
+/* 登入頁窄欄放不下 200px 絲線通道＋兩側面板，邊界圖自成一段較寬的置中區塊 */
+.login-boundary-wrap {
+  position: relative;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(600px, calc(100vw - 40px));
+  margin-bottom: 36px;
+  text-align: left;
+}
+
+.cta-row { margin: 28px 0 20px; }
+
+.btn-block { width: 100%; }
+
+.footnote {
+  color: var(--mist);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: left;
+}
+
+/* =======================================================================
+   畫面二：開通 wizard
+======================================================================= */
+
+.onboard-boundary-wrap { margin-bottom: 40px; }
+
+.wizard-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 28px;
+  align-items: start;
+}
+
+.wizard-steps li { margin-bottom: 4px; }
+
+.wizard-steps .step-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  color: var(--mist);
+}
+
+.wizard-steps .step-btn:disabled { cursor: not-allowed; opacity: .4; }
+
+.wizard-steps li.is-current .step-btn {
+  background: var(--tide);
+  border-color: var(--border-strong);
+  color: var(--ice);
+}
+
+.wizard-steps li.is-done .step-btn { color: var(--up); }
+
+.step-num {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  width: 22px;
+  flex: none;
+}
+
+.wizard-steps li.is-current .step-num,
+.wizard-steps li.is-done .step-num { color: inherit; }
+
+.step-name { font-size: 13.5px; }
+
+.step-check {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--up);
+  visibility: hidden;
+}
+
+.wizard-steps li.is-done .step-check { visibility: visible; }
+
+.wizard-panel { min-width: 0; }
+
+.step-card {
+  background: var(--tide);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px;
+}
+
+.step-card h2 { font-size: 1.4rem; color: var(--ice); }
+.step-card h2:focus { outline: none; }
+
+.hint { color: var(--mist); font-size: 13px; }
+
+.addr { font-size: 15px; letter-spacing: .02em; }
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--ice);
+  border-bottom: 1px solid var(--border);
+}
+
+.check-row:last-of-type { border-bottom: none; }
+
+.check-row input[type="checkbox"] {
+  margin-top: 2px;
+  width: 16px; height: 16px;
+  accent-color: var(--salmon);
+  flex: none;
+}
+
+.step-actions { margin-top: 24px; }
+
+.sign-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  margin-bottom: 16px;
+  background: rgba(var(--ink-rgb), .3);
+}
+
+.sign-card.is-signed { border-color: rgba(var(--up-rgb), .45); }
+
+.sign-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.sign-name { font-family: var(--font-mono); font-size: 14px; color: var(--ice); }
+
+.sign-check { display: none; color: var(--up); font-size: 13px; }
+.sign-card.is-signed .sign-check { display: inline; }
+
+.sign-state {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--mist);
+}
+
+.sign-card.is-signed .sign-state { color: var(--up); }
+
+.sign-desc { color: var(--mist); font-size: 13px; margin-bottom: 12px; }
+
+.sign-hash {
+  font-size: 12px;
+  color: var(--mist);
+  margin-top: 10px;
+  word-break: break-all;
+}
+
+.sign-error {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: var(--radius);
+  background: rgba(var(--down-rgb), .1);
+  border: 1px solid rgba(var(--down-rgb), .35);
+}
+
+.sign-error p { color: var(--down); font-size: 13px; margin: 0 0 8px; }
+
+.deposit-check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(var(--up-rgb), .35);
+  background: rgba(var(--up-rgb), .08);
+  margin-bottom: 24px;
+  font-size: 14px;
+}
+
+.check-icon {
+  color: var(--up);
+  font-family: var(--font-mono);
+  flex: none;
+}
+
+/* =======================================================================
+   畫面三：績效
+======================================================================= */
+
+.equity-hero {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  margin-bottom: 36px;
+}
+
+.equity-amount {
+  font-size: clamp(2.2rem, 6vw, 3rem);
+  font-weight: 300;
+  color: var(--ice);
+  margin: 4px 0 10px;
+}
+
+.equity-spark { text-align: right; }
+.equity-spark svg { display: block; width: 200px; height: 50px; }
+.spark-caption { font-size: 11px; color: var(--mist); margin-top: 4px; }
+
+.perf-boundary-wrap { margin-bottom: 40px; }
+
+.perf-boundary-wrap .boundary-panel dd.heartbeat { color: var(--mist); font-size: 13px; }
+
+/* ---------- 掛單梯 ---------- */
+.ladder-section { margin-bottom: 40px; }
+
+.ladder {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--tide);
+}
+
+.rung {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.ladder .rung:first-child { border-top: none; }
+
+.rung-bar {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  opacity: .14;
+}
+
+.rung-ask .rung-bar { background: var(--down); }
+.rung-bid .rung-bar { background: var(--up); }
+
+.rung-price, .rung-qty { position: relative; z-index: 1; }
+.rung-ask .rung-price { color: var(--down); }
+.rung-bid .rung-price { color: var(--up); }
+.rung-qty { color: var(--mist); }
+
+.ladder-mark {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--tide-2);
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.ladder-mark .mono { font-size: 16px; color: var(--ice); }
+.ladder-mark .label { font-size: 11px; color: var(--mist); letter-spacing: .1em; }
+
+/* ---------- 兩欄：成交 feed / 費用卡 ---------- */
+.two-col {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 20px;
+  align-items: start;
+}
+
+.trades-table { font-size: 13px; }
+.trades-table th {
+  text-align: left;
+  color: var(--mist);
+  font-weight: 400;
+  font-size: 11px;
+  letter-spacing: .06em;
+  padding: 0 8px 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.trades-table td {
+  padding: 8px 8px 8px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--ice);
+}
+.trades-table tr:last-child td { border-bottom: none; }
+
+.side-buy { color: var(--up); }
+.side-sell { color: var(--down); }
+.fee-cell { color: var(--mist); font-size: 12px; }
+
+.fee-total {
+  font-size: 2rem;
+  font-weight: 300;
+  color: var(--ice);
+  margin: 4px 0 2px;
+}
+
+.fee-caption { color: var(--mist); font-size: 12.5px; margin-bottom: 14px; }
+.fee-note { color: var(--mist); font-size: 12.5px; margin-bottom: 18px; }
+
+/* ---------- Responsive：邊界圖直疊（≤620px，比其他版面早收） ---------- */
+@media (max-width: 620px) {
+  .boundary { flex-direction: column; }
+  .boundary-link { flex: none; width: 100%; height: 64px; }
+  .boundary-divider { top: 50%; bottom: auto; left: 6px; right: 6px; border-left: none; border-top: 1px dashed rgba(var(--mist-rgb), .35); }
+  /* 絲線轉垂直：上面板底緣 → 下面板頂緣 */
+  .boundary-thread {
+    left: 50%; right: auto; top: 0; bottom: 0;
+    height: auto; width: 2px;
+    transform: translateX(-50%);
+    background: repeating-linear-gradient(180deg,
+      rgba(var(--mist-rgb), .55) 0 6px, transparent 6px 12px);
+  }
+  .boundary-thread-fill { width: 100%; height: calc(var(--thread-pct, 0) * 1%); }
+}
+
+/* ---------- Responsive ≤480px ---------- */
+@media (max-width: 480px) {
+  .wizard-layout { grid-template-columns: 1fr; }
+  .wizard-steps { display: flex; overflow-x: auto; gap: 6px; padding-bottom: 4px; }
+  .wizard-steps li { margin-bottom: 0; flex: none; }
+
+  .two-col { grid-template-columns: 1fr; }
+  .equity-hero { align-items: flex-start; }
+  .equity-spark { text-align: left; }
+
+  main.page { padding: 28px 14px 60px; }
+}
+
+/* ---------- Reduced motion：全動畫停用 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="proto-banner">原型・示意資料</div>
+
+<header class="app-header">
+  <div class="wordmark-mini">FILET</div>
+  <nav class="tabs" aria-label="畫面切換">
+    <a href="#login" class="tab" id="tab-login">登入</a>
+    <a href="#onboarding" class="tab" id="tab-onboarding">開通</a>
+    <a href="#performance" class="tab" id="tab-performance">績效</a>
+  </nav>
+</header>
+
+<p id="wizard-announcer" class="visually-hidden" role="status" aria-live="polite"></p>
+
+<main class="page">
+
+  <!-- =================================================================
+       畫面一：登入
+  ================================================================== -->
+  <section id="view-login" class="view">
+    <div class="narrow login-inner">
+      <h1 class="wordmark">FILET</h1>
+      <p class="subtitle">資金留在你自己的錢包。策略照樣執行。</p>
+
+      <div class="login-boundary-wrap">
+        <div class="boundary">
+          <div class="boundary-panel boundary-panel--wallet">
+            <p class="eyebrow">你的錢包</p>
+            <dl>
+              <dt>地址</dt>
+              <dd class="mono">尚未連接</dd>
+              <dt>餘額</dt>
+              <dd class="mono">—</dd>
+            </dl>
+          </div>
+          <div class="boundary-link">
+            <div class="boundary-divider" aria-hidden="true"></div>
+            <div class="boundary-thread" style="--thread-pct:0">
+              <span class="boundary-thread-fill"></span>
+            </div>
+            <span class="boundary-pill">尚未授權</span>
+          </div>
+          <div class="boundary-panel boundary-panel--engine">
+            <p class="eyebrow">Filet 引擎</p>
+            <dl>
+              <dt>策略</dt>
+              <dd class="nowrap">網格・多幣</dd>
+              <dt>狀態</dt>
+              <dd class="mono">待命</dd>
+            </dl>
+          </div>
+        </div>
+      </div>
+
+      <div class="cta-row">
+        <button type="button" class="btn btn-primary btn-block" id="cta-connect">連接錢包</button>
+      </div>
+
+      <p class="footnote">每筆成交收取 0.02%（2bp）builder fee，鏈上可驗。跟單有虧損風險，過往績效不代表未來結果。</p>
+    </div>
+  </section>
+
+  <!-- =================================================================
+       畫面二：開通 wizard
+  ================================================================== -->
+  <section id="view-onboarding" class="view" hidden>
+    <div class="onboard-boundary-wrap">
+      <div class="boundary" id="onboard-boundary" style="--thread-pct:0">
+        <div class="boundary-panel boundary-panel--wallet">
+          <p class="eyebrow">你的錢包</p>
+          <dl>
+            <dt>地址</dt>
+            <dd class="mono">0x5579…B5d</dd>
+          </dl>
+        </div>
+        <div class="boundary-link">
+          <div class="boundary-divider" aria-hidden="true"></div>
+          <div class="boundary-thread">
+            <span class="boundary-thread-fill"></span>
+          </div>
+          <span class="boundary-pill">尚未授權</span>
+        </div>
+        <div class="boundary-panel boundary-panel--engine">
+          <p class="eyebrow">Filet 引擎</p>
+          <dl>
+            <dt>策略</dt>
+            <dd class="nowrap">網格・多幣</dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+
+    <div class="wizard-layout">
+      <nav aria-label="開通步驟">
+        <ol class="wizard-steps">
+          <li data-step="1" class="is-current">
+            <button type="button" class="step-btn" aria-current="step">
+              <span class="step-num">01</span><span class="step-name">連接錢包</span><span class="step-check">✓</span>
+            </button>
+          </li>
+          <li data-step="2">
+            <button type="button" class="step-btn" disabled>
+              <span class="step-num">02</span><span class="step-name">風險確認</span><span class="step-check">✓</span>
+            </button>
+          </li>
+          <li data-step="3">
+            <button type="button" class="step-btn" disabled>
+              <span class="step-num">03</span><span class="step-name">簽署授權</span><span class="step-check">✓</span>
+            </button>
+          </li>
+          <li data-step="4">
+            <button type="button" class="step-btn" disabled>
+              <span class="step-num">04</span><span class="step-name">入金啟用</span><span class="step-check">✓</span>
+            </button>
+          </li>
+        </ol>
+      </nav>
+
+      <div class="wizard-panel">
+
+        <!-- Step 01 -->
+        <div class="step-card" data-step-content="1">
+          <p class="eyebrow">01・連接錢包</p>
+          <h2 tabindex="-1">錢包已連接</h2>
+          <p class="addr mono">0x5579…B5d</p>
+          <p class="hint">示意地址，原型不會實際連接錢包。</p>
+          <div class="step-actions">
+            <button type="button" class="btn btn-primary" id="step1-next">下一步</button>
+          </div>
+        </div>
+
+        <!-- Step 02 -->
+        <div class="step-card" data-step-content="2" hidden>
+          <p class="eyebrow">02・風險確認</p>
+          <h2 tabindex="-1">請確認以下事項</h2>
+          <label class="check-row">
+            <input type="checkbox" data-agree="0">
+            <span>我了解跟單有虧損風險</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" data-agree="1">
+            <span>我了解 Filet 僅持有下單權限，無法動用或提領我的資金</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" data-agree="2">
+            <span>我已閱讀費用說明（每筆成交 0.02%）</span>
+          </label>
+          <div class="step-actions">
+            <button type="button" class="btn btn-primary" id="step2-next" disabled>下一步</button>
+          </div>
+        </div>
+
+        <!-- Step 03 -->
+        <div class="step-card" data-step-content="3" hidden>
+          <p class="eyebrow">03・簽署授權</p>
+          <h2 tabindex="-1">簽署兩筆授權</h2>
+
+          <div class="sign-card" data-sign="agent">
+            <div class="sign-card-head">
+              <span class="sign-name">ApproveAgent</span>
+              <span class="sign-check">✓</span>
+              <span class="sign-state">待簽署</span>
+            </div>
+            <p class="sign-desc">授權 Filet trade-only agent key 代下單，無提款權限。</p>
+            <button type="button" class="btn btn-secondary" data-action="sign-agent">以錢包簽署</button>
+            <p class="sign-hash mono" hidden></p>
+            <div class="sign-error" hidden>
+              <p>簽署被拒絕——請在錢包中重試，或聯繫我們。</p>
+              <button type="button" class="btn btn-ghost" data-action="retry-agent">重試</button>
+            </div>
+          </div>
+
+          <div class="sign-card" data-sign="fee">
+            <div class="sign-card-head">
+              <span class="sign-name">ApproveBuilderFee</span>
+              <span class="sign-check">✓</span>
+              <span class="sign-state">待簽署</span>
+            </div>
+            <p class="sign-desc">授權 builder fee 上限 0.1%，每筆成交依實際費率（0.02%）扣收。</p>
+            <button type="button" class="btn btn-secondary" data-action="sign-fee">以錢包簽署</button>
+            <p class="sign-hash mono" hidden></p>
+          </div>
+
+          <div class="step-actions">
+            <button type="button" class="btn btn-primary" id="step3-next" disabled>下一步</button>
+          </div>
+        </div>
+
+        <!-- Step 04 -->
+        <div class="step-card" data-step-content="4" hidden>
+          <p class="eyebrow">04・入金啟用</p>
+          <h2 tabindex="-1">入金檢查</h2>
+          <div class="deposit-check">
+            <span class="check-icon">✓</span>
+            <span>偵測到 <span class="mono">1,000.00 USDC</span> ≥ 100 USDC</span>
+          </div>
+          <div class="step-actions">
+            <button type="button" class="btn btn-primary" id="step4-activate">啟用跟單</button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- =================================================================
+       畫面三：績效（唯讀）
+  ================================================================== -->
+  <section id="view-performance" class="view" hidden>
+
+    <div class="equity-hero">
+      <div class="equity-value">
+        <p class="eyebrow">帳戶權益</p>
+        <p class="equity-amount mono">$1,043.27</p>
+        <span class="chip chip-up">+1.2%・今日</span>
+      </div>
+      <div class="equity-spark">
+        <svg viewBox="0 0 200 50" role="img" aria-label="近 30 日權益走勢，示意資料，整體呈上升趨勢">
+          <polyline points="0.0,41.6 5.1,44.2 10.3,44.9 15.4,46.0 20.5,43.2 25.6,40.9 30.8,37.0 35.9,39.1 41.0,38.7 46.2,41.2 51.3,42.3 56.4,41.3 61.5,43.9 66.7,45.2 71.8,43.0 76.9,41.7 82.1,42.8 87.2,41.2 92.3,37.8 97.4,40.6 102.6,37.3 107.7,34.8 112.8,35.0 117.9,36.6 123.1,32.2 128.2,32.4 133.3,34.5 138.5,36.5 143.6,32.9 148.7,31.1 153.8,27.8 159.0,25.1 164.1,23.9 169.2,19.3 174.4,19.2 179.5,17.8 184.6,14.4 189.7,12.5 194.9,8.8 200.0,4.0"
+            fill="none" stroke="#57C7A4" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" />
+        </svg>
+        <p class="spark-caption">近 30 日</p>
+      </div>
+    </div>
+
+    <div class="perf-boundary-wrap">
+      <div class="boundary">
+        <div class="boundary-panel boundary-panel--wallet">
+          <p class="eyebrow">你的錢包</p>
+          <dl>
+            <dt>地址</dt>
+            <dd class="mono">0x5579…B5d</dd>
+            <dt>權益</dt>
+            <dd class="mono">$1,043.27</dd>
+            <dt>入金累計</dt>
+            <dd class="mono">$1,000.00</dd>
+          </dl>
+        </div>
+        <div class="boundary-link">
+          <div class="boundary-divider" aria-hidden="true"></div>
+          <div class="boundary-thread">
+            <span class="boundary-thread-fill" style="--thread-pct:100"></span>
+          </div>
+          <span class="boundary-pill is-active">trade-only・無提款權</span>
+        </div>
+        <div class="boundary-panel boundary-panel--engine">
+          <p class="eyebrow">Filet 引擎</p>
+          <dl>
+            <dt>策略</dt>
+            <dd class="nowrap">網格・ETH/BTC 多幣</dd>
+            <dt>心跳</dt>
+            <dd class="mono heartbeat">上次同步 42 秒前</dd>
+            <dt>回撤保護</dt>
+            <dd><span class="chip chip-up">正常</span></dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+
+    <section class="ladder-section">
+      <p class="eyebrow">掛單梯・跟隨 leader 0xf97a…ddd1</p>
+      <div class="ladder">
+        <div class="rung rung-ask"><span class="rung-bar" style="width:54.0%"></span><span class="rung-price mono">3,221.0</span><span class="rung-qty mono">0.842</span></div>
+        <div class="rung rung-ask"><span class="rung-bar" style="width:32.7%"></span><span class="rung-price mono">3,219.8</span><span class="rung-qty mono">0.510</span></div>
+        <div class="rung rung-ask"><span class="rung-bar" style="width:77.2%"></span><span class="rung-price mono">3,218.2</span><span class="rung-qty mono">1.204</span></div>
+        <div class="rung rung-ask"><span class="rung-bar" style="width:20.8%"></span><span class="rung-price mono">3,216.0</span><span class="rung-qty mono">0.325</span></div>
+        <div class="ladder-mark"><span class="mono">$3,214.5</span><span class="label">標記價</span></div>
+        <div class="rung rung-bid"><span class="rung-bar" style="width:26.3%"></span><span class="rung-price mono">3,213.0</span><span class="rung-qty mono">0.410</span></div>
+        <div class="rung rung-bid"><span class="rung-bar" style="width:62.8%"></span><span class="rung-price mono">3,211.4</span><span class="rung-qty mono">0.980</span></div>
+        <div class="rung rung-bid"><span class="rung-bar" style="width:17.6%"></span><span class="rung-price mono">3,209.5</span><span class="rung-qty mono">0.275</span></div>
+        <div class="rung rung-bid"><span class="rung-bar" style="width:100%"></span><span class="rung-price mono">3,207.0</span><span class="rung-qty mono">1.560</span></div>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <div class="panel trades-panel">
+        <p class="eyebrow">近期成交</p>
+        <table class="trades-table">
+          <thead>
+            <tr><th scope="col">時間</th><th scope="col">幣</th><th scope="col">方向</th><th scope="col">價格</th><th scope="col">數量</th><th scope="col">Fee</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="mono">14:32:07</td><td>ETH</td><td class="side-buy">買</td><td class="mono">3,214.5</td><td class="mono">0.120</td><td class="mono fee-cell">$0.006</td></tr>
+            <tr><td class="mono">14:29:51</td><td>ETH</td><td class="side-sell">賣</td><td class="mono">3,216.8</td><td class="mono">0.085</td><td class="mono fee-cell">$0.004</td></tr>
+            <tr><td class="mono">14:25:33</td><td>BTC</td><td class="side-buy">買</td><td class="mono">67,842.0</td><td class="mono">0.008</td><td class="mono fee-cell">$0.005</td></tr>
+            <tr><td class="mono">14:21:10</td><td>ETH</td><td class="side-sell">賣</td><td class="mono">3,211.2</td><td class="mono">0.150</td><td class="mono fee-cell">$0.007</td></tr>
+            <tr><td class="mono">14:16:47</td><td>BTC</td><td class="side-sell">賣</td><td class="mono">67,905.5</td><td class="mono">0.012</td><td class="mono fee-cell">$0.008</td></tr>
+            <tr><td class="mono">14:12:02</td><td>ETH</td><td class="side-buy">買</td><td class="mono">3,208.9</td><td class="mono">0.095</td><td class="mono fee-cell">$0.005</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel fee-panel">
+        <p class="eyebrow">費用透明</p>
+        <p class="fee-total mono">$1.84</p>
+        <p class="fee-caption">30 日累計 builder fee</p>
+        <p class="fee-note">費率 0.02%，逐筆鏈上可驗。</p>
+        <button type="button" class="btn btn-secondary" disabled>匯出對帳 CSV</button>
+      </div>
+    </div>
+
+  </section>
+
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var validViews = ["login", "onboarding", "performance"];
+
+  function currentViewId() {
+    var h = (location.hash || "#login").replace("#", "");
+    return validViews.indexOf(h) !== -1 ? h : "login";
+  }
+
+  function renderView() {
+    var id = currentViewId();
+    validViews.forEach(function (v) {
+      var sec = document.getElementById("view-" + v);
+      var tab = document.getElementById("tab-" + v);
+      var active = v === id;
+      if (sec) sec.hidden = !active;
+      if (tab) {
+        if (active) tab.setAttribute("aria-current", "page");
+        else tab.removeAttribute("aria-current");
+      }
+    });
+  }
+
+  window.addEventListener("hashchange", renderView);
+  renderView();
+
+  var ctaConnect = document.getElementById("cta-connect");
+  if (ctaConnect) {
+    ctaConnect.addEventListener("click", function () {
+      location.hash = "#onboarding";
+    });
+  }
+
+  /* ---------------- Wizard ---------------- */
+  var wizard = {
+    step: 1,
+    maxUnlocked: 1,
+    agree: [false, false, false],
+    signedAgent: false,
+    signedFee: false,
+    agentFailedOnce: false
+  };
+
+  var onboardBoundary = document.getElementById("onboard-boundary");
+  var announcer = document.getElementById("wizard-announcer");
+
+  function threadPercent() {
+    if (wizard.step < 3) return 0;
+    if (wizard.step === 3) {
+      var count = (wizard.signedAgent ? 1 : 0) + (wizard.signedFee ? 1 : 0);
+      return count * 50;
+    }
+    return 100;
+  }
+
+  function setThread(pct) {
+    onboardBoundary.style.setProperty("--thread-pct", pct);
+    var pill = onboardBoundary.querySelector(".boundary-pill");
+    if (pct >= 100) {
+      pill.textContent = "trade-only・無提款權";
+      pill.classList.add("is-active");
+    } else {
+      pill.textContent = "尚未授權";
+      pill.classList.remove("is-active");
+    }
+  }
+
+  function pulseThread() {
+    if (reduceMotion) return;
+    var threadEl = onboardBoundary.querySelector(".boundary-thread");
+    threadEl.classList.add("pulse");
+    window.setTimeout(function () { threadEl.classList.remove("pulse"); }, 600);
+  }
+
+  function updateWizardUI() {
+    document.querySelectorAll(".wizard-steps li").forEach(function (li) {
+      var n = Number(li.dataset.step);
+      var btn = li.querySelector("button");
+      li.classList.toggle("is-current", n === wizard.step);
+      li.classList.toggle("is-done", n < wizard.step);
+      btn.disabled = n > wizard.maxUnlocked;
+      if (n === wizard.step) btn.setAttribute("aria-current", "step");
+      else btn.removeAttribute("aria-current");
+    });
+    document.querySelectorAll(".step-card").forEach(function (card) {
+      card.hidden = Number(card.dataset.stepContent) !== wizard.step;
+    });
+    setThread(threadPercent());
+  }
+
+  function goStep(n) {
+    wizard.step = n;
+    wizard.maxUnlocked = Math.max(wizard.maxUnlocked, n);
+    updateWizardUI();
+    if (announcer) announcer.textContent = "目前步驟：" + n + " / 4";
+    var heading = document.querySelector('.step-card[data-step-content="' + n + '"] h2');
+    if (heading) heading.focus({ preventScroll: true });
+  }
+
+  document.querySelectorAll(".wizard-steps .step-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var n = Number(btn.closest("li").dataset.step);
+      if (n <= wizard.maxUnlocked) goStep(n);
+    });
+  });
+
+  var step1Next = document.getElementById("step1-next");
+  if (step1Next) step1Next.addEventListener("click", function () { goStep(2); });
+
+  var step2Next = document.getElementById("step2-next");
+  document.querySelectorAll("[data-agree]").forEach(function (input) {
+    input.addEventListener("change", function () {
+      wizard.agree[Number(input.dataset.agree)] = input.checked;
+      step2Next.disabled = !wizard.agree.every(Boolean);
+    });
+  });
+  if (step2Next) step2Next.addEventListener("click", function () { goStep(3); });
+
+  var agentCard = document.querySelector('[data-sign="agent"]');
+  var feeCard = document.querySelector('[data-sign="fee"]');
+  var step3Next = document.getElementById("step3-next");
+
+  function markSigned(card, hash) {
+    card.classList.add("is-signed");
+    card.querySelector(".sign-state").textContent = "已簽署";
+    var hashEl = card.querySelector(".sign-hash");
+    hashEl.textContent = hash;
+    hashEl.hidden = false;
+    card.querySelectorAll("button[data-action]").forEach(function (b) { b.hidden = true; });
+    var err = card.querySelector(".sign-error");
+    if (err) err.hidden = true;
+  }
+
+  function checkStep3Done() {
+    step3Next.disabled = !(wizard.signedAgent && wizard.signedFee);
+    setThread(threadPercent());
+    if (wizard.signedAgent && wizard.signedFee) pulseThread();
+  }
+
+  var agentSignBtn = agentCard.querySelector('[data-action="sign-agent"]');
+  var agentRetryBtn = agentCard.querySelector('[data-action="retry-agent"]');
+  var agentError = agentCard.querySelector(".sign-error");
+
+  agentSignBtn.addEventListener("click", function () {
+    wizard.agentFailedOnce = true;
+    agentError.hidden = false;
+    agentCard.querySelector(".sign-state").textContent = "被拒絕";
+    agentSignBtn.hidden = true;
+  });
+
+  agentRetryBtn.addEventListener("click", function () {
+    wizard.signedAgent = true;
+    markSigned(agentCard, "0x8f2ac19e7b0c4d6a3f5e1029b8d4c6e0a1f3b771e4");
+    checkStep3Done();
+  });
+
+  feeCard.querySelector('[data-action="sign-fee"]').addEventListener("click", function () {
+    wizard.signedFee = true;
+    markSigned(feeCard, "0x51d0a7c4f2e6b9038a7c1d5e4f0b2a6c8d9e2f9b08");
+    checkStep3Done();
+  });
+
+  if (step3Next) step3Next.addEventListener("click", function () { goStep(4); });
+
+  var step4Activate = document.getElementById("step4-activate");
+  if (step4Activate) {
+    step4Activate.addEventListener("click", function () {
+      wizard.activated = true;
+      updateWizardUI();
+      location.hash = "#performance";
+    });
+  }
+
+  updateWizardUI();
+})();
+</script>
+
+</body>
+</html>
