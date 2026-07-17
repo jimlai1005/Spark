@@ -50,20 +50,27 @@ def serve_forever(sock_path: str, ks: EnvFileKeyStore,
                 conn, _ = srv.accept()
             except socket.timeout:
                 continue
-            with conn:
-                if not authorize_peer(conn):
-                    logger.warning("keysvc 拒絕未授權連線")
-                    continue
-                line = conn.makefile("rb").readline()
-                try:
-                    req = decode_request(line)
-                    resp = handle_generate(req, ks)
-                except ValueError as e:
-                    resp = Response(ok=False, error=str(e))
-                except Exception:
-                    logger.exception("keysvc 處理連線失敗")
-                    resp = Response(ok=False, error="bad request")
-                conn.sendall(encode_response(resp))
+            # last-resort 連線層守衛：單一連線的任何失敗（含 client 提前斷線導致
+            # readline/sendall 拋 BrokenPipeError/ConnectionResetError）只丟棄該連線，
+            # 絕不逃出 while 迴圈害整個金鑰服務停擺（工程原則 3：大聲不吞、迴圈續命）。
+            try:
+                with conn:
+                    if not authorize_peer(conn):
+                        logger.warning("keysvc 拒絕未授權連線")
+                        continue
+                    line = conn.makefile("rb").readline()
+                    try:
+                        req = decode_request(line)
+                        resp = handle_generate(req, ks)
+                    except ValueError as e:
+                        resp = Response(ok=False, error=str(e))
+                    except Exception:
+                        logger.exception("keysvc 處理連線失敗")
+                        resp = Response(ok=False, error="bad request")
+                    conn.sendall(encode_response(resp))
+            except Exception:  # 靜態訊息，不帶 line/req/私鑰
+                logger.exception("keysvc 連線層失敗，丟棄此連線")
+                continue
     finally:
         srv.close()
         if p.exists():

@@ -5,7 +5,7 @@ import socket
 import struct
 from collections.abc import Callable
 
-_PEERCRED_FMT = "3i"  # pid, uid, gid
+_PEERCRED_FMT = "3I"  # pid, uid, gid（unsigned：uid>2^31 才不會被解成負數）
 # socket.SO_PEERCRED 只存在於 Linux——macOS 沒有這個常數，連 import 都不會有它。
 # 用 getattr 保留 Linux 上的真實值，macOS 上退回硬編的 Linux 常數（17），
 # 讓本模組在 macOS 開發機上仍可 import／被 mock 測試（syscall 本身仍只在 Linux 生效）。
