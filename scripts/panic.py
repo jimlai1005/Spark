@@ -1,16 +1,25 @@
 """緊急手動 kill switch：撤全部掛單 → reduce-only 全平 → 寫 ARM_FILE → 告警。
 
 用法: SPARK_ACCOUNT_ID=.. SPARK_USER_ADDR=0x.. SPARK_BUILDER_ADDR=0x.. \\
-      [SPARK_NETWORK=testnet] uv run python -m scripts.panic [--yes]
+      [SPARK_NETWORK=testnet] [FILET_STATE_DIR=..] uv run python -m scripts.panic [--yes]
 
 - 預設 **dry-run**：只讀取並列印將執行的動作（撤單張數、各部位平倉方向與全量），
   不做任何寫入。加 `--yes` 才真的執行 trip 全流程。
 - SPARK_NETWORK 預設 testnet，但**不擋 mainnet**——這是緊急工具，主網出事時必須
   能直接對主網執行；要打主網請顯式 SPARK_NETWORK=mainnet。
-- re-arm＝人工刪 `var/copytrade/killswitch.tripped`（相對專案根）；本腳本不提供刪除路徑。
+- 狀態根：FILET_STATE_DIR（缺省＝repo 根，與 run_copytrade.py 同慣例，保留單實例
+  行為）。多 follower 部署時本檔仍是「單一 follower」CLI——請指定該 follower 專屬
+  的狀態根；跨 follower 一次性平倉見 scripts/panic_all.py（其 state root 由
+  FILET_STATE_BASE/<account_id> 推導，per-follower 強制隔離，不經本旗標）。
+- re-arm＝人工刪 ARM_FILE（相對狀態根 var/copytrade/killswitch.tripped）；本腳本
+  不提供刪除路徑。
 - import 階段不建 Info/Exchange（不打網路）；缺環境變數印用法退出非零。
 - `_AdapterExecutor` 是 Task 12 正式 ActionExecutor 就緒前的薄轉接（只實作 trip 需要的
   三個方法，builder/slippage/signer 建構時注入）；Task 12 完成後由 ActionExecutor 取代。
+- `run_single_follower` 是單一帳號 panic 全流程（dry 或 --yes）的可複用核心，本檔
+  main() 與 scripts/panic_all.py（Task 8 全域 panic）共用——state_root 一律由呼叫端
+  算好傳入，本函式不自行猜根（⭐ load-bearing：跨 follower 呼叫端絕不可傳同一個根，
+  否則 ARM 落錯地方、被引擎下個 cycle 讀不到而抹掉緊急平倉）。
 """
 import os
 import sys
@@ -19,9 +28,16 @@ from pathlib import Path
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
-from spark.copytrade.killswitch import evaluate, is_tripped, plan_close_actions, trip
+from spark.copytrade.killswitch import (
+    FlattenReport,
+    evaluate,
+    is_tripped,
+    plan_close_actions,
+    trip,
+)
 from spark.copytrade.notifier import Notifier
 from spark.exchange.base import BuilderCode, OpenOrder, OrderResult, Position, Signer
+from spark.keystore.base import KeyStore
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,7 +48,16 @@ USAGE = (
 )
 
 
-def _exit_code(report) -> int:
+def resolve_state_dir() -> Path:
+    """狀態根：讀 env FILET_STATE_DIR，缺省回 _REPO_ROOT（與 run_copytrade.py
+    resolve_state_dir() 同慣例、保留單實例行為）。本檔持有自己模組層級的
+    `_REPO_ROOT`（獨立於 run_copytrade 的同名常數），讓既有測試對
+    `panic._REPO_ROOT` 的 monkeypatch 繼續生效。"""
+    raw = os.environ.get("FILET_STATE_DIR")
+    return Path(raw) if raw else _REPO_ROOT
+
+
+def _exit_code(report: FlattenReport) -> int:
     """退出碼＝殘留暴險訊號（純函式，供測試）：平倉失敗**或**掛單清單未知
     （orders_not_cancelled——一張未撤，殘留掛單可能繼續成交）都算未乾淨收場 → 1。"""
     return 1 if (report.failures or report.orders_not_cancelled) else 0
@@ -99,6 +124,72 @@ class _AdapterExecutor:
             self._signer, coin, is_buy, size, self._slippage, self._builder)
 
 
+def run_single_follower(
+    *,
+    network: str,
+    account_id: str,
+    user_addr: str,
+    builder_addr: str,
+    execute: bool,
+    state_root: Path,
+    copy_settings: CopySettings,
+    notifier: Notifier,
+    keystore: KeyStore | None = None,
+) -> tuple[list[str] | None, FlattenReport | None]:
+    """單一帳號 panic 全流程——本檔 main()（單 follower CLI）與 scripts/panic_all.py
+    （跨 follower 全域 panic）共用的可複用核心。
+
+    dry（execute=False）：唯讀 adapter 列印計畫，回 (plan_lines, None)，零寫入、零 ARM。
+        keystore 不需要（唯讀不碰 Keychain/envfile）。
+    --yes（execute=True）：keystore 必填，建 agent signer → 真 adapter → trip()，
+        回 (None, FlattenReport)。
+
+    ⭐ state_root 決定 ARM/alerts 落點，由**呼叫端**算好傳入，本函式不自行猜根：
+    - panic.py 單一 follower CLI：resolve_state_dir()（FILET_STATE_DIR，缺省 repo 根）。
+    - panic_all.py 跨 follower：FILET_STATE_BASE/<account_id>（每 follower 各自一份，
+      絕不可共用單一根——否則 ARM 落錯地方，引擎下個 cycle is_tripped()=False，
+      緊急平倉被一個 cycle 抹掉，違反 killswitch lock-first 設計）。
+
+    網路依賴（Info/Exchange/HyperliquidAdapter）延後到函式內 import（維持 import
+    階段零網路的既有慣例，供 panic_all.py 批次呼叫多次時仍保持該保證）。
+    """
+    if execute and keystore is None:
+        raise ValueError("run_single_follower(execute=True) 需要 keystore 才能取得 agent signer")
+
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+
+    from spark.exchange.hyperliquid import HyperliquidAdapter
+
+    settings = Settings(builder_address=builder_addr, account_id=account_id, network=network)
+    info = Info(settings.api_url, skip_ws=True)
+
+    if not execute:
+        # dry-run：唯讀 adapter（exchange=None 結構性保證零寫入），列印計畫後回傳。
+        reader = HyperliquidAdapter(network, info=info, exchange=None)
+        open_orders = reader.get_open_orders(user_addr)
+        positions = reader.get_positions(user_addr)
+        return _plan_actions(open_orders, positions), None
+
+    # --yes：真執行 trip 全流程。
+    agent = keystore.get_agent_signer(account_id)
+    adapter = HyperliquidAdapter(
+        network, info=info,
+        exchange=Exchange(agent, settings.api_url, account_address=user_addr))
+    executor = _AdapterExecutor(
+        adapter, agent, user_addr,
+        builder=BuilderCode(b=builder_addr, f=settings.f),
+        slippage=copy_settings.slippage)
+
+    ev = adapter.get_equity_view(user_addr)  # current/peak 同源（工程原則 1）
+    # evaluate（非直呼 check_drawdown）：peak<=0 的 degenerate warn 結構性內建。
+    # 手動 panic 不看 breached——照常執行；status 數字如實寫進 ARM_FILE。
+    status = evaluate(ev, copy_settings, notifier)
+    positions = {p.coin: p for p in adapter.get_positions(user_addr)}
+    report = trip(executor, positions, notifier, state_root, status)
+    return None, report
+
+
 def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
     execute = "--yes" in args
@@ -110,56 +201,38 @@ def main(argv: list[str] | None = None) -> None:
         print(f"缺少環境變數: {', '.join(missing)}")
         raise SystemExit(2)
 
-    # 網路依賴延後到這裡才 import/建構（import 階段零網路）。
-    from hyperliquid.exchange import Exchange
-    from hyperliquid.info import Info
-
-    from spark.exchange.hyperliquid import HyperliquidAdapter
-    from spark.keystore.keychain import MacKeychainBackend
-
     network = os.environ.get("SPARK_NETWORK", "testnet")
     account_id = os.environ["SPARK_ACCOUNT_ID"]
     user_addr = os.environ["SPARK_USER_ADDR"]
-    settings = Settings(builder_address=os.environ["SPARK_BUILDER_ADDR"],
-                        account_id=account_id, network=network)
+    builder_addr = os.environ["SPARK_BUILDER_ADDR"]
     copy_settings = CopySettings.from_env()
-    info = Info(settings.api_url, skip_ws=True)
+    state_root = resolve_state_dir()
+    notifier = _StdoutNotifier()
 
-    if is_tripped(_REPO_ROOT):
-        print(f"注意：kill switch 已 tripped（{_REPO_ROOT / 'var/copytrade/killswitch.tripped'}）。"
+    if is_tripped(state_root):
+        print(f"注意：kill switch 已 tripped（{state_root / 'var/copytrade/killswitch.tripped'}）。"
               f"panic 可重複執行以再次撤單/平倉。")
 
     if not execute:
-        # dry-run：唯讀 adapter（exchange=None 結構性保證零寫入），列印計畫後退出。
-        reader = HyperliquidAdapter(network, info=info, exchange=None)
-        open_orders = reader.get_open_orders(user_addr)
-        positions = reader.get_positions(user_addr)
+        plan_lines, _ = run_single_follower(
+            network=network, account_id=account_id, user_addr=user_addr,
+            builder_addr=builder_addr, execute=False, state_root=state_root,
+            copy_settings=copy_settings, notifier=notifier)
         print(f"[DRY-RUN] network={network} user={user_addr}")
-        for line in _plan_actions(open_orders, positions):
+        for line in plan_lines:
             print(line)
         print("以上僅為計畫，未執行任何動作。加 --yes 才會真的撤單/平倉/寫 ARM_FILE。")
         return
 
-    # --yes：真執行 trip 全流程。
+    # --yes：建 keystore 後交給 run_single_follower 執行全流程。
+    from spark.keystore.keychain import MacKeychainBackend
     ks = MacKeychainBackend()
-    agent = ks.get_agent_signer(account_id)
-    adapter = HyperliquidAdapter(
-        network, info=info,
-        exchange=Exchange(agent, settings.api_url, account_address=user_addr))
-    executor = _AdapterExecutor(
-        adapter, agent, user_addr,
-        builder=BuilderCode(b=settings.builder_address, f=settings.f),
-        slippage=copy_settings.slippage)
-    notifier = _StdoutNotifier()
-
-    ev = adapter.get_equity_view(user_addr)  # current/peak 同源（工程原則 1）
-    # evaluate（非直呼 check_drawdown）：peak<=0 的 degenerate warn 結構性內建。
-    # 手動 panic 不看 breached——照常執行；status 數字如實寫進 ARM_FILE。
-    status = evaluate(ev, copy_settings, notifier)
-    positions = {p.coin: p for p in adapter.get_positions(user_addr)}
 
     print(f"network={network} user={user_addr} 開始執行 kill switch trip ...")
-    report = trip(executor, positions, notifier, _REPO_ROOT, status)
+    _, report = run_single_follower(
+        network=network, account_id=account_id, user_addr=user_addr,
+        builder_addr=builder_addr, execute=True, state_root=state_root,
+        copy_settings=copy_settings, notifier=notifier, keystore=ks)
     print(f"完成：撤單 {report.cancelled} 張"
           f"{'（掛單清單未知，一張未撤）' if report.orders_not_cancelled else ''}｜"
           f"平倉成功 {list(report.closed) or '無'}｜"
