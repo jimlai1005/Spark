@@ -1,0 +1,30 @@
+[Unit]
+Description=Filet copytrade follower (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=filet-engine
+Group=filet-engine
+EnvironmentFile=/etc/filet/followers/%i.env
+WorkingDirectory=/opt/filet/spark
+# 每 follower 獨立狀態根（修 kill-switch 連坐）
+Environment=FILET_STATE_DIR=/opt/filet/state/%i
+Environment=FILET_KEYSTORE=envfile
+Environment=FILET_KEYS_DIR=/etc/filet/keys
+ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_copytrade
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# 引擎只讀 agent key（/etc/filet/keys 於 ProtectSystem=strict 下本就唯讀，不列入 RW）；
+# 只有狀態目錄需要寫入
+ReadWritePaths=/opt/filet/state/%i
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
