@@ -51,7 +51,7 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -85,12 +85,23 @@ def fetch_leaderboard(network: str = "mainnet", *, timeout: int = 30) -> list[di
     return payload.get("leaderboardRows", [])
 
 
+def _to_finite_decimal(field: str, raw: Any) -> Decimal:
+    """Decimal 化並拒收非 finite 值。`Decimal(str("NaN"))` / `Decimal(str("Infinity"))`
+    是**合法**建構、不拋例外，卻會在後續排序比較時觸發 InvalidOperation 崩潰整批——
+    故在來源處就把 NaN/Inf 當「格式錯誤」擋下（raise ValueError），走同一條「大聲跳過」路徑。"""
+    value = Decimal(str(raw))
+    if not value.is_finite():
+        raise ValueError(f"{field} 非 finite（NaN/Inf）: {raw!r}")
+    return value
+
+
 def _extract_window_pnl(row: dict, window: str) -> Decimal:
     """從 windowPerformances（[[name, {pnl,...}], ...] 形狀）挖出指定窗口的 pnl。
-    查無該窗口 → KeyError（由呼叫端統一當「缺欄位」處理，大聲跳過並計數）。"""
+    查無該窗口 → KeyError（由呼叫端統一當「缺欄位」處理，大聲跳過並計數）。
+    pnl 非 finite（NaN/Inf）→ ValueError（同上，統一跳過）。"""
     for entry in row.get("windowPerformances", []):
         if isinstance(entry, list) and len(entry) == 2 and entry[0] == window:
-            return Decimal(str(entry[1]["pnl"]))
+            return _to_finite_decimal(f"windowPerformances[{window}].pnl", entry[1]["pnl"])
     raise KeyError(f"windowPerformances 缺 {window!r} 區間")
 
 
@@ -112,9 +123,9 @@ def snapshot_from_rows(rows: list[dict], day: date, *, window: str = DEFAULT_WIN
             address = row["ethAddress"]
             if not isinstance(address, str) or not address:
                 raise ValueError(f"ethAddress 不是合法字串: {address!r}")
-            account_value = Decimal(str(row["accountValue"]))
+            account_value = _to_finite_decimal("accountValue", row["accountValue"])
             pnl = _extract_window_pnl(row, window)
-        except (KeyError, TypeError, ValueError, ArithmeticError) as e:
+        except (KeyError, TypeError, ValueError, InvalidOperation, ArithmeticError) as e:
             skipped += 1
             logger.warning("leaderboard row[%d] 缺欄位或格式錯誤，跳過: %s", i, e)
             continue

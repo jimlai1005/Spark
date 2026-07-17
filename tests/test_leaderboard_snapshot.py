@@ -72,6 +72,62 @@ def test_snapshot_from_rows_skips_missing_field_loudly(caplog):
     assert "跳過" in caplog.text
 
 
+def test_snapshot_from_rows_skips_nan_pnl_without_crashing_batch(caplog):
+    """pnl='NaN' 是合法 Decimal 建構、不拋例外，卻會在排序比較時觸發
+    InvalidOperation 崩潰整批——必須在來源處當格式錯誤跳過，其餘正常 row 照常輸出。"""
+    rows = [
+        _row("0xaaa", "1000", "10"),
+        _row("0xnan", "500", "NaN"),
+        _row("0xbbb", "2000", "20"),
+    ]
+    with caplog.at_level(logging.WARNING):
+        snap = lb.snapshot_from_rows(rows, date(2026, 7, 17))
+    assert snap["skipped_count"] == 1
+    assert snap["row_count"] == 2
+    assert [r["address"] for r in snap["rows"]] == ["0xbbb", "0xaaa"]
+    assert "0xnan" not in [r["address"] for r in snap["rows"]]
+    assert "非 finite" in caplog.text
+
+
+def test_snapshot_from_rows_skips_infinity_account_value(caplog):
+    """account_value='Infinity' 同樣是合法建構的非 finite 值 → 跳過。"""
+    rows = [_row("0xaaa", "1000", "10"), _row("0xinf", "Infinity", "5")]
+    with caplog.at_level(logging.WARNING):
+        snap = lb.snapshot_from_rows(rows, date(2026, 7, 17))
+    assert snap["skipped_count"] == 1
+    assert snap["row_count"] == 1
+    assert snap["rows"][0]["address"] == "0xaaa"
+
+
+def test_snapshot_from_rows_skips_non_numeric_pnl_string(caplog):
+    """pnl 是非數字字串（Decimal 建構就拋 InvalidOperation）→ 跳過，不炸。"""
+    rows = [_row("0xaaa", "1000", "10"), _row("0xbad", "500", "not-a-number")]
+    with caplog.at_level(logging.WARNING):
+        snap = lb.snapshot_from_rows(rows, date(2026, 7, 17))
+    assert snap["skipped_count"] == 1
+    assert snap["row_count"] == 1
+    assert snap["rows"][0]["address"] == "0xaaa"
+
+
+def test_snapshot_from_rows_skips_row_missing_the_day_window(caplog):
+    """windowPerformances 存在但缺 'day' 窗（只有 week/month）→ 跳過。"""
+    row_no_day = {
+        "ethAddress": "0xnoday",
+        "accountValue": "1000",
+        "windowPerformances": [
+            ["week", {"pnl": "1", "roi": "0", "vlm": "0"}],
+            ["month", {"pnl": "2", "roi": "0", "vlm": "0"}],
+        ],
+    }
+    rows = [_row("0xaaa", "1000", "10"), row_no_day]
+    with caplog.at_level(logging.WARNING):
+        snap = lb.snapshot_from_rows(rows, date(2026, 7, 17))
+    assert snap["skipped_count"] == 1
+    assert snap["row_count"] == 1
+    assert snap["rows"][0]["address"] == "0xaaa"
+    assert "缺 'day'" in caplog.text
+
+
 def test_append_snapshot_writes_expected_path_and_content(tmp_path):
     snap = lb.snapshot_from_rows([_row("0xaaa", "1000", "10")], date(2026, 7, 17))
     out_path = lb.append_snapshot(tmp_path, snap)
