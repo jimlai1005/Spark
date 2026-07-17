@@ -14,6 +14,37 @@
 
 ---
 
+## 執行狀態（2026-07-17 完成）
+
+**全 14 task + 2 追加修正實作 + fresh-context 雙審完成；`uv run pytest -q` = 662 passed, 2 deselected；ruff clean。** 分支 `feat/m2-publicapi`（自 `feat/m2-keyservice` 分出），未 push、未動 main。opus 兩輪把關：計畫級對抗審（REVISE_THEN_GO→修訂）＋ 完工後整體非託管總審（A-F 不變量成立，2 必修已修）。
+
+| Task | commit | 備註 |
+|---|---|---|
+| 0 依賴+基線 | `39341cc` | uv.lock gitignored（repo 慣例）|
+| 1 keysvc address op ⭐ | `69bf0ff` | spec deviation：唯讀擴充（desync 自癒），待使用者追認 |
+| 2 config/identity | `4a59ff8` | 常數單一來源（`is` 斷言）|
+| 3 SIWE ⭐ | `c18a140` | EIP-4361 對官方 ABNF 逐項驗過 |
+| 4 ApiStore ⭐ | `dc18173` | nonce 原子單次使用 |
+| 5 typed-data builder ⭐ | `6cadcfc` | 欄位逐字對 SDK；round-trip pin |
+| 6 HLGateway | `4215193` | opus I1 落地：httpx→內建型別轉譯 |
+| 7 app+auth ⭐ | `701f63f` | VerifyBody 無 address 欄（結構性）|
+| 8 agent+status | `f642bff` | opus I2 落地：desync 自癒 |
+| 9 payload ⭐ | `a8f7d1f` | 前端直送；submit 端點 404 測試 |
+| 10 verify+pending+admin | `7961a61` | pending 原子冪等；admin 白名單 |
+| 11 activate CLI ⭐ | `0524d5e` | builder pin 核對；fail-fast 重讀 |
+| 12 入口+systemd | `5b3b923` | 127.0.0.1 only |
+| 追加：502 統一轉譯 | `98fa258` | 兩位 reviewer 獨立點名的系統性缺口 |
+| 13 端到端 ⭐ | `147e5b7` | 真 SIWE+真 keysvc+r/s/v 表面掃描+desync 契約幕 |
+| 追加：keysvc client 邊界 | `6a770fe` | opus 總審 2 必修：截斷回應→transient；settimeout 10s |
+
+**opus 總審結論**：非託管保證 A-F（主鑰不進後端／agent 私鑰只在 keysvc／後端不經手授權簽名／session 結構性隔離／nonce 原子／manifest 只由人工 CLI 寫）**結構上成立且有測試背書**。
+
+**觀察項（非阻擋，記錄）**：pending.json 外部竄改損毀時 load 直接炸＝大聲安全失敗（可接受）；nonce/session 無 reaper（磁碟成長維運項）；CORS 依賴部署反代同源（移交部署計畫）；r/s/v 型別掃描偏窄但由 gateway 無 /exchange 出口 backstop；gateway 寫入面黑名單掃描＋/info 白名單雙測互補；activate 重讀驗證不回滾（docstring 已修辭精準）。
+
+**移交前端計畫**：v 正規化（0/1→27/28）、簽後立即直送 HL /exchange、payload 組裝、（可選）前端側 recover 預驗。**移交部署計畫**：反代 TLS+同源、filet-api 讀不到 keys 的實機驗收、`REPLACE_WITH_FILET_API_UID` 填值。
+
+---
+
 ## 全域紅線（每個任務的實作者與 reviewer 都先讀）
 
 1. ⭐ **主鑰/助記詞永不進後端**：任何端點、任何欄位、任何 log 都不收不存主鑰或助記詞。後端只經手：SIWE 簽名、EIP-712 typed data（無私鑰即可建）、r/s/v 簽名值。
