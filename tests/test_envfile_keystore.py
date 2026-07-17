@@ -49,3 +49,21 @@ def test_private_key_never_in_exception(tmp_path):
         ks.get_agent_signer("acct1")
     except PermissionError as e:
         assert _PK not in str(e) and _PK[2:] not in str(e)
+
+
+# ── M2 Task 10：account_id 路徑安全縱深防禦 ──────────────────────────────
+
+def test_get_agent_signer_rejects_unsafe_account_id_no_filesystem_touch(tmp_path):
+    """繞過 registry 直接呼叫（縱深防禦）：不合法 account_id → ValueError（非
+    KeyError），且不得觸及檔案系統（root 內不應多出任何東西）。"""
+    ks = EnvFileKeyStore(tmp_path)
+    with pytest.raises(ValueError):
+        ks.get_agent_signer("../evil")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_import_agent_key_rejects_unsafe_account_id_no_filesystem_touch(tmp_path):
+    ks = EnvFileKeyStore(tmp_path)
+    with pytest.raises(ValueError):
+        ks.import_agent_key("../evil", _PK)
+    assert list(tmp_path.iterdir()) == []

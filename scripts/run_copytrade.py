@@ -53,9 +53,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def resolve_state_dir() -> Path:
     """狀態根：讀 env FILET_STATE_DIR，缺省回 _REPO_ROOT（保留 M1 單實例行為）。
-    kill switch ARM 檔／alerts.log／shadow JSONL 全部掛在此根之下（per-follower 隔離）。"""
+    kill switch ARM 檔／alerts.log／shadow JSONL 全部掛在此根之下（per-follower 隔離）。
+    相對路徑 → .resolve() 成絕對（T4 reviewer minor：避免 CWD 依賴——同一個相對路徑
+    在不同啟動目錄下會靜默指向不同狀態根，讓 kill switch ARM 檔悄悄失聯）。"""
     raw = os.environ.get("FILET_STATE_DIR")
-    return Path(raw) if raw else _REPO_ROOT
+    return Path(raw).resolve() if raw else _REPO_ROOT
 
 
 def select_keystore() -> KeyStore:

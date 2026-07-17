@@ -415,6 +415,23 @@ def test_panic_plan_actions_is_pure_and_lists_all_actions():
     assert "DOGE" not in text
 
 
+def test_panic_resolve_state_dir_env_override_direct(monkeypatch, tmp_path):
+    """M2 Task 10（T8 sonnet minor）：panic.resolve_state_dir() 讀 FILET_STATE_DIR
+    env 覆寫路徑的直接測試——既有測試（panic_env fixture）都是 monkeypatch
+    panic._REPO_ROOT 繞過 env 分支，這裡直測 env 分支本身。"""
+    import scripts.panic as panic
+
+    monkeypatch.setenv("FILET_STATE_DIR", str(tmp_path))
+    assert panic.resolve_state_dir() == tmp_path
+
+
+def test_panic_resolve_state_dir_defaults_to_repo_root(monkeypatch):
+    import scripts.panic as panic
+
+    monkeypatch.delenv("FILET_STATE_DIR", raising=False)
+    assert panic.resolve_state_dir() == panic._REPO_ROOT
+
+
 # ── 6b. panic main()：monkeypatch 注入 fake，dry / --yes 兩分支 ──────
 
 class _FakePanicAdapter:

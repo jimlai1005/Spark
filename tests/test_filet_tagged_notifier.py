@@ -57,3 +57,15 @@ def test_different_followers_isolated_dedup():
     assert inner.records[0][3] == "alice:key1"  # alice 的 key 在 alice 命名空間
     assert inner.records[1][3] == "bob:key1"    # bob 的 key 在 bob 命名空間
     # 即使 raw key 相同，但 dedup_key 不同（alice:key1 vs bob:key1）所以不去重
+
+
+def test_dedup_key_empty_string_namespaced_not_swallowed():
+    """Test 5（T3 reviewer minor）：dedup_key="" 是有意義但空的 key，應命名空間化
+    為 "<tag>:" 而非被 falsy 判斷吞成 None（與 TelegramNotifier 的 is not None
+    慣例一致）。"""
+    inner = RecordingNotifier()
+    notifier = TaggedNotifier(inner, "alice")
+
+    notifier.info("cat", "msg", dedup_key="")
+
+    assert inner.records[0][3] == "alice:"

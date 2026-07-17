@@ -22,6 +22,17 @@ def test_resolve_state_dir_env_override(monkeypatch, tmp_path):
     assert rc.resolve_state_dir() == tmp_path
 
 
+def test_resolve_state_dir_relative_env_becomes_absolute(monkeypatch, tmp_path):
+    """T4 reviewer minor：相對路徑 FILET_STATE_DIR 必須 .resolve() 成絕對——否則
+    同一相對路徑在不同啟動目錄（CWD）下會靜默指向不同狀態根，kill switch ARM
+    檔可能因此失聯。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FILET_STATE_DIR", "relative/sub")
+    result = rc.resolve_state_dir()
+    assert result.is_absolute()
+    assert result == (tmp_path / "relative" / "sub").resolve()
+
+
 def test_two_state_dirs_isolate_killswitch(tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
     (a / ARM_FILE_RELPATH).parent.mkdir(parents=True)

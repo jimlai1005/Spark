@@ -361,9 +361,16 @@ def test_panic_all_arm_isolation_between_followers(fake_stack):
 @pytest.mark.parametrize("evil_id", ["../bob", "/etc/x", "..", "alice/../bob"])
 def test_panic_all_path_traversal_rejected_no_arm_outside_base(fake_stack, capsys, evil_id):
     """account_id 含 ../、絕對路徑、..、或 X/../Y 互消（opus re-review 追加的
-    「base 內兄弟目錄誤導」）→ _state_root_for 使狀態根落在 base 外或別的 follower
-    目錄：必須拒絕該 follower（不寫任何 ARM）、critical、退出碼非 0；同 manifest 的
-    合法 follower（alice）仍照常平倉。resolve 目標不得出現任何 ARM 檔。"""
+    「base 內兄弟目錄誤導」）→ 兩層防線任一擋下都必須拒絕該 follower（不寫任何
+    ARM）、critical、退出碼非 0；同 manifest 的合法 follower（alice）仍照常平倉；
+    resolve 目標不得出現任何 ARM 檔。
+
+    M2 Task 10 起，這些字元（`/`、`..`）先在 manifest load boundary 被
+    `validate_account_id` 擋下（`load_followers_tolerant` 收進 errors、不再進
+    refs）——比 `_state_root_for` 的 resolve-後檢查更早一層，兩者是縱深防禦的
+    兩道獨立防線，本測試斷言外層（load boundary）攔截的訊息與效果；
+    `_state_root_for` 本身仍是給繞過 followers.py 直呼叫的呼叫端的第二道防線
+    （見該函式 docstring：「不倚賴上游驗證」）。"""
     manifest = _write_manifest(fake_stack.tmp_path, [
         _entry(evil_id, _BOB_ADDR, "mainnet"),
         _entry("alice", _ALICE_ADDR, "mainnet"),
@@ -377,7 +384,7 @@ def test_panic_all_path_traversal_rejected_no_arm_outside_base(fake_stack, capsy
     assert ei.value.code != 0, "路徑穿越的 follower 必須拉高退出碼（不得假成功 exit 0）"
 
     out = capsys.readouterr().out
-    assert "[CRITICAL]" in out and "路徑穿越" in out
+    assert "[CRITICAL]" in out and "完全未被平倉" in out
     # resolve 目標（base 外的兄弟/絕對路徑，或 base 內被誤導的別人目錄）不得被寫 ARM。
     escaped = (Path(str(fake_stack.state_base)) / evil_id).resolve()
     assert not (escaped / ARM_FILE_RELPATH).exists(), "穿越/誤導目標不得被寫入 ARM"
@@ -389,7 +396,10 @@ def test_panic_all_sibling_misdirection_isolated_from_real_follower(fake_stack, 
     """opus re-review 追加：惡意 entry account_id="alice/../bob" resolve 成
     base/bob，parent 檢查通過但會與**真正的** bob follower 共寫同一 killswitch.tripped。
     守衛須擋下惡意 entry（此 manifest 無真 bob）→ base/bob 完全不被寫 ARM，證明
-    兄弟目錄誤導無法冒充/污染任何 follower 的狀態；合法 alice 照常平倉、退出碼非 0。"""
+    兄弟目錄誤導無法冒充/污染任何 follower 的狀態；合法 alice 照常平倉、退出碼非 0。
+
+    M2 Task 10 起，`alice/../bob` 含 `/` 先被 `validate_account_id`（manifest load
+    boundary）擋下，訊息與效果同上一測試——見該測試的 M2 Task 10 說明。"""
     manifest = _write_manifest(fake_stack.tmp_path, [
         _entry("alice/../bob", _BOB_ADDR, "mainnet"),  # 惡意：想寫進 base/bob
         _entry("alice", _ALICE_ADDR, "mainnet"),
@@ -403,7 +413,7 @@ def test_panic_all_sibling_misdirection_isolated_from_real_follower(fake_stack, 
     assert ei.value.code != 0
 
     out = capsys.readouterr().out
-    assert "[CRITICAL]" in out and "路徑穿越" in out
+    assert "[CRITICAL]" in out and "完全未被平倉" in out
     # base/bob（惡意 entry 的 resolve 目標）不得被建立 ARM——與真 bob 目錄隔離。
     assert not _arm_path(fake_stack.state_base, "bob").exists(), \
         "兄弟目錄誤導不得寫進 base/bob（真 bob 若存在也不得被此惡意 entry 污染）"

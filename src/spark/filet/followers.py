@@ -3,11 +3,13 @@ Follower 登錄：manifest（JSON）→ list[FollowerRef]。
 FollowerRef 是跨 follower 工具（匯總、全域 panic）用的最小身分；
 per-follower 完整跟單參數走各自進程的 env（CopySettings.from_env）。"""
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 _NETWORKS = {"testnet", "mainnet"}
 _HEX = set("0123456789abcdefABCDEF")
+_ACCOUNT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,19 @@ class FollowerRef:
     label: str = ""
 
 
+def validate_account_id(s: str) -> None:
+    """account_id 縱深防禦（M2 Task 10）：僅允許 `[a-zA-Z0-9_-]`、長度 1-64。
+
+    account_id 會流進檔案路徑（EnvFileKeyStore `<root>/<account_id>/agent.key`、
+    狀態目錄 `FILET_STATE_BASE/<account_id>`、systemd `%i`）——目前由我方 manifest
+    設定（非攻擊者可控），但 Phase C onboarding 後端將從使用者輸入生成 account_id。
+    這裡把字元集鎖死，拒絕 `..`、`/`、`:`、空字串、超長，在該輸入變為使用者可控前
+    先把載入邊界收斂。單一真相：envfile.py 直接 import 本函式使用（同一 regex，
+    避免兩份定義漂移）。"""
+    if not isinstance(s, str) or not _ACCOUNT_ID_RE.fullmatch(s):
+        raise ValueError(f"account_id 不合法（僅允許英數字/_/-，長度 1-64）: {s!r}")
+
+
 def _check_addr(field: str, value: str) -> None:
     ok = (isinstance(value, str) and value.startswith("0x") and len(value) == 42
           and all(c in _HEX for c in value[2:]))
@@ -28,8 +43,10 @@ def _check_addr(field: str, value: str) -> None:
 
 def _parse_one(i: int, f: dict, seen: set[str]) -> FollowerRef:
     acct = f.get("account_id", "")
-    if not acct:
-        raise ValueError(f"followers[{i}] account_id 不得為空")
+    try:
+        validate_account_id(acct)
+    except ValueError as e:
+        raise ValueError(f"followers[{i}] {e}") from e
     if acct in seen:
         raise ValueError(f"followers[{i}] account_id 重複: {acct!r}")
     _check_addr(f"followers[{i}].user_address", f.get("user_address", ""))
@@ -37,7 +54,10 @@ def _parse_one(i: int, f: dict, seen: set[str]) -> FollowerRef:
     net = f.get("network", "")
     if net not in _NETWORKS:
         raise ValueError(f"followers[{i}].network 須為 {_NETWORKS}: {net!r}")
-    return FollowerRef(acct, f["user_address"], f["builder_address"],
+    # 位址小寫正規化（T6 reviewer Important）：以太坊位址大小寫不敏感，load
+    # boundary 統一 canonical 化，避免北極星去重／跨 follower 比對因大小寫不同
+    # 而重複計（dedup site 已於 c624d2e 修過，這是結構性的正解）。
+    return FollowerRef(acct, f["user_address"].lower(), f["builder_address"].lower(),
                        net, f.get("label", ""))
 
 

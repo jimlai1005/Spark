@@ -5,6 +5,7 @@ import os
 import stat
 from pathlib import Path
 from eth_account import Account
+from spark.filet.followers import validate_account_id
 from spark.keystore.base import KeyStore
 
 
@@ -25,6 +26,7 @@ class EnvFileKeyStore(KeyStore):
             "main-key signing belongs to the onboarding backend only")
 
     def get_agent_signer(self, account_id: str):
+        validate_account_id(account_id)  # 縱深防禦：建路徑前先鎖字元集（M2 Task 10）
         path = self._agent_path(account_id)
         if not path.exists():
             raise KeyError(f"no agent key for account {account_id} at {path}")
@@ -36,6 +38,7 @@ class EnvFileKeyStore(KeyStore):
 
     def import_agent_key(self, account_id: str, private_key: str) -> None:
         """寫入 agent key（供 onboarding 後端，Phase C 用）。父目錄 700、檔案 600。"""
+        validate_account_id(account_id)  # 縱深防禦：建路徑前先鎖字元集（M2 Task 10）
         d = self._root / account_id
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(d, 0o700)

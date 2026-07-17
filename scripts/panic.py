@@ -47,7 +47,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 USAGE = (
     "用法: SPARK_ACCOUNT_ID=.. SPARK_USER_ADDR=0x.. SPARK_BUILDER_ADDR=0x.. \\\n"
-    "      [SPARK_NETWORK=testnet] uv run python -m scripts.panic [--yes]\n"
+    "      [SPARK_NETWORK=testnet] [FILET_STATE_DIR=..] uv run python -m scripts.panic [--yes]\n"
     "預設 dry-run 只列動作；--yes 才執行（撤單→reduce-only 全平→寫 ARM_FILE→告警）。"
 )
 
