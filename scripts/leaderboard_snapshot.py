@@ -160,13 +160,18 @@ def append_snapshot(out_dir: str | Path, snapshot: dict) -> Path:
 
 def main(
     fetch_fn: Callable[[str], list[dict]] = fetch_leaderboard,
-    out_dir: str | Path = DEFAULT_OUT_DIR,
+    out_dir: str | Path | None = None,
     network: str | None = None,
     today: date | None = None,
 ) -> None:
-    """CLI 入口。fetch_fn/out_dir/today 皆可注入（測試用；不觸網）。"""
+    """CLI 入口。fetch_fn/out_dir/today 皆可注入（測試用；不觸網）。
+    out_dir 未指定時：FILET_DATA_DIR 設定 → <FILET_DATA_DIR>/leaderboard（M3 systemd
+    共用資料根）；未設 → DEFAULT_OUT_DIR（行為與 M2 完全相同）。"""
     network = network or os.environ.get("SPARK_NETWORK", "mainnet")
     day = today or datetime.now(timezone.utc).date()
+    if out_dir is None:
+        data_dir = os.environ.get("FILET_DATA_DIR")
+        out_dir = (Path(data_dir) / "leaderboard") if data_dir else DEFAULT_OUT_DIR
 
     rows = fetch_fn(network)
     snapshot = snapshot_from_rows(rows, day)

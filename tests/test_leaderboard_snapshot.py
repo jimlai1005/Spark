@@ -188,3 +188,16 @@ def test_module_import_and_main_are_zero_network():
     assert callable(lb.fetch_leaderboard)
     assert callable(lb.snapshot_from_rows)
     assert callable(lb.append_snapshot)
+
+
+def test_main_out_dir_honors_filet_data_dir(tmp_path, monkeypatch):
+    """M3 additive：FILET_DATA_DIR 設定時全站快照落 <dir>/leaderboard/（unset 行為不變）。"""
+    monkeypatch.setenv("FILET_DATA_DIR", str(tmp_path))
+    from scripts.leaderboard_snapshot import main
+    rows = [{"ethAddress": "0x" + "ab" * 20, "accountValue": "1",
+             "windowPerformances": [["day", {"pnl": "2"}]]}]
+    import pytest as _pytest
+    from datetime import date as _date
+    with _pytest.raises(SystemExit):
+        main(fetch_fn=lambda network: rows, today=_date(2026, 7, 18))
+    assert (tmp_path / "leaderboard" / "2026-07-18.json").exists()
