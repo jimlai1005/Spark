@@ -16,6 +16,33 @@
 
 ---
 
+## 執行狀態（2026-07-18 完成）
+
+**全 11 task + 2 追加修正實作 + fresh-context 雙審完成；`uv run pytest -q` = 744 passed, 2 deselected；ruff clean。** 分支 `feat/m3-billing`（自 `feat/m2-publicapi` 分出，13 commits），未 push、未動 main。opus 三輪把關：計畫級對抗審（REVISE_THEN_GO→修訂）＋完工總審（NEEDS_FIXES F1→修）＋各 ⭐ task 紅線審。
+
+| Task | commit | 備註 |
+|---|---|---|
+| 0 依賴+基線 | `57f1c92` | stripe 12.5.1，SDK 表面探針過 |
+| 1 billing 表 ⭐ | `2451a3f` | 無敏感欄位白名單斷言；單調守衛 |
+| 2 config ⭐ | `7dcf8f2` | sk_test_ `__post_init__` 結構性強制+三元組同設同缺 |
+| 3 billing.py | `b18b9ba` + fix `fa29060` | review 抓 metadata 注入縫→validate 挪進 store 單一邊界 |
+| 4 webhook 端點 ⭐ | `0b05b65` | 唯一免 session；驗簽失敗不碰 DB |
+| 5 checkout/status | `c08be79` | active 409；501 隔離有測試 |
+| 6 run_api 接線 | `a3bc831` | 未設 stripe 時與 M2 完全相同 |
+| 7 leaderboard 模組 | `53f9501` | clearinghouse_state 唯讀；逐地址失敗隔離 |
+| 8 watchlist CLI | `cc8c707` | 落 `leaderboard/watchlist/` 不撞全站快照 |
+| 9 systemd timer | `ffcd55f` | 每日 00:10 UTC，oneshot 兩快照 |
+| 10 全量+順手項 | `2572ad0` | except 收窄；驗簽失敗補 log |
+| opus F1 修 | `536bebe` | **同秒事件互蓋縫**：event.id 去重+created 嚴格比較+同秒平手只降不升（active 不得復活）；欄位級 ALTER TABLE migration |
+
+**opus 總審結論**：測試模式下合併安全——無真收費路徑（sk_test 結構性）、無繞過驗簽的 billing 寫入（grep 全呼叫點證實）、entitlement 只查不動、billing 全 additive、leaderboard 唯讀原子。
+
+**觀察項（非阻擋，記錄）**：O1 Stripe >5min 重試若沿用原簽章會被 300s tolerance 拒（未確證 Stripe 重試是否重簽，實務靠續重試自癒）；O2 快照 position_count 未濾零倉（原始快照非比較用途）；webhook 掉包後 DB 漂移無 reconcile（DB-only 語意，**移交正式收費前計畫**）；payment_status 未檢（test-mode 接受，同上移交）；canceled/none 同 rank 互蓋為純理論路徑（無呼叫端寫 "none"）。
+
+**使用者側啟用步驟**（要試 billing 時）：Stripe 測試帳號建 product+price → 填 `FILET_STRIPE_SECRET_KEY`（sk_test_）/`FILET_STRIPE_WEBHOOK_SECRET`/`FILET_STRIPE_PRICE_ID` 三元組（同設）→ 定價 A/B/C 拍板後換 price id 即可，不改碼。
+
+---
+
 ## 全域紅線（每個任務的實作者與 reviewer 都先讀）
 
 1. ⭐ **絕不真 key**：`FILET_STRIPE_SECRET_KEY` 必須 `sk_test_` 前綴——`ApiConfig.__post_init__` 結構性驗證（任何建構路徑都擋，不只 `from_env`），非測試前綴直接拒啟動（raise）。測試斷言 `sk_live_` 被拒。任何 key 不進 log/repr/例外訊息。
