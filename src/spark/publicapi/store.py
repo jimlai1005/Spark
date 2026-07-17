@@ -8,6 +8,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from spark.filet.followers import validate_account_id
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nonces (
     nonce TEXT PRIMARY KEY,
@@ -158,7 +160,10 @@ class ApiStore:
         ——`WHERE excluded.last_event_created >= billing.last_event_created`，較舊事件
         整筆 no-op（含 id 欄），已取消訂閱不因晚到的舊 active 事件復活；`>=` 允許同值
         ＝重放仍冪等。id 欄 None 時 COALESCE 保留既有值。status 白名單強制——
-        webhook 映射層是唯一寫入者，這裡是縱深防禦。"""
+        webhook 映射層是唯一寫入者，這裡是縱深防禦。
+        account_id 在此驗證（單一邊界，工程原則 5）：account_id 會流進檔案路徑
+        （keystore、systemd %i），所有呼叫端（含未來新增）都繞不開這層。"""
+        validate_account_id(account_id)
         if status not in BILLING_STATUSES:
             raise ValueError(f"未知 billing status: {status!r}（須為 {sorted(BILLING_STATUSES)}）")
         with self._lock, self._db:

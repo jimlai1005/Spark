@@ -121,6 +121,16 @@ def test_billing_rejects_unknown_status(tmp_path):
         store.upsert_billing("f" + "ab" * 20, status="paid", now_s=1.0)
 
 
+def test_billing_upsert_rejects_bad_account_id(tmp_path):
+    """account_id 在 store 邊界驗證（單一邊界，工程原則 5）——會流進檔案路徑，
+    路徑穿越字元一律拒收，所有呼叫端都繞不開。"""
+    import pytest
+    store = _mkstore(tmp_path)
+    with pytest.raises(ValueError):
+        store.upsert_billing("../evil", status="active", now_s=1.0)
+    assert store.get_billing("../evil") is None
+
+
 def test_billing_lookup_by_subscription(tmp_path):
     store = _mkstore(tmp_path)
     acct = "f" + "cd" * 20

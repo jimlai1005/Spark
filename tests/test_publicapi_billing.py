@@ -133,6 +133,19 @@ def test_subscription_event_unmatched_is_ignored(tmp_path):
     assert store.get_billing(ACCT) is None
 
 
+def test_subscription_event_bad_metadata_account_id_refused(tmp_path):
+    """對稱於 checkout 分支的縱深防禦：metadata.account_id 可被 Stripe dashboard
+    手動塞任意值——store 邊界 validate 拒收，回 "unmatched" 語意、不 raise、不寫 DB。"""
+    store = _store(tmp_path)
+    payload = _event_payload("customer.subscription.updated",
+                             {"id": "sub_1", "status": "active", "customer": "cus_1",
+                              "metadata": {"account_id": "../etc/passwd"}})
+    event = verify_webhook_event(payload, _sig(payload), WEBHOOK_SECRET)
+    assert apply_webhook_event(store, event, event_created=1, now_s=1.0) == "unmatched"
+    assert store.get_billing("../etc/passwd") is None
+    assert store.get_billing_by_subscription("sub_1") is None
+
+
 def test_unknown_event_type_ignored(tmp_path):
     store = _store(tmp_path)
     payload = _event_payload("invoice.paid", {"id": "in_1"})
