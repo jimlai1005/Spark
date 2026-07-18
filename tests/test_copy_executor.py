@@ -114,11 +114,16 @@ def test_virtual_book_evolves_place_modify_cancel():
     assert ex.modify(oid, _spec(coin="ETH", limit_px="2100", sz="0.7")) is True
     orders = ex.get_open_orders()
     assert len(orders) == 1
-    assert orders[0].oid == oid  # 就地改，oid 保留
+    new_oid = orders[0].oid
+    # HL batchModify 會重新配發 oid（2026-07-19 testnet 實測），非就地改——
+    # 假件比照真交易所語意，故舊 oid 於 modify 後即作廢。
+    assert new_oid != oid
     assert orders[0].limit_px == Decimal("2100")
     assert orders[0].sz == Decimal("0.7")
 
-    assert ex.cancel("ETH", oid) is True
+    # 拿過期 oid 撤單會失敗（正是修正假件語意後才能暴露的真實行為）
+    assert ex.cancel("ETH", oid) is False
+    assert ex.cancel("ETH", new_oid) is True
     assert ex.get_open_orders() == []
 
 
