@@ -6,8 +6,8 @@ html, body { height: 100%; }
 
 body {
   margin: 0;
-  background: var(--ink);
-  color: var(--ice);
+  background: var(--bg);
+  color: var(--text);
   font-family: var(--font-body);
   font-size: 15px;
   line-height: 1.55;
@@ -30,12 +30,12 @@ table { border-collapse: collapse; width: 100%; }
   clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
 }
 
-/* focus ring — 鮭色 2px，全域一致 */
+/* focus ring — 螢綠 2px，全域一致 */
 a:focus-visible,
 button:focus-visible,
 input:focus-visible,
 [tabindex]:focus-visible {
-  outline: 2px solid var(--salmon);
+  outline: 2px solid var(--primary);
   outline-offset: 2px;
   border-radius: 4px;
 }
@@ -46,7 +46,7 @@ input:focus-visible,
   display: flex; align-items: center; justify-content: space-between;
   gap: 16px;
   padding: 14px 20px;
-  background: rgba(var(--ink-rgb), .92);
+  background: rgba(var(--surface-rgb), .92);
   backdrop-filter: blur(6px);
   border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
@@ -57,7 +57,7 @@ input:focus-visible,
   font-weight: 300;
   letter-spacing: .22em;
   font-size: 15px;
-  color: var(--ice);
+  color: var(--primary);
 }
 
 .tabs { display: flex; gap: 4px; }
@@ -67,7 +67,7 @@ input:focus-visible,
   padding: 8px 16px;
   border-radius: 999px;
   text-decoration: none;
-  color: var(--mist);
+  color: var(--text-dim);
   font-size: 13px;
   letter-spacing: .04em;
   border: 1px solid transparent;
@@ -75,9 +75,9 @@ input:focus-visible,
 }
 
 .tab[aria-current="page"] {
-  color: var(--ice);
+  color: var(--text);
   border-color: var(--border-strong);
-  background: var(--tide);
+  background: var(--card);
 }
 
 /* ---------- 版面容器 ---------- */
@@ -92,18 +92,18 @@ main.page {
 .eyebrow {
   font-size: 11px;
   letter-spacing: .14em;
-  color: var(--mist);
+  color: var(--text-dim);
   margin: 0 0 6px;
 }
 
 .panel {
-  background: var(--tide);
+  background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 20px;
 }
 
-.panel-title { font-size: 15px; font-weight: 500; color: var(--ice); margin: 0 0 4px; }
+.panel-title { font-size: 15px; font-weight: 500; color: var(--text); margin: 0 0 4px; }
 
 /* ---------- 授權絲線／託管邊界（signature element） ---------- */
 .boundary { display: flex; align-items: stretch; gap: 0; }
@@ -111,16 +111,16 @@ main.page {
 .boundary-panel {
   flex: 1 1 0;
   min-width: 0;
-  background: var(--tide);
+  background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 18px 20px;
 }
 
 .boundary-panel dl { margin: 0; }
-.boundary-panel dt { font-size: 11px; color: var(--mist); margin-top: 8px; }
+.boundary-panel dt { font-size: 11px; color: var(--text-dim); margin-top: 8px; }
 .boundary-panel dt:first-of-type { margin-top: 2px; }
-.boundary-panel dd { margin: 2px 0 0; font-size: 14px; color: var(--ice); }
+.boundary-panel dd { margin: 2px 0 0; font-size: 14px; color: var(--text); }
 
 .boundary-link {
   position: relative;
@@ -133,7 +133,7 @@ main.page {
 .boundary-divider {
   position: absolute;
   top: 6px; bottom: 6px; left: 50%;
-  border-left: 1px dashed rgba(var(--mist-rgb), .35);
+  border-left: 1px dashed rgba(var(--text-dim-rgb), .35);
 }
 
 .boundary-thread {
@@ -142,7 +142,7 @@ main.page {
   height: 2px;
   transform: translateY(-50%);
   background: repeating-linear-gradient(90deg,
-    rgba(var(--mist-rgb), .55) 0 6px, transparent 6px 12px);
+    rgba(var(--text-dim-rgb), .55) 0 6px, transparent 6px 12px);
   overflow: hidden;
   z-index: 1;
 }
@@ -151,16 +151,16 @@ main.page {
   display: block;
   height: 100%;
   width: calc(var(--thread-pct, 0) * 1%);
-  background: var(--salmon);
+  background: var(--primary);
   transition: width .6s ease;
 }
 
 .boundary-pill {
   position: relative;
   z-index: 2;
-  background: var(--ink);
-  border: 1px solid rgba(var(--mist-rgb), .4);
-  color: var(--mist);
+  background: var(--bg);
+  border: 1px solid rgba(var(--text-dim-rgb), .4);
+  color: var(--text-dim);
   font-size: 10.5px;
   letter-spacing: .08em;
   padding: 4px 10px;
@@ -169,8 +169,8 @@ main.page {
 }
 
 .boundary-pill.is-active {
-  border-color: var(--salmon);
-  color: var(--salmon);
+  border-color: var(--primary);
+  color: var(--primary);
 }
 
 /* ---------- 按鈕 ---------- */
@@ -183,32 +183,32 @@ main.page {
   border-radius: var(--radius);
   border: 1px solid var(--border-strong);
   background: transparent;
-  color: var(--ice);
+  color: var(--text);
   cursor: pointer;
   font-size: 14px;
   letter-spacing: .02em;
   transition: opacity .15s ease, background .15s ease, border-color .15s ease;
 }
 
-.btn:hover { border-color: rgba(var(--ice-rgb), .3); }
+.btn:hover { border-color: rgba(var(--text-rgb), .3); }
 
 .btn-primary {
-  background: var(--salmon);
-  border-color: var(--salmon);
-  color: var(--ink);
+  background: var(--brand-gradient);
+  border-color: transparent;
+  color: var(--bg);
   font-weight: 600;
 }
 
 .btn-primary:hover { opacity: .92; }
 
-.btn-secondary { background: var(--tide-2); }
+.btn-secondary { background: var(--card-hover); }
 
 .btn-ghost {
   border-color: transparent;
   background: transparent;
   text-decoration: underline;
   padding: 6px 4px;
-  color: var(--mist);
+  color: var(--text-dim);
 }
 
 .btn:disabled { opacity: .35; cursor: not-allowed; }
@@ -224,9 +224,9 @@ main.page {
   font-family: var(--font-mono);
 }
 
-.chip-up { color: var(--up); background: rgba(var(--up-rgb), .14); }
-.chip-down { color: var(--down); background: rgba(var(--down-rgb), .14); }
-.chip-neutral { color: var(--mist); background: rgba(var(--mist-rgb), .12); font-family: var(--font-body); }
+.chip-up { color: var(--pos); background: rgba(var(--pos-rgb), .14); }
+.chip-down { color: var(--neg); background: rgba(var(--neg-rgb), .14); }
+.chip-neutral { color: var(--text-dim); background: rgba(var(--text-dim-rgb), .12); font-family: var(--font-body); }
 
 /* ---------- 登入頁 ---------- */
 .login-inner { padding-top: 8vh; text-align: center; }
@@ -237,10 +237,14 @@ main.page {
   letter-spacing: .3em;
   font-size: clamp(2.6rem, 9vw, 4.2rem);
   margin: 0 0 16px;
-  color: var(--ice);
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
 }
 
-.subtitle { color: var(--mist); font-size: 16px; margin: 0 0 40px; }
+.subtitle { color: var(--text-dim); font-size: 16px; margin: 0 0 40px; }
 
 .login-boundary-wrap {
   position: relative;
@@ -256,7 +260,7 @@ main.page {
 .btn-block { width: 100%; }
 
 .footnote {
-  color: var(--mist);
+  color: var(--text-dim);
   font-size: 12px;
   line-height: 1.7;
   text-align: left;
@@ -285,18 +289,18 @@ main.page {
   border: 1px solid transparent;
   background: transparent;
   cursor: pointer;
-  color: var(--mist);
+  color: var(--text-dim);
 }
 
 .wizard-steps .step-btn:disabled { cursor: not-allowed; opacity: .4; }
 
 .wizard-steps li.is-current .step-btn {
-  background: var(--tide);
+  background: var(--card);
   border-color: var(--border-strong);
-  color: var(--ice);
+  color: var(--text);
 }
 
-.wizard-steps li.is-done .step-btn { color: var(--up); }
+.wizard-steps li.is-done .step-btn { color: var(--pos); }
 
 .step-num { font-family: var(--font-mono); font-size: 12px; width: 22px; flex: none; }
 
@@ -308,7 +312,7 @@ main.page {
 .step-check {
   margin-left: auto;
   font-size: 12px;
-  color: var(--up);
+  color: var(--pos);
   visibility: hidden;
 }
 
@@ -317,16 +321,16 @@ main.page {
 .wizard-panel { min-width: 0; }
 
 .step-card {
-  background: var(--tide);
+  background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 28px;
 }
 
-.step-card h2 { font-size: 1.4rem; color: var(--ice); }
+.step-card h2 { font-size: 1.4rem; color: var(--text); }
 .step-card h2:focus { outline: none; }
 
-.hint { color: var(--mist); font-size: 13px; }
+.hint { color: var(--text-dim); font-size: 13px; }
 
 .addr { font-size: 15px; letter-spacing: .02em; }
 
@@ -337,7 +341,7 @@ main.page {
   padding: 10px 0;
   cursor: pointer;
   font-size: 14px;
-  color: var(--ice);
+  color: var(--text);
   border-bottom: 1px solid var(--border);
 }
 
@@ -346,37 +350,38 @@ main.page {
 .check-row input[type="checkbox"] {
   margin-top: 2px;
   width: 16px; height: 16px;
-  accent-color: var(--salmon);
+  accent-color: var(--secondary);
   flex: none;
 }
 
 .step-actions { margin-top: 24px; }
 
+/* 簽署卡＝全站最安靜的區塊：用 --surface 素色內嵌，功能色（--pos/--neg）標示簽署狀態 */
 .sign-card {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 18px;
   margin-bottom: 16px;
-  background: rgba(var(--ink-rgb), .3);
+  background: var(--surface);
 }
 
-.sign-card.is-signed { border-color: rgba(var(--up-rgb), .45); }
+.sign-card.is-signed { border-color: rgba(var(--pos-rgb), .45); }
 
 .sign-card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 
-.sign-name { font-family: var(--font-mono); font-size: 14px; color: var(--ice); }
+.sign-name { font-family: var(--font-mono); font-size: 14px; color: var(--text); }
 
-.sign-check { display: none; color: var(--up); font-size: 13px; }
+.sign-check { display: none; color: var(--pos); font-size: 13px; }
 .sign-card.is-signed .sign-check { display: inline; }
 
-.sign-state { margin-left: auto; font-size: 12px; color: var(--mist); }
-.sign-card.is-signed .sign-state { color: var(--up); }
+.sign-state { margin-left: auto; font-size: 12px; color: var(--text-dim); }
+.sign-card.is-signed .sign-state { color: var(--pos); }
 
-.sign-desc { color: var(--mist); font-size: 13px; margin-bottom: 12px; }
+.sign-desc { color: var(--text-dim); font-size: 13px; margin-bottom: 12px; }
 
 .sign-hash {
   font-size: 12px;
-  color: var(--mist);
+  color: var(--text-dim);
   margin-top: 10px;
   word-break: break-all;
 }
@@ -385,11 +390,11 @@ main.page {
   margin-top: 12px;
   padding: 12px;
   border-radius: var(--radius);
-  background: rgba(var(--down-rgb), .1);
-  border: 1px solid rgba(var(--down-rgb), .35);
+  background: rgba(var(--neg-rgb), .1);
+  border: 1px solid rgba(var(--neg-rgb), .35);
 }
 
-.sign-error p { color: var(--down); font-size: 13px; margin: 0 0 8px; }
+.sign-error p { color: var(--neg); font-size: 13px; margin: 0 0 8px; }
 
 .deposit-check {
   display: flex;
@@ -397,30 +402,30 @@ main.page {
   gap: 10px;
   padding: 16px;
   border-radius: var(--radius);
-  border: 1px solid rgba(var(--up-rgb), .35);
-  background: rgba(var(--up-rgb), .08);
+  border: 1px solid rgba(var(--pos-rgb), .35);
+  background: rgba(var(--pos-rgb), .08);
   margin-bottom: 24px;
   font-size: 14px;
 }
 
 .deposit-check.is-pending {
-  border-color: rgba(var(--mist-rgb), .35);
-  background: rgba(var(--mist-rgb), .08);
+  border-color: rgba(var(--text-dim-rgb), .35);
+  background: rgba(var(--text-dim-rgb), .08);
 }
 
-.check-icon { color: var(--up); font-family: var(--font-mono); flex: none; }
-.deposit-check.is-pending .check-icon { color: var(--mist); }
+.check-icon { color: var(--pos); font-family: var(--font-mono); flex: none; }
+.deposit-check.is-pending .check-icon { color: var(--text-dim); }
 
 /* ---------- 狀態頁費用卡 ---------- */
-.fee-total { font-size: 2rem; font-weight: 300; color: var(--ice); margin: 4px 0 2px; }
-.fee-caption { color: var(--mist); font-size: 12.5px; margin-bottom: 14px; }
-.fee-note { color: var(--mist); font-size: 12.5px; margin-bottom: 18px; }
+.fee-total { font-size: 2rem; font-weight: 300; color: var(--text); margin: 4px 0 2px; }
+.fee-caption { color: var(--text-dim); font-size: 12.5px; margin-bottom: 14px; }
+.fee-note { color: var(--text-dim); font-size: 12.5px; margin-bottom: 18px; }
 
 /* ---------- Admin 表 ---------- */
 .admin-table { font-size: 13px; }
 .admin-table th {
   text-align: left;
-  color: var(--mist);
+  color: var(--text-dim);
   font-weight: 400;
   font-size: 11px;
   letter-spacing: .06em;
@@ -430,7 +435,7 @@ main.page {
 .admin-table td {
   padding: 8px 8px 8px 0;
   border-bottom: 1px solid var(--border);
-  color: var(--ice);
+  color: var(--text);
   word-break: break-all;
 }
 .admin-table tr:last-child td { border-bottom: none; }
@@ -439,13 +444,13 @@ main.page {
 @media (max-width: 620px) {
   .boundary { flex-direction: column; }
   .boundary-link { flex: none; width: 100%; height: 64px; }
-  .boundary-divider { top: 50%; bottom: auto; left: 6px; right: 6px; border-left: none; border-top: 1px dashed rgba(var(--mist-rgb), .35); }
+  .boundary-divider { top: 50%; bottom: auto; left: 6px; right: 6px; border-left: none; border-top: 1px dashed rgba(var(--text-dim-rgb), .35); }
   .boundary-thread {
     left: 50%; right: auto; top: 0; bottom: 0;
     height: auto; width: 2px;
     transform: translateX(-50%);
     background: repeating-linear-gradient(180deg,
-      rgba(var(--mist-rgb), .55) 0 6px, transparent 6px 12px);
+      rgba(var(--text-dim-rgb), .55) 0 6px, transparent 6px 12px);
   }
   .boundary-thread-fill { width: 100%; height: calc(var(--thread-pct, 0) * 1%); }
 }

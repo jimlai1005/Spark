@@ -110,3 +110,52 @@ keystore O_EXCL 不覆寫、SIWE nonce 原子單次（rowcount，非 TOCTOU）�
   最終驗收一律以主對話親跑的指令輸出為準。
 - 後續處置：A5/A6 改派 sonnet 重做，主對話以 `ls` / `grep -c` / `git status` /
   實跑 `npm test` 四項親自查證產物確實落盤（86 passed / 19 files）後才認定完成並提交。
+
+---
+
+# 第二輪：testnet 實機獨立複驗 + v2 換色（2026-07-19 稍晚）
+
+背景：開發 session 完成 F1/C1/C2/I1-I5 一系列 kill-switch remediation（equity basis 改 perp、
+新增 `equity.py`、覆蓋度 critical、全期高水位 0.40 絕對閘）。**該批 E2E 是在 remediation 之前跑的**，
+因此以測試角色對 remediated 版本做獨立實機複驗。以下數據皆由主對話親跑並以鏈上查詢佐證。
+
+## 環境
+- Leader＝Builder：`0xbAC652A5Fb611c1BdC3B9D244cc7E0cC03123662`（perp 499.18 / spot 499.0）
+- Follower：`0xfb9c52f56f03d786ad5d435aa70fe45d80569760`（perp 499.30 / spot 499.0）
+- keystore：`EnvFileKeyStore`（`~/filet-dev/keys`，agent.key 600），**全程無主鑰**
+
+## 驗證結果（全數通過）
+
+| # | 驗證點 | 證據 |
+|---|---|---|
+| 1 | **F1** equity basis 改 perp | `--status` → `current=$499.302284`（perp），非含 spot 的 998.30 |
+| 2 | **C1** 覆蓋不足大聲告警 | `⚠️ 回撤保護尚未生效：樣本 0 筆／最舊 0 分鐘` |
+| 3 | **C2** 全期高水位＋絕對閘 | `全期高水位=499.302284 總回撤=0 / 絕對底線 0.40` |
+| 4 | **M2** `--status` 零寫入契約 | 狀態目錄檔案數 執行前 1 → 執行後 1 |
+| 5 | **鏡像精確度** | leader ETH 0.0537 → follower 0.0430＝0.0537×scale 0.8014（鏈上確認 szi=0.043） |
+| 6 | **builder fee 費率** | 0.385532 → 0.457545，delta **+0.072013**；開/平兩回合各 +0.036，= (99.97+80.05)×0.02%×2，**f=20 精確吻合** |
+| 7 | **reduce-only 平倉** | leader 平 → 引擎 `flattened` → 雙邊 marginUsed=0、持倉 0、掛單 0 |
+| 8 | **非託管實機** | follower 鏈上 `extraAgents` 有 `filet` agent 已授權；引擎全程只用 agent key |
+
+**結論：kill-switch 大改沒有弄壞價值鏈，remediated 版本實機可用。**
+
+## v2 換色（開發任務）
+`web/src/styles/{tokens.css,globals.css}` 兩檔，純視覺換色，HTML 結構／文案／邏輯零改動。
+v2 並非單純 token 改名——實際使用面差異包含：`--tide`→`--card`（非 surface）、`--tide-2`→`--card-hover`、
+`--surface` 為新引入的第四層深色（僅用於 `.app-header` 與 `.sign-card`）、`.wordmark` 與 `.btn-primary`
+改用 `--brand-gradient`、checkbox `accent-color` 改配 `--secondary`。`--accent/--warn/--info/--pending`
+在 v2 原型中僅定義未使用，僅收錄待用。
+
+## 測試計劃覆蓋率（scope 至 M3）
+- **M1**：離線稽核 ✅ ＋ 實機價值鏈 ✅
+- **M2**：離線稽核 ✅ ＋ 非託管實機佐證 ✅
+- **M3**：離線稽核 ✅（`sk_test_` 強制、webhook HMAC 先於 DB、`event.created` 單調 guard、501、leaderboard 純函式）
+
+**環境限制無法覆蓋（非遺漏）**：
+1. **[EXTERNAL]** Stripe test-mode 實際 checkout＋webhook 端到端——需真實 Stripe test 金鑰。**M3 唯一缺口**。
+2. **[MAINNET]** 主網 dogfood：shadow 3 天、滑價 ≤10bp、taker share <30%、隔日 CSV 對帳、熔斷實彈。
+3. **[DEPLOY/LINUX]** SO_PEERCRED 真實效力、agent.key 權限隔離、TLS/same-origin、systemd verify。
+
+## 最終總回歸（主對話親跑）
+後端 **769 passed** / ruff clean / 前端 **87 passed** / next lint clean / `npm run build` 成功。
+A1/A2/A3/F1/A5/A6 六項修復＋v2 換色逐項 grep 確認皆在，互不衝突。

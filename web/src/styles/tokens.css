@@ -1,20 +1,27 @@
-/* Filet design tokens — v1 鮭色定案
-   來源：docs/superpowers/design/2026-07-17-m2-dashboard-prototype.html :root
+/* Filet design tokens — v2 深海軍藍定案
+   來源：docs/superpowers/design/2026-07-17-m2-dashboard-prototype-v2.html :root
    （--banner-h 為原型示意條專屬，不抽）。 */
 :root {
   color-scheme: dark;
-  --ink: #101923;      --ink-rgb: 16, 25, 35;
-  --tide: #182634;     --tide-rgb: 24, 38, 52;
-  --tide-2: #1F3140;   --tide-2-rgb: 31, 49, 64;
-  --salmon: #F2917A;   --salmon-rgb: 242, 145, 122;
-  --ice: #EAF2F4;      --ice-rgb: 234, 242, 244;
-  --mist: #8FA3B0;     --mist-rgb: 143, 163, 176;
-  --up: #57C7A4;       --up-rgb: 87, 199, 164;
-  --down: #D96A6A;     --down-rgb: 217, 106, 106;
+  --bg:#07111F;            --bg-rgb:7,17,31;
+  --surface:#0E1B2A;       --surface-rgb:14,27,42;
+  --card:#142334;          --card-rgb:20,35,52;
+  --card-hover:#1A2C40;    --card-hover-rgb:26,44,64;
+  --primary:#19D3AE;       --primary-rgb:25,211,174;
+  --secondary:#528BFF;     --secondary-rgb:82,139,255;
+  --accent:#8B7CFF;        --accent-rgb:139,124,255;
+  --text:#F3F7FA;          --text-rgb:243,247,250;
+  --text-dim:#91A2B5;      --text-dim-rgb:145,162,181;
+  --pos:#2DD4A7;           --pos-rgb:45,212,167;
+  --neg:#FF647C;           --neg-rgb:255,100,124;
+  --warn:#F5B942;          --warn-rgb:245,185,66;
+  --info:#58A6FF;          --info-rgb:88,166,255;
+  --pending:#A78BFA;       --pending-rgb:167,139,250;
+  --brand-gradient: linear-gradient(135deg,#16D6A3 0%,#4C8DFF 55%,#8B5CF6 100%);
 
   --radius: 10px;
-  --border: rgba(var(--ice-rgb), .08);
-  --border-strong: rgba(var(--ice-rgb), .16);
+  --border: #26384A;
+  --border-strong: rgba(var(--text-rgb), .22);
 
   --font-display: "Avenir Next", "Futura", "PingFang TC", sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
