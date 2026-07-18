@@ -30,7 +30,7 @@ from pathlib import Path
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
-from spark.copytrade.equity import perp_equity_view, reset_samples
+from spark.copytrade.equity import perp_equity_view
 from spark.copytrade.killswitch import (
     DrawdownStatus,
     FlattenReport,
@@ -228,8 +228,7 @@ def run_single_follower(
         degraded.append("positions_unavailable")
 
     report = trip(executor, positions, notifier, state_root, status, sleep_fn=sleep_fn)
-    # 對齊 killswitch.trip()：清空 perp 權益樣本，否則人工 re-arm 後舊 peak 仍在窗內會立刻再熔斷。
-    reset_samples(state_root)
+    # 註：trip() 內部已 reset_samples(state_root)（見 killswitch.py），此處不需重複清理。
     if degraded:
         # degrade 反映進 report.failures → _exit_code 非 0，operator 不會誤判乾淨收場。
         report = replace(report, failures=report.failures + tuple(degraded))
