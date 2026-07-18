@@ -49,8 +49,13 @@ export default function LoginPage() {
         signMessage: (message) => signMessageAsync({ message }),
       });
       router.push("/onboarding");
-    } catch {
-      setError(c.rejected);
+    } catch (err) {
+      const e = err as { name?: string; code?: number; message?: string } | undefined;
+      const isRejected =
+        e?.name === "UserRejectedRequestError" ||
+        e?.code === 4001 ||
+        /reject|denied|cancel/i.test(String(e?.message ?? ""));
+      setError(isRejected ? c.rejected : c.loginFailed);
     } finally {
       setPhase("idle");
     }

@@ -23,6 +23,7 @@ export const COPY = {
     signInNote: "登入需要一筆免費的訊息簽名（不上鏈、不花費 gas）。",
     noWallet: "未偵測到瀏覽器錢包。請先安裝 MetaMask 後重新整理本頁。Filet 永遠不會請你輸入私鑰或助記詞。",
     rejected: "你在錢包中取消了簽署。準備好後再點一次「連接錢包」即可。",
+    loginFailed: "登入失敗，請稍後再試。",
     walletPanelTitle: "你的錢包",
     enginePanelTitle: "Filet 引擎",
     addrLabel: "地址",

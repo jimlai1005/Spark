@@ -44,6 +44,15 @@ describe("LoginPage", () => {
     expect(push).not.toHaveBeenCalled();
   });
 
+  it("非拒簽錯誤（例如後端驗簽失敗）→ 顯示登入失敗文案，不顯示拒簽文案", async () => {
+    loginWithSiwe.mockRejectedValueOnce(new Error("401 signature verification failed"));
+    render(<LoginPage />);
+    await userEvent.click(screen.getByRole("button", { name: "連接錢包" }));
+    expect(await screen.findByText(/登入失敗，請稍後再試/)).toBeInTheDocument();
+    expect(screen.queryByText(/取消了簽署/)).not.toBeInTheDocument();
+    expect(push).not.toHaveBeenCalled();
+  });
+
   it("頁面不存在任何文字輸入框（紅線 1：無處可輸入私鑰/助記詞）", () => {
     render(<LoginPage />);
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
