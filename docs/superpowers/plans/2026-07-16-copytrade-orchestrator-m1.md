@@ -23,7 +23,7 @@ T15=2151fb2、T16=d7280b4、T17=c6b675e+aa109ed、T18=edb1f9b+99d6ae3。
 builder `0x63e64A1c73b28Ca4FdFAC409DeE3e2BeE4B84847` ≥100 testnet USDC）；shadow 3 交易日對照屬日曆時間；
 主網 dogfood 屬人工關卡（見 runbook）。
 
-**待使用者裁決（晨間檢查點更新版）**：①T1.3 modify 政策（探針就緒待注資實測）②kill switch 緊急平倉 slippage 5% 是否加寬
+**待使用者裁決（2026-07-19 更新）**：~~①T1.3 modify 政策~~ → **已結案**（testnet 實測：modify 不丟失 builder 歸屬，ratio 0.9998；且 HL batchModify 為 post-only 語意，原風險情境結構上不存在 → 保留 `modify-first` 預設。見 `docs/superpowers/research/2026-07-19-testnet-e2e-findings.md`）　②kill switch 緊急平倉 slippage 5% 是否加寬（仍待裁決）
 ③hl-copytrader 線上機 user@IP（shadow differ 校準用）④trigger 單 M1 不支援（executor 記 skip_trigger，
 leader 若掛 trigger 會在 shadow 浮現——煙霧 3 輪未見）⑤sync_failed critical 每輪必發（無 dedup）是否改長 TTL 去重。
 
@@ -736,7 +736,7 @@ def pair_fills(leader_fills, my_fills, window_s: int) -> list[PairedFill]   # �
 
 ## 晨間檢查點（使用者裁決，過夜執行不得代決）
 
-1. **T1.3 政策**：modify 丟失 builder 歸屬時——容忍漏繳 vs 強制 cancel+place（探針數據在 research 報告；若 testnet 憑證未提供則先看靜態分析）。
+1. ~~**T1.3 政策**：modify 丟失 builder 歸屬時——容忍漏繳 vs 強制 cancel+place~~ → **2026-07-19 結案**：testnet 實測 modify **不丟失**歸屬（A/B ratio 0.99978 / 0.99984，二次獨立重現＋非 modify maker 對照組排除競爭解釋）；更關鍵：HL `batchModify` 帶 **post-only 語意**（穿價 modify 直接被拒），modify 後的單只能掛著等 maker 成交，「modify 成 taker 立即成交而漏繳」這條路徑**結構上不存在**——本裁決題因前提不成立而消解。**處置：保留 `modify_policy="modify-first"` 預設。** 極限：數據為 testnet ETH / f=20 / size=0.01 / 單筆成交 / builder==user，未測連續多次 modify 與 size 放大；主網收費前建議小額覆測一次。
 2. **Testnet 憑證**：`SPARK_ACCOUNT_ID / SPARK_USER_ADDR / SPARK_BUILDER_ADDR`（沿 Phase 1 既有 Keychain 帳戶即可）。提供後補跑 Task 5 實測與 Task 17。
 3. **hl-copytrader 線上 log 路徑**（本機或遠端？systemd journal 或檔案？）——Task 16 differ 對真實 log 校準用。
 4. Shadow 3 交易日的排程方式（本機常駐 or 手動每日跑）。
