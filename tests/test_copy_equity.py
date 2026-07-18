@@ -119,3 +119,49 @@ def test_reset_samples_never_raises(tmp_path: Path, monkeypatch):
 def test_reset_samples_missing_file_is_noop(tmp_path: Path):
     """檔案不存在時不得拋錯（missing_ok）。"""
     reset_samples(tmp_path)
+
+
+def test_coverage_insufficient_when_no_samples(tmp_path: Path):
+    """C1：無樣本時 coverage.sufficient 必須為 False（保護尚未生效）。"""
+    from spark.copytrade.equity import sample_coverage
+
+    cov = sample_coverage(tmp_path, now_fn=lambda: 1000.0)
+    assert cov.count == 0
+    assert cov.sufficient is False
+
+
+def test_coverage_sufficient_after_enough_history(tmp_path: Path):
+    """覆蓋 >= 1 小時且 >= 2 筆才算充足。"""
+    import json
+    from spark.copytrade.equity import SAMPLES_RELPATH, sample_coverage
+
+    p = tmp_path / SAMPLES_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps([[0.0, "500"], [3700.0, "500"]]))
+    cov = sample_coverage(tmp_path, now_fn=lambda: 3700.0)
+    assert cov.count == 2 and cov.sufficient is True
+
+
+def test_lifetime_peak_only_rises(tmp_path: Path):
+    """C2：全期高水位只升不降。"""
+    from spark.copytrade.equity import update_lifetime_peak
+
+    assert update_lifetime_peak(tmp_path, Decimal("1000")) == Decimal("1000")
+    assert update_lifetime_peak(tmp_path, Decimal("800")) == Decimal("1000")
+    assert update_lifetime_peak(tmp_path, Decimal("1200")) == Decimal("1200")
+
+
+def test_lifetime_peak_persist_false_does_not_write(tmp_path: Path):
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
+
+    update_lifetime_peak(tmp_path, Decimal("1000"), persist=False)
+    assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists()
+
+
+def test_reset_samples_clears_lifetime_peak(tmp_path: Path):
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
+
+    update_lifetime_peak(tmp_path, Decimal("1000"))
+    assert (tmp_path / LIFETIME_PEAK_RELPATH).exists()
+    reset_samples(tmp_path)
+    assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists()

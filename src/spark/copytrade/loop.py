@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from spark.copytrade.config import CopySettings
-from spark.copytrade.equity import perp_equity_view
+from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
 from spark.copytrade.killswitch import evaluate, is_tripped, trip
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
@@ -74,7 +74,9 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     # 必須用 evaluate() 而非直呼 check_drawdown（killswitch.py 主迴圈接入接口）：
     # degenerate equity（peak<=0）的 warn 在 evaluate 內結構性內建，不靠這裡記得補。
     ev = perp_equity_view(adapter, ex.my_address, root)
-    status = evaluate(ev, settings, notifier)
+    cov = sample_coverage(root)
+    lifetime = update_lifetime_peak(root, ev.current)
+    status = evaluate(ev, settings, notifier, coverage=cov, lifetime_peak=lifetime)
     if status.breached:
         notifier.critical(
             "killswitch",

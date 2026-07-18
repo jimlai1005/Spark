@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -76,20 +76,47 @@ def check_drawdown(ev: EquityView, max_dd_pct: Decimal) -> DrawdownStatus:
                           drawdown_pct=dd, breached=dd > max_dd_pct)
 
 
-def evaluate(ev: EquityView, settings: CopySettings, notifier: Notifier) -> DrawdownStatus:
-    """回撤判定＋degenerate equity 的結構性告警出口。
+def evaluate(ev: EquityView, settings: CopySettings, notifier: Notifier,
+             *, coverage=None, lifetime_peak: Decimal | None = None) -> DrawdownStatus:
+    """回撤判定＋degenerate／覆蓋不足／慢速底線的結構性告警出口。
 
-    **Task 12 run_cycle 必須用本函式，而非直呼 check_drawdown**——peak<=0 的 warn
-    在這裡發（dedup_key="equity_degenerate"，避免每分鐘洗版），不靠呼叫端記得補。
+    **Task 12 run_cycle 必須用本函式，而非直呼 check_drawdown**——三種告警都在這裡發，
+    不靠呼叫端記得補：
+    1. peak<=0 的 degenerate warn（dedup_key="equity_degenerate"）
+    2. 樣本覆蓋不足 → **critical**（findings F1/C1：空樣本會讓 drawdown 恆 0，
+       「無資料」偽裝成「無回撤」；此時回撤保護實質不存在，必須大聲）
+    3. 慢速絕對底線（findings F1/C2）：7 天窗只量虧損速度，慢跌可繞過；
+       以 lifetime_peak 為基準的回撤超過 max_total_drawdown_pct 即判 breached
     """
     status = check_drawdown(ev, settings.max_drawdown_pct)
     if ev.recent_peak <= 0:
         notifier.warn(
             "killswitch",
             f"權益資料 degenerate（peak={ev.recent_peak}）——回撤判定停用"
-            f"（breached=False），請檢查 portfolio 資料源",
+            f"（breached=False），請檢查資料源",
             dedup_key="equity_degenerate",
         )
+    if coverage is not None and not coverage.sufficient:
+        notifier.critical(
+            "killswitch",
+            f"**回撤保護尚未生效**：樣本覆蓋 {coverage.count} 筆／最舊 "
+            f"{coverage.oldest_age_s / 60:.0f} 分鐘"
+            f"{'（樣本檔讀取失敗！）' if coverage.read_error else ''}"
+            f"——熔斷在覆蓋足夠前不會觸發，請勿據 drawdown 數字判斷風險",
+            dedup_key="equity_coverage_insufficient",
+        )
+    if (lifetime_peak is not None and settings.max_total_drawdown_pct > 0
+            and lifetime_peak > 0):
+        total_dd = (lifetime_peak - status.current) / lifetime_peak
+        if total_dd > settings.max_total_drawdown_pct:
+            notifier.critical(
+                "killswitch",
+                f"**慢速絕對底線觸發**：自開始跟單以來回撤 {total_dd}"
+                f"（高水位 {lifetime_peak} → {status.current}）"
+                f"超過上限 {settings.max_total_drawdown_pct}",
+                dedup_key="equity_total_drawdown",
+            )
+            status = replace(status, drawdown_pct=total_dd, breached=True)
     return status
 
 

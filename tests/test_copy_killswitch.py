@@ -573,3 +573,25 @@ def test_panic_main_yes_degenerate_equity_warns(panic_env, capsys):
         panic_env.panic.main(["--yes"])
     out = capsys.readouterr().out
     assert "[WARN]" in out and "degenerate" in out
+
+
+def test_evaluate_alerts_when_coverage_insufficient():
+    """C1：覆蓋不足必須發 critical（無資料不得偽裝成無回撤）。"""
+    from spark.copytrade.equity import SampleCoverage
+
+    notifier = RecordingNotifier()
+    ev = EquityView(current=Decimal("500"), recent_peak=Decimal("500"))
+    cov = SampleCoverage(count=0, oldest_age_s=0.0, read_error=False)
+    evaluate(ev, CopySettings(), notifier, coverage=cov)
+    messages = [r[2] for r in notifier.records if r[0] == "critical"]
+    assert any("回撤保護尚未生效" in m for m in messages)
+
+
+def test_evaluate_slow_gate_trips_on_lifetime_drawdown():
+    """C2：7 天窗內無回撤，但自開始以來跌超過絕對底線 → 必須 breached。"""
+    notifier = RecordingNotifier()
+    # 窗內 peak==current（慢跌後窗已滾動）→ 快速閘算出 dd=0
+    ev = EquityView(current=Decimal("400"), recent_peak=Decimal("400"))
+    st = evaluate(ev, CopySettings(), notifier, lifetime_peak=Decimal("1000"))
+    assert st.breached is True, "自 1000 跌到 400（60%）應觸發 40% 絕對底線"
+    assert st.drawdown_pct == Decimal("0.6")

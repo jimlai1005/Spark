@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
@@ -28,8 +29,45 @@ from spark.exchange.base import EquityView
 
 SAMPLES_RELPATH = Path("var/copytrade/equity_samples.json")
 WINDOW_S = 7 * 24 * 3600  # 7 天，對齊 hl 的 week-window 語意
+MIN_COVERAGE_S = 3600  # 樣本覆蓋不足 1 小時＝回撤保護尚未生效（見 SampleCoverage）
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SampleCoverage:
+    """樣本覆蓋度——回撤保護是否真的生效的可觀測指標。
+
+    `peak = max(樣本 ∪ current)` 恆 >= current，故 peak 永遠不會 <= 0（除非帳戶被清算），
+    既有的 degenerate 告警在此路徑上結構性失效。空樣本會讓 drawdown 恆為 0——
+    「無資料」偽裝成「無回撤」。本型別讓呼叫端能分辨兩者並大聲告警（findings F1/C1）。
+    """
+    count: int
+    oldest_age_s: float  # 無樣本時為 0.0
+    read_error: bool     # True＝檔案存在但讀不出來（與「首次啟動無檔」不同，更嚴重）
+
+    @property
+    def sufficient(self) -> bool:
+        return (not self.read_error) and self.count >= 2 and self.oldest_age_s >= MIN_COVERAGE_S
+
+
+def sample_coverage(root: Path, *, now_fn=time.time, window_s: int = WINDOW_S) -> SampleCoverage:
+    """回報樣本覆蓋度。read_error 與「檔案不存在」分開——讀不到 ≠ 沒有歷史。"""
+    path = root / SAMPLES_RELPATH
+    read_error = False
+    if path.exists():
+        try:
+            path.read_text()
+        except OSError:
+            read_error = True
+    now = float(now_fn())
+    samples = [(ts, v) for ts, v in _load(path) if 0 <= now - ts <= window_s]
+    oldest = min((ts for ts, _ in samples), default=None)
+    return SampleCoverage(
+        count=len(samples),
+        oldest_age_s=(now - oldest) if oldest is not None else 0.0,
+        read_error=read_error,
+    )
 
 
 def _load(path: Path) -> list[tuple[float, str]]:
@@ -63,17 +101,43 @@ def _save(path: Path, samples: list[tuple[float, str]]) -> None:
     os.replace(tmp, path)
 
 
+LIFETIME_PEAK_RELPATH = Path("var/copytrade/equity_lifetime_peak.json")
+
+
+def update_lifetime_peak(root: Path, current: Decimal, *, persist: bool = True) -> Decimal:
+    """維護「自開始跟單以來」的高水位（慢速絕對底線用，findings F1/C2）。
+
+    與 7 天滾動 peak 不同：本值只升不降，由 `killswitch.trip()` 與人工 re-arm 流程重置
+    （`reset_samples` 一併清除）——語意是「這一段跟單期間的最高點」。
+    persist=False：唯讀（--status／panic 用），不落檔。
+    """
+    path = root / LIFETIME_PEAK_RELPATH
+    prev = Decimal("0")
+    if path.exists():
+        try:
+            prev = Decimal(str(json.loads(path.read_text())))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, ArithmeticError):
+            prev = Decimal("0")
+    peak = max(prev, current)
+    if persist and peak != prev:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(str(peak)))
+        os.replace(tmp, path)
+    return peak
+
+
 def reset_samples(root: Path) -> None:
-    """清空樣本。kill switch 觸發時呼叫——防止人工 re-arm 後被舊 peak 立刻再熔斷。
+    """清空樣本與全期高水位。kill switch 觸發時呼叫——防止人工 re-arm 後被舊 peak 立刻再熔斷。
 
     **絕不拋例外**：本函式在 `killswitch.trip()` 中位於「ARM 已落地」與「總結 critical
     告警」之間，若在此拋錯會吃掉那則告警（操作者收不到平倉成敗清單），違反工程原則 3。
-    清理失敗只是「下次 re-arm 可能被舊 peak 再熔斷」，遠輕於告警遺失。
     """
-    try:
-        (root / SAMPLES_RELPATH).unlink(missing_ok=True)
-    except OSError as e:  # noqa: BLE001 — 清理失敗絕不能擋告警，見 docstring
-        logger.warning("清空 perp 權益樣本失敗（不影響 ARM 鎖定）: %r", e)
+    for rel in (SAMPLES_RELPATH, LIFETIME_PEAK_RELPATH):
+        try:
+            (root / rel).unlink(missing_ok=True)
+        except OSError as e:  # noqa: BLE001 — 清理失敗絕不能擋告警，見 docstring
+            logger.warning("清空 %s 失敗（不影響 ARM 鎖定）: %r", rel, e)
 
 
 def perp_equity_view(adapter, address: str, root: Path, *,

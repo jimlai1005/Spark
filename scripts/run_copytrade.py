@@ -39,7 +39,7 @@ from pathlib import Path
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
-from spark.copytrade.equity import perp_equity_view
+from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
 from spark.copytrade.killswitch import check_drawdown, is_tripped
 from spark.copytrade.loop import main_loop, run_cycle
@@ -140,11 +140,23 @@ def _print_status(adapter, user_addr: str, settings: CopySettings, root: Path) -
     equity 基準與引擎判定一致（perp accountValue + 滾動樣本，findings F1）——
     顯示與判定同基準才不會誤導操作者對緩衝的判斷。
     """
+    from decimal import Decimal
+
     ev = perp_equity_view(adapter, user_addr, root, persist=False)
+    cov = sample_coverage(root)
+    lifetime = update_lifetime_peak(root, ev.current, persist=False)
     st = check_drawdown(ev, settings.max_drawdown_pct)
     breach_tag = "（已超過上限！）" if st.breached else ""
     print(f"equity: current=${ev.current} week_peak=${ev.recent_peak} "
           f"drawdown={st.drawdown_pct} / 上限 {settings.max_drawdown_pct}{breach_tag}")
+    if not cov.sufficient:
+        print(f"  ⚠️ 回撤保護尚未生效：樣本 {cov.count} 筆／最舊 "
+              f"{cov.oldest_age_s / 60:.0f} 分鐘"
+              f"{'（樣本檔讀取失敗！）' if cov.read_error else ''}")
+    if lifetime > 0 and settings.max_total_drawdown_pct > 0:
+        total_dd = (lifetime - ev.current) / lifetime if lifetime > 0 else Decimal("0")
+        print(f"  全期高水位={lifetime} 總回撤={total_dd} / 絕對底線 "
+              f"{settings.max_total_drawdown_pct}")
     positions = adapter.get_positions(user_addr)
     print(f"positions ({len(positions)}):")
     for p in positions:

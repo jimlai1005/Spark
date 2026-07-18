@@ -98,6 +98,10 @@ class CopySettings:
     min_order_notional: Decimal = Decimal("10")  # hl MIN_ORDER_NOTIONAL
     size_tolerance: Decimal = Decimal("0.02")  # hl SIZE_TOLERANCE
     max_drawdown_pct: Decimal = Decimal("0.20")  # hl MAX_DRAWDOWN_PCT
+    # 慢速絕對底線（findings F1/C2）：7 天滾動窗只量「虧損速度」，慢跌（每窗跌幅低於
+    # max_drawdown_pct）可累積成巨額虧損而從不觸發。本門檻以「自開始跟單以來的高水位」
+    # 為基準，兩道閘任一觸發即熔斷。0 = 停用。
+    max_total_drawdown_pct: Decimal = Decimal("0.40")
     settle_seconds: int = 2  # hl orders.py SETTLE_SECONDS
     modify_fail_ttl_s: int = 120  # hl orders.py _MODIFY_SKIP_TTL
     max_consecutive_errors: int = 5  # hl main.py:292 MAX_CONSECUTIVE_ERRORS
@@ -138,6 +142,8 @@ class CopySettings:
             ),
             size_tolerance=_env_decimal("COPY_SIZE_TOLERANCE", str(cls.size_tolerance), env),
             max_drawdown_pct=_env_decimal("COPY_MAX_DRAWDOWN_PCT", str(cls.max_drawdown_pct), env),
+            max_total_drawdown_pct=_env_decimal(
+                "COPY_MAX_TOTAL_DRAWDOWN_PCT", str(cls.max_total_drawdown_pct), env),
             settle_seconds=_env_int("COPY_SETTLE_SECONDS", str(cls.settle_seconds), env),
             modify_fail_ttl_s=_env_int("COPY_MODIFY_FAIL_TTL_S", str(cls.modify_fail_ttl_s), env),
             max_consecutive_errors=_env_int(
@@ -189,5 +195,8 @@ class CopySettings:
 
         if not (0 <= self.slippage < 1):
             raise ValueError(
-                f"slippage must be in [0, 1), got {self.slippage}"
-            )
+                f"slippage must be in [0, 1), got {self.slippage}")
+
+        if not (0 <= self.max_total_drawdown_pct < 1):
+            raise ValueError(
+                f"max_total_drawdown_pct must be in [0, 1), got {self.max_total_drawdown_pct}")
