@@ -12,6 +12,7 @@ export const COPY = {
     loading: "載入中…",
     notLoggedIn: "尚未登入——請先回到登入頁連接錢包。",
     backToLogin: "回登入頁",
+    logout: "登出",
     nonCustodial: "Filet 永遠不會請你輸入私鑰或助記詞；所有簽署只會在你自己的錢包中完成。",
   },
   login: {
@@ -70,7 +71,6 @@ export const COPY = {
     errors: {
       walletRejected: "簽署被拒絕——請在錢包中重試。Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
       signerMismatch: "簽名帳號與登入帳號不符——請在錢包中切回登入時使用的帳號後重試。這筆簽名不會被送出。",
-      chainMissing: "讀不到錢包目前的網路（chainId）——請確認錢包已連接後重試。",
       agentUnavailable: "金鑰服務暫時不可用，請稍後重試。",
       payloadFailed: "取得待簽內容失敗，請稍後重試。",
       hlTransient: "送出授權時網路不穩——可以放心重試，重複送出同一筆簽名不會造成重複授權。",

@@ -53,6 +53,10 @@ export function StepSign({ status, loginAddress, refetchStatus }: StepSignProps)
 
   function makeCard(kind: "agent" | "fee") {
     const fetchPayload = async (): Promise<HlTypedData> => {
+      // !chainId 在 UI 上不可達：兩張卡的簽署鈕都以 chainId 缺失為 disabled 條件
+      // （見下方 SignCard 的 disabled prop）。此處仍防禦性擋一層，走既有
+      // payload-failed 分類（opus 終審 Minor 3：對應的 chainMissing 文案已刪除，
+      // 因為它從未在這條路徑被觸發過——沒有專屬 ApprovalResult kind 可映射）。
       if (!chainId) throw new Error("no chainId");
       const r = kind === "agent"
         ? await getApproveAgentPayload(chainId)
