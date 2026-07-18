@@ -11,7 +11,7 @@
 
 主迴圈接入接口（Task 12 的 run_cycle 實作；本模組只提供積木）：
     cycle 開頭 `is_tripped(root)` → True 則本輪只讀報狀態（＋每小時一次 critical 提醒），
-    不做任何交易動作；False 則 `evaluate(adapter.get_equity_view(addr), settings, notifier)`
+    不做任何交易動作；False 則 `evaluate(perp_equity_view(adapter, addr, root), settings, notifier)`
     （**必須用 evaluate() 而非直呼 check_drawdown**——degenerate equity 的 warn 在
     evaluate 內結構性保證）→ breached 且 settings.flatten_on_breach → `trip(...)`。
 

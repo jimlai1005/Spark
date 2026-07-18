@@ -44,6 +44,9 @@ def test_two_state_dirs_isolate_killswitch(tmp_path):
 class _FakeAdapter:
     """--status 只讀路徑用的假 adapter：零網路、零外呼。"""
 
+    def get_account_value(self, addr):
+        return Decimal("100")
+
     def get_equity_view(self, addr):
         return EquityView(current=Decimal("100"), recent_peak=Decimal("100"))
 

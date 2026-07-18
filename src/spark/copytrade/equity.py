@@ -65,17 +65,22 @@ def reset_samples(root: Path) -> None:
 
 
 def perp_equity_view(adapter, address: str, root: Path, *,
-                     now_fn=time.time, window_s: int = WINDOW_S) -> EquityView:
+                     now_fn=time.time, window_s: int = WINDOW_S,
+                     persist: bool = True) -> EquityView:
     """以 perp accountValue 為基準的 EquityView（current 與 peak 同源同單位）。
 
     current = `adapter.get_account_value(address)`（與 sizing 同一數字，工程原則 1）。
     peak = 滾動窗內樣本與 current 的最大值。
+
+    persist=False：只讀不寫（供 `--status` 顯示與 panic 記錄用——兩者皆有零寫入／
+    不改變狀態的契約，但顯示的基準必須與引擎判定一致，否則操作者的心智模型會脫節）。
     """
     current = adapter.get_account_value(address)
     now = float(now_fn())
     path = root / SAMPLES_RELPATH
     samples = [(ts, v) for ts, v in _load(path) if now - ts <= window_s]
     samples.append((now, str(current)))
-    _save(path, samples)
+    if persist:
+        _save(path, samples)
     peak = max([Decimal(v) for _, v in samples] + [current])
     return EquityView(current=current, recent_peak=peak)

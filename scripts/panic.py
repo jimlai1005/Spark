@@ -30,6 +30,7 @@ from pathlib import Path
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
+from spark.copytrade.equity import perp_equity_view, reset_samples
 from spark.copytrade.killswitch import (
     DrawdownStatus,
     FlattenReport,
@@ -202,8 +203,9 @@ def run_single_follower(
     try:
         # current/peak 同源（工程原則 1）。evaluate（非直呼 check_drawdown）：peak<=0 的
         # degenerate warn 結構性內建。手動 panic 不看 breached——照常執行；數字寫進 ARM。
-        ev = resilient_run(lambda: adapter.get_equity_view(user_addr),
-                           what="panic get_equity_view", idempotent=True, sleep_fn=sleep_fn)
+        ev = resilient_run(
+            lambda: perp_equity_view(adapter, user_addr, state_root, persist=False),
+            what="panic perp_equity_view", idempotent=True, sleep_fn=sleep_fn)
         status = evaluate(ev, copy_settings, notifier)
     except Exception as e:  # noqa: BLE001 — 讀失敗也要繼續鎖死；不得跳過該 follower
         notifier.critical(
@@ -226,6 +228,8 @@ def run_single_follower(
         degraded.append("positions_unavailable")
 
     report = trip(executor, positions, notifier, state_root, status, sleep_fn=sleep_fn)
+    # 對齊 killswitch.trip()：清空 perp 權益樣本，否則人工 re-arm 後舊 peak 仍在窗內會立刻再熔斷。
+    reset_samples(state_root)
     if degraded:
         # degrade 反映進 report.failures → _exit_code 非 0，operator 不會誤判乾淨收場。
         report = replace(report, failures=report.failures + tuple(degraded))

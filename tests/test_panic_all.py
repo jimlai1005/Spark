@@ -92,6 +92,13 @@ def fake_stack(monkeypatch, tmp_path):
                 raise TimeoutError(f"positions timeout attempt {self._pos_calls}")
             return [_position("ETH", cfg.get("size", "2"))]
 
+        def get_account_value(self, address):
+            self._address = address
+            cfg = registry[address]
+            if cfg.get("raise_on_equity"):
+                raise cfg["raise_on_equity"]
+            return Decimal("900")
+
         def get_equity_view(self, address):
             self._address = address
             cfg = registry[address]

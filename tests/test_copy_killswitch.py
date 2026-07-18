@@ -464,6 +464,9 @@ class _FakePanicAdapter:
     def get_positions(self, address):
         return [_position("ETH", "2")]
 
+    def get_account_value(self, address):
+        return self._equity.current
+
     def get_equity_view(self, address):
         return self._equity
 

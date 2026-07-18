@@ -39,6 +39,7 @@ from pathlib import Path
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
+from spark.copytrade.equity import perp_equity_view
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
 from spark.copytrade.killswitch import check_drawdown, is_tripped
 from spark.copytrade.loop import main_loop, run_cycle
@@ -134,8 +135,12 @@ def _print_live_warning(network: str, settings: CopySettings) -> None:
 
 
 def _print_status(adapter, user_addr: str, settings: CopySettings, root: Path) -> None:
-    """只讀報狀態（零寫入；adapter 以 exchange=None 建構，結構性保證）。"""
-    ev = adapter.get_equity_view(user_addr)
+    """只讀報狀態（零寫入：adapter 以 exchange=None 建構＋perp_equity_view(persist=False)）。
+
+    equity 基準與引擎判定一致（perp accountValue + 滾動樣本，findings F1）——
+    顯示與判定同基準才不會誤導操作者對緩衝的判斷。
+    """
+    ev = perp_equity_view(adapter, user_addr, root, persist=False)
     st = check_drawdown(ev, settings.max_drawdown_pct)
     breach_tag = "（已超過上限！）" if st.breached else ""
     print(f"equity: current=${ev.current} week_peak=${ev.recent_peak} "
