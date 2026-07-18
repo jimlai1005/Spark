@@ -60,9 +60,9 @@ class DrawdownStatus:
 def check_drawdown(ev: EquityView, max_dd_pct: Decimal) -> DrawdownStatus:
     """純函式回撤判定。drawdown = (peak - current) / peak；`drawdown > max` 才觸發。
 
-    同源不變量（工程原則 1）：ev.current 與 ev.recent_peak 必須出自**同一次**
-    `get_equity_view()` 呼叫（EquityView 型別本身即此契約，見 base.py docstring）——
-    呼叫端不得拿不同來源/不同時刻的兩個數字拼一個 EquityView 進來。
+    同源不變量（工程原則 1）：ev.current 與 ev.recent_peak 必須同源同單位——引擎路徑
+    由 `perp_equity_view()` 保證（同一欄位 perp accountValue 的即時值與滾動樣本最大值）。
+    呼叫端不得拿不同來源（例如一邊 portfolio 一邊 marginSummary）拼一個 EquityView 進來。
 
     peak <= 0（新帳戶無歷史、或 portfolio 回應異常）→ drawdown=0、breached=False；
     這是「無資料」不是「安全」——warn 由 `evaluate()` 結構性保證。引擎呼叫端一律走

@@ -88,7 +88,13 @@ class AccountSnapshot:
 
 @dataclass(frozen=True)
 class EquityView:
-    """回撤判定用：current 與 recent_peak 必須出自同一次 portfolio 回應（同源比較）。"""
+    """回撤判定用：current 與 recent_peak 必須同源同單位（工程原則 1）。
+
+    2026-07-19 起引擎改由 `spark.copytrade.equity.perp_equity_view()` 產生本型別：
+    current = perp accountValue 即時值、recent_peak = 同一欄位的本地滾動樣本最大值
+    ——同一量測方式的時間序列，仍滿足同源。`HyperliquidAdapter.get_equity_view()`
+    的 portfolio 版本仍存在但引擎不再使用（其值含 spot，會稀釋回撤保護，findings F1）。
+    """
     current: Decimal
     recent_peak: Decimal
 
