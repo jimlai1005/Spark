@@ -28,4 +28,10 @@ describe("語言紅線（spec 不變量 4：2026-06-18 沿用）", () => {
     const joined = allStrings(COPY).join("\n");
     expect(joined).toContain("無法動用或提領");
   });
+
+  it("資金轉出警示存在於 wizard 與績效頁文案", () => {
+    expect(COPY.wizard.fundsWarning).toMatch(/perp/);
+    expect(COPY.wizard.fundsWarning).toMatch(/轉出/);
+    expect(COPY.perf.fundsWarning).toMatch(/轉出/);
+  });
 });

@@ -24,6 +24,7 @@ export function StepRisk({ onConfirm }: { onConfirm: () => void }) {
           <span>{text}</span>
         </label>
       ))}
+      <p className="hint">{c.fundsWarning}</p>
       <div className="step-actions">
         <button type="button" className="btn btn-primary"
           disabled={!agree.every(Boolean)} onClick={onConfirm}>

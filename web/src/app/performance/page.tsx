@@ -69,6 +69,7 @@ export default function PerformancePage() {
         <p className="fee-note">{c.feeUpperNote}</p>
       </div>
       <p className="hint">{c.refreshNote}</p>
+      <p className="hint">{c.fundsWarning}</p>
     </main>
   );
 }

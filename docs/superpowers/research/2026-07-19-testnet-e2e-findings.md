@@ -202,3 +202,16 @@ HL 的 `batchModify` 帶 **post-only 語意**——同一張單、同一個非�
 - 實機：equity 基準 `$499.30`（perp）｜F2 守衛 `exit=1`｜`--status` 零寫入成立
 
 **驗收過程中攔截到的初版缺失**：F1 首版只改引擎主迴圈，遺漏 `--status` 與 `panic.py`（單元測試全綠但實機顯示仍是舊基準）；另發現 panic 有一處重複的 `reset_samples` 且註解誤導 `trip()` 未清理——皆已修正。**教訓：測試綠不等於覆蓋完整，同一語意變更要盤點所有呼叫點。**
+
+---
+
+## I1 處置：資金轉出誤觸發
+
+**使用者裁決（2026-07-19）**：兩者都做——馬上加客戶端警示，同時把 ledger 校正正式排入 public beta。
+
+**已做**：`web/src/lib/copy.ts` 新增 `wizard.fundsWarning` 與 `perf.fundsWarning`，顯示於 onboarding 風險確認步驟與績效頁；`copy.test.ts` 釘住其存在。
+
+**排入 public beta（正式待辦，非註解裡的一句話）**：
+- **項目**：出入金 ledger 校正——用 HL 的資金流端點取得 perp 帳戶的存提記錄，從回撤計算中剔除，使「客戶轉出資金」不再被誤判為虧損。
+- **為何 closed alpha 先不做**：客戶數少、可用文案警示涵蓋；ledger 端點需先做 research（HL 該端點的欄位與分頁行為未驗證），屬 load-bearing 未知。
+- **完成前的殘餘風險**：客戶若忽略警示轉出資金，會被保護性平倉（fail-safe 方向，不會虧錢，但會吃滑價並需人工 re-arm）。

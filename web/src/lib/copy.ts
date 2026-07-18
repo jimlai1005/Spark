@@ -69,6 +69,9 @@ export const COPY = {
     depositPending: "尚未偵測到足額資金（需 ≥ 100 USDC）。請將 USDC 轉入你自己的 Hyperliquid 帳戶（與登入錢包同一地址）；資金全程留在你的帳戶，Filet 無法動用或提領。",
     submitReview: "送出審核",
     submitted: "已送出審核。管理員核准後開始跟單；你隨時可回到本頁或績效頁查看狀態。",
+    fundsWarning:
+      "跟單期間請勿將資金從永續合約（perp）帳戶轉出。系統以 perp 帳戶淨值計算回撤保護，" +
+      "轉出資金會被視為虧損，可能觸發保護性平倉。若要調整資金請先在此頁停止跟單。",
     errors: {
       walletRejected: "簽署被拒絕——請在錢包中重試。Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
       signerMismatch: "簽名帳號與登入帳號不符——請在錢包中切回登入時使用的帳號後重試。這筆簽名不會被送出。",
@@ -101,6 +104,9 @@ export const COPY = {
     feeRateNote: "費率 0.02%，逐筆鏈上可驗。",
     feeUpperNote: "你簽署的授權上限為 0.1%；實際僅收 0.02%。",
     refreshNote: "本頁每 30 秒自動更新。",
+    fundsWarning:
+      "提醒：跟單期間請勿將資金從永續合約（perp）帳戶轉出——系統以 perp 淨值計算回撤保護，" +
+      "轉出會被視為虧損並可能觸發保護性平倉。",
   },
   admin: {
     title: "待核准清單",
