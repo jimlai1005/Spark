@@ -42,6 +42,23 @@ _WRITE_CALLS = ("place_order", "modify_order", "cancel_order", "market_open",
                 "close_reduce_only", "update_leverage")
 
 
+def _seed_equity_peak(root, peak: str, *, ts: float | None = None) -> None:
+    """預先播種 perp 權益樣本檔，讓 perp_equity_view 算出指定的 peak。
+
+    回撤判定 2026-07-19 起改用 perp accountValue + 本地滾動樣本（findings F1），
+    不再讀 adapter 的 EquityView 注入槽——breach 情境改由此 helper 建立。
+    """
+    import json
+    import time
+    from spark.copytrade.equity import SAMPLES_RELPATH
+
+    if ts is None:
+        ts = time.time()
+    p = root / SAMPLES_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps([[ts, peak]]))
+
+
 def _settings(**kw) -> CopySettings:
     kw.setdefault("volatility_weight_enabled", False)
     return CopySettings(**kw)
@@ -95,11 +112,12 @@ def test_breach_with_flatten_calls_trip(tmp_path, monkeypatch):
                         lambda ex, pos, notifier, root, status: calls.append(
                             (pos, root, status)))
     fa = FakeAdapter(
-        equity=EquityView(current=Decimal("700"), recent_peak=Decimal("1000")),  # dd=0.3
+        account_value=Decimal("700"),  # 對照播種的 peak=1000 → dd=0.3
         positions=[Position(coin="ETH", szi=Decimal("1"), entry_px=Decimal("2000"),
                             leverage=5, is_cross=True, unrealized_pnl=Decimal("0"),
                             margin_used=Decimal("0"))],
     )
+    _seed_equity_peak(tmp_path, "1000")
     report, notifier, _ = _run(fa, tmp_path=tmp_path)  # 預設 max_dd=0.20、flatten 開
 
     assert report.tripped is True
@@ -114,7 +132,8 @@ def test_breach_with_flatten_calls_trip(tmp_path, monkeypatch):
 def test_breach_without_flatten_skips_trip_but_still_tripped_report(tmp_path, monkeypatch):
     monkeypatch.setattr(loop_mod, "trip",
                         lambda *a, **k: pytest.fail("flatten_on_breach=False 不得呼叫 trip"))
-    fa = FakeAdapter(equity=EquityView(current=Decimal("700"), recent_peak=Decimal("1000")))
+    fa = FakeAdapter(account_value=Decimal("700"))
+    _seed_equity_peak(tmp_path, "1000")
     report, notifier, _ = _run(fa, settings=_settings(flatten_on_breach=False),
                                tmp_path=tmp_path)
     assert report.tripped is True
