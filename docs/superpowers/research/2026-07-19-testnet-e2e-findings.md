@@ -215,3 +215,31 @@ HL 的 `batchModify` 帶 **post-only 語意**——同一張單、同一個非�
 - **項目**：出入金 ledger 校正——用 HL 的資金流端點取得 perp 帳戶的存提記錄，從回撤計算中剔除，使「客戶轉出資金」不再被誤判為虧損。
 - **為何 closed alpha 先不做**：客戶數少、可用文案警示涵蓋；ledger 端點需先做 research（HL 該端點的欄位與分頁行為未驗證），屬 load-bearing 未知。
 - **完成前的殘餘風險**：客戶若忽略警示轉出資金，會被保護性平倉（fail-safe 方向，不會虧錢，但會吃滑價並需人工 re-arm）。
+
+## opus F1 複審的處置總表（2026-07-19）
+
+F1 首版修好了「基準含 spot」，但 opus 對抗性複審用實跑腳本證實**引入了新的不安全**。全部處置如下。
+
+| # | 問題 | 處置 | 驗證 |
+|---|---|---|---|
+| **C1** | 空樣本＝靜默 fail-open。`peak = max(樣本 ∪ current)` 恆 ≥ current，故既有 `peak<=0` degenerate 告警在新路徑上結構性死掉；檔案遺失／容器無持久化／停機>7天/權限問題 → dd 恆 0 且無聲，`--status` 顯示「健康」 | 新增 `SampleCoverage`／`sample_coverage()`；`evaluate()` 覆蓋不足時發 **critical**（非 warn）；`_load` 的 OSError 與「檔案不存在」分開；`--status` 顯示覆蓋度。**裁決：大聲告警但繼續跟單**（首次部署即拒交易會使系統不可用，而操作者已被大聲告知） | 實跑：檔案遺失／內容毀損兩情境皆發 critical「回撤保護尚未生效」（舊版完全靜默）|
+| **C2** | 7 天滾動窗只量「虧損速度」：每 7 天跌 19% × 8 週 → 累計虧 81.5%，**熔斷從未觸發**；且與「20% 回撤保護」的產品承諾語意不符 | 新增「自開始跟單以來高水位」與 `max_total_drawdown_pct`（**預設 0.40**，`COPY_MAX_TOTAL_DRAWDOWN_PCT` 可調）；快速閘（7天窗 20%）與慢速閘任一觸發即熔斷；`trip()`／re-arm 一併重置 | 實跑同一情境：**第 3 週（累計 46.9%）即熔斷**（引擎實際每 60s 取樣，會更貼近 40% 觸發）|
+| **I1** | 客戶自 perp 轉出資金被算成回撤 → `flatten_on_breach=True` 直接平倉；客戶端**零警示** | **裁決：兩者都做**——onboarding 風險步驟與績效頁加警示文案（測試釘住）；ledger 校正正式排入 public beta 待辦（含 research 前置說明與殘餘風險） | 前端 87 tests 綠、build 成功 |
+| **I3** | `reset_samples` 拋錯會吃掉 kill switch 的總結 critical（位於 ARM 落地與告警之間）| 改為絕不拋例外（`unlink(missing_ok=True)` + try/except → logger.warning）；加測試 | 測試釘住「unlink 失敗時不得拋出」|
+| **I4** | 未來時間戳（時鐘跳動／NTP）永不出窗，污染期＝跳動幅度＋7天 | 過濾改 `0 <= now - ts <= window_s`；加測試 | 遠未來高點樣本不影響 peak |
+| **I5** | 固定 `.tmp` 檔名，多行程併發可產生撕裂檔 → `_load` 回空 → 回饋成 C1 | tmp 檔名加 `os.getpid()` | — |
+| **M1** | `base.py`／`killswitch.py` 的同源契約 docstring 已與實作矛盾 | 兩處更新為新語意 | — |
+| **M2** | `persist=False` 的零寫入契約無測試 | 加 2 個迴歸測試（不建檔、不改動既有檔）| — |
+
+**opus 確認無問題的面向**：同源不變量（current 與 peak 都是 `marginSummary.accountValue` 的時間序列，**比舊版更乾淨**——舊版 current 取四窗最新、peak 只取 week 窗，其實是混窗）；多 follower 隔離；`persist=False` 的顯示偏差方向保守不誤導；sizing 未受影響。
+
+### 刻意延後（記錄理由，非遺漏）
+
+- **I2 單筆插針污染 peak**：unrealizedPnl 受 mark price 影響，冷門幣插針可造成假 peak 並在 7 天內導致假平倉。**延到 public beta**，理由：closed alpha 的 leader 交易主流幣種（深度足夠）；失敗方向是 fail-safe（保住本金，代價是時機不佳＋滑價＋需人工 re-arm）；正確修法（分位數或連續確認）會增加保護語意複雜度，不值得在客戶數個位數時引入。**若 leader 名單納入冷門幣種，此項須先做。**
+- **M3 樣本檔無上限**：`interval_s=60` → 7 天約 10080 筆 ≈ 354 KB，每輪全量讀寫。closed alpha 規模可接受；public beta 前加降頻或筆數上限。
+- **M4 `--status` 直呼 `check_drawdown`**：該路徑無 notifier，結構上呼不了 `evaluate()`；屬 docstring 措辭問題，非行為缺陷。
+
+### 最終驗證（指揮官親跑）
+- Python `uv run pytest -q` → **769 passed, 0 failed**；`ruff check src tests scripts` → clean
+- 前端 `npm test` → **87 passed**；`npm run build` 成功；`npm run lint` clean
+- 實機 `--status` → `$499.30`（perp 基準）＋「⚠️ 回撤保護尚未生效」＋「全期高水位／絕對底線 0.40」三項皆正確顯示
