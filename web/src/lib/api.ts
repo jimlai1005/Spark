@@ -66,6 +66,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (res.status === 502 || res.status === 503) {
     throw new ApiError("upstream", detail ?? "上游服務暫時不可用", res.status, detail);
   }
+  // 非 502/503 的其他 5xx（如 500）目前歸類 client：後端現況不產生此類回應，
+  // 若未來出現需重新評估歸 upstream（並補對應測試），此處僅記錄現況假設。
   throw new ApiError("client", detail ?? `請求失敗（HTTP ${res.status}）`, res.status, detail);
 }
 

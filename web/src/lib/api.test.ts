@@ -139,3 +139,42 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
     }
   });
 });
+
+describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽名（防新函式漏測）", () => {
+  // 上一個 describe 的 calls 陣列是手寫的：新增一個 api.ts 匯出函式時，容易忘記把它加進去，
+  // 讓紅線測試悄悄失去涵蓋。這裡改用 Object.entries 反射列舉「當下實際存在」的匯出函式，
+  // 對每一個都自動呼叫並驗證 body——手寫列表漏了誰，這裡都補上。
+  const EXCLUDED = new Set(["ApiError", "authVerify"]); // ApiError 非函式呼叫端點；authVerify 是唯一合法帶簽名的端點（紅線 3 已知例外，別處測試已覆蓋）
+  const reflected = Object.entries(api).filter(
+    ([name, value]) => typeof value === "function" && !EXCLUDED.has(name),
+  ) as Array<[string, (...args: unknown[]) => Promise<unknown>]>;
+
+  it("反射函式數量與手寫清單一致——手寫清單不會因新函式而過時（保底斷言）", () => {
+    // 對照上一個 describe 的 calls 陣列長度：兩者必須同步增減。
+    const HAND_WRITTEN_LIST_LENGTH = 9;
+    expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
+  });
+
+  function fakeArg(index: number): unknown {
+    // 位置式合理假值：第 2 個參數（index 1）目前都是 chainId，其餘視為地址／字串類參數。
+    // 值本身是否符合語意不重要——這裡只驗證 body 的「欄位名稱」，不驗證欄位值。
+    return index === 1 ? 42161 : "0xAbC0000000000000000000000000000000000001";
+  }
+
+  it.each(reflected)("%s：request body 不含 signature/r/s/v 欄位", async (name, fn) => {
+    mockFetchJson(200, {
+      pending: [], typed_data: {}, nonce: "n", message: "m",
+      address: "0xabc", account_id: "f", agent_address: "0xagent",
+      state: "READY", ok: true,
+    });
+    const args = Array.from({ length: fn.length }, (_, i) => fakeArg(i));
+    await fn(...args).catch(() => undefined);
+    const body = captured[0]?.init.body;
+    if (body != null) {
+      const keys = Object.keys(JSON.parse(body as string));
+      for (const banned of ["signature", "r", "s", "v"]) {
+        expect(keys, `${name} body 含禁止欄位 ${banned}`).not.toContain(banned);
+      }
+    }
+  });
+});
