@@ -315,3 +315,17 @@ def test_equity_view_not_used_for_scale_reminder():
     fa = FakeAdapter(equity=EquityView(current=Decimal("1"), recent_peak=Decimal("2")))
     assert fa.get_account_state("0x").account_value == Decimal("0")
     assert fa.get_equity_view("0x").current == Decimal("1")
+
+
+def test_virtualbook_modify_remints_oid():
+    """釘住假件契約：modify 後 oid 必變（對齊 HL batchModify 實測語意，2026-07-19）。"""
+    book = VirtualBook()
+    spec = _spec(coin="ETH", is_buy=True, sz="0.01", limit_px="1800",
+                 reduce_only=False, tif="Gtc")
+    old_oid = book.place(spec)
+    assert book.modify(old_oid, spec) is True
+    oids = [o.oid for o in book.open_orders()]
+    assert old_oid not in oids, "舊 oid 應已作廢"
+    assert len(oids) == 1, "應只剩一張單"
+    assert oids[0] != old_oid, "新 oid 必須不同於舊 oid"
+    assert book.modify(999999, spec) is False, "不存在的 oid 應回 False"

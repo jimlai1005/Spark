@@ -103,6 +103,7 @@ class VirtualBook:
     """dry-run 記憶體掛單簿：place/modify/cancel 施加於 list[OpenOrder]（oid 自增），
     使 --shadow 連續多輪「desired vs 虛擬簿」對帳收斂——第二輪起 desired 未變時
     plan 應為全 matched、零動作。只模擬掛單簿，不模擬成交/部位。
+    真交易所語意對齐：modify 會重新配發 oid（2026-07-19 testnet 實測），本假件比照。
     """
 
     def __init__(self) -> None:
@@ -116,10 +117,13 @@ class VirtualBook:
         return oid
 
     def modify(self, oid: int, spec: "OrderSpec") -> bool:
-        """就地改單（oid 保留）。oid 不存在 → False（對齊真交易所拒改已消失的單）。"""
+        """改單：模擬 HL batchModify 語意——舊 oid 作廢、配發新 oid（非就地）。oid 不存在 → False。"""
         if oid not in self._orders:
             return False
-        self._orders[oid] = _order_from_spec(oid, spec)
+        del self._orders[oid]
+        new_oid = self._next_oid
+        self._next_oid += 1
+        self._orders[new_oid] = _order_from_spec(new_oid, spec)
         return True
 
     def cancel(self, coin: str, oid: int) -> bool:

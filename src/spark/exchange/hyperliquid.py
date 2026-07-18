@@ -319,6 +319,13 @@ class HyperliquidAdapter(ExchangeAdapter):
         return True
 
     def modify_order(self, agent_signer: Signer, oid: int, order: Order) -> bool:
+        # 2026-07-19 testnet 實測語意（scripts/testnet_modify_probe.py）：
+        #   1. HL modify **會重新配發 oid**（改單前 oid≠成交 oid）；本方法只回 bool、
+        #      刻意丟棄新 oid——安全性依賴呼叫端「每輪重讀 get_open_orders」（loop.py:94），
+        #      這是結構性依賴，勿改成跨輪次快取 oid。
+        #   2. modify **非原子**：被拒時舊單也可能已消失（batchModify 近似 cancel-then-place），
+        #      故「回 False ⇒ 舊單仍在」是錯的假設。
+        #   3. batchModify 帶 post-only 語意：改後的單只能掛著，無法在改單當下吃單成交。
         # ⭐ SDK 0.24.0 modify_order() 無 builder 參數（結構限制，見 ABC docstring 的
         # 紅線例外說明）——此呼叫刻意不帶 builder kwarg。
         res = self._exchange.modify_order(

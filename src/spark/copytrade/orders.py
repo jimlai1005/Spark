@@ -396,6 +396,9 @@ def _reconcile_orders(
       2. 同 slot 但價量不同 → 先試 modify 就地改（保留排隊優先權）。
          TTL 內（近期 modify 失敗過的 coin）或 modify_policy=="cancel-place" → 直接
          降級；modify 回 False → 登記 TTL（clock()+settings.modify_fail_ttl_s）並降級。
+         注意：modify 回 False **不保證舊單仍在**（HL batchModify 非原子，2026-07-19 實測）；
+         降級路徑的 cancel 可能撲空回 False，這是預期行為（`cancelled` 計數會低報），
+         終態仍正確——place 新單後每輪重讀掛單會自然收斂。
       3. **先 cancel（降級舊單 + to_cancel，釋放保證金）後 place（to_place + 降級新規格）**
          ——順序是紅線（hl orders.py:228-243）。
       4. settle 驗證（僅 live）：sleep → 重抓 → 同容忍度算 missing/extra → 不符則
