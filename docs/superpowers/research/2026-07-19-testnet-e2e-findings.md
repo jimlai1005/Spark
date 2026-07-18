@@ -170,3 +170,35 @@ HL 的 `batchModify` 帶 **post-only 語意**——同一張單、同一個非�
 
 **建議（低風險、非緊急）**：修正 F3/F4 的 docstring 與註解使其符合實測語意；`VirtualBook.modify` 改為**也重新配發 oid**，讓假件與真交易所行為一致（否則單元測試對 oid 穩定性給出假信心）。這兩項是「測試保真度」修正，不改變生產行為，可自行處理；但因涉及引擎核心對帳路徑，仍列出供裁決。
 
+
+---
+
+## 處置紀錄（2026-07-19，使用者裁決後執行）
+
+使用者裁決：F1 改、F2 加守衛不全改、F3/F4 修。以下為實際處置與驗證。
+
+### F1 → 已修（回撤基準改 perp + 滾動 7 天峰值）
+- 新增 `src/spark/copytrade/equity.py`：`perp_equity_view()` 以 `get_account_value()`（perp accountValue，**與 sizing 同一個數字**）為 current；peak = 本地滾動 7 天樣本最大值（原子寫 tmp+replace，壞檔退回 current 不阻斷交易）。保留 hl 原本的 week-window 語意而非終身高水位——後者會讓慢跌後貼著門檻反覆熔斷。
+- `killswitch.trip()` 觸發時 `reset_samples(root)`：否則人工 re-arm 後崩跌前的舊 peak 仍在窗內會立刻再熔斷。
+- **覆蓋面修正（指揮官驗收時發現初版遺漏）**：`--status` 顯示與 `panic.py` 的 ARM 記錄原本仍讀舊基準——顯示與判定不同基準會讓操作者誤判緩衝。兩者改用 `perp_equity_view(persist=False)`（維持 `--status` 的零寫入契約）。
+- 迴歸測試：`tests/test_copy_equity.py` 6 例（含 F1 核心迴歸：perp 500→400 必須算出 0.2 回撤，舊基準只會算出約 0.1）。既有 breach 測試改以樣本播種建立情境。
+- **實機驗證**：`--status` 由 `$998.30`（含 spot）→ **`$499.30`**（perp），且執行後無樣本檔（零寫入成立）。
+- commits：`d025a79`、`6f908eb`、`99d6827`、`bda19a1`
+
+### F2 → 已加守衛（不做雙模改造）
+- `scripts/run_testnet_flow.py` 標註「M1 自有錢包模式專用」，`FILET_KEYSTORE=envfile` 時明確拒絕並指路；`get_main_signer` 的 `KeyError` 包成人話訊息。
+- 判定理由：M1 主網 dogfood 仍在待辦，該場景**自有錢包、主鑰在 Keychain 合法**——腳本是 M1 專用工具，不是壞掉的工具；其驗證路徑已被 dashboard onboarding 與改造後的探針取代，雙模改造屬 YAGNI。
+- **實機驗證**：`FILET_KEYSTORE=envfile` 執行 → 印出指路訊息、`exit=1`（非 KeyError traceback）。
+- commit：`4645a16`
+
+### F3/F4 → 已修（測試保真度）
+- `VirtualBook.modify` 改為**重新配發 oid**（對齊 HL batchModify 實測語意），並加測試釘住假件契約本身。
+- 既有測試 `test_virtual_book_evolves_place_modify_cancel` 的斷言（`oid 保留`）編碼了錯誤模型，已修正為驗證 oid 重配發；**修正後斷言更嚴格**——多驗了「拿過期 oid 撤單會失敗」這個真實行為。
+- `hyperliquid.modify_order` / `orders.py` 補上實測語意註解：oid 重配發、非原子（回 False 不保證舊單仍在）、post-only。明文寫出「安全性依賴呼叫端每輪重讀掛單」這條**結構性依賴**，使其從習慣變成契約。
+- commits：`8466482`、`dd16883`
+
+### 最終驗證（指揮官親跑）
+- `uv run pytest -q` → **757 passed, 0 failed**；`ruff check src tests scripts` → clean
+- 實機：equity 基準 `$499.30`（perp）｜F2 守衛 `exit=1`｜`--status` 零寫入成立
+
+**驗收過程中攔截到的初版缺失**：F1 首版只改引擎主迴圈，遺漏 `--status` 與 `panic.py`（單元測試全綠但實機顯示仍是舊基準）；另發現 panic 有一處重複的 `reset_samples` 且註解誤導 `trip()` 未清理——皆已修正。**教訓：測試綠不等於覆蓋完整，同一語意變更要盤點所有呼叫點。**
