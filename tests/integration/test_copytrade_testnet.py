@@ -86,16 +86,15 @@ def test_copytrade_e2e_testnet():
     ks = MacKeychainBackend()
     main = ks.get_main_signer(ACCOUNT_ID)
 
-    # 2. onboarding 冪等重用（main-bound adapter；Keychain 已有 agent key 才跳過 approve，
-    #    避免無謂 rotate——與 test_testnet_flow.py 的 has_agent 模式一致）。
+    # 2. onboarding 冪等重用（main-bound adapter；agent 步驟由 onboard() 對照鏈上
+    #    extraAgents 查詢驅動判定是否需要 approve——與 test_testnet_flow.py 一致）。
     main_adapter, info = _mk_adapter(settings, main)
     try:
-        ks.get_agent_signer(ACCOUNT_ID)
-        has_agent = True
+        local_agent_address = ks.get_agent_signer(ACCOUNT_ID).address
     except KeyError:
-        has_agent = False
+        local_agent_address = None
     result = onboard(main_adapter, settings, main_signer=main, user_address=USER_ADDR,
-                     skip_agent_approval=has_agent,
+                     local_agent_address=local_agent_address,
                      on_agent_key=lambda k: ks.import_key(ACCOUNT_ID, "agent", k))
     assert result.state == OnboardingState.READY
     assert main_adapter.query_max_builder_fee(USER_ADDR, BUILDER_ADDR) != 0

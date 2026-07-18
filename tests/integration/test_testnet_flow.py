@@ -46,15 +46,15 @@ def test_end_to_end_testnet():
     ks = MacKeychainBackend()
     main = ks.get_main_signer(ACCOUNT_ID)
 
-    # onboarding：main-bound adapter；Keychain 沒 agent key 才 approve（避免 rotate）
+    # onboarding：main-bound adapter；agent 步驟由 onboard() 對照鏈上 extraAgents
+    # 查詢驅動判定是否需要 approve（真正冪等，不再單純信任本機 Keychain 是否有 key）。
     main_adapter, info = _mk_adapter(settings, main)
     try:
-        ks.get_agent_signer(ACCOUNT_ID)
-        has_agent = True
+        local_agent_address = ks.get_agent_signer(ACCOUNT_ID).address
     except KeyError:
-        has_agent = False
+        local_agent_address = None
     result = onboard(main_adapter, settings, main_signer=main, user_address=USER_ADDR,
-                     skip_agent_approval=has_agent,
+                     local_agent_address=local_agent_address,
                      on_agent_key=lambda k: ks.import_key(ACCOUNT_ID, "agent", k))
     assert result.state == OnboardingState.READY
     assert main_adapter.query_max_builder_fee(USER_ADDR, BUILDER_ADDR) != 0

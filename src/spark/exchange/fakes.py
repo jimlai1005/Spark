@@ -29,11 +29,14 @@ class FakeAdapter(ExchangeAdapter):
                  open_orders=(), positions=(), account=None, equity=None, fills=(),
                  mids=None, sz_decimals=None, daily_abs_pnl=(),
                  cancel_ok=True, modify_ok=True, market_open_ok=True,
-                 close_reduce_only_ok=True, update_leverage_ok=True):
+                 close_reduce_only_ok=True, update_leverage_ok=True, extra_agents=()):
         self._account_value = Decimal(account_value)
         self._account_values = dict(account_values or {})
         self._max_fee = 0
         self._accrued = Decimal("0")
+        # 鏈上 extraAgents 模擬（小寫正規化，同 HyperliquidAdapter.query_agent_addresses）；
+        # onboarding 的 drift 測試用此注入「目前有效的 agent 地址」。
+        self._extra_agents = [a.lower() for a in extra_agents]
         self._seeded_fills = list(seeded_fills or [])
         self.calls = defaultdict(list)
         self._open_orders = list(open_orders)
@@ -61,6 +64,10 @@ class FakeAdapter(ExchangeAdapter):
 
     def query_builder_accrued(self, builder: str) -> Decimal:
         return self._accrued
+
+    def query_agent_addresses(self, user: str) -> list[str]:
+        self.calls["query_agent_addresses"].append({"user": user})
+        return list(self._extra_agents)
 
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]:
         return list(self._seeded_fills)

@@ -29,14 +29,13 @@ def main():
     main_adapter = HyperliquidAdapter(
         network, info=info, exchange=Exchange(main_signer, settings.api_url))
     try:
-        ks.get_agent_signer(account_id)
-        has_agent = True
+        local_agent_address = ks.get_agent_signer(account_id).address
     except KeyError:
-        has_agent = False
+        local_agent_address = None
     onboard(main_adapter, settings, main_signer=main_signer, user_address=user_addr,
-            skip_agent_approval=has_agent,
+            local_agent_address=local_agent_address,
             on_agent_key=lambda k: ks.import_key(account_id, "agent", k))
-    print(f"onboarding OK（agent {'沿用既有' if has_agent else '新生成並已入 Keychain'}）")
+    print("onboarding OK（agent 授權狀態已對照鏈上 extraAgents 查詢驅動）")
 
     agent = ks.get_agent_signer(account_id)
     agent_adapter = HyperliquidAdapter(

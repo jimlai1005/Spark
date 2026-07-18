@@ -52,6 +52,13 @@ class HyperliquidAdapter(ExchangeAdapter):
         state = self._info.query_referral_state(builder)
         return Decimal(str(state["builderRewards"]))
 
+    def query_agent_addresses(self, user: str) -> list[str]:
+        # SDK 無 wrapper，需 raw post（同 query_max_builder_fee 的 Task 0 findings）。
+        # 正規化小寫：1:1 對照 publicapi/hl.py 的 agent_addresses——同一條鏈上事實
+        # （extraAgents）由兩個獨立模組查詢，正規化方式須一致才能同基準比對（工程原則 1）。
+        agents = self._info.post("/info", {"type": "extraAgents", "user": user})
+        return [a["address"].lower() for a in agents if a.get("address")]
+
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]:
         # stats-data S3 key 為小寫；checksum（mixed-case）地址在 URL 上會 403 → 誤判無 fills。
         url = f"{CSV_BASE_URLS[self._network]}/{builder.lower()}/{day:%Y%m%d}.csv.lz4"
