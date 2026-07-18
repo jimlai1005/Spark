@@ -4,6 +4,7 @@ Hyperliquid builder-code 基礎設施 + copytrade orchestrator（Filet M1）。P
 
 ## 指令
 - 測試（離線）：`uv run pytest`（integration 標記預設跳過）
+- 前端測試：`export PATH="/Users/jim/.nvm/versions/node/v24.18.0/bin:$PATH" && cd web && npm test`（vitest；預設 shell PATH 無 node）
 - Lint：`uv run ruff check src tests scripts`
 - Testnet 流程：`uv run python -m scripts.run_testnet_flow`（需 SPARK_ACCOUNT_ID/SPARK_USER_ADDR/SPARK_BUILDER_ADDR）
 
