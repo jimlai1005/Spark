@@ -1,0 +1,22 @@
+/* Filet design tokens — v1 鮭色定案
+   來源：docs/superpowers/design/2026-07-17-m2-dashboard-prototype.html :root
+   （--banner-h 為原型示意條專屬，不抽）。 */
+:root {
+  color-scheme: dark;
+  --ink: #101923;      --ink-rgb: 16, 25, 35;
+  --tide: #182634;     --tide-rgb: 24, 38, 52;
+  --tide-2: #1F3140;   --tide-2-rgb: 31, 49, 64;
+  --salmon: #F2917A;   --salmon-rgb: 242, 145, 122;
+  --ice: #EAF2F4;      --ice-rgb: 234, 242, 244;
+  --mist: #8FA3B0;     --mist-rgb: 143, 163, 176;
+  --up: #57C7A4;       --up-rgb: 87, 199, 164;
+  --down: #D96A6A;     --down-rgb: 217, 106, 106;
+
+  --radius: 10px;
+  --border: rgba(var(--ice-rgb), .08);
+  --border-strong: rgba(var(--ice-rgb), .16);
+
+  --font-display: "Avenir Next", "Futura", "PingFang TC", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --font-body: -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+}
