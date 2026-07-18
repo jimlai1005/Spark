@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from spark.copytrade.config import CopySettings
+from spark.copytrade.equity import perp_equity_view
 from spark.copytrade.killswitch import evaluate, is_tripped, trip
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
@@ -53,8 +54,9 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     - scale 分子分母的 equity **同用 `get_account_state().account_value`**
       （同一 endpoint 同一欄位，只差地址）——絕不一邊用 portfolio、一邊用
       marginSummary 拼裝。
-    - 回撤判定用 `get_equity_view()`（current/peak 出自單一次 portfolio 呼叫，
-      EquityView 型別即此契約），與 scale 的 equity 各自成對、互不混用。
+    - 回撤判定用 `perp_equity_view()`（perp accountValue 為基準，與 scale 同一數字；
+      peak 為本地 7 天滾動樣本最大值）。2026-07-19 起改用此基準——原 `get_equity_view()`
+      的 portfolio 資料源含 spot，會稀釋熔斷保護（findings F1）。
     """
     records_start = len(ex.records)
 
@@ -71,7 +73,7 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     # ── 2. 回撤判定（同一次 portfolio 回應的 current/peak）─────────────
     # 必須用 evaluate() 而非直呼 check_drawdown（killswitch.py 主迴圈接入接口）：
     # degenerate equity（peak<=0）的 warn 在 evaluate 內結構性內建，不靠這裡記得補。
-    ev = adapter.get_equity_view(ex.my_address)
+    ev = perp_equity_view(adapter, ex.my_address, root)
     status = evaluate(ev, settings, notifier)
     if status.breached:
         notifier.critical(

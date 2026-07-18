@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Iterable
 
 from spark.copytrade.config import CopySettings
+from spark.copytrade.equity import reset_samples
 from spark.copytrade.executor import ExecutorPort
 from spark.copytrade.notifier import Notifier
 from spark.exchange.base import EquityView, Position
@@ -240,6 +241,8 @@ def trip(ex: ExecutorPort, my_positions: dict[str, Position], notifier: Notifier
         "closed": closed,
         "failures": failures,
     }, notifier, root)
+    # 清空 perp 權益樣本：否則人工 re-arm 後，崩跌前的舊 peak 仍在 7 天窗內會立刻再熔斷。
+    reset_samples(root)
 
     # 4) 總結告警
     crit(
