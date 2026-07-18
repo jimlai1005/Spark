@@ -37,7 +37,9 @@ keystore O_EXCL 不覆寫、SIWE nonce 原子單次（rowcount，非 TOCTOU）�
 
 發現皆為 LOW–MEDIUM 的強化 / 測試缺口 / 宣稱落差。
 
-## 已完成並經人工查證（4 項，後端）
+## 已完成並經人工查證（6 項）
+
+### 後端 4 項
 
 | # | 檔案:行號 | 問題 | 修法 | 依據 |
 |---|---|---|---|---|
@@ -54,17 +56,15 @@ keystore O_EXCL 不覆寫、SIWE nonce 原子單次（rowcount，非 TOCTOU）�
 **修復後狀態（人工實跑確認）**：後端 `uv run pytest` → **750 passed, 2 deselected**；
 `ruff check src tests scripts` → All checks passed。
 
-## 未完成（前端 2 項，需重做）
+### 前端 2 項
 
-以下兩項在稽核中被判定為應修，但**尚未實作**（見〈流程教訓〉）：
-
-| # | 目標檔案 | 問題 | 預定修法 | 依據 |
+| # | 檔案:行號 | 問題 | 修法 | 依據 |
 |---|---|---|---|---|
-| A5 | `web/src/app/page.tsx`、`web/src/lib/copy.ts` | 登入失敗一律顯示「你取消了簽署」，掩蓋 401 / 網路錯 | 依錯誤類型分流訊息（拒簽 vs 其他） | spec:83「給明確訊息」 |
-| A6 | `web/src/lib/redline.test.ts`（待新增） | 禁詞測試只掃 `COPY` 物件，寫死中文（Header 分頁標籤、aria-label、layout meta）繞過檢查 | 新增 file-level 全樹禁詞掃描回歸測試 | plan 定案 7「有效覆蓋」 |
+| A5 | `web/src/app/page.tsx:52-58`、`web/src/lib/copy.ts:26` | 登入失敗一律顯示「你取消了簽署」，掩蓋 401 / 網路錯 | 依錯誤類型分流訊息（拒簽 vs 其他） | spec:83「給明確訊息」 |
+| A6 | `web/src/lib/redline.test.ts`（新增） | 禁詞測試只掃 `COPY` 物件，寫死中文（Header 分頁標籤、aria-label、layout meta）繞過檢查 | 新增 file-level 全樹禁詞掃描回歸測試，排除 `*.test.ts(x)` 與 `lib/copy.ts` | plan 定案 7「有效覆蓋」 |
 
-前端現況仍為基線：`npm test` → 84 passed；現有程式碼**實測零禁詞**，
-A6 屬「無測試把關」的預防性缺口，非現行違規。
+**前端狀態（人工實跑確認）**：`npm test` → **86 passed, 19 files**（基線 84/18）；
+`next lint` 無警告。現有程式碼實測零禁詞，A6 為防止未來寫死禁詞的把關。
 
 ## testnet 狀態
 
@@ -108,3 +108,5 @@ A6 屬「無測試把關」的預防性缺口，非現行違規。
   「驗證不自驗」若驗證者本身也是不可靠的 subagent，等於沒有驗證。
 - 建議：安全關鍵或需要判斷的修復不要用 haiku；且無論用什麼模型，
   最終驗收一律以主對話親跑的指令輸出為準。
+- 後續處置：A5/A6 改派 sonnet 重做，主對話以 `ls` / `grep -c` / `git status` /
+  實跑 `npm test` 四項親自查證產物確實落盤（86 passed / 19 files）後才認定完成並提交。
