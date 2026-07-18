@@ -16,7 +16,7 @@ import subprocess
 from pathlib import Path
 
 from spark.filet.followers import load_followers
-from spark.publicapi.config import normalize_address
+from spark.publicapi.config import normalize_address, derive_account_id
 from spark.publicapi.pending import load_pending, remove_pending_entry
 
 
@@ -32,6 +32,12 @@ def activate(account_id: str, pending_path: str, manifest_path: str,
         raise SystemExit(
             f"builder_address 不符！pending={entry['builder_address']} "
             f"期望={expected_builder} —— 條目可疑，拒絕啟用（條目保留供調查）")
+    # ⭐ 結構性核對：account_id 必須是 user_address 衍生物。
+    derived_account_id = derive_account_id(entry["user_address"])
+    if account_id != derived_account_id:
+        raise SystemExit(
+            f"account_id 不符！pending={account_id} "
+            f"衍生={derived_account_id} —— 條目可疑，拒絕啟用（條目保留供調查）")
     manifest = Path(manifest_path)
     data = json.loads(manifest.read_text()) if manifest.exists() else {"followers": []}
     if any(f.get("account_id") == account_id for f in data["followers"]):

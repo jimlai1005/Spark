@@ -186,3 +186,8 @@ class CopySettings:
 
         if self.min_order_notional < 0:
             raise ValueError(f"min_order_notional must be >= 0, got {self.min_order_notional}")
+
+        if not (0 <= self.slippage < 1):
+            raise ValueError(
+                f"slippage must be in [0, 1), got {self.slippage}"
+            )

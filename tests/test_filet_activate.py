@@ -66,3 +66,18 @@ def test_activate_case_insensitive_builder_check(tmp_path):
     activate(_ACCT, str(pending), str(manifest), _BUILDER.upper().replace("0X", "0x"),
              start=False)
     assert len(load_followers(manifest)) == 1
+
+
+def test_activate_rejects_account_id_mismatch(tmp_path):
+    """⭐ 紅線 6：pending 條目 account_id != derive_account_id(user_address) → 拒絕啟用。"""
+    pending = tmp_path / "pending.json"
+    manifest = tmp_path / "followers.json"
+    # 故意寫入不符的 account_id（真正的應該是 f+ab...，但我們寫 f+99...）
+    wrong_acct = "f" + "99" * 20
+    write_pending_entry(pending, account_id=wrong_acct, user_address=_USER,
+                        builder_address=_BUILDER, network="testnet",
+                        agent_address="0x" + "cd" * 20, label="alice")
+    with pytest.raises(SystemExit):
+        activate(wrong_acct, str(pending), str(manifest), _BUILDER, start=False)
+    assert not manifest.exists()                # manifest 未被碰
+    assert len(load_pending(pending)) == 1      # 條目留在佇列供調查

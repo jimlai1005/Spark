@@ -212,3 +212,27 @@ class TestEnvParseErrors:
         """Decimal 解析空字串應拋含 env key 名的 ValueError。"""
         with pytest.raises(ValueError, match="COPY_MAX_DRAWDOWN_PCT"):
             CopySettings.from_env({"COPY_MAX_DRAWDOWN_PCT": ""})
+
+
+class TestSlippageValidation:
+    """測試 slippage 範圍守衛。"""
+
+    def test_slippage_must_be_in_range(self):
+        """slippage 應在 [0, 1)。"""
+        # 負值拒絕
+        with pytest.raises(ValueError, match="slippage"):
+            CopySettings.from_env({"COPY_SLIPPAGE": "-0.1"})
+
+        # >= 1 拒絕
+        with pytest.raises(ValueError, match="slippage"):
+            CopySettings.from_env({"COPY_SLIPPAGE": "1.0"})
+
+        with pytest.raises(ValueError, match="slippage"):
+            CopySettings.from_env({"COPY_SLIPPAGE": "1.5"})
+
+        # 合法值通過
+        settings = CopySettings.from_env({"COPY_SLIPPAGE": "0.01"})
+        assert settings.slippage == Decimal("0.01")
+
+        settings = CopySettings.from_env({"COPY_SLIPPAGE": "0.0"})
+        assert settings.slippage == Decimal("0.0")

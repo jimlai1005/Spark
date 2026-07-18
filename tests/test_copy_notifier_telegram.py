@@ -173,6 +173,38 @@ class TestTelegramNotifierDedup:
         assert "stale_key" not in notifier._dedup_times
         assert "fresh_key" in notifier._dedup_times
 
+    def test_critical_bypasses_dedup(self):
+        """critical 訊息不受 dedup 影響：同 key 連發兩次都送出。"""
+        call_count = 0
+
+        def fake_send(text: str) -> bool:
+            nonlocal call_count
+            call_count += 1
+            return True
+
+        notifier = TelegramNotifier(token="test", chat_id="123", send_fn=fake_send)
+        result1 = notifier.critical("alert", "Critical issue 1", dedup_key="crit_1")
+        result2 = notifier.critical("alert", "Critical issue 2", dedup_key="crit_1")
+        assert result1 is True
+        assert result2 is True
+        assert call_count == 2
+
+    def test_non_critical_still_deduplicated(self):
+        """對照組：non-critical 訊息同 dedup_key 仍被去重。"""
+        call_count = 0
+
+        def fake_send(text: str) -> bool:
+            nonlocal call_count
+            call_count += 1
+            return True
+
+        notifier = TelegramNotifier(token="test", chat_id="123", send_fn=fake_send)
+        result1 = notifier.info("alert", "Info 1", dedup_key="info_1")
+        result2 = notifier.info("alert", "Info 2", dedup_key="info_1")
+        assert result1 is True
+        assert result2 is False
+        assert call_count == 1
+
 
 class TestTelegramNotifierMute:
     """測試分類靜音。"""

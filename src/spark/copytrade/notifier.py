@@ -169,8 +169,8 @@ class TelegramNotifier(Notifier):
         if level != "critical" and category in self._muted_categories:
             return False
 
-        # Dedup 檢查
-        if dedup_key is not None:
+        # Dedup 檢查（critical 不受 dedup 影響）
+        if dedup_key is not None and level != "critical":
             now = self._clock()
             # 順手清掉過期項，避免字典無限成長（照 hl telegram.py 模式）
             for k in [k for k, ts in self._dedup_times.items() if now - ts > self.DEDUP_TTL]:
