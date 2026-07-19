@@ -324,10 +324,17 @@ class CapitalSettingsApplier:
         變了，於是心跳會宣稱一組本輪根本沒有被用來下單的數值，而且看起來完全正常。
         來源與數值都必須出自產生本輪 `CopySettings` 的那一次求值。
 
-        寫入點只有 `_current`（所有「本輪用哪組設定」的路徑都收斂在那裡），所以這個
-        值不可能與 `effective()` 的回傳值不一致。`_current` 提前 raise 的那一格會先
-        清成 None——本輪沒有任何設定生效，回報「沿用環境預設」同樣是錯的，而呼叫端
-        在那一格本來就會回報成錯誤（見 run_copytrade.cycle）。
+        設定**非 None 值**的地方只有 `_current`（所有「本輪用哪組設定」的路徑都收斂
+        在那裡），所以這個值不可能與 `effective()` 的回傳值不一致。
+
+        ⭐ 清成 None 的地方有兩個，缺一不可：`_current` 的開頭，以及 `effective()`
+        的**進入點**。後者是必要的，因為 `_ledger_or_raise()` 會在 `_current` 被呼叫
+        **之前**就 raise（帳本遺失／讀不到）——那條路徑一次都碰不到 `_current`。
+        少了進入點那一次，`effective()` raise 之後這個屬性會留著**上一輪**的值，
+        而它的契約是「上一次 effective() 實際採用的設定」。本輪沒有任何設定生效時，
+        回報「沿用環境預設」（None 以外的任何值）同樣是錯的：呼叫端在那一格本來就
+        會回報成錯誤（見 run_copytrade.cycle），但這個屬性一旦被接進心跳或狀態端點，
+        錯的值會**直接發布出去**，而且看起來完全正常。
         """
         return self._last_applied
 
@@ -438,9 +445,12 @@ class CapitalSettingsApplier:
         （狀態目錄的寫入權限出問題、備份還原了一份壞檔），而它每一輪都會被乘進
         部位大小。「寫進帳本時驗過了」不足以保證「現在讀出來的還是那個值」。
 
-        ⭐ 本函式是「本輪用哪組設定」的**唯一**收斂點，所以也是 `last_applied` 的
-        唯一寫入點——心跳因此拿得到與本輪 `CopySettings` 同一次求值的來源標記。
-        先清成 None 再視情況設回，是為了讓任何提前 raise 的路徑不留下上一輪的值。
+        ⭐ 本函式是「本輪用哪組設定」的**唯一**收斂點，所以也是 `last_applied`
+        唯一設定**非 None 值**的地方——心跳因此拿得到與本輪 `CopySettings` 同一次
+        求值的來源標記。先清成 None 再視情況設回，是為了讓本函式內部提前 raise
+        的路徑（帳本值超界）不留下上一輪的值。
+        ⚠️ 本函式**之前**就 raise 的路徑（`_ledger_or_raise`）碰不到這裡，那一格由
+        `effective()` 的進入點負責清——兩處都要，見 `last_applied` 的 docstring。
         """
         self._last_applied = None
         if applied is None:
@@ -479,6 +489,16 @@ class CapitalSettingsApplier:
         其餘所有失敗（驗簽不過、數值超界、記錄讀不到、落帳失敗）都是
         **不套用 ＋ 沿用現狀**，絕不中斷跟單——已開的部位需要有人繼續管理。
         """
+        # ⭐⭐ 進入點就先清掉 `last_applied`（2026-07-19 opus 審查：契約與實作矛盾）。
+        # `_current` 是唯一設定**非 None 值**的地方，而它自己也會先清；但
+        # `_ledger_or_raise()` 在它之前就可能 raise（帳本遺失／讀不到），那條路徑
+        # 一次都碰不到 `_current`，於是 `_last_applied` 會留著**上一輪**的值。
+        # 目前無害（呼叫端在該路徑直接 return，見 run_copytrade.cycle），但契約是
+        # 「上一次 effective() 實際採用的設定」——下一個人只要照 docstring 相信它、
+        # 把 last_applied 接進心跳或狀態端點，就會發布一組本輪根本沒被用來下單的
+        # 數值，而且看起來完全正常。清在進入點讓「本輪沒有任何設定生效」在**每一條**
+        # 提前退出的路徑上都成立，不必逐條記得。
+        self._last_applied = None
         try:
             ledger = self._ledger_or_raise()
         except CapitalSettingsUnavailable:

@@ -348,6 +348,91 @@ def test_lost_ledger_refuses_to_fall_back_to_defaults(env):
     assert any("拒絕退回環境預設值" in c[2] for c in crits)
 
 
+def test_last_applied_is_cleared_when_the_ledger_is_lost(env):
+    """⭐⭐ `effective()` raise 之後，`last_applied` 必須是 None（不得留上一輪的值）。
+
+    觸發情境：第一輪正常套用了客戶簽章的 5000／0.4，第二輪帳本不見了 → raise。
+    `_last_applied` 的唯一寫入點在 `_current()` 裡，而 raise 發生在
+    `_ledger_or_raise()`——**在 `_current` 被呼叫之前**。少了進入點的清除，
+    這個屬性會停在上一輪的 5000／0.4。
+
+    為什麼要修一個「目前無害」的東西：`run_copytrade.cycle` 在這條路徑直接 return，
+    所以今天沒有人讀到那個殘值。但屬性的契約是「上一次 effective() 實際採用的設定」，
+    而它存在的理由就是給心跳用——下一個人只要照 docstring 相信它、把 last_applied
+    接進心跳或狀態端點，面板就會宣稱一組**本輪根本沒被用來下單**的數值，而且看起來
+    完全正常（那正是這個屬性的 docstring 一開始要防的那件事）。
+    """
+    applier = env.applier()
+    env.write_settings(alloc="5000", util="0.4", nonce="n1")
+    applier.effective(_BASE)
+    assert applier.last_applied is not None          # 基線：第一輪確實採用了
+    assert applier.last_applied.allocated_capital == "5000.00"
+
+    ledger_init_marker_path(env.ledger).write_text("{}")
+    env.ledger.unlink()                              # 帳本不見了，標記還在
+
+    with pytest.raises(CapitalSettingsUnavailable):
+        applier.effective(_BASE)
+    assert applier.last_applied is None, \
+        "本輪沒有任何設定生效，last_applied 不得留著上一輪的值"
+
+
+def test_last_applied_is_cleared_when_the_ledger_is_unreadable(env):
+    """⭐ 同一條契約的另一條 raise 路徑：帳本格式壞掉（`load_ledger` 拋 ValueError）。
+
+    兩條路徑分別釘住，因為它們在 `effective()` 裡走的是**不同的 except 分支**
+    （`CapitalSettingsUnavailable` 直接轉拋 vs `OSError/ValueError` 包裝後拋），
+    而清除點在兩者之前——這條測試同時保證清除點真的擺在 try 之外。
+    """
+    applier = env.applier()
+    env.write_settings(alloc="5000", util="0.4", nonce="n1")
+    applier.effective(_BASE)
+    assert applier.last_applied is not None
+
+    env.ledger.write_text("{ not json")
+    with pytest.raises(CapitalSettingsUnavailable):
+        applier.effective(_BASE)
+    assert applier.last_applied is None
+
+
+def test_last_applied_is_cleared_when_the_ledger_values_are_out_of_range(env):
+    """⭐ `_current` 自己提前 raise 的那一格（帳本值超界＝疑遭竄改）同樣要清乾淨。
+
+    這條在修正前就是綠的（`_current` 開頭本來就清），放進來是為了讓三條 raise
+    路徑在同一處並列——契約是「任何 raise 之後都是 None」，不是「某些 raise」。
+    """
+    applier = env.applier()
+    env.write_settings(alloc="5000", util="0.4", nonce="n1")
+    applier.effective(_BASE)
+    assert applier.last_applied is not None
+
+    # 帳本被動過：使用比例超出 (0, 1]
+    save_ledger(env.ledger, CapitalLedger(
+        redeemed={"n1": "5000.00|0.4000"},
+        applied=AppliedCapital("n1", "5000.00", "10.0000", _at(), _NOW)))
+    with pytest.raises(CapitalSettingsUnavailable):
+        applier.effective(_BASE)
+    assert applier.last_applied is None
+
+
+def test_last_applied_is_none_when_no_override_is_in_effect(env):
+    """⭐ 沒有 override（沿用環境預設）→ None，且**不是**沿用上一輪的值。
+
+    釘住「None ＝ 沿用環境預設」這半邊的語意：帳本裡的 applied 被清掉之後，
+    下一輪必須跟著回到 None，否則心跳會繼續宣稱一組已經不生效的客戶簽章設定。
+    """
+    applier = env.applier()
+    env.write_settings(alloc="5000", util="0.4", nonce="n1")
+    applier.effective(_BASE)
+    assert applier.last_applied is not None
+
+    save_ledger(env.ledger, CapitalLedger(redeemed={"n1": "5000.00|0.4000"},
+                                          applied=None))
+    cs = applier.effective(_BASE)
+    assert cs == _BASE
+    assert applier.last_applied is None
+
+
 def test_first_start_is_not_treated_as_loss(env):
     """真正的首次啟動（帳本無、標記也無）→ 安靜建立初始帳本並繼續。
     此刻沒有 override 可以失去，把它升級成失敗只會擋住跟單。"""
