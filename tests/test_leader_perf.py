@@ -1,0 +1,200 @@
+"""tests/test_leader_perf.py — leader 績效計算（perp 基準，純函式、零網路）。
+
+盯住四件事，每一件都對應一個會讓客戶照著錯數字投真錢的失效：
+(1) 出入金不得污染 TWR——期望值一律**手算**釘死，不抄實作的輸出；
+(2) MDD 必須算在權益指數 I_t 上（AV 基準會被入金遮成 0、被提領放大成幻影）；
+(3) 不足 90 天，回傳結構裡**沒有**年化欄位（不是 None，是鍵不存在）；
+(4) 資料不足／缺欄位一律回明確狀態，不回 0、不回 NaN、不炸。
+"""
+from decimal import Decimal
+
+import pytest
+
+from spark.filet.leader_perf import (MIN_DAYS_FOR_ANNUALIZATION, PERP_PERIODS,
+                                     STATUS_INSUFFICIENT, STATUS_OK,
+                                     TIER_ANNUALIZABLE, TIER_INSUFFICIENT,
+                                     TIER_PNL_ONLY, TIER_WINDOW_RETURN,
+                                     compute_perp_performance,
+                                     compute_window_performance, extract_window,
+                                     jsonable_performance)
+
+DAY_MS = 86_400_000
+
+
+def rows(points, period="perpMonth", extra=()):
+    """points = [(day_offset, account_value, cum_pnl)] → portfolio() 形狀的回應。
+
+    刻意連同一列**非 perp 窗**一起塞（extra 之外預設加 "month"）：真實回應含 8 個
+    期別，若實作不小心抓錯列，測試要看得出來。
+    """
+    av = [[d * DAY_MS, str(a)] for d, a, _ in points]
+    pnl = [[d * DAY_MS, str(p)] for d, _, p in points]
+    out = [["month", {"accountValueHistory": [[0, "999999"]],
+                      "pnlHistory": [[0, "999999"]], "vlm": "0"}]]
+    out.append([period, {"accountValueHistory": av, "pnlHistory": pnl, "vlm": "1"}])
+    out.extend(extra)
+    return out
+
+
+# --- 手算基準 A：含兩次出入金，60 天窗 -------------------------------------
+# 區間 1: ΔP=100, ΔAV=100 → ΔF=0    r=100/1000  = 0.1
+# 區間 2: ΔP=0,   ΔAV=1000 → ΔF=1000（入金） r=0/1100 = 0
+# 區間 3: ΔP=210, ΔAV=210  → ΔF=0    r=210/2100 = 0.1
+# TWR = 1.1 × 1.0 × 1.1 − 1 = 0.21   cum_pnl = 310 − 0 = 310
+_FLOWS_60D = [(0, "1000", "0"), (20, "1100", "100"),
+              (40, "2100", "100"), (60, "2310", "310")]
+
+# --- 手算基準 B：入金讓 AV 單調上升，但 I_t 下降（幻影回撤的反向） ----------
+# 區間 1: ΔP=-100, ΔAV=1900 → ΔF=2000（入金） r=-100/1000  = -0.1 → I=0.9
+# 區間 2: ΔP=-290, ΔAV=2610 → ΔF=2900（入金） r=-290/2900  = -0.1 → I=0.81
+# AV 序列 1000→2900→5510 **嚴格遞增** → AV 基準的 MDD 必為 0；I_t 基準為 0.19。
+_MASKED_LOSS_40D = [(0, "1000", "0"), (20, "2900", "-100"), (40, "5510", "-390")]
+
+
+def test_twr_neutralizes_deposits():
+    """出入金不得污染 TWR：期望值 0.21 為手算（見 _FLOWS_60D 上方推導）。"""
+    r = compute_window_performance(rows(_FLOWS_60D), "perpMonth")
+    assert r["status"] == STATUS_OK
+    assert r["twr"] == Decimal("0.21")
+    assert r["cum_pnl"] == Decimal("310")
+    # ΔF 總和＝那一筆 1000 的入金；由同一回應解出，不需第二個端點。
+    assert r["net_external_flow"] == Decimal("1000")
+    assert r["skipped_intervals"] == 0
+    # 天真作法（末/初 − 1 = 2310/1000 − 1 = 1.31）會把入金算成獲利。
+    assert r["twr"] != Decimal("1.31")
+
+
+def test_equity_index_is_the_compounded_series():
+    r = compute_window_performance(rows(_FLOWS_60D), "perpMonth")
+    assert list(r["equity_index"]) == [Decimal("1"), Decimal("1.1"),
+                                       Decimal("1.1"), Decimal("1.21")]
+
+
+def test_mdd_is_computed_on_equity_index_not_account_value():
+    """⭐ 幻影回撤防線：AV 因入金單調上升，MDD 仍必須反映 I_t 的下跌。
+
+    改成算在 accountValue 上 → AV 嚴格遞增 → MDD 變 0 → 本測試轉紅。
+    """
+    r = compute_window_performance(rows(_MASKED_LOSS_40D), "perpMonth")
+    assert list(r["equity_index"]) == [Decimal("1"), Decimal("0.9"), Decimal("0.81")]
+    assert r["max_drawdown"] == Decimal("0.19")   # (1 − 0.81) / 1
+    assert r["twr"] == Decimal("-0.19")
+    # 這一組資料的 AV 是嚴格遞增的，所以 AV 基準的 MDD 恆為 0——
+    # 斷言「不等於 0」正是在釘住「用錯基準會發生什麼」。
+    assert r["max_drawdown"] != Decimal("0")
+
+
+def test_no_annualized_field_below_90_days():
+    """⭐ 硬規則：不足 90 天，`annualized_return` 這個**鍵不存在**（不是 None）。"""
+    r = compute_window_performance(rows(_FLOWS_60D), "perpMonth")
+    assert r["covered_days"] == Decimal("60.0000")
+    assert r["covered_days"] < MIN_DAYS_FOR_ANNUALIZATION
+    assert "annualized_return" not in r
+    assert r["disclosure_tier"] == TIER_WINDOW_RETURN
+    # 序列化之後也不得長出這個鍵（補成 null 等於把保證交還給呼叫端的記性）。
+    assert "annualized_return" not in jsonable_performance(r)
+
+
+def test_annualized_present_at_exactly_90_days():
+    r = compute_window_performance(
+        rows([(0, "1000", "0"), (90, "1100", "100")]), "perpMonth")
+    assert r["covered_days"] == Decimal("90.0000")
+    assert r["disclosure_tier"] == TIER_ANNUALIZABLE
+    assert "annualized_return" in r
+
+
+def test_annualized_over_one_full_year_equals_window_twr():
+    """365 天窗：年化係數為 1，年化值必須等於窗口 TWR（手算 0.21）。"""
+    r = compute_window_performance(
+        rows([(0, "1000", "0"), (100, "1100", "100"),
+              (200, "2100", "100"), (365, "2310", "310")],
+             period="perpAllTime"), "perpAllTime")
+    assert r["covered_days"] == Decimal("365.0000")
+    assert r["twr"] == Decimal("0.21")
+    assert r["annualized_return"] == Decimal("0.21")
+
+
+def test_below_30_days_gives_dollars_only_no_percentages():
+    """研究文件 2d：< 30 天禁止任何 %報酬率 → 連 twr／MDD 的鍵都不存在。"""
+    r = compute_window_performance(
+        rows([(0, "1000", "0"), (6, "1380", "380")], period="perpWeek"), "perpWeek")
+    assert r["status"] == STATUS_OK
+    assert r["disclosure_tier"] == TIER_PNL_ONLY
+    assert r["cum_pnl"] == Decimal("380")
+    for k in ("twr", "max_drawdown", "annualized_return", "equity_index"):
+        assert k not in r, f"{k} 不該在 pnl_only 層級出現（6 天的 +38% 是噪音）"
+
+
+def test_single_sample_is_insufficient_not_zero():
+    """1 點：明確的「資料不足」，而不是 cum_pnl=0（0 是有意義且錯誤的訊息）。"""
+    r = compute_window_performance(rows([(0, "1000", "0")]), "perpMonth")
+    assert r["status"] == STATUS_INSUFFICIENT
+    assert r["reason"] == "need_at_least_two_samples"
+    assert r["sample_count"] == 1
+    assert r["disclosure_tier"] == TIER_INSUFFICIENT
+    for k in ("cum_pnl", "twr", "max_drawdown", "annualized_return"):
+        assert k not in r
+
+
+@pytest.mark.parametrize("payload,reason", [
+    ([], "window_missing"),                                     # 空回應
+    ([["perpMonth", {}]], "window_missing"),                    # 缺兩個序列
+    ([["perpMonth", {"accountValueHistory": [], "pnlHistory": []}]],
+     "need_at_least_two_samples"),                              # 空序列
+    ([["perpMonth", {"accountValueHistory": [[0, "1"]]}]], "window_missing"),  # 缺 pnl
+    ([["perpMonth", {"accountValueHistory": [[0, "x"]],
+                     "pnlHistory": [[0, "1"]]}]], "window_missing"),  # 值不可解析
+    ([["perpMonth", "not-a-dict"]], "window_missing"),
+    ("not-a-list", "window_missing"),
+])
+def test_malformed_input_degrades_without_crashing(payload, reason):
+    r = compute_window_performance(payload, "perpMonth")
+    assert r["status"] == STATUS_INSUFFICIENT
+    assert r["reason"] == reason
+    assert r["basis"] == "perp"          # 極限註記在不足狀態下也必須帶著
+    assert r["mdd_note"] and r["upper_bound_note"] and r["basis_note"]
+
+
+def test_misaligned_series_refuses_to_compute():
+    """兩序列時間戳不同步 = 非同源（工程原則 1）→ 拒絕計算，不硬配對。"""
+    bad = [["perpMonth", {"accountValueHistory": [[0, "1000"], [DAY_MS * 40, "1100"]],
+                          "pnlHistory": [[0, "0"], [DAY_MS * 39, "100"]]}]]
+    r = compute_window_performance(bad, "perpMonth")
+    assert r["status"] == STATUS_INSUFFICIENT
+    assert r["reason"] == "series_misaligned"
+    assert "twr" not in r
+
+
+def test_denominator_floor_blocks_exploding_returns():
+    """提領到近乎 0 後的小額交易不得產生爆炸性報酬；跳過的區間要誠實計數。"""
+    r = compute_window_performance(
+        rows([(0, "10000", "0"), (20, "5", "-9995"), (40, "15", "-9985")]),
+        "perpMonth")
+    assert r["skipped_intervals"] == 1          # 第二段分母 5 < 100，不計入
+    # 若不設地板，第二段 r = 10/5 = +200%，TWR 會從 −99.95% 反彈成正的。
+    assert r["twr"] == Decimal("-0.9995")
+
+
+def test_extract_window_rejects_non_perp_periods():
+    """⭐ basis 閘門：預設窗含 spot 與 vault，是客戶複製不到的績效 → 結構性拒絕。"""
+    payload = rows(_FLOWS_60D)
+    for bad in ("day", "week", "month", "allTime"):
+        with pytest.raises(ValueError, match="perp"):
+            extract_window(payload, bad)
+    assert extract_window(payload, "perpMonth") is not None
+
+
+def test_compute_perp_performance_covers_all_four_perp_windows():
+    got = compute_perp_performance(rows(_FLOWS_60D))
+    assert set(got) == set(PERP_PERIODS)
+    assert got["perpMonth"]["status"] == STATUS_OK
+    assert got["perpDay"]["status"] == STATUS_INSUFFICIENT   # 該窗不在 fixture 裡
+
+
+def test_jsonable_drops_equity_index_but_keeps_its_length():
+    r = compute_window_performance(rows(_FLOWS_60D), "perpMonth")
+    j = jsonable_performance(r)
+    assert "equity_index" not in j and j["equity_index_len"] == 4
+    assert j["twr"] == "0.21" and isinstance(j["covered_days"], str)
+    j2 = jsonable_performance(r, include_equity_index=True)
+    assert j2["equity_index"] == ["1", "1.1", "1.1", "1.21"]
