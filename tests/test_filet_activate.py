@@ -13,6 +13,17 @@ _USER = "0x" + "ab" * 20
 _ACCT = "f" + "ab" * 20
 
 
+def _no_leaders(tmp_path) -> str:
+    """白名單路徑（2026-07-20 起**必填無預設**）指到一個不存在的檔。
+
+    本段測試盯的是 builder／account_id 兩道結構性核對，pending 條目刻意沒有
+    leader_address ⇒ `_resolve_leader` 在碰白名單之前就回 None，這個值不影響結果。
+    顯式給值有兩個作用：(1) 移除預設值後每個呼叫端都必須明講用哪份白名單把關；
+    (2) 測試不再依賴 repo 工作樹裡那個 var/filet/leaders.json 存不存在（工程原則 4）。
+    """
+    return str(tmp_path / "no-such-leaders.json")
+
+
 def _setup(tmp_path, builder=_BUILDER):
     pending = tmp_path / "pending.json"
     manifest = tmp_path / "followers.json"
@@ -24,7 +35,8 @@ def _setup(tmp_path, builder=_BUILDER):
 
 def test_activate_moves_entry_to_manifest(tmp_path):
     pending, manifest = _setup(tmp_path)
-    msg = activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False)
+    msg = activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False,
+                   leaders_path=_no_leaders(tmp_path))
     refs = load_followers(manifest)  # fail-fast 載入 = 引擎視角驗證
     assert len(refs) == 1
     assert refs[0].account_id == _ACCT
@@ -40,7 +52,8 @@ def test_activate_rejects_builder_mismatch(tmp_path):
     """⭐ 紅線 6：pending 條目 builder != 部署常數 → 條目可疑，拒絕啟用。"""
     pending, manifest = _setup(tmp_path, builder="0x" + "ee" * 20)
     with pytest.raises(SystemExit):
-        activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False)
+        activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False,
+                 leaders_path=_no_leaders(tmp_path))
     assert not manifest.exists()                # manifest 未被碰
     assert len(load_pending(pending)) == 1      # 條目留在佇列供調查
 
@@ -51,20 +64,22 @@ def test_activate_rejects_duplicate_in_manifest(tmp_path):
         "account_id": _ACCT, "user_address": _USER,
         "builder_address": _BUILDER, "network": "testnet"}]}))
     with pytest.raises(SystemExit):
-        activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False)
+        activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False,
+                 leaders_path=_no_leaders(tmp_path))
 
 
 def test_activate_unknown_account(tmp_path):
     pending, manifest = _setup(tmp_path)
     with pytest.raises(SystemExit):
-        activate("f" + "99" * 20, str(pending), str(manifest), _BUILDER, start=False)
+        activate("f" + "99" * 20, str(pending), str(manifest), _BUILDER, start=False,
+                 leaders_path=_no_leaders(tmp_path))
 
 
 def test_activate_case_insensitive_builder_check(tmp_path):
     """比對前同 normalize 基準（工程原則 1）：大小寫不同不該誤判。"""
     pending, manifest = _setup(tmp_path)
     activate(_ACCT, str(pending), str(manifest), _BUILDER.upper().replace("0X", "0x"),
-             start=False)
+             start=False, leaders_path=_no_leaders(tmp_path))
     assert len(load_followers(manifest)) == 1
 
 
@@ -78,7 +93,8 @@ def test_activate_rejects_account_id_mismatch(tmp_path):
                         builder_address=_BUILDER, network="testnet",
                         agent_address="0x" + "cd" * 20, label="alice")
     with pytest.raises(SystemExit):
-        activate(wrong_acct, str(pending), str(manifest), _BUILDER, start=False)
+        activate(wrong_acct, str(pending), str(manifest), _BUILDER, start=False,
+                 leaders_path=_no_leaders(tmp_path))
     assert not manifest.exists()                # manifest 未被碰
     assert len(load_pending(pending)) == 1      # 條目留在佇列供調查
 
@@ -108,7 +124,8 @@ def _pending_with_leader(tmp_path, leader):
 def test_activate_without_leader_writes_none(tmp_path):
     """未指定 leader → None，引擎沿用 env COPY_LEADER_ADDRESS（向後相容）。"""
     pending, manifest = _setup(tmp_path)
-    activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False)
+    activate(_ACCT, str(pending), str(manifest), _BUILDER, start=False,
+             leaders_path=_no_leaders(tmp_path))
     assert load_followers(manifest)[0].leader_address is None
 
 

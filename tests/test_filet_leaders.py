@@ -1,6 +1,7 @@
 """tests/test_filet_leaders.py
 策劃 leader 白名單（客戶可選 leader 的唯一合法來源）。純檔案操作，離線。"""
 import json
+import os
 
 import pytest
 
@@ -218,3 +219,104 @@ def test_follower_unit_pins_absolute_allowlist_path():
             / "filet-follower@.service").read_text()
     assert "Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json" in unit
     assert "Environment=FILET_FOLLOWERS=/opt/filet/spark/var/filet/followers.json" in unit
+
+
+# ── ⭐⭐⭐ 白名單路徑：必填、無預設（2026-07-20，同一失敗模式的第三次）──────────
+# 前兩次是 FILET_EXCHANGE_DIR 與 FILET_STATE_BASE：一條路徑、多個進程各推導一次，
+# 靠字面量剛好相等而成立。白名單是第三個，共用者最多（API／引擎／activate CLI／
+# 兩個快照 timer），而它讀錯的方向是 fail-open——已撤銷的 leader 仍被放行或仍可被選。
+
+_ALL_UNITS_DECLARING_LEADERS_PATH = [
+    "filet-api.service",          # 目錄頁與選 leader：客戶**能選誰**
+    "filet-follower@.service",    # 引擎每輪二次驗證：已在跟的**還能不能繼續**
+    "filet-leaderboard.service",  # 每日快照：**抓誰**
+    "filet-perf-series.service",  # 12 小時序列：**抓誰**（且無法回填）
+]
+
+
+@pytest.mark.parametrize("unit_name", _ALL_UNITS_DECLARING_LEADERS_PATH)
+def test_every_unit_that_reads_the_allowlist_declares_the_same_path(unit_name):
+    """⭐⭐ 每一個會讀白名單的 unit 都必須**顯式**宣告同一個絕對路徑。
+
+    這條測試存在的理由是實機上的具體發現（2026-07-20）：`filet-api` 宣告數為 0、
+    `filet-leaderboard` 為 1，兩者卻指向同一個檔——因為 API 走的是程式預設，而預設
+    恰好錨在 repo 根、API 的 CWD 恰好也是 repo 根。**那是巧合不是強制**：改動其中
+    一邊（搬白名單、改 WorkingDirectory）不會有任何錯誤，只會讓兩邊讀不同的檔。
+    """
+    from pathlib import Path
+
+    unit = (Path(__file__).resolve().parents[1] / "deploy" / unit_name).read_text()
+    assert ("Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json"
+            in unit), f"{unit_name} 未宣告 FILET_LEADERS_PATH（服務將拒絕啟動）"
+
+
+def test_engine_refuses_to_start_without_the_leaders_path_env():
+    """⭐ 引擎漏設 → 拒絕啟動，不得靜默退回 repo 內的預設檔。
+
+    靜默退回的後果不是「讀不到」而是「讀到另一份」：管理端在部署的那份白名單撤銷了
+    一個 leader，引擎卻仍拿 repo 裡那份放行他——撤銷無聲失效，而兩邊 log 都正常。
+    """
+    from spark.filet.leader_resolve import require_leaders_path
+
+    with pytest.raises(ValueError, match="FILET_LEADERS_PATH"):
+        require_leaders_path({})
+    with pytest.raises(ValueError, match="FILET_LEADERS_PATH"):
+        require_leaders_path({"FILET_LEADERS_PATH": ""})
+
+
+def test_relative_leaders_path_is_refused():
+    """⭐ 相對路徑＝CWD 漂移＝兩邊驗不同檔（I4 的舊教訓，隨預設值一起搬進 require）。"""
+    from spark.filet.leader_resolve import require_leaders_path
+
+    with pytest.raises(ValueError, match="絕對路徑"):
+        require_leaders_path({"FILET_LEADERS_PATH": "var/filet/leaders.json"})
+
+
+def test_missing_allowlist_file_is_still_legal(tmp_path):
+    """⭐ 檔案**不存在**仍是合法狀態（與 require_exchange_dir 的目錄檢查刻意不同）：
+    「尚未策劃任何 leader」由 load_leaders 回空清單 → 全部拒絕（安全預設），
+    而 resolve_leader 對「白名單檔不存在」另有明訂的向後相容豁免。在 require 裡
+    檢查存在性會把那兩條既有語意悄悄改掉。"""
+    from spark.filet.leader_resolve import require_leaders_path
+
+    p = tmp_path / "not-created-yet.json"
+    assert require_leaders_path({"FILET_LEADERS_PATH": str(p)}) == str(p)
+
+
+def test_all_consumers_resolve_to_the_same_single_value(tmp_path, monkeypatch):
+    """⭐⭐ 同一份 env → 五個消費端拿到的是**逐字元相同**的同一個值。
+
+    這是本次修法的可執行版本：不是「每個消費端各自能拿到某個值」，而是「同一個 env
+    餵下去，五邊拿到的是同一個」。任何一端偷偷保留自己的預設或加工都會讓這條變紅。
+    """
+    import scripts.filet_activate as fa
+    import scripts.run_copytrade as rc
+    from scripts.watchlist_snapshot import resolve_targets
+    from spark.publicapi.config import ApiConfig
+
+    leaders = tmp_path / "leaders.json"
+    leaders.write_text(json.dumps({"leaders": []}))
+    monkeypatch.setenv("FILET_LEADERS_PATH", str(leaders))
+
+    # 1) API（/api/leaders 目錄頁與選 leader）
+    api_value = ApiConfig.from_env({
+        "FILET_API_NETWORK": "testnet", "FILET_BUILDER_ADDR": "0x" + "b1" * 20,
+        "FILET_SIWE_DOMAIN": "d", "FILET_SIWE_URI": "u", "FILET_API_DB": "db",
+        "FILET_KEYSVC_SOCK": "s", "FILET_PENDING_PATH": "p",
+        "FILET_EXCHANGE_DIR": str(tmp_path), "FILET_STATE_BASE": str(tmp_path),
+        "FILET_LEADERS_PATH": str(leaders)}).leaders_path
+
+    # 2) 引擎（每輪二次驗證）——用閉包實際解析一次，證明它讀的就是這份檔
+    manifest = tmp_path / "followers.json"
+    manifest.write_text(json.dumps({"followers": []}))
+    monkeypatch.setenv("FILET_FOLLOWERS", str(manifest))
+    engine_value = rc.require_leaders_path()
+
+    # 3) activate 人工 CLI（--leaders 未給 → 取 env）
+    cli_value = fa.require_leaders_path(os.environ)
+
+    # 4)+5) 兩個快照 timer 共用 resolve_targets（perf_series import 的是同一支函式）
+    addrs, err = resolve_targets({"FILET_LEADERS_PATH": str(leaders)})
+    assert err is None and addrs  # 空白名單 → 落回 DEFAULT_WATCHLIST，但沒有錯誤
+
+    assert api_value == engine_value == cli_value == str(leaders)

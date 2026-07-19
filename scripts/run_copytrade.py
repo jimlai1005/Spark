@@ -21,8 +21,11 @@
 leader 解析（per-follower ＋ 白名單二次驗證）:
   FILET_FOLLOWERS     follower manifest 路徑（預設＝repo 根下的
                       var/filet/followers.json，**絕對路徑**，不隨 CWD 漂移）。
-  FILET_LEADERS_PATH  策劃 leader 白名單路徑（預設＝repo 根下的 var/filet/leaders.json）。
-  兩者刻意錨定 repo 根：管理端 CLI 與引擎的 CWD 不同，相對路徑會讓兩邊驗不同檔，
+  FILET_LEADERS_PATH  策劃 leader 白名單路徑。⭐ **必填、無預設、必須絕對路徑**
+                      （2026-07-20；漏設即拒絕啟動，見 leader_resolve.require_leaders_path）
+                      ——白名單同時餵 API、本引擎、activate CLI 與兩個快照 timer，
+                      任一邊退回自己的預設值就會出現「兩份白名單」而沒有任何錯誤訊息。
+  絕對路徑是硬性的：管理端 CLI 與引擎的 CWD 不同，相對路徑會讓兩邊驗不同檔，
   下架在一邊生效、引擎那邊仍放行（fail-open）。部署另見 deploy/RUNBOOK.md §5.5。
   本進程跟誰＝manifest 內自己那筆的 leader_address，缺值才回退 env
   COPY_LEADER_ADDRESS（**未移除，既有部署照舊可用**）。兩條路徑都要過白名單
@@ -99,11 +102,11 @@ from spark.filet.leader_change_apply import (
     resolve_changes_path,
 )
 from spark.filet.leader_resolve import (
-    DEFAULT_LEADERS_PATH,
     DEFAULT_MANIFEST_PATH,
     LeaderResolution,
     LeaderResolutionError,
     LeaderWatch,
+    require_leaders_path,
     resolve_leader,
 )
 from spark.filet.tagged_notifier import TaggedNotifier
@@ -147,7 +150,10 @@ def make_leader_resolver(account_id: str | None, user_addr: str,
     resolve_leader 每次呼叫負責。回傳的閉包供 LeaderWatch 每 cycle 呼叫。
     """
     manifest_path = os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH)
-    leaders_path = os.environ.get("FILET_LEADERS_PATH", DEFAULT_LEADERS_PATH)
+    # ⭐ 白名單路徑**必填無預設**（同 require_exchange_dir 的處理）：漏設就拒絕啟動，
+    # 不得靜默退回 repo 內的預設檔——那會讓引擎放行的清單與 API／activate 讀的不是
+    # 同一份，且錯的方向是 fail-open（已撤銷的 leader 仍被放行）。
+    leaders_path = require_leaders_path()
 
     def _resolve() -> LeaderResolution:
         return resolve_leader(account_id=account_id, manifest_path=manifest_path,
@@ -175,7 +181,7 @@ def make_effective_leader_resolver(base_resolve: Callable[[], LeaderResolution],
     applier = LeaderChangeApplier(
         account_id=account_id,
         manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
-        leaders_path=os.environ.get("FILET_LEADERS_PATH", DEFAULT_LEADERS_PATH),
+        leaders_path=require_leaders_path(),   # 同上：必填無預設
         changes_path=resolve_changes_path(),
         ledger_path=state_root / LEDGER_RELPATH,
         notifier=notifier)

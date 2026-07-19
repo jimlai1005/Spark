@@ -26,6 +26,11 @@ def make_cfg(tmp_path, **over):
                 # ⭐ 與 exchange_dir 同樣是**必填無預設**（漏設即拒絕啟動）：測試
                 # 也逐個明講狀態根在哪，才會真的走到「API 與引擎兩份路徑推導」的路徑。
                 state_base=str(tmp_path / "state"),
+                # ⭐ leader 白名單同樣**必填無預設**（2026-07-20，同模式第三次）。
+                # 釘在 tmp_path 還有第二個作用（工程原則 4）：舊版的類預設是
+                # DEFAULT_LEADERS_PATH ＝ **repo 工作樹裡的** var/filet/leaders.json，
+                # 只要有人在本機建了那個檔，沒指定白名單的測試就會靜默改讀真實營運資料。
+                leaders_path=str(tmp_path / "leaders.json"),
                 admin_addresses=frozenset())
     base.update(over)
     return ApiConfig(**base)

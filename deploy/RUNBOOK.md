@@ -415,20 +415,23 @@ sudo systemctl daemon-reload
 > **本節新增於 2026-07-19（實機重新部署發現）**：原文件只有首次安裝路徑，照著重跑
 > 一次會把機器打回未設定狀態。
 
-**問題**：§5.2／§5.3 用 `systemctl edit --full` 把實際值寫進
-`/etc/systemd/system/filet-*.service`，而 §5.1 的 `cp` 覆蓋的**正是同一個路徑**。
-所以在既有機器上重跑 §5.1，會靜默清掉全部 6 個已填入的值：
-
-| unit | 被清掉的值 | 後果 |
-|---|---|---|
-| `filet-api.service` | `FILET_API_NETWORK` | ⭐ 變回 `REPLACE_WITH_NETWORK` → **API 拒絕啟動**（唯一會大聲失敗的一個） |
-| `filet-api.service` | `FILET_BUILDER_ADDR` | builder 收益歸零／下單帶錯 builder |
-| `filet-api.service` | `FILET_SIWE_DOMAIN`、`FILET_SIWE_URI` | SIWE 登入全數失敗（domain 對不上） |
-| `filet-api.service` | `FILET_ADMIN_ADDRESSES` | 沒有人是 admin，後台進不去 |
-| `filet-keysvc.service` | `FILET_KEYSVC_ALLOWED_UIDS`（§5.2） | SO_PEERCRED 白名單失效 → filet-api 呼不到 key-service |
-
-`FILET_API_NETWORK` 起不來反而是**最幸運**的一個：其餘五個都是「服務照樣 active，
-功能靜默壞掉」。所以下面的還原步驟一條都不能跳。
+> 🛑🛑 **本次升級新增一個必填變數：`FILET_LEADERS_PATH`（2026-07-20）**
+>
+> 現行伺服器上的 `/etc/systemd/system/filet-api.service` **沒有這一行**（它以前靠程式
+> 的隱含預設運作）。預設值已被移除，所以**升級後 filet-api 會拒絕啟動**，錯誤訊息是
+> `缺少環境變數: FILET_LEADERS_PATH`。這是刻意的 fail-closed，不是故障——理由見 §5.5。
+>
+> **部署前**先把這一行加進 `/etc/systemd/system/filet-api.service`（repo 版的
+> `deploy/filet-api.service` 已內建，跑完下面步驟 2 的 `cp` 就會帶進來；若這次不跑
+> 那段 `cp`，就必須手動加）：
+>
+> ```ini
+> Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
+> ```
+>
+> 值必須與 `filet-follower@`、`filet-leaderboard`、`filet-perf-series` 三個 unit 逐字元
+> 相同（那三個本來就有這一行）。四邊一致的驗收指令見 **§5.7 驗收 4**。
+> 加完 `daemon-reload` ＋ `restart filet-api`，再跑一次 §5.4 的狀態確認。
 
 #### 步驟 1：覆蓋 unit 之前先備份
 
@@ -567,6 +570,12 @@ grep FILET_KEYSVC_ALLOWED_UIDS /etc/systemd/system/filet-keysvc.service   # 驗�
 > 但本表漏列，照本表填完會留下 `REPLACE_WITH_NETWORK`，API 直接拒絕啟動
 > （`config.from_env` 的 `network not in API_URLS`，fail-closed）。
 
+> 🛑 **升級到 2026-07-20 之後的版本時，`filet-api.service` 多一個必填變數
+> `FILET_LEADERS_PATH`**（不是佔位符，repo 版已內建實際值，故不在上表）。
+> 舊機器的 `/etc/systemd/system/filet-api.service` 沒有這一行，**升級後 filet-api 會
+> 拒絕啟動**（`缺少環境變數: FILET_LEADERS_PATH`）——刻意的 fail-closed，處理方式與
+> 完整理由見 §5.1a 開頭的方框與 §5.5。四個 unit 值一致的驗收見 §5.7 驗收 4。
+
 ```bash
 sudo systemctl daemon-reload
 grep -E 'REPLACE_WITH|PLACEHOLDER' /etc/systemd/system/filet-api.service
@@ -604,6 +613,30 @@ sudo systemctl status filet-dashboard.service --no-pager # 驗收：active (runn
 
 - 任何帶 `--leader` 的 activate 會直接 `SystemExit`（白名單檔不存在 → 空清單 → 全拒）
 - env 回退路徑會走「白名單檔不存在」的向後相容豁免——**這道防線等於沒啟用**
+
+> ⭐⭐⭐ **路徑本身是必填、無預設、必須絕對路徑**（2026-07-20，同一失敗模式的第三次）
+>
+> `FILET_LEADERS_PATH` 有**五個**消費端，各自推導一次路徑：
+>
+> | 消費端 | 讀它決定什麼 | 宣告在哪 |
+> |---|---|---|
+> | `filet-api` | 客戶**能選誰**（目錄頁／選 leader） | `filet-api.service` |
+> | `filet-follower@` | 已在跟的人**還能不能繼續**（每輪二次驗證） | `filet-follower@.service` |
+> | `filet-leaderboard` | 每日快照**抓誰** | `filet-leaderboard.service` |
+> | `filet-perf-series` | 12 小時序列**抓誰**（無法回填） | `filet-perf-series.service` |
+> | `filet_activate` CLI | 管理端**核可誰**（硬閘） | `--leaders` 或執行時的 env |
+>
+> 前兩個實例是 `FILET_EXCHANGE_DIR`（§5.5.1）與 `FILET_STATE_BASE`（§5.5.2），修法相同：
+> **拿掉隱含預設，漏設的那一邊直接起不來**。2026-07-20 之前 `filet-api` 沒有宣告這個
+> 變數卻能正確運作——因為程式的預設值錨在 repo 根，而它的 `WorkingDirectory` 恰好也是
+> repo 根。**那是巧合不是強制**：白名單一搬家（或改 `WorkingDirectory`），API 與引擎就
+>讀不同的白名單，而危險方向是 **fail-open**——管理端在引擎那份撤銷了一個 leader，
+> 目錄頁仍列著他、客戶仍選得到、activate 仍放行。現在漏設一律拒絕啟動。
+>
+> 相對路徑同樣被拒：引擎的 CWD 由 systemd 釘死，管理端跑 CLI 的 CWD 是他當下所在——
+> 同一個相對路徑在兩邊指向不同的檔，症狀一樣是下架無聲失效。
+>
+> 四個 unit 值一致的驗收指令見 **§5.7 驗收 4**；activate CLI 的用法見 **§5.6**。
 
 ```bash
 # 目錄與檔案：owner 必須是 root，且 filet-api 寫不到（承重點，見 §2 權限表）
@@ -964,6 +997,11 @@ sudo -u filet-api env -u FILET_STATE_BASE \
 `/opt/filet/spark/var/filet/followers.json`），症狀是「activate 說成功了，
 follower 起來卻找不到自己」。
 
+⭐ `--leaders` **沒有預設值**（2026-07-20）：不給它、且 env 也沒有 `FILET_LEADERS_PATH`
+→ CLI 直接 exit 2（與缺 `FILET_BUILDER_ADDR` 同一處理）。這是刻意的——本 CLI 由人工在
+某台機器的某個目錄執行，「用哪一份白名單把關」不該由一個看不見的預設值決定。下面的
+指令已經明給了它，照抄即可；`--leaders` 給了就以它為準（管理端當下的明確指示優先於 env）。
+
 ```bash
 cd /opt/filet/spark
 sudo FILET_BUILDER_ADDR=<builder 位址> \
@@ -1139,11 +1177,33 @@ sudo ls -l /var/lib/filet-api/leaderboard/perf_series/ | tail -5
 > ⚠️ **同一個 12h 窗內重跑會被冪等跳過**（`appended=0 idempotent_skips=1`），這是**正確行為**不是故障。
 > 此時 mtime 仍是上一次取樣的時間——不要據此判定「產物沒落地」。<!-- 2026-07-19 實機發現：文件原文會把正確行為誤判成失敗 -->
 
-# 驗收 4：兩個 unit 看到的是同一份白名單（抓取對象的單一來源）
-# --value 不可省略（同 §5.5.2 驗收 2 的方框）：這裡也是逐字元比對兩行輸出
-systemctl show filet-leaderboard.service -p Environment --value | tr ' ' '\n' | grep FILET_LEADERS_PATH
-systemctl show filet-perf-series.service  -p Environment --value | tr ' ' '\n' | grep FILET_LEADERS_PATH
-# 預期：兩行值逐字元相同，且等於 §5.5 建立的 leaders.json 路徑
+# 驗收 4：⭐⭐ **四個** unit 看到的是同一份白名單（抓取對象與「誰能被選」的單一來源）
+# --value 不可省略（同 §5.5.2 驗收 2 的方框）：這裡是逐字元比對四行輸出。
+#
+# ⚠️ 2026-07-20 之前這條只比對兩個 timer，而**在 filet-api 這端根本不成立**：
+# 那時 `filet-api.service` 沒有宣告 FILET_LEADERS_PATH（宣告數 0），API 走的是程式
+# 的隱含預設，只因為它的 WorkingDirectory 恰好是 repo 根、預設值又錨定 repo 根，
+# 兩邊才「恰好」是同一個檔。也就是說：**當時最需要被驗的那一格，驗收指令量不到。**
+# 現在四個 unit 全部顯式宣告（漏設即拒絕啟動），這條才真的證明了單一來源。
+for U in filet-api filet-follower@probe filet-leaderboard filet-perf-series; do
+  printf '%-24s ' "$U"
+  systemctl show "${U}.service" -p Environment --value | tr ' ' '\n' \
+    | sed -n 's/^FILET_LEADERS_PATH=//p'
+done
+# 預期：四行的值逐字元相同，且等於 §5.5 建立的 leaders.json 路徑。
+# ⭐ 任何一行是**空的**就是本節最重要的失敗：那個 unit 沒宣告 → 該服務會拒絕啟動
+#   （filet-api／follower）或該次取樣會 failed（兩個 timer）。
+#
+# `filet-follower@probe` 的 `probe` 是**合成實例名**（同 §5.5.2 驗收 2 的說明）：
+# systemd 對任意實例名都會展開 `%i`，unit 不必啟動、帳號不必存在。模板 unit 本身
+# （`filet-follower@.service`，沒有實例名）則問不出展開後的值，所以這裡一定要帶一個名字。
+
+# 一行式的自動判定（不想用眼睛比四行時用這個）
+UNIQ=$(for U in filet-api filet-follower@probe filet-leaderboard filet-perf-series; do
+         systemctl show "${U}.service" -p Environment --value | tr ' ' '\n' \
+           | sed -n 's/^FILET_LEADERS_PATH=//p'; done | sort -u | wc -l)
+[ "$UNIQ" = "1" ] && echo "四個 unit 同一份白名單 OK" \
+  || echo "★ 失敗：四個 unit 的白名單不一致或有人沒宣告（不同值個數=$UNIQ）"
 ```
 
 #### 例行監控（`filet-perf-series` 需要比其他 timer 更積極的檢查）

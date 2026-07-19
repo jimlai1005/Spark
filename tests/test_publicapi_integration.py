@@ -100,7 +100,11 @@ def test_full_onboarding_flow_offline(tmp_path):
         assert len(load_pending(cfg.pending_path)) == 1
         # 5. 人工 activate → 引擎視角：manifest 讀得到、keystore 有 key
         manifest = tmp_path / "followers.json"
-        activate(account_id, cfg.pending_path, str(manifest), BUILDER, start=False)
+        # leaders_path 自 2026-07-20 起必填無預設（白名單是安全關鍵硬閘，不得靜默
+        # 取用某份預設檔）。本流程的 pending 條目沒有 leader_address ⇒ 白名單不被讀，
+        # 但仍要明講用哪一份把關——這裡沿用 cfg 的那份（API 與 CLI 同源，正是本次修法）。
+        activate(account_id, cfg.pending_path, str(manifest), BUILDER, start=False,
+                 leaders_path=cfg.leaders_path)
         refs = load_followers(manifest)
         assert refs[0].account_id == account_id
         assert refs[0].user_address == wallet.address.lower()

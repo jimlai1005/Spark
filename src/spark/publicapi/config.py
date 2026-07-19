@@ -14,7 +14,7 @@ from spark.config import API_URLS, MIN_BUILDER_BALANCE, Settings
 from spark.filet.followers import validate_account_id
 from spark.filet.capital_settings import capital_settings_path_for
 from spark.filet.leader_change import leader_changes_path_for
-from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
+from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH, require_leaders_path
 
 _HEX = set("0123456789abcdefABCDEF")
 
@@ -59,6 +59,15 @@ class ApiConfig:
     # 當下告訴管理員一切正常。拿掉預設值讓漏設的那一邊**直接拒絕啟動**，
     # 「起不來」刻意優先於「起來了但面板謊報健康」。
     state_base: str
+    # --- leader 白名單（/api/leaders 目錄頁與選 leader 的唯一合法來源）---
+    # ⭐⭐⭐ **刻意沒有預設值**，與 `exchange_dir`／`state_base` 同一個處理、同一個理由
+    # ——這是同一個失敗模式的**第三次**（2026-07-20），而且共用者最多（API、引擎每輪
+    # 二次驗證、activate CLI 硬閘、兩個快照 timer 各推導一次）。舊版預設是引擎的
+    # `DEFAULT_LEADERS_PATH`：實機上 filet-api.service 根本沒宣告這個變數，兩邊指到
+    # 同一個檔純粹因為 API 的 CWD 恰好是 repo 根。危險方向是 fail-open：管理端在引擎
+    # 那份撤銷了一個 leader，API 這份仍列著他 → 客戶選得到一個已被撤銷的 leader。
+    # 取值與檢查的單一定義在 leader_resolve.require_leaders_path（含絕對路徑不變式）。
+    leaders_path: str
     agent_name: str = "filet"         # research：一律給名字，避開 SDK 空名刪欄位特例
     # --- 營運後台（/ops，admin only）唯讀資料來源 ---
     # followers manifest：web 層**只讀**（寫入只有人工 activate CLI，見 pending.py 檔頭）。
@@ -67,11 +76,6 @@ class ApiConfig:
     # builder accrued 歷史序列（北極星實收，由 scripts/copytrade_daily_report.py 每日附加）。
     # API 進程不自己查 accrued——查一次的職責在日報腳本，這裡只讀它落下的檔（紅線：不加總）。
     accrued_history_path: str = "var/copytrade/accrued_history.jsonl"
-    # --- leader 目錄（/api/leaders，session-gated）唯讀資料來源 ---
-    # ⭐ 直接引用引擎的 DEFAULT_LEADERS_PATH，不另寫一個字面量預設（同源，工程原則 1）：
-    # 目錄頁列出的「可選 leader」與引擎放行的清單必須是**同一個檔**。兩邊各自宣告
-    # 預設路徑 → 管理端在引擎那份撤銷、API 這份仍列著他，客戶選了一個已撤銷的 leader。
-    leaders_path: str = DEFAULT_LEADERS_PATH
     # watchlist 每日快照目錄（scripts/watchlist_snapshot.py 的落檔處，cron 00:10 UTC）。
     # 由 DEFAULT_LEADERS_PATH 的父目錄推導＝<repo>/var/filet/leaderboard/watchlist，
     # 對齊 watchlist_snapshot 的 <FILET_DATA_DIR>/leaderboard/watchlist 版面；
@@ -168,9 +172,15 @@ class ApiConfig:
         # 它與引擎 unit 的 FILET_STATE_DIR 是同一條路徑的兩份推導，漏設／漂移的
         # 症狀是健康面板把每一個 follower 都讀成 absent，而 absent 曾被當成
         # 「kill switch 未觸發」上呈。詳見 `state_base` 欄位與 ops.state_root_status。
+        # ⭐⭐⭐ FILET_LEADERS_PATH 同列必填、同一個理由（2026-07-20，同模式第三次）：
+        # 白名單被 API、引擎、activate CLI 與兩個快照 timer 共用，五份獨立推導。
+        # 本進程漏設 → 目錄頁與「客戶能選誰」讀的檔可能不是引擎放行用的那一份，
+        # 而錯的方向是 fail-open（已撤銷的 leader 仍被列出、仍可被選）。
+        # 詳見 `leaders_path` 欄位與 leader_resolve.require_leaders_path。
         required = ["FILET_API_NETWORK", "FILET_BUILDER_ADDR", "FILET_SIWE_DOMAIN",
                     "FILET_SIWE_URI", "FILET_API_DB", "FILET_KEYSVC_SOCK",
-                    "FILET_PENDING_PATH", "FILET_EXCHANGE_DIR", "FILET_STATE_BASE"]
+                    "FILET_PENDING_PATH", "FILET_EXCHANGE_DIR", "FILET_STATE_BASE",
+                    "FILET_LEADERS_PATH"]
         missing = [k for k in required if not env.get(k)]
         if missing:
             raise ValueError(f"缺少環境變數: {', '.join(missing)}")
@@ -193,9 +203,11 @@ class ApiConfig:
         # 兩個 env 名是營運誤設的溫床，這裡讓一個變數就能同時餵引擎與 API。
         followers_path = (env.get("FILET_FOLLOWERS_PATH") or env.get("FILET_FOLLOWERS")
                           or cls.followers_path)
-        # leader 白名單：沿引擎與 activate CLI 既有的 FILET_LEADERS_PATH（同一變數餵三方，
-        # 同上「一個變數就不會半邊誤設」的理由）。
-        leaders_path = env.get("FILET_LEADERS_PATH") or cls.leaders_path
+        # leader 白名單：與引擎／activate CLI／兩個快照 timer 同一個變數（一個變數就
+        # 不會半邊誤設）。⭐ 走 require_leaders_path 而不是自己 env[...]：上面的 required
+        # 清單只證明「有設」，絕對路徑不變式（相對路徑 → 兩個進程的 CWD 不同 → 驗不同檔）
+        # 的定義只有一份，寫在那個函式裡，五個消費端共用同一套檢查。
+        leaders_path = require_leaders_path(env)
         # watchlist 快照目錄：優先顯式 FILET_WATCHLIST_DIR，否則由 cron 用的
         # FILET_DATA_DIR 推導出同一個版面（<data>/leaderboard/watchlist），
         # 兩邊都未設才用類預設——避免「cron 寫 A、API 讀 B」的靜默錯位。

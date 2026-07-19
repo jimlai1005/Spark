@@ -42,6 +42,7 @@ def _env(**over):
         "FILET_PENDING_PATH": "/tmp/pending.json",
         "FILET_EXCHANGE_DIR": "/tmp/filet-exchange",
         "FILET_STATE_BASE": "/opt/filet/state",
+        "FILET_LEADERS_PATH": "/opt/filet/spark/var/filet/leaders.json",
         "FILET_ADMIN_ADDRESSES": "0x" + "ad" * 20,
     }
     base.update(over)
@@ -104,6 +105,50 @@ def test_state_base_has_no_class_level_default_either():
     field = next(f for f in dataclasses.fields(ApiConfig) if f.name == "state_base")
     assert field.default is dataclasses.MISSING
     assert field.default_factory is dataclasses.MISSING
+
+
+def test_leaders_path_is_required_and_has_no_silent_default():
+    """⭐⭐⭐ 漏設 FILET_LEADERS_PATH → **拒絕啟動**（同 FILET_EXCHANGE_DIR／
+    FILET_STATE_BASE 的處理；這是同一個失敗模式的第三次，2026-07-20）。
+
+    白名單有**五個**消費端各推導一次路徑：本 API（客戶能選誰）、引擎每輪的二次驗證
+    （已在跟的人還能不能繼續）、activate CLI 的硬閘（管理端核可誰）、以及 leaderboard
+    與 perf-series 兩個快照 timer（抓誰）。舊版每一端都是
+    `env.get(...) or DEFAULT_LEADERS_PATH`，於是實機上 `filet-api.service` **根本沒有
+    宣告這個變數**卻能正常運作——只因為它的 CWD 恰好是 repo 根，預設值又錨定 repo 根。
+    那是巧合不是強制：白名單一旦搬家（或 WorkingDirectory 一改），API 與引擎就讀
+    **不同的白名單**，而危險方向是 fail-open——管理端在引擎那份撤銷了一個 leader，
+    目錄頁仍列著他、客戶仍選得到。「起不來」刻意優先於「起來了但兩邊讀不同檔」。
+    """
+    with pytest.raises(ValueError, match="FILET_LEADERS_PATH"):
+        ApiConfig.from_env(_env(FILET_LEADERS_PATH=None))
+
+
+def test_leaders_path_has_no_class_level_default_either():
+    """⭐ 連 dataclass 層都沒有預設值（沿 exchange_dir／state_base 的同一個決定）：
+    留一個類屬性預設，from_env 以外的建構路徑（測試、腳本）就會靜默拿到它——
+    而對白名單來說「靜默拿到的那一份」就是**沒有把關**。"""
+    import dataclasses
+
+    field = next(f for f in dataclasses.fields(ApiConfig) if f.name == "leaders_path")
+    assert field.default is dataclasses.MISSING
+    assert field.default_factory is dataclasses.MISSING
+
+
+def test_leaders_path_must_be_absolute():
+    """⭐ 相對路徑一律拒絕：這是舊預設值當初被改成絕對路徑的理由（I4）。
+
+    移除預設值時若沒把這個不變式一起搬進 require_leaders_path，等於用一個新洞
+    （API 的 CWD 一漂移就驗到別的檔）換掉舊洞。
+    """
+    with pytest.raises(ValueError, match="絕對路徑"):
+        ApiConfig.from_env(_env(FILET_LEADERS_PATH="var/filet/leaders.json"))
+
+
+def test_leaders_path_used_verbatim_from_env():
+    """API 讀到的就是 env 指的那一份——不做任何「猜一個更合理的位置」的加工。"""
+    cfg = ApiConfig.from_env(_env(FILET_LEADERS_PATH="/etc/filet/curated.json"))
+    assert cfg.leaders_path == "/etc/filet/curated.json"
 
 
 def test_leader_changes_path_is_anchored_on_the_exchange_dir_not_pending():
@@ -200,6 +245,7 @@ def test_live_key_refused_on_direct_construction():
                   siwe_domain="d", siwe_uri="https://d", db_path="x.db",
                   keysvc_sock="x.sock", pending_path="p.json",
                   exchange_dir="/tmp/filet-exchange", state_base="/opt/filet/state",
+                  leaders_path="/opt/filet/spark/var/filet/leaders.json",
                   admin_addresses=frozenset(),
                   stripe_secret_key="sk_live_abc",
                   stripe_webhook_secret="whsec_x", stripe_price_id="price_x")
@@ -213,6 +259,7 @@ def test_partial_set_refused_on_direct_construction():
                   siwe_domain="d", siwe_uri="https://d", db_path="x.db",
                   keysvc_sock="x.sock", pending_path="p.json",
                   exchange_dir="/tmp/filet-exchange", state_base="/opt/filet/state",
+                  leaders_path="/opt/filet/spark/var/filet/leaders.json",
                   admin_addresses=frozenset(),
                   stripe_secret_key="sk_test_abc")
 

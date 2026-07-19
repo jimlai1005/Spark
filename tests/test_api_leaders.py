@@ -3,6 +3,7 @@
 盯住三件事：(1) 不可選的 leader **連存在都不外流**；(2) 統計拿不到時目錄仍可用；
 (3) 投影白名單不夾帶未列舉欄位（尤其是 enabled/accepting_new 兩個治理旗標）。
 """
+import dataclasses
 import json
 import socket
 
@@ -282,19 +283,32 @@ def test_config_watchlist_dir_from_env(env_key, expect_suffix):
            "FILET_KEYSVC_SOCK": "s", "FILET_PENDING_PATH": "p",
            "FILET_EXCHANGE_DIR": "/var/lib/filet-exchange",
            "FILET_STATE_BASE": "/opt/filet/state",
+           "FILET_LEADERS_PATH": "/opt/filet/spark/var/filet/leaders.json",
            env_key: "/data/x" if env_key == "FILET_DATA_DIR" else "/explicit"}
     cfg = ApiConfig.from_env(env)
     assert cfg.watchlist_dir.endswith(expect_suffix)
 
 
-def test_config_leaders_path_defaults_to_engine_path():
-    """⭐ API 的預設白名單路徑必須就是引擎驗證用的那一份（同源，絕對路徑）。"""
+def test_config_leaders_path_comes_from_env_not_from_a_default():
+    """⭐ 白名單路徑一律由 env 明講（2026-07-20 起無預設值），API 與引擎因此不可能
+    各自「推導」出一份。
+
+    這條**取代**了舊的 `test_config_leaders_path_defaults_to_engine_path`：那條斷言
+    `ApiConfig.leaders_path == DEFAULT_LEADERS_PATH`，也就是把「兩邊靠同一個預設值
+    恰好相等」這件事釘成規格。而實機上 filet-api.service 根本沒宣告這個變數，兩邊
+    指到同一個檔只是因為 API 的 CWD 恰好是 repo 根——巧合被當成保證正是本次要修的
+    東西。同源的保證改由「兩邊都必須顯式宣告同一個 env」提供（見 RUNBOOK §5.7 驗收 4
+    與 tests/test_filet_leaders.py 的 unit 宣告測試）。
+    """
     from pathlib import Path
 
-    from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
     from spark.publicapi.config import ApiConfig
 
-    assert ApiConfig.leaders_path == DEFAULT_LEADERS_PATH
+    assert dataclasses.fields(ApiConfig)  # ApiConfig 仍是 dataclass（下面靠它取欄位）
+    field = next(f for f in dataclasses.fields(ApiConfig) if f.name == "leaders_path")
+    assert field.default is dataclasses.MISSING
+    # watchlist 目錄的預設仍是絕對路徑（它與白名單不同：cron 與 API 都另有 env 可指定，
+    # 且讀錯的後果是統計缺失而不是放行一個已撤銷的 leader）。
     assert Path(ApiConfig.watchlist_dir).is_absolute()
 
 

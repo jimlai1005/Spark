@@ -19,11 +19,15 @@
 「快照有他、序列沒有他」的錯位，而錯位的那幾天**永遠補不回來**。
 
 用法（systemd timer 每 12 小時執行，見 deploy/filet-perf-series.timer）：
-  FILET_DATA_DIR=/var/lib/filet-api [FILET_LEADERS_PATH=...] \\
+  FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json \\
+  FILET_DATA_DIR=/var/lib/filet-api \\
   [SPARK_NETWORK=mainnet] uv run python -m scripts.perf_series_snapshot
 
 環境變數:
-  FILET_LEADERS_PATH      leader 白名單路徑（與引擎／API／activate CLI 同一個變數）
+  FILET_LEADERS_PATH      leader 白名單路徑（與引擎／API／activate CLI 同一個變數）。
+                          ⭐ **必填、無預設、必須絕對路徑**（2026-07-20）：未設即
+                          raise（unit 進 failed）——沿用 resolve_targets 的處理，
+                          理由見 scripts/watchlist_snapshot.py 檔頭最後一段。
   FILET_LEADER_WATCHLIST  逗號分隔的**額外**地址（白名單之外的研究對象）
   FILET_DATA_DIR          資料根目錄（預設 var/filet）；
                           落檔 <root>/leaderboard/perf_series/<address>.jsonl

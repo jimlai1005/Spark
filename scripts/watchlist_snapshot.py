@@ -4,6 +4,7 @@
 /info clearinghouseState（經 HLGateway 唯讀 resilience 邊界，transient 自動重試）。
 
 用法（systemd timer 每日執行，見 deploy/filet-leaderboard.timer）：
+  FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json \\
   FILET_DATA_DIR=/var/lib/filet-api [FILET_LEADER_WATCHLIST=0x..,0x..] \\
   [SPARK_NETWORK=mainnet] uv run python -m scripts.watchlist_snapshot
 
@@ -17,7 +18,9 @@
 兩者取聯集：白名單保證不漏，env 保證研究彈性。
 
 環境變數:
-  FILET_LEADERS_PATH      leader 白名單路徑（與引擎／API／activate CLI 同一個變數）
+  FILET_LEADERS_PATH      leader 白名單路徑（與引擎／API／activate CLI 同一個變數）。
+                          ⭐ **必填、無預設、必須絕對路徑**（2026-07-20）——見下方
+                          「設定錯誤與內容錯誤是兩件事」。
   FILET_LEADER_WATCHLIST  逗號分隔的**額外**地址（白名單之外的研究對象）
   FILET_DATA_DIR          資料根目錄（預設 var/filet）；落檔 <root>/leaderboard/watchlist/<day>.json
   SPARK_NETWORK           mainnet | testnet（預設 mainnet）
@@ -30,6 +33,14 @@
   - 白名單壞掉 → **不中止**（仍以 env 清單抓完並落檔），但寫進快照的
     `leaders_error` ＋ logger.error ＋ exit 1：中止會讓一個手滑的編輯連帶弄丟
     當天所有 leader 的資料點，而序列**無法回填**（今天沒抓就是永久的洞）。
+
+⚠️ 設定錯誤與內容錯誤是兩件事，處理方式刻意相反（2026-07-20）
+------------------------------------------------------------
+上面那條「白名單壞掉不中止」講的是**內容**錯誤（JSON 壞了、路徑指到的檔讀不出來）
+——那時我們仍知道自己該讀哪一份檔，只是那一份當下壞了，於是降級抓 env 清單。
+`FILET_LEADERS_PATH` 未設是**設定**錯誤：我們根本不知道該讀哪一份檔。此時降級會靜默
+抓錯對象（甚至抓成內建的 DEFAULT_WATCHLIST）而 unit 回報 SUCCESS，序列從此對著錯的
+一組 leader 累積，且無法回填。所以它 raise、unit 進 failed —— 大聲失敗優於安靜地錯。
 """
 import os
 import sys
@@ -37,7 +48,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from spark.filet.leaderboard import DEFAULT_WATCHLIST, snapshot_watchlist, write_snapshot
-from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
+from spark.filet.leader_resolve import require_leaders_path
 from spark.filet.leaders import load_leaders
 from spark.publicapi.config import normalize_address
 
@@ -75,10 +86,13 @@ def resolve_targets(env) -> tuple[list[str], str | None]:
 
     白名單載入失敗 → 回 `(env 清單, 錯誤訊息)`：呼叫端負責大聲告警並 exit 1，
     但**不中止當天的擷取**（見檔頭「行為」最後一條）。
+
+    ⚠️ 但 `FILET_LEADERS_PATH` **未設**不走那條軟失敗路徑，直接 raise（檔頭「設定錯誤
+    與內容錯誤是兩件事」）：讀不到指定的那份檔可以降級，不知道該讀哪份檔不行。
     """
     error = None
     whitelisted: list[str] = []
-    path = env.get("FILET_LEADERS_PATH") or DEFAULT_LEADERS_PATH
+    path = require_leaders_path(env)
     try:
         # 檔案不存在 → load_leaders 回 []（尚未策劃任何 leader 是合法狀態）
         whitelisted = [ref.address for ref in load_leaders(path)]

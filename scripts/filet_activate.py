@@ -6,14 +6,20 @@
 followers.json（拒絕重複）→ 以 load_followers fail-fast 重讀驗證（驗證但不回滾：
 os.replace 已提交，重讀失敗時 manifest 保留新版本、pending 條目也保留以便可重跑排查）
 → 自 pending 移除 → 印出（或 --start 執行）systemctl 啟動指令。
-用法: FILET_BUILDER_ADDR=0x... uv run python -m scripts.filet_activate <account_id> \\
+用法: FILET_BUILDER_ADDR=0x... FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json \\
+      uv run python -m scripts.filet_activate <account_id> \\
       [--pending var/filet/pending.json] [--manifest var/filet/followers.json] \\
       [--leader 0x...] [--leaders <白名單絕對路徑>] [--start]
 
 ⚠️ `--pending` 與 `--manifest` 的預設值是 **CWD 相對**的：在錯的目錄跑會寫出一份
 引擎讀不到的 manifest（症狀：activate 說成功、follower 起來卻找不到自己）。
 正式部署請用絕對路徑或先 `cd /opt/filet/spark`——完整指令見 deploy/RUNBOOK.md §5.6。
-`--leaders` 的預設值已錨定 repo 根（絕對路徑），與引擎驗的是同一份檔。
+
+⭐ 白名單路徑**沒有預設值**（2026-07-20）：`--leaders` 或 env `FILET_LEADERS_PATH`
+必須給一個絕對路徑，兩者皆無 → exit 2（與缺 `FILET_BUILDER_ADDR` 同一處理）。
+本 CLI 是人工執行的，CWD 與 env 都由當下那個人決定——舊版靜默退回 repo 根下的
+預設檔，於是「管理端核可時看的白名單」與「伺服器上引擎實際驗的白名單」可以是
+兩份不同的檔，而唯一的症狀是核可了一個引擎不放行（或已被撤銷）的 leader。
 """
 import argparse
 import json
@@ -22,9 +28,9 @@ import subprocess
 from pathlib import Path
 
 from spark.filet.followers import load_followers
-# 白名單預設路徑與引擎共用單一定義：CLI 驗一份檔、引擎驗另一份檔的漂移，
+# 白名單路徑的取得與檢查與引擎共用單一定義：CLI 驗一份檔、引擎驗另一份檔的漂移，
 # 會讓「已核可的 leader」與「引擎眼中合法的 leader」悄悄分家（安全關鍵）。
-from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
+from spark.filet.leader_resolve import LEADERS_PATH_ENV, require_leaders_path
 from spark.filet.leaders import is_selectable, load_leaders
 from spark.publicapi.config import normalize_address, derive_account_id
 from spark.publicapi.pending import load_pending, remove_pending_entry
@@ -63,7 +69,11 @@ def _resolve_leader(entry: dict, override: str | None, leaders_path: str) -> str
 
 def activate(account_id: str, pending_path: str, manifest_path: str,
              expected_builder: str, *, start: bool, leader: str | None = None,
-             leaders_path: str = DEFAULT_LEADERS_PATH) -> str:
+             leaders_path: str) -> str:
+    # `leaders_path` 刻意**無預設值**（2026-07-20，同 exchange_dir／state_base 的處理）：
+    # 留一個預設，任何呼叫端（含測試）就會靜默拿到它，而白名單是安全關鍵的硬閘——
+    # 「拿哪一份白名單把關」必須是每個呼叫端明講的事。解析在 main() 走
+    # require_leaders_path（含絕對路徑不變式），與引擎、API 共用同一套檢查。
     matches = [e for e in load_pending(pending_path)
                if e.get("account_id") == account_id]
     if not matches:
@@ -120,17 +130,28 @@ def main() -> None:
     ap.add_argument("--leader", default=None,
                     help="覆寫此 follower 跟隨的 leader（須在白名單內）；"
                          "省略則用 pending 條目的 leader_address，兩者皆無則沿用 env 預設")
-    ap.add_argument("--leaders",
-                    default=os.environ.get("FILET_LEADERS_PATH", DEFAULT_LEADERS_PATH),
-                    help="策劃 leader 白名單路徑（預設取 env FILET_LEADERS_PATH）")
+    ap.add_argument("--leaders", default=None,
+                    help="策劃 leader 白名單路徑（絕對路徑；未給則取 env "
+                         "FILET_LEADERS_PATH，兩者皆無則拒絕執行——無預設值）")
     args = ap.parse_args()
     builder = os.environ.get("FILET_BUILDER_ADDR")
     if not builder:
         print(__doc__)
         print("缺少環境變數 FILET_BUILDER_ADDR（核對 pending 條目的 builder 用）")
         raise SystemExit(2)
+    # ⭐ 白名單路徑：`--leaders` 是管理端當下的明確指示，優先於 env；兩者皆無就停下來。
+    # 走 require_leaders_path 讓「怎樣算合法的白名單路徑」（含絕對路徑不變式）只有一份
+    # 定義，本 CLI 與引擎、API、兩個快照 timer 共用——這正是本次修法的重點：
+    # 五個消費端不得各自推導一次。
+    try:
+        leaders_path = require_leaders_path(
+            {LEADERS_PATH_ENV: args.leaders} if args.leaders else os.environ)
+    except ValueError as e:
+        print(__doc__)
+        print(f"{e}\n（本 CLI 也可用 --leaders <絕對路徑> 明確指定）")
+        raise SystemExit(2) from e
     print(activate(args.account_id, args.pending, args.manifest, builder,
-                   start=args.start, leader=args.leader, leaders_path=args.leaders))
+                   start=args.start, leader=args.leader, leaders_path=leaders_path))
 
 
 if __name__ == "__main__":

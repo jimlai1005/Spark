@@ -61,6 +61,7 @@ manifest）。**API 進程若被打穿，攻擊者能把 follower 指向惡意 l
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -81,6 +82,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # （與撤銷收尾疊加後，連「已止血」的錯覺都還在）。沿用 resolve_state_dir() 對同一類
 # 問題的既有解法（.resolve() 錨定，不靠啟動目錄）。
 DEFAULT_MANIFEST_PATH = str(_REPO_ROOT / "var" / "filet" / "followers.json")
+# ⚠️ 2026-07-20 起 `DEFAULT_LEADERS_PATH` **不再是任何消費端的隱含 fallback**——它只
+# 是「開發機該把 FILET_LEADERS_PATH 設成什麼」的參考值（與 DEFAULT_EXCHANGE_DIR 同性質）。
+# 理由見 require_leaders_path 的 docstring；取值一律走那個函式或 ApiConfig 的 required 清單。
 DEFAULT_LEADERS_PATH = str(_REPO_ROOT / "var" / "filet" / "leaders.json")
 # 客戶簽章換 leader 記錄的**交換目錄**在開發機該設成什麼（正式部署是
 # /var/lib/filet-exchange）。⚠️ 這**不是**隱含 fallback——寫端（ApiConfig.from_env）
@@ -88,6 +92,63 @@ DEFAULT_LEADERS_PATH = str(_REPO_ROOT / "var" / "filet" / "leaders.json")
 # 必填，漏設一邊直接拒絕啟動。放在本模組是因為這裡已經是所有 var/filet 預設路徑的
 # 單一錨點；兩邊各自宣告一份「開發機預設」正是 C3 那類漂移的起點。
 DEFAULT_EXCHANGE_DIR = str(_REPO_ROOT / "var" / "filet")
+
+# 五個消費端共用的白名單環境變數名（API／引擎／activate CLI／兩個快照 timer）。
+LEADERS_PATH_ENV = "FILET_LEADERS_PATH"
+
+
+def require_leaders_path(env=None) -> str:
+    """解出策劃 leader 白名單的路徑；**未設或非絕對路徑一律 raise ⇒ 拒絕啟動**。
+
+    ⭐⭐ 這是同一個失敗模式的**第三次**（2026-07-20）
+    ------------------------------------------------
+    前兩次是 `FILET_EXCHANGE_DIR`（見 leader_change_apply.require_exchange_dir）與
+    `FILET_STATE_BASE`（見 publicapi.config.state_base）：一條路徑、多個進程各自推導
+    一次，靠字面量剛好相等而成立。本變數是第三個，而且共用它的進程最多：
+
+    | 消費端 | 用途 | 讀取點 |
+    |---|---|---|
+    | `filet-api`（目錄頁／選 leader） | 客戶**能選誰** | `ApiConfig.from_env` 的 required 清單 |
+    | `filet-follower@`（引擎每輪二次驗證） | 已在跟的人**還能不能繼續** | `run_copytrade.make_leader_resolver` |
+    | `filet_activate`（人工 CLI 硬閘） | 管理端**核可誰** | `--leaders` ／ 本函式 |
+    | `filet-leaderboard`／`filet-perf-series` | 快照與序列**抓誰** | `watchlist_snapshot.resolve_targets` |
+
+    舊版每一個消費端都寫 `env.get(...) or DEFAULT_LEADERS_PATH`，於是漏設的症狀是
+    **靜默的**：實機上 `filet-api.service` 根本沒宣告這個變數，只因為它的 CWD 是
+    `/opt/filet/spark`、而 `DEFAULT_LEADERS_PATH` 又錨定 repo 根，兩邊才「恰好」指到
+    同一個檔。任何一次改動（換部署路徑、改 WorkingDirectory、把白名單搬去 /etc）都會
+    讓 API 與引擎讀**不同的白名單**——而危險方向是 fail-open：管理端在引擎那份撤銷了
+    一個 leader，API 這份仍列著他，客戶照樣選得到、activate 照樣放行。
+
+    修法與前兩次完全相同：**拿掉 fallback**，五個消費端全部必填，漏設的那一邊直接
+    起不來。「起不來」在部署當下就被看見；「起來了但兩邊讀不同檔」沒有任何 log。
+
+    **絕對路徑也在此強制**：這正是舊預設值當初被改成絕對路徑的理由（I4）——引擎的
+    CWD 被 systemd 釘死、管理端跑 CLI 的 CWD 是他當下所在，相對路徑會讓兩邊驗不同檔。
+    移除預設值若不把這個不變式一起搬過來，等於用一個新洞換掉舊洞。
+
+    檔案**不存在不是錯誤**，故意不檢查（與 require_exchange_dir 的目錄檢查不同）：
+    「尚未策劃任何 leader」是合法狀態，由 load_leaders 回空清單 → 全部拒絕（安全預設），
+    而 resolve_leader 對「白名單檔不存在」另有明訂的向後相容豁免。在此檢查存在性會把
+    那兩條既有語意悄悄改掉。
+    """
+    env = os.environ if env is None else env
+    raw = env.get(LEADERS_PATH_ENV)
+    if not raw:
+        raise ValueError(
+            f"缺少環境變數 {LEADERS_PATH_ENV}（策劃 leader 白名單路徑，正式部署為 "
+            f"/opt/filet/spark/var/filet/leaders.json，開發機用 {DEFAULT_LEADERS_PATH}）。"
+            f"filet-api／filet-follower@／filet-leaderboard／filet-perf-series 四個 unit "
+            f"與人工 activate CLI **全部都要指到同一個值**——刻意沒有預設值：漏設一邊會讓"
+            f"「客戶能選誰」與「引擎放行誰」讀不同的檔，而兩邊的 log 都正常。"
+            f"見 deploy/RUNBOOK.md §5.5")
+    if not Path(raw).is_absolute():
+        raise ValueError(
+            f"{LEADERS_PATH_ENV}={raw} 必須是絕對路徑——相對路徑會隨進程的 CWD 漂移"
+            f"（引擎的 CWD 由 systemd 釘死，管理端跑 CLI 的 CWD 是他當下所在），"
+            f"兩邊於是驗**不同的檔**，而危險方向是下架無聲失效。見 deploy/RUNBOOK.md §5.5")
+    return raw
+
 
 SOURCE_MANIFEST = "manifest"
 SOURCE_ENV_DEFAULT = "env_default"
