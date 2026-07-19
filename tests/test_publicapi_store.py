@@ -235,3 +235,60 @@ def test_billing_table_has_no_sensitive_columns(tmp_path):
     cols = {row[1] for row in store._db.execute("PRAGMA table_info(billing)")}
     assert cols == {"account_id", "stripe_customer_id", "stripe_subscription_id",
                     "status", "updated_at", "last_event_created", "last_event_id"}
+
+
+# ---------- pending checkout（重複結帳擋板；opus 對抗審查 Important） ----------
+
+def test_claim_pending_checkout_blocks_second_claim(tmp_path):
+    """⭐ 佔位是原子的單一判準：第二次 claim 在 TTL 內一律 False（呼叫端 409）。"""
+    store = _mkstore(tmp_path)
+    acct = "f" + "ab" * 20
+    assert store.claim_pending_checkout(acct, now_s=100.0, ttl_s=900) is True
+    assert store.claim_pending_checkout(acct, now_s=100.0, ttl_s=900) is False
+    assert store.claim_pending_checkout(acct, now_s=999.0, ttl_s=900) is False
+
+
+def test_claim_pending_checkout_expires_and_is_per_account(tmp_path):
+    """逾時後可重新佔位（放棄付款者不被永久卡死）；不同 account 互不影響。"""
+    store = _mkstore(tmp_path)
+    a, b = "f" + "ab" * 20, "f" + "cd" * 20
+    assert store.claim_pending_checkout(a, now_s=100.0, ttl_s=900) is True
+    assert store.claim_pending_checkout(b, now_s=100.0, ttl_s=900) is True
+    assert store.claim_pending_checkout(a, now_s=1000.0, ttl_s=900) is True  # 100+900
+    assert store.get_pending_checkout(a) == 1000.0   # 佔位時刻就地更新
+
+
+def test_clear_pending_checkout_is_idempotent(tmp_path):
+    """clear 是 DELETE：重複呼叫無害（webhook 重放與失敗補償都可能重複觸發）。"""
+    store = _mkstore(tmp_path)
+    acct = "f" + "ab" * 20
+    store.claim_pending_checkout(acct, now_s=100.0, ttl_s=900)
+    store.clear_pending_checkout(acct)
+    store.clear_pending_checkout(acct)
+    assert store.get_pending_checkout(acct) is None
+    assert store.claim_pending_checkout(acct, now_s=101.0, ttl_s=900) is True
+
+
+def test_claim_pending_checkout_validates_account_id(tmp_path):
+    """account_id 會流進檔案路徑，驗證在 store 這層（單一邊界，工程原則 5）。"""
+    import pytest
+    store = _mkstore(tmp_path)
+    with pytest.raises(ValueError):
+        store.claim_pending_checkout("../evil", now_s=1.0, ttl_s=900)
+
+
+def test_pending_checkouts_table_has_no_sensitive_columns(tmp_path):
+    """⭐ 紅線 7 結構性斷言（同 billing 表）：新表只有 account_id 與時刻，
+    無金額、無 Stripe session/secret——新增欄位必須回這裡改白名單。"""
+    store = _mkstore(tmp_path)
+    cols = {row[1] for row in store._db.execute("PRAGMA table_info(pending_checkouts)")}
+    assert cols == {"account_id", "created_at"}
+
+
+def test_pending_checkouts_table_appears_on_existing_db(tmp_path):
+    """對舊 schema DB 重開 → 新表自動出現（CREATE TABLE IF NOT EXISTS 每次都跑）。"""
+    from spark.publicapi.store import ApiStore
+    db = tmp_path / "api.db"
+    ApiStore(db).ensure_onboarding("f" + "ab" * 20, "0x" + "ab" * 20)
+    assert ApiStore(db).claim_pending_checkout("f" + "ab" * 20, now_s=1.0,
+                                               ttl_s=900) is True

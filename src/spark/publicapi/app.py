@@ -13,9 +13,10 @@ from pydantic import BaseModel
 from spark.filet.followers import load_followers_tolerant
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
-from spark.publicapi.billing import (BillingError, BillingSignatureError,
-                                     apply_webhook_event, has_active_subscription,
-                                     plan_catalog, verify_webhook_event)
+from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
+                                     BillingSignatureError, apply_webhook_event,
+                                     has_active_subscription, plan_catalog,
+                                     verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.ops import (customer_pnl, jsonable, load_accrued_series,
                                  revenue_reconciliation, subscription_drift)
@@ -387,7 +388,21 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     @app.post("/api/billing/checkout")
     def billing_checkout(address: str = Depends(_require_session)):
         """建 Checkout Session、回 URL。session 綁定：account_id 由 session 衍生，
-        端點無輸入參數。冪等擋板：已 active → 409。
+        端點無輸入參數。
+
+        **兩道擋板，語意不同，前端要能分辨**（都是 409，detail 不同）：
+        1. 已 active → 「已有生效訂閱」。資料源是本地 billing 表。
+        2. 有未逾時的 pending checkout → 「已有進行中的結帳」。⭐ 這道是必要的：
+           本地 billing 表的**唯一寫入者是 webhook**，使用者付完款導回時 webhook
+           可能還沒送達（秒級延遲，Stripe 不保證即時），第 1 道此時查無記錄 →
+           建出第二個 Checkout Session → 兩張訂閱、兩次扣款。首購路徑連 customer_id
+           都不共用，Stripe 端不會自行去重（工程原則 2：非冪等寫入不能只靠事後狀態）。
+
+        ⭐ 佔位在呼叫 Stripe **之前**（claim → call）：反過來就等於沒擋板，
+        重複請求會在 Stripe 往返的那幾百毫秒內全部通過。
+        ⭐ 建 session 失敗必須把位子還回去（工程原則 3 的補償版）：一次網路抖動
+        不該讓客戶 15 分鐘不能結帳。用 except-clear-raise，不吞例外——原本的失敗
+        分類（ConnectionError/BillingError → 502）照原樣往上走。
         Stripe 失敗分類（紅線 4）：transient=ConnectionError→502 稍後重試（人肉重試，
         非冪等寫入不在後端盲重試）；semantic=BillingError→502 專屬 handler。"""
         _require_billing()
@@ -395,11 +410,20 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         rec = store.get_billing(account_id)
         if rec is not None and rec.status == "active":
             raise HTTPException(status_code=409, detail="已有生效訂閱")
-        url = billing.create_checkout_session(
-            account_id=account_id, price_id=cfg.stripe_price_id,
-            success_url=f"{cfg.siwe_uri}/billing?checkout=success",
-            cancel_url=f"{cfg.siwe_uri}/billing?checkout=cancel",
-            customer_id=rec.stripe_customer_id if rec else None)
+        if not store.claim_pending_checkout(account_id, now_s=now_fn(),
+                                            ttl_s=PENDING_CHECKOUT_TTL_S):
+            raise HTTPException(status_code=409,
+                                detail="已有進行中的結帳，請完成付款或稍候再試")
+        try:
+            url = billing.create_checkout_session(
+                account_id=account_id, price_id=cfg.stripe_price_id,
+                success_url=f"{cfg.siwe_uri}/billing?checkout=success",
+                cancel_url=f"{cfg.siwe_uri}/billing?checkout=cancel",
+                customer_id=rec.stripe_customer_id if rec else None)
+        except Exception:
+            # 沒有建成 session ⇒ 沒有任何 Stripe 副作用 ⇒ 位子必須立刻還回去
+            store.clear_pending_checkout(account_id)
+            raise
         return {"checkout_url": url}
 
     @app.get("/api/billing/plans")

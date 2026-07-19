@@ -6,7 +6,8 @@ import socket
 import pytest
 from fastapi.testclient import TestClient
 
-from spark.publicapi.billing import BillingError, StripeGateway
+from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
+                                     StripeGateway)
 from spark.publicapi.config import derive_account_id
 from tests.publicapi_helpers import billing_cfg, login, make_app, stripe_sig
 
@@ -20,13 +21,13 @@ def _allow_local_sockets(monkeypatch):
     monkeypatch.setattr(socket, "socket", _REAL_SOCKET)
 
 
-def _billing_app(tmp_path, create_fn=None, portal_fn=None, cfg=None):
+def _billing_app(tmp_path, create_fn=None, portal_fn=None, cfg=None, now_fn=None):
     cfg = cfg or billing_cfg(tmp_path)
     gw = StripeGateway("sk_test_abc", create_fn=create_fn or
                        (lambda **p: {"id": "cs_1", "url": "https://checkout.example/cs_1"}),
                        portal_fn=portal_fn or
                        (lambda **p: {"id": "bps_1", "url": "https://portal.example/bps_1"}))
-    app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg, billing=gw)
+    app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg, billing=gw, now_fn=now_fn)
     return app, cfg, store
 
 
@@ -212,6 +213,117 @@ def test_checkout_transient_stripe_failure_is_502(tmp_path):
     login(client)
     r = client.post("/api/billing/checkout")
     assert r.status_code == 502  # 既有 ConnectionError handler：前端「稍後重試」
+
+
+# ---------- ⭐ 重複結帳擋板（opus 對抗審查 Important：工程原則 2 非冪等寫入） ----------
+
+def test_second_checkout_while_pending_is_409(tmp_path):
+    """⭐ 核心情境：付款完成 → 導回 → **webhook 尚未送達** → 使用者再按一次訂閱。
+    本地 billing 表此時仍查無記錄（唯一寫入者是 webhook），舊實作會建出第二個
+    Checkout Session＝兩張訂閱、兩次扣款。首購路徑連 customer_id 都不共用，
+    Stripe 端不會自行去重。"""
+    calls = []
+
+    def create_fn(**p):
+        calls.append(p)
+        return {"id": f"cs_{len(calls)}", "url": f"https://checkout.example/{len(calls)}"}
+
+    app, cfg, store = _billing_app(tmp_path, create_fn=create_fn)
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+    assert client.post("/api/billing/checkout").status_code == 200
+    r = client.post("/api/billing/checkout")
+    assert r.status_code == 409
+    assert "進行中" in r.json()["detail"]
+    assert len(calls) == 1, "第二次請求不得抵達 Stripe（否則就是第二張訂閱）"
+
+
+def test_pending_guard_is_per_account(tmp_path):
+    """擋板只擋同一個 account——別的客戶照常結帳。"""
+    app, cfg, store = _billing_app(tmp_path)
+    c1 = TestClient(app, base_url="https://testserver")
+    c2 = TestClient(app, base_url="https://testserver")
+    login(c1)
+    login(c2)
+    assert c1.post("/api/billing/checkout").status_code == 200
+    assert c2.post("/api/billing/checkout").status_code == 200
+
+
+def test_webhook_clears_pending_and_active_409_is_distinguishable(tmp_path):
+    """webhook 落地後：pending 位子被釋放，且後續 409 走的是**另一道**擋板
+    （「已有生效訂閱」）——兩者語意不同，前端要能分辨（detail 不同字串）。"""
+    app, cfg, store = _billing_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    wallet = login(client)
+    acct = derive_account_id(wallet.address)
+
+    assert client.post("/api/billing/checkout").status_code == 200
+    pending_msg = client.post("/api/billing/checkout").json()["detail"]
+    assert store.get_pending_checkout(acct) is not None
+
+    payload = _event("checkout.session.completed",
+                     {"id": "cs_1", "client_reference_id": acct,
+                      "customer": "cus_1", "subscription": "sub_1"})
+    r = client.post("/api/billing/webhook", content=payload,
+                    headers={"stripe-signature": stripe_sig(payload)})
+    assert r.status_code == 200 and r.json()["outcome"] == "activated"
+    assert store.get_pending_checkout(acct) is None, "webhook 落地必須釋放位子"
+
+    r = client.post("/api/billing/checkout")
+    assert r.status_code == 409
+    assert r.json()["detail"] != pending_msg
+    assert "生效訂閱" in r.json()["detail"]
+
+
+def test_pending_expires_after_ttl_allows_retry(tmp_path):
+    """⭐ 逾時後允許重試：放棄付款的使用者不該被永久卡住（擋板是防重複扣款，
+    不是懲罰）。TTL 內擋、TTL 後放行。"""
+    clock = {"t": 1_000_000.0}
+    app, cfg, store = _billing_app(tmp_path, now_fn=lambda: clock["t"])
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+    assert client.post("/api/billing/checkout").status_code == 200
+
+    clock["t"] += PENDING_CHECKOUT_TTL_S - 1
+    assert client.post("/api/billing/checkout").status_code == 409, "TTL 內仍要擋"
+    clock["t"] += 2
+    assert client.post("/api/billing/checkout").status_code == 200, "TTL 後允許重試"
+
+
+def test_pending_cleared_when_create_session_fails(tmp_path):
+    """⭐ 失敗補償：建 session 拋例外 ⇒ 沒有任何 Stripe 副作用 ⇒ 位子必須立刻還回去。
+    否則一次網路抖動就把客戶卡滿整個 TTL（15 分鐘不能付錢）。"""
+    boom = {"on": True}
+
+    def create_fn(**p):
+        if boom["on"]:
+            raise ConnectionError("stripe 連線失敗")
+        return {"id": "cs_ok", "url": "https://checkout.example/ok"}
+
+    app, cfg, store = _billing_app(tmp_path, create_fn=create_fn)
+    client = TestClient(app, base_url="https://testserver",
+                        raise_server_exceptions=False)
+    wallet = login(client)
+    acct = derive_account_id(wallet.address)
+
+    assert client.post("/api/billing/checkout").status_code == 502  # 失敗分類不變
+    assert store.get_pending_checkout(acct) is None, "失敗後不得留下佔位"
+    boom["on"] = False
+    assert client.post("/api/billing/checkout").status_code == 200, "下一次立刻可重試"
+
+
+def test_pending_cleared_on_semantic_failure_too(tmp_path):
+    """semantic 失敗（BillingError → 502 專屬 handler）同樣要還位子——
+    補償寫在 except Exception，不依賴呼叫端記得為每種例外各寫一次。"""
+    def create_fn(**p):
+        raise BillingError("stripe checkout 建立被拒: StripeError: no such price")
+
+    app, cfg, store = _billing_app(tmp_path, create_fn=create_fn)
+    client = TestClient(app, base_url="https://testserver",
+                        raise_server_exceptions=False)
+    wallet = login(client)
+    assert client.post("/api/billing/checkout").status_code == 502
+    assert store.get_pending_checkout(derive_account_id(wallet.address)) is None
 
 
 def test_status_reads_db(tmp_path):

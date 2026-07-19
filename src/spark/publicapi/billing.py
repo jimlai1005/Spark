@@ -39,6 +39,15 @@ def map_stripe_status(stripe_status: str) -> str:
 # 因為截斷過的清單會讓「本地有、Stripe 沒有」的判斷產生假漂移（工程原則 3）。
 MAX_RECONCILE_SUBSCRIPTIONS = 1000
 
+# 「結帳進行中」擋板的存活時間（秒）。取捨的兩端：
+# - 太短 → 擋不住真正的危險窗口（付款完成 → 導回 → webhook 尚未送達的秒級延遲，
+#   使用者此時再按一次訂閱就會建出第二張訂閱、被扣兩次款）。
+# - 太長 → 放棄付款的使用者被永久卡住，無法重新開始結帳。
+# 15 分鐘遠大於 webhook 的正常延遲，又遠小於 Stripe Checkout Session 的 24h 預設效期。
+# 逾時只是「允許重試」，不是「保證沒有進行中的結帳」——真正的最終防線是 webhook
+# 落地後的 status == "active" 檢查。
+PENDING_CHECKOUT_TTL_S = 900
+
 
 class BillingError(RuntimeError):
     """Stripe 語意失敗（semantic，不重試）：請求被拒、設定錯、回應缺欄位。"""
@@ -227,6 +236,13 @@ def apply_webhook_event(store: ApiStore, event, *, event_created: int,
                              stripe_customer_id=obj.get("customer"),
                              stripe_subscription_id=obj.get("subscription"),
                              now_s=now_s, event_created=event_created, event_id=event_id)
+        # ⭐ 這張結帳已落地 → 釋放「結帳進行中」的位子（否則使用者要等 TTL 才能再結帳）。
+        # 刻意只在**這個**事件釋放：它的語意正是「你手上那張結帳完成了」。
+        # subscription.* 事件不釋放——舊訂閱的 deleted 事件若釋放了一張剛開始的新結帳，
+        # 反而會把重複扣款的縫再打開。放在 upsert 之後、不影響既有的去重與排序守衛
+        # （重放時 upsert no-op，這裡多刪一次無害：DELETE 冪等，且真要再結帳仍有
+        #  status == "active" 那道 409 擋著）。
+        store.clear_pending_checkout(account_id)
         logger.info("billing 開通 account=%s", account_id)
         return "activated"
     if etype in ("customer.subscription.updated", "customer.subscription.deleted"):

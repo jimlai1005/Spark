@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS onboarding (
     user_address TEXT NOT NULL,
     agent_address TEXT
 );
+CREATE TABLE IF NOT EXISTS pending_checkouts (
+    account_id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS billing (
     account_id TEXT PRIMARY KEY,
     stripe_customer_id TEXT,
@@ -149,6 +153,53 @@ class ApiStore:
         with self._lock, self._db:
             self._db.execute("UPDATE onboarding SET agent_address = ? WHERE account_id = ?",
                              (agent_address, account_id))
+
+    # --- pending checkout（重複結帳擋板；opus 對抗審查 Important） ---
+    def claim_pending_checkout(self, account_id: str, *, now_s: float,
+                               ttl_s: float) -> bool:
+        """替 account 佔下「結帳進行中」的位子；已被佔且未逾時 → False（呼叫端 409）。
+
+        存在理由（工程原則 2：非冪等寫入）：checkout session 建立是**非冪等寫入**，
+        而本地 billing 表的唯一寫入者是 webhook。使用者付完款導回、webhook 還沒送達
+        （秒級延遲，Stripe 不保證即時）時再按一次訂閱，`get_billing` 仍查無記錄 →
+        建出第二個 Checkout Session → 兩張訂閱、兩次扣款。首購路徑連 customer_id
+        都還沒有，Stripe 端不會自行去重，本地擋板是唯一防線。
+
+        ⭐ 原子性：讀與寫在同一個 lock 內完成（沿 consume_nonce 的精神）——
+        先 get 再 put 的兩段式會留下 TOCTOU 縫，而這道擋板守的正是「使用者連按兩下」
+        這種毫秒級併發。回傳布林而非讓呼叫端自己比時間，判斷只有一份。
+
+        ⭐ TTL：逾時的舊記錄視同不存在並就地覆蓋——放棄付款的使用者不該被永久卡死
+        （擋板是防重複扣款，不是懲罰）。TTL 值由呼叫端傳入
+        （billing.PENDING_CHECKOUT_TTL_S，單一常數）。"""
+        validate_account_id(account_id)
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT created_at FROM pending_checkouts WHERE account_id = ?",
+                (account_id,)).fetchone()
+            if row is not None and now_s - row[0] < ttl_s:
+                return False
+            self._db.execute(
+                "INSERT OR REPLACE INTO pending_checkouts (account_id, created_at) "
+                "VALUES (?, ?)", (account_id, now_s))
+        return True
+
+    def clear_pending_checkout(self, account_id: str) -> None:
+        """釋放位子。兩個呼叫點都必須有（缺一就會把客戶卡住 TTL 那麼久）：
+        webhook 收到 checkout.session.completed 後；以及建 session 拋例外時的補償
+        （一次網路失敗不該讓客戶 15 分鐘不能重試）。DELETE 天然冪等，重複呼叫無害。"""
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM pending_checkouts WHERE account_id = ?",
+                             (account_id,))
+
+    def get_pending_checkout(self, account_id: str) -> float | None:
+        """回該 account 的 pending 建立時刻（epoch 秒）；無記錄 → None。
+        **唯讀，測試與診斷用**——判斷是否放行一律走 claim_pending_checkout（原子）。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT created_at FROM pending_checkouts WHERE account_id = ?",
+                (account_id,)).fetchone()
+        return row[0] if row else None
 
     # --- billing（M3 計費骨幹；無金額/卡號等敏感資料——紅線 7） ---
     def get_billing(self, account_id: str) -> BillingRecord | None:

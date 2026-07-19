@@ -93,11 +93,14 @@ class FakeHL:
         return [a.lower() for a in self.agents.get(user.lower(), [])]
 
 
-def make_app(tmp_path, cfg=None, billing=None):
+def make_app(tmp_path, cfg=None, billing=None, now_fn=None):
+    """now_fn 可注入假時鐘（TTL 類測試用）——不給就走 create_app 的預設 time.time。"""
     cfg = cfg or make_cfg(tmp_path)
     store = ApiStore(cfg.db_path)
     keysvc, hl = FakeKeysvc(), FakeHL()
-    return create_app(cfg, store, keysvc, hl, billing=billing), cfg, store, keysvc, hl
+    kw = {"billing": billing} if now_fn is None else {"billing": billing,
+                                                      "now_fn": now_fn}
+    return create_app(cfg, store, keysvc, hl, **kw), cfg, store, keysvc, hl
 
 
 def login(client, wallet=None):
