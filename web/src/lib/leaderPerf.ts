@@ -67,6 +67,15 @@ export type PerfLevel = "none" | "pnl" | "window" | "annualized";
  * `perfView()` 維持（見檔頭「成對到齊」）。它讓 JSX 可以直接
  * `{s.twr_insufficient_data && <警示/>}`：標記在，就一定是個 bool，不會有
  * 「undefined 被當成 false 於是靜默宣告資料充足」的路徑。
+ *
+ * ⚠️⚠️ **這個推薦僅限已通過 `perfView()` 的 `PerfShown` 欄位**（本介面的欄位）。
+ * 同一個 `&&`（以及 `?:`）套在**原始 window** 上就是漏洞：`w.twr_insufficient_data`
+ * 缺席時是 `undefined`，`&&` 會把它折進 falsy 分支＝靜默宣告「資料充足」，而那正是
+ * 本模組要防的頭號錯誤。差別不在算子，在讀的是誰——`PerfShown` 受成對到齊的不變式
+ * 約束，缺席的標記配不到一個會被畫出來的數字；原始 window 不受此約束。
+ * 讀原始 window 一律用 `isBooleanMarker()` 做顯式型別檢查。
+ * （`lib/redline.test.ts` 的紅線 (a) 就是照這條線劃的：`?:`／`&&` 只放行 `PerfShown`
+ * 來源，`??`／`||`／`!`／`Boolean()` 則無條件禁止。）
  */
 export interface PerfShown {
   cum_pnl?: string;

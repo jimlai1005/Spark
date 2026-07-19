@@ -135,14 +135,64 @@ function functionOpenBraces(code: string): Set<number> {
 const JSX_TAG = /<\/?[A-Za-z][\w.]*[\s/>]/;
 
 /**
- * 某個位置所屬的 scope 文字。
+ * JSX 元素的區間 `[「<」的索引, 「>」的索引]`——配對 `<Tag>…</Tag>` 與自閉合
+ * `<Tag … />` 都算。
  *
- * 由內往外找第一個「有意義的」區塊：**函式主體**或**含 JSX 標籤的區塊**。
+ * ⭐⭐ 2026-07-20 新增，補一個**實測會逃逸**的洞。舊 `scopeAround` 只認大括號區塊
+ * （函式主體／含 JSX 標籤者），而 `<dd>{fmtRatioPct(s.twr)}</dd>` 這種寫法兩者都不是：
+ * 表達式容器 `{fmtRatioPct(s.twr)}` 內部沒有標籤所以不合格，JSX 元素本身又不是大括號
+ * 分隔的——於是 scope 一路往外逃到整個元件函式主體，而該主體別處已提過標記，
+ * 違規就被吸收了。實測：在既有元件內插入一格無標記的數字，紅線 (b) 不會咬。
+ * 那正是本檔 209 行原本宣稱「不直接取整個函式」所要避免的失效，實際上卻發生了。
+ *
+ * 把 JSX 元素本身納入邊界之後，`<dd>` 成為最內層 scope，違規無處可逃。
+ *
+ * ⚠️ 泛型不是 JSX：`Set<number>`／`Partial<LeaderPerfWindow>` 的 `<` 前面是 word
+ * 字元，真正的 JSX 前面只會是空白／`(`／`{`／`>`／運算子。用這點把兩者分開，否則
+ * .ts 檔的型別註記會被當成標籤，切出假的（過小的）scope 而誤報。
+ */
+function jsxSpans(code: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const open: Array<{ name: string; start: number }> = [];
+  let i = 0;
+  while (i < code.length) {
+    if (code[i] !== "<" || (i > 0 && /[\w$)\]]/.test(code[i - 1]))) { i++; continue; }
+    const m = /^<(\/?)([A-Za-z][\w.]*)[\s/>]/.exec(code.slice(i, i + 200));
+    if (m === null) { i++; continue; }
+    // 標籤的結尾 `>`：屬性值裡的 `{…}` 可能含 `>`（`onClick={() => …}`），
+    // 所以只認大括號深度 0 的那個。
+    let depth = 0;
+    let end = -1;
+    for (let j = i + m[0].length - 1; j < code.length; j++) {
+      const ch = code[j];
+      if (ch === "{") depth++;
+      else if (ch === "}") depth = Math.max(0, depth - 1);
+      else if (ch === ">" && depth === 0) { end = j; break; }
+    }
+    if (end === -1) { i++; continue; }
+    if (m[1] === "/") {
+      for (let k = open.length - 1; k >= 0; k--) {
+        if (open[k].name === m[2]) { spans.push([open[k].start, end]); open.length = k; break; }
+      }
+    } else if (code[end - 1] === "/") spans.push([i, end]);
+    else open.push({ name: m[2], start: i });
+    i = end + 1;
+  }
+  return spans;
+}
+
+/**
+ * 某個位置所屬的 scope 文字＝所有包住它的邊界裡**最小**的那個。
+ *
+ * 邊界有兩類：**大括號區塊**（函式主體，或內含 JSX 標籤者）與 **JSX 元素**。
  * ⭐ 為什麼不直接取最內層大括號：`value={fmtRatioPct(s.twr)}` 的最內層是
  * `{fmtRatioPct(s.twr)}`，那裡面永遠塞不進標記，規則會嚴到無法遵守（而一條無法
- * 遵守的規則最後一定被刪掉）。⭐ 為什麼不直接取整個函式：那樣同一個大型元件裡
- * 只要某處提過標記，其他地方就能白渲染，規則會鬆到擋不住東西。
- * 取「最內層的函式或 JSX 區塊」是兩者之間**真正對應到一次渲染決策**的粒度。
+ * 遵守的規則最後一定被刪掉）。這種「屬性值容器」的正確粒度是它所屬的**整個 JSX
+ * 元素**——`<PerfStat value={…s.twr} marker={…s.twr_insufficient_data} />` 的屬性群組
+ * 就是一次完整的渲染決策，數字與標記本來就該在這裡碰頭。
+ * ⭐ 為什麼不直接取整個函式：那樣同一個大型元件裡只要某處提過標記，其他地方就能
+ * 白渲染。⚠️ 舊版**取最內層合格大括號**看似避開了這點，實測卻仍會退化成整個函式
+ * （見 `jsxSpans` 檔頭），所以現在改成「兩類邊界一起取最小」。
  */
 function scopeAround(code: string, idx: number): string {
   const fnOpens = functionOpenBraces(code);
@@ -151,16 +201,18 @@ function scopeAround(code: string, idx: number): string {
   for (let i = 0; i < code.length; i++) {
     if (code[i] === "{") stack.push(i);
     else if (code[i] === "}") {
-      const open = stack.pop();
-      if (open !== undefined && open < idx && i > idx) enclosing.push([open, i]);
+      const start = stack.pop();
+      if (start === undefined || start >= idx || i <= idx) continue;
+      const body = code.slice(start + 1, i);
+      if (fnOpens.has(start) || JSX_TAG.test(body)) enclosing.push([start + 1, i]);
     }
   }
-  // enclosing 依關閉順序（由內而外）累積，直接取第一個符合條件者。
-  for (const [open, close] of enclosing) {
-    const body = code.slice(open + 1, close);
-    if (fnOpens.has(open) || JSX_TAG.test(body)) return body;
+  for (const [start, end] of jsxSpans(code)) {
+    if (start < idx && end > idx) enclosing.push([start, end + 1]);
   }
-  return code; // 不在任何區塊內（例如 interface 欄位宣告）→ 整檔為 scope
+  if (enclosing.length === 0) return code; // 不在任何區塊內（例如 interface 欄位宣告）
+  enclosing.sort((a, b) => a[1] - a[0] - (b[1] - b[0]));
+  return code.slice(enclosing[0][0], enclosing[0][1]);
 }
 
 function sourceFiles(): string[] {
@@ -172,29 +224,76 @@ function lineOf(code: string, idx: number): number {
   return code.slice(0, idx).split("\n").length;
 }
 
+/**
+ * 這個檔案裡**確定是 `PerfShown`** 的識別字（`const s = view.shown` 的 `s`、
+ * 任何 `x: PerfShown` 的 `x`）。
+ *
+ * ⭐ 為什麼需要它：`?:` 與 `&&` 對標記**不是無條件有害**。`perfView()` 是唯一的邊界，
+ * 它強制「數字與標記成對到齊」——`PerfShown` 上標記缺席時，那個數字也一定不在，
+ * 整格根本不會渲染。所以讀 `PerfShown` 欄位時 `s.marker && <警示/>` 是安全的。
+ * 但**直接讀原始 window**（`w.marker`，還沒過邊界）就沒有這個保證：`undefined`
+ * 會靜靜地折進 falsy 分支＝「資料充足」。同一個算子，安全與否取決於讀的是誰。
+ */
+function perfShownRoots(code: string): Set<string> {
+  const roots = new Set<string>();
+  for (const m of code.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;\n]*)?=\s*[^;\n]*\.shown\b/g,
+  )) roots.add(m[1]);
+  for (const m of code.matchAll(/\b([A-Za-z_$][\w$]*)\s*:\s*PerfShown\b/g)) roots.add(m[1]);
+  return roots;
+}
+
 describe("紅線 (a)：不得對資料不足標記消音", () => {
   /**
-   * `marker ?? false`／`marker || false`／`!marker` 都會把**標記缺席**
-   * （`undefined`）壓成一個 falsy 值，而 falsy 在這裡的語意是「資料充足」——
-   * 等於替後端說了一句它沒說過的保證。標記缺席的正確語意是「我們不知道」，
-   * 而不知道的時候必須 fail closed（見 lib/leaderPerf.ts 的成對到齊規則）。
+   * `marker ?? false`／`marker || false`／`!marker`／`!!marker`／`Boolean(marker)`／
+   * `marker ? a : b`／`marker && x` 都會把**標記缺席**（`undefined`）壓成 falsy，
+   * 而 falsy 在這裡的語意是「資料充足」——等於替後端說了一句它沒說過的保證。
+   * 標記缺席的正確語意是「我們不知道」，不知道的時候必須 fail closed
+   * （見 lib/leaderPerf.ts 的成對到齊規則）。
    *
-   * 要判斷充足與否請用顯式比較（`marker === true` ／ `typeof marker === "boolean"`），
-   * 讓「缺席」這個第三種狀態無法被悄悄折疊掉。
+   * ⚠️ 2026-07-20：算子清單原本只有 `??`／`||`／`!`，實測 `Boolean(marker)`、
+   * `marker ? a : b`、`marker && x` **三種等價寫法全數被放行**。三者折疊 `undefined`
+   * 的方式與 `?? false` 完全相同，卻走了不同的語法路徑——一條只擋得住其中一種寫法的
+   * 紅線，擋住的是拼字而不是語意。
+   *
+   * 分兩級是刻意的：
+   *   - **無條件禁止** `??`／`||`／`!`／`!!`／`Boolean()`：這些對標記沒有安全用法，
+   *     要判斷充足與否一律用顯式比較（`=== true`／`typeof === "boolean"`），
+   *     讓「缺席」這個第三種狀態無法被悄悄折疊掉。
+   *   - **僅限 `PerfShown`** `?:`／`&&`：它們是 React 最慣用的條件渲染寫法，過了
+   *     `perfView()` 邊界之後確實安全（見 `perfShownRoots`）。全面禁止會逼所有 JSX
+   *     改寫成不自然的形狀，而一條無法遵守的規則最後一定被刪掉。
    */
-  it("標記欄位不得接 ??／||／! —— 那等於靜默宣告「資料充足」", () => {
-    const markers = ALL_MARKERS.join("|");
-    // 1. `marker ?? x` / `marker || x`：用預設值頂掉缺席。
-    const coalesce = new RegExp(`\\b(?:${markers})\\b\\s*(?:\\?\\?|\\|\\|)`, "g");
-    // 2. `!marker` / `!s.marker`：直接把缺席折疊成 true。`!` 與標記之間只允許
-    //    屬性存取（`!isBoolean(x.marker)` 這種先做型別檢查的寫法不在此列）。
-    const negate = new RegExp(`![\\s]*[A-Za-z0-9_$.]*\\b(?:${markers})\\b`, "g");
+  it("標記欄位不得接 ??／||／!／!!／Boolean()；?: 與 && 僅限 PerfShown", () => {
+    const M = `(?:${ALL_MARKERS.join("|")})`;
+    // 無條件禁止。`!` 與標記之間只允許屬性存取（`!isBoolean(x.marker)` 這種
+    // 先做型別檢查的寫法不在此列）；`!!marker` 由同一式的第二個 `!` 命中。
+    const always: RegExp[] = [
+      new RegExp(`\\b${M}\\b\\s*(?:\\?\\?|\\|\\|)`, "g"),
+      new RegExp(`![\\s]*[A-Za-z0-9_$.]*\\b${M}\\b`, "g"),
+      new RegExp(`\\bBoolean\\s*\\(\\s*[A-Za-z0-9_$.]*\\b${M}\\b`, "g"),
+    ];
+    // 僅限 PerfShown：捕捉接收者前綴（`s.`／`w.`／空）以便判定。
+    // ⚠️ `\?(?!\s*[?.:])` 把 `??`（上面已擋）、`?.`（選擇性串接）與 `marker?: boolean`
+    //（介面的選擇性欄位宣告，api.ts／leaderPerf.ts 都有）排除在三元之外。
+    const guarded: RegExp[] = [
+      new RegExp(`([A-Za-z0-9_$.]*)\\b${M}\\b\\s*\\?(?!\\s*[?.:])`, "g"),
+      new RegExp(`([A-Za-z0-9_$.]*)\\b${M}\\b\\s*&&`, "g"),
+    ];
     const hits: string[] = [];
     for (const f of sourceFiles()) {
       const code = stripNonCode(readFileSync(f, "utf8"));
-      for (const re of [coalesce, negate]) {
+      for (const re of always) {
         for (const m of code.matchAll(re)) {
           hits.push(`${f}:${lineOf(code, m.index!)}: ${m[0].trim()}`);
+        }
+      }
+      const shownRoots = perfShownRoots(code);
+      for (const re of guarded) {
+        for (const m of code.matchAll(re)) {
+          const root = m[1].replace(/\.$/, "").split(".")[0];
+          if (root !== "" && shownRoots.has(root)) continue;
+          hits.push(`${f}:${lineOf(code, m.index!)}: ${m[0].trim()}（非 PerfShown 來源）`);
         }
       }
     }
