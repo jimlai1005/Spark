@@ -996,6 +996,31 @@ sudo -u filet-api test -r /opt/filet/state/<account_id> \
 
 ---
 
+
+### ⚠️ 5.7a 改動 `leader_perf` 投影欄位後：必須手動重跑一次快照
+
+<!-- 2026-07-19 實機部署發現 -->
+`_leader_perf_public` 刻意用 `if k in row`（不是 `.get()`）投影——**後端刻意不給的鍵不得被憑空造出來**。
+代價是：**磁碟上的快照若由舊碼產生，就沒有新欄位**，而部署本身不會重生快照。
+
+**實際發生過的失效**：改版目的是「績效數字必須帶資料不足警示」，但部署後 API 照樣吐出年化數字、
+**一個警示都沒有**——因為快照是舊碼的。若沒發現，這個狀態會持續到隔天 00:10 UTC timer 觸發。
+**失效方向剛好是這次改版要根除的那一個。**
+
+```bash
+sudo systemctl start filet-leaderboard.service
+# 驗收：確認新欄位真的在快照裡（改成你這次新增的欄位名）
+sudo -u filet-api /opt/filet/spark/.venv/bin/python - <<'EOF'
+import json, glob
+f = sorted(glob.glob("/var/lib/filet-api/leaderboard/watchlist/*.json"))[-1]
+w = json.load(open(f))["rows"][0]["perf"]["windows"]["perpMonth"]
+print([k for k in sorted(w) if "insufficient" in k or "extrapolated" in k])
+EOF
+```
+
+**通則**：任何改動「資料生產者 → 投影 → API」這條鏈的欄位契約時，部署完都要問一句
+**「磁碟上的資料是舊碼產生的嗎？」**——程式碼對、部署對、資料舊，是這條鏈特有的失效。
+
 ### 5.7 ⭐ 兩個定時任務（leaderboard 快照 ＋ 績效序列取樣）
 
 > 編號 `5.7` 是**附加**在 §5 尾端的新章節（不重編任何既有編號，程式碼與文件裡對
@@ -1071,6 +1096,9 @@ sudo ls -l /var/lib/filet-api/leaderboard/perf_series/ | tail -5
 # 預期：watchlist 有今天日期的檔；perf_series 每個白名單 leader 各一個檔，
 # 且 mtime 是剛才那次手動執行。⭐ 沒有檔就是**現在**要查，不是明天
 # （perf_series 尤其：等到明天，今天漏掉的那兩個窗已經永遠補不回來了）
+
+> ⚠️ **同一個 12h 窗內重跑會被冪等跳過**（`appended=0 idempotent_skips=1`），這是**正確行為**不是故障。
+> 此時 mtime 仍是上一次取樣的時間——不要據此判定「產物沒落地」。<!-- 2026-07-19 實機發現：文件原文會把正確行為誤判成失敗 -->
 
 # 驗收 4：兩個 unit 看到的是同一份白名單（抓取對象的單一來源）
 # --value 不可省略（同 §5.5.2 驗收 2 的方框）：這裡也是逐字元比對兩行輸出
