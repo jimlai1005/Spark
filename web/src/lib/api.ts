@@ -2,8 +2,11 @@
  * lib/api.ts — 後端 Public API 的唯一出口（工程原則 5 的前端鏡射）。
  * 一律同源相對路徑 + credentials:"include"（紅線 5）。
  * 錯誤分類（工程原則 2）：auth(401)/client(4xx)/upstream(502|503)/network。
- * ⭐ 紅線 3：唯一帶簽名的呼叫是 authVerify（SIWE 登入簽名，EIP-191）；
- *   EIP-712 授權簽名走 lib/hl.ts 直送 HL，本模組結構上沒有那條路。
+ * ⭐ 紅線 3：帶簽名的後端呼叫只有兩支，兩支都是 EIP-191 personal_sign，且兩支的
+ *   **原文都由伺服器產生**（前端不組字串）：
+ *     1. authVerify —— SIWE 登入簽名；
+ *     2. postLeaderSelect —— 換 leader 授權簽名（原文來自 getLeaderSelectMessage）。
+ *   EIP-712 的鏈上授權簽名走 lib/hl.ts 直送 HL，本模組結構上沒有那條路。
  */
 import type { HlTypedData } from "./hl";
 
@@ -116,6 +119,108 @@ export function getApproveAgentPayload(chainId: number): Promise<TypedDataResp> 
 
 export function getApproveBuilderFeePayload(chainId: number): Promise<TypedDataResp> {
   return post<TypedDataResp>("/api/onboard/payload/approve-builder-fee", { chain_id: chainId });
+}
+
+// ---------- leaders（leader 目錄與換 leader 授權；對照 publicapi/app.py 三個端點） ----------
+/**
+ * 目錄的一位 leader。⭐ 統計欄位是 watchlist 每日快照的**資產負債切面**，
+ * 不是績效：沒有報酬率、沒有回撤、沒有勝率。欄位名刻意與後端／快照原名一字不差
+ * （app.py 的 `_LEADER_STAT_FIELDS`）——在任何一層改名成看起來像績效的東西，
+ * 都會讓使用者把「規模」讀成「賺多少」。顯示層同理：叫什麼就顯示什麼。
+ *
+ * 金額為字串（後端 Decimal 無損序列化，沿 ops 慣例）；該 leader 不在快照中時
+ * 各欄為 null——**不是 0**（0 會被讀成「這個 leader 沒有部位」，是有意義且錯誤的訊息）。
+ */
+export interface LeaderEntry {
+  address: string;
+  name: string;
+  description: string;
+  /** 帳戶淨值（規模）。 */
+  account_value: string | null;
+  /** 名目部位總額（當下曝險）。 */
+  total_ntl_pos: string | null;
+  /** 未實現損益（當下浮動，非已實現報酬）。 */
+  unrealized_pnl: string | null;
+  position_count: number | null;
+}
+
+/**
+ * leader 目錄。⭐ 兩種形狀，判別欄位 `stats_available`：
+ * 快照不可用時後端**不給**時間戳、只給 `note`——型別上就讀不到日期，顯示層因此
+ * 不可能畫出「沒有時點的數字」（工程原則 1 的變形：連時點都不同源的兩個數字不可比）。
+ * 快照可用時 `stats_day`／`stats_as_of` 仍可能為 null（快照缺欄位）——顯示層必須把
+ * 「沒有時間戳」視同「不可顯示數字」，一份三天前的切面沒有時點就會被當成即時數字讀。
+ */
+export type LeadersResp =
+  | {
+      leaders: LeaderEntry[];
+      stats_available: true;
+      stats_day: string | null;
+      stats_as_of: string | null;
+      note: null;
+    }
+  | {
+      leaders: LeaderEntry[];
+      stats_available: false;
+      stats_day: null;
+      stats_as_of: null;
+      /** 後端寫好的原因說明；顯示層原樣呈現，且**不得**顯示任何數字（沿 ops basis_unknown）。 */
+      note: string;
+    };
+
+/** 換 leader 的 canonical 待簽原文 ＋ 一次性 nonce（原文由伺服器產生，前端不重組）。 */
+export interface LeaderSelectMessageResp {
+  message: string;
+  nonce: string;
+  issued_at: string;
+  leader_address: string;
+  account_id: string;
+}
+
+/** 授權成功的回應。⭐ `effective`＝機器可讀語意，後兩個字串是後端寫給人看的原文。 */
+export interface LeaderSelectResp {
+  ok: boolean;
+  account_id: string;
+  leader_address: string;
+  effective: string;
+  effective_note: string;
+  consequences: string;
+}
+
+/** leader 目錄（需 session）。白名單載入失敗 → 503（kind=upstream）。 */
+export function getLeaders(): Promise<LeadersResp> {
+  return request<LeadersResp>("/api/leaders");
+}
+
+/** 取待簽原文（需 session）。leader 不可選 → 400（kind=client）。 */
+export function getLeaderSelectMessage(leaderAddress: string): Promise<LeaderSelectMessageResp> {
+  const q = new URLSearchParams({ leader_address: leaderAddress });
+  return request<LeaderSelectMessageResp>(`/api/leaders/select/message?${q.toString()}`);
+}
+
+/**
+ * 送出換 leader 授權。⭐ 刻意收**整包 payload 物件**而不是散裝欄位：伺服器驗簽時
+ * 會用 account_id／leader_address／nonce／issued_at **重建**訊息再 recover，客戶端
+ * 若從別處（例如 session 的 me.account_id）拼一個欄位進來，就會出現「簽的是 A、
+ * 送的是 B」的縫——症狀是「我本人簽的卻一直被拒」，而兩邊看起來都完全正常。
+ * 由本函式從同一個 payload 物件取全部欄位＝結構上不可能拼錯（工程原則 1）。
+ * `message` 原文原樣回送（後端僅稽核留存，一個位元組差異都不該由前端製造）。
+ *
+ * 非冪等寫入 ＋ nonce 一次性：**不得自動重試**。重送同一筆會因 nonce 已消耗而必然
+ * 失敗；要重來必須整條流程重跑（重取原文、新 nonce、重簽），由使用者按鈕觸發。
+ */
+export function postLeaderSelect(
+  payload: LeaderSelectMessageResp,
+  signature: string,
+): Promise<LeaderSelectResp> {
+  return post<LeaderSelectResp>("/api/leaders/select", {
+    account_id: payload.account_id,
+    leader_address: payload.leader_address,
+    nonce: payload.nonce,
+    issued_at: payload.issued_at,
+    signature,
+    message: payload.message,
+  });
 }
 
 // ---------- admin ----------

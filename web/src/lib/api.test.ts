@@ -161,7 +161,12 @@ describe("端點契約（對照 src/spark/publicapi/app.py）", () => {
 });
 
 describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3）", () => {
-  it("除 authVerify 外，所有端點的請求 body 不含 signature/r/s/v 欄位", async () => {
+  // 已知合法例外（兩支，皆為 EIP-191 personal_sign、原文皆由伺服器產生）：
+  //   authVerify（SIWE 登入）與 postLeaderSelect（換 leader 授權，後端契約要求帶簽名）。
+  // ⭐ 例外不是豁免：postLeaderSelect 另有專屬測試釘住「body 欄位集合恰好是契約六欄」
+  //   （見下方 describe），比這裡的黑名單掃描更嚴——r/s/v 與任何多餘欄位都會被抓到。
+  //   HL 的 EIP-712 授權簽名仍然結構上沒有進後端的路（那條走 lib/hl.ts 直送 HL）。
+  it("除 authVerify／postLeaderSelect 外，所有端點的請求 body 不含 signature/r/s/v 欄位", async () => {
     const calls: Array<() => Promise<unknown>> = [
       () => api.logout(),
       () => api.createAgent(),
@@ -179,6 +184,8 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getBillingStatus(),
       () => api.postBillingCheckout(),
       () => api.postBillingPortal(),
+      () => api.getLeaders(),
+      () => api.getLeaderSelectMessage("0x1111111111111111111111111111111111111111"),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -198,14 +205,17 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
   // 上一個 describe 的 calls 陣列是手寫的：新增一個 api.ts 匯出函式時，容易忘記把它加進去，
   // 讓紅線測試悄悄失去涵蓋。這裡改用 Object.entries 反射列舉「當下實際存在」的匯出函式，
   // 對每一個都自動呼叫並驗證 body——手寫列表漏了誰，這裡都補上。
-  const EXCLUDED = new Set(["ApiError", "authVerify"]); // ApiError 非函式呼叫端點；authVerify 是唯一合法帶簽名的端點（紅線 3 已知例外，別處測試已覆蓋）
+  // ApiError 非函式呼叫端點；authVerify 與 postLeaderSelect 是**僅有的兩個**合法帶簽名的
+  // 端點（皆 EIP-191、原文皆由伺服器產生），各自有專屬測試覆蓋——postLeaderSelect 的
+  // 專屬測試是「欄位集合恰好等於契約六欄」，比本掃描的黑名單更嚴（見檔案末段）。
+  const EXCLUDED = new Set(["ApiError", "authVerify", "postLeaderSelect"]);
   const reflected = Object.entries(api).filter(
     ([name, value]) => typeof value === "function" && !EXCLUDED.has(name),
   ) as Array<[string, (...args: unknown[]) => Promise<unknown>]>;
 
   it("反射函式數量與手寫清單一致——手寫清單不會因新函式而過時（保底斷言）", () => {
     // 對照上一個 describe 的 calls 陣列長度：兩者必須同步增減。
-    const HAND_WRITTEN_LIST_LENGTH = 16;
+    const HAND_WRITTEN_LIST_LENGTH = 18;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 
@@ -230,5 +240,48 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
         expect(keys, `${name} body 含禁止欄位 ${banned}`).not.toContain(banned);
       }
     }
+  });
+});
+
+/**
+ * postLeaderSelect 是紅線 3 的第二個已知例外（後端契約要求帶簽名）。例外必須比通則
+ * **更嚴**：這裡不是黑名單（缺什麼就漏什麼），而是白名單——body 欄位集合必須恰好等於
+ * 契約六欄，多一個欄位就失敗（HL 的 r/s/v、私鑰材料、任何前端自作主張塞進去的東西）。
+ */
+describe("⭐ postLeaderSelect：帶簽名的例外，body 欄位集合精確釘死", () => {
+  const PAYLOAD = {
+    message: "Filet: change copy-trading leader\n\nAccount: fzzz\nNonce: n-1",
+    nonce: "n-1",
+    issued_at: "2026-07-19T00:00:00Z",
+    leader_address: "0x1111111111111111111111111111111111111111",
+    account_id: "fzzz",
+  };
+  const SIG = `0x${"ab".repeat(65)}`;
+
+  it("欄位集合恰為契約六欄（白名單），且不含 r/s/v 或任何多餘欄位", async () => {
+    mockFetchJson(200, { ok: true });
+    await api.postLeaderSelect(PAYLOAD, SIG);
+
+    const body = JSON.parse(captured[0].init.body as string);
+    expect(Object.keys(body).sort()).toEqual(
+      ["account_id", "issued_at", "leader_address", "message", "nonce", "signature"],
+    );
+    expect(captured[0]).toMatchObject({
+      url: "/api/leaders/select", init: expect.objectContaining({ method: "POST" }),
+    });
+  });
+
+  it("⭐ 原文原樣回送，且各欄位一律取自同一包 payload（不從別處拼）", async () => {
+    mockFetchJson(200, { ok: true });
+    await api.postLeaderSelect(PAYLOAD, SIG);
+
+    const body = JSON.parse(captured[0].init.body as string);
+    // 逐位元組相同：換行、大小寫、欄位順序都不得被前端重組（後端會重建訊息驗簽）
+    expect(body.message).toBe(PAYLOAD.message);
+    expect(body.account_id).toBe(PAYLOAD.account_id);
+    expect(body.leader_address).toBe(PAYLOAD.leader_address);
+    expect(body.nonce).toBe(PAYLOAD.nonce);
+    expect(body.issued_at).toBe(PAYLOAD.issued_at);
+    expect(body.signature).toBe(SIG);
   });
 });

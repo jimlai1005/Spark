@@ -590,6 +590,61 @@ main.page {
 .billing-empty-title { font-size: 15px; color: var(--text); margin: 0 0 4px; }
 .billing-empty .btn { margin-top: 14px; }
 
+/* ---------- /leaders：leader 目錄與換 leader 授權 ---------- */
+.leader-scope { border-color: rgba(var(--warn-rgb), .45); margin-bottom: 16px; }
+.leader-scope-title { color: var(--warn); font-size: 14px; font-weight: 500; margin: 0 0 6px; }
+
+.leader-gate { display: block; }
+.leader-gate-title {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 14px; color: var(--text); margin: 0 0 6px;
+}
+
+.leader-stats-notice { margin-top: 16px; }
+.leader-stats-meta { margin-top: 16px; }
+.leader-stats-meta .mono { word-break: break-all; }
+
+.leader-grid {
+  display: grid; gap: 16px; margin-top: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+.leader-card { display: flex; flex-direction: column; }
+.leader-name { font-size: 1.15rem; font-weight: 400; color: var(--text); margin: 0; }
+.leader-addr { margin: 4px 0 10px; }
+.leader-desc { font-size: 13.5px; color: var(--text); margin: 0 0 14px; line-height: 1.6; }
+
+.leader-stats {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px; margin: 0 0 16px;
+}
+.leader-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
+.leader-stat dd { margin: 4px 0 0; font-size: 16px; font-weight: 300; color: var(--text); }
+
+/* 上界警語：與按鈕同一個容器，且視覺上不得比按鈕更弱（誠信要求，不是裝飾）。 */
+.leader-action { margin-top: auto; }
+.leader-upper-bound {
+  font-size: 12.5px; line-height: 1.6; color: var(--text);
+  background: rgba(var(--warn-rgb), .1);
+  border-left: 2px solid rgba(var(--warn-rgb), .6);
+  border-radius: 4px; padding: 8px 10px; margin: 0 0 12px;
+}
+
+.leader-done { border-color: rgba(var(--pos-rgb), .5); margin-top: 16px; }
+.leader-done-title { color: var(--pos); font-size: 14px; margin: 0 0 6px; }
+
+.leader-dialog-backdrop {
+  position: fixed; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+  background: rgba(var(--bg-rgb), .82);
+}
+.leader-dialog { max-width: 520px; width: 100%; max-height: 90vh; overflow-y: auto; }
+.leader-dialog-title { font-size: 16px; color: var(--text); margin: 0 0 10px; }
+.leader-dialog-body { font-size: 13px; color: var(--text); line-height: 1.65; margin: 12px 0 0; }
+.leader-dialog .leader-upper-bound { margin: 14px 0 0; }
+.leader-dialog-actions {
+  display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; flex-wrap: wrap;
+}
+
 /* ---------- Responsive：邊界圖直疊（≤620px） ---------- */
 @media (max-width: 620px) {
   .boundary { flex-direction: column; }
