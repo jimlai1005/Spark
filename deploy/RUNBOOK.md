@@ -158,9 +158,17 @@ uv python list | grep 3.11       # 驗收：3.11.x 已安裝
 > 在伺服器放 GitHub 存取憑證（deploy key／PAT）多一份要管理的機密。改採 **rsync 推碼**：
 > 直接從本機把工作樹同步過去，伺服器端全程不需要任何 GitHub 存取權限。
 
+> ⚠️ **exclude 清單同時是機密邊界，不只是體積優化**（2026-07-19 審查發現）。
+> 前四項擋的是 `.env`／`.env.*`／`*.key`／`.git`。原清單只排除「大／可再生」的目錄，
+> **沒有任何一項是機密**——而 `.gitignore` 明列 `.env` 與 `.env.*`，代表這類檔案在
+> 開發者的工作樹裡是預期會存在的。一旦存在，舊清單就會把它推上正式機（撞紅線 2：
+> 私鑰不得離開本機）。這是**潛在風險而非已發生的外洩**：撰寫本註記時工作樹內
+> 恰好沒有這些檔案。新增 exclude 時不要只想「這個大不大」，要想「這個外洩會怎樣」。
+
 ```bash
 # 在本機執行 (/Users/jim/projects/spark)：
 rsync -az --delete \
+  --exclude .env --exclude '.env.*' --exclude '*.key' --exclude .git \
   --exclude node_modules --exclude .venv --exclude .next \
   --exclude __pycache__ --exclude var --exclude .pytest_cache \
   -e "ssh -i <金鑰路徑>" /Users/jim/projects/spark/ ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER:/tmp/spark-sync/
