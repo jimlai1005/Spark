@@ -186,12 +186,16 @@ class StripeGateway:
 
 def _subscription_public(obj) -> dict:
     """Stripe Subscription → 對帳用 dict（白名單欄位）。obj 可為 StripeObject
-    或純 dict（測試 fake），兩者皆支援 `.get`。"""
+    或純 dict（測試 fake），兩者皆支援 `.get`。
+
+    ⭐ 白名單只收**有人要**的欄位：`subscription_drift` 只讀 `id`／`status`／
+    `metadata.account_id`，故只投影這三個。曾經收了 Stripe `customer` id，
+    但從頭到尾沒有任何下游讀它、也不進任何回應——白名單的價值在於「每一欄都有人要」，
+    留著沒人要的欄位會讓下一個人以為它有用途而開始依賴它。"""
     md = obj.get("metadata") or {}
     return {
         "id": obj.get("id"),
         "status": obj.get("status"),
-        "customer": obj.get("customer"),
         "metadata": {"account_id": md.get("account_id") if hasattr(md, "get") else None},
     }
 

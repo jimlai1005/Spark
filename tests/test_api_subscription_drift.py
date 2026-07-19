@@ -292,14 +292,19 @@ def test_list_subscriptions_truncates_loudly_at_cap():
 
 
 def test_list_subscriptions_whitelists_fields():
-    """白名單投影：金額等其他 Stripe 欄位不進本服務。"""
+    """白名單投影：金額等其他 Stripe 欄位不進本服務。
+
+    白名單只收**有人要**的欄位——`subscription_drift` 只讀 id／status／
+    metadata.account_id。Stripe 的 `customer` id 曾在投影裡但無任何下游讀取，
+    已移除（沒人要的欄位留著，下一個人會以為它有用途而開始依賴它）。"""
     raw = {"id": "sub_1", "status": "active", "customer": "cus_1",
            "metadata": {"account_id": ACCT_A, "secret_note": "x"},
            "latest_invoice": {"amount_paid": 999}}
     out = _gw([[raw]]).list_subscriptions()
     assert out["subscriptions"] == [{
-        "id": "sub_1", "status": "active", "customer": "cus_1",
+        "id": "sub_1", "status": "active",
         "metadata": {"account_id": ACCT_A}}]
+    assert "customer" not in out["subscriptions"][0]
 
 
 def test_list_subscriptions_transient_error_is_connection_error():
