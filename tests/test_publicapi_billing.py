@@ -448,15 +448,19 @@ def test_plan_catalog_never_exposes_stripe_price_id(tmp_path):
     assert "price_SECRET_123" not in json.dumps(catalog)
 
 
-def test_unshipped_paid_features_are_marked_unshipped(tmp_path):
-    """⭐ 誠實揭露：多 leader 與比例 slider **尚未開發**（Phase 3/4）——pro 方案
-    included=True 但 shipped=False，前端據此標「開發中」而不是假裝可用。
-    這個測試是刻意的提醒機制：Phase 3/4 出貨時它會紅燈，提醒把 shipped 改 True。"""
+def test_paid_features_shipped_state_is_pinned(tmp_path):
+    """⭐ 誠實揭露：`included`（方案含不含）與 `shipped`（功能存不存在）是**兩個獨立軸**。
+
+    <!-- 2026-07-19：Phase 3/4 完成，多 leader 與比例 slider 由 shipped=False 改 True。
+         這條測試原本釘 False 當作出貨提醒，已如設計般紅燈並在此同步更新。
+         它現在的職責變成反向：**若有人把 shipped 改回 False（或新增未出貨功能卻忘了標）
+         這裡會紅**，避免方案目錄與實際能力脫節。 -->
+    """
     catalog = plan_catalog(billing_cfg(tmp_path))
     pro = _features(catalog, "pro")
     for key in ("plans.feature.multiLeader", "plans.feature.ratioSlider"):
         assert pro[key]["included"] is True
-        assert pro[key]["shipped"] is False, f"{key} 已出貨？請同步更新方案目錄"
+        assert pro[key]["shipped"] is True, f"{key} 被改回未出貨？請同步更新方案目錄"
     # 已推出的功能：免費層不受限制（跟單不限本金、回撤保護照給）
     free = _features(catalog, "free")
     for key in ("plans.feature.copytrade", "plans.feature.killswitch"):
@@ -464,6 +468,10 @@ def test_unshipped_paid_features_are_marked_unshipped(tmp_path):
     # 免費層不含付費功能
     assert free["plans.feature.multiLeader"]["included"] is False
     assert free["plans.feature.ratioSlider"]["included"] is False
+    # ⭐ 但它們 shipped=True——「功能存在，只是你的方案不含」，不是「功能不存在」。
+    # 兩軸混為一談會讓免費層使用者以為這些功能還沒做出來。
+    assert free["plans.feature.multiLeader"]["shipped"] is True
+    assert free["plans.feature.ratioSlider"]["shipped"] is True
 
 
 def test_plan_catalog_has_no_hardcoded_user_copy(tmp_path):

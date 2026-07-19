@@ -316,20 +316,23 @@ _F_MULTI_LEADER = "plans.feature.multiLeader"
 _F_RATIO_SLIDER = "plans.feature.ratioSlider"
 
 # ⭐ 方案 B（免費層＋月費），使用者拍板：**免費層不受限制**——跟單不限本金、
-# 回撤保護照給；付費解鎖的是多 leader 與比例 slider，而這兩個功能都**尚未開發**
-# （Phase 3/4）。Phase 3/4 完成時把對應 shipped 改 True（tests/test_publicapi_billing.py
-# 有測試釘住 False，屆時會紅燈提醒——這是刻意的提醒機制，不是壞測試）。
+# 回撤保護照給；付費解鎖的是多 leader 與比例 slider。
+# <!-- 2026-07-19：Phase 3/4 完成，兩者 shipped 改 True（提醒測試已同步更新）。
+#      注意 included 與 shipped 是**兩個獨立軸**：免費層 included=False, shipped=True
+#      ＝「這功能存在，但你的方案不含」；不是「不存在」。前端據此顯示三態。
+#      ⚠️ 本次開啟是為了讓使用者能實地檢視全部頁面；billing env 未設時後端仍回 501、
+#      前端整組隱藏，故開啟旗標**不會**讓任何人被收費。 -->
 _FREE_FEATURES = (
     PlanFeature(_F_COPYTRADE, included=True, shipped=True),
     PlanFeature(_F_KILLSWITCH, included=True, shipped=True),
-    PlanFeature(_F_MULTI_LEADER, included=False, shipped=False),
-    PlanFeature(_F_RATIO_SLIDER, included=False, shipped=False),
+    PlanFeature(_F_MULTI_LEADER, included=False, shipped=True),
+    PlanFeature(_F_RATIO_SLIDER, included=False, shipped=True),
 )
 _PRO_FEATURES = (
     PlanFeature(_F_COPYTRADE, included=True, shipped=True),
     PlanFeature(_F_KILLSWITCH, included=True, shipped=True),
-    PlanFeature(_F_MULTI_LEADER, included=True, shipped=False),
-    PlanFeature(_F_RATIO_SLIDER, included=True, shipped=False),
+    PlanFeature(_F_MULTI_LEADER, included=True, shipped=True),
+    PlanFeature(_F_RATIO_SLIDER, included=True, shipped=True),
 )
 
 
