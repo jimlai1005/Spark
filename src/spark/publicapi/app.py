@@ -10,6 +10,13 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from spark.filet.capital_settings import (CapitalSettingsError,
+                                          build_capital_settings_message,
+                                          build_capital_settings_record,
+                                          canonical_capital_values,
+                                          validate_capital_bounds,
+                                          verify_capital_settings,
+                                          write_capital_settings)
 from spark.filet.followers import load_followers_tolerant
 from spark.filet.leader_change import (LeaderChangeError, build_leader_change_message,
                                        build_leader_change_record,
@@ -53,6 +60,24 @@ LEADER_CHANGE_DETAIL = {
     "nonce_unusable": "這份授權已被使用或已過期，請重新取得待簽原文並重簽",
 }
 
+# 資金設定驗簽失敗 → 回給客戶的分類化訊息。與換 leader 分成兩張表（不是共用一張）：
+# 兩者的 reason 集合不同（資金設定多了 action_mismatch／out_of_range），共用一張表
+# 會讓其中一邊的缺鍵靜默落到 DEFAULT，而客戶看到的是一句無法據以行動的通用訊息。
+# ⭐ 同樣刻意不是 `str(e)`：例外訊息為了除錯內嵌了請求原值（nonce、金額），
+# 回顯它與「不記 signature／message 原文」的政策矛盾。
+CAPITAL_SETTINGS_DETAIL_DEFAULT = "資金設定驗證失敗，請重新取得待簽原文並重簽"
+CAPITAL_SETTINGS_DETAIL = {
+    "malformed": "請求欄位格式不正確，請重新取得待簽原文並重簽",
+    "out_of_range": "數值超出允許範圍：投入本金必須大於 0，"
+                    "使用比例必須落在 0（不含）到 1（含）之間",
+    "account_mismatch": "請求的帳號與登入身分不符",
+    "action_mismatch": "這份簽章不是資金設定授權，請重新取得待簽原文並重簽",
+    "expired": "簽章已過期，請重新取得待簽原文並重簽",
+    "bad_signature": "簽章無法驗證，請重新簽署",
+    "signer_mismatch": "簽章者不是本帳號的持有人",
+    "nonce_unusable": "這份授權已被使用或已過期，請重新取得待簽原文並重簽",
+}
+
 
 class VerifyBody(BaseModel):
     nonce: str
@@ -80,6 +105,31 @@ class LeaderSelectBody(BaseModel):
     signature: str
     # 客戶端實際簽的原文。**驗證完全不看它**（伺服器重建自己的版本，見
     # verify_leader_change）——僅原樣留存，供事後比對「客戶當初到底簽了什麼」。
+    message: str = ""
+
+
+class CapitalSettingsBody(BaseModel):
+    """客戶簽章的資金設定請求（欄位＝filet/capital_settings.py 的記錄格式減去 action）。
+
+    ⭐ `action` 刻意**不收**：它由 `build_capital_settings_record` 寫死。讓客戶端
+    指定動作類型，等於把域分隔的一半交還給請求內容——而請求內容整份都在攻擊者的
+    控制範圍內。
+
+    ⭐ 兩個數值收 `str` 而不是 `float`：float 進不了 Decimal 的精確世界（0.1 在
+    float 裡不是 0.1），而這兩個值直接乘進部位大小。收字串讓「客戶簽的字串」與
+    「伺服器驗的字串」是同一個東西，不經過任何二進位浮點的中轉。
+
+    `account_id` 顯式收下再與 session 衍生值比對（不符 403），理由同
+    LeaderSelectBody：它是待簽訊息的一部分，伺服器代推會出現「客戶簽 A、
+    伺服器套用到 B」的縫。
+    """
+
+    account_id: str
+    allocated_capital: str
+    capital_utilization: str
+    nonce: str
+    issued_at: str
+    signature: str
     message: str = ""
 
 
@@ -612,6 +662,157 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "consequences": "生效時引擎會把你的部位收斂到新 leader："
                             "平掉目前的部位、依新 leader 開新部位。"
                             "這是真實成交，會產生實際的交易成本（taker 費用與滑價）。",
+        }
+
+    # ---------- 資金設定（per-follower 本金與使用比例） ----------
+    # ⭐ nonce 與換 leader、SIWE 登入**共用同一張表與同一個 chain_id 域（0）**。
+    # 刻意不另開第三套機具：三套一次性表格意味著三套過期與三套消耗語意，而其中
+    # 一套遲早會漏掉原子性。共用的代價是消耗點必須顯式宣告「我只收這個域的 nonce」
+    # （見 _consume），而**動作之間**的分隔靠的不是 nonce 域，是待簽訊息的模板
+    # ——兩個模板的第一行是不同的固定字面量，任何輸入都到不了第一行，所以不存在
+    # 一組輸入能讓它們產生同一字串（完整論證見 filet/capital_settings.py 檔頭）。
+
+    @app.get("/api/me/capital/message")
+    def capital_settings_message(allocated_capital: str, capital_utilization: str,
+                                 address: str = Depends(_require_session)):
+        """回傳資金設定的 **canonical 待簽原文** ＋ 配套的一次性 nonce。
+
+        形狀沿 `/api/leaders/select/message`：伺服器產生原文，客戶端**原樣**丟進
+        錢包簽名。理由見該端點——驗證端是重建訊息再 recover，客戶端自己組字串會
+        因為一個小數位或一個換行而得到「本人簽的卻一直被拒」，且兩邊 log 都正常。
+
+        ⭐ 邊界在**發原文之前**就檢查（超界 → 400，不發 nonce、不給原文）：
+        讓客戶簽一份必定被 POST 拒絕的原文，是把閘門變成一個只會浪費他一次錢包
+        簽名的陷阱（沿 leaders_select_message 用 is_selectable 的同一個決定）。
+        """
+        account_id = derive_account_id(address)
+        try:
+            # canonical 化（格式）＋ 邊界（政策），兩者都是 semantic 失敗（400）。
+            alloc, alloc_str, util, util_str = canonical_capital_values(
+                allocated_capital, capital_utilization)
+            validate_capital_bounds(alloc, util)
+        except CapitalSettingsError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=CAPITAL_SETTINGS_DETAIL.get(e.reason,
+                                                   CAPITAL_SETTINGS_DETAIL_DEFAULT)
+            ) from None
+
+        issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        nonce = store.issue_nonce(address, _LEADER_CHANGE_CHAIN_ID, issued_at,
+                                  now_s=now_fn(), ttl_s=cfg.nonce_ttl_s)
+        # 回 canonical 字串（不是客戶送來的原樣字串）：客戶端把這兩個值原樣回填進
+        # POST 的 body，兩邊結構上不可能組出不同的字串（工程原則 1）。
+        message = build_capital_settings_message(
+            account_id=account_id, allocated_capital=alloc_str,
+            capital_utilization=util_str, nonce=nonce, issued_at=issued_at)
+        return {"message": message, "nonce": nonce, "issued_at": issued_at,
+                "account_id": account_id, "allocated_capital": alloc_str,
+                "capital_utilization": util_str}
+
+    @app.post("/api/me/capital")
+    def capital_settings_submit(body: CapitalSettingsBody,
+                                address: str = Depends(_require_session)):
+        """客戶**自己簽章**調整投入本金與使用比例 → 寫一筆簽章記錄。
+
+        ⭐ 為什麼這裡也要簽章（威脅模型全文見 filet/capital_settings.py 檔頭）：
+        這兩個值直接乘進部位大小。能改它們的人就能把使用比例拉滿，讓客戶的曝險
+        瞬間變成數倍、清算距離縮到數分之一——而白名單全程放行（它管的是「跟誰」，
+        不是「押多大」），事後看紀錄一切合規。危害與換 leader 同級，所以用同一套
+        信任錨；簽章機制既然已經存在，邊際成本近乎零。
+
+        ⭐ 本端點**不改任何引擎設定**，只落一筆記錄。引擎在套用前自己重新驗章，
+        **並自己重新檢查邊界**——繞過那道驗證等於把整套簽章設計降級成裝飾。
+
+        失敗分類（工程原則 2）：驗簽失敗、動作類型不符、超界、session 不符
+        **全是 semantic**（4xx，不得自動重試）；寫檔失敗才是 transient（5xx）。
+        """
+        # 1) 只能改自己的（同 leaders_select：403 而非 404，不洩漏帳號是否存在）。
+        account_id = derive_account_id(address)
+        if body.account_id != account_id:
+            raise HTTPException(status_code=403, detail="只能變更自己帳號的資金設定")
+
+        # 2) 邊界（政策）。⭐ 超界一律 4xx，**不夾取**：夾取會讓流程順利跑完，
+        #    代價是客戶簽了 A、系統執行了 B，而且沒有人會知道。
+        try:
+            alloc, _alloc_str, util, _util_str = canonical_capital_values(
+                body.allocated_capital, body.capital_utilization)
+            validate_capital_bounds(alloc, util)
+        except CapitalSettingsError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=CAPITAL_SETTINGS_DETAIL.get(e.reason,
+                                                   CAPITAL_SETTINGS_DETAIL_DEFAULT)
+            ) from None
+
+        # 3) 驗章。user_address 出自 **session**（可信來源），不是請求內容。
+        def _consume(nonce: str) -> bool:
+            """一次性 nonce：與換 leader 同一張表、同一個原子 UPDATE、同一個域。
+
+            兩道要求同 leaders_select 的 _consume：nonce 必須是**發給本人**的，
+            且必須是**這個 chain_id 域**發的（擋 SIWE 登入 nonce 被挪用）。
+            ⚠️ 這裡**不**分辨「是換 leader 端點發的還是本端點發的」——兩者同域是
+            刻意的，因為分辨它們的是**簽章本身**：客戶簽的原文寫死了動作類型，
+            拿換 leader 的 nonce 配資金設定的簽章，重建出來的訊息對不上任何一邊。
+            """
+            rec = store.consume_nonce(nonce, now_s=now_fn())
+            return (rec is not None and rec.address == address
+                    and rec.chain_id == _LEADER_CHANGE_CHAIN_ID)
+
+        record = build_capital_settings_record(
+            account_id=body.account_id, allocated_capital=body.allocated_capital,
+            capital_utilization=body.capital_utilization, nonce=body.nonce,
+            issued_at=body.issued_at, signature=body.signature,
+            message=body.message)
+        try:
+            verified = verify_capital_settings(record, account_id=account_id,
+                                               user_address=address,
+                                               now_s=now_fn(),
+                                               consume_nonce=_consume)
+        except CapitalSettingsError as e:
+            # 稽核痕跡（偽造探測）：記 reason 與帳號，**不記** signature／message
+            # 原文，也不記金額（來路不明的內容不進 log）。
+            logger.warning("資金設定驗簽失敗 account=%s reason=%s", account_id, e.reason)
+            raise HTTPException(
+                status_code=400,
+                detail=CAPITAL_SETTINGS_DETAIL.get(e.reason,
+                                                   CAPITAL_SETTINGS_DETAIL_DEFAULT)
+            ) from None
+
+        # 4) 落檔（唯一的寫入，且在**全部驗證通過之後**）。落地的是驗證後的
+        #    canonical 值，不是請求的原樣字串——引擎重建訊息時不必再猜格式。
+        record = build_capital_settings_record(
+            account_id=verified.account_id,
+            allocated_capital=verified.allocated_capital_str,
+            capital_utilization=verified.capital_utilization_str,
+            nonce=verified.nonce, issued_at=verified.issued_at,
+            signature=body.signature, message=body.message)
+        try:
+            write_capital_settings(cfg.capital_settings_path, record)
+        except OSError as e:
+            logger.error("資金設定記錄落檔失敗 account=%s path=%s: %s",
+                         account_id, cfg.capital_settings_path, e)
+            raise HTTPException(status_code=500,
+                                detail="設定記錄寫入失敗，請稍後重試") from e
+        logger.info("資金設定記錄已落地 account=%s", account_id)
+
+        # ⭐ 回應必須明講生效時機與「不做即時強制再平衡」。後者不是實作細節而是
+        #    客戶會直接感受到的行為：調低比例之後部位不會立刻縮小，而是隨 leader
+        #    的下一次動作自然收斂。不講清楚，客戶會以為系統沒反應而重複提交
+        #    （每次都是一次真實的簽章與一顆 nonce）。
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "allocated_capital": verified.allocated_capital_str,
+            "capital_utilization": verified.capital_utilization_str,
+            "effective": "next_engine_cycle",
+            "effective_note": "已記錄，於引擎的下一個 cycle 生效——不是立即生效；"
+                              "引擎會在套用前**自己重新驗證你的簽章與數值範圍**，"
+                              "驗證不過則不會套用。",
+            "consequences": "新的部位大小會在下一個 cycle 起套用，但**不會立即強制"
+                            "再平衡**現有部位——引擎讓部位隨 leader 的後續動作自然"
+                            "收斂，避免一次無謂的 taker 成本。調高比例會放大曝險與"
+                            "清算風險。",
         }
 
     # ---------- onboarding ----------

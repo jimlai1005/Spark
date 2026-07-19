@@ -73,6 +73,18 @@ LEADER_CHANGE_MAX_AGE_S = 600
 LEADER_CHANGE_FIELDS = ("account_id", "leader_address", "nonce", "issued_at",
                         "signature", "message")
 
+# ⭐⭐ 動作類型標識（域分隔，2026-07-19 加入；完整論證見 capital_settings.py 檔頭）。
+# 自從有了第二種客戶簽章記錄（資金設定），「一筆記錄是什麼動作」就必須是可以被
+# **顯式檢查**的東西，而不是靠「它剛好長得像換 leader」推測出來的。
+#
+# ⚠️ 本常數刻意**不在** LEADER_CHANGE_FIELDS 裡：換 leader 的記錄格式維持原樣
+# （加成必填欄位會讓所有既存記錄一次失效，那是一次自我製造的可用性事故）。
+# 這裡的檢查是**單向**的——拒絕「帶著別的動作類型」的記錄，接受「沒有 action」的
+# 既有格式。把資金設定記錄的 action 拿掉再餵進來，會落回真正的結構性防線：
+# 兩種待簽訊息的第一行是不同的固定字面量，任何輸入都到不了第一行，所以兩個模板
+# **不存在**能產生同一字串的輸入 → recover 出的簽章者必定不符 → signer_mismatch。
+ACTION_LEADER_CHANGE = "leader_change"
+
 # nonce 字元集：伺服器發的是 secrets.token_hex(16)，這裡放寬到 URL-safe 但**必須**
 # 收斂——nonce 會被拼進待簽訊息的一行，允許換行等於允許攻擊者自己捏造額外欄位。
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -188,6 +200,19 @@ def verify_leader_change(record: dict, *, account_id: str, user_address: str,
     issued_at，沒有這個依賴，所以能把唯一的副作用擺到最後。
     """
     validate_account_id(account_id)
+
+    # ⭐⭐ 域分隔的顯式檢查（見 ACTION_LEADER_CHANGE 的註解與 capital_settings.py
+    # 檔頭）。擋的是「拿一筆資金設定的簽章記錄來當換 leader 授權」——那一類重放
+    # 本來就會被訊息模板結構性擋下（兩個模板產生不出同一字串），但那條路徑報出來的
+    # 是籠統的 signer_mismatch，會被操作者讀成「客戶簽壞了」而忽略。指名事件的
+    # 拒絕理由是為了讓真正的跨域重放**看起來像**跨域重放。
+    action = record.get("action")
+    if action is not None and action != ACTION_LEADER_CHANGE:
+        raise LeaderChangeError(
+            "action_mismatch",
+            f"記錄的動作類型不是 {ACTION_LEADER_CHANGE}（收到 {action!r}）——拒絕。"
+            f"一筆資金設定的授權絕不能被當成一次換 leader 授權")
+
     expected_user = normalize_hex_address("user_address", user_address)
 
     # 記錄自稱的 account_id 必須與可信來源一致。這條**不是**主要防線（攻擊者當然會

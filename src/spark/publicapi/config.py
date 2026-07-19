@@ -12,6 +12,7 @@ from pathlib import Path
 
 from spark.config import API_URLS, MIN_BUILDER_BALANCE, Settings
 from spark.filet.followers import validate_account_id
+from spark.filet.capital_settings import capital_settings_path_for
 from spark.filet.leader_change import leader_changes_path_for
 from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
 
@@ -117,6 +118,16 @@ class ApiConfig:
         會靜默發生而兩邊看起來都正常。
         """
         return leader_changes_path_for(self.exchange_dir)
+
+    @property
+    def capital_settings_path(self) -> str:
+        """客戶簽章的資金設定記錄落點（filet/capital_settings.py 的格式）。
+
+        與 `leader_changes_path` 同一個交換目錄、同一個權限拓撲（API 寫、引擎讀），
+        但**分開一個檔**：兩份記錄的讀者是兩個獨立的套用器，共用一個檔會讓其中
+        一方的格式問題連坐另一方，而這兩件事各自都能造成資金損失。
+        """
+        return capital_settings_path_for(self.exchange_dir)
 
     @property
     def billing_enabled(self) -> bool:
