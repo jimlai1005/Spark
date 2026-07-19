@@ -195,3 +195,21 @@ def test_sustained_high_still_becomes_peak(tmp_path: Path):
     assert ev.recent_peak == Decimal("1400"), "持續高點必須成為 peak"
     dd = (ev.recent_peak - ev.current) / ev.recent_peak
     assert dd > Decimal("0.28"), "真實回撤必須算得出來"
+
+
+def test_wick_guard_disabled_below_threshold(tmp_path: Path):
+    """樣本 < 3 筆時不做離群值排除——否則 2 筆取次高會摧毀真實 peak、回撤歸零。"""
+    perp_equity_view(_FakeAdapter("500"), "0xabc", tmp_path, now_fn=lambda: 1000.0)
+    ev = perp_equity_view(_FakeAdapter("400"), "0xabc", tmp_path, now_fn=lambda: 2000.0)
+    assert ev.recent_peak == Decimal("500"), "2 筆樣本時 peak 必須是最高值"
+    assert (ev.recent_peak - ev.current) / ev.recent_peak == Decimal("0.2")
+
+
+def test_wick_guard_active_at_threshold(tmp_path: Path):
+    """樣本 >= 3 筆時啟用離群值排除。"""
+    ts = 1000.0
+    for v in ("1000", "1400", "1000"):  # 中間那筆是插針
+        perp_equity_view(_FakeAdapter(v), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    ev = perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+    assert ev.recent_peak == Decimal("1000"), "3 筆以上時插針必須被排除"

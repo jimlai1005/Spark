@@ -30,6 +30,7 @@ from spark.exchange.base import EquityView
 SAMPLES_RELPATH = Path("var/copytrade/equity_samples.json")
 WINDOW_S = 7 * 24 * 3600  # 7 天，對齊 hl 的 week-window 語意
 MIN_COVERAGE_S = 3600  # 樣本覆蓋不足 1 小時＝回撤保護尚未生效（見 SampleCoverage）
+_WICK_GUARD_MIN_SAMPLES = 3  # 少於此筆數無從判斷離群值，peak 退回最高值（見 perp_equity_view）
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +161,20 @@ def perp_equity_view(adapter, address: str, root: Path, *,
     samples.append((now, str(current)))
     if persist:
         _save(path, samples)
-    # I2 插針防護：取**次高值**而非最高值——單一樣本的價格插針（unrealizedPnl 受 mark
+    # I2 插針防護：樣本充足時取**次高值**——單一樣本的價格插針（unrealizedPnl 受 mark
     # price 影響，冷門幣插針即可造成）不會成為 peak 並污染整個窗；真實的持續高點必然
-    # 有多筆樣本，次高值≈最高值。樣本 <2 筆時退回最高值（此時 coverage 不足會另發告警）。
-    # 最後與 current 取 max：維持「peak 為高水位」的慣例，且 current 若本身是插針，
-    # 當輪 dd≈0 無害、下一輪該樣本會被次高值邏輯排除。
+    # 有多筆樣本，次高值≈最高值。
+    # **門檻 3 筆**：少於 3 筆時無從判斷「哪一筆是離群值」（2 筆取次高＝取最低，會直接
+    # 摧毀真實 peak 使回撤歸零），故退回最高值。此區間覆蓋度告警本來就在提醒
+    # 「回撤保護尚未生效」，不會讓操作者誤以為有保護。
+    # 最後與 current 取 max：維持「peak 為高水位」慣例；current 若本身是插針，當輪
+    # dd≈0 無害，下一輪該樣本會被次高值邏輯排除。
     _vals = sorted((Decimal(v) for _, v in samples), reverse=True)
-    _base = _vals[1] if len(_vals) >= 2 else (_vals[0] if _vals else current)
+    if len(_vals) >= _WICK_GUARD_MIN_SAMPLES:
+        _base = _vals[1]
+    elif _vals:
+        _base = _vals[0]
+    else:
+        _base = current
     peak = max(_base, current)
     return EquityView(current=current, recent_peak=peak)
