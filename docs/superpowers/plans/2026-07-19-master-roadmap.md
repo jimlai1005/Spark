@@ -59,28 +59,43 @@
 
 ---
 
-## Phase 2：Billing UI 全套 ＋ 訂閱對帳
+## Phase 2：Billing UI 全套 ＋ 訂閱對帳 【實作完成，修復中】
 
-- [ ] P2.1 `GET /api/billing/plans`（方案定義走設定，改設定即改頁面）
-- [ ] P2.2 `POST /api/billing/portal`（Stripe Customer Portal，取消訂閱交給 Stripe）
-- [ ] P2.3 `/pricing` 方案選擇頁（免費層**不受限制**；付費功能標「開發中」直到 Phase 3/4 完成）
-- [ ] P2.4 `/billing` 訂閱管理頁 ＋ Header 訂閱狀態 chip
-- [ ] P2.5 checkout 流程接線（既有 `POST /api/billing/checkout`）
-- [ ] P2.6 訂閱對帳（Stripe `Subscription.list` vs 本地 billing 表，抓 webhook 掉包漂移）→ **補上 opus 點名的 reconcile 缺口**
+- [x] P2.1/2.2 plans + portal（commit 9688243）
+- [x] P2.6 訂閱對帳（commit 1d3261f）——**補上 opus 點名的 reconcile 缺口**
+- [x] P2.3-2.5 `/pricing`＋`/billing`＋Header chip＋checkout 接線（commit 61ce6f6，前端 130 tests）
 
 **旗標**：billing env 未設時後端 501、前端整組隱藏——可安全合併主線。
+
+### opus 對抗性總審結果（Phase 1+2）：NEEDS_FIXES
+**授權與資料外洩查無問題**（opus 不信任既有測試，自行枚舉全部 18 條路由驗證）：4 條 admin 端點全掛閘、僅 5 條 session 豁免（3 auth＋webhook HMAC＋plans 純記憶體常數）、`customer_id`/`subscription_id` 不進客戶端、白名單投影確為白名單。
+
+必修（修復中）：
+- [ ] **C1 Critical 同基準**：accrued 快照只存日期不存時刻 → 增量涵蓋 `(D-1 T, D T]` 卻與 `[D 00:00, now]` 的 fills 相比。**實測健康帳戶被判 199 倍差異並告警**。修法＝存 `captured_at` 並用它當窗界；缺時刻的舊資料標 `basis_unknown` 不硬算。**與 phantom drawdown 事故同形狀。**
+- [ ] **I2 回鍋客戶假漏財**：Stripe `status="all"` 永久回舊訂閱，同 account 被算兩次（新的 in_sync、舊的落進「收不到錢」清單）→ admin 可能停掉正常付費客戶。修法＝先精確比對、第二輪才 metadata fallback。
+- [ ] **I3 重複結帳**：webhook 落地前可建第二個 session → 兩張訂閱兩次扣款。測試模式無真金流故非 Critical，**開真收費前必修**，現在就補 pending-checkout TTL 擋板。
+- [ ] I4 drift 無前端（`truncated` 不可信警告到不了人眼前）
+- [ ] M5 admin 閘測試靠路徑前綴（換前綴即失效）→ 改釘**資料來源**（`list_billing`/`customer_pnl`/`_load_followers`）
+- [ ] M6 `postcss` overrides；M7 白名單多收了沒人用的 `customer` 欄位
+
+**⚠️ 順序**：`day=` 對齊**必須等 C1 修完**——否則兩張表只是「看起來」同基準而實際仍錯開，比現在更危險（opus 指出）。
 
 ---
 
 ## Phase 3：多 leader（付費功能一）
 
-- [ ] P3.1 資料模型 ⭐：`FollowerRef` 加 leader 欄位；manifest／activate CLI 支援（**破壞性變更，需向後相容既有 manifest**）
-- [ ] P3.2 引擎讀 per-follower leader（取代 `COPY_LEADER_ADDRESS` env 單一來源）⭐
-- [ ] P3.3 leader 目錄 API（可選清單＋各自的 leaderboard 統計，資料來自已在跑的 watchlist snapshot）
-- [ ] P3.4 客戶選 leader 的 API（訂閱狀態 gate：免費層單一 leader、付費多 leader）
+**架構決策（我裁決，使用者可推翻）**：「多 leader」實作為**從策劃清單中選一個 leader**（可切換），非「同時跟多個」。理由：同時跟多個需跨 leader 資金配置邏輯＋每 leader 一個引擎進程（55-60MB），2GB 機器上 5 客戶×3 leader 即滿載。資料模型不排除未來擴充。**若使用者要的是「同時跟多個」，需重新規劃。**
+
+**資安設計**：客戶之後可經 API 改 leader → API 被打穿即可指向惡意 leader（瘋狂交易榨乾 builder fee／反向交易）。**防線＝策劃白名單，且引擎使用前必須自己再驗一次**（不得因「API 已驗過」而省略）。
+
+- [x] P3.1a 白名單＋manifest leader 欄位（commit 9459279，915 tests）——向後相容、activate 硬閘拒絕非白名單 leader
+- [ ] P3.1b `pending.json` 支援 `leader_address`（**目前 `write_pending_entry()` 無此參數，客戶選 leader 的鏈路斷在這裡**）
+- [ ] P3.2 引擎讀 per-follower leader ⭐ + **白名單二次驗證**（目前只有 activate 一道閘）
+- [ ] P3.3 leader 目錄 API（清單＋leaderboard 統計，資料來自已在跑的 watchlist snapshot）
+- [ ] P3.4 客戶選 leader 的 API（訂閱狀態 gate）
 - [ ] P3.5 `/leaders` 前端頁
 
-**注意**：這是整份計畫裡最大的架構變更，且碰引擎核心。P3.1/P3.2 必須 opus 審。
+**注意**：最大架構變更且碰引擎核心。P3.2 必須 opus 審。
 
 ---
 
@@ -113,4 +128,10 @@
 
 - 2026-07-19 ~05:0x：計畫建立；SSH 驗證通過
 - 2026-07-19 ~06:3x：**Phase 0 部署完成**（全驗收+重開機測試通過）
-- 2026-07-19 ~07:0x：**Phase 1 完成**（818 Python / 102 前端 tests）；deploy 檔 bug 修復 0b9c9a8；P0.5 與 P2 後端進行中
+- 2026-07-19 ~07:0x：**Phase 1 完成**（818 Python / 102 前端 tests）；deploy 檔 bug 修復 0b9c9a8
+- 2026-07-19 ~08:0x：P0.5 wagmi 2.19.5/viem 2.55.2（342ee72，**4 個 high 全清**，簽名檔未動、14 條真密碼學測試綠）
+- 2026-07-19 ~09:0x：**Phase 2 實作完成**（915 Python / 130 前端）；**opus 總審 NEEDS_FIXES**（C1 Critical 同基準＋I2/I3 Important，修復中）；**Phase 3 開工**（P3.1a 白名單落地）
+
+### 給未來 session 的提醒
+- 我方每一個關鍵宣稱都做過**變異測試**（故意改壞→確認測試轉紅）：admin 閘、北極星不加總、price_id 不外流、緊急平倉滑價、panic 來源、插針守衛。沿用這個習慣，不要只看綠燈。
+- subagent 多次對規格提出**有理反駁並被採納**（免費卡不該標「即將開放」、`list[dict]` 無法承載 `truncated` 旗標、危害優先於分類整齊、`enabled` 不收字串）。**指令要留反駁空間，不要逼它照抄壞規格。**
