@@ -14,6 +14,7 @@ from spark.filet.followers import load_followers_tolerant
 from spark.filet.leader_change import (LeaderChangeError, build_leader_change_message,
                                        build_leader_change_record,
                                        verify_leader_change, write_leader_change)
+from spark.filet.leader_perf import BASIS_NOTE, MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
 from spark.keysvc.client import KeysvcError
@@ -89,6 +90,44 @@ class LeaderSelectBody(BaseModel):
 _LEADER_STAT_FIELDS = ("account_value", "total_ntl_pos", "unrealized_pnl",
                        "position_count")
 
+# ⭐ 績效欄位與上面的**規模**欄位刻意分開兩張表、在回應裡也分開兩個物件
+# （`performance` vs 平鋪的規模欄位）。理由：`account_value` 之類是資產負債切面，
+# `twr`／`max_drawdown` 是報酬率——把兩者混在同一層，遲早有人把規模欄位改名成
+# 看起來像績效的名字（或反過來讀），而那個誤讀在畫面上完全看不出來。
+_LEADER_PERF_WINDOWS = ("perpMonth", "perpAllTime")
+_LEADER_PERF_FIELDS = ("period", "basis", "status", "reason", "disclosure_tier",
+                       "sample_count", "covered_days", "first_ts_ms", "last_ts_ms",
+                       "skipped_intervals", "cum_pnl", "twr", "max_drawdown",
+                       "annualized_return")
+
+
+def _leader_perf_public(stats: dict | None) -> dict | None:
+    """快照列的 `perf` → 對外的績效投影；沒有績效資料 → None。
+
+    ⭐⭐ 投影用 `if k in row`（**不是** `row.get(k)`）：`leader_perf` 對「不足 90 天
+    不年化」「不足 30 天不給 %」的保證，載體正是**鍵的不存在**。改用 `.get()` 會把
+    缺席的鍵補成 `null` 送給前端，而前端的 `?? 0`／`|| "—"` 之類寫法會把 null 悄悄
+    變成一個數字或一個看起來正常的欄位——那道結構性防線就在這一行退化成「前端記得
+    檢查」。這是本函式唯一真正重要的一行。
+
+    形狀不符（舊快照、schema 漂移）→ None，不 raise：目錄頁不該因為績效缺席而 500
+    （沿本模組既有的兩種降級，見 leaders_directory）。
+    """
+    if not isinstance(stats, dict):
+        return None
+    perf = stats.get("perf")
+    if not isinstance(perf, dict):
+        return None
+    windows = perf.get("windows")
+    if not isinstance(windows, dict):
+        return None
+    out = {}
+    for w in _LEADER_PERF_WINDOWS:
+        row = windows.get(w)
+        if isinstance(row, dict):
+            out[w] = {k: row[k] for k in _LEADER_PERF_FIELDS if k in row}
+    return out or None
+
 
 def _leader_public(ref: LeaderRef, stats: dict | None) -> dict:
     """LeaderRef ＋ 快照列 → 對外 dict。⭐ 白名單列欄位（不是 asdict 再 pop，沿
@@ -102,6 +141,9 @@ def _leader_public(ref: LeaderRef, stats: dict | None) -> dict:
     out = {"address": ref.address, "name": ref.name, "description": ref.description}
     for f in _LEADER_STAT_FIELDS:
         out[f] = stats.get(f) if stats else None
+    # 績效**獨立一個子物件**（見 _LEADER_PERF_WINDOWS 上方）。None = 這個 leader
+    # 沒有績效資料，與「規模欄位為 null」是同一種誠實：不補 0、不補空物件。
+    out["performance"] = _leader_perf_public(stats)
     return out
 
 
@@ -246,6 +288,27 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "note": None if snapshot else
                     "績效統計暫時不可用（每日快照尚未產生或讀取失敗）；"
                     "leader 清單不受影響，仍可正常選擇。",
+            # ⭐ 績效可用性與 `stats_available` 是**兩個獨立**的旗標，不可合併：
+            # 快照可能存在（規模欄位有值）卻沒有績效（舊格式的快照、或 cron 尚未
+            # 啟用 portfolio 抓取）。合併成一個會讓前端在「有規模沒績效」時整片
+            # 顯示「統計不可用」，把有效資料也一起藏起來。
+            "performance_available": bool(
+                snapshot and snapshot.get("perf_source") is not None),
+            "performance_basis": "perp",
+            "performance_windows": list(_LEADER_PERF_WINDOWS),
+            # 三段揭露文案由 leader_perf 的常數供給（單一來源）：計算的極限與
+            # 呈現的警語必須出自同一處，否則改了公式而文案還停在舊說法。
+            "performance_notes": {
+                "basis": BASIS_NOTE,
+                "upper_bound": UPPER_BOUND_NOTE,
+                "max_drawdown": MDD_SAMPLING_NOTE,
+                "sufficiency": "每個窗都附 `covered_days`（涵蓋天數）與 `sample_count`"
+                               "（樣本點數），並以 `disclosure_tier` 標示這段資料"
+                               "**誠實可顯示到什麼程度**：insufficient（無數字）／"
+                               "pnl_only（僅 $ 金額）／window_return（＋窗口報酬率與"
+                               "回撤）／annualizable（＋年化）。不足 90 天的資料"
+                               "**不會**有 `annualized_return` 這個欄位。",
+            },
         }
 
     # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce

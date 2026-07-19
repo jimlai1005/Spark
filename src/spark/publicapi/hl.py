@@ -63,6 +63,21 @@ class HLGateway:
     def get_account_value(self, address: str) -> Decimal:
         return Decimal(self.clearinghouse_state(address)["marginSummary"]["accountValue"])
 
+    def portfolio(self, address: str) -> list:
+        """`portfolio` 的原始回應（唯讀、冪等 → transient 重試）。
+
+        形狀 `[[period, {accountValueHistory, pnlHistory, vlm}], ...]`，8 個 period：
+        `day/week/month/allTime` ＋ `perpDay/perpWeek/perpMonth/perpAllTime`。
+        請求體與 SDK 的 `Info.portfolio` 逐欄位相同（`.venv/.../hyperliquid/info.py:683`
+        的 `{"type": "portfolio", "user": user}`）——本進程不 import SDK（只用 httpx，
+        見檔頭），所以請求體是**照抄查證過的原始碼**，不是憑印象寫的。
+
+        ⚠️ 本方法回**原始**回應，不在這裡挑窗：期別的取捨（只能用 perp 窗）是績效
+        語意問題，屬於 `filet.leader_perf` 的職責。gateway 只負責 IO 與重試——
+        把 basis 決策塞進 IO 層，會讓「為什麼不能用預設窗」的理由散落到兩個檔案。
+        """
+        return self._info({"type": "portfolio", "user": address}, "HL portfolio 查詢")
+
     def max_builder_fee(self, user: str, builder: str) -> int:
         """使用者已核給 builder 的費率上限（十分之一 bp；0 = 未核）。verify/status 用
         != 0 判 builder fee approval 已上鏈；同時是 maxFeeRate 生效的鏈上真相。"""

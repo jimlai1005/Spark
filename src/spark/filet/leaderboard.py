@@ -18,18 +18,40 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
+from spark.filet.leader_perf import compute_perp_performance, jsonable_performance
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_WATCHLIST = ("0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1",)  # M1 leader
 
+# 績效資料的來源標記（落進快照，讓讀端知道這些數字的 basis 是什麼）。
+# 字串裡明講 perp——快照檔會被人直接打開來看，basis 不該只存在於程式碼裡。
+PERF_SOURCE = "portfolio(perp windows)"
+
 
 def snapshot_watchlist(state_fn: Callable[[str], dict], addresses: list[str] | tuple,
-                       day: date) -> dict[str, Any]:
-    """逐地址查 clearinghouseState → 正規化快照 dict（Decimal 過手後以 str 落地）。
+                       day: date, *,
+                       portfolio_fn: Callable[[str], Any] | None = None) -> dict[str, Any]:
+    """逐地址查 clearinghouseState（＋選配 portfolio 績效）→ 正規化快照 dict。
+
     單一地址失敗：大聲隔離（logger.error + error 條目 + error_count），不弄丟整批
-    （工程原則 3——「大聲」= 快照內可見 + log + CLI exit code，見 watchlist_snapshot）。"""
+    （工程原則 3——「大聲」= 快照內可見 + log + CLI exit code，見 watchlist_snapshot）。
+
+    `portfolio_fn`（選配，`HLGateway.portfolio`）：另外抓 **perp 窗**的績效序列並
+    以 `perf` 欄位落地。⭐ 兩件事刻意分開計數：
+    - `error_count`：clearinghouseState 失敗 → 這一列**完全沒有**資料。
+    - `perf_error_count`：規模資料拿到了但績效沒拿到 → 這一列**部分降級**。
+    合成一個計數會讓「整列沒了」與「少了績效」在告警上看起來一樣嚴重，
+    營運端因此分不出該不該緊急處理。兩者都會讓 CLI exit 1（都要有人看一眼）。
+
+    ⚠️ 績效**只取 perp 窗**（leader_perf.PERP_PERIODS）：預設窗是 spot+perp 總和
+    且含 vault 餘額，而 copytrade 只鏡像 perp——用預設窗等於把客戶根本複製不到的
+    報酬存進快照，之後每一個讀這份檔的人都會繼承這個錯誤。理由全文見
+    `spark/filet/leader_perf.py` 檔頭閘門 1。
+    """
     rows: list[dict[str, Any]] = []
     errors = 0
+    perf_errors = 0
     for addr in addresses:
         try:
             state = state_fn(addr)
@@ -37,7 +59,7 @@ def snapshot_watchlist(state_fn: Callable[[str], dict], addresses: list[str] | t
             positions = state.get("assetPositions", [])
             upnl = sum((Decimal(str(p["position"]["unrealizedPnl"])) for p in positions),
                        Decimal("0"))
-            rows.append({
+            row = {
                 "address": addr,
                 "account_value": str(Decimal(str(ms["accountValue"]))),
                 "total_margin_used": str(Decimal(str(ms["totalMarginUsed"]))),
@@ -45,17 +67,34 @@ def snapshot_watchlist(state_fn: Callable[[str], dict], addresses: list[str] | t
                 "withdrawable": str(Decimal(str(state["withdrawable"]))),
                 "unrealized_pnl": str(upnl),
                 "position_count": len(positions),
-            })
+            }
         except Exception as e:  # noqa: BLE001 — 逐地址隔離；計數上報，絕不靜默
             errors += 1
             logger.error("watchlist 快照 %s 失敗: %s", addr, e)
             rows.append({"address": addr, "error": f"{type(e).__name__}: {e}"})
+            continue
+        if portfolio_fn is not None:
+            try:
+                row["perf"] = {
+                    "source": PERF_SOURCE,
+                    "windows": {p: jsonable_performance(r) for p, r
+                                in compute_perp_performance(portfolio_fn(addr)).items()},
+                }
+            except Exception as e:  # noqa: BLE001 — 績效失敗不連坐規模資料
+                perf_errors += 1
+                logger.error("watchlist 績效 %s 失敗: %s", addr, e)
+                row["perf_error"] = f"{type(e).__name__}: {e}"
+        rows.append(row)
     return {
         "day": day.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "clearinghouseState",
+        # None ＝ 本次根本沒抓績效（cron 未啟用）。與「抓了但全失敗」是兩件事：
+        # 前者不該讓讀端顯示「績效暫時不可用」，後者該。
+        "perf_source": PERF_SOURCE if portfolio_fn is not None else None,
         "row_count": len(rows) - errors,
         "error_count": errors,
+        "perf_error_count": perf_errors,
         "rows": rows,
     }
 

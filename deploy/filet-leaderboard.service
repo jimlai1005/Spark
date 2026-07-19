@@ -10,9 +10,12 @@ Group=filet-api
 WorkingDirectory=/opt/filet/spark
 Environment=SPARK_NETWORK=mainnet
 Environment=FILET_DATA_DIR=/var/lib/filet-api
-# watchlist 未設時用內建預設（M1 leader 0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1）。
-# 擴充清單（逗號分隔）：
-#Environment=FILET_LEADER_WATCHLIST=0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1,0x...
+# ⭐ 抓取對象的**單一來源＝leader 白名單**（與 filet-follower@.service 同一個檔）。
+# 白名單新增 leader → 本 timer 自動涵蓋，不必再同步任何 env；漏設 env 導致目錄頁
+# 永遠 null 統計且零告警的缺口就是這樣關掉的。filet-api 對這個檔唯讀（RUNBOOK §5.5）。
+Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
+# 選配：白名單**之外**的額外研究對象（逗號分隔）。與白名單取聯集，不是取代它。
+#Environment=FILET_LEADER_WATCHLIST=0x...,0x...
 # 全站快照 best-effort（ExecStart 前綴 "-"）：stats-data 端點未進官方文件、schema
 # 可能無預告變動——它掛掉不擋 watchlist 快照（定案 11）。
 ExecStart=-/opt/filet/spark/.venv/bin/python -m scripts.leaderboard_snapshot

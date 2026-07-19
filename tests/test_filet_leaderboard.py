@@ -69,3 +69,77 @@ def test_write_snapshot_atomic_and_idempotent(tmp_path):
     data = json.loads(p1.read_text())
     assert data["row_count"] == 2                    # 內容是第二次的
     assert list(out.glob("*")) == [p1]               # 目錄裡只有正式檔，無 tmp 殘檔
+
+
+# --- perp 績效併抓（2026-07-19） -------------------------------------------
+# 40 天窗、AV 因入金單調上升但 I_t 下跌（與 tests/test_leader_perf.py 同一組手算
+# 資料）：快照層只驗「有沒有把值原樣帶下來」，公式正確性由 leader_perf 的測試負責。
+_DAY_MS = 86_400_000
+_PORTFOLIO = [
+    ["month", {"accountValueHistory": [[0, "1"]], "pnlHistory": [[0, "1"]]}],
+    ["perpMonth", {"accountValueHistory": [[0, "1000"], [20 * _DAY_MS, "2900"],
+                                           [40 * _DAY_MS, "5510"]],
+                   "pnlHistory": [[0, "0"], [20 * _DAY_MS, "-100"],
+                                  [40 * _DAY_MS, "-390"]]}],
+]
+
+
+def test_snapshot_includes_perp_performance_when_portfolio_fn_given():
+    snap = snapshot_watchlist(lambda a: STATE1, [ADDR1], date(2026, 7, 18),
+                              portfolio_fn=lambda a: _PORTFOLIO)
+    assert snap["perf_source"] == "portfolio(perp windows)"
+    assert snap["perf_error_count"] == 0
+    row = snap["rows"][0]
+    assert row["account_value"] == str(Decimal(STATE1["marginSummary"]["accountValue"]))
+    win = row["perf"]["windows"]["perpMonth"]
+    assert win["twr"] == "-0.19"
+    assert win["max_drawdown"] == "0.19"     # 算在 I_t 上（AV 遞增，AV 基準會是 0）
+    assert win["covered_days"] == "40.0000" and win["sample_count"] == 3
+    assert win["disclosure_tier"] == "window_return"
+    assert "annualized_return" not in win    # ⭐ 40 天 → 結構上沒有年化欄位
+    assert "equity_index" not in win and win["equity_index_len"] == 3
+
+
+def test_snapshot_only_reads_perp_windows_never_the_default_ones():
+    """⭐ basis：預設窗（含 spot 與 vault）不得混進快照。上面 fixture 的 "month" 列
+    是誘餌——若實作抓錯窗，perpMonth 的數字會變成那一列的值。"""
+    snap = snapshot_watchlist(lambda a: STATE1, [ADDR1], date(2026, 7, 18),
+                              portfolio_fn=lambda a: _PORTFOLIO)
+    assert set(snap["rows"][0]["perf"]["windows"]) == {
+        "perpDay", "perpWeek", "perpMonth", "perpAllTime"}
+    assert snap["rows"][0]["perf"]["windows"]["perpDay"]["status"] == "insufficient"
+
+
+def test_perf_failure_does_not_lose_scale_data():
+    """績效查詢失敗 → 該列仍保有 clearinghouse 規模欄位，只是多一個 perf_error。
+    兩個計數分開：error_count（整列沒了）vs perf_error_count（部分降級）。"""
+    def boom(addr):
+        raise ConnectionError("portfolio down")
+
+    snap = snapshot_watchlist(lambda a: STATE1, [ADDR1], date(2026, 7, 18),
+                              portfolio_fn=boom)
+    assert snap["error_count"] == 0 and snap["perf_error_count"] == 1
+    assert snap["row_count"] == 1
+    row = snap["rows"][0]
+    assert row["account_value"] and "perf" not in row
+    assert "portfolio down" in row["perf_error"]
+
+
+def test_no_portfolio_fn_keeps_old_shape():
+    """未啟用績效抓取 → perf_source 為 None（≠「抓了但全失敗」），列上無 perf 欄。"""
+    snap = snapshot_watchlist(lambda a: STATE1, [ADDR1], date(2026, 7, 18))
+    assert snap["perf_source"] is None and snap["perf_error_count"] == 0
+    assert "perf" not in snap["rows"][0]
+
+
+def test_state_failure_skips_perf_entirely():
+    """clearinghouse 就失敗的列不該再去打 portfolio（沒有規模資料，績效也無處可掛）。"""
+    calls = []
+
+    def state_fn(addr):
+        raise ConnectionError("state down")
+
+    snap = snapshot_watchlist(state_fn, [ADDR1], date(2026, 7, 18),
+                              portfolio_fn=lambda a: calls.append(a) or _PORTFOLIO)
+    assert snap["error_count"] == 1 and snap["perf_error_count"] == 0
+    assert calls == []

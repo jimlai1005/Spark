@@ -30,9 +30,15 @@ _B = "0x" + "b2" * 20   # 例行下架（accepting_new=false）
 _C = "0x" + "c3" * 20   # 安全撤銷（enabled=false）
 
 # 端點承諾的 leader 物件欄位集（多一個少一個都要有人主動改這行）
+# 2026-07-19：新增 `performance`（perp 基準績效，獨立子物件——刻意不與上面的**規模**
+# 欄位平鋪在同一層，見 app.py 的 _LEADER_PERF_WINDOWS 註解）。
 _EXPECTED_KEYS = {"address", "name", "description",
                   "account_value", "total_ntl_pos", "unrealized_pnl",
-                  "position_count"}
+                  "position_count", "performance"}
+# 回應信封的鍵集（同上，改動要主動改這行）
+_EXPECTED_ENVELOPE = {"leaders", "stats_available", "stats_day", "stats_as_of", "note",
+                      "performance_available", "performance_basis",
+                      "performance_windows", "performance_notes"}
 
 
 def write_leaders(tmp_path, entries) -> str:
@@ -45,9 +51,16 @@ def write_snapshot(tmp_path, rows, day="2026-07-19",
                    generated_at="2026-07-19T00:10:00+00:00") -> str:
     d = tmp_path / "watchlist"
     d.mkdir(parents=True, exist_ok=True)
+    # perf_source 跟著列上有沒有 perf 走，鏡像 snapshot_watchlist 的真實行為：
+    # 有抓績效才寫來源標記，沒抓就是 None（＝「cron 未啟用績效」，與「抓了但失敗」
+    # 是兩件事，見 leaderboard.snapshot_watchlist）。
+    perf_source = ("portfolio(perp windows)"
+                   if any(isinstance(r, dict) and "perf" in r for r in rows) else None)
     (d / f"{day}.json").write_text(json.dumps({
         "day": day, "generated_at": generated_at, "source": "clearinghouseState",
-        "row_count": len(rows), "error_count": 0, "rows": rows}))
+        "perf_source": perf_source,
+        "row_count": len(rows), "error_count": 0, "perf_error_count": 0,
+        "rows": rows}))
     return str(d)
 
 
@@ -211,8 +224,7 @@ def test_projection_whitelist_no_extra_fields(tmp_path):
     # 快照的內部欄位不得夾帶外流（withdrawable/total_margin_used 刻意不列）
     assert "withdrawable" not in body["leaders"][0]
     assert "total_margin_used" not in body["leaders"][0]
-    assert set(body) == {"leaders", "stats_available", "stats_day",
-                         "stats_as_of", "note"}
+    assert set(body) == _EXPECTED_ENVELOPE
 
 
 def test_broken_allowlist_returns_503_not_empty_list(tmp_path):
@@ -283,3 +295,159 @@ def test_config_leaders_path_defaults_to_engine_path():
 
     assert ApiConfig.leaders_path == DEFAULT_LEADERS_PATH
     assert Path(ApiConfig.watchlist_dir).is_absolute()
+
+
+# --- perp 績效欄位（2026-07-19） -------------------------------------------
+# 快照層算好的績效如何投影到目錄頁。公式正確性歸 tests/test_leader_perf.py；
+# 這裡只盯「投影有沒有把結構性保證弄丟」與「缺資料會不會 500」。
+def perf_window(**over) -> dict:
+    """一個 window_return 層級的績效窗（40 天 → 有 twr/MDD，**無**年化）。"""
+    base = {"period": "perpMonth", "basis": "perp", "status": "ok", "reason": None,
+            "disclosure_tier": "window_return", "sample_count": "3",
+            "covered_days": "40.0000", "first_ts_ms": 0, "last_ts_ms": 3456000000,
+            "skipped_intervals": 0, "cum_pnl": "-390", "twr": "-0.19",
+            "max_drawdown": "0.19", "equity_index_len": 3,
+            # 快照裡的內部欄位——不在 _LEADER_PERF_FIELDS 白名單內，不得外流
+            "net_external_flow": "4900", "mdd_note": "…", "upper_bound_note": "…"}
+    base.update(over)
+    return base
+
+
+def stat_row_with_perf(addr, windows=None, **over):
+    row = stat_row(addr)
+    row["perf"] = {"source": "portfolio(perp windows)",
+                   "windows": windows or {"perpMonth": perf_window()}}
+    row.update(over)
+    return row
+
+
+def test_performance_fields_surface_on_directory(tmp_path):
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[stat_row_with_perf(_A)])
+    c = _client(app)
+    login(c)
+    body = c.get("/api/leaders").json()
+    perf = body["leaders"][0]["performance"]
+    assert perf["perpMonth"]["twr"] == "-0.19"
+    assert perf["perpMonth"]["max_drawdown"] == "0.19"
+    assert perf["perpMonth"]["basis"] == "perp"
+    # ⭐ 資料充足度必須到得了前端（誠實呈現的核心）
+    assert perf["perpMonth"]["covered_days"] == "40.0000"
+    assert perf["perpMonth"]["sample_count"] == "3"
+    assert perf["perpMonth"]["disclosure_tier"] == "window_return"
+    # ⭐ 「leader 報酬是上界非期望值」＋ basis ＋ MDD 極限，三段揭露都在信封裡
+    assert body["performance_available"] is True
+    assert body["performance_basis"] == "perp"
+    assert "上界" in body["performance_notes"]["upper_bound"]
+    assert "perp" in body["performance_notes"]["basis"]
+    assert "低估" in body["performance_notes"]["max_drawdown"]
+    assert "covered_days" in body["performance_notes"]["sufficiency"]
+
+
+def test_annualized_absence_survives_the_projection(tmp_path):
+    """⭐⭐ 不足 90 天 → 投影後**仍然沒有** annualized_return 這個鍵。
+
+    投影若寫成 `row.get(k)`，缺席的鍵會被補成 null 送到前端，而前端的 `?? 0`
+    會把它變成一個數字——leader_perf 的結構性保證就在那一行退化成「前端記得檢查」。
+    """
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[stat_row_with_perf(_A)])
+    c = _client(app)
+    login(c)
+    r = c.get("/api/leaders")
+    win = r.json()["leaders"][0]["performance"]["perpMonth"]
+    assert "annualized_return" not in win
+    # leader 資料裡任何一層都不得出現這個鍵（信封的揭露文案會提到這個**字串**，
+    # 那是刻意的說明文字，故只掃 leaders 這一段而非整份回應）。
+    assert "annualized_return" not in json.dumps(r.json()["leaders"])
+
+
+def test_annualized_passes_through_when_eligible(tmp_path):
+    """≥90 天的窗則必須帶年化（閘門是「不足才擋」，不是「一律不給」）。"""
+    win = perf_window(period="perpAllTime", covered_days="365.0000",
+                      disclosure_tier="annualizable", annualized_return="0.21")
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[stat_row_with_perf(
+                              _A, windows={"perpAllTime": win})])
+    c = _client(app)
+    login(c)
+    got = c.get("/api/leaders").json()["leaders"][0]["performance"]["perpAllTime"]
+    assert got["annualized_return"] == "0.21"
+    assert got["disclosure_tier"] == "annualizable"
+
+
+def test_perf_projection_whitelist_no_internal_leakage(tmp_path):
+    """投影白名單：快照的內部欄位（net_external_flow、各種 note）不得夾帶外流。"""
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[stat_row_with_perf(_A)])
+    c = _client(app)
+    login(c)
+    r = c.get("/api/leaders")
+    win = r.json()["leaders"][0]["performance"]["perpMonth"]
+    assert set(win) <= {"period", "basis", "status", "reason", "disclosure_tier",
+                        "sample_count", "covered_days", "first_ts_ms", "last_ts_ms",
+                        "skipped_intervals", "cum_pnl", "twr", "max_drawdown",
+                        "annualized_return"}
+    assert "net_external_flow" not in win and "equity_index_len" not in win
+    # 只投影承諾的兩個窗（perpDay/perpWeek 噪音太大，不上目錄頁）
+    assert set(r.json()["leaders"][0]["performance"]) <= {"perpMonth", "perpAllTime"}
+
+
+def test_insufficient_window_projects_status_without_numbers(tmp_path):
+    """資料不足的窗：投影出 status/reason，但**沒有**任何數值鍵（不補 0／null）。"""
+    win = {"period": "perpMonth", "basis": "perp", "status": "insufficient",
+           "reason": "need_at_least_two_samples", "disclosure_tier": "insufficient",
+           "sample_count": 1, "covered_days": None, "skipped_intervals": 0}
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[stat_row_with_perf(
+                              _A, windows={"perpMonth": win})])
+    c = _client(app)
+    login(c)
+    got = c.get("/api/leaders").json()["leaders"][0]["performance"]["perpMonth"]
+    assert got["status"] == "insufficient" and got["reason"] == "need_at_least_two_samples"
+    for k in ("cum_pnl", "twr", "max_drawdown", "annualized_return"):
+        assert k not in got
+
+
+def test_snapshot_without_perf_degrades_gracefully(tmp_path):
+    """⚠️ 向後相容：舊格式快照（無 perf 欄）→ performance 為 null，
+    既有的規模欄位與 stats_available 語意完全不變，**不 500**。"""
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[stat_row(_A)])
+    c = _client(app)
+    login(c)
+    r = c.get("/api/leaders")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["leaders"][0]["performance"] is None
+    assert body["leaders"][0]["account_value"] == "10000.5"   # 規模欄位不受影響
+    assert body["stats_available"] is True                    # 兩個旗標互相獨立
+    assert body["performance_available"] is False
+
+
+@pytest.mark.parametrize("perf", [
+    "not-a-dict", None, {}, {"windows": "not-a-dict"}, {"windows": {}},
+    {"windows": {"perpMonth": "not-a-dict"}},
+])
+def test_malformed_perf_does_not_500(tmp_path, perf):
+    """schema 漂移／半寫的快照 → performance null，目錄照常可用（沿既有兩種降級）。"""
+    row = stat_row(_A)
+    row["perf"] = perf
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[row])
+    c = _client(app)
+    login(c)
+    r = c.get("/api/leaders")
+    assert r.status_code == 200, r.text
+    assert r.json()["leaders"][0]["performance"] is None
+
+
+def test_missing_snapshot_leaves_performance_null(tmp_path):
+    """快照整份缺失 → 規模與績效同時為 null，兩個 available 旗標都是 false。"""
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          with_snapshot=False)
+    c = _client(app)
+    login(c)
+    body = c.get("/api/leaders").json()
+    assert body["leaders"][0]["performance"] is None
+    assert body["stats_available"] is False and body["performance_available"] is False
