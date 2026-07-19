@@ -56,6 +56,11 @@ class ApiConfig:
     # builder accrued 歷史序列（北極星實收，由 scripts/copytrade_daily_report.py 每日附加）。
     # API 進程不自己查 accrued——查一次的職責在日報腳本，這裡只讀它落下的檔（紅線：不加總）。
     accrued_history_path: str = "var/copytrade/accrued_history.jsonl"
+    # per-follower 引擎狀態根的基底（唯讀；API 只讀 skipped 小額落檔）。
+    # ⭐ 沿引擎既有的 FILET_STATE_BASE 與同一個預設值（panic_all.py、
+    # filet_daily_report.py 皆用此變數）——同一件事兩個名字是誤設的溫床，
+    # 而誤設的症狀是營運面板永遠顯示「沒有 skipped」（一個安靜的零）。
+    state_base: str = "/opt/filet/state"
     # --- leader 目錄（/api/leaders，session-gated）唯讀資料來源 ---
     # ⭐ 直接引用引擎的 DEFAULT_LEADERS_PATH，不另寫一個字面量預設（同源，工程原則 1）：
     # 目錄頁列出的「可選 leader」與引擎放行的清單必須是**同一個檔**。兩邊各自宣告
@@ -194,6 +199,7 @@ class ApiConfig:
                    followers_path=followers_path,
                    accrued_history_path=(env.get("FILET_ACCRUED_HISTORY_PATH")
                                          or cls.accrued_history_path),
+                   state_base=env.get("FILET_STATE_BASE") or cls.state_base,
                    leaders_path=leaders_path,
                    watchlist_dir=watchlist_dir,
                    admin_addresses=admins,

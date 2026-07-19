@@ -13,13 +13,17 @@
 兩者的差額正是本函式要算的對帳訊號，互相取代等於把訊號歸零。
 """
 import json
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
 
+from spark.copytrade.report import compute_trade_quality
 from spark.filet.aggregate import collect_follower_summary
 from spark.publicapi.billing import map_stripe_status
+
+logger = logging.getLogger(__name__)
 
 
 def customer_pnl(followers, adapter, start: datetime, end: datetime,
@@ -122,6 +126,178 @@ def revenue_reconciliation(rows, accrued_now: Decimal, accrued_prev: Decimal,
         "over_threshold": over_threshold,
         "threshold_pct": threshold,
         "rows": len(rows),
+    }
+
+
+# ---------- 成交品質（跨 follower 聚合） ----------
+
+# per-follower 的 skipped 小額落檔版面（引擎狀態根之下，一天一個檔）。
+# ⭐ 由 scripts/copytrade_daily_report.load_skipped 的同一個版面推導，不另拼一次：
+# 兩份路徑定義漂移的症狀是「營運面板永遠顯示沒有 skipped」——一個安靜的零。
+SKIPPED_RELDIR = Path("var/copytrade/skipped")
+
+
+def skipped_path_for(state_base, account_id: str, day_iso: str) -> Path:
+    """某個 follower 某一天的 skipped 小額檔（**寫端與讀端的單一定義**）。"""
+    return Path(state_base) / account_id / SKIPPED_RELDIR / f"{day_iso}.json"
+
+
+def load_skipped_notional(path) -> Decimal | None:
+    """讀一天的 skipped 小額名目總和；**無檔或壞檔 → None（不是 0）**。
+
+    ⭐ `None` 與 `0` 在這裡是兩件完全不同的事：0 是「今天沒有跳過任何小額單」，
+    None 是「不知道」。把讀不到當 0 會讓面板顯示一個看起來健康的零——
+    而 skipped 比例正是用來發現「引擎其實一直在跳過客戶的單」的指標，
+    它安靜地歸零等於把這個訊號關掉（健康面板謊報健康）。
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        return sum((Decimal(str(item["notional"])) for item in data), Decimal("0"))
+    except (OSError, ValueError, KeyError, TypeError, InvalidOperation) as e:
+        logger.warning("skipped 小額檔讀取失敗（%s）: %r", p, e)
+        return None
+
+
+def utc_days_in_window(start: datetime, end: datetime) -> list[str]:
+    """窗口涵蓋的 UTC 日期清單（含端點所在日）。"""
+    d, last = start.date(), end.date()
+    out = []
+    while d <= last:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def _window_is_whole_utc_days(start: datetime, end: datetime) -> bool:
+    """窗口是否恰好由整個 UTC 日組成（兩端都在午夜）。
+
+    ⭐ 這個判定決定 `skipped_small_ratio` 算不算得出來（工程原則 1）：
+    skipped 檔**沒有逐筆時間戳**，只能以整天為單位讀取。窗口若不是整日
+    （accrued 窗的兩端是快照時刻，例如 00:10），分子涵蓋整個日曆日、分母只涵蓋
+    窗口內的成交——那是一個混源比較，而它的商看起來完全像一個正常的比例。
+    """
+    midnight = timezone.utc
+    return (start.astimezone(midnight).timetz().replace(tzinfo=None) ==
+            datetime.min.time() and
+            end.astimezone(midnight).timetz().replace(tzinfo=None) ==
+            datetime.min.time() and end > start)
+
+
+def follower_trade_quality(ref, adapter, start: datetime, end: datetime, *,
+                           leader_fills, skipped_notional,
+                           skipped_ratio_comparable: bool) -> dict:
+    """單一 follower 的成交品質列。
+
+    `leader_fills`：該 follower 所跟 leader 在**同一窗口**的成交；`None` ＝ 不知道
+    這個 follower 跟誰（manifest 未記 leader_address），此時 TE 與滑價無從計算
+    ——回 `te_available=False` 而不是回 0（0 會被讀成「零延遲」）。
+    `skipped_notional`：該窗口的 skipped 名目；`None` ＝ 讀不到（同上，不填 0）。
+
+    ⭐ `skipped_ratio_comparable`：skipped 檔以**整個日曆日**為單位（檔內無逐筆
+    時間戳），成交名目卻依窗口過濾。兩者只有在窗口恰好是整個 UTC 日時才同基準
+    （`_window_is_whole_utc_days`）。不同基準時比例一律回 `None` ＋ note，
+    **不硬算**——那個商看起來完全像一個正常的比例，沒有人會發現它是錯的。
+    """
+    errors: list[str] = []
+    try:
+        my_fills = adapter.get_user_fills(ref.user_address, start, end)
+    except Exception as e:  # noqa: BLE001 — 跨 follower 隔離（工程原則 4）
+        # 取不到自己的成交 ⇒ 這一列的每一個量都無從計算。回「未知」而不是零列。
+        return {"account_id": ref.account_id, "label": ref.label,
+                "network": ref.network, "te_available": False,
+                "quality_available": False,
+                "skipped_available": False,
+                "error": f"fills 查詢失敗: {e}"}
+
+    te_available = leader_fills is not None
+    q = compute_trade_quality(leader_fills or [], my_fills,
+                              [("", skipped_notional)]
+                              if skipped_notional is not None else [])
+    row = {
+        "account_id": ref.account_id,
+        "label": ref.label,
+        "network": ref.network,
+        "quality_available": True,
+        "fills": len(my_fills),
+        # taker 佔比只由我方成交算出，與 leader 無關 ⇒ 即使 te_available=False 也有效
+        "taker_share": q.taker_share,
+        # ⭐ TE 與滑價需要 leader 的成交才配得起來；不知道 leader 是誰時一律 null
+        "te_available": te_available,
+        "pair_count": q.pair_count if te_available else None,
+        "median_delay_s": q.median_delay_s if te_available else None,
+        "taker_slippage_bp_median": q.taker_slippage_bp_median if te_available else None,
+        "skipped_available": skipped_notional is not None,
+        "skipped_small_notional": (q.skipped_small_notional
+                                   if skipped_notional is not None else None),
+        "skipped_small_ratio": (q.skipped_small_ratio
+                                if skipped_notional is not None
+                                and skipped_ratio_comparable else None),
+        "error": "; ".join(errors) if errors else None,
+    }
+    if not te_available:
+        row["te_note"] = ("manifest 未記錄該 follower 的 leader_address，"
+                          "無法配對成交 → 配對延遲與滑價無從計算")
+    if skipped_notional is not None and not skipped_ratio_comparable:
+        row["skipped_note"] = (
+            "skipped 小額以日曆日落檔（檔內無逐筆時間戳），本窗口非整個 UTC 日 → "
+            "比例的分子與分母不同基準，故不計算；名目為窗口涵蓋日的合計")
+    return row
+
+
+def trade_quality_rows(followers, adapter, start: datetime, end: datetime, *,
+                       leader_fills_for, skipped_for) -> list[dict]:
+    """⭐ **跨客戶**成交品質列（登記在 tests/test_api_ops.py 的 CROSS_CUSTOMER_SOURCES）。
+
+    授權不在這一層（同本模組其餘函式）：呼叫端必須掛 `_require_admin`。
+
+    ⭐ leader 成交**每個相異 leader 只查一次**（`leader_fills_for` 由呼叫端做快取）：
+    多個 follower 跟同一個 leader 是常態，逐 follower 各查一次會把一次面板載入
+    變成 N 次外呼。
+
+    ⭐ 跨 follower 隔離（工程原則 4）：任一 follower 的查詢失敗只影響該列，
+    其 `error` 原樣上呈（不 log 完就吞），其餘客戶照常有資料。
+    """
+    comparable = _window_is_whole_utc_days(start, end)
+    rows = []
+    for ref in followers:
+        try:
+            leader_fills = leader_fills_for(ref)
+        except Exception as e:  # noqa: BLE001 — leader 查詢失敗只讓該列的 TE 未知
+            leader_fills = None
+            logger.warning("leader 成交查詢失敗 account=%s: %r", ref.account_id, e)
+        row = follower_trade_quality(ref, adapter, start, end,
+                                     leader_fills=leader_fills,
+                                     skipped_notional=skipped_for(ref),
+                                     skipped_ratio_comparable=comparable)
+        rows.append(row)
+    return rows
+
+
+def trade_quality_summary(rows) -> dict:
+    """跨 follower 的彙總（**只彙總算得出來的那些列**，並回報樣本數）。
+
+    ⭐ 分母是「有資料的列數」而不是「follower 總數」，且 `*_sample` 一併上呈：
+    只回一個平均值會讓「10 個客戶裡只有 1 個有資料」與「10 個都有資料」看起來
+    一模一樣。中位數的中位數不是中位數——本函式刻意只回**最差值**與樣本數，
+    不回「中位數的平均」那種沒有統計意義卻很像數字的東西。
+    """
+    delays = [r["median_delay_s"] for r in rows
+              if r.get("median_delay_s") is not None]
+    slips = [r["taker_slippage_bp_median"] for r in rows
+             if r.get("taker_slippage_bp_median") is not None]
+    return {
+        "followers": len(rows),
+        "quality_available_count": sum(1 for r in rows if r.get("quality_available")),
+        "te_available_count": sum(1 for r in rows if r.get("te_available")),
+        "skipped_available_count": sum(1 for r in rows if r.get("skipped_available")),
+        # 最差值（不是平均）：品質面板要回答的是「最慢的那個客戶多慢」
+        "worst_median_delay_s": max(delays) if delays else None,
+        "delay_sample": len(delays),
+        "worst_taker_slippage_bp_median": max(slips) if slips else None,
+        "slippage_sample": len(slips),
     }
 
 

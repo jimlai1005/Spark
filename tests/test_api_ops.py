@@ -8,8 +8,9 @@ test_all_admin_scoped_routes_are_gated 走 FastAPI 的 dependant 樹逐路由檢
 """
 import json
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from eth_account import Account
@@ -104,7 +105,7 @@ def _dep_call_names(dependant) -> set[str]:
 # （例如 /api/reports/all）。任何新的跨客戶讀取入口都必須登記在此，
 # test_cross_customer_source_registry_is_complete 會強迫做這個決定。
 CROSS_CUSTOMER_SOURCES = {"list_billing", "customer_pnl", "_load_followers",
-                          "list_subscriptions"}
+                          "list_subscriptions", "trade_quality_rows"}
 
 
 def test_cross_customer_source_registry_is_complete(tmp_path):
@@ -125,7 +126,8 @@ def test_cross_customer_source_registry_is_complete(tmp_path):
 
     # 跨客戶＝回傳「多個客戶」的資料。逐模組列出候選，與註冊表比對。
     candidates = set()
-    for mod, names in ((ops_mod, ("customer_pnl", "subscription_drift")),
+    for mod, names in ((ops_mod, ("customer_pnl", "subscription_drift",
+                                  "trade_quality_rows")),
                        (store_mod, ("list_billing",)),
                        (app_mod, ("_load_followers",))):
         for n in names:
@@ -178,7 +180,7 @@ def test_cross_customer_sources_are_admin_gated(tmp_path):
         checked.append(path)
     # 檢查真的有跑到東西（空迴圈全綠是最糟的假保證）
     assert set(checked) == {"/api/ops/customers", "/api/ops/revenue",
-                            "/api/ops/subscriptions"}
+                            "/api/ops/subscriptions", "/api/ops/trade-quality"}
 
 
 def test_all_admin_scoped_routes_are_gated(tmp_path):
@@ -198,7 +200,7 @@ def test_all_admin_scoped_routes_are_gated(tmp_path):
             f"{path} 未掛 admin 閘"
         seen.add(path)
     assert seen == {"/api/ops/customers", "/api/ops/revenue", "/api/ops/subscriptions",
-                    "/api/admin/pending"}
+                    "/api/ops/trade-quality", "/api/admin/pending"}
 
 
 @pytest.mark.parametrize("path", ["/api/ops/customers", "/api/ops/revenue",
@@ -728,3 +730,253 @@ def test_ops_customers_tolerates_bad_manifest_entry(tmp_path):
     body = client.get("/api/ops/customers").json()
     assert [r["account_id"] for r in body["customers"]] == [ACCT_A]
     assert len(body["manifest_errors"]) == 1
+
+
+# ---------- ⭐ 成交品質（跨 follower 聚合，admin only） ----------
+
+LEADER = "0x" + "cc" * 20
+
+
+def _q_app(tmp_path, refs=None, history=None, state_base=None):
+    """成交品質端點的現場：admin session ＋ 可指定 state_base（skipped 落檔根）。"""
+    wallet = Account.create()
+    hist = tmp_path / "accrued_history.jsonl"
+    if history is not None:
+        hist.write_text("".join(_hist_line(e) for e in history))
+    refs = refs if refs is not None else [_ref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   accrued_history_path=str(hist),
+                   state_base=str(state_base or (tmp_path / "state")))
+    app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    client = _client(app)
+    login(client, wallet=wallet)
+    return client, cfg, hl
+
+
+def _manifest_with_leader(tmp_path, refs):
+    """manifest 帶 leader_address（TE 配對需要知道每個 follower 跟誰）。"""
+    p = tmp_path / "followers.json"
+    p.write_text(json.dumps({"followers": [
+        {"account_id": r.account_id, "user_address": r.user_address,
+         "builder_address": r.builder_address, "network": r.network,
+         "label": r.label,
+         **({"leader_address": r.leader_address} if r.leader_address else {})}
+        for r in refs]}))
+    return p
+
+
+def _lref(acct=ACCT_A, addr=ADDR_A, label="A", leader=LEADER):
+    return FollowerRef(acct, addr, BUILDER, "testnet", label, leader)
+
+
+def _write_skipped(state_base, account_id, day_iso, items):
+    p = (Path(state_base) / account_id / "var/copytrade/skipped"
+         / f"{day_iso}.json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(items))
+
+
+def test_trade_quality_requires_session(tmp_path):
+    cfg = _ops_cfg(tmp_path)
+    app, *_ = make_app(tmp_path, cfg=cfg)
+    assert _client(app).get("/api/ops/trade-quality").status_code == 401
+
+
+def test_trade_quality_403_for_non_admin(tmp_path):
+    """成交品質是跨客戶資料，一般登入者一律 403。"""
+    cfg = _ops_cfg(tmp_path)
+    app, *_ = make_app(tmp_path, cfg=cfg)
+    client = _client(app)
+    login(client)
+    assert client.get("/api/ops/trade-quality").status_code == 403
+
+
+def test_trade_quality_computes_te_and_slippage(tmp_path):
+    """⭐ 配對延遲與滑價由 leader/我方成交配對算出（與日報同一個算式）。
+
+    leader 於 12:00:00 以 100 買進，我方於 12:00:02 以 101 成交（taker）：
+    延遲 2 秒、滑價 (101-100)/100×10000 = 100 bp（買貴＝正＝不利）。"""
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref()])
+    t0 = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    hl.fills[LEADER] = [_fill(px="100", t=t0)]
+    hl.fills[ADDR_A] = [_fill(px="101", t=t0 + timedelta(seconds=2))]
+
+    body = client.get("/api/ops/trade-quality").json()
+    row = body["followers"][0]
+    assert row["te_available"] is True
+    assert row["pair_count"] == 1
+    assert row["median_delay_s"] == "2"
+    assert Decimal(row["taker_slippage_bp_median"]) == Decimal("100")
+    assert row["taker_share"] == "1"
+
+
+def test_trade_quality_matches_the_daily_report_formula(tmp_path):
+    """⭐⭐ 同源斷言：端點回的數字必須等於日報 `compute_trade_quality` 的輸出。
+
+    兩份算式漂移時，兩張表並排顯示卻已不同基準，而畫面上看不出來（工程原則 1）。
+    本測試把「同源」變成可執行的檢查，不是靠註解宣稱。"""
+    from spark.copytrade.report import compute_trade_quality
+
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref()])
+    t0 = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    leader_fills = [_fill(px="100", t=t0), _fill(px="200", t=t0 + timedelta(minutes=1))]
+    my_fills = [_fill(px="101", t=t0 + timedelta(seconds=3)),
+                _fill(px="204", t=t0 + timedelta(minutes=1, seconds=5))]
+    hl.fills[LEADER] = leader_fills
+    hl.fills[ADDR_A] = my_fills
+
+    row = client.get("/api/ops/trade-quality").json()["followers"][0]
+    expected = compute_trade_quality(leader_fills, my_fills, [])
+    assert row["pair_count"] == expected.pair_count
+    assert row["median_delay_s"] == str(expected.median_delay_s)
+    assert row["taker_slippage_bp_median"] == str(expected.taker_slippage_bp_median)
+    assert row["taker_share"] == str(expected.taker_share)
+
+
+def test_unknown_leader_yields_null_te_not_zero(tmp_path):
+    """⭐⭐ manifest 未記 leader_address → TE／滑價回 null ＋ te_available=false。
+
+    **絕不回 0**：「配對延遲 0 秒」讀起來是完美的跟單品質，實際上是「我們根本
+    不知道要跟誰比」。健康面板謊報健康比沒有面板更危險。"""
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref(leader=None)])
+    hl.fills[ADDR_A] = [_fill()]
+
+    row = client.get("/api/ops/trade-quality").json()["followers"][0]
+    assert row["te_available"] is False
+    assert row["median_delay_s"] is None
+    assert row["taker_slippage_bp_median"] is None
+    assert row["pair_count"] is None
+    assert "leader_address" in row["te_note"]
+    # taker 佔比只由我方成交算出，與 leader 無關 → 仍然有效
+    assert row["taker_share"] == "1"
+
+
+def test_missing_skipped_file_is_unknown_not_zero(tmp_path):
+    """⭐ skipped 檔不存在 → null ＋ skipped_available=false，不填 0。
+    0 讀起來是「沒有跳過任何客戶的單」，正好是這個指標要抓的問題的反面。"""
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref()])
+    hl.fills[ADDR_A] = [_fill()]
+
+    row = client.get("/api/ops/trade-quality").json()["followers"][0]
+    assert row["skipped_available"] is False
+    assert row["skipped_small_notional"] is None
+    assert row["skipped_small_ratio"] is None
+
+
+def test_partial_skipped_days_are_reported_as_unknown(tmp_path):
+    """⭐ 多日窗口只有部分天有檔 → 一律 None。部分合計會偏低，而偏低的 skipped
+    讀起來就是「引擎沒在跳過單」——寧可說不知道，不給一個看不出偏低的數。"""
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref()])
+    today = datetime.now(timezone.utc).date().isoformat()
+    _write_skipped(cfg.state_base, ACCT_A, today, [{"coin": "ETH", "notional": "50"}])
+
+    body = client.get("/api/ops/trade-quality", params={"days": 3}).json()
+    assert len(body["skipped_days"]) == 4        # 3 天窗跨到第 4 個日曆日
+    assert body["followers"][0]["skipped_available"] is False
+
+
+def test_skipped_ratio_omitted_when_window_is_not_whole_days(tmp_path):
+    """⭐⭐ 同基準：skipped 以日曆日落檔、成交依窗口過濾。窗口非整日時
+    **只回名目、不回比例**——那個商看起來完全像一個正常的比例。"""
+    cap_prev = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, cfg, hl = _q_app(
+        tmp_path, refs=[_lref()],
+        history=[("2026-07-18", "10", cap_prev), ("2026-07-19", "16", cap_now)])
+    for day in ("2026-07-18", "2026-07-19"):
+        _write_skipped(cfg.state_base, ACCT_A, day, [{"coin": "ETH", "notional": "50"}])
+    hl.window_aware = True
+    hl.fills[ADDR_A] = [_fill(t=datetime(2026, 7, 18, 9, 0, tzinfo=timezone.utc))]
+
+    row = client.get("/api/ops/trade-quality",
+                     params={"window": "accrued"}).json()["followers"][0]
+    assert row["skipped_available"] is True
+    assert row["skipped_small_notional"] == "100"     # 兩天合計，名目仍然有意義
+    assert row["skipped_small_ratio"] is None         # 比例不同基準 → 不算
+    assert "不同基準" in row["skipped_note"]
+
+
+def test_trade_quality_accrued_window_identical_to_revenue(tmp_path):
+    """⭐ 品質面板與收入對帳並排讀 → 窗口必須出自同一個 ops.accrued_window。"""
+    cap_prev = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, cfg, hl = _q_app(
+        tmp_path, refs=[_lref()],
+        history=[("2026-07-18", "10", cap_prev), ("2026-07-19", "16", cap_now)])
+
+    rev = client.get("/api/ops/revenue").json()
+    q = client.get("/api/ops/trade-quality", params={"window": "accrued"}).json()
+    assert q["window_start"] == rev["window_start"] == cap_prev.isoformat()
+    assert q["window_end"] == rev["window_end"] == cap_now.isoformat()
+
+
+def test_trade_quality_basis_unknown_returns_no_numbers(tmp_path):
+    """舊資料缺 captured_at → basis_unknown ＋ 不回任何數值欄（沿既有慣例）。"""
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref()],
+                             history=[("2026-07-18", "10"), ("2026-07-19", "16")])
+    body = client.get("/api/ops/trade-quality", params={"window": "accrued"}).json()
+    assert body["basis_unknown"] is True
+    assert "followers" not in body
+    assert body["window_start"] is None and body["window_end"] is None
+
+
+def test_trade_quality_window_args_are_mutually_exclusive(tmp_path):
+    client, *_ = _q_app(tmp_path, refs=[_lref()])
+    assert client.get("/api/ops/trade-quality",
+                      params={"days": 7, "window": "accrued"}).status_code == 400
+    assert client.get("/api/ops/trade-quality",
+                      params={"window": "calendar"}).status_code == 400
+    assert client.get("/api/ops/trade-quality", params={"days": 0}).status_code == 400
+    assert client.get("/api/ops/trade-quality", params={"days": 91}).status_code == 400
+
+
+def test_one_follower_failure_does_not_break_others(tmp_path):
+    """跨 follower 隔離：一個客戶的 fills 炸掉，其餘照常有品質資料。"""
+    client, cfg, hl = _q_app(
+        tmp_path, refs=[_lref(), _lref(ACCT_B, ADDR_B, "B")])
+    hl.fills_error[ADDR_A] = RuntimeError("boom-a")
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=5)
+    hl.fills[LEADER] = [_fill(px="100", t=t0)]
+    hl.fills[ADDR_B] = [_fill(px="100", t=t0 + timedelta(seconds=1))]
+
+    rows = {r["account_id"]: r for r in
+            client.get("/api/ops/trade-quality").json()["followers"]}
+    assert "boom-a" in rows[ACCT_A]["error"]
+    assert rows[ACCT_A]["quality_available"] is False
+    assert rows[ACCT_B]["quality_available"] is True
+    assert rows[ACCT_B]["median_delay_s"] == "1"
+
+
+def test_leader_fills_are_fetched_once_per_distinct_leader(tmp_path):
+    """⭐ 多個 follower 跟同一個 leader 時只查一次——否則一次面板載入變成 N 次外呼。"""
+    client, cfg, hl = _q_app(
+        tmp_path, refs=[_lref(), _lref(ACCT_B, ADDR_B, "B")])
+    calls = []
+    orig = hl.get_user_fills
+
+    def _counting(address, start, end):
+        calls.append(address.lower())
+        return orig(address, start, end)
+
+    hl.get_user_fills = _counting
+    client.get("/api/ops/trade-quality")
+    assert calls.count(LEADER.lower()) == 1
+
+
+def test_summary_reports_sample_size_not_just_a_number(tmp_path):
+    """⭐ 彙總必須附樣本數：只回一個最差值會讓「10 個客戶只有 1 個有資料」與
+    「10 個都有資料」看起來一模一樣。"""
+    client, cfg, hl = _q_app(
+        tmp_path, refs=[_lref(), _lref(ACCT_B, ADDR_B, "B", leader=None)])
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=5)
+    hl.fills[LEADER] = [_fill(px="100", t=t0)]
+    hl.fills[ADDR_A] = [_fill(px="100", t=t0 + timedelta(seconds=4))]
+    hl.fills[ADDR_B] = [_fill(px="100", t=t0)]
+
+    s = client.get("/api/ops/trade-quality").json()["summary"]
+    assert s["followers"] == 2
+    assert s["te_available_count"] == 1          # B 不知道跟誰
+    assert s["delay_sample"] == 1
+    assert s["worst_median_delay_s"] == "4"
+    assert s["skipped_available_count"] == 0

@@ -5,6 +5,7 @@ session 衍生，端點無 account 參數（紅線 3：別人不能替你 onboar
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -34,7 +35,10 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.ops import (accrued_window, accrued_window_note, customer_pnl,
                                  jsonable, load_accrued_series,
-                                 revenue_reconciliation, subscription_drift)
+                                 load_skipped_notional, revenue_reconciliation,
+                                 skipped_path_for, subscription_drift,
+                                 trade_quality_rows, trade_quality_summary,
+                                 utc_days_in_window)
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
@@ -989,6 +993,101 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                          "window": "days",
                          "customers": rows,
                          "manifest_errors": manifest_errors})
+
+    @app.get("/api/ops/trade-quality")
+    def ops_trade_quality(days: int | None = None, window: str | None = None,
+                          admin: str = Depends(_require_admin)):
+        """跨 follower 的成交品質（admin only）：TE（配對延遲）／滑價／taker 佔比／
+        skipped 小額。
+
+        ⭐ 這幾個量與 `scripts/copytrade_daily_report.py` 的日報**同源**：兩邊都呼叫
+        `copytrade.report.compute_trade_quality`，不各自複製公式。日報是單一帳戶的
+        每日檢視，本端點是同一組指標的跨客戶橫切——兩份算式會漂移，而兩張表並排
+        顯示時看不出它們已經不同基準（工程原則 1）。
+
+        時間窗與 /api/ops/customers **完全同一套規則**（互斥、同一個
+        `ops.accrued_window()` 推導）：品質面板要能與損益、收入對帳並排讀，
+        三者的窗口就必須出自同一個來源，不得各自推導。
+
+        誠實呈現（本端點最重要的性質）：
+        - 不知道 follower 跟哪個 leader（manifest 無 `leader_address`）→ TE 與滑價
+          回 `null` ＋ `te_available=false`，**不回 0**（0 會被讀成「零延遲」）。
+        - skipped 檔讀不到 → `skipped_available=false` ＋ `null`，同樣不回 0。
+        - skipped 以日曆日落檔而窗口非整日 → 只回名目、**不回比例**（分子分母不同
+          基準）。附 `skipped_note` 說明為什麼那一格是空的。
+        """
+        if window is not None and window != "accrued":
+            raise HTTPException(status_code=400,
+                                detail="window 僅支援 'accrued'（省略則用 days 窗）")
+        if window is not None and days is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="days 與 window=accrued 互斥：accrued 窗由快照時刻決定，"
+                       "不接受天數；請擇一")
+        refs, manifest_errors = _load_followers()
+
+        if window == "accrued":
+            series = load_accrued_series(cfg.accrued_history_path)
+            win = accrued_window(series)
+            if win is None:
+                return jsonable({
+                    "window": "accrued", "basis_unknown": True,
+                    "window_start": None, "window_end": None,
+                    "note": f"{accrued_window_note(series)}；"
+                            f"本次成交品質無法與收入對帳同基準，故不計算。",
+                    "manifest_errors": manifest_errors,
+                })
+            start, end = win
+        else:
+            days = 1 if days is None else days
+            if not 1 <= days <= 90:
+                raise HTTPException(status_code=400, detail="days 須介於 1 到 90")
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=days)
+
+        # ⭐ leader 成交每個相異 leader **查一次**（多個 follower 跟同一個 leader
+        # 是常態）。快取的 key 是正規化小寫位址，否則同一位址的兩種大小寫會各查一次。
+        leader_cache: dict[str, list] = {}
+
+        def _leader_fills_for(ref):
+            addr = (ref.leader_address or "").lower()
+            if not addr:
+                return None       # manifest 未記錄 → TE 不可算（見端點 docstring）
+            if addr not in leader_cache:
+                leader_cache[addr] = hl.get_user_fills(addr, start, end)
+            return leader_cache[addr]
+
+        days_in_window = utc_days_in_window(start, end)
+
+        def _skipped_for(ref):
+            """該 follower 在窗口涵蓋日的 skipped 名目；**任一天讀不到就回 None**。
+
+            ⭐ 「部分天數有檔」不得當成完整合計：少一天的檔會讓名目偏低，而偏低的
+            skipped 讀起來就是「引擎沒在跳過客戶的單」——正好是這個指標要抓的問題。
+            寧可回「不知道」，不回一個偏低卻看不出偏低的數。
+            """
+            total = Decimal("0")
+            for day_iso in days_in_window:
+                v = load_skipped_notional(
+                    skipped_path_for(cfg.state_base, ref.account_id, day_iso))
+                if v is None:
+                    return None
+                total += v
+            return total
+
+        rows = trade_quality_rows(refs, hl, start, end,
+                                  leader_fills_for=_leader_fills_for,
+                                  skipped_for=_skipped_for)
+        return jsonable({
+            "window": window or "days",
+            "basis_unknown": False,
+            **({"days": days} if window != "accrued" else {}),
+            "window_start": start.isoformat(), "window_end": end.isoformat(),
+            "skipped_days": days_in_window,
+            "followers": rows,
+            "summary": trade_quality_summary(rows),
+            "manifest_errors": manifest_errors,
+        })
 
     @app.get("/api/ops/revenue")
     def ops_revenue(threshold_pct: float = 0.01, admin: str = Depends(_require_admin)):

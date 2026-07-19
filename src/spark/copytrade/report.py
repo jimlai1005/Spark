@@ -84,6 +84,65 @@ def pair_fills(leader_fills: list[UserFill], my_fills: list[UserFill], *,
 
 
 @dataclass(frozen=True)
+class TradeQuality:
+    """成交品質的六個量，**與日報完全同源**（`DailyReport` 由本型別組出來）。
+
+    ⭐ 抽出成獨立型別的理由（工程原則 1）：營運後台的跨 follower 品質面板要顯示
+    的就是這幾個數，而它與日報並排被人閱讀、被人相減。兩邊各算一次「看起來一樣」
+    的公式，遲早會有一邊改了另一邊沒改，而畫面上看不出兩個數字已經不同基準。
+    唯一的防法是只有一份算式：日報與 /api/ops/trade-quality 都呼叫
+    `compute_trade_quality`，不各自複製。
+
+    `None` 一律代表「算不出來」（無配對／無 taker 成交），**不是 0**——
+    0 是有意義且錯誤的訊息（「延遲為零」讀起來像完美，實際上是沒有樣本）。
+    """
+    pair_count: int
+    median_delay_s: Decimal | None            # 無配對 → None
+    taker_share: Decimal                      # crossed 成交量 / 我方總成交量；總量 0 → 0
+    taker_slippage_bp_median: Decimal | None  # 只取配對中 mine.crossed=True 的滑價中位數
+    skipped_small_notional: Decimal
+    skipped_small_ratio: Decimal              # skipped / (我方總成交名目 + skipped)；分母 0 → 0
+
+
+def compute_trade_quality(leader_fills: list[UserFill], my_fills: list[UserFill],
+                          skipped: list[tuple[str, Decimal]]) -> TradeQuality:
+    """成交品質六量的**唯一算式**（日報與營運後台共用，見 TradeQuality docstring）。
+
+    Args:
+        skipped: 被跳過的小額訂單 [(coin, notional), ...]（由呼叫端注入）。
+
+    ⚠️ 呼叫端的同基準責任：`leader_fills`／`my_fills`／`skipped` 必須覆蓋**同一段
+    期間**。本函式無從得知三者的時間窗，錯配的症狀是安靜的——例如拿日曆日的
+    skipped 去除以一個非整日窗口的成交名目，得到的比例只是兩個不同期間的商。
+    """
+    paired, _ = pair_fills(leader_fills, my_fills)
+
+    median_delay = _median([p.delay_s for p in paired])
+
+    my_total = sum((f.sz * f.px for f in my_fills), Decimal("0"))
+    if my_total > 0:
+        taker_notional = sum((f.sz * f.px for f in my_fills if f.crossed), Decimal("0"))
+        taker_share = taker_notional / my_total
+    else:
+        taker_share = Decimal("0")
+
+    taker_slippage_median = _median([p.slippage_bp for p in paired if p.mine.crossed])
+
+    skipped_notional = sum((n for _, n in skipped), Decimal("0"))
+    denom = my_total + skipped_notional
+    skipped_ratio = skipped_notional / denom if denom > 0 else Decimal("0")
+
+    return TradeQuality(
+        pair_count=len(paired),
+        median_delay_s=median_delay,
+        taker_share=taker_share,
+        taker_slippage_bp_median=taker_slippage_median,
+        skipped_small_notional=skipped_notional,
+        skipped_small_ratio=skipped_ratio,
+    )
+
+
+@dataclass(frozen=True)
 class DailyReport:
     """日報：TE（配對延遲/滑價）、taker 佔比、skipped 小額、accrued 增量、CSV 對帳三態。"""
     day: date
@@ -105,34 +164,22 @@ def build_daily_report(day: date, leader_fills: list[UserFill], my_fills: list[U
     Args:
         skipped: 被跳過的小額訂單 [(coin, notional), ...]（由呼叫端注入，不依賴 orders 模組）。
         csv_report: ReconcileReport（duck-typed：需有 fill_count 與 matched）。
+
+    成交品質六量一律取自 `compute_trade_quality`（**不在此重算**）：營運後台的
+    跨 follower 面板顯示同一組數字，兩份算式會漂移而畫面上看不出來。
     """
-    paired, _ = pair_fills(leader_fills, my_fills)
-
-    median_delay = _median([p.delay_s for p in paired])
-
-    my_total = sum((f.sz * f.px for f in my_fills), Decimal("0"))
-    if my_total > 0:
-        taker_notional = sum((f.sz * f.px for f in my_fills if f.crossed), Decimal("0"))
-        taker_share = taker_notional / my_total
-    else:
-        taker_share = Decimal("0")
-
-    taker_slippage_median = _median([p.slippage_bp for p in paired if p.mine.crossed])
-
-    skipped_notional = sum((n for _, n in skipped), Decimal("0"))
-    denom = my_total + skipped_notional
-    skipped_ratio = skipped_notional / denom if denom > 0 else Decimal("0")
+    q = compute_trade_quality(leader_fills, my_fills, skipped)
 
     csv_matched = csv_report.matched if csv_report.fill_count > 0 else None
 
     return DailyReport(
         day=day,
-        pair_count=len(paired),
-        median_delay_s=median_delay,
-        taker_share=taker_share,
-        taker_slippage_bp_median=taker_slippage_median,
-        skipped_small_notional=skipped_notional,
-        skipped_small_ratio=skipped_ratio,
+        pair_count=q.pair_count,
+        median_delay_s=q.median_delay_s,
+        taker_share=q.taker_share,
+        taker_slippage_bp_median=q.taker_slippage_bp_median,
+        skipped_small_notional=q.skipped_small_notional,
+        skipped_small_ratio=q.skipped_small_ratio,
         accrued_delta=accrued_today - accrued_prev,
         csv_matched=csv_matched,
     )
