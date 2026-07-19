@@ -109,6 +109,47 @@ def test_gateway_only_posts_to_info():
     assert all(u == "https://x/info" for u, _ in post.calls)
 
 
+def test_get_user_fills_parses_and_only_posts_info():
+    """ops 每客戶損益的資料源：解析 userFillsByTime，欄位語意與
+    HyperliquidAdapter.get_user_fills 同基準；builderFee 缺欄／null 皆視為 0。"""
+    from datetime import datetime, timezone
+    raw = [
+        {"time": 1_700_000_000_000, "coin": "ETH", "px": "2500.5", "sz": "0.4",
+         "side": "B", "crossed": True, "oid": 1, "fee": "0.12", "builderFee": "0.03"},
+        {"time": 1_700_000_060_000, "coin": "BTC", "px": "60000", "sz": "0.01",
+         "side": "A", "crossed": False, "oid": 2, "fee": "0.5", "builderFee": None},
+        {"time": 1_700_000_120_000, "coin": "SOL", "px": "100", "sz": "1",
+         "side": "B", "crossed": True, "oid": 3},
+    ]
+    post = _FakePost([raw])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    start = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+    end = datetime(2023, 11, 14, 23, 0, 0, tzinfo=timezone.utc)
+    fills = gw.get_user_fills("0x" + "ab" * 20, start, end)
+    assert [f.coin for f in fills] == ["ETH", "BTC", "SOL"]
+    assert fills[0].px == Decimal("2500.5") and fills[0].sz == Decimal("0.4")
+    assert fills[0].crossed is True and fills[0].builder_fee == Decimal("0.03")
+    assert fills[1].builder_fee == Decimal("0")   # null → 0
+    assert fills[2].builder_fee == Decimal("0")   # 缺欄 → 0
+    url, body = post.calls[0]
+    assert url == "https://x/info"                # 唯讀：只 POST /info
+    assert body["type"] == "userFillsByTime" and body["user"] == "0x" + "ab" * 20
+    assert body["startTime"] == 1_700_000_000_000  # 整數 ms，無 float 中間值
+    assert body["endTime"] == 1_700_002_800_000
+
+
+def test_to_ms_utc_treats_naive_as_utc():
+    from datetime import datetime, timedelta, timezone
+
+    from spark.publicapi.hl import _to_ms_utc
+    naive = datetime(2023, 11, 14, 22, 13, 20)
+    aware = naive.replace(tzinfo=timezone.utc)
+    assert _to_ms_utc(naive) == _to_ms_utc(aware) == 1_700_000_000_000
+    # aware 非 UTC 時區先轉 UTC 再取 epoch（不以本機時區誤解讀）
+    other = aware.astimezone(timezone(timedelta(hours=8)))
+    assert _to_ms_utc(other) == 1_700_000_000_000
+
+
 def test_clearinghouse_state_returns_full_state():
     """M3 watchlist 快照用：回完整 state（get_account_value 只取其中一欄，行為不變）。"""
     state = {"marginSummary": {"accountValue": "123.5", "totalMarginUsed": "10",

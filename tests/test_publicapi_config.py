@@ -72,6 +72,27 @@ def test_admin_addresses_optional_and_normalized():
     assert cfg2.admin_addresses == frozenset({"0x" + "ad" * 20})
 
 
+def test_ops_paths_default_and_env_override():
+    """營運後台唯讀資料源：未設 env 走預設（沿引擎既有 var/filet 慣例）。"""
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.followers_path == "var/filet/followers.json"
+    assert cfg.accrued_history_path == "var/copytrade/accrued_history.jsonl"
+    cfg2 = ApiConfig.from_env(_env(FILET_FOLLOWERS_PATH="/x/f.json",
+                                   FILET_ACCRUED_HISTORY_PATH="/x/h.jsonl"))
+    assert cfg2.followers_path == "/x/f.json"
+    assert cfg2.accrued_history_path == "/x/h.jsonl"
+
+
+def test_followers_path_falls_back_to_engine_env():
+    """同一份 manifest 兩個 env 名是誤設溫床：回退吃引擎既有的 FILET_FOLLOWERS
+    （scripts/filet_daily_report.py、panic_all.py 用的變數）；兩者同設時新名優先。"""
+    cfg = ApiConfig.from_env(_env(FILET_FOLLOWERS="/engine/f.json"))
+    assert cfg.followers_path == "/engine/f.json"
+    cfg2 = ApiConfig.from_env(_env(FILET_FOLLOWERS="/engine/f.json",
+                                   FILET_FOLLOWERS_PATH="/api/f.json"))
+    assert cfg2.followers_path == "/api/f.json"
+
+
 def test_constants_single_source():
     """opus 審 M4：門檻與費率上限不重新宣告字面量，直接引用 spark.config 既有常數。"""
     from spark.config import MIN_BUILDER_BALANCE, Settings

@@ -39,6 +39,13 @@ class ApiConfig:
     pending_path: str
     admin_addresses: frozenset[str]   # normalize 過的管理員地址白名單
     agent_name: str = "filet"         # research：一律給名字，避開 SDK 空名刪欄位特例
+    # --- 營運後台（/ops，admin only）唯讀資料來源 ---
+    # followers manifest：web 層**只讀**（寫入只有人工 activate CLI，見 pending.py 檔頭）。
+    # 預設值沿引擎既有慣例（scripts/filet_daily_report.py、panic_all.py 皆用此路徑）。
+    followers_path: str = "var/filet/followers.json"
+    # builder accrued 歷史序列（北極星實收，由 scripts/copytrade_daily_report.py 每日附加）。
+    # API 進程不自己查 accrued——查一次的職責在日報腳本，這裡只讀它落下的檔（紅線：不加總）。
+    accrued_history_path: str = "var/copytrade/accrued_history.jsonl"
     # 常數單一來源（opus 審 M4）：不重新宣告字面量，直接引用 spark.config 既有常數。
     # max_rate 無模組級常數——dataclass 的純預設值即類屬性，Settings.max_rate == "0.1%"（D6）。
     max_fee_rate: str = Settings.max_rate
@@ -102,6 +109,11 @@ class ApiConfig:
             missing = sorted(set(stripe_env) - set(present))
             raise ValueError(
                 f"Stripe 設定不完整（三個一起設或都不設）: 缺少 {', '.join(missing)}")
+        # followers manifest 路徑：優先 FILET_FOLLOWERS_PATH，回退引擎既有的
+        # FILET_FOLLOWERS（filet_daily_report/panic_all 用的同一個變數）——同一份檔案
+        # 兩個 env 名是營運誤設的溫床，這裡讓一個變數就能同時餵引擎與 API。
+        followers_path = (env.get("FILET_FOLLOWERS_PATH") or env.get("FILET_FOLLOWERS")
+                          or cls.followers_path)
         return cls(network=network,
                    builder_address=normalize_address(env["FILET_BUILDER_ADDR"]),
                    siwe_domain=env["FILET_SIWE_DOMAIN"],
@@ -109,6 +121,9 @@ class ApiConfig:
                    db_path=env["FILET_API_DB"],
                    keysvc_sock=env["FILET_KEYSVC_SOCK"],
                    pending_path=env["FILET_PENDING_PATH"],
+                   followers_path=followers_path,
+                   accrued_history_path=(env.get("FILET_ACCRUED_HISTORY_PATH")
+                                         or cls.accrued_history_path),
                    admin_addresses=admins,
                    stripe_secret_key=stripe_env["FILET_STRIPE_SECRET_KEY"],
                    stripe_webhook_secret=stripe_env["FILET_STRIPE_WEBHOOK_SECRET"],

@@ -61,9 +61,23 @@ class FakeHL:
         self.account_values: dict[str, Decimal] = {}
         self.max_fees: dict[tuple[str, str], int] = {}
         self.agents: dict[str, list[str]] = {}
+        # ops（跨客戶聚合）用：per-address fills ＋ 可注入的 per-address 查詢失敗，
+        # 讓「一個客戶壞不影響其他客戶」能被實測而非口頭保證。
+        self.fills: dict[str, list] = {}
+        self.fills_error: dict[str, Exception] = {}
+        self.account_value_error: dict[str, Exception] = {}
 
     def get_account_value(self, address: str) -> Decimal:
+        err = self.account_value_error.get(address.lower())
+        if err is not None:
+            raise err
         return self.account_values.get(address.lower(), Decimal("0"))
+
+    def get_user_fills(self, address: str, start, end) -> list:
+        err = self.fills_error.get(address.lower())
+        if err is not None:
+            raise err
+        return list(self.fills.get(address.lower(), []))
 
     def max_builder_fee(self, user: str, builder: str) -> int:
         return self.max_fees.get((user.lower(), builder.lower()), 0)

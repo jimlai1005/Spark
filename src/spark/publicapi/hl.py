@@ -4,13 +4,26 @@ Public API 對 HL 的唯一出口（單一 resilience boundary，工程原則 5�
 本模組刻意沒有任何 /exchange 提交路徑：已簽授權由前端直送 HL（設計定案 1），
 後端結構上無法經手簽名（紅線 5，Task 13 有結構性測試）。"""
 import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
 
+from spark.exchange.base import UserFill
 from spark.resilience import run
 
 _TIMEOUT_S = 10.0
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _to_ms_utc(dt: datetime) -> int:
+    """datetime → epoch 毫秒。刻意鏡像 HyperliquidAdapter._to_ms_utc 的兩條慣例
+    （不 import 它：那會把 hyperliquid SDK 拉進 API 進程，本模組只用 httpx）：
+    naive 視為 UTC、aware 先轉 UTC；純整數運算（timedelta // timedelta），
+    不走 `timestamp()*1000` 的 float 中間值（±1ms 捨入偏差）。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - _EPOCH) // timedelta(milliseconds=1)
 
 
 def _default_post(url: str, body: dict):
@@ -55,6 +68,28 @@ class HLGateway:
         != 0 判 builder fee approval 已上鏈；同時是 maxFeeRate 生效的鏈上真相。"""
         return int(self._info({"type": "maxBuilderFee", "user": user, "builder": builder},
                               "HL maxBuilderFee 查詢"))
+
+    def get_user_fills(self, address: str, start: datetime, end: datetime) -> list[UserFill]:
+        """時間窗成交明細（唯讀、冪等 → transient 重試）。營運後台每客戶損益用：
+        `collect_follower_summary` 只吃 `.sz/.px/.crossed/.builder_fee`，故這裡回
+        與 HyperliquidAdapter.get_user_fills 同型的 UserFill（同一份解析慣例：
+        Decimal(str(...)) 進位、builderFee 缺欄或 null 視為 0），跨兩個 adapter
+        的欄位語意才是同基準（工程原則 1）。
+        ⚠️ 唯讀：只 POST /info，本 gateway 結構上無任何 /exchange 提交面（紅線 5）。"""
+        raw = self._info({"type": "userFillsByTime", "user": address,
+                          "startTime": _to_ms_utc(start), "endTime": _to_ms_utc(end)},
+                         "HL userFillsByTime 查詢")
+        return [UserFill(
+            time=_EPOCH + timedelta(milliseconds=int(f["time"])),
+            coin=f["coin"],
+            px=Decimal(str(f["px"])),
+            sz=Decimal(str(f["sz"])),
+            side=f["side"],
+            crossed=bool(f["crossed"]),
+            oid=f["oid"],
+            fee=Decimal(str(f.get("fee", "0") or "0")),
+            builder_fee=Decimal(str(f.get("builderFee", "0") or "0")),
+        ) for f in raw]
 
     def agent_addresses(self, user: str) -> list[str]:
         """使用者已授權的 agent 地址清單（extraAgents）；小寫正規化供同基準比對。"""

@@ -4,18 +4,21 @@ create_app 注入——測試全離線。onboarding 端點一律綁 session 地�
 session 衍生，端點無 account 參數（紅線 3：別人不能替你 onboard 是結構保證）。"""
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from spark.filet.followers import load_followers_tolerant
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.billing import (BillingError, BillingSignatureError,
                                      apply_webhook_event, has_active_subscription,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
+from spark.publicapi.ops import (customer_pnl, jsonable, load_accrued_series,
+                                 revenue_reconciliation)
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
@@ -62,6 +65,15 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         if addr is None:
             raise HTTPException(status_code=401, detail="未登入或 session 已過期")
         return addr
+
+    def _require_admin(address: str = Depends(_require_session)) -> str:
+        """⭐ 管理端唯一一道閘（單一定義，工程原則 5 的授權版）：**所有**跨客戶端點
+        都必須經過它。無 session → 401（由 _require_session 拋）、非白名單 → 403。
+        刻意做成 dependency 而非各端點各寫一次 if——「跨客戶聚合」是全新的存取模式
+        （其餘端點都 session-scoped），逐點複製檢查遲早會漏掉一點。"""
+        if address not in cfg.admin_addresses:  # 兩側皆 normalize 過
+            raise HTTPException(status_code=403, detail="非管理員")
+        return address
 
     def _require_billing() -> None:
         if billing is None or not cfg.billing_enabled:
@@ -188,12 +200,78 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         return p
 
     @app.get("/api/admin/pending")
-    def admin_pending(address: str = Depends(_require_session)):
+    def admin_pending(admin: str = Depends(_require_admin)):
         """管理端唯讀：檢視 pending 清單（逐筆核對 builder_address 用）。啟用走人工
         CLI scripts/filet_activate.py，web 層無任何 systemd/寫 manifest 權。"""
-        if address not in cfg.admin_addresses:  # 兩側皆 normalize 過
-            raise HTTPException(status_code=403, detail="非管理員")
         return {"pending": load_pending(cfg.pending_path)}
+
+    # ---------- 營運後台 /ops（admin only；全 repo 唯一的跨客戶聚合） ----------
+    def _load_followers():
+        """讀 followers manifest（唯讀；寫入只有人工 activate CLI）。
+        容錯載入：一個壞條目不該讓整張營運報表變空白，壞條目併同回報。"""
+        try:
+            return load_followers_tolerant(cfg.followers_path)
+        except FileNotFoundError as e:
+            # 大聲失敗：manifest 不存在時回空清單會被誤讀成「沒有客戶」（工程原則 3）
+            logger.error("followers manifest 不存在: %s", cfg.followers_path)
+            raise HTTPException(status_code=503,
+                                detail="follower manifest 不存在，請聯絡管理員") from e
+
+    @app.get("/api/ops/customers")
+    def ops_customers(days: int = 1, admin: str = Depends(_require_admin)):
+        """每客戶損益（跨客戶聚合，admin only）。時間窗＝now 往回 days 天。
+        單一 follower 查詢失敗只影響該列的 error 欄，不影響其他客戶（ops.customer_pnl）。"""
+        if not 1 <= days <= 90:
+            raise HTTPException(status_code=400, detail="days 須介於 1 到 90")
+        refs, manifest_errors = _load_followers()
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        rows = customer_pnl(refs, hl, start, end, store=store)
+        return jsonable({"days": days, "start": start.isoformat(),
+                         "end": end.isoformat(), "customers": rows,
+                         "manifest_errors": manifest_errors})
+
+    @app.get("/api/ops/revenue")
+    def ops_revenue(threshold_pct: float = 0.01, admin: str = Depends(_require_admin)):
+        """收入對帳（admin only）：應收（Σ 各客戶歸屬 builder_fee）vs 實收（北極星
+        accrued 今昨差）。
+
+        ⚠️ 同基準（工程原則 1）：accrued 的今昨差來自日報腳本每日查一次落下的歷史
+        序列，其涵蓋期間是「最新一筆的那個 UTC 日」——故 fills 時間窗一律取**同一個
+        UTC 日**，而不是 now 往回 24 小時。兩邊窗口錯開會造出純屬錯配的假 discrepancy。
+
+        歷史序列不足兩點時不硬算（缺 accrued_prev 就把整段累積量當成單日增量，
+        會產生天文數字的假 delta）：回 insufficient_accrued_history，數值欄留 null。"""
+        if threshold_pct < 0:
+            raise HTTPException(status_code=400, detail="threshold_pct 不得為負")
+        refs, manifest_errors = _load_followers()
+        series = load_accrued_series(cfg.accrued_history_path)
+        if len(series) < 2:
+            return jsonable({
+                "insufficient_accrued_history": True,
+                "history_points": len(series),
+                "detail": "accrued 歷史不足兩點，無法計算單日實收增量"
+                          "（由 scripts/copytrade_daily_report.py 每日累積）",
+                "manifest_errors": manifest_errors,
+            })
+        (prev_day, accrued_prev), (day_iso, accrued_now) = series[-2], series[-1]
+        day = date.fromisoformat(day_iso)
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        # 當日仍在進行中 → 取到 now（與日報腳本的 UTC 0 點~now 同慣例）；已過完的日子取整日
+        end = now if day >= now.date() else start + timedelta(days=1)
+        rows = customer_pnl(refs, hl, start, end, store=store)
+        result = revenue_reconciliation(rows, accrued_now, accrued_prev,
+                                        threshold_pct=threshold_pct)
+        if result["over_threshold"]:
+            # 對帳超標＝收入歸屬與鏈上實收對不上，大聲留痕（工程原則 3）
+            logger.warning("收入對帳超標 day=%s attributed=%s accrued_delta=%s pct=%s",
+                           day_iso, result["attributed"], result["accrued_delta"],
+                           result["discrepancy_pct"])
+        return jsonable({**result, "insufficient_accrued_history": False,
+                         "day": day_iso, "prev_day": prev_day,
+                         "window_start": start.isoformat(), "window_end": end.isoformat(),
+                         "customers": rows, "manifest_errors": manifest_errors})
 
     # ---------- 待簽 payload（後端建 typed data，不簽；前端簽完直送 HL /exchange） ----------
     @app.post("/api/onboard/payload/approve-agent")

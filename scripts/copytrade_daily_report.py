@@ -15,7 +15,8 @@
   取兩邊當日 UTC 0點~now 的 user fills → 讀昨日 accrued 快照
   （var/copytrade/accrued_snapshot.json，無檔視為 0）→ query_builder_accrued
   → reconcile 取 csv_report → build_daily_report → 寫 var/copytrade/reports/YYYY-MM-DD.md
-  ＋印 stdout → 更新快照。
+  ＋印 stdout → 更新快照 ＋ 附加 accrued 歷史序列
+  （var/copytrade/accrued_history.jsonl，供營運後台多日對帳）。
 
 注意:
   - skipped 資料本版讀 var/copytrade/skipped/YYYY-MM-DD.json（無檔 → 空 list）；
@@ -40,6 +41,7 @@ from spark.verification.reconcile import reconcile
 DEFAULT_LEADER = "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1"
 VAR_DIR = Path("var/copytrade")
 SNAPSHOT_PATH = VAR_DIR / "accrued_snapshot.json"
+HISTORY_PATH = VAR_DIR / "accrued_history.jsonl"
 
 
 def _usage() -> str:
@@ -61,6 +63,32 @@ def save_accrued_snapshot(day_iso: str, accrued: Decimal) -> None:
     SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
     SNAPSHOT_PATH.write_text(
         json.dumps({"date": day_iso, "accrued": str(accrued)}, indent=2))
+
+
+def append_accrued_history(day_iso: str, accrued: Decimal) -> None:
+    """附加當日 accrued 到歷史序列（jsonl，一天一行）——單一快照只夠今昨比較，
+    歷史序列讓營運後台能做多日對帳（src/spark/publicapi/ops.py 讀它）。
+
+    ⭐ 冪等：同日重跑覆蓋該日那一行（不是再 append 一筆）——重跑日報不該讓
+    同一天出現兩個 accrued 值，那會讓下游的今昨差算成 0。
+    ⭐ additive：不動 save_accrued_snapshot 的既有行為（向後相容）。
+    """
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    rows: dict[str, str] = {}
+    if HISTORY_PATH.exists():
+        for line in HISTORY_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                rows[str(rec["date"])] = str(rec["accrued"])
+            except (ValueError, KeyError, TypeError):
+                continue  # 壞行跳過，不讓一行壞資料擋掉今天的落檔
+    rows[day_iso] = str(accrued)  # 同日重跑覆蓋
+    HISTORY_PATH.write_text(
+        "".join(json.dumps({"date": d, "accrued": rows[d]}) + "\n"
+                for d in sorted(rows)))
 
 
 def load_skipped(day_iso: str) -> list[tuple[str, Decimal]]:
@@ -117,6 +145,7 @@ def main():
     print(f"\n[written] {out_path}", file=sys.stderr)
 
     save_accrued_snapshot(day.isoformat(), accrued_today)
+    append_accrued_history(day.isoformat(), accrued_today)
     raise SystemExit(0)
 
 
