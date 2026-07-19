@@ -67,9 +67,24 @@ class RecordingNotifier(Notifier):
         return True
 
 
+# critical 專用的去重視窗。刻意與一般訊息分開（且更長）：critical 的 dedup_key
+# 是「同一個持續狀態」的識別（dd_breach、tripped、leader_resolve_failed），這種狀態
+# 一旦成立就會每個 cycle 重報一次，用 300s 窗仍會每 5 分鐘洗一次版。抑制期間的次數
+# 會累計並在重送時附上，所以「持續發生」這個事實不會因為去重而消失。
+CRITICAL_DEDUP_TTL_S = 900.0
+
+
 class TelegramNotifier(Notifier):
     """分級 Telegram 通知。無 token/chat → 全靜默回 False（不 raise）。
-    dedup：同 dedup_key 在 TTL 內第二則吞掉（TTL=300s）。
+
+    dedup：同 dedup_key 在 TTL 內第二則吞掉。**critical 也吃 dedup_key**，只是用
+    獨立的 CRITICAL_DEDUP_TTL_S，且重送時附上累計抑制次數。
+    2026-07-19 opus 對抗性審查 I2：原本 critical 完全忽略 dedup_key（同 key 連發 5 次
+    照送 5 則）。後果不是吵而是**遮蔽**——kill switch 的 dd_breach／tripped 告警每分鐘
+    重發，真正的新事件被洗版淹掉，多 follower 共頻道還會撞 Telegram 429（撞了就是
+    整段時間所有告警都送不出去）。安全關鍵告警要「大聲」，但大聲不等於洗版；
+    附上抑制次數才能同時保住「被看見」與「不被淹沒」。
+
     分類靜音：muted_categories 內的 info/warn 吞掉；critical 永不可靜音。
     發送失敗（send_fn 拋例外或回 False）→ 吞掉回 False，絕不讓通知失敗炸引擎。
     """
@@ -100,7 +115,11 @@ class TelegramNotifier(Notifier):
         self._send_fn = send_fn
         self._muted_categories = muted_categories
         self._clock = clock
-        self._dedup_times: dict[str, float] = {}
+        # key -> (最後成功送出的時間戳, 該則當時適用的 TTL)。TTL 隨條目一起存，
+        # 讓 critical 的長窗不會被一則 info 的清掃提前抹掉（兩種 TTL 各管各的）。
+        self._dedup_times: dict[str, tuple[float, float]] = {}
+        # key -> 自上次成功送出以來被抑制的則數（成功送出即歸零）。
+        self._suppressed: dict[str, int] = {}
         # 無 token 或 chat_id 且未注入 send_fn → 禁用
         self._enabled = bool(token and chat_id) or send_fn is not None
 
@@ -152,15 +171,20 @@ class TelegramNotifier(Notifier):
             # 失敗吞掉，不拋異常
             return False
 
+    def _ttl_for(self, level: str) -> float:
+        """該 level 的去重視窗。critical 用獨立常數（見 CRITICAL_DEDUP_TTL_S）。"""
+        return CRITICAL_DEDUP_TTL_S if level == "critical" else self.DEDUP_TTL
+
     def _send(self, level: str, category: str, text: str, dedup_key: str | None = None) -> bool:
         """發送訊息（內部）。
 
         流程：
         1. 未啟用 → False
         2. level != critical 且 category in muted → False
-        3. dedup_key 且 clock()-上次 < TTL → False
-        4. 使用 send_fn 或 _http_send 發送
-        5. 成功則記錄時間戳，失敗（例外/False）→ False
+        3. dedup_key 且 clock()-上次 < 該 level 的 TTL → 記一筆抑制、回 False
+        4. 前次有被抑制過 → 訊息附上累計次數（讓「持續發生」不因去重而消失）
+        5. 使用 send_fn 或 _http_send 發送
+        6. 成功則記錄時間戳並把抑制計數歸零，失敗（例外/False）→ False
         """
         if not self._enabled:
             return False
@@ -169,17 +193,27 @@ class TelegramNotifier(Notifier):
         if level != "critical" and category in self._muted_categories:
             return False
 
-        # Dedup 檢查（critical 不受 dedup 影響）
-        if dedup_key is not None and level != "critical":
+        suppressed = 0
+        if dedup_key is not None:
             now = self._clock()
-            # 順手清掉過期項，避免字典無限成長（照 hl telegram.py 模式）
-            for k in [k for k, ts in self._dedup_times.items() if now - ts > self.DEDUP_TTL]:
-                self._dedup_times.pop(k, None)
-            if dedup_key in self._dedup_times:
-                last_sent = self._dedup_times[dedup_key]
-                if now - last_sent < self.DEDUP_TTL:
-                    return False
+            ttl = self._ttl_for(level)
+            # 順手清掉過期項，避免字典無限成長（照 hl telegram.py 模式）。
+            # 每個條目用它自己當初的 TTL 判定——否則一則 info 的清掃會把還在窗內的
+            # critical 條目掃掉，等於 critical 的長窗被無聲降級成 300s。
+            for k, (ts, k_ttl) in list(self._dedup_times.items()):
+                if now - ts > k_ttl:
+                    self._dedup_times.pop(k, None)
+            entry = self._dedup_times.get(dedup_key)
+            if entry is not None and now - entry[0] < ttl:
+                # 抑制掉，但把次數記下來——下一則重送時要帶出去，
+                # 否則「這件事在窗內又發生了 N 次」這個事實會被去重吃掉。
+                self._suppressed[dedup_key] = self._suppressed.get(dedup_key, 0) + 1
+                return False
             # Dedup 檢查通過，稍後成功時才更新時間戳
+            suppressed = self._suppressed.get(dedup_key, 0)
+
+        if suppressed:
+            text = f"{text}（本則為第 {suppressed + 1} 次，前 {suppressed} 次已抑制）"
 
         # 格式化訊息
         message = self._format_message(level, category, text)
@@ -194,7 +228,8 @@ class TelegramNotifier(Notifier):
 
         # 只在成功時更新 dedup 時間戳（對應 hl telegram.py 的「成功才前進」語意）
         if result and dedup_key is not None:
-            self._dedup_times[dedup_key] = self._clock()
+            self._dedup_times[dedup_key] = (self._clock(), self._ttl_for(level))
+            self._suppressed.pop(dedup_key, None)
 
         return bool(result)
 

@@ -1,5 +1,5 @@
 """TelegramNotifier 單元測試。"""
-from spark.copytrade.notifier import TelegramNotifier
+from spark.copytrade.notifier import CRITICAL_DEDUP_TTL_S, TelegramNotifier
 
 
 class TestTelegramNotifierDisabled:
@@ -173,21 +173,19 @@ class TestTelegramNotifierDedup:
         assert "stale_key" not in notifier._dedup_times
         assert "fresh_key" in notifier._dedup_times
 
-    def test_critical_bypasses_dedup(self):
-        """critical 訊息不受 dedup 影響：同 key 連發兩次都送出。"""
-        call_count = 0
+    def test_critical_honours_dedup_key(self):
+        """⭐ critical 也吃 dedup_key：同 key 在 TTL 內第二則被抑制。
 
-        def fake_send(text: str) -> bool:
-            nonlocal call_count
-            call_count += 1
-            return True
-
-        notifier = TelegramNotifier(token="test", chat_id="123", send_fn=fake_send)
-        result1 = notifier.critical("alert", "Critical issue 1", dedup_key="crit_1")
-        result2 = notifier.critical("alert", "Critical issue 2", dedup_key="crit_1")
-        assert result1 is True
-        assert result2 is True
-        assert call_count == 2
+        2026-07-19 修正（opus 審查 I2）：原本 critical 完全忽略 dedup_key。後果不是吵
+        而是**遮蔽**——kill switch 的 dd_breach／tripped 每分鐘重發，把真正的新事件洗掉，
+        多 follower 共頻道還會撞 Telegram 429（撞了就是所有告警都送不出去）。
+        """
+        sent = []
+        notifier = TelegramNotifier(token="test", chat_id="123",
+                                    send_fn=lambda t: bool(sent.append(t)) or True)
+        assert notifier.critical("alert", "Critical issue 1", dedup_key="crit_1") is True
+        assert notifier.critical("alert", "Critical issue 2", dedup_key="crit_1") is False
+        assert len(sent) == 1
 
     def test_non_critical_still_deduplicated(self):
         """對照組：non-critical 訊息同 dedup_key 仍被去重。"""
@@ -381,3 +379,95 @@ class TestTelegramNotifierFromEnv:
         assert "positions" in notifier._muted_categories
         # 確保沒有多出帶空白的版本
         assert "  orders  " not in notifier._muted_categories
+
+
+class TestCriticalDedup:
+    """⭐ critical 的去重與抑制計數（2026-07-19 opus 審查 I2）。
+
+    設計判準：critical 必須「大聲」，但大聲 ≠ 洗版。去重讓它不淹沒別的告警，
+    抑制計數讓「這件事在窗內又發生了 N 次」不會因為去重而消失——兩者缺一，
+    就會回到「要嘛洗版、要嘛假裝只發生一次」的二選一。
+    """
+
+    @staticmethod
+    def _notifier(sent, clock=None):
+        def _send(text: str) -> bool:
+            sent.append(text)
+            return True
+
+        kw = {"clock": clock} if clock is not None else {}
+        return TelegramNotifier(token="test", chat_id="123", send_fn=_send, **kw)
+
+    def test_same_key_within_ttl_sends_once(self):
+        """同 key 在 TTL 內連發 5 次 → 只送 1 則（原行為是 5 則全送）。"""
+        sent = []
+        n = self._notifier(sent)
+        results = [n.critical("killswitch", f"回撤破線 #{i}", dedup_key="dd_breach")
+                   for i in range(5)]
+        assert results == [True, False, False, False, False]
+        assert len(sent) == 1
+
+    def test_resend_after_ttl_carries_suppression_count(self):
+        """⭐ TTL 過後重送，且訊息帶出這段期間被抑制的次數——「持續發生」不得被吃掉。"""
+        sent, t = [], [0.0]
+        n = self._notifier(sent, clock=lambda: t[0])
+        n.critical("killswitch", "回撤破線", dedup_key="dd_breach")   # 送出
+        for _ in range(4):
+            n.critical("killswitch", "回撤破線", dedup_key="dd_breach")  # 抑制 4 則
+        assert len(sent) == 1
+
+        t[0] = CRITICAL_DEDUP_TTL_S + 1
+        assert n.critical("killswitch", "回撤破線", dedup_key="dd_breach") is True
+        assert len(sent) == 2
+        assert "第 5 次" in sent[1] and "前 4 次已抑制" in sent[1]
+
+    def test_suppression_count_resets_after_successful_send(self):
+        """成功送出即歸零：下一輪的計數從新的抑制期重新算，不累積歷史。"""
+        sent, t = [], [0.0]
+        n = self._notifier(sent, clock=lambda: t[0])
+        n.critical("k", "x", dedup_key="c")
+        n.critical("k", "x", dedup_key="c")            # 抑制 1
+        t[0] = CRITICAL_DEDUP_TTL_S + 1
+        n.critical("k", "x", dedup_key="c")            # 重送（帶「前 1 次」）
+        t[0] = 2 * CRITICAL_DEDUP_TTL_S + 2
+        n.critical("k", "x", dedup_key="c")            # 再重送：中間沒被抑制過
+        assert "已抑制" in sent[1]
+        assert "已抑制" not in sent[2]
+
+    def test_different_keys_are_independent(self):
+        """不同 key 各自獨立——去重不得讓一個持續狀態遮蔽另一個新事件。"""
+        sent = []
+        n = self._notifier(sent)
+        assert n.critical("killswitch", "回撤破線", dedup_key="dd_breach") is True
+        assert n.critical("killswitch", "已 tripped", dedup_key="tripped") is True
+        assert n.critical("leader", "leader 被撤銷", dedup_key="leader_revoked") is True
+        assert len(sent) == 3
+
+    def test_no_dedup_key_never_suppressed(self):
+        """未帶 dedup_key 的 critical 一律照送（沿用既有語意，不受本次修改影響）。"""
+        sent = []
+        n = self._notifier(sent)
+        for _ in range(3):
+            assert n.critical("loop", "連續同步失敗") is True
+        assert len(sent) == 3
+
+    def test_critical_window_is_longer_than_warn_window(self):
+        """critical 與 warn 用各自的 TTL：warn 在 301s 已可重送，critical 還在窗內。"""
+        sent, t = [], [0.0]
+        n = self._notifier(sent, clock=lambda: t[0])
+        n.warn("orders", "w", dedup_key="w1")
+        n.critical("killswitch", "c", dedup_key="c1")
+        t[0] = TelegramNotifier.DEDUP_TTL + 1
+        assert n.warn("orders", "w", dedup_key="w1") is True       # warn 行為不變
+        assert n.critical("killswitch", "c", dedup_key="c1") is False  # critical 仍在窗內
+
+    def test_info_sweep_does_not_shorten_critical_window(self):
+        """⭐ 清掃過期項時每個條目用自己的 TTL：一則 info 的清掃不得把還在窗內的
+        critical 條目掃掉（否則 critical 的長窗被無聲降級成 300s）。"""
+        sent, t = [], [0.0]
+        n = self._notifier(sent, clock=lambda: t[0])
+        n.critical("killswitch", "c", dedup_key="c1")
+        t[0] = TelegramNotifier.DEDUP_TTL + 1
+        n.info("orders", "i", dedup_key="i1")          # 觸發清掃
+        assert "c1" in n._dedup_times
+        assert n.critical("killswitch", "c", dedup_key="c1") is False

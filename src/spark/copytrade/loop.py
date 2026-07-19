@@ -68,7 +68,11 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             "killswitch",
             f"kill switch 已 tripped（{root / 'var/copytrade/killswitch.tripped'}），"
             f"本輪跳過所有交易動作；re-arm＝人工刪除該檔",
-            dedup_key="tripped",  # TelegramNotifier TTL 內去重，避免每分鐘洗版
+            # TelegramNotifier 在 CRITICAL_DEDUP_TTL_S 內去重，避免每分鐘洗版；
+            # 重送時會附上累計抑制次數，所以「還在 tripped」不會因去重而消失。
+            # （2026-07-19 前這行註解宣稱有去重，但 critical 當時完全忽略 dedup_key
+            #   ——註解描述的保護並不存在；I2 已補上實作，註解同步修正。）
+            dedup_key="tripped",
         )
         return tripped_report()
 
