@@ -88,10 +88,21 @@
 
 **資安設計**：客戶之後可經 API 改 leader → API 被打穿即可指向惡意 leader（瘋狂交易榨乾 builder fee／反向交易）。**防線＝策劃白名單，且引擎使用前必須自己再驗一次**（不得因「API 已驗過」而省略）。
 
-- [x] P3.1a 白名單＋manifest leader 欄位（commit 9459279，915 tests）——向後相容、activate 硬閘拒絕非白名單 leader
-- [ ] P3.1b `pending.json` 支援 `leader_address`（**目前 `write_pending_entry()` 無此參數，客戶選 leader 的鏈路斷在這裡**）
-- [ ] P3.2 引擎讀 per-follower leader ⭐ + **白名單二次驗證**（目前只有 activate 一道閘）
-- [ ] P3.3 leader 目錄 API（清單＋leaderboard 統計，資料來自已在跑的 watchlist snapshot）
+- [x] P3.1a 白名單＋manifest leader 欄位（9459279）｜[x] P3.1b pending 帶 leader（048f82f）
+- [x] P3.2 引擎讀 per-follower leader ＋白名單二次驗證（a2082bf）⭐
+- [x] **opus 引擎審 NEEDS_FIXES → 5 項全修**（94319cc/d52210b/41a8e6c/32154d0/ad9e0ac）：C1 撤銷 vs 暫時失敗（`enabled:false` 下架原本對正在跟的 follower **完全無效**，會永遠跟下去——操作者卻以為已止血）｜I1 已驗證 leader → 交易路徑的接縫**零測試**（M10/M11b 兩發變異存活）｜I2 critical 忽略 dedup 會淹掉 kill switch 告警｜I3 出貨組態根本沒有白名單檔｜I4 CWD 相對路徑會讓 CLI 與引擎驗不同檔（fail-open）
+- [x] P3.3 leader 目錄 API（d244b58）＋緊急工具路徑錨定（9aa1635）
+- [x] P3.4a 簽章原語＋選擇端點（a40bcc3／9884487）｜[x] P3.4b 待簽原文端點＋引擎套用＋自有 nonce 帳本（13a8c5e／fe47bcc）
+- [x] P3.5 `/leaders` 前端頁（bc6b8ac，誠信六條各有測試釘住）
+- [x] **opus 鏈路審 NEEDS_FIXES → 全修**（d180255/64dad30/39c89a8/8fe61d4/8c9cc5c）：
+      **C1 ⭐ 整套設計前提被推翻**——前端沒驗證「API 回傳的待簽原文是不是使用者點的那個 leader」，故被打穿的 API 可讓使用者簽下對惡意 leader 的**真實**授權，引擎二次驗章完美放行，稽核看起來完全是客戶自己要求的。修法＝喚起錢包**之前**斷言（簽完再驗擋不住簽章外流）。
+      **C2** 帳本遺失會**靜默**把客戶換回舊 leader 且零告警（＝一次無授權換手＋真實成本）。
+      **C3** 出貨組態下 API 與引擎讀寫**兩個不同檔案**，功能完全不通，API 卻回客戶「下一個 cycle 生效」。
+      I1 `_NONCE_RE` 是唯一的訊息注入閘門卻零測試｜I2 交換目錄權限拓撲｜I3 永久失敗記錄無限告警
+
+### ⚠️ 安全控制的部署前提（必須寫成約束，不能是巧合）
+C1 那道前端防線**有效的前提是「前端與 filet-api 屬不同信任域」**——前端 bundle 由 `filet-dashboard` 服務、檔案 root:root 唯讀，打穿 API 的攻擊者改不到它。
+**若日後前端 bundle 改由 filet-api 服務、或兩者同源部署，這道防護會靜默失效**，而且不會有任何測試轉紅。動部署拓撲前必須重新評估此項。
 - [ ] P3.4 客戶選 leader 的 API（訂閱狀態 gate）⭐ **必須帶客戶 SIWE 簽章，見下方**
 - [ ] P3.5 `/leaders` 前端頁
 
