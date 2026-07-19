@@ -221,6 +221,80 @@ def test_dust_spot_balance_does_not_nag(tmp_path):
     assert client.get("/api/onboard/status").json()["spot_stranded"] is not None
 
 
+def test_funded_customer_never_sees_stranded_spot_warning(tmp_path):
+    """⭐ 已入金 ＋ spot 留零頭 → **不提示**（變異測試靶：拿掉 funded 閘必轉紅）。
+
+    本提示的適用範圍只有一種情形——「perp 還沒錢，而錢在 spot」。perp 已達
+    min_user_deposit 的客戶正在正常跟單，對他顯示「你的錢卡在 spot…請劃轉到 perp」
+    是純粹的困惑與客服成本，而本函式的 docstring 自己就把「假警報比沒提示糟」
+    定為失效方向（查詢失敗時 fail-silent 即據此）。先前 fail-silent 只擋住了
+    「查詢失敗」那一路，成功查到時沒有任何 funded 閘。
+
+    觸發面不是邊角：門檻僅 1 USDC，劃轉留零頭就會中。
+    """
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    hl.account_values[wallet.address.lower()] = Decimal("5000")   # perp 足額
+    hl.spot_usdc[wallet.address.lower()] = Decimal("3")           # spot 只剩零頭
+    s = client.get("/api/onboard/status").json()
+    assert s["funded"] is True
+    assert s["spot_stranded"] is None, "已入金的客戶不得看到『錢卡在 spot』假警報"
+
+
+def test_funded_customer_with_large_spot_balance_still_no_warning(tmp_path):
+    """已入金但同時持有大額 spot（拿去做別的用途）→ 一樣不提示。
+
+    這一條說明為什麼修法是 funded 閘而不是「把門檻改成相對量」：相對門檻只是把
+    假警報的邊界往上挪，這個客戶照樣中。產品本來就預期客戶有 spot 餘額與操作。
+    """
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    hl.account_values[wallet.address.lower()] = Decimal("5000")
+    hl.spot_usdc[wallet.address.lower()] = Decimal("20000")
+    assert client.get("/api/onboard/status").json()["spot_stranded"] is None
+
+
+def test_unfunded_customer_with_spot_balance_still_gets_the_hint(tmp_path):
+    """既有行為不變：未入金 ＋ spot 有錢 → 照常提示（這才是本提示存在的理由）。
+
+    與上面兩條成對——funded 閘必須只關掉假警報，不得把真警報一起關掉。
+    """
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    hl.account_values[wallet.address.lower()] = Decimal("0")      # perp 空的
+    hl.spot_usdc[wallet.address.lower()] = Decimal("250.5")
+    s = client.get("/api/onboard/status").json()
+    assert s["funded"] is False
+    assert s["spot_stranded"] is not None
+    assert s["spot_stranded"]["usdc"] == "250.5"
+
+
+def test_spot_balance_not_queried_at_all_once_funded(tmp_path):
+    """funded 閘排在餘額查詢**之前**：已入金就不該再打一次 spot 查詢。
+
+    不只是省一次呼叫——閘門若排在查詢之後，一個已入金客戶的 spot 查詢失敗
+    仍會走進 except 分支，把「不適用」與「查不到」混成同一件事。
+    """
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    hl.account_values[wallet.address.lower()] = Decimal("5000")
+
+    calls: list[str] = []
+    real = hl.spot_usdc_balance
+
+    def _counting(address):
+        calls.append(address)
+        return real(address)
+
+    hl.spot_usdc_balance = _counting
+    assert client.get("/api/onboard/status").json()["spot_stranded"] is None
+    assert calls == [], "已入金仍查了 spot 餘額 → funded 閘排在查詢之後"
+
+
 def test_spot_query_failure_shows_no_hint_and_does_not_break_status(tmp_path):
     """⭐ 失效方向刻意與 builder 合規監控**相反**：查不到 → 不提示。
     對一個已經劃轉好、正在正常跟單的客戶顯示「你的錢卡住了」是純粹的困惑；

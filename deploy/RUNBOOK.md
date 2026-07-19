@@ -653,6 +653,45 @@ sudo journalctl -u 'filet-follower@*' --since '10 min ago' | grep -i '撤銷\|le
 ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 ARM 檔
 ```
 
+#### 成本熔斷器的狀態檔 `cost_breaker.json`（在哪、什麼時候清）
+
+換手率熔斷器（成交名目 ÷ perp 權益，滾動 24h）唯一的持久狀態，**刻意不是帳本**：
+只存「觸發事件的時間戳」與「上一輪是否處於觸發狀態」。換手率本身每輪從交易所的
+fills 完全重算，所以這個檔遺失**不影響主閘**（停開新倉），只會讓累犯計數歸零。
+
+| 項目 | 內容 |
+|---|---|
+| 路徑 | `/opt/filet/state/<account_id>/var/copytrade/cost_breaker.json` |
+| 自動清除 | **只有 `killswitch.trip()` 會清**（`trip` 內呼叫 `reset_log`，與 `reset_samples` 同一個「已由人接手」的重置點）。人工 re-arm 刪 ARM 檔**不會**清它——清除發生在 trip 當下，不是 re-arm 當下 |
+| 自然出窗 | 觸發記錄逾 24h 會在下一輪 `_prune` 時自動丟棄（不需要人工介入） |
+
+```bash
+# 看某個 follower 目前的觸發歷史（breaches = 各次觸發的 epoch 秒、active = 上輪是否觸發中）
+sudo cat /opt/filet/state/<account_id>/var/copytrade/cost_breaker.json
+```
+
+> ⚠️ **`flatten_on_breach=False` 時會停滿 24h，而且沒有 ARM 檔可刪**——這是這一節
+> 存在的理由。成本熔斷累犯升級（滾動 24h 內觸發達 `cost_breach_escalate_count` 次）
+> 會**比照回撤路徑尊重 `flatten_on_breach`**：關掉時引擎**不 trip**，於是
+> **不強制平倉、不鎖死交易、也不清 `cost_breaker.json`**，但每一輪仍然 `return`
+> 在升級判定處（停止所有交易動作）。結果是引擎會**持續停到最舊的那筆觸發記錄
+> 自然出窗為止（最長 24h）**，而操作者手上**沒有 ARM 檔可以刪**——`flatten_on_breach=True`
+> 時那條「刪 ARM 檔 re-arm」的復原路徑在這裡不存在。
+>
+> 此情境下唯一的留痕是 `cost_escalate_no_flatten` 這則 critical 告警（明載
+> 「既有部位仍在市場上，請人工處置」）。若確認已人工處置、要讓引擎**立刻**恢復：
+>
+> ```bash
+> # 停服務 → 刪狀態檔 → 起服務（刪檔等同人工 re-arm；引擎不會在執行中重讀被刪的檔）
+> sudo systemctl stop filet-follower@<account_id>
+> sudo rm -f /opt/filet/state/<account_id>/var/copytrade/cost_breaker.json
+> sudo systemctl start filet-follower@<account_id>
+> ```
+>
+> ⚠️ 刪檔前先確認**造成觸發的原因已經處理掉**（leader 是不是還在高頻對敲？）。
+> 清掉的是「我方的判定歷史」，不是磨損本身——原因還在的話下一輪就會再度觸發，
+> 而累犯計數已被你歸零，等於把保護往後推遲了一輪。
+
 ### 5.5.1 ⭐⭐ 建立換 leader 交換目錄（不做這步，客戶按「換 leader」永遠不會生效）
 
 > 編號用 `5.5.1` 是刻意的插入步驟——它必須排在 §5.4 拉起服務**之前**做完，

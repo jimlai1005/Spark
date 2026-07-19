@@ -1067,13 +1067,30 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         store.set_agent_address(account_id, agent_address)
         return {"agent_address": agent_address}
 
-    def _spot_stranded(address: str) -> dict | None:
+    def _spot_stranded(address: str, *, funded: bool) -> dict | None:
         """客戶的錢是不是卡在 **spot** 錢包？回提示資料或 None（不提示）。
 
         ⭐ 為什麼這個提示存在：我方只鏡像 perp。客戶從 CEX 提幣或走第三方橋入金時，
         錢會落在 spot，perp 仍是 0 → `funded` 判 False。客戶在交易所頁面上看得到錢，
         卻不知道還差一步劃轉，而畫面上只寫「尚未入金」——這是入金漏斗上最貴的一種
         沉默。本欄位存在的目的就是把那句話補上。
+
+        ⭐ `funded=True` ⇒ 一律不提示（前置閘，排在餘額查詢之前）。上一段就是本提示
+        的全部適用範圍——「perp 還沒錢，而錢在 spot」。perp 已達 `min_user_deposit`
+        的客戶正在正常跟單，對他顯示「你的錢卡在 spot」是純粹的困惑與客服成本，
+        而下一段的 fail-silent 早已把「假警報比沒提示糟」定為本函式的失效方向。
+        觸發面不是邊角：門檻僅 1 USDC，客戶劃轉時留下零頭、或同時持有 spot USDC
+        做別的用途都會中——而產品本來就預期客戶有 spot 餘額與操作
+        （見 `copytrade/costbreaker.py` 的 `_in_perp_scope`）。
+
+        為什麼是 `funded` 閘而不是「把門檻改成 min_user_deposit 的相對量」：
+        (a) 相對門檻只是把假警報的邊界往上挪，已入金又持有大額 spot 的客戶照樣中；
+        (b) `config.py:89` 已明文記載門檻**刻意不**與 `min_user_deposit` 綁定
+            （那是「夠不夠開始跟單」，這是「值不值得提醒」，兩個問題）——改成相對量
+            等於推翻一個有依據的決定；
+        (c) `funded` 由呼叫端傳入而非在此重算：`_progress` 已用
+            `get_account_value(address) >= cfg.min_user_deposit` 算過一次，重算會變成
+            「同一輪內兩次讀取」的混基準（工程原則 1），且多一次 HL 查詢與失敗面。
 
         ⚠️ **只偵測，不代勞**：spot → perp 的劃轉是 user-signed action，需要主鑰才
         簽得動；我方結構上不持有主鑰（非託管不變量，紅線 3）。本函式與它的回傳結構
@@ -1087,6 +1104,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         ConnectionError／TimeoutError 必須在此攔下：本 app 的全域 handler 會把它們
         變成 502，讓一個純輔助欄位打掉整個 onboarding 狀態頁。
         """
+        if funded:
+            return None  # 見 docstring：已入金 ⇒ 本提示不適用，且假警報比沒提示糟
         try:
             spot_usdc = hl.spot_usdc_balance(address)
         except Exception:  # noqa: BLE001 — 見 docstring：假警報比沒提示糟
@@ -1130,8 +1149,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "builder_fee_approved": builder_fee_approved,
             "agent_approved": agent_approved,
             "funded": funded,
-            # None ＝ 沒有卡住的錢、或查不到（兩者對前端是同一件事：不顯示提示）。
-            "spot_stranded": _spot_stranded(address),
+            # None ＝ 已入金、沒有卡住的錢、或查不到（對前端是同一件事：不顯示提示）。
+            # ⭐ funded 傳入而非重算：與上一行同一次讀取的結果，同基準（工程原則 1）。
+            "spot_stranded": _spot_stranded(address, funded=funded),
             "state": "READY" if ready else "IN_PROGRESS",
         }
 

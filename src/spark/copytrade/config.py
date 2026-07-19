@@ -115,6 +115,16 @@ class CopySettings:
     min_order_notional: Decimal = Decimal("10")  # hl MIN_ORDER_NOTIONAL
     size_tolerance: Decimal = Decimal("0.02")  # hl SIZE_TOLERANCE
     max_drawdown_pct: Decimal = Decimal("0.20")  # hl MAX_DRAWDOWN_PCT
+    # ⚠️ **與成本熔斷器耦合（閘門排序的副產物，不是設計意圖）**：`loop.run_cycle` 把
+    # 回撤判定排在成本判定**之前**（D8），所以本欄位實際上決定了「成本閘的分母最低
+    # 會被允許掉到多少」——權益跌到 `(1 - max_drawdown_pct) × 高水位` 才會被前一道閘
+    # 攔下，而換手率 = 成交名目 ÷ 權益。同一份成交名目，分母越低換手率越高：
+    #   放大倍率 = 1 / (1 - max_drawdown_pct)
+    #   0.20（預設）⇒ 1.25×｜0.30 ⇒ 1.43×｜0.40 ⇒ 1.67×｜0.50 ⇒ 2.00×
+    # 即：**調高 max_drawdown_pct 會等比放大成本閘的誤觸面**，而誤觸的下游是累犯升級
+    # → kill switch → 強制平掉客戶部位。調高本欄位時請一併檢視
+    # `cost_max_turnover_24h`（它的 20 是在 max_drawdown_pct=0.20 的前提下推導的：
+    # 「20×／日 ≈ 每日磨 1.3% ⇒ 約 15 天磨到 0.20」——改了 0.20，那句推導也跟著變）。
     # 慢速絕對底線（findings F1/C2）：7 天滾動窗只量「虧損速度」，慢跌（每窗跌幅低於
     # max_drawdown_pct）可累積成巨額虧損而從不觸發。本門檻以「自開始跟單以來的高水位」
     # 為基準，兩道閘任一觸發即熔斷。0 = 停用。
