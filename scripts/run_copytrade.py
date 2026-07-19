@@ -18,6 +18,15 @@
                     同一份 repo 時務必各自指定不同路徑——否則 follower A 觸發
                     的 kill switch ARM 檔會被 follower B 讀到而連坐停單。
 
+leader 解析（per-follower ＋ 白名單二次驗證）:
+  FILET_FOLLOWERS     follower manifest 路徑（預設 var/filet/followers.json）。
+  FILET_LEADERS_PATH  策劃 leader 白名單路徑（預設 var/filet/leaders.json）。
+  本進程跟誰＝manifest 內自己那筆的 leader_address，缺值才回退 env
+  COPY_LEADER_ADDRESS（**未移除，既有部署照舊可用**）。兩條路徑都要過白名單
+  （例外只有「白名單檔不存在」時的 env 回退）。啟動時解析失敗即拒絕啟動；
+  執行中每 cycle 重新解析，失敗則沿用上一個已驗證 leader ＋ critical 告警。
+  威脅模型與逐條規則見 spark/filet/leader_resolve.py 檔頭。
+
 keystore 選擇:
   FILET_KEYSTORE   缺省／keychain → MacKeychainBackend（Mac 開發）；
                     envfile → EnvFileKeyStore(FILET_KEYS_DIR，預設 /etc/filet/keys，VPS 用)。
@@ -34,8 +43,10 @@ keystore 選擇:
 import argparse
 import json
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from spark.config import Settings
 from spark.copytrade.config import CopySettings
@@ -46,6 +57,14 @@ from spark.copytrade.loop import main_loop, run_cycle
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
 from spark.exchange.base import BuilderCode
+from spark.filet.leader_resolve import (
+    DEFAULT_LEADERS_PATH,
+    DEFAULT_MANIFEST_PATH,
+    LeaderResolution,
+    LeaderResolutionError,
+    LeaderWatch,
+    resolve_leader,
+)
 from spark.filet.tagged_notifier import TaggedNotifier
 from spark.keystore.base import KeyStore
 
@@ -73,6 +92,26 @@ def select_keystore() -> KeyStore:
         return EnvFileKeyStore(keys_dir)
     from spark.keystore.keychain import MacKeychainBackend
     return MacKeychainBackend()
+
+
+def make_leader_resolver(account_id: str | None, user_addr: str,
+                         env_default: str) -> Callable[[], LeaderResolution]:
+    """產生「解析本 follower 該跟的 leader」的閉包（每次呼叫重讀檔案）。
+
+    路徑取自 env（沿 panic_all／filet_daily_report 的 FILET_FOLLOWERS 慣例與
+    filet_activate 的 FILET_LEADERS_PATH 慣例），在**建構時**讀一次即可——
+    env 在進程生命期內不變；每輪要重讀的是**檔案內容**，那由閉包內的
+    resolve_leader 每次呼叫負責。回傳的閉包供 LeaderWatch 每 cycle 呼叫。
+    """
+    manifest_path = os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH)
+    leaders_path = os.environ.get("FILET_LEADERS_PATH", DEFAULT_LEADERS_PATH)
+
+    def _resolve() -> LeaderResolution:
+        return resolve_leader(account_id=account_id, manifest_path=manifest_path,
+                              leaders_path=leaders_path, env_default=env_default,
+                              self_address=user_addr)
+
+    return _resolve
 
 
 def wrap_notifier(inner: Notifier, account_id: str | None) -> Notifier:
@@ -197,6 +236,24 @@ def main(argv: list[str] | None = None) -> None:
     settings = Settings(builder_address=builder_addr,
                         account_id=account_id or "acct", network=network)
 
+    # ⭐ leader 解析＋白名單二次驗證，刻意放在建立 Info／取 key 之前：純檔案 IO，
+    # 失敗要在碰網路與 Keychain 之前就拒絕啟動（威脅模型見 leader_resolve.py 檔頭）。
+    # --status 是零寫入的診斷路徑，刻意豁免：設定壞掉的時候正是最需要它能跑的時候，
+    # 讓它因 leader 解析失敗而停擺等於拿走唯一的排查工具（它也不會下任何單）。
+    resolve_leader_fn = make_leader_resolver(
+        account_id, user_addr, copy_settings.leader_address)
+    resolution: LeaderResolution | None = None
+    if not args.status:
+        try:
+            resolution = resolve_leader_fn()
+        except LeaderResolutionError as e:
+            print(f"leader 解析失敗，拒絕啟動：{e}")
+            raise SystemExit(2) from e
+        # 解析結果覆蓋 env 值，之後所有讀 settings.leader_address 的路徑
+        # （live 警告、run_cycle）都吃同一個已驗證位址——單一真相，不並存兩個來源。
+        copy_settings = replace(copy_settings, leader_address=resolution.address)
+        print(f"[leader] {resolution.address}（來源 {resolution.source}）")
+
     # 網路依賴延後到這裡才 import/建構（import 階段零網路）。
     from hyperliquid.info import Info
 
@@ -242,10 +299,18 @@ def main(argv: list[str] | None = None) -> None:
           f"me={user_addr} interval={copy_settings.interval_s}s")
 
     shadow_dir = state_root / "var" / "copytrade" / "shadow"
+    # 每 cycle 重新解析 leader：客戶換 leader 不必重啟服務、不必給 web 層提權；
+    # 解析失敗沿用上一個已驗證值＋critical（refresh() 不 raise，跟單不中斷）。
+    watch = LeaderWatch(resolution, resolve_leader_fn, notifier)
 
     def cycle():
+        res = watch.refresh()
+        # 位址沒變就沿用同一個 settings 物件（避免每輪無謂重建）；變了才 replace，
+        # 讓 run_cycle 的 leader 讀取與本輪解析結果同源（工程原則 1）。
+        cs = (copy_settings if res.address == copy_settings.leader_address
+              else replace(copy_settings, leader_address=res.address))
         start = len(ex.records)
-        report = run_cycle(adapter, ex, copy_settings, notifier, state, state_root)
+        report = run_cycle(adapter, ex, cs, notifier, state, state_root)
         if args.shadow:
             _append_shadow(ex.records[start:], shadow_dir)
         return report

@@ -17,11 +17,12 @@ import subprocess
 from pathlib import Path
 
 from spark.filet.followers import load_followers
+# 白名單預設路徑與引擎共用單一定義：CLI 驗一份檔、引擎驗另一份檔的漂移，
+# 會讓「已核可的 leader」與「引擎眼中合法的 leader」悄悄分家（安全關鍵）。
+from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
 from spark.filet.leaders import is_allowed_leader, load_leaders
 from spark.publicapi.config import normalize_address, derive_account_id
 from spark.publicapi.pending import load_pending, remove_pending_entry
-
-DEFAULT_LEADERS_PATH = "var/filet/leaders.json"
 
 
 def _resolve_leader(entry: dict, override: str | None, leaders_path: str) -> str | None:
