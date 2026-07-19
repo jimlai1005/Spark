@@ -12,8 +12,9 @@ import stripe
 
 from spark.publicapi.billing import (BillingError, BillingSignatureError, StripeGateway,
                                      apply_webhook_event, has_active_subscription,
-                                     map_stripe_status, verify_webhook_event)
+                                     map_stripe_status, plan_catalog, verify_webhook_event)
 from spark.publicapi.store import ApiStore
+from tests.publicapi_helpers import billing_cfg, make_cfg
 
 ACCT = "f" + "ab" * 20
 WEBHOOK_SECRET = "whsec_test_secret"
@@ -326,6 +327,153 @@ def test_secret_key_not_in_gateway_repr_or_errors(monkeypatch):
     with pytest.raises(BillingError) as ei:
         _gateway_call(gw)
     assert "sk_test_supersecret" not in str(ei.value)
+
+
+# ---------- Customer Portal（失敗分類與 checkout 同一套規則） ----------
+
+def _portal_call(gw):
+    return gw.create_portal_session(customer_id="cus_1", return_url="https://d/billing")
+
+
+def test_portal_session_params_and_url(monkeypatch):
+    seen = {}
+
+    def fake_create(api_key=None, **params):
+        seen.update(params, api_key=api_key)
+        return {"id": "bps_1", "url": "https://billing.stripe.com/p/session/bps_1"}
+
+    monkeypatch.setattr(stripe.billing_portal.Session, "create", fake_create)
+    url = _portal_call(StripeGateway("sk_test_abc"))
+    assert url == "https://billing.stripe.com/p/session/bps_1"
+    assert seen["api_key"] == "sk_test_abc"
+    assert seen["customer"] == "cus_1"
+    assert seen["return_url"] == "https://d/billing"
+
+
+def test_portal_transient_error_translated_no_retry(monkeypatch):
+    """APIConnectionError → ConnectionError（app 統一 502），且**只呼叫一次**：
+    重試政策與 checkout 一致，不在邊界內為 portal 開特例（工程原則 2）。"""
+    calls = []
+
+    def boom(api_key=None, **p):
+        calls.append(1)
+        raise stripe.APIConnectionError("conn reset")
+
+    monkeypatch.setattr(stripe.billing_portal.Session, "create", boom)
+    with pytest.raises(ConnectionError):
+        _portal_call(StripeGateway("sk_test_abc"))
+    assert len(calls) == 1
+
+
+def test_portal_rate_limit_is_transient(monkeypatch):
+    def boom(api_key=None, **p):
+        raise stripe.RateLimitError("slow down")
+    monkeypatch.setattr(stripe.billing_portal.Session, "create", boom)
+    with pytest.raises(ConnectionError):
+        _portal_call(StripeGateway("sk_test_abc"))
+
+
+def test_portal_semantic_error_is_billing_error(monkeypatch):
+    """no such customer / portal 未設定 → semantic，不重試。"""
+    def boom(api_key=None, **p):
+        raise stripe.StripeError("no such customer")
+    monkeypatch.setattr(stripe.billing_portal.Session, "create", boom)
+    with pytest.raises(BillingError):
+        _portal_call(StripeGateway("sk_test_abc"))
+
+
+def test_portal_missing_url_is_billing_error(monkeypatch):
+    monkeypatch.setattr(stripe.billing_portal.Session, "create",
+                        lambda api_key=None, **p: {"id": "bps_1", "url": None})
+    with pytest.raises(BillingError):
+        _portal_call(StripeGateway("sk_test_abc"))
+
+
+def test_portal_secret_key_not_leaked(monkeypatch):
+    def boom(api_key=None, **p):
+        raise stripe.StripeError("bad request")
+    monkeypatch.setattr(stripe.billing_portal.Session, "create", boom)
+    with pytest.raises(BillingError) as ei:
+        _portal_call(StripeGateway("sk_test_supersecret"))
+    assert "sk_test_supersecret" not in str(ei.value)
+
+
+# ---------- 方案目錄 ----------
+
+def _features(catalog: dict, plan_id: str) -> dict[str, dict]:
+    plan = next(p for p in catalog["plans"] if p["id"] == plan_id)
+    return {f["text_key"]: f for f in plan["features"]}
+
+
+def test_plan_catalog_full_when_billing_disabled(tmp_path):
+    """⭐ billing 未設定（無 stripe 三元組）時**仍回完整方案目錄**——定價頁在未接
+    金流時要顯示「即將開放」，而不是整頁消失。只有 billing_enabled/purchasable 轉 False。"""
+    catalog = plan_catalog(make_cfg(tmp_path))
+    assert catalog["billing_enabled"] is False
+    assert [p["id"] for p in catalog["plans"]] == ["free", "pro"]
+    assert all(p["purchasable"] is False for p in catalog["plans"])
+    # 目錄內容不因 billing 停用而縮水：四項功能照列
+    assert len(_features(catalog, "pro")) == 4
+    assert catalog["plans"][1]["price_display"] is None  # 價格未設 → 前端「價格待定」
+
+
+def test_plan_catalog_purchasable_only_for_paid_plan_when_enabled(tmp_path):
+    catalog = plan_catalog(billing_cfg(tmp_path, stripe_price_display="$29 / 月"))
+    assert catalog["billing_enabled"] is True
+    free, pro = catalog["plans"]
+    assert free["purchasable"] is False   # 免費方案無 price_id → 恆 False
+    assert free["price_display"] is None
+    assert pro["purchasable"] is True
+    assert pro["price_display"] == "$29 / 月"  # 價格走設定（使用者尚未拍板）
+
+
+def test_plan_catalog_never_exposes_stripe_price_id(tmp_path):
+    """⭐ 結構性斷言（紅線 2）：price_id 不得出現在對外目錄的任何角落。
+    遞迴掃全部鍵與值——新增欄位若夾帶 price_id 會在這裡紅燈。"""
+    cfg = billing_cfg(tmp_path, stripe_price_id="price_SECRET_123")
+    catalog = plan_catalog(cfg)
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                assert "price_id" not in k, f"對外欄位夾帶 price_id: {k}"
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+        else:
+            assert node != "price_SECRET_123"
+
+    walk(catalog)
+    assert "price_SECRET_123" not in json.dumps(catalog)
+
+
+def test_unshipped_paid_features_are_marked_unshipped(tmp_path):
+    """⭐ 誠實揭露：多 leader 與比例 slider **尚未開發**（Phase 3/4）——pro 方案
+    included=True 但 shipped=False，前端據此標「開發中」而不是假裝可用。
+    這個測試是刻意的提醒機制：Phase 3/4 出貨時它會紅燈，提醒把 shipped 改 True。"""
+    catalog = plan_catalog(billing_cfg(tmp_path))
+    pro = _features(catalog, "pro")
+    for key in ("plans.feature.multiLeader", "plans.feature.ratioSlider"):
+        assert pro[key]["included"] is True
+        assert pro[key]["shipped"] is False, f"{key} 已出貨？請同步更新方案目錄"
+    # 已推出的功能：免費層不受限制（跟單不限本金、回撤保護照給）
+    free = _features(catalog, "free")
+    for key in ("plans.feature.copytrade", "plans.feature.killswitch"):
+        assert free[key] == {"text_key": key, "included": True, "shipped": True}
+    # 免費層不含付費功能
+    assert free["plans.feature.multiLeader"]["included"] is False
+    assert free["plans.feature.ratioSlider"]["included"] is False
+
+
+def test_plan_catalog_has_no_hardcoded_user_copy(tmp_path):
+    """⭐ 紅線 1：後端只給 i18n 鍵，使用者可見文案在前端 copy.ts。
+    每個 name_key/text_key 都必須長得像鍵（plans.* 命名空間、無空白）。"""
+    catalog = plan_catalog(billing_cfg(tmp_path))
+    for plan in catalog["plans"]:
+        assert plan["name_key"].startswith("plans.") and " " not in plan["name_key"]
+        for f in plan["features"]:
+            assert f["text_key"].startswith("plans.feature.") and " " not in f["text_key"]
 
 
 # ---------- entitlement（紅線 6：只查不動） ----------

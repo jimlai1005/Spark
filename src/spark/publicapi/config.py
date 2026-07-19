@@ -60,6 +60,10 @@ class ApiConfig:
     stripe_secret_key: str | None = field(default=None, repr=False)
     stripe_webhook_secret: str | None = field(default=None, repr=False)
     stripe_price_id: str | None = None
+    # 定價頁顯示字串（例："$29 / 月"）。⭐ 刻意**不納入**三元組的同設或同缺驗證：
+    # 它只是顯示用字串，缺了不影響任何金流路徑（plan_catalog 回 price_display=None，
+    # 前端顯示「價格待定」）。價格數字使用者尚未拍板 → 走設定不寫死在程式碼。
+    stripe_price_display: str | None = None
 
     def __post_init__(self):
         if self.stripe_secret_key is not None and \
@@ -127,4 +131,7 @@ class ApiConfig:
                    admin_addresses=admins,
                    stripe_secret_key=stripe_env["FILET_STRIPE_SECRET_KEY"],
                    stripe_webhook_secret=stripe_env["FILET_STRIPE_WEBHOOK_SECRET"],
-                   stripe_price_id=stripe_env["FILET_STRIPE_PRICE_ID"])
+                   stripe_price_id=stripe_env["FILET_STRIPE_PRICE_ID"],
+                   # 獨立讀取（不進 stripe_env）：納入 stripe_env 會被上面的
+                   # 「三個一起設」檢查算成第四個成員，讓純顯示字串能擋下啟動
+                   stripe_price_display=env.get("FILET_STRIPE_PRICE_DISPLAY") or None)

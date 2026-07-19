@@ -111,9 +111,13 @@ STRIPE_WEBHOOK_SECRET = "whsec_test_secret"
 
 
 def billing_cfg(tmp_path, **over):
-    return make_cfg(tmp_path, stripe_secret_key="sk_test_abc",
-                    stripe_webhook_secret=STRIPE_WEBHOOK_SECRET,
-                    stripe_price_id="price_test_1", **over)
+    """stripe 三元組齊備的 cfg。預設用 dict 合併（不是直接傳 kwarg）——呼叫端才能
+    覆寫 stripe_price_id 等預設值而不撞上 "multiple values for keyword argument"。"""
+    base = dict(stripe_secret_key="sk_test_abc",
+                stripe_webhook_secret=STRIPE_WEBHOOK_SECRET,
+                stripe_price_id="price_test_1")
+    base.update(over)
+    return make_cfg(tmp_path, **base)
 
 
 def stripe_sig(payload: bytes, secret: str = STRIPE_WEBHOOK_SECRET,

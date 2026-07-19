@@ -15,7 +15,7 @@ from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.billing import (BillingError, BillingSignatureError,
                                      apply_webhook_event, has_active_subscription,
-                                     verify_webhook_event)
+                                     plan_catalog, verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.ops import (customer_pnl, jsonable, load_accrued_series,
                                  revenue_reconciliation)
@@ -350,6 +350,35 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             cancel_url=f"{cfg.siwe_uri}/billing?checkout=cancel",
             customer_id=rec.stripe_customer_id if rec else None)
         return {"checkout_url": url}
+
+    @app.get("/api/billing/plans")
+    def billing_plans():
+        """方案目錄（定價頁資料源）。⭐ 兩個刻意的豁免：
+        1. **不需 session**——定價頁要能在登入前瀏覽（全 app 第二個 session 豁免端點，
+           但與 webhook 不同，這裡沒有任何授權需求：回的是公開商品資訊、無帳號資料、
+           無 DB 讀取、無 Stripe 呼叫）。
+        2. **不過 _require_billing**——billing 未設定時仍回完整目錄
+           （billing_enabled=false、purchasable=false），前端據此顯示「即將開放」，
+           而不是整頁 501 消失。
+        回傳不含 stripe_price_id（plan_catalog 白名單欄位，結構性）。"""
+        return plan_catalog(cfg)
+
+    @app.post("/api/billing/portal")
+    def billing_portal(address: str = Depends(_require_session)):
+        """Stripe Customer Portal（自助改付款方式／取消訂閱），回 portal URL。
+        session 綁定：customer_id 由 session 衍生的 account 查 DB 得到，端點無輸入
+        參數——使用者不可能指定別人的 customer（沿「別人不能替你 onboard」精神）。
+        無 customer_id → 409：portal 只能管理既有訂閱，沒有 customer 就無可管理者。
+        Stripe 失敗分類（紅線 4）：transient=ConnectionError→502 稍後重試；
+        semantic=BillingError→502 專屬 handler。"""
+        _require_billing()
+        account_id = derive_account_id(address)
+        rec = store.get_billing(account_id)
+        if rec is None or not rec.stripe_customer_id:
+            raise HTTPException(status_code=409, detail="尚無訂閱記錄，請先訂閱")
+        url = billing.create_portal_session(customer_id=rec.stripe_customer_id,
+                                            return_url=f"{cfg.siwe_uri}/billing")
+        return {"url": url}
 
     @app.get("/api/billing/status")
     def billing_status(address: str = Depends(_require_session)):

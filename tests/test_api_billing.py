@@ -6,7 +6,7 @@ import socket
 import pytest
 from fastapi.testclient import TestClient
 
-from spark.publicapi.billing import StripeGateway
+from spark.publicapi.billing import BillingError, StripeGateway
 from spark.publicapi.config import derive_account_id
 from tests.publicapi_helpers import billing_cfg, login, make_app, stripe_sig
 
@@ -20,10 +20,12 @@ def _allow_local_sockets(monkeypatch):
     monkeypatch.setattr(socket, "socket", _REAL_SOCKET)
 
 
-def _billing_app(tmp_path, create_fn=None):
-    cfg = billing_cfg(tmp_path)
+def _billing_app(tmp_path, create_fn=None, portal_fn=None, cfg=None):
+    cfg = cfg or billing_cfg(tmp_path)
     gw = StripeGateway("sk_test_abc", create_fn=create_fn or
-                       (lambda **p: {"id": "cs_1", "url": "https://checkout.example/cs_1"}))
+                       (lambda **p: {"id": "cs_1", "url": "https://checkout.example/cs_1"}),
+                       portal_fn=portal_fn or
+                       (lambda **p: {"id": "bps_1", "url": "https://portal.example/bps_1"}))
     app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg, billing=gw)
     return app, cfg, store
 
@@ -237,6 +239,123 @@ def test_billing_endpoints_501_when_disabled(tmp_path):
     login(client)
     assert client.post("/api/billing/checkout").status_code == 501
     assert client.get("/api/billing/status").status_code == 501
+
+
+# ---------- plans（公開端點：無 session、billing 停用亦可讀） ----------
+
+def test_plans_needs_no_session(tmp_path):
+    """⭐ 定價頁要能在登入前瀏覽——**不帶 cookie 也回 200**（刻意的 session 豁免）。"""
+    app, cfg, store = _billing_app(tmp_path)
+    r = TestClient(app).get("/api/billing/plans")
+    assert r.status_code == 200, r.text
+    assert [p["id"] for p in r.json()["plans"]] == ["free", "pro"]
+
+
+def test_plans_available_when_billing_disabled(tmp_path):
+    """⭐ 與其他 billing 端點不同：**不回 501**——未接金流時前端要顯示
+    「即將開放」，而不是整頁消失。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)  # 無 stripe 設定、無 gateway
+    r = TestClient(app).get("/api/billing/plans")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["billing_enabled"] is False
+    assert all(p["purchasable"] is False for p in body["plans"])
+    assert len(body["plans"]) == 2  # 目錄不縮水
+
+
+def test_plans_response_has_no_stripe_price_id(tmp_path):
+    """⭐ 紅線 2 的端點層防線：HTTP 回應原文不得含 price_id（結構性）。"""
+    cfg = billing_cfg(tmp_path, stripe_price_id="price_SECRET_123",
+                      stripe_price_display="$29 / 月")
+    app, cfg, store = _billing_app(tmp_path, cfg=cfg)
+    r = TestClient(app).get("/api/billing/plans")
+    assert r.status_code == 200
+    assert "price_SECRET_123" not in r.text
+    assert "price_id" not in r.text
+    pro = next(p for p in r.json()["plans"] if p["id"] == "pro")
+    assert pro["price_display"] == "$29 / 月" and pro["purchasable"] is True
+
+
+# ---------- portal（session 綁定；無訂閱 409） ----------
+
+def test_portal_returns_url_bound_to_session(tmp_path):
+    seen = {}
+
+    def portal_fn(**p):
+        seen.update(p)
+        return {"id": "bps_1", "url": "https://portal.example/bps_1"}
+
+    app, cfg, store = _billing_app(tmp_path, portal_fn=portal_fn)
+    client = TestClient(app, base_url="https://testserver")
+    wallet = login(client)
+    store.upsert_billing(derive_account_id(wallet.address), status="active",
+                         stripe_customer_id="cus_7", now_s=1.0)
+    r = client.post("/api/billing/portal")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"url": "https://portal.example/bps_1"}
+    # customer 只能來自 session 衍生的 account（端點無輸入參數）
+    assert seen["customer"] == "cus_7"
+    assert seen["return_url"] == f"{cfg.siwe_uri}/billing"  # 從 siwe_uri 衍生，無新 env
+
+
+def test_portal_409_when_no_customer(tmp_path):
+    """尚無訂閱記錄 → 409（portal 只能管理既有訂閱）。"""
+    app, cfg, store = _billing_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+    r = client.post("/api/billing/portal")
+    assert r.status_code == 409
+    assert "訂閱" in r.json()["detail"]
+
+
+def test_portal_409_when_record_exists_without_customer_id(tmp_path):
+    """有 billing 列但 customer_id 為空（例如 webhook 只寫了狀態）→ 一樣 409，
+    不得拿 None 去呼叫 Stripe。"""
+    app, cfg, store = _billing_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    wallet = login(client)
+    store.upsert_billing(derive_account_id(wallet.address), status="canceled", now_s=1.0)
+    assert client.post("/api/billing/portal").status_code == 409
+
+
+def test_portal_requires_session(tmp_path):
+    app, cfg, store = _billing_app(tmp_path)
+    assert TestClient(app).post("/api/billing/portal").status_code == 401
+
+
+def test_portal_501_when_billing_disabled(tmp_path):
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+    assert client.post("/api/billing/portal").status_code == 501
+
+
+def test_portal_transient_stripe_failure_is_502(tmp_path):
+    def portal_fn(**p):
+        raise ConnectionError("stripe 連線失敗")  # gateway 對 transient 轉譯後的形態
+
+    app, cfg, store = _billing_app(tmp_path, portal_fn=portal_fn)
+    client = TestClient(app, base_url="https://testserver", raise_server_exceptions=False)
+    wallet = login(client)
+    store.upsert_billing(derive_account_id(wallet.address), status="active",
+                         stripe_customer_id="cus_7", now_s=1.0)
+    r = client.post("/api/billing/portal")
+    assert r.status_code == 502  # 既有 ConnectionError handler：前端「稍後重試」
+
+
+def test_portal_semantic_stripe_failure_is_502(tmp_path):
+    """semantic（no such customer / portal 未設定）→ BillingError → 專屬 502 handler。"""
+    def portal_fn(**p):
+        raise BillingError("stripe portal 建立被拒: StripeError: no such customer")
+
+    app, cfg, store = _billing_app(tmp_path, portal_fn=portal_fn)
+    client = TestClient(app, base_url="https://testserver", raise_server_exceptions=False)
+    wallet = login(client)
+    store.upsert_billing(derive_account_id(wallet.address), status="active",
+                         stripe_customer_id="cus_7", now_s=1.0)
+    r = client.post("/api/billing/portal")
+    assert r.status_code == 502
+    assert "計費服務錯誤" in r.json()["detail"]
 
 
 def test_onboarding_unaffected_when_billing_disabled(tmp_path):

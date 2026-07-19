@@ -10,8 +10,11 @@ M3 計費骨幹（**全程 Stripe 測試模式**；sk_test_ 強制在 ApiConfig�
   （opus 總審 F1——Stripe event.created 秒級精度、不保證投遞順序，`>=` 同時服務
   去重與排序會在同秒留下縫：canceled 已套用後同秒晚到的 active 不得覆寫回去）。
 - has_active_subscription：entitlement **只查不動**——不接任何自動停用跟單邏輯
-  （停用是政策決策，留使用者人工裁決；紅線 6）。"""
+  （停用是政策決策，留使用者人工裁決；紅線 6）。
+- plan_catalog：方案目錄。功能清單版控於程式碼、價格與 price_id 走設定；
+  `shipped=False` 誠實揭露「已規劃但未推出」——不賣不存在的功能。"""
 import logging
+from dataclasses import dataclass
 
 from spark.filet.followers import validate_account_id
 from spark.publicapi.store import ApiStore
@@ -44,9 +47,10 @@ class StripeGateway:
     （無全域 stripe.api_key 狀態）。失敗分類集中在 create_checkout_session 一處，
     注入 fake 也繞不開（結構性）。"""
 
-    def __init__(self, secret_key: str, create_fn=None):
+    def __init__(self, secret_key: str, create_fn=None, portal_fn=None):
         self._secret_key = secret_key
         self._create = create_fn or self._default_create
+        self._portal = portal_fn or self._default_portal
 
     def __repr__(self) -> str:  # key 不進 repr/log（紅線 1）
         return "<StripeGateway test-mode>"
@@ -54,6 +58,10 @@ class StripeGateway:
     def _default_create(self, **params):
         import stripe
         return stripe.checkout.Session.create(api_key=self._secret_key, **params)
+
+    def _default_portal(self, **params):
+        import stripe
+        return stripe.billing_portal.Session.create(api_key=self._secret_key, **params)
 
     def create_checkout_session(self, *, account_id: str, price_id: str,
                                 success_url: str, cancel_url: str,
@@ -86,6 +94,27 @@ class StripeGateway:
         url = session["url"] if isinstance(session, dict) else getattr(session, "url", None)
         if not url:
             raise BillingError("stripe 回應缺 checkout url")
+        return url
+
+    def create_portal_session(self, *, customer_id: str, return_url: str) -> str:
+        """建 Billing Portal Session（改付款方式／取消訂閱），回 portal URL。
+        失敗分類與重試政策**刻意與 create_checkout_session 完全一致**（同一邊界、
+        同一套規則）：transient（連線／限流）→ ConnectionError → app 統一 502
+        「稍後重試」，由使用者重按；semantic → BillingError。
+        單次嘗試不重試：portal session 建立同屬非冪等寫入（工程原則 2）——雖然
+        重複建立只是多產生一條短效連結（無金流副作用），但重試決策留在同一處，
+        不讓「這個大概沒差」在邊界內開特例。"""
+        import stripe
+        try:
+            session = self._portal(customer=customer_id, return_url=return_url)
+        except (stripe.APIConnectionError, stripe.RateLimitError) as e:
+            raise ConnectionError(f"stripe 連線失敗: {type(e).__name__}") from e
+        except stripe.StripeError as e:
+            raise BillingError(f"stripe portal 建立被拒: {type(e).__name__}: "
+                               f"{getattr(e, 'user_message', None) or e}") from e
+        url = session["url"] if isinstance(session, dict) else getattr(session, "url", None)
+        if not url:
+            raise BillingError("stripe 回應缺 portal url")
         return url
 
 
@@ -166,3 +195,85 @@ def has_active_subscription(store: ApiStore, account_id: str) -> bool:
     本函式不得接任何自動停用邏輯（紅線 6）。"""
     rec = store.get_billing(account_id)
     return rec is not None and rec.status == "active"
+
+
+# ---------- 方案目錄（定價頁資料源） ----------
+
+@dataclass(frozen=True)
+class PlanFeature:
+    """text_key：前端 copy.ts 的鍵——⭐ 後端不寫死使用者可見文案（紅線 1）。
+    included：該方案是否包含此功能。
+    shipped：該功能是否**已推出**（False = 已規劃、開發中）。included 與 shipped
+    刻意分成兩個軸：付費層可以「包含但尚未推出」，前端據此標「開發中」而不是
+    假裝可用——不賣不存在的功能。"""
+    text_key: str
+    included: bool
+    shipped: bool
+
+
+@dataclass(frozen=True)
+class Plan:
+    id: str
+    name_key: str
+    price_display: str | None   # None = 免費（或價格未設定 → 前端顯示「價格待定」）
+    stripe_price_id: str | None  # ⭐ 內部欄位，不外流（見 _plan_public 白名單）
+    features: tuple[PlanFeature, ...]
+
+
+# 功能鍵（單一真相：前端 copy.ts 用同名鍵渲染）
+_F_COPYTRADE = "plans.feature.copytrade"
+_F_KILLSWITCH = "plans.feature.killswitch"
+_F_MULTI_LEADER = "plans.feature.multiLeader"
+_F_RATIO_SLIDER = "plans.feature.ratioSlider"
+
+# ⭐ 方案 B（免費層＋月費），使用者拍板：**免費層不受限制**——跟單不限本金、
+# 回撤保護照給；付費解鎖的是多 leader 與比例 slider，而這兩個功能都**尚未開發**
+# （Phase 3/4）。Phase 3/4 完成時把對應 shipped 改 True（tests/test_publicapi_billing.py
+# 有測試釘住 False，屆時會紅燈提醒——這是刻意的提醒機制，不是壞測試）。
+_FREE_FEATURES = (
+    PlanFeature(_F_COPYTRADE, included=True, shipped=True),
+    PlanFeature(_F_KILLSWITCH, included=True, shipped=True),
+    PlanFeature(_F_MULTI_LEADER, included=False, shipped=False),
+    PlanFeature(_F_RATIO_SLIDER, included=False, shipped=False),
+)
+_PRO_FEATURES = (
+    PlanFeature(_F_COPYTRADE, included=True, shipped=True),
+    PlanFeature(_F_KILLSWITCH, included=True, shipped=True),
+    PlanFeature(_F_MULTI_LEADER, included=True, shipped=False),
+    PlanFeature(_F_RATIO_SLIDER, included=True, shipped=False),
+)
+
+
+def _plan_public(plan: Plan, *, billing_enabled: bool) -> dict:
+    """Plan → 對外 dict。⭐ 白名單列欄位（不是 asdict 再 pop）：stripe_price_id
+    要外流必須有人**主動加一行**，結構性防洩（工程原則 5 的精神）。"""
+    return {
+        "id": plan.id,
+        "name_key": plan.name_key,
+        "price_display": plan.price_display,
+        "features": [{"text_key": f.text_key, "included": f.included,
+                      "shipped": f.shipped} for f in plan.features],
+        # 可購買 = 有 price_id **且** billing 已啟用。免費方案無 price_id → 恆 False。
+        "purchasable": bool(plan.stripe_price_id) and billing_enabled,
+    }
+
+
+def plan_catalog(cfg) -> dict:
+    """回方案目錄。
+
+    設計：**功能清單版本控管於程式碼**（結構穩定、可測試），**價格與 Stripe price_id
+    走設定**（使用者尚未拍板價格，改設定不改碼）。`shipped=False` 表示該功能已規劃但
+    尚未推出——前端據此標示「開發中」而非假裝可用（誠實揭露：不賣不存在的功能）。
+
+    billing 未設定時仍回完整目錄（billing_enabled=False、purchasable=False）：
+    定價頁在未接金流時要顯示「即將開放」，而不是整頁消失。"""
+    plans = (
+        Plan(id="free", name_key="plans.free.name", price_display=None,
+             stripe_price_id=None, features=_FREE_FEATURES),
+        Plan(id="pro", name_key="plans.pro.name",
+             price_display=cfg.stripe_price_display,
+             stripe_price_id=cfg.stripe_price_id, features=_PRO_FEATURES),
+    )
+    return {"billing_enabled": cfg.billing_enabled,
+            "plans": [_plan_public(p, billing_enabled=cfg.billing_enabled)
+                      for p in plans]}

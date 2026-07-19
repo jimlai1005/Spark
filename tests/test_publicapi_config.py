@@ -161,6 +161,30 @@ def test_partial_set_refused_on_direct_construction():
                   stripe_secret_key="sk_test_abc")
 
 
+def test_price_display_is_optional_and_not_part_of_trio():
+    """⭐ price_display 只是顯示字串，**不納入**三元組的同設或同缺驗證：
+    三元組齊全但沒設它 → 照常啟動、值為 None（前端顯示「價格待定」）。
+    價格數字使用者尚未拍板 → 走設定，不寫死在程式碼。"""
+    cfg = ApiConfig.from_env(_env(FILET_STRIPE_SECRET_KEY="sk_test_abc",
+                                  FILET_STRIPE_WEBHOOK_SECRET="whsec_x",
+                                  FILET_STRIPE_PRICE_ID="price_x"))
+    assert cfg.stripe_price_display is None
+    assert cfg.billing_enabled is True
+    cfg = ApiConfig.from_env(_env(FILET_STRIPE_SECRET_KEY="sk_test_abc",
+                                  FILET_STRIPE_WEBHOOK_SECRET="whsec_x",
+                                  FILET_STRIPE_PRICE_ID="price_x",
+                                  FILET_STRIPE_PRICE_DISPLAY="$29 / 月"))
+    assert cfg.stripe_price_display == "$29 / 月"
+
+
+def test_price_display_alone_does_not_enable_billing():
+    """只設顯示字串（無三元組）不得被當成「設了 stripe」而擋下啟動——
+    它不是金流設定的一員。"""
+    cfg = ApiConfig.from_env(_env(FILET_STRIPE_PRICE_DISPLAY="$29 / 月"))
+    assert cfg.billing_enabled is False
+    assert cfg.stripe_price_display == "$29 / 月"
+
+
 def test_key_not_in_config_repr():
     """secret 不進 repr/log（縱深防禦；dataclass 預設 repr 會印全部欄位——必須遮）。"""
     cfg = ApiConfig.from_env(_env(FILET_STRIPE_SECRET_KEY="sk_test_secret123",
