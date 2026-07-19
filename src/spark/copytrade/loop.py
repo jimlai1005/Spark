@@ -40,7 +40,9 @@ _EMPTY_RECONCILE = ReconcileResult(placed=0, cancelled=0, modified=0, matched=0,
                                    sync_failed=False, skipped_small=())
 
 
-def _tripped_report() -> CycleReport:
+def tripped_report() -> CycleReport:
+    """零交易動作的一輪。公開（非 _ 前綴）是因為 run_copytrade 的 leader 撤銷路徑
+    也要回報「這一輪什麼都沒做」——兩處各造一份會漂移。"""
     return CycleReport(reconcile=_EMPTY_RECONCILE, safety_net={"skipped": True},
                        scale=Decimal("0"), tripped=True)
 
@@ -68,7 +70,7 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             f"本輪跳過所有交易動作；re-arm＝人工刪除該檔",
             dedup_key="tripped",  # TelegramNotifier TTL 內去重，避免每分鐘洗版
         )
-        return _tripped_report()
+        return tripped_report()
 
     # ── 2. 回撤判定（同一次 portfolio 回應的 current/peak）─────────────
     # 必須用 evaluate() 而非直呼 check_drawdown（killswitch.py 主迴圈接入接口）：
@@ -87,7 +89,7 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         if settings.flatten_on_breach:
             my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
             trip(ex, my_positions, notifier, root, status)
-        return _tripped_report()
+        return tripped_report()
 
     # ── 3. leader / my 狀態讀取 ────────────────────────────────────────
     leader = settings.leader_address

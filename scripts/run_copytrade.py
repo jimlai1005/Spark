@@ -44,6 +44,7 @@ import argparse
 import json
 import os
 from dataclasses import replace
+from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -52,8 +53,8 @@ from spark.config import Settings
 from spark.copytrade.config import CopySettings
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
-from spark.copytrade.killswitch import check_drawdown, is_tripped
-from spark.copytrade.loop import main_loop, run_cycle
+from spark.copytrade.killswitch import DrawdownStatus, check_drawdown, is_tripped, trip
+from spark.copytrade.loop import main_loop, run_cycle, tripped_report
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
 from spark.exchange.base import BuilderCode
@@ -112,6 +113,27 @@ def make_leader_resolver(account_id: str | None, user_addr: str,
                               self_address=user_addr)
 
     return _resolve
+
+
+def make_revocation_wind_down(adapter, ex, notifier: Notifier,
+                              root: Path) -> Callable[[], None]:
+    """leader 被白名單撤銷時的**受控收尾**閉包（交給 LeaderWatch 在偵測到撤銷時呼叫）。
+
+    ⭐ 刻意重用 `killswitch.trip`，不另寫一套收尾：trip 的順序（lock-first 寫 ARM →
+    撤全部掛單 → reduce-only 全平 → 覆寫 ARM → 持久告警）是紅線，兩套實作必然漂移，
+    而漂移的那一套只在真出事時才會被執行到——那正是最不能出錯的時刻。
+
+    reason="leader_revoked" 讓 ARM 檔寫出鎖死的真正理由（回撤數字在這條路徑上全是 0，
+    沒有 reason 的話操作者只會看到一份看不出所以然的 payload）。
+    """
+    def _wind_down() -> None:
+        positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
+        trip(ex, positions, notifier, root,
+             DrawdownStatus(current=Decimal("0"), peak=Decimal("0"),
+                            drawdown_pct=Decimal("0"), breached=False),
+             reason="leader_revoked")
+
+    return _wind_down
 
 
 def wrap_notifier(inner: Notifier, account_id: str | None) -> Notifier:
@@ -179,8 +201,6 @@ def _print_status(adapter, user_addr: str, settings: CopySettings, root: Path) -
     equity 基準與引擎判定一致（perp accountValue + 滾動樣本，findings F1）——
     顯示與判定同基準才不會誤導操作者對緩衝的判斷。
     """
-    from decimal import Decimal
-
     ev = perp_equity_view(adapter, user_addr, root, persist=False)
     cov = sample_coverage(root)
     lifetime = update_lifetime_peak(root, ev.current, persist=False)
@@ -300,11 +320,19 @@ def main(argv: list[str] | None = None) -> None:
 
     shadow_dir = state_root / "var" / "copytrade" / "shadow"
     # 每 cycle 重新解析 leader：客戶換 leader 不必重啟服務、不必給 web 層提權；
-    # 解析失敗沿用上一個已驗證值＋critical（refresh() 不 raise，跟單不中斷）。
-    watch = LeaderWatch(resolution, resolve_leader_fn, notifier)
+    # transient 失敗沿用上一個已驗證值＋critical（refresh() 不 raise，跟單不中斷）；
+    # **撤銷**（enabled=false／條目被移除）則走 on_revoked 受控收尾並回 None。
+    watch = LeaderWatch(resolution, resolve_leader_fn, notifier,
+                        on_revoked=make_revocation_wind_down(
+                            adapter, ex, notifier, state_root))
 
     def cycle():
         res = watch.refresh()
+        if res is None:
+            # leader 已被撤銷、收尾已執行（或已大聲失敗）→ 本輪起零交易動作。
+            # 刻意不倚賴「trip 寫了 ARM 檔所以 run_cycle 會自己短路」：ARM 寫入失敗時
+            # 那個短路不存在，而「停止開新倉」不能建立在另一個動作成功的前提上。
+            return tripped_report()
         # 位址沒變就沿用同一個 settings 物件（避免每輪無謂重建）；變了才 replace，
         # 讓 run_cycle 的 leader 讀取與本輪解析結果同源（工程原則 1）。
         cs = (copy_settings if res.address == copy_settings.leader_address

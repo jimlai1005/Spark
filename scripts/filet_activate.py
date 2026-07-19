@@ -20,7 +20,7 @@ from spark.filet.followers import load_followers
 # 白名單預設路徑與引擎共用單一定義：CLI 驗一份檔、引擎驗另一份檔的漂移，
 # 會讓「已核可的 leader」與「引擎眼中合法的 leader」悄悄分家（安全關鍵）。
 from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
-from spark.filet.leaders import is_allowed_leader, load_leaders
+from spark.filet.leaders import is_selectable, load_leaders
 from spark.publicapi.config import normalize_address, derive_account_id
 from spark.publicapi.pending import load_pending, remove_pending_entry
 
@@ -46,10 +46,13 @@ def _resolve_leader(entry: dict, override: str | None, leaders_path: str) -> str
         raise SystemExit(f"leader 位址不合法: {raw!r} —— {e}") from e
     # 白名單檔不存在 → 空清單 → 任何指定的 leader 都被拒（安全預設：
     # 尚未策劃任何 leader 時，沒有人是可選的）。格式壞掉 → load_leaders fail-fast。
-    if not is_allowed_leader(leader, load_leaders(leaders_path)):
+    # 用 is_selectable（**選擇時**的述詞，enabled 與 accepting_new 都要過），不是引擎
+    # 持續驗證用的 is_still_permitted——例行下架（accepting_new=false）的 leader
+    # 不該再收新客戶，但已在跟的人不受影響（兩個旗標的分工見 leaders.py 檔頭）。
+    if not is_selectable(leader, load_leaders(leaders_path)):
         raise SystemExit(
-            f"leader {leader} 不在策劃白名單（{leaders_path}）或已下架 —— 拒絕啟用。"
-            f"要新增 leader 請由管理端編輯白名單檔，不要繞過本檢查")
+            f"leader {leader} 不在策劃白名單（{leaders_path}）、已被撤銷或已停止收新客戶"
+            f" —— 拒絕啟用。要新增 leader 請由管理端編輯白名單檔，不要繞過本檢查")
     return leader
 
 

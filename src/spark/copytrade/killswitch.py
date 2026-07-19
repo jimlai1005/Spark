@@ -182,8 +182,14 @@ def _write_arm(arm_path: Path, payload: dict, notifier: Notifier, root: Path) ->
 
 
 def trip(ex: ExecutorPort, my_positions: dict[str, Position], notifier: Notifier,
-         root: Path, status: DrawdownStatus, *, sleep_fn=time.sleep) -> FlattenReport:
+         root: Path, status: DrawdownStatus, *, sleep_fn=time.sleep,
+         reason: str = "") -> FlattenReport:
     """觸發 kill switch：鎖檔 → 撤單 → 全平 → 覆寫 ARM → 總結告警。順序是紅線，不得重排。
+
+    reason：非回撤觸發時的原因標籤（例如 leader 被白名單撤銷 → `"leader_revoked"`），
+    寫進 ARM payload 與總結告警。留空＝回撤觸發（既有行為，payload 不變）。
+    沒有它的話，非回撤觸發寫出的 ARM 檔會是一份 `drawdown_pct=0 breached=false` 的
+    payload，操作者讀了只會更困惑——鎖死交易的理由必須寫在鎖上。
 
     0. **Lock-first**：先寫 preliminary ARM（時間戳＋status＋phase=flatten_in_progress）
        ——flatten 中途 process 被殺，重啟後仍 tripped。寫不進去（OSError）→ critical
@@ -216,6 +222,7 @@ def trip(ex: ExecutorPort, my_positions: dict[str, Position], notifier: Notifier
         "peak": str(status.peak),
         "drawdown_pct": str(status.drawdown_pct),
         "breached": status.breached,
+        **({"reason": reason} if reason else {}),
     }
 
     # 0) Lock-first：任何交易動作之前先落鎖檔
@@ -277,7 +284,8 @@ def trip(ex: ExecutorPort, my_positions: dict[str, Position], notifier: Notifier
 
     # 4) 總結告警
     crit(
-        f"KILL SWITCH TRIPPED：dd={status.drawdown_pct} current={status.current} "
+        f"KILL SWITCH TRIPPED{f'（原因：{reason}）' if reason else ''}："
+        f"dd={status.drawdown_pct} current={status.current} "
         f"peak={status.peak}｜撤單成功 {cancelled} 張"
         f"{'（掛單清單未知，一張未撤）' if orders_not_cancelled else ''}｜"
         f"平倉成功 {closed or '無'}｜平倉失敗 {failures or '無'}｜"

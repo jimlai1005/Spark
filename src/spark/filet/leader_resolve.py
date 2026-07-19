@@ -31,14 +31,29 @@ manifest）。**API 進程若被打穿，攻擊者能把 follower 指向惡意 l
 4. leader **不得等於 follower 自己的位址**（自己跟自己無意義，且會形成回饋迴圈：
    本方下的單會被下一輪當成 leader 目標再放大）→ 拒絕。
 
-失敗語意（工程原則 2、3）
-----------------------
-- **啟動時**解析失敗 → 呼叫端拒絕啟動（LeaderResolutionError 上拋），
-  **不得靜默回退 env**：靜默回退正是攻擊者想要的降級路徑。
-- **執行中**解析失敗（白名單檔壞掉、manifest 暫時讀不到、新 leader 不在白名單）
-  → `LeaderWatch.refresh()` **保持使用上一個已驗證通過的 leader** ＋ 發 critical，
-  **絕不**停止跟單、**絕不**靜默切換。理由：已在跑的部位需要有人繼續管理，
-  停止跟單＝部位無人看管；靜默切換＝安全關鍵事件被吞掉（原則 3）。
+⭐ 失敗語意：撤銷（semantic）與暫時失敗（transient）必須分開（工程原則 2、3）
+--------------------------------------------------------------------------
+2026-07-19 opus 對抗性審查 Critical：本模組原本用一個 `except Exception` 把所有
+執行中失敗都當成「沿用上一個 leader ＋ critical」。但兩種失敗的性質完全相反：
+
+- **transient**：白名單檔暫時讀不到、IO 錯、manifest 暫時損毀 → 解析**沒有結論**，
+  沿用上一個已驗證值是對的（已在跑的部位需要有人繼續管理，停手＝部位無人看管）。
+- **semantic（撤銷）**：解析成功，白名單**明確拒絕**這個 leader（`enabled:false`
+  或整筆被移除）→ 沿用舊值是災難：管理端把出事的 leader（帳號被盜、對敲、策略
+  失控）撤下來之後，跟他的人會**永遠繼續跟下去**，而操作者以為已經止血了。
+
+所以撤銷走獨立的 `LeaderRevokedError`，由 `LeaderWatch.refresh()` 觸發**受控收尾**
+（停止開新倉 → 平掉現有部位 → 鎖死 kill switch，重用 killswitch.trip）。
+`accepting_new:false` 的**例行下架**不走這條路（leaders.py 檔頭有兩個旗標的分工）。
+
+逐條：
+- **啟動時**解析失敗（含撤銷）→ 呼叫端拒絕啟動（LeaderResolutionError 上拋），
+  **不得靜默回退 env**：靜默回退正是攻擊者想要的降級路徑。啟動時撤銷不需收尾——
+  本來就還沒開倉。
+- **執行中撤銷**（LeaderRevokedError）→ 受控收尾＋critical，`refresh()` 回 `None`
+  表示「本輪起不得交易」。
+- **執行中其他失敗**（白名單檔壞掉/讀不到、manifest 暫時損毀）→ 沿用上一個已驗證
+  leader ＋ critical，**絕不**停止跟單、**絕不**靜默切換（原則 3）。
 - **leader 實際變更** → critical，訊息含舊 leader／新 leader／來源。換 leader 會讓
   引擎收斂到新 leader 的部位（平舊開新，有實際 taker 成本），屬重大事件必須留痕。
 """
@@ -51,7 +66,7 @@ from typing import Callable
 
 from spark.copytrade.notifier import Notifier
 from spark.filet.followers import FollowerRef, load_followers, normalize_hex_address
-from spark.filet.leaders import is_allowed_leader, load_leaders
+from spark.filet.leaders import is_still_permitted, load_leaders
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +78,24 @@ SOURCE_ENV_DEFAULT = "env_default"
 
 
 class LeaderResolutionError(ValueError):
-    """leader 解析失敗。啟動時＝拒絕啟動；執行中＝沿用上一個已驗證 leader＋critical。"""
+    """leader 解析失敗（**transient**：讀不到、檔案缺失、格式壞）。
+
+    啟動時＝拒絕啟動；執行中＝沿用上一個已驗證 leader＋critical（解析沒有結論，
+    不代表現在跟的這個 leader 有問題）。
+    """
+
+
+class LeaderRevokedError(LeaderResolutionError):
+    """⭐ **semantic**：解析成功，但白名單明確拒絕這個 leader（`enabled:false`
+    或整筆被移除）。
+
+    **只**在「白名單成功載入且明確拒絕」時 raise——白名單檔不存在／載入失敗一律是
+    上面的 transient 基類，不得升級成撤銷（把「檔案暫時讀不到」誤判成「leader 被
+    撤銷」會拿真實的平倉成本去回應一次 IO 打嗝）。
+
+    執行中收到這個 → 受控收尾（見 LeaderWatch.refresh）。啟動時收到 → 拒絕啟動
+    （繼承自基類的行為，本來就沒開倉，不需收尾）。
+    """
 
 
 @dataclass(frozen=True)
@@ -139,11 +171,19 @@ def resolve_leader(*, account_id: str | None, manifest_path: str | Path,
 
     if ref is not None and ref.leader_address is not None:
         candidate, source = ref.leader_address, SOURCE_MANIFEST
-        if not is_allowed_leader(candidate, leaders):
+        if allowlist_absent:
+            # transient：沒有白名單可比對 ≠ 白名單拒絕了他。明確指定卻驗不了照樣拒絕
+            # （見規則 2），但**不是**撤銷——不得讓一個消失的檔案觸發全體收尾。
             raise LeaderResolutionError(
-                f"manifest 指定的 leader {candidate} 不在白名單（{leaders_file}）或已下架"
-                f"——拒絕跟單。manifest 明確指定卻無法通過白名單，正是被竄改的樣子；"
-                f"要新增 leader 請由管理端編輯白名單檔，不要繞過本檢查")
+                f"manifest 指定的 leader {candidate} 無法驗證：白名單檔不存在"
+                f"（{leaders_file}）——拒絕跟單。明確指定卻沒有白名單可驗，"
+                f"正是被竄改後的樣子，不享有 env 回退豁免")
+        if not is_still_permitted(candidate, leaders):
+            raise LeaderRevokedError(
+                f"manifest 指定的 leader {candidate} 不在白名單（{leaders_file}）或已被"
+                f"撤銷（enabled=false／條目已移除）——拒絕跟單。manifest 明確指定卻無法"
+                f"通過白名單，正是被竄改的樣子；要新增 leader 請由管理端編輯白名單檔，"
+                f"不要繞過本檢查")
     else:
         source = SOURCE_ENV_DEFAULT
         try:
@@ -155,9 +195,9 @@ def resolve_leader(*, account_id: str | None, manifest_path: str | Path,
                 "leader 白名單檔不存在（%s）——env 預設 leader %s 放行（向後相容："
                 "既有部署尚未策劃白名單）；建檔後本路徑即恢復驗證",
                 leaders_file, candidate)
-        elif not is_allowed_leader(candidate, leaders):
-            raise LeaderResolutionError(
-                f"env 預設 leader {candidate} 不在白名單（{leaders_file}）或已下架"
+        elif not is_still_permitted(candidate, leaders):
+            raise LeaderRevokedError(
+                f"env 預設 leader {candidate} 不在白名單（{leaders_file}）或已被撤銷"
                 f"——拒絕跟單。預設值不因為是預設就豁免驗證（一致性）")
 
     if candidate in _self_addresses(self_address, ref):
@@ -176,15 +216,28 @@ class LeaderWatch:
     """
 
     def __init__(self, initial: LeaderResolution,
-                 resolve: Callable[[], LeaderResolution], notifier: Notifier):
+                 resolve: Callable[[], LeaderResolution], notifier: Notifier,
+                 *, on_revoked: Callable[[], None] | None = None):
+        """on_revoked：leader 被撤銷時的**受控收尾**機具（撤單→平倉→鎖死 kill switch）。
+
+        刻意用注入而非在本模組裡直接呼叫 killswitch.trip：本模組是純檔案解析層，
+        不該長出 exchange 依賴。實際接線見 scripts/run_copytrade.make_revocation_wind_down。
+        為 None（dry/shadow、單元測試）→ 仍然停止交易，但不假裝收了尾（會 log）。
+        """
         self.current = initial
         self._resolve = resolve
         self._notifier = notifier
+        self._on_revoked = on_revoked
 
-    def refresh(self) -> LeaderResolution:
+    def refresh(self) -> LeaderResolution | None:
         """重新解析並回傳本輪該用的 leader。**本函式不會 raise**——跟單不中斷。
 
-        - 解析失敗 → critical ＋ 保留上一個已驗證 leader（原則 3：大聲，不吞）。
+        回傳 `None` ＝ **本輪起不得交易**（leader 已被撤銷，已執行受控收尾）。
+        呼叫端必須把 None 當成「跳過本輪所有交易動作」，不得退化成沿用舊值。
+
+        - **撤銷**（LeaderRevokedError）→ 受控收尾：critical（明說已撤銷、正在收尾）
+          → 停止開新倉（回 None）→ flatten 現有部位 → trip kill switch。
+        - **其他解析失敗** → critical ＋ 保留上一個已驗證 leader（原則 3：大聲，不吞）。
           刻意攔 `Exception` 而非只攔 LeaderResolutionError：此處是「引擎必須繼續
           管理已開部位」的安全關鍵路徑，任何未預期的例外（權限、IO、型別）都不該
           讓 leader 解析炸掉整個 cycle；代價是必須大聲——所以一律 critical＋log。
@@ -193,6 +246,9 @@ class LeaderWatch:
         """
         try:
             new = self._resolve()
+        except LeaderRevokedError as e:
+            self._wind_down(e)
+            return None
         except Exception as e:  # noqa: BLE001 —— 見 docstring：安全關鍵路徑，不得中斷跟單
             logger.error("leader 重新解析失敗，沿用 %s: %s", self.current.address, e,
                          exc_info=True)
@@ -217,3 +273,33 @@ class LeaderWatch:
                         self.current.source, new.source)
             self.current = new
         return self.current
+
+    def _wind_down(self, e: LeaderRevokedError) -> None:
+        """leader 被撤銷 → 受控收尾。收尾失敗也絕不讓例外逃出 refresh()。
+
+        `self.current` 刻意**不更新**：撤銷不是「換 leader」，沒有新的合法值可換；
+        保留舊值讓後續每一輪都重新判定為撤銷、重新嘗試收尾（收尾第一次失敗時，
+        下一輪還會再試——鎖不住／平不掉不會因為只喊一次就算了）。
+        """
+        logger.error("leader %s 已被白名單撤銷，開始受控收尾: %s",
+                     self.current.address, e, exc_info=True)
+        self._notifier.critical(
+            "leader",
+            f"**leader {self.current.address} 已被白名單撤銷**（{e}）——"
+            f"**停止開新倉並受控收尾**：撤掉全部掛單、reduce-only 平掉現有部位、"
+            f"鎖死 kill switch。跟單已終止，re-arm＝人工刪 ARM 檔",
+            dedup_key=f"leader_revoked:{self.current.address}")
+        if self._on_revoked is None:
+            # 沒接收尾機具（dry/shadow 或單元測試）→ 停止交易，但不假裝收了尾。
+            logger.error("未注入 on_revoked 收尾機具——僅停止交易，未平倉、未鎖 kill switch")
+            return
+        try:
+            self._on_revoked()
+        except Exception as ex:  # noqa: BLE001 —— 收尾失敗必須大聲，但不得炸掉 cycle
+            logger.exception("leader 撤銷收尾失敗")
+            self._notifier.critical(
+                "leader",
+                f"**leader 撤銷收尾失敗**（{ex!r}）——引擎已停止交易，但部位可能仍在、"
+                f"kill switch 可能未鎖死，需**人工確認**；緊急全平："
+                f"uv run python -m scripts.panic --yes",
+                dedup_key=f"leader_revoke_wind_down_failed:{self.current.address}")

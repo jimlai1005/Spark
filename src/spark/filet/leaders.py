@@ -4,6 +4,27 @@
 **這份檔案是資安邊界，不是設定檔**。客戶可選的 leader 只能來自這裡；白名單本身
 只有管理端能寫（檔案權限由部署保證，filet-api 對它不該有寫權——同 followers.json
 的權限拓撲，見 publicapi/pending.py 檔頭）。
+
+⭐ 兩種「下架」是兩件事，用兩個旗標（2026-07-19 opus 對抗性審查 Critical）
+----------------------------------------------------------------------
+早期只有一個 `enabled`，被迫同時承擔「例行下架」與「安全撤銷」兩種語意，於是
+**管理端把出事的 leader 標成 enabled:false 之後，正在跟他的 follower 會繼續跟下去**
+（引擎執行中的解析失敗一律「沿用上一個已驗證 leader」）——操作者卻因為「我已下架＝
+已止血」的錯誤認知而不去按真正的停止鍵。現在拆成：
+
+- `enabled`（安全撤銷）：False ＝ **這個 leader 現在有問題**（帳號被盜、對敲、策略
+  失控）。後果：新客戶選不到，**且正在跟的 follower 立刻進入受控收尾**——停止開新倉、
+  平掉現有部位、鎖死 kill switch（見 leader_resolve.LeaderRevokedError 與 LeaderWatch）。
+  這是有實際 taker 成本、需人工 re-arm 的重動作，只在真的要止血時用。
+- `accepting_new`（例行下架）：False ＝ **不再開放新客戶選擇**（名額滿、策略調整中、
+  準備退場）。後果：新客戶選不到，**正在跟的 follower 完全不受影響**，繼續正常跟單。
+
+**把 leader 整筆從清單移除 等同 enabled:false**（引擎驗不到就是撤銷）——所以例行
+下架請改 `accepting_new`，不要刪條目，否則會意外觸發所有跟隨者的收尾。
+
+呼叫端不該自己記得該看哪個旗標，所以本模組**不提供**籠統的 `is_allowed`，
+只提供兩個把用途寫在名字裡的述詞：`is_selectable`（選擇時）與
+`is_still_permitted`（引擎持續驗證時）。
 """
 import json
 from dataclasses import dataclass
@@ -19,7 +40,10 @@ class LeaderRef:
     address: str          # 正規化小寫
     name: str             # 顯示名稱
     description: str = ""
-    enabled: bool = True   # 下架用（不刪除，保留歷史）
+    # ⭐ 兩個旗標的語意差異見檔頭：enabled=安全撤銷（會收尾正在跟的人）、
+    # accepting_new=例行下架（只擋新客戶）。搞混的代價是「以為止血了其實沒有」。
+    enabled: bool = True
+    accepting_new: bool = True
 
 
 def load_leaders(path: str | Path) -> list[LeaderRef]:
@@ -70,19 +94,45 @@ def load_leaders(path: str | Path) -> list[LeaderRef]:
             # 不接受 truthy 值（"false"、0、1）：下架旗標被字串 "false" 判成 True
             # 是靜默放行下架中的 leader，屬安全關鍵誤判 → 只收真正的 bool。
             raise ValueError(f"leaders[{i}].enabled 須為布林: {enabled!r}")
+        accepting_new = entry.get("accepting_new", True)
+        if not isinstance(accepting_new, bool):
+            raise ValueError(
+                f"leaders[{i}].accepting_new 須為布林: {accepting_new!r}")
         seen.add(addr)
-        leaders.append(LeaderRef(addr, name, description, enabled))
+        leaders.append(LeaderRef(addr, name, description, enabled, accepting_new))
     return leaders
 
 
-def is_allowed_leader(address: str, leaders: list[LeaderRef]) -> bool:
-    """該地址是否在白名單且 enabled。位址比較一律正規化小寫（同基準，工程原則 1）。
+def _lookup(address: str, leaders: list[LeaderRef]) -> LeaderRef | None:
+    """位址比較一律正規化小寫（同基準，工程原則 1）。
 
-    address 不合法（非 0x + 40 hex）→ False，不 raise：呼叫點是閘門，
-    「不合法」的正確語意就是「不放行」。
+    address 不合法（非 0x + 40 hex）→ None，不 raise：呼叫點是閘門，
+    「不合法」的正確語意就是「查無此人」→ 兩個述詞都會因此回 False（不放行）。
     """
     try:
         target = normalize_hex_address("address", address)
     except ValueError:
-        return False
-    return any(x.address == target and x.enabled for x in leaders)
+        return None
+    return next((x for x in leaders if x.address == target), None)
+
+
+def is_selectable(address: str, leaders: list[LeaderRef]) -> bool:
+    """**新客戶現在可以選這個 leader 嗎**（activate CLI／選單用的述詞）。
+
+    兩個旗標都要過：`enabled`（沒有安全問題）**且** `accepting_new`（還收新客戶）。
+    這是比 is_still_permitted 嚴格的一側——擋錯了只是少一個選項，放錯了是把新客戶
+    送給一個已經停止接客或已出事的 leader。
+    """
+    ref = _lookup(address, leaders)
+    return ref is not None and ref.enabled and ref.accepting_new
+
+
+def is_still_permitted(address: str, leaders: list[LeaderRef]) -> bool:
+    """**正在跟這個 leader 的 follower 可以繼續跟嗎**（引擎每輪驗證用的述詞）。
+
+    只看 `enabled`：`accepting_new=False` 是例行下架，對已在跟的人**無影響**
+    （硬要把他們趕走等於用一次真實的平倉成本去執行一個純行銷決策）。
+    回 False ＝ 安全撤銷或整筆被移除 → 呼叫端必須受控收尾，不得沿用舊值。
+    """
+    ref = _lookup(address, leaders)
+    return ref is not None and ref.enabled

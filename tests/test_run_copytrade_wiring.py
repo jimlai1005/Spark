@@ -85,6 +85,76 @@ def test_make_leader_resolver_env_fallback(monkeypatch, tmp_path):
     assert res.address == _OTHER and res.source == SOURCE_ENV_DEFAULT
 
 
+def test_make_leader_resolver_ignores_routine_delisting(monkeypatch, tmp_path):
+    """⭐ accepting_new=false（例行下架）→ 引擎照常解析成功，正在跟的人不受影響。"""
+    _wire_env(monkeypatch, tmp_path, manifest_leader=_LEADER,
+              allowlist=[{"address": _LEADER, "name": "Alpha", "accepting_new": False}])
+    assert rc.make_leader_resolver("alice", _ME, _OTHER)().address == _LEADER
+
+
+# ── ⭐ leader 撤銷的受控收尾（撤單 → reduce-only 全平 → 鎖死 kill switch）──
+
+def test_revocation_wind_down_flattens_and_trips(tmp_path):
+    """⭐ make_revocation_wind_down() 真的走 killswitch.trip：撤掉掛單、平掉部位、
+    寫下 ARM 檔（且 payload 標明 reason=leader_revoked，不是一份看不出所以然的
+    drawdown=0 紀錄）。"""
+    from decimal import Decimal
+
+    from spark.copytrade.killswitch import ARM_FILE_RELPATH, is_tripped
+    from spark.copytrade.notifier import RecordingNotifier
+    from spark.exchange.base import OpenOrder, OrderResult, Position
+
+    order = OpenOrder(oid=7, coin="ETH", is_buy=True, limit_px=Decimal("2000"),
+                      sz=Decimal("1"), reduce_only=False, is_trigger=False,
+                      trigger_px=None, tpsl=None)
+    position = Position(coin="ETH", szi=Decimal("2"), entry_px=Decimal("1900"),
+                        leverage=5, is_cross=True, unrealized_pnl=Decimal("0"),
+                        margin_used=Decimal("100"))
+
+    class _Ex:
+        my_address = _ME
+
+        def __init__(self):
+            self.calls = []
+
+        def get_open_orders(self):
+            return [order]
+
+        def cancel(self, coin, oid):
+            self.calls.append(("cancel", coin, oid))
+            return True
+
+        def close_reduce_only(self, coin, is_buy, size, *, emergency=False):
+            self.calls.append(("close", coin, is_buy, size, emergency))
+            return OrderResult(ok=True, filled_size=size, avg_px=Decimal("100"), raw={})
+
+    class _Adapter:
+        def get_positions(self, address):
+            assert address == _ME
+            return [position]
+
+    ex, notifier = _Ex(), RecordingNotifier()
+    rc.make_revocation_wind_down(_Adapter(), ex, notifier, tmp_path)()
+
+    assert ("cancel", "ETH", 7) in ex.calls               # 掛單撤掉
+    assert ("close", "ETH", False, Decimal("2"), True) in ex.calls  # 部位平掉（緊急）
+    assert is_tripped(tmp_path)                            # kill switch 鎖死
+    payload = json.loads((tmp_path / ARM_FILE_RELPATH).read_text())
+    assert payload["reason"] == "leader_revoked"           # 鎖死的理由寫在鎖上
+    assert any("leader_revoked" in r[2] for r in notifier.records if r[0] == "critical")
+
+
+def test_main_refuses_to_start_when_leader_revoked(monkeypatch, tmp_path, capsys):
+    """⭐ 啟動時 leader 已被撤銷（enabled=false）→ 拒絕啟動（維持既有行為：
+    本來就還沒開倉，不需收尾）。"""
+    _wire_env(monkeypatch, tmp_path, manifest_leader=_LEADER,
+              allowlist=[{"address": _LEADER, "name": "Alpha", "enabled": False}])
+    with pytest.raises(SystemExit) as e:
+        rc.main(["--once"])
+    assert e.value.code == 2
+    assert "leader 解析失敗，拒絕啟動" in capsys.readouterr().out
+
+
 def test_main_refuses_to_start_when_leader_not_allowlisted(monkeypatch, tmp_path, capsys):
     """⭐ 啟動時 leader 不在白名單 → 拒絕啟動（SystemExit(2)），且在碰網路之前。
 

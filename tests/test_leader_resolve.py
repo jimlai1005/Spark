@@ -15,6 +15,7 @@ from spark.filet.leader_resolve import (
     SOURCE_MANIFEST,
     LeaderResolution,
     LeaderResolutionError,
+    LeaderRevokedError,
     LeaderWatch,
     resolve_leader,
 )
@@ -92,11 +93,65 @@ def test_rejects_manifest_leader_not_in_allowlist(tmp_path):
 
 
 def test_rejects_disabled_leader(tmp_path):
-    """⭐ 下架（enabled=False）的 leader 一律拒絕——條目保留只為歷史。"""
-    with pytest.raises(LeaderResolutionError, match="不在白名單|已下架"):
+    """⭐ 撤銷（enabled=False）的 leader 一律拒絕——條目保留只為歷史。"""
+    with pytest.raises(LeaderResolutionError, match="不在白名單|已被撤銷"):
         _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_LEADER),
                  leaders=_leaders(tmp_path, [
                      {"address": _LEADER, "name": "Alpha", "enabled": False}]))
+
+
+# ── ⭐⭐ 失敗分類：撤銷（semantic）vs 暫時失敗（transient）────────────────
+# 這兩類的正確反應完全相反（收尾 vs 沿用），所以型別必須分得開——
+# 「沿用上一個 leader」套在撤銷上，等於管理端下架了但跟單永遠不停。
+
+@pytest.mark.parametrize("entry", [
+    {"address": _LEADER, "name": "Alpha", "enabled": False},   # 明確撤銷
+    {"address": _OTHER, "name": "Other"},                       # 整筆被移除
+])
+def test_allowlist_rejection_is_revocation(tmp_path, entry):
+    """⭐ 白名單載入成功卻拒絕這個 leader → LeaderRevokedError（semantic）。"""
+    with pytest.raises(LeaderRevokedError):
+        _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_LEADER),
+                 leaders=_leaders(tmp_path, [entry]))
+
+
+def test_env_default_rejection_is_revocation(tmp_path):
+    """env 回退路徑的白名單拒絕同樣是撤銷（預設值不因為是預設就換一套語意）。"""
+    with pytest.raises(LeaderRevokedError):
+        _resolve(tmp_path, manifest=_manifest(tmp_path, leader=None),
+                 leaders=_leaders(tmp_path, [{"address": _LEADER, "name": "Alpha"}]))
+
+
+def test_missing_allowlist_is_not_revocation(tmp_path):
+    """⭐ 白名單檔不存在 → transient，**不得**升級成撤銷。
+
+    誤判的代價：一次 IO 打嗝／掛載失敗會讓所有 follower 平倉並鎖死 kill switch。
+    """
+    with pytest.raises(LeaderResolutionError) as e:
+        _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_LEADER))
+    assert not isinstance(e.value, LeaderRevokedError)
+
+
+def test_malformed_allowlist_is_not_revocation(tmp_path):
+    """白名單格式壞掉 → transient（fail-fast 拒絕，但不是「這個 leader 被撤銷」）。"""
+    p = tmp_path / "leaders.json"
+    p.write_text("{not json")
+    with pytest.raises(LeaderResolutionError) as e:
+        _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_LEADER), leaders=p)
+    assert not isinstance(e.value, LeaderRevokedError)
+
+
+def test_accepting_new_false_does_not_affect_running_follower(tmp_path):
+    """⭐⭐ 例行下架（accepting_new=False、enabled 仍 True）→ **正在跟的 follower
+    完全不受影響**，解析照常成功。
+
+    這條與上面的撤銷測試成對：兩種「下架」走兩條完全不同的路，白名單編輯者選錯
+    旗標的後果（該止血沒止／不該平倉卻平）在這裡被釘住。
+    """
+    res = _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_LEADER),
+                   leaders=_leaders(tmp_path, [
+                       {"address": _LEADER, "name": "Alpha", "accepting_new": False}]))
+    assert res == LeaderResolution(_LEADER, SOURCE_MANIFEST)
 
 
 def test_rejects_env_default_not_in_allowlist(tmp_path):
@@ -218,30 +273,97 @@ def _crits(n: RecordingNotifier):
     return [r for r in n.records if r[0] == "critical"]
 
 
-def test_watch_keeps_last_leader_and_alerts_on_failure():
-    """⭐ 執行中解析失敗 → 沿用上一個已驗證 leader ＋ critical 告警，跟單不中斷。"""
+def _raise(exc):
+    """回一個「一呼叫就拋 exc」的 resolve 閉包。"""
+    def _f():
+        raise exc
+    return _f
+
+
+def test_watch_keeps_last_leader_on_transient_failure():
+    """⭐ 執行中**transient** 解析失敗（白名單檔暫時讀不到）→ 沿用上一個已驗證
+    leader ＋ critical 告警，跟單不中斷、**不得誤觸收尾**。
+
+    ⚠️ 本測試只涵蓋 transient。撤銷（LeaderRevokedError）走完全相反的路，
+    見 test_watch_winds_down_on_revocation——兩者不可混為一談。
+    """
     n = RecordingNotifier()
+    wound_down = []
 
     def boom():
-        raise LeaderResolutionError("白名單檔壞掉")
+        raise LeaderResolutionError("白名單檔暫時讀不到")
 
-    w = LeaderWatch(_A, boom, n)
+    w = LeaderWatch(_A, boom, n, on_revoked=lambda: wound_down.append(1))
     assert w.refresh() == _A          # 沿用，不中斷、不靜默切換
     assert w.current == _A
+    assert wound_down == []           # ⭐ transient 絕不觸發收尾
     crits = _crits(n)
     assert len(crits) == 1            # 告警真的被呼叫（不只是沒 crash）
     assert "沿用上一個已驗證的 leader" in crits[0][2] and _LEADER in crits[0][2]
 
 
 def test_watch_survives_unexpected_exception():
-    """未預期的例外（IO/權限）同樣不得炸掉 cycle——大聲＋沿用。"""
+    """未預期的例外（IO/權限）同樣不得炸掉 cycle——大聲＋沿用，且不觸發收尾。"""
     n = RecordingNotifier()
+    wound_down = []
 
     def boom():
         raise OSError("permission denied")
 
-    assert LeaderWatch(_A, boom, n).refresh() == _A
+    w = LeaderWatch(_A, boom, n, on_revoked=lambda: wound_down.append(1))
+    assert w.refresh() == _A
     assert len(_crits(n)) == 1
+    assert wound_down == []
+
+
+# ── ⭐⭐ 撤銷：受控收尾（停止開新倉 → flatten → trip kill switch）────────
+
+def test_watch_winds_down_on_revocation():
+    """⭐ 執行中偵測到撤銷 → refresh() 回 None（本輪起不得交易）＋呼叫收尾機具
+    ＋critical 明說已被撤銷、正在收尾。
+
+    這是本次修復的核心：撤銷若走 transient 的「沿用舊 leader」路徑，管理端把出事的
+    leader 標成 enabled:false 之後，跟他的 follower 會永遠繼續跟下去，而操作者以為
+    已經止血了——這正是最危險的地方。
+    """
+    n = RecordingNotifier()
+    wound_down = []
+    w = LeaderWatch(_A, _raise(LeaderRevokedError("leader 已被撤銷")), n,
+                    on_revoked=lambda: wound_down.append(1))
+
+    assert w.refresh() is None        # ⭐ 停止開新倉
+    assert wound_down == [1]          # ⭐ 收尾（flatten + trip）確實被呼叫
+    crits = _crits(n)
+    assert len(crits) == 1
+    assert "撤銷" in crits[0][2] and "收尾" in crits[0][2] and _LEADER in crits[0][2]
+
+
+def test_watch_wind_down_failure_is_loud_but_still_stops_trading():
+    """收尾機具本身炸掉（例如 ARM 檔寫不進去）→ 仍然回 None（不交易）＋第二則
+    critical 說明需人工確認。絕不因為收尾失敗就恢復跟單。"""
+    n = RecordingNotifier()
+
+    def bad_wind_down():
+        raise OSError("ARM 檔寫入失敗")
+
+    w = LeaderWatch(_A, _raise(LeaderRevokedError("撤銷")), n,
+                    on_revoked=bad_wind_down)
+    assert w.refresh() is None
+    crits = _crits(n)
+    assert len(crits) == 2
+    assert "收尾失敗" in crits[1][2] and "人工" in crits[1][2]
+
+
+def test_watch_keeps_retrying_wind_down_while_revoked():
+    """撤銷是持續狀態：每一輪都重新判定為撤銷、重新嘗試收尾
+    （第一次收尾失敗不會因為喊過一次就算了）。"""
+    n = RecordingNotifier()
+    calls = []
+    w = LeaderWatch(_A, _raise(LeaderRevokedError("撤銷")), n,
+                    on_revoked=lambda: calls.append(1))
+    assert w.refresh() is None and w.refresh() is None
+    assert calls == [1, 1]
+    assert w.current == _A   # 撤銷不是「換 leader」，current 不動
 
 
 def test_watch_alerts_critical_on_leader_change():
