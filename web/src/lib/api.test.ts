@@ -112,8 +112,14 @@ describe("端點契約（對照 src/spark/publicapi/app.py）", () => {
     expect(captured[0].url).toBe("/api/admin/pending");
 
     mockFetchJson(200, { days: 7, customers: [], manifest_errors: [] });
-    await api.getOpsCustomers(7);
+    await api.getOpsCustomers({ days: 7 });
     expect(captured[0].url).toBe("/api/ops/customers?days=7");
+
+    // ⭐ 同基準模式：與 /api/ops/revenue 共用後端的窗口推導函式。days 與 window 互斥，
+    // 型別（OpsCustomersQuery 的 optional-never）已擋掉同時給——這裡釘住送出的 query。
+    mockFetchJson(200, { window: "accrued", basis_unknown: false, customers: [], manifest_errors: [] });
+    await api.getOpsCustomers({ window: "accrued" });
+    expect(captured[0].url).toBe("/api/ops/customers?window=accrued");
 
     mockFetchJson(200, { insufficient_accrued_history: true, manifest_errors: [] });
     await api.getOpsRevenue(0.01);
@@ -166,7 +172,7 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getAdminPending(),
       () => api.getMe(),
       () => api.getNonce("0xAbC0000000000000000000000000000000000001", 1),
-      () => api.getOpsCustomers(1),
+      () => api.getOpsCustomers({ days: 1 }),
       () => api.getOpsRevenue(0.01),
       () => api.getOpsSubscriptions(),
       () => api.getBillingPlans(),

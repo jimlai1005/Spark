@@ -56,10 +56,29 @@ const FAILED_ROW: OpsCustomerRow = {
   error: "account_value 查詢失敗: upstream timeout",
 };
 
+/**
+ * 預設樣本＝同基準模式（window=accrued）。窗口刻意與 REVENUE_OK 完全相同——
+ * 後端讓兩個端點共用同一個窗口推導函式，fixture 必須反映那個保證。
+ */
 const CUSTOMERS: OpsCustomersResp = {
-  days: 1,
+  window: "accrued",
+  basis_unknown: false,
   start: "2026-07-18T00:00:00+00:00",
   end: "2026-07-19T00:00:00+00:00",
+  window_start: "2026-07-18T00:00:00+00:00",
+  window_end: "2026-07-19T00:00:00+00:00",
+  customers: [ROW],
+  manifest_errors: [],
+};
+
+/** 自由檢視窗（days）：與對帳窗必定錯開，這個模式下兩張表本來就不可相減。 */
+const CUSTOMERS_DAYS: OpsCustomersResp = {
+  window: "days",
+  days: 7,
+  start: "2026-07-12T00:00:00+00:00",
+  end: "2026-07-19T00:00:00+00:00",
+  window_start: "2026-07-12T00:00:00+00:00",
+  window_end: "2026-07-19T00:00:00+00:00",
   customers: [ROW],
   manifest_errors: [],
 };
@@ -206,6 +225,82 @@ describe("OpsPage", () => {
     expect(win?.textContent).toContain("2026-07-19T00:00:00+00:00");
   });
 
+  // ---------- 共用比較窗口（同基準的可視化防線） ----------
+  // 背景：收入對帳與客戶損益的窗口曾錯開一整天，健康帳戶被誤判 199 倍差異並觸發告警。
+  // 後端已讓兩個端點共用同一個窗口推導函式；以下三條測試釘住「前端把那個保證顯示出來，
+  // 而且在保證失效時大聲說出來」——保證本身在後端，可視化防線在這裡。
+
+  it("⭐ 預設 window=accrued → 兩張表共用一個窗口標頭（顯示一次），無不一致警告", async () => {
+    getOpsRevenue.mockResolvedValue(REVENUE_OK);
+    getOpsCustomers.mockResolvedValue(CUSTOMERS);
+    render(wrap(<OpsPage />));
+
+    expect(await screen.findByText(ROW.account_id)).toBeInTheDocument();
+    // 預設就是同基準模式（不是 days）——這是本頁可相減的唯一模式
+    expect(getOpsCustomers).toHaveBeenCalledWith({ window: "accrued" });
+
+    // 共用標頭只出現一次，且明說兩張表同窗口
+    expect(screen.getByText("以下兩張表使用同一比較窗口")).toBeInTheDocument();
+    const banner = document.querySelector(".ops-window-banner");
+    expect(banner?.textContent).toMatch(/可直接對照相減/);
+    expect(banner?.textContent).toContain("2026-07-18T00:00:00+00:00");
+    expect(banner?.textContent).toContain("2026-07-19T00:00:00+00:00");
+    expect(document.querySelectorAll(".ops-window-banner").length).toBe(1);
+
+    // 窗口一致 → 不得出現任何警告
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("兩張表的比較窗口不一致，數字不可相減")).toBeNull();
+  });
+
+  it("⭐ 兩張表窗口竟然不同 → role=alert 警告數字不可相減（前端不盲信後端保證）", async () => {
+    getOpsRevenue.mockResolvedValue(REVENUE_OK);
+    getOpsCustomers.mockResolvedValue({
+      ...CUSTOMERS,
+      // 錯開一整天——正是那個 Critical 的形狀。後端保證不會發生，但保證退化時
+      // 前端必須是第二道防線，而不是安靜地照樣把兩張表並排。
+      window_start: "2026-07-17T00:00:00+00:00",
+      window_end: "2026-07-18T00:00:00+00:00",
+    });
+    render(wrap(<OpsPage />));
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("兩張表的比較窗口不一致，數字不可相減")).toBeInTheDocument();
+    // 警告要直接指出差在哪：兩組窗口並排列出，不必自己翻兩張表
+    expect(alert.textContent).toContain("2026-07-19T00:00:00+00:00"); // 收入對帳側
+    expect(alert.textContent).toContain("2026-07-17T00:00:00+00:00"); // 客戶損益側
+    // 不得一邊警告不一致、一邊還宣稱同基準
+    expect(screen.queryByText("以下兩張表使用同一比較窗口")).toBeNull();
+  });
+
+  it("customers basis_unknown → 顯示後端 note，該區塊不出現任何數字也不畫空表", async () => {
+    getOpsRevenue.mockResolvedValue(REVENUE_OK);
+    getOpsCustomers.mockResolvedValue({
+      window: "accrued",
+      basis_unknown: true,
+      window_start: null,
+      window_end: null,
+      note: "歷史資料缺快照時刻（captured_at），無法對齊窗口；本次客戶損益無法與收入對帳同基準，故不計算。",
+      manifest_errors: [],
+    } satisfies OpsCustomersResp);
+    render(wrap(<OpsPage />));
+
+    expect(await screen.findByText(/無法與收入對帳同基準/)).toBeInTheDocument();
+    expect(screen.getByText("快照時刻無法對齊，本表跳過計算。")).toBeInTheDocument();
+
+    const section = screen.getByRole("region", { name: "每客戶損益" });
+    // ⭐ 沿 revenue basis_unknown 分支的嚴格度：不畫表（空表會被讀成「今天沒人成交」），
+    // 說明面板內不得出現任何數字。（數字檢查限定在面板內：本區塊有 1/7/30 切換鈕。）
+    expect(section.querySelector(".ops-table")).toBeNull();
+    const notice = section.querySelector(".ops-notice");
+    expect(notice?.textContent).not.toMatch(/\d/);
+    expect(notice?.textContent).not.toMatch(/undefined|NaN/);
+    expect(screen.queryByText("125,000.50")).toBeNull();
+    expect(screen.queryByText(ROW.account_id)).toBeNull();
+    // 窗口算不出來 → 不渲染共用標頭（不謊報一致），也不誤報不一致
+    expect(screen.queryByText("以下兩張表使用同一比較窗口")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("訂閱對帳：零漂移 → 顯示一致訊息，四類清單皆為空且無警示", async () => {
     getOpsRevenue.mockResolvedValue(REVENUE_OK);
     getOpsCustomers.mockResolvedValue(CUSTOMERS);
@@ -333,17 +428,30 @@ describe("OpsPage", () => {
     expect(screen.getByText(ROW.account_id)).toBeInTheDocument();
   });
 
-  it("天數切換 → 以新的 days 重新查詢", async () => {
+  it("期間切換 → days 模式送 {days}，切回對帳窗口送 {window:'accrued'}", async () => {
     getOpsRevenue.mockResolvedValue(REVENUE_OK);
-    getOpsCustomers.mockResolvedValue(CUSTOMERS);
+    getOpsCustomers.mockImplementation((q: { days?: number; window?: string }) =>
+      Promise.resolve(q?.window === "accrued" ? CUSTOMERS : { ...CUSTOMERS_DAYS, days: q?.days }),
+    );
     render(wrap(<OpsPage />));
     expect(await screen.findByText(ROW.account_id)).toBeInTheDocument();
-    expect(getOpsCustomers).toHaveBeenCalledWith(1);
+    // ⭐ 預設是同基準模式，不是 1 天自由窗
+    expect(getOpsCustomers).toHaveBeenCalledWith({ window: "accrued" });
 
     await userEvent.click(screen.getByRole("button", { name: "7 天" }));
-    expect(getOpsCustomers).toHaveBeenCalledWith(7);
+    expect(getOpsCustomers).toHaveBeenCalledWith({ days: 7 });
     await userEvent.click(screen.getByRole("button", { name: "30 天" }));
-    expect(getOpsCustomers).toHaveBeenCalledWith(30);
+    expect(getOpsCustomers).toHaveBeenCalledWith({ days: 30 });
+
+    // ⭐ days 模式下兩張表本來就不同基準：改口說「不可相減」，且**不**誤報窗口不一致。
+    // 每次切天數都跳紅色警告會訓練人忽略它，等於親手拆掉這道防線。
+    expect(await screen.findByText(/不可直接相減/)).toBeInTheDocument();
+    expect(screen.queryByText("以下兩張表使用同一比較窗口")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "對帳窗口（同基準）" }));
+    expect(getOpsCustomers).toHaveBeenCalledWith({ window: "accrued" });
+    expect(await screen.findByText("以下兩張表使用同一比較窗口")).toBeInTheDocument();
   });
 
   it("XSS：user_address 與 error 含 <script> 時以純文字呈現（React 轉義）", async () => {

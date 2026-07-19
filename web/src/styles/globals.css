@@ -458,6 +458,19 @@ main.page {
 .ops-stat dd.is-bad { color: var(--neg); }
 .ops-window { margin-top: 10px; word-break: break-all; }
 
+/* 共用比較窗口標頭：兩張表之前顯示一次。刻意做得比區塊標題更顯眼——
+   「兩張表同基準」是讀這一頁的前提，不是腳註。 */
+.ops-window-banner {
+  border-color: rgba(var(--primary-rgb), .35);
+  margin-top: 20px;
+}
+.ops-window-banner-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  margin: 0;
+}
+
 .ops-alert {
   border: 1px solid rgba(var(--neg-rgb), .5);
   background: rgba(var(--neg-rgb), .1);

@@ -144,14 +144,56 @@ export interface OpsCustomerRow {
   error: string | null;
 }
 
-export interface OpsCustomersResp {
-  days: number;
-  start: string;
-  end: string;
-  customers: OpsCustomerRow[];
-  /** 壞掉的 manifest 條目（容錯載入跳過者）。 */
-  manifest_errors: string[];
-}
+/**
+ * 每客戶損益，**三種**回應形狀，判別欄位為 `window`（＋ accrued 下的 `basis_unknown`）。
+ * 沿 OpsRevenueResp 的 discriminated union 慣例：漏處理分支時 TS 編譯期報錯。
+ *
+ * ⭐ `window: "accrued"` 是本端點**唯一**能與 /api/ops/revenue 並排相減的模式——
+ * 兩者共用後端 `ops.accrued_window()`，window_start/window_end 必為同值（結構性同源）。
+ * `window: "days"` 是自由檢視窗（now 往回 N 天），與對帳窗必定錯開，兩張表不可相減。
+ */
+export type OpsCustomersResp =
+  | {
+      window: "days";
+      days: number;
+      start: string;
+      end: string;
+      window_start: string;
+      window_end: string;
+      customers: OpsCustomerRow[];
+      /** 壞掉的 manifest 條目（容錯載入跳過者）。 */
+      manifest_errors: string[];
+    }
+  | {
+      window: "accrued";
+      basis_unknown: false;
+      start: string;
+      end: string;
+      window_start: string;
+      window_end: string;
+      customers: OpsCustomerRow[];
+      manifest_errors: string[];
+    }
+  | {
+      window: "accrued";
+      basis_unknown: true;
+      /** ⭐ 窗口界只能來自快照時刻；缺了就沒有正確答案 → 後端回 null，不用日曆日猜。 */
+      window_start: null;
+      window_end: null;
+      /** 後端寫好的原因說明；顯示層原樣呈現，且**不得**顯示任何數字。 */
+      note: string;
+      /** ⭐ 本分支後端不給 `customers` 也不給 `days`——型別上就讀不到（不會畫成空表）。 */
+      manifest_errors: string[];
+    };
+
+/**
+ * customers 的時間窗參數：`days` 與 `window=accrued` **互斥**（同時給後端回 400）。
+ * ⭐ 用 optional-never 讓「同時給」在型別層就不可能——把後端的 400 提前到編譯期，
+ * 靜默走錯基準正是本頁要消滅的失敗模式（工程原則 1）。
+ */
+export type OpsCustomersQuery =
+  | { days: number; window?: never }
+  | { window: "accrued"; days?: never };
 
 /**
  * 收入對帳，**三種**回應形狀，兩層判別欄位（discriminant）：
@@ -278,9 +320,14 @@ export function postBillingPortal(): Promise<{ url: string }> {
   return post<{ url: string }>("/api/billing/portal");
 }
 
-/** 每客戶損益（days 1..90；超出範圍後端回 400 → ApiError kind=client）。 */
-export function getOpsCustomers(days: number): Promise<OpsCustomersResp> {
-  const q = new URLSearchParams({ days: String(days) });
+/**
+ * 每客戶損益。`{ window: "accrued" }` → 與 /api/ops/revenue 同一比較窗口（可相減）；
+ * `{ days }` → 自由檢視窗（1..90，超出範圍後端回 400 → ApiError kind=client）。
+ */
+export function getOpsCustomers(query: OpsCustomersQuery): Promise<OpsCustomersResp> {
+  const q = new URLSearchParams(
+    query.window === "accrued" ? { window: "accrued" } : { days: String(query.days) },
+  );
   return request<OpsCustomersResp>(`/api/ops/customers?${q.toString()}`);
 }
 

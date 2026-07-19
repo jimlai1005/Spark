@@ -25,20 +25,26 @@ import { COPY } from "@/lib/copy";
 import { fmtAmount, fmtRatioPct, NO_VALUE, shortAddr } from "@/lib/format";
 
 const DAY_OPTIONS = [1, 7, 30] as const;
+/**
+ * 客戶表的時間窗模式。⭐ 預設 `accrued`：那是唯一與收入對帳同基準（可相減）的模式。
+ * 1/7/30 天是自由檢視窗，與對帳窗必定錯開——切過去時畫面必須改口說「不可相減」。
+ */
+type RangeMode = "accrued" | (typeof DAY_OPTIONS)[number];
 /** 與後端 /api/ops/revenue 的 threshold_pct 預設同值（比例，非百分比）。 */
 const THRESHOLD_PCT = 0.01;
 
 const c = COPY.ops;
 
 export default function OpsPage() {
-  const [days, setDays] = useState<number>(1);
+  const [mode, setMode] = useState<RangeMode>("accrued");
   const revenue = useQuery<OpsRevenueResp>({
     queryKey: ["ops-revenue"],
     queryFn: () => getOpsRevenue(THRESHOLD_PCT),
   });
   const customers = useQuery<OpsCustomersResp>({
-    queryKey: ["ops-customers", days],
-    queryFn: () => getOpsCustomers(days),
+    queryKey: ["ops-customers", mode],
+    queryFn: () =>
+      getOpsCustomers(mode === "accrued" ? { window: "accrued" } : { days: mode }),
   });
   const subscriptions = useQuery<OpsSubscriptionsResp>({
     queryKey: ["ops-subscriptions"],
@@ -60,6 +66,13 @@ export default function OpsPage() {
     <main className="page">
       <p className="eyebrow">{c.eyebrow}</p>
       <h1>{c.title}</h1>
+
+      {/* ⭐ 共用窗口標頭：顯示一次，明說下方兩張表同基準。放在兩張表之前而非各自表內，
+          是為了讓「它們相同」變成一個可以被人肉核對的單一事實，而不是要讀者自己去
+          比對兩處印出來的區間（那正是那個 Critical bug 得以潛伏一整天的原因）。 */}
+      {mode === "accrued" && (
+        <WindowBanner revenue={revenue.data} customers={customers.data} />
+      )}
 
       <section aria-label="收入對帳">
         <h2 className="ops-section-title">{c.revenue.title}</h2>
@@ -90,8 +103,12 @@ export default function OpsPage() {
 
       <section aria-label="每客戶損益">
         <h2 className="ops-section-title">{c.customers.title}</h2>
-        <p className="hint">{c.customers.note}</p>
-        <RangeTabs days={days} onSelect={setDays} />
+        {/* 文案隨模式切換：accrued＝可相減；days＝自由檢視窗、不可相減。
+            同一句話不能同時對兩種模式成立，寫死任何一句都會在另一種模式下說謊。 */}
+        <p className="hint">
+          {mode === "accrued" ? c.customers.note : c.customers.daysNote}
+        </p>
+        <RangeTabs mode={mode} onSelect={setMode} />
         {customers.error ? (
           <p className="ops-query-error">{errText(customers.error)}</p>
         ) : customers.data ? (
@@ -106,6 +123,57 @@ export default function OpsPage() {
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+// ---------- 共用比較窗口 ----------
+/**
+ * 從任一 ops 回應取出窗口兩端；算不出窗口的分支（歷史不足／basis_unknown）回 null。
+ * ⭐ 只讀後端給的 window_start/window_end，不從 day／start／end 推——推導出來的窗口
+ * 看起來一樣可信，卻可能與另一張表不同源，那正是這次 Critical 的成因（工程原則 1）。
+ */
+function windowOf(d: OpsRevenueResp | OpsCustomersResp | undefined): [string, string] | null {
+  if (!d || !("window_start" in d)) return null;
+  const { window_start: s, window_end: e } = d;
+  return s != null && e != null ? [s, e] : null;
+}
+
+/**
+ * 兩張表的共用窗口標頭 ＋ 不一致守衛。
+ *
+ * 後端已讓 `/api/ops/customers?window=accrued` 與 `/api/ops/revenue` 共用同一個窗口
+ * 推導函式，但前端**不盲信**：真的收到兩組不同的窗口時以 role="alert" 大聲說「不可相減」。
+ * 這是防止「健康帳戶被誤判 199 倍差異」那個 Critical 再度靜默潛伏的可視化防線——
+ * 靜默錯位算得出數字，只是全錯（工程原則 3：安全關鍵的失敗必須大聲）。
+ *
+ * 任一邊算不出窗口 → 不渲染：各自的區塊已經寫明原因，這裡再猜一個窗口只會製造假確定感。
+ */
+function WindowBanner({ revenue, customers }: {
+  revenue: OpsRevenueResp | undefined;
+  customers: OpsCustomersResp | undefined;
+}) {
+  const w = c.window;
+  const rw = windowOf(revenue);
+  const cw = windowOf(customers);
+  if (!rw || !cw) return null;
+
+  if (rw[0] !== cw[0] || rw[1] !== cw[1]) {
+    return (
+      <div className="ops-alert" role="alert">
+        <p className="ops-alert-title">{w.mismatchTitle}</p>
+        <p className="ops-alert-body">{w.mismatchBody}</p>
+        {/* 兩組窗口並排列出：警告要能直接告訴人「差在哪」，不然還得自己去翻兩張表 */}
+        <p className="hint mono ops-window">{w.revenueLabel}: {rw[0]} → {rw[1]}</p>
+        <p className="hint mono ops-window">{w.customersLabel}: {cw[0]} → {cw[1]}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="panel ops-window-banner">
+      <p className="ops-window-banner-title">{w.sharedTitle}</p>
+      <p className="hint mono ops-window">{w.label}: {rw[0]} → {rw[1]}</p>
+      <p className="hint">{w.sharedNote}</p>
+    </div>
+  );
 }
 
 // ---------- 收入對帳 ----------
@@ -278,22 +346,28 @@ function DriftList({ title, desc, rows }: {
 }
 
 // ---------- 每客戶損益 ----------
-function RangeTabs({ days, onSelect }: { days: number; onSelect: (d: number) => void }) {
-  const labels: Record<number, string> = {
-    1: c.customers.ranges.d1, 7: c.customers.ranges.d7, 30: c.customers.ranges.d30,
-  };
+/** ⭐ 「對帳窗口」排第一且為預設：同基準是常用路徑，不同基準才是需要刻意選擇的例外。 */
+function RangeTabs({ mode, onSelect }: {
+  mode: RangeMode; onSelect: (m: RangeMode) => void;
+}) {
+  const r = c.customers.ranges;
+  const labels: Record<number, string> = { 1: r.d1, 7: r.d7, 30: r.d30 };
+  const options: Array<{ value: RangeMode; label: string }> = [
+    { value: "accrued", label: r.accrued },
+    ...DAY_OPTIONS.map((d) => ({ value: d as RangeMode, label: labels[d] })),
+  ];
   return (
     <div className="ops-range" role="group" aria-label="統計期間">
       <span className="hint">{c.customers.rangeLabel}</span>
-      {DAY_OPTIONS.map((d) => (
+      {options.map(({ value, label }) => (
         <button
-          key={d}
+          key={String(value)}
           type="button"
-          className={`btn btn-secondary ops-range-btn${d === days ? " is-active" : ""}`}
-          aria-pressed={d === days}
-          onClick={() => onSelect(d)}
+          className={`btn btn-secondary ops-range-btn${value === mode ? " is-active" : ""}`}
+          aria-pressed={value === mode}
+          onClick={() => onSelect(value)}
         >
-          {labels[d]}
+          {label}
         </button>
       ))}
     </div>
@@ -302,6 +376,18 @@ function RangeTabs({ days, onSelect }: { days: number; onSelect: (d: number) => 
 
 function CustomersBlock({ data }: { data: OpsCustomersResp }) {
   const cols = c.customers.cols;
+  // ⭐ 判別欄位先擋：窗口對不齊時整塊不出現任何數字（沿 RevenueBlock 的 basis_unknown
+  // 分支，同樣的嚴格度）。後端在這個分支不給 customers——顯示空表會被讀成「今天沒客戶
+  // 成交」，那是個看起來已對帳的假結論。連 manifest_errors 都不列（同 revenue 的作法）。
+  if (data.window === "accrued" && data.basis_unknown) {
+    return (
+      <div className="panel ops-notice">
+        <p className="ops-notice-title">{c.customers.basisUnknown}</p>
+        <p className="hint">{data.note}</p>
+        <p className="hint">{c.customers.basisUnknownNote}</p>
+      </div>
+    );
+  }
   const rows = data.customers ?? [];
   const manifestErrors = data.manifest_errors ?? [];
   return (
