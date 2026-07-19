@@ -19,6 +19,11 @@ class FollowerRef:
     builder_address: str
     network: str
     label: str = ""
+    # 該 follower 跟隨的 leader（正規化小寫）。None = 沿用進程 env 的
+    # COPY_LEADER_ADDRESS——舊 manifest 沒有這個鍵，載入必須照常成功（向後相容）。
+    # ⭐ 真相來源：manifest 是「這個 follower 跟誰」的唯一權威；引擎使用前必須再以
+    # leaders.is_allowed_leader 驗一次白名單（見 leaders.py docstring 的資安論證）。
+    leader_address: str | None = None
 
 
 def validate_account_id(s: str) -> None:
@@ -41,6 +46,31 @@ def _check_addr(field: str, value: str) -> None:
         raise ValueError(f"{field} 不是合法地址（0x + 40 hex）: {value!r}")
 
 
+def normalize_hex_address(field: str, value: str) -> str:
+    """校驗 0x + 40 hex 並回小寫正規化——位址比較的同一基準（工程原則 1）。
+
+    刻意**不**重用 `spark.publicapi.config.normalize_address`：該模組已 import 本模組的
+    `validate_account_id`（publicapi/config.py:13），反向 import 會造成循環相依。
+    依賴方向是單向的：filet 是底層套件，publicapi 依賴 filet，filet 不回頭依賴 publicapi。
+    兩份實作的規則相同（0x + 40 hex → lower）；此處是 filet 側的單一定義，
+    filet.leaders 與本模組共用它，不再各寫一份。"""
+    _check_addr(field, value)
+    return value.lower()
+
+
+def _parse_leader(i: int, f: dict) -> str | None:
+    """manifest 的 leader_address 欄位 → 正規化位址或 None。
+
+    向後相容：缺鍵、null、空字串一律視為「未指定」→ None（引擎沿用 env 的
+    COPY_LEADER_ADDRESS）。舊 manifest 沒有這個鍵，載入不得因此失敗。
+    「未指定」回退到的是管理端設定的 env 值，因此是安全預設；但只要有值，
+    格式就必須合法，否則本條目算壞條目（fail-fast／進錯誤清單，沿既有慣例）。"""
+    raw = f.get("leader_address")
+    if raw is None or raw == "":
+        return None
+    return normalize_hex_address(f"followers[{i}].leader_address", raw)
+
+
 def _parse_one(i: int, f: dict, seen: set[str]) -> FollowerRef:
     acct = f.get("account_id", "")
     try:
@@ -58,7 +88,7 @@ def _parse_one(i: int, f: dict, seen: set[str]) -> FollowerRef:
     # boundary 統一 canonical 化，避免北極星去重／跨 follower 比對因大小寫不同
     # 而重複計（dedup site 已於 c624d2e 修過，這是結構性的正解）。
     return FollowerRef(acct, f["user_address"].lower(), f["builder_address"].lower(),
-                       net, f.get("label", ""))
+                       net, f.get("label", ""), _parse_leader(i, f))
 
 
 def load_followers(manifest_path: str | Path) -> list[FollowerRef]:

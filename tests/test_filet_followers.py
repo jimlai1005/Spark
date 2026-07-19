@@ -130,3 +130,47 @@ def test_addresses_normalized_to_lowercase(tmp_path):
     refs = load_followers(_w(tmp_path, mixed))
     assert refs[0].user_address == "0x" + "a" * 40
     assert refs[0].builder_address == "0x" + "b" * 40
+
+
+# ── 多 leader：manifest 的 leader_address 欄位 ──────────────────────────
+
+_LEADER = "0x" + "d4" * 20
+
+
+def test_legacy_manifest_without_leader_field_loads(tmp_path):
+    """⭐ 向後相容：既有 manifest 沒有 leader_address 鍵，載入不得失敗，值為 None
+    （引擎沿用 env 的 COPY_LEADER_ADDRESS）。"""
+    refs = load_followers(_w(tmp_path, _GOOD))       # _GOOD 無 leader_address 鍵
+    assert [r.leader_address for r in refs] == [None, None]
+
+
+def test_leader_address_loaded_and_normalized(tmp_path):
+    one = {"followers": [{**_GOOD["followers"][0],
+                          "leader_address": _LEADER.upper().replace("0X", "0x")}]}
+    assert load_followers(_w(tmp_path, one))[0].leader_address == _LEADER
+
+
+@pytest.mark.parametrize("empty", [None, ""])
+def test_leader_address_null_or_empty_is_unset(tmp_path, empty):
+    """null／空字串 = 未指定 → None（回退到管理端設定的 env 值，安全預設）。"""
+    one = {"followers": [{**_GOOD["followers"][0], "leader_address": empty}]}
+    assert load_followers(_w(tmp_path, one))[0].leader_address is None
+
+
+@pytest.mark.parametrize("bad", ["0xshort", "0x" + "z" * 40, "nope"])
+def test_bad_leader_address_fail_fast(tmp_path, bad):
+    """有值就必須合法：沿既有慣例 fail-fast。"""
+    one = {"followers": [{**_GOOD["followers"][0], "leader_address": bad}]}
+    with pytest.raises(ValueError):
+        load_followers(_w(tmp_path, one))
+
+
+def test_bad_leader_address_tolerant_collects_error(tmp_path):
+    """容錯載入：壞 leader 的條目進錯誤清單，其他 follower 照常救得回來。"""
+    mixed = {"followers": [
+        _GOOD["followers"][0],
+        {**_GOOD["followers"][1], "leader_address": "0xshort"},
+    ]}
+    refs, errors = load_followers_tolerant(_w(tmp_path, mixed))
+    assert [r.account_id for r in refs] == ["alice"]
+    assert len(errors) == 1 and "leader_address" in errors[0]
