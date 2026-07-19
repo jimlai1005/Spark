@@ -8,6 +8,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ApiError,
+  getAdminPending,
   getBillingStatus,
   getMe,
   getStatus,
@@ -65,4 +66,32 @@ export function useBillingStatus(opts: { enabled: boolean }) {
     queryFn: getBillingStatus,
     enabled: opts.enabled,
   });
+}
+
+/**
+ * 這個 session 是不是管理員——⭐ **答案由後端給，前端不判斷**（紅線：不得用前端判斷
+ * 取代後端授權）。
+ *
+ * 做法是**探測**而非推論：打一支真正掛著 `_require_admin` 的端點（/api/admin/pending，
+ * app.py:1097），成功才回 true。非管理員拿到 403 → false；未登入拿到 401 → false。
+ * 也就是說「是不是 admin」這個判斷自始至終只在後端做過一次，前端只是把後端的答案
+ * 反映到導覽列上。刻意**不**改用「比對地址清單」或「Me 加一個 is_admin 旗標」之類的
+ * 前端推論——那會讓前端持有一份可能與後端不同步的第二事實。
+ *
+ * 這個回傳值只准用來決定「要不要顯示連結」。它**不是**存取控制：/ops 與 /admin 的
+ * 每一支端點都各自掛著後端 admin 閘，使用者手打網址仍會吃 403 並看到「此頁僅限管理員」，
+ * 兩頁的 403 分支都已有測試釘住。
+ *
+ * queryKey 與 /admin 頁共用 → 進到 /admin 時零額外請求（react-query 快取去重）。
+ * enabled 綁登入：未登入不打（避免必然的 401 噪音，與 useBillingStatus 同慣例）。
+ */
+export function useIsAdmin(opts: { enabled: boolean }): boolean {
+  const q = useQuery({
+    queryKey: ["admin-pending"],
+    queryFn: getAdminPending,
+    enabled: opts.enabled,
+    staleTime: 60_000,
+  });
+  // 只認成功。載入中／403／401／任何錯誤一律 false——不確定時不顯示（fail closed）。
+  return !!q.data;
 }

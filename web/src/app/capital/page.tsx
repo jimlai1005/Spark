@@ -48,6 +48,7 @@ import {
   canonicalUtilizationPct,
   type CapitalValues,
 } from "@/lib/capitalValues";
+import { ActivationNotice } from "@/components/ActivationNotice";
 import { COPY } from "@/lib/copy";
 import { NO_VALUE, fmtAmount, fmtRatioPct } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
@@ -169,6 +170,9 @@ export default function CapitalPage() {
       <p className="eyebrow">{c.eyebrow}</p>
       <h1>{c.title}</h1>
       <p className="hint">{c.subtitle}</p>
+
+      {/* 未活化就先說——否則使用者會調完、簽完，才撞上後端的「查無 follower」。 */}
+      <ActivationNotice />
 
       {/* ⭐ 誠信要求 2：先讓人看懂這兩個數字是什麼，再讓他調。 */}
       <div className="panel capital-glossary">

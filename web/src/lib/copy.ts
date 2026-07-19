@@ -14,6 +14,31 @@ export const COPY = {
     backToLogin: "回登入頁",
     logout: "登出",
     nonCustodial: "Filet 永遠不會請你輸入私鑰或助記詞；所有簽署只會在你自己的錢包中完成。",
+    notActivated: "這個帳號還沒開通完成——請先回到開通頁完成授權與入金。",
+    goOnboarding: "前往開通",
+  },
+  /**
+   * 導覽列文案（單一來源）。⭐ 這裡刻意收齊**全部** tab 的字面值：先前 登入／開通／
+   * 績效 硬編在 Header.tsx、只有「方案」走 COPY，同一列文字有兩個來源——改文案時
+   * 很容易只改到一半，而畫面上看不出來哪個字沒被改到。
+   *
+   * ⭐⭐ 分組的意義是 **UX 可見性，不是授權**（紅線 3）：
+   *   - `PUBLIC`：任何人都看得到，頁面自己各有登入 guard。
+   *   - `MEMBER`：登入後才顯示（未登入看到「訂閱管理」只會點進去吃一個「尚未登入」）。
+   *   - `ADMIN`：只有後端真的放行 /api/admin/pending 的人才顯示（見 hooks.useIsAdmin）。
+   * 藏起連結**不構成任何保護**——/ops 與 /admin 的每一支端點都掛著後端 `_require_admin`，
+   * 手打網址進來照樣吃 403 並顯示「此頁僅限管理員」。前端只負責不把死路擺在人眼前。
+   */
+  nav: {
+    login: "登入",
+    onboarding: "開通",
+    leaders: "跟單對象",
+    capital: "資金配置",
+    performance: "績效",
+    pricing: "方案",
+    billing: "訂閱管理",
+    ops: "營運",
+    admin: "待核准",
   },
   login: {
     subtitle: "資金留在你自己的錢包。策略照樣執行。",
@@ -513,7 +538,7 @@ export const COPY = {
    * 3. 價格未拍板時後端 price_display 為 null → 顯示「價格待定」，絕不顯示 0。
    */
   billing: {
-    navPricing: "方案",
+    // navPricing 已移入 COPY.nav.pricing（導覽文案單一來源，2026-07-19）。
     pricingEyebrow: "PRICING",
     pricingTitle: "方案與定價",
     pricingSubtitle: "免費層不限本金、不限跟單。付費解鎖的是多 leader 與跟單比例調整。",

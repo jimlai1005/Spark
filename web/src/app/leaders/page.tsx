@@ -60,6 +60,7 @@ import {
   type LeaderSelectResp,
   type LeadersResp,
 } from "@/lib/api";
+import { ActivationNotice } from "@/components/ActivationNotice";
 import { COPY } from "@/lib/copy";
 import { NO_VALUE, fmtAmount, fmtRatioPct, shortAddr } from "@/lib/format";
 import {
@@ -191,6 +192,9 @@ export default function LeadersPage() {
         <p className="ops-notice-title">{c.currentUnknownTitle}</p>
         <p className="hint">{c.currentUnknownNote}</p>
       </div>
+
+      {/* 未活化就先說——否則使用者會一路簽到最後才撞上「查無 follower」。 */}
+      <ActivationNotice />
 
       {!gate.open && (
         <div className="panel plan-notice leader-gate">
