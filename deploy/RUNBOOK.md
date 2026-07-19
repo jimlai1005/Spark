@@ -378,6 +378,75 @@ sudo journalctl -u 'filet-follower@*' --since '10 min ago' | grep -i '撤銷\|le
 ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 ARM 檔
 ```
 
+### 5.5.1 ⭐⭐ 建立換 leader 交換目錄（不做這步，客戶按「換 leader」永遠不會生效）
+
+> 編號用 `5.5.1` 是刻意的插入步驟——它必須排在 §5.4 拉起服務**之前**做完，
+> 但不重編後面的章節號（避免程式碼裡的 §5.6 引用失效）。
+
+客戶簽章的換 leader 記錄是 **filet-api 寫、引擎讀** 的**共享**產物，它有自己的目錄。
+
+**為什麼不能跟 `pending.json` 同住 `/var/lib/filet-api`**（2026-07-19 opus 審查 C3，
+上線前抓到）：`pending.json` 是 **API 私有**產物（含活化前的客戶資料，只有 filet-api
+該讀得到），而變更記錄必須讓 **filet-engine** 讀得到。一個目錄的權限**滿足不了這兩個
+相反的要求**，於是舊設計實際跑出來的結果是：API 寫 `/var/lib/filet-api/leader_changes.json`、
+引擎讀 repo 內的 `var/filet/leader_changes.json`——**兩個進程根本在讀寫不同的檔案**，
+換 leader 功能完全不通，而 API 仍回客戶「於引擎的下一個 cycle 生效」。
+
+| 路徑 | owner:group | mode | 建立方式 | 用途 |
+|---|---|---|---|---|
+| `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ **只放** `leader_changes.json`。owner 寫、group 讀、other 無 |
+
+**方向是單向的**：filet-api 寫、filet-follower@ 讀。引擎那邊的 unit **刻意不把這個目錄
+列入 `ReadWritePaths`**——被打穿的引擎因此污染不了 API 的狀態。
+
+```bash
+sudo mkdir -p /var/lib/filet-exchange
+sudo chown filet-api:filet-engine /var/lib/filet-exchange
+sudo chmod 0750 /var/lib/filet-exchange
+```
+
+**兩個 unit 都必須宣告 `FILET_EXCHANGE_DIR`**（`deploy/filet-api.service` 與
+`deploy/filet-follower@.service` 已內建，值必須逐字元相同）：
+
+```ini
+Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
+```
+
+⭐ **半邊漏設會拒絕啟動，不會靜默失效**：這個變數**沒有預設值**。API 漏設 →
+`ApiConfig.from_env` 拒絕啟動；引擎漏設 → `require_exchange_dir` 拒絕啟動
+（unit 進 `failed`，是可監控的狀態）。「起不來」刻意優先於「起來了但功能靜默失效」
+——後者可能好幾天沒人發現，而期間客戶每一次換 leader 都石沉大海。
+
+#### 驗收（三條都要跑，缺一條就沒證明打通）
+
+```bash
+# 驗收 1：filet-api 寫得進去
+sudo -u filet-api touch /var/lib/filet-exchange/.probe \
+  && echo "api 可寫 OK" || echo "★ 失敗：api 寫不進，換 leader 記錄永遠落不了地"
+
+# 驗收 2：filet-engine 讀得到（同一個檔，不是同名的另一個檔）
+sudo -u filet-engine test -r /var/lib/filet-exchange/.probe \
+  && echo "engine 可讀 OK" || echo "★ 失敗：引擎讀不到，客戶按了永遠不生效"
+
+# 驗收 3：filet-engine 寫**不**進去（方向單向；寫得進代表 mode/group 給錯了）
+sudo -u filet-engine touch /var/lib/filet-exchange/.engine-probe \
+  && echo "★ 危險：引擎可寫，單向性失效！" || echo "engine 不可寫 OK"
+
+sudo rm -f /var/lib/filet-exchange/.probe
+
+# 驗收 4：兩個 unit 宣告的值真的相同（打錯字是本節唯一擋不住的殘餘風險）
+systemctl show filet-api.service -p Environment | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
+systemctl show 'filet-follower@<account_id>.service' -p Environment \
+  | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
+```
+
+> 「兩邊都設了但**值不同**」是唯一擋不住的一格（兩個進程各看各的 env，沒有共同的
+> 仲裁者）。驗收 4 是人工比對；長期由 `scripts/filet_daily_report.py` 的
+> 「已寫入但未被套用」對帳告警接住——記錄落地超過 30 分鐘而引擎帳本沒有對應的
+> redeemed nonce 就告警，那涵蓋路徑不通、權限錯、引擎沒跑整類失敗。
+
+---
+
 ### 5.6 activate 一個 follower（人工 CLI）
 
 ⚠️ **必須指定絕對路徑或先 `cd`**：`--pending`／`--manifest` 的預設值是 CWD 相對的，

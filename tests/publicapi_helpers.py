@@ -20,6 +20,9 @@ def make_cfg(tmp_path, **over):
                 db_path=str(tmp_path / "api.db"),
                 keysvc_sock=str(tmp_path / "keysvc.sock"),
                 pending_path=str(tmp_path / "pending.json"),
+                # ⭐ 交換目錄與 pending 分家（C3 修法）：共享產物有自己的目錄，
+                # 測試也照這個拓撲擺，才會真的走到「兩個不同目錄」的路徑。
+                exchange_dir=str(tmp_path / "exchange"),
                 admin_addresses=frozenset())
     base.update(over)
     return ApiConfig(**base)

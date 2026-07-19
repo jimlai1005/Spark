@@ -61,6 +61,17 @@ def _write_manifest(tmp_path, leader):
     return m
 
 
+def _exchange_dir(tmp_path):
+    """API 與引擎共用的**專屬交換目錄**（正式部署 /var/lib/filet-exchange）。
+
+    ⭐ 兩端由同一個 helper 算出來，測試裡就不可能出現「寫端與讀端各拼一次路徑」
+    的漂移——那正是 C3 在正式部署上發生的事。
+    """
+    d = tmp_path / "exchange"
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def _wire_env(monkeypatch, tmp_path, *, manifest_leader, allowlist):
     """佈置一份 manifest ＋ 白名單，並把引擎需要的 env 全部設好。"""
     m = _write_manifest(tmp_path, manifest_leader)
@@ -72,6 +83,7 @@ def _wire_env(monkeypatch, tmp_path, *, manifest_leader, allowlist):
     monkeypatch.setenv("SPARK_BUILDER_ADDR", _BUILDER)
     monkeypatch.setenv("SPARK_ACCOUNT_ID", "alice")
     monkeypatch.setenv("SPARK_NETWORK", "mainnet")
+    monkeypatch.setenv("FILET_EXCHANGE_DIR", str(_exchange_dir(tmp_path)))
     monkeypatch.delenv("COPY_LIVE_TRADING", raising=False)
 
 
@@ -276,7 +288,11 @@ def test_leader_change_mid_run_reaches_run_cycle(monkeypatch, tmp_path):
 
 
 def _signed_change(tmp_path, wallet, *, leader, account_id="alice", nonce="n1"):
-    """簽一筆合法的換 leader 記錄並落到 API 慣例的位置（pending.json 的同目錄）。"""
+    """簽一筆合法的換 leader 記錄並落到 API 慣例的位置（**專屬交換目錄**）。
+
+    2026-07-19 C3 修法前錨在 pending.json 的同目錄——那讓共享產物與 API 私有產物
+    同住一個目錄，實際部署時兩個進程讀寫不同的檔案。現在錨在 FILET_EXCHANGE_DIR。
+    """
     from datetime import datetime, timezone
 
     from eth_account.messages import encode_defunct
@@ -293,9 +309,9 @@ def _signed_change(tmp_path, wallet, *, leader, account_id="alice", nonce="n1"):
     rec = build_leader_change_record(account_id=account_id, leader_address=leader,
                                      nonce=nonce, issued_at=issued_at,
                                      signature=sig, message=msg)
-    pending = tmp_path / "pending.json"
-    write_leader_change(leader_changes_path_for(pending), rec)
-    return pending
+    exchange = _exchange_dir(tmp_path)
+    write_leader_change(leader_changes_path_for(exchange), rec)
+    return exchange
 
 
 def _wire_signed(monkeypatch, tmp_path, *, allowlist):
@@ -317,6 +333,7 @@ def _wire_signed(monkeypatch, tmp_path, *, allowlist):
     monkeypatch.setenv("SPARK_ACCOUNT_ID", "alice")
     monkeypatch.setenv("SPARK_NETWORK", "mainnet")
     monkeypatch.setenv("FILET_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("FILET_EXCHANGE_DIR", str(_exchange_dir(tmp_path)))
     monkeypatch.delenv("COPY_LIVE_TRADING", raising=False)
     monkeypatch.delenv("COPY_TG_BOT_TOKEN", raising=False)
     return wallet
@@ -331,8 +348,7 @@ def test_customer_signed_change_reaches_run_cycle(monkeypatch, tmp_path):
     wallet = _wire_signed(monkeypatch, tmp_path,
                           allowlist=[{"address": _LEADER, "name": "Alpha"},
                                      {"address": _OTHER, "name": "Bravo"}])
-    pending = _signed_change(tmp_path, wallet, leader=_OTHER)
-    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _signed_change(tmp_path, wallet, leader=_OTHER)
     _stub_network(monkeypatch)
     seen = []
     _record_leaders(monkeypatch, seen)
@@ -353,8 +369,7 @@ def test_customer_signed_change_is_applied_once_across_cycles(monkeypatch, tmp_p
     wallet = _wire_signed(monkeypatch, tmp_path,
                           allowlist=[{"address": _LEADER, "name": "Alpha"},
                                      {"address": _OTHER, "name": "Bravo"}])
-    pending = _signed_change(tmp_path, wallet, leader=_OTHER)
-    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _signed_change(tmp_path, wallet, leader=_OTHER)
     _stub_network(monkeypatch)
     seen = []
     _record_leaders(monkeypatch, seen)
@@ -386,8 +401,7 @@ def test_revocation_preempts_a_valid_signed_change(monkeypatch, tmp_path):
         monkeypatch, tmp_path,
         allowlist=[{"address": _LEADER, "name": "Alpha", "enabled": False},
                    {"address": _OTHER, "name": "Bravo"}])
-    pending = _signed_change(tmp_path, wallet, leader=_OTHER)
-    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _signed_change(tmp_path, wallet, leader=_OTHER)
     _stub_network(monkeypatch)
 
     with pytest.raises(SystemExit) as e:
@@ -405,8 +419,7 @@ def test_dry_run_without_account_id_skips_the_applier(monkeypatch, tmp_path):
                           allowlist=[{"address": _OTHER, "name": "Bravo"}])
     monkeypatch.delenv("SPARK_ACCOUNT_ID", raising=False)
     monkeypatch.setenv("COPY_LEADER_ADDRESS", _OTHER)
-    pending = _signed_change(tmp_path, wallet, leader=_LEADER)
-    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _signed_change(tmp_path, wallet, leader=_LEADER)
     _stub_network(monkeypatch)
     seen = []
     _record_leaders(monkeypatch, seen)

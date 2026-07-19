@@ -15,6 +15,12 @@ Environment=FILET_SIWE_URI=REPLACE_WITH_DASHBOARD_URI
 Environment=FILET_API_DB=/var/lib/filet-api/api.db
 Environment=FILET_KEYSVC_SOCK=/run/filet/keysvc.sock
 Environment=FILET_PENDING_PATH=/var/lib/filet-api/pending.json
+# ⭐ 客戶簽章換 leader 記錄的**專屬交換目錄**（API 寫、引擎讀）。必須與
+# filet-follower@.service 的同名變數逐字元相同——漏設一邊會拒絕啟動（刻意無預設值），
+# 設成不同值則由 RUNBOOK §5.5.1 的驗收指令與日報的對帳告警接住。
+# 目錄本身是 filet-api:filet-engine 0750，由 RUNBOOK §5.5.1 手動建立（不由服務建）：
+# 服務建的話會是 filet-api:filet-api 0755，引擎讀不到而 other 讀得到，兩個方向都錯。
+Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
 Environment=FILET_ADMIN_ADDRESSES=REPLACE_WITH_ADMIN_ADDRESSES
 Environment=FILET_API_PORT=8700
 # M3 計費（測試模式）：要啟用時取消註解並填 Stripe **測試** key（sk_test_ 前綴強制，
@@ -29,7 +35,8 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/filet-api /run/filet
+# 交換目錄列入 RW：API 是這個檔唯一的寫入者（引擎那邊刻意不列，方向單向）。
+ReadWritePaths=/var/lib/filet-api /run/filet /var/lib/filet-exchange
 PrivateTmp=true
 
 [Install]

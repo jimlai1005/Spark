@@ -82,6 +82,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # 問題的既有解法（.resolve() 錨定，不靠啟動目錄）。
 DEFAULT_MANIFEST_PATH = str(_REPO_ROOT / "var" / "filet" / "followers.json")
 DEFAULT_LEADERS_PATH = str(_REPO_ROOT / "var" / "filet" / "leaders.json")
+# 客戶簽章換 leader 記錄的**交換目錄**在開發機該設成什麼（正式部署是
+# /var/lib/filet-exchange）。⚠️ 這**不是**隱含 fallback——寫端（ApiConfig.from_env）
+# 與讀端（leader_change_apply.require_exchange_dir）都把 FILET_EXCHANGE_DIR 列為
+# 必填，漏設一邊直接拒絕啟動。放在本模組是因為這裡已經是所有 var/filet 預設路徑的
+# 單一錨點；兩邊各自宣告一份「開發機預設」正是 C3 那類漂移的起點。
+DEFAULT_EXCHANGE_DIR = str(_REPO_ROOT / "var" / "filet")
 
 SOURCE_MANIFEST = "manifest"
 SOURCE_ENV_DEFAULT = "env_default"

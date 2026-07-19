@@ -366,10 +366,16 @@ def test_endpoint_never_touches_the_followers_manifest(tmp_path):
     assert manifest.read_text() == before
 
 
-def test_leader_changes_path_lives_beside_pending(tmp_path):
-    """⭐ 落點沿 pending.json 的同一個目錄＝API 進程本來就擁有寫權的那個目錄；
-    不另開 env（多一個旋鈕就多一個「API 寫 A、引擎讀 B」的靜默錯位）。"""
+def test_leader_changes_path_lives_in_the_dedicated_exchange_dir(tmp_path):
+    """⭐⭐ 落點是**專屬交換目錄**，與 API 私有的 pending.json 分屬不同目錄。
+
+    2026-07-19 opus 審查 C3：原本錨在 pending.json 上。那逼共享產物（API 寫、引擎讀）
+    與私有產物（活化前客戶資料，只有 API 該讀得到）同住一個目錄，而該目錄的權限
+    只能滿足其中一方——實際部署的結果是兩個進程讀寫**不同的檔案**，功能完全不通。
+    專屬目錄讓兩件事各自拿到自己需要的權限（交換目錄 filet-api:filet-engine 0750）。
+    """
     from pathlib import Path
     cfg = make_cfg(tmp_path)
-    assert Path(cfg.leader_changes_path).parent == Path(cfg.pending_path).parent
     assert Path(cfg.leader_changes_path).name == "leader_changes.json"
+    assert Path(cfg.leader_changes_path).parent == Path(cfg.exchange_dir)
+    assert Path(cfg.leader_changes_path).parent != Path(cfg.pending_path).parent

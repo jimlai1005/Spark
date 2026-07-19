@@ -1,4 +1,6 @@
 """tests/test_publicapi_config.py"""
+from pathlib import Path
+
 import pytest
 
 from spark.filet.followers import validate_account_id
@@ -38,6 +40,7 @@ def _env(**over):
         "FILET_API_DB": "/tmp/api.db",
         "FILET_KEYSVC_SOCK": "/run/filet/keysvc.sock",
         "FILET_PENDING_PATH": "/tmp/pending.json",
+        "FILET_EXCHANGE_DIR": "/tmp/filet-exchange",
         "FILET_ADMIN_ADDRESSES": "0x" + "ad" * 20,
     }
     base.update(over)
@@ -63,6 +66,33 @@ def test_from_env_missing_var_raises():
 def test_from_env_bad_network_raises():
     with pytest.raises(ValueError, match="network"):
         ApiConfig.from_env(_env(FILET_API_NETWORK="devnet"))
+
+
+# ── ⭐ 交換目錄：半邊漏設必須大聲失敗（opus 審查 I2）────────────────────
+
+def test_exchange_dir_is_required_and_has_no_silent_default():
+    """⭐ 漏設 FILET_EXCHANGE_DIR → **拒絕啟動**，不得靜默退回某個預設值。
+
+    這個變數的兩端是兩個 systemd unit（filet-api 寫、filet-follower@ 讀）。舊設計
+    給了隱含 fallback，於是漏設的症狀是靜默的：API 寫在 A、引擎讀 B，客戶按了換
+    leader、API 回 200 說「下一個 cycle 生效」，而它永遠不會生效——兩邊 log 都正常。
+    「起不來」比「起來了但功能靜默失效」早好幾天被發現。
+    """
+    with pytest.raises(ValueError, match="FILET_EXCHANGE_DIR"):
+        ApiConfig.from_env(_env(FILET_EXCHANGE_DIR=None))
+
+
+def test_leader_changes_path_is_anchored_on_the_exchange_dir_not_pending():
+    """⭐⭐ 記錄檔錨在**專屬交換目錄**，不是 API 私有的 pending.json 所在目錄。
+
+    共享產物錨在私有產物身上會逼兩者同目錄，而該目錄的權限只能滿足其中一方
+    （pending.json 含活化前的客戶資料，只有 filet-api 該讀得到；記錄檔則必須讓
+    引擎讀得到）——這正是 C3 的根因。
+    """
+    cfg = ApiConfig.from_env(_env(FILET_PENDING_PATH="/var/lib/filet-api/pending.json",
+                                  FILET_EXCHANGE_DIR="/var/lib/filet-exchange"))
+    assert cfg.leader_changes_path == "/var/lib/filet-exchange/leader_changes.json"
+    assert Path(cfg.leader_changes_path).parent != Path(cfg.pending_path).parent
 
 
 def test_admin_addresses_optional_and_normalized():
@@ -145,7 +175,7 @@ def test_live_key_refused_on_direct_construction():
         ApiConfig(network="testnet", builder_address="0x" + "b1" * 20,
                   siwe_domain="d", siwe_uri="https://d", db_path="x.db",
                   keysvc_sock="x.sock", pending_path="p.json",
-                  admin_addresses=frozenset(),
+                  exchange_dir="/tmp/filet-exchange", admin_addresses=frozenset(),
                   stripe_secret_key="sk_live_abc",
                   stripe_webhook_secret="whsec_x", stripe_price_id="price_x")
 
@@ -157,7 +187,7 @@ def test_partial_set_refused_on_direct_construction():
         ApiConfig(network="testnet", builder_address="0x" + "b1" * 20,
                   siwe_domain="d", siwe_uri="https://d", db_path="x.db",
                   keysvc_sock="x.sock", pending_path="p.json",
-                  admin_addresses=frozenset(),
+                  exchange_dir="/tmp/filet-exchange", admin_addresses=frozenset(),
                   stripe_secret_key="sk_test_abc")
 
 

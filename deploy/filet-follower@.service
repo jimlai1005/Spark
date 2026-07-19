@@ -20,6 +20,13 @@ Environment=FILET_KEYS_DIR=/etc/filet/keys
 # 這份檔必須是 root:root 644（filet-api 寫不到）——見 RUNBOOK §5.5。
 Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
 Environment=FILET_FOLLOWERS=/opt/filet/spark/var/filet/followers.json
+# ⭐ 客戶簽章換 leader 記錄的交換目錄（引擎**唯讀**）。必須與 filet-api.service 的
+# 同名變數逐字元相同；漏設會讓引擎拒絕啟動（require_exchange_dir，刻意無預設值——
+# 舊版的隱含預設讓 API 寫 /var/lib/filet-api、引擎讀 repo 內的 var/filet，功能完全
+# 不通而兩邊 log 都正常）。
+# ⚠️ **刻意不列入 ReadWritePaths**：方向是單向的（API 寫、引擎讀）。被打穿的引擎
+# 因此污染不了 API 的狀態；引擎那邊真正需要寫的只有自己的 FILET_STATE_DIR。
+Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_copytrade
 Restart=on-failure
 RestartSec=10

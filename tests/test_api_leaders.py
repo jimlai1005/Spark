@@ -268,6 +268,7 @@ def test_config_watchlist_dir_from_env(env_key, expect_suffix):
     env = {"FILET_API_NETWORK": "testnet", "FILET_BUILDER_ADDR": "0x" + "b1" * 20,
            "FILET_SIWE_DOMAIN": "d", "FILET_SIWE_URI": "u", "FILET_API_DB": "db",
            "FILET_KEYSVC_SOCK": "s", "FILET_PENDING_PATH": "p",
+           "FILET_EXCHANGE_DIR": "/var/lib/filet-exchange",
            env_key: "/data/x" if env_key == "FILET_DATA_DIR" else "/explicit"}
     cfg = ApiConfig.from_env(env)
     assert cfg.watchlist_dir.endswith(expect_suffix)

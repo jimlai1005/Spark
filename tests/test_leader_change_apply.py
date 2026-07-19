@@ -30,9 +30,9 @@ from spark.filet.leader_change_apply import (DEFAULT_LEADER_CHANGES_PATH,
                                              LeaderChangeApplier,
                                              ledger_init_marker_path, load_ledger,
                                              resolve_changes_path, save_ledger)
-from spark.filet.leader_resolve import (SOURCE_CUSTOMER_SIGNED, SOURCE_MANIFEST,
-                                        LeaderResolution, LeaderResolutionError,
-                                        LeaderRevokedError)
+from spark.filet.leader_resolve import (DEFAULT_EXCHANGE_DIR, SOURCE_CUSTOMER_SIGNED,
+                                        SOURCE_MANIFEST, LeaderResolution,
+                                        LeaderResolutionError, LeaderRevokedError)
 
 _OLD_LEADER = "0x" + "a1" * 20   # manifest 登錄的（base 解析結果）
 _NEW_LEADER = "0x" + "d4" * 20   # 客戶簽章要換到的
@@ -615,23 +615,59 @@ def test_broken_ledger_fails_closed(env, content):
 
 # ── 路徑推導：寫端與讀端必須是同一份定義 ─────────────────────────────
 
-def test_changes_path_follows_the_api_pending_env():
-    """⭐ 引擎讀的檔＝API 寫的檔。兩邊各自一個 env 就有兩個能被半邊誤設的旋鈕，
-    而設錯的症狀是靜默的（客戶按了換 leader 卻永遠不生效，兩邊 log 都正常）。"""
+def test_engine_and_api_resolve_the_same_file_from_the_exchange_dir(tmp_path):
+    """⭐⭐ 引擎讀的檔＝API 寫的檔，**且錨點是專屬交換目錄而非 pending.json**。
+
+    2026-07-19 opus 審查 C3 實測：API 寫 /var/lib/filet-api/leader_changes.json、
+    引擎讀 repo 內的 var/filet/leader_changes.json——路徑根本不一致，換 leader 功能
+    完全不通，而 API 仍回客戶「於引擎的下一個 cycle 生效」。根因是把**共享**產物
+    錨在 **API 私有**產物（pending.json）身上，於是兩者被迫同目錄，而該目錄的權限
+    只能滿足其中一方。
+    """
     from spark.publicapi.config import ApiConfig
 
-    pending = "/var/lib/filet-api/pending.json"
-    engine_side = resolve_changes_path({"FILET_PENDING_PATH": pending})
+    exchange = tmp_path / "filet-exchange"
+    exchange.mkdir()
+    engine_side = resolve_changes_path({"FILET_EXCHANGE_DIR": str(exchange)})
     api_side = ApiConfig(
         network="testnet", builder_address="0x" + "b1" * 20,
         siwe_domain="d", siwe_uri="u", db_path="db", keysvc_sock="s",
-        pending_path=pending, admin_addresses=frozenset()).leader_changes_path
-    assert engine_side == api_side == "/var/lib/filet-api/leader_changes.json"
+        pending_path="/var/lib/filet-api/pending.json",
+        exchange_dir=str(exchange), admin_addresses=frozenset()).leader_changes_path
+    assert engine_side == api_side == str(exchange / "leader_changes.json")
+    # 且**不**與 pending.json 同目錄——那正是被修掉的錨點。
+    assert Path(api_side).parent != Path("/var/lib/filet-api")
 
 
-def test_changes_path_default_is_absolute_and_beside_the_manifest():
-    """未設 env → repo 根錨定的絕對路徑（不隨引擎的 CWD 漂移，沿
-    DEFAULT_MANIFEST_PATH／DEFAULT_LEADERS_PATH 的既有理由）。"""
-    p = Path(resolve_changes_path({}))
-    assert p.is_absolute() and str(p) == DEFAULT_LEADER_CHANGES_PATH
+def test_engine_refuses_to_start_without_the_exchange_dir_env():
+    """⭐ 半邊漏設必須**大聲失敗**，不得靜默退回某個預設值（opus 審查 I2）。
+
+    舊版未設 env → 回 repo 內的預設路徑。於是「API 設了、引擎沒設」的部署會安靜地
+    讀寫兩個不同的檔案：客戶按了換 leader、API 回 200 說下一個 cycle 生效，而它
+    永遠不會生效，兩邊 log 都完全正常。拿掉 fallback 之後，漏設的那一邊起不來。
+    """
+    with pytest.raises(ValueError, match="FILET_EXCHANGE_DIR"):
+        resolve_changes_path({})
+
+
+def test_engine_refuses_to_start_when_the_exchange_dir_is_unreadable(tmp_path):
+    """路徑打錯／目錄還沒建／group 權限給錯 → 症狀同樣是「永遠沒有記錄」，
+    同樣必須在啟動時喊出來，而不是等第一個客戶按下換 leader 才發現。"""
+    missing = tmp_path / "not-created-yet"
+    with pytest.raises(ValueError, match="FILET_EXCHANGE_DIR"):
+        resolve_changes_path({"FILET_EXCHANGE_DIR": str(missing)})
+
+    not_a_dir = tmp_path / "a-file"
+    not_a_dir.write_text("")
+    with pytest.raises(ValueError, match="FILET_EXCHANGE_DIR"):
+        resolve_changes_path({"FILET_EXCHANGE_DIR": str(not_a_dir)})
+
+
+def test_dev_exchange_dir_constant_is_absolute_and_repo_anchored():
+    """開發機參考值仍是 repo 根錨定的絕對路徑（不隨 CWD 漂移，沿
+    DEFAULT_MANIFEST_PATH／DEFAULT_LEADERS_PATH 的既有理由）；它是「該把 env 設成
+    什麼」的單一參考值，**不是** fallback（上面兩條釘住這件事）。"""
+    p = Path(DEFAULT_LEADER_CHANGES_PATH)
+    assert p.is_absolute()
     assert p.name == "leader_changes.json" and p.parent.name == "filet"
+    assert str(p.parent) == DEFAULT_EXCHANGE_DIR

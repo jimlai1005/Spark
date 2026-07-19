@@ -96,7 +96,7 @@ from spark.copytrade.notifier import Notifier
 from spark.filet.followers import load_followers, normalize_hex_address
 from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_for,
                                        load_leader_changes, verify_leader_change)
-from spark.filet.leader_resolve import (DEFAULT_MANIFEST_PATH, SOURCE_CUSTOMER_SIGNED,
+from spark.filet.leader_resolve import (DEFAULT_EXCHANGE_DIR, SOURCE_CUSTOMER_SIGNED,
                                         LeaderResolution, LeaderResolutionError,
                                         LeaderRevokedError)
 from spark.filet.leaders import is_still_permitted, load_leaders
@@ -108,22 +108,73 @@ logger = logging.getLogger(__name__)
 # nonce 把 B 的合法變更擋掉（症狀是「換了沒反應」，而且完全不告警）。
 LEDGER_RELPATH = Path("var/filet/leader_change_ledger.json")
 
-# 記錄檔的預設路徑：與 manifest 同目錄（dev 的 FILET_PENDING_PATH=var/filet/pending.json
-# 推導出的正是同一個位置）。正式部署一律由 FILET_PENDING_PATH 指定，見 resolve_changes_path。
-DEFAULT_LEADER_CHANGES_PATH = leader_changes_path_for(DEFAULT_MANIFEST_PATH)
+# 記錄檔在 dev 交換目錄下的位置（測試與文件引用；正式部署一律由 env 決定）。
+# DEFAULT_EXCHANGE_DIR 由 leader_resolve 提供（所有 var/filet 預設路徑的單一錨點）。
+DEFAULT_LEADER_CHANGES_PATH = leader_changes_path_for(DEFAULT_EXCHANGE_DIR)
+
+# 兩個 unit 都必須宣告的交換目錄環境變數（filet-api 寫、filet-follower@ 讀）。
+EXCHANGE_DIR_ENV = "FILET_EXCHANGE_DIR"
+
+
+def require_exchange_dir(env=None) -> Path:
+    """引擎啟動時解出交換目錄；**未設或不可讀一律 raise ⇒ 拒絕啟動**。
+
+    ⭐⭐ 這個函式的存在理由是「半邊漏設不得靜默無效」（opus 審查 I2）
+    ----------------------------------------------------------------
+    交換目錄有兩個使用者、兩個 systemd unit，所以有兩個能被半邊漏設的旋鈕。舊設計
+    給了隱含 fallback（未設 → repo 內的 var/filet），於是漏設的症狀是**靜默的**：
+    API 寫 `/var/lib/filet-exchange/leader_changes.json`、引擎讀 repo 裡那份，
+    客戶按了換 leader、API 回 200 說「下一個 cycle 生效」，而它永遠不會生效——
+    兩邊的 log 都完全正常。這正是 C3 實際發生過的事。
+
+    修法是**拿掉 fallback**：兩邊都把這個 env 列為必填（API 側是
+    `ApiConfig.from_env` 的 required 清單），漏設的那一邊直接起不來。
+    - 引擎漏設 → 本函式 raise → 拒絕啟動（systemd Restart=on-failure ＋
+      StartLimitBurst=5 → unit 進 failed，是可監控的狀態）。
+    - API 漏設 → `ApiConfig.from_env` raise → 拒絕啟動。
+    「起不來」刻意優先於「起來但功能靜默失效」：前者在部署當下就被看見（那一刻有人
+    在看），後者可能好幾天沒人發現，而期間客戶每一次換 leader 都石沉大海。這也沿
+    leader_resolve 既有的「啟動時解析失敗＝拒絕啟動」慣例。
+
+    「兩邊都設了但**設成不同目錄**」是本函式擋不住的最後一格（兩個進程各自看自己的
+    env，沒有共同的仲裁者）。那一格由 RUNBOOK §5.5.1 的驗收指令（實際寫入再實際讀出）
+    與 scripts/filet_daily_report.py 的「已寫入但未被套用」對帳告警接住。
+
+    目錄可讀性也在此檢查：路徑打錯、目錄還沒建、group 權限給錯，症狀同樣是靜默
+    的「永遠沒有記錄」，同樣必須在啟動時就喊出來，而不是等到第一個客戶按下換 leader。
+    """
+    env = os.environ if env is None else env
+    raw = env.get(EXCHANGE_DIR_ENV)
+    if not raw:
+        raise ValueError(
+            f"缺少環境變數 {EXCHANGE_DIR_ENV}（客戶簽章換 leader 記錄的交換目錄，"
+            f"正式部署為 /var/lib/filet-exchange，開發機用 {DEFAULT_EXCHANGE_DIR}）。"
+            f"filet-api.service 與 filet-follower@.service **兩個 unit 都必須宣告**"
+            f"同一個值——刻意沒有預設值：漏設一邊會讓 API 寫的記錄引擎永遠讀不到，"
+            f"而兩邊的 log 都正常。建目錄與權限見 deploy/RUNBOOK.md §5.5.1")
+    p = Path(raw)
+    if not p.is_dir():
+        raise ValueError(
+            f"{EXCHANGE_DIR_ENV}={raw} 不是一個存在的目錄——引擎讀不到任何換 leader "
+            f"記錄，且症狀是靜默的（客戶按了永遠不生效）。見 deploy/RUNBOOK.md §5.5.1")
+    if not os.access(p, os.R_OK | os.X_OK):
+        raise ValueError(
+            f"{EXCHANGE_DIR_ENV}={raw} 對引擎不可讀——請確認目錄為 "
+            f"filet-api:filet-engine 0750 且引擎使用者在 filet-engine 群組內。"
+            f"見 deploy/RUNBOOK.md §5.5.1")
+    return p
 
 
 def resolve_changes_path(env=None) -> str:
-    """引擎要讀的變更記錄檔路徑。
+    """引擎要讀的變更記錄檔路徑（**啟動時呼叫一次**，未設 env ⇒ 拒絕啟動）。
 
-    ⭐ 沿用 **API 自己的** `FILET_PENDING_PATH`，不另開一個引擎專用 env：這個檔的
-    寫端與讀端是兩個進程，各自一個 env 就有兩個能被半邊誤設的旋鈕，而設錯的症狀
-    （API 寫 A、引擎讀 B）是靜默的——客戶按了換 leader 卻永遠不生效，兩邊的 log
-    都正常。一個變數餵多方，沿 FILET_FOLLOWERS／FILET_LEADERS_PATH 的既有慣例。
+    路徑推導與 API 的寫端共用 `leader_changes_path_for`（單一定義），錨點是
+    `FILET_EXCHANGE_DIR` 指的**專屬交換目錄**——不是 API 私有的 pending.json 所在
+    目錄，理由見 leader_change.leader_changes_path_for 的 docstring。
+
+    ⚠️ 沒有「取不到就回預設值」這條路：那正是 C3 的成因（見 require_exchange_dir）。
     """
-    env = os.environ if env is None else env
-    pending = env.get("FILET_PENDING_PATH")
-    return leader_changes_path_for(pending) if pending else DEFAULT_LEADER_CHANGES_PATH
+    return leader_changes_path_for(require_exchange_dir(env))
 
 
 @dataclass(frozen=True)

@@ -257,20 +257,31 @@ def build_leader_change_record(*, account_id: str, leader_address: str, nonce: s
             "message": message}
 
 
-def leader_changes_path_for(pending_path: str | Path) -> str:
-    """由 API 的 `pending.json` 路徑推導出變更記錄檔的路徑（**寫端與讀端的單一定義**）。
+def leader_changes_path_for(exchange_dir: str | Path) -> str:
+    """由**交換目錄**推導出變更記錄檔的路徑（**寫端與讀端的單一定義**）。
 
-    ⭐ 為什麼是一個函式而不是兩邊各寫一行 `with_name(...)`：這個檔有兩個不同進程的
-    使用者——filet-api 寫（ApiConfig.leader_changes_path）、引擎讀
-    （leader_change_apply.resolve_changes_path）。兩邊各自拼一次字串就是兩份會漂移的
+    ⭐ 為什麼是一個函式而不是兩邊各寫一行字串拼接：這個檔有兩個不同進程的使用者
+    ——filet-api 寫（ApiConfig.leader_changes_path）、引擎讀
+    （leader_change_apply.resolve_changes_path）。兩邊各自拼一次就是兩份會漂移的
     定義，而漂移的症狀是**靜默的**：客戶按了換 leader、API 回 200、記錄確實落地，
     引擎卻永遠讀不到那個檔——兩邊的 log 都顯示一切正常（工程原則 1：被比較／被配對
     的兩個值必須同源、同處計算）。
 
-    落在 pending.json 的同一個目錄，理由見 ApiConfig.leader_changes_path 的 docstring
-    （那是唯一已知「API 進程有寫權」的目錄）。
+    ⭐⭐ 錨點是**交換目錄本身**，不是 pending.json（2026-07-19 opus 審查 C3 的修法）
+    ------------------------------------------------------------------------
+    舊版由 `pending.json` 推導。那個錨點選錯了：pending.json 是 **API 私有**的產物
+    （內含活化前的客戶資料，必須只有 filet-api 讀得到），而變更記錄是 **API 與引擎
+    共享**的產物。把共享物錨在私有物身上，兩者被迫同目錄，而該目錄的權限只能滿足
+    其中一方——實際部署的結果是 API 寫 `/var/lib/filet-api/leader_changes.json`、
+    引擎讀 repo 內的 `var/filet/leader_changes.json`，**路徑根本不一致**，功能完全
+    不通，而 API 仍回客戶「於引擎的下一個 cycle 生效」（它永遠不會生效）。
+
+    修法是給共享物一個**專屬目錄**（`FILET_EXCHANGE_DIR`，正式部署
+    `/var/lib/filet-exchange`，`filet-api:filet-engine` 0750）：API 寫、引擎讀、
+    引擎無寫權。方向單向，被打穿的引擎污染不了 API 狀態；權限拓撲與部署步驟見
+    deploy/RUNBOOK.md §5.5.1。
     """
-    return str(Path(pending_path).with_name("leader_changes.json"))
+    return str(Path(exchange_dir) / "leader_changes.json")
 
 
 def load_leader_changes(path: str | Path) -> list[dict]:

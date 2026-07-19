@@ -41,6 +41,12 @@ class ApiConfig:
     keysvc_sock: str
     pending_path: str
     admin_addresses: frozenset[str]   # normalize 過的管理員地址白名單
+    # ⭐ 客戶簽章換 leader 記錄的**專屬交換目錄**（API 寫、引擎讀，引擎無寫權）。
+    # 與 pending.json 分家的理由見 leader_changes_path 的 docstring。
+    # ⚠️ **刻意沒有預設值**（連 dataclass 層都沒有）：給了預設值就會有人在不知情的
+    # 情況下把記錄寫到那個預設目錄去——正式部署是靜默錯位（C3 本體），測試裡則是
+    # 直接寫進 repo 的工作樹。每個建構點都必須明講這個檔要落在哪。
+    exchange_dir: str
     agent_name: str = "filet"         # research：一律給名字，避開 SDK 空名刪欄位特例
     # --- 營運後台（/ops，admin only）唯讀資料來源 ---
     # followers manifest：web 層**只讀**（寫入只有人工 activate CLI，見 pending.py 檔頭）。
@@ -96,12 +102,12 @@ class ApiConfig:
     def leader_changes_path(self) -> str:
         """客戶簽章的換 leader 記錄落點（filet/leader_change.py 的格式）。
 
-        ⭐ **由 pending_path 推導，不另開 env**：這個檔必須落在「API 進程寫得到」
-        的地方，而 pending.json 所在的目錄正是唯一已知滿足此條件的目錄（權限拓撲見
-        pending.py 檔頭：filet-api 擁有 pending，對引擎 manifest 沒有寫權）。
-        另開一個 FILET_LEADER_CHANGES_PATH 只會多一個能被半邊誤設的旋鈕——設錯的
-        症狀是「API 寫在 A、引擎讀 B」，客戶按了換 leader 卻永遠不生效，而且兩邊
-        各自看起來都正常（沿 followers/leaders 路徑「一個變數餵多方」的既有理由）。
+        ⭐⭐ 錨在**專屬交換目錄** `exchange_dir`，不是 `pending_path`
+        （2026-07-19 opus 審查 C3 的修法）：pending.json 是 **API 私有**產物（含
+        活化前的客戶資料，只有 filet-api 該讀得到），變更記錄卻是 **API 與引擎共享**
+        的產物。把共享物錨在私有物身上會逼兩者同目錄，而該目錄的權限只能滿足其中
+        一方——實際結果是 API 寫 /var/lib/filet-api/、引擎讀 repo 內的 var/filet/，
+        路徑根本不一致，功能完全不通，而 API 仍回客戶「下一個 cycle 生效」。
 
         API **不**在此直接改 manifest：一方面進程本就沒有寫權，另一方面繞過引擎的
         二次驗章等於把整套簽章設計退化成裝飾（leader_change.py 檔頭的威脅模型）。
@@ -110,7 +116,7 @@ class ApiConfig:
         （引擎的 leader_change_apply）必須是同一份定義，否則「API 寫 A、引擎讀 B」
         會靜默發生而兩邊看起來都正常。
         """
-        return leader_changes_path_for(self.pending_path)
+        return leader_changes_path_for(self.exchange_dir)
 
     @property
     def billing_enabled(self) -> bool:
@@ -127,9 +133,13 @@ class ApiConfig:
     @classmethod
     def from_env(cls, env=None) -> "ApiConfig":
         env = os.environ if env is None else env
+        # ⭐ FILET_EXCHANGE_DIR 是**必填**（opus 審查 I2）：它與引擎的
+        # require_exchange_dir 是同一個變數的兩端，任一端漏設都會讓 API 寫的記錄
+        # 引擎永遠讀不到，而兩邊的 log 都正常。刻意不給隱含預設值——漏設的那一邊
+        # 直接拒絕啟動，比「起來了但功能靜默失效」早好幾天被發現。
         required = ["FILET_API_NETWORK", "FILET_BUILDER_ADDR", "FILET_SIWE_DOMAIN",
                     "FILET_SIWE_URI", "FILET_API_DB", "FILET_KEYSVC_SOCK",
-                    "FILET_PENDING_PATH"]
+                    "FILET_PENDING_PATH", "FILET_EXCHANGE_DIR"]
         missing = [k for k in required if not env.get(k)]
         if missing:
             raise ValueError(f"缺少環境變數: {', '.join(missing)}")
@@ -169,6 +179,7 @@ class ApiConfig:
                    db_path=env["FILET_API_DB"],
                    keysvc_sock=env["FILET_KEYSVC_SOCK"],
                    pending_path=env["FILET_PENDING_PATH"],
+                   exchange_dir=env["FILET_EXCHANGE_DIR"],
                    followers_path=followers_path,
                    accrued_history_path=(env.get("FILET_ACCRUED_HISTORY_PATH")
                                          or cls.accrued_history_path),
