@@ -8,6 +8,10 @@ Type=oneshot
 User=filet-api
 Group=filet-api
 WorkingDirectory=/opt/filet/spark
+# 2026-07-19：此處 mainnet 是**刻意的例外**，即使部署在 testnet 機器上也不要改。
+# 理由：本服務只讀 HL 公開統計（唯讀，不下單），而 testnet 的 leader 統計無意義——
+# 改成 testnet 會讓績效資料變成垃圾，且因為仍有資料落地而不會有人發現。
+# 副作用：這台機器並非完全與主網隔離。評估隔離性時要把這兩個 timer 算進去。
 Environment=SPARK_NETWORK=mainnet
 Environment=FILET_DATA_DIR=/var/lib/filet-api
 # ⭐ 抓取對象的**單一來源＝leader 白名單**（與 filet-leaderboard.service 逐字元相同
