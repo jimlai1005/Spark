@@ -12,6 +12,7 @@ from pathlib import Path
 
 from spark.config import API_URLS, MIN_BUILDER_BALANCE, Settings
 from spark.filet.followers import validate_account_id
+from spark.filet.leader_change import leader_changes_path_for
 from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
 
 _HEX = set("0123456789abcdefABCDEF")
@@ -104,8 +105,12 @@ class ApiConfig:
 
         API **不**在此直接改 manifest：一方面進程本就沒有寫權，另一方面繞過引擎的
         二次驗章等於把整套簽章設計退化成裝飾（leader_change.py 檔頭的威脅模型）。
+
+        推導本身放在 `leader_change.leader_changes_path_for`：寫端（本處）與讀端
+        （引擎的 leader_change_apply）必須是同一份定義，否則「API 寫 A、引擎讀 B」
+        會靜默發生而兩邊看起來都正常。
         """
-        return str(Path(self.pending_path).with_name("leader_changes.json"))
+        return leader_changes_path_for(self.pending_path)
 
     @property
     def billing_enabled(self) -> bool:

@@ -257,6 +257,22 @@ def build_leader_change_record(*, account_id: str, leader_address: str, nonce: s
             "message": message}
 
 
+def leader_changes_path_for(pending_path: str | Path) -> str:
+    """由 API 的 `pending.json` 路徑推導出變更記錄檔的路徑（**寫端與讀端的單一定義**）。
+
+    ⭐ 為什麼是一個函式而不是兩邊各寫一行 `with_name(...)`：這個檔有兩個不同進程的
+    使用者——filet-api 寫（ApiConfig.leader_changes_path）、引擎讀
+    （leader_change_apply.resolve_changes_path）。兩邊各自拼一次字串就是兩份會漂移的
+    定義，而漂移的症狀是**靜默的**：客戶按了換 leader、API 回 200、記錄確實落地，
+    引擎卻永遠讀不到那個檔——兩邊的 log 都顯示一切正常（工程原則 1：被比較／被配對
+    的兩個值必須同源、同處計算）。
+
+    落在 pending.json 的同一個目錄，理由見 ApiConfig.leader_changes_path 的 docstring
+    （那是唯一已知「API 進程有寫權」的目錄）。
+    """
+    return str(Path(pending_path).with_name("leader_changes.json"))
+
+
 def load_leader_changes(path: str | Path) -> list[dict]:
     """讀變更記錄檔；不存在 → 空清單（尚無人換 leader 是完全正常的狀態）。
 

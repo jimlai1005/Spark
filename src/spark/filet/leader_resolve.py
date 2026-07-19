@@ -85,6 +85,11 @@ DEFAULT_LEADERS_PATH = str(_REPO_ROOT / "var" / "filet" / "leaders.json")
 
 SOURCE_MANIFEST = "manifest"
 SOURCE_ENV_DEFAULT = "env_default"
+# ⭐ 客戶親自簽章授權的 leader（leader_change_apply 套用後的來源標記）。刻意與
+# SOURCE_MANIFEST 分開：manifest 是「營運端登錄的」、customer_signed 是「客戶本人
+# 用私鑰授權的」，兩者的信任來源完全不同。告警訊息會帶上這個字串，操作者看到
+# leader 變更時第一眼就能分辨「這是客戶自己要求的」還是「有人改了 manifest」。
+SOURCE_CUSTOMER_SIGNED = "customer_signed"
 
 
 class LeaderResolutionError(ValueError):

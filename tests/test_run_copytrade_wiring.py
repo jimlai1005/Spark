@@ -267,3 +267,151 @@ def test_leader_change_mid_run_reaches_run_cycle(monkeypatch, tmp_path):
     rc.main([])
 
     assert seen == [_LEADER, _OTHER]
+
+
+# ── ⭐⭐ 客戶簽章的換 leader：從記錄檔一路到 run_cycle 的接縫 ─────────────
+# 這一段與上面兩條同樣是「接縫測試」：模組單元測試證明 applier 本身對，這裡證明它
+# 真的被接進 main() 的解析路徑、而且結果真的餵給了下單的那一段。少了它，把
+# make_effective_leader_resolver 從 main() 拿掉會全綠通過。
+
+
+def _signed_change(tmp_path, wallet, *, leader, account_id="alice", nonce="n1"):
+    """簽一筆合法的換 leader 記錄並落到 API 慣例的位置（pending.json 的同目錄）。"""
+    from datetime import datetime, timezone
+
+    from eth_account.messages import encode_defunct
+
+    from spark.filet.leader_change import (build_leader_change_message,
+                                           build_leader_change_record,
+                                           leader_changes_path_for,
+                                           write_leader_change)
+
+    issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    msg = build_leader_change_message(account_id=account_id, leader_address=leader,
+                                      nonce=nonce, issued_at=issued_at)
+    sig = wallet.sign_message(encode_defunct(text=msg)).signature.hex()
+    rec = build_leader_change_record(account_id=account_id, leader_address=leader,
+                                     nonce=nonce, issued_at=issued_at,
+                                     signature=sig, message=msg)
+    pending = tmp_path / "pending.json"
+    write_leader_change(leader_changes_path_for(pending), rec)
+    return pending
+
+
+def _wire_signed(monkeypatch, tmp_path, *, allowlist):
+    """`_wire_env` 的變體：follower 的 user_address 換成一把真錢包（才能簽章）。"""
+    from eth_account import Account
+
+    wallet = Account.create()
+    m = tmp_path / "followers.json"
+    m.write_text(json.dumps({"followers": [
+        {"account_id": "alice", "user_address": wallet.address,
+         "builder_address": _BUILDER, "network": "mainnet", "label": "",
+         "leader_address": _LEADER}]}))
+    lp = tmp_path / "leaders.json"
+    lp.write_text(json.dumps({"leaders": allowlist}))
+    monkeypatch.setenv("FILET_FOLLOWERS", str(m))
+    monkeypatch.setenv("FILET_LEADERS_PATH", str(lp))
+    monkeypatch.setenv("SPARK_USER_ADDR", wallet.address)
+    monkeypatch.setenv("SPARK_BUILDER_ADDR", _BUILDER)
+    monkeypatch.setenv("SPARK_ACCOUNT_ID", "alice")
+    monkeypatch.setenv("SPARK_NETWORK", "mainnet")
+    monkeypatch.setenv("FILET_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("COPY_LIVE_TRADING", raising=False)
+    monkeypatch.delenv("COPY_TG_BOT_TOKEN", raising=False)
+    return wallet
+
+
+def test_customer_signed_change_reaches_run_cycle(monkeypatch, tmp_path):
+    """⭐⭐ 客戶簽章的變更必須真的變成 run_cycle 拿去下單的那個位址。
+
+    manifest 說跟 _LEADER，客戶簽章說換到 _OTHER —— 下單路徑必須看到 _OTHER。
+    這是「引擎會依此改變拿客戶的錢跟誰交易」那句話的可執行版本。
+    """
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"},
+                                     {"address": _OTHER, "name": "Bravo"}])
+    pending = _signed_change(tmp_path, wallet, leader=_OTHER)
+    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _stub_network(monkeypatch)
+    seen = []
+    _record_leaders(monkeypatch, seen)
+
+    rc.main(["--once"])
+
+    assert seen == [_OTHER]
+
+
+def test_customer_signed_change_is_applied_once_across_cycles(monkeypatch, tmp_path):
+    """⭐ 冪等的接線版：記錄檔在每個 cycle 都還在，但只能兌現一次。
+
+    帳本內容在第二輪之後必須逐位元組不變——重複套用的症狀是每輪一次真實的
+    平舊開新，而且看起來完全正常（每輪都像一次「換 leader 成功」）。
+    """
+    from spark.filet.leader_change_apply import LEDGER_RELPATH
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"},
+                                     {"address": _OTHER, "name": "Bravo"}])
+    pending = _signed_change(tmp_path, wallet, leader=_OTHER)
+    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _stub_network(monkeypatch)
+    seen = []
+    _record_leaders(monkeypatch, seen)
+    ledger = tmp_path / "state" / LEDGER_RELPATH
+    snapshots = []
+
+    def _fake_main_loop(mk_cycle, settings, notifier):
+        for _ in range(3):
+            mk_cycle()
+            snapshots.append(ledger.read_text())
+
+    monkeypatch.setattr(rc, "main_loop", _fake_main_loop)
+    rc.main([])
+
+    assert seen == [_OTHER, _OTHER, _OTHER]      # 一直跟新 leader
+    assert len(set(snapshots)) == 1              # ⭐ 帳本只被寫過一次
+
+
+def test_revocation_preempts_a_valid_signed_change(monkeypatch, tmp_path):
+    """⭐⭐ 撤銷優先：manifest 的 leader 已被撤銷、同時有一筆完全合法的客戶簽章
+    變更指向另一個健康的 leader → 引擎**不得**用那筆變更把自己救活。
+
+    安全動作優先於便利動作。啟動時撤銷＝拒絕啟動（本來就還沒開倉，不需收尾），
+    而那筆變更必須原封不動地留著（帳本零寫入）——它不是被消耗掉，只是這一輪輪不到它。
+    """
+    from spark.filet.leader_change_apply import LEDGER_RELPATH
+
+    wallet = _wire_signed(
+        monkeypatch, tmp_path,
+        allowlist=[{"address": _LEADER, "name": "Alpha", "enabled": False},
+                   {"address": _OTHER, "name": "Bravo"}])
+    pending = _signed_change(tmp_path, wallet, leader=_OTHER)
+    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _stub_network(monkeypatch)
+
+    with pytest.raises(SystemExit) as e:
+        rc.main(["--once"])
+    assert e.value.code == 2
+    assert not (tmp_path / "state" / LEDGER_RELPATH).exists()   # ⭐ 未被兌現
+
+
+def test_dry_run_without_account_id_skips_the_applier(monkeypatch, tmp_path):
+    """dry/shadow 無 SPARK_ACCOUNT_ID → 沒有身分就沒有「哪一筆記錄是我的」，
+    也沒有可信的 user_address 可比對簽章者 → 整條套用路徑跳過（不建帳本）。"""
+    from spark.filet.leader_change_apply import LEDGER_RELPATH
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _OTHER, "name": "Bravo"}])
+    monkeypatch.delenv("SPARK_ACCOUNT_ID", raising=False)
+    monkeypatch.setenv("COPY_LEADER_ADDRESS", _OTHER)
+    pending = _signed_change(tmp_path, wallet, leader=_LEADER)
+    monkeypatch.setenv("FILET_PENDING_PATH", str(pending))
+    _stub_network(monkeypatch)
+    seen = []
+    _record_leaders(monkeypatch, seen)
+
+    rc.main(["--once", "--dry-run"])
+
+    assert seen == [_OTHER]                                     # 走 env 回退
+    assert not (tmp_path / "state" / LEDGER_RELPATH).exists()

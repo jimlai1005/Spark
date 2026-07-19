@@ -31,6 +31,19 @@ leader 解析（per-follower ＋ 白名單二次驗證）:
   **撤銷**（enabled=false／條目被移除）則受控收尾（平倉＋鎖死 kill switch）。
   威脅模型與逐條規則見 spark/filet/leader_resolve.py 檔頭。
 
+客戶簽章的換 leader（疊在上面那層解析之上）:
+  FILET_PENDING_PATH  filet-api 的 pending.json 路徑；變更記錄檔＝它的同目錄
+                      leader_changes.json（**與 API 共用同一個 env**，不另開旋鈕：
+                      兩個 env 就有兩個能被半邊誤設的地方，設錯的症狀是「客戶按了
+                      換 leader 卻永遠不生效」而兩邊 log 都正常）。未設則用
+                      repo 根下的 var/filet/leader_changes.json。
+  引擎每輪自己重新驗章（user_address 取自 manifest，不取自記錄），通過後再過一次
+  白名單（is_still_permitted）才套用，並把已兌現的 nonce 記在自己的帳本
+  <FILET_STATE_DIR>/var/filet/leader_change_ledger.json（原子寫）——API 的 nonce 存
+  在它自己的 SQLite，引擎讀不到，沒有這份帳本同一筆記錄會每輪重複套用。
+  **撤銷優先**：同一輪既有撤銷又有合法變更時，先收尾、不套用變更。
+  威脅模型見 spark/filet/leader_change_apply.py 檔頭。
+
 keystore 選擇:
   FILET_KEYSTORE   缺省／keychain → MacKeychainBackend（Mac 開發）；
                     envfile → EnvFileKeyStore(FILET_KEYS_DIR，預設 /etc/filet/keys，VPS 用)。
@@ -62,6 +75,11 @@ from spark.copytrade.loop import main_loop, run_cycle, tripped_report
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
 from spark.exchange.base import BuilderCode
+from spark.filet.leader_change_apply import (
+    LEDGER_RELPATH,
+    LeaderChangeApplier,
+    resolve_changes_path,
+)
 from spark.filet.leader_resolve import (
     DEFAULT_LEADERS_PATH,
     DEFAULT_MANIFEST_PATH,
@@ -115,6 +133,35 @@ def make_leader_resolver(account_id: str | None, user_addr: str,
         return resolve_leader(account_id=account_id, manifest_path=manifest_path,
                               leaders_path=leaders_path, env_default=env_default,
                               self_address=user_addr)
+
+    return _resolve
+
+
+def make_effective_leader_resolver(base_resolve: Callable[[], LeaderResolution],
+                                   *, account_id: str | None, notifier: Notifier,
+                                   state_root: Path) -> Callable[[], LeaderResolution]:
+    """把「客戶簽章的換 leader 記錄」疊在基礎解析之上，回傳每 cycle 用的解析閉包。
+
+    ⭐ 撤銷優先是**結構性**的，不靠任何一行 if：`base_resolve()` 在參數位置先被
+    求值，leader 被撤銷時它直接 raise LeaderRevokedError，applier 一行都不會跑
+    （見 leader_change_apply 檔頭）。安全動作優先於便利動作——晚一輪換 leader 是
+    客戶多等幾十秒，晚一輪收尾是繼續跟著一個已知出事的 leader 下單。
+
+    `account_id` 為 None（dry/shadow 無身分）→ 原樣回傳 base_resolve：沒有帳號就
+    沒有「哪一筆記錄是我的」，也沒有可信的 user_address 可比對簽章者。
+    """
+    if account_id is None:
+        return base_resolve
+    applier = LeaderChangeApplier(
+        account_id=account_id,
+        manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
+        leaders_path=os.environ.get("FILET_LEADERS_PATH", DEFAULT_LEADERS_PATH),
+        changes_path=resolve_changes_path(),
+        ledger_path=state_root / LEDGER_RELPATH,
+        notifier=notifier)
+
+    def _resolve() -> LeaderResolution:
+        return applier.effective(base_resolve())
 
     return _resolve
 
@@ -260,12 +307,24 @@ def main(argv: list[str] | None = None) -> None:
     settings = Settings(builder_address=builder_addr,
                         account_id=account_id or "acct", network=network)
 
+    # 狀態根與 notifier 都是純本地建構（讀 env／存欄位，零網路），刻意提到 leader
+    # 解析之前：解析現在也要套用客戶簽章的換 leader 記錄，而那需要狀態根（引擎自己的
+    # 已兌現 nonce 帳本落在那裡）與一個能發 critical 的 notifier。
+    state_root = resolve_state_dir()
+    notifier = (TelegramNotifier.from_env()
+                if os.environ.get("COPY_TG_BOT_TOKEN") else NullNotifier())
+    notifier = wrap_notifier(notifier, account_id)
+
     # ⭐ leader 解析＋白名單二次驗證，刻意放在建立 Info／取 key 之前：純檔案 IO，
     # 失敗要在碰網路與 Keychain 之前就拒絕啟動（威脅模型見 leader_resolve.py 檔頭）。
     # --status 是零寫入的診斷路徑，刻意豁免：設定壞掉的時候正是最需要它能跑的時候，
     # 讓它因 leader 解析失敗而停擺等於拿走唯一的排查工具（它也不會下任何單）。
-    resolve_leader_fn = make_leader_resolver(
-        account_id, user_addr, copy_settings.leader_address)
+    # ⭐ 啟動時就走**含客戶簽章變更**的完整解析（不只每 cycle）：否則每次重啟都會先
+    # 退回 manifest 的舊 leader、第一輪再換回來——一次沒有意義的部位收斂，還會在每次
+    # 重啟時發一則假的「leader 已變更」告警。
+    resolve_leader_fn = make_effective_leader_resolver(
+        make_leader_resolver(account_id, user_addr, copy_settings.leader_address),
+        account_id=account_id, notifier=notifier, state_root=state_root)
     resolution: LeaderResolution | None = None
     if not args.status:
         try:
@@ -287,7 +346,6 @@ def main(argv: list[str] | None = None) -> None:
     from spark.exchange.hyperliquid import HyperliquidAdapter
 
     info = Info(settings.api_url, skip_ws=True)
-    state_root = resolve_state_dir()
 
     if args.status:
         adapter = HyperliquidAdapter(network, info=info, exchange=None)
@@ -316,9 +374,6 @@ def main(argv: list[str] | None = None) -> None:
         adapter, signer, BuilderCode(b=builder_addr, f=settings.f),
         live=live, my_address=user_addr, settings=copy_settings,
         virtual_book=VirtualBook() if args.shadow else None)
-    notifier = (TelegramNotifier.from_env()
-                if os.environ.get("COPY_TG_BOT_TOKEN") else NullNotifier())
-    notifier = wrap_notifier(notifier, account_id)
     state = ReconcileState()
 
     mode = "LIVE" if live else ("SHADOW" if args.shadow else "DRY-RUN")
