@@ -15,8 +15,11 @@
     "next": "15.5.20",
     "react": "19.0.0",
     "react-dom": "19.0.0",
-    "viem": "2.22.8",
-    "wagmi": "2.14.9"
+    "viem": "2.55.2",
+    "wagmi": "2.19.5"
+  },
+  "overrides": {
+    "viem": "2.55.2"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "6.6.3",
