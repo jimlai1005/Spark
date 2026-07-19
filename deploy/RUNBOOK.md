@@ -248,6 +248,40 @@ sudo systemctl daemon-reload
 # 先不 enable/start——等 §6 依順序統一拉起
 ```
 
+### 4.4 ⚠️ 安全前提：前端與 filet-api 必須是不同信任域
+
+**這一節不是操作步驟，是一條部署約束。改動部署拓撲前必須回來讀。**
+
+`/leaders` 換 leader 流程有一道**前端防線**——在喚起錢包前斷言「伺服器回傳的待簽
+授權對象 == 使用者所選的 leader」。它擋的是：**filet-api 被打穿後，讓使用者簽下
+對攻擊者所選 leader 的真實授權**。客戶的簽章是整套設計裡唯一能回答「這位客戶真的
+要求換到他嗎」的東西（見 `src/spark/filet/leader_change.py` 檔頭的威脅模型），
+而簽章一旦被騙取，後面引擎的二次驗章會**正常通過**——因為簽章本身是真的。
+
+**這道防線有效的前提是：前端 bundle 由 `filet-dashboard` 服務、檔案 root:root 唯讀，
+攻擊者打穿 filet-api 改不到它。** 前端與 API 分屬兩個信任域，斷言才有意義：
+被打穿的一方無法竄改做斷言的那一方。
+
+> **⚠️ 若日後改由 filet-api 服務前端 bundle、或兩者同源部署，此防護會靜默失效，
+> 且不會有任何測試轉紅。** 攻擊者只要能改到 bundle，就能連同那句斷言一起改掉，
+> 而所有測試仍然全綠、所有服務仍然正常運作——沒有任何訊號會告訴你防線沒了。
+
+變更部署拓撲（合併服務、改用同一個進程服務靜態檔、把前端搬到 API 的 static 目錄、
+引入會同時代理兩者的 SSR/BFF 層）**之前必須重新評估**，並在此記錄評估結論。
+
+驗收（確認兩者確實是不同信任域）：
+
+```bash
+# 1. 前端 bundle 的 owner 必須是 root，且 filet-api 寫不到
+ls -ld /opt/filet/spark/web/.next
+sudo -u filet-api touch /opt/filet/spark/web/.next/probe 2>&1 | head -1
+# 預期：touch: cannot touch ...: Permission denied
+
+# 2. 兩個服務跑在不同 User 底下（同一個 User 就不是兩個信任域）
+systemctl show filet-dashboard -p User; systemctl show filet-api -p User
+# 預期：User=filet-dashboard / User=filet-api，兩者不同
+```
+
 ---
 
 ## 5. systemd units 安裝順序

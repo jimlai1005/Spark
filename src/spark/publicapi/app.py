@@ -13,7 +13,8 @@ from pydantic import BaseModel
 from spark.filet.followers import load_followers_tolerant
 from spark.filet.leader_change import (LeaderChangeError, build_leader_change_message,
                                        build_leader_change_record,
-                                       verify_leader_change, write_leader_change)
+                                       load_leader_changes, verify_leader_change,
+                                       write_leader_change)
 from spark.filet.leader_perf import BASIS_NOTE, MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
@@ -236,6 +237,128 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     @app.get("/api/me")
     def me(address: str = Depends(_require_session)):
         return {"address": address, "account_id": derive_account_id(address)}
+
+    @app.get("/api/me/leader")
+    def me_leader(address: str = Depends(_require_session)):
+        """客戶查**自己目前跟隨的 leader**。
+
+        ⭐ 為什麼需要這個端點：跟隨關係的唯一真相在 followers manifest，而 manifest
+        原本只有 admin 端點讀得到——客戶因此無從知道自己在跟誰，`/leaders` 頁只能
+        顯示「本頁無法標示你目前跟隨的 leader」。這對一個「換 leader 要簽章」的產品
+        是個洞：客戶在不知道現況的情況下被要求簽署變更。
+
+        ⭐ **只回自己的**，且結構上不可能回別人的：account_id 由 session 衍生，
+        本端點**沒有任何 account 參數**（沿檔頭的既有慣例——「別人不能替你 onboard」
+        是結構保證而不是檢查）。想查別人只能先拿到別人的 session。
+
+        ⭐ 四種狀態各有明確語意，**不用 null 讓前端猜**（`leader_address` 為 null
+        時，前端必須靠 `status` 才知道是「還沒活化」還是「用引擎預設」）：
+        - `following`：manifest 明確指定了 leader。
+        - `engine_default`：已活化但未指定 leader，引擎沿用進程 env 的
+          `COPY_LEADER_ADDRESS`（leader_resolve 的回退路徑）。這是**真的在跟單**，
+          只是跟的對象由部署決定——與「沒在跟單」是完全不同的處境。
+        - `not_activated`：manifest 裡沒有這個帳號（活化是人工 CLI 動作，見 pending.py）。
+        - `indeterminate`：帳號不在 manifest **且** manifest 有無法解析的條目——
+          壞掉的那筆可能就是他自己的。回 `not_activated` 會讓一個正在跟單的客戶
+          以為自己沒在跟單（危險方向的誤讀，工程原則 3）。
+
+        manifest 讀不到 → 503（沿營運後台讀 manifest 的同一種失敗處理）：回
+        「你沒在跟單」比回錯誤危險，客戶會因此以為資金沒在動而不去看它。
+
+        ⚠️ 本端點刻意**不直接**取用跨客戶的 manifest 載入器，只透過
+        `_load_own_follower` 拿自己那一筆——理由見該函式 docstring
+        （tests/test_api_ops.py 的跨客戶 admin 閘會結構性檢查這件事）。
+        """
+        account_id = derive_account_id(address)
+        mine, manifest_degraded = _load_own_follower(account_id)
+
+        if mine is None:
+            indeterminate = manifest_degraded
+            return {
+                "account_id": account_id,
+                "status": "indeterminate" if indeterminate else "not_activated",
+                "leader_address": None, "leader_name": None,
+                "pending_change": None,
+                "note": ("目前無法確認你的跟隨狀態（帳號清單有無法解析的條目）；"
+                         "請聯絡管理員，不要當作「未在跟單」處理。") if indeterminate else
+                        "你的帳號尚未啟用跟單（啟用是人工作業）；完成入金與授權後，"
+                        "管理員會為你啟用，屆時這裡會顯示你跟隨的 leader。",
+            }
+
+        leader = mine.leader_address
+        # 名稱只從白名單查（客戶在目錄頁看過的同一份資料）。⚠️ 治理旗標
+        # enabled／accepting_new **不外流**（沿 _leader_public 的既有理由）——
+        # 查無名稱只代表「不在目前的可選清單裡」，不告訴他是哪一種下架。
+        name = None
+        if leader is not None:
+            try:
+                name = next((r.name for r in load_leaders(cfg.leaders_path)
+                             if r.address == leader), None)
+            except ValueError:
+                # 白名單壞掉不該讓客戶查不到自己的 leader：位址本身出自 manifest，
+                # 是獨立於白名單的真相。少一個顯示名稱而已，大聲留痕即可。
+                logger.error("leader 白名單載入失敗（僅影響顯示名稱） %s", cfg.leaders_path)
+
+        return {
+            "account_id": account_id,
+            "status": "following" if leader else "engine_default",
+            "leader_address": leader,
+            "leader_name": name,
+            "pending_change": _pending_leader_change(account_id, leader),
+            "note": ("這是引擎目前為你跟隨的 leader。" if leader else
+                     "你已啟用跟單，但尚未指定 leader，引擎沿用部署的預設設定。"
+                     "你可以到 leader 目錄選擇一位——在那之前，跟單仍在進行中。"),
+        }
+
+    def _load_own_follower(account_id: str):
+        """manifest → **只**這一個帳號的 FollowerRef，回 `(ref | None, 有壞條目)`。
+
+        ⭐ 為什麼不是在端點裡拿 `_load_followers()` 再自己 filter（2026-07-19）：
+        `_load_followers` 是登記在案的**跨客戶讀取入口**（tests/test_api_ops.py 的
+        `CROSS_CUSTOMER_SOURCES`），凡是直接用它的路由都必須掛 admin 閘——那條結構性
+        檢查抓到了本端點，而且抓得對：一個 session-gated 的客戶端點手上握著全體客戶
+        的清單，只靠一行 filter 把別人濾掉，是「記得寫對」而不是「寫不錯」。
+        這裡把窄化收進單一函式，端點結構上就拿不到別人的資料——多客戶清單的生命週期
+        完全不離開這個函式。（工程原則 5 的同型：邊界強制，而非呼叫點自律。）
+
+        回傳的第二個值 = manifest 有無法解析的條目。呼叫端**必須**用它區分
+        「確定沒有這個帳號」與「可能有但那筆壞了」——見 me_leader 的 indeterminate。
+        """
+        refs, manifest_errors = _load_followers()
+        return (next((r for r in refs if r.account_id == account_id), None),
+                bool(manifest_errors))
+
+    def _pending_leader_change(account_id: str, current_leader: str | None) -> dict | None:
+        """客戶已簽署、但**尚未反映在 manifest** 的換 leader 記錄。
+
+        ⭐ 只在「已提交的 leader ≠ manifest 目前的 leader」時才回報為 pending：
+        引擎套用之後記錄仍留在檔案裡（write_leader_change 是同 account 覆蓋，不是
+        流水帳），若照單全收，客戶會永遠看到一個早就生效的「處理中」。比較的兩側
+        （記錄裡的位址、manifest 裡的位址）都已正規化成小寫，同基準（工程原則 1）。
+
+        ⚠️ 只投影 `leader_address` 與 `issued_at`——**signature 絕不外流**
+        （沿 leaders_select 「不記 signature／message 原文」的政策）。
+        """
+        try:
+            changes = load_leader_changes(cfg.leader_changes_path)
+        except (OSError, ValueError) as e:
+            # 交換目錄讀不到只影響「處理中」提示，不影響主要答案 → 降級不中斷。
+            logger.error("換 leader 記錄讀取失敗 %s: %s", cfg.leader_changes_path, e)
+            return None
+        rec = next((c for c in changes if isinstance(c, dict)
+                    and c.get("account_id") == account_id), None)
+        if rec is None:
+            return None
+        target = rec.get("leader_address")
+        if not isinstance(target, str) or target == current_leader:
+            return None
+        return {
+            "leader_address": target,
+            "issued_at": rec.get("issued_at"),
+            "effective": "next_engine_cycle",
+            "note": "你已簽署換 leader，尚未生效：引擎會在下一個 cycle 重新驗證你的"
+                    "簽章與白名單後套用。",
+        }
 
     # ---------- leader 目錄（客戶自選 leader 的資料來源） ----------
     def _load_leaders_or_503() -> list[LeaderRef]:
