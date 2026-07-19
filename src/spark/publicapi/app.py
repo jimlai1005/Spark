@@ -11,7 +11,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from spark.filet.followers import load_followers_tolerant
-from spark.filet.leader_change import (LeaderChangeError, build_leader_change_record,
+from spark.filet.leader_change import (LeaderChangeError, build_leader_change_message,
+                                       build_leader_change_record,
                                        verify_leader_change, write_leader_change)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
@@ -229,6 +230,60 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     "績效統計暫時不可用（每日快照尚未產生或讀取失敗）；"
                     "leader 清單不受影響，仍可正常選擇。",
         }
+
+    # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce
+    # 空間，見 leaders_select 的 _consume）——刻意不另開一套機具：兩套一次性表格
+    # 意味著兩套過期、兩套消耗語意，而其中一套遲早會漏掉原子性。
+    # chain_id 對「換 leader」沒有意義，統一發 0，並順帶得到一個防禦性質：
+    # auth_verify 會拿 chain_id=0 重建 SIWE 訊息，客戶從來不會簽那一份，recover 必然
+    # 對不上 → 本端點發出的 nonce **無法**被挪去完成一次登入（auth_nonce 端點自己
+    # 拒收 chain_id <= 0，所以 0 是登入路徑產生不出來的值）。
+    _LEADER_CHANGE_CHAIN_ID = 0
+
+    @app.get("/api/leaders/select/message")
+    def leaders_select_message(leader_address: str,
+                               address: str = Depends(_require_session)):
+        """回傳換 leader 的 **canonical 待簽原文** ＋ 配套的一次性 nonce。
+
+        ⭐ 為什麼原文必須由伺服器產生（沿 SIWE 的既有理由，見 auth_nonce）：
+        驗證端是**重建**訊息再 recover（verify_leader_change 刻意不看客戶送來的
+        `message`），所以客戶端組出的字串必須與伺服器**逐位元組相同**。少一個換行、
+        位址大小寫不同、欄位順序換一下，症狀都是「我本人簽的卻一直被拒」——而那個
+        症狀在客戶端與伺服器兩邊看起來都完全正常，是最難診斷的一類 bug。讓伺服器
+        回傳原文，客戶端**原樣**丟進錢包簽名，兩邊結構上不可能組出不同的字串
+        （工程原則 1：被比較的兩個值同源、同處計算）。
+
+        本端點**只產生原文，不改任何狀態**——唯一的副作用是簽發 nonce（沿
+        auth_nonce 的既有慣例；nonce 要能被 select 端點原子消耗，就必須先存在）。
+        真正的變更寫入只發生在 POST /api/leaders/select，且在**全部驗證通過之後**。
+
+        ⚠️ 這裡用 `is_selectable`（enabled **且** accepting_new），與 select 端點
+        同一個述詞：不可選的 leader 連待簽原文都不該給。若這裡放寬成
+        `is_still_permitted`（引擎的述詞），客戶會拿到一份能簽、簽了卻必定被
+        select 端點拒絕的原文——把一個閘門變成一個只會浪費客戶一次簽名的陷阱。
+        """
+        account_id = derive_account_id(address)
+        refs = _load_leaders_or_503()
+        # 不可選（含不在白名單／已撤銷／不收新客戶／位址格式壞）→ 400，且理由不分辨
+        # （治理狀態不外流，沿 /api/leaders 與 select 端點的既有理由）。
+        if not is_selectable(leader_address, refs):
+            raise HTTPException(status_code=400,
+                                detail="該 leader 目前不可選擇，請重新整理 leader 列表")
+        # 走到這裡代表 is_selectable 已在白名單裡找到它 → 位址必然合法可正規化。
+        leader = normalize_address(leader_address)
+        # issued_at 版型沿 auth_nonce（帶 Z 的 UTC）——leader_change._parse_issued_at
+        # 要求帶時區，naive 時間會被直接拒絕。
+        issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        nonce = store.issue_nonce(address, _LEADER_CHANGE_CHAIN_ID, issued_at,
+                                  now_s=now_fn(), ttl_s=cfg.nonce_ttl_s)
+        message = build_leader_change_message(account_id=account_id,
+                                              leader_address=leader,
+                                              nonce=nonce, issued_at=issued_at)
+        # 四個欄位全回：客戶端把 message 原樣拿去簽，其餘三個原樣回填進 select 的
+        # request body。任何一個由客戶端自己重算，就等於把「兩邊必須同源」的保證
+        # 交還給客戶端的記性。
+        return {"message": message, "nonce": nonce, "issued_at": issued_at,
+                "leader_address": leader, "account_id": account_id}
 
     @app.post("/api/leaders/select")
     def leaders_select(body: LeaderSelectBody,
