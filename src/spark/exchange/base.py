@@ -109,6 +109,7 @@ class UserFill:
     crossed: bool         # True = taker
     oid: int
     fee: Decimal
+    builder_fee: Decimal = Decimal("0")   # 該筆成交歸屬我方 builder 的費用（HL fills 的 builderFee；無此欄位視為 0）
 
 
 class ExchangeAdapter(ABC):

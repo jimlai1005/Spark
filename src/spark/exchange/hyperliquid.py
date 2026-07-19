@@ -204,6 +204,7 @@ class HyperliquidAdapter(ExchangeAdapter):
                 crossed=bool(f["crossed"]),
                 oid=f["oid"],
                 fee=Decimal(str(f.get("fee", "0"))),
+                builder_fee=Decimal(str(f.get("builderFee", "0") or "0")),
             ))
         return fills
 

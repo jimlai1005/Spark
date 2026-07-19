@@ -331,6 +331,34 @@ def test_get_user_fills_missing_fee_defaults_zero_and_maker_not_crossed():
     assert f.fee == Decimal("0")
     assert isinstance(f.fee, Decimal)
     assert f.crossed is False
+    # builderFee 亦缺鍵 → 預設 0（本筆非我方路由的成交）
+    assert f.builder_fee == Decimal("0")
+
+
+def test_get_user_fills_parses_builder_fee():
+    fills_raw = [
+        {"coin": "ETH", "px": "4000.25", "sz": "0.1", "side": "B", "time": 1750000000000,
+         "crossed": True, "oid": 111, "fee": "0.008", "builderFee": "0.002"},
+    ]
+    ad = _adapter(fills=fills_raw)
+    f = ad.get_user_fills(
+        "0xuser", datetime(2025, 6, 15, tzinfo=timezone.utc), datetime(2025, 6, 16, tzinfo=timezone.utc)
+    )[0]
+    assert f.builder_fee == Decimal("0.002")
+    assert isinstance(f.builder_fee, Decimal)
+
+
+def test_get_user_fills_builder_fee_none_defaults_zero():
+    # HL 回應可能給 builderFee=None（而非缺鍵）——"or "0"" 需接住，不得炸
+    fills_raw = [
+        {"coin": "ETH", "px": "4000.25", "sz": "0.1", "side": "B", "time": 1750000000000,
+         "crossed": True, "oid": 111, "fee": "0.008", "builderFee": None},
+    ]
+    ad = _adapter(fills=fills_raw)
+    f = ad.get_user_fills(
+        "0xuser", datetime(2025, 6, 15, tzinfo=timezone.utc), datetime(2025, 6, 16, tzinfo=timezone.utc)
+    )[0]
+    assert f.builder_fee == Decimal("0")
 
 
 # --- 6. get_all_mids ---

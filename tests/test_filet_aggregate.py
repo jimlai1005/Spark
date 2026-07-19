@@ -64,10 +64,11 @@ def test_empty_no_crash():
 # --- collect_follower_summary：三案（正常算 taker_share、例外入 summary、空 fills） ---
 
 class _FakeFill:
-    def __init__(self, sz, px, crossed):
+    def __init__(self, sz, px, crossed, builder_fee="0"):
         self.sz = Decimal(sz)
         self.px = Decimal(px)
         self.crossed = crossed
+        self.builder_fee = Decimal(builder_fee)
 
 
 class _FakeAdapter:
@@ -113,6 +114,46 @@ def test_collect_follower_summary_empty_fills():
     assert s.error is None
     assert s.fills == 0
     assert s.taker_share == Decimal("0")
+    assert s.notional == Decimal("0")
+    assert s.builder_fee == Decimal("0")
+
+
+def test_collect_follower_summary_sums_notional_and_builder_fee():
+    # 手算：notional = 2*100 + 1*50 + 3*10 = 280；builder_fee = 0.02 + 0.01 + 0（缺鍵視為 0）
+    fills = [
+        _FakeFill("2", "100", True, builder_fee="0.02"),
+        _FakeFill("1", "50", True, builder_fee="0.01"),
+        _FakeFill("3", "10", False),  # builder_fee 預設 "0"
+    ]
+    adapter = _FakeAdapter(fills=fills)
+    s = collect_follower_summary(_ref("dave"), adapter, _START, _END)
+    assert s.error is None
+    assert s.notional == Decimal("280")
+    assert s.builder_fee == Decimal("0.03")
+
+
+def test_collect_follower_summary_error_branch_has_zero_notional_and_fee():
+    adapter = _FakeAdapter(raises=RuntimeError("boom: connection reset"))
+    s = collect_follower_summary(_ref("eve"), adapter, _START, _END)
+    assert s.error is not None and "boom" in s.error
+    assert s.notional == Decimal("0")
+    assert s.builder_fee == Decimal("0")
+
+
+def test_north_star_unaffected_by_summaries_builder_fee():
+    # 紅線釘樁：即使 summaries 的 builder_fee 加總遠大於／小於 north_star，
+    # aggregate() 回傳的 north_star_fee_delta 必須原封不動——不得由 summaries 推導。
+    summaries_low = [FollowerSummary(_ref("alice"), fills=1, taker_share=Decimal("1"),
+                                      notional=Decimal("100"), builder_fee=Decimal("0.001"))]
+    summaries_high = [FollowerSummary(_ref("alice"), fills=1, taker_share=Decimal("1"),
+                                       notional=Decimal("999999"), builder_fee=Decimal("999")),
+                       FollowerSummary(_ref("bob"), fills=1, taker_share=Decimal("1"),
+                                       notional=Decimal("999999"), builder_fee=Decimal("999"))]
+    agg_low = aggregate(date(2026, 7, 17), summaries_low, north_star_fee_delta=Decimal("1.84"))
+    agg_high = aggregate(date(2026, 7, 17), summaries_high, north_star_fee_delta=Decimal("1.84"))
+    assert agg_low.north_star_fee_delta == Decimal("1.84")
+    assert agg_high.north_star_fee_delta == Decimal("1.84")
+    assert agg_low.north_star_fee_delta == agg_high.north_star_fee_delta
 
 
 # --- filet_daily_report.main() wiring 整合測試 ---

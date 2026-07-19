@@ -19,6 +19,10 @@ class FollowerSummary:
     ref: FollowerRef
     fills: int                    # 該 follower 當日成交筆數（fills 衍生）
     taker_share: Decimal          # 該 follower 當日 taker 佔比
+    notional: Decimal = Decimal("0")      # 當日路由名目（Σ sz×px）
+    builder_fee: Decimal = Decimal("0")   # 當日歸屬我方的 builder fee（Σ fills 的 builder_fee）
+                                          # ⚠️ 歸屬分析用，**非**北極星——北極星是 builder 層級查一次的
+                                          # north_star_fee_delta，絕不由此加總推導（見 AggregateReport）
     error: str | None = None      # 查詢失敗時記錄，不中斷其他 follower
 
 
@@ -33,9 +37,10 @@ def collect_follower_summary(ref: FollowerRef, adapter, start: datetime,
         ntl = sum((f.sz * f.px for f in fills), Decimal("0"))
         taker_ntl = sum((f.sz * f.px for f in fills if f.crossed), Decimal("0"))
         share = (taker_ntl / ntl) if ntl > 0 else Decimal("0")
-        return FollowerSummary(ref, len(fills), share, None)
+        fee_sum = sum((f.builder_fee for f in fills), Decimal("0"))
+        return FollowerSummary(ref, len(fills), share, ntl, fee_sum, None)
     except Exception as e:  # noqa: BLE001 — 跨 follower 隔離，錯誤入 summary 不外拋
-        return FollowerSummary(ref, 0, Decimal("0"), error=str(e))
+        return FollowerSummary(ref, 0, Decimal("0"), Decimal("0"), Decimal("0"), error=str(e))
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,9 @@ class AggregateReport:
     day: date
     summaries: tuple[FollowerSummary, ...]
     north_star_fee_delta: Decimal  # builder 層級查一次的單日增量（絕不跨 follower 相加）
+    # ⚠️ 與 summaries[].builder_fee 的區分：本欄是 builder 位址全域累積的差（**實收**，權威值）；
+    # summaries[].builder_fee 是各 follower 成交歸屬的加總（**應收／歸屬**，分析與對帳用）。
+    # 兩者的差額即收入對帳訊號，**不可互相取代**。
     follower_count: int
     ok_count: int
 
