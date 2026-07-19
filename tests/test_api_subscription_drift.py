@@ -167,6 +167,70 @@ def test_subscription_id_takes_precedence_over_metadata():
     assert d["stripe_active_local_not"] == []
 
 
+# ---------- ⭐ 回鍋客戶：兩輪比對（opus 對抗審查 Important） ----------
+
+def test_returning_customer_old_canceled_sub_is_not_revenue_leak():
+    """⭐ 回鍋客戶不得產生假漏財：同一 account 有一張已 canceled 的舊訂閱＋一張
+    active 的新訂閱，本地記錄指向新訂閱。
+
+    舊實作逐筆各自 fallback：新訂閱精確命中 → in_sync；舊訂閱 sub id 對不上本地、
+    改走 metadata.account_id → 又對到同一列 → local active vs stripe canceled →
+    落入 local_active_stripe_not。那份清單的語意是「還在服務卻收不到錢」，
+    admin 照著它去停用的會是一位**正常付費**的客戶。"""
+    d = subscription_drift(
+        [_local(ACCT_A, "active", "sub_new")],
+        [_sub("sub_old", "canceled", ACCT_A), _sub("sub_new", "active", ACCT_A)])
+    assert d["drift_count"] == 0
+    assert d["in_sync_count"] == 1
+    for key in ("local_active_stripe_not", "stripe_active_local_not",
+                "status_mismatch", "orphan_stripe"):
+        assert d[key] == [], key
+    assert d["superseded_count"] == 1      # 舊訂閱有被交代，不是靜默丟棄
+    assert d["stripe_count"] == 2
+
+
+def test_returning_customer_regardless_of_stripe_order():
+    """順序無關：Stripe 先回新訂閱或先回舊訂閱，結果必須一致——第一輪跑**完**
+    才進第二輪，正是為了不依賴回傳順序。"""
+    for subs in ([_sub("sub_new", "active", ACCT_A), _sub("sub_old", "canceled", ACCT_A)],
+                 [_sub("sub_old", "canceled", ACCT_A), _sub("sub_new", "active", ACCT_A)]):
+        d = subscription_drift([_local(ACCT_A, "active", "sub_new")], subs)
+        assert d["drift_count"] == 0 and d["in_sync_count"] == 1
+
+
+def test_returning_customer_real_drift_still_detected():
+    """反面：舊訂閱被跳過**不得**連帶蓋掉真漂移——本地 active、新訂閱在 Stripe 已
+    取消時，照樣要報漏財。"""
+    d = subscription_drift(
+        [_local(ACCT_A, "active", "sub_new")],
+        [_sub("sub_old", "canceled", ACCT_A), _sub("sub_new", "canceled", ACCT_A)])
+    assert [e["account_id"] for e in d["local_active_stripe_not"]] == [ACCT_A]
+    assert d["drift_count"] == 1 and d["superseded_count"] == 1
+
+
+def test_multiple_metadata_matches_prefer_active_and_count_once():
+    """本地沒存 sub id（webhook 掉首包）而 Stripe 有兩張：只認一張，且優先取 active
+    （那張才代表當前權益），account 不得被重複計數。"""
+    d = subscription_drift(
+        [_local(ACCT_A, "none", None)],
+        [_sub("sub_old", "canceled", ACCT_A), _sub("sub_new", "active", ACCT_A)])
+    assert len(d["stripe_active_local_not"]) == 1
+    assert d["stripe_active_local_not"][0]["stripe_subscription_id"] == "sub_new"
+    assert d["local_active_stripe_not"] == [] and d["status_mismatch"] == []
+    assert d["drift_count"] == 1 and d["superseded_count"] == 1
+
+
+def test_endpoint_returning_customer_no_false_drift(tmp_path):
+    """端點層同一情境（走真 store 的 BillingRecord）：不得有任何漂移。"""
+    client, store = _app(tmp_path, pages=[[_sub("sub_old", "canceled", ACCT_A),
+                                           _sub("sub_new", "active", ACCT_A)]])
+    store.upsert_billing(ACCT_A, status="active", stripe_subscription_id="sub_new",
+                         now_s=1.0)
+    body = client.get("/api/ops/subscriptions").json()
+    assert body["drift_count"] == 0 and body["in_sync_count"] == 1
+    assert body["local_active_stripe_not"] == []
+
+
 def test_accepts_billing_record_dataclass_rows(tmp_path):
     """local_rows 可直接吃 store.list_billing() 的 BillingRecord（非 dict）。"""
     from spark.publicapi.store import ApiStore

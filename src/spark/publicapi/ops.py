@@ -166,6 +166,20 @@ def subscription_drift(local_rows, stripe_subs) -> dict:
 
     對應鍵：優先 `stripe_subscription_id`，其次 metadata 的 account_id
     （沿 `apply_webhook_event` 的雙保險慣例）。`matched_by` 欄位記錄實際命中的是哪一個。
+
+    ⚠️ **兩輪比對的順序是正確性要求，不是效能考量**（opus 對抗審查 Important）：
+    第一輪跑完**全部**的精確比對（`stripe_subscription_id`），第二輪才做 metadata
+    fallback，且只對第一輪未命中的 account 生效。顛倒順序（逐筆各自 fallback）會誤判
+    回鍋客戶：本地表每個 account 只存**一個** subscription id，而 `status="all"` 會
+    永久回傳歷史上已取消的訂閱、其 metadata 同樣帶 account_id——同一個 account 於是
+    被算兩次（新訂閱精確命中 in_sync、舊訂閱走 fallback 落入 `local_active_stripe_not`），
+    docstring 宣稱的「四類互斥不重複計數」在此破功。危害是實質的：
+    `local_active_stripe_not` 的語意是「還在服務卻收不到錢」，admin 照著它去停用的
+    會是一位**正常付費**的客戶。已被精確命中的 account，其歷史訂閱直接跳過
+    （計入 `superseded_count`，不進任何漂移清單）。
+
+    同一 account 有多張 Stripe 訂閱但本地沒存 id（webhook 掉了首包）時，第二輪只認
+    **一張**：優先取 active 者（那張才代表當前權益），其餘同樣計入 `superseded_count`。
     """
     local_rows = list(local_rows)
     by_sub: dict[str, object] = {}
@@ -186,19 +200,54 @@ def subscription_drift(local_rows, stripe_subs) -> dict:
     matched_accounts: set[str] = set()
     stripe_count = 0
 
+    # ---- 第一輪：精確比對（stripe_subscription_id）。⭐ 必須先跑**完**，
+    # 因為第二輪要知道哪些 account 已經被精確命中（見 docstring 的回鍋客戶說明）。
+    pairs: list[tuple[object, object, str | None]] = []   # (sub, row|None, matched_by)
+    deferred: list[object] = []                           # 第一輪沒命中，留給第二輪
     for sub in stripe_subs:
         stripe_count += 1
+        row = by_sub.get(_field(sub, "id")) if _field(sub, "id") else None
+        if row is None:
+            deferred.append(sub)
+            continue
+        matched_accounts.add(_field(row, "account_id"))
+        pairs.append((sub, row, "subscription_id"))
+
+    # ---- 第二輪：metadata fallback，只對第一輪未命中的 account 生效
+    superseded_count = 0
+    claimed_at: dict[str, int] = {}   # 本輪已認領的 account → 其在 pairs 中的索引
+    for sub in deferred:
+        md = _field(sub, "metadata") or {}
+        md_acct = md.get("account_id") if isinstance(md, dict) else None
+        row = by_acct.get(md_acct) if md_acct else None
+        if row is None:
+            pairs.append((sub, None, None))     # 對不到本地 account，照原邏輯分類
+            continue
+        acct = _field(row, "account_id")
+        if acct in matched_accounts:
+            # ⭐ 該 account 已被精確命中：這是回鍋客戶的歷史訂閱，跳過（不進任何清單）
+            superseded_count += 1
+            continue
+        idx = claimed_at.get(acct)
+        if idx is None:
+            claimed_at[acct] = len(pairs)
+            pairs.append((sub, row, "metadata"))
+            continue
+        # 同一 account 的第二張：只有 active 取代非 active（active 才代表當前權益）
+        superseded_count += 1
+        held = pairs[idx][0]
+        if (map_stripe_status(_field(sub, "status") or "") == _ACTIVE
+                and map_stripe_status(_field(held, "status") or "") != _ACTIVE):
+            pairs[idx] = (sub, row, "metadata")
+    matched_accounts |= set(claimed_at)
+
+    # ---- 分類（兩輪的配對結果共用同一套判準）
+    for sub, row, matched_by in pairs:
         sub_id = _field(sub, "id")
         raw_status = _field(sub, "status") or ""
         stripe_status = map_stripe_status(raw_status)  # ⭐ 正規化後才比（同基準）
         md = _field(sub, "metadata") or {}
         md_acct = md.get("account_id") if isinstance(md, dict) else None
-
-        row = by_sub.get(sub_id) if sub_id else None
-        matched_by = "subscription_id" if row is not None else None
-        if row is None and md_acct:
-            row = by_acct.get(md_acct)
-            matched_by = "metadata" if row is not None else None
 
         if row is None:
             entry = {"account_id": md_acct, "local_status": None,
@@ -209,8 +258,7 @@ def subscription_drift(local_rows, stripe_subs) -> dict:
              else orphan_stripe).append(entry)
             continue
 
-        acct = _field(row, "account_id")
-        matched_accounts.add(acct)
+        acct = _field(row, "account_id")   # matched_accounts 已在兩輪比對時登記
         local_status = _field(row, "status") or "none"
         entry = {"account_id": acct, "local_status": local_status,
                  "stripe_status": stripe_status, "stripe_status_raw": raw_status,
@@ -252,6 +300,9 @@ def subscription_drift(local_rows, stripe_subs) -> dict:
         "drift_count": drift_count,
         "local_count": len(local_rows),
         "stripe_count": stripe_count,
+        # 被更新訂閱取代的歷史訂閱筆數（回鍋客戶）。**不是漂移**，不計入 drift_count；
+        # 上呈是為了讓 stripe_count 對得起來——靜默丟棄會讓人以為對帳漏看了幾筆。
+        "superseded_count": superseded_count,
     }
 
 
