@@ -46,10 +46,14 @@
 
 ## Phase 1：ops 後端 ＋ 客戶損益 ＋ 收入對帳
 
-- [ ] P1.1 `/api/ops/*` admin-gated 端點骨架 ⭐（跨客戶聚合，資安新存取模式；結構性測試：非 admin 一律 403）
-- [ ] P1.2 客戶損益聚合（per-follower 路由量／實收 builder fee／本金／訂閱狀態／淨貢獻）
-- [ ] P1.3 收入對帳（應收 Σ成交×f vs 實收鏈上 accrued，差額門檻告警）
-- [ ] P1.4 `/ops` 前端頁（admin 白名單、表格優先於圖表）
+- [x] P1.1 `/api/ops/*` admin-gated ⭐（commit 90e85b7）——結構性測試遍歷 FastAPI 相依樹驗證所有 ops/admin 路由都掛閘（**變異測試確認**：拿掉閘 → 2 個測試立刻紅）
+- [x] P1.2 客戶損益（資料層 5a4ede2：`UserFill` 加 `builder_fee`、`FollowerSummary` 加 notional／builder_fee；**變異測試確認**「北極星不加總」紅線受保護）
+- [x] P1.3 收入對帳（含 174a2d3：應收 0 但實收非 0 時仍告警，不因算不出比例而靜默放行）
+- [x] P1.4 `/ops` 前端頁（commit 166d704，前端 102 tests）
+
+**Phase 1 完成**。實作過程中 subagent 對規格提出的四項有理反駁均已採納：accrued 來源改讀歷史檔（不擴大 HLGateway 唯讀面）、fills 窗口釘成與 accrued 同一 UTC 日（同基準，工程原則 1）、manifest 改 tolerant 載入（一個壞條目不得讓整張報表 500）、缺歷史時不硬算（避免把累積量當單日增量）。
+
+**待辦（Phase 1 尾巴）**：ops customers 端點支援 `day=YYYY-MM-DD`——目前收入對帳固定取「最新 accrued 快照的 UTC 日」、客戶表卻是 now 往回 N 天，**兩張表的 builder fee 不可相減**（前端已標註但仍有誤讀風險）。
 
 **為何先做**：不依賴定價與律師；客戶損益數據**直接餵未來的定價微調**。
 
@@ -108,4 +112,5 @@
 ## 進度紀錄
 
 - 2026-07-19 ~05:0x：計畫建立；SSH 驗證通過
-- 2026-07-19 ~06:3x：**Phase 0 部署完成**（全驗收+重開機測試通過）；P1a/P1b 完成（816 tests）；P1c 與 deploy 修復進行中
+- 2026-07-19 ~06:3x：**Phase 0 部署完成**（全驗收+重開機測試通過）
+- 2026-07-19 ~07:0x：**Phase 1 完成**（818 Python / 102 前端 tests）；deploy 檔 bug 修復 0b9c9a8；P0.5 與 P2 後端進行中
