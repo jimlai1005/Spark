@@ -14,9 +14,12 @@ import {
   ApiError,
   getOpsCustomers,
   getOpsRevenue,
+  getOpsSubscriptions,
   type OpsCustomerRow,
   type OpsCustomersResp,
   type OpsRevenueResp,
+  type OpsSubscriptionEntry,
+  type OpsSubscriptionsResp,
 } from "@/lib/api";
 import { COPY } from "@/lib/copy";
 import { fmtAmount, fmtRatioPct, NO_VALUE, shortAddr } from "@/lib/format";
@@ -37,8 +40,12 @@ export default function OpsPage() {
     queryKey: ["ops-customers", days],
     queryFn: () => getOpsCustomers(days),
   });
+  const subscriptions = useQuery<OpsSubscriptionsResp>({
+    queryKey: ["ops-subscriptions"],
+    queryFn: getOpsSubscriptions,
+  });
 
-  const errors = [revenue.error, customers.error];
+  const errors = [revenue.error, customers.error, subscriptions.error];
   if (errors.some((e) => e instanceof ApiError && e.status === 403)) {
     return <main className="page"><p>{c.forbidden}</p></main>;
   }
@@ -64,6 +71,22 @@ export default function OpsPage() {
           <p className="hint">{COPY.common.loading}</p>
         )}
       </section>
+
+      {/* billing 未啟用（501）→ 整段不渲染。沿 /billing 與 Header 的既有慣例：
+          「功能還沒開放」不是錯誤，也不該在營運頁留一塊永遠紅的區塊。 */}
+      {!(subscriptions.error instanceof ApiError && subscriptions.error.status === 501) && (
+        <section aria-label="訂閱對帳">
+          <h2 className="ops-section-title">{c.subscriptions.title}</h2>
+          <p className="hint">{c.subscriptions.note}</p>
+          {subscriptions.error ? (
+            <p className="ops-query-error">{errText(subscriptions.error)}</p>
+          ) : subscriptions.data ? (
+            <SubscriptionsBlock data={subscriptions.data} />
+          ) : (
+            <p className="hint">{COPY.common.loading}</p>
+          )}
+        </section>
+      )}
 
       <section aria-label="每客戶損益">
         <h2 className="ops-section-title">{c.customers.title}</h2>
@@ -96,6 +119,18 @@ function RevenueBlock({ data }: { data: OpsRevenueResp }) {
         <p className="ops-notice-title">{r.insufficient}</p>
         <p className="hint">{r.insufficientNote}</p>
         <p className="hint mono">history_points: {data.history_points}</p>
+      </div>
+    );
+  }
+  // ⭐ 第二個判別欄位：窗口對不齊（快照缺 captured_at 或時刻非嚴格遞增）。
+  // 這裡連 day／prev_day 都不顯示——任何看得像區間的東西都會被讀成「已對帳的區間」，
+  // 而窗口正是這個分支唯一不知道的東西。只給後端寫好的原因說明。
+  if (data.basis_unknown) {
+    return (
+      <div className="panel ops-notice">
+        <p className="ops-notice-title">{r.basisUnknown}</p>
+        <p className="hint">{data.note}</p>
+        <p className="hint">{r.basisUnknownNote}</p>
       </div>
     );
   }
@@ -132,6 +167,9 @@ function RevenueBlock({ data }: { data: OpsRevenueResp }) {
         </dl>
         {pctUnknown && <p className="hint">{r.pctUnavailable}</p>}
         {!data.over_threshold && <p className="hint">{r.ok}</p>}
+        {/* ⭐ 實際比較窗口（快照時刻，非日曆日）必須攤在畫面上：窗口與 fills 取樣區間
+            錯開曾是 Critical bug，且是靜默的——數字照樣算得出來，只是錯的。把區間顯示
+            出來，同一類錯位下次由人眼一秒發現（可視化防線，不靠再加一條檢查清單）。 */}
         <p className="hint mono ops-window">
           {r.window}: {data.window_start} → {data.window_end}（{data.prev_day} → {data.day}）
         </p>
@@ -147,6 +185,94 @@ function Stat({ label, value, raw, tone = "neutral" }: {
     <div className="ops-stat">
       <dt>{label}</dt>
       <dd className={`mono${tone === "bad" ? " is-bad" : ""}`} title={raw ?? undefined}>{value}</dd>
+    </div>
+  );
+}
+
+// ---------- 訂閱對帳 ----------
+/**
+ * 本地 billing 表 vs Stripe。⭐ 清單順序＝危害順序（付了錢沒權益 > 漏財 > 狀態不符 >
+ * 孤兒），不是後端回傳順序也不是字母序——admin 從上往下看就是從最該處理的看起。
+ * 計數與清單長度皆由後端給，前端不重算（重算等於製造第二個真相來源，工程原則 1）。
+ */
+function SubscriptionsBlock({ data }: { data: OpsSubscriptionsResp }) {
+  const s = c.subscriptions;
+  const lists = [
+    { key: "stripe_active_local_not", meta: s.lists.stripeActiveLocalNot, rows: data.stripe_active_local_not },
+    { key: "local_active_stripe_not", meta: s.lists.localActiveStripeNot, rows: data.local_active_stripe_not },
+    { key: "status_mismatch", meta: s.lists.statusMismatch, rows: data.status_mismatch },
+    { key: "orphan_stripe", meta: s.lists.orphanStripe, rows: data.orphan_stripe },
+  ];
+  return (
+    <>
+      {/* ⭐ 截斷警告在最上方且用 role="alert"：樣本不完整時整個區塊的結論都不可信，
+          尤其「Stripe 查無」可能是假漂移。放在清單下方等於讓人先看到結論才看到警告。 */}
+      {data.truncated && (
+        <div className="ops-alert ops-alert-warn" role="alert">
+          <p className="ops-alert-title">{s.truncatedTitle}</p>
+          <p className="ops-alert-body">{s.truncatedBody}</p>
+        </div>
+      )}
+      <div className="panel">
+        <dl className="ops-stats">
+          <Stat label={s.counts.drift} value={String(data.drift_count)}
+                tone={data.drift_count > 0 ? "bad" : "neutral"} />
+          <Stat label={s.counts.inSync} value={String(data.in_sync_count)} />
+          <Stat label={s.counts.local} value={String(data.local_count)} />
+          <Stat label={s.counts.stripe} value={String(data.stripe_count)} />
+          <Stat label={s.counts.superseded} value={String(data.superseded_count)} />
+        </dl>
+        {data.superseded_count > 0 && <p className="hint">{s.supersededNote}</p>}
+        {data.drift_count === 0 && <p className="hint">{s.clean}</p>}
+        <p className="hint">{s.detectOnly}</p>
+      </div>
+      {lists.map(({ key, meta, rows }) => (
+        <DriftList key={key} title={meta.title} desc={meta.desc} rows={rows} />
+      ))}
+    </>
+  );
+}
+
+/** 單一漂移清單。空清單也保留標題與「無」——標題本身就是「這一類已檢查過」的證據。 */
+function DriftList({ title, desc, rows }: {
+  title: string; desc: string; rows: OpsSubscriptionEntry[];
+}) {
+  const cols = c.subscriptions.cols;
+  return (
+    <div className="panel ops-drift">
+      <h3 className="ops-drift-title">
+        {title}
+        <span className="ops-drift-count">{rows.length}</span>
+      </h3>
+      <p className="hint">{desc}</p>
+      {rows.length === 0 ? (
+        <p className="hint">{c.subscriptions.empty}</p>
+      ) : (
+        <table className="admin-table ops-table">
+          <thead>
+            <tr>
+              <th scope="col">{cols.account}</th>
+              <th scope="col">{cols.local}</th>
+              <th scope="col">{cols.stripe}</th>
+              <th scope="col">{cols.raw}</th>
+              <th scope="col">{cols.subId}</th>
+              <th scope="col">{cols.matchedBy}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((e, i) => (
+              <tr key={`${e.stripe_subscription_id ?? e.account_id ?? "row"}-${i}`}>
+                <td className="mono">{e.account_id ?? NO_VALUE}</td>
+                <td className="mono">{e.local_status ?? NO_VALUE}</td>
+                <td className="mono">{e.stripe_status ?? NO_VALUE}</td>
+                <td className="mono">{e.stripe_status_raw ?? NO_VALUE}</td>
+                <td className="mono">{e.stripe_subscription_id ?? NO_VALUE}</td>
+                <td className="mono">{e.matched_by ?? NO_VALUE}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }

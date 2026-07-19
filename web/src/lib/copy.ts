@@ -148,6 +148,12 @@ export const COPY = {
         "實收增量＝今昨兩點的差；只有一點時無從得知單日增量。此處刻意不顯示 0——"
         + "把整段累積量當成單日增量會造出天文數字的假差額。每日報表腳本會持續累積快照。",
       pctUnavailable: "應收為 0，百分比無從計算（差額請直接看金額欄）。",
+      // basis_unknown：窗口對不齊時整段不顯示任何數字（連日期都不顯示）。理由與
+      // insufficient 同源——算不出來就不要給數字，看得到的數字會被當成已對帳的結論。
+      basisUnknown: "快照時刻無法對齊，本日對帳跳過。",
+      basisUnknownNote:
+        "比較窗口的兩端只能取自快照時刻；缺了或順序顛倒時，任何窗口都是猜的。"
+        + "此處刻意不顯示金額與區間——錯開一天的對帳數字會叫人去查根本不存在的問題。",
     },
     customers: {
       title: "每客戶損益",
@@ -167,6 +173,60 @@ export const COPY = {
         takerShare: "taker 佔比",
         accountValue: "帳戶淨值",
         subscription: "訂閱狀態",
+      },
+    },
+    /**
+     * 訂閱對帳文案。⭐ 清單標題一律寫「危害是什麼」而不是欄位名：admin 看到
+     * 「local_active_stripe_not」不會知道要做什麼，看到「還在服務卻收不到錢」會。
+     */
+    subscriptions: {
+      title: "訂閱對帳",
+      note:
+        "本地 billing 表 vs Stripe 真實狀態。webhook 是本地表的唯一寫入者，掉一包就永久漂移；"
+        + "這張表是唯一的察覺途徑。",
+      detectOnly:
+        "本區塊只偵測、不修正：以 Stripe 為準覆寫本地會直接改動計費與權益，屬人工決策。"
+        + "看到漂移請先到 Stripe 後台確認真相，再決定怎麼處理。",
+      clean: "四類漂移皆為零，本地與 Stripe 一致。",
+      counts: {
+        inSync: "一致",
+        drift: "漂移合計",
+        stripe: "Stripe 訂閱數",
+        local: "本地記錄數",
+        superseded: "已被取代（回鍋客戶）",
+      },
+      supersededNote: "「已被取代」是同一客戶的歷史訂閱，不是漂移，不計入漂移合計。",
+      truncatedTitle: "樣本不完整，本區塊結論不可信",
+      truncatedBody:
+        "Stripe 訂閱清單已達 1000 筆上限，未取得完整樣本。此時「Stripe 查無」類的判定"
+        + "可能全是假漂移（訂閱其實存在，只是沒被取回）。請勿依本區塊停用任何客戶——"
+        + "先縮小查詢範圍或直接到 Stripe 後台逐筆確認。",
+      lists: {
+        stripeActiveLocalNot: {
+          title: "客戶付了錢卻沒拿到權益（危害最高）",
+          desc: "Stripe 顯示訂閱生效，本地卻沒有記錄或非 active——客戶正在付費但拿不到付費功能。優先處理。",
+        },
+        localActiveStripeNot: {
+          title: "還在提供服務卻收不到錢（漏財）",
+          desc: "本地 active，Stripe 上非 active 或查無此訂閱——服務照給，費用卻沒進來。",
+        },
+        statusMismatch: {
+          title: "兩邊狀態不一致（需人工判讀）",
+          desc: "兩邊都有記錄但狀態對不上（例如本地 past_due、Stripe 已取消），權益判定會依本地值，可能不是當前真相。",
+        },
+        orphanStripe: {
+          title: "對不到本地帳號的 Stripe 訂閱（非 active）",
+          desc: "多為外部手建或測試殘留。非 active 故無立即權益影響，但會讓計費報表對不起來。",
+        },
+      },
+      empty: "無",
+      cols: {
+        account: "account_id",
+        local: "本地狀態",
+        stripe: "Stripe 狀態（正規化）",
+        raw: "Stripe 原始值",
+        subId: "stripe_subscription_id",
+        matchedBy: "命中方式",
       },
     },
   },

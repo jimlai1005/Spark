@@ -154,8 +154,14 @@ export interface OpsCustomersResp {
 }
 
 /**
- * 收入對帳。`insufficient_accrued_history` 是判別欄位（discriminant）：
- * 為 true 時後端**不給**任何數值欄——型別上就讀不到，避免把「無資料」顯示成 0。
+ * 收入對帳，**三種**回應形狀，兩層判別欄位（discriminant）：
+ *   1. `insufficient_accrued_history: true` — 歷史不足兩點。
+ *   2. `basis_unknown: true` — 歷史有兩點但快照時刻缺漏／非嚴格遞增（回填或時鐘倒退），
+ *      窗口無從對齊。
+ *   3. 兩者皆 false — 正常對帳結果。
+ * ⭐ 前兩種後端**不給**任何數值欄——型別上就讀不到，避免把「無資料」顯示成 0。
+ * 這裡刻意用 discriminated union 而非全欄位 optional：漏處理分支時 TS 會在編譯期報錯，
+ * 而不是在畫面上渲染出 undefined（結構性擋掉，不靠人記得處理，工程原則 5 的精神）。
  */
 export type OpsRevenueResp =
   | {
@@ -166,6 +172,21 @@ export type OpsRevenueResp =
     }
   | {
       insufficient_accrued_history: false;
+      basis_unknown: true;
+      /** 恆 False：算不出來 ≠ 有異常，後端刻意不告警。 */
+      over_threshold: false;
+      day: string;
+      prev_day: string;
+      /** ⭐ 窗口界只能來自快照時刻，缺了就沒有正確答案 → 後端回 null，不用日期猜。 */
+      window_start: null;
+      window_end: null;
+      /** 後端寫好的原因說明（缺 captured_at ／ 時刻非嚴格遞增），顯示層原樣呈現。 */
+      note: string;
+      manifest_errors: string[];
+    }
+  | {
+      insufficient_accrued_history: false;
+      basis_unknown: false;
       /** 應收／歸屬：Σ 各客戶 builder_fee。 */
       attributed: string;
       /** 實收／北極星：builder 位址累積量的今昨差（查一次，不由 rows 推導）。 */
@@ -180,6 +201,12 @@ export type OpsRevenueResp =
       rows: number;
       day: string;
       prev_day: string;
+      /**
+       * ⭐ 實際比較窗口＝兩個快照時刻（captured_at），**不是**日曆日。顯示層必須把它
+       * 秀出來：窗口與 fills 取樣區間錯開曾經是 Critical bug（日報 cron 排在 00:10 時，
+       * accrued 增量涵蓋昨天一整天、fills 卻只有今天十幾分鐘，健康帳戶被誤判成漏財）。
+       * 把區間攤在畫面上，同一類錯位下次一眼就看得出來。
+       */
       window_start: string;
       window_end: string;
       customers: OpsCustomerRow[];
@@ -261,4 +288,54 @@ export function getOpsCustomers(days: number): Promise<OpsCustomersResp> {
 export function getOpsRevenue(thresholdPct: number): Promise<OpsRevenueResp> {
   const q = new URLSearchParams({ threshold_pct: String(thresholdPct) });
   return request<OpsRevenueResp>(`/api/ops/revenue?${q.toString()}`);
+}
+
+/**
+ * 訂閱對帳的一列（本地 billing 表 vs Stripe）。
+ * ⭐ 每個欄位都可能是 null：對不到本地 account 時 `account_id`／`local_status` 為 null，
+ * 本地有而 Stripe 查無時 `stripe_status`／`stripe_status_raw` 為 null。顯示層一律用
+ * NO_VALUE 佔位，不得退化成空字串（分不出「查無」與「空值」）。
+ */
+export interface OpsSubscriptionEntry {
+  account_id: string | null;
+  local_status: string | null;
+  /** 已用後端 map_stripe_status 正規化到本地值域（同基準比較，工程原則 1）。 */
+  stripe_status: string | null;
+  /** Stripe 原始 status（trialing／unpaid…）；正規化前的原文，供人工查證用。 */
+  stripe_status_raw: string | null;
+  stripe_subscription_id: string | null;
+  /** 命中方式：精確 id 比對或 metadata fallback；對不到本地 account 時為 null。 */
+  matched_by: "subscription_id" | "metadata" | null;
+}
+
+/**
+ * 訂閱對帳結果。四個漂移清單**互斥不重複計數**，危害程度不同（後端 ops.subscription_drift）：
+ * `stripe_active_local_not`（客戶付了錢沒權益）> `local_active_stripe_not`（漏財）>
+ * `status_mismatch` > `orphan_stripe`。顯示層的排序必須照這個順序，不得按字母或長度排。
+ */
+export interface OpsSubscriptionsResp {
+  local_active_stripe_not: OpsSubscriptionEntry[];
+  stripe_active_local_not: OpsSubscriptionEntry[];
+  status_mismatch: OpsSubscriptionEntry[];
+  orphan_stripe: OpsSubscriptionEntry[];
+  in_sync_count: number;
+  drift_count: number;
+  local_count: number;
+  stripe_count: number;
+  /** 被更新訂閱取代的歷史訂閱（回鍋客戶）。**不是漂移**，不計入 drift_count。 */
+  superseded_count: number;
+  /**
+   * ⭐ 達 Stripe 列表上限，樣本不完整。為 true 時「本地有、Stripe 查無」可能全是**假漂移**
+   * ——顯示層必須把結論不可信這件事講出來，不得靜默照常顯示（工程原則 3）。
+   */
+  truncated: boolean;
+}
+
+/**
+ * 訂閱對帳（admin only）。billing 未啟用 → 501（kind=client, status=501），
+ * 消費端據此整段隱藏（沿 /billing 與 Header 的既有慣例）。
+ * 冪等讀取，重試安全——但本端點**只偵測不修正**，任何以 Stripe 為準的同步都是人工決策。
+ */
+export function getOpsSubscriptions(): Promise<OpsSubscriptionsResp> {
+  return request<OpsSubscriptionsResp>("/api/ops/subscriptions");
 }

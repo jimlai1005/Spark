@@ -19,7 +19,8 @@
     "wagmi": "2.19.5"
   },
   "overrides": {
-    "viem": "2.55.2"
+    "viem": "2.55.2",
+    "postcss": "^8.5.10"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "6.6.3",

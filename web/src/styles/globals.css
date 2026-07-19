@@ -491,6 +491,26 @@ main.page {
 .ops-row-error { white-space: normal !important; font-size: 12px; }
 .ops-row-error-label { color: var(--neg); margin-right: 6px; }
 
+/* 訂閱對帳：四個漂移清單依危害排序，標題自帶筆數 chip（一眼看出哪一類要先處理）。 */
+.ops-drift { margin-top: 12px; }
+.ops-drift-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+.ops-drift-count {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
 /* ---------- Pricing / Billing ---------- */
 /* chip 只在已登入且 billing 啟用時渲染；margin-left:auto 讓它與登出鈕成組靠右，
    未渲染時 header 的 space-between 行為完全不變（不顯示就不影響版面）。 */
