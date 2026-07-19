@@ -23,12 +23,20 @@
 
 ---
 
-## Phase 0：部署前置與上線 【進行中】
+## Phase 0：部署前置與上線 【已完成，剩一個使用者動作】
 
-- [x] P0.1 Next.js CVE-2025-29927 bump（部署前必做）
-- [ ] P0.2 部署到 Lightsail（照 `deploy/RUNBOOK.md`）
-- [ ] P0.3 實機驗收：filet-api 讀不到 keys、SO_PEERCRED 生效、外網只走 nginx
-- [ ] P0.4 端到端煙霧測試（瀏覽器連上、SIWE 登入、看得到頁面）
+- [x] P0.1 Next.js CVE-2025-29927 bump → 15.5.20（commit 0d4877d）
+- [x] P0.2 部署到 Lightsail（rsync 推碼，HEAD 5a4ede2）
+- [x] P0.3 實機驗收**全數通過**：filet-api 生得出 key 但讀不到 key 檔（Permission denied）、SO_PEERCRED 拒絕非白名單 uid、後端埠外部不可達（且只綁 127.0.0.1）、http→https 301、安全 headers 齊全
+- [x] P0.3b **實際重開機測試**：20 秒回來、四服務自啟、socket 重建、零錯誤
+- [ ] **P0.4 ⚠️ 需使用者操作**：Lightsail Console → Networking → 開 IPv4 firewall 的 **80 與 443**（雲防火牆獨立於 ufw，目前只開 22）。IAM user `claude` 無 lightsail 權限，無法代勞。
+      開完後跑：`sudo certbot --nginx -d 52-197-137-3.sslip.io --redirect --agree-tos -m jimlai1005@gmail.com` 即可把自簽換成真憑證。
+- [x] P0.4b 修 repo 的兩個真 bug（keysvc 缺 WorkingDirectory、nginx 1.25 語法）＋ RUNBOOK 8 處修正
+- [ ] P0.5 升 wagmi/viem 修 20 個錢包相依漏洞（4 high）→ 之後重新部署前端
+
+**部署現況**：testnet 模式、keystore 空、billing 停用、TLS 為**自簽**（LE 因雲防火牆擋住 HTTP-01 而失敗）。
+**容量實測**：四服務合計 203MB，available 1372MB，每 follower 約 55-60MB → **可容納 15-20 個 follower**（先前估 8-12 太保守）。磁碟 6G/58G。
+**待重新部署**：伺服器上是 5a4ede2，本地已推進到更新的 commit。P1/P2 完成後一併重佈。
 
 **已知風險：TLS 需要網域**。session cookie 是 `secure=True`，純 http（IP）登入會失敗。
 處置順序：① 試 `52-197-137-3.sslip.io` 之類的 wildcard DNS ＋ Let's Encrypt（真實憑證）
@@ -99,4 +107,5 @@
 
 ## 進度紀錄
 
-- 2026-07-19 ~05:0x：計畫建立；SSH 驗證通過；P0.1 派工中
+- 2026-07-19 ~05:0x：計畫建立；SSH 驗證通過
+- 2026-07-19 ~06:3x：**Phase 0 部署完成**（全驗收+重開機測試通過）；P1a/P1b 完成（816 tests）；P1c 與 deploy 修復進行中
