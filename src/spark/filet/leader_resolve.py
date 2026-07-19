@@ -70,8 +70,17 @@ from spark.filet.leaders import is_still_permitted, load_leaders
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MANIFEST_PATH = "var/filet/followers.json"
-DEFAULT_LEADERS_PATH = "var/filet/leaders.json"
+# repo 根（.../src/spark/filet/leader_resolve.py → 上溯 3 層）。
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# ⭐ 預設路徑必須是**絕對**的（2026-07-19 opus 對抗性審查 I4）。原本是 CWD 相對的
+# "var/filet/leaders.json"：引擎的 CWD 被 systemd 釘在 /opt/filet/spark，管理端跑
+# activate CLI 的 CWD 是他當下所在的目錄——兩邊會驗**不同的檔案**。危險方向是
+# fail-open：管理端在 A 檔把 leader 下架、引擎讀的 B 檔仍列著他 → 下架無聲失效
+# （與撤銷收尾疊加後，連「已止血」的錯覺都還在）。沿用 resolve_state_dir() 對同一類
+# 問題的既有解法（.resolve() 錨定，不靠啟動目錄）。
+DEFAULT_MANIFEST_PATH = str(_REPO_ROOT / "var" / "filet" / "followers.json")
+DEFAULT_LEADERS_PATH = str(_REPO_ROOT / "var" / "filet" / "leaders.json")
 
 SOURCE_MANIFEST = "manifest"
 SOURCE_ENV_DEFAULT = "env_default"

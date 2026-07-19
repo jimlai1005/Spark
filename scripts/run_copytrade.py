@@ -19,12 +19,16 @@
                     的 kill switch ARM 檔會被 follower B 讀到而連坐停單。
 
 leader 解析（per-follower ＋ 白名單二次驗證）:
-  FILET_FOLLOWERS     follower manifest 路徑（預設 var/filet/followers.json）。
-  FILET_LEADERS_PATH  策劃 leader 白名單路徑（預設 var/filet/leaders.json）。
+  FILET_FOLLOWERS     follower manifest 路徑（預設＝repo 根下的
+                      var/filet/followers.json，**絕對路徑**，不隨 CWD 漂移）。
+  FILET_LEADERS_PATH  策劃 leader 白名單路徑（預設＝repo 根下的 var/filet/leaders.json）。
+  兩者刻意錨定 repo 根：管理端 CLI 與引擎的 CWD 不同，相對路徑會讓兩邊驗不同檔，
+  下架在一邊生效、引擎那邊仍放行（fail-open）。部署另見 deploy/RUNBOOK.md §5.5。
   本進程跟誰＝manifest 內自己那筆的 leader_address，缺值才回退 env
   COPY_LEADER_ADDRESS（**未移除，既有部署照舊可用**）。兩條路徑都要過白名單
   （例外只有「白名單檔不存在」時的 env 回退）。啟動時解析失敗即拒絕啟動；
-  執行中每 cycle 重新解析，失敗則沿用上一個已驗證 leader ＋ critical 告警。
+  執行中每 cycle 重新解析：transient 失敗沿用上一個已驗證 leader ＋ critical；
+  **撤銷**（enabled=false／條目被移除）則受控收尾（平倉＋鎖死 kill switch）。
   威脅模型與逐條規則見 spark/filet/leader_resolve.py 檔頭。
 
 keystore 選擇:

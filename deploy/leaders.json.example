@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "★★ 這是範例檔，部署時必須替換成真實內容 ★★",
+    "位置：/opt/filet/spark/var/filet/leaders.json（見 RUNBOOK §5.5）",
+    "權限：root:root 644 —— 必須是 filet-api 寫不到的位置。這是整道防線的承重點：",
+    "  filet-api 若被打穿，攻擊者能改 pending.json 乃至 manifest，把 follower 指向",
+    "  惡意 leader（對敲榨 builder fee／反向交易洗掉客戶資金）；他寫不到這份白名單，",
+    "  所以引擎每輪拿白名單再驗一次才是真正擋下來的那道。白名單若可寫 = 防線歸零。",
+    "",
+    "兩個旗標是兩件事（搞混的代價：該止血的沒止／不該平倉的平了）：",
+    "  enabled=false        安全撤銷 —— 這個 leader 現在有問題（帳號被盜、對敲、",
+    "                       策略失控）。新客戶選不到，**且正在跟的 follower 立刻進入",
+    "                       受控收尾**：撤單、reduce-only 全平、鎖死 kill switch。",
+    "                       有實際 taker 成本、需人工 re-arm。只在真的要止血時用。",
+    "  accepting_new=false  例行下架 —— 不再開放新客戶選擇（名額滿、策略調整中、",
+    "                       準備退場）。新客戶選不到，**正在跟的人完全不受影響**。",
+    "",
+    "⚠️ 把條目整筆刪掉 等同 enabled=false（引擎驗不到就是撤銷，會觸發所有跟隨者收尾）。",
+    "   例行下架請改 accepting_new，不要刪條目。",
+    "",
+    "格式為 fail-fast：JSON 壞掉／欄位型別錯／位址重複 → 引擎與 activate CLI 都會停，",
+    "不會降級成空清單放行。改完務必用 `python -m json.tool` 驗一次再存。",
+    "本 _comment 欄位會被 loader 忽略（只讀 leaders 陣列），但正式檔建議刪掉保持乾淨。"
+  ],
+  "leaders": [
+    {
+      "address": "0x1111111111111111111111111111111111111111",
+      "name": "Alpha Trend",
+      "description": "範例：中頻趨勢跟隨。正常營運中，開放新客戶。",
+      "enabled": true,
+      "accepting_new": true
+    },
+    {
+      "address": "0x2222222222222222222222222222222222222222",
+      "name": "Beta Carry",
+      "description": "範例：例行下架 —— 名額已滿，不收新客戶；既有 follower 照常跟單。",
+      "enabled": true,
+      "accepting_new": false
+    },
+    {
+      "address": "0x3333333333333333333333333333333333333333",
+      "name": "Gamma Legacy",
+      "description": "範例：安全撤銷 —— 條目保留供歷史查核，跟隨者已被收尾。",
+      "enabled": false,
+      "accepting_new": false
+    }
+  ]
+}

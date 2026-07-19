@@ -15,6 +15,11 @@ WorkingDirectory=/opt/filet/spark
 Environment=FILET_STATE_DIR=/opt/filet/state/%i
 Environment=FILET_KEYSTORE=envfile
 Environment=FILET_KEYS_DIR=/etc/filet/keys
+# ⭐ leader 白名單：顯式絕對路徑，不倚賴 WorkingDirectory。管理端跑 activate CLI 的
+# CWD 與引擎的 CWD 不同，兩邊驗不同檔＝下架在一邊生效、引擎那邊仍放行（fail-open）。
+# 這份檔必須是 root:root 644（filet-api 寫不到）——見 RUNBOOK §5.5。
+Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
+Environment=FILET_FOLLOWERS=/opt/filet/spark/var/filet/followers.json
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_copytrade
 Restart=on-failure
 RestartSec=10

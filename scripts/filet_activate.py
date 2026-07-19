@@ -8,7 +8,12 @@ os.replace 已提交，重讀失敗時 manifest 保留新版本、pending 條目
 → 自 pending 移除 → 印出（或 --start 執行）systemctl 啟動指令。
 用法: FILET_BUILDER_ADDR=0x... uv run python -m scripts.filet_activate <account_id> \\
       [--pending var/filet/pending.json] [--manifest var/filet/followers.json] \\
-      [--leader 0x...] [--leaders var/filet/leaders.json] [--start]
+      [--leader 0x...] [--leaders <白名單絕對路徑>] [--start]
+
+⚠️ `--pending` 與 `--manifest` 的預設值是 **CWD 相對**的：在錯的目錄跑會寫出一份
+引擎讀不到的 manifest（症狀：activate 說成功、follower 起來卻找不到自己）。
+正式部署請用絕對路徑或先 `cd /opt/filet/spark`——完整指令見 deploy/RUNBOOK.md §5.6。
+`--leaders` 的預設值已錨定 repo 根（絕對路徑），與引擎驗的是同一份檔。
 """
 import argparse
 import json

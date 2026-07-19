@@ -160,3 +160,61 @@ def test_disabled_wins_over_accepting_new(tmp_path):
         {"address": _A, "name": "Alpha", "enabled": False, "accepting_new": False}]}))
     assert is_selectable(_A, leaders) is False
     assert is_still_permitted(_A, leaders) is False
+
+
+# ── 出貨組態：預設路徑與範例檔（opus 審查 I3/I4）─────────────────────────
+
+def test_default_paths_are_absolute_and_repo_anchored():
+    """⭐ 預設路徑必須絕對且錨定 repo 根，不隨 CWD 漂移。
+
+    相對路徑的危險方向是 fail-open：引擎 CWD 被 systemd 釘在 /opt/filet/spark，
+    管理端跑 CLI 的 CWD 是他當下所在——兩邊驗不同檔時，管理端在 A 檔下架、
+    引擎讀的 B 檔仍列著他，下架無聲失效。
+    """
+    from pathlib import Path
+
+    from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH, DEFAULT_MANIFEST_PATH
+
+    repo_root = Path(__file__).resolve().parents[1]
+    for p in (DEFAULT_LEADERS_PATH, DEFAULT_MANIFEST_PATH):
+        assert Path(p).is_absolute(), p
+        assert Path(p).is_relative_to(repo_root), p
+    assert Path(DEFAULT_LEADERS_PATH).name == "leaders.json"
+    assert Path(DEFAULT_MANIFEST_PATH).name == "followers.json"
+
+
+def test_shipped_example_allowlist_parses_and_shows_both_flags():
+    """⭐ deploy/leaders.json.example 必須是**合法且可載入**的白名單。
+
+    RUNBOOK 叫操作者 `cp` 它當起手式——範例壞掉 = 部署當下才 fail-fast 的地雷。
+    同時釘住三筆範例分別示範了三種狀態（正常／例行下架／安全撤銷），
+    因為那正是這份範例存在的教學價值。
+    """
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / "deploy" / "leaders.json.example"
+    leaders = load_leaders(example)
+    assert len(leaders) == 3
+    states = {(x.enabled, x.accepting_new) for x in leaders}
+    assert (True, True) in states     # 正常營運
+    assert (True, False) in states    # 例行下架：已在跟的不受影響
+    assert (False, False) in states   # 安全撤銷：跟隨者已被收尾
+    # 各自對應到正確的述詞結果
+    normal = next(x for x in leaders if x.enabled and x.accepting_new)
+    delisted = next(x for x in leaders if x.enabled and not x.accepting_new)
+    revoked = next(x for x in leaders if not x.enabled)
+    assert is_selectable(normal.address, leaders) is True
+    assert is_selectable(delisted.address, leaders) is False
+    assert is_still_permitted(delisted.address, leaders) is True
+    assert is_still_permitted(revoked.address, leaders) is False
+
+
+def test_follower_unit_pins_absolute_allowlist_path():
+    """⭐ systemd unit 必須顯式設 FILET_LEADERS_PATH——照 RUNBOOK 部署出來的系統
+    不能倚賴 WorkingDirectory 加相對路徑（那正是 CWD 漂移的來源）。"""
+    from pathlib import Path
+
+    unit = (Path(__file__).resolve().parents[1] / "deploy"
+            / "filet-follower@.service").read_text()
+    assert "Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json" in unit
+    assert "Environment=FILET_FOLLOWERS=/opt/filet/spark/var/filet/followers.json" in unit

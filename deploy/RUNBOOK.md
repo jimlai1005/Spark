@@ -106,6 +106,8 @@ id filet-api   # 驗收：groups 輸出含 filet-api 與 filet-engine 兩者
 | `/var/lib/filet-api` | `filet-api:filet-api` | `0750`（systemd `StateDirectory` 預設） | 由 `filet-api.service` 的 `StateDirectory=filet-api` 自動建立 | `api.db`、`pending.json` |
 | `/run/filet` | `filet-engine:filet-engine` | `0750`（`RuntimeDirectoryMode` 見 `filet-keysvc.service`） | 由 `filet-keysvc.service` 的 `RuntimeDirectory=filet` 自動建立（服務啟動時） | `keysvc.sock`（socket 檔本身 660，見 `serve_forever` chmod） |
 | `/opt/filet/state/<account_id>` | `filet-engine:filet-engine` | `700` | 由 `filet-follower@.service` 的 `ReadWritePaths` 隱含要求，首次啟動前手動 `mkdir -p` | 單一 follower 引擎狀態根（kill-switch 不連坐） |
+| `/opt/filet/spark/var/filet` | `root:root` | `755` | 手動 mkdir（§5.5） | leader 白名單與 follower manifest 的所在目錄 |
+| `/opt/filet/spark/var/filet/leaders.json` | **`root:root`** | **`644`** | 手動建立（§5.5，範本 `deploy/leaders.json.example`） | ⭐ 策劃 leader 白名單。**承重點：filet-api 必須寫不到**——它被打穿時攻擊者能改 pending/manifest，唯獨改不了這份檔，引擎每輪的二次驗證才擋得住 |
 
 ```bash
 sudo mkdir -p /opt/filet/spark
@@ -314,8 +316,91 @@ sudo systemctl enable --now filet-dashboard.service
 sudo systemctl status filet-dashboard.service --no-pager # 驗收：active (running)
 
 # follower@<account_id> 不在這裡起——依 spec §7，activate 是人工 CLI 動作
-# （`scripts/filet_activate.py <account_id>`），只在有帳號完成 onboarding+verify 後才拉起。
+# （見 §5.5 的 activate 指令），只在有帳號完成 onboarding+verify 後才拉起。
 # 本 runbook 只負責讓「拉起 follower 的能力」就緒，不代表部署當下就有帳號要拉。
+```
+
+### 5.5 ⭐ 建立 leader 白名單（**不做這步，第一個選 leader 的客戶就會卡死**）
+
+白名單是「客戶可以跟哪些 leader」的唯一合法來源，也是 filet-api 被打穿時**唯一**
+還擋得住「把 follower 指向惡意 leader」的東西（威脅模型見
+`src/spark/filet/leaders.py` 檔頭）。repo 內**刻意不附**真實的 `leaders.json`
+（它是營運資料，不是程式碼），所以這步不做的話：
+
+- 任何帶 `--leader` 的 activate 會直接 `SystemExit`（白名單檔不存在 → 空清單 → 全拒）
+- env 回退路徑會走「白名單檔不存在」的向後相容豁免——**這道防線等於沒啟用**
+
+```bash
+# 目錄與檔案：owner 必須是 root，且 filet-api 寫不到（承重點，見 §2 權限表）
+sudo mkdir -p /opt/filet/spark/var/filet
+sudo chown root:root /opt/filet/spark/var/filet
+sudo chmod 755 /opt/filet/spark/var/filet
+
+# 以範本起手，改成真實 leader（範本內含兩個旗標的用法說明）
+sudo cp /opt/filet/spark/deploy/leaders.json.example \
+        /opt/filet/spark/var/filet/leaders.json
+sudo vi /opt/filet/spark/var/filet/leaders.json   # 換掉三筆範例位址與名稱
+
+sudo chown root:root /opt/filet/spark/var/filet/leaders.json
+sudo chmod 644 /opt/filet/spark/var/filet/leaders.json
+
+# 驗收 1：JSON 合法（格式壞掉會讓引擎與 activate 一起 fail-fast）
+python3 -m json.tool /opt/filet/spark/var/filet/leaders.json > /dev/null && echo "JSON OK"
+
+# 驗收 2：權限正確——filet-api 讀得到、寫不到
+sudo -u filet-api test -r /opt/filet/spark/var/filet/leaders.json && echo "api 可讀 OK"
+sudo -u filet-api test -w /opt/filet/spark/var/filet/leaders.json \
+  && echo "★ 危險：filet-api 可寫，白名單防線失效！" || echo "api 不可寫 OK"
+```
+
+#### 下架一個 leader 時：`enabled` 還是 `accepting_new`？
+
+**選錯的代價是雙向的**（該止血的沒止血／不該平倉的付了平倉成本），所以先問一句：
+**「正在跟他的客戶，現在該不該立刻出場？」**
+
+| 情境 | 用哪個 | 對**正在跟**的 follower 的後果 |
+|---|---|---|
+| 帳號被盜、開始對敲、策略失控、任何需要**立刻止血** | `"enabled": false` | ⭐ **受控收尾**：停止開新倉 → 撤單 → reduce-only 全平 → 鎖死 kill switch。有真實 taker 成本，**re-arm 需人工刪 ARM 檔** |
+| 名額滿、策略調整中、準備退場等**例行下架** | `"accepting_new": false` | **完全不受影響**，繼續正常跟單 |
+
+```bash
+# 改完一律重驗 JSON——白名單壞掉會讓引擎 fail-fast（這是刻意的，但要知道）
+python3 -m json.tool /opt/filet/spark/var/filet/leaders.json > /dev/null && echo "JSON OK"
+```
+
+- ⚠️ **把條目整筆刪掉 ＝ `enabled: false`**（引擎驗不到就當作撤銷，會觸發所有跟隨者
+  收尾）。例行下架請改 `accepting_new`，**不要刪條目**——條目保留也才有歷史可查。
+- 改動**不需要重啟 follower**：引擎每個 cycle 重讀白名單，最遲下一輪生效。
+- `enabled: false` 之後請確認收尾真的發生了（別停在「我已下架＝已止血」的假設上）：
+
+```bash
+sudo journalctl -u 'filet-follower@*' --since '10 min ago' | grep -i '撤銷\|leader_revoked'
+ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 ARM 檔
+```
+
+### 5.6 activate 一個 follower（人工 CLI）
+
+⚠️ **必須指定絕對路徑或先 `cd`**：`--pending`／`--manifest` 的預設值是 CWD 相對的，
+在錯的目錄跑會寫出一份引擎讀不到的 manifest（引擎讀的是
+`/opt/filet/spark/var/filet/followers.json`），症狀是「activate 說成功了，
+follower 起來卻找不到自己」。
+
+```bash
+cd /opt/filet/spark
+sudo FILET_BUILDER_ADDR=<builder 位址> \
+  ./.venv/bin/python -m scripts.filet_activate <account_id> \
+  --pending  /var/lib/filet-api/pending.json \
+  --manifest /opt/filet/spark/var/filet/followers.json \
+  --leaders  /opt/filet/spark/var/filet/leaders.json \
+  --leader   <leader 位址>
+
+# 驗收：manifest 裡有這筆、leader 是預期的那個
+sudo python3 -m json.tool /opt/filet/spark/var/filet/followers.json | grep -A5 <account_id>
+
+sudo mkdir -p /opt/filet/state/<account_id>
+sudo chown filet-engine:filet-engine /opt/filet/state/<account_id>
+sudo chmod 700 /opt/filet/state/<account_id>
+sudo systemctl start filet-follower@<account_id>
 ```
 
 ---
