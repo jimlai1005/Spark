@@ -645,6 +645,66 @@ main.page {
   display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; flex-wrap: wrap;
 }
 
+/* ---------- /capital 資金配置（投入本金 × 使用比例） ---------- */
+.capital-section-title { font-size: 14px; color: var(--text); margin: 0 0 8px; font-weight: 500; }
+.capital-glossary { margin-bottom: 16px; }
+.capital-terms { margin: 0 0 14px; }
+.capital-terms dt {
+  font-size: 13px; color: var(--text); font-weight: 500; margin-top: 10px;
+}
+.capital-terms dt:first-child { margin-top: 0; }
+.capital-terms dd {
+  margin: 4px 0 0; font-size: 13px; color: var(--text-dim); line-height: 1.65;
+}
+.capital-product-title { font-size: 13px; color: var(--text); margin: 0 0 4px; font-weight: 500; }
+.capital-session { margin-top: 16px; }
+.capital-gate { display: block; }
+.capital-gate-title {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: var(--text); font-size: 14px; margin: 0 0 6px;
+}
+.capital-form { margin-top: 16px; }
+.capital-field { display: block; margin: 18px 0 0; }
+.capital-field-label {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 13px; color: var(--text); margin-bottom: 6px;
+}
+.capital-util-value { font-size: 18px; font-weight: 300; color: var(--text); }
+.capital-field .hint { display: block; margin-top: 6px; }
+.capital-input {
+  width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 15px;
+  color: var(--text); background: rgba(var(--text-dim-rgb), .08);
+  border: 1px solid rgba(var(--text-dim-rgb), .35); border-radius: 6px;
+}
+.capital-input:focus { outline: 2px solid rgba(var(--primary-rgb), .5); outline-offset: 1px; }
+.capital-slider { width: 100%; accent-color: var(--primary); }
+/* ⭐ 風險揭露與滑桿同一個容器（不得被推到頁尾）：邊框與底色讓它讀起來像警語。 */
+.capital-risk {
+  margin-top: 18px; padding: 12px 14px; border-radius: 6px;
+  border: 1px solid rgba(var(--warn-rgb), .45); background: rgba(var(--warn-rgb), .08);
+}
+.capital-risk-title { color: var(--warn); font-size: 13.5px; font-weight: 500; margin: 0 0 6px; }
+.capital-risk-body { font-size: 13px; color: var(--text); line-height: 1.65; margin: 0; }
+.capital-basis {
+  display: flex; flex-direction: column; gap: 4px; margin-top: 18px;
+}
+.capital-basis-label { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
+.capital-basis-value { font-size: 20px; font-weight: 300; color: var(--text); }
+.capital-input-error {
+  margin: 14px 0 0; font-size: 13px; color: var(--neg); line-height: 1.6;
+}
+.capital-form .btn-block { margin-top: 14px; }
+.capital-diff { margin: 0 0 12px; }
+.capital-diff dt {
+  font-size: 11px; color: var(--text-dim); letter-spacing: .04em; margin-top: 10px;
+}
+.capital-diff dt:first-child { margin-top: 0; }
+.capital-diff dd { margin: 3px 0 0; font-size: 15px; color: var(--text); }
+.capital-diff-new { color: var(--primary); font-size: 17px; }
+.capital-done { border-color: rgba(var(--pos-rgb), .5); margin-top: 16px; }
+.capital-done-title { color: var(--pos); font-size: 14px; margin: 0 0 6px; }
+.capital-dialog .capital-risk-title { margin-top: 14px; }
+
 /* ---------- Responsive：邊界圖直疊（≤620px） ---------- */
 @media (max-width: 620px) {
   .boundary { flex-direction: column; }
