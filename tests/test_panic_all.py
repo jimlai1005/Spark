@@ -427,6 +427,27 @@ def test_panic_all_sibling_misdirection_isolated_from_real_follower(fake_stack, 
     assert _arm_path(fake_stack.state_base, "alice").exists()
 
 
+# ── 緊急平倒滑價分離測試 ────────────────────────────────────────────────────
+
+def test_panic_close_uses_flatten_slippage_in_adapter_executor():
+    """panic 路徑（_AdapterExecutor）必須用 emergency=True 傳 flatten_slippage 到 adapter。
+
+    次佳方案驗證：檢查 _AdapterExecutor.close_reduce_only 原始碼確實計算了正確滑價。
+    理想方案需改假 adapter 來記錄 slippage，但會破壞現有測試；本次採檢查原始碼驗證。
+    """
+    from scripts.panic import _AdapterExecutor
+    import inspect
+
+    source = inspect.getsource(_AdapterExecutor.close_reduce_only)
+    # 驗證 emergency=True 時選擇 flatten_slippage
+    assert "self._flatten_slippage if emergency" in source, \
+        "_AdapterExecutor.close_reduce_only 必須在 emergency=True 時選擇 flatten_slippage"
+    # 驗證傳給 adapter 的 slippage 變數名正確
+    assert "slip = " in source, "必須有滑價計算變數"
+    assert "close_reduce_only(" in source and "slip," in source, \
+        "必須將計算出的 slip 傳給 adapter.close_reduce_only"
+
+
 # ── F1b（Task 10 fast-follow，reviewer Important）：_state_root_for 三道防線直測 ──
 #
 # Task 10 起，account_id 含 `/`／`..` 會先在 manifest load boundary 被

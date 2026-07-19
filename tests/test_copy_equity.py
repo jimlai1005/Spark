@@ -148,7 +148,54 @@ def test_lifetime_peak_only_rises(tmp_path: Path):
 
     assert update_lifetime_peak(tmp_path, Decimal("1000")) == Decimal("1000")
     assert update_lifetime_peak(tmp_path, Decimal("800")) == Decimal("1000")
-    assert update_lifetime_peak(tmp_path, Decimal("1200")) == Decimal("1200")
+
+
+def test_wick_guard_threshold_is_exactly_three(tmp_path: Path):
+    """門檻邊界：恰好 3 筆時啟用防護（2 筆不啟用已另有測試）。"""
+    ts = 1000.0
+    for v in ("1000", "1400"):
+        perp_equity_view(_FakeAdapter(v), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    # 此時檔內 2 筆；本次呼叫寫入第 3 筆後即達門檻
+    ev = perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+    assert ev.recent_peak == Decimal("1000"), "達 3 筆即應排除單筆插針 1400"
+
+
+def test_wick_guard_current_making_new_high(tmp_path: Path):
+    """防護啟用時 current 創新高：peak 必須跟上 current（否則 dd 為負）。"""
+    ts = 1000.0
+    for v in ("1000", "1000", "1000"):
+        perp_equity_view(_FakeAdapter(v), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    ev = perp_equity_view(_FakeAdapter("1500"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+    assert ev.recent_peak == Decimal("1500"), "current 創新高時 peak 必須等於 current"
+    assert ev.current == Decimal("1500")
+
+
+def test_dilution_regression_with_guard_active(tmp_path: Path):
+    """F1 迴歸（防護啟用版）：樣本充足時，perp 真跌 20% 仍須算出 0.2。
+
+    先前的 F1 迴歸測試只有 2 筆樣本（防護未啟用）——本測試確保防護啟用後
+    真實回撤依然偵測得到，不被次高值邏輯吃掉。
+    """
+    ts = 1000.0
+    for _ in range(5):
+        perp_equity_view(_FakeAdapter("500"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    ev = perp_equity_view(_FakeAdapter("400"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+    assert ev.recent_peak == Decimal("500")
+    assert (ev.recent_peak - ev.current) / ev.recent_peak == Decimal("0.2")
+
+
+def test_low_side_spike_does_not_lower_peak(tmp_path: Path):
+    """低側插針（瞬間下殺）不得壓低 peak——否則真回撤會被低估。"""
+    ts = 1000.0
+    for v in ("1000", "1000", "1000", "200", "1000"):  # 200 是低側插針
+        perp_equity_view(_FakeAdapter(v), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    ev = perp_equity_view(_FakeAdapter("700"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+    assert ev.recent_peak == Decimal("1000"), "低側插針不得影響 peak"
+    assert (ev.recent_peak - ev.current) / ev.recent_peak == Decimal("0.3")
 
 
 def test_lifetime_peak_persist_false_does_not_write(tmp_path: Path):

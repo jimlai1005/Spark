@@ -236,3 +236,18 @@ class TestSlippageValidation:
 
         settings = CopySettings.from_env({"COPY_SLIPPAGE": "0.0"})
         assert settings.slippage == Decimal("0.0")
+
+    def test_flatten_slippage_default_and_env_override(self):
+        """緊急滑價：預設值與 env 覆寫。"""
+        assert CopySettings().flatten_slippage == Decimal("0.30")
+        s = CopySettings.from_env({
+            "COPY_FLATTEN_SLIPPAGE": "0.5",
+        })
+        assert s.flatten_slippage == Decimal("0.5")
+
+    def test_flatten_slippage_out_of_range_rejected(self):
+        """越界守衛：[0,1) 之外必須拒絕。"""
+        with pytest.raises(ValueError, match="flatten_slippage"):
+            CopySettings(flatten_slippage=Decimal("1.0"))
+        with pytest.raises(ValueError, match="flatten_slippage"):
+            CopySettings(flatten_slippage=Decimal("-0.1"))

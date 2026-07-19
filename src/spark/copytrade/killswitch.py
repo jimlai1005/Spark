@@ -23,9 +23,12 @@
 持久證據層（M1）：trip 內每則 critical 同步 append 至 `var/copytrade/alerts.log`
 （時間戳＋訊息）——「大聲」不能只等於 Telegram uptime，通知端掛掉時本地仍有證據。
 
-已知取捨（待使用者裁決，本次不改碼）：緊急平倉沿用 CopySettings.slippage=5%
-（hl trader.py:312 硬編值）。恐慌行情滑價可能超過 5% 導致 IOC 未成交（會如實記入
-failures 並 critical）；是否為 kill switch 路徑單獨加寬 slippage，留待人工決定。
+緊急平倉滑價（2026-07-19 已裁決並實作）：本模組平倉一律以 `emergency=True` 呼叫
+`ExecutorPort.close_reduce_only`，走 `CopySettings.flatten_slippage`（預設 0.30，
+`COPY_FLATTEN_SLIPPAGE` 可調）而非一般跟單用的 `slippage`（0.05）。理由：一般平倉
+未成交只是下一輪再試，緊急平倉未成交＝保護整個失效、部位繼續曝險。IOC 限價語意是
+「可接受的最差價」而非「成交在該價」——寬頻寬只確保跳空時仍能出場，不等於接受該幅度虧損。
+仍可能未成交（如市場暫停），該情形如實記入 failures 並 critical。
 """
 from __future__ import annotations
 

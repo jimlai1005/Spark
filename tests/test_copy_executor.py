@@ -13,7 +13,7 @@ import pytest
 from spark.copytrade.config import CopySettings
 from spark.copytrade.executor import ActionExecutor, ActionRecord, ExecutorPort, VirtualBook
 from spark.copytrade.orders import OrderSpec
-from spark.exchange.base import BuilderCode, EquityView, OpenOrder
+from spark.exchange.base import BuilderCode, EquityView, OpenOrder, OrderResult
 from spark.exchange.fakes import FakeAdapter
 from spark.exchange.hyperliquid import HyperliquidAdapter
 
@@ -334,3 +334,35 @@ def test_virtualbook_modify_remints_oid():
     assert len(oids) == 1, "應只剩一張單"
     assert oids[0] != old_oid, "新 oid 必須不同於舊 oid"
     assert book.modify(999999, spec) is False, "不存在的 oid 應回 False"
+
+
+def test_emergency_close_uses_flatten_slippage():
+    """滑價分離：emergency=True 必須把 flatten_slippage 傳到 adapter（不只是布林值有傳）。"""
+    seen = {}
+
+    class _Ad:
+        def close_reduce_only(self, signer, coin, is_buy, size, slippage, builder):
+            seen["slippage"] = slippage
+            return OrderResult(ok=True, filled_size=size, avg_px=Decimal("1"), raw={})
+
+    ex = _executor(live=True)
+    ex._adapter = _Ad()
+    ex.close_reduce_only("ETH", is_buy=False, size=Decimal("1"), emergency=True)
+    assert seen["slippage"] == ex._settings.flatten_slippage
+    assert seen["slippage"] == Decimal("0.30"), "預設緊急滑價應為 0.30"
+
+
+def test_normal_close_uses_normal_slippage():
+    """分離性：一般平倉必須走 slippage（0.05），不得誤用 flatten_slippage。"""
+    seen = {}
+
+    class _Ad:
+        def close_reduce_only(self, signer, coin, is_buy, size, slippage, builder):
+            seen["slippage"] = slippage
+            return OrderResult(ok=True, filled_size=size, avg_px=Decimal("1"), raw={})
+
+    ex = _executor(live=True)
+    ex._adapter = _Ad()
+    ex.close_reduce_only("ETH", is_buy=False, size=Decimal("1"))
+    assert seen["slippage"] == ex._settings.slippage
+    assert seen["slippage"] != ex._settings.flatten_slippage, "兩者必須分離"
