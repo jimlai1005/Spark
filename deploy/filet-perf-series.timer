@@ -1,0 +1,21 @@
+[Unit]
+Description=Filet leader performance time series sampling every 12 hours
+
+[Timer]
+# ⭐ 00:05 與 12:05 UTC ＝ perf_series.SAMPLE_INTERVAL_HOURS（12）的兩個窗各一次。
+# 這個節奏與 src/spark/filet/perf_series.py 的常數是同一個決定的兩半：抓的是
+# perpDay 窗（涵蓋 24h），12 小時抓一次才有約 12 小時的**重疊**，而重疊是拼接時
+# 把窗內累積 PnL 重定基準的唯一依據。改成 24 小時 ⇒ 重疊消失 ⇒ 序列每次都斷段。
+OnCalendar=*-*-* 00,12:05:00 UTC
+# ⭐ 整點後緩衝 5 分鐘 ＋ 最多 4 分鐘隨機延遲：兩者相加最晚 00:09／12:09，仍落在
+# 同一個 12 小時 bucket 內（bucket 由 sample_bucket 向下取整到 00 或 12）。
+# 調大 RandomizedDelaySec 前先確認 起始分鐘 + 延遲 < 60 分鐘，否則跨不過 bucket 邊界
+# 的問題不會發生，但補跑與正常跑會落進同一格而被冪等跳過一次。
+RandomizedDelaySec=240
+# 關機／重開錯過的窗開機後補跑。補跑若已跨進下一個 bucket，append_samples 的冪等
+# 鍵會讓它寫成新的一筆（正確：那確實是新的取樣時刻），漏掉的那個窗則永久缺席
+# ——拼接時會顯示為「開新分段」，是可見的證據而不是靜默的洞。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

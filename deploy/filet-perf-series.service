@@ -1,0 +1,32 @@
+[Unit]
+Description=Filet leader performance time series collector (12h, append-only, read-only upstream)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=filet-api
+Group=filet-api
+WorkingDirectory=/opt/filet/spark
+Environment=SPARK_NETWORK=mainnet
+Environment=FILET_DATA_DIR=/var/lib/filet-api
+# ⭐ 抓取對象的**單一來源＝leader 白名單**（與 filet-leaderboard.service 逐字元相同
+# 的變數與路徑）。白名單新增 leader → 本 timer 自動涵蓋，不必再同步任何 env。
+# 這裡漏設的代價比快照那邊嚴重：快照漏一天可以明天補抓最新值，序列漏一次就是一個
+# **永久的洞**（perpDay 窗只保留 24 小時）。filet-api 對這個檔唯讀（RUNBOOK §5.5）。
+Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
+# 選配：白名單**之外**的額外研究對象（逗號分隔）。與白名單取聯集，不是取代它。
+#Environment=FILET_LEADER_WATCHLIST=0x...,0x...
+# ⚠️ 刻意**沒有** "-" 前綴（與 filet-leaderboard.service 的全站快照不同）：那份
+# best-effort 是因為 stats-data 端點未進官方文件、掛了不影響主線；這支腳本失敗
+# 代表**這個 12 小時窗的資料點永久消失**，必須讓 unit 進 failed 被監控看見。
+ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.perf_series_snapshot
+StateDirectory=filet-api
+ReadWritePaths=/var/lib/filet-api
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
