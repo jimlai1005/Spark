@@ -20,7 +20,8 @@ manifest）。**API 進程若被打穿，攻擊者能把 follower 指向惡意 l
 解析規則（resolve_leader）
 ------------------------
 1. 讀 manifest 找到自己的 FollowerRef。
-2. `ref.leader_address` 有值 → **必須通過 is_allowed_leader**，否則拒絕。
+2. `ref.leader_address` 有值 → **必須通過 is_still_permitted**（引擎持續驗證用的
+   述詞，只看 enabled；`accepting_new` 只擋新客戶——見 leaders.py），否則拒絕。
    白名單檔不存在時本路徑**一樣拒絕**：明確指定了 leader 卻沒有白名單可驗，
    正是被竄改後的樣子，不豁免。
 3. `ref.leader_address` 為 None → 回退 env `COPY_LEADER_ADDRESS`；**env 預設也要
@@ -238,6 +239,21 @@ class LeaderWatch:
         self._notifier = notifier
         self._on_revoked = on_revoked
 
+    def _critical(self, text: str, *, dedup_key: str) -> None:
+        """發 critical，且**告警失敗不得升級成跟單中斷**。
+
+        注入的 Notifier 由呼叫端提供（TelegramNotifier 自己吞例外，但 TaggedNotifier
+        之類的包裝、或未來換的實作沒有這個保證）。原本 refresh() 的 except 區塊直接
+        呼叫 notifier.critical()：那一行若拋例外，refresh() 就會 raise → main_loop
+        累積連續錯誤計數 → SystemExit(1)。也就是「Telegram 掛了」會演變成「引擎停機、
+        部位無人看管」，與本類別 docstring 宣稱的「不會 raise」直接矛盾。
+        告警是觀測層，觀測層壞掉絕不能弄停被觀測的系統。
+        """
+        try:
+            self._notifier.critical("leader", text, dedup_key=dedup_key)
+        except Exception:  # noqa: BLE001 —— 見 docstring：告警失敗只 log
+            logger.exception("leader critical 告警發送失敗（跟單不受影響）")
+
     def refresh(self) -> LeaderResolution | None:
         """重新解析並回傳本輪該用的 leader。**本函式不會 raise**——跟單不中斷。
 
@@ -261,8 +277,7 @@ class LeaderWatch:
         except Exception as e:  # noqa: BLE001 —— 見 docstring：安全關鍵路徑，不得中斷跟單
             logger.error("leader 重新解析失敗，沿用 %s: %s", self.current.address, e,
                          exc_info=True)
-            self._notifier.critical(
-                "leader",
+            self._critical(
                 f"leader 重新解析失敗（{e}）——**沿用上一個已驗證的 leader "
                 f"{self.current.address}（來源 {self.current.source}）**，跟單不中斷；"
                 f"請檢查 follower manifest 與 leader 白名單檔",
@@ -271,8 +286,7 @@ class LeaderWatch:
         if new.address != self.current.address:
             old = self.current
             self.current = new
-            self._notifier.critical(
-                "leader",
+            self._critical(
                 f"**leader 已變更**：{old.address}（來源 {old.source}）→ "
                 f"{new.address}（來源 {new.source}）——引擎將收斂到新 leader 的部位"
                 f"（平掉舊部位、開新部位，有實際 taker 成本）",
@@ -292,8 +306,7 @@ class LeaderWatch:
         """
         logger.error("leader %s 已被白名單撤銷，開始受控收尾: %s",
                      self.current.address, e, exc_info=True)
-        self._notifier.critical(
-            "leader",
+        self._critical(
             f"**leader {self.current.address} 已被白名單撤銷**（{e}）——"
             f"**停止開新倉並受控收尾**：撤掉全部掛單、reduce-only 平掉現有部位、"
             f"鎖死 kill switch。跟單已終止，re-arm＝人工刪 ARM 檔",
@@ -306,8 +319,7 @@ class LeaderWatch:
             self._on_revoked()
         except Exception as ex:  # noqa: BLE001 —— 收尾失敗必須大聲，但不得炸掉 cycle
             logger.exception("leader 撤銷收尾失敗")
-            self._notifier.critical(
-                "leader",
+            self._critical(
                 f"**leader 撤銷收尾失敗**（{ex!r}）——引擎已停止交易，但部位可能仍在、"
                 f"kill switch 可能未鎖死，需**人工確認**；緊急全平："
                 f"uv run python -m scripts.panic --yes",

@@ -22,7 +22,8 @@ class FollowerRef:
     # 該 follower 跟隨的 leader（正規化小寫）。None = 沿用進程 env 的
     # COPY_LEADER_ADDRESS——舊 manifest 沒有這個鍵，載入必須照常成功（向後相容）。
     # ⭐ 真相來源：manifest 是「這個 follower 跟誰」的唯一權威；引擎使用前必須再以
-    # leaders.is_allowed_leader 驗一次白名單（見 leaders.py docstring 的資安論證）。
+    # leaders.is_still_permitted 驗一次白名單（見 leaders.py 檔頭的資安論證與兩個
+    # 旗標的分工；選擇時另有 is_selectable，兩者看的旗標不同）。
     leader_address: str | None = None
 
 

@@ -48,8 +48,8 @@ import argparse
 import json
 import os
 from dataclasses import replace
-from decimal import Decimal
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
@@ -275,6 +275,9 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(2) from e
         # 解析結果覆蓋 env 值，之後所有讀 settings.leader_address 的路徑
         # （live 警告、run_cycle）都吃同一個已驗證位址——單一真相，不並存兩個來源。
+        # 不變式：resolve_leader_fn() 只會回 LeaderResolution 或 raise，
+        # 故此處 resolution 必非 None（見下方 LeaderWatch 前的 assert）。
+        assert resolution is not None
         copy_settings = replace(copy_settings, leader_address=resolution.address)
         print(f"[leader] {resolution.address}（來源 {resolution.source}）")
 
@@ -326,6 +329,11 @@ def main(argv: list[str] | None = None) -> None:
     # 每 cycle 重新解析 leader：客戶換 leader 不必重啟服務、不必給 web 層提權；
     # transient 失敗沿用上一個已驗證值＋critical（refresh() 不 raise，跟單不中斷）；
     # **撤銷**（enabled=false／條目被移除）則走 on_revoked 受控收尾並回 None。
+    # 不變式：走到這裡代表 args.status 為 False（--status 早已 return），所以上面的
+    # `if not args.status` 區塊必定執行過、resolution 必非 None。這個不變式目前只靠
+    # 「--status 提前 return」維持——把它寫成 assert，讓未來有人在中間插入新分支時
+    # 是在這裡炸掉，而不是把 None 餵進 LeaderWatch 後在第一輪 refresh 才神祕失敗。
+    assert resolution is not None
     watch = LeaderWatch(resolution, resolve_leader_fn, notifier,
                         on_revoked=make_revocation_wind_down(
                             adapter, ex, notifier, state_root))

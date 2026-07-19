@@ -409,3 +409,44 @@ def test_watch_recovers_after_transient_failure(tmp_path):
     assert w.refresh() == _A   # 第一輪失敗：沿用
     assert w.refresh() == _B   # 第二輪成功：切換（並告警）
     assert len(_crits(n)) == 2
+
+
+# ── N2：告警失敗不得中斷跟單 ────────────────────────────────────────────
+
+class _ExplodingNotifier(RecordingNotifier):
+    """每則 critical 都拋例外的 Notifier（模擬包裝層／自訂實作沒吞例外）。"""
+
+    def critical(self, category, text, dedup_key=None):
+        raise RuntimeError("telegram 掛了")
+
+
+@pytest.mark.parametrize("resolve_fn, expected", [
+    (lambda: (_ for _ in ()).throw(LeaderResolutionError("暫時讀不到")), _A),  # transient
+    (lambda: _B, _B),                                                          # leader 變更
+])
+def test_notifier_failure_does_not_break_following(resolve_fn, expected):
+    """⭐ 注入的 Notifier 拋例外 → refresh() 不得 raise，跟單照常。
+
+    原本 except 區塊內的 notifier.critical() 本身無保護：它一拋例外，refresh() 就
+    raise → main_loop 累積連續錯誤 → SystemExit(1)。也就是「Telegram 掛了」會演變成
+    「引擎停機、部位無人看管」——告警失敗反而中斷跟單，是最不該有的因果。
+    """
+    w = LeaderWatch(_A, resolve_fn, _ExplodingNotifier())
+    assert w.refresh() == expected
+
+
+def test_notifier_failure_does_not_break_revocation_wind_down():
+    """撤銷路徑同理：告警炸掉不得阻止收尾，也不得讓 refresh() raise。"""
+    n = _ExplodingNotifier()
+    calls = []
+    w = LeaderWatch(_A, _raise(LeaderRevokedError("撤銷")), n,
+                    on_revoked=lambda: calls.append(1))
+    assert w.refresh() is None
+    assert calls == [1]        # 告警失敗，但收尾照做
+
+
+def test_notifier_failure_during_wind_down_failure_is_still_contained():
+    """最壞情況：收尾失敗 **且** 告警也失敗 → 仍然不 raise、仍然停止交易。"""
+    w = LeaderWatch(_A, _raise(LeaderRevokedError("撤銷")), _ExplodingNotifier(),
+                    on_revoked=_raise(OSError("ARM 寫入失敗")))
+    assert w.refresh() is None
