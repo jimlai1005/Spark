@@ -98,9 +98,96 @@ def _dep_call_names(dependant) -> set[str]:
     return names
 
 
+# ⭐ 跨客戶資料來源註冊表：全 repo「一次讀到多個客戶資料」的入口符號。
+# 用途：admin 閘的結構性檢查以**資料來源**為鍵，而非路徑前綴——前綴檢查防得住
+# 「新增 /api/ops/* 忘了掛閘」，卻完全看不到寫在別的前綴下的跨客戶端點
+# （例如 /api/reports/all）。任何新的跨客戶讀取入口都必須登記在此，
+# test_cross_customer_source_registry_is_complete 會強迫做這個決定。
+CROSS_CUSTOMER_SOURCES = {"list_billing", "customer_pnl", "_load_followers",
+                          "list_subscriptions"}
+
+
+def test_cross_customer_source_registry_is_complete(tmp_path):
+    """釘住 CROSS_CUSTOMER_SOURCES 就是**目前全部**的跨客戶讀取入口。
+
+    新增一個跨客戶資料來源 → 本測試紅 → 被迫在此登記，登記後
+    test_cross_customer_sources_are_admin_gated 立刻開始檢查用到它的每個路由。
+    （沿 web/src/lib/api.test.ts 手寫清單長度那條測試的精神：清單本身要被釘住，
+    否則「檢查清單內的東西」只是檢查了一個會自己縮水的清單。）
+
+    極限：本測試只釘集合內容，不會自己去發現新的來源——它換來的是「新增時會撞牆」，
+    不是「自動偵測」。"""
+    import inspect
+
+    from spark.publicapi import app as app_mod
+    from spark.publicapi import ops as ops_mod
+    from spark.publicapi import store as store_mod
+
+    # 跨客戶＝回傳「多個客戶」的資料。逐模組列出候選，與註冊表比對。
+    candidates = set()
+    for mod, names in ((ops_mod, ("customer_pnl", "subscription_drift")),
+                       (store_mod, ("list_billing",)),
+                       (app_mod, ("_load_followers",))):
+        for n in names:
+            if n == "_load_followers":
+                candidates.add(n)      # create_app 內的閉包，靠原始碼字串比對
+            elif hasattr(mod, n) or hasattr(getattr(mod, "ApiStore", object), n):
+                candidates.add(n)
+    # subscription_drift 本身不讀資料（純函式，資料由 list_billing/list_subscriptions
+    # 餵入），故不列入註冊表——註冊表要的是**讀取入口**，不是處理函式。
+    candidates.discard("subscription_drift")
+    candidates.add("list_subscriptions")   # StripeGateway：跨客戶讀 Stripe 訂閱
+    assert candidates == CROSS_CUSTOMER_SOURCES, (
+        "跨客戶資料來源有增減——新增的入口必須登記進 CROSS_CUSTOMER_SOURCES，"
+        "並確認用到它的每個路由都掛了 admin 閘")
+    assert inspect.isfunction(ops_mod.customer_pnl)
+
+
+def test_cross_customer_sources_are_admin_gated(tmp_path):
+    """⭐ 以**資料來源**為鍵的閘檢查：任何 handler 只要在自己的原始碼裡引用了
+    CROSS_CUSTOMER_SOURCES 的符號，其 dependant 樹就必須含 _require_admin。
+
+    這比路徑前綴嚴格：跨客戶端點就算寫在 /api/reports/all 也逃不掉。
+
+    ⚠️ **本檢查的極限（誠實標註，不要以為它保證了它不保證的事）**：
+    只看 handler **自己**的原始碼（inspect.getsource）。若 handler 呼叫某個 helper、
+    由那個 helper 間接碰到跨客戶資料，本檢查看不到——這**不是**完備的呼叫圖分析。
+    要做到完備需要靜態呼叫圖或執行期追蹤；目前的取捨是「零依賴、涵蓋直接引用」。
+    與 test_all_admin_scoped_routes_are_gated（路徑前綴）互補，兩條都保留：
+    前綴那條抓「/ops 下新端點忘了掛閘」，本條抓「跨客戶端點藏在別的前綴下」。
+    """
+    import inspect
+
+    app, *_ = make_app(tmp_path)
+    checked = []
+    for route in app.routes:
+        endpoint = getattr(route, "endpoint", None)
+        dependant = getattr(route, "dependant", None)
+        if endpoint is None or dependant is None:
+            continue
+        try:
+            source = inspect.getsource(endpoint)
+        except (OSError, TypeError):        # 內建/動態產生的路由，無原始碼可讀
+            continue
+        used = {s for s in CROSS_CUSTOMER_SOURCES if s in source}
+        if not used:
+            continue
+        path = getattr(route, "path", "")
+        assert "_require_admin" in _dep_call_names(dependant), (
+            f"{path} 直接讀跨客戶資料 {sorted(used)} 卻未掛 admin 閘")
+        checked.append(path)
+    # 檢查真的有跑到東西（空迴圈全綠是最糟的假保證）
+    assert set(checked) == {"/api/ops/customers", "/api/ops/revenue",
+                            "/api/ops/subscriptions"}
+
+
 def test_all_admin_scoped_routes_are_gated(tmp_path):
     """結構性：每個 /api/ops/* 與 /api/admin/* 路由的 dependant 樹裡都必須有
-    _require_admin。新端點忘了掛閘 → 本測試紅（不靠 code review 記得）。"""
+    _require_admin。新端點忘了掛閘 → 本測試紅（不靠 code review 記得）。
+
+    與 test_cross_customer_sources_are_admin_gated 互補、刻意不合併：本條以**路徑**
+    為鍵（抓 /ops 下的新端點），那條以**資料來源**為鍵（抓藏在別的前綴下的跨客戶端點）。
+    """
     app, *_ = make_app(tmp_path)
     seen = set()
     for route in app.routes:
