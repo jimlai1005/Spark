@@ -299,6 +299,10 @@ sudo cp /opt/filet/spark/deploy/filet-follower@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
+> 兩個**定時任務**（`filet-leaderboard` 與 `filet-perf-series`）的 unit 不在這裡裝，
+> 它們有自己的一節：**§5.7**。不做那一節不影響本節的服務起得來，但 leader 目錄頁
+> 會永遠沒有統計、績效序列會永久缺資料點（見該節）。
+
 ### 5.2 填 `REPLACE_WITH_FILET_API_UID`
 
 `filet-keysvc.service` 的 `FILET_KEYSVC_ALLOWED_UIDS` 必須是 `filet-api` 的**實際數字 uid**
@@ -428,7 +432,12 @@ ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 AR
 
 | 路徑 | owner:group | mode | 建立方式 | 用途 |
 |---|---|---|---|---|
-| `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ **只放** `leader_changes.json`。owner 寫、group 讀、other 無 |
+| `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ 客戶簽章的共享記錄：`leader_changes.json`（換 leader）＋ `capital_settings.json`（資金設定）。owner 寫、group 讀、other 無 |
+
+> 兩份記錄**刻意分開兩個檔**（不是同一個檔多一個欄位）：讀者是兩個獨立的套用器，
+> 共用一個檔會讓其中一方的格式問題連坐另一方——而這兩件事各自都能造成資金損失，
+> 不該共命運（`src/spark/filet/capital_settings.py` 檔頭）。兩者同目錄、同權限拓撲，
+> 所以本節的建立與驗收步驟**一次涵蓋兩者**，不需要另外再建一個目錄。
 
 **方向是單向的**：filet-api 寫、filet-follower@ 讀。引擎那邊的 unit **刻意不把這個目錄
 列入 `ReadWritePaths`**——被打穿的引擎因此污染不了 API 的狀態。
@@ -505,6 +514,135 @@ sudo chown filet-engine:filet-engine /opt/filet/state/<account_id>
 sudo chmod 700 /opt/filet/state/<account_id>
 sudo systemctl start filet-follower@<account_id>
 ```
+
+#### ⚠️ 健康面板與狀態根權限（`/api/ops/health` 預設看不到，這是刻意的預設）
+
+`0700` 表示只有 `filet-engine` 讀得到狀態根。營運健康面板跑在 **filet-api** 進程裡，
+所以**預設情況下它讀不到**任何 follower 的 kill switch 狀態、equity 樣本覆蓋度與
+告警數——面板會把這些格子顯示成 **「未知」**（`null`），這是正確且刻意的行為，
+不是 bug。
+
+> ⭐ 面板**不會**因為讀不到就顯示「未觸發／健康」。這一格曾經是個真的 bug：
+> Python 的 `Path.exists()` 會把 PermissionError 吞成 `False`，於是一個**確實已經
+> 熔斷**的 follower 會被回報成「kill switch 未觸發」。現在由
+> `ops.state_root_status()` 先探測可讀性，讀不到一律整列標未知
+> （回歸測試：`tests/test_api_ops.py::test_unreadable_state_root_never_reports_killswitch_as_untripped`）。
+
+**要讓面板真的看得到，需要放寬到 `0750`**（`filet-api` 已是 `filet-engine` 群組的
+附加成員，見 §2）：
+
+```bash
+# ⚠️ 這是一個**權限放寬**的決定，請先確認你要的是哪一邊的取捨：
+#   維持 0700 → 面板顯示「未知」，但狀態根（含 ARM 檔、equity 樣本、已兌現帳本）
+#               只有引擎讀得到。
+#   放寬 0750 → 面板可用，代價是 filet-api 被打穿時可以**讀**（仍不能寫）這些檔案。
+#               這些檔案不含私鑰（私鑰在 keysvc，filet-api 本來就讀不到，見 §8 驗收 1）。
+sudo chmod 0750 /opt/filet/state/<account_id>
+
+# 驗收：filet-api 讀得到，且**寫不進去**（唯讀方向必須維持）
+sudo -u filet-api test -r /opt/filet/state/<account_id> \
+  && echo "api 可讀 OK（面板會有資料）" || echo "api 仍讀不到（面板顯示未知）"
+sudo -u filet-api touch /opt/filet/state/<account_id>/.probe \
+  && echo "★ 危險：api 可寫，唯讀方向失效！" || echo "api 不可寫 OK"
+```
+
+---
+
+### 5.7 ⭐ 兩個定時任務（leaderboard 快照 ＋ 績效序列取樣）
+
+> 編號 `5.7` 是**附加**在 §5 尾端的新章節（不重編任何既有編號，程式碼與文件裡對
+> §5.5.1／§5.6 的引用不受影響——沿 §5.5.1 的同一個插入慣例）。
+
+兩個 timer 都跑在 `filet-api` 帳號下、都只讀上游、都把結果寫進 `/var/lib/filet-api`。
+兩者的抓取對象都來自**同一個 leader 白名單**（§5.5 的 `leaders.json`），所以白名單
+新增 leader 之後不需要再同步任何 env。
+
+| Timer | 節奏 | 產物 | 漏跑的後果 |
+|---|---|---|---|
+| `filet-leaderboard` | 每日 00:10 UTC | 全站 top-N ＋ watchlist 快照 | **可補**：明天再抓一次最新值即可 |
+| `filet-perf-series` | 每 12 小時（00:05／12:05 UTC） | leader 績效時間序列 | ⭐⭐ **不可補**：見下方警告 |
+
+#### ⚠️⚠️ `filet-perf-series` 是 append-only 且**無法回填**——它的存活監控比其他 timer 重要
+
+這支腳本抓的是 Hyperliquid 的 `perpDay` 窗，**該窗只保留 24 小時**。漏跑一次就是
+**那個 12 小時窗的資料點永久消失**，明天、下週、任何時候都補不回來——上游根本
+不再持有那段資料。
+
+而且後果不只是「少一個點」：序列的拼接靠**相鄰兩次取樣的重疊**把窗內累積 PnL 重定
+基準（12 小時抓一次 → 約 12 小時重疊）。漏一次 ⇒ 重疊消失 ⇒ 拼接時**產生一個新的
+分段**，那個斷點會一路留在往後所有的績效圖上。
+
+所以：
+
+- unit 檔**刻意沒有** `ExecStart` 的 `-` 前綴（與 `filet-leaderboard` 的全站快照那條
+  相反）——失敗必須讓 unit 進 `failed`，被監控看見。
+- **這一支的失敗必須有人處理**，不能像日常告警那樣攢著。它與其他 timer 不同的地方
+  在於「晚點再看」這個選項不存在：等你看到的時候，資料已經沒了。
+- `Persistent=true` 只救「關機期間錯過、開機後仍在同一個 bucket 內」的情形。補跑若
+  已跨進下一個 bucket，漏掉的那個窗**永久缺席**（會顯示為新分段，是可見的證據而不是
+  靜默的洞）。
+
+#### 安裝與啟用
+
+```bash
+sudo cp /opt/filet/spark/deploy/filet-leaderboard.service /etc/systemd/system/
+sudo cp /opt/filet/spark/deploy/filet-leaderboard.timer   /etc/systemd/system/
+sudo cp /opt/filet/spark/deploy/filet-perf-series.service /etc/systemd/system/
+sudo cp /opt/filet/spark/deploy/filet-perf-series.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# ⚠️ enable --now 的是 **.timer**，不是 .service。
+# enable 錯對象（enable 了 .service）會讓這支 oneshot 在**每次開機**跑一次、
+# 而且從此不再定時跑——症狀是「資料每隔幾天才有一筆」，很久沒有人會發現。
+sudo systemctl enable --now filet-leaderboard.timer
+sudo systemctl enable --now filet-perf-series.timer
+```
+
+#### 驗收（四條都要跑）
+
+```bash
+# 驗收 1：兩個 timer 都已排程，且下次觸發時間合理（00:10／00:05 或 12:05 UTC）
+systemctl list-timers 'filet-*' --all --no-pager
+# 預期：兩行都在，NEXT 欄有時間、不是 n/a（n/a = timer 沒 enable 或 OnCalendar 寫錯）
+
+# 驗收 2：手動各跑一次，確認**現在就能成功**（不要等到明天才發現 env 或權限錯）
+sudo systemctl start filet-leaderboard.service
+systemctl status filet-leaderboard.service --no-pager -l   # 預期：SUCCESS（oneshot 跑完即 inactive）
+sudo systemctl start filet-perf-series.service
+systemctl status filet-perf-series.service --no-pager -l   # 預期：SUCCESS
+
+# 驗收 3：產物真的落地了（unit 回 SUCCESS 但沒有檔＝白名單是空的／路徑錯）
+# 版面出自 scripts/watchlist_snapshot.py 與 filet/perf_series.py 的 series_dir_for：
+#   <FILET_DATA_DIR>/leaderboard/watchlist/<YYYY-MM-DD>.json   （一天一個檔）
+#   <FILET_DATA_DIR>/leaderboard/perf_series/<address>.json    （一個 leader 一個檔）
+sudo ls -l /var/lib/filet-api/leaderboard/watchlist/   | tail -5
+sudo ls -l /var/lib/filet-api/leaderboard/perf_series/ | tail -5
+# 預期：watchlist 有今天日期的檔；perf_series 每個白名單 leader 各一個檔，
+# 且 mtime 是剛才那次手動執行。⭐ 沒有檔就是**現在**要查，不是明天
+# （perf_series 尤其：等到明天，今天漏掉的那兩個窗已經永遠補不回來了）
+
+# 驗收 4：兩個 unit 看到的是同一份白名單（抓取對象的單一來源）
+systemctl show filet-leaderboard.service -p Environment | tr ' ' '\n' | grep FILET_LEADERS_PATH
+systemctl show filet-perf-series.service  -p Environment | tr ' ' '\n' | grep FILET_LEADERS_PATH
+# 預期：兩行值逐字元相同，且等於 §5.5 建立的 leaders.json 路徑
+```
+
+#### 例行監控（`filet-perf-series` 需要比其他 timer 更積極的檢查）
+
+```bash
+# 有沒有跑失敗（⭐ perf-series 出現在這裡就是資料已經開始缺了）
+systemctl list-units 'filet-*' --state=failed --no-pager
+
+# 最近幾次執行的結果
+sudo journalctl -u filet-perf-series --since '3 days ago' --no-pager | tail -30
+
+# ⭐ 最直接的檢查：序列檔最後更新是多久以前？超過 ~12.5 小時就代表漏了一個窗
+sudo ls -lt --time-style=long-iso /var/lib/filet-api/leaderboard/perf_series/ | head -5
+```
+
+> 營運後台的健康面板（`/api/ops/health`）看的是 **follower 引擎**的存活，**不涵蓋
+> 這兩個 timer**。timer 的存活由 `systemctl list-timers` 與上面的 `--state=failed`
+> 檢查負責——兩者是不同的東西，不要以為面板是綠的就代表序列還在收。
 
 ---
 
@@ -672,6 +810,10 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://FILET_DOMAIN_PLACEHOLDER/api/a
 | 全部 follower 最近錯誤 | `sudo journalctl -u 'filet-follower@*' -p err --since today` |
 | nginx access/error | `sudo tail -f /var/log/nginx/{access,error}.log` |
 | 服務啟動失敗的完整原因 | `sudo systemctl status <unit> --no-pager -l` |
+| 兩個 timer 的排程狀態 | `systemctl list-timers 'filet-*' --all --no-pager` |
+| ⭐ 績效序列近日執行結果（漏跑＝資料永久缺，見 §5.7） | `sudo journalctl -u filet-perf-series --since '3 days ago' --no-pager` |
+| leaderboard 快照近日執行結果 | `sudo journalctl -u filet-leaderboard --since '3 days ago' --no-pager` |
+| 任何進入 failed 的 unit（含 timer） | `systemctl list-units 'filet-*' --state=failed --no-pager` |
 
 ### 9.2 服務重啟順序
 
