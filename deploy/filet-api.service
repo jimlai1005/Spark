@@ -8,7 +8,10 @@ Type=simple
 User=filet-api
 Group=filet-api
 WorkingDirectory=/opt/filet/spark
-Environment=FILET_API_NETWORK=mainnet
+# ⚠️ 安全關鍵：不得出貨具體值。此檔會覆蓋 /etc/systemd/system/ 的同名檔，
+# 若這裡硬編 mainnet，一次照 RUNBOOK 的重新部署就會把 testnet 機器翻上主網。
+# 未填時 config.from_env 會因 `network not in API_URLS` 拒絕啟動（fail-closed）。
+Environment=FILET_API_NETWORK=REPLACE_WITH_NETWORK
 Environment=FILET_BUILDER_ADDR=REPLACE_WITH_BUILDER_ADDRESS
 Environment=FILET_SIWE_DOMAIN=REPLACE_WITH_DASHBOARD_DOMAIN
 Environment=FILET_SIWE_URI=REPLACE_WITH_DASHBOARD_URI

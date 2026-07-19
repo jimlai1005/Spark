@@ -21,6 +21,7 @@
 |---|---|---|
 | `FILET_DOMAIN_PLACEHOLDER` | 對外網域（例如 `filet.example.com`），DNS A 記錄需先指到 Lightsail 靜態 IP | 使用者決定，見附錄 A |
 | `FILET_LIGHTSAIL_IP_PLACEHOLDER` | Lightsail 靜態 IP | 開實例後取得 |
+| `REPLACE_WITH_NETWORK` | ⭐ `filet-api.service` 的 `FILET_API_NETWORK`：`testnet` 或 `mainnet`。**這台機器是測試機就填 `testnet`**——填錯＝整台機器對主網真實資金下單。2026-07-19 起改為佔位符（原硬編 `mainnet`），見 §5.3 | 依機器定位決定，見 §5.3 |
 | `FILET_BUILDER_ADDR_PLACEHOLDER` | 我方 builder 錢包地址（`FILET_BUILDER_ADDR`／`filet-api.service` 的 `FILET_BUILDER_ADDR`） | 使用者決定，見附錄 A |
 | `FILET_ADMIN_ADDRESSES_PLACEHOLDER` | admin 白名單地址（逗號分隔） | 使用者決定，見附錄 A |
 | `FILET_GIT_REMOTE_PLACEHOLDER` | ~~repo 取得方式，本 repo 目前無 git remote~~ **已於 2026-07-19 更新**：repo 已有私有 remote（`git@github.com:jimlai1005/Spark.git`），但部署改採 rsync 推碼、不用 git clone——見 §3.2 | 不適用（見 §3.2） |
@@ -168,12 +169,21 @@ rsync -az --delete \
 ```bash
 # 回 Lightsail：把暫存目錄搬到正式路徑並修正 owner
 sudo mkdir -p /opt/filet
-sudo rsync -a --delete /tmp/spark-sync/ /opt/filet/spark/
+sudo rsync -a --delete \
+  --exclude .venv --exclude web/node_modules --exclude web/.next --exclude var \
+  /tmp/spark-sync/ /opt/filet/spark/
 rm -rf /tmp/spark-sync   # 清掉暫存，不留在 /tmp
 ```
 
 ```bash
 cd /opt/filet/spark
+
+# ⚠️ 重新部署才需要這一段（2026-07-19 實機重新部署發現）：首次部署末尾的
+# `chown -R root:root`（本節最後一行）會讓 .venv 與 uv.lock 變成 root 所有，
+# 之後以 ubuntu 身分跑 uv sync 一律 Permission denied。首次部署時這兩個路徑
+# 還不存在，`|| true` 讓這行在首次部署也能無害地跑過去。
+sudo chown -R ubuntu:ubuntu /opt/filet/spark/.venv /opt/filet/spark/uv.lock 2>/dev/null || true
+
 uv sync   # 從 pyproject.toml 解析、產生 .venv/ 與 uv.lock（uv.lock 是 gitignored，僅存在此機）
 uv run python -c "import spark; print('spark import OK')"   # 驗收
 
@@ -181,12 +191,26 @@ uv run python -c "import spark; print('spark import OK')"   # 驗收
 readlink -f .venv/bin/python    # 應指向 /opt/filet/python/...，不得出現 /home
 
 # 首次部署後，把解出的版本記進本文件（見文末「附錄 B」），避免下次部署解出不同版本造成漂移。
+
+# ⭐ 還原成 root 所有——這一步不是收尾潔癖，是安全邊界：三個 service user 跑的就是
+# 這棵樹底下的程式碼，留成 ubuntu 所有＝任何拿到 ubuntu 的人都能改服務執行的程式碼
+# （不需要 sudo、不會留下 sudo 稽核紀錄）。重新部署跑完 uv sync 後務必回到這一行。
 sudo chown -R root:root /opt/filet/spark
 sudo chmod -R go-w /opt/filet/spark   # 確保 group/other 無寫入權（唯讀給三個 service user）
+
+# 驗收：venv 與 repo 根都已回到 root 所有（重新部署時最容易漏的一步）
+sudo ls -ld /opt/filet/spark /opt/filet/spark/.venv   # 預期：兩行都是 root root
 ```
 
 > 之後每次重新部署（拉新版本）：重跑上面兩段 rsync（`--delete` 會清掉伺服器上已刪除的
 > 檔案，保持與本機工作樹一致），再視情況重跑 `uv sync`（只在依賴有變動時需要）。
+>
+> 🛑 **但重新部署不是「把本文件從頭跑一遍」**（2026-07-19 實機重新部署發現）：§5.1 的
+> `cp` 會靜默清掉 §5.2／§5.3 填進 `/etc/systemd/system/` 的實際值。動 systemd unit 之前
+> **先讀 §5.1a**，那一節列出重新部署專屬的備份／還原步驟與其餘會踩到的點。
+>
+> ⚠️ 兩段 rsync 的 `--exclude` 清單也是重新部署的承重點：少了 `--exclude var`，
+> `--delete` 會連 §5.5 的 leader 白名單（`var/filet/leaders.json`）一起刪掉。
 
 ---
 
@@ -229,7 +253,16 @@ npm --version
 > 前提：`web/` 目錄已由前端計畫（`docs/superpowers/plans/2026-07-17-m2-frontend.md`，
 > 尚未執行）落地。本節假設 `web/` 已存在並含 `package.json`/`package-lock.json`。
 
+> ⚠️ **build 前一定要先把 `web/` 交還給 ubuntu**（2026-07-19 實機重新部署發現）。
+> §3.2 結尾的 `chown -R root:root /opt/filet/spark` 是**遞迴**的，`web/` 也被收成 root
+> 所有；重新部署時 `web/node_modules`、`web/.next` 更是早就是 root 的了。以 ubuntu
+> 身分跑 `npm ci`／`npm run build` 會直接 Permission denied（`npm ci` 要重建
+> `node_modules`、build 要寫 `.next`，兩者都在這棵子樹底下）。
+
 ```bash
+# build 前：把整個 web/ 交給 ubuntu（涵蓋 node_modules 與 .next 兩個實際寫入點）
+sudo chown -R ubuntu:ubuntu /opt/filet/spark/web
+
 cd /opt/filet/spark/web
 npm ci    # 需要已 commit 的 package-lock.json；若尚無 lock 檔，改用 npm install 並在
           # 部署後把產生的 package-lock.json commit 回 repo（鎖版本，避免下次部署解出不同版本）
@@ -237,8 +270,15 @@ npm run build   # 驗收：`.next/` 產出，無 build error
 ```
 
 ```bash
+# ⭐ build 後**必須**還原成 root——這是 §4.4「前端與 filet-api 是不同信任域」的
+# 承重點之一：bundle 留成 ubuntu 所有，等於任何拿到 ubuntu 的人都能改前端執行的
+# 程式碼（含 §4.4 那道「待簽授權對象 == 使用者所選 leader」的前端防線），
+# 不需要 sudo、不留 sudo 稽核紀錄。§4.4 的驗收 1 正是在檢查這一格。
 sudo chown -R root:root /opt/filet/spark/web
 sudo chmod -R go-w /opt/filet/spark/web
+
+# 驗收：owner 已回到 root（重新部署時最容易漏的一步）
+sudo ls -ld /opt/filet/spark/web /opt/filet/spark/web/.next   # 預期：兩行都是 root root
 ```
 
 ### 4.3 安裝 dashboard systemd unit
@@ -292,6 +332,12 @@ onboarding）→ dashboard → follower（依帳號 activate 後才起，見 §5
 
 ### 5.1 安裝 unit 檔
 
+> 🛑 **這台機器已經部署過的話：先做完 §5.1a 的步驟 1（備份），再回來跑下面這段。**
+>（2026-07-19 實機重新部署發現）下面每一行都會**覆蓋**掉 §5.2／§5.3 曾經填進
+> `/etc/systemd/system/` 的實際值，而且是**靜默**的——沒有任何錯誤輸出，服務照樣
+> `active`，功能卻已經壞掉。跑完這段之後**不要 start 服務**，先回 §5.1a 步驟 3 還原。
+> 首次安裝（`/etc/systemd/system/` 底下還沒有 `filet-*.service`）則直接往下跑。
+
 ```bash
 sudo cp /opt/filet/spark/deploy/filet-keysvc.service   /etc/systemd/system/
 sudo cp /opt/filet/spark/deploy/filet-api.service      /etc/systemd/system/
@@ -303,6 +349,128 @@ sudo systemctl daemon-reload
 > 兩個**定時任務**（`filet-leaderboard` 與 `filet-perf-series`）的 unit 不在這裡裝，
 > 它們有自己的一節：**§5.7**。不做那一節不影響本節的服務起得來，但 leader 目錄頁
 > 會永遠沒有統計、績效序列會永久缺資料點（見該節）。
+
+### 5.1a ⭐⭐ 重新部署既有機器（**不是首次安裝就必讀這節**）
+
+> 編號用 `5.1a` 是刻意的插入步驟——不重編後面的章節號（避免既有交叉引用失效）。
+> **本節新增於 2026-07-19（實機重新部署發現）**：原文件只有首次安裝路徑，照著重跑
+> 一次會把機器打回未設定狀態。
+
+**問題**：§5.2／§5.3 用 `systemctl edit --full` 把實際值寫進
+`/etc/systemd/system/filet-*.service`，而 §5.1 的 `cp` 覆蓋的**正是同一個路徑**。
+所以在既有機器上重跑 §5.1，會靜默清掉全部 6 個已填入的值：
+
+| unit | 被清掉的值 | 後果 |
+|---|---|---|
+| `filet-api.service` | `FILET_API_NETWORK` | ⭐ 變回 `REPLACE_WITH_NETWORK` → **API 拒絕啟動**（唯一會大聲失敗的一個） |
+| `filet-api.service` | `FILET_BUILDER_ADDR` | builder 收益歸零／下單帶錯 builder |
+| `filet-api.service` | `FILET_SIWE_DOMAIN`、`FILET_SIWE_URI` | SIWE 登入全數失敗（domain 對不上） |
+| `filet-api.service` | `FILET_ADMIN_ADDRESSES` | 沒有人是 admin，後台進不去 |
+| `filet-keysvc.service` | `FILET_KEYSVC_ALLOWED_UIDS`（§5.2） | SO_PEERCRED 白名單失效 → filet-api 呼不到 key-service |
+
+`FILET_API_NETWORK` 起不來反而是**最幸運**的一個：其餘五個都是「服務照樣 active，
+功能靜默壞掉」。所以下面的還原步驟一條都不能跳。
+
+#### 步驟 1：覆蓋 unit 之前先備份
+
+```bash
+# 帶日期的備份目錄（同一天重跑多次也不互相覆蓋，故帶時分秒）
+BACKUP_DIR=/etc/filet/unit-backups/$(date -u +%Y-%m-%d-%H%M%S)
+sudo mkdir -p "$BACKUP_DIR"
+sudo cp -a /etc/systemd/system/filet-*.service "$BACKUP_DIR"/
+sudo chmod 700 /etc/filet/unit-backups "$BACKUP_DIR"   # 內含 admin／builder 位址，不給 other
+
+echo "$BACKUP_DIR"                     # 記下這個路徑，步驟 3 要用
+sudo ls -1 "$BACKUP_DIR"               # 驗收：至少有 filet-api.service 與 filet-keysvc.service
+```
+
+> ⚠️ `$BACKUP_DIR` 只是目前 shell 的變數，登出就沒了。中途登出重進的話，這樣找回最新那個：
+>
+> ```bash
+> BACKUP_DIR=/etc/filet/unit-backups/$(sudo ls -1 /etc/filet/unit-backups | sort | tail -1)
+> sudo ls -1 "$BACKUP_DIR"   # 驗收：確認是你要的那份備份
+> ```
+
+#### 步驟 2：照 §5.1 覆蓋 unit 檔
+
+回 §5.1 跑那段 `cp` ＋ `daemon-reload`。**跑完先不要 start 任何服務**，先做步驟 3。
+
+#### 步驟 3：把 6 個值從備份還原回去
+
+> ⭐ 下面的迴圈**刻意不印出任何值**——只印變數名。備份裡含 builder 錢包位址與
+> admin 位址，不該出現在部署日誌／終端捲動紀錄／截圖裡。
+
+```bash
+for PAIR in \
+  filet-api.service:FILET_API_NETWORK \
+  filet-api.service:FILET_BUILDER_ADDR \
+  filet-api.service:FILET_SIWE_DOMAIN \
+  filet-api.service:FILET_SIWE_URI \
+  filet-api.service:FILET_ADMIN_ADDRESSES \
+  filet-keysvc.service:FILET_KEYSVC_ALLOWED_UIDS
+do
+  UNIT="${PAIR%%:*}"; VAR="${PAIR##*:}"
+  LINE="$(sudo grep -m1 -E "^Environment=${VAR}=" "$BACKUP_DIR/$UNIT" || true)"
+  if [ -z "$LINE" ]; then
+    echo "★ $UNIT: $VAR 在備份中找不到——手動處理（舊版 unit 可能還沒有這個變數）"
+    continue
+  fi
+  case "$LINE" in
+    *REPLACE_WITH*)
+      echo "★ $UNIT: $VAR 備份裡仍是佔位符——舊機器本來就沒填好，依 §5.2／§5.3 手動填"
+      continue ;;
+  esac
+  # 用 | 當分隔符：值可能含 /（SIWE URI），但這 6 個值（網路名／hex 位址／網域／
+  # https URI／逗號分隔位址／數字 uid）都不含 | 或 &（& 在 sed 取代字串裡有特殊意義）。
+  # 未來若有值可能含這兩個字元，這一行要改成逐字元轉義的寫法。
+  sudo sed -i "s|^Environment=${VAR}=.*|${LINE}|" "/etc/systemd/system/$UNIT"
+  echo "restored: $UNIT $VAR"          # 只印變數名，不印值
+done
+```
+
+預期輸出：6 行 `restored: ...`，沒有任何 `★`。出現 `★` 就照該行提示手動補，
+**補完再往下**——這一節唯一的失敗模式就是「以為還原了，其實少了一個」。
+
+#### 步驟 4：daemon-reload 與驗證
+
+```bash
+sudo systemctl daemon-reload
+
+# 驗收 1：兩個 unit 都不再有殘留佔位符（只印檔名與計數，不印值）
+grep -c 'REPLACE_WITH' /etc/systemd/system/filet-api.service \
+                       /etc/systemd/system/filet-keysvc.service
+# 預期：兩行都以 :0 結尾
+
+# 驗收 2：network 確實不是佔位符，且與這台機器的定位相符
+#（此值非機密，刻意印出來看——它是填錯代價最高的一個，見 §5.3）
+grep -E '^Environment=FILET_API_NETWORK=' /etc/systemd/system/filet-api.service
+# 預期：testnet（測試機）或 mainnet（正式機）；出現 REPLACE_WITH_NETWORK 代表步驟 3 沒生效
+
+# 驗收 3：systemd 實際載入的值與檔案一致（daemon-reload 漏跑就會不一致）
+#（只比對變數名是否齊全，不印值）
+systemctl show filet-api.service -p Environment | tr ' ' '\n' \
+  | grep -oE 'FILET_(API_NETWORK|BUILDER_ADDR|SIWE_DOMAIN|SIWE_URI|ADMIN_ADDRESSES)' | sort
+# 預期：五個變數名各一行，一個都不缺
+```
+
+#### 步驟 5：其餘重新部署會踩到的點（逐一確認）
+
+- **§3.2 `uv sync` 與 §4.2 `npm ci`／`npm run build` 會 Permission denied**——首次部署
+  末尾已把 `/opt/filet/spark` chown 成 `root:root`。兩節各自已補上「build 前 chown 給
+  ubuntu、build 後還原 root」的步驟，照該節做。
+- **`var/` 目錄（leaders.json、manifest）靠 rsync 的 `--exclude var` 保護**——§3.2 兩段
+  rsync 的 exclude 清單少一個，`--delete` 就會連白名單一起刪掉。跑之前確認 exclude
+  清單完整（`.venv`／`web/node_modules`／`web/.next`／`var`）。
+- **`/var/lib/filet-exchange` 與 `/etc/filet/keys` 不受重新部署影響**（不在 repo 路徑下），
+  但仍值得跑一次 §5.5.1 的驗收確認權限沒被別的操作動過。
+- **§6 的 nginx 設定同樣不要重跑**——`cp nginx-filet.conf` 會蓋掉網域代換**與 certbot
+  寫進去的 `ssl_certificate` 路徑／HTTP→HTTPS redirect**，症狀是 `nginx -t` 直接失敗
+  （憑證路徑變回 `FILET_DOMAIN_PLACEHOLDER`）。反代設定沒改就整節跳過；真的改了就
+  先 `sudo cp -a /etc/nginx/sites-available/filet "$BACKUP_DIR"/` 再動，重跑後補做
+  `sed` 代換與 `sudo certbot --nginx -d <網域>`（certbot 會重新改寫，不需重新簽發）。
+- **§5.7 的兩個 timer unit 可以安全重跑**（那四個檔沒有任何佔位符），但重跑後要記得
+  `daemon-reload`。
+- **重啟順序照 §9.2**，不要在這裡逐一 `restart`。
 
 ### 5.2 填 `REPLACE_WITH_FILET_API_UID`
 
@@ -326,19 +494,28 @@ grep FILET_KEYSVC_ALLOWED_UIDS /etc/systemd/system/filet-keysvc.service   # 驗�
 
 ### 5.3 其餘環境變數佔位符
 
-`filet-api.service` 還有三個佔位符要填（同樣用 `systemctl edit --full filet-api.service`）：
+`filet-api.service` 還有五個佔位符要填（同樣用 `systemctl edit --full filet-api.service`）：
 
 | 變數 | 填入值 |
 |---|---|
+| `FILET_API_NETWORK` | ⭐ `testnet` 或 `mainnet`。**測試機必須填 `testnet`**——填成 `mainnet` 會讓這台機器連上主網、對真實資金下單。此欄 2026-07-19 起才成為佔位符（原本硬編 `mainnet`），見 `deploy/filet-api.service` 該行註解 |
 | `FILET_BUILDER_ADDR` | `FILET_BUILDER_ADDR_PLACEHOLDER`（附錄 A） |
 | `FILET_SIWE_DOMAIN` | `FILET_DOMAIN_PLACEHOLDER` 實際網域 |
 | `FILET_SIWE_URI` | `https://FILET_DOMAIN_PLACEHOLDER` |
 | `FILET_ADMIN_ADDRESSES` | `FILET_ADMIN_ADDRESSES_PLACEHOLDER`（附錄 A，逗號分隔） |
 
+> `FILET_API_NETWORK` 一列補於 2026-07-19（**實機重新部署發現**）：它已改為佔位符，
+> 但本表漏列，照本表填完會留下 `REPLACE_WITH_NETWORK`，API 直接拒絕啟動
+> （`config.from_env` 的 `network not in API_URLS`，fail-closed）。
+
 ```bash
 sudo systemctl daemon-reload
 grep -E 'REPLACE_WITH|PLACEHOLDER' /etc/systemd/system/filet-api.service
 # 驗收：改完後這個 grep 應該零輸出（找不到任何殘留佔位符）
+
+# ⭐ network 額外單獨確認一次（它是唯一「填錯不會報錯、但會連上主網」的欄位）
+grep -E '^Environment=FILET_API_NETWORK=' /etc/systemd/system/filet-api.service
+# 預期：testnet（測試機）或 mainnet（正式機）——與這台機器的定位相符才往下走
 ```
 
 ### 5.4 拉起服務（依序，逐一確認再往下）
@@ -435,6 +612,7 @@ ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 AR
 |---|---|---|---|---|
 | `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ **api→engine** 通道：客戶簽章的共享記錄 `leader_changes.json`（換 leader）＋ `capital_settings.json`（資金設定）。owner 寫、group 讀、other 無 |
 | `/var/lib/filet-exchange/engine/` | **`filet-engine:filet-api`** | **`0750`** | 手動 mkdir（本節） | ⭐ **engine→api** 通道（**owner/group 剛好對調**）：引擎發布的健康心跳 `engine/health/<account_id>.json`。引擎寫、API 讀 |
+| `/var/lib/filet-exchange/engine/health/` | **`filet-engine:filet-api`** | **`0750`** | 手動 mkdir（本節，2026-07-19 補） | 心跳檔實際落點。⭐ **不要倚賴引擎自建**——它建得出來，但會是 `filet-engine:filet-engine` ＋ umask 決定的 mode（通常 0755，比設計意圖寬），理由見本節下方 |
 
 > 兩份客戶簽章記錄**刻意分開兩個檔**（不是同一個檔多一個欄位）：讀者是兩個獨立的
 > 套用器，共用一個檔會讓其中一方的格式問題連坐另一方——而這兩件事各自都能造成
@@ -473,7 +651,26 @@ sudo chmod 0750 /var/lib/filet-exchange
 sudo mkdir -p /var/lib/filet-exchange/engine
 sudo chown filet-engine:filet-api /var/lib/filet-exchange/engine
 sudo chmod 0750 /var/lib/filet-exchange/engine
+
+# ⭐ health/ 這一層也要人工建（2026-07-19 實機重新部署發現——原文件漏了這三行）
+sudo mkdir -p /var/lib/filet-exchange/engine/health
+sudo chown filet-engine:filet-api /var/lib/filet-exchange/engine/health
+sudo chmod 0750 /var/lib/filet-exchange/engine/health
 ```
+
+**為什麼 `health/` 不能倚賴引擎自建**：引擎的 `write_heartbeat` 確實會
+`p.parent.mkdir(parents=True, exist_ok=True)`（`src/spark/filet/engine_health.py:217`），
+所以漏建**不會**壞掉功能——這正是它危險的地方：**它會安靜地成功，但建出來的權限比
+設計意圖寬**。引擎自建的結果是 `filet-engine:filet-engine`、mode 取決於當下的 umask
+（預設 022 → `0755`）：
+
+- group 錯成 `filet-engine`：filet-api 讀得到心跳**不是**靠群組，而是靠 `other` 的
+  `r-x` 位元——等於這一格對系統上**所有**帳號開放，而不是只對 API。
+- 哪天有人把服務的 umask 收緊（或加 `UMask=0077`），`other` 位元消失，**面板會在
+  沒有任何人改過部署的情況下突然全部變成 `missing`**——而根因藏在一次 umask 變更裡。
+
+人工建立讓這一格的權限是**部署決定**，跟上面 `engine/` 的理由一致：「引擎能寫什麼、
+誰讀得到」不該是引擎自己（或 umask）決定的事。
 
 **兩個 unit 都必須宣告 `FILET_EXCHANGE_DIR`**（`deploy/filet-api.service` 與
 `deploy/filet-follower@.service` 已內建，值必須逐字元相同）：
@@ -487,9 +684,24 @@ Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
 （unit 進 `failed`，是可監控的狀態）。「起不來」刻意優先於「起來了但功能靜默失效」
 ——後者可能好幾天沒人發現，而期間客戶每一次換 leader 都石沉大海。
 
-#### 驗收（七條都要跑，缺一條就沒證明打通）
+#### 驗收（八條都要跑，缺一條就沒證明打通）
 
 ```bash
+# ── 驗收 0：三層目錄的 owner/group/mode 逐層正確 ──
+# ⚠️ 必須 sudo（2026-07-19 實機重新部署發現）：根目錄是 0750 且 other 無權，
+# ubuntu 既不是 owner（filet-api）也不在 group（filet-engine），連 traverse 都不行——
+# 不加 sudo 的 `ls -ld` 會在後兩層直接 Permission denied，看起來像「目錄沒建」。
+sudo ls -ld /var/lib/filet-exchange \
+            /var/lib/filet-exchange/engine \
+            /var/lib/filet-exchange/engine/health
+# 預期（逐行）：
+#   drwxr-x--- ... filet-api    filet-engine  /var/lib/filet-exchange
+#   drwxr-x--- ... filet-engine filet-api     /var/lib/filet-exchange/engine
+#   drwxr-x--- ... filet-engine filet-api     /var/lib/filet-exchange/engine/health
+# ⭐ 第 2、3 行的 owner/group 相對第 1 行是**對調**的；三行的 mode 都必須是 drwxr-x---。
+# health 那行若是 filet-engine filet-engine 或 drwxr-xr-x，代表它是引擎自建的，
+# 照上面三行指令重設一次（引擎下個 cycle 不會再改它）。
+
 # ── api→engine 通道（根目錄）──
 # 驗收 1：filet-api 寫得進去
 sudo -u filet-api touch /var/lib/filet-exchange/.probe \
@@ -676,8 +888,11 @@ systemctl status filet-perf-series.service --no-pager -l   # 預期：SUCCESS
 
 # 驗收 3：產物真的落地了（unit 回 SUCCESS 但沒有檔＝白名單是空的／路徑錯）
 # 版面出自 scripts/watchlist_snapshot.py 與 filet/perf_series.py 的 series_dir_for：
-#   <FILET_DATA_DIR>/leaderboard/watchlist/<YYYY-MM-DD>.json   （一天一個檔）
-#   <FILET_DATA_DIR>/leaderboard/perf_series/<address>.json    （一個 leader 一個檔）
+#   <FILET_DATA_DIR>/leaderboard/watchlist/<YYYY-MM-DD>.json    （一天一個檔）
+#   <FILET_DATA_DIR>/leaderboard/perf_series/<address>.jsonl    （一個 leader 一個檔）
+# ⚠️ 副檔名是 .jsonl 不是 .json（2026-07-19 實機重新部署發現，原文件寫錯）——
+# 實際出自 `series_path_for`（src/spark/filet/perf_series.py:105，append-only 每行一筆）。
+# 照舊文找 .json 會一個檔都找不到，誤判成「產物沒落地」而去查根本沒壞的 timer。
 sudo ls -l /var/lib/filet-api/leaderboard/watchlist/   | tail -5
 sudo ls -l /var/lib/filet-api/leaderboard/perf_series/ | tail -5
 # 預期：watchlist 有今天日期的檔；perf_series 每個白名單 leader 各一個檔，
