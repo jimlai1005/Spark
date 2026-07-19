@@ -180,7 +180,8 @@ def test_cross_customer_sources_are_admin_gated(tmp_path):
         checked.append(path)
     # 檢查真的有跑到東西（空迴圈全綠是最糟的假保證）
     assert set(checked) == {"/api/ops/customers", "/api/ops/revenue",
-                            "/api/ops/subscriptions", "/api/ops/trade-quality"}
+                            "/api/ops/subscriptions", "/api/ops/trade-quality",
+                            "/api/ops/health"}
 
 
 def test_all_admin_scoped_routes_are_gated(tmp_path):
@@ -200,7 +201,7 @@ def test_all_admin_scoped_routes_are_gated(tmp_path):
             f"{path} 未掛 admin 閘"
         seen.add(path)
     assert seen == {"/api/ops/customers", "/api/ops/revenue", "/api/ops/subscriptions",
-                    "/api/ops/trade-quality", "/api/admin/pending"}
+                    "/api/ops/trade-quality", "/api/ops/health", "/api/admin/pending"}
 
 
 @pytest.mark.parametrize("path", ["/api/ops/customers", "/api/ops/revenue",
@@ -980,3 +981,256 @@ def test_summary_reports_sample_size_not_just_a_number(tmp_path):
     assert s["delay_sample"] == 1
     assert s["worst_median_delay_s"] == "4"
     assert s["skipped_available_count"] == 0
+
+
+# ---------- ⭐ 系統健康面板（admin only；謊報健康比沒有面板更危險） ----------
+
+def _h_app(tmp_path, refs=None, state_base=None, exchange_dir=None):
+    wallet = Account.create()
+    refs = refs if refs is not None else [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(state_base or (tmp_path / "state")),
+                   exchange_dir=str(exchange_dir or (tmp_path / "exchange")))
+    app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    client = _client(app)
+    login(client, wallet=wallet)
+    return client, cfg
+
+
+def _write_samples(state_base, account_id, samples):
+    p = Path(state_base) / account_id / "var/copytrade/equity_samples.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps([[ts, str(v)] for ts, v in samples]))
+
+
+def _trip_killswitch(state_base, account_id):
+    p = Path(state_base) / account_id / "var/copytrade/killswitch.tripped"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"status": "tripped"}))
+
+
+def test_health_requires_session(tmp_path):
+    cfg = _ops_cfg(tmp_path)
+    app, *_ = make_app(tmp_path, cfg=cfg)
+    assert _client(app).get("/api/ops/health").status_code == 401
+
+
+def test_health_403_for_non_admin(tmp_path):
+    cfg = _ops_cfg(tmp_path)
+    app, *_ = make_app(tmp_path, cfg=cfg)
+    client = _client(app)
+    login(client)
+    assert client.get("/api/ops/health").status_code == 403
+
+
+def test_health_reports_alive_engine_with_fresh_samples(tmp_path):
+    """引擎每 cycle 寫一筆 equity 樣本 → 有新樣本＝存活（代理指標）。"""
+    client, cfg = _h_app(tmp_path)
+    now = datetime.now(timezone.utc).timestamp()
+    _write_samples(cfg.state_base, ACCT_A, [(now - 7200, "1000"), (now - 30, "1010")])
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["engine_alive"] is True
+    assert row["last_sample_age_s"] is not None and row["last_sample_age_s"] < 120
+    assert row["sample_count"] == 2
+    assert row["sample_coverage_sufficient"] is True
+    assert row["killswitch_tripped"] is False and row["killswitch_known"] is True
+
+
+def test_health_reports_stale_engine(tmp_path):
+    """樣本很舊（> ENGINE_STALE_S）→ engine_alive=false（明確的壞，不是未知）。"""
+    from spark.publicapi.ops import ENGINE_STALE_S
+
+    client, cfg = _h_app(tmp_path)
+    now = datetime.now(timezone.utc).timestamp()
+    _write_samples(cfg.state_base, ACCT_A, [(now - ENGINE_STALE_S - 300, "1000")])
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["engine_alive"] is False
+
+
+def test_no_samples_is_unknown_not_dead_and_not_alive(tmp_path):
+    """⭐⭐ 無樣本 → engine_alive=null。**不是 false**（那是「已確認沒回應」），
+    更不是 true。三態必須分得開，否則面板無法區分「引擎掛了」與「我們看不到」。"""
+    client, cfg = _h_app(tmp_path)
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["engine_alive"] is None
+    assert row["last_sample_age_s"] is None
+    assert row["sample_count"] == 0
+
+
+def test_liveness_basis_is_declared_not_claimed_as_process_check(tmp_path):
+    """⭐ 誠實標註：這是 equity 樣本的代理，不是 process 檢查。
+    把代理當成真的存活檢查上呈，是另一種謊報健康。"""
+    client, cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert body["followers"][0]["liveness_basis"] == "equity_sample"
+    assert body["engine_stale_after_s"] > 0
+
+
+def test_health_reports_tripped_killswitch(tmp_path):
+    client, cfg = _h_app(tmp_path)
+    _trip_killswitch(cfg.state_base, ACCT_A)
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["killswitch_tripped"] is True
+    assert client.get("/api/ops/health").json()["summary"][
+        "killswitch_tripped_count"] == 1
+
+
+def test_unreadable_samples_do_not_report_healthy_coverage(tmp_path):
+    """⭐ 樣本檔存在但讀不出來 → coverage_known=false ＋ null，不報一個健康的覆蓋度。
+    read_error 與「首次啟動無檔」是兩件事，後者較輕微。"""
+    client, cfg = _h_app(tmp_path)
+    p = Path(cfg.state_base) / ACCT_A / "var/copytrade/equity_samples.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("[]")
+    p.chmod(0o000)
+    try:
+        row = client.get("/api/ops/health").json()["followers"][0]
+    finally:
+        p.chmod(0o644)
+    assert row["coverage_known"] is False
+    assert row["sample_coverage_sufficient"] is None
+    assert row["error"] is not None
+
+
+def test_alerts_count_and_zero_is_a_real_zero(tmp_path):
+    """告警檔不存在＝引擎從未寫過告警，那確實是 0（與「讀不到」不同）。"""
+    client, cfg = _h_app(tmp_path)
+    assert client.get("/api/ops/health").json()["followers"][0]["alerts"] == 0
+
+    p = Path(cfg.state_base) / ACCT_A / "var/copytrade/alerts.log"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("a\nb\n\nc\n")
+    body = client.get("/api/ops/health").json()
+    assert body["followers"][0]["alerts"] == 3          # 空行不計
+    assert body["summary"]["alerts_total"] == 3
+
+
+def test_unapplied_leader_change_backlog_is_reported(tmp_path):
+    """⭐ 「客戶簽了、API 收了、引擎從沒套用」的即時視圖——與日報同一個判定
+    （leader_change_apply.scan_unapplied_leader_changes）。"""
+    from spark.filet.leader_change import build_leader_change_record
+
+    exchange = tmp_path / "exchange"
+    exchange.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    issued = (now - timedelta(hours=2)).isoformat()
+    rec = build_leader_change_record(
+        account_id=ACCT_A, leader_address=LEADER, nonce="n1",
+        issued_at=issued, signature="0xsig", message="m")
+    (exchange / "leader_changes.json").write_text(json.dumps({"changes": [rec]}))
+
+    client, cfg = _h_app(tmp_path, exchange_dir=exchange)
+    body = client.get("/api/ops/health").json()
+    assert body["summary"]["unapplied_leader_changes"] == 1
+    entry = body["unapplied_leader_changes"][0]
+    assert entry["account_id"] == ACCT_A and entry["reason"] == "not_redeemed"
+
+
+def test_fresh_leader_change_is_not_backlog(tmp_path):
+    """還新的記錄不算積壓（引擎可能只是還沒跑到下一輪）——不得狼來了。"""
+    from spark.filet.leader_change import build_leader_change_record
+
+    exchange = tmp_path / "exchange"
+    exchange.mkdir(parents=True, exist_ok=True)
+    issued = datetime.now(timezone.utc).isoformat()
+    rec = build_leader_change_record(
+        account_id=ACCT_A, leader_address=LEADER, nonce="n1",
+        issued_at=issued, signature="0xsig", message="m")
+    (exchange / "leader_changes.json").write_text(json.dumps({"changes": [rec]}))
+
+    client, cfg = _h_app(tmp_path, exchange_dir=exchange)
+    assert client.get("/api/ops/health").json()[
+        "summary"]["unapplied_leader_changes"] == 0
+
+
+def test_unreadable_change_file_yields_null_backlog_not_zero(tmp_path):
+    """⭐⭐ 記錄檔讀不到 → 積壓回 **null ＋ 錯誤原文**，不是 0。
+    0 會被讀成「沒有積壓」，實際上是「無從得知有沒有積壓」——正好相反的兩件事。"""
+    exchange = tmp_path / "exchange"
+    exchange.mkdir(parents=True, exist_ok=True)
+    (exchange / "leader_changes.json").write_text("{ not json")
+
+    client, cfg = _h_app(tmp_path, exchange_dir=exchange)
+    summary = client.get("/api/ops/health").json()["summary"]
+    assert summary["unapplied_leader_changes"] is None
+    assert summary["leader_change_errors"], "查不下去必須留下原因"
+
+
+def test_summary_separates_unknown_from_healthy(tmp_path):
+    """⭐⭐ 「0 個引擎沒回應」與「全部引擎狀態都讀不到」在單一計數上長得一樣。
+    每個計數都必須有 *_unknown 兄弟欄，否則面板會把看不見畫成健康。"""
+    client, cfg = _h_app(tmp_path, refs=[_lref(), _lref(ACCT_B, ADDR_B, "B")])
+    now = datetime.now(timezone.utc).timestamp()
+    _write_samples(cfg.state_base, ACCT_A, [(now - 7200, "1"), (now - 10, "1")])
+
+    s = client.get("/api/ops/health").json()["summary"]
+    assert s["followers"] == 2
+    assert s["engine_alive_count"] == 1
+    assert s["engine_stale_count"] == 0          # B 不是「沒回應」
+    assert s["engine_unknown_count"] == 1        # B 是「不知道」
+    # ⚠️ 覆蓋度與存活是**兩個不同的三態**，刻意不合併：B 沒有樣本檔，
+    # 「回撤保護尚未生效」是一個**確定**的答案（insufficient），而「引擎在不在」
+    # 才是不知道。unknown 只保留給真正讀不到的情形（read_error）。
+    assert s["coverage_insufficient_count"] == 1
+    assert s["coverage_unknown_count"] == 0
+
+
+def test_health_survives_a_missing_state_root(tmp_path):
+    """狀態根整個不存在（follower 剛 activate、尚未啟動）→ 未知，不是 500。"""
+    client, cfg = _h_app(tmp_path, state_base=tmp_path / "nonexistent")
+    body = client.get("/api/ops/health").json()
+    assert body["followers"][0]["engine_alive"] is None
+    assert body["followers"][0]["killswitch_tripped"] is False
+
+
+def test_unreadable_state_root_never_reports_killswitch_as_untripped(tmp_path):
+    """⭐⭐ 本面板最不能犯的錯，寫成回歸測試。
+
+    引擎的狀態根是 `filet-engine:filet-engine 0700`，面板跑在 filet-api 進程——
+    跨了一道權限邊界。`Path.exists()` 會把 PermissionError **吞成 False**，於是
+    `is_tripped()` 會對一個**確實已經觸發**的 kill switch 回答「沒有觸發」：面板
+    會在客戶的引擎已經熔斷、部位已被平掉的當下，告訴管理員一切正常。
+
+    正確行為：整列標未知（null）＋ error，絕不落到任何看起來健康的預設值。
+    """
+    client, cfg = _h_app(tmp_path)
+    root = Path(cfg.state_base) / ACCT_A
+    root.mkdir(parents=True, exist_ok=True)
+    _trip_killswitch(cfg.state_base, ACCT_A)      # 確實觸發了
+    root.chmod(0o000)                              # 但面板讀不到
+    try:
+        body = client.get("/api/ops/health").json()
+    finally:
+        root.chmod(0o755)
+
+    row = body["followers"][0]
+    assert row["killswitch_tripped"] is None, "讀不到絕不可回報成「沒有觸發」"
+    assert row["killswitch_known"] is False
+    assert row["engine_alive"] is None
+    assert row["alerts"] is None
+    assert row["error"] is not None
+    assert body["summary"]["killswitch_unknown_count"] == 1
+    assert body["summary"]["killswitch_tripped_count"] == 0   # 未知不算成已觸發
+
+
+def test_absent_state_root_is_distinguished_from_unreadable(tmp_path):
+    """`absent`（剛 activate、引擎沒跑過）與 `unreadable`（有東西但看不到）必須
+    分開：前者「沒有 ARM 檔」是**真的**沒觸發，後者只能說不知道。"""
+    from spark.publicapi.ops import state_root_status
+
+    missing = tmp_path / "nope" / "acct"
+    assert state_root_status(missing) == "absent"
+
+    root = tmp_path / "state" / "acct"
+    root.mkdir(parents=True)
+    assert state_root_status(root) == "readable"
+    root.chmod(0o000)
+    try:
+        assert state_root_status(root) == "unreadable"
+    finally:
+        root.chmod(0o755)

@@ -95,7 +95,8 @@ from pathlib import Path
 from spark.copytrade.notifier import Notifier
 from spark.filet.followers import load_followers, normalize_hex_address
 from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_for,
-                                       load_leader_changes, verify_leader_change)
+                                       load_leader_changes, parse_issued_at,
+                                       verify_leader_change)
 from spark.filet.leader_resolve import (DEFAULT_EXCHANGE_DIR, SOURCE_CUSTOMER_SIGNED,
                                         LeaderResolution, LeaderResolutionError,
                                         LeaderRevokedError)
@@ -175,6 +176,101 @@ def resolve_changes_path(env=None) -> str:
     ⚠️ 沒有「取不到就回預設值」這條路：那正是 C3 的成因（見 require_exchange_dir）。
     """
     return leader_changes_path_for(require_exchange_dir(env))
+
+
+# ⭐ 「已寫入但未被套用」的判定門檻（秒）。一筆記錄落地超過這麼久，引擎的已兌現帳本
+# 卻還沒有對應的 nonce ⇒ 這條鏈路壞了。30 分鐘遠大於引擎的 cycle 間隔（數十秒）與
+# 任何合理的重啟窗，所以逾時不可能是「還沒輪到」；它是真的沒發生。
+LEADER_CHANGE_STALE_S = 1800
+
+
+@dataclass(frozen=True)
+class UnappliedChange:
+    """一筆「客戶簽了、API 收了，但引擎從沒套用」的變更（或一個讓人無法確認的障礙）。
+
+    `reason` 是機器可讀碼，呼叫端據此決定怎麼呈現：
+    - `not_redeemed`——記錄逾時，帳本裡沒有對應的已兌現 nonce（**本體**）。
+    - `bad_issued_at`——記錄的 issued_at 不合法，引擎會拒絕它。
+    - `ledger_unreadable`——帳本讀不到，**無法確認**是否已套用（不是「未套用」）。
+    """
+
+    account_id: str
+    nonce: str | None
+    age_s: float | None
+    ledger_path: str | None
+    reason: str
+    detail: str | None = None
+
+
+def scan_unapplied_leader_changes(refs, now_s: float, *, changes_path=None,
+                                  ledger_for, stale_s: float = LEADER_CHANGE_STALE_S
+                                  ) -> tuple[list[UnappliedChange], list[str]]:
+    """對帳「客戶簽了、API 收了，但引擎從沒套用」的整類失敗（**結構化結果**）。
+
+    ⭐ 為什麼需要這一項（2026-07-19 opus 審查 I2）
+    ----------------------------------------------
+    換 leader 這條鏈路橫跨兩個進程、兩套權限、兩個目錄。它的可用性失敗是**靜默**的：
+    API 驗完章、寫檔、回客戶 200「於引擎的下一個 cycle 生效」，而引擎那邊可能根本
+    讀不到那個檔（路徑不通、group 權限錯、引擎沒在跑）。三種原因症狀完全一樣——
+    什麼都不會發生，兩邊的 log 都正常，客戶以為換好了，實際上還跟著舊 leader。
+
+    判定用的兩個值刻意同源同單位（工程原則 1）：記錄的年齡由**記錄自己的**
+    `issued_at` 換算成 epoch 秒，與傳入的 `now_s` 相減；帳本則用引擎寫入時的同一個
+    `load_ledger`。跨進程比對「這顆 nonce 兌現了沒」只看 `redeemed`——那正是引擎
+    冪等性的唯一述詞，用別的欄位推斷會與引擎的實際行為漂移。
+
+    ⭐⭐ **本函式是這個判定的單一定義**，有兩個消費端：每日對帳報告
+    （`scripts/filet_daily_report.leader_change_warnings`，渲染成人看的字串）與
+    營運健康面板（`/api/ops/health`，即時視圖）。兩邊各寫一次判定式，其中一邊遲早
+    會與引擎的實際行為漂移——而一個對帳工具最糟的失效是狼來了，因為它會訓練
+    操作者忽略它。
+
+    回傳 `(findings, errors)`：`errors` 是「這條鏈路本身查不下去」的障礙
+    （交換目錄沒設好、記錄檔讀不到），**不 raise**——呼叫端的其他部分不該被
+    這一項的失敗擋住。
+    """
+    try:
+        path = changes_path or resolve_changes_path()
+    except ValueError as e:
+        # 交換目錄本身沒設好 ⇒ 這條鏈路必定不通。這**就是**要報的事，不是略過的理由。
+        return [], [f"換 leader 記錄無法定位（交換目錄設定有問題）：{e}"]
+    try:
+        records = load_leader_changes(path)
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        return [], [f"換 leader 記錄檔讀取失敗（{path}）：{e!r}"
+                    f"——無法確認是否有未套用的變更"]
+
+    known = {r.account_id for r in refs}
+    findings: list[UnappliedChange] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        account_id, nonce = rec.get("account_id"), rec.get("nonce")
+        if not isinstance(account_id, str) or not isinstance(nonce, str):
+            continue
+        if account_id not in known:
+            # manifest 沒有這個帳號＝尚未 activate。引擎本來就不會套用它，不是鏈路故障。
+            continue
+        try:
+            age_s = now_s - parse_issued_at(rec.get("issued_at")).timestamp()
+        except (LeaderChangeError, AttributeError):
+            findings.append(UnappliedChange(account_id, nonce, None, None,
+                                            "bad_issued_at"))
+            continue
+        if age_s <= stale_s:
+            continue        # 還新，引擎可能只是還沒跑到下一輪
+        ledger_path = ledger_for(account_id)
+        try:
+            ledger = load_ledger(ledger_path)
+        except (OSError, ValueError) as e:
+            findings.append(UnappliedChange(account_id, nonce, age_s,
+                                            str(ledger_path), "ledger_unreadable",
+                                            detail=repr(e)))
+            continue
+        if nonce not in ledger.redeemed:
+            findings.append(UnappliedChange(account_id, nonce, age_s,
+                                            str(ledger_path), "not_redeemed"))
+    return findings, []
 
 
 @dataclass(frozen=True)

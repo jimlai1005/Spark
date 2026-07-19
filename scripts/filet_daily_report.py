@@ -42,10 +42,8 @@ from spark.config import API_URLS
 from spark.exchange.hyperliquid import HyperliquidAdapter
 from spark.filet.aggregate import aggregate, builder_fee_delta, collect_follower_summary, render_aggregate
 from spark.filet.followers import load_followers_tolerant
-from spark.filet.leader_change import (LeaderChangeError, load_leader_changes,
-                                       parse_issued_at)
-from spark.filet.leader_change_apply import (LEDGER_RELPATH, load_ledger,
-                                             resolve_changes_path)
+from spark.filet.leader_change_apply import (LEADER_CHANGE_STALE_S, LEDGER_RELPATH,
+                                             scan_unapplied_leader_changes)
 from spark.filet.leader_resolve import DEFAULT_MANIFEST_PATH
 
 # ⭐ repo 根錨定，**不是** CWD 相對（沿 leader_resolve.DEFAULT_MANIFEST_PATH 的
@@ -58,11 +56,6 @@ VAR_DIR = Path(DEFAULT_MANIFEST_PATH).parent
 DEFAULT_MANIFEST = VAR_DIR / "followers.json"
 SNAPSHOT_PATH = VAR_DIR / "builder_accrued_snapshot.json"
 REPORTS_DIR = VAR_DIR / "reports"
-
-# ⭐ 「已寫入但未被套用」的判定門檻（秒）。一筆記錄落地超過這麼久，引擎的已兌現帳本
-# 卻還沒有對應的 nonce ⇒ 這條鏈路壞了。30 分鐘遠大於引擎的 cycle 間隔（數十秒）與
-# 任何合理的重啟窗，所以逾時不可能是「還沒輪到」；它是真的沒發生。
-LEADER_CHANGE_STALE_S = 1800
 
 # per-follower 狀態根的基底（對齊 systemd 的 FILET_STATE_DIR=/opt/filet/state/%i，
 # 沿 panic_all.py 的同一個 env 與同一個預設值——同一件事兩個名字是誤設的溫床）。
@@ -128,49 +121,30 @@ def leader_change_warnings(refs, now_s, changes_path=None, ledger_for=None) -> l
 
     回傳的是給人看的告警字串清單（空清單＝一切正常）。不 raise：日報的其他部分
     （北極星）不該被這一項的失敗擋住。
+
+    ⭐ 判定本身住在 `leader_change_apply.scan_unapplied_leader_changes`（**單一定義**），
+    本函式只負責渲染成人看的字串。營運健康面板（/api/ops/health）是同一個判定的
+    即時視圖，兩邊各寫一次判定式會漂移，而一個對帳工具最糟的失效是狼來了。
     """
     ledger_for = ledger_for or ledger_path_for
-    try:
-        path = changes_path or resolve_changes_path()
-    except ValueError as e:
-        # 交換目錄本身沒設好 ⇒ 這條鏈路必定不通。這**就是**要報的事，不是略過的理由。
-        return [f"換 leader 記錄無法定位（交換目錄設定有問題）：{e}"]
-    try:
-        records = load_leader_changes(path)
-    except (OSError, ValueError, TypeError, AttributeError) as e:
-        return [f"換 leader 記錄檔讀取失敗（{path}）：{e!r}——無法確認是否有未套用的變更"]
+    findings, errors = scan_unapplied_leader_changes(
+        refs, now_s, changes_path=changes_path, ledger_for=ledger_for,
+        stale_s=LEADER_CHANGE_STALE_S)
 
-    known = {r.account_id for r in refs}
-    warnings: list[str] = []
-    for rec in records:
-        if not isinstance(rec, dict):
-            continue
-        account_id, nonce = rec.get("account_id"), rec.get("nonce")
-        if not isinstance(account_id, str) or not isinstance(nonce, str):
-            continue
-        if account_id not in known:
-            # manifest 沒有這個帳號＝尚未 activate。引擎本來就不會套用它，不是鏈路故障。
-            continue
-        try:
-            age_s = now_s - parse_issued_at(rec.get("issued_at")).timestamp()
-        except (LeaderChangeError, AttributeError):
-            warnings.append(f"換 leader 記錄的 issued_at 不合法（account={account_id}）"
+    warnings: list[str] = list(errors)
+    for f in findings:
+        if f.reason == "bad_issued_at":
+            warnings.append(f"換 leader 記錄的 issued_at 不合法（account={f.account_id}）"
                             f"——引擎會拒絕它，客戶的變更不會生效")
-            continue
-        if age_s <= LEADER_CHANGE_STALE_S:
-            continue        # 還新，引擎可能只是還沒跑到下一輪
-        ledger_path = ledger_for(account_id)
-        try:
-            ledger = load_ledger(ledger_path)
-        except (OSError, ValueError) as e:
-            warnings.append(f"換 leader 對帳失敗：帳本讀不到（{ledger_path}）：{e!r}"
-                            f"——無法確認 account={account_id} 的變更是否已套用")
-            continue
-        if nonce not in ledger.redeemed:
+        elif f.reason == "ledger_unreadable":
+            warnings.append(f"換 leader 對帳失敗：帳本讀不到（{f.ledger_path}）："
+                            f"{f.detail}——無法確認 account={f.account_id} 的變更"
+                            f"是否已套用")
+        else:
             warnings.append(
-                f"**換 leader 已記錄但未被套用**：account={account_id} 的變更已落地 "
-                f"{age_s / 60:.0f} 分鐘（> {LEADER_CHANGE_STALE_S // 60} 分），引擎帳本"
-                f"（{ledger_path}）卻沒有對應的已兌現 nonce。客戶以為換好了，實際仍跟"
+                f"**換 leader 已記錄但未被套用**：account={f.account_id} 的變更已落地 "
+                f"{f.age_s / 60:.0f} 分鐘（> {LEADER_CHANGE_STALE_S // 60} 分），引擎帳本"
+                f"（{f.ledger_path}）卻沒有對應的已兌現 nonce。客戶以為換好了，實際仍跟"
                 f"舊 leader。請依序檢查：交換目錄權限（RUNBOOK §5.5.1 的四條驗收）、"
                 f"兩個 unit 的 FILET_EXCHANGE_DIR 是否同值、該 follower 引擎是否在跑")
     return warnings

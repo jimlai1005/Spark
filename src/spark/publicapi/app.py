@@ -6,6 +6,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -33,12 +34,19 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
                                      has_active_subscription, plan_catalog,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
+# 健康面板讀的是**引擎自己寫的**狀態檔——路徑常數與判定一律引用引擎的定義，
+# 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
+from spark.copytrade.equity import sample_coverage
+from spark.copytrade.killswitch import ALERTS_LOG_RELPATH, is_tripped
+from spark.filet.leader_change_apply import LEDGER_RELPATH as LC_LEDGER_RELPATH
+from spark.filet.leader_change_apply import scan_unapplied_leader_changes
+from spark.publicapi.ops import ENGINE_STALE_S
 from spark.publicapi.ops import (accrued_window, accrued_window_note, customer_pnl,
-                                 jsonable, load_accrued_series,
-                                 load_skipped_notional, revenue_reconciliation,
-                                 skipped_path_for, subscription_drift,
-                                 trade_quality_rows, trade_quality_summary,
-                                 utc_days_in_window)
+                                 follower_health, health_summary, jsonable,
+                                 load_accrued_series, load_skipped_notional,
+                                 revenue_reconciliation, skipped_path_for,
+                                 subscription_drift, trade_quality_rows,
+                                 trade_quality_summary, utc_days_in_window)
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
@@ -993,6 +1001,67 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                          "window": "days",
                          "customers": rows,
                          "manifest_errors": manifest_errors})
+
+    @app.get("/api/ops/health")
+    def ops_health(admin: str = Depends(_require_admin)):
+        """系統健康面板（admin only）：引擎存活、kill switch、樣本覆蓋度、上次快照
+        時間、告警數，以及**換 leader 已寫入但未套用的積壓**。
+
+        ⭐⭐ 本端點的設計原則只有一條：**讀不到就說讀不到**。每一格都有一個
+        「未知」狀態，且未知**絕不**被折疊成看起來健康的值——
+        - kill switch 讀不到 → `null` ＋ `killswitch_known=false`（不是「沒觸發」）
+        - 無 equity 樣本 → `engine_alive=null`（不是 false，更不是 true）
+        - 告警檔讀不到 → `alerts=null`（不是 0）
+        - 換 leader 鏈路查不下去 → `unapplied_leader_changes=null`（不是 0）
+        健康面板的讀者用它決定「要不要現在去看」；一個謊報健康的格子會讓他**不去
+        看**，而那正是他最該去看的時刻。謊報健康比沒有面板更危險。
+
+        ⚠️ `engine_alive` 的基準（誠實標註，`liveness_basis` 欄位一併上呈）：
+        這**不是** process 檢查，而是「引擎最近有沒有寫 equity 樣本」的代理
+        （引擎每 cycle 寫一筆）。一個還在寫檔卻不下單的進程，這一格看起來會健康。
+        真正的 process 存活由 systemd 管（RUNBOOK 的 `systemctl status`）。
+
+        ⭐ 積壓的判定與每日對帳報告**同源**：兩者都呼叫
+        `leader_change_apply.scan_unapplied_leader_changes`，不各自寫一次判定式
+        ——本端點是那份日報的即時視圖，兩邊漂移會讓其中一邊變成狼來了。
+        """
+        refs, manifest_errors = _load_followers()
+        now_s = now_fn()
+
+        def _state_root(ref):
+            return Path(cfg.state_base) / ref.account_id
+
+        rows = [follower_health(
+            ref, _state_root(ref), now_fn=lambda: now_s,
+            coverage_fn=lambda root: sample_coverage(root, now_fn=lambda: now_s),
+            killswitch_fn=is_tripped,
+            alerts_path_fn=lambda root: root / ALERTS_LOG_RELPATH,
+        ) for ref in refs]
+
+        # 換 leader 積壓：查不下去（交換目錄沒設好、記錄檔讀不到）→ None ＋ 錯誤原文，
+        # **不是 0**。0 會被讀成「沒有積壓」，實際是「無從得知有沒有積壓」。
+        try:
+            findings, lc_errors = scan_unapplied_leader_changes(
+                refs, now_s,
+                changes_path=cfg.leader_changes_path,
+                ledger_for=lambda acct: (Path(cfg.state_base) / acct
+                                         / LC_LEDGER_RELPATH))
+        except Exception as e:  # noqa: BLE001 — 健康面板不得被單一項目打成 500
+            logger.warning("換 leader 積壓掃描失敗: %r", e)
+            findings, lc_errors = None, [f"換 leader 積壓掃描失敗：{e!r}"]
+
+        backlog = None if (findings is None or lc_errors) else len(findings)
+        return jsonable({
+            "checked_at": datetime.fromtimestamp(now_s, timezone.utc).isoformat(),
+            "engine_stale_after_s": ENGINE_STALE_S,
+            "followers": rows,
+            "unapplied_leader_changes": [
+                {"account_id": f.account_id, "nonce": f.nonce,
+                 "age_s": f.age_s, "reason": f.reason}
+                for f in (findings or [])],
+            "summary": health_summary(rows, backlog, lc_errors),
+            "manifest_errors": manifest_errors,
+        })
 
     @app.get("/api/ops/trade-quality")
     def ops_trade_quality(days: int | None = None, window: str | None = None,

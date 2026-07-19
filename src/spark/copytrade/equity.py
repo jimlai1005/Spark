@@ -46,6 +46,11 @@ class SampleCoverage:
     count: int
     oldest_age_s: float  # 無樣本時為 0.0
     read_error: bool     # True＝檔案存在但讀不出來（與「首次啟動無檔」不同，更嚴重）
+    # ⭐ 最新樣本的年齡（秒）；**無樣本時為 None，不是 0.0**。
+    # 引擎每個 cycle 寫一筆樣本，所以這個值是「引擎上次動的時間」最好的可觀測代理
+    # （見 /api/ops/health 的 liveness_basis）。None 與 0.0 在這裡差很多：0.0 是
+    # 「剛剛才寫過」＝最健康的值，而無樣本其實是「完全不知道引擎在不在」。
+    newest_age_s: float | None = None
 
     @property
     def sufficient(self) -> bool:
@@ -64,10 +69,12 @@ def sample_coverage(root: Path, *, now_fn=time.time, window_s: int = WINDOW_S) -
     now = float(now_fn())
     samples = [(ts, v) for ts, v in _load(path) if 0 <= now - ts <= window_s]
     oldest = min((ts for ts, _ in samples), default=None)
+    newest = max((ts for ts, _ in samples), default=None)
     return SampleCoverage(
         count=len(samples),
         oldest_age_s=(now - oldest) if oldest is not None else 0.0,
         read_error=read_error,
+        newest_age_s=(now - newest) if newest is not None else None,
     )
 
 

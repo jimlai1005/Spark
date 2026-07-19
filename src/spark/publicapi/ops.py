@@ -14,6 +14,7 @@
 """
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -298,6 +299,164 @@ def trade_quality_summary(rows) -> dict:
         "delay_sample": len(delays),
         "worst_taker_slippage_bp_median": max(slips) if slips else None,
         "slippage_sample": len(slips),
+    }
+
+
+# ---------- 系統健康（跨 follower 聚合） ----------
+
+# 引擎每個 cycle 寫一筆 equity 樣本；超過這麼久沒有新樣本 ⇒ 判為 stale。
+# ⭐ 取遠大於 `CopySettings.interval_s` 預設（60s）的值：門檻若貼近 cycle 間隔，
+# 一次正常的 GC 停頓或一輪慢的 API 就會讓面板閃紅——而會誤報的面板等於沒有面板
+# （操作者會學會忽略它）。10 分鐘＝連續 10 個 cycle 沒動，那不是抖動。
+ENGINE_STALE_S = 600
+
+
+def _alerts_count(path) -> int | None:
+    """告警記錄的行數；讀不到 → None（**不是 0**）。
+
+    0 是「沒有任何告警」＝面板上最令人安心的數字。讀不到卻顯示 0，等於在
+    「告警檔權限壞掉」的當下告訴操作者一切正常——健康面板謊報健康比沒有面板更危險。
+    """
+    p = Path(path)
+    if not p.exists():
+        return 0        # 檔案不存在＝引擎從未寫過告警，這確實是 0
+    try:
+        return sum(1 for line in p.read_text().splitlines() if line.strip())
+    except OSError as e:
+        logger.warning("告警記錄讀取失敗（%s）: %r", p, e)
+        return None
+
+
+def state_root_status(root) -> str:
+    """狀態根的可讀性：`absent` | `readable` | `unreadable`。
+
+    ⭐⭐ 為什麼這個探測必須存在（否則面板會謊報健康）：引擎的狀態根是
+    `filet-engine:filet-engine 0700`，而健康面板跑在 **filet-api** 進程裡——
+    跨了一道權限邊界。`Path.exists()` 在**讀不到的目錄**底下一律回 `False`
+    （它把 PermissionError 吞成 False），於是 `is_tripped()` 會對一個**確實已經
+    觸發**的 kill switch 回答「沒有觸發」。那是這個面板最不能犯的錯：
+    它會在客戶的引擎已經熔斷、部位已經被平掉的當下，告訴管理員一切正常。
+
+    `absent`（狀態根根本不存在）與 `unreadable` 必須分開：前者是「這個 follower
+    剛 activate、引擎還沒跑過」，此時「沒有 ARM 檔」是**真的**沒觸發；後者是
+    「有東西在那裡但我們看不到」，只能回未知。
+    """
+    p = Path(root)
+    try:
+        if not p.is_dir():
+            # 不存在（或不是目錄）。⚠️ 這裡也可能是「父目錄讀不到」——
+            # 用 os.access 對父目錄再確認一次，避免把權限問題誤判成「尚未啟動」。
+            parent = p.parent
+            if parent.is_dir() and not os.access(parent, os.R_OK | os.X_OK):
+                return "unreadable"
+            return "absent"
+        os.listdir(p)          # 真正的讀取探測（exists() 不會拋，listdir 會）
+    except OSError:
+        return "unreadable"
+    return "readable"
+
+
+def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
+                    alerts_path_fn) -> dict:
+    """單一 follower 的健康列。**每一格讀不到都回明確的「未知」**。
+
+    ⭐⭐ 本函式最重要的性質是它**不會**在讀不到時填一個看起來健康的值：
+    - kill switch 狀態讀不到 → `killswitch_tripped: null` ＋ `killswitch_known: false`
+      （不是 `false`＝「沒觸發」）。
+    - 無 equity 樣本 → `engine_alive: null`（不是 `false`，更不是 `true`）。
+    - 告警檔讀不到 → `alerts: null`（不是 0）。
+
+    理由：健康面板的讀者會用它決定「要不要現在去看」。一個謊報健康的格子會讓他
+    **不去看**，而那正是他最該去看的時刻。未知看起來刺眼是對的——它就是要刺眼。
+
+    ⚠️ `engine_alive` 的基準（誠實標註）：這**不是**真正的 process 檢查，而是
+    「引擎最近有沒有寫過 equity 樣本」的代理（引擎每 cycle 寫一筆）。回應以
+    `liveness_basis` 明講這件事——把代理指標當成真的存活檢查上呈，是另一種謊報。
+    一個掛在 D 狀態、還在寫檔卻不下單的進程，這一格看起來會是健康的。
+    """
+    row: dict = {"account_id": ref.account_id, "label": ref.label,
+                 "network": ref.network,
+                 "liveness_basis": "equity_sample",
+                 "state_root": str(state_root)}
+
+    # ⭐⭐ 先探測可讀性（見 state_root_status）：狀態根讀不到時，底下每一個
+    # `Path.exists()` 都會安靜地回 False——kill switch 會被回報成「沒有觸發」。
+    # 讀不到就整列標未知，不讓任何一格落到「看起來健康」的預設值上。
+    status = state_root_status(state_root)
+    if status == "unreadable":
+        row.update({
+            "coverage_known": False, "sample_count": None,
+            "sample_coverage_sufficient": None, "last_sample_age_s": None,
+            "engine_alive": None,
+            "killswitch_tripped": None, "killswitch_known": False,
+            "alerts": None,
+            "error": (f"狀態根讀不到（{state_root}）——kill switch、覆蓋度、告警數"
+                      f"全部無從確認。filet-api 需要對該目錄的讀取權限"
+                      f"（RUNBOOK §5.6 的健康面板說明）"),
+        })
+        return row
+
+    try:
+        cov = coverage_fn(state_root)
+    except Exception as e:  # noqa: BLE001 — 跨 follower 隔離（工程原則 4）
+        row.update({"coverage_known": False, "sample_count": None,
+                    "sample_coverage_sufficient": None,
+                    "last_sample_age_s": None, "engine_alive": None,
+                    "error": f"樣本覆蓋度讀取失敗: {e}"})
+    else:
+        # read_error＝檔案在但讀不出來，與「首次啟動無檔」是兩件事（見 SampleCoverage）
+        row.update({
+            "coverage_known": not cov.read_error,
+            "sample_count": None if cov.read_error else cov.count,
+            "sample_coverage_sufficient": None if cov.read_error else cov.sufficient,
+            "last_sample_age_s": cov.newest_age_s,
+            # 無樣本 → None（不知道），不是 False（已死）也不是 True（活著）
+            "engine_alive": (None if cov.newest_age_s is None
+                             else cov.newest_age_s <= ENGINE_STALE_S),
+            "error": None,
+        })
+        if cov.read_error:
+            row["error"] = "equity 樣本檔存在但讀不出來——回撤保護是否生效無從確認"
+
+    try:
+        row["killswitch_tripped"] = bool(killswitch_fn(state_root))
+        row["killswitch_known"] = True
+    except Exception as e:  # noqa: BLE001 — 同上；讀不到絕不當成「沒觸發」
+        row["killswitch_tripped"] = None
+        row["killswitch_known"] = False
+        row["error"] = "; ".join(filter(None, [row.get("error"),
+                                               f"kill switch 狀態讀取失敗: {e}"]))
+
+    row["alerts"] = _alerts_count(alerts_path_fn(state_root))
+    return row
+
+
+def health_summary(rows, unapplied_leader_changes: int | None,
+                   leader_change_errors) -> dict:
+    """跨 follower 的健康彙總。
+
+    ⭐ 每一個計數都附一個 `*_unknown` 兄弟欄：「0 個引擎沒回應」與「10 個引擎的
+    狀態都讀不到」在單一計數上長得一模一樣，而後者才是該立刻處理的那個。
+    """
+    return {
+        "followers": len(rows),
+        "engine_alive_count": sum(1 for r in rows if r.get("engine_alive") is True),
+        "engine_stale_count": sum(1 for r in rows if r.get("engine_alive") is False),
+        "engine_unknown_count": sum(1 for r in rows if r.get("engine_alive") is None),
+        "killswitch_tripped_count": sum(1 for r in rows
+                                        if r.get("killswitch_tripped") is True),
+        "killswitch_unknown_count": sum(1 for r in rows
+                                        if not r.get("killswitch_known")),
+        "coverage_insufficient_count": sum(
+            1 for r in rows if r.get("sample_coverage_sufficient") is False),
+        "coverage_unknown_count": sum(
+            1 for r in rows if r.get("sample_coverage_sufficient") is None),
+        "alerts_total": sum(r["alerts"] for r in rows if r.get("alerts") is not None),
+        "alerts_unknown_count": sum(1 for r in rows if r.get("alerts") is None),
+        # ⭐ 「已寫入但未套用」的積壓：None ＝ 這條鏈路查不下去（見 leader_change_errors），
+        # **不是** 0。0 會被讀成「沒有積壓」，而實際上是「無從得知有沒有積壓」。
+        "unapplied_leader_changes": unapplied_leader_changes,
+        "leader_change_errors": list(leader_change_errors),
     }
 
 
