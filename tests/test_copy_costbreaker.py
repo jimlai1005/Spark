@@ -3,11 +3,13 @@
 驗收條件 1-8 逐條對應（測試名稱標註 A1..A8）＋ D5 硬規則的兩條放行路徑。
 全離線：FakeAdapter/FakeExecutor 注入，無網路、無真通知。
 
-⭐ 本檔的三個「變異測試靶」（拿掉對應實作必須轉紅，見各測試 docstring）：
+⭐ 本檔的四個「變異測試靶」（拿掉對應實作必須轉紅，見各測試 docstring）：
   - `test_a4_*`：權益與成交名目同源同輪（D2）
+  - `test_denominator_*` / `test_equity_view_*`：分母**恰為** `ev.current`（D2）
   - `test_d5_*`：reduce-only 一律放行（D5）
   - `test_a3_*`：累犯升級（D6）
 """
+import dataclasses
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -341,6 +343,99 @@ def test_a5_repeated_cycles_do_not_accumulate_turnover(tmp_path):
     fa = FakeAdapter(account_value=Decimal("500"), fills=_fills(3))
     seen = {_eval(fa, tmp_path)[0].turnover for _ in range(4)}
     assert seen == {Decimal("24")}
+
+
+# ── D2 ⭐⭐ 分母**恰為** ev.current：EquityView 的其他欄位一律不得替代 ────
+#
+# 這一組測試存在的理由：D2 是本模組檔頭用 ⭐⭐ 標註、綁定兩次實盤事故的不變量，
+# 但先前**只有註解在守它**——把 `check_cost` 的 `equity = ev.current` 改成
+# `ev.recent_peak`，全套測試仍全綠（其餘 8 個同批變異都被咬到，只有這個活下來）。
+# 原因是所有既有測試的 helper 都讓 `current == recent_peak`，分母換掉看不出來。
+#
+# 危害方向是單向且無聲的：`recent_peak >= current` 恆成立 ⇒ 分母只會被灌水 ⇒
+# 換手率被**低估** ⇒ 熔斷器該觸發時不觸發，而且沒有任何徵兆。
+#
+# ⭐ 結構性（工程原則 5 的 meta-rule：不要用「記得檢查」去守不變量）：候選欄位由
+# `dataclasses.fields(EquityView)` 反查，EquityView 一旦增減欄位，
+# `test_equity_view_field_inventory_pins_denominator_candidates` 立刻轉紅，
+# 強迫新欄位也被「誤用會轉紅」的參數化測試涵蓋——不靠下一個人記得回來補。
+
+# 各欄位的測試值：互異、且滿足 recent_peak >= current 的語意（新欄位請沿用
+# 「比 current 大一個數量級」的慣例，才會落在「分母灌水」的危害方向上）。
+_DENOM_CANDIDATES: dict[str, str] = {"current": "100", "recent_peak": "1000"}
+_SKEW_NOTIONAL = Decimal("2500")   # ÷100 = 25× > 20 觸發；÷1000 = 2.5× 不觸發
+
+
+def _skewed_ev() -> EquityView:
+    """current 與其他欄位刻意差一個數量級——分母換掉就會被算式咬到。"""
+    return EquityView(**{k: Decimal(v) for k, v in _DENOM_CANDIDATES.items()})
+
+
+def _skew_fills() -> list[UserFill]:
+    """單筆、名目固定 _SKEW_NOTIONAL 的窗內成交（1 筆遠低於 fill_count 門檻，
+    確保觸發與否只由換手率決定）。"""
+    return [_fill(sz="1", px=str(_SKEW_NOTIONAL))]
+
+
+def test_equity_view_field_inventory_pins_denominator_candidates():
+    """⭐ EquityView 增減欄位 → 本測試轉紅，強迫新欄位補進 `_DENOM_CANDIDATES`，
+    連帶被下方「誤用即轉紅」的參數化測試涵蓋。這是本組測試的結構性那一半：
+    沒有它，新增一個 `lifetime_peak` 之類的欄位又會回到「只有註解守著」。"""
+    names = {f.name for f in dataclasses.fields(EquityView)}
+    assert names == set(_DENOM_CANDIDATES), (
+        f"EquityView 欄位變了（{sorted(names)}）——新欄位同樣可能被誤用為換手率分母。"
+        f"請在 _DENOM_CANDIDATES 補上一個與 current 互異的值（慣例：大一個數量級）。"
+    )
+
+
+def test_denominator_is_exactly_ev_current_not_any_other_field():
+    """⭐⭐ 變異測試靶：`check_cost` 的分母改成 ev 的任何其他欄位 → 本測試必轉紅。
+
+    current=100、recent_peak=1000（刻意不等），成交名目固定 2500：
+    正確分母 → 25×；換成 recent_peak → 2.5×（差 10 倍，且是低估方向）。
+    """
+    ev = _skewed_ev()
+    st = check_cost(ev, _skew_fills(), _settings(), now_s=NOW)
+
+    assert st.notional == _SKEW_NOTIONAL
+    assert st.equity == ev.current, "CostStatus.equity 必須回報實際用的分母"
+    assert st.equity == Decimal("100"), "分母被換成 EquityView 的其他欄位了"
+    assert st.turnover == _SKEW_NOTIONAL / ev.current == Decimal("25")
+
+
+@pytest.mark.parametrize("wrong_field",
+                         [n for n in _DENOM_CANDIDATES if n != "current"])
+def test_denominator_swap_to_other_equity_field_flips_the_verdict(wrong_field):
+    """⭐⭐ 分母換成 EquityView 的其他欄位 ⇒ **判定翻面**（保護靜默失效）。
+
+    上一條盯數值，這一條盯後果：同一組 fills，用 `ev.current` 觸發、用其他欄位
+    不觸發。參數化涵蓋 current 以外的每一個欄位，不是只擋 recent_peak 一個。
+    """
+    ev = _skewed_ev()
+    settings = _settings()
+    st = check_cost(ev, _skew_fills(), settings, now_s=NOW)
+
+    assert st.breached is True and st.reasons == ("turnover",), \
+        "以 ev.current 為分母必須觸發；未觸發代表分母被灌水了"
+
+    wrong_turnover = _SKEW_NOTIONAL / getattr(ev, wrong_field)
+    assert wrong_turnover <= settings.cost_max_turnover_24h, (
+        f"測試設計檢查：改用 ev.{wrong_field} 當分母確實不會觸發，"
+        f"故本測試對分母欄位敏感（{wrong_turnover}× <= "
+        f"{settings.cost_max_turnover_24h}×）"
+    )
+
+
+def test_evaluate_cost_denominator_is_ev_current_end_to_end(tmp_path):
+    """引擎接入點同樣只能用 `ev.current`——純函式對了但 evaluate_cost 自己換一個
+    欄位當分母，客戶端看到的仍是失效的熔斷器。"""
+    fa = FakeAdapter(account_value=Decimal("999999"), fills=_skew_fills())
+    st, notifier = _eval(fa, tmp_path, ev=_skewed_ev())
+
+    assert st.equity == Decimal("100")
+    assert st.turnover == Decimal("25")
+    assert st.breached is True
+    assert len(_crits(notifier)) == 1, "觸發必須發 critical 告警"
 
 
 # ── D2 同基準：分子也只能是主 DEX perp（現貨／非主 DEX 一律不計）───────
