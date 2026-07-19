@@ -63,6 +63,13 @@ from spark.filet.signing import recover_personal_sign_address
 LEADER_CHANGE_MAX_AGE_S = 600
 
 # 記錄的鍵集（多一個少一個都要有人主動改這行，沿 _LEADER_STAT_FIELDS 的慣例）。
+# ⭐ **強制它的是測試，不是這行註解**（2026-07-19 opus 審查 Minor 1：原本這是全 repo
+# 零引用的死常數，註解卻宣稱有強制——一個什麼都沒強制卻宣稱有的常數比沒有更糟，
+# 它會讓下一個人以為改欄位有防護網）。真正的兩道釘子：
+#   tests/test_leader_change.py::test_record_field_set_is_pinned_by_the_constant
+#     —— build_leader_change_record 的輸出鍵與順序 == 本常數
+#   tests/test_leader_change.py::test_api_request_body_carries_exactly_the_record_fields
+#     —— publicapi 的 LeaderSelectBody 欄位集 == 本常數（HTTP 體與落檔記錄不得漂移）
 LEADER_CHANGE_FIELDS = ("account_id", "leader_address", "nonce", "issued_at",
                         "signature", "message")
 

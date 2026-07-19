@@ -280,6 +280,85 @@ def test_missing_required_field_is_rejected(key):
         _verify(rec, w)
 
 
+# ── ⭐⭐ nonce 字元集：唯一擋訊息注入的閘門（opus 審查 I1）──────────────
+# nonce 會被原樣拼進待簽訊息的一行。允許換行 ＝ 允許攻擊者在他**自己簽的**訊息裡
+# 捏造額外欄位。`_NONCE_RE` 是擋這件事的**唯一**一道檢查，卻一直零測試——審查者把
+# 它變異成 `if False` 之後全測試仍然全綠。
+#
+# ⚠️ 這些測試必須斷言 `reason == "malformed"`，不能只斷言「有 raise」：注入的 nonce
+# 若由**別人**簽，簽章比對本來就會擋下它（reason=signer_mismatch），那樣的測試殺不掉
+# 變異。真正的威脅是攻擊者拿**自己的**私鑰簽一份含注入 nonce 的訊息——那時 recover
+# 出的簽章者完全正確，除了 `_NONCE_RE` 之外沒有任何一道檢查會拒絕它。
+
+@pytest.mark.parametrize("bad_nonce", [
+    "n0\nIssued At: 2099-01-01T00:00:00+00:00",   # 偽造時效欄位
+    "n0\nLeader: " + _OTHER_LEADER,               # 偽造 leader 欄位
+    "n0\n",                                       # 裸換行
+    "n0\r\nAccount: fdead",                       # CRLF
+    "n0 with spaces",                             # 非 URL-safe 字元
+    "n0/../../etc/passwd",                        # 路徑字元
+    "x" * 129,                                    # 超長
+    "",                                           # 空（由 _require_str 擋）
+])
+def test_injection_nonce_is_rejected_as_malformed(bad_nonce):
+    """⭐⭐ 由**本人正確簽署**、其餘欄位全部合法，只有 nonce 帶注入字元 → 必須以
+    `malformed` 拒絕。
+
+    這是本檔唯一殺得掉 `_NONCE_RE` 變異的測試：拿掉那一行，下面這筆記錄會**驗證
+    通過**（簽章者正確、時效正確、account 正確），攻擊者就得到一份訊息裡含有他自己
+    捏造欄位的合法授權。
+    """
+    w = Account.create()
+    rec = _record(w, nonce=bad_nonce)
+    with pytest.raises(LeaderChangeError) as e:
+        _verify(rec, w)
+    assert e.value.reason == "malformed"
+
+
+def test_injection_nonce_would_otherwise_verify():
+    """⭐ 反證：同一筆記錄除了 nonce 之外**每一項檢查都會過**——證明上面那條測試
+    真的是被 `_NONCE_RE` 擋下的，不是被別的檢查順便擋掉的。
+
+    做法：把注入字元換成合法字元、其餘完全不動，記錄就驗證成功。
+    """
+    w = Account.create()
+    ok = _record(w, nonce="n0-Issued-At-2099")     # 同樣的意圖，合法字元集
+    assert _verify(ok, w).nonce == "n0-Issued-At-2099"
+
+
+def test_nonce_guard_runs_before_the_nonce_is_consumed():
+    """壞 nonce 不得燒掉一次性資源：格式檢查在 consume_nonce 之前（自我 DoS 防護）。"""
+    w = Account.create()
+    ledger = _NonceLedger("n0")
+    with pytest.raises(LeaderChangeError):
+        _verify(_record(w, nonce="n0\nLeader: 0x00"), w, consume=ledger)
+    assert ledger.consumed == [] and ledger.available == {"n0"}
+
+
+# ── 記錄鍵集常數：要嘛真的強制，要嘛不該存在 ──────────────────────────
+
+def test_record_field_set_is_pinned_by_the_constant():
+    """`LEADER_CHANGE_FIELDS` 宣稱「多一個少一個都要有人主動改這行」——本測試就是
+    讓那句話成真的東西（opus 審查 Minor 1：原本它是零引用的死常數，宣稱有強制卻
+    什麼都沒強制）。順序也釘住：記錄的鍵順序是 diff 友善性的一部分。"""
+    from spark.filet.leader_change import LEADER_CHANGE_FIELDS
+
+    rec = _record(Account.create())
+    assert tuple(rec) == LEADER_CHANGE_FIELDS
+
+
+def test_api_request_body_carries_exactly_the_record_fields():
+    """⭐ 常數的真正承重點：HTTP 請求體與落檔記錄必須帶**同一組**欄位。
+
+    兩者漂移的症狀是靜默的——前端送了新欄位、記錄沒存，或記錄要求的欄位前端沒送，
+    而兩邊各自看起來都正常。這條測試讓「加欄位」這件事至少要有人改到這一行。
+    """
+    from spark.filet.leader_change import LEADER_CHANGE_FIELDS
+    from spark.publicapi.app import LeaderSelectBody
+
+    assert set(LeaderSelectBody.model_fields) == set(LEADER_CHANGE_FIELDS)
+
+
 def test_bad_signature_reason_is_distinguishable():
     """壞簽名（驗不出來）與簽錯人（驗出別人）是兩種失敗，reason 必須分得開。"""
     w = Account.create()

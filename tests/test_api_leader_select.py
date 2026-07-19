@@ -60,10 +60,16 @@ def _login(client, store, cfg, wallet):
     return r.json()["account_id"]
 
 
-def _fresh_nonce(client, wallet):
-    """取一個一次性 nonce（沿用 SIWE 的同一張表——本端點刻意不另開 nonce 機具）。"""
-    r = client.get("/api/auth/nonce",
-                   params={"address": wallet.address, "chain_id": 42161})
+def _fresh_nonce(client, wallet, *, leader=_A):
+    """取一個**換 leader 域**的一次性 nonce（`/api/leaders/select/message`）。
+
+    ⭐ 刻意不用 `/api/auth/nonce`（SIWE 登入域，chain_id > 0）：兩者共用同一張表，
+    但 chain_id 是域分隔符——select 端點只收 chain_id == 0 的 nonce（opus 審查
+    Minor 3）。原本這個 helper 拿登入 nonce 來換 leader，等於測試自己在示範那個
+    被修掉的跨域挪用；見 test_login_nonce_cannot_be_used_to_change_leader。
+    """
+    r = client.get("/api/leaders/select/message",
+                   params={"leader_address": leader})
     assert r.status_code == 200, r.text
     return r.json()["nonce"]
 
@@ -86,7 +92,7 @@ def _payload(*, account_id, leader, nonce, wallet, issued_at=None,
 
 def _select(client, store, cfg, wallet, *, leader=_A, **over):
     acct = _login(client, store, cfg, wallet)
-    nonce = _fresh_nonce(client, wallet)
+    nonce = _fresh_nonce(client, wallet, leader=_A)
     body = _payload(account_id=acct, leader=leader, nonce=nonce, wallet=wallet,
                     **over)
     return client.post("/api/leaders/select", json=body), acct
@@ -240,11 +246,19 @@ def test_broken_allowlist_returns_503_not_a_silent_accept(tmp_path):
     """白名單壞掉 → 503（transient，可重試）。**不得**當成空清單放行或拒絕：
     兩邊都會把一個手滑的編輯偽裝成正常狀態（沿 load_leaders 的 fail-fast）。"""
     p = tmp_path / "leaders.json"
-    p.write_text("{ not json")
+    p.write_text(json.dumps({"leaders": _LEADERS}))
     cfg = make_cfg(tmp_path, leaders_path=str(p))
     app, cfg, store, *_ = make_app(tmp_path, cfg=cfg)
     c = TestClient(app, base_url="https://testserver")
-    r, _ = _select(c, store, cfg, Account.create())
+    # 先在白名單健康時取得 session 與 nonce（nonce 出自 select/message，該端點同樣
+    # 會讀白名單），再把白名單弄壞——盯的是 **select 端點**對壞白名單的反應。
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    nonce = _fresh_nonce(c, w)
+    p.write_text("{ not json")
+
+    r = c.post("/api/leaders/select",
+               json=_payload(account_id=acct, leader=_A, nonce=nonce, wallet=w))
     assert r.status_code == 503
     assert load_leader_changes(cfg.leader_changes_path) == []
 
@@ -379,3 +393,86 @@ def test_leader_changes_path_lives_in_the_dedicated_exchange_dir(tmp_path):
     assert Path(cfg.leader_changes_path).name == "leader_changes.json"
     assert Path(cfg.leader_changes_path).parent == Path(cfg.exchange_dir)
     assert Path(cfg.leader_changes_path).parent != Path(cfg.pending_path).parent
+
+
+# ── ⭐ 域分隔與回應衛生（opus 審查 Minor 2／3）─────────────────────────
+
+def test_login_nonce_cannot_be_used_to_change_leader(tmp_path):
+    """⭐ SIWE **登入** nonce（chain_id > 0）不得被挪來換 leader。
+
+    兩種 nonce 共用同一張表（刻意——兩套一次性機具意味著兩套過期與兩套消耗語意，
+    其中一套遲早漏掉原子性），所以 `chain_id` 就是域分隔符：換 leader 一律發 0，
+    而登入端點拒收 chain_id <= 0。反方向（拿換 leader 的 nonce 去登入）本來就擋得住
+    ——auth_verify 拿 chain_id=0 重建 SIWE 訊息必然 recover 不符。但**只擋一邊的
+    分隔符不是分隔符**：這個方向原本沒有檢查，於是一顆登入 nonce 就能完成一次換手。
+    """
+    c, cfg, store = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    # 登入域的 nonce（chain_id=42161），其餘欄位全部由本人正確簽署
+    r0 = c.get("/api/auth/nonce",
+               params={"address": w.address, "chain_id": 42161})
+    login_nonce = r0.json()["nonce"]
+
+    r = c.post("/api/leaders/select",
+               json=_payload(account_id=acct, leader=_A, nonce=login_nonce, wallet=w))
+
+    assert r.status_code == 400
+    assert load_leader_changes(cfg.leader_changes_path) == []   # 記錄不得落地
+
+
+def test_leader_change_nonce_still_works_after_the_domain_check(tmp_path):
+    """反證：同一套流程換成**本域**的 nonce 就會成功——證明上面那條擋的是域，
+    不是把整條路徑擋死了。"""
+    c, cfg, store = _make(tmp_path)
+    r, _ = _select(c, store, cfg, Account.create())
+    assert r.status_code == 200, r.text
+
+
+def test_error_detail_never_echoes_client_input(tmp_path):
+    """⭐ 400 的 detail 不得回顯客戶送來的 nonce／issued_at／signature 原值。
+
+    例外訊息為了除錯內嵌了請求原值（例如「nonce 格式不合法: '...'」），直接
+    `detail=str(e)` 會讓本端點自陳的「不記 signature／message 原文」政策在 HTTP
+    回應這一側破功。分類碼由伺服器決定，內容不含任何請求輸入。
+    """
+    c, cfg, store = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    nonce = _fresh_nonce(c, w)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    marker = "PROBE-9f3a-injected"
+    body["issued_at"] = marker                    # 壞格式 → reason=malformed
+    body["signature"] = "0x" + "ab" * 65
+
+    r = c.post("/api/leaders/select", json=body)
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert marker not in detail
+    assert body["signature"] not in detail
+    assert nonce not in detail
+    assert detail in _all_leader_change_details()
+
+
+def _all_leader_change_details():
+    """端點允許回出去的**全部**字串（分類化訊息表）——白名單式斷言：任何新增的
+    回應字串都必須是這張表裡的固定值，不能是由請求內容拼出來的。
+
+    直接引用 app 模組的那張表（單一來源）：測試自己抄一份字串就會與實作漂移，
+    而漂移的那一天沒有人會發現（工程原則 1）。
+    """
+    from spark.publicapi.app import LEADER_CHANGE_DETAIL, LEADER_CHANGE_DETAIL_DEFAULT
+    return set(LEADER_CHANGE_DETAIL.values()) | {LEADER_CHANGE_DETAIL_DEFAULT}
+
+
+def test_expired_signature_detail_is_classified_not_raw(tmp_path):
+    """過期路徑同樣走分類表（原本 str(e) 會把秒數與請求時間戳一起回出去）。"""
+    c, cfg, store = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    nonce = _fresh_nonce(c, w)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w,
+                    issued_at=_now_iso(-LEADER_CHANGE_MAX_AGE_S - 60))
+    r = c.post("/api/leaders/select", json=body)
+    assert r.status_code == 400
+    assert r.json()["detail"] in _all_leader_change_details()

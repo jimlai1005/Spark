@@ -34,6 +34,23 @@ logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "filet_session"
 
+# 換 leader 驗簽失敗 → 回給客戶的**分類化**訊息。key 是 LeaderChangeError.reason
+# （伺服器產生的機器可讀碼），value 是可以安全外顯的固定字串。
+# ⭐ 刻意不是 `str(e)`（opus 審查 Minor 2）：例外訊息為了除錯內嵌了請求原值
+# （nonce／issued_at／位址），回顯它與本端點自陳的「不記 signature／message 原文」
+# 政策直接矛盾。放在模組層是為了讓測試能把它當**單一來源**做白名單式斷言
+# （見 test_api_leader_select.test_error_detail_never_echoes_client_input）——
+# 表格與斷言各抄一份字串就會漂移，而漂移的那一天沒有人會發現。
+LEADER_CHANGE_DETAIL_DEFAULT = "簽章驗證失敗，請重新取得待簽原文並重簽"
+LEADER_CHANGE_DETAIL = {
+    "malformed": "請求欄位格式不正確，請重新取得待簽原文並重簽",
+    "account_mismatch": "請求的帳號與登入身分不符",
+    "expired": "簽章已過期，請重新取得待簽原文並重簽",
+    "bad_signature": "簽章無法驗證，請重新簽署",
+    "signer_mismatch": "簽章者不是本帳號的持有人",
+    "nonce_unusable": "這份授權已被使用或已過期，請重新取得待簽原文並重簽",
+}
+
 
 class VerifyBody(BaseModel):
     nonce: str
@@ -337,10 +354,21 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         #    訊息由 verify_leader_change 自己重建，body.message 只是稽核留存。
         def _consume(nonce: str) -> bool:
             """一次性 nonce：沿 SIWE 的同一張表與同一個原子 UPDATE。
-            額外要求 nonce 是**發給本人**的——否則 A 能拿 B 的 nonce 去湊，
-            雖不足以偽造簽章，卻能無成本地作廢別人手上的授權。"""
+
+            兩道額外要求，缺一不可：
+            1. nonce 是**發給本人**的——否則 A 能拿 B 的 nonce 去湊，雖不足以偽造
+               簽章，卻能無成本地作廢別人手上的授權。
+            2. ⭐ nonce 是**本端點發的**（`chain_id == _LEADER_CHANGE_CHAIN_ID`，即 0）。
+               沒有這一條，一顆 SIWE **登入** nonce 就能被挪來換 leader（opus 審查
+               Minor 3）。反方向的防禦本來就成立——auth_verify 拿 chain_id=0 重建
+               SIWE 訊息必然 recover 不符，且 auth_nonce 拒收 chain_id <= 0——但
+               「域分隔」要成立必須**兩個方向都是結構性的**，只擋一邊的分隔符不是
+               分隔符。兩張表合一是刻意的（見 _LEADER_CHANGE_CHAIN_ID 的註解），
+               代價就是必須在消耗點顯式宣告「我只收我這個域的 nonce」。
+            """
             rec = store.consume_nonce(nonce, now_s=now_fn())
-            return rec is not None and rec.address == address
+            return (rec is not None and rec.address == address
+                    and rec.chain_id == _LEADER_CHANGE_CHAIN_ID)
 
         record = build_leader_change_record(
             account_id=body.account_id, leader_address=body.leader_address,
@@ -354,7 +382,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             # 稽核痕跡（偽造探測）：記 reason 與帳號，**不記** signature／message 原文
             # ——來路不明的內容不進 log（沿 billing webhook 驗簽失敗的既有作法）。
             logger.warning("換 leader 驗簽失敗 account=%s reason=%s", account_id, e.reason)
-            raise HTTPException(status_code=400, detail=str(e)) from None
+            # ⭐ 回**分類化的訊息**，不是 str(e)（opus 審查 Minor 2）：例外訊息內嵌
+            # 客戶送來的 nonce／issued_at／signature 原值（例如「nonce 格式不合法:
+            # '...'」），回顯它等於把「不記 signature／message 原文」的政策在 HTTP
+            # 回應這一側破功。分類碼由伺服器決定，內容不含任何請求輸入。
+            raise HTTPException(
+                status_code=400,
+                detail=LEADER_CHANGE_DETAIL.get(e.reason, LEADER_CHANGE_DETAIL_DEFAULT)
+            ) from None
 
         # 4) 落檔。這是唯一的寫入，且必須在**全部驗證通過之後**——驗簽失敗卻留下
         #    記錄，等於把「被拒絕的請求」偽裝成待套用的意圖。
