@@ -127,8 +127,13 @@ def build_leader_change_message(*, account_id: str, leader_address: str,
     )
 
 
-def _parse_issued_at(raw: object) -> datetime:
+def parse_issued_at(raw: object) -> datetime:
     """ISO8601 → aware UTC datetime。壞格式／裸 naive 時間一律拒絕。
+
+    **公開**（非底線前綴）是刻意的：驗證端（verify_leader_change）與對帳端
+    （scripts/filet_daily_report.leader_change_warnings）必須用**同一個**解析器把
+    issued_at 換算成 epoch 秒，否則「這筆記錄多舊」在兩處會有兩個答案，而對帳工具
+    的誤判會直接訓練操作者忽略它（工程原則 1：被比較的值同源同單位同處計算）。
 
     naive（無時區）也拒絕：把它當成 UTC 是一個**看不見的假設**，客戶端若送的是本地
     時間，時效檢查就會憑空多／少幾小時——而時效檢查正是擋重放的那一半。
@@ -204,7 +209,7 @@ def verify_leader_change(record: dict, *, account_id: str, user_address: str,
     signature = _require_str(record, "signature")
 
     # 時效：兩側都換算成 epoch 秒再比（同源同單位，工程原則 1）。
-    age_s = now_s - _parse_issued_at(issued_at).timestamp()
+    age_s = now_s - parse_issued_at(issued_at).timestamp()
     if age_s > LEADER_CHANGE_MAX_AGE_S:
         raise LeaderChangeError(
             "expired",

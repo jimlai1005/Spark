@@ -5,6 +5,7 @@ per-follower summary 只做 fills 衍生指標（fills 數、taker_share），�
 import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import scripts.filet_daily_report as fdr
 from spark.filet.followers import FollowerRef
@@ -248,3 +249,110 @@ def test_wiring_north_star_uses_prev_snapshot(tmp_path, monkeypatch):
     # 北極星＝今日 5.5 - 昨日快照 3.66 = 1.84（查一次的差）
     assert adapter.accrued_calls == ["0x" + "b" * 40]
     assert report.north_star_fee_delta == Decimal("1.84")
+
+
+# ── ⭐ 換 leader 鏈路對帳：「已寫入但未被套用」（opus 審查 I2）─────────────
+# 這條鏈路橫跨兩個進程、兩套權限、兩個目錄，而它的可用性失敗是**靜默**的：API 驗完
+# 章、寫檔、回客戶 200「下一個 cycle 生效」，引擎那邊卻可能根本讀不到那個檔（路徑
+# 不通、group 權限錯、引擎沒在跑）。三種原因症狀完全一樣——什麼都不會發生，兩邊的
+# log 都正常，客戶以為換好了。日報是唯一會讓它浮出來的地方。
+
+_NOW_S = 1_800_000_000.0
+
+
+def _change_record(account_id, nonce, age_s):
+    """一筆落地了 age_s 秒的記錄（issued_at 由 _NOW_S 回推，與判定端同源同單位）。"""
+    from spark.filet.leader_change import build_leader_change_record
+    issued_at = datetime.fromtimestamp(_NOW_S - age_s, timezone.utc).isoformat()
+    return build_leader_change_record(
+        account_id=account_id, leader_address="0x" + "d4" * 20, nonce=nonce,
+        issued_at=issued_at, signature="0xsig", message="msg")
+
+
+def _write_changes(tmp_path, *records):
+    path = tmp_path / "leader_changes.json"
+    path.write_text(json.dumps({"changes": list(records)}))
+    return path
+
+
+def _write_ledger(tmp_path, account_id, redeemed):
+    from spark.filet.leader_change_apply import Ledger, save_ledger
+    path = tmp_path / account_id / "ledger.json"
+    save_ledger(path, Ledger(redeemed=redeemed, applied=None))
+    return path
+
+
+def test_stale_change_never_applied_is_reported(tmp_path):
+    """⭐ 記錄逾時未套用 → 告警。這捕捉「客戶簽了、API 收了、引擎從沒套用」整類失敗。"""
+    changes = _write_changes(tmp_path, _change_record("alice", "n1", age_s=3600))
+    _write_ledger(tmp_path, "alice", {})            # 帳本存在但沒有這顆 nonce
+
+    warns = fdr.leader_change_warnings(
+        [_ref("alice")], _NOW_S, changes_path=changes,
+        ledger_for=lambda a: tmp_path / a / "ledger.json")
+
+    assert len(warns) == 1
+    assert "未被套用" in warns[0] and "alice" in warns[0]
+
+
+def test_applied_change_is_not_reported(tmp_path):
+    """已被套用（帳本有對應的已兌現 nonce）→ 不告警。對帳工具最糟的失效是狼來了。"""
+    changes = _write_changes(tmp_path, _change_record("alice", "n1", age_s=3600))
+    _write_ledger(tmp_path, "alice", {"n1": "0x" + "d4" * 20})
+
+    assert fdr.leader_change_warnings(
+        [_ref("alice")], _NOW_S, changes_path=changes,
+        ledger_for=lambda a: tmp_path / a / "ledger.json") == []
+
+
+def test_fresh_change_is_not_reported(tmp_path):
+    """記錄還很新（未逾時）→ 不告警：引擎可能只是還沒跑到下一輪。
+
+    門檻 30 分鐘遠大於 cycle 間隔與任何合理的重啟窗，所以逾時不可能是「還沒輪到」。
+    """
+    fresh = fdr.LEADER_CHANGE_STALE_S - 60
+    changes = _write_changes(tmp_path, _change_record("alice", "n1", age_s=fresh))
+    _write_ledger(tmp_path, "alice", {})            # 尚未套用，但還在容忍窗內
+
+    assert fdr.leader_change_warnings(
+        [_ref("alice")], _NOW_S, changes_path=changes,
+        ledger_for=lambda a: tmp_path / a / "ledger.json") == []
+
+
+def test_missing_ledger_for_a_stale_change_is_reported(tmp_path):
+    """帳本檔根本不存在（引擎從沒跑過／狀態根不對）→ 逾時記錄照樣要報。
+
+    load_ledger 對缺檔回空帳本，於是 nonce 必不在 redeemed 裡 → 落在同一條告警上。
+    """
+    changes = _write_changes(tmp_path, _change_record("alice", "n1", age_s=3600))
+
+    warns = fdr.leader_change_warnings(
+        [_ref("alice")], _NOW_S, changes_path=changes,
+        ledger_for=lambda a: tmp_path / a / "nonexistent.json")
+    assert len(warns) == 1 and "未被套用" in warns[0]
+
+
+def test_change_for_an_unactivated_account_is_not_reported(tmp_path):
+    """manifest 沒有這個帳號＝尚未 activate，引擎本來就不會套用它——不是鏈路故障。"""
+    changes = _write_changes(tmp_path, _change_record("nobody", "n1", age_s=3600))
+
+    assert fdr.leader_change_warnings(
+        [_ref("alice")], _NOW_S, changes_path=changes,
+        ledger_for=lambda a: tmp_path / a / "ledger.json") == []
+
+
+def test_unresolvable_exchange_dir_is_itself_the_alert(tmp_path, monkeypatch):
+    """⭐ 交換目錄沒設好 ⇒ 這條鏈路必定不通。那**就是**要報的事，不是略過的理由。"""
+    monkeypatch.delenv("FILET_EXCHANGE_DIR", raising=False)
+
+    warns = fdr.leader_change_warnings([_ref("alice")], _NOW_S)
+    assert len(warns) == 1 and "FILET_EXCHANGE_DIR" in warns[0]
+
+
+def test_ledger_path_derives_from_the_engine_relpath(monkeypatch):
+    """帳本落點由引擎寫入時用的同一個常數推導，不另拼字串——兩份定義漂移會讓對帳
+    工具找不到帳本而把**每一筆**記錄都報成未套用（狼來了）。"""
+    from spark.filet.leader_change_apply import LEDGER_RELPATH
+
+    monkeypatch.setenv("FILET_STATE_BASE", "/opt/filet/state")
+    assert fdr.ledger_path_for("alice") == Path("/opt/filet/state/alice") / LEDGER_RELPATH

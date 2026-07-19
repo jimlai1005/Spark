@@ -271,7 +271,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                 detail="該 leader 目前不可選擇，請重新整理 leader 列表")
         # 走到這裡代表 is_selectable 已在白名單裡找到它 → 位址必然合法可正規化。
         leader = normalize_address(leader_address)
-        # issued_at 版型沿 auth_nonce（帶 Z 的 UTC）——leader_change._parse_issued_at
+        # issued_at 版型沿 auth_nonce（帶 Z 的 UTC）——leader_change.parse_issued_at
         # 要求帶時區，naive 時間會被直接拒絕。
         issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         nonce = store.issue_nonce(address, _LEADER_CHANGE_CHAIN_ID, issued_at,
