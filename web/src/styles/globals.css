@@ -440,6 +440,57 @@ main.page {
 }
 .admin-table tr:last-child td { border-bottom: none; }
 
+/* ---------- Ops 營運儀表板 ---------- */
+.ops-section-title {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
+  margin: 32px 0 8px;
+}
+.ops-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+  margin: 14px 0 10px;
+}
+.ops-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
+.ops-stat dd { margin: 4px 0 0; font-size: 20px; font-weight: 300; color: var(--text); }
+.ops-stat dd.is-bad { color: var(--neg); }
+.ops-window { margin-top: 10px; word-break: break-all; }
+
+.ops-alert {
+  border: 1px solid rgba(var(--neg-rgb), .5);
+  background: rgba(var(--neg-rgb), .1);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.ops-alert-title { color: var(--neg); font-weight: 500; margin: 0 0 6px; font-size: 14px; }
+.ops-alert-body { color: var(--text); font-size: 13px; margin: 0; line-height: 1.6; }
+.ops-alert-warn { border-color: rgba(var(--warn-rgb), .5); background: rgba(var(--warn-rgb), .1); }
+.ops-alert-warn .ops-alert-title { color: var(--warn); }
+.ops-error-list { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--text); }
+
+.ops-notice {
+  border-color: rgba(var(--info-rgb), .45);
+}
+.ops-notice-title { color: var(--info); font-size: 14px; margin: 0 0 6px; }
+
+.ops-query-error { color: var(--neg); font-size: 13px; }
+
+.ops-range { display: flex; align-items: center; gap: 8px; margin: 12px 0 16px; flex-wrap: wrap; }
+.ops-range-btn { padding: 5px 12px; font-size: 12.5px; }
+.ops-range-btn.is-active {
+  border-color: rgba(var(--primary-rgb), .6);
+  color: var(--primary);
+}
+
+.ops-table td { word-break: normal; }
+.ops-table td.mono { white-space: nowrap; }
+.ops-row-failed td { background: rgba(var(--neg-rgb), .07); }
+.ops-row-error { white-space: normal !important; font-size: 12px; }
+.ops-row-error-label { color: var(--neg); margin-right: 6px; }
+
 /* ---------- Responsive：邊界圖直疊（≤620px） ---------- */
 @media (max-width: 620px) {
   .boundary { flex-direction: column; }

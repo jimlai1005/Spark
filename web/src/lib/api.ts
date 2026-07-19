@@ -122,3 +122,78 @@ export function getApproveBuilderFeePayload(chainId: number): Promise<TypedDataR
 export function getAdminPending(): Promise<{ pending: PendingEntry[] }> {
   return request<{ pending: PendingEntry[] }>("/api/admin/pending");
 }
+
+// ---------- ops（管理端；跨客戶聚合） ----------
+/**
+ * ⭐ 金額欄一律 string：後端 ops.jsonable 把 Decimal 序列化成字串（float 會有精度
+ * 損失，對帳數字不得走 float）。前端也不在型別層把它們變回 number——只在顯示的
+ * 最後一刻 parse（lib/format.ts），算術比較留在後端。
+ */
+export interface OpsCustomerRow {
+  account_id: string;
+  user_address: string;
+  label: string;
+  network: string;
+  fills: number;
+  notional: string;
+  builder_fee: string;
+  taker_share: string;
+  account_value: string | null;
+  subscription: string;
+  /** 該列查詢失敗的原文（跨客戶隔離：其他列照樣有資料）。 */
+  error: string | null;
+}
+
+export interface OpsCustomersResp {
+  days: number;
+  start: string;
+  end: string;
+  customers: OpsCustomerRow[];
+  /** 壞掉的 manifest 條目（容錯載入跳過者）。 */
+  manifest_errors: string[];
+}
+
+/**
+ * 收入對帳。`insufficient_accrued_history` 是判別欄位（discriminant）：
+ * 為 true 時後端**不給**任何數值欄——型別上就讀不到，避免把「無資料」顯示成 0。
+ */
+export type OpsRevenueResp =
+  | {
+      insufficient_accrued_history: true;
+      history_points: number;
+      detail: string;
+      manifest_errors: string[];
+    }
+  | {
+      insufficient_accrued_history: false;
+      /** 應收／歸屬：Σ 各客戶 builder_fee。 */
+      attributed: string;
+      /** 實收／北極星：builder 位址累積量的今昨差（查一次，不由 rows 推導）。 */
+      accrued_delta: string;
+      accrued_now: string;
+      accrued_prev: string;
+      discrepancy: string;
+      /** attributed 為 0 時後端回 null（不得除零）——顯示層須區分 null 與 0。 */
+      discrepancy_pct: string | null;
+      over_threshold: boolean;
+      threshold_pct: string;
+      rows: number;
+      day: string;
+      prev_day: string;
+      window_start: string;
+      window_end: string;
+      customers: OpsCustomerRow[];
+      manifest_errors: string[];
+    };
+
+/** 每客戶損益（days 1..90；超出範圍後端回 400 → ApiError kind=client）。 */
+export function getOpsCustomers(days: number): Promise<OpsCustomersResp> {
+  const q = new URLSearchParams({ days: String(days) });
+  return request<OpsCustomersResp>(`/api/ops/customers?${q.toString()}`);
+}
+
+/** 收入對帳（threshold_pct 為比例，非百分比；0.01 = 1%）。 */
+export function getOpsRevenue(thresholdPct: number): Promise<OpsRevenueResp> {
+  const q = new URLSearchParams({ threshold_pct: String(thresholdPct) });
+  return request<OpsRevenueResp>(`/api/ops/revenue?${q.toString()}`);
+}

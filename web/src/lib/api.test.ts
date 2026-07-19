@@ -110,6 +110,14 @@ describe("端點契約（對照 src/spark/publicapi/app.py）", () => {
     mockFetchJson(200, { pending: [] });
     await api.getAdminPending();
     expect(captured[0].url).toBe("/api/admin/pending");
+
+    mockFetchJson(200, { days: 7, customers: [], manifest_errors: [] });
+    await api.getOpsCustomers(7);
+    expect(captured[0].url).toBe("/api/ops/customers?days=7");
+
+    mockFetchJson(200, { insufficient_accrued_history: true, manifest_errors: [] });
+    await api.getOpsRevenue(0.01);
+    expect(captured[0].url).toBe("/api/ops/revenue?threshold_pct=0.01");
   });
 });
 
@@ -125,6 +133,8 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getAdminPending(),
       () => api.getMe(),
       () => api.getNonce("0xAbC0000000000000000000000000000000000001", 1),
+      () => api.getOpsCustomers(1),
+      () => api.getOpsRevenue(0.01),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -151,7 +161,7 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
 
   it("反射函式數量與手寫清單一致——手寫清單不會因新函式而過時（保底斷言）", () => {
     // 對照上一個 describe 的 calls 陣列長度：兩者必須同步增減。
-    const HAND_WRITTEN_LIST_LENGTH = 9;
+    const HAND_WRITTEN_LIST_LENGTH = 11;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

@@ -122,4 +122,52 @@ export const COPY = {
       label: "label",
     },
   },
+  ops: {
+    title: "營運儀表板",
+    eyebrow: "OPS",
+    forbidden: "此頁僅限管理員。",
+    revenue: {
+      title: "收入對帳",
+      note: "應收＝各客戶成交歸屬的 builder fee 加總；實收＝builder 位址鏈上累積量的今昨差（查一次，不由客戶列推導）。兩者的差額就是對帳訊號。",
+      attributed: "應收（歸屬）",
+      accruedDelta: "實收（鏈上增量）",
+      discrepancy: "差額（實收 − 應收）",
+      discrepancyPct: "差額百分比",
+      threshold: "告警門檻",
+      window: "對帳期間",
+      rowsCounted: "納入歸屬的客戶列數",
+      ok: "差額在門檻內。",
+      alertTitle: "收入對帳超出門檻",
+      alertBody:
+        "歸屬分析與鏈上實收對不上，請先查當日 fills 明細再決定是否調整歸屬。常見原因："
+        + "(1) modify 路徑的改單無 builder 欄位，該筆成交收不到費；"
+        + "(2) 有非經我方路由的成交（客戶自行下單）被計入淨值卻不產生 builder fee；"
+        + "(3) 鏈上累積量入帳有延遲，跨 UTC 日邊界時兩邊暫時錯位。",
+      insufficient: "歷史資料累積中，需至少兩日快照才能對帳。",
+      insufficientNote:
+        "實收增量＝今昨兩點的差；只有一點時無從得知單日增量。此處刻意不顯示 0——"
+        + "把整段累積量當成單日增量會造出天文數字的假差額。每日報表腳本會持續累積快照。",
+      pctUnavailable: "應收為 0，百分比無從計算（差額請直接看金額欄）。",
+    },
+    customers: {
+      title: "每客戶損益",
+      note: "本表期間與上方對帳期間各自獨立（對帳固定取同一個 UTC 日），兩張表的數字不可直接相減。",
+      empty: "目前沒有客戶資料。",
+      rangeLabel: "統計期間",
+      ranges: { d1: "1 天", d7: "7 天", d30: "30 天" },
+      manifestErrors: "manifest 有壞條目被跳過，以下項目未納入本表（其餘客戶照常顯示）：",
+      rowError: "此列查詢失敗：",
+      rowErrorHint: "單一客戶查詢失敗只影響該列，其餘客戶的數字仍然有效。",
+      cols: {
+        account: "帳號",
+        address: "地址",
+        fills: "成交筆數",
+        notional: "路由名目",
+        builderFee: "歸屬 builder fee",
+        takerShare: "taker 佔比",
+        accountValue: "帳戶淨值",
+        subscription: "訂閱狀態",
+      },
+    },
+  },
 } as const;
