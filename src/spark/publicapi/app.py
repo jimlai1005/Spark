@@ -11,6 +11,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from spark.filet.followers import load_followers_tolerant
+from spark.filet.leader_change import (LeaderChangeError, build_leader_change_record,
+                                       verify_leader_change, write_leader_change)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
 from spark.keysvc.client import KeysvcError
@@ -39,6 +41,26 @@ class VerifyBody(BaseModel):
 
 class ChainIdBody(BaseModel):
     chain_id: int
+
+
+class LeaderSelectBody(BaseModel):
+    """客戶簽章的換 leader 請求（欄位＝filet/leader_change.py 的記錄格式）。
+
+    ⭐ `account_id` 是全 app 少數**顯式收 account 參數**的端點（其餘一律由 session
+    衍生，見檔頭）。這不是破例，是被簽章本身逼出來的：account_id 是待簽訊息的一部分，
+    客戶簽的是「把 **fxxx** 這個帳號換到某 leader」。若伺服器改成自己從 session 推導，
+    就會出現「客戶簽的是 A、伺服器套用到 B」的縫；收下來再與 session 衍生值比對
+    （不符 403），客戶簽了什麼就只能被套用到什麼。
+    """
+
+    account_id: str
+    leader_address: str
+    nonce: str
+    issued_at: str
+    signature: str
+    # 客戶端實際簽的原文。**驗證完全不看它**（伺服器重建自己的版本，見
+    # verify_leader_change）——僅原樣留存，供事後比對「客戶當初到底簽了什麼」。
+    message: str = ""
 
 
 # leader 目錄要外流的**快照統計欄位白名單**。watchlist 快照存的是一日一點的資產負債
@@ -156,6 +178,18 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         return {"address": address, "account_id": derive_account_id(address)}
 
     # ---------- leader 目錄（客戶自選 leader 的資料來源） ----------
+    def _load_leaders_or_503() -> list[LeaderRef]:
+        """白名單載入的單一入口（工程原則 5）：目錄與選擇兩個端點必須看**同一份**
+        清單、以**同一種**方式失敗。壞掉一律 503、**不得**降級成空清單——空清單在
+        目錄端看起來像「目前沒有 leader」，在選擇端則會讓所有 leader 都變成不可選，
+        兩邊都是把一個手滑的編輯偽裝成正常狀態。"""
+        try:
+            return load_leaders(cfg.leaders_path)
+        except ValueError as e:
+            logger.error("leader 白名單載入失敗 %s: %s", cfg.leaders_path, e)
+            raise HTTPException(
+                status_code=503, detail="leader 名單暫時不可用，請稍後重試") from e
+
     @app.get("/api/leaders")
     def leaders_directory(address: str = Depends(_require_session)):
         """客戶**現在可以選**的 leader 清單 ＋ 每個 leader 的快照統計。
@@ -182,12 +216,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         白名單載入失敗（JSON 壞／格式錯）→ 503，**不回空清單**：空清單看起來像
         「目前沒有 leader」的正常狀態，會讓一個手滑的編輯靜默變成全站無 leader。
         """
-        try:
-            refs = load_leaders(cfg.leaders_path)
-        except ValueError as e:
-            logger.error("leader 白名單載入失敗 %s: %s", cfg.leaders_path, e)
-            raise HTTPException(
-                status_code=503, detail="leader 名單暫時不可用，請稍後重試") from e
+        refs = _load_leaders_or_503()
         selectable = [r for r in refs if is_selectable(r.address, refs)]
         snapshot = load_latest_snapshot(cfg.watchlist_dir)
         rows = snapshot_rows_by_address(snapshot)
@@ -199,6 +228,114 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "note": None if snapshot else
                     "績效統計暫時不可用（每日快照尚未產生或讀取失敗）；"
                     "leader 清單不受影響，仍可正常選擇。",
+        }
+
+    @app.post("/api/leaders/select")
+    def leaders_select(body: LeaderSelectBody,
+                       address: str = Depends(_require_session)):
+        """客戶**自己簽章**要求換 leader → 寫一筆簽章變更記錄。
+
+        ⭐ 為什麼是簽章而不是「登入後按個鈕就改」（改本端點前先讀
+        filet/leader_change.py 檔頭的完整威脅模型）：營運方從客戶換 leader 的收斂
+        交易中賺 builder fee，從 churn 獲利的一方不該同時是守住 churn 的一方。而
+        白名單只回答「這個 leader 一般而言可不可接受」，回答不了「這位客戶真的要求
+        換到他嗎」——能寫入變更的人可以把保守客戶指向白名單內、但對他完全不適合的
+        高槓桿策略，白名單全程放行，一次切換就是實質損失。客戶的簽章是唯一能回答
+        後面那個問題的東西，而本進程被打穿也偽造不出它。
+
+        ⭐ 本端點**不改 manifest**，只落一筆記錄。兩個理由缺一不可：
+        (1) filet-api 對引擎 manifest 本就沒有寫權（權限拓撲見 pending.py 檔頭）；
+        (2) 就算有，直接改也會繞過引擎套用前的**二次驗章**——那道驗證的價值正在於
+        它獨立於本進程，繞過它等於把整套簽章設計降級成裝飾。
+
+        失敗分類（紅線 4／工程原則 2）：驗簽失敗、leader 不可選、session 不符
+        **全是 semantic**——重試同一份請求必定再次失敗，客戶端不得自動重試。
+        寫檔失敗才是 transient（5xx，可重試；寫入冪等：同 account 覆蓋）。
+
+        ⭐ 驗簽失敗一律 **400 而非 401**：401 在本 app 的既有語意是「session 沒了」，
+        前端據此把使用者踢回登入頁（web 的 session-expiry redirect）。簽章壞掉時
+        session 好端端的，回 401 會讓客戶莫名其妙被登出，而真正的問題（他簽錯了／
+        簽章過期）反而不會被顯示出來。
+        """
+        # 1) 客戶只能改自己的：body 的 account_id 必須等於 session 衍生值。
+        #    account_id 是待簽訊息的一部分（見 LeaderSelectBody），所以必須顯式收下
+        #    再比對，不能由伺服器代推——代推會讓「客戶簽 A、伺服器套用到 B」成為可能。
+        account_id = derive_account_id(address)
+        if body.account_id != account_id:
+            # 403 而非 404：對方確實通過了身分驗證，只是無權變更這個帳號。
+            # 不回洩該 account 是否存在（列舉防禦）。
+            raise HTTPException(status_code=403,
+                                detail="只能變更自己帳號的 leader")
+
+        # 2) leader 必須是**目錄可選**的（is_selectable ＝ enabled 且 accepting_new）。
+        #    ⚠️ 刻意不是 is_still_permitted：那是引擎對「已經在跟的人可否繼續跟」的
+        #    述詞（只看 enabled），用在這裡會讓客戶選中一個已停止接客的 leader。
+        #    兩個旗標的語意差異見 filet/leaders.py 檔頭。
+        refs = _load_leaders_or_503()
+        if not is_selectable(body.leader_address, refs):
+            # 不區分「不在白名單」「已撤銷」「不收新客戶」——後兩者是內部治理資訊
+            # （沿 /api/leaders 不外流治理狀態的既有理由）。
+            raise HTTPException(status_code=400,
+                                detail="該 leader 目前不可選擇，請重新整理 leader 列表")
+
+        # 3) 驗章。⭐ user_address 出自 **session**（可信來源），不是請求內容；
+        #    訊息由 verify_leader_change 自己重建，body.message 只是稽核留存。
+        def _consume(nonce: str) -> bool:
+            """一次性 nonce：沿 SIWE 的同一張表與同一個原子 UPDATE。
+            額外要求 nonce 是**發給本人**的——否則 A 能拿 B 的 nonce 去湊，
+            雖不足以偽造簽章，卻能無成本地作廢別人手上的授權。"""
+            rec = store.consume_nonce(nonce, now_s=now_fn())
+            return rec is not None and rec.address == address
+
+        record = build_leader_change_record(
+            account_id=body.account_id, leader_address=body.leader_address,
+            nonce=body.nonce, issued_at=body.issued_at, signature=body.signature,
+            message=body.message)
+        try:
+            verified = verify_leader_change(record, account_id=account_id,
+                                            user_address=address, now_s=now_fn(),
+                                            consume_nonce=_consume)
+        except LeaderChangeError as e:
+            # 稽核痕跡（偽造探測）：記 reason 與帳號，**不記** signature／message 原文
+            # ——來路不明的內容不進 log（沿 billing webhook 驗簽失敗的既有作法）。
+            logger.warning("換 leader 驗簽失敗 account=%s reason=%s", account_id, e.reason)
+            raise HTTPException(status_code=400, detail=str(e)) from None
+
+        # 4) 落檔。這是唯一的寫入，且必須在**全部驗證通過之後**——驗簽失敗卻留下
+        #    記錄，等於把「被拒絕的請求」偽裝成待套用的意圖。
+        # 落地的是**驗證後的正規化值**（verified.*），不是請求的原樣字串——位址大小寫
+        # 在此收斂成單一基準，引擎端不必再猜（工程原則 1）。signature 原樣保留，
+        # 引擎重驗時會自己重建訊息，正規化是冪等的，重驗結果相同。
+        record = build_leader_change_record(
+            account_id=verified.account_id, leader_address=verified.leader_address,
+            nonce=verified.nonce, issued_at=verified.issued_at,
+            signature=body.signature, message=body.message)
+        try:
+            write_leader_change(cfg.leader_changes_path, record)
+        except OSError as e:
+            # transient：磁碟／權限問題，重試可能成功（寫入冪等：同 account 覆蓋）。
+            # 大聲留痕（工程原則 3）：客戶的意圖已驗證通過卻沒能落地，不能靜靜吞掉。
+            logger.error("換 leader 記錄落檔失敗 account=%s path=%s: %s",
+                         account_id, cfg.leader_changes_path, e)
+            raise HTTPException(status_code=500,
+                                detail="變更記錄寫入失敗，請稍後重試") from e
+        logger.info("換 leader 記錄已落地 account=%s leader=%s",
+                    account_id, verified.leader_address)
+
+        # ⭐ 回應必須明講後果與生效時機，不讓前端自己猜（`effective` 是機器可讀的
+        #    語意欄位，後面兩個字串是給人看的）。換 leader 不是換一個設定值：引擎會
+        #    收斂到新 leader 的部位，平掉舊部位、開新部位，有實際的 taker 成本。
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "leader_address": verified.leader_address,
+            "effective": "next_engine_cycle",
+            "effective_note": "已記錄，於引擎的下一個 cycle 生效——不是立即生效；"
+                              "引擎會在套用前**自己重新驗證你的簽章與白名單**，"
+                              "驗證不過則不會套用。",
+            "consequences": "生效時引擎會把你的部位收斂到新 leader："
+                            "平掉目前的部位、依新 leader 開新部位。"
+                            "這是真實成交，會產生實際的交易成本（taker 費用與滑價）。",
         }
 
     # ---------- onboarding ----------

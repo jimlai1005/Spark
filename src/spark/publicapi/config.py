@@ -92,6 +92,22 @@ class ApiConfig:
                              "三個一起設或都不設）")
 
     @property
+    def leader_changes_path(self) -> str:
+        """客戶簽章的換 leader 記錄落點（filet/leader_change.py 的格式）。
+
+        ⭐ **由 pending_path 推導，不另開 env**：這個檔必須落在「API 進程寫得到」
+        的地方，而 pending.json 所在的目錄正是唯一已知滿足此條件的目錄（權限拓撲見
+        pending.py 檔頭：filet-api 擁有 pending，對引擎 manifest 沒有寫權）。
+        另開一個 FILET_LEADER_CHANGES_PATH 只會多一個能被半邊誤設的旋鈕——設錯的
+        症狀是「API 寫在 A、引擎讀 B」，客戶按了換 leader 卻永遠不生效，而且兩邊
+        各自看起來都正常（沿 followers/leaders 路徑「一個變數餵多方」的既有理由）。
+
+        API **不**在此直接改 manifest：一方面進程本就沒有寫權，另一方面繞過引擎的
+        二次驗章等於把整套簽章設計退化成裝飾（leader_change.py 檔頭的威脅模型）。
+        """
+        return str(Path(self.pending_path).with_name("leader_changes.json"))
+
+    @property
     def billing_enabled(self) -> bool:
         return self.stripe_secret_key is not None
 
