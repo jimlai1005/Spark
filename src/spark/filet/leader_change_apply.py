@@ -55,6 +55,33 @@ manifest 的 leader」——那會變成「你跟的 leader 出事了，所以�
 述詞用 `is_still_permitted`（只看 `enabled`），**不是** `is_selectable`：後者是選單
 端的述詞（另含 `accepting_new`），用在這裡會讓一個例行下架（名額滿）的 leader 把
 正在跟他的人趕走——用一次真實的平倉成本去執行一個純行銷決策。
+
+⭐⭐ 帳本**遺失**（檔案不存在）≠ 首次啟動——兩者必須可區分
+--------------------------------------------------------
+`applied` 是「客戶已授權的 override」**唯一**的持久化來源（manifest 不會被更新）。
+所以帳本一旦消失，`_current()` 會拿 `applied is None` 當成「從未有過變更」而回退到
+manifest 的舊 leader——一次**沒有客戶授權的換手**，外加真實的平舊開新成本，而且
+全程安靜。這正是本模組宣稱要防的事，卻只對「格式壞」fail-closed，對「檔案不存在」
+沒有防線（2026-07-19 opus 對抗性審查 C2，實跑重現：刪帳本 → 下一輪 source=manifest、
+零告警）。
+
+**怎麼區分**：引擎在**真正的首次啟動**就無條件落一份空帳本，並在同目錄留下一個
+**初始化標記**（`<帳本名>.init`，見 `ledger_init_marker_path`）。此後：
+
+| 帳本 | 標記 | 判定 |
+|---|---|---|
+| 有 | — | 正常，照讀 |
+| 無 | 無 | 真正的首次啟動 → 落初始帳本＋標記，安靜繼續（此時沒有 override 可失去）|
+| 無 | **有** | **遺失** → `LeaderResolutionError` ＋ critical，**絕不回退 base** |
+
+落檔順序是「先帳本、後標記」且刻意不可對調：中途斷電時，「有帳本無標記」下一輪會
+被判成正常（照讀，正確）；反過來「有標記無帳本」會被判成遺失（假告警）。
+
+⚠️ 已知極限（誠實標註）：**整個狀態根被重建**時標記與帳本一起消失，看起來就是一次
+首次啟動——這一格分辨不出來。它不是本機制的漏洞而是它的邊界：狀態根同時裝著
+kill switch ARM 檔與 equity 樣本，整根消失是更大的事故，且此時 `initialize_ledger`
+會 log 一行「已建立初始帳本」，同一個 account 第二次出現這行就是狀態根被重建的證據。
+本機制覆蓋的是真正常見的那格：帳本檔被單獨刪除／輪替／備份還原漏檔。
 """
 from __future__ import annotations
 
@@ -117,8 +144,24 @@ class Ledger:
     applied: AppliedChange | None
 
 
+def ledger_init_marker_path(path: str | Path) -> Path:
+    """初始化標記的落點，由帳本路徑推導（**單一定義**，寫端與讀端不會漂移）。
+
+    存在的唯一理由：帳本檔沒辦法當自己「曾經存在過」的證據。少了這個標記，
+    「檔案不存在」就同時是首次啟動與帳本遺失兩種語意，而這兩者的正確處置完全相反
+    （安靜繼續 vs 拒絕退回 base ＋ 告警）。見模組 docstring 的判定表。
+    """
+    p = Path(path)
+    return p.with_name(p.name + ".init")
+
+
 def load_ledger(path: str | Path) -> Ledger:
-    """讀帳本。檔案不存在 → 空帳本（首次啟動的正常狀態）。
+    """讀帳本（**純讀取**）。檔案不存在 → 空帳本。
+
+    ⚠️ 「檔案不存在」在這一層**沒有**語意判定：它究竟是首次啟動還是帳本遺失，
+    要靠初始化標記才分得出來，而那個政策住在
+    `LeaderChangeApplier._ledger_or_raise`（見模組 docstring 的判定表）。
+    引擎路徑一律走 applier，不要繞過它直接用本函式的空帳本回退值當結論。
 
     **格式壞掉一律 raise（fail-closed），絕不當成空帳本**：把壞檔當空帳本會同時
     造成兩個災難——(1) 已兌現的 nonce 全部忘記，同一筆記錄可以被重放；(2) `applied`
@@ -177,6 +220,34 @@ def save_ledger(path: str | Path, ledger: Ledger) -> None:
     tmp = p.parent / f"{p.name}.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     os.replace(tmp, p)
+
+
+def initialize_ledger(path: str | Path) -> bool:
+    """真正的首次啟動：無條件落一份空帳本 ＋ 初始化標記。回傳是否成功落地。
+
+    **順序（先帳本、後標記）是刻意的**，不可對調：兩步之間斷電時，「有帳本無標記」
+    下一輪被判成正常（照讀，正確）；「有標記無帳本」會被判成遺失而發出假告警。
+    把不可避免的中斷偏向假陰性（少一次告警）而不是假陽性（狼來了），是因為這個
+    告警必須保持稀有才有人看——而真正的遺失下一輪仍會被抓到（標記那時已經在了）。
+
+    寫入失敗 → 回 False ＋ log，**不 raise**：首次啟動的定義就是「還沒有任何客戶
+    授權的 override」，此刻沒有東西可以失去，把它升級成解析失敗只會讓一個寫不進去
+    的狀態目錄擋住跟單。真正該大聲的是稍後套用時的落帳失敗（那條路徑本來就會
+    critical 並拒絕套用）。
+    """
+    p = Path(path)
+    try:
+        save_ledger(p, Ledger({}, None))
+        marker = ledger_init_marker_path(p)
+        tmp = marker.parent / f"{marker.name}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"initialized_at": time.time()}, indent=2))
+        os.replace(tmp, marker)
+    except OSError as e:
+        logger.warning("換 leader 初始帳本落檔失敗（%s），本輪以空帳本繼續: %r", p, e)
+        return False
+    logger.info("換 leader：已建立初始帳本與初始化標記（%s）——此後帳本缺席一律"
+                "視為遺失。同一個 account 第二次看到這行代表狀態根被重建了", p)
+    return True
 
 
 class LeaderChangeApplier:
@@ -284,6 +355,36 @@ class LeaderChangeApplier:
         """
         return nonce in ledger.redeemed
 
+    # ---------- 帳本載入政策（缺席＝首次啟動 vs 遺失） ----------
+
+    def _ledger_or_raise(self) -> Ledger:
+        """讀帳本，並在「檔案不存在」時判定它是首次啟動還是**遺失**。
+
+        判定表與理由見模組 docstring。這裡只重申最關鍵的一句：帳本缺席時回退到
+        base（manifest 的 leader）是**錯的**——`applied` 是客戶授權的 override
+        唯一的持久化來源，回退等於在客戶沒有授權的情況下把他換回舊 leader，並付出
+        一次真實的平舊開新成本。所以遺失一律上拋，由 LeaderWatch 沿用上一個已驗證
+        的值（transient 處置）。
+        """
+        if self._ledger_path.exists():
+            return load_ledger(self._ledger_path)
+        if not ledger_init_marker_path(self._ledger_path).exists():
+            initialize_ledger(self._ledger_path)   # 失敗只 log，見該函式 docstring
+            return Ledger({}, None)
+        # 標記在、帳本不在 ⇒ 這個引擎確實建過帳本，現在它不見了。
+        # ⚠️ 告警文字**指名真正的事件**，刻意不複用 verify_failed 之類的既有 reason：
+        # 「某筆記錄驗簽失敗」會被操作者讀成「一筆過期記錄被忽略」（無害），而實際
+        # 發生的是「客戶已授權的 override 消失，差一點就無授權換手」（要立刻處理）。
+        self._critical(
+            f"**換 leader 帳本遺失**（{self._ledger_path} 曾經存在，現在不見了）——"
+            f"**已授權 override 遺失，拒絕退回 manifest 的 leader**。回退會是一次"
+            f"沒有客戶授權的換手，外加真實的平舊開新成本。本輪不解析，引擎沿用上一個"
+            f"已驗證的 leader；請從備份還原帳本，或確認狀態目錄未被重建",
+            dedup_key="leader_change_ledger_lost")
+        raise LeaderResolutionError(
+            f"換 leader 帳本遺失（{self._ledger_path}）——已授權 override 遺失，"
+            f"拒絕退回 manifest 的 leader")
+
     # ---------- 現狀（＝已套用的 override，或基礎解析結果） ----------
 
     def _current(self, base: LeaderResolution,
@@ -318,14 +419,19 @@ class LeaderChangeApplier:
         """回傳本輪真正該跟的 leader。
 
         raise 的情形只有兩種，且都由 `LeaderWatch` 接手處理：
-        - `LeaderResolutionError`（帳本讀不到）→ transient：沿用上一輪 ＋ critical。
+        - `LeaderResolutionError`（帳本讀不到**或遺失**）→ transient：沿用上一輪
+          ＋ critical。遺失那一格另有本模組自己發的、指名事件的 critical。
         - `LeaderRevokedError`（已套用的 leader 被撤銷）→ 受控收尾。
 
         其餘所有失敗（驗簽不過、leader 不被允許、記錄讀不到、落帳失敗）都是
         **不套用 ＋ 沿用現狀**，絕不中斷跟單——已開的部位需要有人繼續管理。
         """
         try:
-            ledger = load_ledger(self._ledger_path)
+            ledger = self._ledger_or_raise()
+        except LeaderResolutionError:
+            # 帳本**遺失**（_ledger_or_raise 已告警且已指名事件）——原樣上拋，
+            # 不要再包一層把「遺失」模糊成籠統的「無法載入」。
+            raise
         except (OSError, ValueError) as e:
             # 帳本讀不到 ⇒ 既不知道哪些 nonce 兌現過，也不知道目前生效的 override
             # 是誰。此時「回退 base」是錯的（可能是一次無授權換手），只能宣告

@@ -27,7 +27,8 @@ from spark.filet.leader_change import (build_leader_change_message,
                                        write_leader_change)
 from spark.filet.leader_change_apply import (DEFAULT_LEADER_CHANGES_PATH,
                                              AppliedChange, Ledger,
-                                             LeaderChangeApplier, load_ledger,
+                                             LeaderChangeApplier,
+                                             ledger_init_marker_path, load_ledger,
                                              resolve_changes_path, save_ledger)
 from spark.filet.leader_resolve import (SOURCE_CUSTOMER_SIGNED, SOURCE_MANIFEST,
                                         LeaderResolution, LeaderResolutionError,
@@ -350,11 +351,17 @@ def test_applied_leader_later_revoked_winds_down_instead_of_reverting(env):
 # ── 最常見的路徑：什麼都沒有 ──────────────────────────────────────────
 
 def test_no_record_is_silent_and_changes_nothing(env):
-    """⭐ 絕大多數 cycle 都走這條（沒有人在換 leader）：行為不變、**零告警**、
-    不建立任何檔案。這條路徑一旦會吵，告警就會失去意義。"""
+    """⭐ 絕大多數 cycle 都走這條（沒有人在換 leader）：行為不變、**零告警**。
+    這條路徑一旦會吵，告警就會失去意義。
+
+    ⚠️ 2026-07-19 C2 修法後，這條路徑**會**在首次啟動落下一份空帳本（那份帳本正是
+    「此後缺席＝遺失」的前提，見上方帳本遺失段）。原本的 `not ledger.exists()`
+    斷言編碼的是舊契約，已換成「內容為空 ＋ 仍然零告警」——同等強度地釘住
+    「這條路徑不改變任何行為、不吵」，但不再要求它把狀態目錄留成空白。
+    """
     assert env.applier().effective(_BASE) == _BASE
     assert env.notifier.records == []
-    assert not env.ledger.exists()
+    assert load_ledger(env.ledger) == Ledger({}, None)   # 空帳本＝什麼都沒發生
 
 
 def test_empty_changes_file_is_silent(env):
@@ -400,6 +407,128 @@ def test_broken_ledger_is_transient_not_a_silent_revert(env):
     with pytest.raises(LeaderResolutionError) as e:
         env.applier().effective(_BASE)
     assert not isinstance(e.value, LeaderRevokedError)   # 不得誤升級成撤銷
+
+
+# ── ⭐⭐ 帳本遺失（檔案不存在）≠ 首次啟動 ─────────────────────────────
+# 2026-07-19 opus 對抗性審查 C2：`applied` 是客戶授權 override 唯一的持久化來源
+# （manifest 不會被更新），所以帳本一被刪掉，引擎就會安靜地把客戶換回 manifest 的
+# 舊 leader——一次沒有授權的換手，外加真實的平舊開新成本。審查者實跑重現：刪帳本 →
+# 下一輪 source=manifest、alerts raised this cycle: 0。舊碼對「格式壞」fail-closed，
+# 對「檔案不存在」沒有任何防線，而這一格正是既有測試沒覆蓋的。
+
+
+def test_ledger_loss_after_an_applied_override_never_reverts_to_manifest(env):
+    """⭐⭐ 本檔最重要的新增條目：**已套用 override 後帳本消失 → 不得退回 base**。
+
+    這條盯的不是「讀檔失敗」而是「檔案不見了」——舊碼把它與首次啟動混為一談，
+    於是 `applied is None` → 回 manifest 的舊 leader，全程零告警。
+    """
+    env.write_change()
+    assert env.applier().effective(_BASE).address == _NEW_LEADER   # 先真的套用一次
+    env.ledger.unlink()                                            # 帳本被刪掉
+    env.notifier.records.clear()
+
+    with pytest.raises(LeaderResolutionError) as e:
+        env.applier().effective(_BASE)
+    assert not isinstance(e.value, LeaderRevokedError)   # 不得誤升級成撤銷
+
+    crits = env.crits()
+    assert len(crits) == 1
+    text = crits[0][2]
+    # ⭐ 告警必須**指名事件**：操作者要能一眼分辨「一筆記錄被忽略」（無害）與
+    # 「客戶授權的 override 遺失」（要立刻處理）。
+    assert "遺失" in text and "拒絕退回" in text
+
+
+def test_ledger_loss_alert_is_not_the_generic_verify_failed_reason(env):
+    """遺失的 dedup_key 必須自成一類——複用 verify_failed 之類的既有 key 會讓這則
+    告警被前一則同 key 的訊息去重掉，也會被操作者讀成完全不同的事件。"""
+    env.write_change()
+    env.applier().effective(_BASE)
+    env.ledger.unlink()
+    env.notifier.records.clear()
+
+    with pytest.raises(LeaderResolutionError):
+        env.applier().effective(_BASE)
+    keys = [r[3] for r in env.crits()]
+    assert keys == ["leader_change_ledger_lost"]
+
+
+def test_genuine_first_start_is_silent_and_writes_an_initial_ledger(env):
+    """真正的首次啟動（帳本與標記皆無）→ 正常運作、**不告警**，並落下初始帳本。
+
+    初始帳本本身就是「此後缺席＝遺失」的前提：沒有這一步，上面那條偵測永遠不會觸發。
+    """
+    assert not env.ledger.exists()
+    res = env.applier().effective(_BASE)
+
+    assert res == _BASE                    # 沒有變更記錄 → 照常用 manifest 的 leader
+    assert env.crits() == []               # 首次啟動不是事件
+    assert load_ledger(env.ledger) == Ledger({}, None)
+    assert ledger_init_marker_path(env.ledger).exists()
+
+
+def test_second_start_after_initialisation_treats_absence_as_loss(env):
+    """初始化過（標記在）之後，帳本缺席一律是遺失——即使當時還沒有任何 override。
+
+    刻意不放寬成「只有 applied 不為 None 才算遺失」：判斷「有沒有 override」需要
+    讀帳本，而帳本正是不見的那個東西（用遺失的證據去判斷遺失是不是要緊，是循環論證）。
+    """
+    env.applier().effective(_BASE)         # 首次啟動：落初始帳本＋標記
+    env.ledger.unlink()
+    env.notifier.records.clear()
+
+    with pytest.raises(LeaderResolutionError):
+        env.applier().effective(_BASE)
+
+
+def test_override_survives_restart_when_the_ledger_is_still_there(env):
+    """重啟後帳本仍在 → override 仍生效、不告警（新機制不得誤傷正常路徑）。"""
+    env.write_change()
+    assert env.applier().effective(_BASE).address == _NEW_LEADER
+    env.notifier.records.clear()
+
+    fresh = env.applier()                  # 模擬新進程：同樣的路徑、全新的物件
+    assert fresh.effective(_BASE) == LeaderResolution(_NEW_LEADER, SOURCE_CUSTOMER_SIGNED)
+    assert env.crits() == []
+
+
+def test_initialisation_writes_the_ledger_before_the_marker(env, monkeypatch):
+    """落檔順序：先帳本後標記。反過來的話，兩步之間斷電會留下「有標記無帳本」，
+    下一輪被判成遺失 → 一則假告警（狼來了會讓真的那則沒人看）。"""
+    import spark.filet.leader_change_apply as mod
+
+    real_save = mod.save_ledger
+    marker_existed_when_ledger_written: list[bool] = []
+
+    def _spy(path, ledger):
+        marker_existed_when_ledger_written.append(
+            ledger_init_marker_path(path).exists())
+        return real_save(path, ledger)
+
+    monkeypatch.setattr(mod, "save_ledger", _spy)
+    env.applier().effective(_BASE)
+
+    assert marker_existed_when_ledger_written == [False]   # 寫帳本時標記尚不存在
+    assert ledger_init_marker_path(env.ledger).exists()    # 但最終兩者都在
+
+
+def test_initial_ledger_write_failure_does_not_block_following(env, monkeypatch):
+    """初始帳本寫不進去 → 只 log、以空帳本繼續，**不**升級成解析失敗。
+
+    首次啟動的定義就是「還沒有任何客戶授權的 override」，此刻沒有東西可以失去；
+    把它升級成 raise 只會讓一個寫不進去的狀態目錄擋住跟單。真正該大聲的是稍後
+    套用時的落帳失敗（見 test_ledger_write_failure_blocks_the_apply）。
+    """
+    import spark.filet.leader_change_apply as mod
+
+    def _boom(*a, **k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(mod, "save_ledger", _boom)
+    assert env.applier().effective(_BASE) == _BASE
+    assert env.crits() == []
+    assert not env.ledger.exists()
 
 
 def test_ledger_write_failure_blocks_the_apply(env, monkeypatch):
