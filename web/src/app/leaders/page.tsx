@@ -9,18 +9,21 @@
  *    而那個誤讀在畫面上完全看不出來（後端也是基於同一理由把 `performance` 放在
  *    獨立子物件，見 app.py `_LEADER_PERF_WINDOWS` 上方註解）。
  *
- *    ⭐⭐ `performance` 的結構性不變式：**該不該顯示，載體是「鍵存不存在」**
- *    （後端分級揭露見 filet/leader_perf.py；publicapi/app.py 的 `_leader_perf_public`
- *    刻意用 `if k in row` 投影而不是 `.get()`，就是為了不把缺席的鍵補成 null）：
- *      - 樣本不足 30 天 → **沒有** `twr`／`max_drawdown` 鍵（tier `pnl_only`）
- *      - 樣本不足 90 天 → **沒有** `annualized_return` 鍵（tier `window_return`）
+ *    ⭐⭐ `performance` 的結構性不變式（2026-07-19 揭露模型改版後）：
+ *    **數字與它的警示標記同生共死**。舊模型用「鍵存不存在」承載分級揭露（不足
+ *    30 天就沒有 `twr` 鍵），改版後薄資料的數字**照樣回傳**，警示改由一組
+ *    `*_insufficient_data` 標記承載（見 filet/leader_perf.py 檔頭）。
+ *      - `twr`／`max_drawdown`：恆存在，帶 `*_insufficient_data`（< 30 天為 true）
+ *      - `annualized_return`：帶不足標記 ＋ `..._extrapolated_from_days`（實際天數）；
+ *        三鍵**一起**缺席的唯一情形是年化在數學上無定義（`1+TWR <= 0`）
  *      - `status="insufficient"` → 連 `cum_pnl` 都沒有
- *    **缺鍵的意思是「不該顯示」，不是「顯示為空」。** 用 `?? "—"`／`|| 0` 之類的預設值
- *    接上去，等於把後端刻意不給的東西在前端造出來——後端那道結構性防線就在那一行
- *    退化成「前端記得檢查」。lib/redline.test.ts 有一條斷言在擋這個寫法。
- *    ⭐ 本頁因此**不在 JSX 裡判斷鍵存不存在**：判定全部收斂在 lib/leaderPerf.ts 的
- *    `perfView()`（後端授權的 tier ∩ 資料實際具備，兩個方向都擋），JSX 只讀
- *    `view.shown` 上**存在的**鍵。散在畫面各處的判斷遲早會漏掉一處。
+ *    ⚠️ 最危險的失敗方向因此換了邊：不再是「造出後端沒給的數字」，而是
+ *    **「把數字送出去而沒有它的警示」**——一個 7 天 +3% 的 leader 年化是 365%，
+ *    數字本身完全正常，少掉標記就完全看不出它把雜訊放大了 52 倍。
+ *    ⭐ 本頁因此**不在 JSX 裡自己判斷成對與否**：判定全部收斂在 lib/leaderPerf.ts
+ *    的 `perfView()`（數字 ∩ 標記，缺一就 fail closed），JSX 只讀 `view.shown` 上
+ *    **存在的**鍵，且渲染數字的地方必須在同一個 scope 讀到它的標記——
+ *    lib/redline.test.ts 的兩條結構性斷言在擋這兩件事。
  *
  *    與績效數字同時揭露、且**貼著數字**（不是頁尾小字）的三件事：
  *      - `max_drawdown` 由 15 分鐘取樣算出，**系統性低估**真實盤中回撤——貼著 MDD；
@@ -556,29 +559,60 @@ function PerfWindowBlock({ name, view, notes }: {
           )}
         </div>
       ) : (
-        <dl className="leader-perf-stats">
-          {s.cum_pnl !== undefined && (
-            <PerfStat name="cum-pnl" label={c.perf.cols.cumPnl} hint={c.perf.colHints.cumPnl}
-              value={fmtAmount(s.cum_pnl)} raw={s.cum_pnl} />
+        <>
+          <dl className="leader-perf-stats">
+            {s.cum_pnl !== undefined && (
+              <PerfStat name="cum-pnl" label={c.perf.cols.cumPnl} hint={c.perf.colHints.cumPnl}
+                value={fmtAmount(s.cum_pnl)} raw={s.cum_pnl} />
+            )}
+            {/*
+              ⭐⭐ 標記與數字在**同一個 JSX 區塊**裡讀出來，不是「上面畫數字、
+              下面某處畫警語」：redline.test.ts 的紅線 (b) 就在檢查這件事。
+              薄資料的 TWR 現在照樣顯示，這行 marker 是它唯一的警示載體。
+            */}
+            {s.twr !== undefined && s.twr_insufficient_data !== undefined && (
+              <PerfStat name="twr" label={c.perf.cols.twr} hint={c.perf.colHints.twr}
+                value={fmtRatioPct(s.twr)} raw={s.twr}
+                marker={s.twr_insufficient_data ? thinMarker(view.coveredDays) : undefined} />
+            )}
+            {s.max_drawdown !== undefined
+              && s.max_drawdown_insufficient_data !== undefined && (
+              // ⭐ 取樣低估的警語與 MDD 數字在**同一個容器**：分開放，看到數字的人
+              // 不一定看得到警語，而「回撤只有 3%」正是最需要那句話的時候。
+              <PerfStat name="max-drawdown" label={c.perf.cols.maxDrawdown}
+                hint={c.perf.colHints.maxDrawdown}
+                value={fmtRatioPct(s.max_drawdown)} raw={s.max_drawdown}
+                note={notes.maxDrawdown}
+                marker={s.max_drawdown_insufficient_data
+                  ? thinMarker(view.coveredDays) : undefined} />
+            )}
+          </dl>
+
+          {/*
+            ⭐⭐ 年化**刻意排在期間報酬之後、另起一個字級較小的次級區塊**。
+            理由是誠信而不是版面：期間報酬是**實際發生過的事**，年化是**外推**。
+            一個 7 天 +3% 的 leader 年化會顯示成 365%——那個數字的錨定效果極強，
+            而它在數學上把 7 天的雜訊放大了 52 倍。並排等大會讓最不可靠的數字
+            拿到最大的視覺份量，所以這裡把版面權重與證據強度對齊。
+            年化三鍵一起缺席（數學上無定義）時，整區不渲染——**絕不**只留標記。
+          */}
+          {s.annualized_return !== undefined
+            && s.annualized_return_insufficient_data !== undefined
+            && s.annualized_return_extrapolated_from_days !== undefined && (
+            <dl className="leader-perf-annualized">
+              <PerfStat name="annualized-return" label={c.perf.cols.annualizedReturn}
+                hint={c.perf.colHints.annualizedReturn}
+                value={fmtRatioPct(s.annualized_return)} raw={s.annualized_return}
+                note={c.perf.annualizedSecondaryNote}
+                marker={fillDays(
+                  s.annualized_return_insufficient_data
+                    ? c.perf.markerExtrapolatedThinBody
+                    : c.perf.markerExtrapolatedBody,
+                  s.annualized_return_extrapolated_from_days,
+                )} />
+            </dl>
           )}
-          {s.twr !== undefined && (
-            <PerfStat name="twr" label={c.perf.cols.twr} hint={c.perf.colHints.twr}
-              value={fmtRatioPct(s.twr)} raw={s.twr} />
-          )}
-          {s.max_drawdown !== undefined && (
-            // ⭐ 取樣低估的警語與 MDD 數字在**同一個容器**：分開放，看到數字的人
-            // 不一定看得到警語，而「回撤只有 3%」正是最需要那句話的時候。
-            <PerfStat name="max-drawdown" label={c.perf.cols.maxDrawdown}
-              hint={c.perf.colHints.maxDrawdown}
-              value={fmtRatioPct(s.max_drawdown)} raw={s.max_drawdown}
-              note={notes.maxDrawdown} />
-          )}
-          {s.annualized_return !== undefined && (
-            <PerfStat name="annualized-return" label={c.perf.cols.annualizedReturn}
-              hint={c.perf.colHints.annualizedReturn}
-              value={fmtRatioPct(s.annualized_return)} raw={s.annualized_return} />
-          )}
-        </dl>
+        </>
       )}
 
       {/* 缺一級就說明缺什麼、為什麼、還差幾天——把空白變成狀態。 */}
@@ -615,14 +649,43 @@ function PerfGap({ title, body, shortfall }: {
   );
 }
 
-/** 一個績效數字。`note` 與數字同容器（給 MDD 的取樣警語用）。 */
-function PerfStat({ name, label, hint, value, raw, note }: {
-  name: string; label: string; hint: string; value: string; raw: string; note?: string;
+/**
+ * 「僅涵蓋 N 天」的不足標記文字。
+ * ⭐ 天數一律取自後端送來的值（單一來源），前端不從別處推算——涵蓋天數與不足判定
+ * 出自後端同一次計算，混用兩個來源正是最容易產生無聲誤判的地方。
+ */
+function thinMarker(coveredDays: number | null): string {
+  const body = coveredDays === null
+    ? c.perf.markerThinBodyNoDays
+    : c.perf.markerThinBody.replace("{days}", fmtDays(coveredDays));
+  return `${c.perf.markerThinTitle}：${body}`;
+}
+
+/** `{days}` 佔位符 → 後端送來的天數字串（Decimal string，例如 `"6.0000"`）。 */
+function fillDays(template: string, daysRaw: string): string {
+  return template.replace("{days}", fmtDays(Number(daysRaw)));
+}
+
+/**
+ * 一個績效數字。`note` 與 `marker` 都與數字**同容器**——分開放，看到數字的人不一定
+ * 看得到警語。
+ *
+ * ⭐ `marker` 與 `note` 刻意分成兩個 prop：`note` 是這個指標**恆常**的極限說明
+ * （例如 MDD 的取樣低估），`marker` 是**這一次資料**的不足／外推警示。兩者的成因與
+ * 生命週期不同，合成一個欄位會讓「這次資料很薄」被寫成一句看起來像常態免責的話。
+ */
+function PerfStat({ name, label, hint, value, raw, note, marker }: {
+  name: string; label: string; hint: string; value: string; raw: string;
+  note?: string; marker?: string;
 }) {
   return (
     <div className={`leader-perf-stat leader-perf-stat-${name}`}>
       <dt title={hint}>{label}</dt>
       <dd className="mono" title={raw}>{value}</dd>
+      {/* 緊貼數字：role="note" 讓螢幕閱讀器也拿得到這個警示，不只是視覺上的小字。 */}
+      {marker && (
+        <p className="leader-perf-stat-marker" role="note">{marker}</p>
+      )}
       {note && <p className="leader-perf-stat-note">{note}</p>}
     </div>
   );

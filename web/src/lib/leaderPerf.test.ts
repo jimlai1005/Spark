@@ -10,8 +10,11 @@ import {
 /**
  * fixture 依**後端實際線上形狀**：Decimal 欄位序列化後是 **string**
  * （filet/leader_perf.py `jsonable_performance`：`str(v) if isinstance(v, Decimal)`），
- * `sample_count`／`skipped_intervals`／`*_ts_ms` 才是 number。
- * ⭐ 分級揭露的載體是**鍵的不存在**（不是 null）：低層級的 fixture 一律**不寫**那些鍵。
+ * `sample_count`／`skipped_intervals`／`*_ts_ms` 是 number，
+ * 三個 `*_insufficient_data` 是**原生 bool**（後端刻意不轉字串）。
+ *
+ * ⚠️ 2026-07-19 揭露模型改版：資料不足**不再**由缺鍵承載，而是由標記承載，
+ * 所以 fixture 一律**同時**帶數字與標記——這才是線上真正的形狀。
  */
 function win(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -19,40 +22,76 @@ function win(over: Record<string, unknown> = {}): Record<string, unknown> {
     disclosure_tier: "annualizable",
     sample_count: 745, covered_days: "412.5000",
     first_ts_ms: 1700000000000, last_ts_ms: 1735640000000, skipped_intervals: 0,
-    cum_pnl: "18234.55", twr: "0.3421", max_drawdown: "0.1875",
-    annualized_return: "0.2938",
+    cum_pnl: "18234.55",
+    twr: "0.3421", twr_insufficient_data: false,
+    max_drawdown: "0.1875", max_drawdown_insufficient_data: false,
+    annualized_return: "0.2938", annualized_return_insufficient_data: false,
+    annualized_return_extrapolated_from_days: "412.5000",
     ...over,
   };
 }
 
-describe("perfView — 分級揭露：鍵存不存在決定能不能顯示", () => {
-  it("annualizable（四個鍵齊全）→ 四個數字都可顯示", () => {
+/** 完整的 shown（供 `toEqual` 用）：數字與標記成對，缺一不可。 */
+const SHOWN_FULL = {
+  cum_pnl: "18234.55",
+  twr: "0.3421", twr_insufficient_data: false,
+  max_drawdown: "0.1875", max_drawdown_insufficient_data: false,
+  annualized_return: "0.2938", annualized_return_insufficient_data: false,
+  annualized_return_extrapolated_from_days: "412.5000",
+};
+
+/** 整組年化欄位（三鍵同生共死）→ 一起拿掉，模擬「年化在數學上無定義」。 */
+function dropAnnualGroup(w: Record<string, unknown>): Record<string, unknown> {
+  const {
+    annualized_return: _a,
+    annualized_return_insufficient_data: _b,
+    annualized_return_extrapolated_from_days: _c,
+    ...rest
+  } = w;
+  return rest;
+}
+
+/** 整組窗口報酬欄位 → 一起拿掉（舊快照／窗太短算不出來）。 */
+function dropWindowGroup(w: Record<string, unknown>): Record<string, unknown> {
+  const {
+    twr: _t, twr_insufficient_data: _ti,
+    max_drawdown: _m, max_drawdown_insufficient_data: _mi,
+    ...rest
+  } = w;
+  return rest;
+}
+
+describe("perfView — 揭露：數字與標記必須成對到齊", () => {
+  it("四個數字 ＋ 標記齊全 → 全部可顯示", () => {
     const v = perfView(win());
     expect(v.level).toBe("annualized");
     expect(v.degraded).toBe(false);
-    expect(v.shown).toEqual({
-      cum_pnl: "18234.55", twr: "0.3421",
-      max_drawdown: "0.1875", annualized_return: "0.2938",
-    });
-    // 型別實測：Decimal → string，樣本數才是 number
+    expect(v.shown).toEqual(SHOWN_FULL);
+    // 型別實測：Decimal → string，樣本數是 number，標記是原生 bool
     expect(typeof v.shown.twr).toBe("string");
+    expect(typeof v.shown.twr_insufficient_data).toBe("boolean");
     expect(v.coveredDays).toBe(412.5);
     expect(v.sampleCount).toBe(745);
   });
 
-  it("⭐ window_return（不足 90 天 → 沒有 annualized_return 鍵）→ 年化「鍵不存在」", () => {
-    const { annualized_return: _drop, ...rest } = win({ disclosure_tier: "window_return", covered_days: "45.2000" });
+  it("⭐ 年化整組缺席（數學上無定義）→ 年化「鍵不存在」，且不算降級", () => {
+    const rest = dropAnnualGroup(
+      win({ disclosure_tier: "window_return", covered_days: "45.2000" }));
     const v = perfView(rest);
     expect(v.level).toBe("window");
+    // 三鍵一起缺席是後端的合法狀態（1+TWR <= 0），不是 schema 漂移
     expect(v.degraded).toBe(false);
     // ⭐ 不是 null、不是 "—"、不是 0——是這個鍵**根本不存在**
     expect("annualized_return" in v.shown).toBe(false);
+    // ⭐ 標記也絕不單獨存在：不得畫出「由 N 天外推」卻沒有被外推的數字
+    expect("annualized_return_insufficient_data" in v.shown).toBe(false);
+    expect("annualized_return_extrapolated_from_days" in v.shown).toBe(false);
     expect(v.shown.twr).toBe("0.3421");
   });
 
-  it("⭐ pnl_only（不足 30 天 → 沒有 twr／max_drawdown 鍵）→ 兩個百分比都不存在", () => {
-    const { twr: _t, max_drawdown: _m, annualized_return: _a, ...rest } =
-      win({ disclosure_tier: "pnl_only", covered_days: "6.1000", sample_count: 12 });
+  it("⭐ 窗口報酬與年化都整組缺席（舊快照）→ 只剩累積損益，不算降級", () => {
+    const rest = dropAnnualGroup(dropWindowGroup(
+      win({ disclosure_tier: "pnl_only", covered_days: "6.1000", sample_count: 12 })));
     const v = perfView(rest);
     expect(v.level).toBe("pnl");
     expect(v.degraded).toBe(false);
@@ -60,6 +99,77 @@ describe("perfView — 分級揭露：鍵存不存在決定能不能顯示", () 
     expect("max_drawdown" in v.shown).toBe(false);
     expect("annualized_return" in v.shown).toBe(false);
     expect(v.shown.cum_pnl).toBe("18234.55");
+  });
+
+  /**
+   * ⭐⭐ 改版後的核心行為：資料很薄**照樣顯示數字**，標記負責說出它有多薄。
+   * 舊行為是「不足 30 天就把 twr／MDD 藏起來」，那條規則已隨後端一起作廢。
+   */
+  it("⭐⭐ 薄資料（6 天）→ 數字照樣顯示，且標記為 true", () => {
+    const v = perfView(win({
+      disclosure_tier: "pnl_only", covered_days: "6.0000", sample_count: 12,
+      twr_insufficient_data: true, max_drawdown_insufficient_data: true,
+      annualized_return_insufficient_data: true,
+      annualized_return_extrapolated_from_days: "6.0000",
+      annualized_return: "3.6500",
+    }));
+    expect(v.level).toBe("annualized");
+    expect(v.degraded).toBe(false);
+    expect(v.shown.twr).toBe("0.3421");
+    expect(v.shown.twr_insufficient_data).toBe(true);
+    expect(v.shown.max_drawdown_insufficient_data).toBe(true);
+    expect(v.shown.annualized_return).toBe("3.6500");
+    expect(v.shown.annualized_return_insufficient_data).toBe(true);
+    expect(v.shown.annualized_return_extrapolated_from_days).toBe("6.0000");
+  });
+
+  /**
+   * ⭐⭐ fail closed 的頭號情境：數字在、標記缺席。
+   * 標記缺席的語意是「我們不知道這段資料夠不夠」，不是「資料充足」——
+   * 把它當成充足並照畫，等於替後端說了一句它沒說過的話。
+   */
+  it.each([
+    ["twr", "twr_insufficient_data"],
+    ["max_drawdown", "max_drawdown_insufficient_data"],
+  ])("⭐⭐ %s 有值但標記缺席 → 不顯示（fail closed）＋ degraded", (metric, marker) => {
+    const w = win();
+    delete w[marker];
+    const v = perfView(w);
+    expect(metric in v.shown).toBe(false);
+    // 一起給或一起不給：另一個也跟著不顯示
+    expect("twr" in v.shown).toBe(false);
+    expect("max_drawdown" in v.shown).toBe(false);
+    expect(v.degraded).toBe(true);
+  });
+
+  it("⭐⭐ 標記是字串 \"false\" 而非 bool → 不顯示（字串 \"false\" 的真值是 true）", () => {
+    const v = perfView(win({ twr_insufficient_data: "false" }));
+    expect("twr" in v.shown).toBe(false);
+    expect(v.degraded).toBe(true);
+  });
+
+  it("⭐⭐ 年化少了外推天數 → 整格不畫：說不出「由 N 天外推」就不該給那個數字", () => {
+    const w = win();
+    delete w.annualized_return_extrapolated_from_days;
+    const v = perfView(w);
+    expect(v.level).toBe("window");
+    expect("annualized_return" in v.shown).toBe(false);
+    expect(v.degraded).toBe(true);
+  });
+
+  it("⭐ 不變式：shown 裡有數字，就一定有它的標記（JSX 可以安心直接讀）", () => {
+    for (const fixture of [win(), win({ twr_insufficient_data: true }),
+      dropAnnualGroup(win()), dropWindowGroup(win())]) {
+      const s = perfView(fixture).shown;
+      if ("twr" in s) expect(typeof s.twr_insufficient_data).toBe("boolean");
+      if ("max_drawdown" in s) {
+        expect(typeof s.max_drawdown_insufficient_data).toBe("boolean");
+      }
+      if ("annualized_return" in s) {
+        expect(typeof s.annualized_return_insufficient_data).toBe("boolean");
+        expect(typeof s.annualized_return_extrapolated_from_days).toBe("string");
+      }
+    }
   });
 
   it("⭐ insufficient → 連 cum_pnl 都沒有；covered_days 為 null（後端 _insufficient 原形）", () => {
@@ -78,9 +188,9 @@ describe("perfView — 分級揭露：鍵存不存在決定能不能顯示", () 
   });
 });
 
-describe("perfView — 兩個方向都要擋（tier 授權 ∩ 資料具備）", () => {
-  it("⭐ tier 宣稱 annualizable 但鍵缺漏（schema 漂移）→ 降級且 degraded=true，不無中生有", () => {
-    const { annualized_return: _drop, ...rest } = win(); // tier 仍宣稱 annualizable
+describe("perfView — 不成對就不放行（數字 ∩ 標記）", () => {
+  it("⭐ 數字缺漏但標記還在（schema 漂移）→ 不顯示且 degraded=true，不無中生有", () => {
+    const { annualized_return: _drop, ...rest } = win(); // 兩個年化標記仍在
     const v = perfView(rest);
     expect(v.level).toBe("window");
     expect("annualized_return" in v.shown).toBe(false);
@@ -88,12 +198,28 @@ describe("perfView — 兩個方向都要擋（tier 授權 ∩ 資料具備）",
     expect(v.degraded).toBe(true);
   });
 
-  it("⭐ 鍵在但 tier 不許（pnl_only 夾帶 twr）→ 不顯示：tier 才是揭露決策", () => {
-    const v = perfView(win({ disclosure_tier: "pnl_only" }));
-    expect(v.level).toBe("pnl");
-    expect("twr" in v.shown).toBe(false);
-    expect("max_drawdown" in v.shown).toBe(false);
-    expect("annualized_return" in v.shown).toBe(false);
+  /**
+   * ⚠️ 本測試 2026-07-19 **反轉**：原規則是「鍵在但 tier 不許 → 不顯示，
+   * tier 才是揭露決策」。改版後 tier 只是 `covered_days` 的純函式，**不再**決定
+   * 哪些鍵存在，因此拿 tier 去擋數字只會把薄資料的數字藏起來——而「藏起來」正是
+   * 這次改版明確要停止的行為（使用者裁決：照樣顯示，但帶標記）。
+   * tier 唯一保留的擋門作用是 rank 0（見下一個 describe 的 unknown tier 測試）。
+   */
+  it("⭐⭐ tier=pnl_only 但數字與標記齊全 → 照樣顯示（tier 不再是顯示授權）", () => {
+    const v = perfView(win({
+      disclosure_tier: "pnl_only", covered_days: "6.1000",
+      twr_insufficient_data: true, max_drawdown_insufficient_data: true,
+      annualized_return_insufficient_data: true,
+      annualized_return_extrapolated_from_days: "6.1000",
+    }));
+    expect(v.level).toBe("annualized");
+    expect(v.shown.twr).toBe("0.3421");
+    expect(v.shown.max_drawdown).toBe("0.1875");
+    expect(v.shown.annualized_return).toBe("0.2938");
+    // 顯示了，但每一個都帶著「資料不足」的標記——警示沒有跟著消失
+    expect(v.shown.twr_insufficient_data).toBe(true);
+    expect(v.shown.max_drawdown_insufficient_data).toBe(true);
+    expect(v.shown.annualized_return_insufficient_data).toBe(true);
   });
 
   it("⭐ twr 與 max_drawdown 只有其中一個 → 兩個都不顯示", () => {

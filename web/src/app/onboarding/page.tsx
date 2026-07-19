@@ -6,8 +6,9 @@ import { ReconnectGate } from "@/components/wizard/ReconnectGate";
 import { StepDeposit } from "@/components/wizard/StepDeposit";
 import { StepRisk } from "@/components/wizard/StepRisk";
 import { StepSign } from "@/components/wizard/StepSign";
+import type { SpotStranded } from "@/lib/api";
 import { COPY } from "@/lib/copy";
-import { shortAddr } from "@/lib/format";
+import { fmtAmount, shortAddr } from "@/lib/format";
 import { useMe, useOnboardingStatus } from "@/lib/hooks";
 import { deriveStep, getRiskConfirmed, setRiskConfirmed, threadPercent } from "@/lib/wizard";
 import { useCallback, useReducer } from "react";
@@ -65,6 +66,13 @@ export default function OnboardingPage() {
         />
       </div>
 
+      {/*
+        ⭐ 錢卡在 spot 的提示放在精靈**外層**、步驟之上：它是「為什麼第 4 步的資金
+        一直偵測不到」的答案，而第 4 步在錢包未連線時會被重連閘取代——放進步驟裡，
+        最需要看到它的人反而看不到。`null`（沒有卡住的錢**或**查詢失敗）→ 整塊不畫。
+      */}
+      {s?.spot_stranded != null && <SpotStrandedNotice info={s.spot_stranded} />}
+
       <div className="wizard-layout">
         <nav aria-label="開通步驟">
           <ol className="wizard-steps">
@@ -103,5 +111,44 @@ export default function OnboardingPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+/**
+ * 「你有資金停在 spot 錢包」提示。
+ *
+ * ⚠️⚠️ **本元件永遠不會有一顆「幫我劃轉」按鈕**，這不是還沒做，是做不到：
+ * spot → perp 是 user-signed action，需要客戶的**主鑰**才簽得動，而我方結構上
+ * 不持有主鑰（非託管不變量）。畫一顆我們兌現不了的按鈕，比不畫還糟——客戶會停在
+ * 這裡等它生效。能提供的只有「說明 ＋ 外部連結」，連結把人送到他自己的錢包介面，
+ * 由他自己簽。
+ *
+ * ⭐ 金額與門檻取自後端（單一來源）；後端 `note` 原文刻意**不**直接渲染：它帶有
+ * 給非 HTML 消費端看的 Markdown 強調符號（`**spot**`），照搬會在畫面上留下裸露的
+ * 星號。此處改用等義的前端文案，數字仍然只有後端這一個來源。
+ */
+function SpotStrandedNotice({ info }: { info: SpotStranded }) {
+  const c = COPY.wizard;
+  return (
+    <section className="spot-stranded" role="status" aria-label={c.spotStrandedTitle}>
+      <p className="spot-stranded-title">{c.spotStrandedTitle}</p>
+      <p>{c.spotStrandedBody}</p>
+      <dl className="spot-stranded-facts">
+        <div>
+          <dt>{c.spotStrandedAmountLabel}</dt>
+          <dd className="mono" title={info.usdc}>{fmtAmount(info.usdc)} USDC</dd>
+        </div>
+        <div>
+          <dt>{c.spotStrandedThresholdLabel}</dt>
+          <dd className="mono" title={info.threshold}>{fmtAmount(info.threshold)} USDC</dd>
+        </div>
+      </dl>
+      <p className="hint">{c.spotStrandedManualNote}</p>
+      {/* 外部連結（非按鈕）：動作發生在客戶自己的錢包介面，不在我們這裡。 */}
+      <a className="btn btn-ghost" href={c.spotStrandedLinkHref}
+         target="_blank" rel="noopener noreferrer">
+        {c.spotStrandedLink}
+      </a>
+    </section>
   );
 }

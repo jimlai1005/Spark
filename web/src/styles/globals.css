@@ -734,6 +734,30 @@ main.page {
   border-left: 2px solid rgba(var(--warn-rgb), .5);
   border-radius: 4px; padding: 6px 8px;
 }
+/* 資料不足／外推標記：與數字同一格、緊貼數字，且用警示色而非 dim 色——
+   它不是次要資訊，它是這個數字唯一的警示載體。 */
+.leader-perf-stat-marker {
+  margin: 4px 0 0; font-size: 11.5px; line-height: 1.5;
+  color: var(--warn); font-weight: 400;
+}
+
+/* ⭐⭐ 年化欄位的視覺弱化（誠信要求，不是版面偏好）。
+   期間報酬是**實際發生過的事**，年化是**外推**：一個 7 天 +3% 的 leader 年化會
+   顯示成 365%，那個數字的錨定效果極強，而它在數學上把 7 天的雜訊放大了 52 倍。
+   若與期間報酬並排等大，最不可靠的數字會拿到最大的視覺份量。所以這裡刻意：
+   1. 另起一區、排在期間報酬**之後**（不是並排的第四格）；
+   2. 數值字級小於上方 stats（16px → 13px）、顏色降到 dim；
+   3. 左側細線與縮排，讀起來像「附註推算」而不是「一項成績」。 */
+.leader-perf-annualized {
+  margin: 10px 0 0; padding: 8px 0 0 10px;
+  border-top: 1px solid var(--border);
+  border-left: 2px solid rgba(var(--warn-rgb), .28);
+}
+.leader-perf-annualized .leader-perf-stat dt { font-size: 10.5px; }
+.leader-perf-annualized .leader-perf-stat dd {
+  font-size: 13px; font-weight: 300; color: var(--text-dim);
+}
+
 /* 「資料不足」「還差幾天」：畫成有內容的狀態區塊——不是一排「—」。 */
 .leader-perf-state {
   border: 1px dashed var(--border); border-radius: 6px;

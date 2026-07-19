@@ -34,6 +34,24 @@ export interface Me { address: string; account_id: string }
 export interface NonceResp { nonce: string; message: string }
 export interface AgentResp { agent_address: string; recovered?: boolean }
 export interface TypedDataResp { typed_data: HlTypedData }
+/**
+ * 錢卡在 **spot** 錢包的提示（`/api/onboard/status` 的 `spot_stranded`）。
+ *
+ * ⚠️⚠️ 本結構**刻意不含**任何劃轉入口、代簽 payload 或「幫我轉」旗標，顯示層也
+ * 絕不得長出一顆這種按鈕：spot → perp 是 user-signed action，需要客戶的**主鑰**才簽
+ * 得動，而我方結構上不持有主鑰（非託管不變量）。做得到的只有「說明 ＋ 外部連結」。
+ *
+ * 型別註記（實測後端 `publicapi/app.py::_spot_stranded`）：`usdc`／`threshold` 是
+ * Decimal → **string**（落地慣例）；`action_required` 目前恆為
+ * `"manual_transfer_spot_to_perp"`——名字本身就在說「只能人工」。
+ */
+export interface SpotStranded {
+  usdc: string;
+  threshold: string;
+  action_required: string;
+  note: string;
+}
+
 export interface OnboardStatus {
   address: string;
   account_id: string;
@@ -42,6 +60,14 @@ export interface OnboardStatus {
   builder_fee_approved: boolean;
   agent_approved: boolean;
   funded: boolean;
+  /**
+   * `null` ＝ 沒有卡住的錢**或**查詢失敗——後端刻意把兩者合成同一個值
+   * （`_spot_stranded` 對查詢失敗 fail-silent：對一個已正常跟單的客戶顯示
+   * 「你的錢卡在 spot」是純粹的困惑，假警報比沒提示糟）。
+   * ⭐ 所以前端對 `null` 的正確反應是**完全不顯示**，不是顯示「無卡住資金」——
+   * 後者會把一個「我們也不知道」的狀態畫成一句肯定的斷言。
+   */
+  spot_stranded: SpotStranded | null;
   state: "READY" | "IN_PROGRESS";
 }
 export interface PendingEntry {
@@ -166,22 +192,26 @@ export type LeaderPerf = { [window: string]: LeaderPerfWindow | undefined };
 /**
  * 一個績效窗的原始線上形狀（`_LEADER_PERF_FIELDS` 白名單投影）。
  *
- * ⭐⭐ 四個數值欄位刻意宣告為 **optional**，因為線上就是這樣：後端的分級揭露
- * 用「鍵存不存在」承載（app.py `_leader_perf_public` 用 `if k in row` 投影，
- * 不是 `.get()`，就是為了不把缺席補成 null）——
- *   - 不足 30 天 → **沒有** `twr`／`max_drawdown` 鍵（tier `pnl_only`）
- *   - 不足 90 天 → **沒有** `annualized_return` 鍵（tier `window_return`）
- *   - `status="insufficient"` → 連 `cum_pnl` 都沒有
- * **缺鍵 = 不該顯示，不是顯示為空。** 不要在這裡補 `| null`，也不要在顯示層用
- * `?? "—"`／`|| 0` 接起來——那等於把後端刻意不給的數字在前端造出來。
- * 要判定能顯示什麼請走 `lib/leaderPerf.ts` 的 `perfView()`（單一判定點），
- * `lib/redline.test.ts` 有一條結構性斷言在擋預設值寫法。
+ * ⭐⭐ 揭露模型改版（2026-07-19，後端 `filet/leader_perf.py` 檔頭）：
+ * **舊行為**——資料不足時後端**不給鍵**，缺鍵＝不該顯示。
+ * **新行為**——資料不足時**照樣給數字**，警示改由一組 `*_insufficient_data`
+ * 布林標記承載。所以 `twr`／`max_drawdown`／`annualized_return` 現在幾乎恆存在，
+ * 唯一的缺席情形是**年化在數學上無定義**（`1+TWR <= 0`，帳戶被歸零）——此時
+ * 三個 `annualized_*` 鍵**一起**缺席（標記絕不單獨存在）。
+ *
+ * ⚠️ 這個改版把最危險的失敗方向從「憑空造出數字」換成了「**把數字送出去而沒有
+ * 它的警示**」：一個 7 天 +3% 的 leader，年化會算成 365%，數字本身完全正常，
+ * 少掉標記則畫面上完全看不出它是外推的。因此標記是**強制欄位**：
+ * `lib/leaderPerf.ts` 的 `perfView()` 拿不到標記就不放行數字（fail closed），
+ * `lib/redline.test.ts` 有兩條結構性斷言擋「把標記消音」與「渲染數字卻不讀標記」。
  *
  * 型別註記（**實測自後端**，不是推測）：後端內部一律 Decimal，
  * `leader_perf.jsonable_performance` 落地時 `str(v) if isinstance(v, Decimal)`，
- * 所以 `covered_days`／`cum_pnl`／`twr`／`max_drawdown`／`annualized_return`
- * 在 JSON 裡是 **string**（無損序列化，沿 ops 慣例）；
- * `sample_count`／`skipped_intervals`／`first_ts_ms`／`last_ts_ms` 才是 **number**。
+ * 所以 `covered_days`／`cum_pnl`／`twr`／`max_drawdown`／`annualized_return`／
+ * `annualized_return_extrapolated_from_days` 在 JSON 裡是 **string**；
+ * `sample_count`／`skipped_intervals`／`first_ts_ms`／`last_ts_ms` 是 **number**；
+ * 三個 `*_insufficient_data` 是**原生 bool**（後端刻意不轉字串——`"False"` 這種
+ * 字串的真值是 **true**，轉了就是一個致命的無聲反轉）。
  */
 export interface LeaderPerfWindow {
   /** 窗名，例如 `perpMonth`。 */
@@ -192,7 +222,11 @@ export interface LeaderPerfWindow {
   status: string;
   /** 資料不足的機器可讀原因碼；`ok` 時為 null。 */
   reason: string | null;
-  /** `insufficient`／`pnl_only`／`window_return`／`annualizable`。 */
+  /**
+   * `insufficient`／`pnl_only`／`window_return`／`annualizable`。
+   * ⚠️ 改版後這是 `covered_days` 的**純函式**，**不再**決定哪些鍵存在，因此也
+   * 不再是「能不能顯示」的授權——顯示與否看數字與標記是否成對到齊。
+   */
   disclosure_tier: string;
   /** 樣本點數（number）。 */
   sample_count: number;
@@ -201,11 +235,22 @@ export interface LeaderPerfWindow {
   first_ts_ms: number | null;
   last_ts_ms: number | null;
   skipped_intervals: number;
-  /** 以下四個：**缺鍵即不得顯示**（見上方 ⭐⭐）。 */
   cum_pnl?: string;
   twr?: string;
+  /** `covered_days < 30` → true。⭐ 與 `twr` **同生共死**，缺了就不准顯示 `twr`。 */
+  twr_insufficient_data?: boolean;
   max_drawdown?: string;
+  /** `covered_days < 30` → true。⭐ 與 `max_drawdown` 同生共死。 */
+  max_drawdown_insufficient_data?: boolean;
+  /** 缺席＝年化在數學上無定義（此時另兩個 `annualized_*` 也一起缺席）。 */
   annualized_return?: string;
+  /** `covered_days < 90` → true。 */
+  annualized_return_insufficient_data?: boolean;
+  /**
+   * 年化實際涵蓋的天數（Decimal → **string**，例如 `"6.0000"`）。後端**無條件**
+   * 回傳（不是只在不足時才給）：年化本質上就是外推，前端要能一律寫出「由 N 天外推」。
+   */
+  annualized_return_extrapolated_from_days?: string;
 }
 
 /**

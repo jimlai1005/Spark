@@ -67,30 +67,50 @@ function leaders(over: Partial<LeadersResp> = {}): LeadersResp {
 
 /**
  * 績效窗 fixture。⭐ 依**後端實際線上形狀**：Decimal 欄位序列化後是 **string**
- * （filet/leader_perf.py `jsonable_performance`），`sample_count` 才是 number。
- * ⭐⭐ 分級揭露的載體是**鍵的不存在**——低層級的 fixture 一律**不寫**那些鍵，
- * 不是寫成 null。fixture 若補成 null，就驗不到本頁真正要防的那件事。
+ * （filet/leader_perf.py `jsonable_performance`），`sample_count` 是 number，
+ * 三個 `*_insufficient_data` 是**原生 bool**。
+ * ⭐⭐ 2026-07-19 改版：資料不足**不再**由缺鍵承載，而是由標記承載，所以數字與
+ * 標記一律成對出現——缺一半的 fixture 代表 schema 漂移，是另一組測試在驗的東西。
  */
 const PERF_ANNUALIZABLE = {
   period: "perpAllTime", basis: "perp", status: "ok", reason: null,
   disclosure_tier: "annualizable", sample_count: 745, covered_days: "412.5000",
   first_ts_ms: 1700000000000, last_ts_ms: 1735640000000, skipped_intervals: 0,
-  cum_pnl: "18234.55", twr: "0.3421", max_drawdown: "0.1875",
-  annualized_return: "0.2938",
+  cum_pnl: "18234.55",
+  twr: "0.3421", twr_insufficient_data: false,
+  max_drawdown: "0.1875", max_drawdown_insufficient_data: false,
+  annualized_return: "0.2938", annualized_return_insufficient_data: false,
+  annualized_return_extrapolated_from_days: "412.5000",
 };
-/** 不足 90 天 → **沒有** `annualized_return` 鍵。 */
+/** 年化在數學上無定義（1+TWR <= 0）→ 三個 `annualized_*` 鍵**一起**缺席。 */
 const PERF_WINDOW = {
   period: "perpMonth", basis: "perp", status: "ok", reason: null,
   disclosure_tier: "window_return", sample_count: 128, covered_days: "45.2000",
   first_ts_ms: 1731000000000, last_ts_ms: 1734900000000, skipped_intervals: 2,
-  cum_pnl: "820.10", twr: "0.0712", max_drawdown: "0.0304",
+  cum_pnl: "820.10",
+  twr: "0.0712", twr_insufficient_data: false,
+  max_drawdown: "0.0304", max_drawdown_insufficient_data: false,
 };
-/** 不足 30 天 → **沒有** `twr`／`max_drawdown` 鍵。 */
+/** 舊快照：窗口報酬與年化整組缺席，只剩累積損益。 */
 const PERF_PNL_ONLY = {
   period: "perpMonth", basis: "perp", status: "ok", reason: null,
   disclosure_tier: "pnl_only", sample_count: 24, covered_days: "6.1000",
   first_ts_ms: 1734300000000, last_ts_ms: 1734827040000, skipped_intervals: 0,
   cum_pnl: "310.75",
+};
+/**
+ * ⭐⭐ 改版後的主線情境：涵蓋 6 天，**每個數字都在**，每個都帶 `insufficient=true`。
+ * 7 天 +3% 年化成 365% 的那個放大效應，就是這組 fixture 要釘住的顯示行為。
+ */
+const PERF_THIN = {
+  period: "perpMonth", basis: "perp", status: "ok", reason: null,
+  disclosure_tier: "pnl_only", sample_count: 24, covered_days: "6.0000",
+  first_ts_ms: 1734300000000, last_ts_ms: 1734818400000, skipped_intervals: 0,
+  cum_pnl: "310.75",
+  twr: "0.0300", twr_insufficient_data: true,
+  max_drawdown: "0.0120", max_drawdown_insufficient_data: true,
+  annualized_return: "5.1234", annualized_return_insufficient_data: true,
+  annualized_return_extrapolated_from_days: "6.0000",
 };
 /** 資料不足 → 連 `cum_pnl` 都沒有；covered_days 為 null（後端 `_insufficient` 原形）。 */
 const PERF_INSUFFICIENT = {
@@ -353,6 +373,106 @@ describe("LeadersPage — 績效分級揭露 ⭐⭐（缺鍵＝不該顯示，�
     expect(gap.textContent).toMatch(/需要至少 30 天/);
     expect(gap.textContent).toMatch(/不是「報酬為零」或「沒有回撤」/);
     expect(gap.textContent).toContain("距門檻還差 23.9 天");   // 30 - 6.1
+  });
+
+  /* ────────────────────────────────────────────────────────────────────────
+   * 2026-07-19 揭露模型改版：薄資料**照樣顯示數字**，標記負責說出它有多薄。
+   * 以下這組測試釘住的是「數字給了，但看得出它建立在多少資料上」。
+   * ──────────────────────────────────────────────────────────────────────── */
+
+  it("⭐⭐ 不足 30 天：twr／MDD 照樣顯示，且**緊貼數字**標明資料不足與涵蓋天數", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_THIN }));
+    render(wrap(<LeadersPage />));
+    await screen.findByLabelText("績效（perp）");
+
+    // 數字有給——這正是改版要的行為（舊行為是整格藏起來）
+    const twrCell = document.querySelector(".leader-perf-stat-twr")!;
+    expect(twrCell.textContent).toContain("3.0%");
+    // ⭐ 警示與數字**同一格**：分開放，看到數字的人不一定看得到警示
+    const twrMarker = twrCell.querySelector(".leader-perf-stat-marker")!;
+    expect(twrMarker.textContent).toContain("資料不足");
+    expect(twrMarker.textContent).toContain("6.0 天");   // 實際涵蓋天數
+    expect(twrMarker.textContent).toMatch(/低於 30 天門檻/);
+
+    const mddCell = document.querySelector(".leader-perf-stat-max-drawdown")!;
+    expect(mddCell.textContent).toContain("1.2%");
+    const mddMarker = mddCell.querySelector(".leader-perf-stat-marker")!;
+    expect(mddMarker.textContent).toContain("資料不足");
+    expect(mddMarker.textContent).toContain("6.0 天");
+  });
+
+  it("⭐⭐ 不足 90 天的年化：必須寫明「由 N 天資料外推」（N 取自後端外推天數）", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_THIN }));
+    render(wrap(<LeadersPage />));
+    await screen.findByLabelText("績效（perp）");
+
+    const cell = document.querySelector(".leader-perf-stat-annualized-return")!;
+    expect(cell.textContent).toContain("512.3%");        // 年化 5.1234
+    const marker = cell.querySelector(".leader-perf-stat-marker")!;
+    // ⭐ 這句話是這個數字唯一的警示載體：拿掉它，畫面上就只剩一個 512% 的數字
+    expect(marker.textContent).toContain("由 6.0 天資料外推");
+    expect(marker.textContent).toMatch(/遠低於 90 天門檻/);
+    // 明說它不是對未來一年的預期——年化最常見的誤讀
+    expect(marker.textContent).toMatch(/不是對未來一年的預期/);
+  });
+
+  it("⭐ 資料充足的年化：仍然寫明由幾天外推（年化本質上就是外推）", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
+    render(wrap(<LeadersPage />));
+    await screen.findByLabelText("績效（perp）");
+
+    const marker = document.querySelector(
+      ".leader-perf-stat-annualized-return .leader-perf-stat-marker")!;
+    expect(marker.textContent).toContain("由 412.5 天資料外推");
+  });
+
+  it("⭐⭐ 年化的視覺份量弱於期間報酬：另起次級區塊，不與期間報酬並排等大", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
+    render(wrap(<LeadersPage />));
+    const block = await screen.findByLabelText("績效（perp）");
+
+    // 1. 年化**不在**主要 stats 清單裡（期間報酬才在）
+    const primary = Array.from(block.querySelectorAll(".leader-perf-stats .leader-perf-stat dt"))
+      .map((n) => n.textContent);
+    expect(primary).toEqual(["累積損益", "窗口報酬率（TWR）", "最大回撤（MDD）"]);
+    expect(primary).not.toContain("年化報酬率");
+
+    // 2. 年化在自己的次級容器裡
+    const secondary = block.querySelector(".leader-perf-annualized")!;
+    expect(secondary).not.toBeNull();
+    expect(secondary.textContent).toContain("年化報酬率");
+    expect(secondary.textContent).toContain("29.4%");
+
+    // 3. 次級容器排在主要 stats **之後**（DOM 順序＝閱讀順序）
+    const stats = block.querySelector(".leader-perf-stats")!;
+    expect(stats.compareDocumentPosition(secondary))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+
+    // 4. 明說為什麼降階：外推 vs 實際發生的事
+    expect(secondary.textContent).toMatch(/年化是外推出來的推算值/);
+  });
+
+  it("⭐⭐ 年化三鍵一起缺席 → 整個年化欄位不渲染，**不得**只顯示標記", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
+    render(wrap(<LeadersPage />));
+    const block = await screen.findByLabelText("績效（perp）");
+
+    expect(document.querySelectorAll(".leader-perf-annualized")).toHaveLength(0);
+    expect(document.querySelectorAll(".leader-perf-stat-annualized-return")).toHaveLength(0);
+    // ⭐ 標記絕不單獨存在：不得出現「由 N 天外推」卻沒有被外推的那個數字
+    expect(block.textContent).not.toContain("外推");
+  });
+
+  it("⭐⭐ 標記缺席（schema 漂移）→ 數字整格不畫，且大聲說出降級（不靜默當作充足）", async () => {
+    const { twr_insufficient_data: _drop, ...noMarker } = PERF_THIN;
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: noMarker }));
+    render(wrap(<LeadersPage />));
+    const block = await screen.findByLabelText("績效（perp）");
+
+    // 沒有標記就沒有數字：一個沒有警示的薄資料百分比，比不顯示危險得多
+    expect(document.querySelectorAll(".leader-perf-stat-twr")).toHaveLength(0);
+    expect(document.querySelectorAll(".leader-perf-stat-max-drawdown")).toHaveLength(0);
+    expect(block.querySelector(".leader-perf-degraded")).not.toBeNull();
   });
 
   it("⭐ 誠信 2：上界警語在績效區塊內（與績效數字同一個容器，不是頁尾小字）", async () => {
