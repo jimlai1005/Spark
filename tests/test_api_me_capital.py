@@ -79,7 +79,8 @@ def write_hb(cfg, account_id, *, alloc="1000.00", util="0.5000", full=False,
 
     payload = build_heartbeat(
         account_id=account_id, now_s=time.time() - age_s, killswitch_tripped=False,
-        coverage=None, leader_address=_LEADER, leader_source="manifest",
+        coverage=None, alerts_count=0,
+        leader_address=_LEADER, leader_source="manifest",
         allocated_capital=alloc, capital_utilization=util, use_full_equity=full,
         capital_source=source, capital_changed_at=changed_at,
         cycle_result="no_action", cycle_detail=None)

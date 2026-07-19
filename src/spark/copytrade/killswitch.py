@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -47,6 +48,8 @@ from spark.copytrade.executor import ExecutorPort
 from spark.copytrade.notifier import Notifier
 from spark.exchange.base import EquityView, Position
 from spark.resilience import run as resilient_run
+
+logger = logging.getLogger(__name__)
 
 ARM_FILE_RELPATH = Path("var/copytrade/killswitch.tripped")
 ALERTS_LOG_RELPATH = Path("var/copytrade/alerts.log")
@@ -166,6 +169,29 @@ def _append_alert(root: Path, text: str) -> None:
             f.write(f"{datetime.now(timezone.utc).isoformat()} {text}\n")
     except OSError as e:
         print(f"alerts.log 寫入失敗: {e!r}｜原訊息: {text}", file=sys.stderr)
+
+
+def count_alerts(path) -> int | None:
+    """告警記錄的行數；**讀不到 → None（不是 0）**。檔案不存在 → 0。
+
+    ⭐ 落在寫端旁邊（`_append_alert` 是唯一的寫入者）且**全 repo 只有這一份**：
+    兩個讀端各數一次會漂移。營運面板有兩條取得這個數字的路徑——filet-api 直讀
+    狀態根，以及引擎把它放進健康心跳——兩條路徑必須算出同一個數，否則面板上
+    「直讀說 3、心跳說 0」而讀者無從判斷該信哪一個（工程原則 1：同源同基準）。
+
+    0 是「沒有任何告警」＝面板上最令人安心的數字。讀不到卻顯示 0，等於在
+    「告警檔權限壞掉」的當下告訴操作者一切正常——健康面板謊報健康比沒有面板更危險。
+    「檔案不存在」在**讀得到的**狀態根之下確實是 0（引擎從未寫過告警）；狀態根本身
+    讀不到或不存在時，呼叫端根本不該走到這裡（見 publicapi.ops.follower_health）。
+    """
+    p = Path(path)
+    if not p.exists():
+        return 0        # 檔案不存在＝引擎從未寫過告警，這確實是 0
+    try:
+        return sum(1 for line in p.read_text().splitlines() if line.strip())
+    except OSError as e:
+        logger.warning("告警記錄讀取失敗（%s）: %r", p, e)
+        return None
 
 
 def _write_arm(arm_path: Path, payload: dict, notifier: Notifier, root: Path) -> None:

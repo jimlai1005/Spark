@@ -41,6 +41,7 @@ def _env(**over):
         "FILET_KEYSVC_SOCK": "/run/filet/keysvc.sock",
         "FILET_PENDING_PATH": "/tmp/pending.json",
         "FILET_EXCHANGE_DIR": "/tmp/filet-exchange",
+        "FILET_STATE_BASE": "/opt/filet/state",
         "FILET_ADMIN_ADDRESSES": "0x" + "ad" * 20,
     }
     base.update(over)
@@ -80,6 +81,29 @@ def test_exchange_dir_is_required_and_has_no_silent_default():
     """
     with pytest.raises(ValueError, match="FILET_EXCHANGE_DIR"):
         ApiConfig.from_env(_env(FILET_EXCHANGE_DIR=None))
+
+
+def test_state_base_is_required_and_has_no_silent_default():
+    """⭐⭐ 漏設 FILET_STATE_BASE → **拒絕啟動**（與 FILET_EXCHANGE_DIR 同一處理）。
+
+    這個變數與引擎 unit 的 `FILET_STATE_DIR=/opt/filet/state/%i` 是同一條路徑的
+    **兩份獨立推導**，沒有共同的仲裁者。舊版有隱含預設 `/opt/filet/state`，於是
+    漏設／設錯的症狀是靜默的：API 去讀一個引擎沒在寫的目錄，每個 follower 的狀態根
+    都 `absent`，而面板當時把 absent 讀成「kill switch 未觸發」——在引擎已經熔斷、
+    部位已被平掉的當下報告一切正常。「起不來」刻意優先於「起來了但面板謊報健康」。
+    """
+    with pytest.raises(ValueError, match="FILET_STATE_BASE"):
+        ApiConfig.from_env(_env(FILET_STATE_BASE=None))
+
+
+def test_state_base_has_no_class_level_default_either():
+    """⭐ 連 dataclass 層都沒有預設值（沿 exchange_dir 的同一個結構性決定）：
+    留一個類屬性預設，from_env 以外的建構路徑（測試、腳本）就會靜默拿到它。"""
+    import dataclasses
+
+    field = next(f for f in dataclasses.fields(ApiConfig) if f.name == "state_base")
+    assert field.default is dataclasses.MISSING
+    assert field.default_factory is dataclasses.MISSING
 
 
 def test_leader_changes_path_is_anchored_on_the_exchange_dir_not_pending():
@@ -175,7 +199,8 @@ def test_live_key_refused_on_direct_construction():
         ApiConfig(network="testnet", builder_address="0x" + "b1" * 20,
                   siwe_domain="d", siwe_uri="https://d", db_path="x.db",
                   keysvc_sock="x.sock", pending_path="p.json",
-                  exchange_dir="/tmp/filet-exchange", admin_addresses=frozenset(),
+                  exchange_dir="/tmp/filet-exchange", state_base="/opt/filet/state",
+                  admin_addresses=frozenset(),
                   stripe_secret_key="sk_live_abc",
                   stripe_webhook_secret="whsec_x", stripe_price_id="price_x")
 
@@ -187,7 +212,8 @@ def test_partial_set_refused_on_direct_construction():
         ApiConfig(network="testnet", builder_address="0x" + "b1" * 20,
                   siwe_domain="d", siwe_uri="https://d", db_path="x.db",
                   keysvc_sock="x.sock", pending_path="p.json",
-                  exchange_dir="/tmp/filet-exchange", admin_addresses=frozenset(),
+                  exchange_dir="/tmp/filet-exchange", state_base="/opt/filet/state",
+                  admin_addresses=frozenset(),
                   stripe_secret_key="sk_test_abc")
 
 

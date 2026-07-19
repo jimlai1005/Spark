@@ -89,7 +89,7 @@ HEARTBEAT_STALE_S = 600
 # 心跳頂層鍵集（多一個少一個都要有人主動改這行，並被測試逼著解釋為什麼）。
 # 沿 CAPITAL_SETTINGS_FIELDS 的既有慣例：釘住它的是測試，不是註解。
 HEARTBEAT_FIELDS = ("account_id", "written_at", "written_at_s", "killswitch_tripped",
-                    "coverage", "leader", "capital", "last_cycle")
+                    "coverage", "alerts", "leader", "capital", "last_cycle")
 
 # ⭐⭐ 禁止出現在心跳裡的鍵名片段（大小寫不敏感）。命中即拒寫，見
 # `_reject_secret_material`。清單刻意含 `nonce`／`message`：它們本身不是密鑰，
@@ -162,7 +162,8 @@ def _reject_secret_material(payload: object, *, path: str = "") -> None:
 
 
 def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool | None,
-                    coverage, leader_address: str | None, leader_source: str | None,
+                    coverage, alerts_count: int | None,
+                    leader_address: str | None, leader_source: str | None,
                     allocated_capital: str | None, capital_utilization: str | None,
                     use_full_equity: bool | None, capital_source: str,
                     capital_changed_at: str | None, cycle_result: str,
@@ -177,6 +178,13 @@ def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool |
 
     `coverage` 收 `copytrade.equity.SampleCoverage` 或 None（讀取失敗）。這裡只投影
     四個摘要值，不投影樣本序列本身——面板要的是「夠不夠」，不是每一筆權益。
+
+    ⭐ `alerts_count`（`killswitch.count_alerts` 的產物，`None` ＝引擎自己也讀不到）
+    帶著 `known` 旗標落檔，理由與 `coverage` 完全一樣：`{"known": false}` 與
+    `{"known": true, "count": 0}` 在面板上是兩件事，而後者是最令人安心的數字。
+    這一格**沒有它面板就補不起來**——狀態根對 filet-api 不可讀（或路徑漂移）時，
+    直讀的告警數恆為未知，心跳是唯一的來源。刻意是**必填參數**（無預設值）：
+    下一個加欄位的人必須在呼叫點明講這個數從哪來，而不是繼承一個安靜的 None。
     """
     cov: dict = {"known": False, "count": None, "oldest_age_s": None,
                  "newest_age_s": None, "sufficient": None}
@@ -192,6 +200,7 @@ def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool |
         "written_at_s": float(now_s),
         "killswitch_tripped": killswitch_tripped,
         "coverage": cov,
+        "alerts": {"known": alerts_count is not None, "count": alerts_count},
         "leader": {"address": leader_address, "source": leader_source},
         "capital": {"allocated_capital": allocated_capital,
                     "capital_utilization": capital_utilization,

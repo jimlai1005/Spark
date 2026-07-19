@@ -72,7 +72,8 @@ from spark.config import Settings
 from spark.copytrade.config import CopySettings
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
-from spark.copytrade.killswitch import DrawdownStatus, check_drawdown, is_tripped, trip
+from spark.copytrade.killswitch import (ALERTS_LOG_RELPATH, DrawdownStatus,
+                                        check_drawdown, count_alerts, is_tripped, trip)
 from spark.copytrade.loop import main_loop, run_cycle, tripped_report
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
@@ -248,6 +249,11 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
                 cov = sample_coverage(state_root, now_fn=lambda: now_s)
             except OSError:
                 cov = None
+            # ⭐ 告警數同理由引擎自己數（面板那一側在狀態根不可讀／路徑漂移時
+            # 恆為未知，心跳是唯一來源）。共用 `killswitch.count_alerts`——直讀端
+            # 與心跳端各數一次會漂移，而面板會並排顯示這兩個數（工程原則 1）。
+            # 它已把「讀不到」回成 None（不是 0），這裡不再補一層 try。
+            alerts_count = count_alerts(state_root / ALERTS_LOG_RELPATH)
             alloc = util = None
             full = None
             capital_source = "unavailable"
@@ -266,7 +272,7 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
                         applied_capital.applied_at, timezone.utc).isoformat()
             payload = build_heartbeat(
                 account_id=account_id, now_s=now_s, killswitch_tripped=tripped,
-                coverage=cov,
+                coverage=cov, alerts_count=alerts_count,
                 leader_address=(leader.address if leader is not None else None),
                 leader_source=(leader.source if leader is not None else None),
                 allocated_capital=alloc, capital_utilization=util,

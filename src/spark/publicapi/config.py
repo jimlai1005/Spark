@@ -48,6 +48,17 @@ class ApiConfig:
     # 情況下把記錄寫到那個預設目錄去——正式部署是靜默錯位（C3 本體），測試裡則是
     # 直接寫進 repo 的工作樹。每個建構點都必須明講這個檔要落在哪。
     exchange_dir: str
+    # ⭐⭐ per-follower 引擎狀態根的基底（唯讀；API 讀 skipped 小額落檔與健康直讀）。
+    # **刻意沒有預設值**，與 `exchange_dir` 完全同一個處理與同一個理由
+    # （見 from_env 的 required 清單與 leader_change_apply.require_exchange_dir）：
+    # 這個值與引擎的 `FILET_STATE_DIR`（systemd `/opt/filet/state/%i`）是**兩份獨立
+    # 推導**，兩者今天相等純粹因為兩個檔案裡的兩個字面量剛好一樣。
+    # 舊版給了隱含預設 `/opt/filet/state`，於是漏設／設錯的症狀是**靜默的**：
+    # API 去看一個引擎根本沒在寫的目錄，每一個狀態根都 `absent`，而面板會把
+    # 「沒有 ARM 檔」讀成「kill switch 未觸發」——在引擎已經熔斷、部位已被平掉的
+    # 當下告訴管理員一切正常。拿掉預設值讓漏設的那一邊**直接拒絕啟動**，
+    # 「起不來」刻意優先於「起來了但面板謊報健康」。
+    state_base: str
     agent_name: str = "filet"         # research：一律給名字，避開 SDK 空名刪欄位特例
     # --- 營運後台（/ops，admin only）唯讀資料來源 ---
     # followers manifest：web 層**只讀**（寫入只有人工 activate CLI，見 pending.py 檔頭）。
@@ -56,11 +67,6 @@ class ApiConfig:
     # builder accrued 歷史序列（北極星實收，由 scripts/copytrade_daily_report.py 每日附加）。
     # API 進程不自己查 accrued——查一次的職責在日報腳本，這裡只讀它落下的檔（紅線：不加總）。
     accrued_history_path: str = "var/copytrade/accrued_history.jsonl"
-    # per-follower 引擎狀態根的基底（唯讀；API 只讀 skipped 小額落檔）。
-    # ⭐ 沿引擎既有的 FILET_STATE_BASE 與同一個預設值（panic_all.py、
-    # filet_daily_report.py 皆用此變數）——同一件事兩個名字是誤設的溫床，
-    # 而誤設的症狀是營運面板永遠顯示「沒有 skipped」（一個安靜的零）。
-    state_base: str = "/opt/filet/state"
     # --- leader 目錄（/api/leaders，session-gated）唯讀資料來源 ---
     # ⭐ 直接引用引擎的 DEFAULT_LEADERS_PATH，不另寫一個字面量預設（同源，工程原則 1）：
     # 目錄頁列出的「可選 leader」與引擎放行的清單必須是**同一個檔**。兩邊各自宣告
@@ -153,9 +159,13 @@ class ApiConfig:
         # require_exchange_dir 是同一個變數的兩端，任一端漏設都會讓 API 寫的記錄
         # 引擎永遠讀不到，而兩邊的 log 都正常。刻意不給隱含預設值——漏設的那一邊
         # 直接拒絕啟動，比「起來了但功能靜默失效」早好幾天被發現。
+        # ⭐ FILET_STATE_BASE 同列必填、同一個理由（2026-07-19 opus 審查 Critical）：
+        # 它與引擎 unit 的 FILET_STATE_DIR 是同一條路徑的兩份推導，漏設／漂移的
+        # 症狀是健康面板把每一個 follower 都讀成 absent，而 absent 曾被當成
+        # 「kill switch 未觸發」上呈。詳見 `state_base` 欄位與 ops.state_root_status。
         required = ["FILET_API_NETWORK", "FILET_BUILDER_ADDR", "FILET_SIWE_DOMAIN",
                     "FILET_SIWE_URI", "FILET_API_DB", "FILET_KEYSVC_SOCK",
-                    "FILET_PENDING_PATH", "FILET_EXCHANGE_DIR"]
+                    "FILET_PENDING_PATH", "FILET_EXCHANGE_DIR", "FILET_STATE_BASE"]
         missing = [k for k in required if not env.get(k)]
         if missing:
             raise ValueError(f"缺少環境變數: {', '.join(missing)}")
@@ -199,7 +209,7 @@ class ApiConfig:
                    followers_path=followers_path,
                    accrued_history_path=(env.get("FILET_ACCRUED_HISTORY_PATH")
                                          or cls.accrued_history_path),
-                   state_base=env.get("FILET_STATE_BASE") or cls.state_base,
+                   state_base=env["FILET_STATE_BASE"],
                    leaders_path=leaders_path,
                    watchlist_dir=watchlist_dir,
                    admin_addresses=admins,

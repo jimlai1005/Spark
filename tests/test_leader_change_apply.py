@@ -633,7 +633,8 @@ def test_engine_and_api_resolve_the_same_file_from_the_exchange_dir(tmp_path):
         network="testnet", builder_address="0x" + "b1" * 20,
         siwe_domain="d", siwe_uri="u", db_path="db", keysvc_sock="s",
         pending_path="/var/lib/filet-api/pending.json",
-        exchange_dir=str(exchange), admin_addresses=frozenset()).leader_changes_path
+        exchange_dir=str(exchange), state_base=str(tmp_path / "state"),
+        admin_addresses=frozenset()).leader_changes_path
     assert engine_side == api_side == str(exchange / "leader_changes.json")
     # 且**不**與 pending.json 同目錄——那正是被修掉的錨點。
     assert Path(api_side).parent != Path("/var/lib/filet-api")

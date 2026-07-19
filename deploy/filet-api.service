@@ -24,6 +24,13 @@ Environment=FILET_PENDING_PATH=/var/lib/filet-api/pending.json
 # 目錄本身是 filet-api:filet-engine 0750，由 RUNBOOK §5.5.1 手動建立（不由服務建）：
 # 服務建的話會是 filet-api:filet-api 0755，引擎讀不到而 other 讀得到，兩個方向都錯。
 Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
+# ⭐⭐ per-follower 引擎狀態根的**基底**。必須讓 `<此值>/<account_id>` 逐字元等於
+# filet-follower@.service 的 `FILET_STATE_DIR=/opt/filet/state/%i`（`%i` ＝ account_id）
+# ——兩個 unit 對同一條路徑各推導一次，沒有共同的仲裁者。刻意無預設值（漏設即拒絕
+# 啟動）：舊版的隱含預設會讓設錯的症狀變成靜默的——API 去看一個引擎沒在寫的目錄，
+# 每個 follower 的狀態根都 `absent`，而面板曾把 absent 讀成「kill switch 未觸發」，
+# 等於在引擎已熔斷、部位已被平掉的當下報告一切正常。驗收指令見 RUNBOOK §5.5.2。
+Environment=FILET_STATE_BASE=/opt/filet/state
 Environment=FILET_ADMIN_ADDRESSES=REPLACE_WITH_ADMIN_ADDRESSES
 Environment=FILET_API_PORT=8700
 # M3 計費（測試模式）：要啟用時取消註解並填 Stripe **測試** key（sk_test_ 前綴強制，

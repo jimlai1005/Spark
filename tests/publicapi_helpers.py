@@ -23,6 +23,9 @@ def make_cfg(tmp_path, **over):
                 # ⭐ 交換目錄與 pending 分家（C3 修法）：共享產物有自己的目錄，
                 # 測試也照這個拓撲擺，才會真的走到「兩個不同目錄」的路徑。
                 exchange_dir=str(tmp_path / "exchange"),
+                # ⭐ 與 exchange_dir 同樣是**必填無預設**（漏設即拒絕啟動）：測試
+                # 也逐個明講狀態根在哪，才會真的走到「API 與引擎兩份路徑推導」的路徑。
+                state_base=str(tmp_path / "state"),
                 admin_addresses=frozenset())
     base.update(over)
     return ApiConfig(**base)

@@ -753,6 +753,71 @@ systemctl show 'filet-follower@<account_id>.service' -p Environment \
 
 ---
 
+### 5.5.2 ⭐⭐ 宣告 `FILET_STATE_BASE`（不做這步，filet-api 會拒絕啟動）
+
+換 leader 的交換目錄（§5.5.1）是「同一條路徑、兩個 unit 各推導一次」的**第一個**
+實例。狀態根是**第二個**，而且它壞掉的方式更安靜：
+
+| | 引擎（`filet-follower@.service`） | API（`filet-api.service`） |
+|---|---|---|
+| 變數 | `FILET_STATE_DIR=/opt/filet/state/%i` | `FILET_STATE_BASE=/opt/filet/state` |
+| 用途 | ARM 檔／equity 樣本／`alerts.log`／兩份帳本的落點 | 健康面板與 skipped 小額的**讀**取根 |
+
+`%i` ＝ systemd 實例名 ＝ `account_id`，所以兩者的關係是
+**`<FILET_STATE_BASE>/<account_id>` 必須逐字元等於 `FILET_STATE_DIR`**。
+
+```ini
+# deploy/filet-api.service（已內建）
+Environment=FILET_STATE_BASE=/opt/filet/state
+```
+
+⭐ **這個變數沒有預設值，漏設會拒絕啟動**（`ApiConfig.from_env` 的 `required` 清單，
+與 `FILET_EXCHANGE_DIR` 同一個處理）。2026-07-19 之前它有一個隱含預設
+`/opt/filet/state`，於是**設錯或漏設的症狀是靜默的**：API 去讀一個引擎根本沒在寫的
+目錄 → 每個 follower 的狀態根都是 `absent` → 而面板當時把 `absent` 讀成
+「沒有 ARM 檔＝kill switch 未觸發」，並以「已知」上呈。也就是說：**引擎已經熔斷、
+部位已經被平掉的當下，面板會告訴管理員一切正常。**
+
+修法有兩層，兩層都要（缺一層就只是換一種方式謊報）：
+1. **擋源頭**：本變數升為必填，漏設直接起不來（本節）。
+2. **面板不再自作主張**：`absent` 與 `unreadable` 一視同仁——kill switch 與告警數
+   一律交給引擎發布的心跳（§5.6），只有「心跳新鮮且明說未觸發」才敢顯示未觸發。
+   心跳來自引擎**自己的**狀態根，那一份路徑不可能弄錯。
+
+#### 驗收（三條都要跑）
+
+```bash
+# ── 驗收 1：API 端宣告了這個變數（沒宣告的話服務根本起不來，見驗收 3）──
+systemctl show filet-api.service -p Environment | tr ' ' '\n' | grep FILET_STATE_BASE
+# 預期：FILET_STATE_BASE=/opt/filet/state
+
+# ── 驗收 2：⭐ 兩個 unit 拼出來的是**同一個目錄**（本節唯一真正重要的一條）──
+# 取兩邊的值自己算一次，不要用眼睛比對——差一個尾斜線或大小寫都看不出來。
+ACCT=<account_id>
+BASE="$(systemctl show filet-api.service -p Environment | tr ' ' '\n' \
+        | sed -n 's/^FILET_STATE_BASE=//p')"
+DIR="$(systemctl show "filet-follower@${ACCT}.service" -p Environment | tr ' ' '\n' \
+       | sed -n 's/^FILET_STATE_DIR=//p')"
+[ "$(realpath -m "$BASE/$ACCT")" = "$(realpath -m "$DIR")" ] \
+  && echo "狀態根一致 OK: $DIR" \
+  || echo "★ 失敗：API 讀 $BASE/$ACCT，引擎寫 $DIR —— 面板會把每一列讀成 absent"
+
+# ── 驗收 3：漏設就起不來（fail-closed，非破壞性：只在子 shell 裡試跑）──
+sudo -u filet-api env -u FILET_STATE_BASE \
+  /opt/filet/spark/.venv/bin/python -c \
+  'from spark.publicapi.config import ApiConfig; ApiConfig.from_env()' 2>&1 \
+  | grep -q FILET_STATE_BASE \
+  && echo "漏設拒絕啟動 OK" || echo "★ 失敗：漏設沒有拒絕啟動，隱含預設值又回來了"
+```
+
+> 驗收 2 的 `★` 是**部署當下唯一能抓到路徑漂移的時機**。錯過它之後，這條錯誤不會
+> 有任何 log、不會有任何告警，面板上只會看到每個 follower 的 `basis` 都是 `absent`
+> ——而那與「客戶剛 activate、引擎還沒跑過」長得一模一樣。心跳（§5.6）是唯一的
+> 補救：`basis: heartbeat` 且 `heartbeat_status: ok` 代表面板拿到的是引擎自報的
+> 真相，路徑漂移不影響它。**面板上一整排 `absent` ＋ 心跳 `missing` ＝先查這一節。**
+
+---
+
 ### 5.6 activate 一個 follower（人工 CLI）
 
 ⚠️ **必須指定絕對路徑或先 `cd`**：`--pending`／`--manifest` 的預設值是 CWD 相對的，

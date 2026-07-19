@@ -37,7 +37,7 @@ class _Cov:
 
 def _payload(now_s=_NOW, **over):
     base = dict(account_id=ACCT, now_s=now_s, killswitch_tripped=False,
-                coverage=_Cov(), leader_address="0x" + "d4" * 20,
+                coverage=_Cov(), alerts_count=0, leader_address="0x" + "d4" * 20,
                 leader_source="customer_signed", allocated_capital="5000.00",
                 capital_utilization="0.4000", use_full_equity=False,
                 capital_source="customer_signed",
@@ -111,6 +111,19 @@ def test_coverage_read_error_reports_unknown_not_zero():
     cov = _payload(coverage=_Cov(read_error=True))["coverage"]
     assert cov["known"] is False
     assert cov["count"] is None and cov["sufficient"] is None
+
+
+def test_alerts_count_rides_the_heartbeat_with_a_known_flag():
+    """⭐ 告警數必須進心跳，而且要帶 `known` 旗標（沿 coverage 的同一個形狀）。
+
+    存在理由：面板直讀告警檔需要讀得到狀態根，而正式部署的狀態根是
+    `0700 filet-engine`（面板讀不到），路徑也可能漂移。少了這一格，`alerts` 在
+    那些情境下**永遠**是未知——而「0 則告警」正是操作者判斷「不用現在去看」的依據。
+    """
+    assert _payload(alerts_count=3)["alerts"] == {"known": True, "count": 3}
+    # ⭐ 真的 0 則與「引擎自己也讀不到」是兩件事，不得長成同一個樣子
+    assert _payload(alerts_count=0)["alerts"] == {"known": True, "count": 0}
+    assert _payload(alerts_count=None)["alerts"] == {"known": False, "count": None}
 
 
 def test_missing_coverage_object_reports_unknown():

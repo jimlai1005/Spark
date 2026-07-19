@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
 
+from spark.copytrade.killswitch import count_alerts
 from spark.copytrade.report import compute_trade_quality
 from spark.filet.aggregate import collect_follower_summary
 from spark.filet.engine_health import HEARTBEAT_STALE_S
@@ -318,22 +319,6 @@ ENGINE_STALE_S = 600
 _HEARTBEAT_STALE_S = HEARTBEAT_STALE_S
 
 
-def _alerts_count(path) -> int | None:
-    """告警記錄的行數；讀不到 → None（**不是 0**）。
-
-    0 是「沒有任何告警」＝面板上最令人安心的數字。讀不到卻顯示 0，等於在
-    「告警檔權限壞掉」的當下告訴操作者一切正常——健康面板謊報健康比沒有面板更危險。
-    """
-    p = Path(path)
-    if not p.exists():
-        return 0        # 檔案不存在＝引擎從未寫過告警，這確實是 0
-    try:
-        return sum(1 for line in p.read_text().splitlines() if line.strip())
-    except OSError as e:
-        logger.warning("告警記錄讀取失敗（%s）: %r", p, e)
-        return None
-
-
 def state_root_status(root) -> str:
     """狀態根的可讀性：`absent` | `readable` | `unreadable`。
 
@@ -344,9 +329,21 @@ def state_root_status(root) -> str:
     觸發**的 kill switch 回答「沒有觸發」。那是這個面板最不能犯的錯：
     它會在客戶的引擎已經熔斷、部位已經被平掉的當下，告訴管理員一切正常。
 
-    `absent`（狀態根根本不存在）與 `unreadable` 必須分開：前者是「這個 follower
-    剛 activate、引擎還沒跑過」，此時「沒有 ARM 檔」是**真的**沒觸發；後者是
-    「有東西在那裡但我們看不到」，只能回未知。
+    `absent`（狀態根根本不存在）與 `unreadable` 仍然分開回報，因為兩者的**處置**
+    不同（前者多半是「剛 activate、引擎還沒跑過」或路徑設錯，後者是權限問題），
+    這個區別以 `basis` 欄位原樣上呈給操作者。
+
+    ⚠️ 但「分得開」**不等於**「absent 可以直讀」（2026-07-19 修正）：本函式的舊
+    docstring 曾主張 absent 時「沒有 ARM 檔是真的沒觸發」，所以 `follower_health`
+    讓 absent 走直讀。那個論證**只在路徑正確的前提下成立**，而面板恰恰分不出
+    「引擎沒跑過」與「我看錯地方」——兩者在這個探測底下長得一模一樣。
+    API 的狀態根是 `Path(cfg.state_base)/account_id`、引擎的是 systemd 注入的
+    `FILET_STATE_DIR`，**兩份獨立推導**；一旦漂移，absent 會在引擎已經熔斷、部位
+    已被平掉的當下被讀成「沒有 ARM 檔＝未觸發」。故 `follower_health` 現在對
+    absent 與 unreadable 一視同仁，把 kill switch 與告警數交給心跳補
+    （心跳來自引擎自己的狀態根，那一份路徑不可能弄錯）。
+    `FILET_STATE_BASE` 也因此升為必填（見 `ApiConfig.from_env`）——擋掉漂移的
+    源頭，比事後在面板上補救可靠。
     """
     p = Path(root)
     try:
@@ -382,6 +379,9 @@ def _apply_heartbeat(row: dict, hb) -> dict:
     所以有直讀就用直讀，並以 `basis` 欄位明講這一列的值出自哪一邊——兩個來源
     並存卻不標示，讀者無從判斷他看到的數字有多舊（工程原則 1 的變形）。
     `leader` 與 `capital` 例外：狀態根**沒有**這兩者的可讀投影，它們只可能來自心跳。
+    `alerts` 是第三種情形——直讀**有**這個投影，但它可能是未知（狀態根 absent／
+    unreadable，或告警檔本身讀不到）。規則仍是同一條：有直讀就用直讀，
+    只有 `None`（未知）那一格才由心跳補。
     """
     row["heartbeat_status"] = hb.status
     row["heartbeat_at"] = hb.at
@@ -398,6 +398,17 @@ def _apply_heartbeat(row: dict, hb) -> dict:
     row["leader_source"] = leader.get("source")
     row["capital"] = data.get("capital")
     row["last_cycle"] = data.get("last_cycle")
+
+    # ⭐ 告警數：**只補未知的格子**（直讀已經給出數字時不覆蓋——它較新鮮）。
+    # 這一格非補不可：狀態根 absent／unreadable 時 `alerts` 恆為 None，而
+    # 「有幾則告警」正是操作者判斷「要不要現在去看」的依據之一。心跳的計數與直讀
+    # 出自**同一個** `killswitch.count_alerts`，兩側同基準（工程原則 1）。
+    if row.get("alerts") is None:
+        alerts = data.get("alerts") or {}
+        count = alerts.get("count")
+        if alerts.get("known") is True and isinstance(count, int) \
+                and not isinstance(count, bool):
+            row["alerts"] = count
 
     if row.get("basis") == "state_root":
         return row      # 直讀已經給了 kill switch 與覆蓋度，心跳不覆蓋較新鮮的值
@@ -455,19 +466,29 @@ def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
     # `Path.exists()` 都會安靜地回 False——kill switch 會被回報成「沒有觸發」。
     # 讀不到就整列標未知，不讓任何一格落到「看起來健康」的預設值上。
     status = state_root_status(state_root)
-    # `basis` ＝這一列的 kill switch／覆蓋度出自哪裡。只有真的讀得到才算 state_root；
-    # absent（狀態根不存在）刻意**不算**，那一格的「沒有 ARM 檔」與心跳相比資訊量
-    # 低得多，該讓心跳補上（見 _apply_heartbeat 的疊加規則）。
+    # `basis` ＝這一列的 kill switch／覆蓋度出自哪裡。只有真的讀得到才算 state_root。
     row["basis"] = "state_root" if status == "readable" else status
-    if status == "unreadable":
+    if status != "readable":
+        # ⭐⭐ `absent` 與 `unreadable` **一視同仁**（2026-07-19 修正的 Critical）。
+        # 舊版只有 unreadable 走這一支，absent 落到底下的直讀，於是「沒有 ARM 檔」
+        # 被斷言成「kill switch 未觸發」並以 killswitch_known=True 上呈。那個推論
+        # 需要一個面板無法驗證的前提：**我看的是引擎真正在寫的那個目錄**。
+        # API 由 `cfg.state_base`／引擎由 systemd 的 `FILET_STATE_DIR` 各自推導，
+        # 兩者相等靠的是兩個字面量剛好一樣；漂移的症狀就是整批 follower 同時
+        # 「absent 且一切正常」——在引擎已經熔斷的當下。
+        # 未知看起來刺眼是對的：能斷言未觸發的只有「心跳新鮮且明說未觸發」。
+        why = ("讀不到" if status == "unreadable" else "不存在")
+        hint = ("——請確認目錄權限" if status == "unreadable" else
+                "——可能是剛 activate、引擎尚未跑過，**也可能是 FILET_STATE_BASE "
+                "與引擎的 FILET_STATE_DIR 不一致（面板分不出這兩者）**")
         row.update({
             "coverage_known": False, "sample_count": None,
             "sample_coverage_sufficient": None, "last_sample_age_s": None,
             "engine_alive": None,
             "killswitch_tripped": None, "killswitch_known": False,
             "alerts": None,
-            "error": (f"狀態根讀不到（{state_root}）——kill switch、覆蓋度、告警數"
-                      f"改由引擎發布的健康心跳提供（見 RUNBOOK §5.6）；"
+            "error": (f"狀態根{why}（{state_root}）{hint}——kill switch、覆蓋度、"
+                      f"告警數改由引擎發布的健康心跳提供（見 RUNBOOK §5.6）；"
                       f"心跳也讀不到時整列維持未知"),
         })
         return _apply_heartbeat(row, heartbeat_fn(ref.account_id)) \
@@ -504,7 +525,7 @@ def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
         row["error"] = "; ".join(filter(None, [row.get("error"),
                                                f"kill switch 狀態讀取失敗: {e}"]))
 
-    row["alerts"] = _alerts_count(alerts_path_fn(state_root))
+    row["alerts"] = count_alerts(alerts_path_fn(state_root))
     if heartbeat_fn is None:
         return row
     return _apply_heartbeat(row, heartbeat_fn(ref.account_id))

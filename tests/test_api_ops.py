@@ -1052,8 +1052,14 @@ def test_health_reports_stale_engine(tmp_path):
 
 def test_no_samples_is_unknown_not_dead_and_not_alive(tmp_path):
     """⭐⭐ 無樣本 → engine_alive=null。**不是 false**（那是「已確認沒回應」），
-    更不是 true。三態必須分得開，否則面板無法區分「引擎掛了」與「我們看不到」。"""
+    更不是 true。三態必須分得開，否則面板無法區分「引擎掛了」與「我們看不到」。
+
+    狀態根**存在且讀得到**、只是還沒有樣本檔——這才是本測試要問的那一格。
+    （狀態根不存在是另一件事：見 test_absent_state_root_never_reports_killswitch_
+    as_untripped，那條路徑整列都是未知，連 sample_count 都是 null。）
+    """
     client, cfg = _h_app(tmp_path)
+    (Path(cfg.state_base) / ACCT_A).mkdir(parents=True, exist_ok=True)
 
     row = client.get("/api/ops/health").json()["followers"][0]
     assert row["engine_alive"] is None
@@ -1098,8 +1104,14 @@ def test_unreadable_samples_do_not_report_healthy_coverage(tmp_path):
 
 
 def test_alerts_count_and_zero_is_a_real_zero(tmp_path):
-    """告警檔不存在＝引擎從未寫過告警，那確實是 0（與「讀不到」不同）。"""
+    """告警檔不存在＝引擎從未寫過告警，那確實是 0（與「讀不到」不同）。
+
+    ⚠️ 前提是**狀態根讀得到**：這個 0 的意思是「我看得到那個目錄，裡面沒有告警檔」。
+    狀態根本身不存在時連這個推論都不成立（我可能在看錯的目錄），那條路徑回 null
+    ——見 test_absent_state_root_never_reports_killswitch_as_untripped。
+    """
     client, cfg = _h_app(tmp_path)
+    (Path(cfg.state_base) / ACCT_A).mkdir(parents=True, exist_ok=True)
     assert client.get("/api/ops/health").json()["followers"][0]["alerts"] == 0
 
     p = Path(cfg.state_base) / ACCT_A / "var/copytrade/alerts.log"
@@ -1167,6 +1179,10 @@ def test_summary_separates_unknown_from_healthy(tmp_path):
     client, cfg = _h_app(tmp_path, refs=[_lref(), _lref(ACCT_B, ADDR_B, "B")])
     now = datetime.now(timezone.utc).timestamp()
     _write_samples(cfg.state_base, ACCT_A, [(now - 7200, "1"), (now - 10, "1")])
+    # B 的狀態根**存在且讀得到**，只是還沒有樣本檔——本測試要問的是「覆蓋度不足
+    # （確定的答案）與存活未知是兩個獨立三態」。狀態根不存在是第三種情形，
+    # 那時整列都是未知（見下方 absent 的回歸測試），會蓋掉這裡要區分的東西。
+    (Path(cfg.state_base) / ACCT_B).mkdir(parents=True, exist_ok=True)
 
     s = client.get("/api/ops/health").json()["summary"]
     assert s["followers"] == 2
@@ -1181,11 +1197,17 @@ def test_summary_separates_unknown_from_healthy(tmp_path):
 
 
 def test_health_survives_a_missing_state_root(tmp_path):
-    """狀態根整個不存在（follower 剛 activate、尚未啟動）→ 未知，不是 500。"""
+    """狀態根整個不存在（follower 剛 activate、尚未啟動）→ 未知，不是 500。
+
+    ⚠️ 本測試在 2026-07-19 之前斷言 `killswitch_tripped is False`（「沒有 ARM 檔＝
+    真的沒觸發」）。那個斷言**釘住的正是一個 Critical**，已改為 null ＋ known=False
+    ——理由與觸發情境見下一條回歸測試。這裡只保留「不炸成 500」這個本來的意圖。
+    """
     client, cfg = _h_app(tmp_path, state_base=tmp_path / "nonexistent")
     body = client.get("/api/ops/health").json()
     assert body["followers"][0]["engine_alive"] is None
-    assert body["followers"][0]["killswitch_tripped"] is False
+    assert body["followers"][0]["killswitch_tripped"] is None
+    assert body["followers"][0]["killswitch_known"] is False
 
 
 def test_unreadable_state_root_never_reports_killswitch_as_untripped(tmp_path):
@@ -1218,9 +1240,106 @@ def test_unreadable_state_root_never_reports_killswitch_as_untripped(tmp_path):
     assert body["summary"]["killswitch_tripped_count"] == 0   # 未知不算成已觸發
 
 
+def test_absent_state_root_never_reports_killswitch_as_untripped(tmp_path):
+    """⭐⭐ 狀態根**不存在**時，面板不得宣稱 kill switch 未觸發（2026-07-19 Critical）。
+
+    觸發情境（這是真的會發生的部署狀態，不是理論上的）：API 的狀態根是
+    `Path(cfg.state_base)/account_id`，引擎的是 systemd 注入的 `FILET_STATE_DIR`
+    ——**兩份獨立推導**。兩者今天相等只因為兩個檔案裡的兩個字面量剛好一樣。
+    一旦漂移（改了 base、打錯字、換了部署路徑），API 會去看一個引擎根本沒在寫的
+    目錄：每個 follower 都 `absent`，而舊版把 absent 當成「沒有 ARM 檔＝沒觸發」
+    直讀上呈——於是**引擎已經熔斷、部位已經被平掉的當下，面板顯示一切正常**。
+
+    本測試把那個現場擺出來：引擎確實已經熔斷（ARM 檔寫在**引擎的**狀態根裡），
+    但面板看的是另一個目錄。面板唯一可接受的答案是「不知道」。
+    """
+    client, cfg = _h_app(tmp_path, state_base=tmp_path / "api-thinks-here")
+    # 引擎其實寫在別的地方，而且它**已經觸發**了 kill switch。
+    _trip_killswitch(tmp_path / "engine-actually-writes-here", ACCT_A)
+
+    body = client.get("/api/ops/health").json()
+    row = body["followers"][0]
+    assert row["killswitch_tripped"] is None, "看錯目錄絕不可回報成「沒有觸發」"
+    assert row["killswitch_known"] is False
+    assert row["basis"] == "absent"          # 但仍說得出「為什麼不知道」
+    assert row["error"] is not None
+    assert body["summary"]["killswitch_unknown_count"] == 1
+    assert body["summary"]["killswitch_tripped_count"] == 0
+
+
+def test_absent_state_root_reports_alerts_as_unknown_not_zero(tmp_path):
+    """⭐ 同一個現場的告警數那一格：**null，不是 0**。
+
+    0 是面板上最令人安心的數字。心跳補不上時（見下一條）它必須維持未知——
+    `HEARTBEAT_FIELDS` 在 2026-07-19 之前不含告警數，所以這一格當時**任何情況下
+    都不會被修正**，一個安靜的零會一路顯示到有人親自 ssh 上去看。
+    """
+    client, cfg = _h_app(tmp_path, state_base=tmp_path / "nonexistent")
+    body = client.get("/api/ops/health").json()
+    assert body["followers"][0]["alerts"] is None
+    assert body["summary"]["alerts_unknown_count"] == 1
+    assert body["summary"]["alerts_total"] == 0    # 未知不得混進總數
+
+
+def test_absent_state_root_trusts_a_fresh_heartbeat_saying_untripped(tmp_path):
+    """⭐ 能斷言「未觸發」的只有一種證據：**心跳新鮮且明說未觸發**。
+
+    這是上一條的另一半——absent 一律未知會讓面板變得無用，所以必須有一條補得回來
+    的路。心跳來自引擎**自己的**狀態根（那一份路徑不可能弄錯），所以它是這個現場
+    唯一可信的來源；`basis` 一併說明這一列出自心跳而非直讀。
+    """
+    client, cfg = _h_app(tmp_path, state_base=tmp_path / "nonexistent")
+    _write_heartbeat(cfg, ACCT_A, tripped=False, alerts_count=7)
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["basis"] == "heartbeat"
+    assert row["heartbeat_status"] == "ok"
+    assert row["killswitch_tripped"] is False and row["killswitch_known"] is True
+    # ⭐ 告警數也由心跳補上（絕不是 0——引擎自己數出來是 7）
+    assert row["alerts"] == 7
+
+
+def test_direct_read_alerts_win_over_the_heartbeat(tmp_path):
+    """⭐ 心跳**只補未知的格子**：直讀數得出來時以直讀為準（較新鮮）。
+
+    兩個來源都給得出這個數字，若心跳覆蓋直讀，面板顯示的會是最多一個心跳週期前的
+    告警數——而告警數正是「要不要現在去看」的依據。
+    """
+    client, cfg = _h_app(tmp_path)
+    p = Path(cfg.state_base) / ACCT_A / "var/copytrade/alerts.log"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("a\nb\nc\nd\n")               # 直讀：4 則（現況）
+    _write_heartbeat(cfg, ACCT_A, alerts_count=1)   # 心跳：1 則（較舊）
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["alerts"] == 4
+
+
+def test_stale_heartbeat_cannot_rescue_an_absent_state_root(tmp_path):
+    """⭐⭐ absent ＋ **過期**心跳 ⇒ 仍然是未知。
+
+    過期的心跳不是目前狀態（`read_heartbeat` 結構性地不回傳 payload）。若這條放行，
+    absent 的修法就等於什麼都沒修——一份 40 分鐘前的「未觸發」照樣會被顯示成現況。
+    """
+    from spark.filet.engine_health import HEARTBEAT_STALE_S
+
+    client, cfg = _h_app(tmp_path, state_base=tmp_path / "nonexistent")
+    _write_heartbeat(cfg, ACCT_A, age_s=HEARTBEAT_STALE_S + 60,
+                     tripped=False, alerts_count=0)
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["heartbeat_status"] == "stale"
+    assert row["killswitch_tripped"] is None and row["killswitch_known"] is False
+    assert row["alerts"] is None, "過期心跳裡的 0 則告警不得成為現況"
+
+
 def test_absent_state_root_is_distinguished_from_unreadable(tmp_path):
-    """`absent`（剛 activate、引擎沒跑過）與 `unreadable`（有東西但看不到）必須
-    分開：前者「沒有 ARM 檔」是**真的**沒觸發，後者只能說不知道。"""
+    """`absent`（剛 activate、引擎沒跑過）與 `unreadable`（有東西但看不到）在
+    **探測層**仍然分開回報：兩者的處置不同（部署待辦 vs 權限問題），`basis` 原樣上呈。
+
+    ⚠️ 但「分得開」不等於「absent 可以直讀」——`follower_health` 對兩者一視同仁，
+    因為面板分不出「引擎沒跑過」與「我看錯目錄」（見上方 absent 的回歸測試）。
+    """
     from spark.publicapi.ops import state_root_status
 
     missing = tmp_path / "nope" / "acct"
@@ -1244,7 +1363,8 @@ def test_absent_state_root_is_distinguished_from_unreadable(tmp_path):
 def _write_heartbeat(cfg, account_id, *, age_s=5.0, tripped=False, count=12,
                      newest_age_s=20.0, leader="0x" + "d4" * 20,
                      leader_source="manifest", alloc="5000.00", util="0.4000",
-                     capital_source="customer_signed", result="no_action"):
+                     capital_source="customer_signed", result="no_action",
+                     alerts_count=0):
     """以引擎的**同一個產生器**寫一份心跳（測試不自己拼 JSON——自己拼的話，
     寫端改了欄位這裡不會紅，接縫測試就變成一份與現實無關的自證）。"""
     from spark.filet.engine_health import (build_heartbeat, heartbeat_path_for,
@@ -1262,7 +1382,8 @@ def _write_heartbeat(cfg, account_id, *, age_s=5.0, tripped=False, count=12,
     now = datetime.now(timezone.utc).timestamp()
     payload = build_heartbeat(
         account_id=account_id, now_s=now - age_s, killswitch_tripped=tripped,
-        coverage=_Cov(), leader_address=leader, leader_source=leader_source,
+        coverage=_Cov(), alerts_count=alerts_count,
+        leader_address=leader, leader_source=leader_source,
         allocated_capital=alloc, capital_utilization=util, use_full_equity=False,
         capital_source=capital_source, capital_changed_at=None,
         cycle_result=result, cycle_detail=None)
