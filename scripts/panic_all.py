@@ -39,12 +39,18 @@ from pathlib import Path
 
 from spark.copytrade.config import CopySettings
 from spark.filet.followers import load_followers_tolerant
+from spark.filet.leader_resolve import DEFAULT_MANIFEST_PATH
 from spark.filet.tagged_notifier import TaggedNotifier
 
 from scripts.panic import _StdoutNotifier, _exit_code, run_single_follower
 from scripts.run_copytrade import select_keystore
 
-DEFAULT_MANIFEST = Path("var/filet/followers.json")
+# ⭐ repo 根錨定，**不是** CWD 相對（沿 leader_resolve.DEFAULT_MANIFEST_PATH 的
+# I4 修法）。本檔是**緊急工具**：出事時操作者是從哪個目錄 ssh 進來的無法預期，
+# 而 CWD 相對路徑會讓 `panic_all --yes` 在最需要它的那一刻 FileNotFoundError
+# 找不到 manifest（大聲失敗、非 fail-open，但緊急工具停擺本身就不可接受）。
+# 直接引用 leader_resolve 的常數，不另寫一份字面量——同一份檔兩個預設值必定漂移。
+DEFAULT_MANIFEST = Path(DEFAULT_MANIFEST_PATH)
 DEFAULT_STATE_BASE = "/opt/filet/state"
 
 USAGE = (

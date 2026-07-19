@@ -37,8 +37,15 @@ from spark.config import API_URLS
 from spark.exchange.hyperliquid import HyperliquidAdapter
 from spark.filet.aggregate import aggregate, builder_fee_delta, collect_follower_summary, render_aggregate
 from spark.filet.followers import load_followers_tolerant
+from spark.filet.leader_resolve import DEFAULT_MANIFEST_PATH
 
-VAR_DIR = Path("var/filet")
+# ⭐ repo 根錨定，**不是** CWD 相對（沿 leader_resolve.DEFAULT_MANIFEST_PATH 的
+# I4 修法）。日報由 cron/systemd 跑，CWD 未必等於 repo 根：manifest 讀不到會
+# FileNotFoundError 大聲失敗（非 fail-open），但 SNAPSHOT_PATH 讀錯位置的方向更壞——
+# 讀不到既有快照會被當成「無檔＝0」，於是 builder_fee_delta 把**全期累積量**當成
+# 當日增量報出去（北極星數字暴增），而且會把錯的快照寫回錯的地方。
+# 三個路徑同源於 VAR_DIR：只錨定 manifest 會讓同一份 var/filet 一半絕對一半相對。
+VAR_DIR = Path(DEFAULT_MANIFEST_PATH).parent
 DEFAULT_MANIFEST = VAR_DIR / "followers.json"
 SNAPSHOT_PATH = VAR_DIR / "builder_accrued_snapshot.json"
 REPORTS_DIR = VAR_DIR / "reports"
