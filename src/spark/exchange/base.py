@@ -151,6 +151,22 @@ class ExchangeAdapter(ABC):
         授權——查詢驅動而非信任呼叫端旗標，才是真正冪等（B1-F1 修正）。"""
         ...
     @abstractmethod
+    def query_user_abstraction(self, user: str) -> str:
+        """地址的 account abstraction 模式（HL `userAbstraction`）——**唯讀**。
+
+        為什麼 adapter 需要這個查詢：HL 官方文件明載 builder code 生效的條件是
+        「**the builder** must have at least 100 USDC in perps account value and
+        must use standard as the account abstraction mode」。主詞是 builder 而非
+        客戶，而模式若不是 standard，builder fee 會**無聲**停止累積——成交照常、
+        客戶無感、只有收入曲線變平。這是營運層的唯一觀測點（見
+        `spark.filet.builder_compliance`）。
+
+        回傳交易所的**原始模式字串**，不在此判定合規：判定門檻屬營運政策，
+        住在 `builder_compliance`（單一定義）。無法解讀的回應形狀 → ValueError，
+        由呼叫端轉成「未知 → 告警」，絕不回一個看起來合規的預設值。
+        """
+        ...
+    @abstractmethod
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]: ...
     @abstractmethod
     def get_open_orders(self, address: str) -> list[OpenOrder]: ...

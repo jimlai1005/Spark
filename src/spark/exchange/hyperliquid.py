@@ -53,6 +53,31 @@ class HyperliquidAdapter(ExchangeAdapter):
         state = self._info.query_referral_state(builder)
         return Decimal(str(state["builderRewards"]))
 
+    def query_user_abstraction(self, user: str) -> str:
+        """`userAbstraction` 的原始模式字串（唯讀）。語意見 ABC docstring。
+
+        SDK 有 wrapper：`hyperliquid/info.py:634` 的 `query_user_abstraction_state`
+        → `POST /info {"type": "userAbstraction", "user": ...}`（已對照 .venv 內
+        原始碼查證，非憑印象）。
+
+        ⭐ 回應形狀防禦：實測回的是裸字串（如 `"disabled"`），但 SDK 的型別註記是
+        `Any`。若哪天變成物件，`str(raw)` 會產出 `"{'mode': ...}"` 這種**永遠不合規**
+        的字串——方向是安全的（誤報勝於漏報），但訊息會很難懂，所以顯式挑幾個可能的
+        鍵；都不中就 raise，由呼叫端轉成「未知 → 告警」。**絕不**回一個預設值：
+        對一個會無聲斷掉營收的條件，「查不到就當它沒事」是最糟的失效方向。
+        """
+        raw = self._info.query_user_abstraction_state(user)
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, dict):
+            for k in ("userAbstraction", "abstraction", "mode"):
+                v = raw.get(k)
+                if isinstance(v, str):
+                    return v
+        raise ValueError(
+            f"userAbstraction 回應形狀無法解讀（{type(raw).__name__}）——"
+            "不猜測模式，請人工檢查上游 schema")
+
     def query_agent_addresses(self, user: str) -> list[str]:
         # SDK 無 wrapper，需 raw post（同 query_max_builder_fee 的 Task 0 findings）。
         # 正規化小寫：1:1 對照 publicapi/hl.py 的 agent_addresses——同一條鏈上事實

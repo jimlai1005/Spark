@@ -29,7 +29,8 @@ class FakeAdapter(ExchangeAdapter):
                  open_orders=(), positions=(), account=None, equity=None, fills=(),
                  mids=None, sz_decimals=None, daily_abs_pnl=(),
                  cancel_ok=True, modify_ok=True, market_open_ok=True,
-                 close_reduce_only_ok=True, update_leverage_ok=True, extra_agents=()):
+                 close_reduce_only_ok=True, update_leverage_ok=True, extra_agents=(),
+                 user_abstraction="disabled"):
         self._account_value = Decimal(account_value)
         self._account_values = dict(account_values or {})
         self._max_fee = 0
@@ -37,6 +38,10 @@ class FakeAdapter(ExchangeAdapter):
         # 鏈上 extraAgents 模擬（小寫正規化，同 HyperliquidAdapter.query_agent_addresses）；
         # onboarding 的 drift 測試用此注入「目前有效的 agent 地址」。
         self._extra_agents = [a.lower() for a in extra_agents]
+        # account abstraction 模式。預設 "disabled" ＝ HL 的 standard 模式（我方
+        # builder 位址目前的實測值），也就是**合規**的那一邊——預設合規讓既有測試
+        # 不必逐一注入；不合規的情境由測試顯式設定，才看得出是刻意的。
+        self._user_abstraction = user_abstraction
         self._seeded_fills = list(seeded_fills or [])
         self.calls = defaultdict(list)
         self._open_orders = list(open_orders)
@@ -68,6 +73,10 @@ class FakeAdapter(ExchangeAdapter):
     def query_agent_addresses(self, user: str) -> list[str]:
         self.calls["query_agent_addresses"].append({"user": user})
         return list(self._extra_agents)
+
+    def query_user_abstraction(self, user: str) -> str:
+        self.calls["query_user_abstraction"].append({"user": user})
+        return self._user_abstraction
 
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]:
         return list(self._seeded_fills)

@@ -15,6 +15,10 @@
     （var/filet/builder_accrued_snapshot.json，無檔視為 0）→ builder_fee_delta；
     加總（跨「相異 builder」相加合法——M2 通常只有一個 builder，跨「follower」
     才是紅線禁止的重複計）；更新快照。
+  → ⭐ builder 資格合規：對同一批 mainnet builder 查 perp 淨值 ≥ 100 USDC 與
+    account abstraction mode == standard（HL 官方生效條件，主詞是 builder）。
+    任一不符或查不到 → 報表頂部 🚨 區塊 ＋ stderr [ALERT]。見
+    src/spark/filet/builder_compliance.py 檔頭。
   → per-follower：collect_follower_summary(ref, adapter, start, end)
     （當日 UTC 0 點～now；函式內建錯誤隔離，單一 follower 失敗不中止其他）。
   → aggregate → render_aggregate 印 stdout ＋寫 var/filet/reports/YYYY-MM-DD.md。
@@ -41,6 +45,7 @@ from hyperliquid.info import Info
 from spark.config import API_URLS
 from spark.exchange.hyperliquid import HyperliquidAdapter
 from spark.filet.aggregate import aggregate, builder_fee_delta, collect_follower_summary, render_aggregate
+from spark.filet.builder_compliance import check_builders
 from spark.filet.followers import load_followers_tolerant
 from spark.filet.leader_change_apply import (LEADER_CHANGE_STALE_S, LEDGER_RELPATH,
                                              scan_unapplied_leader_changes)
@@ -179,6 +184,13 @@ def generate_report(refs, load_errors, adapter_for, now):
         north_star_delta += builder_fee_delta(accrued_today, prev)
         today_accrued[builder] = accrued_today
 
+    # --- ⭐ builder 資格合規（營收關鍵；見 filet/builder_compliance.py 檔頭）---
+    # 這裡查的是「builder fee 到底還會不會產生」，與上面查的「產生了多少」是兩件事：
+    # 資格斷掉時北極星增量會是 0，而 0 與「今天沒人交易」在報表上長得一模一樣。
+    # 放在北極星之後、per-follower 之前，用的是同一批 mainnet builder 位址（同源）。
+    _compliance, compliance_alerts_ = check_builders(
+        lambda: adapter_for("mainnet"), mainnet_builders)
+
     # --- per-follower summary（fills 衍生，不查 accrued）---
     summaries = []
     for ref in refs:
@@ -187,6 +199,15 @@ def generate_report(refs, load_errors, adapter_for, now):
 
     report = aggregate(day, summaries, north_star_fee_delta=north_star_delta)
     text = render_aggregate(report)
+
+    # ⭐ 合規告警排在最前面（在低估註記與 manifest 錯誤之前）：它是唯一一種「一切
+    # 看起來正常但錢已經不再進來」的失效，讀報表的人必須先看到它（工程原則 3）。
+    if compliance_alerts_:
+        text += "\n\n## 🚨 builder 資格異常（builder fee 可能已停止累積）\n" + \
+                "\n".join(f"- {a}" for a in compliance_alerts_)
+        for a in compliance_alerts_:
+            print(f"[ALERT] {a}", file=sys.stderr)
+
     if failed_builders:
         text += (f"\n\n> 注意：北極星不含 {failed_builders} 個查詢失敗的 builder，"
                  "當日增量為低估值。")

@@ -161,13 +161,23 @@ def test_north_star_unaffected_by_summaries_builder_fee():
 
 
 class _CountingAdapter:
-    """記數 query_builder_accrued 呼叫；get_user_fills 回可設定的空/非空 fills。"""
+    """記數 query_builder_accrued 呼叫；get_user_fills 回可設定的空/非空 fills。
 
-    def __init__(self, accrued, fills=None):
+    合規查詢（get_account_value／query_user_abstraction）預設回**合規**值，讓既有的
+    北極星 wiring 測試不必逐一注入；不合規情境由專屬測試顯式覆寫（見檔案下方的
+    builder 資格合規區塊）。`boom_*` 旗標讓測試模擬查詢失敗。
+    """
+
+    def __init__(self, accrued, fills=None, equity=Decimal("500"),
+                 abstraction="disabled", boom_equity=False, boom_abstraction=False):
         self._accrued = accrued
         self._fills = fills if fills is not None else []
         self.accrued_calls = []          # 每次呼叫記錄 builder 參數
         self.fills_calls = []            # 每次呼叫記錄 address 參數
+        self._equity = equity
+        self._abstraction = abstraction
+        self._boom_equity = boom_equity
+        self._boom_abstraction = boom_abstraction
 
     def query_builder_accrued(self, builder):
         self.accrued_calls.append(builder)
@@ -176,6 +186,16 @@ class _CountingAdapter:
     def get_user_fills(self, address, start, end):
         self.fills_calls.append(address)
         return list(self._fills)
+
+    def get_account_value(self, address):
+        if self._boom_equity:
+            raise ConnectionError("clearinghouse down")
+        return self._equity
+
+    def query_user_abstraction(self, user):
+        if self._boom_abstraction:
+            raise ConnectionError("userAbstraction down")
+        return self._abstraction
 
 
 def _ref_full(aid, builder, net="mainnet"):
@@ -249,6 +269,65 @@ def test_wiring_north_star_uses_prev_snapshot(tmp_path, monkeypatch):
     # 北極星＝今日 5.5 - 昨日快照 3.66 = 1.84（查一次的差）
     assert adapter.accrued_calls == ["0x" + "b" * 40]
     assert report.north_star_fee_delta == Decimal("1.84")
+
+
+# ── ⭐ builder 資格合規接進日報（2026-07-19 營收風險）────────────────────────
+# builder fee 資格斷掉時北極星增量是 0，而 0 與「今天沒人交易」在報表上長得一模一樣。
+# 日報是唯一會定期被看的地方，所以合規告警必須出現在報表本文與 stderr 兩處。
+
+
+def _report_text(tmp_path):
+    return (tmp_path / "reports" / "2026-07-17.md").read_text()
+
+
+def _compliance_wiring(tmp_path, monkeypatch, adapter):
+    monkeypatch.setattr(fdr, "SNAPSHOT_PATH", tmp_path / "snap.json")
+    monkeypatch.setattr(fdr, "REPORTS_DIR", tmp_path / "reports")
+    refs = [_ref_full("alice", "0x" + "B" * 40, "mainnet")]
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    fdr.generate_report(refs, [], lambda _n: adapter, now)
+    return _report_text(tmp_path)
+
+
+def test_daily_report_silent_when_builder_compliant(tmp_path, monkeypatch, capsys):
+    text = _compliance_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), equity=Decimal("500"), abstraction="disabled"))
+    assert "builder 資格異常" not in text
+    assert "[ALERT]" not in capsys.readouterr().err
+
+
+def test_daily_report_alerts_on_low_builder_equity(tmp_path, monkeypatch, capsys):
+    text = _compliance_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), equity=Decimal("42")))
+    assert "builder 資格異常" in text and "42" in text
+    assert "[ALERT]" in capsys.readouterr().err      # 大聲（工程原則 3）
+
+
+def test_daily_report_alerts_on_non_standard_abstraction(tmp_path, monkeypatch):
+    text = _compliance_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), abstraction="default"))
+    # ⭐ "default" 亦不放行（語意未經官方確認）
+    assert "builder 資格異常" in text and "default" in text
+
+
+def test_daily_report_alerts_when_compliance_query_fails(tmp_path, monkeypatch):
+    """⭐ 查不到 ≠ 合規：報表必須說「未知」並告警，不得靜默略過。"""
+    text = _compliance_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), boom_equity=True, boom_abstraction=True))
+    assert "builder 資格異常" in text
+    assert "不得視為合規" in text
+
+
+def test_daily_report_compliance_only_checks_mainnet_builders(tmp_path, monkeypatch):
+    """testnet builder 的 fee 無真實經濟意義（已排除於北極星）→ 合規也不查，
+    否則 testnet-only 部署每天都會收到一則無意義的告警。"""
+    monkeypatch.setattr(fdr, "SNAPSHOT_PATH", tmp_path / "snap.json")
+    monkeypatch.setattr(fdr, "REPORTS_DIR", tmp_path / "reports")
+    refs = [_ref_full("carol", "0x" + "c" * 40, "testnet")]
+    adapter = _CountingAdapter(accrued=Decimal("9.9"), equity=Decimal("1"))
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    fdr.generate_report(refs, [], lambda _n: adapter, now)
+    assert "builder 資格異常" not in _report_text(tmp_path)
 
 
 # ── ⭐ 換 leader 鏈路對帳：「已寫入但未被套用」（opus 審查 I2）─────────────
