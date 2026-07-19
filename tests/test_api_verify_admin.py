@@ -53,6 +53,44 @@ def test_remove_pending(tmp_path):
     assert load_pending(p) == []
 
 
+# --- pending 條目攜帶客戶選的 leader（P3.1b）---
+
+_LEADER = "0x" + "d4" * 20
+
+
+def test_write_pending_carries_leader(tmp_path):
+    """客戶在 web 層選的 leader 要能寫進佇列——activate CLI 讀的就是這個鍵。"""
+    p = tmp_path / "pending.json"
+    write_pending_entry(p, **_entry(), leader_address=_LEADER)
+    assert load_pending(p)[0]["leader_address"] == _LEADER
+
+
+def test_write_pending_normalizes_leader_case(tmp_path):
+    """位址大小寫不敏感；寫入即正規化小寫（同基準比較，工程原則 1）。"""
+    p = tmp_path / "pending.json"
+    write_pending_entry(p, **_entry(), leader_address=_LEADER.upper().replace("0X", "0x"))
+    assert load_pending(p)[0]["leader_address"] == _LEADER
+
+
+@pytest.mark.parametrize("absent", [None, ""])
+def test_write_pending_without_leader_omits_key(tmp_path, absent):
+    """未指定 → **不長出該鍵**（向後相容：舊條目缺鍵＝引擎沿用 env 預設）。
+    空字串與 None 同義，與 followers._parse_leader 的「空即未指定」慣例一致。"""
+    p = tmp_path / "pending.json"
+    write_pending_entry(p, **_entry(), leader_address=absent)
+    assert "leader_address" not in load_pending(p)[0]
+
+
+@pytest.mark.parametrize("bad", ["0xshort", "0x" + "z" * 40, "not-an-address"])
+def test_write_pending_rejects_malformed_leader(tmp_path, bad):
+    """只驗格式（白名單硬閘在 activate CLI 與引擎側，見 write_pending_entry
+    docstring 的分工論證）。壞格式一律拒絕，且佇列不被碰。"""
+    p = tmp_path / "pending.json"
+    with pytest.raises(ValueError):
+        write_pending_entry(p, **_entry(), leader_address=bad)
+    assert load_pending(p) == []
+
+
 # --- verify 端點 ---
 
 def _make_ready(client, hl, wallet):
