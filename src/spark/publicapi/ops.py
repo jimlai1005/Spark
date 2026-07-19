@@ -13,9 +13,10 @@
 兩者的差額正是本函式要算的對帳訊號，互相取代等於把訊號歸零。
 """
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import NamedTuple
 
 from spark.filet.aggregate import collect_follower_summary
 from spark.publicapi.billing import map_stripe_status
@@ -88,6 +89,10 @@ def revenue_reconciliation(rows, accrued_now: Decimal, accrued_prev: Decimal,
 
     ⚠️ 同基準要求（工程原則 1）：呼叫端必須保證 rows 的時間窗與 accrued 今昨差
     覆蓋**同一段期間**，否則 discrepancy 是窗口錯配的假訊號、不是真對不上。
+    唯一正確的窗口是 `(AccruedPoint[前].captured_at, AccruedPoint[後].captured_at]`
+    ——accrued 是查詢當下的累積量，不是日曆日的量（opus 對抗審查 Critical：日報
+    cron 排在 00:10 時，用日曆日取 fills 會與 accrued 增量錯開整整一天）。
+    快照時刻缺漏時呼叫端必須**放棄計算**，不得用日期回推（見 app.ops_revenue）。
 
     除零防護：`attributed` 為 0 時 `discrepancy_pct` 回 None（不得除零）；
     但若 `accrued_delta` 非 0（收到費用卻歸屬不到任何客戶）仍判 `over_threshold`
@@ -250,9 +255,40 @@ def subscription_drift(local_rows, stripe_subs) -> dict:
     }
 
 
-def load_accrued_series(path: str | Path) -> list[tuple[str, Decimal]]:
-    """讀 accrued 歷史序列（jsonl，每行 {"date": ..., "accrued": ...}），
-    依日期升冪回 [(day_iso, accrued), ...]；無檔 → 空 list。
+class AccruedPoint(NamedTuple):
+    """accrued 歷史序列的一個點。
+
+    ⭐ `captured_at`（快照時刻）是**對帳窗口的唯一合法基準**（工程原則 1）：
+    accrued 是「查詢當下」的鏈上累積量，故 `accrued[D] - accrued[D-1]` 涵蓋的是
+    `(captured_at[D-1], captured_at[D]]`，**不是**日曆日 D。舊格式的行沒有這個欄位
+    → None，呼叫端**必須拒絕硬算**（用日期猜窗口＝混源比較，見 app.ops_revenue
+    的 basis_unknown 分支）。
+    """
+    date: str
+    accrued: Decimal
+    captured_at: datetime | None
+
+
+def _parse_captured_at(raw) -> datetime | None:
+    """ISO8601 → tz-aware UTC datetime。缺值／壞值一律 None（**不猜**）：
+    下游看到 None 會拒絕對帳，那比拿猜來的時刻算出假 discrepancy 安全。
+    無時區的字串視為 UTC——唯一寫入者（scripts/copytrade_daily_report.py）一律寫 UTC。"""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def load_accrued_series(path: str | Path) -> list[AccruedPoint]:
+    """讀 accrued 歷史序列（jsonl，每行
+    `{"date": ..., "captured_at": ..., "accrued": ...}`），依日期升冪回
+    [AccruedPoint, ...]；無檔 → 空 list。
+
+    新舊格式並存：`captured_at` 是後加的欄位（opus 對抗審查 Critical 的修法），
+    舊行沒有 → 該點的 `captured_at` 為 None。**不回填猜測值**。
 
     容錯（營運檢視不該被一行壞資料整份打掉）：壞行跳過。但**不**把壞行當 0——
     accrued 是累積量，把缺值當 0 會造出巨大的假 delta。
@@ -260,17 +296,19 @@ def load_accrued_series(path: str | Path) -> list[tuple[str, Decimal]]:
     p = Path(path)
     if not p.exists():
         return []
-    out: list[tuple[str, Decimal]] = []
+    out: list[AccruedPoint] = []
     for line in p.read_text().splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             rec = json.loads(line)
-            out.append((str(rec["date"]), Decimal(str(rec["accrued"]))))
+            out.append(AccruedPoint(str(rec["date"]),
+                                    Decimal(str(rec["accrued"])),
+                                    _parse_captured_at(rec.get("captured_at"))))
         except (ValueError, KeyError, TypeError, InvalidOperation):
             continue
-    out.sort(key=lambda t: t[0])
+    out.sort(key=lambda p: p.date)
     return out
 
 

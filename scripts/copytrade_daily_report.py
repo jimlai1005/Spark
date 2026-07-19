@@ -65,16 +65,31 @@ def save_accrued_snapshot(day_iso: str, accrued: Decimal) -> None:
         json.dumps({"date": day_iso, "accrued": str(accrued)}, indent=2))
 
 
-def append_accrued_history(day_iso: str, accrued: Decimal) -> None:
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def append_accrued_history(day_iso: str, accrued: Decimal, *,
+                           now_fn=_utc_now) -> None:
     """附加當日 accrued 到歷史序列（jsonl，一天一行）——單一快照只夠今昨比較，
     歷史序列讓營運後台能做多日對帳（src/spark/publicapi/ops.py 讀它）。
 
+    ⭐ 每行必帶 `captured_at`（快照時刻，UTC ISO8601）——**這是下游對帳窗口的唯一
+    合法基準**（工程原則 1）：accrued 是「查詢當下」的鏈上累積量，故相鄰兩筆的差
+    涵蓋 `(captured_at[前], captured_at[後]]`，**不是**日曆日。只存日期會讓營運後台
+    拿「昨天一整天的實收」去比「今天 0 點到現在的應收」——cron 排在 00:10 時這是
+    整整一天的錯配，健康帳戶會被判成巨大差異並誤報漏財（opus 對抗審查 Critical）。
+    `now_fn` 可注入：呼叫端傳入 accrued **實際查詢當下**的時刻，測試可釘死。
+
     ⭐ 冪等：同日重跑覆蓋該日那一行（不是再 append 一筆）——重跑日報不該讓
-    同一天出現兩個 accrued 值，那會讓下游的今昨差算成 0。
+    同一天出現兩個 accrued 值，那會讓下游的今昨差算成 0。覆蓋時 accrued 與
+    captured_at **一起換**：兩者必須同時來自同一次查詢，拆開更新等於自造混源比較。
+    ⭐ 舊行（無 captured_at）原樣保留、不回填猜測值——猜出來的窗口比沒有窗口更危險，
+    下游看到缺值會拒絕硬算（ops.load_accrued_series → app.ops_revenue 的 basis_unknown）。
     ⭐ additive：不動 save_accrued_snapshot 的既有行為（向後相容）。
     """
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    rows: dict[str, str] = {}
+    rows: dict[str, dict] = {}
     if HISTORY_PATH.exists():
         for line in HISTORY_PATH.read_text().splitlines():
             line = line.strip()
@@ -82,13 +97,17 @@ def append_accrued_history(day_iso: str, accrued: Decimal) -> None:
                 continue
             try:
                 rec = json.loads(line)
-                rows[str(rec["date"])] = str(rec["accrued"])
+                row = {"date": str(rec["date"])}
+                if rec.get("captured_at"):
+                    row["captured_at"] = str(rec["captured_at"])
+                row["accrued"] = str(rec["accrued"])
+                rows[row["date"]] = row
             except (ValueError, KeyError, TypeError):
                 continue  # 壞行跳過，不讓一行壞資料擋掉今天的落檔
-    rows[day_iso] = str(accrued)  # 同日重跑覆蓋
+    rows[day_iso] = {"date": day_iso, "captured_at": now_fn().isoformat(),
+                     "accrued": str(accrued)}  # 同日重跑覆蓋（值與時刻同源）
     HISTORY_PATH.write_text(
-        "".join(json.dumps({"date": d, "accrued": rows[d]}) + "\n"
-                for d in sorted(rows)))
+        "".join(json.dumps(rows[d]) + "\n" for d in sorted(rows)))
 
 
 def load_skipped(day_iso: str) -> list[tuple[str, Decimal]]:
@@ -129,6 +148,9 @@ def main():
 
     accrued_prev = load_accrued_snapshot()
     accrued_today = adapter.query_builder_accrued(builder_addr)
+    # ⭐ 快照時刻取自 accrued 查詢**當下**（不是 main() 開頭的 now）：下游用它當對帳
+    # 窗口界，值與時刻必須同源同時刻（工程原則 1）
+    accrued_captured_at = datetime.now(timezone.utc)
     csv_report = reconcile(adapter, builder_addr, day)
     skipped = load_skipped(day.isoformat())
 
@@ -145,7 +167,8 @@ def main():
     print(f"\n[written] {out_path}", file=sys.stderr)
 
     save_accrued_snapshot(day.isoformat(), accrued_today)
-    append_accrued_history(day.isoformat(), accrued_today)
+    append_accrued_history(day.isoformat(), accrued_today,
+                           now_fn=lambda: accrued_captured_at)
     raise SystemExit(0)
 
 

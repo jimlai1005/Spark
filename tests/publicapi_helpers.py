@@ -66,6 +66,10 @@ class FakeHL:
         self.fills: dict[str, list] = {}
         self.fills_error: dict[str, Exception] = {}
         self.account_value_error: dict[str, Exception] = {}
+        # 預設「塞什麼就回什麼」（多數測試不在意窗口）。收入對帳的窗口正確性測試
+        # 需要真的依 [start, end] 過濾——設 True 打開，否則「窗口取錯」在 fake 上
+        # 看不出來（正是 opus 對抗審查 Critical 能潛伏的原因）。
+        self.window_aware = False
 
     def get_account_value(self, address: str) -> Decimal:
         err = self.account_value_error.get(address.lower())
@@ -77,7 +81,10 @@ class FakeHL:
         err = self.fills_error.get(address.lower())
         if err is not None:
             raise err
-        return list(self.fills.get(address.lower(), []))
+        fills = list(self.fills.get(address.lower(), []))
+        if self.window_aware:
+            fills = [f for f in fills if start <= f.time <= end]
+        return fills
 
     def max_builder_fee(self, user: str, builder: str) -> int:
         return self.max_fees.get((user.lower(), builder.lower()), 0)

@@ -44,8 +44,8 @@ def _ref(acct=ACCT_A, addr=ADDR_A, label="A"):
     return FollowerRef(acct, addr, BUILDER, "testnet", label)
 
 
-def _fill(sz="2", px="100", crossed=True, builder_fee="0.5"):
-    return UserFill(time=datetime(2026, 7, 19, tzinfo=timezone.utc), coin="ETH",
+def _fill(sz="2", px="100", crossed=True, builder_fee="0.5", t=None):
+    return UserFill(time=t or datetime(2026, 7, 19, tzinfo=timezone.utc), coin="ETH",
                     px=Decimal(px), sz=Decimal(sz), side="B", crossed=crossed,
                     oid=1, fee=Decimal("0.1"), builder_fee=Decimal(builder_fee))
 
@@ -59,12 +59,22 @@ def _manifest(tmp_path, refs):
     return p
 
 
+def _hist_line(entry) -> str:
+    """history 條目 → jsonl 一行。三元組 (date, accrued, captured_at) 寫新格式；
+    二元組 (date, accrued) 寫**舊格式**（無 captured_at）——舊資料相容性靠它測。"""
+    if len(entry) == 3:
+        d, a, cap = entry
+        return json.dumps({"date": d, "captured_at": cap.isoformat(),
+                           "accrued": str(a)}) + "\n"
+    d, a = entry
+    return json.dumps({"date": d, "accrued": str(a)}) + "\n"
+
+
 def _ops_cfg(tmp_path, admin_addresses=frozenset(), refs=None, history=None):
     refs = refs if refs is not None else [_ref()]
     hist = tmp_path / "accrued_history.jsonl"
     if history is not None:
-        hist.write_text("".join(
-            json.dumps({"date": d, "accrued": str(a)}) + "\n" for d, a in history))
+        hist.write_text("".join(_hist_line(e) for e in history))
     return make_cfg(tmp_path, admin_addresses=admin_addresses,
                     followers_path=str(_manifest(tmp_path, refs)),
                     accrued_history_path=str(hist))
@@ -276,14 +286,44 @@ def test_north_star_never_derived_from_rows():
 # ---------- accrued 歷史序列 ----------
 
 def test_load_accrued_series_sorted_and_tolerant(tmp_path):
+    """壞行跳過、依日期升冪。⭐ 斷言形狀改為 AccruedPoint 三元組（新增 captured_at）：
+    這不是遷就測試，是被比較的兩個值必須同基準所要求的欄位（工程原則 1）。"""
     p = tmp_path / "h.jsonl"
-    p.write_text('{"date": "2026-07-19", "accrued": "2"}\n'
+    p.write_text('{"date": "2026-07-19", "captured_at": "2026-07-19T00:10:00+00:00",'
+                 ' "accrued": "2"}\n'
                  'not-json\n'
                  '\n'
-                 '{"date": "2026-07-18", "accrued": "1"}\n'
+                 '{"date": "2026-07-18", "captured_at": "2026-07-18T00:10:00+00:00",'
+                 ' "accrued": "1"}\n'
                  '{"accrued": "9"}\n')
-    assert load_accrued_series(p) == [("2026-07-18", Decimal("1")),
-                                      ("2026-07-19", Decimal("2"))]
+    assert load_accrued_series(p) == [
+        ("2026-07-18", Decimal("1"), datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)),
+        ("2026-07-19", Decimal("2"), datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc))]
+
+
+def test_load_accrued_series_mixed_old_and_new_format(tmp_path):
+    """⭐ 新舊格式混合的歷史檔要能載入：舊行（無 captured_at）→ None，不猜、不丟掉
+    accrued 值；壞掉的 captured_at 也降級成 None（拒絕硬算比猜一個時刻安全）。"""
+    p = tmp_path / "h.jsonl"
+    p.write_text('{"date": "2026-07-17", "accrued": "1"}\n'
+                 '{"date": "2026-07-18", "captured_at": "garbage", "accrued": "2"}\n'
+                 '{"date": "2026-07-19", "captured_at": "2026-07-19T00:10:00+00:00",'
+                 ' "accrued": "3"}\n')
+    series = load_accrued_series(p)
+    assert [pt.date for pt in series] == ["2026-07-17", "2026-07-18", "2026-07-19"]
+    assert [pt.accrued for pt in series] == [Decimal("1"), Decimal("2"), Decimal("3")]
+    assert series[0].captured_at is None and series[1].captured_at is None
+    assert series[2].captured_at == datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+
+
+def test_load_accrued_series_naive_captured_at_is_utc(tmp_path):
+    """無時區的 captured_at 視為 UTC（唯一寫入者一律寫 UTC）——不得回 naive
+    datetime，否則與 tz-aware 的 fills 時間比較會直接 TypeError。"""
+    p = tmp_path / "h.jsonl"
+    p.write_text('{"date": "2026-07-19", "captured_at": "2026-07-19T00:10:00",'
+                 ' "accrued": "3"}\n')
+    assert load_accrued_series(p)[0].captured_at == datetime(
+        2026, 7, 19, 0, 10, tzinfo=timezone.utc)
 
 
 def test_load_accrued_series_missing_file(tmp_path):
@@ -291,15 +331,45 @@ def test_load_accrued_series_missing_file(tmp_path):
 
 
 def test_append_accrued_history_idempotent(tmp_path, monkeypatch):
-    """⭐ 同日重跑覆蓋該日那一行（不是再 append 一筆）——否則今昨差會被算成 0。"""
+    """⭐ 同日重跑覆蓋該日那一行（不是再 append 一筆）——否則今昨差會被算成 0。
+    覆蓋時 captured_at 跟著換：值與時刻同源（重跑的 accrued 屬於重跑那一刻）。"""
     import scripts.copytrade_daily_report as rpt
     monkeypatch.setattr(rpt, "HISTORY_PATH", tmp_path / "accrued_history.jsonl")
-    rpt.append_accrued_history("2026-07-18", Decimal("1.5"))
-    rpt.append_accrued_history("2026-07-19", Decimal("2.5"))
-    rpt.append_accrued_history("2026-07-19", Decimal("2.75"))   # 同日重跑
-    assert load_accrued_series(rpt.HISTORY_PATH) == [("2026-07-18", Decimal("1.5")),
-                                                     ("2026-07-19", Decimal("2.75"))]
+    t18 = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    t19 = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    t19b = datetime(2026, 7, 19, 6, 30, tzinfo=timezone.utc)
+    rpt.append_accrued_history("2026-07-18", Decimal("1.5"), now_fn=lambda: t18)
+    rpt.append_accrued_history("2026-07-19", Decimal("2.5"), now_fn=lambda: t19)
+    rpt.append_accrued_history("2026-07-19", Decimal("2.75"), now_fn=lambda: t19b)
+    assert load_accrued_series(rpt.HISTORY_PATH) == [
+        ("2026-07-18", Decimal("1.5"), t18),
+        ("2026-07-19", Decimal("2.75"), t19b)]   # accrued 與 captured_at 一起換
     assert len(rpt.HISTORY_PATH.read_text().strip().splitlines()) == 2
+
+
+def test_append_accrued_history_records_capture_time(tmp_path, monkeypatch):
+    """⭐ Critical 修法的核心：每行必須落下快照時刻——下游拿它當對帳窗口界。
+    預設值走真時鐘（此處只驗欄位存在且可解析），可注入以便釘死。"""
+    import scripts.copytrade_daily_report as rpt
+    monkeypatch.setattr(rpt, "HISTORY_PATH", tmp_path / "h.jsonl")
+    rpt.append_accrued_history("2026-07-19", Decimal("3"))
+    rec = json.loads(rpt.HISTORY_PATH.read_text().strip())
+    assert set(rec) == {"date", "captured_at", "accrued"}
+    assert datetime.fromisoformat(rec["captured_at"]).tzinfo is not None
+
+
+def test_append_accrued_history_preserves_legacy_rows(tmp_path, monkeypatch):
+    """舊行（無 captured_at）原樣保留、**不回填猜測值**——猜出來的窗口比沒有窗口
+    危險；下游看到缺值會拒絕對帳（basis_unknown）而不是算出假數字。"""
+    import scripts.copytrade_daily_report as rpt
+    hist = tmp_path / "h.jsonl"
+    monkeypatch.setattr(rpt, "HISTORY_PATH", hist)
+    hist.write_text('{"date": "2026-07-18", "accrued": "1"}\n')
+    t19 = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    rpt.append_accrued_history("2026-07-19", Decimal("2"), now_fn=lambda: t19)
+    series = load_accrued_series(hist)
+    assert series[0].captured_at is None      # 舊行不被回填
+    assert series[1].captured_at == t19
 
 
 def test_append_accrued_history_does_not_touch_snapshot(tmp_path, monkeypatch):
@@ -326,20 +396,114 @@ def test_revenue_insufficient_history(tmp_path):
 
 
 def test_revenue_computes_from_history_and_rows(tmp_path):
-    today = datetime.now(timezone.utc).date().isoformat()
+    """history 條目改為三元組（含 captured_at）：不是遷就測試——沒有快照時刻，
+    端點依設計就會拒絕對帳（見下面的 basis_unknown 測試）。"""
+    cap_prev = datetime(2026, 7, 1, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
     client, cfg, store, hl = _admin_app(
         tmp_path, refs=[_ref(), _ref(ACCT_B, ADDR_B, "B")],
-        history=[("2026-07-01", "10"), (today, "16")])
+        history=[("2026-07-01", "10", cap_prev), ("2026-07-19", "16", cap_now)])
     hl.fills[ADDR_A] = [_fill(builder_fee="2")]
     hl.fills[ADDR_B] = [_fill(builder_fee="3")]
     body = client.get("/api/ops/revenue", params={"threshold_pct": 0.1}).json()
     assert body["insufficient_accrued_history"] is False
+    assert body["basis_unknown"] is False
     assert body["attributed"] == "5"          # 2 + 3（歸屬／應收）
     assert body["accrued_delta"] == "6"       # 16 − 10（北極星／實收，查一次不加總）
     assert body["discrepancy"] == "1"
     assert body["over_threshold"] is True     # 1/5 = 20% > 10%
-    assert body["day"] == today and body["prev_day"] == "2026-07-01"
+    assert body["day"] == "2026-07-19" and body["prev_day"] == "2026-07-01"
     assert len(body["customers"]) == 2
+
+
+# ---------- ⭐ 對帳窗口＝快照時刻（opus 對抗審查 Critical，工程原則 1） ----------
+
+def test_revenue_window_comes_from_capture_time_not_calendar_day(tmp_path):
+    """⭐ 複現 opus 的情境：cron 排在每日 00:10、帳目**完全正常**的錢包不得誤報。
+
+    accrued 增量涵蓋 (07-18 00:10, 07-19 00:10]——那是「昨天一整天」。舊實作拿它去
+    比 [07-19 00:00, now] 的 fills，只看得到最後十幾分鐘的成交（此例 2 / 6），
+    差 66% → 觸發「收入對帳超標」告警並叫醒管理員去查不存在的漏財。
+    修法：兩側窗口都取自 captured_at，同源同基準 → 應收 6 == 實收 6，不告警。"""
+    cap_prev = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, cfg, store, hl = _admin_app(
+        tmp_path, history=[("2026-07-18", "10", cap_prev), ("2026-07-19", "16", cap_now)])
+    hl.window_aware = True   # 只有真的依窗口過濾，窗口取錯才會被測出來
+    hl.fills[ADDR_A] = [
+        _fill(builder_fee="4", t=datetime(2026, 7, 18, 9, 0, tzinfo=timezone.utc)),
+        _fill(builder_fee="2", t=datetime(2026, 7, 19, 0, 5, tzinfo=timezone.utc)),
+    ]
+    body = client.get("/api/ops/revenue", params={"threshold_pct": 0.01}).json()
+    assert body["basis_unknown"] is False
+    # 窗口界＝快照時刻本身（不是 00:00，也不是 now）
+    assert body["window_start"] == cap_prev.isoformat()
+    assert body["window_end"] == cap_now.isoformat()
+    assert body["attributed"] == "6"        # 兩筆都在窗口內（4 + 2）
+    assert body["accrued_delta"] == "6"     # 16 − 10
+    assert body["discrepancy"] == "0"
+    assert body["over_threshold"] is False, "健康帳戶不得誤報漏財"
+
+
+def test_revenue_window_excludes_fills_outside_capture_window(tmp_path):
+    """窗口確實會排除界外成交（證明上一個測試的「全數落在窗內」不是因為沒過濾）。"""
+    cap_prev = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, cfg, store, hl = _admin_app(
+        tmp_path, history=[("2026-07-18", "10", cap_prev), ("2026-07-19", "12", cap_now)])
+    hl.window_aware = True
+    hl.fills[ADDR_A] = [
+        _fill(builder_fee="2", t=datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)),
+        _fill(builder_fee="99", t=datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)),
+        _fill(builder_fee="99", t=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)),
+    ]
+    body = client.get("/api/ops/revenue", params={"threshold_pct": 0.01}).json()
+    assert body["attributed"] == "2"       # 界外的 99 兩筆都不計
+    assert body["over_threshold"] is False
+
+
+def test_revenue_basis_unknown_when_capture_time_missing(tmp_path):
+    """⭐ 舊資料（無 captured_at）→ 明確標 basis_unknown、**不硬算、不告警**。
+    算錯的數字比沒有數字危險：用日期猜窗口會整整錯開一天。"""
+    client, cfg, store, hl = _admin_app(
+        tmp_path, history=[("2026-07-18", "10"), ("2026-07-19", "16")])
+    hl.fills[ADDR_A] = [_fill(builder_fee="2")]
+    body = client.get("/api/ops/revenue").json()
+    assert body["basis_unknown"] is True
+    assert body["over_threshold"] is False
+    assert "captured_at" in body["note"]
+    for k in ("discrepancy", "discrepancy_pct", "attributed", "accrued_delta"):
+        assert k not in body, f"{k} 不得在缺基準時被算出來"
+    assert body["window_start"] is None and body["window_end"] is None
+
+
+def test_revenue_basis_unknown_when_only_one_side_has_capture_time(tmp_path):
+    """只有一側有快照時刻同樣不可比（混源比較正是事故形狀）。"""
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, *_ = _admin_app(
+        tmp_path, history=[("2026-07-18", "10"), ("2026-07-19", "16", cap_now)])
+    body = client.get("/api/ops/revenue").json()
+    assert body["basis_unknown"] is True and body["over_threshold"] is False
+
+
+def test_revenue_basis_unknown_when_capture_times_not_increasing(tmp_path):
+    """快照時刻非嚴格遞增（回填／時鐘倒退）→ 窗口無意義，一樣拒算。"""
+    cap_prev = datetime(2026, 7, 19, 8, 0, tzinfo=timezone.utc)   # 比後一筆還晚
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, *_ = _admin_app(
+        tmp_path, history=[("2026-07-18", "10", cap_prev), ("2026-07-19", "16", cap_now)])
+    body = client.get("/api/ops/revenue").json()
+    assert body["basis_unknown"] is True and body["over_threshold"] is False
+    assert "遞增" in body["note"]
+
+
+def test_revenue_no_false_alarm_logged_when_basis_unknown(tmp_path, caplog):
+    """basis_unknown 時不得留下「收入對帳超標」的告警痕跡（誤報會消耗信任）。"""
+    import logging
+    client, *_ = _admin_app(tmp_path, history=[("2026-07-18", "10"), ("2026-07-19", "99")])
+    with caplog.at_level(logging.WARNING):
+        client.get("/api/ops/revenue")
+    assert "收入對帳超標" not in caplog.text
 
 
 def test_revenue_rejects_negative_threshold(tmp_path):

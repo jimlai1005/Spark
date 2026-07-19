@@ -4,7 +4,7 @@ create_app 注入——測試全離線。onboarding 端點一律綁 session 地�
 session 衍生，端點無 account 參數（紅線 3：別人不能替你 onboard 是結構保證）。"""
 import logging
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -236,12 +236,19 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         """收入對帳（admin only）：應收（Σ 各客戶歸屬 builder_fee）vs 實收（北極星
         accrued 今昨差）。
 
-        ⚠️ 同基準（工程原則 1）：accrued 的今昨差來自日報腳本每日查一次落下的歷史
-        序列，其涵蓋期間是「最新一筆的那個 UTC 日」——故 fills 時間窗一律取**同一個
-        UTC 日**，而不是 now 往回 24 小時。兩邊窗口錯開會造出純屬錯配的假 discrepancy。
+        ⚠️ 同基準（工程原則 1）：accrued 是**查詢當下**的鏈上累積量，故相鄰兩筆的差
+        涵蓋 `(前次 captured_at, 本次 captured_at]`——fills 窗口一律取**這兩個快照時刻**，
+        不是日曆日。曾經用日曆日取 fills（opus 對抗審查 Critical）：日報 cron 排在
+        00:10 時，accrued 增量其實是「昨天一整天」，fills 卻只有「今天 0 點到現在」
+        的十幾分鐘，健康帳戶會被判成巨大差異並誤報漏財。
 
-        歷史序列不足兩點時不硬算（缺 accrued_prev 就把整段累積量當成單日增量，
-        會產生天文數字的假 delta）：回 insufficient_accrued_history，數值欄留 null。"""
+        兩種**拒絕計算**的情形（回結構化旗標而非硬算——算錯的數字比沒有數字危險）：
+        - `insufficient_accrued_history`：歷史不足兩點（缺 accrued_prev 會把整段累積量
+          當成單日增量，產生天文數字的假 delta）。
+        - `basis_unknown`：相鄰兩筆任一缺 `captured_at`（舊格式資料），或兩個時刻非
+          嚴格遞增（快照被回填／時鐘倒退）——窗口無從對齊，不算 discrepancy、
+          不告警（`over_threshold` 恆 False），附 `note` 說明原因。
+        兩種情形都不回數值欄（型別上就讀不到，避免顯示層把「無資料」畫成 0）。"""
         if threshold_pct < 0:
             raise HTTPException(status_code=400, detail="threshold_pct 不得為負")
         refs, manifest_errors = _load_followers()
@@ -254,22 +261,33 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                           "（由 scripts/copytrade_daily_report.py 每日累積）",
                 "manifest_errors": manifest_errors,
             })
-        (prev_day, accrued_prev), (day_iso, accrued_now) = series[-2], series[-1]
-        day = date.fromisoformat(day_iso)
-        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        # 當日仍在進行中 → 取到 now（與日報腳本的 UTC 0 點~now 同慣例）；已過完的日子取整日
-        end = now if day >= now.date() else start + timedelta(days=1)
+        prev_pt, now_pt = series[-2], series[-1]
+        start, end = prev_pt.captured_at, now_pt.captured_at
+        if start is None or end is None or end <= start:
+            # ⭐ 不硬算：窗口界只能來自快照時刻，缺了就沒有正確答案。用日期猜會整整
+            # 錯開一天，把健康帳戶判成漏財——錯的數字會叫醒人去查不存在的問題。
+            note = ("歷史資料缺快照時刻（captured_at），無法對齊窗口"
+                    if start is None or end is None else
+                    "相鄰兩筆快照時刻非嚴格遞增（回填或時鐘倒退），無法對齊窗口")
+            return jsonable({
+                "insufficient_accrued_history": False, "basis_unknown": True,
+                "over_threshold": False,          # 不告警：算不出來 ≠ 有異常
+                "day": now_pt.date, "prev_day": prev_pt.date,
+                "window_start": None, "window_end": None,
+                "note": f"{note}；本日對帳跳過（下一次日報落檔後即自動恢復）。",
+                "manifest_errors": manifest_errors,
+            })
         rows = customer_pnl(refs, hl, start, end, store=store)
-        result = revenue_reconciliation(rows, accrued_now, accrued_prev,
+        result = revenue_reconciliation(rows, now_pt.accrued, prev_pt.accrued,
                                         threshold_pct=threshold_pct)
         if result["over_threshold"]:
             # 對帳超標＝收入歸屬與鏈上實收對不上，大聲留痕（工程原則 3）
             logger.warning("收入對帳超標 day=%s attributed=%s accrued_delta=%s pct=%s",
-                           day_iso, result["attributed"], result["accrued_delta"],
+                           now_pt.date, result["attributed"], result["accrued_delta"],
                            result["discrepancy_pct"])
         return jsonable({**result, "insufficient_accrued_history": False,
-                         "day": day_iso, "prev_day": prev_day,
+                         "basis_unknown": False,
+                         "day": now_pt.date, "prev_day": prev_pt.date,
                          "window_start": start.isoformat(), "window_end": end.isoformat(),
                          "customers": rows, "manifest_errors": manifest_errors})
 
