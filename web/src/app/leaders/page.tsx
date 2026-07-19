@@ -67,7 +67,8 @@ type Phase =
   | { t: "confirming"; leader: LeaderEntry }
   | { t: "running"; leader: LeaderEntry }
   | { t: "done"; resp: LeaderSelectResp }
-  | { t: "error"; message: string; detail?: string };
+  /** `dismissOnly`：此錯誤要求使用者停手回報，不得提供「重新操作」按鈕。 */
+  | { t: "error"; message: string; detail?: string; dismissOnly?: boolean };
 
 export default function LeadersPage() {
   const me = useMe();
@@ -99,7 +100,9 @@ export default function LeadersPage() {
         recover: recoverPersonalSigner,
         submit: postLeaderSelect,
       },
-      { expectedSigner: me.data.address },
+      // ⭐ expectedLeader＝使用者實際點的那一位。沒有這個，被打穿的 API 可以回一份
+      // 指向別人的原文，而流程的其他每一關（recover、後端重建驗簽）都會照樣放行。
+      { expectedSigner: me.data.address, expectedLeader: leader.address },
     );
     if (r.ok) setPhase({ t: "done", resp: r.resp });
     else setPhase({ t: "error", ...errorCopy(r) });
@@ -150,7 +153,7 @@ export default function LeadersPage() {
           {phase.detail && <p className="hint mono">{phase.detail}</p>}
           <button type="button" className="btn btn-ghost"
             onClick={() => setPhase({ t: "idle" })}>
-            {c.errors.retry}
+            {phase.dismissOnly ? c.errors.dismiss : c.errors.retry}
           </button>
         </div>
       )}
@@ -187,10 +190,13 @@ export default function LeadersPage() {
  * 後端 detail 原樣附在第二行（供回報問題用），不做字串比對推測原因。
  */
 function errorCopy(r: Extract<LeaderSelectFlowResult, { ok: false }>):
-  { message: string; detail?: string } {
+  { message: string; detail?: string; dismissOnly?: boolean } {
   const e = c.errors;
   if (r.kind === "wallet-rejected") return { message: e.walletRejected };
   if (r.kind === "signer-mismatch") return { message: e.signerMismatch };
+  // ⭐ 伺服器指定的授權對象 ≠ 使用者所選：唯一一種「請停手並回報」的失敗，
+  // 因此連按鈕都不給「重新操作」（見 copy.ts 的 leaderMismatch）。
+  if (r.kind === "leader-mismatch") return { message: e.leaderMismatch, dismissOnly: true };
   const err = r.error;
   const detail = err instanceof ApiError ? err.detail : undefined;
   if (err instanceof ApiError) {

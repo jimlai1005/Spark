@@ -83,8 +83,15 @@ function catalog(multiLeaderShipped: boolean): BillingPlansResp {
   };
 }
 
+/**
+ * ⭐ 原文必須含 `Leader: <位址>` 那一行——這不是裝飾，是伺服器版型的一部分
+ * （filet/leader_change.py 的 `_message`，位址正規化為小寫），也是前端 leader 預驗
+ * 的第二道比對對象。fixture 若省略它，測試就驗不到真實流程會走的那條路徑。
+ */
 const MSG: LeaderSelectMessageResp = {
-  message: "Filet: change copy-trading leader\n\nAccount: fabc\nNonce: n-1",
+  message:
+    "Filet: change copy-trading leader\n\nAccount: fabc\n" +
+    "Leader: 0x1111111111111111111111111111111111111111\nNonce: n-1",
   nonce: "n-1",
   issued_at: "2026-07-19T00:00:00Z",
   leader_address: "0x1111111111111111111111111111111111111111",
@@ -304,6 +311,79 @@ describe("LeadersPage — 簽章授權流程（沿 approvalFlow 的謹慎度）"
     await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("你的 leader 沒有被變更");
+    expect(postLeaderSelect).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * ⭐ 被打穿的 filet-api 唯一能無中生有一次換手的路徑：使用者點 Alpha，API 回一份
+   * 指向別人的待簽原文。錢包只顯示一串 hex，使用者按下簽署後，那份簽章對後端而言
+   * 完全合法——所以攔截必須發生在**喚起錢包之前**。
+   */
+  it("⭐ Critical：API 回傳的 leader_address ≠ 使用者所選 → 不喚起錢包、不送出", async () => {
+    const EVIL = "0xEEEE000000000000000000000000000000000EEE";
+    getLeaderSelectMessage.mockResolvedValue({
+      ...MSG,
+      leader_address: EVIL,
+      message: MSG.message.replace(MSG.leader_address, EVIL),
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirm();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    // 使用者連一次簽名請求都不該看到（簽了就已經是一份有效授權）
+    expect(await screen.findByRole("alert")).toHaveTextContent("授權對象與你選擇的 leader 不符");
+    expect(signMessageAsync).not.toHaveBeenCalled();
+    expect(postLeaderSelect).not.toHaveBeenCalled();
+  });
+
+  it("⭐ 第二道：leader_address 相符但 message 內含的位址不同 → 同樣中止", async () => {
+    const EVIL = "0xEEEE000000000000000000000000000000000EEE";
+    getLeaderSelectMessage.mockResolvedValue({
+      ...MSG,
+      message: MSG.message.replace(MSG.leader_address, EVIL),
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirm();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("授權對象與你選擇的 leader 不符");
+    expect(signMessageAsync).not.toHaveBeenCalled();
+    expect(postLeaderSelect).not.toHaveBeenCalled();
+  });
+
+  it("⭐ leader 不符的文案要求使用者停手回報，且不提供「重新操作」按鈕", async () => {
+    getLeaderSelectMessage.mockResolvedValue({
+      ...MSG,
+      leader_address: "0xEEEE000000000000000000000000000000000EEE",
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirm();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    const alert = await screen.findByRole("alert");
+    // 明說現況：沒簽、沒送出、設定沒變
+    expect(alert).toHaveTextContent("沒有被簽署");
+    expect(alert).toHaveTextContent("沒有變動");
+    // ⭐ 明確叫使用者不要重試並回報——不得出現誘導重試的字眼
+    expect(alert).toHaveTextContent("請不要重試");
+    expect(alert).toHaveTextContent("回報客服");
+    expect(alert.textContent).not.toMatch(/請稍後再試|重新整理/);
+    // 按鈕是純關閉，不是「重新操作」（否則等於用按鈕收回文案的結論）
+    expect(screen.getByRole("button", { name: "關閉" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重新操作" })).not.toBeInTheDocument();
+  });
+
+  it("大小寫不同但實為同一位址 → 不得誤擋，流程正常完成", async () => {
+    getLeaderSelectMessage.mockResolvedValue({
+      ...MSG,
+      leader_address: MSG.leader_address.toUpperCase(),
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirm();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
+    expect(signMessageAsync).toHaveBeenCalledTimes(1);
     expect(postLeaderSelect).toHaveBeenCalledTimes(1);
   });
 
