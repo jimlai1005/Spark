@@ -529,6 +529,11 @@ describe("LeadersPage — 績效分級揭露 ⭐⭐（缺鍵＝不該顯示，�
     expect(await screen.findByText(/統計缺少時點，本頁不顯示任何數字/)).toBeInTheDocument();
     expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
     expect(document.querySelectorAll(".leader-stat")).toHaveLength(0);
+    // ⭐ 揭露文案與實際渲染共用同一個判定：這裡沒畫績效，文案就不得宣稱有績效區。
+    // （兩處各算一次的話，會出現「文案說下半部是績效、下半部其實空的」這種各自
+    //   都對、湊起來是假話的狀態。）
+    expect(screen.queryByText(/規模／曝險與績效是兩類不同的數字/)).not.toBeInTheDocument();
+    expect(screen.getByText(/沒有報酬率、沒有回撤、沒有勝率/)).toBeInTheDocument();
   });
 
   it("⭐ 不依績效排序：清單順序沿用後端順序（排序＝本頁在替使用者推薦）", async () => {

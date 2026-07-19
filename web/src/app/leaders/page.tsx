@@ -97,6 +97,21 @@ function gateOf(plans: BillingPlansResp | undefined): Gate {
   return shipped ? { open: true } : { open: false, reason: "unshipped" };
 }
 
+/**
+ * 這次到底會不會畫績效——⭐ **單一判定**，揭露文案與實際渲染共用同一個答案。
+ * 兩邊各算一次是工程原則 1 的反例：文案說「下半部是績效」、下半部卻因為缺時點
+ * 而什麼都沒畫，兩邊各自都「對」，湊在一起就是假話。
+ *
+ * fail closed：`performance_available` 不是明確的 true（載入中、舊版後端沒這個
+ * 欄位、後端說沒有）→ 一律當作沒有績效。時點條件與規模欄位同源：績效與規模出自
+ * 同一份每日快照，沒有時點的報酬率一樣會被當成即時數字讀。
+ */
+function perfVisible(data: LeadersResp | undefined): boolean {
+  if (!data) return false;
+  const hasTimestamp = data.stats_day != null || data.stats_as_of != null;
+  return data.performance_available === true && hasTimestamp;
+}
+
 type Phase =
   | { t: "idle" }
   | { t: "confirming"; leader: LeaderEntry }
@@ -123,10 +138,9 @@ export default function LeadersPage() {
   });
   const gate = gateOf(plans.data);
   // ⭐ 揭露文案必須描述**畫面上實際有什麼**：顯示績效時還說「本頁沒有報酬率、
-  // 沒有回撤」，那句話本身就成了頁面上第一個不誠實的元素。fail closed：
-  // `performance_available` 不是明確的 true（含載入中、舊版後端沒這個欄位）→
-  // 一律當作沒有績效，走原本那份「本頁只有規模與曝險」的文案。
-  const perfShown = leaders.data?.performance_available === true;
+  // 沒有回撤」，那句話本身就成了頁面上第一個不誠實的元素。判定與實際渲染共用
+  // `perfVisible`（同一個答案，不各算一次）。
+  const perfShown = perfVisible(leaders.data);
 
   async function runFlow(leader: LeaderEntry) {
     // 防禦性重擋一層：閘門關著時連流程都不啟動（按鈕已 disabled，這裡是第二道）。
@@ -279,10 +293,10 @@ function LeaderList({ data, gate, busy, onSelect }: {
   // 後者同樣危險——一份三天前的切面沒有時點就會被當成即時數字讀。
   const hasTimestamp = data.stats_day != null || data.stats_as_of != null;
   const statsShown = data.stats_available && hasTimestamp;
-  // ⭐ 績效自己一道閘，但**同樣受時點閘管**：績效與規模出自同一份每日快照，
-  // 沒有時點的報酬率一樣會被當成即時數字讀。刻意不把兩個 available 旗標合併
-  // （後端明寫不可合併）——這裡是 `performance_available` ∩ 時點，不是 ∩ `stats_available`。
-  const perfShown = data.performance_available === true && hasTimestamp;
+  // ⭐ 績效自己一道閘，但**同樣受時點閘管**（見 perfVisible）：刻意不把兩個
+  // available 旗標合併（後端明寫不可合併）——是 `performance_available` ∩ 時點，
+  // 不是 ∩ `stats_available`。與上方揭露文案共用同一個判定，不各算一次。
+  const perfShown = perfVisible(data);
   // 後端明確說「沒有績效」才畫原因；欄位整個缺席（舊版後端不談績效）則整區不出現，
   // 兩種情況的共通點是**一個數字都不畫**。
   const perfUnavailable = data.performance_available === false;
