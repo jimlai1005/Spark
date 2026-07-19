@@ -165,12 +165,29 @@ uv python list | grep 3.11       # 驗收：3.11.x 已安裝
 > 私鑰不得離開本機）。這是**潛在風險而非已發生的外洩**：撰寫本註記時工作樹內
 > 恰好沒有這些檔案。新增 exclude 時不要只想「這個大不大」，要想「這個外洩會怎樣」。
 
+> ⚠️ **`uv.lock` 必須在兩段 rsync 都 exclude**（2026-07-20 審查發現，**行為與敘述不符**）。
+> 本節下方寫著「`uv.lock` 是 gitignored，僅存在此機（＝伺服器）」，但它**沒有出現在
+> 任何一段的 exclude 清單裡**——所以每次部署其實都是**本機的 lock 蓋掉伺服器的**。
+> 敘述說 A、行為是 B，這個不一致本身就是問題：本次部署無害（依賴沒變），但只要本機
+> 曾在不同依賴狀態下解過 lock，下一次部署就會**靜默改動正式機的依賴版本**，而
+> `uv sync` 會忠實地照那份 lock 裝——沒有任何錯誤訊息。
+>
+> 這台機器的本機與伺服器**本來就不是同一個解析環境**：本機是 macOS ＋ Python 3.14，
+> 伺服器是 Linux ＋ Python 3.11（§3.1 釘死）。lock 由伺服器自己解、留在伺服器，是這份
+> 文件一貫的模型（見下方 `uv sync` 那行、重新部署前的 `chown` 修正、以及附錄 B 記錄
+> 解出的版本以便偵測漂移）。修法就是把敘述缺的那一格補上，維持該模型。
+>
+> **兩段都要加**：第一段少了它 → 本機的 lock 進 `/tmp/spark-sync/`；第二段少了它 →
+> `--delete` 會把伺服器上那份**刪掉**（`--exclude` 同時保護目的端的檔案不被 `--delete`
+> 清除）。只加一段等於換一種方式弄丟它。
+
 ```bash
 # 在本機執行 (/Users/jim/projects/spark)：
 rsync -az --delete \
   --exclude .env --exclude '.env.*' --exclude '*.key' --exclude .git \
   --exclude node_modules --exclude .venv --exclude .next \
   --exclude __pycache__ --exclude var --exclude .pytest_cache \
+  --exclude uv.lock \
   -e "ssh -i <金鑰路徑>" /Users/jim/projects/spark/ ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER:/tmp/spark-sync/
 ```
 
@@ -179,8 +196,14 @@ rsync -az --delete \
 sudo mkdir -p /opt/filet
 sudo rsync -a --delete \
   --exclude .venv --exclude web/node_modules --exclude web/.next --exclude var \
+  --exclude uv.lock \
   /tmp/spark-sync/ /opt/filet/spark/
 rm -rf /tmp/spark-sync   # 清掉暫存，不留在 /tmp
+
+# 驗收：伺服器上的 uv.lock 沒有被本次部署動到（mtime 應是上一次在**這台伺服器**跑
+# uv sync 的時間，不是剛才那一秒）。首次部署時它還不存在，這行會 No such file——正常。
+ls -l --time-style=long-iso /opt/filet/spark/uv.lock 2>/dev/null \
+  || echo "（首次部署：uv.lock 尚未產生，下面的 uv sync 會建它）"
 ```
 
 > ⭐ **伺服器上「沒有 git repo」是刻意的，不是缺陷**（2026-07-19 實機重新部署發現）。
@@ -422,8 +445,8 @@ sudo systemctl daemon-reload
 > `缺少環境變數: FILET_LEADERS_PATH`。這是刻意的 fail-closed，不是故障——理由見 §5.5。
 >
 > **部署前**先把這一行加進 `/etc/systemd/system/filet-api.service`（repo 版的
-> `deploy/filet-api.service` 已內建，跑完下面步驟 2 的 `cp` 就會帶進來；若這次不跑
-> 那段 `cp`，就必須手動加）：
+> `deploy/filet-api.service` 已內建，跑完下面步驟 2 的 `cp` 就會帶進來；但若你依
+> **步驟 0** 判定要跳過 `cp`，就必須手動加）：
 >
 > ```ini
 > Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
@@ -432,6 +455,46 @@ sudo systemctl daemon-reload
 > 值必須與 `filet-follower@`、`filet-leaderboard`、`filet-perf-series` 三個 unit 逐字元
 > 相同（那三個本來就有這一行）。四邊一致的驗收指令見 **§5.7 驗收 4**。
 > 加完 `daemon-reload` ＋ `restart filet-api`，再跑一次 §5.4 的狀態確認。
+
+**問題**：§5.2／§5.3 用 `systemctl edit --full` 把實際值寫進
+`/etc/systemd/system/filet-*.service`，而 §5.1 的 `cp` 覆蓋的**正是同一個路徑**。
+所以在既有機器上重跑 §5.1，會靜默清掉全部 6 個已填入的值：
+
+| unit | 被清掉的值 | 後果 |
+|---|---|---|
+| `filet-api.service` | `FILET_API_NETWORK` | ⭐ 變回 `REPLACE_WITH_NETWORK` → **API 拒絕啟動**（唯一會大聲失敗的一個） |
+| `filet-api.service` | `FILET_BUILDER_ADDR` | builder 收益歸零／下單帶錯 builder |
+| `filet-api.service` | `FILET_SIWE_DOMAIN`、`FILET_SIWE_URI` | SIWE 登入全數失敗（domain 對不上） |
+| `filet-api.service` | `FILET_ADMIN_ADDRESSES` | 沒有人是 admin，後台進不去 |
+| `filet-keysvc.service` | `FILET_KEYSVC_ALLOWED_UIDS`（§5.2） | SO_PEERCRED 白名單失效 → filet-api 呼不到 key-service |
+
+`FILET_API_NETWORK` 起不來反而是**最幸運**的一個：其餘五個都是「服務照樣 active，
+功能靜默壞掉」。所以下面的還原步驟一條都不能跳。
+
+#### 步驟 0：先 diff repo 版與 `/etc` 現行版，決定要不要跑 §5.1 的 `cp`
+
+<!-- 2026-07-20 新增：本次部署實際採用且證明安全的作法 -->
+
+§5.1 的 `cp` ＋ §5.1a 步驟 3 的還原，合起來是「把 6 個實際值換成佔位符、再還原回去」。
+**若 repo 版與現行版的差異只是那幾個已填值**，整段就是純風險零收益（中途中斷、還原
+迴圈少還原一個、`sed` 撞到特殊字元——每一種都會讓服務靜默壞掉），此時**直接跳過
+§5.1 與步驟 3**，只做 `daemon-reload`。
+
+```bash
+# 逐一 diff（unit 沒有真正的改動時，輸出應只有那幾行 REPLACE_WITH / 已填值的差異）
+for U in filet-keysvc filet-api filet-dashboard filet-follower@; do
+  echo "=== $U ==="
+  sudo diff -u "/etc/systemd/system/${U}.service" "/opt/filet/spark/deploy/${U}.service"
+done
+```
+
+判讀：
+- **差異只有已填值 vs `REPLACE_WITH_*` 佔位符** → 跳過 §5.1 的 `cp` 與步驟 3，
+  這次部署不動 unit 檔。
+- **有其他差異**（多／少一行 `Environment=`、`ExecStart`／`ReadWritePaths`／沙箱選項變了）
+  → 那些正是本次升級要帶上去的東西，照常跑 §5.1 ＋ 步驟 1／3。
+  ⚠️ 本次（2026-07-20）就屬於這一類：`filet-api.service` 多了 `FILET_LEADERS_PATH` 一行。
+- 拿不準 → 照常跑完整流程（步驟 1 的備份先做）。多做一次是可回復的，跳錯不是。
 
 #### 步驟 1：覆蓋 unit 之前先備份
 
@@ -522,7 +585,11 @@ systemctl show filet-api.service -p Environment --value | tr ' ' '\n' \
   ubuntu、build 後還原 root」的步驟，照該節做。
 - **`var/` 目錄（leaders.json、manifest）靠 rsync 的 `--exclude var` 保護**——§3.2 兩段
   rsync 的 exclude 清單少一個，`--delete` 就會連白名單一起刪掉。跑之前確認 exclude
-  清單完整（`.venv`／`web/node_modules`／`web/.next`／`var`）。
+  清單完整（`.venv`／`web/node_modules`／`web/.next`／`var`／`uv.lock`）。
+  <!-- 2026-07-20：uv.lock 補進本清單，理由見 §3.2 上方的方框（原本漏列，導致每次
+       部署都是本機的 lock 蓋掉伺服器的，與 §3.2 的敘述矛盾）。 -->
+- **本次升級（2026-07-20）多一個必填變數 `FILET_LEADERS_PATH`**——見本節開頭的方框，
+  不補會讓 filet-api 拒絕啟動。
 - **`/var/lib/filet-exchange` 與 `/etc/filet/keys` 不受重新部署影響**（不在 repo 路徑下），
   但仍值得跑一次 §5.5.1 的驗收確認權限沒被別的操作動過。
 - **§6 的 nginx 設定同樣不要重跑**——`cp nginx-filet.conf` 會蓋掉網域代換**與 certbot
@@ -869,9 +936,20 @@ sudo rm -f /var/lib/filet-exchange/engine/.probe
 #    只要其中一邊的 FILET_EXCHANGE_DIR 剛好排在該 unit 的第一個，兩行就會長得不一樣，
 #    在**設定完全正確**的機器上誤報成不一致。理由詳見 §5.5.2 驗收 2 的方框。
 systemctl show filet-api.service -p Environment --value | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
-systemctl show 'filet-follower@<account_id>.service' -p Environment --value \
+systemctl show 'filet-follower@probe.service' -p Environment --value \
   | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
 ```
+
+> ⚠️ **實例名不可省略，但也不必是真實帳號**（2026-07-20 修正）。上面第二行原本寫
+> `filet-follower@<account_id>.service`，在**還沒有任何 follower 的機器上跑不出東西**
+> ——而那正是首次部署時的狀態，也就是這條驗收最該被跑的時候。模板 unit 本身
+> （`filet-follower@.service`，`@` 後面空的）同樣問不出值：systemd 要有具體實例才能
+> 展開 `%i`。
+>
+> 解法是給一個**合成實例名**（這裡用 `probe`）：`%i` 對任意名字都會展開，unit 不必
+> 啟動、帳號不必存在、不會建立任何東西。`FILET_EXCHANGE_DIR` 的值本來就與實例名無關
+> （不含 `%i`），所以拿 `probe` 問到的就是真實 follower 會拿到的值。
+> 同一個技巧在 §5.5.2 驗收 2（那裡用 `synthetic-check-0001`）與 §5.7 驗收 4 都用得上。
 
 > 「兩邊都設了但**值不同**」是唯一擋不住的一格（兩個進程各看各的 env，沒有共同的
 > 仲裁者）。驗收 4 是人工比對；長期由 `scripts/filet_daily_report.py` 的
