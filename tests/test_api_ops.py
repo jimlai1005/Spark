@@ -1234,3 +1234,179 @@ def test_absent_state_root_is_distinguished_from_unreadable(tmp_path):
         assert state_root_status(root) == "unreadable"
     finally:
         root.chmod(0o755)
+
+
+# ---------- ⭐⭐ 引擎健康心跳（取代放寬狀態根權限） ----------
+# 正式部署的狀態根是 0700 filet-engine，面板跑在 filet-api ⇒ 直讀一律「未知」。
+# 修法**不是**放寬到 0750（那是拿廣泛的讀取權換窄的資訊需求），而是讓引擎每 cycle
+# 往交換目錄的 engine→api 子通道發布一份窄的摘要。以下三條釘住這個接縫。
+
+def _write_heartbeat(cfg, account_id, *, age_s=5.0, tripped=False, count=12,
+                     newest_age_s=20.0, leader="0x" + "d4" * 20,
+                     leader_source="manifest", alloc="5000.00", util="0.4000",
+                     capital_source="customer_signed", result="no_action"):
+    """以引擎的**同一個產生器**寫一份心跳（測試不自己拼 JSON——自己拼的話，
+    寫端改了欄位這裡不會紅，接縫測試就變成一份與現實無關的自證）。"""
+    from spark.filet.engine_health import (build_heartbeat, heartbeat_path_for,
+                                           write_heartbeat)
+
+    class _Cov:
+        def __init__(self):
+            self.count, self.oldest_age_s = count, 86400.0
+            self.newest_age_s, self.read_error = newest_age_s, False
+
+        @property
+        def sufficient(self):
+            return True
+
+    now = datetime.now(timezone.utc).timestamp()
+    payload = build_heartbeat(
+        account_id=account_id, now_s=now - age_s, killswitch_tripped=tripped,
+        coverage=_Cov(), leader_address=leader, leader_source=leader_source,
+        allocated_capital=alloc, capital_utilization=util, use_full_equity=False,
+        capital_source=capital_source, capital_changed_at=None,
+        cycle_result=result, cycle_detail=None)
+    p = heartbeat_path_for(cfg.exchange_dir, account_id)
+    write_heartbeat(p, payload)
+    return p
+
+
+def _unreadable_state_root(cfg, account_id):
+    """把狀態根做成正式部署的樣子（面板讀不到），回傳 root 供收尾 chmod。"""
+    root = Path(cfg.state_base) / account_id
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o000)
+    return root
+
+
+def test_heartbeat_fills_the_panel_when_the_state_root_is_unreadable(tmp_path):
+    """⭐⭐ 預設部署（狀態根 0700）下，面板的資料來自引擎發布的心跳。
+
+    這條是整個機制的存在理由：不放寬權限，面板照樣看得到 kill switch、覆蓋度、
+    目前跟的 leader 與目前的資金設定。`basis` 明講這一列出自心跳而非直讀。
+    """
+    client, cfg = _h_app(tmp_path)
+    root = _unreadable_state_root(cfg, ACCT_A)
+    _write_heartbeat(cfg, ACCT_A, tripped=True, leader_source="customer_signed")
+    try:
+        row = client.get("/api/ops/health").json()["followers"][0]
+    finally:
+        root.chmod(0o755)
+
+    assert row["basis"] == "heartbeat"
+    assert row["heartbeat_status"] == "ok"
+    assert row["killswitch_tripped"] is True and row["killswitch_known"] is True
+    assert row["sample_count"] == 12 and row["sample_coverage_sufficient"] is True
+    assert row["engine_alive"] is True
+    assert row["leader_address"] == "0x" + "d4" * 20
+    assert row["leader_source"] == "customer_signed"
+    assert row["capital"]["allocated_capital"] == "5000.00"
+    assert row["capital"]["capital_utilization"] == "0.4000"
+    assert row["capital"]["source"] == "customer_signed"
+    assert row["last_cycle"]["result"] == "no_action"
+
+
+def test_stale_heartbeat_is_never_shown_as_current_state(tmp_path):
+    """⭐⭐ 本節最重要的一條。心跳過期 → 標「過期」＋ 最後心跳時刻，
+    而心跳裡的值**一個都不得**出現在現況欄位上。
+
+    拿掉 `read_heartbeat` 的過期分支，本測試會紅在 `killswitch_tripped is None`：
+    一份 40 分鐘前的「kill switch 未觸發」會在客戶的引擎已經熔斷的當下被顯示成
+    現況——這正是本面板最不能犯的錯（謊報健康比沒有面板更危險）。
+    """
+    from spark.filet.engine_health import HEARTBEAT_STALE_S
+
+    client, cfg = _h_app(tmp_path)
+    root = _unreadable_state_root(cfg, ACCT_A)
+    # 過期的心跳說「一切正常」：沒觸發、樣本充足、剛剛才跑完一輪。
+    _write_heartbeat(cfg, ACCT_A, age_s=HEARTBEAT_STALE_S + 60, tripped=False,
+                     result="ok")
+    try:
+        body = client.get("/api/ops/health").json()
+    finally:
+        root.chmod(0o755)
+
+    row = body["followers"][0]
+    assert row["heartbeat_status"] == "stale"
+    assert row["heartbeat_at"] is not None            # 最後心跳時刻要說得出來
+    assert row["heartbeat_age_s"] > HEARTBEAT_STALE_S  # 過期多久也要說得出來
+    # ⭐ 過期心跳的內容一律不得成為現況
+    assert row["killswitch_tripped"] is None, "過期的「未觸發」不得被當成現況"
+    assert row["killswitch_known"] is False
+    assert row["engine_alive"] is None
+    assert row["sample_count"] is None
+    assert row["last_cycle"] is None and row["capital"] is None
+    assert row["leader_address"] is None
+    assert row["basis"] != "heartbeat"
+    assert body["summary"]["heartbeat_stale_count"] == 1
+    assert body["summary"]["killswitch_unknown_count"] == 1
+
+
+def test_missing_heartbeat_leaves_the_row_unknown_with_an_age(tmp_path):
+    """⭐ 沒有心跳檔 → 整列維持未知（**不是**一組看起來健康的預設值），
+    且 `heartbeat_status` 說明是 `missing` 而非 `stale`——前者多半是部署待辦
+    （子目錄沒建／剛 activate），後者是「引擎沒跑或寫不進去」，處置不同。"""
+    client, cfg = _h_app(tmp_path)
+    root = _unreadable_state_root(cfg, ACCT_A)
+    try:
+        body = client.get("/api/ops/health").json()
+    finally:
+        root.chmod(0o755)
+
+    row = body["followers"][0]
+    assert row["heartbeat_status"] == "missing"
+    assert row["heartbeat_age_s"] is None and row["heartbeat_at"] is None
+    assert row["killswitch_tripped"] is None and row["killswitch_known"] is False
+    assert row["engine_alive"] is None
+    assert body["summary"]["heartbeat_missing_count"] == 1
+    assert body["summary"]["heartbeat_ok_count"] == 0
+
+
+def test_direct_read_wins_over_heartbeat_and_says_so(tmp_path):
+    """狀態根讀得到時以直讀為準（較新鮮），`basis` 標明來源。
+
+    兩個來源並存卻不標示，讀者無從判斷他看到的數字有多舊。leader／資金設定沒有
+    直讀的對應物，所以它們**永遠**來自心跳——即使 basis 是 state_root。
+    """
+    client, cfg = _h_app(tmp_path)
+    _trip_killswitch(cfg.state_base, ACCT_A)          # 直讀：已觸發
+    _write_heartbeat(cfg, ACCT_A, tripped=False)      # 心跳：說沒觸發（較舊）
+
+    row = client.get("/api/ops/health").json()["followers"][0]
+    assert row["basis"] == "state_root"
+    assert row["killswitch_tripped"] is True          # 以直讀為準
+    assert row["heartbeat_status"] == "ok"
+    assert row["leader_address"] == "0x" + "d4" * 20  # 但 leader 只有心跳給得出來
+
+
+def test_heartbeat_sample_age_is_corrected_by_the_heartbeat_age(tmp_path):
+    """⭐ 心跳裡的「樣本 20 秒前寫過」是**心跳寫入當下**量到的，不是現在。
+
+    面板要判斷引擎現在活不活，必須把心跳自己的年齡加回去（兩個加數同單位、同一次
+    讀取）。少了這一步，一份接近過期的心跳裡那句「樣本剛寫過」會被當成現在的事實。
+    """
+    client, cfg = _h_app(tmp_path)
+    root = _unreadable_state_root(cfg, ACCT_A)
+    _write_heartbeat(cfg, ACCT_A, age_s=400.0, newest_age_s=300.0)
+    try:
+        row = client.get("/api/ops/health").json()["followers"][0]
+    finally:
+        root.chmod(0o755)
+
+    assert row["last_sample_age_s"] >= 700.0          # 300（心跳內）＋ 400（心跳齡）
+    assert row["engine_alive"] is False               # > ENGINE_STALE_S(600)
+
+
+def test_health_panel_never_exposes_signature_material(tmp_path):
+    """⭐ 面板回應整份掃描：沒有簽章／nonce／原文外流。
+
+    心跳是引擎寫給一個權限較低的進程看的，而面板又會把它轉給瀏覽器。
+    """
+    from spark.filet.engine_health import FORBIDDEN_KEY_PARTS
+
+    client, cfg = _h_app(tmp_path)
+    _write_heartbeat(cfg, ACCT_A)
+    raw = client.get("/api/ops/health").text
+
+    for part in FORBIDDEN_KEY_PARTS:
+        assert f'"{part}"' not in raw, f"健康面板外流了 {part}"

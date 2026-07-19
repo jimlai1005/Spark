@@ -38,6 +38,8 @@ from spark.publicapi.config import ApiConfig, derive_account_id, normalize_addre
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
 from spark.copytrade.equity import sample_coverage
 from spark.copytrade.killswitch import ALERTS_LOG_RELPATH, is_tripped
+from spark.filet.engine_health import (HeartbeatRead, heartbeat_path_for,
+                                       read_heartbeat)
 from spark.filet.leader_change_apply import LEDGER_RELPATH as LC_LEDGER_RELPATH
 from spark.filet.leader_change_apply import scan_unapplied_leader_changes
 from spark.publicapi.ops import ENGINE_STALE_S
@@ -1002,6 +1004,21 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                          "customers": rows,
                          "manifest_errors": manifest_errors})
 
+    def _read_heartbeat(account_id: str, now_s: float) -> HeartbeatRead:
+        """讀一個 follower 的引擎健康心跳（**只吃單一 account**，結構上拿不到別人的）。
+
+        路徑由 `account_id` 推導 ⇒ 沒有「先載入全部再 filter」這一步，也就沒有
+        「忘記 filter」這個 bug（沿 `_load_own_follower` 的同一個決定）。
+        任何失敗都降級成 `unreadable`，**不 raise**：健康面板不得被單一 follower
+        的心跳問題打成 500——那會讓其餘 follower 的狀態也一起看不到。
+        """
+        try:
+            return read_heartbeat(
+                heartbeat_path_for(cfg.exchange_dir, account_id), now_s)
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning("心跳讀取失敗 account=%s: %r", account_id, e)
+            return HeartbeatRead("unreadable")
+
     @app.get("/api/ops/health")
     def ops_health(admin: str = Depends(_require_admin)):
         """系統健康面板（admin only）：引擎存活、kill switch、樣本覆蓋度、上次快照
@@ -1021,6 +1038,23 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         （引擎每 cycle 寫一筆）。一個還在寫檔卻不下單的進程，這一格看起來會健康。
         真正的 process 存活由 systemd 管（RUNBOOK 的 `systemctl status`）。
 
+        ⭐⭐ 資料來源：**引擎主動發布的健康心跳**（`filet.engine_health`），不是把
+        引擎的狀態根權限放寬給 API。狀態根是 `0700 filet-engine`，面板跑在 filet-api
+        ——放寬到 0750 會讓 API 讀得到引擎的**全部**狀態（權益樣本、ARM 檔、兩份已
+        兌現帳本、告警流水），而面板只需要幾個摘要值。改由引擎每 cycle 往交換目錄的
+        engine→api 子通道寫一份窄的摘要：**發布一份窄的產物，優於開放廣泛的讀取權**
+        （與換 leader 的設計同構，只是通道反向）。每列的 `basis` 說明它的 kill switch
+        與覆蓋度出自直讀（`state_root`）還是心跳（`heartbeat`）。
+
+        ⭐⭐ **過期的心跳不會被當成目前狀態顯示**：`heartbeat_status="stale"` 時，
+        面板只多出「最後心跳時刻」與「心跳年齡」兩格，心跳裡的值一個都不會被填進去
+        （`read_heartbeat` 在過期時結構性地不回傳 payload）。心跳讀不到／過期時整列
+        維持既有的「未知」語意——一份 40 分鐘前的「kill switch 未觸發」，在客戶的引擎
+        已經熔斷的當下顯示成現況，正是本面板最不能犯的錯。
+        `heartbeat_status` 三態不折疊：`missing`（引擎從未寫過／子目錄沒建）、
+        `stale`（引擎沒跑，或引擎在跑但寫不進交換目錄）、`unreadable`（檔案壞了）
+        的處置完全不同，合成一個「未知」等於把 admin 該做的第一步藏起來。
+
         ⭐ 積壓的判定與每日對帳報告**同源**：兩者都呼叫
         `leader_change_apply.scan_unapplied_leader_changes`，不各自寫一次判定式
         ——本端點是那份日報的即時視圖，兩邊漂移會讓其中一邊變成狼來了。
@@ -1036,6 +1070,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             coverage_fn=lambda root: sample_coverage(root, now_fn=lambda: now_s),
             killswitch_fn=is_tripped,
             alerts_path_fn=lambda root: root / ALERTS_LOG_RELPATH,
+            heartbeat_fn=lambda acct: _read_heartbeat(acct, now_s),
         ) for ref in refs]
 
         # 換 leader 積壓：查不下去（交換目錄沒設好、記錄檔讀不到）→ None ＋ 錯誤原文，

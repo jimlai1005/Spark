@@ -562,3 +562,155 @@ def test_dry_run_without_account_id_skips_the_capital_applier(monkeypatch, tmp_p
     assert seen == [(rc.CopySettings().allocated_capital,
                      rc.CopySettings().capital_utilization)]   # env 預設
     assert not (tmp_path / "state" / LEDGER_RELPATH).exists()
+
+
+# ── ⭐⭐ 引擎健康心跳的接線（取代放寬狀態根權限）────────────────────────
+# 模組測試（tests/test_engine_health.py）證明心跳本身對；這一段證明它真的被接進
+# main() 的 cycle，而且發布的是**本輪實際採用**的 leader 與資金設定。少了它，把
+# make_heartbeat_publisher 從 cycle() 拿掉會全綠通過。
+
+
+def _read_hb(tmp_path, account_id="alice"):
+    from spark.filet.engine_health import heartbeat_path_for
+
+    p = heartbeat_path_for(_exchange_dir(tmp_path), account_id)
+    return (json.loads(p.read_text()) if p.exists() else None), p
+
+
+def test_engine_publishes_a_heartbeat_each_cycle(monkeypatch, tmp_path):
+    """⭐⭐ 每 cycle 一份心跳，內容＝**本輪實際用來下單**的 leader 與資金設定。
+
+    來源標記與數值必須出自同一次求值（CapitalSettingsApplier.last_applied）：
+    心跳若自己再讀一次帳本，兩次讀取之間帳本可能已變，於是它會宣稱一組本輪根本
+    沒有被拿去下單的數值——而且看起來完全正常。
+    """
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_capital(tmp_path, wallet, alloc="5000", util="0.4")
+    _stub_network(monkeypatch)
+    _record_capital(monkeypatch, [])
+
+    rc.main(["--once"])
+
+    hb, _ = _read_hb(tmp_path)
+    assert hb is not None, "cycle 跑完卻沒有心跳落地"
+    assert hb["account_id"] == "alice"
+    assert hb["leader"]["address"] == _LEADER
+    assert hb["killswitch_tripped"] is False
+    assert hb["capital"] == {"allocated_capital": "5000.00",
+                             "capital_utilization": "0.4000",
+                             "use_full_equity": False,
+                             "source": "customer_signed",
+                             "changed_at": hb["capital"]["changed_at"]}
+    assert hb["capital"]["changed_at"] is not None      # 上次變更時刻說得出來
+    assert hb["last_cycle"]["result"] in {"ok", "no_action", "tripped"}
+
+
+def test_heartbeat_reports_env_default_capital_source(monkeypatch, tmp_path):
+    """沒有客戶簽章時來源是 `env_default`——與 `customer_signed` 分得開。
+
+    分不開的話，`/api/me/capital` 就無法告訴客戶「你上次簽的到底生效了沒」。
+    """
+    _wire_signed(monkeypatch, tmp_path,
+                 allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _stub_network(monkeypatch)
+    _record_capital(monkeypatch, [])
+
+    rc.main(["--once"])
+
+    hb, _ = _read_hb(tmp_path)
+    assert hb["capital"]["source"] == "env_default"
+    assert hb["capital"]["changed_at"] is None
+
+
+def test_heartbeat_never_carries_signature_material(monkeypatch, tmp_path):
+    """⭐⭐ 走完一次**真實簽章**的套用之後，心跳檔裡不得有簽章的任何一段。
+
+    心跳落在 API 讀得到的目錄裡（權限較低的信任域）。這條掃的是真的落地的檔案，
+    不是一份手工造的 payload。
+    """
+    from spark.filet.capital_settings import (capital_settings_path_for,
+                                              load_capital_settings)
+    from spark.filet.engine_health import FORBIDDEN_KEY_PARTS
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_capital(tmp_path, wallet, alloc="5000", util="0.4")
+    _stub_network(monkeypatch)
+    _record_capital(monkeypatch, [])
+
+    rc.main(["--once"])
+
+    rec = load_capital_settings(capital_settings_path_for(_exchange_dir(tmp_path)))[0]
+    raw = _read_hb(tmp_path)[1].read_text()
+    assert rec["signature"] not in raw                 # 真的那一串簽章不在裡面
+    assert rec["message"] not in raw                   # 待簽原文也不在
+    assert rec["nonce"] not in raw
+    for part in FORBIDDEN_KEY_PARTS:
+        assert f'"{part}"' not in raw
+
+
+def test_heartbeat_write_failure_does_not_stop_copytrading(monkeypatch, tmp_path):
+    """⭐⭐ 心跳寫不出去 → **跟單照跑**（可觀測性不得中斷被觀測的系統）。
+
+    這裡把 engine→api 子通道的位置佔成一個**檔案**，讓 mkdir 真的失敗（不是 mock
+    一個假例外）。run_cycle 仍然要收到本輪的設定，且 main() 不得拋出。
+    """
+    from spark.filet.engine_health import engine_publish_dir_for
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_capital(tmp_path, wallet, alloc="5000", util="0.4")
+    blocker = engine_publish_dir_for(_exchange_dir(tmp_path))
+    blocker.write_text("我是一個檔案，不是目錄")        # 心跳必定寫不進去
+    _stub_network(monkeypatch)
+    seen = []
+    _record_capital(monkeypatch, seen)
+
+    rc.main(["--once"])                                  # 不得拋出
+
+    from decimal import Decimal
+    assert seen == [(Decimal("5000.00"), Decimal("0.4000"))]   # 跟單照跑
+    assert blocker.is_file()                             # 心跳確實沒落地
+
+
+def test_heartbeat_records_a_zero_action_cycle_after_revocation(monkeypatch, tmp_path):
+    """⭐ leader 被撤銷（本輪零交易動作）也要發心跳，且 `result` 指名事件。
+
+    最需要面板的時刻正是引擎不做事的時刻。若心跳只在成功路徑上發，「引擎收尾後
+    靜靜停在那裡」在面板上會退化成「心跳過期」，與「引擎掛了」分不開。
+    """
+    _wire_signed(monkeypatch, tmp_path,
+                 allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _stub_network(monkeypatch)
+    seen = []
+    _record_capital(monkeypatch, seen)
+
+    def _fake_refresh(self):
+        return None          # leader 已被撤銷、收尾已執行
+
+    monkeypatch.setattr(rc.LeaderWatch, "refresh", _fake_refresh)
+
+    rc.main(["--once"])
+
+    hb, _ = _read_hb(tmp_path)
+    assert seen == []                                   # 確實零交易動作
+    assert hb["last_cycle"]["result"] == "revoked"
+    assert hb["leader"]["address"] is None
+    assert hb["capital"]["source"] == "unavailable"     # 不謊報一組沒在用的數值
+    assert hb["capital"]["allocated_capital"] is None
+
+
+def test_dry_run_without_account_id_publishes_no_heartbeat(monkeypatch, tmp_path):
+    """無 SPARK_ACCOUNT_ID → 沒有「這是誰的心跳」→ 整條發布路徑跳過。"""
+    _wire_signed(monkeypatch, tmp_path,
+                 allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    monkeypatch.delenv("SPARK_ACCOUNT_ID", raising=False)
+    monkeypatch.setenv("COPY_LEADER_ADDRESS", _LEADER)
+    _stub_network(monkeypatch)
+    _record_capital(monkeypatch, [])
+
+    rc.main(["--once", "--dry-run"])
+
+    from spark.filet.engine_health import heartbeat_dir_for
+    assert not heartbeat_dir_for(_exchange_dir(tmp_path)).exists()

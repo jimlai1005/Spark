@@ -59,7 +59,9 @@ keystore 選擇:
 """
 import argparse
 import json
+import logging
 import os
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -78,14 +80,21 @@ from spark.exchange.base import BuilderCode
 from spark.filet.capital_settings_apply import (
     LEDGER_RELPATH as CAPITAL_LEDGER_RELPATH,
 )
+from spark.filet.capital_settings import canonical_capital_values
 from spark.filet.capital_settings_apply import (
     CapitalSettingsApplier,
     CapitalSettingsUnavailable,
     resolve_capital_settings_path,
 )
+from spark.filet.engine_health import (
+    build_heartbeat,
+    heartbeat_path_for,
+    publish_heartbeat,
+)
 from spark.filet.leader_change_apply import (
     LEDGER_RELPATH,
     LeaderChangeApplier,
+    require_exchange_dir,
     resolve_changes_path,
 )
 from spark.filet.leader_resolve import (
@@ -98,6 +107,8 @@ from spark.filet.leader_resolve import (
 )
 from spark.filet.tagged_notifier import TaggedNotifier
 from spark.keystore.base import KeyStore
+
+logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -194,6 +205,80 @@ def make_capital_settings_applier(*, account_id: str | None, notifier: Notifier,
         settings_path=resolve_capital_settings_path(),
         ledger_path=state_root / CAPITAL_LEDGER_RELPATH,
         notifier=notifier)
+
+
+def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
+                             now_fn=time.time):
+    """建立「每 cycle 發布一份健康摘要到交換目錄」的閉包；無 account_id → None。
+
+    ⭐⭐ 為什麼引擎要主動發布，而不是讓面板去讀狀態根（完整論證見
+    `spark.filet.engine_health` 檔頭）：面板需要五個摘要值，狀態根裡裝的是引擎的
+    全部狀態（equity 樣本、kill switch ARM 檔、兩份已兌現帳本、告警流水）。
+    為了讀五個數字而把整包交給另一個進程，是拿廣泛的讀取權換窄的資訊需求。
+    **發布一份窄的產物，優於開放廣泛的讀取權**——與換 leader 的設計同構，只是通道反向。
+
+    `account_id` 為 None（dry/shadow 無身分）→ 回 None：心跳是 per-follower 的，
+    沒有帳號就沒有「這是誰的心跳」（沿 make_capital_settings_applier 的同一個決定）。
+
+    落點在建構時解出一次（`require_exchange_dir` 未設 env 即 raise ⇒ 拒絕啟動，與
+    換 leader／資金設定同一條「半邊漏設不得靜默無效」的規則）；每輪重讀的是狀態根
+    的內容，那由閉包內每次呼叫負責。
+    """
+    if account_id is None:
+        return None
+    path = heartbeat_path_for(require_exchange_dir(), account_id)
+
+    def _publish(*, leader, settings, applied_capital, result: str,
+                 detail: str | None) -> bool:
+        """⚠️ **絕不 raise**：心跳是可觀測性，不是安全關鍵路徑（工程原則 3 的邊界）。
+
+        `settings` 為 None ⇒ 本輪根本沒解出設定（leader 撤銷／資金設定不可判定），
+        資金那一格回 `source="unavailable"` ＋ 全 null，**不回上一輪的值**：面板顯示
+        一組本輪沒有被用來下單的數字，比顯示「不知道」危險。
+        """
+        try:
+            now_s = float(now_fn())
+            # kill switch 與樣本覆蓋度由引擎**自己**讀自己的狀態根（它讀得到，
+            # 這正是本機制的重點）；讀取失敗一律回 None ＝未知，不回「沒觸發」。
+            try:
+                tripped = bool(is_tripped(state_root))
+            except OSError:
+                tripped = None
+            try:
+                cov = sample_coverage(state_root, now_fn=lambda: now_s)
+            except OSError:
+                cov = None
+            alloc = util = None
+            full = None
+            capital_source = "unavailable"
+            changed_at = None
+            if settings is not None:
+                # canonical 化：與客戶簽章記錄／帳本裡的字串形式同一個產生器，
+                # 兩邊結構上不可能組出不同的字串（工程原則 1）——`/api/me/capital`
+                # 要拿它與「已提交但未套用」的記錄相減，兩側必須同基準。
+                _, alloc, _, util = canonical_capital_values(
+                    settings.allocated_capital, settings.capital_utilization)
+                full = bool(settings.use_full_equity)
+                capital_source = ("customer_signed" if applied_capital is not None
+                                  else "env_default")
+                if applied_capital is not None:
+                    changed_at = datetime.fromtimestamp(
+                        applied_capital.applied_at, timezone.utc).isoformat()
+            payload = build_heartbeat(
+                account_id=account_id, now_s=now_s, killswitch_tripped=tripped,
+                coverage=cov,
+                leader_address=(leader.address if leader is not None else None),
+                leader_source=(leader.source if leader is not None else None),
+                allocated_capital=alloc, capital_utilization=util,
+                use_full_equity=full, capital_source=capital_source,
+                capital_changed_at=changed_at, cycle_result=result,
+                cycle_detail=detail)
+        except Exception:  # noqa: BLE001 — 見 docstring：組不出心跳也不得中斷跟單
+            logger.exception("心跳組裝失敗（跟單不受影響）")
+            return False
+        return publish_heartbeat(path, payload)
+
+    return _publish
 
 
 def make_revocation_wind_down(adapter, ex, notifier: Notifier,
@@ -424,35 +509,66 @@ def main(argv: list[str] | None = None) -> None:
                             adapter, ex, notifier, state_root))
     capital_applier = make_capital_settings_applier(
         account_id=account_id, notifier=notifier, state_root=state_root)
+    publish_hb = make_heartbeat_publisher(account_id=account_id,
+                                          state_root=state_root)
 
     def cycle():
-        res = watch.refresh()
-        if res is None:
-            # leader 已被撤銷、收尾已執行（或已大聲失敗）→ 本輪起零交易動作。
-            # 刻意不倚賴「trip 寫了 ARM 檔所以 run_cycle 會自己短路」：ARM 寫入失敗時
-            # 那個短路不存在，而「停止開新倉」不能建立在另一個動作成功的前提上。
-            return tripped_report()
-        # 位址沒變就沿用同一個 settings 物件（避免每輪無謂重建）；變了才 replace，
-        # 讓 run_cycle 的 leader 讀取與本輪解析結果同源（工程原則 1）。
-        cs = (copy_settings if res.address == copy_settings.leader_address
-              else replace(copy_settings, leader_address=res.address))
-        # ⭐ 資金設定疊在**已解析 leader 的** settings 之上。順序與換 leader 無關
-        # （兩者改的是不同欄位），但擺在後面讓「本輪最終用的 settings」只有一個
-        # 產生點——中間插一個 run_cycle 就會出現兩個都自稱是本輪設定的物件。
-        if capital_applier is not None:
-            try:
-                cs = capital_applier.effective(cs)
-            except CapitalSettingsUnavailable:
-                # ⭐⭐ 帳本遺失／讀不到／內容超界 ⇒ **本輪零交易動作**，
-                # 絕不用 env 預設值繼續跑。applier 已發過指名事件的 critical。
-                # 退回預設是一次沒有客戶授權的曝險變更，而且全程安靜——這正是
-                # 整個模組要防的事（見 capital_settings_apply 檔頭）。
+        # ⭐ 心跳的本輪快照。每個出口在 return 之前更新它，`finally` 統一發布一次
+        # ——包含例外離開的那條路徑（`result` 的初值就是 error，所以「引擎炸了」
+        # 這件事本身也會被發布出去，而不是變成一段沉默）。
+        # `settings` 與 `capital` **一起**在同一行設定：來源標記必須與本輪真正用來
+        # 下單的那組值出自同一次求值（工程原則 1，見 CapitalSettingsApplier.last_applied）。
+        hb = {"leader": None, "settings": None, "capital": None,
+              "result": "error", "detail": "本輪未完成（例外中斷）"}
+        try:
+            res = watch.refresh()
+            if res is None:
+                # leader 已被撤銷、收尾已執行（或已大聲失敗）→ 本輪起零交易動作。
+                # 刻意不倚賴「trip 寫了 ARM 檔所以 run_cycle 會自己短路」：ARM 寫入失敗時
+                # 那個短路不存在，而「停止開新倉」不能建立在另一個動作成功的前提上。
+                hb["result"] = "revoked"
+                hb["detail"] = "leader 已被撤銷，收尾已執行；本輪起零交易動作"
                 return tripped_report()
-        start = len(ex.records)
-        report = run_cycle(adapter, ex, cs, notifier, state, state_root)
-        if args.shadow:
-            _append_shadow(ex.records[start:], shadow_dir)
-        return report
+            hb["leader"] = res
+            # 位址沒變就沿用同一個 settings 物件（避免每輪無謂重建）；變了才 replace，
+            # 讓 run_cycle 的 leader 讀取與本輪解析結果同源（工程原則 1）。
+            cs = (copy_settings if res.address == copy_settings.leader_address
+                  else replace(copy_settings, leader_address=res.address))
+            # ⭐ 資金設定疊在**已解析 leader 的** settings 之上。順序與換 leader 無關
+            # （兩者改的是不同欄位），但擺在後面讓「本輪最終用的 settings」只有一個
+            # 產生點——中間插一個 run_cycle 就會出現兩個都自稱是本輪設定的物件。
+            if capital_applier is not None:
+                try:
+                    cs = capital_applier.effective(cs)
+                except CapitalSettingsUnavailable:
+                    # ⭐⭐ 帳本遺失／讀不到／內容超界 ⇒ **本輪零交易動作**，
+                    # 絕不用 env 預設值繼續跑。applier 已發過指名事件的 critical。
+                    # 退回預設是一次沒有客戶授權的曝險變更，而且全程安靜——這正是
+                    # 整個模組要防的事（見 capital_settings_apply 檔頭）。
+                    hb["detail"] = ("資金設定無法判定（帳本遺失／讀不到／內容超界），"
+                                    "本輪零交易動作")
+                    return tripped_report()
+            hb["settings"] = cs
+            hb["capital"] = (capital_applier.last_applied
+                             if capital_applier is not None else None)
+            start = len(ex.records)
+            report = run_cycle(adapter, ex, cs, notifier, state, state_root)
+            if args.shadow:
+                _append_shadow(ex.records[start:], shadow_dir)
+            # 三種正常結局分開回報：`tripped`（kill switch 已跳，零動作）、`ok`
+            # （本輪真的下了單）、`no_action`（跑完但無事可做——絕大多數 cycle）。
+            # 合成一個「成功」會讓面板分不出「引擎在跟單」與「引擎已熔斷但還活著」。
+            # `getattr` 而非 `report.tripped`：心跳是可觀測性，不得因為 run_cycle 改了
+            # 回傳型別（或測試替身回了別的東西）而把跟單這一輪打成 AttributeError。
+            hb["result"] = ("tripped" if getattr(report, "tripped", False)
+                            else "ok" if len(ex.records) > start else "no_action")
+            hb["detail"] = None
+            return report
+        finally:
+            if publish_hb is not None:
+                publish_hb(leader=hb["leader"], settings=hb["settings"],
+                           applied_capital=hb["capital"], result=hb["result"],
+                           detail=hb["detail"])
 
     if args.once:
         print(cycle())

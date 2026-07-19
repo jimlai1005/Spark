@@ -105,7 +105,8 @@ id filet-api   # 驗收：groups 輸出含 filet-api 與 filet-engine 兩者
 | `/etc/filet/followers` | `filet-engine:filet-engine` | `700` | 手動 mkdir | per-follower `<id>.env`（640，見 `deploy/follower.env.example`） |
 | `/var/lib/filet-api` | `filet-api:filet-api` | `0750`（systemd `StateDirectory` 預設） | 由 `filet-api.service` 的 `StateDirectory=filet-api` 自動建立 | `api.db`、`pending.json` |
 | `/run/filet` | `filet-engine:filet-engine` | `0750`（`RuntimeDirectoryMode` 見 `filet-keysvc.service`） | 由 `filet-keysvc.service` 的 `RuntimeDirectory=filet` 自動建立（服務啟動時） | `keysvc.sock`（socket 檔本身 660，見 `serve_forever` chmod） |
-| `/opt/filet/state/<account_id>` | `filet-engine:filet-engine` | `700` | 由 `filet-follower@.service` 的 `ReadWritePaths` 隱含要求，首次啟動前手動 `mkdir -p` | 單一 follower 引擎狀態根（kill-switch 不連坐） |
+| `/opt/filet/state/<account_id>` | `filet-engine:filet-engine` | `700` | 由 `filet-follower@.service` 的 `ReadWritePaths` 隱含要求，首次啟動前手動 `mkdir -p` | 單一 follower 引擎狀態根（kill-switch 不連坐）。⭐ **維持 700，不要為了健康面板放寬**——面板改讀引擎發布的心跳，見 §5.6 |
+| `/var/lib/filet-exchange` ＋ `…/engine` | 見 §5.5.1（**owner/group 對調的兩層**） | `0750` | 手動 mkdir（§5.5.1） | 兩個單向通道：根層 API 寫／引擎讀（客戶簽章記錄），`engine/` 引擎寫／API 讀（健康心跳） |
 | `/opt/filet/spark/var/filet` | `root:root` | `755` | 手動 mkdir（§5.5） | leader 白名單與 follower manifest 的所在目錄 |
 | `/opt/filet/spark/var/filet/leaders.json` | **`root:root`** | **`644`** | 手動建立（§5.5，範本 `deploy/leaders.json.example`） | ⭐ 策劃 leader 白名單。**承重點：filet-api 必須寫不到**——它被打穿時攻擊者能改 pending/manifest，唯獨改不了這份檔，引擎每輪的二次驗證才擋得住 |
 
@@ -432,20 +433,46 @@ ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 AR
 
 | 路徑 | owner:group | mode | 建立方式 | 用途 |
 |---|---|---|---|---|
-| `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ 客戶簽章的共享記錄：`leader_changes.json`（換 leader）＋ `capital_settings.json`（資金設定）。owner 寫、group 讀、other 無 |
+| `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ **api→engine** 通道：客戶簽章的共享記錄 `leader_changes.json`（換 leader）＋ `capital_settings.json`（資金設定）。owner 寫、group 讀、other 無 |
+| `/var/lib/filet-exchange/engine/` | **`filet-engine:filet-api`** | **`0750`** | 手動 mkdir（本節） | ⭐ **engine→api** 通道（**owner/group 剛好對調**）：引擎發布的健康心跳 `engine/health/<account_id>.json`。引擎寫、API 讀 |
 
-> 兩份記錄**刻意分開兩個檔**（不是同一個檔多一個欄位）：讀者是兩個獨立的套用器，
-> 共用一個檔會讓其中一方的格式問題連坐另一方——而這兩件事各自都能造成資金損失，
-> 不該共命運（`src/spark/filet/capital_settings.py` 檔頭）。兩者同目錄、同權限拓撲，
-> 所以本節的建立與驗收步驟**一次涵蓋兩者**，不需要另外再建一個目錄。
+> 兩份客戶簽章記錄**刻意分開兩個檔**（不是同一個檔多一個欄位）：讀者是兩個獨立的
+> 套用器，共用一個檔會讓其中一方的格式問題連坐另一方——而這兩件事各自都能造成
+> 資金損失，不該共命運（`src/spark/filet/capital_settings.py` 檔頭）。兩者同目錄、
+> 同權限拓撲，所以本節的建立與驗收步驟**一次涵蓋兩者**。
 
-**方向是單向的**：filet-api 寫、filet-follower@ 讀。引擎那邊的 unit **刻意不把這個目錄
-列入 `ReadWritePaths`**——被打穿的引擎因此污染不了 API 的狀態。
+**⭐⭐ 兩個單向通道，沒有任何雙向可寫的路徑**（`src/spark/filet/engine_health.py` 檔頭）：
+
+```
+/var/lib/filet-exchange/              filet-api:filet-engine  0750   ← api→engine
+├── leader_changes.json                                              （API 寫、引擎讀）
+├── capital_settings.json
+└── engine/                           filet-engine:filet-api  0750   ← engine→api
+    └── health/                                                      （引擎寫、API 讀）
+        └── <account_id>.json
+```
+
+- 根目錄的 owner 仍是 `filet-api`：引擎對它**沒有寫權**，被打穿的引擎改寫不了客戶
+  簽章記錄。
+- 子目錄 `engine/` 的 owner/group **對調**：引擎能寫這一格、API 只能讀；API 對它
+  沒有寫權。所以「引擎可寫」的範圍恰好是它要發布的那一格，不是整個交換目錄。
+- `deploy/filet-follower@.service` 對稱地**只**把 `engine/` 列入 `ReadWritePaths`
+  （根目錄不列入）。
+- ⚠️ **子目錄必須人工建立**：引擎對根目錄無寫權，`mkdir` 會失敗。這是刻意的——
+  「引擎能寫什麼」是部署決定，不是引擎自己決定的事。漏建的症狀是**心跳寫不出去、
+  但跟單照常**（可觀測性不得中斷被觀測的系統），面板上會看到 `heartbeat_status`
+  由 `missing` 轉成 `stale`。
 
 ```bash
 sudo mkdir -p /var/lib/filet-exchange
 sudo chown filet-api:filet-engine /var/lib/filet-exchange
 sudo chmod 0750 /var/lib/filet-exchange
+
+# ⭐ engine→api 子通道（健康心跳）。owner/group 與上面**剛好對調**——這一行寫反
+# 的話，引擎寫不進去（心跳永遠 missing）或 API 讀不到（面板永遠未知）。
+sudo mkdir -p /var/lib/filet-exchange/engine
+sudo chown filet-engine:filet-api /var/lib/filet-exchange/engine
+sudo chmod 0750 /var/lib/filet-exchange/engine
 ```
 
 **兩個 unit 都必須宣告 `FILET_EXCHANGE_DIR`**（`deploy/filet-api.service` 與
@@ -460,9 +487,10 @@ Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
 （unit 進 `failed`，是可監控的狀態）。「起不來」刻意優先於「起來了但功能靜默失效」
 ——後者可能好幾天沒人發現，而期間客戶每一次換 leader 都石沉大海。
 
-#### 驗收（三條都要跑，缺一條就沒證明打通）
+#### 驗收（七條都要跑，缺一條就沒證明打通）
 
 ```bash
+# ── api→engine 通道（根目錄）──
 # 驗收 1：filet-api 寫得進去
 sudo -u filet-api touch /var/lib/filet-exchange/.probe \
   && echo "api 可寫 OK" || echo "★ 失敗：api 寫不進，換 leader 記錄永遠落不了地"
@@ -476,6 +504,21 @@ sudo -u filet-engine touch /var/lib/filet-exchange/.engine-probe \
   && echo "★ 危險：引擎可寫，單向性失效！" || echo "engine 不可寫 OK"
 
 sudo rm -f /var/lib/filet-exchange/.probe
+
+# ── engine→api 通道（engine/ 子目錄，方向相反）──
+# 驗收 3a：filet-engine 寫得進子目錄（心跳落點）
+sudo -u filet-engine touch /var/lib/filet-exchange/engine/.probe \
+  && echo "engine 可寫子通道 OK" || echo "★ 失敗：心跳寫不出去，面板永遠未知"
+
+# 驗收 3b：filet-api 讀得到（不讀就沒有面板）
+sudo -u filet-api test -r /var/lib/filet-exchange/engine/.probe \
+  && echo "api 可讀子通道 OK" || echo "★ 失敗：面板讀不到心跳"
+
+# 驗收 3c：filet-api 寫**不**進子通道（反向單向性；寫得進代表 owner/group 給反了）
+sudo -u filet-api touch /var/lib/filet-exchange/engine/.api-probe \
+  && echo "★ 危險：api 可寫子通道，單向性失效！" || echo "api 不可寫子通道 OK"
+
+sudo rm -f /var/lib/filet-exchange/engine/.probe
 
 # 驗收 4：兩個 unit 宣告的值真的相同（打錯字是本節唯一擋不住的殘餘風險）
 systemctl show filet-api.service -p Environment | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
@@ -515,12 +558,39 @@ sudo chmod 700 /opt/filet/state/<account_id>
 sudo systemctl start filet-follower@<account_id>
 ```
 
-#### ⚠️ 健康面板與狀態根權限（`/api/ops/health` 預設看不到，這是刻意的預設）
+#### ⭐⭐ 健康面板的資料來自**引擎發布的心跳**，狀態根維持 `0700`（不要放寬）
 
-`0700` 表示只有 `filet-engine` 讀得到狀態根。營運健康面板跑在 **filet-api** 進程裡，
-所以**預設情況下它讀不到**任何 follower 的 kill switch 狀態、equity 樣本覆蓋度與
-告警數——面板會把這些格子顯示成 **「未知」**（`null`），這是正確且刻意的行為，
-不是 bug。
+`0700` 表示只有 `filet-engine` 讀得到狀態根，而營運健康面板跑在 **filet-api** 進程裡
+——直讀一律讀不到。**這個權限維持不變，不要改成 0750。**
+
+> ⚠️ 本節在 2026-07-19 之前建議 `chmod 0750 /opt/filet/state/<account_id>` 來讓面板
+> 看得到資料。**那個建議已被撤回，不要照做。** 理由：面板需要的是幾個摘要值
+> （kill switch 有沒有跳、樣本夠不夠、跟誰、押多大），而狀態根裡裝的是引擎的**全部**
+> 狀態——equity 樣本序列、kill switch ARM 檔、兩份已兌現 nonce 帳本、告警流水。
+> 為了讀五個數字而把這一整包交給另一個進程，是拿「廣泛的讀取權」換「窄的資訊需求」。
+
+**取而代之**：引擎每個 cycle 主動往 §5.5.1 的 **engine→api 子通道**發布一份窄的健康
+摘要（`/var/lib/filet-exchange/engine/health/<account_id>.json`），面板從那裡讀。
+設計與換 leader 同構——**發布一份窄的產物，優於開放廣泛的讀取權**——只是通道反向。
+實作與威脅模型見 `src/spark/filet/engine_health.py` 檔頭。
+
+心跳只含摘要，**結構性地不含**簽章／nonce／密鑰材料：寫入邊界會掃描整份 payload，
+命中就拒寫（`tests/test_engine_health.py` 釘住）。
+
+- **面板每列的 `basis`** 說明那一列的 kill switch 與覆蓋度出自直讀（`state_root`，
+  只有在有人放寬過權限時才會出現）還是心跳（`heartbeat`）。
+- **`heartbeat_status` 三態不折疊**，處置各不相同：
+  | 值 | 意思 | 先做什麼 |
+  |---|---|---|
+  | `ok` | 心跳新鮮（≤ 600s） | 無 |
+  | `missing` | 從未寫過 | 檢查 §5.5.1 的 `engine/` 子目錄建了沒、權限對不對 |
+  | `stale` | 有心跳但過期 | `systemctl status filet-follower@<account_id>`；引擎在跑卻過期＝寫不進子通道 |
+  | `unreadable` | 檔案在但讀不出來／格式壞 | 看檔案本身 |
+- ⭐ **過期的心跳不會被當成目前狀態顯示**：`stale` 時面板只多出「最後心跳時刻」與
+  「心跳年齡」兩格，心跳裡的值一個都不會被填進現況欄位
+  （回歸測試：`tests/test_api_ops.py::test_stale_heartbeat_is_never_shown_as_current_state`）。
+  一份 40 分鐘前的「kill switch 未觸發」在客戶的引擎已經熔斷的當下顯示成現況，
+  是本面板最不能犯的錯。
 
 > ⭐ 面板**不會**因為讀不到就顯示「未觸發／健康」。這一格曾經是個真的 bug：
 > Python 的 `Path.exists()` 會把 PermissionError 吞成 `False`，於是一個**確實已經
@@ -528,22 +598,15 @@ sudo systemctl start filet-follower@<account_id>
 > `ops.state_root_status()` 先探測可讀性，讀不到一律整列標未知
 > （回歸測試：`tests/test_api_ops.py::test_unreadable_state_root_never_reports_killswitch_as_untripped`）。
 
-**要讓面板真的看得到，需要放寬到 `0750`**（`filet-api` 已是 `filet-engine` 群組的
-附加成員，見 §2）：
-
 ```bash
-# ⚠️ 這是一個**權限放寬**的決定，請先確認你要的是哪一邊的取捨：
-#   維持 0700 → 面板顯示「未知」，但狀態根（含 ARM 檔、equity 樣本、已兌現帳本）
-#               只有引擎讀得到。
-#   放寬 0750 → 面板可用，代價是 filet-api 被打穿時可以**讀**（仍不能寫）這些檔案。
-#               這些檔案不含私鑰（私鑰在 keysvc，filet-api 本來就讀不到，見 §8 驗收 1）。
-sudo chmod 0750 /opt/filet/state/<account_id>
+# 驗收：activate 並啟動 follower 之後，等一個 cycle（預設 60s），心跳應該落地
+sudo -u filet-api test -r /var/lib/filet-exchange/engine/health/<account_id>.json \
+  && echo "心跳 OK（面板會有資料）" || echo "★ 心跳缺席：見 §5.5.1 的子目錄與權限"
 
-# 驗收：filet-api 讀得到，且**寫不進去**（唯讀方向必須維持）
+# 狀態根**維持** 0700：這一條應該印「api 不可讀 OK」
 sudo -u filet-api test -r /opt/filet/state/<account_id> \
-  && echo "api 可讀 OK（面板會有資料）" || echo "api 仍讀不到（面板顯示未知）"
-sudo -u filet-api touch /opt/filet/state/<account_id>/.probe \
-  && echo "★ 危險：api 可寫，唯讀方向失效！" || echo "api 不可寫 OK"
+  && echo "★ 注意：狀態根已被放寬，面板會改用直讀（basis=state_root）" \
+  || echo "api 不可讀 OK（面板改用心跳，這是預期的部署形態）"
 ```
 
 ---

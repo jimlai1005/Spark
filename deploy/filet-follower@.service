@@ -20,12 +20,13 @@ Environment=FILET_KEYS_DIR=/etc/filet/keys
 # 這份檔必須是 root:root 644（filet-api 寫不到）——見 RUNBOOK §5.5。
 Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
 Environment=FILET_FOLLOWERS=/opt/filet/spark/var/filet/followers.json
-# ⭐ 客戶簽章換 leader 記錄的交換目錄（引擎**唯讀**）。必須與 filet-api.service 的
-# 同名變數逐字元相同；漏設會讓引擎拒絕啟動（require_exchange_dir，刻意無預設值——
-# 舊版的隱含預設讓 API 寫 /var/lib/filet-api、引擎讀 repo 內的 var/filet，功能完全
-# 不通而兩邊 log 都正常）。
-# ⚠️ **刻意不列入 ReadWritePaths**：方向是單向的（API 寫、引擎讀）。被打穿的引擎
-# 因此污染不了 API 的狀態；引擎那邊真正需要寫的只有自己的 FILET_STATE_DIR。
+# ⭐ 客戶簽章換 leader／資金設定記錄的交換目錄。必須與 filet-api.service 的同名變數
+# 逐字元相同；漏設會讓引擎拒絕啟動（require_exchange_dir，刻意無預設值——舊版的隱含
+# 預設讓 API 寫 /var/lib/filet-api、引擎讀 repo 內的 var/filet，功能完全不通而兩邊
+# log 都正常）。
+# ⚠️ 目錄**根**刻意不列入 ReadWritePaths：那一層是 api→engine 單向（API 寫、引擎讀），
+# 被打穿的引擎因此改寫不了客戶簽章記錄。引擎唯一能寫的是底下的 engine/ 子目錄
+# （engine→api 單向，健康心跳落點，見下方 ReadWritePaths 與 RUNBOOK §5.5.1）。
 Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_copytrade
 Restart=on-failure
@@ -34,8 +35,14 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 # 引擎只讀 agent key（/etc/filet/keys 於 ProtectSystem=strict 下本就唯讀，不列入 RW）；
-# 只有狀態目錄需要寫入
-ReadWritePaths=/opt/filet/state/%i
+# 需要寫入的只有兩處：
+#   1. 自己的狀態根。
+#   2. ⭐ 交換目錄底下的 engine/ 子通道（健康心跳落點）。**只有這個子目錄，不是整個
+#      交換目錄**：面板要的是幾個摘要值，而放寬整個交換目錄會讓被打穿的引擎能改寫
+#      客戶簽章的換 leader／資金設定記錄。目錄本身由 RUNBOOK §5.5.1 人工建立
+#      （filet-engine:filet-api 0750）——引擎對交換目錄根無寫權，建不出它，這是刻意的：
+#      「引擎能寫什麼」是部署決定，不是引擎自己決定的事。
+ReadWritePaths=/opt/filet/state/%i /var/lib/filet-exchange/engine
 PrivateTmp=true
 
 [Install]

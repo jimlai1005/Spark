@@ -287,6 +287,25 @@ class CapitalSettingsApplier:
         self._ledger_path = Path(ledger_path)
         self._notifier = notifier
         self._now_fn = now_fn
+        # ⭐ 上一次 `effective()` 實際採用的客戶簽章設定（見 `last_applied`）。
+        self._last_applied: AppliedCapital | None = None
+
+    @property
+    def last_applied(self) -> AppliedCapital | None:
+        """上一次 `effective()` 實際採用的客戶簽章設定；**None ＝ 沿用環境預設**。
+
+        ⭐⭐ 為什麼是一個由 `effective()` 順帶記下的值，而不是「需要時再讀一次帳本」
+        （工程原則 1）：健康心跳要回報「目前生效的資金設定**與它的來源**」。若心跳
+        自己去 `load_ledger` 讀一次，那是**第二次讀取**——兩次讀取之間帳本可能已經
+        變了，於是心跳會宣稱一組本輪根本沒有被用來下單的數值，而且看起來完全正常。
+        來源與數值都必須出自產生本輪 `CopySettings` 的那一次求值。
+
+        寫入點只有 `_current`（所有「本輪用哪組設定」的路徑都收斂在那裡），所以這個
+        值不可能與 `effective()` 的回傳值不一致。`_current` 提前 raise 的那一格會先
+        清成 None——本輪沒有任何設定生效，回報「沿用環境預設」同樣是錯的，而呼叫端
+        在那一格本來就會回報成錯誤（見 run_copytrade.cycle）。
+        """
+        return self._last_applied
 
     # ---------- 告警 ----------
 
@@ -394,7 +413,12 @@ class CapitalSettingsApplier:
         有 override → 套上去，且**每輪重驗邊界**：帳本裡的值也可能被竄改
         （狀態目錄的寫入權限出問題、備份還原了一份壞檔），而它每一輪都會被乘進
         部位大小。「寫進帳本時驗過了」不足以保證「現在讀出來的還是那個值」。
+
+        ⭐ 本函式是「本輪用哪組設定」的**唯一**收斂點，所以也是 `last_applied` 的
+        唯一寫入點——心跳因此拿得到與本輪 `CopySettings` 同一次求值的來源標記。
+        先清成 None 再視情況設回，是為了讓任何提前 raise 的路徑不留下上一輪的值。
         """
+        self._last_applied = None
         if applied is None:
             return base
         alloc, util = applied.as_decimals()
@@ -414,6 +438,7 @@ class CapitalSettingsApplier:
                 dedup_key="capital_settings_ledger_out_of_range")
             raise CapitalSettingsUnavailable(
                 f"資金設定帳本內的數值超出允許範圍（{self._ledger_path}）") from None
+        self._last_applied = applied
         # 三個欄位一起換：`CopySettings.__post_init__` 有同一條「模式與金額必須配對」
         # 的不變量，只換其中兩個會在那裡直接 raise（那是對的——半套的設定不該生效）。
         return replace(base, allocated_capital=alloc, capital_utilization=util,

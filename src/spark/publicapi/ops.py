@@ -22,6 +22,7 @@ from typing import NamedTuple
 
 from spark.copytrade.report import compute_trade_quality
 from spark.filet.aggregate import collect_follower_summary
+from spark.filet.engine_health import HEARTBEAT_STALE_S
 from spark.publicapi.billing import map_stripe_status
 
 logger = logging.getLogger(__name__)
@@ -310,6 +311,12 @@ def trade_quality_summary(rows) -> dict:
 # （操作者會學會忽略它）。10 分鐘＝連續 10 個 cycle 沒動，那不是抖動。
 ENGINE_STALE_S = 600
 
+# ⭐ 心跳的過期門檻由 `filet.engine_health` 定義（引擎是寫端，門檻該住在寫端旁邊），
+# 這裡只引用不重寫。兩個常數目前相等且由 tests/test_engine_health.py 釘住——理由見
+# HEARTBEAT_STALE_S 的 docstring：兩者回答同一個問題，各自漂移會讓面板上「引擎存活」
+# 與「心跳新鮮」在同一時刻給出相反的答案。
+_HEARTBEAT_STALE_S = HEARTBEAT_STALE_S
+
 
 def _alerts_count(path) -> int | None:
     """告警記錄的行數；讀不到 → None（**不是 0**）。
@@ -356,8 +363,69 @@ def state_root_status(root) -> str:
     return "readable"
 
 
+def _apply_heartbeat(row: dict, hb) -> dict:
+    """把引擎發布的健康心跳疊到健康列上（**過期的心跳只留時刻與年齡**）。
+
+    ⭐⭐ 為什麼面板需要心跳（完整論證見 `filet.engine_health` 檔頭）：引擎的狀態根是
+    `0700 filet-engine`，面板跑在 filet-api——預設每一格都是「未知」。修法**不是**把
+    狀態根放寬到 0750（那是拿廣泛的讀取權換窄的資訊需求），而是讓引擎主動發布一份
+    窄的摘要到交換目錄的 engine→api 子通道。
+
+    ⭐⭐ **過期的心跳不是目前狀態**。`hb.data` 只在 `status == "ok"` 時非 None
+    （`read_heartbeat` 的結構性保證），所以過期時本函式**拿不到**那些值，即使想填
+    也填不進去；面板只會多出「上次心跳時刻 ＋ 年齡」兩格。一份 40 分鐘前的
+    「kill switch 未觸發」在客戶的引擎已經熔斷的當下顯示成現況，正是這個面板最不能
+    犯的錯（謊報健康比沒有面板更危險）。
+
+    ⚠️ 疊加規則（優先序刻意寫死）：**狀態根直讀優先，心跳只補未知的格子**。
+    兩者都是同一批底層事實（同一個 ARM 檔、同一份 equity 樣本），直讀較新鮮，
+    所以有直讀就用直讀，並以 `basis` 欄位明講這一列的值出自哪一邊——兩個來源
+    並存卻不標示，讀者無從判斷他看到的數字有多舊（工程原則 1 的變形）。
+    `leader` 與 `capital` 例外：狀態根**沒有**這兩者的可讀投影，它們只可能來自心跳。
+    """
+    row["heartbeat_status"] = hb.status
+    row["heartbeat_at"] = hb.at
+    row["heartbeat_age_s"] = hb.age_s
+    row["heartbeat_stale_after_s"] = _HEARTBEAT_STALE_S
+    data = hb.data
+    if data is None:
+        # missing／stale／unreadable：三者在面板上是三件不同的事（引擎從未寫過／
+        # 引擎沒跑或寫不進去／檔案壞了），所以 status 原樣上呈，不折疊成一個「未知」。
+        return row
+
+    leader = data.get("leader") or {}
+    row["leader_address"] = leader.get("address")
+    row["leader_source"] = leader.get("source")
+    row["capital"] = data.get("capital")
+    row["last_cycle"] = data.get("last_cycle")
+
+    if row.get("basis") == "state_root":
+        return row      # 直讀已經給了 kill switch 與覆蓋度，心跳不覆蓋較新鮮的值
+    row["basis"] = "heartbeat"
+    tripped = data.get("killswitch_tripped")
+    if isinstance(tripped, bool):
+        row["killswitch_tripped"] = tripped
+        row["killswitch_known"] = True
+    cov = data.get("coverage") or {}
+    if cov.get("known") is True:
+        row["coverage_known"] = True
+        row["sample_count"] = cov.get("count")
+        row["sample_coverage_sufficient"] = cov.get("sufficient")
+    newest = cov.get("newest_age_s")
+    if isinstance(newest, (int, float)) and not isinstance(newest, bool):
+        # ⚠️ 樣本年齡是**心跳寫入當下**量到的，不是現在量到的。面板要顯示「引擎活著」
+        # 就必須把心跳自己的年齡也加回去，否則一份兩小時前的心跳裡那句「樣本 5 秒前
+        # 才寫過」會被當成現在的事實——正是「過期心跳不得當成現況」的細粒度版本。
+        # 兩個加數同單位、同一次讀取（工程原則 1）。
+        row["last_sample_age_s"] = float(newest) + float(hb.age_s or 0.0)
+        row["engine_alive"] = row["last_sample_age_s"] <= ENGINE_STALE_S
+    if row.get("error") and row["killswitch_known"]:
+        row["error"] = None
+    return row
+
+
 def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
-                    alerts_path_fn) -> dict:
+                    alerts_path_fn, heartbeat_fn=None) -> dict:
     """單一 follower 的健康列。**每一格讀不到都回明確的「未知」**。
 
     ⭐⭐ 本函式最重要的性質是它**不會**在讀不到時填一個看起來健康的值：
@@ -377,12 +445,20 @@ def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
     row: dict = {"account_id": ref.account_id, "label": ref.label,
                  "network": ref.network,
                  "liveness_basis": "equity_sample",
-                 "state_root": str(state_root)}
+                 "state_root": str(state_root),
+                 # 心跳專屬的格子先給明確的 None（不是缺鍵）：缺鍵在 JSON 上與
+                 # 「值為 null」對前端是兩種形狀，而這一列每一欄都該恆定存在。
+                 "leader_address": None, "leader_source": None,
+                 "capital": None, "last_cycle": None}
 
     # ⭐⭐ 先探測可讀性（見 state_root_status）：狀態根讀不到時，底下每一個
     # `Path.exists()` 都會安靜地回 False——kill switch 會被回報成「沒有觸發」。
     # 讀不到就整列標未知，不讓任何一格落到「看起來健康」的預設值上。
     status = state_root_status(state_root)
+    # `basis` ＝這一列的 kill switch／覆蓋度出自哪裡。只有真的讀得到才算 state_root；
+    # absent（狀態根不存在）刻意**不算**，那一格的「沒有 ARM 檔」與心跳相比資訊量
+    # 低得多，該讓心跳補上（見 _apply_heartbeat 的疊加規則）。
+    row["basis"] = "state_root" if status == "readable" else status
     if status == "unreadable":
         row.update({
             "coverage_known": False, "sample_count": None,
@@ -391,10 +467,11 @@ def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
             "killswitch_tripped": None, "killswitch_known": False,
             "alerts": None,
             "error": (f"狀態根讀不到（{state_root}）——kill switch、覆蓋度、告警數"
-                      f"全部無從確認。filet-api 需要對該目錄的讀取權限"
-                      f"（RUNBOOK §5.6 的健康面板說明）"),
+                      f"改由引擎發布的健康心跳提供（見 RUNBOOK §5.6）；"
+                      f"心跳也讀不到時整列維持未知"),
         })
-        return row
+        return _apply_heartbeat(row, heartbeat_fn(ref.account_id)) \
+            if heartbeat_fn is not None else row
 
     try:
         cov = coverage_fn(state_root)
@@ -428,7 +505,9 @@ def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
                                                f"kill switch 狀態讀取失敗: {e}"]))
 
     row["alerts"] = _alerts_count(alerts_path_fn(state_root))
-    return row
+    if heartbeat_fn is None:
+        return row
+    return _apply_heartbeat(row, heartbeat_fn(ref.account_id))
 
 
 def health_summary(rows, unapplied_leader_changes: int | None,
@@ -453,6 +532,15 @@ def health_summary(rows, unapplied_leader_changes: int | None,
             1 for r in rows if r.get("sample_coverage_sufficient") is None),
         "alerts_total": sum(r["alerts"] for r in rows if r.get("alerts") is not None),
         "alerts_unknown_count": sum(1 for r in rows if r.get("alerts") is None),
+        # ⭐ 心跳三態各自計數，**不合併成一個「心跳有問題」**：`stale` 是「引擎沒跑
+        # 或寫不進交換目錄」（要立刻查），`missing` 多半是「剛 activate／子目錄沒建」
+        # （部署待辦）。合成一個數字會讓前者被後者的常態雜訊蓋掉。
+        "heartbeat_ok_count": sum(1 for r in rows
+                                  if r.get("heartbeat_status") == "ok"),
+        "heartbeat_stale_count": sum(1 for r in rows
+                                     if r.get("heartbeat_status") == "stale"),
+        "heartbeat_missing_count": sum(1 for r in rows
+                                       if r.get("heartbeat_status") == "missing"),
         # ⭐ 「已寫入但未套用」的積壓：None ＝ 這條鏈路查不下去（見 leader_change_errors），
         # **不是** 0。0 會被讀成「沒有積壓」，而實際上是「無從得知有沒有積壓」。
         "unapplied_leader_changes": unapplied_leader_changes,
