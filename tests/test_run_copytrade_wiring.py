@@ -428,3 +428,137 @@ def test_dry_run_without_account_id_skips_the_applier(monkeypatch, tmp_path):
 
     assert seen == [_OTHER]                                     # 走 env 回退
     assert not (tmp_path / "state" / LEDGER_RELPATH).exists()
+
+
+# ── ⭐⭐ 客戶簽章的資金設定：從記錄檔一路到 run_cycle 的接縫 ──────────────
+# 與上面的換 leader 接縫同一個理由：模組單元測試證明 applier 本身對，這裡證明它
+# 真的被接進 main() 的 cycle、而且結果真的餵給了下單的那一段。少了它，把
+# make_capital_settings_applier 從 cycle() 拿掉會全綠通過。
+
+
+def _signed_capital(tmp_path, wallet, *, alloc="5000", util="0.4",
+                    account_id="alice", nonce="c1"):
+    """簽一筆合法的資金設定記錄並落到 API 慣例的位置（**專屬交換目錄**）。"""
+    from datetime import datetime, timezone
+
+    from eth_account.messages import encode_defunct
+
+    from spark.filet.capital_settings import (build_capital_settings_message,
+                                              build_capital_settings_record,
+                                              canonical_capital_values,
+                                              capital_settings_path_for,
+                                              write_capital_settings)
+
+    issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _, alloc_s, _, util_s = canonical_capital_values(alloc, util)
+    msg = build_capital_settings_message(
+        account_id=account_id, allocated_capital=alloc_s,
+        capital_utilization=util_s, nonce=nonce, issued_at=issued_at)
+    sig = wallet.sign_message(encode_defunct(text=msg)).signature.hex()
+    rec = build_capital_settings_record(
+        account_id=account_id, allocated_capital=alloc_s,
+        capital_utilization=util_s, nonce=nonce, issued_at=issued_at,
+        signature=sig, message=msg)
+    exchange = _exchange_dir(tmp_path)
+    write_capital_settings(capital_settings_path_for(exchange), rec)
+    return exchange
+
+
+def _record_capital(monkeypatch, seen):
+    """把 run_cycle 換成記錄「本輪拿到的資金設定」的替身。"""
+    def _fake_run_cycle(adapter, ex, settings, notifier, state, root):
+        seen.append((settings.allocated_capital, settings.capital_utilization))
+        return "report"
+
+    monkeypatch.setattr(rc, "run_cycle", _fake_run_cycle)
+
+
+def test_signed_capital_settings_reach_run_cycle(monkeypatch, tmp_path):
+    """⭐⭐ 客戶簽章的資金設定必須真的變成 run_cycle 拿去算部位大小的那組值。
+
+    env 預設是「用全部權益 × 100%」，客戶簽章說「5000 × 40%」——sizing 路徑必須
+    看到後者。這是「這兩個值直接乘進部位大小」那句話的可執行版本。
+    """
+    from decimal import Decimal
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_capital(tmp_path, wallet, alloc="5000", util="0.4")
+    _stub_network(monkeypatch)
+    seen = []
+    _record_capital(monkeypatch, seen)
+
+    rc.main(["--once"])
+
+    assert seen == [(Decimal("5000.00"), Decimal("0.4000"))]
+
+
+def test_capital_settings_applied_once_across_cycles(monkeypatch, tmp_path):
+    """⭐ 冪等的接線版：記錄檔每輪都在，但只兌現一次（帳本逐位元組不變）。"""
+    from decimal import Decimal
+
+    from spark.filet.capital_settings_apply import LEDGER_RELPATH
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_capital(tmp_path, wallet, alloc="5000", util="0.4")
+    _stub_network(monkeypatch)
+    seen = []
+    _record_capital(monkeypatch, seen)
+    ledger = tmp_path / "state" / LEDGER_RELPATH
+    snapshots = []
+
+    def _fake_main_loop(mk_cycle, settings, notifier):
+        for _ in range(3):
+            mk_cycle()
+            snapshots.append(ledger.read_text())
+
+    monkeypatch.setattr(rc, "main_loop", _fake_main_loop)
+    rc.main([])
+
+    assert seen == [(Decimal("5000.00"), Decimal("0.4000"))] * 3
+    assert len(set(snapshots)) == 1              # ⭐ 帳本只被寫過一次
+
+
+def test_lost_capital_ledger_stops_trading_for_the_cycle(monkeypatch, tmp_path):
+    """⭐⭐ 帳本遺失（標記在、帳本不在）→ 本輪**零交易動作**，run_cycle 不被呼叫。
+
+    絕不用 env 預設值繼續跑：那是一次沒有客戶授權的曝險變更，而且全程安靜。
+    """
+    from spark.filet.capital_settings_apply import (LEDGER_RELPATH,
+                                                    ledger_init_marker_path)
+
+    _wire_signed(monkeypatch, tmp_path,
+                 allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    ledger = tmp_path / "state" / LEDGER_RELPATH
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger_init_marker_path(ledger).write_text("{}")     # 標記在，帳本不在
+    _stub_network(monkeypatch)
+    seen = []
+    _record_capital(monkeypatch, seen)
+
+    rc.main(["--once"])
+
+    assert seen == []                                    # ⭐ 本輪零交易動作
+    assert not ledger.exists()                           # 也沒有偷偷重建
+
+
+def test_dry_run_without_account_id_skips_the_capital_applier(monkeypatch, tmp_path):
+    """dry/shadow 無 SPARK_ACCOUNT_ID → 沒有身分就沒有可信的簽章者比對基準 →
+    整條套用路徑跳過（不建帳本、走 env 預設）。"""
+    from spark.filet.capital_settings_apply import LEDGER_RELPATH
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    monkeypatch.delenv("SPARK_ACCOUNT_ID", raising=False)
+    monkeypatch.setenv("COPY_LEADER_ADDRESS", _LEADER)
+    _signed_capital(tmp_path, wallet, alloc="5000", util="0.4")
+    _stub_network(monkeypatch)
+    seen = []
+    _record_capital(monkeypatch, seen)
+
+    rc.main(["--once", "--dry-run"])
+
+    assert seen == [(rc.CopySettings().allocated_capital,
+                     rc.CopySettings().capital_utilization)]   # env 預設
+    assert not (tmp_path / "state" / LEDGER_RELPATH).exists()

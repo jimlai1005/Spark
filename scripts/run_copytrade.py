@@ -75,6 +75,14 @@ from spark.copytrade.loop import main_loop, run_cycle, tripped_report
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
 from spark.exchange.base import BuilderCode
+from spark.filet.capital_settings_apply import (
+    LEDGER_RELPATH as CAPITAL_LEDGER_RELPATH,
+)
+from spark.filet.capital_settings_apply import (
+    CapitalSettingsApplier,
+    CapitalSettingsUnavailable,
+    resolve_capital_settings_path,
+)
 from spark.filet.leader_change_apply import (
     LEDGER_RELPATH,
     LeaderChangeApplier,
@@ -164,6 +172,28 @@ def make_effective_leader_resolver(base_resolve: Callable[[], LeaderResolution],
         return applier.effective(base_resolve())
 
     return _resolve
+
+
+def make_capital_settings_applier(*, account_id: str | None, notifier: Notifier,
+                                  state_root: Path):
+    """建立每 cycle 套用「客戶簽章資金設定」的 applier；無 account_id → None。
+
+    `account_id` 為 None（dry/shadow 無身分）→ 回 None：沒有帳號就沒有「哪一筆記錄
+    是我的」，也沒有可信的 user_address 可比對簽章者（沿 make_effective_leader_resolver
+    的同一個決定）。
+
+    形狀與換 leader 的 applier 一致，但**不是**同一個接線點：換 leader 疊在
+    `LeaderResolution` 上（由 LeaderWatch 每輪解析），資金設定疊在 `CopySettings` 上
+    （由 cycle 直接套）。兩者互不依賴——同一輪內兩者都能各自套用，見 cycle()。
+    """
+    if account_id is None:
+        return None
+    return CapitalSettingsApplier(
+        account_id=account_id,
+        manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
+        settings_path=resolve_capital_settings_path(),
+        ledger_path=state_root / CAPITAL_LEDGER_RELPATH,
+        notifier=notifier)
 
 
 def make_revocation_wind_down(adapter, ex, notifier: Notifier,
@@ -392,6 +422,8 @@ def main(argv: list[str] | None = None) -> None:
     watch = LeaderWatch(resolution, resolve_leader_fn, notifier,
                         on_revoked=make_revocation_wind_down(
                             adapter, ex, notifier, state_root))
+    capital_applier = make_capital_settings_applier(
+        account_id=account_id, notifier=notifier, state_root=state_root)
 
     def cycle():
         res = watch.refresh()
@@ -404,6 +436,18 @@ def main(argv: list[str] | None = None) -> None:
         # 讓 run_cycle 的 leader 讀取與本輪解析結果同源（工程原則 1）。
         cs = (copy_settings if res.address == copy_settings.leader_address
               else replace(copy_settings, leader_address=res.address))
+        # ⭐ 資金設定疊在**已解析 leader 的** settings 之上。順序與換 leader 無關
+        # （兩者改的是不同欄位），但擺在後面讓「本輪最終用的 settings」只有一個
+        # 產生點——中間插一個 run_cycle 就會出現兩個都自稱是本輪設定的物件。
+        if capital_applier is not None:
+            try:
+                cs = capital_applier.effective(cs)
+            except CapitalSettingsUnavailable:
+                # ⭐⭐ 帳本遺失／讀不到／內容超界 ⇒ **本輪零交易動作**，
+                # 絕不用 env 預設值繼續跑。applier 已發過指名事件的 critical。
+                # 退回預設是一次沒有客戶授權的曝險變更，而且全程安靜——這正是
+                # 整個模組要防的事（見 capital_settings_apply 檔頭）。
+                return tripped_report()
         start = len(ex.records)
         report = run_cycle(adapter, ex, cs, notifier, state, state_root)
         if args.shadow:
