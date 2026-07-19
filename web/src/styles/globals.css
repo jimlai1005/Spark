@@ -673,6 +673,81 @@ main.page {
 .leader-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
 .leader-stat dd { margin: 4px 0 0; font-size: 16px; font-weight: 300; color: var(--text); }
 
+/* ---- 卡片下區：績效。⭐ 與上區（規模／曝險）之間有明確分隔線與自己的標題：
+   兩者是不同類的東西，視覺上黏在一起就會被讀成同一類（誠信要求，不是裝飾）。 ---- */
+.leader-perf-notice { margin-top: 16px; }
+.leader-perf {
+  border-top: 1px solid var(--border);
+  padding-top: 14px; margin: 0 0 16px;
+}
+.leader-perf-title {
+  font-size: 13px; font-weight: 500; color: var(--text); margin: 0 0 4px;
+  letter-spacing: .02em;
+}
+.leader-perf-scope { margin: 0 0 10px; }
+/* 上界警語：與績效數字同一個區塊，樣式與按鈕旁那則一致（同等份量，不是小字）。 */
+.leader-perf-upper-bound {
+  font-size: 12.5px; line-height: 1.6; color: var(--text);
+  background: rgba(var(--warn-rgb), .1);
+  border-left: 2px solid rgba(var(--warn-rgb), .6);
+  border-radius: 4px; padding: 8px 10px; margin: 0 0 12px;
+}
+.leader-perf-window {
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; margin: 0 0 10px;
+}
+.leader-perf-window-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px;
+}
+.leader-perf-period { font-size: 12.5px; color: var(--text); }
+/* 揭露層級標籤：每個窗都有，讓「資料還不夠」是一個看得見的狀態而不是空欄位。 */
+.leader-perf-tier {
+  font-size: 10.5px; letter-spacing: .03em; padding: 2px 7px; border-radius: 999px;
+  color: var(--text-dim); border: 1px solid var(--border); background: rgba(var(--bg-rgb), .45);
+}
+.leader-perf-window[data-tier="annualizable"] .leader-perf-tier {
+  color: var(--pos); border-color: rgba(var(--pos-rgb), .5);
+}
+.leader-perf-window[data-tier="insufficient"] .leader-perf-tier,
+.leader-perf-window[data-tier="unknown"] .leader-perf-tier {
+  color: var(--warn); border-color: rgba(var(--warn-rgb), .5);
+}
+/* 資料充足度：與數字同層級的顯示，不是折疊起來的細節。 */
+.leader-perf-sufficiency {
+  display: flex; gap: 14px; flex-wrap: wrap; margin: 0 0 4px;
+  font-size: 11.5px; color: var(--text-dim);
+}
+.leader-perf-suff-item { white-space: nowrap; }
+.leader-perf-suff-note { margin: 0 0 10px; font-size: 11.5px; }
+
+.leader-perf-stats {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px; margin: 0;
+}
+.leader-perf-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
+.leader-perf-stat dd { margin: 4px 0 0; font-size: 16px; font-weight: 300; color: var(--text); }
+/* MDD 的取樣警語：與數字同一格，跨滿兩欄，不得被推走。 */
+.leader-perf-stat-max-drawdown { grid-column: 1 / -1; }
+.leader-perf-stat-note {
+  margin: 6px 0 0; font-size: 11.5px; line-height: 1.55; color: var(--text);
+  background: rgba(var(--warn-rgb), .08);
+  border-left: 2px solid rgba(var(--warn-rgb), .5);
+  border-radius: 4px; padding: 6px 8px;
+}
+/* 「資料不足」「還差幾天」：畫成有內容的狀態區塊——不是一排「—」。 */
+.leader-perf-state {
+  border: 1px dashed var(--border); border-radius: 6px;
+  padding: 10px 12px; margin: 10px 0 0; background: rgba(var(--bg-rgb), .45);
+}
+.leader-perf-state-title { font-size: 12.5px; color: var(--text); margin: 0 0 6px; }
+.leader-perf-state-insufficient { border-color: rgba(var(--warn-rgb), .45); }
+.leader-perf-shortfall {
+  margin: 6px 0 0; font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums;
+}
+.leader-perf-degraded {
+  margin: 10px 0 0; font-size: 12px; line-height: 1.55; color: var(--warn);
+}
+
 /* 上界警語：與按鈕同一個容器，且視覺上不得比按鈕更弱（誠信要求，不是裝飾）。 */
 .leader-action { margin-top: auto; }
 .leader-upper-bound {

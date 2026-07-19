@@ -3,6 +3,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { NO_VALUE } from "@/lib/format";
 import {
   ApiError,
   type BillingPlansResp,
@@ -60,6 +61,65 @@ function leaders(over: Partial<LeadersResp> = {}): LeadersResp {
     stats_day: "2026-07-18",
     stats_as_of: "2026-07-18T00:10:03+00:00",
     note: null,
+    ...over,
+  } as LeadersResp;
+}
+
+/**
+ * 績效窗 fixture。⭐ 依**後端實際線上形狀**：Decimal 欄位序列化後是 **string**
+ * （filet/leader_perf.py `jsonable_performance`），`sample_count` 才是 number。
+ * ⭐⭐ 分級揭露的載體是**鍵的不存在**——低層級的 fixture 一律**不寫**那些鍵，
+ * 不是寫成 null。fixture 若補成 null，就驗不到本頁真正要防的那件事。
+ */
+const PERF_ANNUALIZABLE = {
+  period: "perpAllTime", basis: "perp", status: "ok", reason: null,
+  disclosure_tier: "annualizable", sample_count: 745, covered_days: "412.5000",
+  first_ts_ms: 1700000000000, last_ts_ms: 1735640000000, skipped_intervals: 0,
+  cum_pnl: "18234.55", twr: "0.3421", max_drawdown: "0.1875",
+  annualized_return: "0.2938",
+};
+/** 不足 90 天 → **沒有** `annualized_return` 鍵。 */
+const PERF_WINDOW = {
+  period: "perpMonth", basis: "perp", status: "ok", reason: null,
+  disclosure_tier: "window_return", sample_count: 128, covered_days: "45.2000",
+  first_ts_ms: 1731000000000, last_ts_ms: 1734900000000, skipped_intervals: 2,
+  cum_pnl: "820.10", twr: "0.0712", max_drawdown: "0.0304",
+};
+/** 不足 30 天 → **沒有** `twr`／`max_drawdown` 鍵。 */
+const PERF_PNL_ONLY = {
+  period: "perpMonth", basis: "perp", status: "ok", reason: null,
+  disclosure_tier: "pnl_only", sample_count: 24, covered_days: "6.1000",
+  first_ts_ms: 1734300000000, last_ts_ms: 1734827040000, skipped_intervals: 0,
+  cum_pnl: "310.75",
+};
+/** 資料不足 → 連 `cum_pnl` 都沒有；covered_days 為 null（後端 `_insufficient` 原形）。 */
+const PERF_INSUFFICIENT = {
+  period: "perpMonth", basis: "perp", status: "insufficient",
+  reason: "need_at_least_two_samples", disclosure_tier: "insufficient",
+  sample_count: 1, covered_days: null, first_ts_ms: null, last_ts_ms: null,
+  skipped_intervals: 0,
+};
+
+const PERF_NOTES = {
+  basis: "後端基準原文",
+  upper_bound: "後端上界原文：leader 的報酬是跟單者的上界，不是期望值。",
+  max_drawdown: "後端回撤原文：MDD 由 15 分鐘取樣推得，系統性低估。",
+  sufficiency: "後端充足度原文：涵蓋天數與樣本點數決定可信度。",
+};
+
+/** 帶績效的目錄回應（`performance_available: true` ＋ 逐 leader 的 `performance`）。 */
+function leadersWithPerf(
+  performance: Record<string, unknown> | null,
+  over: Partial<LeadersResp> = {},
+): LeadersResp {
+  const base = leaders();
+  return {
+    ...base,
+    leaders: [{ ...base.leaders[0], performance }],
+    performance_available: true,
+    performance_basis: "perp",
+    performance_windows: ["perpMonth", "perpAllTime"],
+    performance_notes: PERF_NOTES,
     ...over,
   } as LeadersResp;
 }
@@ -217,6 +277,293 @@ describe("LeadersPage — 誠信揭露 ⭐（本頁最重要的部分）", () =>
   it("「目前跟隨中」沒有資料來源 → 明說缺口，不猜、不標示", async () => {
     render(wrap(<LeadersPage />));
     expect(await screen.findByText(/本頁無法標示你目前跟隨中的 leader/)).toBeInTheDocument();
+  });
+});
+
+/**
+ * ⭐⭐ 績效揭露。本區每一條都對應一條誠信規則——這一頁的數字會直接決定客戶把錢
+ * 投給誰，所以「少顯示」永遠優於「顯示一個看起來正常但是前端造出來的數字」。
+ */
+describe("LeadersPage — 績效分級揭露 ⭐⭐（缺鍵＝不該顯示，不是顯示為空）", () => {
+  it("⭐ 誠信 1：annualizable → 四個數字都畫；型別是後端的 string（Decimal 序列化）", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
+    render(wrap(<LeadersPage />));
+
+    const block = (await screen.findByLabelText("績效（perp）"));
+    expect(block.textContent).toContain("18,234.55");   // cum_pnl
+    expect(block.textContent).toContain("34.2%");       // twr 0.3421
+    expect(block.textContent).toContain("18.8%");       // max_drawdown 0.1875
+    expect(block.textContent).toContain("29.4%");       // annualized_return 0.2938
+    expect(screen.getByText("年化報酬率")).toBeInTheDocument();
+  });
+
+  it("⭐⭐ 誠信 1：不足 90 天（無 annualized_return 鍵）→ 年化整個欄位不渲染，不畫「—」", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
+    render(wrap(<LeadersPage />));
+
+    const block = await screen.findByLabelText("績效（perp）");
+    // 欄位本身不存在——不是存在但顯示為空
+    expect(document.querySelectorAll(".leader-perf-stat-annualized-return")).toHaveLength(0);
+    expect(screen.queryByText("年化報酬率")).not.toBeInTheDocument();
+    // ⭐ 釘死實際畫出來的格子：只有三格，且沒有任何一格是佔位符。
+    // （刻意驗 dd 而不是整段 textContent——文案裡的破折號是標點，不是佔位符。）
+    const values = Array.from(block.querySelectorAll(".leader-perf-stat dd"))
+      .map((n) => n.textContent);
+    expect(values).toEqual(["820.10", "7.1%", "3.0%"]);
+    expect(values).not.toContain(NO_VALUE);
+  });
+
+  it("⭐⭐ 誠信 1：不足 30 天（無 twr／max_drawdown 鍵）→ 兩個百分比欄位都不渲染", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_PNL_ONLY }));
+    render(wrap(<LeadersPage />));
+
+    const block = await screen.findByLabelText("績效（perp）");
+    expect(document.querySelectorAll(".leader-perf-stat-twr")).toHaveLength(0);
+    expect(document.querySelectorAll(".leader-perf-stat-max-drawdown")).toHaveLength(0);
+    // ⭐ 釘死欄位清單：只有「累積損益」一欄，沒有被補成空欄位。
+    // （驗 dt 而不是全頁文字——說明「為什麼沒有報酬率」的那段本來就會提到這些詞。）
+    const labels = Array.from(block.querySelectorAll(".leader-perf-stat dt"))
+      .map((n) => n.textContent);
+    expect(labels).toEqual(["累積損益"]);
+    const values = Array.from(block.querySelectorAll(".leader-perf-stat dd"))
+      .map((n) => n.textContent);
+    expect(values).toEqual(["310.75"]);
+    expect(values).not.toContain(NO_VALUE);
+    // 不足 30 天 → 整區不得出現任何百分比
+    expect(block.textContent).not.toContain("%");
+  });
+
+  it("⭐ 誠信 1／5：缺一級要說明「缺什麼、為什麼、還差幾天」——不是留白", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
+    render(wrap(<LeadersPage />));
+
+    const gap = (await screen.findByText("尚未提供年化報酬率")).closest(".leader-perf-state")!;
+    expect(gap.textContent).toMatch(/年化需要至少 90 天/);
+    // ⭐ 不是「年化為零」——明說這是資料還不夠的狀態
+    expect(gap.textContent).toMatch(/不是「年化為零」/);
+    // 還差多少天：涵蓋 45.2 天 → 距 90 天還差 44.8 天
+    expect(gap.textContent).toContain("距門檻還差 44.8 天");
+  });
+
+  it("⭐ 誠信 1／5：pnl_only 也要說明還差幾天才有報酬率與回撤", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_PNL_ONLY }));
+    render(wrap(<LeadersPage />));
+
+    const gap = (await screen.findByText("尚未提供報酬率與回撤")).closest(".leader-perf-state")!;
+    expect(gap.textContent).toMatch(/需要至少 30 天/);
+    expect(gap.textContent).toMatch(/不是「報酬為零」或「沒有回撤」/);
+    expect(gap.textContent).toContain("距門檻還差 23.9 天");   // 30 - 6.1
+  });
+
+  it("⭐ 誠信 2：上界警語在績效區塊內（與績效數字同一個容器，不是頁尾小字）", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
+    render(wrap(<LeadersPage />));
+
+    const block = await screen.findByLabelText("績效（perp）");
+    const warn = block.querySelector(".leader-perf-upper-bound")!;
+    expect(warn).toBeTruthy();
+    // 後端原文優先（單一來源）
+    expect(warn.textContent).toContain("上界，不是期望值");
+    // 警語與數字在同一個容器裡
+    expect(block.textContent).toContain("34.2%");
+  });
+
+  it("⭐ 誠信 2：後端沒給上界原文 → 用前端等義文案遞補（數字旁不得沒有警語）", async () => {
+    getLeaders.mockResolvedValue(
+      leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }, { performance_notes: {} }),
+    );
+    render(wrap(<LeadersPage />));
+
+    const block = await screen.findByLabelText("績效（perp）");
+    const warn = block.querySelector(".leader-perf-upper-bound")!;
+    expect(warn.textContent).toMatch(/是跟單者的上界，不是你的期望值/);
+    expect(warn.textContent).toMatch(/你的實際結果會低於這裡的數字/);
+  });
+
+  it("⭐ 誠信 3：MDD 取樣低估的警語與 MDD 數字在**同一格**（不得被拆開）", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
+    render(wrap(<LeadersPage />));
+
+    await screen.findByLabelText("績效（perp）");
+    const cell = document.querySelector(".leader-perf-stat-max-drawdown")!;
+    expect(cell.textContent).toContain("3.0%");             // 數字
+    expect(cell.textContent).toContain("15 分鐘取樣");       // 警語，同一格
+    expect(cell.textContent).toContain("系統性低估");
+  });
+
+  it("⭐ 誠信 3：後端沒給回撤原文 → 前端文案遞補，且點名「回撤看起來小」要存疑", async () => {
+    getLeaders.mockResolvedValue(
+      leadersWithPerf({ perpMonth: PERF_WINDOW }, { performance_notes: {} }),
+    );
+    render(wrap(<LeadersPage />));
+
+    await screen.findByLabelText("績效（perp）");
+    const cell = document.querySelector(".leader-perf-stat-max-drawdown")!;
+    expect(cell.textContent).toMatch(/系統性低估/);
+    expect(cell.textContent).toMatch(/回撤的下界/);
+    expect(cell.textContent).toMatch(/回撤看起來特別小的 leader 尤其要存疑/);
+  });
+
+  it("⭐ 誠信 4：資料充足度（涵蓋天數＋樣本點數）與數字同時顯示", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
+    render(wrap(<LeadersPage />));
+
+    await screen.findByLabelText("績效（perp）");
+    const suff = document.querySelector(".leader-perf-sufficiency")!;
+    expect(suff.textContent).toContain("涵蓋天數: 45.2 天");
+    expect(suff.textContent).toContain("樣本點數: 128 點");
+    // 為什麼要看它：涵蓋 31 天與涵蓋兩年的報酬率長得一樣
+    const note = document.querySelector(".leader-perf-suff-note")!;
+    expect(note.textContent).toBeTruthy();
+  });
+
+  it("⭐ 誠信 4：涵蓋天數不同、數字相同的兩個窗，充足度必須看得出差別", async () => {
+    getLeaders.mockResolvedValue(
+      leadersWithPerf({ perpMonth: PERF_WINDOW, perpAllTime: PERF_ANNUALIZABLE }),
+    );
+    render(wrap(<LeadersPage />));
+
+    await screen.findByLabelText("績效（perp）");
+    const suffs = Array.from(document.querySelectorAll(".leader-perf-sufficiency"))
+      .map((n) => n.textContent);
+    expect(suffs).toHaveLength(2);
+    expect(suffs[0]).toContain("45.2 天");
+    expect(suffs[1]).toContain("412.5 天");
+  });
+
+  it("⭐ 誠信 5：每個窗都有揭露層級標籤——「資料不足」是一個狀態，不是幾格空白", async () => {
+    getLeaders.mockResolvedValue(
+      leadersWithPerf({ perpMonth: PERF_PNL_ONLY, perpAllTime: PERF_ANNUALIZABLE }),
+    );
+    render(wrap(<LeadersPage />));
+
+    await screen.findByLabelText("績效（perp）");
+    const tiers = Array.from(document.querySelectorAll(".leader-perf-tier"))
+      .map((n) => n.textContent);
+    // 兩個窗的層級**不同**，且各自說出資料到什麼程度
+    expect(tiers[0]).toBe("僅累積損益：涵蓋不足 30 天，不提供任何百分比");
+    expect(tiers[1]).toBe("可年化：涵蓋 90 天以上");
+    // data-tier 讓兩種狀態在樣式上也分得開（不是同一個樣子少幾個數字）
+    const windows = Array.from(document.querySelectorAll(".leader-perf-window"));
+    expect(windows.map((n) => n.getAttribute("data-tier")))
+      .toEqual(["pnl_only", "annualizable"]);
+  });
+
+  it("⭐ 誠信 5／6：tier=insufficient → 該窗零數字指標，畫成「資料不足」狀態並附原因碼", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_INSUFFICIENT }));
+    render(wrap(<LeadersPage />));
+
+    await screen.findByLabelText("績效（perp）");
+    // 一格指標都不畫
+    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
+    const state = (await screen.findByText("資料不足以計算此窗的指標"))
+      .closest(".leader-perf-state")!;
+    expect(state.textContent).toMatch(/連累積損益都不顯示/);
+    // 明說「0」會是資料不足的假象，不是結論
+    expect(state.textContent).toMatch(/資料不足的假象/);
+    expect(state.textContent).toContain("原因碼: need_at_least_two_samples");
+  });
+
+  it("⭐ 誠信 6：performance_available=false → 顯示原因，且該區塊零數字、零績效欄位", async () => {
+    getLeaders.mockResolvedValue(
+      leadersWithPerf(null, { performance_available: false, performance_notes: undefined }),
+    );
+    render(wrap(<LeadersPage />));
+
+    const notice = await screen.findByText(/績效資料暫時不可用/);
+    const block = notice.closest(".leader-perf-notice")!;
+    expect(block.textContent).not.toMatch(/\d/);
+    // 一個績效欄位都不畫（沿 stats_available=false 的嚴格度）
+    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
+    expect(document.querySelectorAll(".leader-perf-window")).toHaveLength(0);
+    // 規模欄位不受影響（兩個旗標獨立，後端明寫不可合併）
+    expect(document.querySelectorAll(".leader-stat")).toHaveLength(4);
+  });
+
+  it("⭐ 誠信 6：leader 缺 performance → 說明沒有資料，不畫任何績效數字", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf(null));
+    render(wrap(<LeadersPage />));
+
+    const state = (await screen.findByText("這位 leader 沒有績效資料"))
+      .closest(".leader-perf-state")!;
+    expect(state.textContent).toMatch(/不代表「績效為零」/);
+    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
+    // 規模照畫
+    expect(document.querySelectorAll(".leader-stat")).toHaveLength(4);
+  });
+
+  it("⭐ 後端宣稱的層級高於實際資料（schema 漂移）→ 出聲，不靜默降級", async () => {
+    // tier 說 annualizable，但 annualized_return 鍵不存在
+    const { annualized_return: _drop, ...drifted } = PERF_ANNUALIZABLE;
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: drifted }));
+    render(wrap(<LeadersPage />));
+
+    await screen.findByLabelText("績效（perp）");
+    expect(screen.queryByText("年化報酬率")).not.toBeInTheDocument();
+    expect(screen.getByText(/後端宣告的揭露層級高於實際附上的資料/)).toBeInTheDocument();
+  });
+
+  it("⭐ 規模／曝險與績效是兩個分開的容器（混在一起會被讀成同一類數字）", async () => {
+    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
+    render(wrap(<LeadersPage />));
+
+    const perf = await screen.findByLabelText("績效（perp）");
+    const stats = document.querySelector(".leader-stats")!;
+    // 兩個容器互不包含
+    expect(perf.contains(stats)).toBe(false);
+    expect(stats.contains(perf)).toBe(false);
+    // 規模那張表仍然只有原本四欄（沒有被塞進績效欄位）
+    const labels = Array.from(stats.querySelectorAll("dt")).map((n) => n.textContent);
+    expect(labels).toEqual(["帳戶淨值", "名目部位總額", "未實現損益", "持倉數"]);
+    // 揭露文案改成描述「畫面上實際有什麼」（顯示績效時不得再宣稱本頁沒有報酬率）
+    expect(screen.getByText(/規模／曝險與績效是兩類不同的數字/)).toBeInTheDocument();
+    expect(screen.queryByText(/沒有報酬率、沒有回撤、沒有勝率/)).not.toBeInTheDocument();
+  });
+
+  it("⭐ 沒有時點 → 連績效也不畫（同一份快照，沒有時點的報酬率一樣會被當成即時值）", async () => {
+    getLeaders.mockResolvedValue(
+      leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }, { stats_day: null, stats_as_of: null }),
+    );
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText(/統計缺少時點，本頁不顯示任何數字/)).toBeInTheDocument();
+    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
+    expect(document.querySelectorAll(".leader-stat")).toHaveLength(0);
+  });
+
+  it("⭐ 不依績效排序：清單順序沿用後端順序（排序＝本頁在替使用者推薦）", async () => {
+    const base = leaders();
+    getLeaders.mockResolvedValue({
+      ...base,
+      performance_available: true,
+      performance_windows: ["perpAllTime"],
+      performance_notes: PERF_NOTES,
+      leaders: [
+        // 後端給的第一位績效較差，第二位較好——畫面**不得**因此把第二位排到前面
+        { ...base.leaders[0], name: "Alpha", performance: { perpAllTime: PERF_WINDOW } },
+        {
+          ...base.leaders[0], address: "0x3333333333333333333333333333333333333333",
+          name: "Zeta", performance: { perpAllTime: PERF_ANNUALIZABLE },
+        },
+      ],
+    } as LeadersResp);
+    render(wrap(<LeadersPage />));
+
+    await screen.findByText("Zeta");
+    const names = Array.from(document.querySelectorAll(".leader-name")).map((n) => n.textContent);
+    expect(names).toEqual(["Alpha", "Zeta"]);
+    // 也不得出現任何績效排序控制項
+    expect(screen.queryByRole("button", { name: /排序/ })).not.toBeInTheDocument();
+  });
+
+  it("後端沒有 performance_available 欄位（舊版）→ fail closed：整區不出現，零績效數字", async () => {
+    render(wrap(<LeadersPage />));   // 預設 fixture 沒有績效欄位
+
+    await screen.findByText("Alpha");
+    expect(document.querySelectorAll(".leader-perf")).toHaveLength(0);
+    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
+    // 舊版文案（本頁確實沒有報酬率）仍為真
+    expect(screen.getByText(/沒有報酬率、沒有回撤、沒有勝率/)).toBeInTheDocument();
   });
 });
 

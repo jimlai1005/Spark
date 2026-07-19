@@ -3,13 +3,11 @@
  * /leaders — 選擇跟單 leader（含錢包簽章授權流程）。
  *
  * ⭐ 本頁的核心需求是**誠實揭露**，不是版面：
- * 1. 本頁**只顯示規模與當下曝險**：帳戶淨值、名目部位總額、未實現損益、持倉數。
- *    欄位名一律沿用後端原名的直譯，前端**不換算、不改名**——本頁上任何看起來像
- *    報酬率的東西都是這裡憑空造出來的。
- *
- *    ⚠️ 這條是從「後端沒有任何績效指標」改寫來的，原說法自 commit a1bf002 起已失效：
- *    `/api/leaders` 現在**確實**回一個 `performance` 子物件（perpMonth／perpAllTime），
- *    只是本頁尚未接上。要接的人請先讀完下面這段——那是接法的硬性規則，不是背景說明。
+ * 1. 卡片分成**兩區，視覺上分開**：上區是規模與當下曝險（帳戶淨值、名目部位總額、
+ *    未實現損益、持倉數），下區才是績效（報酬率與回撤）。欄位名一律沿用後端原名的
+ *    直譯，前端**不換算、不改名**——把兩區混在一起，使用者會把規模讀成績效，
+ *    而那個誤讀在畫面上完全看不出來（後端也是基於同一理由把 `performance` 放在
+ *    獨立子物件，見 app.py `_LEADER_PERF_WINDOWS` 上方註解）。
  *
  *    ⭐⭐ `performance` 的結構性不變式：**該不該顯示，載體是「鍵存不存在」**
  *    （後端分級揭露見 filet/leader_perf.py；publicapi/app.py 的 `_leader_perf_public`
@@ -19,13 +17,20 @@
  *      - `status="insufficient"` → 連 `cum_pnl` 都沒有
  *    **缺鍵的意思是「不該顯示」，不是「顯示為空」。** 用 `?? "—"`／`|| 0` 之類的預設值
  *    接上去，等於把後端刻意不給的東西在前端造出來——後端那道結構性防線就在那一行
- *    退化成「前端記得檢查」。要顯示就走 `disclosure_tier` 分支、或
- *    `"annualized_return" in w` 這種二元判斷，不要走預設值。
- *    lib/redline.test.ts 有一條斷言在擋這個寫法。
+ *    退化成「前端記得檢查」。lib/redline.test.ts 有一條斷言在擋這個寫法。
+ *    ⭐ 本頁因此**不在 JSX 裡判斷鍵存不存在**：判定全部收斂在 lib/leaderPerf.ts 的
+ *    `perfView()`（後端授權的 tier ∩ 資料實際具備，兩個方向都擋），JSX 只讀
+ *    `view.shown` 上**存在的**鍵。散在畫面各處的判斷遲早會漏掉一處。
  *
- *    接上時必須同時揭露的兩件事：`max_drawdown` 由 15 分鐘取樣算出，**系統性低估**
- *    真實盤中回撤（取樣點之間更深的回撤看不見）；而 leader 的任何報酬率都是跟單者的
- *    **上界不是期望值**（第 3 點那句警語同樣適用於績效數字，不是只適用於規模數字）。
+ *    與績效數字同時揭露、且**貼著數字**（不是頁尾小字）的三件事：
+ *      - `max_drawdown` 由 15 分鐘取樣算出，**系統性低估**真實盤中回撤——貼著 MDD；
+ *      - leader 的任何報酬率都是跟單者的**上界不是期望值**——貼著績效區；
+ *      - 資料充足度（`covered_days`／`sample_count`）——與數字同時出現：
+ *        涵蓋 31 天與涵蓋 2 年的 TWR 在畫面上長得一模一樣，可信度卻天差地遠。
+ *
+ *    ⭐ 刻意**不提供依績效排序**：排序等同於本頁在替使用者推薦，而這些數字的限制
+ *    （上界、低估的 MDD、可能只有 31 天的樣本）還不足以支撐推薦。清單順序沿用
+ *    後端給的順序。要加排序的人請先想清楚這一點，並讓它是使用者主動選擇＋附警語。
  * 2. 數字取自每日快照。`stats_available=false`（快照不可用）→ 一個數字都不畫；
  *    快照可用但**沒有時點**（day 與 generated_at 皆缺）→ 同樣一個數字都不畫。
  *    沒有時點的數字會被當成即時數字讀，比沒有數字危險（沿 /ops basis_unknown 的嚴格度）。
@@ -56,7 +61,17 @@ import {
   type LeadersResp,
 } from "@/lib/api";
 import { COPY } from "@/lib/copy";
-import { NO_VALUE, fmtAmount, shortAddr } from "@/lib/format";
+import { NO_VALUE, fmtAmount, fmtRatioPct, shortAddr } from "@/lib/format";
+import {
+  MIN_DAYS_FOR_ANNUALIZATION,
+  MIN_DAYS_FOR_RETURN,
+  daysShortOf,
+  fmtDays,
+  perfView,
+  resolvePerfNotes,
+  type LeaderPerfView,
+  type PerfNotesResolved,
+} from "@/lib/leaderPerf";
 import { useMe } from "@/lib/hooks";
 import { runLeaderSelectFlow, type LeaderSelectFlowResult } from "@/lib/leaderSelectFlow";
 import { recoverPersonalSigner } from "@/lib/sign";
@@ -107,6 +122,11 @@ export default function LeadersPage() {
     queryFn: getBillingPlans,
   });
   const gate = gateOf(plans.data);
+  // ⭐ 揭露文案必須描述**畫面上實際有什麼**：顯示績效時還說「本頁沒有報酬率、
+  // 沒有回撤」，那句話本身就成了頁面上第一個不誠實的元素。fail closed：
+  // `performance_available` 不是明確的 true（含載入中、舊版後端沒這個欄位）→
+  // 一律當作沒有績效，走原本那份「本頁只有規模與曝險」的文案。
+  const perfShown = leaders.data?.performance_available === true;
 
   async function runFlow(leader: LeaderEntry) {
     // 防禦性重擋一層：閘門關著時連流程都不啟動（按鈕已 disabled，這裡是第二道）。
@@ -146,8 +166,10 @@ export default function LeadersPage() {
 
       {/* ⭐ 誠信要求 1／2：在任何數字之前先講清楚這些數字是什麼、不是什麼。 */}
       <div className="panel leader-scope">
-        <p className="leader-scope-title">{c.statsScopeTitle}</p>
-        <p className="hint">{c.statsScopeBody}</p>
+        <p className="leader-scope-title">
+          {perfShown ? c.statsScopeTitleWithPerf : c.statsScopeTitle}
+        </p>
+        <p className="hint">{perfShown ? c.statsScopeBodyWithPerf : c.statsScopeBody}</p>
       </div>
 
       {/* 「目前跟隨中」沒有客戶端資料來源——說明缺口，不猜一個標記。 */}
@@ -257,6 +279,26 @@ function LeaderList({ data, gate, busy, onSelect }: {
   // 後者同樣危險——一份三天前的切面沒有時點就會被當成即時數字讀。
   const hasTimestamp = data.stats_day != null || data.stats_as_of != null;
   const statsShown = data.stats_available && hasTimestamp;
+  // ⭐ 績效自己一道閘，但**同樣受時點閘管**：績效與規模出自同一份每日快照，
+  // 沒有時點的報酬率一樣會被當成即時數字讀。刻意不把兩個 available 旗標合併
+  // （後端明寫不可合併）——這裡是 `performance_available` ∩ 時點，不是 ∩ `stats_available`。
+  const perfShown = data.performance_available === true && hasTimestamp;
+  // 後端明確說「沒有績效」才畫原因；欄位整個缺席（舊版後端不談績效）則整區不出現，
+  // 兩種情況的共通點是**一個數字都不畫**。
+  const perfUnavailable = data.performance_available === false;
+  // 警語在此一次解析（後端原文優先，空白或缺席才用前端等義文案）——顯示層不再自己
+  // 判斷警語有沒有；⭐ 數字缺了不顯示、警語缺了要補上，見 resolvePerfNotes。
+  const notes = resolvePerfNotes(data.performance_notes, {
+    basis: c.perf.basisFallback,
+    upperBound: c.perf.upperBoundFallback,
+    maxDrawdown: c.perf.mddFallback,
+    sufficiency: c.perf.sufficiencyFallback,
+  });
+  // 窗的顯示順序以後端清單為準（單一來源）；缺席時退回後端 `_LEADER_PERF_WINDOWS`
+  // 的內容（改一邊要改兩邊）。
+  const windows = Array.isArray(data.performance_windows)
+    ? data.performance_windows
+    : DEFAULT_PERF_WINDOWS;
 
   return (
     <>
@@ -283,6 +325,14 @@ function LeaderList({ data, gate, busy, onSelect }: {
         </div>
       )}
 
+      {/* ⭐ 誠信要求：績效不可得 → 說原因，且整段零數字（沿 stats_available 的嚴格度）。 */}
+      {perfUnavailable && (
+        <div className="panel ops-notice leader-perf-notice">
+          <p className="ops-notice-title">{c.perf.unavailableTitle}</p>
+          <p className="hint">{c.perf.unavailableBody}</p>
+        </div>
+      )}
+
       {data.leaders.length === 0 ? (
         <p>{c.empty}</p>
       ) : (
@@ -292,6 +342,9 @@ function LeaderList({ data, gate, busy, onSelect }: {
               key={leader.address}
               leader={leader}
               statsShown={statsShown}
+              perfShown={perfShown}
+              perfWindows={windows}
+              perfNotes={notes}
               gate={gate}
               busy={busy}
               onSelect={onSelect}
@@ -303,9 +356,14 @@ function LeaderList({ data, gate, busy, onSelect }: {
   );
 }
 
-function LeaderCard({ leader, statsShown, gate, busy, onSelect }: {
+function LeaderCard({
+  leader, statsShown, perfShown, perfWindows, perfNotes, gate, busy, onSelect,
+}: {
   leader: LeaderEntry;
   statsShown: boolean;
+  perfShown: boolean;
+  perfWindows: string[];
+  perfNotes: PerfNotesResolved;
   gate: Gate;
   busy: boolean;
   onSelect: (leader: LeaderEntry) => void;
@@ -321,6 +379,7 @@ function LeaderCard({ leader, statsShown, gate, busy, onSelect }: {
       <p className="hint mono leader-addr" title={leader.address}>{shortAddr(leader.address)}</p>
       <p className="leader-desc">{leader.description}</p>
 
+      {/* ---- 上區：規模與當下曝險（資產負債切面，不是績效） ---- */}
       {statsShown && (
         hasStats ? (
           <dl className="leader-stats">
@@ -336,6 +395,11 @@ function LeaderCard({ leader, statsShown, gate, busy, onSelect }: {
         ) : (
           <p className="hint">{c.leaderStatsMissing}</p>
         )
+      )}
+
+      {/* ---- 下區：績效（報酬率與回撤）。與上區之間有明確分隔，不共用容器。 ---- */}
+      {perfShown && (
+        <LeaderPerfBlock leader={leader} windows={perfWindows} notes={perfNotes} />
       )}
 
       {/* ⭐ 誠信要求 5：上界警語與按鈕同一個容器，不得被推到頁尾。 */}
@@ -361,6 +425,187 @@ function LeaderStat({ label, hint, value, raw }: {
     <div className="leader-stat">
       <dt title={hint}>{label}</dt>
       <dd className="mono" title={raw ?? undefined}>{value}</dd>
+    </div>
+  );
+}
+
+/**
+ * 後端 `_LEADER_PERF_WINDOWS` 的內容（改一邊要改兩邊）。只在回應沒帶
+ * `performance_windows` 時使用——正常情況一律以後端那份清單為準。
+ */
+const DEFAULT_PERF_WINDOWS = ["perpMonth", "perpAllTime"];
+
+/**
+ * 卡片下區：績效。⭐ 與上區（規模／曝險）分屬兩個容器、各有標題，不是同一張表格
+ * 多幾欄——混在一起，使用者會把「淨值大」讀成「賺得多」。
+ *
+ * 上界警語放在**本區塊內、所有數字之前**：它適用於這一區的每一個數字，
+ * 而不是頁尾的一句免責。
+ */
+function LeaderPerfBlock({ leader, windows, notes }: {
+  leader: LeaderEntry;
+  windows: string[];
+  notes: PerfNotesResolved;
+}) {
+  const rows = leader.performance;
+  // 該 leader 沒有績效資料 → 這是一個**狀態**，要說出來；不畫空欄位、不畫 0。
+  const present = rows ? windows.filter((w) => rows[w] != null) : [];
+
+  return (
+    <section className="leader-perf" aria-label={c.perf.sectionTitle}>
+      <p className="leader-perf-title">{c.perf.sectionTitle}</p>
+      <p className="hint leader-perf-scope">{c.perf.sectionNote}</p>
+      {/*
+        ⭐ 上界警語。後端 `performance_notes` 有給就用後端原文（單一來源：計算的極限
+        與呈現的警語必須出自同一處），沒給才用等義的前端文案——
+        警語與數字的規則相反：數字缺了就不顯示，警語缺了要補上。
+      */}
+      <p className="leader-perf-upper-bound">
+        {notes.upperBound}
+      </p>
+
+      {present.length === 0 ? (
+        <div className="leader-perf-state leader-perf-state-empty">
+          <p className="leader-perf-state-title">{c.perf.leaderMissingTitle}</p>
+          <p className="hint">{c.perf.leaderMissingBody}</p>
+        </div>
+      ) : (
+        present.map((w) => (
+          <PerfWindowBlock key={w} name={w} view={perfView(rows?.[w])} notes={notes} />
+        ))
+      )}
+
+      <p className="hint leader-perf-basis">{notes.basis}</p>
+    </section>
+  );
+}
+
+/**
+ * 一個績效窗。⭐ 本函式**不判斷鍵存不存在**的規則，只讀 `view.shown` 上存在的鍵
+ * （判定收斂在 lib/leaderPerf.ts 的 `perfView`）。用 `!== undefined` 而不是
+ * `?? 預設值`：缺席就整個欄位不渲染，不留一格「—」——一格「—」看起來像
+ * 「有查到而且是空的」，那正是後端用「鍵不存在」避免的誤讀。
+ *
+ * ⭐ 分級揭露要看得出是**狀態**，不是「這幾格恰好空著」：每個窗都帶一個層級標籤，
+ * 且凡是缺一級就有一段對應的說明（缺什麼、為什麼、還差幾天）。
+ */
+function PerfWindowBlock({ name, view, notes }: {
+  name: string;
+  view: LeaderPerfView;
+  notes: PerfNotesResolved;
+}) {
+  const s = view.shown;
+  const tierLabel = c.perf.tiers[view.tier as keyof typeof c.perf.tiers];
+  const gapToWindow = daysShortOf(view.coveredDays, MIN_DAYS_FOR_RETURN);
+  const gapToAnnual = daysShortOf(view.coveredDays, MIN_DAYS_FOR_ANNUALIZATION);
+
+  return (
+    <div className="leader-perf-window" data-tier={view.tier} data-level={view.level}>
+      <p className="leader-perf-window-head">
+        <span className="leader-perf-period">{c.perf.periods[name] ?? name}</span>
+        <span className="leader-perf-tier" title={c.perf.tierLabel}>{tierLabel}</span>
+      </p>
+
+      {/*
+        ⭐ 資料充足度與數字同時出現，不是折疊起來的細節：涵蓋 31 天的 TWR 與涵蓋
+        兩年的 TWR 在畫面上長得一模一樣，可信度卻天差地遠。
+      */}
+      <p className="leader-perf-sufficiency">
+        <span className="leader-perf-suff-item" title={view.coveredDaysRaw ?? undefined}>
+          {c.perf.coveredDaysLabel}:{" "}
+          {view.coveredDays === null
+            ? NO_VALUE
+            : `${fmtDays(view.coveredDays)} ${c.perf.daysUnit}`}
+        </span>
+        <span className="leader-perf-suff-item">
+          {c.perf.sampleCountLabel}:{" "}
+          {view.sampleCount === null
+            ? NO_VALUE
+            : `${view.sampleCount} ${c.perf.pointsUnit}`}
+        </span>
+      </p>
+      <p className="hint leader-perf-suff-note">
+        {notes.sufficiency}
+      </p>
+
+      {view.level === "none" ? (
+        // 「資料不足」畫成一個有內容的狀態區塊——不是一排空欄位。
+        <div className="leader-perf-state leader-perf-state-insufficient">
+          <p className="leader-perf-state-title">{c.perf.insufficientTitle}</p>
+          <p className="hint">{c.perf.insufficientBody}</p>
+          {view.reason !== null && (
+            <p className="hint mono">{c.perf.reasonLabel}: {view.reason}</p>
+          )}
+        </div>
+      ) : (
+        <dl className="leader-perf-stats">
+          {s.cum_pnl !== undefined && (
+            <PerfStat name="cum-pnl" label={c.perf.cols.cumPnl} hint={c.perf.colHints.cumPnl}
+              value={fmtAmount(s.cum_pnl)} raw={s.cum_pnl} />
+          )}
+          {s.twr !== undefined && (
+            <PerfStat name="twr" label={c.perf.cols.twr} hint={c.perf.colHints.twr}
+              value={fmtRatioPct(s.twr)} raw={s.twr} />
+          )}
+          {s.max_drawdown !== undefined && (
+            // ⭐ 取樣低估的警語與 MDD 數字在**同一個容器**：分開放，看到數字的人
+            // 不一定看得到警語，而「回撤只有 3%」正是最需要那句話的時候。
+            <PerfStat name="max-drawdown" label={c.perf.cols.maxDrawdown}
+              hint={c.perf.colHints.maxDrawdown}
+              value={fmtRatioPct(s.max_drawdown)} raw={s.max_drawdown}
+              note={notes.maxDrawdown} />
+          )}
+          {s.annualized_return !== undefined && (
+            <PerfStat name="annualized-return" label={c.perf.cols.annualizedReturn}
+              hint={c.perf.colHints.annualizedReturn}
+              value={fmtRatioPct(s.annualized_return)} raw={s.annualized_return} />
+          )}
+        </dl>
+      )}
+
+      {/* 缺一級就說明缺什麼、為什麼、還差幾天——把空白變成狀態。 */}
+      {view.level === "pnl" && (
+        <PerfGap title={c.perf.gapWindowTitle} body={c.perf.gapWindowBody} shortfall={gapToWindow} />
+      )}
+      {view.level === "window" && (
+        <PerfGap title={c.perf.gapAnnualizedTitle} body={c.perf.gapAnnualizedBody}
+          shortfall={gapToAnnual} />
+      )}
+
+      {/* 後端宣告的層級高於實際資料 → 出聲，不靜默降級（工程原則 3）。 */}
+      {view.degraded && (
+        <p className="leader-perf-degraded" role="status">{c.perf.degradedNote}</p>
+      )}
+    </div>
+  );
+}
+
+/** 缺少的那一級：說明 ＋ 距門檻還差幾天（已達門檻卻仍缺 → 只給說明，不編一個天數）。 */
+function PerfGap({ title, body, shortfall }: {
+  title: string; body: string; shortfall: number | null;
+}) {
+  return (
+    <div className="leader-perf-state leader-perf-state-gap">
+      <p className="leader-perf-state-title">{title}</p>
+      <p className="hint">{body}</p>
+      {shortfall !== null && (
+        <p className="leader-perf-shortfall">
+          {c.perf.gapShortfallLabel} {fmtDays(shortfall)} {c.perf.daysUnit}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** 一個績效數字。`note` 與數字同容器（給 MDD 的取樣警語用）。 */
+function PerfStat({ name, label, hint, value, raw, note }: {
+  name: string; label: string; hint: string; value: string; raw: string; note?: string;
+}) {
+  return (
+    <div className={`leader-perf-stat leader-perf-stat-${name}`}>
+      <dt title={hint}>{label}</dt>
+      <dd className="mono" title={raw}>{value}</dd>
+      {note && <p className="leader-perf-stat-note">{note}</p>}
     </div>
   );
 }

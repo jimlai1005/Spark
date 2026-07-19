@@ -127,8 +127,9 @@ export function getApproveBuilderFeePayload(chainId: number): Promise<TypedDataR
 
 // ---------- leaders（leader 目錄與換 leader 授權；對照 publicapi/app.py 三個端點） ----------
 /**
- * 目錄的一位 leader。⭐ 統計欄位是 watchlist 每日快照的**資產負債切面**，
- * 不是績效：沒有報酬率、沒有回撤、沒有勝率。欄位名刻意與後端／快照原名一字不差
+ * 目錄的一位 leader。⭐ **平鋪的統計欄位**是 watchlist 每日快照的**資產負債切面**，
+ * 不是績效——報酬率與回撤一律只在 `performance` 子物件裡（兩者分屬兩層是後端刻意的
+ * 設計，見該欄位註解）。欄位名刻意與後端／快照原名一字不差
  * （app.py 的 `_LEADER_STAT_FIELDS`）——在任何一層改名成看起來像績效的東西，
  * 都會讓使用者把「規模」讀成「賺多少」。顯示層同理：叫什麼就顯示什麼。
  *
@@ -146,6 +147,97 @@ export interface LeaderEntry {
   /** 未實現損益（當下浮動，非已實現報酬）。 */
   unrealized_pnl: string | null;
   position_count: number | null;
+  /**
+   * 績效（perp 窗）。⭐ 與上面的**規模**欄位刻意分屬兩層，理由見後端
+   * `_LEADER_PERF_WINDOWS` 上方註解：資產負債切面與報酬率混在同一層，遲早有人
+   * 把其中一個讀成另一個，而那個誤讀在畫面上完全看不出來。
+   *
+   * `null`／缺席 = 這位 leader 沒有績效資料——**不是**「績效為 0」。
+   */
+  performance?: LeaderPerf | null;
+}
+
+/**
+ * 一位 leader 的績效，依窗切分（後端 `_LEADER_PERF_WINDOWS`：perpMonth／perpAllTime）。
+ * 窗本身也可能缺席（該窗算不出來），所以值是 optional。
+ */
+export type LeaderPerf = { [window: string]: LeaderPerfWindow | undefined };
+
+/**
+ * 一個績效窗的原始線上形狀（`_LEADER_PERF_FIELDS` 白名單投影）。
+ *
+ * ⭐⭐ 四個數值欄位刻意宣告為 **optional**，因為線上就是這樣：後端的分級揭露
+ * 用「鍵存不存在」承載（app.py `_leader_perf_public` 用 `if k in row` 投影，
+ * 不是 `.get()`，就是為了不把缺席補成 null）——
+ *   - 不足 30 天 → **沒有** `twr`／`max_drawdown` 鍵（tier `pnl_only`）
+ *   - 不足 90 天 → **沒有** `annualized_return` 鍵（tier `window_return`）
+ *   - `status="insufficient"` → 連 `cum_pnl` 都沒有
+ * **缺鍵 = 不該顯示，不是顯示為空。** 不要在這裡補 `| null`，也不要在顯示層用
+ * `?? "—"`／`|| 0` 接起來——那等於把後端刻意不給的數字在前端造出來。
+ * 要判定能顯示什麼請走 `lib/leaderPerf.ts` 的 `perfView()`（單一判定點），
+ * `lib/redline.test.ts` 有一條結構性斷言在擋預設值寫法。
+ *
+ * 型別註記（**實測自後端**，不是推測）：後端內部一律 Decimal，
+ * `leader_perf.jsonable_performance` 落地時 `str(v) if isinstance(v, Decimal)`，
+ * 所以 `covered_days`／`cum_pnl`／`twr`／`max_drawdown`／`annualized_return`
+ * 在 JSON 裡是 **string**（無損序列化，沿 ops 慣例）；
+ * `sample_count`／`skipped_intervals`／`first_ts_ms`／`last_ts_ms` 才是 **number**。
+ */
+export interface LeaderPerfWindow {
+  /** 窗名，例如 `perpMonth`。 */
+  period: string;
+  /** 基準，目前恆為 `perp`。 */
+  basis: string;
+  /** `ok`／`insufficient`。 */
+  status: string;
+  /** 資料不足的機器可讀原因碼；`ok` 時為 null。 */
+  reason: string | null;
+  /** `insufficient`／`pnl_only`／`window_return`／`annualizable`。 */
+  disclosure_tier: string;
+  /** 樣本點數（number）。 */
+  sample_count: number;
+  /** 涵蓋天數。Decimal → **string**（例如 `"45.2000"`）；資料不足時為 null。 */
+  covered_days: string | null;
+  first_ts_ms: number | null;
+  last_ts_ms: number | null;
+  skipped_intervals: number;
+  /** 以下四個：**缺鍵即不得顯示**（見上方 ⭐⭐）。 */
+  cum_pnl?: string;
+  twr?: string;
+  max_drawdown?: string;
+  annualized_return?: string;
+}
+
+/**
+ * 績效的揭露文案，由後端 `leader_perf` 的常數供給（**單一來源**：計算的極限與
+ * 呈現的警語必須出自同一處，否則改了公式而文案還停在舊說法）。
+ * 全部 optional：舊版後端沒有這些欄位時，顯示層改用自己的等義文案——
+ * ⭐ 警語與數字的規則相反：**數字**缺了就不顯示，**警語**缺了要補上。
+ * 少一個數字只是少一個數字，少一句警語則是把數字送出去而沒有它的極限說明。
+ */
+export interface LeaderPerfNotes {
+  basis?: string;
+  upper_bound?: string;
+  max_drawdown?: string;
+  sufficiency?: string;
+}
+
+/**
+ * 目錄回應裡的績效**中繼資訊**（與逐 leader 的 `performance` 分開）。
+ * 全部 optional：現行後端一律回傳，但顯示層對缺席**fail closed**
+ * （`performance_available` 不是明確的 true 就整區不畫，見 /leaders 顯示層）。
+ */
+export interface LeadersPerfMeta {
+  /**
+   * ⭐ 與 `stats_available` 是**兩個獨立**的旗標，不可合併（後端註解明寫）：
+   * 快照可能存在（規模欄位有值）卻沒有績效。合併會讓「有規模沒績效」時
+   * 把有效資料也一起藏起來。
+   */
+  performance_available?: boolean;
+  performance_basis?: string;
+  /** 窗的顯示順序以後端這份清單為準（單一來源）。 */
+  performance_windows?: string[];
+  performance_notes?: LeaderPerfNotes;
 }
 
 /**
@@ -155,7 +247,7 @@ export interface LeaderEntry {
  * 快照可用時 `stats_day`／`stats_as_of` 仍可能為 null（快照缺欄位）——顯示層必須把
  * 「沒有時間戳」視同「不可顯示數字」，一份三天前的切面沒有時點就會被當成即時數字讀。
  */
-export type LeadersResp =
+export type LeadersResp = LeadersPerfMeta & (
   | {
       leaders: LeaderEntry[];
       stats_available: true;
@@ -170,7 +262,8 @@ export type LeadersResp =
       stats_as_of: null;
       /** 後端寫好的原因說明；顯示層原樣呈現，且**不得**顯示任何數字（沿 ops basis_unknown）。 */
       note: string;
-    };
+    }
+);
 
 /** 換 leader 的 canonical 待簽原文 ＋ 一次性 nonce（原文由伺服器產生，前端不重組）。 */
 export interface LeaderSelectMessageResp {
