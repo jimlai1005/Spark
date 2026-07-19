@@ -143,6 +143,22 @@ describe("runLeaderSelectFlow — leader 預驗 ⭐（伺服器指定的對象�
     expect(d.submit).not.toHaveBeenCalled();
   });
 
+  it("⭐ 第一道：message 本體對，但 leader_address 欄位指向別人 → 同樣中止", async () => {
+    // 上一條的對偶。這一側才是**真正生效**的那一側：後端是拿 `leader_address`
+    // 重建訊息來驗簽的，訊息本體它根本不看。所以這種竄改對使用者是隱形的——
+    // 錢包裡顯示的原文從頭到尾指向他選的人，欄位卻指向 0xEVIL。
+    // 只比對 message 本體的預驗會整條放行這一種（兩邊都比對的理由就在這裡）。
+    const d = deps({
+      fetchMessage: vi.fn(async () => ({ ...PAYLOAD, leader_address: EVIL })),
+    });
+    const r = await runLeaderSelectFlow(d, { expectedSigner: SIGNER, expectedLeader: SELECTED });
+
+    expect(r).toEqual({ ok: false, kind: "leader-mismatch" });
+    expect(d.signMessage).not.toHaveBeenCalled();
+    expect(d.recover).not.toHaveBeenCalled();
+    expect(d.submit).not.toHaveBeenCalled();
+  });
+
   it("大小寫不同但實為同一位址 → 正常通過（位址大小寫不敏感，不得誤擋）", async () => {
     // 使用者端拿到 checksum 形式、伺服器版型正規化成小寫：這是**正常**情況，
     // 誤擋在這裡會讓每一次換 leader 都失敗（且看起來像遭到攻擊）。
