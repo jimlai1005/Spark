@@ -865,6 +865,57 @@ def test_missing_skipped_file_is_unknown_not_zero(tmp_path):
     assert row["skipped_small_ratio"] is None
 
 
+def test_corrupt_skipped_file_is_unknown_not_zero(tmp_path):
+    """⭐⭐ skipped 檔**壞掉**（存在但解不開）→ null，**不是 0**。
+
+    觸發情境：引擎寫檔寫到一半被 kill／磁碟滿／被人手動編輯壞。`load_skipped_notional`
+    的 except 若回 `Decimal("0")` 而不是 None，這一列會顯示 `skipped_available: true`
+    ＋ 名目 0 ＋ 比例 0——一組**看起來完全健康**的數字。而 skipped 比例正是用來發現
+    「引擎其實一直在跳過客戶的單」的指標，把它安靜地歸零等於把這個訊號關掉。
+
+    「檔案不存在」已有 test_missing_skipped_file_is_unknown_not_zero 蓋住；本條蓋的是
+    **檔案在但讀不出來**那一格（走的是另一條 except 分支，兩者要分別釘）。
+    """
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref()])
+    hl.fills[ADDR_A] = [_fill()]
+    # ⚠️ 窗口跨多個日曆日，且**任一天讀不到就回 None**。若只寫壞掉的那一天，
+    # 其餘天數本來就缺檔，這條測試會因為別的理由變綠——壞檔回 0 的變異照樣存活。
+    # 所以先讓每一天都有合法的檔，再單獨把其中一天弄壞：這樣「壞檔回 0」與
+    # 「壞檔回 None」才會產生不同的結果（前者 available=true，後者 false）。
+    days = client.get("/api/ops/trade-quality").json()["skipped_days"]
+    assert len(days) >= 2
+    for day in days:
+        _write_skipped(cfg.state_base, ACCT_A, day, [{"coin": "ETH", "notional": "50"}])
+    ok = client.get("/api/ops/trade-quality").json()["followers"][0]
+    assert ok["skipped_available"] is True      # 基線：全部合法時確實算得出來
+
+    p = Path(cfg.state_base) / ACCT_A / "var/copytrade/skipped" / f"{days[-1]}.json"
+    p.write_text("{ this is not json")           # 撕裂／被編輯壞的檔
+
+    row = client.get("/api/ops/trade-quality").json()["followers"][0]
+    assert row["skipped_available"] is False
+    assert row["skipped_small_notional"] is None
+    assert row["skipped_small_ratio"] is None
+
+
+def test_skipped_file_with_bad_item_shape_is_unknown_not_zero(tmp_path):
+    """⭐ 同上的另一種壞法：JSON 合法但條目缺 `notional`（KeyError 那一支）。
+
+    分開釘是因為兩者走不同的 except 型別，而「合法 JSON、錯的形狀」是版本升級時
+    最可能發生的一種——寫端改了欄位名，讀端安靜地回 0。
+    """
+    client, cfg, hl = _q_app(tmp_path, refs=[_lref()])
+    hl.fills[ADDR_A] = [_fill()]
+    days = client.get("/api/ops/trade-quality").json()["skipped_days"]
+    for day in days:            # 同上：其餘天數必須合法，壞的那天才是唯一變因
+        _write_skipped(cfg.state_base, ACCT_A, day, [{"coin": "ETH", "notional": "50"}])
+    _write_skipped(cfg.state_base, ACCT_A, days[-1], [{"coin": "ETH", "amount": "50"}])
+
+    row = client.get("/api/ops/trade-quality").json()["followers"][0]
+    assert row["skipped_available"] is False
+    assert row["skipped_small_notional"] is None
+
+
 def test_partial_skipped_days_are_reported_as_unknown(tmp_path):
     """⭐ 多日窗口只有部分天有檔 → 一律 None。部分合計會偏低，而偏低的 skipped
     讀起來就是「引擎沒在跳過單」——寧可說不知道，不給一個看不出偏低的數。"""
@@ -981,6 +1032,54 @@ def test_summary_reports_sample_size_not_just_a_number(tmp_path):
     assert s["delay_sample"] == 1
     assert s["worst_median_delay_s"] == "4"
     assert s["skipped_available_count"] == 0
+
+
+def test_summary_reports_the_worst_client_not_the_best(tmp_path):
+    """⭐⭐ 「最差值」必須真的是最差（`max`，不是 `min`）——本測試的存在理由是
+    **這個變異在整份測試套件下原本存活**。
+
+    觸發情境：任何一次「順手」把 `max` 寫成 `min`（或把彙總改成平均）。品質面板要
+    回答的是「最慢的那個客戶多慢」；換成 `min` 之後它回答的是「最快的那個客戶多快」
+    ——面板上的數字**依然完全正常**（小、綠、像個好指標），而真正在受苦的那個客戶
+    從彙總裡消失了。沒有任何斷言會紅，因為兩者都是合法的秒數。
+
+    ⭐ 樣本必須 ≥2 且**值不同**：既有的 test_summary_reports_sample_size 只有一個
+    樣本，max 與 min 在它底下恆等——那正是變異能存活的原因。
+    """
+    client, cfg, hl = _q_app(
+        tmp_path, refs=[_lref(), _lref(ACCT_B, ADDR_B, "B")])
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=5)
+    hl.fills[LEADER] = [_fill(px="100", t=t0)]
+    hl.fills[ADDR_A] = [_fill(px="100", t=t0 + timedelta(seconds=2))]   # 快的客戶
+    hl.fills[ADDR_B] = [_fill(px="110", t=t0 + timedelta(seconds=9))]   # 慢的客戶
+
+    s = client.get("/api/ops/trade-quality").json()["summary"]
+    assert s["delay_sample"] == 2
+    assert s["worst_median_delay_s"] == "9", "最差＝最慢的那個客戶，不是最快的"
+    # 滑價同理：A 照 leader 價成交（0 bp）、B 貴了 10%（1000 bp）
+    assert s["slippage_sample"] == 2
+    assert s["worst_taker_slippage_bp_median"] == "1000.0"
+
+
+def test_summary_worst_values_are_pure_and_pinned_at_the_function_level(tmp_path):
+    """⭐ 同一條規則在純函式層再釘一次（不經 HTTP／adapter）。
+
+    端到端那條依賴 `compute_trade_quality` 算出來的值；這條直接餵列，讓「彙總取
+    最差值」這個規則在 `trade_quality_summary` 自己的介面上也有一條會咬的測試——
+    未來若彙總被抽走或改寫，兩層至少有一層會紅。
+    """
+    from spark.publicapi.ops import trade_quality_summary
+
+    rows = [
+        {"quality_available": True, "te_available": True,
+         "median_delay_s": Decimal("2"), "taker_slippage_bp_median": Decimal("5")},
+        {"quality_available": True, "te_available": True,
+         "median_delay_s": Decimal("30"), "taker_slippage_bp_median": Decimal("900")},
+    ]
+    s = trade_quality_summary(rows)
+    assert s["worst_median_delay_s"] == Decimal("30")
+    assert s["worst_taker_slippage_bp_median"] == Decimal("900")
+    assert s["delay_sample"] == 2 and s["slippage_sample"] == 2
 
 
 # ---------- ⭐ 系統健康面板（admin only；謊報健康比沒有面板更危險） ----------
@@ -1120,6 +1219,53 @@ def test_alerts_count_and_zero_is_a_real_zero(tmp_path):
     body = client.get("/api/ops/health").json()
     assert body["followers"][0]["alerts"] == 3          # 空行不計
     assert body["summary"]["alerts_total"] == 3
+
+
+def test_unreadable_alerts_file_is_unknown_not_zero(tmp_path):
+    """⭐⭐ 告警檔**存在但讀不出來** → null，**不是 0**。
+
+    觸發情境：狀態根讀得到（面板正常運作），但 `alerts.log` 自己的權限壞掉
+    ——引擎以 filet-engine 建檔、有人手動 chmod 過、或磁碟層的 IO 錯誤。
+    `count_alerts` 的 except 若回 0，面板會在**告警檔壞掉的當下**顯示
+    「0 則告警」＝最令人安心的數字，而操作者會據此決定**不去看**。
+
+    與「檔案不存在＝真的 0」（test_alerts_count_and_zero_is_a_real_zero）是刻意分開
+    的兩格：那一格的 0 有依據（我看得到目錄，裡面沒有告警檔），這一格沒有。
+    """
+    client, cfg = _h_app(tmp_path)
+    p = Path(cfg.state_base) / ACCT_A / "var/copytrade/alerts.log"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("boom\nboom\n")
+    p.chmod(0o000)
+    try:
+        body = client.get("/api/ops/health").json()
+    finally:
+        p.chmod(0o644)
+
+    row = body["followers"][0]
+    assert row["alerts"] is None, "讀不到的告警數絕不可顯示成 0"
+    assert row["basis"] == "state_root"      # 狀態根本身是讀得到的，只有這一格壞
+    assert body["summary"]["alerts_unknown_count"] == 1
+    assert body["summary"]["alerts_total"] == 0
+
+
+def test_unreadable_alerts_file_falls_back_to_the_heartbeat(tmp_path):
+    """⭐ 上一條的補救：直讀讀不到時，引擎自報的告警數補得上來（它讀得到自己的檔）。
+
+    這也順帶釘住「心跳只補未知的格子」——這裡直讀是 None（未知），所以心跳生效。
+    """
+    client, cfg = _h_app(tmp_path)
+    p = Path(cfg.state_base) / ACCT_A / "var/copytrade/alerts.log"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("boom\nboom\n")
+    p.chmod(0o000)
+    _write_heartbeat(cfg, ACCT_A, alerts_count=2)
+    try:
+        row = client.get("/api/ops/health").json()["followers"][0]
+    finally:
+        p.chmod(0o644)
+
+    assert row["alerts"] == 2
 
 
 def test_unapplied_leader_change_backlog_is_reported(tmp_path):
