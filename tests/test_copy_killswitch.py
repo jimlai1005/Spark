@@ -67,7 +67,8 @@ class FakeExecutor:
             raise RuntimeError(f"boom cancelling oid={oid}")
         return oid not in self._cancel_fail_oids
 
-    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal) -> OrderResult:
+    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal,
+                          *, emergency: bool = False) -> OrderResult:
         self.records.append(("close", coin, is_buy, size))
         if self._on_close is not None:
             self._on_close(coin)
@@ -481,6 +482,9 @@ class _FakePanicAdapter:
         return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"),
                            raw={"error": "rejected"})
 
+    # A：emergency 參數由 ActionExecutor 內部轉換成 slippage，adapter 不感知
+    # def close_reduce_only_emergency(self, ...): 此層無需變化
+
 
 @pytest.fixture
 def panic_env(monkeypatch, tmp_path):
@@ -595,3 +599,31 @@ def test_evaluate_slow_gate_trips_on_lifetime_drawdown():
     st = evaluate(ev, CopySettings(), notifier, lifetime_peak=Decimal("1000"))
     assert st.breached is True, "自 1000 跌到 400（60%）應觸發 40% 絕對底線"
     assert st.drawdown_pct == Decimal("0.6")
+
+
+def test_trip_uses_emergency_slippage(tmp_path):
+    """A：kill switch 平倉必須用 flatten_slippage（寬頻寬），否則跳空時掛不上。"""
+    seen = {}
+
+    class _Ex:
+        my_address = "0x"
+        live = True
+
+        def get_open_orders(self):
+            return []
+
+        def cancel(self, coin, oid):
+            return True
+
+        def close_reduce_only(self, coin, is_buy, size, *, emergency=False):
+            seen["emergency"] = emergency
+            return OrderResult(ok=True, filled_size=size, avg_px=Decimal("1"), raw={})
+
+    pos = {"ETH": Position(coin="ETH", szi=Decimal("1"), entry_px=Decimal("2000"),
+                           leverage=5, is_cross=True, unrealized_pnl=Decimal("0"),
+                           margin_used=Decimal("0"))}
+    trip(_Ex(), pos, RecordingNotifier(), tmp_path,
+         DrawdownStatus(current=Decimal("800"), peak=Decimal("1000"),
+                        drawdown_pct=Decimal("0.2"), breached=True),
+         sleep_fn=lambda s: None)
+    assert seen.get("emergency") is True, "trip 必須以 emergency=True 平倉"

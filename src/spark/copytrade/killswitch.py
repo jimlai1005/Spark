@@ -247,7 +247,8 @@ def trip(ex: ExecutorPort, my_positions: dict[str, Position], notifier: Notifier
     for act in plan_close_actions(my_positions.values()):
         try:
             res = resilient_run(
-                lambda a=act: ex.close_reduce_only(a.coin, a.is_buy, a.size),
+                lambda a=act: ex.close_reduce_only(a.coin, a.is_buy, a.size,
+                                                   emergency=True),
                 what=f"killswitch 平倉 {act.coin}", idempotent=True, sleep_fn=sleep_fn)
             ok, detail = res.ok, res.raw
         except Exception as e:  # noqa: BLE001 —— 邊界重試已耗盡或語意錯誤，即終態

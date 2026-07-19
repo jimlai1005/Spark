@@ -165,3 +165,33 @@ def test_reset_samples_clears_lifetime_peak(tmp_path: Path):
     assert (tmp_path / LIFETIME_PEAK_RELPATH).exists()
     reset_samples(tmp_path)
     assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists()
+
+
+def test_single_wick_does_not_pollute_peak(tmp_path: Path):
+    """I2：單筆插針不得成為 peak（否則假回撤→假平倉）。
+
+    情境（opus 複審提出）：equity 穩定 1000 → 一次 wick 到 1400 → 回到 1000。
+    舊行為 peak=1400 → dd=0.286 → 觸發 20% 熔斷（假平倉）。
+    """
+    ts = 1000.0
+    for _ in range(3):
+        perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    perp_equity_view(_FakeAdapter("1400"), "0xabc", tmp_path, now_fn=lambda t=ts: t)  # wick
+    ts += 60
+    ev = perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+    assert ev.recent_peak == Decimal("1000"), "單筆插針不得成為 peak"
+    dd = (ev.recent_peak - ev.current) / ev.recent_peak
+    assert dd == Decimal("0"), "不得產生假回撤"
+
+
+def test_sustained_high_still_becomes_peak(tmp_path: Path):
+    """對照組：真實的持續高點（多筆樣本）仍必須成為 peak——防護不得誤殺真回撤。"""
+    ts = 1000.0
+    for _ in range(3):
+        perp_equity_view(_FakeAdapter("1400"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    ev = perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+    assert ev.recent_peak == Decimal("1400"), "持續高點必須成為 peak"
+    dd = (ev.recent_peak - ev.current) / ev.recent_peak
+    assert dd > Decimal("0.28"), "真實回撤必須算得出來"

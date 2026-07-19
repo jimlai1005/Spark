@@ -160,5 +160,12 @@ def perp_equity_view(adapter, address: str, root: Path, *,
     samples.append((now, str(current)))
     if persist:
         _save(path, samples)
-    peak = max([Decimal(v) for _, v in samples] + [current])
+    # I2 插針防護：取**次高值**而非最高值——單一樣本的價格插針（unrealizedPnl 受 mark
+    # price 影響，冷門幣插針即可造成）不會成為 peak 並污染整個窗；真實的持續高點必然
+    # 有多筆樣本，次高值≈最高值。樣本 <2 筆時退回最高值（此時 coverage 不足會另發告警）。
+    # 最後與 current 取 max：維持「peak 為高水位」的慣例，且 current 若本身是插針，
+    # 當輪 dd≈0 無害、下一輪該樣本會被次高值邏輯排除。
+    _vals = sorted((Decimal(v) for _, v in samples), reverse=True)
+    _base = _vals[1] if len(_vals) >= 2 else (_vals[0] if _vals else current)
+    peak = max(_base, current)
     return EquityView(current=current, recent_peak=peak)

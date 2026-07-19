@@ -52,8 +52,9 @@ class ExecutorPort(Protocol):
         """市價開倉。"""
         ...
 
-    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal) -> OrderResult:
-        """市價平倉（reduce-only）。"""
+    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal,
+                          *, emergency: bool = False) -> OrderResult:
+        """市價平倉（reduce-only）。emergency=True 用 flatten_slippage（遠寬頻寬）。"""
         ...
 
     def update_leverage(self, coin: str, leverage: int, is_cross: bool) -> bool:
@@ -235,16 +236,22 @@ class ActionExecutor:
         })
         return res
 
-    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal) -> OrderResult:
+    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal,
+                          *, emergency: bool = False) -> OrderResult:
+        # emergency（kill switch/panic）用 flatten_slippage：緊急平倉沒成交＝保護失效，
+        # 寬頻寬確保跳空時仍能出場（IOC 仍從最佳價吃起，不是成交在最差價）。
+        slip = (self._settings.flatten_slippage if emergency
+                else self._settings.slippage)
         if self.live:
             res = self._adapter.close_reduce_only(self._signer, coin, is_buy, size,
-                                                  self._settings.slippage, self._builder)
+                                                  slip, self._builder)
         else:
             res = OrderResult(ok=True, filled_size=size, avg_px=Decimal("0"),
                               raw={"dry_run": True})
         self._record("close", coin, {
             "is_buy": is_buy, "sz": str(size),
-            "slippage": str(self._settings.slippage), "ok": res.ok,
+            "slippage": str(slip), "emergency": emergency,
+            "ok": res.ok,
         })
         return res
 

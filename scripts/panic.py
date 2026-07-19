@@ -114,13 +114,14 @@ class _AdapterExecutor:
     """
 
     def __init__(self, adapter, agent_signer: Signer, user_addr: str,
-                 builder: BuilderCode, slippage: Decimal):
+                 builder: BuilderCode, slippage: Decimal, flatten_slippage: Decimal | None = None):
         self.records: list = []  # ExecutorPort 介面欄位
         self._adapter = adapter
         self._signer = agent_signer
         self._user_addr = user_addr
         self._builder = builder
         self._slippage = slippage
+        self._flatten_slippage = flatten_slippage if flatten_slippage is not None else slippage
 
     def get_open_orders(self) -> list[OpenOrder]:
         return self._adapter.get_open_orders(self._user_addr)
@@ -128,9 +129,12 @@ class _AdapterExecutor:
     def cancel(self, coin: str, oid: int) -> bool:
         return self._adapter.cancel_order(self._signer, coin, oid)
 
-    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal) -> OrderResult:
+    def close_reduce_only(self, coin: str, is_buy: bool, size: Decimal,
+                          *, emergency: bool = False) -> OrderResult:
+        # emergency（kill switch/panic）用 flatten_slippage：寬頻寬確保出場
+        slip = self._flatten_slippage if emergency else self._slippage
         return self._adapter.close_reduce_only(
-            self._signer, coin, is_buy, size, self._slippage, self._builder)
+            self._signer, coin, is_buy, size, slip, self._builder)
 
 
 def run_single_follower(
@@ -196,7 +200,8 @@ def run_single_follower(
     executor = _AdapterExecutor(
         adapter, agent, user_addr,
         builder=BuilderCode(b=builder_addr, f=settings.f),
-        slippage=copy_settings.slippage)
+        slippage=copy_settings.slippage,
+        flatten_slippage=copy_settings.flatten_slippage)
 
     # 前置讀取經 resilience 邊界（讀取冪等可重試）；耗盡即 degrade——鎖死優先。
     degraded: list[str] = []

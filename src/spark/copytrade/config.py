@@ -111,6 +111,11 @@ class CopySettings:
     # 函式層預設（硬編，移植自 hl）
     px_rel_tol: Decimal = Decimal("1e-4")  # hl orders.py:40 _prices_equal rel
     slippage: Decimal = Decimal("0.05")  # hl trader.py:312 硬編
+    # 緊急平倉（kill switch / panic）專用滑價容忍。一般跟單平倉沒成交無所謂（下一輪再試），
+    # 緊急平倉沒成交＝保護整個失效、部位繼續曝險——故用遠寬的頻寬。
+    # 注意 IOC 限價語意：這是「可接受的最差價」，不是「一定成交在這個價」——
+    # 實際仍從最佳價往下吃，寬頻寬只是確保跳空時仍能出場。
+    flatten_slippage: Decimal = Decimal("0.30")
 
     @classmethod
     def from_env(
@@ -157,6 +162,8 @@ class CopySettings:
             ),
             px_rel_tol=_env_decimal("COPY_PX_REL_TOL", str(cls.px_rel_tol), env),
             slippage=_env_decimal("COPY_SLIPPAGE", str(cls.slippage), env),
+            flatten_slippage=_env_decimal(
+                "COPY_FLATTEN_SLIPPAGE", str(cls.flatten_slippage), env),
         )
 
     def __post_init__(self) -> None:
@@ -196,6 +203,10 @@ class CopySettings:
         if not (0 <= self.slippage < 1):
             raise ValueError(
                 f"slippage must be in [0, 1), got {self.slippage}")
+
+        if not (0 <= self.flatten_slippage < 1):
+            raise ValueError(
+                f"flatten_slippage must be in [0, 1), got {self.flatten_slippage}")
 
         if not (0 <= self.max_total_drawdown_pct < 1):
             raise ValueError(
