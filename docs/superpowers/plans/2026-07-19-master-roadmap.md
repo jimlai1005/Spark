@@ -92,8 +92,25 @@
 - [ ] P3.1b `pending.json` 支援 `leader_address`（**目前 `write_pending_entry()` 無此參數，客戶選 leader 的鏈路斷在這裡**）
 - [ ] P3.2 引擎讀 per-follower leader ⭐ + **白名單二次驗證**（目前只有 activate 一道閘）
 - [ ] P3.3 leader 目錄 API（清單＋leaderboard 統計，資料來自已在跑的 watchlist snapshot）
-- [ ] P3.4 客戶選 leader 的 API（訂閱狀態 gate）
+- [ ] P3.4 客戶選 leader 的 API（訂閱狀態 gate）⭐ **必須帶客戶 SIWE 簽章，見下方**
 - [ ] P3.5 `/leaders` 前端頁
+
+### ⭐ 換 leader 的信任錨：客戶簽章（opus 審查逼出的架構決定）
+
+**我的決定（使用者可推翻）**：P3.4 的換 leader 請求**必須攜帶客戶的 SIWE 簽章**（含 nonce 與目標 leader 位址），引擎驗章後才接受。機具已存在（`src/spark/publicapi/siwe.py`）。代價＝每次換 leader 要簽一次錢包，有 UX 摩擦。
+
+**為什麼值得這個摩擦**——白名單回答的是「這個 leader 一般而言可不可接受」，**完全沒有回答「這位客戶真的要求換到他嗎」**。opus 找到兩個白名單結構上擋不住的攻擊：
+
+1. **合法 leader 之間的無認證重導向**（比抖動嚴重）：能寫 manifest 的人可把 follower 指向白名單內、但對他完全不適合的 leader（例如 10x 槓桿高波動策略）。白名單全程放行，因為那個 leader **確實**在白名單裡。**一次切換就能造成實質損失**，不需要抖動。
+2. **抖動**：在合法 leader 之間高頻切換，每次都付真實 taker 成本。（成本比原估低——`positions.py:188-243` 對重疊 coin 走差額調整而非平掉重開。）
+
+**⚠️ 激勵錯位（最該讓使用者知道的一點）**：客戶每次換 leader 產生的額外成交，都會讓**我方的 builder fee 收入增加**（`accrued` 鍵在 builder 位址）。**從 churn 中獲利的那一方，正是被指定來守住 churn 的那一方。** 這是為什麼客戶簽章比任何營運端冷卻期都更該優先——守門人不該是受益人。營運端冷卻期仍值得做（引擎是唯一知道成本是否真的付出去的元件），但當成唯一解就是把守門責任放在守不住的位置。
+
+**第三個建議（opus 認為最值得先做，尚未實作）**：**成本熔斷器**——對「每日複製成交筆數／累計 taker 成本佔權益比」設上限，超過即停開新倉並告警。好處是**與 leader 是誰無關**：抖動、白名單內的自營對敲、單純一個換手率爆炸的合法 leader，全被同一道閘門蓋住。這是原則 5 的味道（結構性，不靠人記得檢查）。**待使用者裁決是否納入 P3/P4。**
+
+### 威脅模型校準（誠實標註，opus 查證）
+我原本論證的攻擊「filet-api 被打穿 → 竄改 manifest 的 leader」**在出貨組態下不可達**：`filet-api.service` 的 `ReadWritePaths` ＋ `ProtectSystem=strict`，而 manifest 在 root 擁有的目錄。攻擊者只寫得到 `pending.json`，而 pending→manifest 之間隔著 activate 的白名單硬閘**與一個人類**。**真正承重的控制是檔案系統拓撲**，引擎側二次驗證是成本近零的縱深防禦（值得留著，尤其若日後 manifest 搬家），但**不要高估它今天的邊際價值**。
+另注（既有性質、非本次引入）：所有 follower 共用 `filet-engine` user 且 `/etc/filet/keys` 為共用目錄——引擎側任一進程被打穿即可讀**所有** follower 的 agent key。白名單對這條路徑零保護。
 
 **注意**：最大架構變更且碰引擎核心。P3.2 必須 opus 審。
 
