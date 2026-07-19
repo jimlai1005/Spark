@@ -364,6 +364,249 @@ export type OpsRevenueResp =
       manifest_errors: string[];
     };
 
+// ---------- ops 成交品質（admin；跨客戶橫切，對照 app.py 的 /api/ops/trade-quality） ----------
+/**
+ * 單一 follower 的成交品質列。**兩種形狀，判別欄位 `quality_available`**：
+ * 自己的 fills 查不到時後端**不給**任何量測欄（連 taker_share 都沒有）——型別上就
+ * 讀不到，顯示層不可能把「查詢失敗」畫成一列 0（沿 OpsRevenueResp 的既有慣例）。
+ *
+ * ⭐ 三個「未知」旗標互相獨立，不得合併：
+ * - `te_available=false`＝不知道這個 follower 跟誰（manifest 無 leader_address）→
+ *   配對延遲與滑價為 null。**不是 0**：「延遲 0 秒」讀起來是完美的跟單品質。
+ * - `skipped_available=false`＝skipped 檔讀不到 → 名目與比例皆 null（同樣不是 0）。
+ * - `skipped_available=true` 但 `skipped_small_ratio=null`＝窗口非整個 UTC 日，
+ *   分子（日曆日落檔）與分母（依窗口過濾）不同基準，後端刻意不硬算（工程原則 1）。
+ *   顯示層必須把這兩種 null 分開說：一個是「讀不到」，一個是「此窗口算不出來」。
+ *
+ * ⚠️ 數值欄一律 string（後端 jsonable 把 Decimal 無損序列化）；`fills`／`pair_count`
+ * 是真正的計數，故為 number。
+ */
+export type OpsTradeQualityRow =
+  | {
+      account_id: string;
+      label: string;
+      network: string;
+      quality_available: false;
+      te_available: false;
+      skipped_available: false;
+      /** 本分支必有原文（fills 查詢失敗）；跨客戶隔離，其餘列照常有資料。 */
+      error: string;
+    }
+  | {
+      account_id: string;
+      label: string;
+      network: string;
+      quality_available: true;
+      fills: number;
+      /** taker 佔比：只由我方成交算出，與 leader 無關 → te_available=false 時仍有效。 */
+      taker_share: string;
+      te_available: boolean;
+      pair_count: number | null;
+      /** ⭐ 配對延遲**中位數**（秒）：我方成交與 leader 對應成交的時間差。不是「速度」。 */
+      median_delay_s: string | null;
+      /** taker 滑價中位數（bp）；正值＝成交價對跟單者不利。 */
+      taker_slippage_bp_median: string | null;
+      skipped_available: boolean;
+      skipped_small_notional: string | null;
+      skipped_small_ratio: string | null;
+      /** te_available=false 時後端附上的原因說明。 */
+      te_note?: string;
+      /** 比例不可比時後端附上的原因說明（分子分母不同基準）。 */
+      skipped_note?: string;
+      error: string | null;
+    };
+
+/**
+ * 跨 follower 彙總。⭐ 只回**最差值**與樣本數，不回「中位數的平均」那種沒有統計
+ * 意義卻很像數字的東西。`*_sample` 必須與最差值一起顯示：只給一個最差值會讓
+ * 「10 個客戶只有 1 個有資料」與「10 個都有資料」在畫面上長得一模一樣。
+ */
+export interface OpsTradeQualitySummary {
+  followers: number;
+  quality_available_count: number;
+  te_available_count: number;
+  skipped_available_count: number;
+  worst_median_delay_s: string | null;
+  delay_sample: number;
+  worst_taker_slippage_bp_median: string | null;
+  slippage_sample: number;
+}
+
+/**
+ * 成交品質，**兩種**回應形狀，判別欄位 `basis_unknown`（沿 OpsRevenueResp 的慣例）。
+ * basis_unknown 分支後端**不給** `followers`／`summary`——型別上就讀不到，
+ * 顯示層不可能畫出空表（空表會被讀成「今天成交品質完美」）。
+ */
+export type OpsTradeQualityResp =
+  | {
+      window: "accrued";
+      basis_unknown: true;
+      window_start: null;
+      window_end: null;
+      /** 後端寫好的原因說明；顯示層原樣呈現，且**不得**顯示任何數字。 */
+      note: string;
+      manifest_errors: string[];
+    }
+  | {
+      window: "accrued" | "days";
+      basis_unknown: false;
+      /** 僅 days 窗有此欄（accrued 窗由快照時刻決定，不接受天數）。 */
+      days?: number;
+      window_start: string;
+      window_end: string;
+      /** 窗口涵蓋的日曆日（skipped 以日曆日落檔，供人肉核對比例的分母基準）。 */
+      skipped_days: string[];
+      followers: OpsTradeQualityRow[];
+      summary: OpsTradeQualitySummary;
+      manifest_errors: string[];
+    };
+
+/**
+ * 成交品質。時間窗與 /api/ops/customers **同一套規則**（互斥、同一個
+ * `ops.accrued_window()` 推導）——三張表要能並排讀，窗口就必須同源。
+ */
+export function getOpsTradeQuality(query: OpsCustomersQuery): Promise<OpsTradeQualityResp> {
+  const q = new URLSearchParams(
+    query.window === "accrued" ? { window: "accrued" } : { days: String(query.days) },
+  );
+  return request<OpsTradeQualityResp>(`/api/ops/trade-quality?${q.toString()}`);
+}
+
+// ---------- ops 系統健康（admin；對照 app.py 的 /api/ops/health） ----------
+/**
+ * 引擎當輪實際採用的資金設定（心跳投影）。⚠️ 兩個數值一律 string：它們直接乘進
+ * 部位大小，而 0.1 在 float 裡不是 0.1（沿 CapitalSettingsResp 的既有慣例）。
+ */
+export interface OpsHealthCapital {
+  allocated_capital: string | null;
+  capital_utilization: string | null;
+  use_full_equity: boolean | null;
+  /** 這組值從哪來（已簽署的設定／預設值…），由引擎在同一次求值中標記。 */
+  source: string;
+  changed_at: string | null;
+}
+
+/** 引擎上一個 cycle 的結果（心跳投影）。 */
+export interface OpsHealthLastCycle {
+  result: string;
+  detail: string | null;
+}
+
+/**
+ * 單一 follower 的健康列。⭐⭐ **本型別的每一個「未知」都必須留在型別上**：
+ * 後端刻意讓讀不到的格子回 `null`＋一個 `*_known` 兄弟欄，而不是折疊成看起來
+ * 健康的值。顯示層若把 `null` 當 falsy 處理（`killswitch_tripped` 為 null 時顯示
+ * 「未觸發」），就等於在客戶的引擎已經熔斷、部位已被平掉的當下告訴管理員一切正常。
+ * 謊報健康比沒有面板更危險——所以三態一律經由 page 的 `engineState`／
+ * `killswitchState` 純函式轉成明確的字串聯集，不在 JSX 裡直接用布林判斷。
+ *
+ * ⚠️ `liveness_basis`（誠實標註，後端一併上呈）：這**不是** process 檢查，而是
+ * 「引擎最近有沒有寫心跳（equity 樣本，每 cycle 一筆）」的代理。刻意型別為 string
+ * 而非字面量聯集：後端換掉判定基準時，顯示層會原樣顯示那個新代碼（看得懂但陌生），
+ * 而不是靜默沿用一句已經不成立的說明——過期的說明比沒有說明更危險。
+ */
+export interface OpsHealthFollower {
+  account_id: string;
+  label: string;
+  network: string;
+  liveness_basis: string;
+  state_root: string;
+  /**
+   * ⭐⭐ 引擎心跳的新鮮度。已知值 `ok`／`stale`／`missing`／`unreadable`——後端刻意
+   * **不把後三者折疊成一個「未知」**（處置完全不同：missing 多半是剛啟用或子通道
+   * 沒建好，stale 是引擎沒跑或寫不進交換目錄，unreadable 是檔案壞了）。
+   *
+   * 型別刻意為 `string` 而非字面量聯集：後端新增一種狀態時，顯示層會原樣顯示那個
+   * 陌生代碼（看得懂但明顯不對勁），而不是靜默落進某個既有分支——落進 "ok" 的
+   * 那一版會謊報健康，而那是本面板最不能犯的錯。
+   */
+  heartbeat_status: string;
+  /** ⭐ 最後一次心跳的時刻（引擎寫入時的 UTC ISO）。過期時**只剩這個與年齡**。 */
+  heartbeat_at: string | null;
+  heartbeat_age_s: number | null;
+  heartbeat_stale_after_s: number;
+  /**
+   * ⭐ 這一列的 kill switch 與覆蓋度**出自哪個來源**：`state_root`（API 直讀，較新鮮）
+   * 或 `heartbeat`（引擎發布的摘要），另有 `absent`／`unreadable`。兩個來源並存卻
+   * 不標示，讀者無從判斷他看到的值有多舊（工程原則 1 的變形）。同為 string 以容納
+   * 後端新增的來源。
+   */
+  basis: string;
+  /** 以下四項**只可能來自心跳**（狀態根沒有可讀投影）；心跳非 ok 時一律 null。 */
+  leader_address: string | null;
+  leader_source: string | null;
+  capital: OpsHealthCapital | null;
+  last_cycle: OpsHealthLastCycle | null;
+  coverage_known: boolean;
+  sample_count: number | null;
+  /** 回撤保護是否已生效。false＝**確定**尚未生效（樣本不足），null＝讀不到。 */
+  sample_coverage_sufficient: boolean | null;
+  /** 最後一次心跳距 `checked_at` 的秒數；null＝完全沒有心跳（不是 0）。 */
+  last_sample_age_s: number | null;
+  /** ⭐ 三態：true＝心跳新鮮；false＝心跳過期；null＝讀不到（既非健康也非確定的壞）。 */
+  engine_alive: boolean | null;
+  /** ⭐ 三態：true＝已觸發（該客戶已停止跟單）；false＝未觸發；null＝讀不到。 */
+  killswitch_tripped: boolean | null;
+  /** false ⇒ `killswitch_tripped` 的 null 是「無從確認」，**不是**「沒觸發」。 */
+  killswitch_known: boolean;
+  /** 告警筆數；null＝告警檔讀不到（**不是** 0，0 是「確實沒有告警」）。 */
+  alerts: number | null;
+  error: string | null;
+}
+
+/** 「客戶簽了、API 收了、引擎從沒套用」的一筆積壓（reason 為機器可讀碼）。 */
+export interface OpsUnappliedLeaderChange {
+  account_id: string;
+  nonce: string | null;
+  age_s: number | null;
+  /** not_redeemed／bad_issued_at／ledger_unreadable；未知碼顯示層原樣呈現。 */
+  reason: string;
+}
+
+/**
+ * 健康彙總。⭐ 每個計數都有一個 `*_unknown` 兄弟欄：「0 個引擎沒回應」與
+ * 「10 個引擎的狀態都讀不到」在單一計數上長得一模一樣，而後者才是該立刻處理的那個。
+ */
+export interface OpsHealthSummary {
+  followers: number;
+  engine_alive_count: number;
+  engine_stale_count: number;
+  engine_unknown_count: number;
+  killswitch_tripped_count: number;
+  killswitch_unknown_count: number;
+  coverage_insufficient_count: number;
+  coverage_unknown_count: number;
+  alerts_total: number;
+  alerts_unknown_count: number;
+  /**
+   * ⭐ 心跳三態各自計數，**不合併成一個「心跳有問題」**：`stale`＝引擎沒跑或寫不進
+   * 交換目錄（要立刻查），`missing`＝多半剛 activate／子通道沒建（部署待辦）。
+   * 合成一個數字會讓前者被後者的常態雜訊蓋掉。
+   */
+  heartbeat_ok_count: number;
+  heartbeat_stale_count: number;
+  heartbeat_missing_count: number;
+  /** ⭐ null＝這條鏈路查不下去（見 leader_change_errors），**不是** 0（沒有積壓）。 */
+  unapplied_leader_changes: number | null;
+  leader_change_errors: string[];
+}
+
+export interface OpsHealthResp {
+  /** 本次檢查的時刻；心跳年齡以此為基準（同源，故可相減出最後心跳時刻）。 */
+  checked_at: string;
+  /** 心跳超過這麼久沒更新即判為過期（後端 ENGINE_STALE_S）。 */
+  engine_stale_after_s: number;
+  followers: OpsHealthFollower[];
+  unapplied_leader_changes: OpsUnappliedLeaderChange[];
+  summary: OpsHealthSummary;
+  manifest_errors: string[];
+}
+
+/** 系統健康（admin only）。冪等讀取，重試安全。 */
+export function getOpsHealth(): Promise<OpsHealthResp> {
+  return request<OpsHealthResp>("/api/ops/health");
+}
+
 // ---------- billing（M3 計費；對照 src/spark/publicapi/app.py 的四個端點） ----------
 /**
  * 方案目錄的功能列。`included` 與 `shipped` 是**兩個獨立的軸**（後端 billing.py

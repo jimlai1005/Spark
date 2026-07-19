@@ -524,6 +524,59 @@ main.page {
   padding: 1px 8px;
 }
 
+/* ---------- Ops 成交品質 / 系統健康 ---------- */
+.ops-subtitle {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+.ops-basis + .ops-basis::before { content: " / "; color: var(--text-dim); }
+
+/* ⭐ 「未知」刻意做得刺眼：它就是要打斷掃視。一個低調的灰色「—」會被當成
+   「這格沒事」，而它其實常常是「我們看不到」——面板謊報健康比沒有面板更危險。 */
+.ops-unknown {
+  font-size: 12px;
+  color: var(--warn);
+  border-bottom: 1px dashed rgba(var(--warn-rgb), .6);
+  cursor: help;
+  white-space: nowrap;
+}
+
+.ops-chip {
+  display: inline-block;
+  font-size: 11.5px;
+  line-height: 1.6;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.ops-chip-ok { color: var(--pos); border-color: rgba(var(--pos-rgb), .45); }
+.ops-chip-warn { color: var(--warn); border-color: rgba(var(--warn-rgb), .55); }
+/* kill switch 已觸發＝該客戶已停止跟單。實心紅底，不是描邊——這一格必須在
+   掃過一整頁時自己跳出來，而不是等人逐列讀文字。 */
+.ops-chip-bad {
+  color: var(--bg);
+  background: var(--neg);
+  border-color: var(--neg);
+  font-weight: 500;
+}
+.ops-chip-unknown {
+  color: var(--warn);
+  border-color: rgba(var(--warn-rgb), .55);
+  border-style: dashed;
+}
+
+/* ⭐ 視覺上明顯（不只是文字）：整列紅底 ＋ 左緣紅槓。 */
+.ops-row-tripped td {
+  background: rgba(var(--neg-rgb), .12);
+}
+.ops-row-tripped td:first-child {
+  box-shadow: inset 3px 0 0 var(--neg);
+}
+
 /* ---------- Pricing / Billing ---------- */
 /* chip 只在已登入且 billing 啟用時渲染；margin-left:auto 讓它與登出鈕成組靠右，
    未渲染時 header 的 space-between 行為完全不變（不顯示就不影響版面）。 */

@@ -13,16 +13,22 @@ import { useState } from "react";
 import {
   ApiError,
   getOpsCustomers,
+  getOpsHealth,
   getOpsRevenue,
   getOpsSubscriptions,
+  getOpsTradeQuality,
   type OpsCustomerRow,
   type OpsCustomersResp,
+  type OpsHealthResp,
   type OpsRevenueResp,
   type OpsSubscriptionEntry,
   type OpsSubscriptionsResp,
+  type OpsTradeQualityResp,
 } from "@/lib/api";
 import { COPY } from "@/lib/copy";
 import { fmtAmount, fmtRatioPct, NO_VALUE, shortAddr } from "@/lib/format";
+import { HealthBlock } from "./HealthPanel";
+import { TradeQualityBlock } from "./TradeQualityPanel";
 
 const DAY_OPTIONS = [1, 7, 30] as const;
 /**
@@ -50,8 +56,24 @@ export default function OpsPage() {
     queryKey: ["ops-subscriptions"],
     queryFn: getOpsSubscriptions,
   });
+  /**
+   * ⭐ 成交品質沿用**同一個** `mode`：三張表要能並排讀，窗口就得由同一個控制項決定。
+   * 讓品質面板自己記一個窗口，等於在同一頁上放兩個不同的比較基準，而畫面上看不出
+   * 它們不同——那正是那個 Critical bug 的形狀（工程原則 1）。
+   */
+  const tradeQuality = useQuery<OpsTradeQualityResp>({
+    queryKey: ["ops-trade-quality", mode],
+    queryFn: () =>
+      getOpsTradeQuality(mode === "accrued" ? { window: "accrued" } : { days: mode }),
+  });
+  /** 系統健康沒有窗口參數：它是「此刻」的檢查，不與上面三張表共用比較窗口。 */
+  const health = useQuery<OpsHealthResp>({
+    queryKey: ["ops-health"],
+    queryFn: getOpsHealth,
+  });
 
-  const errors = [revenue.error, customers.error, subscriptions.error];
+  const errors = [revenue.error, customers.error, subscriptions.error,
+                  tradeQuality.error, health.error];
   if (errors.some((e) => e instanceof ApiError && e.status === 403)) {
     return <main className="page"><p>{c.forbidden}</p></main>;
   }
@@ -71,7 +93,11 @@ export default function OpsPage() {
           是為了讓「它們相同」變成一個可以被人肉核對的單一事實，而不是要讀者自己去
           比對兩處印出來的區間（那正是那個 Critical bug 得以潛伏一整天的原因）。 */}
       {mode === "accrued" && (
-        <WindowBanner revenue={revenue.data} customers={customers.data} />
+        <WindowBanner
+          revenue={revenue.data}
+          customers={customers.data}
+          tradeQuality={tradeQuality.data}
+        />
       )}
 
       <section aria-label="收入對帳">
@@ -117,6 +143,40 @@ export default function OpsPage() {
           <p className="hint">{COPY.common.loading}</p>
         )}
       </section>
+
+      {/* 成交品質：與上面兩張表同一個 mode（同一個比較窗口）。載入失敗只降級本區塊。 */}
+      <section aria-label="成交品質">
+        <h2 className="ops-section-title">{c.tradeQuality.title}</h2>
+        <p className="hint">{c.tradeQuality.note}</p>
+        <p className="hint">
+          {mode === "accrued"
+            ? c.tradeQuality.sameWindowNote
+            : c.tradeQuality.daysWindowNote}
+        </p>
+        {tradeQuality.error ? (
+          <p className="ops-query-error">
+            {c.tradeQuality.loadFailed} {errText(tradeQuality.error)}
+          </p>
+        ) : tradeQuality.data ? (
+          <TradeQualityBlock data={tradeQuality.data} />
+        ) : (
+          <p className="hint">{COPY.common.loading}</p>
+        )}
+      </section>
+
+      {/* 系統健康：無窗口參數（「此刻」的檢查）。同樣各自降級。 */}
+      <section aria-label="系統健康">
+        <h2 className="ops-section-title">{c.health.title}</h2>
+        {health.error ? (
+          <p className="ops-query-error">
+            {c.health.loadFailed} {errText(health.error)}
+          </p>
+        ) : health.data ? (
+          <HealthBlock data={health.data} />
+        ) : (
+          <p className="hint">{COPY.common.loading}</p>
+        )}
+      </section>
     </main>
   );
 }
@@ -131,7 +191,9 @@ function errText(e: unknown): string {
  * ⭐ 只讀後端給的 window_start/window_end，不從 day／start／end 推——推導出來的窗口
  * 看起來一樣可信，卻可能與另一張表不同源，那正是這次 Critical 的成因（工程原則 1）。
  */
-function windowOf(d: OpsRevenueResp | OpsCustomersResp | undefined): [string, string] | null {
+function windowOf(
+  d: OpsRevenueResp | OpsCustomersResp | OpsTradeQualityResp | undefined,
+): [string, string] | null {
   if (!d || !("window_start" in d)) return null;
   const { window_start: s, window_end: e } = d;
   return s != null && e != null ? [s, e] : null;
@@ -147,23 +209,37 @@ function windowOf(d: OpsRevenueResp | OpsCustomersResp | undefined): [string, st
  *
  * 任一邊算不出窗口 → 不渲染：各自的區塊已經寫明原因，這裡再猜一個窗口只會製造假確定感。
  */
-function WindowBanner({ revenue, customers }: {
+function WindowBanner({ revenue, customers, tradeQuality }: {
   revenue: OpsRevenueResp | undefined;
   customers: OpsCustomersResp | undefined;
+  tradeQuality: OpsTradeQualityResp | undefined;
 }) {
   const w = c.window;
   const rw = windowOf(revenue);
   const cw = windowOf(customers);
+  // 成交品質**可選**地納入本標頭：它算不出窗口時（basis_unknown／載入失敗）本標頭
+  // 照舊只描述另外兩張表，由品質區塊自己說明為什麼它沒有數字。硬把一個不存在的
+  // 窗口湊進來，只會讓標頭宣稱一件它並不知道的事。
+  const tw = windowOf(tradeQuality);
   if (!rw || !cw) return null;
 
-  if (rw[0] !== cw[0] || rw[1] !== cw[1]) {
+  const pairMismatch = rw[0] !== cw[0] || rw[1] !== cw[1];
+  const tqMismatch = tw != null && (tw[0] !== rw[0] || tw[1] !== rw[1]);
+  if (pairMismatch || tqMismatch) {
     return (
       <div className="ops-alert" role="alert">
-        <p className="ops-alert-title">{w.mismatchTitle}</p>
-        <p className="ops-alert-body">{w.mismatchBody}</p>
-        {/* 兩組窗口並排列出：警告要能直接告訴人「差在哪」，不然還得自己去翻兩張表 */}
+        <p className="ops-alert-title">
+          {pairMismatch ? w.mismatchTitle : w.tqMismatchTitle}
+        </p>
+        <p className="ops-alert-body">
+          {pairMismatch ? w.mismatchBody : w.tqMismatchBody}
+        </p>
+        {/* 各組窗口並排列出：警告要能直接告訴人「差在哪」，不然還得自己去翻幾張表 */}
         <p className="hint mono ops-window">{w.revenueLabel}: {rw[0]} → {rw[1]}</p>
         <p className="hint mono ops-window">{w.customersLabel}: {cw[0]} → {cw[1]}</p>
+        {tw && (
+          <p className="hint mono ops-window">{w.tradeQualityLabel}: {tw[0]} → {tw[1]}</p>
+        )}
       </div>
     );
   }
@@ -172,6 +248,9 @@ function WindowBanner({ revenue, customers }: {
       <p className="ops-window-banner-title">{w.sharedTitle}</p>
       <p className="hint mono ops-window">{w.label}: {rw[0]} → {rw[1]}</p>
       <p className="hint">{w.sharedNote}</p>
+      {/* 品質面板也在同一個窗口上時，把它併進**同一個**標頭：另外印一次窗口，
+          等於又製造一個要人肉比對的地方，而那正是這個標頭當初要消滅的東西。 */}
+      {tw && <p className="hint">{w.tradeQualityShared}</p>}
     </div>
   );
 }

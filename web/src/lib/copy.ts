@@ -144,6 +144,14 @@ export const COPY = {
         + "判成巨額漏財）。請先確認後端窗口推導是否退化，修好之前不要依本頁下對帳結論。",
       revenueLabel: "收入對帳窗口",
       customersLabel: "每客戶損益窗口",
+      // 成交品質併入同一個標頭（它與另外兩張表共用同一個窗口推導函式時）。
+      tradeQualityLabel: "成交品質窗口",
+      tradeQualityShared: "成交品質面板也取自同一組快照時刻，三張表可並排對照。",
+      tqMismatchTitle: "成交品質的比較窗口與對帳表不一致，數字不可並排相減",
+      tqMismatchBody:
+        "成交品質應與收入對帳共用同一個窗口推導函式，實際收到的窗口卻不同——"
+        + "在這個狀態下把延遲、滑價與上面兩張表的數字並排解讀，會把兩段不同時間的"
+        + "成交當成同一批。請先確認後端窗口推導是否退化，修好之前不要並排看這幾張表。",
     },
     revenue: {
       title: "收入對帳",
@@ -205,6 +213,241 @@ export const COPY = {
         accountValue: "帳戶淨值",
         subscription: "訂閱狀態",
       },
+    },
+    /**
+     * 成交品質面板。⭐ 指標名稱用營運看得懂的話，但**不得改變其意義**：
+     * `median_delay_s` 是「配對延遲中位數」——我方成交與 leader 對應成交的時間差。
+     * 把它寫成「速度」或「反應時間」會讓人拿這個數字去回答另一個問題
+     * （「系統快不快」），而那個問題這個數字答不了。
+     */
+    tradeQuality: {
+      title: "成交品質",
+      note:
+        "配對延遲＝我方成交與 leader 對應成交的時間差；滑價以 bp 計，正值代表成交價"
+        + "對跟單者不利。這幾個量與每日對帳報告呼叫同一個算式，不是另外算一份"
+        + "（兩份算式漂移時，兩張表並排看不出已經不同基準）。",
+      // 窗口說明隨模式切換：同一句話不能同時對兩種模式成立。
+      sameWindowNote: "本表與上方收入對帳、每客戶損益取自同一組快照時刻，三張表可並排對照。",
+      // ⚠️ 措辭刻意與客戶表的 daysNote 不同字（「並排」vs「直接」）：兩段文案同時
+      // 出現在同一畫面上，用字一模一樣會讓「這句話在講哪張表」變成要靠位置猜。
+      daysWindowNote:
+        "自由檢視窗：本表取「現在往回 N 天」，與上方收入對帳的窗口（快照時刻）不同基準，"
+        + "兩者的數字不可並排相減。要三張表並排對照請切回「對帳窗口」。",
+      basisUnknown: "快照時刻無法對齊，本次成交品質跳過計算。",
+      basisUnknownNote:
+        "比較窗口的兩端只能取自快照時刻；缺了或順序顛倒時，任何窗口都是猜的。"
+        + "此處刻意不顯示任何品質數字——與其他表不同基準的延遲與滑價，會被讀成可並排"
+        + "對照的數字。",
+      loadFailed: "成交品質載入失敗，本區塊的數字無從得知（其他區塊不受影響）：",
+      empty: "目前沒有可計算成交品質的客戶。",
+      summaryTitle: "跨客戶彙總（最差值，不是平均）",
+      summaryNote:
+        "彙總只涵蓋算得出來的那些客戶，樣本數一併列出：只給一個最差值，會讓"
+        + "「10 個客戶裡只有 1 個有資料」與「10 個都有資料」在畫面上長得一模一樣。"
+        + "中位數的中位數不是中位數，故此處刻意不提供平均。",
+      stats: {
+        followers: "客戶數",
+        qualityAvailable: "有品質資料的客戶",
+        teAvailable: "可配對的客戶（知道跟誰）",
+        skippedAvailable: "有跳過小額資料的客戶",
+        worstDelay: "最慢的配對延遲中位數（秒）",
+        delaySample: "延遲樣本數（客戶）",
+        worstSlippage: "最差的 taker 滑價中位數（bp）",
+        slippageSample: "滑價樣本數（客戶）",
+      },
+      cols: {
+        account: "帳號",
+        fills: "我方成交筆數",
+        takerShare: "taker 佔比",
+        pairCount: "配對成功筆數",
+        medianDelay: "配對延遲中位數（秒）",
+        slippage: "taker 滑價中位數（bp）",
+        skippedNotional: "跳過的小額名目",
+        skippedRatio: "跳過小額佔比",
+      },
+      // ⭐ 三種 null 的意義完全不同，文案必須分得開——全部寫「—」等於把
+      // 「不知道」「算不出來」「查詢失敗」混成同一格。
+      teUnavailable: "無法配對",
+      teUnavailableHint: "不知道這位客戶跟的是誰（manifest 未記 leader_address），延遲與滑價無從計算——刻意不填 0，「延遲 0 秒」讀起來是完美的跟單品質。",
+      skippedUnavailable: "讀不到",
+      skippedUnavailableHint: "跳過小額的記錄檔讀不到（或窗口涵蓋日只有部分天有檔）。部分天的合計會偏低，而偏低的數字讀起來正好像「引擎沒在跳過單」。",
+      // ⚠️ 本任務的核心之一：比例在非整個 UTC 日的窗口下必為 null，
+      // 必須顯示「此窗口無法計算」，不得顯示成 0，也不得留白（留白會被讀成 0）。
+      ratioIncomparable: "此窗口無法計算",
+      ratioIncomparableHint: "跳過小額以整個日曆日落檔（檔內無逐筆時間戳），成交名目卻依窗口過濾。窗口不是整個 UTC 日時，這個比例的分子與分母不同基準——那個商看起來完全像一個正常的比例，所以刻意不算。名目仍然有意義，見左欄。",
+      skippedDaysLabel: "跳過小額的落檔日（比例分母的基準）",
+      rowError: "此列查詢失敗：",
+      rowErrorHint: "單一客戶查詢失敗只影響該列，其餘客戶的品質數字仍然有效。",
+      window: "本表窗口",
+    },
+    /**
+     * 系統健康面板。⭐⭐ 本區塊只有一條設計原則：**讀不到就說讀不到**。
+     * 每一格都有「未知」狀態，而未知**絕不**被折疊成看起來健康的值——
+     * 面板的讀者用它決定「要不要現在去看」，一個謊報健康的格子會讓他**不去看**，
+     * 而那正是他最該去看的時刻。謊報健康比沒有面板更危險。
+     *
+     * 文案上的具體要求：狀態字樣「一切良好」「未觸發」「已生效」只能出現在
+     * 對應的健康分支，不得出現在任何說明句裡——否則「未知時畫面不得出現健康字樣」
+     * 這條就無法用測試釘住（測試會被說明文字裡的同一個詞誤傷）。
+     */
+    health: {
+      title: "系統健康",
+      note:
+        "跨客戶的引擎狀態橫切。每一格都有「未知」——讀不到的項目一律標未知，"
+        + "不會退化成看起來安全的值。未知看起來刺眼是刻意的。",
+      loadFailed: "系統健康載入失敗，本區塊的狀態無從得知（其他區塊不受影響）：",
+      empty: "目前沒有可檢查的客戶。",
+      checkedAtLabel: "本次檢查時刻",
+      staleAfterLabel: "心跳超過此秒數判為過期",
+      // ⭐ 誠實標註：權益樣本欄是代理指標，不是 process 檢查。
+      basisTitle: "「權益樣本」是代理指標，不是 process 存活檢查",
+      basisBody:
+        "那一欄看的是引擎最近有沒有寫過 equity 樣本（每個 cycle 一筆）。一個還在寫檔"
+        + "卻已經不下單的進程，那一欄看起來會是綠燈。真正的 process 存活由 systemd 管"
+        + "（RUNBOOK 的 systemctl status），不要拿那一欄取代它。",
+      basisLabel: "取樣判定基準",
+      basisEquitySample: "equity 樣本（引擎每 cycle 寫一筆）",
+      basisUnknownPrefix: "後端回報的基準代碼（本頁尚無對應說明）：",
+      /**
+       * ⭐⭐ 資料來源揭露。引擎的狀態根是 0700 filet-engine，面板跑在 filet-api——
+       * 面板看得到什麼，取決於它是直讀狀態根還是讀引擎發布的心跳。同一格數字，
+       * 兩個來源的新鮮度差很多，不標示等於讓人拿一個不知道多舊的值下判斷。
+       */
+      sourceTitle: "這張表的資料從哪來",
+      sourceBody:
+        "引擎的狀態目錄只有引擎自己讀得到（0700），面板跑在另一個帳號下。所以面板的"
+        + "資料來自引擎每個 cycle 主動發布的一份窄摘要（心跳）；少數格子面板讀得到就"
+        + "直讀。每一列的「來源」欄說明它的 kill switch 與覆蓋度出自哪一邊——直讀較新鮮。",
+      sourceLabel: "來源",
+      sources: {
+        state_root: "直讀狀態根",
+        heartbeat: "引擎心跳",
+        absent: "狀態根不存在",
+        unreadable: "狀態根讀不到",
+      },
+      sourceUnknownPrefix: "後端回報的來源代碼（本頁尚無對應說明）：",
+      // ⭐⭐ 心跳新鮮度。四態刻意不折疊成一個「未知」：處置完全不同。
+      heartbeat: {
+        ok: "心跳新鮮",
+        stale: "心跳過期",
+        missing: "從未收到心跳",
+        unreadable: "心跳讀不到",
+        unknownPrefix: "後端回報的心跳狀態代碼（本頁尚無對應說明）：",
+        okHint: "引擎在門檻時間內寫過心跳，本列的 leader 與資金設定才有值。",
+        staleHint: "引擎已超過門檻沒有寫心跳——可能是引擎沒在跑，也可能是它在跑但寫不進交換目錄。心跳裡的值一個都不會被顯示成現況（後端在過期時結構上就不回傳那些值）。",
+        missingHint: "這個客戶從來沒有心跳檔。多半是剛啟用、引擎還沒跑過第一個 cycle，或交換目錄的子通道還沒建立（部署待辦）。",
+        unreadableHint: "心跳檔存在但讀不出來（格式壞了或時刻在未來）。這一列的狀態全部無從確認。",
+      },
+      // 狀態字樣。⭐ 健康字樣（一切良好／未觸發／已生效／心跳新鮮）彼此不互為子字串，
+      // 也不得出現在任何說明或標籤裡：測試要能用 not.toMatch 斷言「未知時不出現健康字樣」。
+      state: {
+        alive: "一切良好",
+        stale: "樣本過期",
+        engineUnknown: "樣本未知",
+        tripped: "已觸發",
+        armed: "未觸發",
+        killswitchUnknown: "狀態未知",
+        covered: "已生效",
+        insufficient: "尚未生效",
+        coverageUnknown: "覆蓋未知",
+        /** 通用未知（告警數、積壓筆數、心跳非 ok 時的引擎現況）。 */
+        unknown: "未知",
+      },
+      // ---------- 引擎現況（只可能來自心跳；心跳非 ok 時整區為未知） ----------
+      // ⚠️ 標題刻意不含「心跳新鮮」四字：那是心跳欄的健康值字樣，出現在標題裡會讓
+      // 「未知時畫面不得出現健康字樣」這條測不起來（測試會被標題誤傷）。
+      engineStateTitle: "引擎現況（心跳非新鮮時一律未知）",
+      engineStateNote:
+        "以下是引擎上一個 cycle 實際採用的值。心跳過期或收不到時，這些格子一律「未知」"
+        + "——後端在心跳過期時結構上就不回傳這些值，所以本頁不可能拿一份幾十分鐘前的"
+        + "設定當成現在生效的設定。",
+      engineStateCols: {
+        account: "帳號",
+        leader: "目前 leader",
+        leaderSource: "leader 來源",
+        allocated: "投入本金",
+        utilization: "使用比例",
+        fullEquity: "使用全額權益",
+        capitalSource: "資金設定來源",
+        lastCycle: "上次 cycle",
+      },
+      yes: "是",
+      no: "否",
+      // ⭐ 過期的綠燈比沒有燈更危險：過期時必須同時標「過期」與最後心跳時刻，
+      // 不得把一個過期的心跳當成目前狀態呈現。
+      staleTitle: "有客戶的引擎心跳已過期",
+      staleBody:
+        "這些客戶的引擎已經超過門檻沒有寫入心跳。心跳停了不代表部位被平掉，但代表"
+        + "回撤保護與跟單都可能已經停止運作——最後心跳時刻見下表，那是「上次看到它」"
+        + "的時間，不是它現在的狀態。",
+      // kill switch 已觸發＝該客戶已停止跟單，視覺上必須明顯（不只是文字）。
+      trippedTitle: "有客戶的 kill switch 已觸發，這些客戶已停止跟單",
+      trippedBody:
+        "回撤保護已在這些客戶的帳戶上熔斷並平倉，引擎不會再為他們跟單，直到人工"
+        + "重新 arm。請先確認客戶已被告知，再依 RUNBOOK 處理重新啟用。",
+      unknownTitle: "有格子讀不到，這些項目的狀態無從確認",
+      unknownBody:
+        "以下計數不是「沒有問題」，是「看不到」——最常見的原因是 filet-api 對引擎的"
+        + "狀態目錄沒有讀取權限（狀態根為 0700，跨了一道權限邊界）。在讀不到的期間，"
+        + "熔斷與否、回撤保護是否生效都無從得知，請優先修掉權限再看這張表。",
+      cols: {
+        account: "帳號",
+        heartbeat: "引擎心跳",
+        lastBeat: "最後心跳時刻",
+        engine: "權益樣本",
+        coverage: "回撤保護覆蓋",
+        killswitch: "kill switch",
+        alerts: "告警筆數",
+        source: "來源",
+      },
+      stats: {
+        followers: "客戶數",
+        heartbeatOk: "心跳可用",
+        heartbeatStale: "心跳已過期",
+        heartbeatMissing: "心跳從未寫過",
+        engineAlive: "權益樣本存活",
+        engineStale: "權益樣本已過期",
+        engineUnknown: "權益樣本讀不到",
+        killswitchTripped: "kill switch 已熔斷",
+        killswitchUnknown: "kill switch 讀不到",
+        coverageInsufficient: "回撤保護樣本不足",
+        coverageUnknown: "回撤保護讀不到",
+        alertsTotal: "告警合計",
+        alertsUnknown: "告警數讀不到",
+        backlog: "換 leader 未套用積壓",
+      },
+      // 年齡的單位（元件不內嵌中文字串，沿本檔既有慣例）。
+      units: { sec: "秒", min: "分", hour: "小時", day: "天" },
+      ageSuffix: "前",
+      lastBeatNever: "從未收到心跳",
+      lastBeatNeverHint: "這個客戶的狀態目錄裡沒有任何 equity 樣本。可能是剛啟用、引擎還沒跑過第一個 cycle，也可能是引擎從來沒起來過——本頁分不出這兩者，故不猜。",
+      coverageInsufficientHint: "樣本不足一小時或少於兩筆：回撤保護的 peak 還沒有足夠歷史，此時保護尚未真正發揮作用。這是一個確定的答案，不是「讀不到」。",
+      rowError: "此列讀取失敗：",
+      // ---------- 換 leader 積壓 ----------
+      backlogTitle: "換 leader：已寫入但引擎從沒套用",
+      backlogNote:
+        "客戶簽了、API 收了並回覆「下一個 cycle 生效」，引擎卻從沒套用——這條鏈路"
+        + "橫跨兩個進程與兩套權限，它的失敗是靜默的（兩邊的 log 都正常，客戶以為換好了）。"
+        + "判定與每日對帳報告呼叫同一個函式，不是另寫一份。",
+      backlogEmpty: "沒有積壓的換 leader 記錄。",
+      backlogUnknownTitle: "換 leader 積壓無從得知",
+      backlogUnknownBody:
+        "這條鏈路查不下去（交換目錄沒設好或記錄檔讀不到），所以本頁不顯示積壓筆數。"
+        + "此處刻意不顯示 0——0 會被讀成「沒有積壓」，而實際上是「不知道有沒有積壓」，"
+        + "兩者正好相反。原因如下：",
+      backlogCols: {
+        account: "帳號",
+        nonce: "nonce",
+        age: "記錄年齡",
+        reason: "判定原因",
+      },
+      reasons: {
+        not_redeemed: "記錄已逾時，引擎帳本裡沒有兌現記錄——客戶簽了，引擎從沒套用",
+        bad_issued_at: "記錄的 issued_at 不合法，引擎會拒收這筆變更",
+        ledger_unreadable: "引擎帳本讀不到，無法確認是否已套用（不等於未套用）",
+      },
+      reasonUnknownPrefix: "後端回報的原因代碼（本頁尚無對應說明）：",
+      manifestErrors: "manifest 有壞條目被跳過，以下項目未納入本區塊（其餘客戶照常檢查）：",
     },
     /**
      * 訂閱對帳文案。⭐ 清單標題一律寫「危害是什麼」而不是欄位名：admin 看到

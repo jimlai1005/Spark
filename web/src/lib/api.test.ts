@@ -181,6 +181,8 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getOpsCustomers({ days: 1 }),
       () => api.getOpsRevenue(0.01),
       () => api.getOpsSubscriptions(),
+      () => api.getOpsTradeQuality({ days: 1 }),
+      () => api.getOpsHealth(),
       () => api.getBillingPlans(),
       () => api.getBillingStatus(),
       () => api.postBillingCheckout(),
@@ -220,7 +222,8 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
 
   it("反射函式數量與手寫清單一致——手寫清單不會因新函式而過時（保底斷言）", () => {
     // 對照上一個 describe 的 calls 陣列長度：兩者必須同步增減。
-    const HAND_WRITTEN_LIST_LENGTH = 19;
+    // 2026-07-19：+2（getOpsTradeQuality、getOpsHealth，/ops 兩個新面板）
+    const HAND_WRITTEN_LIST_LENGTH = 21;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 
