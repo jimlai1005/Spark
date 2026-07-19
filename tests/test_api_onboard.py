@@ -164,3 +164,88 @@ def test_status_isolated_between_users(tmp_path):
     login(c2)
     c1.post("/api/onboard/agent")
     assert c2.get("/api/onboard/status").json()["agent_generated"] is False
+
+
+# ── ⭐ spot「卡住資金」偵測（2026-07-19 入金體驗）──────────────────────────
+# 我方只鏡像 perp。客戶從 CEX 提幣或走第三方橋入金時錢會落在 spot，perp 仍是 0 →
+# funded 判 False，而畫面上只寫「尚未入金」。劃轉是 user-signed action，我方結構上
+# 無法代做（需要主鑰，違反非託管不變量）——所以只能偵測＋提示。
+
+
+def test_spot_balance_surfaces_transfer_hint(tmp_path):
+    """spot 有錢 → 回提示資訊，且**足以讓前端寫出金額**。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    hl.spot_usdc[wallet.address.lower()] = Decimal("250.5")
+    s = client.get("/api/onboard/status").json()
+    assert s["spot_stranded"] is not None
+    assert s["spot_stranded"]["usdc"] == "250.5"
+    assert s["spot_stranded"]["action_required"] == "manual_transfer_spot_to_perp"
+    assert "250.5" in s["spot_stranded"]["note"]
+
+
+def test_spot_hint_never_offers_to_transfer_on_the_customers_behalf(tmp_path):
+    """⭐ 非託管不變量（紅線 3）：提示只能說明，不得提供或暗示代客戶劃轉的能力。
+    劃轉需要主鑰簽章，我方結構上不持有——承諾一個做不到的動作比不提示更糟。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    hl.spot_usdc[wallet.address.lower()] = Decimal("250.5")
+    hint = client.get("/api/onboard/status").json()["spot_stranded"]
+    # 沒有任何代簽 payload／劃轉入口的欄位
+    assert set(hint) == {"usdc", "threshold", "action_required", "note"}
+    for k in ("typed_data", "transfer_payload", "transfer_url", "auto_transfer"):
+        assert k not in hint
+    # 文案必須明說「我們無法代為操作」
+    assert "無法" in hint["note"] and "主鑰" in hint["note"]
+
+
+def test_no_spot_balance_no_hint(tmp_path):
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    login(client)
+    assert client.get("/api/onboard/status").json()["spot_stranded"] is None
+
+
+def test_dust_spot_balance_does_not_nag(tmp_path):
+    """塵埃餘額不提示：每次登入都跳一個處理不掉的提示，會讓客戶學會忽略所有提示。
+    邊界：門檻值本身要提示（>= 而非 >），否則剛好 1 USDC 的人永遠看不到說明。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    assert cfg.spot_stranded_min_usdc == Decimal("1")
+    hl.spot_usdc[wallet.address.lower()] = Decimal("0.9999")
+    assert client.get("/api/onboard/status").json()["spot_stranded"] is None
+    hl.spot_usdc[wallet.address.lower()] = Decimal("1")
+    assert client.get("/api/onboard/status").json()["spot_stranded"] is not None
+
+
+def test_spot_query_failure_shows_no_hint_and_does_not_break_status(tmp_path):
+    """⭐ 失效方向刻意與 builder 合規監控**相反**：查不到 → 不提示。
+    對一個已經劃轉好、正在正常跟單的客戶顯示「你的錢卡住了」是純粹的困惑；
+    漏掉一次提示的代價只是他下次載入才看到。假警報比沒提示糟。
+
+    ⚠️ 同時釘住：這個輔助查詢的失敗**不得**把整個 onboarding 狀態頁打成 502
+    （本 app 有 ConnectionError/TimeoutError → 502 的全域 handler）。
+    """
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    for exc in (ConnectionError("spot down"), TimeoutError("slow"),
+                ValueError("schema drift")):
+        hl.spot_error[wallet.address.lower()] = exc
+        r = client.get("/api/onboard/status")
+        assert r.status_code == 200, f"{exc!r} 打掉了狀態頁: {r.text}"
+        assert r.json()["spot_stranded"] is None
+
+
+def test_spot_hint_is_isolated_between_users(tmp_path):
+    """⭐ 只回自己的：address 出自 session，端點無 account 參數（沿既有結構）。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    c1, c2 = _client(app), _client(app)
+    w1 = login(c1)
+    login(c2)
+    hl.spot_usdc[w1.address.lower()] = Decimal("500")
+    assert c1.get("/api/onboard/status").json()["spot_stranded"] is not None
+    assert c2.get("/api/onboard/status").json()["spot_stranded"] is None

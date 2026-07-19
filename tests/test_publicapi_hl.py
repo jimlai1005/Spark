@@ -5,6 +5,7 @@ monkeypatch httpx.post，不觸網。"""
 from decimal import Decimal
 
 import httpx
+import pytest
 
 from spark.publicapi.hl import HLGateway
 from spark.resilience import RETRY_BASE_DELAY
@@ -165,3 +166,44 @@ def test_clearinghouse_state_returns_full_state():
     assert gw.clearinghouse_state("0xabc") == state
     from decimal import Decimal
     assert gw.get_account_value("0xabc") == Decimal("123.5")
+
+
+# ── spot USDC 餘額（「錢卡在 spot」偵測的資料源）──────────────────────────
+
+def test_spot_usdc_balance_parses_and_only_posts_info():
+    """解析 spotClearinghouseState 的 balances；請求體照抄 SDK info.py:130。"""
+    post = _FakePost([{"balances": [
+        {"coin": "HYPE", "token": 1, "total": "12.5", "hold": "0"},
+        {"coin": "USDC", "token": 0, "total": "250.5", "hold": "10"},
+    ]}])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    assert gw.spot_usdc_balance("0x" + "ab" * 20) == Decimal("250.5")
+    url, body = post.calls[0]
+    assert url == "https://x/info"
+    assert body == {"type": "spotClearinghouseState", "user": "0x" + "ab" * 20}
+
+
+def test_spot_usdc_balance_uses_total_not_total_minus_hold():
+    """⭐ 取 `total`：`hold` 是 spot 掛單佔用，那些錢一樣需要客戶自己處理，
+    一樣屬於「卡在 spot」。扣掉 hold 會讓一個把 USDC 全掛在 spot 單上的客戶
+    看到「你沒有卡住的錢」——那正是他最需要看到提示的時候。"""
+    post = _FakePost([{"balances": [
+        {"coin": "USDC", "token": 0, "total": "100", "hold": "100"}]}])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    assert gw.spot_usdc_balance("0x" + "ab" * 20) == Decimal("100")
+
+
+@pytest.mark.parametrize("payload", [
+    {"balances": []},                                    # 完全沒有 spot 部位
+    {"balances": [{"coin": "HYPE", "total": "9"}]},       # 有幣但沒有 USDC
+    {"balances": [{"coin": "USDC", "total": "abc"}]},      # 值不可解析
+    {},                                                   # 缺 balances
+    {"balances": None},
+    "not-a-dict",
+])
+def test_spot_usdc_balance_degrades_to_zero_never_raises(payload):
+    """形狀不符 → 0（＝不提示）。這個查詢唯一的用途是「要不要顯示一句提示」，
+    猜不出來就不提示，不該讓客戶的 onboarding 狀態頁 500。"""
+    gw = HLGateway("https://x", post_fn=_FakePost([payload]),
+                   sleep_fn=lambda s: None)
+    assert gw.spot_usdc_balance("0x" + "ab" * 20) == Decimal("0")

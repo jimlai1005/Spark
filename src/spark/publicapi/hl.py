@@ -78,6 +78,38 @@ class HLGateway:
         """
         return self._info({"type": "portfolio", "user": address}, "HL portfolio 查詢")
 
+    def spot_usdc_balance(self, address: str) -> Decimal:
+        """spot 錢包的 USDC 餘額（唯讀、冪等 → transient 重試）。
+
+        ⭐ 為什麼需要它（入金體驗，2026-07-19）：我方**只鏡像 perp**。客戶從 CEX
+        提幣或走第三方橋入金時，錢會落在 **spot** 錢包，perp 帳戶仍是 0——onboarding
+        的 `funded` 因此判 False，而客戶看著交易所頁面上明明有錢，不知道少了哪一步。
+        spot → perp 的劃轉是 **user-signed action**，我方結構上無法代做（那需要主鑰，
+        違反非託管不變量）。所以能做的只有**偵測並提示**，不能代勞。
+
+        請求體照抄查證過的 SDK 原始碼（`hyperliquid/info.py:130` 的 `spot_user_state`
+        → `{"type": "spotClearinghouseState", "user": address}`）；本進程不 import SDK
+        （只用 httpx，見檔頭），所以是抄原始碼而非憑印象。
+
+        回應形狀 `{"balances": [{"coin": "USDC", "token": 0, "total": "...",
+        "hold": "...", ...}, ...]}`。取 `total`（**不是** `total - hold`）：hold 是
+        spot 掛單佔用，那些錢一樣需要客戶自己處理，一樣屬於「卡在 spot」。
+        查無 USDC 項 → 0（真的沒有這個幣種，不是錯誤）。
+        形狀不符 → 0：本查詢的唯一用途是「要不要顯示一句提示」，猜不出來就不提示，
+        而不是讓客戶的 onboarding 狀態頁 500。
+        """
+        raw = self._info({"type": "spotClearinghouseState", "user": address},
+                         "HL spotClearinghouseState 查詢")
+        if not isinstance(raw, dict):
+            return Decimal("0")
+        for b in raw.get("balances") or []:
+            if isinstance(b, dict) and b.get("coin") == "USDC":
+                try:
+                    return Decimal(str(b.get("total", "0")))
+                except (ValueError, ArithmeticError):
+                    return Decimal("0")
+        return Decimal("0")
+
     def max_builder_fee(self, user: str, builder: str) -> int:
         """使用者已核給 builder 的費率上限（十分之一 bp；0 = 未核）。verify/status 用
         != 0 判 builder fee approval 已上鏈；同時是 maxFeeRate 生效的鏈上真相。"""

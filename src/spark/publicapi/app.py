@@ -1067,8 +1067,56 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         store.set_agent_address(account_id, agent_address)
         return {"agent_address": agent_address}
 
+    def _spot_stranded(address: str) -> dict | None:
+        """客戶的錢是不是卡在 **spot** 錢包？回提示資料或 None（不提示）。
+
+        ⭐ 為什麼這個提示存在：我方只鏡像 perp。客戶從 CEX 提幣或走第三方橋入金時，
+        錢會落在 spot，perp 仍是 0 → `funded` 判 False。客戶在交易所頁面上看得到錢，
+        卻不知道還差一步劃轉，而畫面上只寫「尚未入金」——這是入金漏斗上最貴的一種
+        沉默。本欄位存在的目的就是把那句話補上。
+
+        ⚠️ **只偵測，不代勞**：spot → perp 的劃轉是 user-signed action，需要主鑰才
+        簽得動；我方結構上不持有主鑰（非託管不變量，紅線 3）。本函式與它的回傳結構
+        因此刻意**不含**任何劃轉入口、代簽 payload 或「幫我轉」的旗標——那會是一個
+        我們無法兌現、且不該讓任何人以為存在的承諾。前端只能顯示說明與外部連結。
+
+        ⭐ 查詢失敗 → **None（不提示）**，而不是「未知」或悲觀提示。這裡的失效方向
+        與 builder 合規監控**刻意相反**：對一個已經劃轉好、正在正常跟單的客戶顯示
+        「你的錢卡在 spot」是純粹的困惑與客服成本，而漏掉一次提示的代價只是他晚一點
+        知道（下次載入就會看到）。假警報比沒提示糟——所以這裡 fail-silent。
+        ConnectionError／TimeoutError 必須在此攔下：本 app 的全域 handler 會把它們
+        變成 502，讓一個純輔助欄位打掉整個 onboarding 狀態頁。
+        """
+        try:
+            spot_usdc = hl.spot_usdc_balance(address)
+        except Exception:  # noqa: BLE001 — 見 docstring：假警報比沒提示糟
+            logger.warning("spot 餘額查詢失敗（僅影響提示，不影響 onboarding 判定）")
+            return None
+        if spot_usdc < cfg.spot_stranded_min_usdc:
+            return None
+        return {
+            "usdc": str(spot_usdc),                       # Decimal → str（落地慣例）
+            "threshold": str(cfg.spot_stranded_min_usdc),
+            # ⭐ 顯式說明「為什麼只能你自己動手」：不寫的話，下一個讀這份回應的人
+            # 很自然會問「那你們幫我轉一下」，而答案是結構上不行。
+            "action_required": "manual_transfer_spot_to_perp",
+            "note": (f"你有 {spot_usdc} USDC 在 **spot** 錢包。跟單只使用 perp 帳戶，"
+                     "所以這筆錢要由你自己在 Hyperliquid 介面劃轉到 perp 才會開始"
+                     "跟單。劃轉需要你的主錢包簽章，我們**無法**代為操作"
+                     "（我們不持有你的主鑰）。"),
+        }
+
     def _progress(address: str) -> dict:
-        """onboarding 進度：狀態靠鏈上查詢判定（冪等、斷點續走以此為準，沿 M1 精神）。"""
+        """onboarding 進度：狀態靠鏈上查詢判定（冪等、斷點續走以此為準，沿 M1 精神）。
+
+        ⭐ 為什麼 spot 提示放在這裡而不是 `/api/me/leader`（2026-07-19）：
+        1. 這裡是 `funded=False` 的**產生地**，而「錢卡在 spot」正是它最常見的原因。
+           把診斷放在結論旁邊，前端不必自己把兩個端點的資料拼起來推理。
+        2. `/api/me/leader` 目前**完全不觸網**（只讀 manifest）。為了一個輔助提示給它
+           加上一條 HL 查詢，等於給一個純本地端點引進新的延遲與失敗模式。
+        3. session 隔離沿用既有結構：`address` 來自 `Depends(_require_session)`，
+           本函式**沒有** account 參數，結構上查不到別人的 spot 餘額。
+        """
         account_id = derive_account_id(address)
         agent_address = store.get_agent_address(account_id)
         builder_fee_approved = hl.max_builder_fee(address, cfg.builder_address) != 0
@@ -1082,6 +1130,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "builder_fee_approved": builder_fee_approved,
             "agent_approved": agent_approved,
             "funded": funded,
+            # None ＝ 沒有卡住的錢、或查不到（兩者對前端是同一件事：不顯示提示）。
+            "spot_stranded": _spot_stranded(address),
             "state": "READY" if ready else "IN_PROGRESS",
         }
 

@@ -84,6 +84,11 @@ class ApiConfig:
     # 兩種語意共用同一鏈上門檻常數（builder 啟用門檻 100 USDC），兩個別名指向同一來源：
     min_user_deposit: Decimal = MIN_BUILDER_BALANCE     # 使用者入金門檻（status/verify funded）
     min_builder_balance: Decimal = MIN_BUILDER_BALANCE  # builder 資格門檻（payload pre-flight）
+    # spot「卡住資金」提示的下限（USDC）。低於此值不提示：塵埃餘額（交易所常見的
+    # 0.0001 USDC 零頭）不值得打擾客戶，而每次登入都跳一個處理不掉的提示會讓他
+    # 學會忽略所有提示。⭐ 刻意**不**與 min_user_deposit 綁在一起：那是「夠不夠開始
+    # 跟單」，這是「值不值得提一句」，兩個不同的問題共用一個門檻遲早會有人改錯一邊。
+    spot_stranded_min_usdc: Decimal = Decimal("1")
     session_ttl_s: int = 7 * 24 * 3600
     nonce_ttl_s: int = 300
     # --- M3 計費骨幹（全 optional；未設＝billing 停用，onboarding 不受影響） ---
