@@ -34,6 +34,12 @@ def map_stripe_status(stripe_status: str) -> str:
     return _STRIPE_STATUS_MAP.get(stripe_status, "canceled")
 
 
+# 對帳單次拉取的硬上限：避免 auto-pagination 在異常帳戶（或 API 迴圈）下無限翻頁。
+# 達上限時**不靜默截斷**——list_subscriptions 回 truncated=True，端點原樣上呈，
+# 因為截斷過的清單會讓「本地有、Stripe 沒有」的判斷產生假漂移（工程原則 3）。
+MAX_RECONCILE_SUBSCRIPTIONS = 1000
+
+
 class BillingError(RuntimeError):
     """Stripe 語意失敗（semantic，不重試）：請求被拒、設定錯、回應缺欄位。"""
 
@@ -47,10 +53,11 @@ class StripeGateway:
     （無全域 stripe.api_key 狀態）。失敗分類集中在 create_checkout_session 一處，
     注入 fake 也繞不開（結構性）。"""
 
-    def __init__(self, secret_key: str, create_fn=None, portal_fn=None):
+    def __init__(self, secret_key: str, create_fn=None, portal_fn=None, list_fn=None):
         self._secret_key = secret_key
         self._create = create_fn or self._default_create
         self._portal = portal_fn or self._default_portal
+        self._list = list_fn or self._default_list
 
     def __repr__(self) -> str:  # key 不進 repr/log（紅線 1）
         return "<StripeGateway test-mode>"
@@ -62,6 +69,10 @@ class StripeGateway:
     def _default_portal(self, **params):
         import stripe
         return stripe.billing_portal.Session.create(api_key=self._secret_key, **params)
+
+    def _default_list(self, **params):
+        import stripe
+        return stripe.Subscription.list(api_key=self._secret_key, **params)
 
     def create_checkout_session(self, *, account_id: str, price_id: str,
                                 success_url: str, cancel_url: str,
@@ -116,6 +127,64 @@ class StripeGateway:
         if not url:
             raise BillingError("stripe 回應缺 portal url")
         return url
+
+
+    def list_subscriptions(self, *, limit: int = 100) -> dict:
+        """列出 Stripe 上的訂閱（對帳用，**唯讀**）。回
+        `{"subscriptions": [...], "truncated": bool}`。
+
+        ⭐ 與 checkout/portal 的關鍵差異——**這是讀取，冪等，重試安全**：
+        重跑一次只是多讀一次，不會多開一張訂閱、不會多扣一次錢。checkout/portal
+        是非冪等寫入，回應遺失時重試會產生重複副作用，故那兩處刻意單次嘗試
+        （工程原則 2）。本方法沒有那個約束，日後要在邊界內加退避重試是安全的；
+        目前**刻意先不加**：這是 admin 手動開啟的營運檢視，失敗即 502、由管理員重新
+        整理頁面即可，人肉重試比隱藏的自動重試更容易看見 Stripe 端的異常。
+
+        `status="all"`：Stripe 預設只回未取消者，但對帳最想抓的正是「本地 active
+        而 Stripe 已取消」（漏財），漏掉已取消者等於漏掉主要訊號。
+
+        分頁：`limit` 是**每頁**筆數（Stripe 上限 100），總量靠 SDK 的
+        `auto_paging_iter()` 翻完；再套 `MAX_RECONCILE_SUBSCRIPTIONS` 硬上限防無限迴圈。
+        達上限時回 `truncated=True` 而不是靜默截斷——截斷的清單會讓「本地有、Stripe
+        沒有」變成假漂移，呼叫端必須知道自己拿到的是不完整的樣本。
+
+        欄位白名單投影（沿 `_plan_public` 慣例）：只取對帳需要的 id/status/customer/
+        metadata.account_id，其餘 Stripe 欄位（含金額、卡片資訊）不進本服務。
+        """
+        import stripe
+        subs: list[dict] = []
+        truncated = False
+        try:
+            page = self._list(status="all", limit=limit)
+            # auto_paging_iter 是惰性的：翻頁的網路呼叫發生在迭代當中，
+            # 故整個迴圈都必須在 try 內，否則第二頁的失敗會逃出失敗分類。
+            for obj in page.auto_paging_iter():
+                if len(subs) >= MAX_RECONCILE_SUBSCRIPTIONS:
+                    truncated = True
+                    break
+                subs.append(_subscription_public(obj))
+        except (stripe.APIConnectionError, stripe.RateLimitError) as e:
+            raise ConnectionError(f"stripe 連線失敗: {type(e).__name__}") from e
+        except stripe.StripeError as e:
+            raise BillingError(f"stripe 訂閱列表被拒: {type(e).__name__}: "
+                               f"{getattr(e, 'user_message', None) or e}") from e
+        if truncated:
+            # 大聲留痕（工程原則 3）：對帳樣本不完整是「結論不可信」而非「沒事」
+            logger.warning("stripe 訂閱列表達上限 %d 筆，對帳樣本不完整",
+                           MAX_RECONCILE_SUBSCRIPTIONS)
+        return {"subscriptions": subs, "truncated": truncated}
+
+
+def _subscription_public(obj) -> dict:
+    """Stripe Subscription → 對帳用 dict（白名單欄位）。obj 可為 StripeObject
+    或純 dict（測試 fake），兩者皆支援 `.get`。"""
+    md = obj.get("metadata") or {}
+    return {
+        "id": obj.get("id"),
+        "status": obj.get("status"),
+        "customer": obj.get("customer"),
+        "metadata": {"account_id": md.get("account_id") if hasattr(md, "get") else None},
+    }
 
 
 def verify_webhook_event(payload: bytes, sig_header: str, webhook_secret: str):

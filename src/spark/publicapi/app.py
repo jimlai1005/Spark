@@ -18,7 +18,7 @@ from spark.publicapi.billing import (BillingError, BillingSignatureError,
                                      plan_catalog, verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.ops import (customer_pnl, jsonable, load_accrued_series,
-                                 revenue_reconciliation)
+                                 revenue_reconciliation, subscription_drift)
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
@@ -272,6 +272,39 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                          "day": day_iso, "prev_day": prev_day,
                          "window_start": start.isoformat(), "window_end": end.isoformat(),
                          "customers": rows, "manifest_errors": manifest_errors})
+
+    @app.get("/api/ops/subscriptions")
+    def ops_subscriptions(admin: str = Depends(_require_admin)):
+        """訂閱對帳（admin only）：本地 billing 表 vs Stripe 真實狀態。
+
+        存在理由：webhook 是本地 billing 表的唯一寫入者，掉一包就永久漂移，
+        原本沒有任何察覺途徑。兩個漂移方向的危害不同（見 ops.subscription_drift）：
+        本地 active／Stripe 已取消 = 漏財；Stripe active／本地沒有 = 客戶付了錢沒權益。
+
+        ⭐ **刻意只偵測、不修正**：本端點不做任何寫入（不改本地 billing、不碰 Stripe）。
+        「一鍵以 Stripe 為準同步本地」會直接改變計費與 entitlement 狀態——那是碰錢的
+        操作，必須是人工決策（紅線 5/6 的精神）。修正動作留待後續，且需使用者明確授權。
+        本輪的正確用法：看到漂移 → 人工確認 Stripe 端真相 → 決定怎麼處理。
+
+        ⚠️ `truncated=True` 時清單不完整（達 MAX_RECONCILE_SUBSCRIPTIONS 上限），
+        `local_active_stripe_not` 內「Stripe 查無此訂閱」的項目可能是假漂移——
+        原樣上呈而非靜默吞掉，讓管理員知道結論不可信（工程原則 3）。
+
+        Stripe 失敗分類（紅線 4）：transient=ConnectionError→502；semantic=BillingError→502。
+        列表查詢是冪等讀取（與 checkout 不同），重試安全——見 list_subscriptions docstring。
+        """
+        _require_billing()
+        listing = billing.list_subscriptions()
+        result = subscription_drift(store.list_billing(), listing["subscriptions"])
+        if result["drift_count"]:
+            # 漂移＝計費與服務對不上，大聲留痕（工程原則 3），不只靜靜回 200
+            logger.warning("訂閱對帳發現漂移 total=%d 漏財=%d 付錢沒權益=%d "
+                           "狀態不符=%d 孤兒=%d truncated=%s",
+                           result["drift_count"], len(result["local_active_stripe_not"]),
+                           len(result["stripe_active_local_not"]),
+                           len(result["status_mismatch"]), len(result["orphan_stripe"]),
+                           listing["truncated"])
+        return jsonable({**result, "truncated": listing["truncated"]})
 
     # ---------- 待簽 payload（後端建 typed data，不簽；前端簽完直送 HL /exchange） ----------
     @app.post("/api/onboard/payload/approve-agent")

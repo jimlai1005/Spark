@@ -159,6 +159,19 @@ class ApiStore:
                 "WHERE account_id = ?", (account_id,)).fetchone()
         return BillingRecord(*row) if row else None
 
+    def list_billing(self) -> list[BillingRecord]:
+        """全表列出（**唯讀**，訂閱對帳專用）。⭐ 全 repo 唯二的跨客戶讀取之一
+        （另一個是 ops.customer_pnl）——呼叫端必須掛 admin 閘（app.py `_require_admin`）。
+        對帳需要「本地有記錄但 Stripe 沒有」與「Stripe 有但本地完全沒記錄」兩個方向，
+        逐 account 查（get_billing）只看得到前者，故必須全表掃。
+        依 account_id 排序：輸出穩定，diff 與測試不受 SQLite 回傳順序影響。"""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT account_id, stripe_customer_id, stripe_subscription_id, "
+                "status, updated_at, last_event_created, last_event_id FROM billing "
+                "ORDER BY account_id").fetchall()
+        return [BillingRecord(*row) for row in rows]
+
     def get_billing_by_subscription(self, subscription_id: str) -> BillingRecord | None:
         """webhook subscription 事件無 metadata 時的 fallback 對應（設計定案 4）。"""
         with self._lock:

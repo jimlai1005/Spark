@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from spark.filet.aggregate import collect_follower_summary
+from spark.publicapi.billing import map_stripe_status
 
 
 def customer_pnl(followers, adapter, start: datetime, end: datetime,
@@ -116,6 +117,136 @@ def revenue_reconciliation(rows, accrued_now: Decimal, accrued_prev: Decimal,
         "over_threshold": over_threshold,
         "threshold_pct": threshold,
         "rows": len(rows),
+    }
+
+
+_ACTIVE = "active"
+
+
+def _field(row, name):
+    """支援 BillingRecord（dataclass）與 dict 兩種來源——純函式不綁定 store 型別。"""
+    if isinstance(row, dict):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def subscription_drift(local_rows, stripe_subs) -> dict:
+    """比對本地 billing 表與 Stripe 訂閱，找出漂移（**唯讀偵測，不做任何修正**）。
+
+    存在理由：webhook 是本地 billing 表的唯一寫入者，掉一包就永久漂移，且兩個方向的
+    危害不同——
+    - `local_active_stripe_not`：本地 active 但 Stripe 非 active（含 Stripe 上根本
+      查無此訂閱）→ **漏財**：還在提供服務卻收不到錢。
+    - `stripe_active_local_not`：Stripe active 但本地非 active／無記錄 → **客戶付了錢
+      沒拿到權益**：信任問題，比漏財更嚴重。
+    - `status_mismatch`：兩邊都有、狀態不同，但不屬上述兩類（例如 past_due vs canceled）。
+    - `orphan_stripe`：對不到任何本地 account 的 Stripe 訂閱，且**非 active**
+      （多為外部手建或測試殘留）。
+
+    ⚠️ 分類優先序（刻意的：危害優先於分類整齊）：Stripe active 卻對不到本地 account，
+    同時符合 `stripe_active_local_not`（無記錄）與 `orphan_stripe`（對不到）的字面
+    定義。一律歸入 `stripe_active_local_not`——那是「有人付了錢」的清單，漏掉一筆的
+    代價遠高於 orphan 清單多一筆。故 `orphan_stripe` 只收非 active 的孤兒，四類互斥
+    不重複計數。
+
+    ⚠️ 同基準比較（工程原則 1）：Stripe 的**原始** status 與本地 status 不同一套值域
+    （Stripe 有 trialing/unpaid/incomplete…，本地只有 none/active/past_due/canceled）。
+    比較前一律先過 `map_stripe_status` 正規化到本地值域，兩側同基準——否則 `trialing`
+    會被誤判成 mismatch，而它在本地映射就是 `active`（webhook 寫入時走的是同一個
+    映射函式，這裡刻意重用同一個，不另寫一份對照表）。
+
+    ⚠️ 呼叫端注意：`stripe_subs` 若是被截斷的清單（見 `StripeGateway
+    .list_subscriptions` 的 `truncated`），「本地有、Stripe 沒有」的判定會產生假漂移
+    ——本函式無從得知截斷與否，截斷旗標由呼叫端一併上呈。
+
+    對應鍵：優先 `stripe_subscription_id`，其次 metadata 的 account_id
+    （沿 `apply_webhook_event` 的雙保險慣例）。`matched_by` 欄位記錄實際命中的是哪一個。
+    """
+    local_rows = list(local_rows)
+    by_sub: dict[str, object] = {}
+    by_acct: dict[str, object] = {}
+    for row in local_rows:
+        acct = _field(row, "account_id")
+        sub_id = _field(row, "stripe_subscription_id")
+        if acct:
+            by_acct[acct] = row
+        if sub_id:
+            by_sub[sub_id] = row
+
+    local_active_stripe_not: list[dict] = []
+    stripe_active_local_not: list[dict] = []
+    status_mismatch: list[dict] = []
+    orphan_stripe: list[dict] = []
+    in_sync = 0
+    matched_accounts: set[str] = set()
+    stripe_count = 0
+
+    for sub in stripe_subs:
+        stripe_count += 1
+        sub_id = _field(sub, "id")
+        raw_status = _field(sub, "status") or ""
+        stripe_status = map_stripe_status(raw_status)  # ⭐ 正規化後才比（同基準）
+        md = _field(sub, "metadata") or {}
+        md_acct = md.get("account_id") if isinstance(md, dict) else None
+
+        row = by_sub.get(sub_id) if sub_id else None
+        matched_by = "subscription_id" if row is not None else None
+        if row is None and md_acct:
+            row = by_acct.get(md_acct)
+            matched_by = "metadata" if row is not None else None
+
+        if row is None:
+            entry = {"account_id": md_acct, "local_status": None,
+                     "stripe_status": stripe_status, "stripe_status_raw": raw_status,
+                     "stripe_subscription_id": sub_id, "matched_by": None}
+            # 危害優先：付了錢卻對不到帳號 → 進「客戶沒拿到權益」清單，不進 orphan
+            (stripe_active_local_not if stripe_status == _ACTIVE
+             else orphan_stripe).append(entry)
+            continue
+
+        acct = _field(row, "account_id")
+        matched_accounts.add(acct)
+        local_status = _field(row, "status") or "none"
+        entry = {"account_id": acct, "local_status": local_status,
+                 "stripe_status": stripe_status, "stripe_status_raw": raw_status,
+                 "stripe_subscription_id": sub_id, "matched_by": matched_by}
+        if local_status == _ACTIVE and stripe_status != _ACTIVE:
+            local_active_stripe_not.append(entry)
+        elif stripe_status == _ACTIVE and local_status != _ACTIVE:
+            stripe_active_local_not.append(entry)
+        elif stripe_status != local_status:
+            status_mismatch.append(entry)
+        else:
+            in_sync += 1
+
+    # 本地有、Stripe 完全查無此訂閱（status="all" 已涵蓋已取消者，故「查無」＝真的沒有）
+    for row in local_rows:
+        acct = _field(row, "account_id")
+        if acct in matched_accounts:
+            continue
+        local_status = _field(row, "status") or "none"
+        entry = {"account_id": acct, "local_status": local_status,
+                 "stripe_status": None, "stripe_status_raw": None,
+                 "stripe_subscription_id": _field(row, "stripe_subscription_id"),
+                 "matched_by": None}
+        if local_status == _ACTIVE:
+            local_active_stripe_not.append(entry)   # 漏財：給了權益，Stripe 上沒這筆
+        elif local_status in ("none", "canceled"):
+            in_sync += 1                            # 兩邊都無權益＝一致
+        else:
+            status_mismatch.append(entry)           # past_due 卻查無訂閱：要查
+
+    drift_count = (len(local_active_stripe_not) + len(stripe_active_local_not)
+                   + len(status_mismatch) + len(orphan_stripe))
+    return {
+        "local_active_stripe_not": local_active_stripe_not,
+        "stripe_active_local_not": stripe_active_local_not,
+        "status_mismatch": status_mismatch,
+        "orphan_stripe": orphan_stripe,
+        "in_sync_count": in_sync,
+        "drift_count": drift_count,
+        "local_count": len(local_rows),
+        "stripe_count": stripe_count,
     }
 
 

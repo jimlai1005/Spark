@@ -100,17 +100,20 @@ def test_all_admin_scoped_routes_are_gated(tmp_path):
         assert "_require_admin" in _dep_call_names(route.dependant), \
             f"{path} 未掛 admin 閘"
         seen.add(path)
-    assert seen == {"/api/ops/customers", "/api/ops/revenue", "/api/admin/pending"}
+    assert seen == {"/api/ops/customers", "/api/ops/revenue", "/api/ops/subscriptions",
+                    "/api/admin/pending"}
 
 
-@pytest.mark.parametrize("path", ["/api/ops/customers", "/api/ops/revenue"])
+@pytest.mark.parametrize("path", ["/api/ops/customers", "/api/ops/revenue",
+                                  "/api/ops/subscriptions"])
 def test_ops_requires_session(tmp_path, path):
     cfg = _ops_cfg(tmp_path)
     app, *_ = make_app(tmp_path, cfg=cfg)
     assert _client(app).get(path).status_code == 401
 
 
-@pytest.mark.parametrize("path", ["/api/ops/customers", "/api/ops/revenue"])
+@pytest.mark.parametrize("path", ["/api/ops/customers", "/api/ops/revenue",
+                                  "/api/ops/subscriptions"])
 def test_ops_403_for_non_admin(tmp_path, path):
     """已登入但不在白名單 → 403（跨客戶資料絕不外洩給一般客戶）。"""
     cfg = _ops_cfg(tmp_path)
