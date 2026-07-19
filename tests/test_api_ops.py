@@ -231,13 +231,28 @@ def test_reconciliation_under_threshold():
 
 def test_reconciliation_zero_attributed_no_zero_division():
     """⭐ 除零防護：attributed 為 0 → pct 回 None（不炸、不假裝 0%）；
-    但 discrepancy 仍照實回報，「應收 0 而實收非 0」的異常不會消失。"""
+    但若 accrued_delta 非 0 則 over_threshold 為 True（異常不得靜默放行）。"""
     out = revenue_reconciliation([], Decimal("5"), Decimal("0"),
                                  threshold_pct=Decimal("0.01"))
     assert out["attributed"] == Decimal("0")
     assert out["discrepancy_pct"] is None
-    assert out["over_threshold"] is False
+    assert out["over_threshold"] is True  # 收到費用卻無歸屬，必須告警
     assert out["discrepancy"] == Decimal("5")
+
+
+def test_zero_attributed_with_accrued_flags_anomaly():
+    """應收 0 但實收非 0：算不出百分比，但仍必須判為異常（不得靜默放行）。"""
+    out = revenue_reconciliation([], Decimal("5"), Decimal("0"),
+                                 threshold_pct=Decimal("0.01"))
+    assert out["discrepancy_pct"] is None
+    assert out["over_threshold"] is True, "收到費用卻歸屬不到客戶，必須告警"
+
+
+def test_zero_attributed_zero_accrued_is_not_anomaly():
+    """應收 0 且實收 0：安靜的一天，不得誤報。"""
+    out = revenue_reconciliation([], Decimal("0"), Decimal("0"),
+                                 threshold_pct=Decimal("0.01"))
+    assert out["over_threshold"] is False
 
 
 def test_north_star_never_derived_from_rows():

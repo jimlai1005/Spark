@@ -88,16 +88,24 @@ def revenue_reconciliation(rows, accrued_now: Decimal, accrued_prev: Decimal,
     ⚠️ 同基準要求（工程原則 1）：呼叫端必須保證 rows 的時間窗與 accrued 今昨差
     覆蓋**同一段期間**，否則 discrepancy 是窗口錯配的假訊號、不是真對不上。
 
-    除零防護：`attributed` 為 0 時 `discrepancy_pct` 回 None（不得除零），
-    此時 `over_threshold` 為 False——但 `discrepancy` 仍照實回報，
-    「應收 0 而實收非 0」的異常不會因為算不出百分比而消失。
+    除零防護：`attributed` 為 0 時 `discrepancy_pct` 回 None（不得除零）；
+    但若 `accrued_delta` 非 0（收到費用卻歸屬不到任何客戶）仍判 `over_threshold`
+    為 True——異常不得因為算不出百分比而靜默放行。若 `accrued_delta` 也為 0
+    則 `over_threshold` 為 False（無收費，無異常）。
     """
     attributed = sum((_as_decimal(r.get("builder_fee")) for r in rows), Decimal("0"))
     # ⭐ 只從參數取；此處刻意不出現任何 rows 的聚合（紅線：北極星不由 rows 推導）
     accrued_delta = Decimal(str(accrued_now)) - Decimal(str(accrued_prev))
     discrepancy = accrued_delta - attributed
-    pct = (abs(discrepancy) / attributed) if attributed != 0 else None
     threshold = Decimal(str(threshold_pct))
+    # attributed == 0 但 accrued_delta != 0：收到費用卻歸屬不到任何客戶——
+    # 百分比無從計算（除零），但這是該告警的異常，不得因為算不出比例而靜默放行。
+    if attributed == 0:
+        pct = None
+        over_threshold = accrued_delta != 0
+    else:
+        pct = abs(discrepancy) / attributed
+        over_threshold = pct > threshold
     return {
         "attributed": attributed,
         "accrued_delta": accrued_delta,
@@ -105,7 +113,7 @@ def revenue_reconciliation(rows, accrued_now: Decimal, accrued_prev: Decimal,
         "accrued_prev": Decimal(str(accrued_prev)),
         "discrepancy": discrepancy,
         "discrepancy_pct": pct,
-        "over_threshold": pct is not None and pct > threshold,
+        "over_threshold": over_threshold,
         "threshold_pct": threshold,
         "rows": len(rows),
     }
