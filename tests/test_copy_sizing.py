@@ -7,6 +7,8 @@ hl-copytrader 對應（唯讀移植來源）：
 """
 from decimal import Decimal
 
+import pytest
+
 from spark.copytrade.config import CopySettings
 from spark.copytrade.sizing import (
     HoldingStats,
@@ -23,17 +25,32 @@ EQ = Decimal("10000")  # compute_volatility_stats 的 equity 參數（M1 未使�
 
 
 class TestResolveCapital:
-    """port hl sync.py:21-26。"""
+    """port hl sync.py:21-26。模式由**顯式旗標**選擇（不再由 allocated 的值兼任）。"""
 
-    def test_allocated_zero_uses_equity(self):
-        assert resolve_capital(Decimal("2500"), Decimal("0")) == Decimal("2500")
+    def test_full_equity_uses_equity(self):
+        assert resolve_capital(Decimal("2500"), Decimal("0"),
+                               use_full_equity=True) == Decimal("2500")
 
     def test_allocated_positive_uses_fixed(self):
-        assert resolve_capital(Decimal("2500"), Decimal("5000")) == Decimal("5000")
+        assert resolve_capital(Decimal("2500"), Decimal("5000"),
+                               use_full_equity=False) == Decimal("5000")
 
     def test_negative_equity_clamped_to_zero(self):
         # hl sync.py:26 的 max(my_equity, 0.0)
-        assert resolve_capital(Decimal("-100"), Decimal("0")) == Decimal("0")
+        assert resolve_capital(Decimal("-100"), Decimal("0"),
+                               use_full_equity=True) == Decimal("0")
+
+    def test_use_full_equity_is_required_keyword(self):
+        """⭐ 模式必須在**呼叫點**宣告：沒有預設值可以讓呼叫端不小心選到一邊。
+        兩個模式差的是整個曝險基準（固定本金 vs 整個帳戶）。"""
+        with pytest.raises(TypeError):
+            resolve_capital(Decimal("2500"), Decimal("0"))
+
+    def test_fixed_mode_ignores_equity_entirely(self):
+        """固定本金模式下 my_equity 完全不參與——包含權益比本金大的情形。
+        （舊實作在此路徑上同解；本測試釘住的是「模式由旗標決定」而非由大小關係決定。）"""
+        assert resolve_capital(Decimal("999999"), Decimal("5000"),
+                               use_full_equity=False) == Decimal("5000")
 
 
 class TestComputeScaleFactor:
@@ -83,7 +100,7 @@ class TestComputeScaleFactor:
 
     def test_allocated_capital_overrides_equity(self):
         # allocated=5000 → 5000×1×1/100000 = 0.05（不看 my_equity=1000）
-        s = CopySettings(allocated_capital=Decimal("5000"))
+        s = CopySettings(allocated_capital=Decimal("5000"), use_full_equity=False)
         scale = compute_scale_factor(
             Decimal("100000"), Decimal("1000"),
             target_notional=Decimal("0"), settings=s, weight=Decimal("1"),

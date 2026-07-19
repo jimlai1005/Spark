@@ -131,6 +131,12 @@ class CapitalSettingsBody(BaseModel):
     issued_at: str
     signature: str
     message: str = ""
+    # ⭐ 顯式的本金模式旗標（見 filet/capital_settings.py 檔頭）。收 bool 而非字串：
+    # Pydantic 會把 "true"/"1" 之類的寬鬆真值轉成 True，但**記錄層**（require_bool_flag）
+    # 只收真正的 bool——這裡先收窄成 bool，落檔時就一定是合法型別。
+    # 預設 False＝固定本金模式，也就是**限制較嚴**的那一邊：舊版客戶端不送這個欄位
+    # 時行為與改動前完全相同，且漏送不可能放行一筆「用全部權益」的授權。
+    use_full_equity: bool = False
 
 
 # leader 目錄要外流的**快照統計欄位白名單**。watchlist 快照存的是一日一點的資產負債
@@ -674,6 +680,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
     @app.get("/api/me/capital/message")
     def capital_settings_message(allocated_capital: str, capital_utilization: str,
+                                 use_full_equity: bool = False,
                                  address: str = Depends(_require_session)):
         """回傳資金設定的 **canonical 待簽原文** ＋ 配套的一次性 nonce。
 
@@ -684,13 +691,17 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         ⭐ 邊界在**發原文之前**就檢查（超界 → 400，不發 nonce、不給原文）：
         讓客戶簽一份必定被 POST 拒絕的原文，是把閘門變成一個只會浪費他一次錢包
         簽名的陷阱（沿 leaders_select_message 用 is_selectable 的同一個決定）。
+
+        ⭐ `use_full_equity=true` 時 `allocated_capital` 必須送 0（不是「隨便送、
+        反正會被忽略」）——邊界檢查會擋下矛盾組合，理由見 validate_capital_bounds：
+        客戶不該簽下一份同時寫著「本金 1000」與「用全部權益」的授權。
         """
         account_id = derive_account_id(address)
         try:
             # canonical 化（格式）＋ 邊界（政策），兩者都是 semantic 失敗（400）。
             alloc, alloc_str, util, util_str = canonical_capital_values(
                 allocated_capital, capital_utilization)
-            validate_capital_bounds(alloc, util)
+            validate_capital_bounds(alloc, util, use_full_equity=use_full_equity)
         except CapitalSettingsError as e:
             raise HTTPException(
                 status_code=400,
@@ -705,10 +716,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # POST 的 body，兩邊結構上不可能組出不同的字串（工程原則 1）。
         message = build_capital_settings_message(
             account_id=account_id, allocated_capital=alloc_str,
-            capital_utilization=util_str, nonce=nonce, issued_at=issued_at)
+            capital_utilization=util_str, nonce=nonce, issued_at=issued_at,
+            use_full_equity=use_full_equity)
+        # 旗標原樣回給客戶端，讓它原封不動回填進 POST body——與兩個金額字串同一個
+        # 理由（工程原則 1）：伺服器重建訊息時用的是哪個值，客戶端就該回哪個值。
         return {"message": message, "nonce": nonce, "issued_at": issued_at,
                 "account_id": account_id, "allocated_capital": alloc_str,
-                "capital_utilization": util_str}
+                "capital_utilization": util_str,
+                "use_full_equity": use_full_equity}
 
     @app.post("/api/me/capital")
     def capital_settings_submit(body: CapitalSettingsBody,
@@ -737,7 +752,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         try:
             alloc, _alloc_str, util, _util_str = canonical_capital_values(
                 body.allocated_capital, body.capital_utilization)
-            validate_capital_bounds(alloc, util)
+            validate_capital_bounds(alloc, util,
+                                    use_full_equity=body.use_full_equity)
         except CapitalSettingsError as e:
             raise HTTPException(
                 status_code=400,
@@ -763,7 +779,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             account_id=body.account_id, allocated_capital=body.allocated_capital,
             capital_utilization=body.capital_utilization, nonce=body.nonce,
             issued_at=body.issued_at, signature=body.signature,
-            message=body.message)
+            message=body.message, use_full_equity=body.use_full_equity)
         try:
             verified = verify_capital_settings(record, account_id=account_id,
                                                user_address=address,
@@ -786,7 +802,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             allocated_capital=verified.allocated_capital_str,
             capital_utilization=verified.capital_utilization_str,
             nonce=verified.nonce, issued_at=verified.issued_at,
-            signature=body.signature, message=body.message)
+            signature=body.signature, message=body.message,
+            # 旗標取自 **verified**（驗章通過的值），不是 body——落檔的每一個欄位
+            # 都必須是通過驗證的那一份，否則落地的記錄與客戶簽的原文可以不一致。
+            use_full_equity=verified.use_full_equity)
         try:
             write_capital_settings(cfg.capital_settings_path, record)
         except OSError as e:
@@ -805,6 +824,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "account_id": account_id,
             "allocated_capital": verified.allocated_capital_str,
             "capital_utilization": verified.capital_utilization_str,
+            "use_full_equity": verified.use_full_equity,
             "effective": "next_engine_cycle",
             "effective_note": "已記錄，於引擎的下一個 cycle 生效——不是立即生效；"
                               "引擎會在套用前**自己重新驗證你的簽章與數值範圍**，"

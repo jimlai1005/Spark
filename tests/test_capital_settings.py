@@ -22,6 +22,7 @@ from eth_account.messages import encode_defunct
 
 from spark.filet.capital_settings import (ACTION_CAPITAL_SETTINGS,
                                           CAPITAL_SETTINGS_FIELDS,
+                                          FULL_EQUITY_MESSAGE_VALUE,
                                           CapitalSettingsError,
                                           build_capital_settings_message,
                                           build_capital_settings_record,
@@ -62,18 +63,21 @@ def _sign(wallet, message: str) -> str:
 
 
 def _record(wallet, *, account_id=None, alloc="1000", util="0.5", nonce="n1",
-            issued_at=None, signer=None, tamper=None) -> dict:
+            issued_at=None, signer=None, tamper=None,
+            use_full_equity=False) -> dict:
     """簽一筆合法的資金設定記錄。`tamper` 在簽完之後改動欄位（重放／竄改）。"""
     account_id = account_id or _acct(wallet)
     issued_at = issued_at or _at()
     _, alloc_s, _, util_s = canonical_capital_values(alloc, util)
     msg = build_capital_settings_message(
         account_id=account_id, allocated_capital=alloc_s,
-        capital_utilization=util_s, nonce=nonce, issued_at=issued_at)
+        capital_utilization=util_s, nonce=nonce, issued_at=issued_at,
+        use_full_equity=use_full_equity)
     rec = build_capital_settings_record(
         account_id=account_id, allocated_capital=alloc_s,
         capital_utilization=util_s, nonce=nonce, issued_at=issued_at,
-        signature=_sign(signer or wallet, msg), message=msg)
+        signature=_sign(signer or wallet, msg), message=msg,
+        use_full_equity=use_full_equity)
     if tamper:
         rec.update(tamper)
     return rec
@@ -431,3 +435,141 @@ def test_path_is_anchored_on_the_exchange_dir(tmp_path):
 def test_record_is_json_serialisable(tmp_path, wallet):
     """落檔內容必須是純 JSON（Decimal 不得漏進來）。"""
     json.dumps(_record(wallet))
+
+
+# ── ⭐ use_full_equity：顯式旗標（解除 `0` 的語意重載） ────────────────
+
+def test_full_equity_record_verifies(wallet):
+    """⭐ 「用全部權益」是一筆合法的客戶簽章意圖（本金 0 ＋ 旗標 True）。
+    改動前這組值無法通過邊界檢查，客戶因此無法表達這個意圖。"""
+    rec = _record(wallet, alloc="0", util="0.5", use_full_equity=True)
+    v = verify_capital_settings(rec, account_id=_acct(wallet),
+                                user_address=wallet.address, now_s=_NOW,
+                                consume_nonce=_always)
+    assert v.use_full_equity is True
+    assert v.allocated_capital == Decimal("0")
+
+
+def test_absent_flag_reads_as_fixed_capital(wallet):
+    """⭐ 向後相容：改動前寫下的記錄沒有這個欄位 → False（固定本金）。
+    那是它當時的正確語意；讀成 True 會把一筆固定本金授權放大成整個帳戶。"""
+    rec = _record(wallet)
+    del rec["use_full_equity"]
+    v = verify_capital_settings(rec, account_id=_acct(wallet),
+                                user_address=wallet.address, now_s=_NOW,
+                                consume_nonce=_always)
+    assert v.use_full_equity is False
+    assert v.allocated_capital == Decimal("1000")
+
+
+@pytest.mark.parametrize("bad", ["true", "True", 1, 0, "yes", []])
+def test_non_boolean_flag_is_malformed(wallet, bad):
+    """⭐ 嚴格型別：只收真正的 JSON bool。寬鬆解析等於替這個旗標多開幾種等價
+    寫法，而每一種都是「驗證端與套用端解讀不一致」的機會。"""
+    rec = _record(wallet, tamper={"use_full_equity": bad})
+    with pytest.raises(CapitalSettingsError) as ei:
+        verify_capital_settings(rec, account_id=_acct(wallet),
+                                user_address=wallet.address, now_s=_NOW,
+                                consume_nonce=_always)
+    assert ei.value.reason == "malformed"
+
+
+def test_flipping_the_flag_after_signing_is_rejected(wallet):
+    """⭐⭐ 旗標**受簽章保護**：簽完之後翻轉它 → 重建出的原文不同 → signer_mismatch。
+
+    若這條轉綠（放行），任何能寫記錄檔的人都能把客戶的本金基準從一個固定數字
+    換成整個帳戶——白名單全程放行，事後看紀錄一切合規。
+    """
+    rec = _record(wallet, alloc="1000", tamper={"use_full_equity": True})
+    with pytest.raises(CapitalSettingsError) as ei:
+        verify_capital_settings(rec, account_id=_acct(wallet),
+                                user_address=wallet.address, now_s=_NOW,
+                                consume_nonce=_always)
+    assert ei.value.reason == "signer_mismatch"
+
+
+def test_flipping_the_flag_off_after_signing_is_rejected(wallet):
+    """反方向（全權益 → 固定本金）同樣被擋：兩個方向都必須是簽章保護的。"""
+    rec = _record(wallet, alloc="0", use_full_equity=True,
+                  tamper={"use_full_equity": False})
+    with pytest.raises(CapitalSettingsError) as ei:
+        verify_capital_settings(rec, account_id=_acct(wallet),
+                                user_address=wallet.address, now_s=_NOW,
+                                consume_nonce=_always)
+    assert ei.value.reason == "signer_mismatch"
+
+
+def test_the_two_capital_modes_produce_different_messages(wallet):
+    """⭐ 兩種模式的待簽原文必定不同，且**只差在 `Allocated Capital:` 那一行的值**。
+    金額經 canonical 化恆為數字，永遠寫不出 `full account equity` 這個字面量
+    ⇒ 兩種模式結構上不可能碰撞（不依賴任何欄位檢查）。"""
+    common = dict(account_id="f" + "1" * 40, capital_utilization="0.5000",
+                  nonce="n", issued_at="2026-07-19T00:00:00Z")
+    fixed = build_capital_settings_message(allocated_capital="0.00",
+                                           use_full_equity=False, **common)
+    full = build_capital_settings_message(allocated_capital="0.00",
+                                          use_full_equity=True, **common)
+    assert fixed != full
+    assert "Allocated Capital: 0.00 USDC" in fixed
+    assert f"Allocated Capital: {FULL_EQUITY_MESSAGE_VALUE}" in full
+    diff = [(a, b) for a, b in zip(fixed.splitlines(), full.splitlines()) if a != b]
+    assert len(diff) == 1 and diff[0][0].startswith("Allocated Capital:")
+
+
+def test_fixed_mode_message_is_byte_identical_to_the_legacy_template(wallet):
+    """⭐ 向後相容的關鍵斷言：`use_full_equity=False`（預設）的原文與改動前
+    **逐位元組相同**——旗標編碼進既有那一行的值，沒有新增任何一行。
+    這是「舊客戶端不送旗標也照常運作」的結構性依據。"""
+    msg = build_capital_settings_message(
+        account_id="f" + "1" * 40, allocated_capital="1000.00",
+        capital_utilization="0.5000", nonce="n", issued_at="2026-07-19T00:00:00Z")
+    assert msg == (
+        "Filet: update copy-trading capital allocation\n"
+        "\n"
+        "Signing this authorises Filet to change how much capital mirrors your leader.\n"
+        "These values scale your position sizes directly: a higher utilisation means\n"
+        "larger positions and a closer liquidation distance.\n"
+        "It takes effect on the engine's next cycle. No immediate forced rebalance is\n"
+        "performed; positions converge naturally as the leader trades.\n"
+        "\n"
+        f"Account: {'f' + '1' * 40}\n"
+        "Allocated Capital: 1000.00 USDC\n"
+        "Capital Utilization: 0.5000\n"
+        "Nonce: n\n"
+        "Issued At: 2026-07-19T00:00:00Z")
+
+
+@pytest.mark.parametrize("alloc", ["1000", "0.01", "-1"])
+def test_full_equity_mode_requires_zero_capital(alloc):
+    """⭐⭐ 「兩個都有值」被**拒絕**，不是「其中一個蓋過另一個」。
+
+    客戶簽的是人看得懂的文字；「本金 1000 USDC」與「用全部權益」同時出現在
+    錢包裡，他無從知道系統會執行哪一句。忽略其中一句＝系統替他選，而選錯
+    不會有任何人發現。
+    """
+    a, _, u, _ = canonical_capital_values(alloc, "0.5")
+    with pytest.raises(CapitalSettingsError) as ei:
+        validate_capital_bounds(a, u, use_full_equity=True)
+    assert ei.value.reason == "out_of_range"
+
+
+def test_fixed_mode_still_requires_positive_capital():
+    """固定本金模式的既有邊界不變（本金 0 仍然是非法值）——旗標是新增的表達
+    途徑，不是把舊邊界放寬。"""
+    a, _, u, _ = canonical_capital_values("0", "0.5")
+    with pytest.raises(CapitalSettingsError) as ei:
+        validate_capital_bounds(a, u, use_full_equity=False)
+    assert ei.value.reason == "out_of_range"
+
+
+def test_bounds_default_is_the_restrictive_mode():
+    """⭐ 漏傳 use_full_equity 時落到**限制較嚴**的那一邊（固定本金）：
+    預設值只可能誤擋，不可能誤放一筆「用全部權益」的授權。"""
+    a, _, u, _ = canonical_capital_values("0", "0.5")
+    with pytest.raises(CapitalSettingsError):
+        validate_capital_bounds(a, u)        # 不傳旗標 → 走 > 0 的嚴格分支
+
+
+def test_full_equity_with_zero_capital_is_accepted():
+    a, _, u, _ = canonical_capital_values("0", "0.5")
+    validate_capital_bounds(a, u, use_full_equity=True)   # 不 raise 即通過

@@ -55,13 +55,25 @@ _MIN_VOL_DAYS = 3  # hl weight.py:42 硬編（today + 至少 2 天基準才算�
 _EPS = Decimal("1e-9")  # hl protection.py:101,103 硬編的部位歸零判斷 epsilon
 
 
-def resolve_capital(my_equity: Decimal, allocated: Decimal) -> Decimal:
-    """跟單本金：allocated > 0 用固定值；<= 0 則自動用我方帳戶當前權益。
+def resolve_capital(my_equity: Decimal, allocated: Decimal, *,
+                    use_full_equity: bool) -> Decimal:
+    """跟單本金：`use_full_equity` 選模式，**不再由 `allocated` 的值兼任開關**。
 
-    port hl sync.py:21-26（hl 讀模組常數 ALLOCATED_CAPITAL；spark 由呼叫端傳入
-    settings.allocated_capital）。負的 my_equity 夾為 0（照 hl 的 max(my_equity, 0.0)）。
+    - `use_full_equity=True` → 我方帳戶當前權益（負值夾為 0，照 hl 的 max(my_equity, 0.0)）。
+    - `use_full_equity=False` → 固定本金 `allocated`。
+
+    port hl sync.py:21-26；**與 hl 的結構偏差**：hl 用 `ALLOCATED_CAPITAL > 0` 這個
+    值本身當模式開關，spark 改成顯式旗標（理由見 CopySettings.use_full_equity）。
+    行為在合法輸入上與舊版逐一相等——`CopySettings.__post_init__` 保證
+    `use_full_equity=True ⟺ allocated == 0`，兩式在該不變量下同解。
+
+    ⭐ `use_full_equity` 是**必填關鍵字**（不給預設值）：這是「用多少錢跟單」的
+    模式選擇，預設值會讓某個呼叫端在不知情的情況下選到一邊，而兩邊差的是整個
+    曝險基準。呼叫點被迫宣告（工程原則 5 的形狀）。
     """
-    return allocated if allocated > 0 else max(my_equity, Decimal("0"))
+    if use_full_equity:
+        return max(my_equity, Decimal("0"))
+    return allocated
 
 
 def compute_scale_factor(
@@ -85,7 +97,8 @@ def compute_scale_factor(
     結構偏差：hl 在函式內呼叫 get_position_weight()（隱式全域＋快取）；spark 由
     呼叫端先以 position_weight() 算好 weight 傳入。
     """
-    cap = resolve_capital(my_equity, settings.allocated_capital)
+    cap = resolve_capital(my_equity, settings.allocated_capital,
+                          use_full_equity=settings.use_full_equity)
     if leader_equity <= 0 or cap <= 0:
         return Decimal("0")
     scale = (cap * settings.capital_utilization * weight) / leader_equity

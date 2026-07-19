@@ -40,16 +40,17 @@ def client_wallet(tmp_path):
     return client, cfg, wallet
 
 
-def _get_message(client, alloc="1000", util="0.5"):
-    return client.get("/api/me/capital/message",
-                      params={"allocated_capital": alloc,
-                              "capital_utilization": util})
+def _get_message(client, alloc="1000", util="0.5", use_full_equity=None):
+    params = {"allocated_capital": alloc, "capital_utilization": util}
+    if use_full_equity is not None:
+        params["use_full_equity"] = str(use_full_equity).lower()
+    return client.get("/api/me/capital/message", params=params)
 
 
 def _submit(client, wallet, *, alloc="1000", util="0.5", account_id=None,
-            signer=None, tamper=None):
+            signer=None, tamper=None, use_full_equity=None):
     """完整流程：取原文 → 簽 → POST。`tamper` 在簽完之後改 body。"""
-    r = _get_message(client, alloc, util)
+    r = _get_message(client, alloc, util, use_full_equity)
     assert r.status_code == 200, r.text
     m = r.json()
     sig = (signer or wallet).sign_message(
@@ -57,6 +58,7 @@ def _submit(client, wallet, *, alloc="1000", util="0.5", account_id=None,
     body = {"account_id": account_id or m["account_id"],
             "allocated_capital": m["allocated_capital"],
             "capital_utilization": m["capital_utilization"],
+            "use_full_equity": m["use_full_equity"],
             "nonce": m["nonce"], "issued_at": m["issued_at"],
             "signature": sig, "message": m["message"]}
     if tamper:
@@ -323,3 +325,85 @@ def test_capital_and_leader_records_land_in_separate_files(client_wallet):
     _submit(client, wallet)
     assert cfg.capital_settings_path != cfg.leader_changes_path
     assert load_capital_settings(cfg.capital_settings_path)
+
+
+# ── ⭐ use_full_equity：API 端的顯式旗標 ──────────────────────────────
+
+def test_full_equity_round_trip_through_the_api(client_wallet):
+    """⭐ 本旗標存在的理由，寫成一條端到端斷言：客戶**能夠**透過 API 表達
+    「用全部權益」。改動前這是做不到的——資金設定 API 要求 allocated_capital > 0，
+    而引擎用 0 代表全權益，兩個條件互斥。"""
+    client, cfg, wallet = client_wallet
+    r = _submit(client, wallet, alloc="0", util="0.5", use_full_equity=True)
+    assert r.status_code == 200, r.text
+    assert r.json()["use_full_equity"] is True
+    assert r.json()["allocated_capital"] == "0.00"
+
+    rec = load_capital_settings(cfg.capital_settings_path)[0]
+    assert rec["use_full_equity"] is True          # 真正的 JSON bool，非字串
+    assert rec["allocated_capital"] == "0.00"
+
+
+def test_full_equity_message_states_the_mode_in_words(client_wallet):
+    """客戶在錢包裡看到的必須是「用全部權益」這句話本身，不是一個 0。
+    簽名畫面上的 `Allocated Capital: 0.00 USDC` 會被讀成「本金零」。"""
+    client, _cfg, _wallet = client_wallet
+    m = _get_message(client, "0", "0.5", use_full_equity=True).json()
+    assert "Allocated Capital: full account equity" in m["message"]
+    assert "0.00 USDC" not in m["message"]
+
+
+def test_fixed_capital_still_works_and_is_the_default(client_wallet):
+    """向後相容：不送旗標 → 固定本金模式，行為與改動前完全相同。"""
+    client, cfg, wallet = client_wallet
+    r = _submit(client, wallet, alloc="2500", util="0.25")
+    assert r.status_code == 200, r.text
+    assert r.json()["use_full_equity"] is False
+    assert load_capital_settings(cfg.capital_settings_path)[0]["use_full_equity"] is False
+
+
+def test_message_endpoint_rejects_contradictory_pair(client_wallet):
+    """⭐ 邊界在**發原文之前**就擋：矛盾組合不發 nonce、不給原文——
+    讓客戶簽一份必定被 POST 拒絕的原文，只是浪費他一次錢包簽名。"""
+    client, _cfg, _wallet = client_wallet
+    r = _get_message(client, "1000", "0.5", use_full_equity=True)
+    assert r.status_code == 400
+
+
+def test_message_endpoint_rejects_zero_capital_in_fixed_mode(client_wallet):
+    """固定本金模式送 0 仍然是 400（既有邊界不因新旗標而放寬）。"""
+    client, _cfg, _wallet = client_wallet
+    assert _get_message(client, "0", "0.5").status_code == 400
+    assert _get_message(client, "0", "0.5", use_full_equity=False).status_code == 400
+
+
+def test_flipping_the_flag_in_the_body_is_rejected(client_wallet):
+    """⭐⭐ 拿一份「固定本金」的簽章、在 body 裡把旗標翻成 true → 400。
+    伺服器重建原文時會用翻轉後的旗標，recover 出的位址對不上。"""
+    client, cfg, wallet = client_wallet
+    r = _submit(client, wallet, alloc="1000", util="0.5",
+                tamper={"use_full_equity": True})
+    assert r.status_code == 400
+    assert load_capital_settings(cfg.capital_settings_path) == []   # 未落檔
+
+
+def test_flipping_the_flag_off_in_the_body_is_rejected(client_wallet):
+    """反方向同樣被擋（全權益 → 固定本金）。"""
+    client, cfg, wallet = client_wallet
+    r = _submit(client, wallet, alloc="0", util="0.5", use_full_equity=True,
+                tamper={"use_full_equity": False})
+    assert r.status_code == 400
+    assert load_capital_settings(cfg.capital_settings_path) == []
+
+
+def test_legacy_body_without_the_flag_is_accepted(client_wallet):
+    """⭐ 向後相容：舊客戶端不送 use_full_equity 欄位 → 視為固定本金，照常成功。"""
+    client, cfg, wallet = client_wallet
+    m = _get_message(client, "1000", "0.5").json()
+    sig = wallet.sign_message(encode_defunct(text=m["message"])).signature.hex()
+    r = client.post("/api/me/capital", json={
+        "account_id": m["account_id"], "allocated_capital": m["allocated_capital"],
+        "capital_utilization": m["capital_utilization"], "nonce": m["nonce"],
+        "issued_at": m["issued_at"], "signature": sig, "message": m["message"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["use_full_equity"] is False

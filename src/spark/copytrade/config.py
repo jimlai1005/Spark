@@ -73,7 +73,7 @@ class CopySettings:
 
     分三類欄位：
     1. 刻意覆蓋（不讀 hl）：leader_address, live_trading, interval_s, modify_policy,
-       flatten_on_breach, allocated_capital
+       flatten_on_breach, allocated_capital, use_full_equity
     2. 照抄 hl 預設值：capital_utilization, position_weight, max_target_leverage,
        min_order_notional, size_tolerance, max_drawdown_pct, settle_seconds,
        modify_fail_ttl_s, max_consecutive_errors, volatility_weight_enabled,
@@ -89,7 +89,24 @@ class CopySettings:
     # ＋不做任何交易動作，equity 回升到未 breach 即自動恢復跟單——不寫 ARM 檔、
     # 不需人工 re-arm（與 True 的 kill switch 硬鎖死是兩種語意）。
     flatten_on_breach: bool = True
-    allocated_capital: Decimal = Decimal("0")  # 0=用全權益，刻意覆蓋 hl 的 5000
+    # ⭐⭐ 跟單本金的**兩種模式，由顯式旗標選擇**（2026-07-19：解除 `0` 的語意重載）。
+    # 舊版讓 `allocated_capital == 0` 兼任「用全部權益」的開關，於是同一個值同時是
+    # 「邊界檢查的下界」與「語意開關」——兩者撞在一起的直接後果是：資金設定 API
+    # 要求 `allocated_capital > 0`（那是對的，客戶不該簽一筆「本金 0」的授權），
+    # 客戶因此**無法透過 API 表達「用全部權益」**。加旗標而不是放寬邊界，是因為
+    # 放寬邊界會讓「客戶手滑送 0」與「客戶要用全部權益」變成同一筆記錄。
+    #
+    # 兩個欄位的合法組合由 `__post_init__` 收斂成**恰好兩種**（見該處）：
+    #   use_full_equity=True  ⇒ allocated_capital 必須為 0（不是「被忽略」，是不准有值）
+    #   use_full_equity=False ⇒ allocated_capital 必須 > 0
+    # 「兩個都有值」在型別層就不存在，所以不需要規定誰蓋過誰。
+    #
+    # 預設 True 的理由（向後相容）：本欄位的預設值必須與 `allocated_capital` 的預設
+    # 值（0）配對成合法組合，而 0 在舊語意下就是「用全部權益」——`CopySettings()`
+    # 因此與改動前**行為完全相同**。既有部署走的是 `from_env`，那裡另有一層遷移
+    # 推導（見該處），設了 COPY_ALLOCATED_CAPITAL 的部署不會被這個預設值改掉。
+    allocated_capital: Decimal = Decimal("0")  # use_full_equity=False 時才有意義
+    use_full_equity: bool = True
 
     # 照抄 hl 預設值（來自 hl-copytrader config.py:33-115）
     capital_utilization: Decimal = Decimal("1.0")  # hl CAPITAL_UTILIZATION
@@ -125,7 +142,17 @@ class CopySettings:
 
         env=None 時用 os.environ；否則用傳入的 dict（可覆蓋 os.environ）。
         變數名前綴 COPY_（如 COPY_LEADER_ADDRESS、COPY_LIVE_TRADING）。
+
+        ⭐ `COPY_USE_FULL_EQUITY` 未設時的預設值由 `COPY_ALLOCATED_CAPITAL` **推導**
+        （`alloc <= 0` ⇒ True）。這是一次性的**遷移相容層**，不是把 0 重新請回來當
+        語意開關：欄位本身仍然是顯式的，`__post_init__` 仍然拒絕任何矛盾組合，只是
+        「完全沒聽過這個旗標的既有 EnvironmentFile」會被解讀成它在舊語意下的意思。
+        既有部署因此零改動：設了 COPY_ALLOCATED_CAPITAL=5000 的機器推導出 False
+        （固定本金，行為不變），沒設的機器推導出 True（全權益，行為不變）。
+        顯式設了 COPY_USE_FULL_EQUITY 卻與金額矛盾的組合，在 `__post_init__` 直接
+        拒絕啟動——那是設定錯誤，靜默挑一邊執行等於替客戶決定曝險。
         """
+        alloc = _env_decimal("COPY_ALLOCATED_CAPITAL", str(cls.allocated_capital), env)
         return cls(
             leader_address=_env_str("COPY_LEADER_ADDRESS", cls.leader_address, env),
             live_trading=_env_bool("COPY_LIVE_TRADING", str(cls.live_trading).lower(), env),
@@ -134,7 +161,9 @@ class CopySettings:
             flatten_on_breach=_env_bool(
                 "COPY_FLATTEN_ON_BREACH", str(cls.flatten_on_breach).lower(), env
             ),
-            allocated_capital=_env_decimal("COPY_ALLOCATED_CAPITAL", str(cls.allocated_capital), env),
+            allocated_capital=alloc,
+            use_full_equity=_env_bool("COPY_USE_FULL_EQUITY",
+                                      str(alloc <= 0).lower(), env),
             capital_utilization=_env_decimal(
                 "COPY_CAPITAL_UTILIZATION", str(cls.capital_utilization), env
             ),
@@ -211,3 +240,20 @@ class CopySettings:
         if not (0 <= self.max_total_drawdown_pct < 1):
             raise ValueError(
                 f"max_total_drawdown_pct must be in [0, 1), got {self.max_total_drawdown_pct}")
+
+        # ⭐⭐ 本金模式的不變量：兩個欄位只有**兩種**合法組合（見欄位宣告處）。
+        # 兩個方向都檢查是刻意的——只檢查一邊會留下一個「有值卻不生效」的狀態，
+        # 而那正是本次改動要根除的東西（設定檔寫著 5000、引擎實際用全部權益，
+        # 兩邊的 log 都正常）。矛盾一律**拒絕啟動**，不靜默挑一邊：挑哪一邊都是
+        # 在替客戶決定曝險倍數，而錯的那一邊沒有任何人會發現。
+        if self.use_full_equity:
+            if self.allocated_capital != 0:
+                raise ValueError(
+                    "use_full_equity=True 時 allocated_capital 必須為 0（收到 "
+                    f"{self.allocated_capital}）——兩個都給值的話，「本金」到底是哪一個"
+                    "沒有答案。要用固定本金請設 use_full_equity=False")
+        elif self.allocated_capital <= 0:
+            raise ValueError(
+                "use_full_equity=False 時 allocated_capital 必須 > 0（收到 "
+                f"{self.allocated_capital}）——本金 0 會讓所有目標部位歸零，"
+                "那是靜默停止跟單。要用全部權益請設 use_full_equity=True")

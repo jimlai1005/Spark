@@ -73,20 +73,22 @@ class _Env:
             now_fn=lambda: now_s)
 
     def write_settings(self, *, alloc="5000", util="0.4", nonce="n1",
-                       issued_at=None, signer=None, account_id=None, tamper=None):
+                       issued_at=None, signer=None, account_id=None, tamper=None,
+                       use_full_equity=False):
         """簽一筆合法記錄並落檔。`tamper` 在簽完之後改動欄位（重放／竄改）。"""
         account_id = account_id or self.account_id
         issued_at = issued_at or _at()
         _, alloc_s, _, util_s = canonical_capital_values(alloc, util)
         msg = build_capital_settings_message(
             account_id=account_id, allocated_capital=alloc_s,
-            capital_utilization=util_s, nonce=nonce, issued_at=issued_at)
+            capital_utilization=util_s, nonce=nonce, issued_at=issued_at,
+            use_full_equity=use_full_equity)
         sig = (signer or self.wallet).sign_message(
             encode_defunct(text=msg)).signature.hex()
         rec = build_capital_settings_record(
             account_id=account_id, allocated_capital=alloc_s,
             capital_utilization=util_s, nonce=nonce, issued_at=issued_at,
-            signature=sig, message=msg)
+            signature=sig, message=msg, use_full_equity=use_full_equity)
         if tamper:
             rec.update(tamper)
         write_capital_settings(self.settings, rec)
@@ -121,7 +123,9 @@ def test_applied_settings_are_recorded_in_the_ledger(env):
     env.applier().effective(_BASE)
 
     ledger = load_ledger(env.ledger)
-    assert ledger.redeemed == {"n-abc": "5000.00|0.4000"}
+    # 指紋含本金模式（`fixed`／`full`）：少了它，「同一顆 nonce、同樣的 0 元、
+    # 旗標被翻轉」會被誤判成正常的檔案殘留而靜默放行。
+    assert ledger.redeemed == {"n-abc": "5000.00|0.4000|fixed"}
     assert ledger.applied is not None
     assert ledger.applied.nonce == "n-abc"
     assert ledger.applied.as_decimals() == (Decimal("5000.00"), Decimal("0.4000"))
@@ -197,7 +201,7 @@ def test_engine_never_clamps_out_of_range_values(env):
     # base 用一個**與上界不同**的值：預設的 1.0 在數值上等於「夾到上界」的結果，
     # 用它當基準就分不出「沿用現狀」與「被夾成 1」——兩者都會讓斷言通過。
     base = CopySettings(leader_address=_LEADER, allocated_capital=Decimal("100"),
-                        capital_utilization=Decimal("0.3"))
+                        use_full_equity=False, capital_utilization=Decimal("0.3"))
     env.write_settings(alloc="5000", util="10")
     cs = env.applier().effective(base)
     assert cs.capital_utilization == Decimal("0.3")     # 沿用現狀
@@ -468,3 +472,122 @@ def test_ledgers_are_separate_files(env, tmp_path):
     from spark.filet.capital_settings_apply import LEDGER_RELPATH as CAP
     from spark.filet.leader_change_apply import LEDGER_RELPATH as LC
     assert CAP != LC
+
+
+# ── ⭐ use_full_equity：顯式旗標的引擎端全鏈路 ────────────────────────
+
+def test_full_equity_mode_is_applied_end_to_end(env):
+    """⭐ 客戶簽「用全部權益」→ 引擎套用 use_full_equity=True ＋ 本金 0。
+
+    這是本旗標存在的理由：改動前客戶**無法透過 API 表達**這個意圖（API 要求
+    allocated_capital > 0，而舊語意用 0 代表全權益，兩者互斥）。"""
+    env.write_settings(alloc="0", util="0.4", use_full_equity=True)
+    cs = env.applier().effective(_BASE)
+
+    assert cs.use_full_equity is True
+    assert cs.allocated_capital == Decimal("0.00")
+    assert cs.capital_utilization == Decimal("0.4000")
+
+
+def test_fixed_capital_mode_is_applied_end_to_end(env):
+    """對照組：不送旗標＝固定本金模式，行為與改動前相同（向後相容）。"""
+    env.write_settings(alloc="5000", util="0.4")
+    cs = env.applier().effective(_BASE)
+
+    assert cs.use_full_equity is False
+    assert cs.allocated_capital == Decimal("5000.00")
+
+
+def test_flipping_the_flag_after_signing_is_rejected(env):
+    """⭐⭐ 旗標受簽章保護：簽完之後把 use_full_equity 從 False 翻成 True →
+    驗證端重建出另一份原文 → signer_mismatch → **不套用**。
+
+    若這個測試轉紅，代表旗標退化成一個記錄裡可以任意翻轉的布林值，
+    而翻轉它就等於把客戶的本金基準從一個固定數字換成整個帳戶。"""
+    env.write_settings(alloc="5000", util="0.4", tamper={"use_full_equity": True})
+    cs = env.applier().effective(_BASE)
+
+    assert cs.allocated_capital == _BASE.allocated_capital    # 沿用現狀，未套用
+    assert cs.use_full_equity == _BASE.use_full_equity
+    assert any("驗簽失敗" in c[2] for c in env.crits())
+
+
+def test_flipping_the_flag_off_after_signing_is_rejected(env):
+    """反方向同樣被擋（全權益 → 固定本金）：兩個方向都必須是簽章保護的。"""
+    env.write_settings(alloc="0", util="0.4", use_full_equity=True,
+                       tamper={"use_full_equity": False})
+    cs = env.applier().effective(_BASE)
+
+    assert cs.capital_utilization == _BASE.capital_utilization   # 未套用
+    assert any("驗簽失敗" in c[2] for c in env.crits())
+
+
+def test_engine_rejects_fixed_mode_with_zero_capital(env):
+    """⭐⭐ 引擎端**獨立**再驗（不繼承 API 的判斷）：use_full_equity=False 配
+    allocated_capital=0 是矛盾組合 → 拒絕套用 ＋ critical ＋ 沿用現狀。
+
+    這條路徑代表「API 被打穿或被繞過（有人直接寫交換目錄）」的情形——記錄本身
+    簽章完全合法，擋下它的只有引擎自己的邊界檢查。拿掉那道檢查，本測試必須轉紅。"""
+    env.write_settings(alloc="0", util="0.4", use_full_equity=False)
+    cs = env.applier().effective(_BASE)
+
+    assert cs.allocated_capital == _BASE.allocated_capital       # 未套用
+    assert cs.capital_utilization == _BASE.capital_utilization
+    crits = env.crits()
+    assert any("超出允許範圍" in c[2] for c in crits)
+    assert load_ledger(env.ledger).applied is None               # 也沒落帳
+
+
+def test_engine_rejects_full_equity_mode_with_nonzero_capital(env):
+    """另一半的矛盾組合：use_full_equity=True 配非 0 本金 → 同樣拒絕。
+    「本金 1000 ＋ 用全部權益」是兩句互斥的授權，系統不得替客戶挑一句執行。"""
+    env.write_settings(alloc="1000", util="0.4", use_full_equity=True)
+    cs = env.applier().effective(_BASE)
+
+    assert cs.capital_utilization == _BASE.capital_utilization   # 未套用
+    assert any("超出允許範圍" in c[2] for c in env.crits())
+
+
+def test_ledger_roundtrip_preserves_the_flag(env):
+    """帳本必須把旗標持久化：掉了它，重啟後「全部權益」會被讀成「固定本金 0」，
+    而後者在邊界檢查下是非法值 → 引擎每輪拒絕套用（靜默失去客戶已授權的設定）。"""
+    env.write_settings(alloc="0", util="0.4", use_full_equity=True)
+    env.applier().effective(_BASE)
+
+    applied = load_ledger(env.ledger).applied
+    assert applied is not None and applied.use_full_equity is True
+    assert applied.fingerprint.endswith("|full")
+    # 重新讀帳本（模擬重啟）後仍套用得出同一組值
+    assert env.applier().effective(_BASE).use_full_equity is True
+
+
+def test_legacy_ledger_without_the_flag_reads_as_fixed_capital(env):
+    """⭐ 向後相容：改動前寫下的帳本沒有這個鍵 → 讀成 False（固定本金），
+    那是它當時的正確語意（本旗標問世前記錄一律帶 allocated_capital > 0）。
+    絕不能讀成 True——那會把一筆固定本金的授權放大成整個帳戶。"""
+    env.ledger.parent.mkdir(parents=True, exist_ok=True)
+    env.ledger.write_text(json.dumps({
+        "redeemed": {"n-old": "5000.00|0.4000"},
+        "applied": {"nonce": "n-old", "allocated_capital": "5000.00",
+                    "capital_utilization": "0.4000", "issued_at": _at(),
+                    "applied_at": _NOW}}))
+    ledger = load_ledger(env.ledger)
+    assert ledger.applied is not None
+    assert ledger.applied.use_full_equity is False
+
+    cs = env.applier().effective(_BASE)
+    assert cs.use_full_equity is False
+    assert cs.allocated_capital == Decimal("5000.00")
+
+
+def test_ledger_rejects_non_boolean_flag(env):
+    """帳本裡的旗標型別不合法 → fail-closed（raise），不猜、不當成 False。"""
+    env.ledger.parent.mkdir(parents=True, exist_ok=True)
+    env.ledger.write_text(json.dumps({
+        "redeemed": {},
+        "applied": {"nonce": "n1", "allocated_capital": "0.00",
+                    "use_full_equity": "true",        # 字串，不是 bool
+                    "capital_utilization": "0.4000", "issued_at": _at(),
+                    "applied_at": _NOW}}))
+    with pytest.raises(ValueError):
+        load_ledger(env.ledger)

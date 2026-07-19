@@ -12,7 +12,8 @@
 ⭐⭐ 為什麼引擎要**再驗一次邊界**（本模組與換 leader 最大的不同）
 --------------------------------------------------------------
 換 leader 的引擎端二次檢查是「這個 leader 還在白名單嗎」；資金設定的對應物是
-**數值邊界**（`allocated_capital > 0`、`capital_utilization ∈ (0,1]`）。
+**數值邊界**（`capital_utilization ∈ (0,1]`，以及本金依 `use_full_equity` 模式
+二選一：固定本金必須 > 0、全部權益必須恰為 0——見 capital_settings.py 檔頭）。
 
 為什麼不能只信 API 驗過：這兩個值**直接乘進部位大小**
 （sizing.compute_scale_factor:88-91 `cap * capital_utilization * weight / leader_equity`）。
@@ -74,6 +75,7 @@ from spark.filet.capital_settings import (CapitalSettingsError,
                                           capital_settings_path_for,
                                           canonical_capital_values,
                                           load_capital_settings,
+                                          require_bool_flag,
                                           validate_capital_bounds,
                                           verify_capital_settings)
 from spark.filet.followers import load_followers
@@ -125,6 +127,10 @@ class AppliedCapital:
     capital_utilization: str
     issued_at: str
     applied_at: float     # epoch 秒，稽核用
+    # ⭐ 本金模式（見 capital_settings.py 檔頭）。舊帳本沒有這個鍵 → False，
+    # 那是舊記錄的正確語意（本旗標問世前一律是固定本金且 > 0），所以既有帳本
+    # 不因新欄位而失效，也不會被誤讀成「全部權益」。
+    use_full_equity: bool = False
 
     def as_decimals(self) -> tuple[Decimal, Decimal]:
         return Decimal(self.allocated_capital), Decimal(self.capital_utilization)
@@ -136,8 +142,13 @@ class AppliedCapital:
         存指紋而不是只存 nonce：同一顆 nonce 配上**不同數值**再次出現＝竄改，
         必須與「正常的檔案殘留」分開處置（沿 leader_change_apply 對 nonce 重用的
         同一個判別）。
+
+        ⭐ 指紋**必須含 `use_full_equity`**：它與金額一樣決定曝險基準，漏掉它會讓
+        「同一顆 nonce、同樣的 0 元、旗標從 False 翻成 True」被判成正常的檔案殘留
+        而靜默忽略——竄改偵測在最關鍵的那個欄位上失明。
         """
-        return f"{self.allocated_capital}|{self.capital_utilization}"
+        return (f"{self.allocated_capital}|{self.capital_utilization}"
+                f"|{'full' if self.use_full_equity else 'fixed'}")
 
 
 @dataclass(frozen=True)
@@ -192,12 +203,18 @@ def load_ledger(path: str | Path) -> CapitalLedger:
         if not isinstance(applied_raw, dict):
             raise ValueError(f"資金設定帳本的 applied 須為物件或 null（{p}）")
         try:
+            flag = applied_raw.get("use_full_equity", False)
+            if not isinstance(flag, bool):
+                # 嚴格型別（同記錄層的 require_bool_flag）：這個旗標決定本金基準，
+                # 寬鬆解析等於替它多開幾個等價寫法，而帳本是每輪都會被讀的。
+                raise ValueError("use_full_equity 必須是布林值")
             applied = AppliedCapital(
                 nonce=str(applied_raw["nonce"]),
                 allocated_capital=str(applied_raw["allocated_capital"]),
                 capital_utilization=str(applied_raw["capital_utilization"]),
                 issued_at=str(applied_raw["issued_at"]),
-                applied_at=float(applied_raw.get("applied_at", 0.0)))
+                applied_at=float(applied_raw.get("applied_at", 0.0)),
+                use_full_equity=flag)
             # ⭐ 落檔的數值必須仍然解得出 Decimal。壞掉的話 fail-closed 比「套用一個
             # 解不出來的值」安全得多——後者會在 sizing 那裡以一個完全無關的例外炸掉。
             applied.as_decimals()
@@ -219,6 +236,7 @@ def save_ledger(path: str | Path, ledger: CapitalLedger) -> None:
         a = ledger.applied
         payload["applied"] = {"nonce": a.nonce,
                               "allocated_capital": a.allocated_capital,
+                              "use_full_equity": bool(a.use_full_equity),
                               "capital_utilization": a.capital_utilization,
                               "issued_at": a.issued_at, "applied_at": a.applied_at}
     tmp = p.parent / f"{p.name}.{os.getpid()}.tmp"
@@ -381,7 +399,10 @@ class CapitalSettingsApplier:
             return base
         alloc, util = applied.as_decimals()
         try:
-            validate_capital_bounds(alloc, util)
+            # ⭐ 邊界依**帳本自己記下的模式**驗（同源：模式與數值出自同一次兌現）。
+            # 拿另一個來源的旗標去驗這組數值就是混源比較（工程原則 1）。
+            validate_capital_bounds(alloc, util,
+                                    use_full_equity=applied.use_full_equity)
         except CapitalSettingsError:
             # ⭐ 帳本裡的值超界 ⇒ 帳本被動過。**不套用、也不退回 base**——退回 base
             # 同樣是一次無授權的曝險變更。本輪宣告無法判定，交由呼叫端停止交易動作。
@@ -393,7 +414,10 @@ class CapitalSettingsApplier:
                 dedup_key="capital_settings_ledger_out_of_range")
             raise CapitalSettingsUnavailable(
                 f"資金設定帳本內的數值超出允許範圍（{self._ledger_path}）") from None
-        return replace(base, allocated_capital=alloc, capital_utilization=util)
+        # 三個欄位一起換：`CopySettings.__post_init__` 有同一條「模式與金額必須配對」
+        # 的不變量，只換其中兩個會在那裡直接 raise（那是對的——半套的設定不該生效）。
+        return replace(base, allocated_capital=alloc, capital_utilization=util,
+                       use_full_equity=applied.use_full_equity)
 
     # ---------- 主流程 ----------
 
@@ -465,7 +489,8 @@ class CapitalSettingsApplier:
         # 探測誤報成一次客戶的手滑。
         try:
             validate_capital_bounds(verified.allocated_capital,
-                                    verified.capital_utilization)
+                                    verified.capital_utilization,
+                                    use_full_equity=verified.use_full_equity)
         except CapitalSettingsError as e:
             logger.error("資金設定超出範圍 account=%s reason=%s",
                          self._account_id, e.reason)
@@ -473,7 +498,8 @@ class CapitalSettingsApplier:
                 "**客戶簽章的資金設定超出允許範圍** —— **拒絕套用**，沿用目前的設定。"
                 "簽章本身是有效的；擋下它的是引擎自己的邊界檢查（API 也擋，但引擎"
                 "不因為 API 驗過而省略——這兩個值直接乘進部位大小，一個壞值就是一次"
-                "超額曝險）。允許範圍：投入本金 > 0、使用比例 ∈ (0, 1]",
+                "超額曝險）。允許範圍：使用比例 ∈ (0, 1]；投入本金在固定本金模式"
+                "（use_full_equity=false）必須 > 0，在全部權益模式必須為 0",
                 dedup_key="capital_settings_out_of_range")
             return self._current(base, ledger.applied)
 
@@ -482,10 +508,11 @@ class CapitalSettingsApplier:
             allocated_capital=verified.allocated_capital_str,
             capital_utilization=verified.capital_utilization_str,
             issued_at=verified.issued_at,
-            applied_at=float(self._now_fn()))
-        old = (f"{ledger.applied.allocated_capital}|"
-               f"{ledger.applied.capital_utilization}") if ledger.applied else (
-            f"{base.allocated_capital}|{base.capital_utilization}（環境預設）")
+            applied_at=float(self._now_fn()),
+            use_full_equity=verified.use_full_equity)
+        old = ledger.applied.fingerprint if ledger.applied else (
+            f"{base.allocated_capital}|{base.capital_utilization}"
+            f"|{'full' if base.use_full_equity else 'fixed'}（環境預設）")
         try:
             save_ledger(self._ledger_path, CapitalLedger(
                 redeemed={**ledger.redeemed, verified.nonce: applied.fingerprint},
@@ -502,25 +529,31 @@ class CapitalSettingsApplier:
             return self._current(base, ledger.applied)
 
         self._critical(
-            f"**已套用客戶簽章授權的資金設定**：{old} → "
-            f"{applied.allocated_capital}|{applied.capital_utilization}"
+            f"**已套用客戶簽章授權的資金設定**：{old} → {applied.fingerprint}"
             f"（來源：**客戶簽章授權**，account={self._account_id}）——"
             f"新的部位大小自**下一個 cycle** 起套用；**不做即時強制再平衡**，"
             f"部位隨 leader 的後續動作自然收斂（避免一次無謂的 taker 成本）。"
             f"本次變更已由引擎獨立重新驗章並重新檢查數值範圍",
             dedup_key=f"capital_settings_applied:{verified.nonce}")
-        logger.info("資金設定已套用 account=%s %s → %s|%s", self._account_id, old,
-                    applied.allocated_capital, applied.capital_utilization)
+        logger.info("資金設定已套用 account=%s %s → %s", self._account_id, old,
+                    applied.fingerprint)
         return self._current(base, applied)
 
     # ---------- 小工具 ----------
 
     @staticmethod
     def _record_fingerprint(rec: dict) -> str | None:
-        """記錄自稱的數值指紋（canonical 化後）；不合法回 None（→ 一律當成不相符）。"""
+        """記錄自稱的數值指紋（canonical 化後）；不合法回 None（→ 一律當成不相符）。
+
+        ⭐ 必須與 `AppliedCapital.fingerprint` **同式**（含 `use_full_equity`）：
+        兩式一旦漂移，比對就恆為不相符（每輪一則假的竄改告警）或恆為相符
+        （真的竄改被當成檔案殘留放過）。旗標型別不合法 → None ＝ 不相符，
+        走告警路徑而不是靜默忽略。
+        """
         try:
             _, alloc, _, util = canonical_capital_values(
                 rec.get("allocated_capital"), rec.get("capital_utilization"))
+            flag = require_bool_flag(rec, "use_full_equity")
         except (CapitalSettingsError, ValueError, TypeError):
             return None
-        return f"{alloc}|{util}"
+        return f"{alloc}|{util}|{'full' if flag else 'fixed'}"

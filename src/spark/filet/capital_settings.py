@@ -68,6 +68,27 @@ log 都完全正常——與位址大小寫是同一類 bug（leader_change.buil
 
 小數位超過上限一律**拒絕**（`malformed`），不 quantize 掉：靜默截斷是在客戶不知情
 的狀況下改動他簽署的數字，而這個數字直接乘進部位大小。
+
+⭐ 本金的兩種模式：`use_full_equity` 是**顯式旗標**（2026-07-19）
+----------------------------------------------------------------
+引擎一直支援「用全部權益跟單」，但舊版是用 `allocated_capital == 0` 這個**值**
+兼任開關。本模組的政策邊界要求 `allocated_capital > 0`（正確：客戶不該簽一筆
+「本金 0」的授權），兩者相撞的結果是客戶**無法透過 API 表達「用全部權益」**。
+
+修法不是放寬邊界（放寬會讓「手滑送 0」與「我要用全部權益」變成同一筆記錄，
+而它們的曝險差距是整個帳戶），而是加一個顯式旗標，並讓兩個欄位只有兩種合法組合：
+
+| use_full_equity | allocated_capital | 語意 |
+|---|---|---|
+| False（預設／舊記錄） | > 0 | 固定本金 |
+| True | **恰好 0** | 全部權益 |
+
+「兩個都有值」被 `validate_capital_bounds` 拒絕，不是「後者覆蓋前者」——客戶簽的
+是人看得懂的文字，兩句矛盾的授權同時出現在錢包裡，他無從知道系統會執行哪一句。
+
+旗標**受簽章保護**：它編碼進待簽訊息的 `Allocated Capital:` 那一行的值
+（見 `build_capital_settings_message`），竄改它會讓重建的原文對不上 → `signer_mismatch`。
+記錄裡缺席該欄位 → False（舊記錄的正確語意，故既有記錄不因新欄位失效）。
 """
 from __future__ import annotations
 
@@ -99,8 +120,8 @@ CAPITAL_SETTINGS_MAX_AGE_S = LEADER_CHANGE_MAX_AGE_S
 # ⚠️ **沒有 signer 欄位**（見檔頭）。`action` 排在最前面：它是這筆記錄「是什麼」的
 # 宣告，讀檔的人第一眼就該看到。
 CAPITAL_SETTINGS_FIELDS = ("action", "account_id", "allocated_capital",
-                           "capital_utilization", "nonce", "issued_at",
-                           "signature", "message")
+                           "use_full_equity", "capital_utilization", "nonce",
+                           "issued_at", "signature", "message")
 
 # nonce 字元集：與 leader_change 同一條規則（同一個 nonce 池、同一個拼進訊息的風險）。
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -121,6 +142,14 @@ _MAX_ABS = Decimal("1e15")
 # 擋下的值，且症狀是一次超額曝險。
 MIN_ALLOCATED_CAPITAL = Decimal("0")   # 嚴格大於
 MAX_CAPITAL_UTILIZATION = Decimal("1")  # 含上界
+
+# ⭐ 「用全部權益」模式在待簽訊息裡的**固定字面量**（取代金額）。
+# 為什麼不是多加一行 `Use Full Equity: yes`：多一行會改動**所有**既有模式的訊息
+# 版型，讓改動前發出的原文全部對不上；把旗標編碼進既有那一行的**值**，
+# `use_full_equity=False` 的訊息與改動前**逐位元組相同**（向後相容），而兩種模式
+# 的字串又必定不同（金額經 `_canonical_decimal` 一律是數字，永遠寫不出這個字面量
+# ——結構上不可能碰撞，不依賴任何欄位檢查）。
+FULL_EQUITY_MESSAGE_VALUE = "full account equity"
 
 
 class CapitalSettingsError(ValueError):
@@ -152,6 +181,9 @@ class VerifiedCapitalSettings:
     capital_utilization_str: str  # canonical，固定 UTILIZATION_DECIMALS 位
     nonce: str
     issued_at: str
+    # ⭐ True ⇒ 客戶授權的是「用全部權益」，此時 `allocated_capital` 恆為 0
+    # （由 validate_capital_bounds 強制，不是「有值但被忽略」）。
+    use_full_equity: bool = False
 
 
 def _canonical_decimal(field: str, raw: object, decimals: int) -> tuple[Decimal, str]:
@@ -197,8 +229,23 @@ def canonical_capital_values(allocated_capital: object,
 
 
 def validate_capital_bounds(allocated_capital: Decimal,
-                            capital_utilization: Decimal) -> None:
-    """政策邊界：`allocated_capital > 0`、`capital_utilization ∈ (0, 1]`。
+                            capital_utilization: Decimal, *,
+                            use_full_equity: bool = False) -> None:
+    """政策邊界：`capital_utilization ∈ (0, 1]`，本金依模式二選一：
+
+    - `use_full_equity=False`（預設）→ `allocated_capital > 0`。
+    - `use_full_equity=True`  → `allocated_capital` 必須**恰好為 0**。
+
+    ⭐ 為什麼「必須為 0」而不是「有值也無所謂，反正會被忽略」：客戶簽的是一段
+    人看得懂的文字，而「本金 1000 USDC ＋ 用全部權益」這兩句同時出現在錢包裡是
+    自相矛盾的授權——他無從知道系統會執行哪一句。拒絕它，客戶就只會簽出恰好一種
+    語意的授權；「忽略」則是讓系統替他選一句，而選錯沒有任何人會發現。
+    記錄層因此不存在「兩個都有值」的狀態（`CopySettings.__post_init__` 在引擎層
+    有同一條不變量，兩層各自獨立強制）。
+
+    ⭐ 預設值 `use_full_equity=False` 是刻意選**限制較嚴**的那一邊：忘記傳這個
+    參數的呼叫端會落到「必須 > 0」的分支，也就是**不可能**因為漏傳而放行一筆
+    原本該被擋下的授權。預設值只會誤擋，不會誤放。
 
     ⭐⭐ 這個函式是**每個執行點各自呼叫**的，不是驗簽的一部分——刻意如此。
     `verify_capital_settings` 回答的是「這是不是客戶本人的意圖」（真實性），
@@ -210,11 +257,19 @@ def validate_capital_bounds(allocated_capital: Decimal,
     ⚠️ **不夾取、不修正、不四捨五入**：超界一律 raise。夾取（clamp）是最誘人的
     錯誤選項——它讓流程順利跑完，代價是客戶簽了 A、系統執行了 B，而且沒有人會知道。
     """
-    if allocated_capital <= MIN_ALLOCATED_CAPITAL:
+    if use_full_equity:
+        if allocated_capital != 0:
+            raise CapitalSettingsError(
+                "out_of_range",
+                f"use_full_equity=True 時 allocated_capital 必須為 0"
+                f"（收到 {allocated_capital}）——「用全部權益」與「本金 X」是兩句"
+                f"互相矛盾的授權，不得同時出現在同一份客戶簽章裡")
+    elif allocated_capital <= MIN_ALLOCATED_CAPITAL:
         raise CapitalSettingsError(
             "out_of_range",
             f"allocated_capital 必須 > {MIN_ALLOCATED_CAPITAL}"
-            f"（收到 {allocated_capital}）")
+            f"（收到 {allocated_capital}）——若要用全部權益，請顯式送 "
+            f"use_full_equity=true，不要用金額 0 代表它")
     if not (Decimal("0") < capital_utilization <= MAX_CAPITAL_UTILIZATION):
         raise CapitalSettingsError(
             "out_of_range",
@@ -224,7 +279,8 @@ def validate_capital_bounds(allocated_capital: Decimal,
 
 def build_capital_settings_message(*, account_id: str, allocated_capital: object,
                                    capital_utilization: object, nonce: str,
-                                   issued_at: str) -> str:
+                                   issued_at: str,
+                                   use_full_equity: bool = False) -> str:
     """待簽訊息的**唯一**版型（伺服器與引擎都用它重建，客戶端照此組字串簽名）。
 
     ⭐⭐ 第一行 `"Filet: update copy-trading capital allocation"` 是**域分隔符**：
@@ -238,11 +294,23 @@ def build_capital_settings_message(*, account_id: str, allocated_capital: object
     第一行之後的兩句寫明**後果與生效時機**（不是裝飾）：客戶在錢包裡看到的就是這段
     文字，「這會改變部位大小」「下一個 cycle 生效」「不會立刻強制再平衡」必須出現
     在他按下簽名之前。
+
+    ⭐ 本金模式編碼在 `Allocated Capital:` 那一行的**值**上，不另加一行
+    （理由與不可碰撞性見 `FULL_EQUITY_MESSAGE_VALUE`）：
+      - `use_full_equity=False` → `Allocated Capital: 1000.00 USDC`（與改動前逐位元組相同）
+      - `use_full_equity=True`  → `Allocated Capital: full account equity`
+    兩者必定不同 ⇒ 一份「固定本金」的簽章無法被改寫成「用全部權益」（反向亦然）：
+    竄改旗標會讓驗證端重建出另一份原文，recover 出的位址對不上 → `signer_mismatch`。
+    旗標因此**受簽章保護**，而不是一個記錄裡可以任意翻轉的布林值。
+
+    `use_full_equity=True` 時 `allocated_capital` 仍會被 canonical 化並要求為 0
+    （`validate_capital_bounds` 的政策），避免記錄裡留著一個不會生效卻看得到的金額。
     """
     _, cap = _canonical_decimal("allocated_capital", allocated_capital,
                                 CAPITAL_DECIMALS)
     _, util = _canonical_decimal("capital_utilization", capital_utilization,
                                  UTILIZATION_DECIMALS)
+    cap_line = (FULL_EQUITY_MESSAGE_VALUE if use_full_equity else f"{cap} USDC")
     return (
         "Filet: update copy-trading capital allocation\n"
         "\n"
@@ -253,11 +321,34 @@ def build_capital_settings_message(*, account_id: str, allocated_capital: object
         "performed; positions converge naturally as the leader trades.\n"
         "\n"
         f"Account: {account_id}\n"
-        f"Allocated Capital: {cap} USDC\n"
+        f"Allocated Capital: {cap_line}\n"
         f"Capital Utilization: {util}\n"
         f"Nonce: {nonce}\n"
         f"Issued At: {issued_at}"
     )
+
+
+def require_bool_flag(record: dict, key: str) -> bool:
+    """記錄裡的布林旗標，**嚴格解析**：只接受真正的 JSON bool，缺席 → False。
+
+    ⭐ 為什麼不接受 `"true"` / `1` / `"yes"`：這個旗標決定客戶的本金基準是「一個
+    固定數字」還是「整個帳戶」。寬鬆解析等於在旗標周圍多開幾個等價寫法，而每個
+    等價寫法都是一次「攻擊者送了某個真值、驗證端與套用端對它的解讀不一致」的機會。
+    嚴格解析讓記錄的表示法唯一——不合法的型別一律 `malformed`，早退早拒。
+
+    缺席 → False 是**舊記錄的正確語意**（本旗標問世前，記錄一律帶 `allocated_capital
+    > 0` 的固定本金），所以既有記錄不因新欄位而失效；且缺席落到的是限制較嚴的
+    那一邊，漏帶欄位不可能放行一筆「用全部權益」的授權。
+    """
+    v = record.get(key)
+    if v is None:
+        return False
+    if not isinstance(v, bool):
+        raise CapitalSettingsError(
+            "malformed",
+            f"{key} 必須是布林值（收到 {type(v).__name__}）——"
+            f"字串／數字一律拒絕，這個旗標決定本金基準，表示法必須唯一")
+    return v
 
 
 def _require_str(record: dict, key: str) -> str:
@@ -316,6 +407,8 @@ def verify_capital_settings(record: dict, *, account_id: str, user_address: str,
     util, util_str = _canonical_decimal(
         "capital_utilization", record.get("capital_utilization"),
         UTILIZATION_DECIMALS)
+    # 旗標進得了重建的訊息，所以它與金額一樣受簽章保護（見 build_capital_settings_message）。
+    use_full_equity = require_bool_flag(record, "use_full_equity")
 
     nonce = _require_str(record, "nonce")
     if not _NONCE_RE.fullmatch(nonce):
@@ -348,7 +441,8 @@ def verify_capital_settings(record: dict, *, account_id: str, user_address: str,
     # message」是假驗證——攻擊者同時提供兩者，當然自洽）。
     expected_message = build_capital_settings_message(
         account_id=account_id, allocated_capital=alloc_str,
-        capital_utilization=util_str, nonce=nonce, issued_at=issued_at)
+        capital_utilization=util_str, nonce=nonce, issued_at=issued_at,
+        use_full_equity=use_full_equity)
     try:
         signer = recover_personal_sign_address(expected_message, signature)
     except Exception as e:  # noqa: BLE001 —— 壞簽名格式一律轉 semantic 拒絕
@@ -374,13 +468,14 @@ def verify_capital_settings(record: dict, *, account_id: str, user_address: str,
         account_id=account_id, user_address=expected_user,
         allocated_capital=alloc, capital_utilization=util,
         allocated_capital_str=alloc_str, capital_utilization_str=util_str,
-        nonce=nonce, issued_at=issued_at)
+        nonce=nonce, issued_at=issued_at, use_full_equity=use_full_equity)
 
 
 def build_capital_settings_record(*, account_id: str, allocated_capital: object,
                                   capital_utilization: object, nonce: str,
                                   issued_at: str, signature: str,
-                                  message: str) -> dict:
+                                  message: str,
+                                  use_full_equity: bool = False) -> dict:
     """組出落檔用的記錄 dict（欄位順序固定＝CAPITAL_SETTINGS_FIELDS，diff 友善）。
 
     `action` 由本函式**寫死**成 `ACTION_CAPITAL_SETTINGS`，不從參數收：呼叫端能指定
@@ -392,8 +487,12 @@ def build_capital_settings_record(*, account_id: str, allocated_capital: object,
                                 CAPITAL_DECIMALS)
     _, util = _canonical_decimal("capital_utilization", capital_utilization,
                                  UTILIZATION_DECIMALS)
+    # `use_full_equity` 一律以真正的 JSON bool 落檔（讀端 `require_bool_flag`
+    # 嚴格比對型別）；順序跟著 CAPITAL_SETTINGS_FIELDS，緊接在金額之後——
+    # 讀檔的人看到金額的下一眼就是「這個金額算不算數」。
     return {"action": ACTION_CAPITAL_SETTINGS, "account_id": account_id,
-            "allocated_capital": cap, "capital_utilization": util,
+            "allocated_capital": cap, "use_full_equity": bool(use_full_equity),
+            "capital_utilization": util,
             "nonce": nonce, "issued_at": issued_at, "signature": signature,
             "message": message}
 
