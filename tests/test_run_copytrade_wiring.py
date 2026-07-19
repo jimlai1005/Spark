@@ -50,14 +50,20 @@ _LEADER = "0x" + "d4" * 20
 _OTHER = "0x" + "e5" * 20
 
 
-def _wire_env(monkeypatch, tmp_path, *, manifest_leader, allowlist):
-    """佈置一份 manifest ＋ 白名單，並把引擎需要的 env 全部設好。"""
+def _write_manifest(tmp_path, leader):
+    """（重）寫 follower manifest。回傳路徑；leader=None ＝ 不指定（走 env 回退）。"""
     m = tmp_path / "followers.json"
     entry = {"account_id": "alice", "user_address": _ME,
              "builder_address": _BUILDER, "network": "mainnet", "label": ""}
-    if manifest_leader is not None:
-        entry["leader_address"] = manifest_leader
+    if leader is not None:
+        entry["leader_address"] = leader
     m.write_text(json.dumps({"followers": [entry]}))
+    return m
+
+
+def _wire_env(monkeypatch, tmp_path, *, manifest_leader, allowlist):
+    """佈置一份 manifest ＋ 白名單，並把引擎需要的 env 全部設好。"""
+    m = _write_manifest(tmp_path, manifest_leader)
     lp = tmp_path / "leaders.json"
     lp.write_text(json.dumps({"leaders": allowlist}))
     monkeypatch.setenv("FILET_FOLLOWERS", str(m))
@@ -167,3 +173,97 @@ def test_main_refuses_to_start_when_leader_not_allowlisted(monkeypatch, tmp_path
         rc.main(["--once"])
     assert e.value.code == 2
     assert "leader 解析失敗，拒絕啟動" in capsys.readouterr().out
+
+
+# ── ⭐ 已驗證 leader → 實際交易路徑的接縫 ────────────────────────────────
+# 這條鏈上風險最高的一段：白名單驗過的位址，必須真的是 run_cycle 拿去下單的位址。
+# 2026-07-19 opus 對抗性審查實測「刪掉 main() 的 replace(leader_address=...)」與
+# 「cycle() 內改用啟動時的 settings、丟棄每輪 refresh 結果」兩個變異，990 全綠都沒咬到
+# ——程式碼當時是對的，但接縫零測試保護，任何重構動到那裡都不會有紅燈。
+
+
+def _stub_network(monkeypatch):
+    """把 main() 的網路依賴換成替身。
+
+    main() 內是延後 import（`from hyperliquid.info import Info`），所以在模組上換掉
+    屬性即可攔截。conftest 的 autouse socket-ban 之下這是唯一能走完 main() 的方式，
+    也順帶證明了替身之外沒有其它對外連線。
+    """
+    import hyperliquid.info
+
+    import spark.exchange.hyperliquid as hl
+
+    class _Info:
+        def __init__(self, *a, **k):
+            pass
+
+    class _Adapter:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_positions(self, address):
+            return []
+
+    monkeypatch.setattr(hyperliquid.info, "Info", _Info)
+    monkeypatch.setattr(hl, "HyperliquidAdapter", _Adapter)
+
+
+def _record_leaders(monkeypatch, seen):
+    """把 run_cycle 換成只記錄「本輪拿到的 leader_address」的替身。"""
+    def _fake_run_cycle(adapter, ex, settings, notifier, state, root):
+        seen.append(settings.leader_address)
+        return "report"
+
+    monkeypatch.setattr(rc, "run_cycle", _fake_run_cycle)
+
+
+def test_verified_leader_reaches_run_cycle(monkeypatch, tmp_path, capsys):
+    """⭐ 啟動時：run_cycle 收到的 leader **等於白名單驗過的解析結果**，不是 env 原值。
+
+    env COPY_LEADER_ADDRESS 刻意設成另一個位址，讓「解析結果沒有覆蓋 env 值」這個
+    變異無所遁形：
+    - run_cycle 拿到的位址（交易路徑的真相）
+    - 啟動橫幅印出的位址（操作者判斷「我在跟誰」的唯一依據；印錯等於對人說謊）
+    兩者都必須是已驗證的那一個。
+    """
+    _wire_env(monkeypatch, tmp_path, manifest_leader=_LEADER,
+              allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    monkeypatch.setenv("COPY_LEADER_ADDRESS", _OTHER)   # 未經驗證的 env 原值
+    monkeypatch.setenv("FILET_STATE_DIR", str(tmp_path))
+    _stub_network(monkeypatch)
+    seen = []
+    _record_leaders(monkeypatch, seen)
+
+    rc.main(["--once"])
+
+    assert seen == [_LEADER]                 # 交易路徑吃的是已驗證位址
+    out = capsys.readouterr().out
+    assert f"leader={_LEADER}" in out        # 橫幅說的也是同一個
+    assert f"leader={_OTHER}" not in out     # 未驗證的 env 值不得外洩到任何一處
+
+
+def test_leader_change_mid_run_reaches_run_cycle(monkeypatch, tmp_path):
+    """⭐ 執行中：第二輪解析出**不同**位址時，run_cycle 第二次必須收到**新**位址。
+
+    每輪重新解析的意義全在這裡——客戶換 leader 不必重啟服務。若每輪 refresh 的結果
+    被丟棄（沿用啟動時的 settings），換 leader 會靜默失效：引擎繼續跟舊 leader，
+    而 manifest、web 介面、告警都顯示已經換了。
+    """
+    _wire_env(monkeypatch, tmp_path, manifest_leader=_LEADER,
+              allowlist=[{"address": _LEADER, "name": "Alpha"},
+                         {"address": _OTHER, "name": "Bravo"}])
+    monkeypatch.setenv("FILET_STATE_DIR", str(tmp_path))
+    _stub_network(monkeypatch)
+    seen = []
+    _record_leaders(monkeypatch, seen)
+
+    def _fake_main_loop(mk_cycle, settings, notifier):
+        mk_cycle()
+        _write_manifest(tmp_path, _OTHER)   # 客戶在執行中換了 leader
+        mk_cycle()
+
+    monkeypatch.setattr(rc, "main_loop", _fake_main_loop)
+
+    rc.main([])
+
+    assert seen == [_LEADER, _OTHER]
