@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=filet-engine
 Group=filet-engine
+WorkingDirectory=/opt/filet/spark
 RuntimeDirectory=filet
 RuntimeDirectoryMode=0750
 Environment=FILET_KEYSVC_SOCK=/run/filet/keysvc.sock

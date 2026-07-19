@@ -23,11 +23,25 @@
 | `FILET_LIGHTSAIL_IP_PLACEHOLDER` | Lightsail 靜態 IP | 開實例後取得 |
 | `FILET_BUILDER_ADDR_PLACEHOLDER` | 我方 builder 錢包地址（`FILET_BUILDER_ADDR`／`filet-api.service` 的 `FILET_BUILDER_ADDR`） | 使用者決定，見附錄 A |
 | `FILET_ADMIN_ADDRESSES_PLACEHOLDER` | admin 白名單地址（逗號分隔） | 使用者決定，見附錄 A |
-| `FILET_GIT_REMOTE_PLACEHOLDER` | repo 取得方式——見 §4.2（**本 repo 目前無 git remote**，需先決定推送目標或改用 rsync） | 使用者決定，見附錄 A |
+| `FILET_GIT_REMOTE_PLACEHOLDER` | ~~repo 取得方式，本 repo 目前無 git remote~~ **已於 2026-07-19 更新**：repo 已有私有 remote（`git@github.com:jimlai1005/Spark.git`），但部署改採 rsync 推碼、不用 git clone——見 §3.2 | 不適用（見 §3.2） |
 
 ---
 
 ## 1. 系統準備
+
+### ⚠️ 前置：Lightsail 雲防火牆（本機 ufw 之外的另一層）（2026-07-19 實機部署修正）
+
+Lightsail 實例有**獨立於 ufw 的雲端防火牆**，預設只放行 22。未開 80/443 時：
+外網完全連不到、且 **Let's Encrypt 的 HTTP-01 challenge 會逾時失敗**（憑證簽不下來）。
+
+操作：Lightsail Console → 實例 → Networking → IPv4 Firewall → 新增 HTTP(80) 與 HTTPS(443)。
+（此步**無法用 CLI 完成**，除非 IAM user 有 lightsail:* 權限。）
+
+驗證（從**外部**機器）：
+
+```bash
+nc -z -w5 <IP> 80 && echo "80 OPEN"; nc -z -w5 <IP> 443 && echo "443 OPEN"
+```
 
 ```bash
 # 以有 sudo 權限的一般帳號登入（Lightsail 預設 ubuntu 帳號）
@@ -48,7 +62,10 @@ sudo systemctl enable --now fail2ban
 sudo fail2ban-client status sshd   # 驗收：Status for the jail: sshd 正常輸出
 
 # 自動安全更新（降低長期未 patch 風險；不影響本 runbook 其餘步驟）
-sudo dpkg-reconfigure -plow unattended-upgrades
+# ⚠️ 非互動式寫法（2026-07-19 實機部署修正）——`dpkg-reconfigure -plow` 會跳互動視窗，
+# 批次 SSH 部署（無 tty）跑不了，會卡住整個部署腳本。
+echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | sudo debconf-set-selections
+sudo dpkg-reconfigure -f noninteractive unattended-upgrades
 ```
 
 ---
@@ -117,35 +134,39 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"   # 或重新登入 shell
 uv --version                     # 驗收：印出版本號
 
+# ⚠️ 必須指定安裝路徑（2026-07-19 實機部署修正）
+# 預設會裝進 /home/ubuntu/.local/share/uv/python，但所有 systemd unit 都設了
+# ProtectHome=true——venv 的 interpreter symlink 會指向服務讀不到的 /home，服務必定起不來。
+sudo mkdir -p /opt/filet/python && sudo chown ubuntu:ubuntu /opt/filet/python
+export UV_PYTHON_INSTALL_DIR=/opt/filet/python
 uv python install 3.11
 uv python list | grep 3.11       # 驗收：3.11.x 已安裝
 ```
 
-### 3.2 repo 部署
+> `export UV_PYTHON_INSTALL_DIR=...` 只在目前 shell session 生效。若中途登出重進再執行
+> §3.2 的 `uv sync`，記得重新 `export` 一次，否則 `uv sync` 會退回預設路徑另外裝一份到
+> `/home`，重蹈同一個 bug。venv 是否乾淨的實際驗證在 §3.2（`readlink -f .venv/bin/python`）。
 
-> ⚠️ **本 repo 目前沒有設定 git remote**（`git remote -v` 空）。以下二選一，`FILET_GIT_REMOTE_PLACEHOLDER`
-> 依你的選擇填入——這是附錄 A 的決策點之一，先確定才能執行本節。
+### 3.2 repo 部署（rsync 推碼，2026-07-19 實機部署修正）
 
-**選項 A（有私有 git host，例如 GitHub private repo）：**
+> repo 其實已有私有 remote（`git@github.com:jimlai1005/Spark.git`）——原文件寫「本 repo
+> 目前無 git remote」已過時。但本次部署刻意不在伺服器上執行 `git clone`：這是私有 repo，
+> 在伺服器放 GitHub 存取憑證（deploy key／PAT）多一份要管理的機密。改採 **rsync 推碼**：
+> 直接從本機把工作樹同步過去，伺服器端全程不需要任何 GitHub 存取權限。
 
 ```bash
-sudo mkdir -p /opt/filet && sudo chown "$USER":"$USER" /opt/filet   # 暫時放寬給部署帳號寫
-git clone FILET_GIT_REMOTE_PLACEHOLDER /opt/filet/spark
+# 在本機執行 (/Users/jim/projects/spark)：
+rsync -az --delete \
+  --exclude node_modules --exclude .venv --exclude .next \
+  --exclude __pycache__ --exclude var --exclude .pytest_cache \
+  -e "ssh -i <金鑰路徑>" /Users/jim/projects/spark/ ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER:/tmp/spark-sync/
 ```
 
-**選項 B（無 remote，直接從本機 push 到伺服器的 bare repo）：**
-
 ```bash
-# 在 Lightsail 上：
-sudo mkdir -p /opt/filet && sudo chown "$USER":"$USER" /opt/filet
-git init --bare /opt/filet/spark.git
-
-# 在本機 (/Users/jim/projects/spark)：
-git remote add lightsail ssh://ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER/opt/filet/spark.git
-git push lightsail feat/m2-publicapi:main   # 或部署當下決定的正式分支
-
-# 回 Lightsail：
-git clone /opt/filet/spark.git /opt/filet/spark
+# 回 Lightsail：把暫存目錄搬到正式路徑並修正 owner
+sudo mkdir -p /opt/filet
+sudo rsync -a --delete /tmp/spark-sync/ /opt/filet/spark/
+rm -rf /tmp/spark-sync   # 清掉暫存，不留在 /tmp
 ```
 
 ```bash
@@ -153,14 +174,43 @@ cd /opt/filet/spark
 uv sync   # 從 pyproject.toml 解析、產生 .venv/ 與 uv.lock（uv.lock 是 gitignored，僅存在此機）
 uv run python -c "import spark; print('spark import OK')"   # 驗收
 
+# 驗證 venv 內零 /home 參照（確認 §3.1 的 UV_PYTHON_INSTALL_DIR 修正生效）：
+readlink -f .venv/bin/python    # 應指向 /opt/filet/python/...，不得出現 /home
+
 # 首次部署後，把解出的版本記進本文件（見文末「附錄 B」），避免下次部署解出不同版本造成漂移。
 sudo chown -R root:root /opt/filet/spark
 sudo chmod -R go-w /opt/filet/spark   # 確保 group/other 無寫入權（唯讀給三個 service user）
 ```
 
+> 之後每次重新部署（拉新版本）：重跑上面兩段 rsync（`--delete` 會清掉伺服器上已刪除的
+> 檔案，保持與本機工作樹一致），再視情況重跑 `uv sync`（只在依賴有變動時需要）。
+
 ---
 
 ## 4. Node 20 LTS + 前端 build + dashboard 部署
+
+### 4.0 Swap 與 follower 容量估算（2GB 機型，2026-07-19 實機部署修正）
+
+2GB RAM 機型跑 `npm run build`（§4.2）偶爾會頂到記憶體上限；先建 2GB swapfile 當保險，
+免得 build 中途被 OOM killer 打斷。實測本次部署 build 只用到約 3MB swap（代表平常不會
+真的觸發），純粹是防禦性配置，不建才是賭運氣。
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+free -m   # 驗收：Swap 行顯示 2048 total
+
+# 開機自動掛載（持久化，不然重開機後 swap 就沒了）
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+cat /etc/fstab | grep swapfile   # 驗收：有這一行
+```
+
+**follower 容量估算（實測值）**：四個常駐服務（keysvc + api + dashboard + nginx，不含
+follower）合計約 203MB，`free -m` 的 available 約 1372MB；每個 `filet-follower@` 實例
+實測約 55-60MB。以此估算，**約可容納 15-20 個 follower** 才會開始吃到 swap；建議接近
+10 個 follower 時就開始盯 `free -m -h`，不要等到逼近上限才注意。
 
 ### 4.1 安裝 Node 20 LTS
 
@@ -329,21 +379,26 @@ systemctl list-timers | grep certbot   # 驗收：有一條 certbot.timer
 ```bash
 # 先用 key-service 生一把測試用 agent key（不影響任何真實帳號——account_id 自訂測試值）
 # 走正常路徑：透過已啟動的 filet-api，呼一次 onboarding agent 生成端點會更貼近真實情境；
-# 若還沒接前端，可直接用 python 對 socket 送一筆 generate 測試（以 filet-engine 身分執行）：
-sudo -u filet-engine /opt/filet/spark/.venv/bin/python - <<'PY'
+# 若還沒接前端，可直接用 python 對 socket 送一筆 generate 測試。
+# ⚠️ 必須以 filet-api 身分執行（2026-07-19 實機部署修正）——SO_PEERCRED 白名單
+# （FILET_KEYSVC_ALLOWED_UIDS，見 §5.2）只認 filet-api 的 uid，用 filet-engine 呼會被拒絕：
+sudo -u filet-api /opt/filet/spark/.venv/bin/python - <<'PY'
 import socket, json
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect("/run/filet/keysvc.sock")
 s.sendall((json.dumps({"op": "generate", "account_id": "deploytest0000000000000000000000000000"}) + "\n").encode())
 print(s.recv(4096))
 PY
-# 預期：{"ok": true, "agent_address": "0x...", ...} 之類的 JSON（確認 keysvc 正常運作）
+# 預期：{"ok": true, "agent_address": "0x...", ...} 之類的 JSON（確認 keysvc 正常運作，
+# 且走的是生產真實路徑——這是唯一被白名單允許呼 generate 的身分）
 
 sudo -u filet-api ls /etc/filet/keys
 # 預期：ls: cannot open directory '/etc/filet/keys': Permission denied
 
 sudo -u filet-api cat /etc/filet/keys/deploytest0000000000000000000000000000/agent.key
 # 預期：cat: /etc/filet/keys/deploytest0000000000000000000000000000/agent.key: Permission denied
+# 驗收意義：filet-api 生得出 key（上面 generate 成功），卻讀不到 key 檔本身——
+# 這正是非託管不變量要證明的事（生成與持有分離），不是同一件事的兩個弱驗證。
 
 sudo -u filet-dashboard cat /etc/filet/keys/deploytest0000000000000000000000000000/agent.key
 # 預期：同上 Permission denied（filet-dashboard 連 filet-engine 群組都不在，權限更嚴）
@@ -479,22 +534,31 @@ sudo nginx -t && sudo systemctl reload nginx
    不是隨便填的測試值，需與 onboarding 流程要核准的鏈上帳戶一致。
 3. **`FILET_ADMIN_ADDRESSES_PLACEHOLDER`**：admin 白名單地址——誰能看 `/admin/pending`，需你
    指定至少一個地址。
-4. **repo 取得方式（§3.2 選項 A vs B）**：本 repo 目前沒有設定任何 git remote
-   （`git remote -v` 空輸出）。部署前要嘛先把 repo push 到一個私有 git host（選項 A，較常規、
-   之後拉版方便），要嘛用裸 repo + push 到伺服器（選項 B，不依賴第三方 host）。這是架構層
-   的選擇，不是本次任務範圍內能替你定案的事。
+4. **repo 取得方式**：**已於 2026-07-19 更新**——repo 已有私有 remote
+   （`git@github.com:jimlai1005/Spark.git`），但本次部署刻意不在伺服器上用 `git clone`
+   （避免把 GitHub 存取憑證放上伺服器），改採 **rsync 推碼**（見 §3.2），伺服器端全程
+   不需要任何 GitHub 存取權限。若之後想改回 `git clone` 流程，需額外在伺服器建 deploy key
+   並鎖唯讀權限——不是目前採用的方式，此點不再是待決策項。
 5. **§7 環境變數檔改用 `EnvironmentFile`**：屬於「值得做但非本次紅線允許動手」的加固——
    是否要在部署日順手做，由你決定（步驟已寫在 §7）。
 6. **certbot 續期失敗的告警管道**：本文件只確認 `certbot.timer` 存在，沒有另外接告警
    （例如憑證到期前 N 天發 Telegram）。若要接，需決定告警管道與門檻，超出本次三檔案範圍。
 
-## 附錄 B：首次部署後記錄（部署日填寫）
+## 附錄 B：首次部署後記錄
 
 > `uv.lock` 是 gitignored（repo 慣例，見 `.gitignore`），所以「這次部署實際解出哪些版本」
 > 只存在於部署機器上，不會自動留痕。**首次部署完成後，把 `uv sync` 實際解出的版本貼在這裡**，
 > 之後任何一次重新 `uv sync`（例如換機器、換磁碟）都能對照，避免依賴漂移是排查困難的第一步。
 
+**2026-07-19 首次實機部署（Lightsail，Ubuntu 22.04.5）實測版本：**
+
 ```
-# TODO（部署日填）：uv run python -c "import importlib.metadata as m; [print(d.name, d.version) for d in m.distributions()]" 的輸出，
-# 或至少貼 hyperliquid-python-sdk / fastapi / uvicorn / eth-account 幾個關鍵套件版本。
+fastapi                  0.139.2
+uvicorn                  0.51.0
+eth-account               0.13.7
+hyperliquid-python-sdk    0.24.0
+pydantic                  2.13.4
+Node.js                   20（LTS，見 §4.1）
+nginx                     1.18（Ubuntu 22.04 內建，非 1.25+——見 deploy/nginx-filet.conf 的
+                          http2 語法註解，這是 Bug 2 的根因）
 ```
