@@ -46,7 +46,9 @@ SDK 端的型別定義（**已實際查證，非憑印象**）：
 
 以及：unified account 與 portfolio margin 各**限 50k user actions/day**，standard 無此限制。
 
-我方 builder 地址**必須留在 standard mode**。這句話的主詞歧義見第 7 節反面證據 2——它對產品的影響取決於怎麼讀，**未被官方文件消解**。
+我方 builder 地址**必須留在 standard mode**。
+
+> ✅ **主詞歧義已於 2026-07-19 解決 → 見文末「第 8 節」。結論：主詞是我方 builder 地址（讀法 A），客戶的帳戶模式不影響 builder fee。** 官方 builder-codes 頁另有一句無歧義的表述，並經 mainnet 實測反證讀法 B。原「反面證據 2」已作廢。
 
 ---
 
@@ -239,10 +241,8 @@ spot USDC 直接算 perp 保證金。但與 builder fee 的 standard-mode 要求
 
 1. **官方從未明文寫「agent 不能簽 user-signed action」**。第 3 題的結論建立在：SDK 程式碼結構、SDK 官方 example 的守衛式、recover 函式命名、以及多個第三方一致陳述——**四條間接證據，零條官方明文**。我認為結論成立，但若要當作產品承諾對客戶宣稱「我們碰不到你的錢」，**建議用 testnet agent key 實打一次 `usd_class_transfer` 看錯誤訊息**，把它變成實跑輸出。這是唯讀查詢做不到的，必須實際送一筆（testnet、金額極小、預期失敗）。
 
-2. **「Builder code addresses must be in standard mode to accrue builder fees」的主詞有歧義，而兩種讀法對產品影響天差地別**：
-   - 讀法 A（我採用的）：指**我方 builder 地址**必須是 standard → 只要我們自己別亂切模式即可，影響可控。
-   - 讀法 B：指**使用 builder code 下單的地址**（即客戶）→ 任何自行切到 unifiedAccount 的客戶都會讓我們**收不到 builder fee**，而我們**無法阻止也無法察覺**（除非主動輪詢 `query_user_abstraction_state`）。
-   官方文件沒有消解這個歧義。**這是本次研究發現的最大商業風險**，建議列為必須向 HL 澄清或 testnet 實測的項目。（若採讀法 B，第 6 節第 5 條的唯讀偵測就從「體驗優化」升級為「收入保護的必需品」。）
+2. ~~**「Builder code addresses must be in standard mode to accrue builder fees」的主詞有歧義**~~
+   **❌ 已作廢（2026-07-19）**：主詞已判定為**我方 builder 地址**（讀法 A），官方另一頁有無歧義表述，並經 mainnet 實測反證讀法 B。**詳見第 8 節。** 原文保留於 git history。
 
 3. **Q5 的「HL 大概率有處理」是演繹推測，不是證據**。前一份研究已標為最關鍵未驗證假設，本次仍未證實。若實測落在結果 B，績效顯示邏輯要重寫並引入第二個端點對帳，違反目前刻意維持的單一來源架構。
 
@@ -288,7 +288,7 @@ spot USDC 直接算 perp 保證金。但與 builder fee 的 standard-mode 要求
 
 ## 建議下一步（依重要性）
 
-1. **釐清 builder standard-mode 的主詞**（反面證據 2）——這是唯一可能直接影響收入的未知。
+1. ~~**釐清 builder standard-mode 的主詞**~~ → **✅ 已完成（見第 8 節）**。結論：讀法 A，客戶模式不影響收入。改為新的第 1 順位：**把「我方 builder 地址 == standard mode」做成部署前斷言＋定期監控**（第 8 節第 5 題）。
 2. **執行第 5 節實驗**（需 testnet 主鑰）——決定績效顯示邏輯要不要重寫。
 3. **加唯讀偵測**：`spot_user_state` + `query_user_abstraction_state` → dashboard 提示「N USDC 卡在 Spot」。零風險、直接降低入金流失。
 4. **寫入金教學**（第 6 節 5 條），主推 Arbitrum 原生 USDC 走官方 bridge。
@@ -312,3 +312,234 @@ spot USDC 直接算 perp 保證金。但與 builder fee 的 standard-mode 要求
 **對照組成立**是這次判讀可信的關鍵：同一序列裡「資金流動不計入」與「交易損益計入」兩種行為都出現了，所以不是「剛好都是 0」。
 
 ⚠️ 仍未驗證：反方向（perp→spot）在**有部位**時的行為、以及跨 `perpWeek`／`perpMonth` 窗的一致性。本次帳戶無部位無掛單。
+
+---
+
+# ⭐ 第 8 節：builder standard-mode 的主詞——**已判定（2026-07-19）**
+
+**動機**：builder fee 是本產品唯一營收來源。若主詞是「客戶」，任何客戶自行切到 unified account 都會靜默斷我方營收。
+
+## 結論先行
+
+1. **主詞是「我方 builder 地址」（讀法 A）。** 官方 builder-codes 頁有一句**無語法歧義**的表述：「**The builder** must have at least 100 USDC in perps account value and must use standard as the account abstraction mode.」——主詞明寫 "The builder"，且與同段前文的 "the end user" 刻意分開。
+2. **讀法 B 經 mainnet 實測直接證偽**：找到一個**目前處於 `unifiedAccount` 模式**的 mainnet 地址，其最近 2000 筆 fills **全部帶 `builderFee`**，最新一筆發生在查詢前 **4.5 分鐘**。客戶模式不影響 builder fee 收取。
+3. **模式可唯讀查詢**：`POST /info {"type":"userAbstraction","user":"0x..."}`，回傳 `"default"｜"disabled"｜"unifiedAccount"｜"portfolioMargin"`。我方 testnet builder 與 follower 皆為 `"disabled"`（＝standard），**目前合規**。
+
+**商業影響：原先列為「最大商業風險」的項目消失。** 營收模型不受客戶帳戶模式影響；需要控管的只有**我方自己的 builder 地址**。
+
+---
+
+## 第 1 題：那句話的主詞是誰？→ **我方 builder 地址**
+
+### 證據 1（最強）：官方另一頁的無歧義表述
+
+[Builder codes](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/builder-codes)（以 `.md` 取得原文），逐字：
+
+> "In order to use builder codes, **the end user** would first approve a max fee for the builder address via the `ApproveBuilderFee` action. This action must be signed by the user's main wallet, not an agent/API wallet. **The builder** must have at least 100 USDC in perps account value and must use standard as the account abstraction mode."
+
+**三點決定性**：
+- 主詞明寫 **"The builder"**，不是 "the user"、不是 "addresses using builder codes"。
+- 同一段前兩句的主詞是 **"the end user"**——作者在第三句**刻意換主詞**，這不是疏漏而是區分。
+- 綁在同一句的另一條件是「**至少 100 USDC perps 帳戶淨值**」——這顯然是**對 builder 的資格門檻（反濫發）**，不可能是對每一位客戶的要求（否則小額客戶全部無法交易，與 HL 現實不符）。兩個條件共用一個主詞，主詞只能是 builder。
+
+### 證據 2：account abstraction modes 頁的模式描述自洽
+
+[Account abstraction modes](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/account-abstraction-modes) 逐字，模式 3：
+
+> "Manual / Standard (recommended for market makers, high volume automated users, and **deployers/builders**): separate perp and spot balances, separate DEX balances."
+
+官方把 standard 標為「**推薦給 builders**」——與「builder 必須用 standard」同向；若該要求是針對一般下單客戶，這句「推薦給 builders」就成了廢話。
+
+### 證據 3：詞法——"Builder code address" 是「builder 的地址」
+
+- 官方 builder-codes 頁：「`b` is **the address of the builder**」
+- SDK `utils/types.py:184`（`.venv/lib/python3.14/site-packages/hyperliquid/`）逐字註解：`# b is the public address of the builder, f is the amount of the fee in tenths of basis points.`
+- 官方 CSV 路徑參數名即 `{builder_address}`：`https://stats-data.hyperliquid.xyz/Mainnet/builder_fills/{builder_address}/{YYYYMMDD}.csv.lz4`
+
+「builder code address」在 HL 術語體系中固定指**收費方地址**，不曾用來指下單者。原句 "Builder code addresses must be in standard mode" 即「登記為 builder code 的那些地址」。
+
+### 證據 4：第三方一致（弱，僅交叉印證）
+
+[Dwellir](https://www.dwellir.com/blog/hyperliquid-builder-codes)、[HypeBasis](https://hypebasis.io/builder-fees) 等轉述皆作「**the builder** must ... use standard as the account abstraction mode」；某開源 builder 範本文件把它寫成「`NEXT_PUBLIC_BUILDER_ADDRESS` ... **that account** must have minimum 100 USDC in Perps Available」——同樣指向 builder 自己的帳戶。
+
+**判定信心：高。** 這不是「證據不足」——官方有無歧義表述，且下方有實測反證。**無需向 HL 官方提問。**
+
+---
+
+## 第 2 題：standard mode 的定義，與前一份研究的核對
+
+**前一份研究的說法正確**，但需補一個第四值。官方 [Account abstraction modes](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/account-abstraction-modes) 完整四模式（逐字節錄）：
+
+| # | 官方字面 | 語意 |
+|---|---|---|
+| 1 | **Unified account** (recommended for most users) | 每個資產單一餘額，spot 與 perp 統一為單一保證金池 |
+| 2 | **Portfolio margin** (most capital efficient) | 全組合統一（HYPE / BTC / USDC / USDT） |
+| 3 | **Manual / Standard** (recommended for market makers, high volume automated users, and deployers/builders) | perp 與 spot 餘額分離、各 DEX 餘額分離 |
+| 4 | **DEX abstraction** (to be discontinued) | 另一條軸；官方已標示將淘汰 |
+
+**「standard mode」＝ 官方模式 3「Manual / Standard」**，即**不啟用任何 abstraction** 的原始行為。
+
+### API 值 ↔ 官方名稱對照（**注意有第四值 `default`，SDK 型別未涵蓋**）
+
+SDK 寫入端型別 `utils/types.py:186`：`Abstraction = Literal["unifiedAccount", "portfolioMargin", "disabled"]`；wire 對照 `exchange.py:59-63`：`{"disabled": "i", "unifiedAccount": "u", "portfolioMargin": "p"}`。
+
+但**唯讀端實測回傳值多一個 `"default"`**（本次實測，見下）：
+
+| API 回傳 | 對應官方模式 | 說明 |
+|---|---|---|
+| `"disabled"` | Manual / Standard | abstraction 已明確關閉 ✅ builder 合規 |
+| `"default"` | 推定 ≈ Standard（**未經官方確認**） | 從未設定過。實測全新地址即回此值；SDK example 註解「the account must be in "default" mode to succeed」佐證＝「未設定」 |
+| `"unifiedAccount"` | Unified account | |
+| `"portfolioMargin"` | Portfolio margin | |
+
+⚠️ **`"default"` 是否等同 standard，官方文件未明說——標記為推定。** 對我方無實務影響：我方 builder 地址實測為 `"disabled"`（明確 standard），不落在這個灰區。**但若日後更換 mainnet builder 地址，建議明確設為 `disabled` 而非依賴 `default`**（見第 5 題）。
+
+---
+
+## 第 3 題：能不能查某地址的模式？→ **能，唯讀公開端點，無需金鑰**
+
+**端點**：`POST https://api.hyperliquid.xyz/info`（testnet：`https://api.hyperliquid-testnet.xyz/info`）
+**Body**：`{"type": "userAbstraction", "user": "0x..."}`
+**SDK 封裝**：`info.py:634-635`（`.venv/lib/python3.14/site-packages/hyperliquid/info.py`）逐字：
+
+```python
+def query_user_abstraction_state(self, user: str) -> Any:
+    return self.post("/info", {"type": "userAbstraction", "user": user})
+```
+
+**本 repo 尚未接線**：`grep -rn "abstraction" src/ scripts/ web/src/ tests/` → 零命中。
+
+### 實測輸出（2026-07-19，真實執行）
+
+我方 testnet 兩個地址（**驗收條件 3**）：
+
+```
+$ curl -s -X POST "https://api.hyperliquid-testnet.xyz/info" -H "Content-Type: application/json" \
+    -d '{"type":"userAbstraction","user":"0xfB9C52f56F03D786AD5D435aa70fe45D80569760"}'
+"disabled"
+
+$ curl -s -X POST "https://api.hyperliquid-testnet.xyz/info" -H "Content-Type: application/json" \
+    -d '{"type":"userAbstraction","user":"0xbAC652A5Fb611c1BdC3B9D244cc7E0cC03123662"}'
+"disabled"
+```
+
+- Follower9760 `0xfB9C52…9760` → `"disabled"`（standard）
+- **Leader＝Builder3662 `0xbAC652…3662` → `"disabled"`（standard）→ 我方 builder 地址合規** ✅
+
+**端點確實能區分模式**（否則「偵測」是假的）——同一端點的對照輸出：
+
+```
+0x0000000000000000000000000000000000000001 (testnet, 全新)  => "default"
+0xdfc24b077bc1425ad1dea75bcb6f8158e10df303 (mainnet, HLP)   => "default"
+0x5078c2fbea2b2ad61bc840bc023e35fce56bedb6 (mainnet)        => "unifiedAccount"
+```
+
+100 個 mainnet 真實地址（取自 HLP vault `followers`）的模式分布實測：
+`Counter({'unifiedAccount': 58, 'default': 41, 'disabled': 1})` ——三種值都出現，**判別力已證實**。
+
+---
+
+## 第 4 題：直接驗證 → **做到了，且直接證偽讀法 B**
+
+### 為什麼不能用我方 testnet 資料回答
+
+`docs/superpowers/research/2026-07-19-testnet-e2e-findings.md:72-77`（V2）記錄 builder fee 實收 0.02%。但本次實測顯示 **follower 當時就是 `"disabled"`（standard）**——該實驗**無法區分兩種讀法**（讀法 B 下 standard 客戶本來就該收得到）。**既有 testnet 資料對本題是無效證據**，不得引用為支持。
+
+### 實際做的實驗：mainnet 反例搜尋
+
+**設計**：若讀法 B 成立，則「處於 unifiedAccount 模式的地址」**不可能**有 `builderFee` > 0 的成交。找到一個反例即證偽。
+
+**方法**：取 HLP vault `followers` 的 100 個真實 mainnet 地址 → 逐一查 `userAbstraction` → 再查 `userFills` 掃 `builderFee` 欄位。腳本：`scratchpad/probe.py`（暫存，未入 repo）。
+
+**結果（真實輸出）**：
+
+```
+addresses: 100
+mode distribution: Counter({'unifiedAccount': 58, 'default': 41, 'disabled': 1})
+
+=== addresses WITH builder-fee fills, by mode ===
+0x7bfee91193d9df2ac0bfe90191d40f23c773c060  mode=unifiedAccount   fills=2000  builderFee_fills=2000
+0xd9b0a1568c93cea0ab03f1d3597ab1becaba400e  mode=unifiedAccount   fills=2000  builderFee_fills=6
+
+summary (addresses with >=1 builderFee fill): {'unifiedAccount': 2}
+total scanned: 95
+```
+
+**時序驗證（排除「先收費、後改模式」這個競爭解釋）**——對 `0x7bfee9…c060` 複查：
+
+```
+mode NOW: unifiedAccount
+builderFee fills: 2000 of 2000
+earliest: 2026-07-19 12:06:47 UTC
+latest  : 2026-07-19 15:08:51 UTC
+now     : 2026-07-19 15:13:21 UTC
+latest builderFee fill: {"coin": "para:CRDO", "px": "199.69", "sz": "0.09",
+                         "fee": "0.002142", "builderFee": "0.001797", "time": 1784473731185}
+implied builder fee rate: 0.009999%
+```
+
+**判讀**：該地址**此刻**處於 `unifiedAccount`，而最近一筆帶 builder fee 的成交在 **4.5 分鐘前**；連續 3 小時、2000 筆成交**每一筆**都帶 builder fee，費率精確 0.01%（f=10）。「模式是在收費之後才切換的」這個解釋在 4.5 分鐘的間隔下不成立。
+
+**⇒ 讀法 B 證偽。客戶處於 unified account 模式，builder fee 照收。**
+
+**誠實標註（此實驗的極限）**：`userFills` 的 `builderFee` 證明**費用已向客戶收取**，嚴格說並未直接證明**該筆費用已入帳至 builder 的 `builderRewards`**。理論上仍存在「收了但沒撥給 builder」的殘餘可能。但 (a) 官方明文說 builder codes「processed entirely onchain as part of the fee logic」，(b) 官方把資格條件明確歸屬於 builder 而非 user，(c) 若成立則等同 HL 靜默侵吞——三者使該殘餘可能性極低。**若要 100% 閉合，唯一方法是我方 mainnet 上線後，拿一位 unifiedAccount 客戶的成交去對帳 `query_builder_accrued` 的增量**（`src/spark/exchange/hyperliquid.py:50-53`）。建議列為上線後第一週的對帳項，而非上線前的阻塞項。
+
+---
+
+## 第 5 題：緩解方案 → **讀法 B 不成立，防護重心移到「我方 builder 地址」**
+
+原設想的「客戶側偵測＋提示」**不再是收入保護的必需品**。真正需要的是**我方單點的自我監控**——這反而更好，因為它是我們完全可控的單一物件。
+
+### 建議 A（**應做，高價值低成本**）：builder 地址模式的部署前斷言＋定期監控
+
+- **檢查**：`POST /info {"type":"userAbstraction","user":<我方 builder>}` 必須回 `"disabled"`（或經確認的 `"default"`）。
+- **落點**：(i) `onboarding` / 啟動時的前置檢查一次；(ii) 既有日報 `scripts/copytrade_daily_report.py` 加一行。
+- **失敗處理**：屬**安全關鍵**（直接斷營收）→ 依全域工程原則 3，**大聲告警**，不得 log 完吞掉。
+- **可靠度：高**。單一地址、唯讀、確定性回傳、我方完全可控。
+- **順帶一併檢查**：builder 地址 perps 帳戶淨值 **≥ 100 USDC**（官方同句要求，同樣是斷營收條件，且我方可能因提領而跌破——比模式更容易無聲觸發）。這條**目前完全沒有監控**，建議與模式檢查一起做。
+
+### 建議 B（**應做，但動機改變**）：客戶側模式查詢仍值得接
+
+不再為了保護 builder fee，而是為了**入金體驗**（第 6 節第 5 條）：`unifiedAccount`／`portfolioMargin` 的客戶**不需要** spot→perp 劃轉，可略過該教學步驟。
+- **可靠度：高**（唯讀端點，已實測可區分）。
+- **優先度：中**（體驗優化，非收入保護）。
+
+### 建議 C（**上線後對帳**，閉合第 4 題的殘餘不確定性）
+
+mainnet 首週：挑一位模式為 `unifiedAccount` 的實際客戶，比對其成交的 `builderFee` 總和 vs `query_builder_accrued` 增量。若一致 → 殘餘可能性歸零。
+- **可靠度：高，但需要真實客戶流量**，故只能事後做。
+
+### 不建議
+
+- ❌ **強制或勸說客戶切換帳戶模式**。已證實無必要；且切換會改變客戶的風險模型（spot 資產暴露於 perp 爆倉風險），我方無權亦不應誘導。第 4 節「不要呼叫 `agent_set_abstraction`」的結論**維持不變**，且理由更強了——原本理由之一「與 builder fee 的 standard-mode 要求可能衝突」現已證明不存在，但其餘兩條（改變客戶風險模型、50k actions/day 上限）仍然成立。
+
+---
+
+## 第 8 節的反面證據（主動列出）
+
+1. **`"default"` 的語意未經官方確認**（第 2 題）。若 `default` 實際上**不**算 standard，而我方某日新建的 mainnet builder 地址停在 `default`，則建議 A 的斷言若寫成「`disabled` 或 `default` 皆放行」就會漏抓。**緩解：斷言只放行 `"disabled"`，強制明確設定**——寧可多一次人工設定，不要賭語意。
+2. **實測樣本有偏**：100 個地址取自 HLP vault followers，是「會存 vault 的活躍用戶」，非隨機。但這**不影響證偽邏輯**——證偽只需要一個反例，且反例本身（4.5 分鐘前、2000/2000 筆）品質極高。取樣偏差只影響「模式分布比例」的代表性，那個數字本報告不作結論用。
+3. **`builderFee` 已收取 ≠ builder 已入帳**（第 4 題誠實標註）。這是本節唯一未完全閉合的環節，處置見建議 C。
+4. **官方文件在他處已被證實會寫錯**（第 7 節反面證據 5：PnL 公式字面寫反）。因此本節**沒有只靠文件**——實測是獨立於文件的第二條腿，兩腿同向才下判定。
+5. **時間點依賴**：HL 正在演進（模式 4 標示 "to be discontinued"、portfolio margin 為新功能）。本結論成立於 **2026-07-19**。若 HL 日後改變 builder fee 與模式的互動，建議 A 的監控會是**第一個發現的人**——這是把一次性研究結論轉成持續性保障的理由。
+
+---
+
+## 第 8 節來源
+
+**官方文件**
+- [Builder codes](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/builder-codes)（`.md` 版取得原文）——「The builder must have at least 100 USDC in perps account value and must use standard as the account abstraction mode.」＋「`b` is the address of the builder」＋ `{builder_address}` CSV 路徑
+- [Account abstraction modes](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/account-abstraction-modes)——四模式全文、"recommended for ... deployers/builders"、"Builder code addresses must be in standard mode to accrue builder fees"
+
+**SDK（hyperliquid-python-sdk 0.24.0，`.venv/lib/python3.14/site-packages/hyperliquid/`）**
+- `info.py:634-635` `query_user_abstraction_state`｜`utils/types.py:184-187` `BuilderInfo` 註解與 `Abstraction`｜`exchange.py:59-63` wire 對照
+
+**本 repo**
+- `src/spark/exchange/hyperliquid.py:47-53`（`maxBuilderFee` / `query_builder_accrued`）｜`docs/superpowers/research/2026-07-19-testnet-e2e-findings.md:72-77`（V2，**本題無效證據**，理由見第 4 題）
+
+**實測（2026-07-19，唯讀公開端點，無金鑰）**
+- testnet `userAbstraction`：`0xfB9C52…9760` → `"disabled"`；`0xbAC652…3662` → `"disabled"`
+- mainnet 100 地址掃描：`unifiedAccount` 58 / `default` 41 / `disabled` 1
+- mainnet 反例：`0x7bfee91193d9df2ac0bfe90191d40f23c773c060`（`unifiedAccount`，2000/2000 筆帶 `builderFee`，最新距查詢 4.5 分鐘）
+
+**第三方（僅交叉印證）**：[Dwellir builder codes](https://www.dwellir.com/blog/hyperliquid-builder-codes)｜[HypeBasis](https://hypebasis.io/builder-fees)
