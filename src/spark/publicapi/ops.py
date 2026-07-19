@@ -363,6 +363,45 @@ def load_accrued_series(path: str | Path) -> list[AccruedPoint]:
     return out
 
 
+def accrued_window(series) -> tuple[datetime, datetime] | None:
+    """從 accrued 歷史序列推導對帳窗口 `(start, end]`。
+
+    ⭐ **這是收入對帳與客戶損益共用的唯一窗口來源**（工程原則 1：被比較的兩個值
+    必須同源同基準）。兩個端點都必須呼叫本函式，不得各自推導出「看起來一樣」的窗口——
+    這正是先前那個 Critical（健康帳戶被誤判 199 倍差異）的成因。抽成函式而非各自
+    複製一份日期算式，是刻意的結構性修法：兩份「長得一樣」的推導會各自漂移，
+    而漂移後兩張表的 builder fee 仍然並排顯示、仍然看起來可以相減。
+
+    窗口界一律取相鄰兩筆快照的 `captured_at`——accrued 是查詢當下的鏈上累積量，
+    不是日曆日的量，故 `accrued[-1] - accrued[-2]` 涵蓋的是
+    `(captured_at[-2], captured_at[-1]]`。
+
+    回 None 代表無法對齊（資料不足或缺 `captured_at`），呼叫端必須據此標示 basis_unknown，
+    不得自行退化成日曆日或 now 往回 N 天。
+    """
+    points = list(series)
+    if len(points) < 2:
+        return None
+    prev_pt, now_pt = points[-2], points[-1]
+    start, end = prev_pt.captured_at, now_pt.captured_at
+    if start is None or end is None or end <= start:
+        return None
+    return start, end
+
+
+def accrued_window_note(series) -> str:
+    """`accrued_window` 回 None 時，說明「為什麼對不齊」的人話（供 basis_unknown 的
+    `note` 用）。刻意與窗口推導分家：這裡只解釋，不產生任何時間界——
+    否則就成了第二個窗口來源。"""
+    points = list(series)
+    if len(points) < 2:
+        return "accrued 歷史不足兩點，無法推導對帳窗口"
+    prev_pt, now_pt = points[-2], points[-1]
+    if prev_pt.captured_at is None or now_pt.captured_at is None:
+        return "歷史資料缺快照時刻（captured_at），無法對齊窗口"
+    return "相鄰兩筆快照時刻非嚴格遞增（回填或時鐘倒退），無法對齊窗口"
+
+
 def _as_decimal(v) -> Decimal:
     if v is None:
         return Decimal("0")

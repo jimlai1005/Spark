@@ -506,6 +506,107 @@ def test_revenue_no_false_alarm_logged_when_basis_unknown(tmp_path, caplog):
     assert "收入對帳超標" not in caplog.text
 
 
+# ---------- ⭐ 兩張表共用同一個窗口（工程原則 1 的結構性修法） ----------
+
+def test_customers_accrued_window_identical_to_revenue_window(tmp_path):
+    """⭐ 本修復的核心斷言：`/api/ops/customers?window=accrued` 與 `/api/ops/revenue`
+    的 window_start／window_end **完全相同**（同一個 `ops.accrued_window` 推導）。
+
+    存在理由：兩張表的 builder fee 並排顯示，若窗口不同就不可相減，而「不可相減」
+    在畫面上看不出來。前端文字標註擋不住誤讀，只有同源窗口擋得住。"""
+    cap_prev = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, cfg, store, hl = _admin_app(
+        tmp_path, history=[("2026-07-18", "10", cap_prev), ("2026-07-19", "16", cap_now)])
+    hl.window_aware = True
+    hl.fills[ADDR_A] = [_fill(builder_fee="6",
+                              t=datetime(2026, 7, 18, 9, 0, tzinfo=timezone.utc))]
+    rev = client.get("/api/ops/revenue").json()
+    cus = client.get("/api/ops/customers", params={"window": "accrued"}).json()
+    assert cus["basis_unknown"] is False
+    assert cus["window_start"] == rev["window_start"] == cap_prev.isoformat()
+    assert cus["window_end"] == rev["window_end"] == cap_now.isoformat()
+    # 同窗 → 兩表的 builder fee 真的可以相減（應收 6 對上實收 6）
+    assert cus["customers"][0]["builder_fee"] == rev["attributed"] == "6"
+
+
+def test_customers_accrued_window_differs_from_days_window(tmp_path):
+    """反面：預設 days 窗與 accrued 窗**必定不同**（days 從 now 回推，accrued 取快照
+    時刻）。若哪天兩者「碰巧相同」，代表 days 分支偷偷改用了快照時刻——那正是
+    「看起來同基準」的假對齊，本測試要讓它紅。"""
+    cap_prev = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    client, *_ = _admin_app(
+        tmp_path, history=[("2026-07-18", "10", cap_prev), ("2026-07-19", "16", cap_now)])
+    accrued = client.get("/api/ops/customers", params={"window": "accrued"}).json()
+    default = client.get("/api/ops/customers").json()
+    assert default["window"] == "days" and default["days"] == 1
+    assert default["window_end"] != accrued["window_end"]
+
+
+def test_customers_accrued_window_basis_unknown_returns_no_numbers(tmp_path):
+    """無法對齊（舊資料缺 captured_at）→ basis_unknown ＋ note，**不回數值欄**。
+    不得退化成日曆日或 now 往回 N 天（沿收入對帳的既有慣例）。"""
+    client, cfg, store, hl = _admin_app(
+        tmp_path, history=[("2026-07-18", "10"), ("2026-07-19", "16")])
+    hl.fills[ADDR_A] = [_fill(builder_fee="2")]
+    body = client.get("/api/ops/customers", params={"window": "accrued"}).json()
+    assert body["basis_unknown"] is True
+    assert "captured_at" in body["note"]
+    assert body["window_start"] is None and body["window_end"] is None
+    for k in ("customers", "days"):
+        assert k not in body, f"{k} 不得在缺基準時被回出來"
+
+
+def test_customers_accrued_window_basis_unknown_when_history_too_short(tmp_path):
+    """歷史不足兩點同樣無法對齊 → basis_unknown（不偷偷用 days 窗補位）。"""
+    client, *_ = _admin_app(tmp_path, history=[("2026-07-19", "16")])
+    body = client.get("/api/ops/customers", params={"window": "accrued"}).json()
+    assert body["basis_unknown"] is True and "customers" not in body
+
+
+def test_customers_days_and_accrued_window_are_mutually_exclusive(tmp_path):
+    """兩者同時給 → 400。不靜默忽略其中一個：被忽略的那個會讓人以為自己看的是
+    另一個基準，正是本修復要消滅的誤讀。"""
+    client, *_ = _admin_app(tmp_path)
+    r = client.get("/api/ops/customers", params={"days": 7, "window": "accrued"})
+    assert r.status_code == 400
+    assert "互斥" in r.json()["detail"]
+
+
+def test_customers_rejects_unknown_window_value(tmp_path):
+    """未知的 window 值 → 400（靜默退回 days 窗＝再造一次假對齊）。"""
+    client, *_ = _admin_app(tmp_path)
+    assert client.get("/api/ops/customers",
+                      params={"window": "calendar"}).status_code == 400
+
+
+def test_customers_default_behaviour_unchanged_without_window(tmp_path):
+    """向後相容：未指定 window → 既有 days 行為完全不變（含預設 days=1）。"""
+    client, cfg, store, hl = _admin_app(tmp_path)
+    hl.fills[ADDR_A] = [_fill(builder_fee="0.5")]
+    body = client.get("/api/ops/customers").json()
+    assert body["days"] == 1
+    assert body["customers"][0]["builder_fee"] == "0.5"
+    assert body["start"] == body["window_start"]
+    assert body["end"] == body["window_end"]
+
+
+def test_accrued_window_is_single_source_for_both_endpoints():
+    """單元層：窗口推導只有這一個入口，且無法對齊時回 None（呼叫端據此標
+    basis_unknown，不得自行退化）。"""
+    from spark.publicapi.ops import AccruedPoint, accrued_window
+
+    cap_prev = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+    cap_now = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+    ok = [AccruedPoint("2026-07-18", Decimal("10"), cap_prev),
+          AccruedPoint("2026-07-19", Decimal("16"), cap_now)]
+    assert accrued_window(ok) == (cap_prev, cap_now)
+    assert accrued_window(ok[:1]) is None                      # 不足兩點
+    assert accrued_window([ok[0], AccruedPoint("2026-07-19", Decimal("16"), None)]) is None
+    assert accrued_window([ok[1], ok[0]]) is None              # 非嚴格遞增
+
+
 def test_revenue_rejects_negative_threshold(tmp_path):
     client, *_ = _admin_app(tmp_path, history=[("2026-07-18", "1"), ("2026-07-19", "2")])
     assert client.get("/api/ops/revenue",

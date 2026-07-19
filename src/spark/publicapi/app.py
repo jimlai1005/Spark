@@ -18,7 +18,8 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
                                      has_active_subscription, plan_catalog,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
-from spark.publicapi.ops import (customer_pnl, jsonable, load_accrued_series,
+from spark.publicapi.ops import (accrued_window, accrued_window_note, customer_pnl,
+                                 jsonable, load_accrued_series,
                                  revenue_reconciliation, subscription_drift)
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
@@ -219,17 +220,68 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                 detail="follower manifest 不存在，請聯絡管理員") from e
 
     @app.get("/api/ops/customers")
-    def ops_customers(days: int = 1, admin: str = Depends(_require_admin)):
-        """每客戶損益（跨客戶聚合，admin only）。時間窗＝now 往回 days 天。
-        單一 follower 查詢失敗只影響該列的 error 欄，不影響其他客戶（ops.customer_pnl）。"""
+    def ops_customers(days: int | None = None, window: str | None = None,
+                      admin: str = Depends(_require_admin)):
+        """每客戶損益（跨客戶聚合，admin only）。
+
+        兩種時間窗，**互斥**：
+        - 預設（未給 `window`）：now 往回 `days` 天（預設 1）。自由檢視用。
+        - `window=accrued`：⭐ 與 /api/ops/revenue **同一個窗口**——兩者都呼叫
+          `ops.accrued_window()`，不各自推導。這是本端點與收入對帳表可以並排相減的
+          唯一模式；預設的 days 窗與 accrued 快照窗會錯開（accrued 是查詢當下的
+          累積量，不對齊日曆日），兩張表的 builder fee 在該模式下**不可相減**。
+
+        `days` 與 `window=accrued` 同時給 → 400。不靜默忽略其中一個：靜默的那一半
+        會讓人以為自己看的是另一個基準（工程原則 1 的失敗正是「看起來同基準」）。
+
+        單一 follower 查詢失敗只影響該列的 error 欄，不影響其他客戶（ops.customer_pnl）。
+        """
+        if window is not None and window != "accrued":
+            raise HTTPException(status_code=400,
+                                detail="window 僅支援 'accrued'（省略則用 days 窗）")
+        if window is not None and days is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="days 與 window=accrued 互斥：accrued 窗由快照時刻決定，"
+                       "不接受天數；請擇一")
+        refs, manifest_errors = _load_followers()
+
+        if window == "accrued":
+            series = load_accrued_series(cfg.accrued_history_path)
+            win = accrued_window(series)
+            if win is None:
+                # 不退化成日曆日／now 往回 N 天：那會產生一個「看起來對齊」的窗口，
+                # 正是本修復要消滅的東西（同 ops_revenue 的 basis_unknown 分支）。
+                return jsonable({
+                    "window": "accrued", "basis_unknown": True,
+                    "window_start": None, "window_end": None,
+                    "note": f"{accrued_window_note(series)}；"
+                            f"本次客戶損益無法與收入對帳同基準，故不計算。",
+                    "manifest_errors": manifest_errors,
+                })
+            start, end = win
+            rows = customer_pnl(refs, hl, start, end, store=store)
+            return jsonable({"window": "accrued", "basis_unknown": False,
+                             "window_start": start.isoformat(),
+                             "window_end": end.isoformat(),
+                             "start": start.isoformat(), "end": end.isoformat(),
+                             "customers": rows,
+                             "manifest_errors": manifest_errors})
+
+        days = 1 if days is None else days
         if not 1 <= days <= 90:
             raise HTTPException(status_code=400, detail="days 須介於 1 到 90")
-        refs, manifest_errors = _load_followers()
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=days)
         rows = customer_pnl(refs, hl, start, end, store=store)
         return jsonable({"days": days, "start": start.isoformat(),
-                         "end": end.isoformat(), "customers": rows,
+                         "end": end.isoformat(),
+                         # window_start/window_end 兩個端點同名同義，讓人肉核對兩張表
+                         # 的窗口是否真的相同（days 窗與 accrued 窗必定不同）
+                         "window_start": start.isoformat(),
+                         "window_end": end.isoformat(),
+                         "window": "days",
+                         "customers": rows,
                          "manifest_errors": manifest_errors})
 
     @app.get("/api/ops/revenue")
@@ -263,13 +315,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 "manifest_errors": manifest_errors,
             })
         prev_pt, now_pt = series[-2], series[-1]
-        start, end = prev_pt.captured_at, now_pt.captured_at
-        if start is None or end is None or end <= start:
-            # ⭐ 不硬算：窗口界只能來自快照時刻，缺了就沒有正確答案。用日期猜會整整
-            # 錯開一天，把健康帳戶判成漏財——錯的數字會叫醒人去查不存在的問題。
-            note = ("歷史資料缺快照時刻（captured_at），無法對齊窗口"
-                    if start is None or end is None else
-                    "相鄰兩筆快照時刻非嚴格遞增（回填或時鐘倒退），無法對齊窗口")
+        # ⭐ 窗口只從 ops.accrued_window 取（與 /api/ops/customers?window=accrued 同源，
+        # 工程原則 1）。不硬算：窗口界只能來自快照時刻，缺了就沒有正確答案。用日期猜
+        # 會整整錯開一天，把健康帳戶判成漏財——錯的數字會叫醒人去查不存在的問題。
+        win = accrued_window(series)
+        if win is None:
+            note = accrued_window_note(series)
             return jsonable({
                 "insufficient_accrued_history": False, "basis_unknown": True,
                 "over_threshold": False,          # 不告警：算不出來 ≠ 有異常
@@ -278,6 +329,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 "note": f"{note}；本日對帳跳過（下一次日報落檔後即自動恢復）。",
                 "manifest_errors": manifest_errors,
             })
+        start, end = win
         rows = customer_pnl(refs, hl, start, end, store=store)
         result = revenue_reconciliation(rows, now_pt.accrued, prev_pt.accrued,
                                         threshold_pct=threshold_pct)
