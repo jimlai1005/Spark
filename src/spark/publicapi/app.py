@@ -16,9 +16,12 @@ from spark.filet.capital_settings import (CapitalSettingsError,
                                           build_capital_settings_message,
                                           build_capital_settings_record,
                                           canonical_capital_values,
+                                          load_capital_settings,
+                                          require_bool_flag,
                                           validate_capital_bounds,
                                           verify_capital_settings,
                                           write_capital_settings)
+from spark.filet.capital_settings_apply import capital_fingerprint
 from spark.filet.followers import load_followers_tolerant
 from spark.filet.leader_change import (LeaderChangeError, build_leader_change_message,
                                        build_leader_change_record,
@@ -38,8 +41,8 @@ from spark.publicapi.config import ApiConfig, derive_account_id, normalize_addre
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
 from spark.copytrade.equity import sample_coverage
 from spark.copytrade.killswitch import ALERTS_LOG_RELPATH, is_tripped
-from spark.filet.engine_health import (HeartbeatRead, heartbeat_path_for,
-                                       read_heartbeat)
+from spark.filet.engine_health import (HEARTBEAT_STALE_S, HeartbeatRead,
+                                       heartbeat_path_for, read_heartbeat)
 from spark.filet.leader_change_apply import LEDGER_RELPATH as LC_LEDGER_RELPATH
 from spark.filet.leader_change_apply import scan_unapplied_leader_changes
 from spark.publicapi.ops import ENGINE_STALE_S
@@ -691,6 +694,176 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     # （見 _consume），而**動作之間**的分隔靠的不是 nonce 域，是待簽訊息的模板
     # ——兩個模板的第一行是不同的固定字面量，任何輸入都到不了第一行，所以不存在
     # 一組輸入能讓它們產生同一字串（完整論證見 filet/capital_settings.py 檔頭）。
+
+    def _load_own_capital_record(account_id: str) -> dict | None:
+        """交換目錄 → **只**這一個帳號的資金設定記錄，且**只投影安全欄位**。
+
+        ⭐⭐ 兩層窄化，都是結構性的（沿 `_load_own_follower` 的同一個決定）：
+        1. 多帳號清單的生命週期完全不離開本函式 ⇒ 端點結構上拿不到別人的記錄，
+           不是靠端點裡記得寫一行 filter。
+        2. **回傳值只含安全欄位**（金額、比例、模式、提交時刻與指紋）——`signature`
+           與 `message` 原文結構上到不了回應，不是靠端點記得別把它們塞進去。
+           這是紅線 3 的形狀：讓它寫不出來，而不是提醒別寫（工程原則 5 的精神）。
+
+        記錄壞掉／讀不到一律回 None（＝「查不到已提交的設定」），**不 raise**：
+        這一格只影響「處理中」提示，不該讓客戶連自己目前生效的設定都查不到。
+        """
+        try:
+            records = load_capital_settings(cfg.capital_settings_path)
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            logger.error("資金設定記錄讀取失敗 %s: %r", cfg.capital_settings_path, e)
+            return None
+        mine = [r for r in records if isinstance(r, dict)
+                and r.get("account_id") == account_id]
+        if not mine:
+            return None
+        # write_capital_settings 是「同 account 覆蓋」，正常至多一筆；取最後一筆
+        # ＝取最新意圖（沿引擎 `_my_record` 的同一個選法，兩邊看的是同一筆）。
+        rec = mine[-1]
+        try:
+            _, alloc, _, util = canonical_capital_values(
+                rec.get("allocated_capital"), rec.get("capital_utilization"))
+            full = require_bool_flag(rec, "use_full_equity")
+        except (CapitalSettingsError, ValueError, TypeError):
+            # 記錄格式壞 ⇒ 引擎也會拒絕它。這裡當成「沒有待套用的記錄」，
+            # 不對客戶宣稱有一筆處理中的變更（那會讓他一直等一個不會來的生效）。
+            return None
+        issued_at = rec.get("issued_at")
+        return {"allocated_capital": alloc, "capital_utilization": util,
+                "use_full_equity": full,
+                "submitted_at": issued_at if isinstance(issued_at, str) else None,
+                # 指紋與引擎的竄改偵測共用 `capital_fingerprint`（單一定義）：
+                # 「已提交 vs 已生效」的判定式與引擎眼中的「同一組設定」必須同義。
+                "fingerprint": capital_fingerprint(alloc, util, full)}
+
+    @app.get("/api/me/capital")
+    def me_capital(address: str = Depends(_require_session)):
+        """客戶查**自己目前生效的資金設定**，以及已提交但尚未套用的那一筆。
+
+        ⭐ 為什麼需要這個端點：`/capital` 頁要客戶簽署一次改變曝險倍數的授權，卻
+        沒有任何地方能告訴他**現在的值是多少**、**上次簽的到底生效了沒**。前後對照
+        永遠缺左半邊，客戶只能在不知道現況的情況下按下簽名。
+
+        ⭐ **只回自己的**，且結構上不可能回別人的：account_id 由 session 衍生，本端點
+        **沒有任何 account 參數**，兩個資料來源都是「只吃單一 account」的載入函式
+        （`_read_heartbeat` 的路徑由 account_id 推導、`_load_own_capital_record`
+        在函式內窄化並只投影安全欄位）。想查別人只能先拿到別人的 session。
+
+        ⭐⭐ **「已提交」與「已生效」必須分得開**（本端點最重要的性質）。
+        生效值的唯一來源是**引擎發布的健康心跳**——那是引擎真正拿去乘部位大小的那組
+        值。交換目錄裡的記錄只是「客戶簽了、API 收了」，引擎可能還沒套用、也可能因為
+        白名單／邊界檢查而永遠不會套用。把記錄當成生效值回傳，會讓一個把使用比例從
+        1.0 調到 0.2 的客戶以為曝險已經降下來了，而實際上一點都沒變。
+        所以：記錄與心跳的指紋不同（或心跳讀不到）⇒ 記錄一律歸入 `pending`。
+
+        `pending.state` 兩態，語意不同：
+        - `not_yet_applied`——生效值已知且與提交值不同 ⇒ **確定**還沒套用。
+        - `unconfirmed`——生效值不可知（心跳缺席／過期）⇒ **無從得知**套用了沒。
+          這一態刻意不折疊進上一態：前者可以安心等下一個 cycle，後者代表引擎那邊
+          可能出了事，處置完全不同。
+
+        `status` 四態，**不用 null 讓前端猜**：
+        - `effective`——心跳新鮮，生效值可知。
+        - `unknown`——已活化但心跳缺席／過期／引擎本輪無法判定資金設定。
+        - `not_activated`——帳號尚未活化（活化是人工 CLI 動作）。
+        - `indeterminate`——帳號不在 manifest **且** manifest 有壞條目（壞的那筆可能
+          就是他自己的）。回 `not_activated` 會讓一個正在跟單的客戶以為自己沒在跟單。
+
+        ⚠️ **不外流** signature／message 原文：`_load_own_capital_record` 只投影安全
+        欄位，所以那些東西結構上到不了這裡（沿 `_pending_leader_change` 的同一政策）。
+        """
+        account_id = derive_account_id(address)
+        mine, manifest_degraded = _load_own_follower(account_id)
+        submitted = _load_own_capital_record(account_id)
+
+        if mine is None:
+            # 尚未活化：他仍可能已經簽過一筆（POST 不要求活化）。照實說「已提交、
+            # 活化後才會生效」，比假裝沒有這筆記錄誠實。
+            return jsonable({
+                "account_id": account_id,
+                "status": "indeterminate" if manifest_degraded else "not_activated",
+                "effective": None,
+                "pending": _capital_pending(submitted, None),
+                "heartbeat": None,
+                "note": ("目前無法確認你的資金設定（帳號清單有無法解析的條目）；"
+                         "請聯絡管理員，不要當作「未設定」處理。") if manifest_degraded
+                        else "你的帳號尚未啟用跟單，因此還沒有生效中的資金設定。"
+                             "啟用後，這裡會顯示引擎實際採用的本金與使用比例。",
+            })
+
+        hb = _read_heartbeat(account_id, now_fn())
+        # ⭐ `hb.data` 只有在心跳新鮮時才非 None（engine_health 的結構性保證）——
+        # 過期的心跳到不了這裡，也就不可能被當成生效值回傳。
+        cap = (hb.data or {}).get("capital") or {}
+        effective = None
+        if cap.get("source") in ("customer_signed", "env_default"):
+            effective = {
+                "allocated_capital": cap.get("allocated_capital"),
+                "capital_utilization": cap.get("capital_utilization"),
+                "use_full_equity": cap.get("use_full_equity"),
+                "source": cap.get("source"),
+                # 上次變更時刻＝引擎**實際套用**的時刻（不是客戶簽署的時刻）：
+                # 客戶問的是「我改的東西什麼時候開始作用」。env 預設 → null。
+                "changed_at": cap.get("changed_at"),
+                # 這組值是引擎在哪一刻回報的——沒有這個時間戳，一份接近過期的心跳
+                # 會被當成即時查詢讀（工程原則 1 的變形：連時點都不同源）。
+                "as_of": hb.at,
+            }
+
+        effective_fp = None
+        if effective is not None and all(
+                effective[k] is not None
+                for k in ("allocated_capital", "capital_utilization")):
+            effective_fp = capital_fingerprint(effective["allocated_capital"],
+                                               effective["capital_utilization"],
+                                               bool(effective["use_full_equity"]))
+        return jsonable({
+            "account_id": account_id,
+            "status": "effective" if effective is not None else "unknown",
+            "effective": effective,
+            "pending": _capital_pending(submitted, effective_fp),
+            "heartbeat": {"status": hb.status, "at": hb.at, "age_s": hb.age_s,
+                          "stale_after_s": HEARTBEAT_STALE_S},
+            "note": ("這是引擎目前實際採用的本金與使用比例。"
+                     if effective is not None else
+                     "目前無法確認生效中的資金設定（引擎的健康心跳缺席或已過期）。"
+                     "**請不要**把下方「已提交」的數值當成生效值——它可能還沒被套用。"
+                     "若這個狀態持續，請聯絡管理員。"),
+        })
+
+    def _capital_pending(submitted: dict | None, effective_fp: str | None) -> dict | None:
+        """「已提交但尚未生效」的那一筆（**已生效的一律不回報為 pending**）。
+
+        ⭐⭐ 本函式是「已提交 vs 已生效」這個區分的**單一實作點**。拿掉指紋比對，
+        兩種災難二選一：
+        - 恆回 pending ⇒ 客戶永遠看到一個早就生效的「處理中」（記錄檔沒有人負責清，
+          `write_capital_settings` 是同 account 覆蓋而非流水帳），久了他會學會忽略它。
+        - 恆回 None ⇒ 一筆還沒套用的變更被當成已生效，客戶以為自己的曝險已經降下來了
+          ——這個方向會讓他在錯誤的安全感下加碼，是兩者中危險得多的那個。
+
+        比較的兩側同基準（工程原則 1）：兩邊都是 `capital_fingerprint` 算出的指紋，
+        而輸入都是 `canonical_capital_values` 產出的 canonical 字串。拿 `"1000"` 與
+        `"1000.00"` 直接比是同一類 bug 的另一個版本。
+        """
+        if submitted is None:
+            return None
+        if effective_fp is not None and submitted["fingerprint"] == effective_fp:
+            return None      # 已生效——記錄留在檔案裡是正常的，不是「處理中」
+        unconfirmed = effective_fp is None
+        return {
+            "allocated_capital": submitted["allocated_capital"],
+            "capital_utilization": submitted["capital_utilization"],
+            "use_full_equity": submitted["use_full_equity"],
+            "submitted_at": submitted["submitted_at"],
+            "state": "unconfirmed" if unconfirmed else "not_yet_applied",
+            "effective_when": "next_engine_cycle",
+            "note": ("你已簽署這組設定，但目前**無法確認**它生效了沒（引擎的健康心跳"
+                     "缺席或已過期）。在確認之前，請以你原本的設定評估曝險。"
+                     if unconfirmed else
+                     "你已簽署這組設定，**尚未生效**：引擎會在下一個 cycle 重新驗證你的"
+                     "簽章與數值範圍後套用。套用不會立即強制再平衡，部位隨 leader 的"
+                     "後續動作自然收斂。"),
+        }
 
     @app.get("/api/me/capital/message")
     def capital_settings_message(allocated_capital: str, capital_utilization: str,

@@ -113,6 +113,28 @@ def resolve_capital_settings_path(env=None) -> str:
     return capital_settings_path_for(require_exchange_dir(env))
 
 
+def capital_fingerprint(allocated_capital: str, capital_utilization: str,
+                        use_full_equity: bool) -> str:
+    """「一組資金設定」的單一字串表示（**全 repo 唯一的一份**）。
+
+    ⭐⭐ 三個消費端共用它，各寫一份會壞在不同的方向上：
+    - 引擎的竄改偵測（`AppliedCapital.fingerprint` vs `_record_fingerprint`）：兩式
+      漂移 ⇒ 比對恆為不相符（每輪一則假的竄改告警）或恆為相符（真的竄改被放過）。
+    - `/api/me/capital` 的「已提交 vs 已生效」判定：兩式漂移 ⇒ 一筆早就生效的設定
+      被永遠顯示成「處理中」，或一筆還沒生效的被顯示成已生效（後者更糟——客戶會
+      以為自己的曝險已經降下來了）。
+
+    輸入必須是 **canonical 字串**（`canonical_capital_values` 的產物），不是 Decimal：
+    `1000`、`1000.0`、`1000.00` 是同一個數卻是三個不同的指紋，而正規化的單一來源在
+    `capital_settings._canonical_decimal`，不在這裡。
+
+    ⭐ 指紋**必須含 `use_full_equity`**：它與金額一樣決定曝險基準，漏掉它會讓
+    「同樣的 0 元、旗標從 False 翻成 True」被判成相同——在最關鍵的欄位上失明。
+    """
+    return (f"{allocated_capital}|{capital_utilization}"
+            f"|{'full' if use_full_equity else 'fixed'}")
+
+
 @dataclass(frozen=True)
 class AppliedCapital:
     """目前生效中的客戶簽章資金設定（帳本的 `applied` 區塊）。
@@ -146,9 +168,11 @@ class AppliedCapital:
         ⭐ 指紋**必須含 `use_full_equity`**：它與金額一樣決定曝險基準，漏掉它會讓
         「同一顆 nonce、同樣的 0 元、旗標從 False 翻成 True」被判成正常的檔案殘留
         而靜默忽略——竄改偵測在最關鍵的那個欄位上失明。
+
+        算式本身在模組級的 `capital_fingerprint`（單一定義，見該函式 docstring）。
         """
-        return (f"{self.allocated_capital}|{self.capital_utilization}"
-                f"|{'full' if self.use_full_equity else 'fixed'}")
+        return capital_fingerprint(self.allocated_capital, self.capital_utilization,
+                                   self.use_full_equity)
 
 
 @dataclass(frozen=True)
@@ -570,9 +594,8 @@ class CapitalSettingsApplier:
     def _record_fingerprint(rec: dict) -> str | None:
         """記錄自稱的數值指紋（canonical 化後）；不合法回 None（→ 一律當成不相符）。
 
-        ⭐ 必須與 `AppliedCapital.fingerprint` **同式**（含 `use_full_equity`）：
-        兩式一旦漂移，比對就恆為不相符（每輪一則假的竄改告警）或恆為相符
-        （真的竄改被當成檔案殘留放過）。旗標型別不合法 → None ＝ 不相符，
+        ⭐ 與 `AppliedCapital.fingerprint` **同式**——結構上同式，因為兩者都呼叫
+        `capital_fingerprint`，而不是各自拼一次字串。旗標型別不合法 → None ＝ 不相符，
         走告警路徑而不是靜默忽略。
         """
         try:
@@ -581,4 +604,4 @@ class CapitalSettingsApplier:
             flag = require_bool_flag(rec, "use_full_equity")
         except (CapitalSettingsError, ValueError, TypeError):
             return None
-        return f"{alloc}|{util}|{'full' if flag else 'fixed'}"
+        return capital_fingerprint(alloc, util, flag)
