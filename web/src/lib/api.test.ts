@@ -119,6 +119,39 @@ describe("端點契約（對照 src/spark/publicapi/app.py）", () => {
     await api.getOpsRevenue(0.01);
     expect(captured[0].url).toBe("/api/ops/revenue?threshold_pct=0.01");
   });
+
+  it("billing 四端點：路徑、方法、回傳欄位（checkout 回 checkout_url、portal 回 url）", async () => {
+    mockFetchJson(200, { billing_enabled: false, plans: [] });
+    const plans = await api.getBillingPlans();
+    expect(captured[0].url).toBe("/api/billing/plans");
+    expect(captured[0].init.method).toBeUndefined(); // GET
+    expect(plans.billing_enabled).toBe(false);
+
+    mockFetchJson(200, { account_id: "fabc", status: "active", active: true });
+    const st = await api.getBillingStatus();
+    expect(captured[0].url).toBe("/api/billing/status");
+    expect(st.status).toBe("active");
+
+    // ⭐ checkout 的欄位名是 checkout_url，不是 url——兩者不同，型別與測試一起釘住
+    mockFetchJson(200, { checkout_url: "https://checkout.stripe.test/s1" });
+    const co = await api.postBillingCheckout();
+    expect(captured[0]).toMatchObject({
+      url: "/api/billing/checkout", init: expect.objectContaining({ method: "POST" }),
+    });
+    expect(co.checkout_url).toBe("https://checkout.stripe.test/s1");
+
+    mockFetchJson(200, { url: "https://portal.stripe.test/p1" });
+    const po = await api.postBillingPortal();
+    expect(captured[0]).toMatchObject({
+      url: "/api/billing/portal", init: expect.objectContaining({ method: "POST" }),
+    });
+    expect(po.url).toBe("https://portal.stripe.test/p1");
+  });
+
+  it("billing 未啟用 → 501 歸 kind=client 且保留 status（前端據此顯示「即將開放」）", async () => {
+    mockFetchJson(501, { detail: "計費未啟用" });
+    await expect(api.getBillingStatus()).rejects.toMatchObject({ kind: "client", status: 501 });
+  });
 });
 
 describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3）", () => {
@@ -135,6 +168,10 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getNonce("0xAbC0000000000000000000000000000000000001", 1),
       () => api.getOpsCustomers(1),
       () => api.getOpsRevenue(0.01),
+      () => api.getBillingPlans(),
+      () => api.getBillingStatus(),
+      () => api.postBillingCheckout(),
+      () => api.postBillingPortal(),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -161,7 +198,7 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
 
   it("反射函式數量與手寫清單一致——手寫清單不會因新函式而過時（保底斷言）", () => {
     // 對照上一個 describe 的 calls 陣列長度：兩者必須同步增減。
-    const HAND_WRITTEN_LIST_LENGTH = 11;
+    const HAND_WRITTEN_LIST_LENGTH = 15;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

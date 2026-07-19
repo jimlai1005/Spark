@@ -170,4 +170,82 @@ export const COPY = {
       },
     },
   },
+  /**
+   * 計費／方案文案。⭐ 誠實揭露原則（產品要求，非 UI 細節）：
+   * 1. 免費層**不受任何限制**——不限本金、不限跟單；付費解鎖的是多 leader 與比例調整。
+   *    文案不得暗示免費層有隱藏限制。
+   * 2. 尚未推出的功能（後端 shipped=false）一律標「開發中」，不得讓使用者以為
+   *    付款即可使用（pricing 頁測試釘住此條）。
+   * 3. 價格未拍板時後端 price_display 為 null → 顯示「價格待定」，絕不顯示 0。
+   */
+  billing: {
+    navPricing: "方案",
+    pricingEyebrow: "PRICING",
+    pricingTitle: "方案與定價",
+    pricingSubtitle: "免費層不限本金、不限跟單。付費解鎖的是多 leader 與跟單比例調整。",
+    // 後端只送 i18n 鍵（billing.py 的 name_key / text_key），文案一律在這裡。
+    // 鍵名與 src/spark/publicapi/billing.py 的 _F_* 常數同源，改一邊要改兩邊。
+    keys: {
+      "plans.free.name": "免費",
+      "plans.pro.name": "專業",
+      "plans.feature.copytrade": "跟單執行（不限本金、不限跟單筆數）",
+      "plans.feature.killswitch": "回撤保護（kill-switch 自動平倉）",
+      "plans.feature.multiLeader": "同時跟隨多位 leader",
+      "plans.feature.ratioSlider": "跟單比例自訂",
+    },
+    priceFree: "免費",
+    priceTbd: "價格待定",
+    priceTbdNote: "價格尚未定案，確定後會在本頁公告。",
+    perMonth: "／月",
+    // ⭐ 未推出功能的標示：視覺與文字都必須讓人一眼看出「現在還不能用」
+    unshippedBadge: "開發中，敬請期待",
+    unshippedNote: "標示為「開發中」的功能尚未推出，訂閱後也還不能使用；推出前請以免費層的功能為準。",
+    includedAria: "已包含",
+    excludedAria: "未包含",
+    subscribe: "訂閱",
+    subscribing: "前往付款頁…",
+    comingSoon: "即將開放",
+    disabledNote: "訂閱功能即將開放",
+    freePlanAction: "免費使用中，無需訂閱",
+    loginFirst: "請先登入",
+    // 訂閱管理頁
+    manageEyebrow: "BILLING",
+    manageTitle: "訂閱管理",
+    currentPlanLabel: "目前方案",
+    statusLabel: "訂閱狀態",
+    // 狀態標籤（chip 用）。none 刻意用「未訂閱」而非「尚無訂閱」：後者是空狀態
+    // 區塊的標題，同一畫面出現兩個一樣的字串會讓人分不出哪個是狀態、哪個是提示。
+    status: {
+      active: "訂閱中",
+      past_due: "付款逾期",
+      canceled: "已取消",
+      none: "未訂閱",
+    },
+    planNameActive: "專業",
+    planNameFree: "免費",
+    pastDueNote: "最近一次扣款未成功，請更新付款方式，否則訂閱會被取消。",
+    manage: "管理訂閱",
+    managing: "前往付款入口…",
+    manageNote: "更新付款方式與取消訂閱都在 Stripe 的付款入口完成——我們不自建，也不經手你的卡片資料。",
+    noSubscription: "尚無訂閱",
+    noSubscriptionNote: "你目前使用免費層：不限本金、不限跟單。",
+    goPricing: "查看方案",
+    errors: {
+      alreadyActive: "你已有生效中的訂閱，不需重複訂閱。請到本頁的「管理訂閱」調整。",
+      noRecord: "尚無訂閱記錄，請先從方案頁訂閱。",
+      notEnabled: "訂閱功能即將開放，請稍後再試。",
+      checkoutFailed: "無法開啟付款頁，請稍後再點一次。重複點擊不會產生重複訂閱。",
+      portalFailed: "無法開啟付款入口，請稍後再點一次。",
+      loadFailed: "載入方案資料失敗，請重新整理本頁。",
+    },
+  },
 } as const;
+
+/**
+ * 後端 i18n 鍵（name_key / text_key）→ 使用者可見文案。
+ * 未知鍵**原樣回傳**而不是空字串或丟棄該列：後端新增功能鍵而前端還沒補文案時，
+ * 顯示鍵名雖然醜，但至少使用者看得到「有這一項」；靜默隱藏會讓方案表少一列而無人察覺。
+ */
+export function copyForKey(key: string): string {
+  return (COPY.billing.keys as Record<string, string>)[key] ?? key;
+}

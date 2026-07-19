@@ -491,6 +491,72 @@ main.page {
 .ops-row-error { white-space: normal !important; font-size: 12px; }
 .ops-row-error-label { color: var(--neg); margin-right: 6px; }
 
+/* ---------- Pricing / Billing ---------- */
+/* chip 只在已登入且 billing 啟用時渲染；margin-left:auto 讓它與登出鈕成組靠右，
+   未渲染時 header 的 space-between 行為完全不變（不顯示就不影響版面）。 */
+.header-chip { margin-left: auto; text-decoration: none; }
+
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin-top: 20px;
+}
+
+.plan-card { display: flex; flex-direction: column; }
+.plan-card.is-purchasable { border-color: rgba(var(--primary-rgb), .45); }
+.plan-name { font-size: 1.2rem; font-weight: 400; margin: 0; color: var(--text); }
+.plan-price { font-size: 2rem; font-weight: 300; color: var(--text); margin: 6px 0 2px; }
+.plan-price-unit { font-size: 13px; color: var(--text-dim); margin-left: 4px; }
+
+.plan-features { list-style: none; padding: 0; margin: 16px 0 20px; flex: 1; }
+.plan-feature {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 13.5px; color: var(--text); padding: 7px 0;
+  border-bottom: 1px solid rgba(var(--text-dim-rgb), .12);
+}
+.plan-feature:last-child { border-bottom: none; }
+.plan-mark { font-family: var(--font-mono); color: var(--text-dim); flex: none; }
+.plan-mark.is-ok { color: var(--pos); }
+.plan-feature.is-excluded { color: var(--text-dim); opacity: .6; }
+/* 未推出：弱化字色＋徽章，視覺上明顯不同於可用功能（不得只靠徽章文字） */
+.plan-feature.is-unshipped { color: var(--text-dim); }
+.plan-badge {
+  font-size: 11px; letter-spacing: .04em;
+  color: var(--warn);
+  background: rgba(var(--warn-rgb), .12);
+  border: 1px solid rgba(var(--warn-rgb), .35);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.plan-action-note { margin: 0; }
+.plan-unshipped-note { margin-top: 16px; }
+.plan-notice {
+  color: var(--warn);
+  background: rgba(var(--warn-rgb), .1);
+  border: 1px solid rgba(var(--warn-rgb), .35);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 13px;
+}
+.plan-error {
+  color: var(--neg);
+  background: rgba(var(--neg-rgb), .1);
+  border: 1px solid rgba(var(--neg-rgb), .4);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 13px;
+}
+
+.billing-panel { margin-top: 20px; }
+.billing-stats { display: flex; gap: 40px; margin: 0 0 18px; flex-wrap: wrap; }
+.billing-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
+.billing-stat dd { margin: 6px 0 0; font-size: 18px; font-weight: 300; color: var(--text); }
+.billing-manage-note { margin: 12px 0 0; }
+.billing-empty-title { font-size: 15px; color: var(--text); margin: 0 0 4px; }
+.billing-empty .btn { margin-top: 14px; }
+
 /* ---------- Responsive：邊界圖直疊（≤620px） ---------- */
 @media (max-width: 620px) {
   .boundary { flex-direction: column; }

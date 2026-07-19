@@ -186,6 +186,71 @@ export type OpsRevenueResp =
       manifest_errors: string[];
     };
 
+// ---------- billing（M3 計費；對照 src/spark/publicapi/app.py 的四個端點） ----------
+/**
+ * 方案目錄的功能列。`included` 與 `shipped` 是**兩個獨立的軸**（後端 billing.py
+ * PlanFeature 的鏡射）：付費層可以「包含但尚未推出」——顯示層必須據此標「開發中」
+ * 而非假裝可用。前端不得把兩者合併成單一布林（合併就抹掉了誠實揭露的資訊）。
+ */
+export interface BillingFeature {
+  /** i18n 鍵（後端不寫死使用者可見文案）；文案在 lib/copy.ts 的 COPY.billing.keys。 */
+  text_key: string;
+  included: boolean;
+  shipped: boolean;
+}
+
+export interface BillingPlan {
+  id: string;
+  name_key: string;
+  /** null = 免費方案，或價格尚未設定 → 顯示「價格待定」，絕不退化成 0。 */
+  price_display: string | null;
+  /** 有 stripe price_id 且 billing 已啟用；免費方案恆 false。 */
+  purchasable: boolean;
+  features: BillingFeature[];
+}
+
+export interface BillingPlansResp {
+  billing_enabled: boolean;
+  plans: BillingPlan[];
+}
+
+/** 後端白名單映射的結果（未知 stripe 狀態一律歸 canceled）；無記錄為 "none"。 */
+export type BillingStatusValue = "active" | "past_due" | "canceled" | "none";
+
+export interface BillingStatusResp {
+  account_id: string;
+  status: BillingStatusValue;
+  /** entitlement 查詢結果（僅供顯示；停用跟單是人工政策決策，前端不得自動化）。 */
+  active: boolean;
+}
+
+/** 方案目錄。⭐ 公開端點：不需 session，未登入的定價頁照樣拿得到。 */
+export function getBillingPlans(): Promise<BillingPlansResp> {
+  return request<BillingPlansResp>("/api/billing/plans");
+}
+
+/** 訂閱狀態（需 session）。billing 未啟用 → 501（kind=client, status=501）。 */
+export function getBillingStatus(): Promise<BillingStatusResp> {
+  return request<BillingStatusResp>("/api/billing/status");
+}
+
+/**
+ * 建 Stripe Checkout Session，回 `checkout_url`（⭐ 欄位名不是 `url`——與 portal 不同，
+ * 見 app.py billing_checkout）。已有生效訂閱 → 409；billing 未啟用 → 501。
+ * 非冪等寫入：呼叫端**不得自動重試**，失敗一律交回使用者重按（人肉重試天然去重）。
+ */
+export function postBillingCheckout(): Promise<{ checkout_url: string }> {
+  return post<{ checkout_url: string }>("/api/billing/checkout");
+}
+
+/**
+ * 建 Stripe Billing Portal Session，回 `url`。無訂閱記錄 → 409；未啟用 → 501。
+ * 同為非冪等寫入，重試政策同上。
+ */
+export function postBillingPortal(): Promise<{ url: string }> {
+  return post<{ url: string }>("/api/billing/portal");
+}
+
 /** 每客戶損益（days 1..90；超出範圍後端回 400 → ApiError kind=client）。 */
 export function getOpsCustomers(days: number): Promise<OpsCustomersResp> {
   const q = new URLSearchParams({ days: String(days) });
