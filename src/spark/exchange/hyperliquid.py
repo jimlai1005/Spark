@@ -7,7 +7,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, Context, ROUND_HALF_EVEN
 from spark.config import CSV_BASE_URLS
 from spark.exchange.base import (
-    ExchangeAdapter, Order, BuilderCode, Fill, TxResult, OrderResult, Signer,
+    USER_FILLS_PAGE_LIMIT, ExchangeAdapter, FillsTruncatedError, Order, BuilderCode,
+    Fill, TxResult, OrderResult, Signer,
     OpenOrder, Position, AccountSnapshot, EquityView, UserFill,
 )
 from spark.exchange.csv_fills import parse_builder_fills
@@ -189,9 +190,27 @@ class HyperliquidAdapter(ExchangeAdapter):
         return (dt - HyperliquidAdapter._EPOCH) // timedelta(milliseconds=1)
 
     def get_user_fills(self, address: str, start: datetime, end: datetime) -> list[UserFill]:
+        """視窗內的成交。**達 API 單次上限即拋 FillsTruncatedError，絕不靜默回傳半份。**
+
+        `userFillsByTime` 單次最多回 `USER_FILLS_PAGE_LIMIT` 筆且不提供「還有更多」
+        的旗標，所以「剛好回滿上限」是唯一能觀測到的截斷徵兆——我們把它一律當成
+        截斷（回滿上限而恰好沒有第 2001 筆的情形極少，且誤判的代價只是呼叫端說
+        「不知道」，遠低於靜默低估的代價）。
+
+        刻意**不做分頁**：分頁需要「回傳依時間升冪」與「以 tid 去重」兩個對 HL API
+        的假設，本 repo 全離線測試無法對真實 API 驗證；假設錯的方向是重複計入 ⇒
+        換手率分子被**灌大** ⇒ 誤觸成本熔斷 ⇒ 累犯升級 ⇒ 強制平掉客戶部位。
+        拿一個未驗證的假設去換「少呼叫幾次」，賠率不對。要拉長窗口請由呼叫端切段。
+        """
         raw = self._info.user_fills_by_time(
             address, self._to_ms_utc(start), self._to_ms_utc(end)
         )
+        if len(raw) >= USER_FILLS_PAGE_LIMIT:
+            # 訊息不含位址／時間戳：見 FillsTruncatedError（避免被誤分類為 transient）。
+            raise FillsTruncatedError(
+                f"成交查詢回傳筆數達單次上限（{len(raw)} 筆）——視窗內的成交未取全，"
+                f"任何以此為分子的計算都會低估；請縮小查詢窗口"
+            )
         fills = []
         for f in raw:
             fills.append(UserFill(

@@ -8,6 +8,30 @@ from typing import Any
 # Signer：keystore 回傳、可被 adapter 拿去簽 EIP-712 的物件（Phase 1 為 eth_account LocalAccount）。
 Signer = Any
 
+# Hyperliquid `userFillsByTime` 的單次回傳上限。達到此筆數 ⇒ 視窗內還有沒被回傳的成交。
+USER_FILLS_PAGE_LIMIT = 2000
+
+
+class FillsTruncatedError(RuntimeError):
+    """`get_user_fills` 回傳筆數達 API 單次上限 ⇒ 視窗內的成交**沒被取全**。
+
+    ⭐ 為什麼要拋而不是照樣回傳：截斷後的清單看起來完全正常——筆數少、名目小，
+    沒有任何一個呼叫端能從結果本身看出它不完整。而每一個下游用途對「偏低」的
+    反應都恰好是最危險的那個：成本熔斷器的換手率分子被低估 ⇒ **該擋的不擋**；
+    builder fee 匯總少算 ⇒ 對帳數字錯得毫無徵兆。靜默低估的後果是保護在最該
+    作用時失效（工程原則 3：安全關鍵路徑不得吞掉失敗）。
+
+    語意錯誤（不是暫時性）：重試同一個窗口只會再拿回同樣被截斷的 2000 筆，
+    所以訊息刻意不含 `resilience._TRANSIENT_MARKERS`，且不嵌入位址／時間戳
+    （十六進位位址可能剛好含 "503" 之類的字串而被誤判成暫時性錯誤）。
+    正確的處置是縮小查詢窗口或分頁，不是重試（工程原則 2）。
+
+    既有呼叫端（`filet.aggregate.collect_follower_summary`、
+    `publicapi.ops` 的成交品質列）都已把 `get_user_fills` 的例外轉成明確的
+    「error／未知」欄位而非 0，所以拋出在那些路徑上是升級成「說不知道」，
+    不是新的崩潰面。
+    """
+
 
 @dataclass(frozen=True)
 class BuilderCode:

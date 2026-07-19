@@ -28,6 +28,10 @@
 （本專案的實盤事故：混源比較產生幻影 41.9% 回撤而停掉交易；F1 則是分母含 spot
 使回撤保護被稀釋到接近失效。兩次都不是「算錯」，是「兩邊不同源」。）
 
+⭐ 同基準是**雙向**的：分子也只能是主 DEX perp 的成交（`_in_perp_scope`）。
+分子混入現貨／非主 DEX ＝ `(perp＋spot 名目) ÷ perp 權益`，同一個錯的鏡像方向，
+而它的誤報會一路走到 `killswitch.trip` 強制平掉客戶部位。`fill_count` 同樣要濾。
+
 ## D3 ⭐ 無狀態：每輪從 fills 重算，**不維護帳本**
 本專案已因「帳本遺失」出過兩次事故（一次 Critical）。換手率可以從交易所的 fills
 完全重建，所以不要建帳本：重啟不重置預算、沒有帳本可遺失、沒有 fail-closed 分支。
@@ -68,6 +72,12 @@ fills 查詢失敗屬 **transient**：經 resilience 邊界重試（讀取冪等
 理由：查不到 fills 的當下，我們對「客戶正在被磨損多快」一無所知，而放行的代價
 是繼續開新倉（增加曝險與成本），擋下的代價只是暫停開新倉（平倉仍放行、不困住客戶）。
 兩者不對稱，所以往「維持上一輪判定」倒——上一輪沒觸發就照常，上一輪觸發就繼續擋。
+
+⭐ **截斷（`FillsTruncatedError`）走另一條分支，不是 stale**：fills 達 API 單次上限
+代表分子被**確定方向地低估**（真值只會更高），此時沿用上一輪＝上一輪沒觸發就放行，
+而「24h 內成交達 2000 筆」正是這道閘門存在的理由——那會讓熔斷器在最該作用時失效。
+故截斷一律 fail-closed（`breached=True`＋`truncated=True`＋critical），但**不記為
+觸發 episode**：資料層問題不得把客戶推到累犯升級、強制平倉。
 """
 from __future__ import annotations
 
@@ -82,8 +92,9 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from spark.copytrade.config import CopySettings
+from spark.copytrade.instrument import _coin_dex, _is_spot_coin
 from spark.copytrade.notifier import Notifier
-from spark.exchange.base import EquityView, UserFill
+from spark.exchange.base import EquityView, FillsTruncatedError, UserFill
 from spark.resilience import run as resilient_run
 
 logger = logging.getLogger(__name__)
@@ -94,6 +105,7 @@ WINDOW_S = 24 * 3600  # D4：滾動 24 小時（不是日曆日）
 # 觸發原因標籤（進 CostStatus.reasons 與告警文字）
 REASON_TURNOVER = "turnover"
 REASON_FILL_COUNT = "fill_count"
+REASON_TRUNCATED = "fills_truncated"
 
 
 @dataclass(frozen=True)
@@ -113,6 +125,7 @@ class CostStatus:
     escalate: bool = False     # True＝滾動窗內觸發次數達標，呼叫端應 trip kill switch
     breach_count: int = 0      # 滾動窗內的觸發**次數**（episode 數，含本次）
     enabled: bool = True       # False＝兩項門檻皆停用，本輪未查 fills（向後相容路徑）
+    truncated: bool = False    # True＝fills 達 API 上限被截斷，本輪的量測**不可信**
 
 
 def _disabled_status() -> CostStatus:
@@ -150,6 +163,29 @@ def window_fills(fills: Iterable[UserFill], *, now_s: float,
     return out
 
 
+def _in_perp_scope(coin: str) -> bool:
+    """該成交是否落在「分母所涵蓋的範圍」＝主 DEX perp。
+
+    ⭐⭐ 這是同基準要求（工程原則 1），**不是效能考量**：分母固定是
+    `get_account_value()`＝主 DEX perp 的 accountValue（D2），分子若混入現貨
+    （`PURR/USDC`、`@107`）或非主 DEX（`xyz:NVDA`）的成交名目，算出來的就是
+    `(perp＋spot＋其他 DEX 名目) ÷ perp 權益`——兩邊不同源、不同基準，
+    與本專案幻影 41.9% 回撤事故（分母含 spot）是同一個錯的鏡像。
+
+    這不只是「偏保守」：客戶在同一顆錢包做一筆大額現貨就會把換手率灌爆 →
+    誤觸停開新倉；24h 內誤觸達 `cost_breach_escalate_count` 次 → 累犯升級 →
+    `killswitch.trip` **強制平掉客戶的 perp 部位**。誤報在這條路徑上會動到客戶的錢，
+    而產品本來就預期客戶有 spot 餘額與操作。
+
+    次要度量 `fill_count` 必須套用同一道過濾（見 check_cost）：它的門檻同樣是
+    「跟單引擎在主 DEX perp 上的成交筆數」，混入現貨碎單會有一模一樣的誤報路徑。
+
+    沿用本專案既有慣例 `instrument._is_spot_coin` / `_coin_dex`（`orders._build_desired`
+    與 `positions.sync_positions` 兩處排除範圍時已在用），不另立一套判定。
+    """
+    return not (_is_spot_coin(coin) or _coin_dex(coin))
+
+
 def check_cost(ev: EquityView, fills: Sequence[UserFill], settings: CopySettings, *,
                now_s: float, window_s: int = WINDOW_S) -> CostStatus:
     """純函式成本判定。**分子分母同基準的唯一責任點**（D2）。
@@ -165,7 +201,11 @@ def check_cost(ev: EquityView, fills: Sequence[UserFill], settings: CopySettings
     門檻語意 `>` 嚴格大於（對齊 killswitch.check_drawdown，兩道熔斷器的門檻讀法
     必須一致，否則同一份文件寫的「上限」在兩處是兩個意思）。
     """
-    win = window_fills(fills, now_s=now_s, window_s=window_s)
+    # ⭐⭐ 分子與分母都必須是**主 DEX perp** 範圍（見 _in_perp_scope）：分母是 perp
+    # accountValue，分子若含現貨／非主 DEX 就是混源比較。turnover 與 fill_count
+    # 兩項度量共用同一份 `win`，過濾只做一次——兩項各濾一次必然漂移。
+    win = [f for f in window_fills(fills, now_s=now_s, window_s=window_s)
+           if _in_perp_scope(f.coin)]
     notional = sum((f.sz * f.px for f in win), Decimal("0"))
     equity = ev.current
     turnover = (notional / equity) if equity > 0 else Decimal("0")
@@ -300,6 +340,27 @@ def evaluate_cost(adapter, address: str, ev: EquityView, settings: CopySettings,
         fills = resilient_run(
             lambda: adapter.get_user_fills(address, start, end),
             what="成本熔斷器取成交", idempotent=True, sleep_fn=sleep_fn)
+    except FillsTruncatedError as e:
+        # ⭐ 截斷 ≠ 查不到，兩者的正確處置相反，所以分開接（必須排在泛 except 之前）：
+        # 查不到 ⇒ 我們對磨損速度一無所知 ⇒ 沿用上一輪判定；
+        # 截斷 ⇒ 我們**知道**分子被低估了（真值只會更高，方向是確定的）⇒ fail closed。
+        # 沿用上一輪在這裡會是最糟的選擇：上一輪沒觸發就照常放行，而「24h 內成交
+        # 達 2000 筆」正是這道閘門存在的理由——熔斷器會在最該作用時失效。
+        #
+        # 只關最輕的那道閘（停開新倉，reduce-only 照常，D5 硬規則不變），且刻意
+        # **不記為新的觸發 episode**：資料層問題不該把客戶一路推到 kill switch
+        # 強制平倉（比照 stale 的理由，見下方分支）。
+        notifier.critical(
+            "costbreaker",
+            f"成交查詢結果被截斷（{e}）——換手率分子必然低估，本輪量測不可信；"
+            f"已 fail-closed 停止開新倉，**reduce-only 平倉仍放行**"
+            f"（不計入累犯次數，不會因此升級到強制平倉）",
+            dedup_key="cost_fills_truncated",
+        )
+        return CostStatus(turnover=Decimal("0"), notional=Decimal("0"), equity=ev.current,
+                          fill_count=0, breached=True, reasons=(REASON_TRUNCATED,),
+                          truncated=True,
+                          breach_count=len(_prune(log.breaches, now_s, window_s)))
     except Exception as e:  # noqa: BLE001 —— 安全關鍵：查不到不等於安全
         notifier.critical(
             "costbreaker",

@@ -37,6 +37,7 @@ from spark.exchange.base import (
     AccountSnapshot,
     BuilderCode,
     EquityView,
+    FillsTruncatedError,
     OpenOrder,
     OrderResult,
     Position,
@@ -340,6 +341,88 @@ def test_a5_repeated_cycles_do_not_accumulate_turnover(tmp_path):
     fa = FakeAdapter(account_value=Decimal("500"), fills=_fills(3))
     seen = {_eval(fa, tmp_path)[0].turnover for _ in range(4)}
     assert seen == {Decimal("24")}
+
+
+# ── D2 同基準：分子也只能是主 DEX perp（現貨／非主 DEX 一律不計）───────
+def test_spot_and_foreign_dex_fills_excluded_from_both_metrics():
+    """⭐ 變異測試靶：拿掉 `_in_perp_scope` 過濾，本測試必轉紅。
+
+    分母是 perp accountValue，分子若含現貨（`PURR/USDC`、`@107`）或非主 DEX
+    （`xyz:NVDA`）就是混源比較（工程原則 1）。`fill_count` 必須套同一道過濾——
+    否則次要度量有一模一樣的誤報路徑（客戶的現貨碎單灌爆筆數 → 誤觸）。
+    """
+    mixed = [
+        _fill(sz="1", px="1000", coin="ETH"),          # 唯一該計入的一筆
+        _fill(sz="1", px="9000", coin="PURR/USDC"),    # 現貨（交易對名稱含 '/'）
+        _fill(sz="1", px="9000", coin="@107"),         # 現貨（'@' 索引代號）
+        _fill(sz="1", px="9000", coin="xyz:NVDA"),     # 非主 DEX
+    ]
+    st = check_cost(_ev("1000"), mixed, _settings(), now_s=NOW)
+    assert st.notional == Decimal("1000"), "只有主 DEX perp 的名目可以進分子"
+    assert st.fill_count == 1, "fill_count 必須套用同一道過濾，否則同型誤報"
+    assert st.turnover == Decimal("1")
+    assert st.breached is False
+
+
+def test_spot_fills_alone_cannot_trip_the_breaker(tmp_path):
+    """端到端：整批都是現貨成交 ⇒ 換手率 0、不觸發、不發任何告警。
+
+    誤報在這條路徑上不只是「偏保守」——24h 內誤觸達次數上限會累犯升級到
+    killswitch.trip，強制平掉客戶的 perp 部位。
+    """
+    fa = FakeAdapter(account_value=Decimal("500"),
+                     fills=[_fill(sz="10", px="9000", coin="PURR/USDC"),
+                            _fill(sz="10", px="9000", coin="@107")])
+    st, notifier = _eval(fa, tmp_path)
+    assert (st.notional, st.fill_count, st.breached) == (Decimal("0"), 0, False)
+    assert notifier.records == []
+
+
+# ── fills 被 API 上限截斷 → fail closed，絕不靜默低估 ──────────────────
+class _TruncatedAdapter(FakeAdapter):
+    """get_user_fills 拋 FillsTruncatedError（HL 單次 2000 筆上限被打到）。"""
+
+    def get_user_fills(self, address, start, end):
+        raise FillsTruncatedError("成交查詢回傳筆數達單次上限（2000 筆）")
+
+
+def test_truncated_fills_fail_closed_and_alert(tmp_path):
+    """⭐ 截斷 ≠ 查不到：分子被**確定方向地**低估，所以 fail closed 而非沿用上一輪。
+
+    沿用上一輪在這裡是最糟的選擇——上一輪沒觸發就照常放行，而「24h 內成交達
+    2000 筆」正是這道閘門存在的理由，熔斷器會在最該作用時失效。
+    """
+    st, notifier = _eval(_TruncatedAdapter(account_value=Decimal("500")), tmp_path)
+
+    assert st.truncated is True, "結果必須被明確標記為不可信"
+    assert st.breached is True, "已知低估 ⇒ 停開新倉（最輕的閘），不得靜默放行"
+    assert st.reasons == ("fills_truncated",)
+    crits = _crits(notifier)
+    assert len(crits) == 1 and crits[0][3] == "cost_fills_truncated", \
+        f"截斷必須大聲，且與 cost_fills_unavailable 分開，實得 {notifier.records}"
+    assert "reduce-only" in crits[0][2], "必須說明平倉仍放行（D5 硬規則不變）"
+
+
+def test_truncated_fills_do_not_count_as_a_breach_episode(tmp_path):
+    """資料層問題不得把客戶一路推到 kill switch 強制平倉（比照 stale 的理由）。"""
+    bad = _TruncatedAdapter(account_value=Decimal("500"))
+    for _ in range(5):
+        st, _ = _eval(bad, tmp_path)
+    assert st.escalate is False
+    assert load_log(tmp_path).breaches == (), "截斷輪不得寫入觸發記錄"
+
+
+def test_truncated_fills_is_not_retried(tmp_path):
+    """語意錯誤：重試同一個窗口只會再拿回同樣被截斷的 2000 筆（工程原則 2）。"""
+    calls = []
+
+    class _Counting(FakeAdapter):
+        def get_user_fills(self, address, start, end):
+            calls.append(1)
+            raise FillsTruncatedError("成交查詢回傳筆數達單次上限（2000 筆）")
+
+    _eval(_Counting(account_value=Decimal("500")), tmp_path)
+    assert len(calls) == 1, "截斷不得走 transient 重試路徑"
 
 
 # ── A7 fills 查詢失敗 → transient，沿用上一輪判定 ────────────────────

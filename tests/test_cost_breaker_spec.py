@@ -993,13 +993,17 @@ def test_escalation_trips_kill_switch_and_needs_manual_rearm(tmp_path):
     assert arm.exists(), "本模組不得自行 re-arm"
 
 
-def test_escalation_ignores_flatten_on_breach_setting(tmp_path, monkeypatch):
-    """特徵化（characterization）：flatten_on_breach=False 時，回撤路徑不 trip，
-    但成本熔斷的累犯升級**仍**呼叫 trip（＝仍會強制平倉並鎖死）。
+def test_escalation_respects_flatten_on_breach_setting(tmp_path, monkeypatch):
+    """**2026-07-19 裁決：升級尊重 flatten_on_breach，與回撤路徑一致。**
 
-    計畫 D5 說成本熔斷器「不做強制平倉」、D8 說它「不得覆蓋前兩者的行為」，
-    但 D6 又說累犯要 trip kill switch——三者對本情境的讀法不一致。
-    此測試只釘住現況，歧義在回報中提出，不預設哪一邊是對的。
+    原為特徵化測試，釘住的舊行為是：`flatten_on_breach=False` 時回撤路徑不 trip，
+    但成本熔斷的累犯升級**仍**呼叫 trip（強制平倉＋鎖死）——操作者明確關掉的行為，
+    被三道閘門中最輕的那一道繞過。裁決理由：升級的語意是「把事情交給更重的那道閘」，
+    那就該用**那道閘的規則**，而不是繞過它（也呼應 D8：成本熔斷器不得覆蓋前兩者的
+    行為）。本測試已更新為反映新行為。
+
+    仍必須成立的部分：本輪一律 `tripped=True`（停止所有交易動作），且不平倉這件事
+    必須有 critical 留痕——「不強制平倉」不等於「安靜放過」。
     """
     import time as _t
     calls = []
@@ -1010,7 +1014,26 @@ def test_escalation_ignores_flatten_on_breach_setting(tmp_path, monkeypatch):
                      positions=[_pos("ETH", "1")],
                      fills=_fills_notional("25000", now_s=now))
 
-    report, _, _ = _run_cycle(fa, tmp_path, settings=_settings(flatten_on_breach=False))
+    report, n, _ = _run_cycle(fa, tmp_path, settings=_settings(flatten_on_breach=False))
+    assert report.tripped is True, "升級輪仍必須停止本輪所有交易動作"
+    assert calls == [], "flatten_on_breach=False 時累犯升級不得 trip（不得強制平倉／鎖死）"
+    assert not (tmp_path / ARM_FILE_RELPATH).exists(), "未 trip 就不該落 ARM_FILE"
+    assert any(r[0] == "critical" and "未" in r[2] and "平倉" in r[2]
+               for r in n.records), f"不平倉必須留痕（critical），實得 {n.records}"
+
+
+def test_escalation_still_trips_when_flatten_on_breach_is_on(tmp_path, monkeypatch):
+    """裁決的另一半：預設 flatten_on_breach=True 時，累犯升級照常 trip（D6 不變）。"""
+    import time as _t
+    calls = []
+    monkeypatch.setattr(loop_mod, "trip", lambda *a, **k: calls.append((a, k)))
+    now = _t.time()
+    save_log(tmp_path, BreachLog(breaches=(now - 3600, now - 1800), active=False))
+    fa = FakeAdapter(account_value=Decimal("1000"), account=_account("1000"),
+                     positions=[_pos("ETH", "1")],
+                     fills=_fills_notional("25000", now_s=now))
+
+    report, _, _ = _run_cycle(fa, tmp_path, settings=_settings(flatten_on_breach=True))
     assert report.tripped is True
     assert len(calls) == 1
     assert calls[0][1].get("reason") == "cost_breach"

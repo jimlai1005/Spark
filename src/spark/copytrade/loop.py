@@ -2,8 +2,8 @@
 
 run_cycle 順序（killswitch docstring 的主迴圈接入接口 + Task 12 spec）：
   is_tripped 短路 → 回撤判定（breach → flatten_on_breach 時 trip）→ **成本熔斷判定**
-  → leader/my 讀取 → weight/scale → sync_open_orders（safety_net=sync_positions 接線）
-  → skip_trigger 告警。
+  （escalate → 同樣 flatten_on_breach 時才 trip，見下）→ leader/my 讀取 → weight/scale
+  → sync_open_orders（safety_net=sync_positions 接線）→ skip_trigger 告警。
 
 ⭐ 這個順序編碼了三道閘門的優先序（成本熔斷計畫 D8）：
 `leader 撤銷`（在 run_copytrade 層，run_cycle 之前）> `kill switch（回撤）`
@@ -118,11 +118,31 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         # D6 累犯升級：滾動 24h 內反覆觸發 ⇒ 交給 kill switch（需人工 re-arm）。
         # 刻意重用 killswitch.trip 而非另寫收尾（同 leader_revoked 的理由：
         # 兩套實作必然漂移，而漂移的那套只在真出事時才被執行到）。
-        my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
-        trip(ex, my_positions, notifier, root,
-             DrawdownStatus(current=ev.current, peak=ev.recent_peak,
-                            drawdown_pct=Decimal("0"), breached=False),
-             reason="cost_breach")
+        #
+        # ⭐ 2026-07-19 裁決：升級**必須比照上面的回撤路徑尊重 flatten_on_breach**。
+        # 升級的語意是「把事情交給更重的那道閘」，那就該用那道閘的規則；若成本這道
+        # 最輕的閘可以繞過操作者明確關掉的設定，等於最輕的閘擁有最重的權限，而且
+        # 是回撤路徑做不到的事（D8 說成本熔斷器不得覆蓋前兩者的行為）。
+        # 兩條路徑的形狀刻意寫成一樣：`if flatten_on_breach: trip(...)` → 一律
+        # `return tripped_report()`（停止本輪所有交易動作），差別只在要不要強制平倉。
+        if settings.flatten_on_breach:
+            my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
+            trip(ex, my_positions, notifier, root,
+                 DrawdownStatus(current=ev.current, peak=ev.recent_peak,
+                                drawdown_pct=Decimal("0"), breached=False),
+                 reason="cost_breach")
+        else:
+            # 不 trip ⇒ 沒有 ARM 檔、沒有 trip 內建的總結 critical，這則告警是本情境
+            # 唯一的留痕，不得省（工程原則 3）。也提醒操作者：沒鎖檔就沒有人工
+            # re-arm 這道關卡，只要觸發記錄還在滾動窗內，每一輪都會停在這裡。
+            notifier.critical(
+                "costbreaker",
+                f"**成本熔斷累犯升級**（滾動 24h 內第 {cost.breach_count} 次觸發）"
+                f"｜本輪起停止所有交易動作"
+                f"｜`flatten_on_breach=False`，故**未**強制平倉、**未**鎖死交易"
+                f"（與回撤路徑同一規則）——既有部位仍在市場上，請人工處置",
+                dedup_key="cost_escalate_no_flatten",
+            )
         return tripped_report()
 
     # ── 3. leader / my 狀態讀取 ────────────────────────────────────────

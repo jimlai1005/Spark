@@ -8,7 +8,9 @@ from decimal import Decimal
 
 import pytest
 
+from spark.exchange.base import USER_FILLS_PAGE_LIMIT, FillsTruncatedError
 from spark.exchange.hyperliquid import HyperliquidAdapter
+from spark.resilience import _is_transient_error
 
 
 class FakeInfo:
@@ -359,6 +361,49 @@ def test_get_user_fills_builder_fee_none_defaults_zero():
         "0xuser", datetime(2025, 6, 15, tzinfo=timezone.utc), datetime(2025, 6, 16, tzinfo=timezone.utc)
     )[0]
     assert f.builder_fee == Decimal("0")
+
+
+def _raw_fill(i: int) -> dict:
+    return {"coin": "ETH", "px": "4000", "sz": "0.1", "side": "B",
+            "time": 1750000000000 + i, "crossed": True, "oid": i, "fee": "0.008"}
+
+
+def test_get_user_fills_raises_when_page_limit_reached():
+    """⭐ 達 API 單次上限 ⇒ 視窗內成交沒取全 ⇒ **絕不靜默回傳半份**。
+
+    截斷後的清單看起來完全正常（筆數少、名目小），沒有任何呼叫端能從結果本身看出
+    它不完整；而下游對「偏低」的反應恰好都是最危險的那個——成本熔斷器的換手率分子
+    被低估 ⇒ 該擋的不擋。變異測試靶：拿掉上限檢查，本測試必轉紅。
+    """
+    ad = _adapter(fills=[_raw_fill(i) for i in range(USER_FILLS_PAGE_LIMIT)])
+    with pytest.raises(FillsTruncatedError) as ei:
+        ad.get_user_fills("0xuser", datetime(2025, 6, 15, tzinfo=timezone.utc),
+                          datetime(2025, 6, 16, tzinfo=timezone.utc))
+    assert str(USER_FILLS_PAGE_LIMIT) in str(ei.value), "訊息須帶實際筆數"
+
+
+def test_truncation_error_is_not_classified_as_transient():
+    """截斷是語意錯誤：重試同一窗口只會再拿回同樣的 2000 筆（工程原則 2）。
+
+    訊息刻意不含位址／時間戳——十六進位位址可能剛好含 "503" 等 transient marker
+    而讓 resilience 邊界誤判成可重試。
+    """
+    ad = _adapter(fills=[_raw_fill(i) for i in range(USER_FILLS_PAGE_LIMIT)])
+    try:
+        ad.get_user_fills("0x503abc", datetime(2025, 6, 15, tzinfo=timezone.utc),
+                          datetime(2025, 6, 16, tzinfo=timezone.utc))
+    except FillsTruncatedError as e:
+        assert _is_transient_error(e) is False
+    else:  # pragma: no cover
+        pytest.fail("未拋 FillsTruncatedError")
+
+
+def test_get_user_fills_just_below_page_limit_is_returned_normally():
+    """邊界對偶：上限 - 1 筆屬正常回應，照常回傳、不得誤拋。"""
+    ad = _adapter(fills=[_raw_fill(i) for i in range(USER_FILLS_PAGE_LIMIT - 1)])
+    out = ad.get_user_fills("0xuser", datetime(2025, 6, 15, tzinfo=timezone.utc),
+                            datetime(2025, 6, 16, tzinfo=timezone.utc))
+    assert len(out) == USER_FILLS_PAGE_LIMIT - 1
 
 
 # --- 6. get_all_mids ---
