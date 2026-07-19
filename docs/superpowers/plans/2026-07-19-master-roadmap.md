@@ -108,6 +108,17 @@
 
 **第三個建議（opus 認為最值得先做，尚未實作）**：**成本熔斷器**——對「每日複製成交筆數／累計 taker 成本佔權益比」設上限，超過即停開新倉並告警。好處是**與 leader 是誰無關**：抖動、白名單內的自營對敲、單純一個換手率爆炸的合法 leader，全被同一道閘門蓋住。這是原則 5 的味道（結構性，不靠人記得檢查）。**待使用者裁決是否納入 P3/P4。**
 
+### leader 績效指標：研究結論與實作約束
+全文 `docs/superpowers/research/2026-07-19-leader-performance-metrics.md`。**動任何績效顯示前先讀。**
+
+- **好消息**：HL `portfolio()` 的 `pnlHistory` 官方定義**已扣除出入金**，不必自建扣除管線。`accountValueHistory` 與它同一次回應、同一組時間戳，`ΔF = ΔAV − ΔP` 即得淨現金流（同源同基準）。
+- ⭐ **最大風險是 basis 不是出入金**：`portfolio()` 預設窗 = **spot + perp 總和（含 vault）**，而 copytrade **只鏡像 perp**。必須用 `perpDay/perpWeek/perpMonth/perpAllTime`，否則顯示的績效含**客戶根本複製不到**的部分。
+- **MDD 必須算在權益指數 `I_t` 上，不能算在 `AV` 上**（算在 AV 上＝幻影回撤同型）。
+- **不足 90 天一律不年化**。「7 天賺 3%」顯示成「年化 365%」是本專案最易犯的誤導。
+- **UI 必須標明**：leader 報酬率是跟單者報酬率的**上界不是期望值**（滑價／延遲／資金規模差異侵蝕），任何 API 都解決不了。另 15 分鐘取樣使 MDD **系統性低估**——「回撤看起來很小」的 leader 要特別存疑。
+- ⚠️ **上線前必須實測的未知**：spot→perp 的 `accountClassTransfer` 會不會被 perp 窗當入金扣除？若否，內部劃轉會顯示成 perp 獲利。可用 testnet 錢包做一次劃轉觀察兩序列反應。
+- **無法回填**：自建拼接時間序列（每 12h 抓 perpDay 窗）今天不開始，90 天後仍沒有 90 天資料。
+
 ### 威脅模型校準（誠實標註，opus 查證）
 我原本論證的攻擊「filet-api 被打穿 → 竄改 manifest 的 leader」**在出貨組態下不可達**：`filet-api.service` 的 `ReadWritePaths` ＋ `ProtectSystem=strict`，而 manifest 在 root 擁有的目錄。攻擊者只寫得到 `pending.json`，而 pending→manifest 之間隔著 activate 的白名單硬閘**與一個人類**。**真正承重的控制是檔案系統拓撲**，引擎側二次驗證是成本近零的縱深防禦（值得留著，尤其若日後 manifest 搬家），但**不要高估它今天的邊際價值**。
 另注（既有性質、非本次引入）：所有 follower 共用 `filet-engine` user 且 `/etc/filet/keys` 為共用目錄——引擎側任一進程被打穿即可讀**所有** follower 的 agent key。白名單對這條路徑零保護。
