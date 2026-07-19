@@ -183,6 +183,18 @@ sudo rsync -a --delete \
 rm -rf /tmp/spark-sync   # 清掉暫存，不留在 /tmp
 ```
 
+> ⭐ **伺服器上「沒有 git repo」是刻意的，不是缺陷**（2026-07-19 實機重新部署發現）。
+> 第一段 rsync 排除了 `.git`，所以 `/tmp/spark-sync/` 裡沒有 `.git`；第二段的 `--delete`
+> 因此會把伺服器上原有的 `/opt/filet/spark/.git` 刪掉——實機已確認它現在不存在。
+>
+> **不要用「第二段也加 `--exclude .git`」來修**：那會在伺服器留下一份**永遠不再更新**的
+> 舊 `.git`，`git log` 會顯示錯誤的版本，比沒有更危險（讓人以為部署的是別的 commit）。
+> 正式機不該有 git repo 本來就更好：攻擊面更小、不會有人在上面誤跑 git 指令改動線上程式碼。
+>
+> 代價是**版本可追溯性**與**回滾**都不能再依賴伺服器上的 git：
+> 前者由下面的 `DEPLOYED_VERSION` 標記檔接手，後者見**重寫過的 §9.3**（回滾改由
+> 操作者本機驅動）。
+
 ```bash
 cd /opt/filet/spark
 
@@ -209,6 +221,45 @@ sudo chmod -R go-w /opt/filet/spark   # 確保 group/other 無寫入權（唯讀
 # 驗收：venv 與 repo 根都已回到 root 所有（重新部署時最容易漏的一步）
 sudo ls -ld /opt/filet/spark /opt/filet/spark/.venv   # 預期：兩行都是 root root
 ```
+
+#### ⭐ 最後一步：寫版本標記檔 `DEPLOYED_VERSION`（2026-07-19 實機重新部署發現）
+
+伺服器上沒有 `.git`（見本節上方說明），所以「這台機器現在跑的是哪一版」**只有這個檔知道**。
+§9.3 的回滾要靠它判斷「現在是哪一版」，漏寫這一步等於回滾時無從下手。
+
+**寫入方式：本機算值、ssh 寫入（部署完成之後）**——不是先寫進本機工作樹再讓 rsync 帶上去。
+理由有三：(1) 標記檔要描述「**實際落地**的東西」，寫在 rsync＋`chown` 都成功之後，才不會
+出現「rsync 中途失敗、標記檔卻宣稱新版本」；(2) 不會在本機工作樹留一個未追蹤的檔案
+（也就不必為它加 `.gitignore`，更不會讓 `git describe --dirty` 把自己算進去）；
+(3) 上面第二段 rsync 的 `--delete` 每次都會先刪掉舊的標記檔（來源 `/tmp/spark-sync/` 裡沒有它），
+所以失敗情境是「**標記檔不見了**」這種一眼看得出的大聲失敗，而不是留著一份騙人的舊版本號。
+
+```bash
+# 在本機執行 (/Users/jim/projects/spark)，<金鑰路徑> 與上面 rsync 用的同一把：
+printf 'commit=%s\ndescribe=%s\ndeployed_at_utc=%s\ndeployed_by=%s@%s\n' \
+  "$(git rev-parse HEAD)" \
+  "$(git describe --always --dirty)" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "$(whoami)" "$(hostname -s)" \
+| ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+    'sudo tee /opt/filet/spark/DEPLOYED_VERSION >/dev/null \
+     && sudo chown root:root /opt/filet/spark/DEPLOYED_VERSION \
+     && sudo chmod 644 /opt/filet/spark/DEPLOYED_VERSION \
+     && cat /opt/filet/spark/DEPLOYED_VERSION'
+```
+
+預期輸出（`cat` 直接把寫進去的四行印回來，就是驗收）：
+
+```
+commit=696e3cfa84152a062eccbfa2a634316ea40c27c6
+describe=696e3cf
+deployed_at_utc=2026-07-19T13:51:36Z
+deployed_by=jim@Jims-MacBook-Pro
+```
+
+> ⚠️ `describe` 出現 `-dirty` 字尾＝**推上去的是未 commit 的工作樹**。測試機可接受；
+> 正式機看到 `-dirty` 代表這一版在 git 裡不存在，**無法回滾到它**（§9.3 的回滾以 commit
+> 為單位）。正式機部署前先把工作樹 commit 乾淨。
 
 > 之後每次重新部署（拉新版本）：重跑上面兩段 rsync（`--delete` 會清掉伺服器上已刪除的
 > 檔案，保持與本機工作樹一致），再視情況重跑 `uv sync`（只在依賴有變動時需要）。
@@ -455,8 +506,8 @@ grep -E '^Environment=FILET_API_NETWORK=' /etc/systemd/system/filet-api.service
 # 預期：testnet（測試機）或 mainnet（正式機）；出現 REPLACE_WITH_NETWORK 代表步驟 3 沒生效
 
 # 驗收 3：systemd 實際載入的值與檔案一致（daemon-reload 漏跑就會不一致）
-#（只比對變數名是否齊全，不印值）
-systemctl show filet-api.service -p Environment | tr ' ' '\n' \
+#（只比對變數名是否齊全，不印值；--value 的理由見 §5.5.2 驗收 2 的方框）
+systemctl show filet-api.service -p Environment --value | tr ' ' '\n' \
   | grep -oE 'FILET_(API_NETWORK|BUILDER_ADDR|SIWE_DOMAIN|SIWE_URI|ADMIN_ADDRESSES)' | sort
 # 預期：五個變數名各一行，一個都不缺
 ```
@@ -741,8 +792,12 @@ sudo -u filet-api touch /var/lib/filet-exchange/engine/.api-probe \
 sudo rm -f /var/lib/filet-exchange/engine/.probe
 
 # 驗收 4：兩個 unit 宣告的值真的相同（打錯字是本節唯一擋不住的殘餘風險）
-systemctl show filet-api.service -p Environment | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
-systemctl show 'filet-follower@<account_id>.service' -p Environment \
+# ⚠️ 兩行都要 --value（2026-07-19 實機重新部署發現）：沒有它，`systemctl show -p Environment`
+#    輸出的**第一個** token 會帶著 `Environment=` 屬性前綴。這裡是逐字元比對兩行輸出，
+#    只要其中一邊的 FILET_EXCHANGE_DIR 剛好排在該 unit 的第一個，兩行就會長得不一樣，
+#    在**設定完全正確**的機器上誤報成不一致。理由詳見 §5.5.2 驗收 2 的方框。
+systemctl show filet-api.service -p Environment --value | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
+systemctl show 'filet-follower@<account_id>.service' -p Environment --value \
   | tr ' ' '\n' | grep FILET_EXCHANGE_DIR
 ```
 
@@ -788,16 +843,21 @@ Environment=FILET_STATE_BASE=/opt/filet/state
 
 ```bash
 # ── 驗收 1：API 端宣告了這個變數（沒宣告的話服務根本起不來，見驗收 3）──
-systemctl show filet-api.service -p Environment | tr ' ' '\n' | grep FILET_STATE_BASE
+systemctl show filet-api.service -p Environment --value | tr ' ' '\n' | grep FILET_STATE_BASE
 # 預期：FILET_STATE_BASE=/opt/filet/state
 
 # ── 驗收 2：⭐ 兩個 unit 拼出來的是**同一個目錄**（本節唯一真正重要的一條）──
 # 取兩邊的值自己算一次，不要用眼睛比對——差一個尾斜線或大小寫都看不出來。
+# ⚠️ 兩個 systemctl show 的 --value 不可省略（2026-07-19 實機重新部署發現）——見下方方框。
+# ACCT 用真實 account id；這台機器還沒有 follower 的話見下方「零 follower 的機器」。
 ACCT=<account_id>
-BASE="$(systemctl show filet-api.service -p Environment | tr ' ' '\n' \
+BASE="$(systemctl show filet-api.service -p Environment --value | tr ' ' '\n' \
         | sed -n 's/^FILET_STATE_BASE=//p')"
-DIR="$(systemctl show "filet-follower@${ACCT}.service" -p Environment | tr ' ' '\n' \
+DIR="$(systemctl show "filet-follower@${ACCT}.service" -p Environment --value | tr ' ' '\n' \
        | sed -n 's/^FILET_STATE_DIR=//p')"
+# 先確認兩個值都抓到了——空值代表指令本身有問題，不是設定有問題
+[ -n "$BASE" ] && [ -n "$DIR" ] \
+  || echo "★ BASE 或 DIR 抓不到值（BASE='$BASE' DIR='$DIR'）——先查指令，別急著改 unit"
 [ "$(realpath -m "$BASE/$ACCT")" = "$(realpath -m "$DIR")" ] \
   && echo "狀態根一致 OK: $DIR" \
   || echo "★ 失敗：API 讀 $BASE/$ACCT，引擎寫 $DIR —— 面板會把每一列讀成 absent"
@@ -810,11 +870,51 @@ sudo -u filet-api env -u FILET_STATE_BASE \
   && echo "漏設拒絕啟動 OK" || echo "★ 失敗：漏設沒有拒絕啟動，隱含預設值又回來了"
 ```
 
+> ⚠️⚠️ **`systemctl show -p Environment` 一定要加 `--value`**（2026-07-19 實機重新部署發現。
+> 本節驗收 2 原本沒加，是一個**會在設定正確的機器上誤報失敗**的驗收指令——那比沒有驗收更糟，
+> 它會訓練操作者忽略告警。）
+>
+> 不加 `--value` 時，輸出是 `Environment=VAR1=val1 VAR2=val2 ...`：**只有第一個 token 帶著
+> `Environment=` 屬性前綴**。經 `tr ' ' '\n'` 拆行後，第一行變成
+> `Environment=FILET_STATE_DIR=/opt/filet/state/%i`，於是錨定在行首的
+> `sed -n 's/^FILET_STATE_DIR=//p'` **抓不到**，變數為空，判定失敗。
+>
+> 而 `FILET_STATE_DIR` 正是 `filet-follower@.service` 的**第一個** `Environment=`——
+> 也就是說這條驗收在真實 unit 上必定誤報。舊寫法看起來能用，只是因為對照組
+> `FILET_STATE_BASE` 在 `filet-api.service` 裡排在後面（第 9 個），碰巧沒有前綴。
+> **這是「靠排序碰巧成立」的脆弱性：任何一次 unit 檔調序都會讓它翻臉**，所以本文件
+> 所有解析 `-p Environment` 的地方都統一加了 `--value`，即使目前碰巧不受影響的那幾處
+> 也一併加（§5.1a 驗收 3、§5.5.1 驗收 4、§5.7 驗收 4）。
+>
+> 加上 `--value` 後實測：三組合成 acct 全部一致。
+
+> **零 follower 的機器怎麼跑驗收 2**：`ACCT` 不需要是真實存在的帳號。systemd 對**任意**
+> 實例名都會展開 `%i`，`systemctl show 'filet-follower@<任意字串>.service'` 照樣印得出
+> 推導後的 `FILET_STATE_DIR`（unit 不必啟動、帳號不必存在）。所以剛部署完、還沒有任何
+> follower 的機器，用合成 id 驗證路徑推導即可：
+>
+> ```bash
+> ACCT=synthetic-check-0001    # 合成 id，只為驗證 %i 展開；不會建立任何東西
+> ```
+>
+> 驗的是「BASE 拼 ACCT」與「引擎展開的 DIR」是否逐字元相等，這個關係與 ACCT 取什麼值無關。
+> 多跑幾個不同的合成 id（含含連字號、含數字的）更能確認沒有奇怪的展開行為。
+
 > 驗收 2 的 `★` 是**部署當下唯一能抓到路徑漂移的時機**。錯過它之後，這條錯誤不會
 > 有任何 log、不會有任何告警，面板上只會看到每個 follower 的 `basis` 都是 `absent`
 > ——而那與「客戶剛 activate、引擎還沒跑過」長得一模一樣。心跳（§5.6）是唯一的
 > 補救：`basis: heartbeat` 且 `heartbeat_status: ok` 代表面板拿到的是引擎自報的
 > 真相，路徑漂移不影響它。**面板上一整排 `absent` ＋ 心跳 `missing` ＝先查這一節。**
+>
+> ⚠️ **症狀不一定是 `absent`，也可能是 `unreadable`**（2026-07-19 實機重新部署發現）：
+> 兩者取決於**權限佈局**，都指向同一個根因，都要查這一節。
+> - 路徑指到一個**不存在**的目錄 → `absent`。
+> - 路徑存在但 filet-api **讀不到** → `unreadable`。實機的 `/opt/filet/state` 是
+>   `0700 filet-engine`（§5.6 刻意不放寬），filet-api 連 traverse 都不行，所以在這台機器上
+>   路徑漂移實際看到的是 `unreadable` 而不是 `absent`。
+>
+> 面板把兩者一視同仁（見上方修法第 2 點），所以**看到哪一個都一樣要查**——
+> 不要因為文件寫 `absent` 而在看到 `unreadable` 時以為是別的問題。
 
 ---
 
@@ -973,8 +1073,9 @@ sudo ls -l /var/lib/filet-api/leaderboard/perf_series/ | tail -5
 # （perf_series 尤其：等到明天，今天漏掉的那兩個窗已經永遠補不回來了）
 
 # 驗收 4：兩個 unit 看到的是同一份白名單（抓取對象的單一來源）
-systemctl show filet-leaderboard.service -p Environment | tr ' ' '\n' | grep FILET_LEADERS_PATH
-systemctl show filet-perf-series.service  -p Environment | tr ' ' '\n' | grep FILET_LEADERS_PATH
+# --value 不可省略（同 §5.5.2 驗收 2 的方框）：這裡也是逐字元比對兩行輸出
+systemctl show filet-leaderboard.service -p Environment --value | tr ' ' '\n' | grep FILET_LEADERS_PATH
+systemctl show filet-perf-series.service  -p Environment --value | tr ' ' '\n' | grep FILET_LEADERS_PATH
 # 預期：兩行值逐字元相同，且等於 §5.5 建立的 leaders.json 路徑
 ```
 
@@ -1181,29 +1282,146 @@ sudo systemctl status filet-dashboard.service --no-pager
 /opt/filet/spark/deploy/reload_follower.sh
 ```
 
-### 9.3 回滾
+> ⚠️ **`reload_follower.sh` 的執行位元**（2026-07-19 實機重新部署發現）：repo 內原本是
+> `644`，直接呼叫會得到 `Permission denied`／`command not found`。已在 repo 裡 `chmod +x`
+> 成 `755`（git 記錄了模式變更：`old mode 100644` → `new mode 100755`），§3.2 的
+> `rsync -a` 會保留權限位元，所以新部署的機器拿到的就是可執行的版本。
+>
+> 選 `chmod +x` 而不是把這行改成 `sudo bash <path>`，理由是**後者會改變 sudo 的語意**：
+> 這支腳本內部是**逐個 unit** 跑 `sudo systemctl restart`（它的檔頭寫明「需求：執行者對
+> `systemctl restart filet-follower@*` 有 sudo NOPASSWD」）。整支用 `sudo bash` 跑等於
+> 讓整個迴圈以 root 執行，套用的是 root 的權限而非操作者的 NOPASSWD 規則，違背腳本
+> 原本「最小權限、只放行這一種 restart」的設計。
+>
+> **舊機器上驗證**（重新部署前這台機器的檔案可能還是 644）：
+>
+> ```bash
+> ls -l /opt/filet/spark/deploy/reload_follower.sh   # 預期：-rwxr-xr-x
+> # 若仍是 -rw-r--r--：重跑 §3.2 的 rsync 就會帶上新模式；急用時的一次性補救：
+> sudo chmod +x /opt/filet/spark/deploy/reload_follower.sh
+> ```
+
+### 9.3 回滾（2026-07-19 實機重新部署發現：**全節重寫**）
+
+> 🛑 **舊版本節的 `cd /opt/filet/spark && git checkout ...` 已經失效，不要照做。**
+> 伺服器上**沒有 git repo**（`/opt/filet/spark/.git` 不存在，實機已確認；成因與「為什麼
+> 這是刻意的」見 §3.2）。在伺服器上跑 `git log`／`git checkout` 只會得到
+> `fatal: not a git repository`。
+>
+> **新模型：回滾由操作者本機驅動，伺服器只是被同步的目標。**
+> 回滾 ＝ 本機 `git checkout <舊 commit>` → 重跑 §3.2 的 rsync → 重跑 §5.1a 的 unit 還原
+> → 依 §9.2 重啟。與一次正常部署走的是**同一條路徑**，只是本機停在舊 commit 上——
+> 這正是它可靠的原因：回滾不是一條平時沒人走、真的要用時才發現壞掉的獨立程序。
+
+#### 步驟 0：先確認「現在部署的是哪一版」與「要回滾到哪一版」
 
 ```bash
-cd /opt/filet/spark
-git log --oneline -5              # 確認目前 commit 與要回滾到的目標
-git checkout <上一個已知良好的 commit/tag>
-uv sync                            # 依回滾後的 pyproject.toml 重新解析（可能觸發依賴降版）
-# 若前端也要回滾：
-cd web && npm ci && npm run build && cd ..
+# ── 現在是哪一版：讀伺服器上的版本標記檔（§3.2 最後一步寫的）──
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER 'cat /opt/filet/spark/DEPLOYED_VERSION'
+# 預期：commit= / describe= / deployed_at_utc= / deployed_by= 四行
+# ⚠️ 檔案不存在＝上一次部署沒跑 §3.2 最後一步（或跑到一半失敗）。此時無法從機器上
+#    確定版本，只能靠部署紀錄回推——不要用猜的 commit 回滾。
+```
 
-# 依 §9.2 順序重啟
-sudo systemctl restart filet-keysvc.service filet-api.service filet-dashboard.service
+```bash
+# ── 要回滾到哪一版：在**本機**看 git 歷史（伺服器沒有 git，只有本機有）──
+cd /Users/jim/projects/spark
+git log --oneline -10
+# 用上面 DEPLOYED_VERSION 的 commit= 對照，確認目前線上版本在歷史上的位置，
+# 再挑「上一個已知良好」的 commit。
+git log --oneline -1 <目前線上的 commit>   # 驗收：這個 commit 在本機確實存在
+```
+
+#### 步驟 1：本機切到要回滾的 commit
+
+```bash
+cd /Users/jim/projects/spark
+git status --porcelain          # ⚠️ 必須是空的——有未 commit 的改動會被一起推上正式機
+git checkout <要回滾到的 commit>
+git describe --always --dirty   # 驗收：印出的短 hash 就是等一下會部署上去的版本
+```
+
+> 回滾結束、線上恢復之後，本機記得 `git checkout feat/m2-frontend`（或原本的分支）切回來，
+> 不然下一次部署會從 detached HEAD 推出去。
+
+#### 步驟 2：重跑 §3.2 的 rsync（兩段都要）
+
+回 **§3.2 從頭到尾整節跑一遍**（本機→`/tmp/spark-sync/` 的 rsync、伺服器→`/opt/filet/spark/`
+的 rsync、`chown ubuntu` → `uv sync` → `chown -R root:root` 收尾）。回滾是重新部署，
+**不要只挑 rsync 那兩段跑**——尤其別漏掉重新部署專屬的
+`sudo chown -R ubuntu:ubuntu .venv uv.lock` 那一行，漏了 `uv sync` 會 Permission denied。
+
+- `--delete` 會把新版本多出來的檔案清掉，這正是回滾要的效果。
+- `--exclude var` 保護 leader 白名單（§5.5）不被回滾波及——白名單是營運資料不是程式碼。
+- **依賴可能降版**：`uv sync` 會依回滾後的 `pyproject.toml` 重新解析。
+- 前端要一起回滾就照 §4.2 重跑 `npm ci && npm run build`（含 build 前後的 chown 兩步）。
+
+#### 步驟 3：重跑 §5.1a 的 unit 還原（**最容易漏、漏了會靜默壞掉**）
+
+回滾的 rsync 一樣會覆蓋 `/opt/filet/spark/deploy/` 下的 unit 檔。只要這次回滾**有重跑
+§5.1 的 `cp`**（unit 檔在兩版之間有差異時就必須重跑），就會清掉 `/etc/systemd/system/`
+裡那 6 個實際值——照 **§5.1a 步驟 1→4** 走一遍（備份、覆蓋、還原 6 個值、`daemon-reload` 與驗證）。
+
+> 兩版之間 unit 檔沒有任何差異時，可以整個跳過 §5.1／§5.1a——但**要先確認**：
+> 本機 `git diff <舊commit> <目前線上commit> -- deploy/` 沒有輸出才算確認。
+
+#### 步驟 4：重寫版本標記檔
+
+回滾也是一次部署，**標記檔必須跟著回滾**，否則下一個人讀到的是錯的版本號。
+照 §3.2 最後一步那段 `printf ... | ssh ... sudo tee` 再跑一次（此時本機 HEAD 已在舊 commit 上，
+算出來的就是回滾後的版本）。
+
+#### 步驟 5：依 §9.2 順序重啟
+
+```bash
+sudo systemctl restart filet-keysvc.service
+sudo systemctl status filet-keysvc.service --no-pager   # 確認 active 再往下
+sudo systemctl restart filet-api.service
+sudo systemctl status filet-api.service --no-pager
+sudo systemctl restart filet-dashboard.service
+sudo systemctl status filet-dashboard.service --no-pager
 /opt/filet/spark/deploy/reload_follower.sh
+```
 
-# nginx 設定回滾（若本次部署也改了 nginx-filet.conf）：
+#### 步驟 6（僅在本次部署也改過 nginx 設定時）
+
+```bash
+# 先備份現行設定，再換回舊版設定檔
 sudo cp /etc/nginx/sites-available/filet /etc/nginx/sites-available/filet.bak-$(date +%F)
 # 換回舊版設定檔後：
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-**回滾不動的東西**：`/etc/filet/keys`（agent key，任何回滾都不該刪/改金鑰檔——那是
-非託管信任鏈的一部分，回滾程式碼不等於回滾金鑰狀態）；`/var/lib/filet-api` 的
-`pending.json`/`api.db`（onboarding 進度，回滾程式碼版本不代表要清使用者進度）。
+> ⚠️ 別直接從 repo `cp nginx-filet.conf` 蓋回去——那會清掉網域代換與 certbot 寫進去的
+> 憑證路徑（同 §5.1a 步驟 5 的警告）。
+
+#### ⚠️⚠️ 回滾**不會**回滾資料——這是本節最重要的一段
+
+回滾只換程式碼。以下全部**維持在新版本留下的狀態**，不會跟著倒退：
+
+| 資料 | 為什麼不動 |
+|---|---|
+| `/etc/filet/keys`（agent key） | 非託管信任鏈的一部分；回滾程式碼不等於回滾金鑰狀態 |
+| `/var/lib/filet-api`（`api.db`、`pending.json`） | 使用者 onboarding 進度，不在 rsync 範圍內 |
+| `/opt/filet/spark/var/`（leaders.json、manifest） | 被兩段 rsync 的 `--exclude var` 保護 |
+| `/opt/filet/state/<account_id>`（ARM 檔、equity 樣本、帳本、`alerts.log`） | 狀態根不在 repo 路徑下，rsync 完全碰不到 |
+| `/var/lib/filet-exchange`（換 leader 交換目錄、心跳） | 同上，不在同步範圍 |
+
+**因此：如果被回滾掉的那一版曾經升級過任何資料格式（DB schema、manifest 欄位、帳本行格式、
+心跳 JSON 欄位），舊程式碼會讀到「比它新」的資料。** 這類不相容可能是大聲的（起不來、
+fail-fast），也可能是安靜的（欄位讀不到→當成預設值→面板顯示錯誤狀態）。
+
+回滾**之前**必須先回答：**這兩版之間有沒有動過資料格式？**
+
+```bash
+# 在本機比對兩版之間有沒有碰到會寫資料的模組（回滾前必看）
+cd /Users/jim/projects/spark
+git diff --stat <要回滾到的 commit> <目前線上的 commit> -- \
+  src/spark/publicapi/ src/spark/filet/ src/spark/copytrade/
+```
+
+有輸出就逐一看 diff 判斷是否含格式變更；**判不準就不要自行回滾，先問使用者**——
+資料格式不相容造成的損壞，往往比原本要回滾的那個 bug 更難救。
 
 ---
 
