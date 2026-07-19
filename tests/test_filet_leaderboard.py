@@ -96,7 +96,12 @@ def test_snapshot_includes_perp_performance_when_portfolio_fn_given():
     assert win["max_drawdown"] == "0.19"     # 算在 I_t 上（AV 遞增，AV 基準會是 0）
     assert win["covered_days"] == "40.0000" and win["sample_count"] == 3
     assert win["disclosure_tier"] == "window_return"
-    assert "annualized_return" not in win    # ⭐ 40 天 → 結構上沒有年化欄位
+    # ⚠️ 2026-07-19 揭露模型改版（使用者裁決「顯示但註記」）：40 天窗**照樣**有年化，
+    # 但必須連同不足標記與外推天數一起落進快照——快照是目錄頁的資料源，標記在這一層
+    # 掉了，前端就再也拿不到警示（見 filet/leader_perf.py 檔頭「揭露模型改版」）。
+    assert win["annualized_return_insufficient_data"] is True
+    assert win["annualized_return_extrapolated_from_days"] == "40.0000"
+    assert win["twr_insufficient_data"] is False      # 40 天 ≥ 30 天門檻
     assert "equity_index" not in win and win["equity_index_len"] == 3
 
 

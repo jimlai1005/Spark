@@ -3,14 +3,16 @@
 盯住四件事，每一件都對應一個會讓客戶照著錯數字投真錢的失效：
 (1) 出入金不得污染 TWR——期望值一律**手算**釘死，不抄實作的輸出；
 (2) MDD 必須算在權益指數 I_t 上（AV 基準會被入金遮成 0、被提領放大成幻影）；
-(3) 不足 90 天，回傳結構裡**沒有**年化欄位（不是 None，是鍵不存在）；
+(3) ⚠️ 2026-07-19 使用者裁決改版：薄資料的指標**照樣回傳**，但每一個都必須帶
+    自己的不足標記，年化另帶「由幾天外推」。標記漏掉＝一個沒有警示的外推數字。
 (4) 資料不足／缺欄位一律回明確狀態，不回 0、不回 NaN、不炸。
 """
 from decimal import Decimal
 
 import pytest
 
-from spark.filet.leader_perf import (MIN_DAYS_FOR_ANNUALIZATION, PERP_PERIODS,
+from spark.filet.leader_perf import (INSUFFICIENCY_MARKERS,
+                                     MIN_DAYS_FOR_ANNUALIZATION, PERP_PERIODS,
                                      STATUS_INSUFFICIENT, STATUS_OK,
                                      TIER_ANNUALIZABLE, TIER_INSUFFICIENT,
                                      TIER_PNL_ONLY, TIER_WINDOW_RETURN,
@@ -84,23 +86,56 @@ def test_mdd_is_computed_on_equity_index_not_account_value():
     assert r["max_drawdown"] != Decimal("0")
 
 
-def test_no_annualized_field_below_90_days():
-    """⭐ 硬規則：不足 90 天，`annualized_return` 這個**鍵不存在**（不是 None）。"""
+def test_below_90_days_still_annualizes_but_marks_it_extrapolated():
+    """⭐ 改版後的硬規則：不足 90 天**照樣**給年化，但必須帶不足標記＋外推天數。
+
+    ⭐ 變異測試點：拿掉 `annualized_return_insufficient_data` 或
+    `annualized_return_extrapolated_from_days` 的賦值 → 本測試 KeyError 轉紅。
+    """
     r = compute_window_performance(rows(_FLOWS_60D), "perpMonth")
     assert r["covered_days"] == Decimal("60.0000")
     assert r["covered_days"] < MIN_DAYS_FOR_ANNUALIZATION
-    assert "annualized_return" not in r
-    assert r["disclosure_tier"] == TIER_WINDOW_RETURN
-    # 序列化之後也不得長出這個鍵（補成 null 等於把保證交還給呼叫端的記性）。
-    assert "annualized_return" not in jsonable_performance(r)
+    assert "annualized_return" in r                     # 數字要給
+    assert r["annualized_return_insufficient_data"] is True     # 但要說它不足
+    # ⭐ 外推天數 = **實際涵蓋天數**，前端才寫得出「由 60 天外推」。
+    assert r["annualized_return_extrapolated_from_days"] == Decimal("60.0000")
+    assert r["annualized_return_extrapolated_from_days"] == r["covered_days"]
+    assert r["disclosure_tier"] == TIER_WINDOW_RETURN   # 分級＝資料充足度
+    # 序列化後標記不得消失（Decimal 轉字串、bool 保持 bool）。
+    j = jsonable_performance(r)
+    assert j["annualized_return_insufficient_data"] is True
+    assert j["annualized_return_extrapolated_from_days"] == "60.0000"
 
 
-def test_annualized_present_at_exactly_90_days():
+def test_sufficient_data_is_marked_sufficient_not_everything_insufficient():
+    """⭐ 反面釘死：≥90 天的窗，三個不足標記全部 False。
+
+    沒有這一條，實作把所有標記寫死成 True 也會過——那等於沒有標記。
+    """
     r = compute_window_performance(
         rows([(0, "1000", "0"), (90, "1100", "100")]), "perpMonth")
     assert r["covered_days"] == Decimal("90.0000")
     assert r["disclosure_tier"] == TIER_ANNUALIZABLE
     assert "annualized_return" in r
+    assert r["twr_insufficient_data"] is False
+    assert r["max_drawdown_insufficient_data"] is False
+    assert r["annualized_return_insufficient_data"] is False
+    # 充足與否是兩個獨立的判定，但外推天數**恆存在**：90 天窗的年化仍是外推。
+    assert r["annualized_return_extrapolated_from_days"] == Decimal("90.0000")
+
+
+def test_annualized_markers_never_appear_without_the_number():
+    """⭐ 標記與數字同生共死：年化在數學上無定義（帳戶歸零）→ 三個 annualized_* 鍵
+    一起缺席。只留標記會讓前端顯示「由 N 天外推」卻沒有被外推的數字。"""
+    # 100 天窗，權益指數走到 0（ΔP = −1000 於 AV=1000 → r = −1 → I = 0）。
+    r = compute_window_performance(
+        rows([(0, "1000", "0"), (100, "0", "-1000")]), "perpMonth")
+    assert r["status"] == STATUS_OK
+    assert r["twr"] == Decimal("-1")
+    assert r["disclosure_tier"] == TIER_ANNUALIZABLE      # 天數夠，是數學無解
+    for k in ("annualized_return", "annualized_return_insufficient_data",
+              "annualized_return_extrapolated_from_days"):
+        assert k not in r, f"{k} 不該在年化無定義時單獨存在"
 
 
 def test_annualized_over_one_full_year_equals_window_twr():
@@ -114,15 +149,36 @@ def test_annualized_over_one_full_year_equals_window_twr():
     assert r["annualized_return"] == Decimal("0.21")
 
 
-def test_below_30_days_gives_dollars_only_no_percentages():
-    """研究文件 2d：< 30 天禁止任何 %報酬率 → 連 twr／MDD 的鍵都不存在。"""
+def test_below_30_days_shows_percentages_but_marks_each_metric_insufficient():
+    """⭐⭐ 改版核心：6 天的資料照樣給 twr／MDD，但**每一個指標各自**帶不足標記。
+
+    標記做在指標層級（不是只有 disclosure_tier 一個全域欄位）的理由：前端可能只
+    渲染 MDD 一個數字，全域旗標在那個畫面上完全不會出現。
+
+    ⭐ 變異測試點：拿掉 `twr_insufficient_data`／`max_drawdown_insufficient_data`
+    的賦值 → 本測試 KeyError 轉紅。
+    """
     r = compute_window_performance(
         rows([(0, "1000", "0"), (6, "1380", "380")], period="perpWeek"), "perpWeek")
     assert r["status"] == STATUS_OK
-    assert r["disclosure_tier"] == TIER_PNL_ONLY
+    assert r["disclosure_tier"] == TIER_PNL_ONLY      # 分級＝「資料很薄」
     assert r["cum_pnl"] == Decimal("380")
-    for k in ("twr", "max_drawdown", "annualized_return", "equity_index"):
-        assert k not in r, f"{k} 不該在 pnl_only 層級出現（6 天的 +38% 是噪音）"
+    # 數字要給（使用者裁決：顯示但註記）
+    assert r["twr"] == Decimal("0.38")
+    assert "max_drawdown" in r and "equity_index" in r
+    # 每個受影響的指標各自帶標記——缺一個都會讓那個指標在前端裸奔
+    assert r["twr_insufficient_data"] is True
+    assert r["max_drawdown_insufficient_data"] is True
+    assert r["annualized_return_insufficient_data"] is True
+    assert r["annualized_return_extrapolated_from_days"] == Decimal("6.0000")
+
+
+def test_every_declared_marker_is_actually_emitted():
+    """`INSUFFICIENCY_MARKERS` 是下游投影白名單的唯一來源（publicapi/app.py 由它拼出
+    `_LEADER_PERF_FIELDS`）。宣告了卻沒被發出的欄位＝白名單裡的死字串，會讓「標記
+    有沒有到前端」這件事無法被任何測試證偽。"""
+    r = compute_window_performance(rows(_FLOWS_60D), "perpMonth")
+    assert set(INSUFFICIENCY_MARKERS) <= set(r)
 
 
 def test_single_sample_is_insufficient_not_zero():

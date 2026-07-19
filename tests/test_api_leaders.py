@@ -377,6 +377,37 @@ def test_annualized_passes_through_when_eligible(tmp_path):
     assert got["disclosure_tier"] == "annualizable"
 
 
+def test_insufficiency_markers_survive_the_projection(tmp_path):
+    """⭐⭐ 2026-07-19 揭露模型改版後**唯一**的警示載體：指標層級的不足標記。
+
+    改版前「資料不足」由缺鍵承載，前端漏看就是少顯示一個欄位；改版後薄資料的
+    `twr`／`annualized_return` 照樣外流，警示全靠這幾個標記。投影白名單漏掉任何
+    一個 → 前端拿到一個沒有任何警示的外推數字，而畫面上完全看不出來。
+
+    ⭐ 變異測試點：從 `_LEADER_PERF_FIELDS` 拿掉 `INSUFFICIENCY_MARKERS` → 本測試轉紅。
+    """
+    win = perf_window(covered_days="6.0000", disclosure_tier="pnl_only",
+                      twr="0.38", max_drawdown="0",
+                      twr_insufficient_data=True,
+                      max_drawdown_insufficient_data=True,
+                      annualized_return="365.0",
+                      annualized_return_insufficient_data=True,
+                      annualized_return_extrapolated_from_days="6.0000")
+    app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],
+                          snapshot_rows=[stat_row_with_perf(
+                              _A, windows={"perpMonth": win})])
+    c = _client(app)
+    login(c)
+    got = c.get("/api/leaders").json()["leaders"][0]["performance"]["perpMonth"]
+    assert got["twr"] == "0.38"                       # 數字有給
+    assert got["twr_insufficient_data"] is True       # 警示也有給
+    assert got["max_drawdown_insufficient_data"] is True
+    assert got["annualized_return"] == "365.0"
+    assert got["annualized_return_insufficient_data"] is True
+    # ⭐ 前端要能寫出「由 6 天外推」——沒有這個天數，「年化 36500%」看起來像事實
+    assert got["annualized_return_extrapolated_from_days"] == "6.0000"
+
+
 def test_perf_projection_whitelist_no_internal_leakage(tmp_path):
     """投影白名單：快照的內部欄位（net_external_flow、各種 note）不得夾帶外流。"""
     app = make_leader_app(tmp_path, [{"address": _A, "name": "Alpha"}],

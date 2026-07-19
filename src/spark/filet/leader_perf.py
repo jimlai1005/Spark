@@ -20,11 +20,40 @@ Leader 績效指標（**perp 基準**）——純函式，零網路。
    leader 一路入金會讓 AV 單調上升，把真實的虧損完全遮住 → AV 基準的 MDD = 0。
    `I_t` 已把出入金中性化，是唯一正確的基準。
 
-3. **不足 90 天，結構上回不出年化欄位**。不是「呼叫端記得不要顯示」——
-   `annualized_return` 這個**鍵根本不存在**於回傳的 dict 裡。「7 天賺 3%」被顯示成
-   「年化 365%」是本專案最容易犯的誤導，而它只要有人忘記檢查一次就會發生。
-   同理，`covered_days < 30` 時連 `twr`／`max_drawdown` 的鍵都不存在（研究文件 2d
-   的分級揭露表：< 30 天禁止任何 %報酬率）。
+3. **資料不足的指標一律帶「指標層級」的不足標記**。⚠️ 2026-07-19 使用者裁決改版：
+   此閘門原本的載體是「鍵不存在」（< 30 天無 `twr`／`max_drawdown`、< 90 天無
+   `annualized_return`）。現行語意是 **「顯示，但註記」**——數字給，但每一個受影響
+   的指標旁邊都帶著一個**自己的**布林標記，且年化額外帶「由幾天外推」的天數。
+   標記做在**指標層級**而不是只在 `disclosure_tier` 說一次：前端可能只渲染其中一個
+   指標（例如只顯示 MDD），一個全域旗標在那個畫面上會整個漏掉。
+   見下方「揭露模型改版」段落，含對前端結構性防線的影響。
+
+揭露模型改版（2026-07-19；⭐ 前端必須跟進）
+------------------------------------------
+**改動前**：分級揭露的載體是**鍵的存在與否**。`web/src/lib/redline.test.ts` 有一條
+防線禁止前端對績效欄位使用 `??`／`||`，其前提正是「缺鍵＝這個數字不該被顯示，補上
+預設值就是把結構性保證退化成前端的記性」。
+
+**改動後**：`twr`／`max_drawdown`／`annualized_return` 在資料充足度不足時**照樣回傳**，
+所以「鍵永遠存在」。那條防線的**意義因此改變**——它不再是「防止把不該顯示的東西顯示
+出來」，而是「防止把**不足標記**吃掉」。前端真正該被禁止的是：拿到
+`twr_insufficient_data`／`annualized_return_extrapolated_from_days` 卻用 `??`／`||`
+把它們消音，或在標記為 True 時仍把數字渲染成與充足資料無異的樣子。
+（本模組不碰 `web/`；防線調整由前端任務處理。）
+
+**新的欄位契約**（`status == "ok"` 且 `sample_count >= 2` 時）：
+- `twr`、`max_drawdown`、`equity_index`、`cum_pnl`：**恆存在**。
+- `twr_insufficient_data`、`max_drawdown_insufficient_data`：bool，
+  `covered_days < MIN_DAYS_FOR_RETURN`（30 天）時為 True。
+- `annualized_return`：存在，**除非**年化在數學上無定義（`1+TWR <= 0`，帳戶被歸零）。
+- `annualized_return_insufficient_data`：bool，`covered_days < MIN_DAYS_FOR_ANNUALIZATION`
+  （90 天）時為 True。
+- `annualized_return_extrapolated_from_days`：Decimal，**實際涵蓋天數**。年化本質上
+  就是外推（除非窗剛好 365 天），這個欄位讓前端能寫出「由 N 天外推」而不是把一個
+  複利放大後的數字當成事實。與 `annualized_return` 同生共死（一起在、一起不在），
+  刻意不獨立存在——標記與它所描述的數字必須同源（工程原則 1）。
+- `disclosure_tier`：**保留**（前端已在用），但語意從「給不給看」改為
+  **「資料充足度分級」**。層級值不變（相容），純粹是 `covered_days` 的函式。
 
 出入金為什麼不必另外查 ledger（工程原則 1：同源、同基準、同處計算）
 ------------------------------------------------------------------
@@ -66,10 +95,11 @@ DAYS_PER_YEAR = Decimal("365")
 # 一律不計入複利，並在 `skipped_intervals` 誠實回報跳過了幾段。
 DENOMINATOR_FLOOR = Decimal("100")
 
-# 分級揭露門檻（研究文件 2d）。門檻寫成常數而不是散在判斷式裡：
-# 「多少天可以顯示什麼」是會被討論、會被外部審查的判準，必須有單一可引用的位置。
-MIN_DAYS_FOR_RETURN = Decimal("30")        # < 30 天：只給 $ 金額，禁止任何 %
-MIN_DAYS_FOR_ANNUALIZATION = Decimal("90")  # < 90 天：禁止年化（硬規則）
+# 資料充足度門檻（研究文件 2d；2026-07-19 起語意為「足不足」而非「給不給」）。
+# 門檻寫成常數而不是散在判斷式裡：「多少天的資料算充足」是會被討論、會被外部審查的
+# 判準，必須有單一可引用的位置。
+MIN_DAYS_FOR_RETURN = Decimal("30")        # < 30 天：%報酬率噪音 >> 訊號 → 標記不足
+MIN_DAYS_FOR_ANNUALIZATION = Decimal("90")  # < 90 天：年化是激進外推 → 標記不足
 
 MDD_SAMPLING_NOTE = (
     "MDD 由 15 分鐘取樣的權益指數推得，取樣間隔內的來回不可見 → "
@@ -81,12 +111,24 @@ BASIS_NOTE = (
     "基準為 **perp only**（perpDay/perpWeek/perpMonth/perpAllTime 窗），"
     "與 copytrade 實際鏡像的範圍一致；不含 spot 與 vault 餘額。")
 
-# 揭露層級（由 covered_days 決定，見檔頭閘門 3）。層級決定「哪些鍵存在」，
-# 不是「哪些鍵是 null」——null 會被下游 `?? 0` 掉，缺鍵不會。
-TIER_INSUFFICIENT = "insufficient"    # 連 $ 金額都不能給
-TIER_PNL_ONLY = "pnl_only"            # 只有累積 PnL（$）
-TIER_WINDOW_RETURN = "window_return"  # ＋ 窗口 TWR、MDD、權益指數
-TIER_ANNUALIZABLE = "annualizable"    # ＋ 年化
+# 資料充足度分級（純粹是 covered_days 的函式，見檔頭「揭露模型改版」）。
+# ⚠️ 層級**值**刻意不改名（前端已在用；改名是一次無謂的破壞性變更），但語意已從
+# 「這一層給哪些鍵」變成「這一層的資料有多厚」。歷史名稱因此讀起來偏保守：
+# `pnl_only` 現在**仍會**回 twr／MDD，只是它們全部帶 `*_insufficient_data = True`。
+TIER_INSUFFICIENT = "insufficient"    # 算不出任何指標（<2 點／缺窗／序列不同步）
+TIER_PNL_ONLY = "pnl_only"            # covered_days < 30：%報酬率可看但資料很薄
+TIER_WINDOW_RETURN = "window_return"  # 30 ≤ covered_days < 90：窗口報酬足、年化仍是外推
+TIER_ANNUALIZABLE = "annualizable"    # covered_days ≥ 90：年化的資料基礎足夠
+
+# ⭐ 指標層級的不足標記欄位名（單一來源）。下游投影白名單（publicapi/app.py 的
+# `_LEADER_PERF_FIELDS`）由此常數拼出來，不各自抄一份字串——標記與它所描述的數字
+# 若在投影層走散，前端會拿到一個沒有任何警示的外推數字，那正是本次改版要避免的事。
+INSUFFICIENCY_MARKERS = (
+    "twr_insufficient_data",
+    "max_drawdown_insufficient_data",
+    "annualized_return_insufficient_data",
+    "annualized_return_extrapolated_from_days",
+)
 
 # status/reason 的機器可讀碼（給下游分辨「為什麼沒有數字」；文案由 UI 決定）
 STATUS_OK = "ok"
@@ -177,15 +219,18 @@ def extract_window(portfolio_rows: Any, period: str
 def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, Any]:
     """單一 perp 窗的績效計算。**純函式、不觸網**。
 
-    回傳 dict 的鍵集合**隨資料充足度變動**（見檔頭閘門 3 與 `_insufficient`）：
-    - `status == "insufficient"`：無任何數值結果鍵。
-    - `disclosure_tier == "pnl_only"`：＋ `cum_pnl`。
-    - `disclosure_tier == "window_return"`：＋ `twr`、`max_drawdown`、`equity_index`。
-    - `disclosure_tier == "annualizable"`：＋ `annualized_return`。
+    回傳的鍵集合（2026-07-19 改版，見檔頭「揭露模型改版」）：
+    - `status == "insufficient"`：**無任何數值結果鍵**（連 `cum_pnl` 都沒有）。
+      這一類是「算不出來」——缺窗、<2 個取樣點、兩序列時間戳不同步——與「算得出來
+      但資料薄」是完全不同的處境，前者沒有任何數字可言，不受本次改版影響。
+    - `status == "ok"`：`cum_pnl`／`twr`／`max_drawdown`／`equity_index` **恆存在**，
+      各自帶 `*_insufficient_data` 標記；`annualized_return` 存在（除非數學上無定義），
+      帶 `annualized_return_insufficient_data` ＋ `annualized_return_extrapolated_from_days`。
 
-    ⭐ 「鍵不存在」而不是「鍵為 None」是刻意的：下游用 `d.get("annualized_return")`
-    拿到 None 還是可能被 `or 0` 吃掉，而 `"annualized_return" in d` 是二元的、
-    測試釘得住的。
+    ⭐ 為什麼標記做在**每個指標**上而不是只有 `disclosure_tier` 一個全域欄位：
+    前端不保證整組一起渲染——只顯示 MDD 的卡片、只顯示年化的排行榜列，都會讓一個
+    全域旗標完全不出現在那個畫面上。標記與它所描述的數字綁在一起，才不會在任何一種
+    渲染組合下走散（工程原則 1 的同源要求推到 UI 邊界）。
     """
     window = extract_window(portfolio_rows, period)
     if window is None:
@@ -253,32 +298,49 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
         "basis_note": BASIS_NOTE,
     }
 
-    # --- 分級揭露：層級決定哪些鍵存在 ---
-    if covered_days < MIN_DAYS_FOR_RETURN:
-        # < 30 天：只給 $ 金額。%報酬率在這個樣本長度下噪音遠大於訊號，
-        # 而畫面上的「+38%」不會附帶「這是 6 天的數字」這個脈絡。
-        out["disclosure_tier"] = TIER_PNL_ONLY
-        out["cum_pnl"] = cum_pnl
-        return out
+    # --- 資料充足度分級：層級是 covered_days 的純函式，不決定哪些鍵存在 ---
+    out["disclosure_tier"] = _tier_for(covered_days)
+
+    # ⭐ 兩個不足判定各自寫出來、各自掛在自己的指標旁邊。用同一個布林變數餵兩個
+    # 欄位也會過測試，但那會在「哪天 MDD 有了自己的門檻」時變成一個無聲的錯誤。
+    thin_return = covered_days < MIN_DAYS_FOR_RETURN
 
     out["cum_pnl"] = cum_pnl
     out["twr"] = equity_index[-1] - Decimal("1")
     out["equity_index"] = tuple(equity_index)
     out["max_drawdown"] = _max_drawdown(equity_index)
-
-    if covered_days < MIN_DAYS_FOR_ANNUALIZATION:
-        out["disclosure_tier"] = TIER_WINDOW_RETURN
-        return out                       # ⭐ 年化的鍵在此路徑上結構性不存在
+    out["twr_insufficient_data"] = thin_return
+    out["max_drawdown_insufficient_data"] = thin_return
 
     annualized = _annualize(equity_index[-1], covered_days)
     if annualized is None:
-        # 帳戶被歸零（1+TWR <= 0）→ 年化在數學上沒有定義。降級成 window_return，
-        # 而不是回一個 -100% 之類看起來像結論的數字。
-        out["disclosure_tier"] = TIER_WINDOW_RETURN
+        # 帳戶被歸零（1+TWR <= 0）→ 年化在**數學上**沒有定義（非正數的非整數次方
+        # 無實數解）。這與「資料不足」是兩回事：不足是可以標記後照樣顯示的，無定義
+        # 沒有任何數字可標。三個 annualized_* 鍵在此路徑上一起缺席——標記絕不單獨
+        # 存在，否則前端會看到「由 40 天外推」卻沒有被外推的數字。
         return out
-    out["disclosure_tier"] = TIER_ANNUALIZABLE
+
     out["annualized_return"] = annualized
+    out["annualized_return_insufficient_data"] = (
+        covered_days < MIN_DAYS_FOR_ANNUALIZATION)
+    # 年化**本質上就是外推**（除非窗剛好 365 天），所以這個欄位無條件回傳實際涵蓋
+    # 天數，而不是只在不足時才給：前端要能一律寫出「由 N 天外推」。
+    out["annualized_return_extrapolated_from_days"] = covered_days
     return out
+
+
+def _tier_for(covered_days: Decimal) -> str:
+    """`covered_days` → 資料充足度分級。純函式、無副作用、與鍵的存在與否無關。
+
+    ⭐ 刻意做成 covered_days 的單純函式：分級一旦開始參考「這次算不算得出年化」
+    之類的計算結果，同樣的天數就會依帳戶狀況給出不同層級，而前端拿層級去決定版面
+    （例如「annualizable 才顯示年化欄位」）時會看到版面自己跳動。
+    """
+    if covered_days < MIN_DAYS_FOR_RETURN:
+        return TIER_PNL_ONLY
+    if covered_days < MIN_DAYS_FOR_ANNUALIZATION:
+        return TIER_WINDOW_RETURN
+    return TIER_ANNUALIZABLE
 
 
 def _max_drawdown(equity_index: list[Decimal]) -> Decimal:
@@ -301,7 +363,12 @@ def _max_drawdown(equity_index: list[Decimal]) -> Decimal:
 
 
 def _annualize(growth: Decimal, covered_days: Decimal) -> Decimal | None:
-    """`(1+TWR)^(365/天數) − 1`。呼叫點已保證 `covered_days >= 90`（硬規則）。
+    """`(1+TWR)^(365/天數) − 1`。
+
+    ⚠️ 2026-07-19 起呼叫點**不再**保證 `covered_days >= 90`：短窗照樣年化，但結果
+    一定伴隨 `annualized_return_insufficient_data=True` 與
+    `annualized_return_extrapolated_from_days`（實際天數）一起送出去。短窗年化在
+    數值上是激進外推（7 天賺 3% → 年化 365%），揭露責任因此完全落在那兩個標記上。
 
     `growth <= 0`（帳戶被歸零或更糟）→ None：非正數的非整數次方沒有實數解。
     """
@@ -328,8 +395,10 @@ def jsonable_performance(perf: dict[str, Any], *, include_equity_index: bool = F
                          ) -> dict[str, Any]:
     """績效 dict → 可 JSON 序列化（Decimal → str，沿 leaderboard.py 的落地慣例）。
 
-    ⭐ 缺鍵一律**保持缺鍵**（不補 None）：`annualized_return` 的結構性缺席是本模組
-    最重要的保證，序列化時補成 `null` 等於把它降級成「呼叫端記得檢查」。
+    ⭐ 缺鍵一律**保持缺鍵**（不補 None）。改版後 `annualized_return` 的缺席只剩一種
+    原因——年化在數學上無定義（帳戶歸零）——補成 `null` 會讓那個處境看起來像「有這個
+    欄位只是還沒算」。`*_insufficient_data` 是 bool，原樣通過（不轉字串：前端要能
+    直接 `if (marker)`，把它變成 `"False"` 這種**真值為 True** 的字串是致命的）。
 
     `equity_index` 預設**不輸出**：它是每窗數十到數百點的序列，落進每日快照會讓
     檔案膨脹一個數量級，而快照的用途是純量指標。要畫圖的呼叫端顯式打開。

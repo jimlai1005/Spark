@@ -27,7 +27,8 @@ from spark.filet.leader_change import (LeaderChangeError, build_leader_change_me
                                        build_leader_change_record,
                                        load_leader_changes, verify_leader_change,
                                        write_leader_change)
-from spark.filet.leader_perf import BASIS_NOTE, MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE
+from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
+                                     MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
 from spark.keysvc.client import KeysvcError
@@ -172,17 +173,25 @@ _LEADER_PERF_WINDOWS = ("perpMonth", "perpAllTime")
 _LEADER_PERF_FIELDS = ("period", "basis", "status", "reason", "disclosure_tier",
                        "sample_count", "covered_days", "first_ts_ms", "last_ts_ms",
                        "skipped_intervals", "cum_pnl", "twr", "max_drawdown",
-                       "annualized_return")
+                       "annualized_return") + INSUFFICIENCY_MARKERS
+# ⭐ 不足標記由 `leader_perf.INSUFFICIENCY_MARKERS` **拼進來**，不在這裡重抄一份字串
+# （2026-07-19 改版）：改版後績效指標即使資料很薄也照樣外流，唯一的警示載體就是那些
+# 標記。白名單漏掉任何一個 → 前端拿到一個沒有任何警示的外推數字，而畫面上完全看不
+# 出來。用拼接而非複製，讓「新增了標記卻忘了外流」這個錯誤寫不出來（工程原則 5）。
 
 
 def _leader_perf_public(stats: dict | None) -> dict | None:
     """快照列的 `perf` → 對外的績效投影；沒有績效資料 → None。
 
-    ⭐⭐ 投影用 `if k in row`（**不是** `row.get(k)`）：`leader_perf` 對「不足 90 天
-    不年化」「不足 30 天不給 %」的保證，載體正是**鍵的不存在**。改用 `.get()` 會把
-    缺席的鍵補成 `null` 送給前端，而前端的 `?? 0`／`|| "—"` 之類寫法會把 null 悄悄
-    變成一個數字或一個看起來正常的欄位——那道結構性防線就在這一行退化成「前端記得
-    檢查」。這是本函式唯一真正重要的一行。
+    ⭐⭐ 投影用 `if k in row`（**不是** `row.get(k)`）：舊快照沒有新欄位、`leader_perf`
+    在年化數學上無定義時也不回 `annualized_return`。改用 `.get()` 會把這些缺席的鍵
+    補成 `null` 送給前端，而前端的 `?? 0`／`|| "—"` 之類寫法會把 null 悄悄變成一個
+    數字或一個看起來正常的欄位。這是本函式唯一真正重要的一行。
+
+    ⚠️ 2026-07-19 揭露模型改版後，「資料不足」**不再**由缺鍵承載（見
+    `filet/leader_perf.py` 檔頭「揭露模型改版」）：薄資料的 `twr`／`annualized_return`
+    照樣外流，警示改由 `INSUFFICIENCY_MARKERS` 那組指標層級標記承載。所以本投影的
+    白名單**必須**含那組標記——漏掉等於外流一個無警示的外推數字。
 
     形狀不符（舊快照、schema 漂移）→ None，不 raise：目錄頁不該因為績效缺席而 500
     （沿本模組既有的兩種降級，見 leaders_directory）。
