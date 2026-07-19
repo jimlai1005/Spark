@@ -8,9 +8,11 @@ Public API 設定與身分衍生。
 import os
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 
 from spark.config import API_URLS, MIN_BUILDER_BALANCE, Settings
 from spark.filet.followers import validate_account_id
+from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH
 
 _HEX = set("0123456789abcdefABCDEF")
 
@@ -46,6 +48,17 @@ class ApiConfig:
     # builder accrued 歷史序列（北極星實收，由 scripts/copytrade_daily_report.py 每日附加）。
     # API 進程不自己查 accrued——查一次的職責在日報腳本，這裡只讀它落下的檔（紅線：不加總）。
     accrued_history_path: str = "var/copytrade/accrued_history.jsonl"
+    # --- leader 目錄（/api/leaders，session-gated）唯讀資料來源 ---
+    # ⭐ 直接引用引擎的 DEFAULT_LEADERS_PATH，不另寫一個字面量預設（同源，工程原則 1）：
+    # 目錄頁列出的「可選 leader」與引擎放行的清單必須是**同一個檔**。兩邊各自宣告
+    # 預設路徑 → 管理端在引擎那份撤銷、API 這份仍列著他，客戶選了一個已撤銷的 leader。
+    leaders_path: str = DEFAULT_LEADERS_PATH
+    # watchlist 每日快照目錄（scripts/watchlist_snapshot.py 的落檔處，cron 00:10 UTC）。
+    # 由 DEFAULT_LEADERS_PATH 的父目錄推導＝<repo>/var/filet/leaderboard/watchlist，
+    # 對齊 watchlist_snapshot 的 <FILET_DATA_DIR>/leaderboard/watchlist 版面；
+    # 一併繼承它的 repo 根錨定（絕對路徑，不隨 API 進程的 CWD 漂移）。
+    watchlist_dir: str = str(
+        Path(DEFAULT_LEADERS_PATH).parent / "leaderboard" / "watchlist")
     # 常數單一來源（opus 審 M4）：不重新宣告字面量，直接引用 spark.config 既有常數。
     # max_rate 無模組級常數——dataclass 的純預設值即類屬性，Settings.max_rate == "0.1%"（D6）。
     max_fee_rate: str = Settings.max_rate
@@ -118,6 +131,16 @@ class ApiConfig:
         # 兩個 env 名是營運誤設的溫床，這裡讓一個變數就能同時餵引擎與 API。
         followers_path = (env.get("FILET_FOLLOWERS_PATH") or env.get("FILET_FOLLOWERS")
                           or cls.followers_path)
+        # leader 白名單：沿引擎與 activate CLI 既有的 FILET_LEADERS_PATH（同一變數餵三方，
+        # 同上「一個變數就不會半邊誤設」的理由）。
+        leaders_path = env.get("FILET_LEADERS_PATH") or cls.leaders_path
+        # watchlist 快照目錄：優先顯式 FILET_WATCHLIST_DIR，否則由 cron 用的
+        # FILET_DATA_DIR 推導出同一個版面（<data>/leaderboard/watchlist），
+        # 兩邊都未設才用類預設——避免「cron 寫 A、API 讀 B」的靜默錯位。
+        data_dir = env.get("FILET_DATA_DIR")
+        watchlist_dir = (env.get("FILET_WATCHLIST_DIR")
+                         or (str(Path(data_dir) / "leaderboard" / "watchlist")
+                             if data_dir else cls.watchlist_dir))
         return cls(network=network,
                    builder_address=normalize_address(env["FILET_BUILDER_ADDR"]),
                    siwe_domain=env["FILET_SIWE_DOMAIN"],
@@ -128,6 +151,8 @@ class ApiConfig:
                    followers_path=followers_path,
                    accrued_history_path=(env.get("FILET_ACCRUED_HISTORY_PATH")
                                          or cls.accrued_history_path),
+                   leaders_path=leaders_path,
+                   watchlist_dir=watchlist_dir,
                    admin_addresses=admins,
                    stripe_secret_key=stripe_env["FILET_STRIPE_SECRET_KEY"],
                    stripe_webhook_secret=stripe_env["FILET_STRIPE_WEBHOOK_SECRET"],

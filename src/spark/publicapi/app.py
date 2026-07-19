@@ -11,6 +11,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from spark.filet.followers import load_followers_tolerant
+from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
+from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
@@ -37,6 +39,30 @@ class VerifyBody(BaseModel):
 
 class ChainIdBody(BaseModel):
     chain_id: int
+
+
+# leader 目錄要外流的**快照統計欄位白名單**。watchlist 快照存的是一日一點的資產負債
+# 切面（見 filet/leaderboard.py 檔頭），**不是**報酬率／Sharpe——欄位命名刻意沿用
+# 快照原名，避免在 API 層改名成看起來像績效指標的東西。
+# 刻意不外流的兩個快照欄位：`withdrawable`／`total_margin_used`——對「該不該選這個
+# leader」沒有增量資訊，卻極易被讀成與客戶自己資金有關的數字。要外流請主動加一行。
+_LEADER_STAT_FIELDS = ("account_value", "total_ntl_pos", "unrealized_pnl",
+                       "position_count")
+
+
+def _leader_public(ref: LeaderRef, stats: dict | None) -> dict:
+    """LeaderRef ＋ 快照列 → 對外 dict。⭐ 白名單列欄位（不是 asdict 再 pop，沿
+    `_plan_public` 慣例）：`enabled`／`accepting_new` 是**內部治理狀態**，不外流——
+    客戶不需要知道某個 leader 是「例行下架」還是「安全撤銷」，而後者外流等同於
+    公告「這個 leader 出事了」。不可選的 leader 根本不會走到這個函式（見端點）。
+
+    stats 為 None（該 leader 不在 watchlist／快照不可用）→ 統計欄位全 null，
+    不填 0：0 會被讀成「這個 leader 沒有部位」，是有意義且錯誤的訊息。
+    """
+    out = {"address": ref.address, "name": ref.name, "description": ref.description}
+    for f in _LEADER_STAT_FIELDS:
+        out[f] = stats.get(f) if stats else None
+    return out
 
 
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
@@ -128,6 +154,52 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     @app.get("/api/me")
     def me(address: str = Depends(_require_session)):
         return {"address": address, "account_id": derive_account_id(address)}
+
+    # ---------- leader 目錄（客戶自選 leader 的資料來源） ----------
+    @app.get("/api/leaders")
+    def leaders_directory(address: str = Depends(_require_session)):
+        """客戶**現在可以選**的 leader 清單 ＋ 每個 leader 的快照統計。
+
+        ⭐ 過濾一律走 `leaders.is_selectable`（＝`enabled` **且** `accepting_new`），
+        不在這裡自己寫旗標判斷。兩個旗標語意不同、且**任一為假都不該出現在目錄**：
+        - `enabled=False` ＝ 安全撤銷（這個 leader 出事了）；
+        - `accepting_new=False` ＝ 例行下架（名額滿／準備退場，只擋新客戶）。
+        不可選的 leader **連 address 都不外流**——「白名單裡有這筆但你選不到」本身
+        就是治理資訊（哪個 leader 剛被撤銷），沒有理由讓客戶端推得出來。
+
+        統計來源＝**已存在的 watchlist 每日快照**（cron 00:10 UTC），不打 HL 即時查詢：
+        目錄頁會被頻繁瀏覽，逐次請求轉成上游查詢等於把使用者流量放大成對交易所的
+        突發流量（而目錄頁本來就不需要秒級新鮮度）。
+
+        兩種降級，都**不讓整個目錄 500**——拿不到統計只是少幾個數字，回不出清單則是
+        客戶完全無法選 leader（後果嚴重得多）：
+        - 快照缺失／讀取失敗 → 照回清單，統計欄位全 null，`stats_available=false`＋`note`。
+        - 個別 leader 不在 watchlist（或該列是失敗列）→ 只有他的統計為 null。
+
+        `stats_as_of`／`stats_day` 必回：沒有時間戳的話，一份三天前的數字會被當成
+        即時數字讀（工程原則 1 的變形——比較的兩端連時點都不同源）。
+
+        白名單載入失敗（JSON 壞／格式錯）→ 503，**不回空清單**：空清單看起來像
+        「目前沒有 leader」的正常狀態，會讓一個手滑的編輯靜默變成全站無 leader。
+        """
+        try:
+            refs = load_leaders(cfg.leaders_path)
+        except ValueError as e:
+            logger.error("leader 白名單載入失敗 %s: %s", cfg.leaders_path, e)
+            raise HTTPException(
+                status_code=503, detail="leader 名單暫時不可用，請稍後重試") from e
+        selectable = [r for r in refs if is_selectable(r.address, refs)]
+        snapshot = load_latest_snapshot(cfg.watchlist_dir)
+        rows = snapshot_rows_by_address(snapshot)
+        return {
+            "leaders": [_leader_public(r, rows.get(r.address)) for r in selectable],
+            "stats_available": snapshot is not None,
+            "stats_day": snapshot.get("day") if snapshot else None,
+            "stats_as_of": snapshot.get("generated_at") if snapshot else None,
+            "note": None if snapshot else
+                    "績效統計暫時不可用（每日快照尚未產生或讀取失敗）；"
+                    "leader 清單不受影響，仍可正常選擇。",
+        }
 
     # ---------- onboarding ----------
     @app.post("/api/onboard/agent")

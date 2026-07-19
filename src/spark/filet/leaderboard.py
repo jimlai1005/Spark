@@ -60,6 +60,53 @@ def snapshot_watchlist(state_fn: Callable[[str], dict], addresses: list[str] | t
     }
 
 
+def load_latest_snapshot(out_dir: str | Path) -> dict[str, Any] | None:
+    """讀 <out_dir> 下**最新一天**的快照（檔名＝ISO 日期，字典序即時序）。
+
+    唯讀消費端用（目錄頁 /api/leaders）：cron 每日 00:10 UTC 產出，讀的一方永遠是
+    「拿得到就用、拿不到就沒有統計」，**不得**因為統計缺席而讓上層功能停擺。
+    故目錄不存在／無快照檔／JSON 壞／結構不符 → 回 None（不 raise），
+    但一律 logger.error 留痕（工程原則 3 的「大聲」：呼叫端另需把「統計不可用」
+    這件事顯式回給使用者，不可假裝統計是 0 或最新）。
+
+    刻意**不**回退到更舊的快照：舊資料被當成今天的資料讀，比沒有資料危險。
+    """
+    d = Path(out_dir)
+    files = sorted(p for p in d.glob("*.json") if not p.name.startswith("."))
+    if not files:
+        logger.error("watchlist 快照目錄無可用快照: %s", d)
+        return None
+    latest = files[-1]
+    try:
+        data = json.loads(latest.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("watchlist 快照讀取失敗 %s: %s", latest, e)
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        logger.error("watchlist 快照結構不符（缺 rows 陣列）: %s", latest)
+        return None
+    return data
+
+
+def snapshot_rows_by_address(snapshot: dict | None) -> dict[str, dict[str, Any]]:
+    """快照 → {address: row}，**只收成功列**（含 "error" 鍵的失敗列一律剔除）。
+
+    失敗列只有 address ＋ error 兩個鍵；若讓它留在索引裡，呼叫端的
+    `row.get("account_value")` 會拿到 None 卻分不出「這個 leader 沒被快照到」與
+    「快照到但欄位缺」——兩者對使用者的意義相同（沒有統計），在此統一成「查無此列」。
+    """
+    if not snapshot:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for row in snapshot.get("rows", []):
+        if not isinstance(row, dict) or "error" in row:
+            continue
+        addr = row.get("address")
+        if isinstance(addr, str):
+            out[addr.lower()] = row
+    return out
+
+
 def write_snapshot(out_dir: str | Path, snapshot: dict) -> Path:
     """原子寫 <out_dir>/<day>.json：同目錄 tmp + os.replace（同檔系統原子）；
     同日重跑覆寫同檔＝冪等（檔名 = day）。cron 中途被殺不留半寫檔。"""
