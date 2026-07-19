@@ -141,6 +141,7 @@ def sync_positions(
     protected: AbstractSet[str] = frozenset(),
     size_decimals: Callable[[str], int],
     mids: Mapping[str, Decimal],
+    no_new_exposure: bool = False,
 ) -> dict:
     """同步我方部位到 leader 部位（乘以 scale）。
 
@@ -148,6 +149,15 @@ def sync_positions(
           "skipped": [...], "failed": [...]}。
     每個 list 內是 dict，至少含 "coin" 欄位；"skipped"/"failed" 額外附
     "reason"/"action" 說明原因。
+
+    `no_new_exposure`（成本熔斷器接線，見 `costbreaker`）：True ⇒ 任何**增加曝險**
+    的動作一律跳過（新開倉、同向加倉、反轉後的重新開倉），記
+    `reason="cost_breaker_*"`。
+
+    ⭐ **reduce-only 一律放行——這是硬規則，絕不把客戶困在部位裡**（計畫 D5）：
+    減倉、leader 已平的跟平、以及反轉時的「先平掉舊部位」那一腿，在
+    `no_new_exposure=True` 時**照常執行**。反轉的淨效果因此是「只平不開」——
+    曝險單向下降，這正是熔斷期間想要的方向。
     """
     result: dict = {"opened": [], "adjusted": [], "flattened": [], "skipped": [], "failed": []}
 
@@ -171,6 +181,9 @@ def sync_positions(
 
         if coin not in my_positions:
             # ── 新開倉（hl sync.py:104-119）──
+            if no_new_exposure:
+                result["skipped"].append({"coin": coin, "reason": "cost_breaker_open"})
+                continue
             if coin in protected:
                 result["skipped"].append({"coin": coin, "reason": "protected_open"})
                 notifier.warn(
@@ -209,6 +222,11 @@ def sync_positions(
             # 下游依 adjusted 判定「已同步」，不得與 failed 並存。
             is_buy_close = my_side == "short"
             close_ok = _try_close_reduce_only(ex, notifier, result, coin, is_buy_close, my_size)
+            if no_new_exposure:
+                # ⭐ 平掉舊部位那一腿是 reduce-only，照常執行（D5 硬規則）；只擋反向重開。
+                # 淨效果：曝險單向下降，正是熔斷期間想要的方向。
+                result["skipped"].append({"coin": coin, "reason": "cost_breaker_flip_open"})
+                continue
             open_ok = _leverage_and_open(ex, notifier, result, coin, target_side, target_size,
                                          tgt.leverage, tgt.is_cross)
             if close_ok and open_ok:
@@ -225,6 +243,10 @@ def sync_positions(
             if diff > 0:
                 # ── 同向加倉（trader.py:285-292；經 open_position → set_leverage
                 # trader.py:163，故加倉前同樣先設槓桿）──
+                if no_new_exposure:
+                    result["skipped"].append(
+                        {"coin": coin, "reason": "cost_breaker_increase"})
+                    continue
                 if _leverage_and_open(ex, notifier, result, coin, target_side, diff,
                                       tgt.leverage, tgt.is_cross):
                     result["adjusted"].append({

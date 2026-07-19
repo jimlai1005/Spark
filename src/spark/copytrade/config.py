@@ -119,6 +119,38 @@ class CopySettings:
     # max_drawdown_pct）可累積成巨額虧損而從不觸發。本門檻以「自開始跟單以來的高水位」
     # 為基準，兩道閘任一觸發即熔斷。0 = 停用。
     max_total_drawdown_pct: Decimal = Decimal("0.40")
+    # ── 成本熔斷器（2026-07-19，plans/2026-07-19-cost-circuit-breaker.md）─────
+    # 對「客戶資金被交易磨損的速度」設上限，**與 leader 是誰無關**。度量是換手率
+    # （滾動 24h 成交名目 ÷ perp 權益）與成交筆數，不是手續費——手續費資料不完整
+    # （UserFill 只有 builder_fee，HL 自身費率與滑價不在內），拿不完整的分子算
+    # 「成本佔比」會系統性低估（D1）。
+    #
+    # ⭐ 這道閘門為何必須預設開啟：我方從客戶的每一筆成交賺 builder fee，
+    # **從磨損中獲利的一方正是被指定守住磨損的一方**。靠營運端自律不成立，
+    # 只能靠結構。0 = 停用該項（兩項皆 0 ⇒ 完全停用，行為與加入本功能前一致）。
+    #
+    # ⚠️ **此預設未經真實資料校準，上線前需以實際跟單資料調整**（D7 誠實標註）。
+    # 目前唯一的真實觀測：2026-07-18 testnet 日報 accrued 增量 0.279122 USDC ÷
+    # f=20（0.02%）⇒ builder 歸屬名目約 1395.6 USDC；該測試中 builder == leader
+    # 錢包，故此數含兩邊，follower 側約 700 ÷ perp 權益 500 ⇒ 換手率約 1.4×／日，
+    # 且那是刻意密集的全生命週期演練日（開/加/減/反手/全平＋modify 探針），
+    # 不是常態跟單。樣本 = 1 個 testnet 日，不足以訂出有信心的值。
+    #
+    # 20 的取值理由（保守＝不易誤觸，D7 指定方向）：單位名目摩擦約 0.065%
+    # （HL taker 0.045% + builder 0.02%），20×／日 ≈ 每日磨掉權益 1.3%，
+    # 約 15 天磨到 max_drawdown_pct(0.20)——即純磨損攻擊下成本閘**早於**回撤閘
+    # 觸發（它該是較輕、較早的一道），同時仍高於唯一真實觀測值約 14 倍。
+    # 收緊是安全方向；放寬前請先有真實跟單資料。
+    cost_max_turnover_24h: Decimal = Decimal("20")
+    # 次要度量：滾動 24h 成交筆數。抓「換手率看不到的高頻小額對敲」——大帳戶用
+    # min_order_notional(10) 的碎單洗量，名目佔權益比例很小但筆筆都付 taker 成本。
+    # 400 筆 ≈ 觀測值(10 筆/日)的 40 倍；引擎 interval_s=60 ⇒ 每日至多 1440 輪。
+    cost_max_fills_24h: int = 400
+    # ⭐ 累犯升級（D6）：純自動恢復會讓濫用**穩定在門檻上**持續進行——每次觸發後
+    # 稍微收手、掉回門檻下自動恢復、再衝上去。滾動 24h 內觸發達此次數 → trip kill
+    # switch（需人工 re-arm），讓持續性問題必須有人看一眼。0/1 皆視為「一次即升級」。
+    cost_breach_escalate_count: int = 3
+
     settle_seconds: int = 2  # hl orders.py SETTLE_SECONDS
     modify_fail_ttl_s: int = 120  # hl orders.py _MODIFY_SKIP_TTL
     max_consecutive_errors: int = 5  # hl main.py:292 MAX_CONSECUTIVE_ERRORS
@@ -178,6 +210,12 @@ class CopySettings:
             max_drawdown_pct=_env_decimal("COPY_MAX_DRAWDOWN_PCT", str(cls.max_drawdown_pct), env),
             max_total_drawdown_pct=_env_decimal(
                 "COPY_MAX_TOTAL_DRAWDOWN_PCT", str(cls.max_total_drawdown_pct), env),
+            cost_max_turnover_24h=_env_decimal(
+                "COPY_COST_MAX_TURNOVER_24H", str(cls.cost_max_turnover_24h), env),
+            cost_max_fills_24h=_env_int(
+                "COPY_COST_MAX_FILLS_24H", str(cls.cost_max_fills_24h), env),
+            cost_breach_escalate_count=_env_int(
+                "COPY_COST_BREACH_ESCALATE_COUNT", str(cls.cost_breach_escalate_count), env),
             settle_seconds=_env_int("COPY_SETTLE_SECONDS", str(cls.settle_seconds), env),
             modify_fail_ttl_s=_env_int("COPY_MODIFY_FAIL_TTL_S", str(cls.modify_fail_ttl_s), env),
             max_consecutive_errors=_env_int(
@@ -240,6 +278,20 @@ class CopySettings:
         if not (0 <= self.max_total_drawdown_pct < 1):
             raise ValueError(
                 f"max_total_drawdown_pct must be in [0, 1), got {self.max_total_drawdown_pct}")
+
+        # 成本熔斷器：負值一律拒絕啟動。負門檻會讓「任何成交都超標」永久擋住開新倉，
+        # 那不是保護而是靜默停止跟單——與 allocated_capital<=0 同一類錯誤，拒絕而非
+        # 靜默挑一邊。0 是合法的（＝停用該項）。
+        if self.cost_max_turnover_24h < 0:
+            raise ValueError(
+                f"cost_max_turnover_24h must be >= 0 (0=停用), got {self.cost_max_turnover_24h}")
+        if self.cost_max_fills_24h < 0:
+            raise ValueError(
+                f"cost_max_fills_24h must be >= 0 (0=停用), got {self.cost_max_fills_24h}")
+        if self.cost_breach_escalate_count < 0:
+            raise ValueError(
+                "cost_breach_escalate_count must be >= 0, got "
+                f"{self.cost_breach_escalate_count}")
 
         # ⭐⭐ 本金模式的不變量：兩個欄位只有**兩種**合法組合（見欄位宣告處）。
         # 兩個方向都檢查是刻意的——只檢查一邊會留下一個「有值卻不生效」的狀態，

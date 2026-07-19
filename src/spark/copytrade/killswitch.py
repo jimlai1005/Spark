@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Iterable
 
 from spark.copytrade.config import CopySettings
+from spark.copytrade.costbreaker import reset_log as reset_cost_log
 from spark.copytrade.equity import reset_samples
 from spark.copytrade.executor import ExecutorPort
 from spark.copytrade.notifier import Notifier
@@ -307,6 +308,11 @@ def trip(ex: ExecutorPort, my_positions: dict[str, Position], notifier: Notifier
     }, notifier, root)
     # 清空 perp 權益樣本：否則人工 re-arm 後，崩跌前的舊 peak 仍在 7 天窗內會立刻再熔斷。
     reset_samples(root)
+    # 同理清空成本熔斷器的觸發歷史：否則人工 re-arm 後，窗內的舊觸發記錄仍在，
+    # 下一次觸發就立刻再度累犯升級、再鎖死一次——人工複查等於沒有效果。
+    # 兩者都是「已由人接手處理」的重置點，語意一致（reset_log 同樣絕不拋例外，
+    # 它位於 ARM 落地與總結 critical 之間，拋錯會吃掉那則告警）。
+    reset_cost_log(root)
 
     # 4) 總結告警
     crit(

@@ -59,7 +59,7 @@ class SkippedOrder:
 
     coin: str
     notional: Decimal
-    reason: str  # ∈ {"small", "spot", "protected", "reduce_only_no_pos"}
+    reason: str  # ∈ {"small", "spot", "protected", "reduce_only_no_pos", "cost_breaker"}
 
 
 @dataclass(frozen=True)
@@ -220,11 +220,16 @@ def _build_desired(
     size_decimals: Callable[[str], int],
     my_positions: dict[str, Position],
     protected: set[str],
+    no_new_exposure: bool = False,
 ) -> tuple[list[OrderSpec], list[SkippedOrder]]:
     """將 leader 掛單縮放成「我方期望掛單規格」清單。1:1 port 自 hl orders.py:79-127。
 
     過濾順序（與 hl 一致，決定優先順位）：
       1. 現貨標的（不支援跟單）→ 記 SkippedOrder(reason="spot")，先排除避免下單錯誤。
+      1.5 成本熔斷器（spark 新增，非 hl）：`no_new_exposure` 且非 reduce-only →
+         記 SkippedOrder(reason="cost_breaker")。⭐ **reduce-only 一律放行**（D5
+         硬規則，絕不把客戶困在部位裡）——語意與 protected 完全相同，差別只在
+         protected 是 per-coin、成本熔斷是帳戶級。
       2. 抗單保護標的且非 reduce-only（拒絕補倉，但保留減倉/止盈止損單）→
          記 SkippedOrder(reason="protected")。
       3. reduce-only 且我方無對應部位（G4：交易所會拒絕這種單）→
@@ -238,6 +243,10 @@ def _build_desired(
         coin = o.coin
         if _is_spot_coin(coin):
             skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"), reason="spot"))
+            continue
+        if no_new_exposure and not o.reduce_only:
+            skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
+                                        reason="cost_breaker"))
             continue
         if coin in protected and not o.reduce_only:
             skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"), reason="protected"))
@@ -514,6 +523,7 @@ def sync_open_orders(
     state,
     live: bool,
     protected: set[str] = frozenset(),
+    no_new_exposure: bool = False,
     leverage_by_coin: Mapping[str, tuple[int, bool]] | None = None,
     safety_net: Callable[[], dict] | None = None,
     skip_safety_net: bool = False,
@@ -554,6 +564,7 @@ def sync_open_orders(
         size_decimals=ex.get_size_decimals,
         my_positions=my_positions,
         protected=set(protected),
+        no_new_exposure=no_new_exposure,
     )
     small = tuple(s for s in skipped if s.reason == "small")
     for s in small:
@@ -569,6 +580,16 @@ def sync_open_orders(
             "orders",
             f"[抗單保護] 拒絕複製 {coin} 補倉單",
             dedup_key=f"protected:{coin}",
+        )
+    cost_coins = sorted({s.coin for s in skipped if s.reason == "cost_breaker"})
+    for coin in cost_coins:
+        # 單一 dedup_key（非 per-coin）：熔斷是帳戶級事件，per-coin 去重會讓
+        # leader 掛 20 個標的時噴 20 則講同一件事的告警。真正的觸發數字已由
+        # costbreaker 的 critical 帶出，這裡只是說明「這一輪誰被擋了」。
+        notifier.warn(
+            "orders",
+            f"[成本熔斷] 停止開新倉中，跳過 {coin} 進場掛單（reduce-only 不受影響）",
+            dedup_key="cost_breaker_orders",
         )
 
     if leverage_by_coin is not None:

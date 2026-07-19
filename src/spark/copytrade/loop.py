@@ -1,8 +1,14 @@
 """主迴圈：單輪同步組裝（run_cycle）與固定間隔排程（main_loop）。
 
 run_cycle 順序（killswitch docstring 的主迴圈接入接口 + Task 12 spec）：
-  is_tripped 短路 → 回撤判定（breach → flatten_on_breach 時 trip）→ leader/my 讀取
-  → weight/scale → sync_open_orders（safety_net=sync_positions 接線）→ skip_trigger 告警。
+  is_tripped 短路 → 回撤判定（breach → flatten_on_breach 時 trip）→ **成本熔斷判定**
+  → leader/my 讀取 → weight/scale → sync_open_orders（safety_net=sync_positions 接線）
+  → skip_trigger 告警。
+
+⭐ 這個順序編碼了三道閘門的優先序（成本熔斷計畫 D8）：
+`leader 撤銷`（在 run_copytrade 層，run_cycle 之前）> `kill switch（回撤）`
+> `成本熔斷器`。前面的閘一旦成立就已 return，後面的走不到——優先序由位置保證，
+不是靠呼叫端記得檢查旗標。
 
 main_loop 排程（port hl-copytrader main.py:122-131 的分鐘鍵防重跑與
 :291-292,351-363 的連續錯誤熔斷；頻率由 CopySettings.interval_s 決定，
@@ -18,8 +24,9 @@ from pathlib import Path
 from typing import Callable
 
 from spark.copytrade.config import CopySettings
+from spark.copytrade.costbreaker import evaluate_cost
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
-from spark.copytrade.killswitch import evaluate, is_tripped, trip
+from spark.copytrade.killswitch import DrawdownStatus, evaluate, is_tripped, trip
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
     CycleReport,
@@ -95,6 +102,29 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             trip(ex, my_positions, notifier, root, status)
         return tripped_report()
 
+    # ── 2.5 成本熔斷器（計畫 D8 的優先序在此結構性成立）─────────────────
+    # `leader 撤銷` > `kill switch（回撤）` > `成本熔斷器`。前兩者一旦成立，
+    # 上面兩段已經 return，走不到這裡——優先序不是靠註解約定，是靠位置。
+    # 成本熔斷器是最輕的一道：只把 no_new_exposure 交給下游（停開新倉、
+    # reduce-only 照常），不自己平倉、不覆寫前兩者的行為。
+    #
+    # ⭐⭐ 同基準（D2）：分母用**這一輪、這一次讀取**的 `ev.current`
+    # ——就是上面回撤判定用的同一個 perp accountValue（`perp_equity_view` 的產出）。
+    # 絕不改成 my_state.account_value 或 adapter.get_equity_view()：後者含 spot，
+    # 分母灌水會讓換手率被低估、保護靜默失效（findings F1 同型問題）。
+    # 也不要在這裡重讀一次 get_account_value：同源但不同輪，仍是混基準。
+    cost = evaluate_cost(adapter, ex.my_address, ev, settings, notifier, root)
+    if cost.escalate:
+        # D6 累犯升級：滾動 24h 內反覆觸發 ⇒ 交給 kill switch（需人工 re-arm）。
+        # 刻意重用 killswitch.trip 而非另寫收尾（同 leader_revoked 的理由：
+        # 兩套實作必然漂移，而漂移的那套只在真出事時才被執行到）。
+        my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
+        trip(ex, my_positions, notifier, root,
+             DrawdownStatus(current=ev.current, peak=ev.recent_peak,
+                            drawdown_pct=Decimal("0"), breached=False),
+             reason="cost_breach")
+        return tripped_report()
+
     # ── 3. leader / my 狀態讀取 ────────────────────────────────────────
     leader = settings.leader_address
     leader_orders = adapter.get_open_orders(leader)
@@ -143,12 +173,14 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             ex, leader_positions, pos, scale,
             settings=settings, notifier=notifier, protected=set(protected),
             size_decimals=ex.get_size_decimals, mids=adapter.get_all_mids(),
+            no_new_exposure=cost.breached,
         )
 
     report = sync_open_orders(
         ex, leader_orders, my_orders, my_positions, scale,
         settings=settings, notifier=notifier, state=state, live=ex.live,
-        protected=set(protected), leverage_by_coin=leverage_by_coin,
+        protected=set(protected), no_new_exposure=cost.breached,
+        leverage_by_coin=leverage_by_coin,
         safety_net=_safety_net,
     )
 
