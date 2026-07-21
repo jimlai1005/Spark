@@ -435,3 +435,135 @@ def test_ledger_path_derives_from_the_engine_relpath(monkeypatch):
 
     monkeypatch.setenv("FILET_STATE_BASE", "/opt/filet/state")
     assert fdr.ledger_path_for("alice") == Path("/opt/filet/state/alice") / LEDGER_RELPATH
+
+
+# ── ⭐ 營收關鍵告警推到 Notifier（builder 資格 ＋ 換 leader 對帳）─────────────
+# 這兩類告警原本只寫 stderr `[ALERT]`／報表檔——埋在 journal 與檔案裡，營收靜默中斷時
+# 沒人會即時看到。此節釘住：告警**另外**推到注入的 Notifier（新增管道，不取代既有輸出），
+# 帶正確的 category／text／dedup_key；無告警時 notifier 不被呼叫；stderr/報表仍照舊。
+
+
+def _push_wiring(tmp_path, monkeypatch, adapter, notifier, refs=None):
+    """把 SNAPSHOT/REPORTS 導向 tmp_path，跑 generate_report，回報表本文。
+
+    FILET_EXCHANGE_DIR 指向存在但無 leader_changes.json 的 tmp_path → 換 leader 對帳
+    產生零告警，讓本節的 builder 斷言與換 leader 噪音隔離（未設 env 會自成一則告警）。
+    """
+    monkeypatch.setattr(fdr, "SNAPSHOT_PATH", tmp_path / "snap.json")
+    monkeypatch.setattr(fdr, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setenv("FILET_EXCHANGE_DIR", str(tmp_path))
+    if refs is None:
+        refs = [_ref_full("alice", "0x" + "B" * 40, "mainnet")]
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    fdr.generate_report(refs, [], lambda _n: adapter, now, notifier)
+    return _report_text(tmp_path)
+
+
+def test_low_equity_alert_is_pushed_to_notifier(tmp_path, monkeypatch, capsys):
+    """⭐ builder 淨值不足 → notifier.critical 被呼叫，category=builder合規、
+    dedup_key 帶 builder 位址＋條件、text 含淨值。stderr/報表仍照舊（稽核軌跡）。"""
+    from spark.copytrade.notifier import RecordingNotifier
+    notifier = RecordingNotifier()
+    text = _push_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), equity=Decimal("42")), notifier)
+
+    crit = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crit) == 1
+    level, category, body, dedup = crit[0]
+    assert category == "builder合規"
+    assert dedup == "builder_equity_" + "0x" + "b" * 40   # 位址小寫正規化＋條件
+    assert "42" in body
+    # 既有管道不受影響（新增而非取代）
+    assert "builder 資格異常" in text
+    assert "[ALERT]" in capsys.readouterr().err
+
+
+def test_non_standard_mode_alert_pushed_with_mode_dedup_key(tmp_path, monkeypatch):
+    """⭐ mode 不合規 → 獨立的 builder_mode_<addr> dedup_key（與 equity 條件互不遮蔽）。"""
+    from spark.copytrade.notifier import RecordingNotifier
+    notifier = RecordingNotifier()
+    _push_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), abstraction="unifiedAccount"), notifier)
+
+    crit = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crit) == 1
+    assert crit[0][1] == "builder合規"
+    assert crit[0][3] == "builder_mode_" + "0x" + "b" * 40
+
+
+def test_both_conditions_failing_push_two_independent_dedup_keys(tmp_path, monkeypatch):
+    """⭐ 兩條件皆不符 → 兩則 critical，dedup_key 各自獨立（一個被抑制不會遮蔽另一個）。"""
+    from spark.copytrade.notifier import RecordingNotifier
+    notifier = RecordingNotifier()
+    _push_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), equity=Decimal("10"), abstraction="unifiedAccount"),
+        notifier)
+
+    keys = {r[3] for r in notifier.records if r[0] == "critical"}
+    b = "0x" + "b" * 40
+    assert keys == {f"builder_equity_{b}", f"builder_mode_{b}"}
+
+
+def test_leader_change_alert_is_pushed_to_notifier(tmp_path, monkeypatch):
+    """⭐ 換 leader 逾時未套用 → notifier.critical，category=換leader對帳、
+    dedup_key 帶 account_id。"""
+    from spark.copytrade.notifier import RecordingNotifier
+    changes = _write_changes(tmp_path, _change_record("alice", "n1", age_s=3600))
+    _write_ledger(tmp_path, "alice", {})
+    monkeypatch.setenv("FILET_EXCHANGE_DIR", str(tmp_path / "does-not-matter"))
+    # 用 leader_change_items 直接驗證結構化告警（避免拼裝整個 generate_report 環境）
+    items = fdr.leader_change_items(
+        [_ref("alice")], _NOW_S, changes_path=changes,
+        ledger_for=lambda a: tmp_path / a / "ledger.json")
+    assert len(items) == 1
+    key, body = items[0]
+    assert "alice" in key and "未被套用" in body
+    # 且 generate_report 會把它推到 notifier
+    notifier = RecordingNotifier()
+    monkeypatch.setattr(fdr, "SNAPSHOT_PATH", tmp_path / "snap.json")
+    monkeypatch.setattr(fdr, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(fdr, "leader_change_items", lambda refs, now_s: items)
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    fdr.generate_report([_ref("alice")], [], lambda _n: _CountingAdapter(
+        accrued=Decimal("5.5")), now, notifier)
+    crit = [r for r in notifier.records if r[0] == "critical"
+            and r[1] == "換leader對帳"]
+    assert len(crit) == 1
+    assert crit[0][3] == key and "alice" in crit[0][3]
+
+
+def test_no_alerts_means_notifier_never_called(tmp_path, monkeypatch):
+    """⭐ 完全合規、無換 leader 告警 → notifier 一次都不被呼叫（不製造背景噪音）。"""
+    from spark.copytrade.notifier import RecordingNotifier
+    notifier = RecordingNotifier()
+    _push_wiring(tmp_path, monkeypatch, _CountingAdapter(
+        accrued=Decimal("5.5"), equity=Decimal("500"), abstraction="disabled"),
+        notifier)
+    assert notifier.records == []
+
+
+def test_generate_report_defaults_to_null_notifier(tmp_path, monkeypatch, capsys):
+    """未注入 notifier（既有呼叫端）→ NullNotifier，行為不變，stderr 仍輸出。"""
+    monkeypatch.setattr(fdr, "SNAPSHOT_PATH", tmp_path / "snap.json")
+    monkeypatch.setattr(fdr, "REPORTS_DIR", tmp_path / "reports")
+    refs = [_ref_full("alice", "0x" + "B" * 40, "mainnet")]
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    # 不傳 notifier；低淨值 → 仍要有 [ALERT] stderr（既有稽核軌跡）
+    fdr.generate_report(refs, [], lambda _n: _CountingAdapter(
+        accrued=Decimal("5.5"), equity=Decimal("42")), now)
+    assert "[ALERT]" in capsys.readouterr().err
+
+
+def test_build_notifier_is_null_without_telegram_env():
+    """無 COPY_TG_* → NullNotifier（行為與過去完全一致）。"""
+    from spark.copytrade.notifier import NullNotifier
+    assert isinstance(fdr.build_notifier({}), NullNotifier)
+    # 只有 token 沒 chat_id 也降級 NullNotifier（兩者缺一不可）
+    assert isinstance(fdr.build_notifier({"COPY_TG_BOT_TOKEN": "x"}), NullNotifier)
+
+
+def test_build_notifier_is_telegram_with_env():
+    """有 COPY_TG_BOT_TOKEN＋COPY_TG_CHAT_ID → TelegramNotifier（不實際發送）。"""
+    from spark.copytrade.notifier import TelegramNotifier
+    n = fdr.build_notifier({"COPY_TG_BOT_TOKEN": "t", "COPY_TG_CHAT_ID": "c"})
+    assert isinstance(n, TelegramNotifier)

@@ -43,9 +43,10 @@ from pathlib import Path
 from hyperliquid.info import Info
 
 from spark.config import API_URLS
+from spark.copytrade.notifier import Notifier, NullNotifier, TelegramNotifier
 from spark.exchange.hyperliquid import HyperliquidAdapter
 from spark.filet.aggregate import aggregate, builder_fee_delta, collect_follower_summary, render_aggregate
-from spark.filet.builder_compliance import check_builders
+from spark.filet.builder_compliance import check_builders, compliance_alert_items
 from spark.filet.followers import load_followers_tolerant
 from spark.filet.leader_change_apply import (LEADER_CHANGE_STALE_S, LEDGER_RELPATH,
                                              scan_unapplied_leader_changes)
@@ -109,6 +110,44 @@ def ledger_path_for(account_id: str, state_base=None) -> Path:
     return base / account_id / LEDGER_RELPATH
 
 
+def leader_change_items(refs, now_s, changes_path=None, ledger_for=None) -> list[tuple[str, str]]:
+    """對帳告警的結構化形式：`(dedup_key, text)` 清單（空清單＝一切正常）。
+
+    ⭐ `dedup_key` 帶 **account_id + reason**：同一個帳號的同一種對帳失敗持續存在時，
+    推播端（Notifier）靠 TTL 去重不洗版，而不同帳號／不同 reason 各自獨立。掃描層級的
+    錯誤（沒有 account 歸屬，例如交換目錄解不出來）用 `leader_change_scan_error_<i>` 做鍵。
+
+    `leader_change_warnings()`（純字串清單，報表本文與 stderr 用）是本函式 `text` 的視圖——
+    單一定義，兩者不會漂移。判定本身仍住在 `scan_unapplied_leader_changes`（見下）。
+    """
+    ledger_for = ledger_for or ledger_path_for
+    findings, errors = scan_unapplied_leader_changes(
+        refs, now_s, changes_path=changes_path, ledger_for=ledger_for,
+        stale_s=LEADER_CHANGE_STALE_S)
+
+    items: list[tuple[str, str]] = []
+    for i, e in enumerate(errors):
+        items.append((f"leader_change_scan_error_{i}", e))
+    for f in findings:
+        key = f"leader_change_{f.account_id}_{f.reason}"
+        if f.reason == "bad_issued_at":
+            text = (f"換 leader 記錄的 issued_at 不合法（account={f.account_id}）"
+                    f"——引擎會拒絕它，客戶的變更不會生效")
+        elif f.reason == "ledger_unreadable":
+            text = (f"換 leader 對帳失敗：帳本讀不到（{f.ledger_path}）："
+                    f"{f.detail}——無法確認 account={f.account_id} 的變更"
+                    f"是否已套用")
+        else:
+            text = (
+                f"**換 leader 已記錄但未被套用**：account={f.account_id} 的變更已落地 "
+                f"{f.age_s / 60:.0f} 分鐘（> {LEADER_CHANGE_STALE_S // 60} 分），引擎帳本"
+                f"（{f.ledger_path}）卻沒有對應的已兌現 nonce。客戶以為換好了，實際仍跟"
+                f"舊 leader。請依序檢查：交換目錄權限（RUNBOOK §5.5.1 的四條驗收）、"
+                f"兩個 unit 的 FILET_EXCHANGE_DIR 是否同值、該 follower 引擎是否在跑")
+        items.append((key, text))
+    return items
+
+
 def leader_change_warnings(refs, now_s, changes_path=None, ledger_for=None) -> list[str]:
     """對帳「客戶簽了、API 收了，但引擎從沒套用」的整類失敗。
 
@@ -130,39 +169,27 @@ def leader_change_warnings(refs, now_s, changes_path=None, ledger_for=None) -> l
     ⭐ 判定本身住在 `leader_change_apply.scan_unapplied_leader_changes`（**單一定義**），
     本函式只負責渲染成人看的字串。營運健康面板（/api/ops/health）是同一個判定的
     即時視圖，兩邊各寫一次判定式會漂移，而一個對帳工具最糟的失效是狼來了。
+
+    渲染細節（含 dedup_key）住在 `leader_change_items`；本函式是其 text 的字串視圖。
     """
-    ledger_for = ledger_for or ledger_path_for
-    findings, errors = scan_unapplied_leader_changes(
-        refs, now_s, changes_path=changes_path, ledger_for=ledger_for,
-        stale_s=LEADER_CHANGE_STALE_S)
-
-    warnings: list[str] = list(errors)
-    for f in findings:
-        if f.reason == "bad_issued_at":
-            warnings.append(f"換 leader 記錄的 issued_at 不合法（account={f.account_id}）"
-                            f"——引擎會拒絕它，客戶的變更不會生效")
-        elif f.reason == "ledger_unreadable":
-            warnings.append(f"換 leader 對帳失敗：帳本讀不到（{f.ledger_path}）："
-                            f"{f.detail}——無法確認 account={f.account_id} 的變更"
-                            f"是否已套用")
-        else:
-            warnings.append(
-                f"**換 leader 已記錄但未被套用**：account={f.account_id} 的變更已落地 "
-                f"{f.age_s / 60:.0f} 分鐘（> {LEADER_CHANGE_STALE_S // 60} 分），引擎帳本"
-                f"（{f.ledger_path}）卻沒有對應的已兌現 nonce。客戶以為換好了，實際仍跟"
-                f"舊 leader。請依序檢查：交換目錄權限（RUNBOOK §5.5.1 的四條驗收）、"
-                f"兩個 unit 的 FILET_EXCHANGE_DIR 是否同值、該 follower 引擎是否在跑")
-    return warnings
+    return [text for _key, text in leader_change_items(
+        refs, now_s, changes_path=changes_path, ledger_for=ledger_for)]
 
 
-def generate_report(refs, load_errors, adapter_for, now):
+def generate_report(refs, load_errors, adapter_for, now, notifier: Notifier | None = None):
     """核心 wiring（adapter_for 注入以便離線測試）。回 AggregateReport。
 
     adapter_for: Callable[[str], adapter]——依 network 回一個 exchange adapter。
     北極星：對每個相異 mainnet builder 查一次 accrued（testnet 不計入），減快照 →
     builder_fee_delta；per-follower：collect_follower_summary（不查 accrued）。
     寫報表與快照為副作用。查詢失敗的 builder 大聲告警、其當日增量不計入（低估方向）。
+
+    notifier: 推播管道（注入，預設 NullNotifier）。營收關鍵告警（builder 資格、換 leader
+    對帳）除了既有的 stderr `[ALERT]`／報表檔（稽核軌跡）之外，**另外**推到 Notifier
+    ——那兩者埋在 journal 與檔案裡，營收靜默中斷時沒人會即時看到。這是新增管道，不取代
+    既有輸出；無 Telegram 憑證時注入 NullNotifier，行為與過去完全一致（只 stderr/檔案）。
     """
+    notifier = notifier or NullNotifier()
     day = now.date()
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
 
@@ -207,6 +234,11 @@ def generate_report(refs, load_errors, adapter_for, now):
                 "\n".join(f"- {a}" for a in compliance_alerts_)
         for a in compliance_alerts_:
             print(f"[ALERT] {a}", file=sys.stderr)
+        # ⭐ 新增推播管道：每一條合規告警 → notifier.critical（帶 builder+條件的 dedup_key）。
+        # stderr/報表是稽核軌跡；推播是唯一能在營收靜默中斷時即時觸達的路徑（工程原則 3）。
+        for r in _compliance:
+            for item in compliance_alert_items(r):
+                notifier.critical("builder合規", item.text, dedup_key=item.dedup_key)
 
     if failed_builders:
         text += (f"\n\n> 注意：北極星不含 {failed_builders} 個查詢失敗的 builder，"
@@ -217,11 +249,15 @@ def generate_report(refs, load_errors, adapter_for, now):
     # ⭐ 換 leader 鏈路對帳：把「客戶簽了、API 收了、引擎從沒套用」這類**可用性**
     # 失敗變大聲（工程原則 3）。它不影響北極星，但它是唯一會在日報裡浮出來的訊號
     # ——這條鏈路壞掉時，其他所有地方看起來都完全正常。
-    lc_warnings = leader_change_warnings(refs, now.timestamp())
-    if lc_warnings:
+    lc_items = leader_change_items(refs, now.timestamp())
+    if lc_items:
+        lc_warnings = [w for _key, w in lc_items]
         text += "\n\n## ⚠️ 換 leader 未生效\n" + "\n".join(f"- {w}" for w in lc_warnings)
         for w in lc_warnings:
             print(f"[WARN] {w}", file=sys.stderr)
+        # ⭐ 新增推播管道：每一條對帳告警 → notifier.critical（帶 account_id 的 dedup_key）。
+        for key, w in lc_items:
+            notifier.critical("換leader對帳", w, dedup_key=key)
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = REPORTS_DIR / f"{day.isoformat()}.md"
@@ -235,6 +271,20 @@ def generate_report(refs, load_errors, adapter_for, now):
         save_builder_snapshot(day.isoformat(), merged)
 
     return report
+
+
+def build_notifier(env: dict[str, str] | None = None) -> Notifier:
+    """依環境變數建構推播管道（沿 copytrade 引擎慣例）。
+
+    有 `COPY_TG_BOT_TOKEN`＋`COPY_TG_CHAT_ID` → `TelegramNotifier.from_env()`（實測可送）；
+    否則 → `NullNotifier`（行為與過去完全一致，只 stderr/報表檔）。憑證缺失不是錯誤，
+    是降級：日報照跑，只是少了即時推播（systemd unit 的 `-EnvironmentFile=` 讓缺檔不擋啟動）。
+    """
+    if env is None:
+        env = dict(os.environ)
+    if env.get("COPY_TG_BOT_TOKEN") and env.get("COPY_TG_CHAT_ID"):
+        return TelegramNotifier.from_env(env)
+    return NullNotifier()
 
 
 def main():
@@ -258,7 +308,7 @@ def main():
                 network, info=Info(API_URLS[network], skip_ws=True), exchange=None)
         return adapters[network]
 
-    generate_report(refs, load_errors, adapter_for, now)
+    generate_report(refs, load_errors, adapter_for, now, build_notifier())
     raise SystemExit(0)
 
 

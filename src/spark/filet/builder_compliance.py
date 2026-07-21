@@ -129,41 +129,66 @@ def check_builder_compliance(adapter, builder: str) -> BuilderCompliance:
                              mode=mode, mode_ok=mode_ok, errors=tuple(errors))
 
 
-def compliance_alerts(result: BuilderCompliance) -> list[str]:
-    """判定結果 → 告警字串清單（空清單＝完全合規，無話可說）。
+@dataclass(frozen=True)
+class ComplianceAlert:
+    """單一告警＝(dedup_key, text)。
+
+    ⭐ `dedup_key` 帶 **builder 位址 + 條件**（`builder_equity_<addr>`／
+    `builder_mode_<addr>`）。推播端（Notifier）用它做 TTL 去重：同一個 builder 的
+    同一個條件持續不合規時不洗版，但不同 builder／不同條件各自獨立、互不遮蔽。
+    """
+    dedup_key: str
+    text: str
+
+
+def compliance_alert_items(result: BuilderCompliance) -> list[ComplianceAlert]:
+    """判定結果 → 結構化告警清單（空清單＝完全合規，無話可說）。
 
     ⭐ 兩個條件**各自**產生一則告警，不合併成一句「builder 不合規」：兩者的處置動作
     完全不同（入金 vs 改帳戶設定），而一則含糊的告警會讓操作者只修掉他先看到的那個，
     以為修完了。兩者皆不符時**兩則都要出現**。
+
+    `compliance_alerts()`（純字串清單）由本函式的 `text` 導出——兩者的字串逐字相同，
+    是**單一定義**：報表本文用字串清單，推播用附帶 dedup_key 的結構化清單，不會漂移。
     """
-    alerts: list[str] = []
+    items: list[ComplianceAlert] = []
     b = result.builder
 
     if result.equity_ok is None:
-        alerts.append(
+        items.append(ComplianceAlert(
+            f"builder_equity_{b}",
             f"**builder 資格未知**：{b} 的 perp 淨值查不到，無法確認是否 ≥ "
             f"{BUILDER_MIN_PERP_EQUITY} USDC 門檻。**不得視為合規**——低於門檻時 "
-            "builder fee 會無聲停止累積。請人工確認。")
+            "builder fee 會無聲停止累積。請人工確認。"))
     elif not result.equity_ok:
-        alerts.append(
+        items.append(ComplianceAlert(
+            f"builder_equity_{b}",
             f"**builder fee 可能已停止累積**：{b} 的 perp 淨值 {result.equity} USDC "
             f"低於 HL 官方門檻 {BUILDER_MIN_PERP_EQUITY} USDC。成交會照常發生但**不會"
-            "產生 builder fee**，且沒有任何其他訊號會顯示這件事。請立即入金。")
+            "產生 builder fee**，且沒有任何其他訊號會顯示這件事。請立即入金。"))
 
     if result.mode_ok is None:
-        alerts.append(
+        items.append(ComplianceAlert(
+            f"builder_mode_{b}",
             f"**builder 資格未知**：{b} 的 account abstraction mode 查不到，無法確認"
-            "是否為 standard。**不得視為合規**。請人工確認。")
+            "是否為 standard。**不得視為合規**。請人工確認。"))
     elif not result.mode_ok:
-        alerts.append(
+        items.append(ComplianceAlert(
+            f"builder_mode_{b}",
             f"**builder fee 可能已停止累積**：{b} 的 account abstraction mode 為 "
             f"{result.mode!r}，不在放行清單 {sorted(COMPLIANT_ABSTRACTION_MODES)} 內"
             "（HL 官方要求 standard 模式）。注意 'default' 亦刻意視為不合規——其語意"
-            "未經官方確認，不賭。請人工確認帳戶設定。")
+            "未經官方確認，不賭。請人工確認帳戶設定。"))
 
-    for e in result.errors:
-        alerts.append(f"builder {b} 合規查詢錯誤：{e}")
-    return alerts
+    for i, e in enumerate(result.errors):
+        items.append(ComplianceAlert(
+            f"builder_error_{b}_{i}", f"builder {b} 合規查詢錯誤：{e}"))
+    return items
+
+
+def compliance_alerts(result: BuilderCompliance) -> list[str]:
+    """判定結果 → 告警字串清單（空清單＝完全合規）。`compliance_alert_items` 的字串視圖。"""
+    return [item.text for item in compliance_alert_items(result)]
 
 
 def check_builders(adapter_for, builders) -> tuple[list[BuilderCompliance], list[str]]:
