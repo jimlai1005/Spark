@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily filet cross-follower report at 00:20 UTC
+
+[Timer]
+# 00:20 UTC：排在 perf-series(00:05) 與 leaderboard(00:10) 之後，讓它們先落地當日快照。
+# 日界後緩衝到 20 分，RandomizedDelay 再避免整點雪崩；起始分 20 + 最多 5 分延遲仍
+# 遠在同日內。Persistent：關機錯過開機補跑——日報漏跑可補（明天重算），與 perf-series
+# 的不可回填不同，所以這裡補跑沒有資料損失風險。
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

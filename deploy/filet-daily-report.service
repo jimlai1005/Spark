@@ -1,0 +1,38 @@
+[Unit]
+Description=Filet daily cross-follower report (north star + builder compliance + leader-change reconciliation, pushes revenue-critical alerts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# ⭐ filet-engine（不是 filet-api）：日報讀 per-follower 狀態根做換 leader 對帳，
+# 而 /opt/filet/state/<id> 是 filet-engine:filet-engine 0700（§2 目錄表）——只有引擎
+# 帳號讀得到。telegram.env 是 root:filet-engine 0640，filet-engine 也讀得到。
+User=filet-engine
+Group=filet-engine
+WorkingDirectory=/opt/filet/spark
+# ⭐ Telegram 憑證檔**允許不存在**（`-` 前綴）：沒有憑證就降級成 NullNotifier，
+# 日報照跑（只是少了即時推播）。憑證只從這個檔注入，**絕不硬編進 unit**
+# （COPY_TG_BOT_TOKEN / COPY_TG_CHAT_ID，建立與權限見 RUNBOOK §5.7a）。
+EnvironmentFile=-/etc/filet/telegram.env
+# follower manifest／狀態根／換 leader 交換目錄——與 filet-follower@.service、
+# filet-api.service **逐字元相同**（單一來源；漏設或設錯會讓對帳讀錯目錄而靜默失效）。
+Environment=FILET_FOLLOWERS=/opt/filet/spark/var/filet/followers.json
+Environment=FILET_STATE_BASE=/opt/filet/state
+Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
+# ⚠️ 刻意**沒有** `-` 前綴（與 filet-leaderboard 的 best-effort 相反）：這是營收關鍵
+# 告警的唯一定時來源，失敗必須讓 unit 進 failed 被監控看見，不能靜默吞掉。
+ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.filet_daily_report
+# 唯二要**寫**的路徑：報表輸出與 builder accrued 快照（都在 var/filet 底下，且刻意
+# 只授權這兩個 filet-engine 擁有的子項——var/filet 目錄本身維持 root:root，leaders.json
+# 承重點不受影響）。引擎狀態根與交換目錄只讀（ProtectSystem=strict 下讀取本就放行），
+# 不列入 ReadWritePaths。兩者的建立與 chown 見 RUNBOOK §5.7a。
+ReadWritePaths=/opt/filet/spark/var/filet/reports
+ReadWritePaths=/opt/filet/spark/var/filet/builder_accrued_snapshot.json
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

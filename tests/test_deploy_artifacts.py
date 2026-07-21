@@ -334,6 +334,7 @@ def test_keysvc_allowed_uids_stays_a_placeholder():
 _HARDENED_UNITS = [
     "filet-api.service", "filet-dashboard.service", "filet-follower@.service",
     "filet-keysvc.service", "filet-leaderboard.service", "filet-perf-series.service",
+    "filet-daily-report.service",
 ]
 
 

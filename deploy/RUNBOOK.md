@@ -1303,6 +1303,111 @@ sudo ls -lt --time-style=long-iso /var/lib/filet-api/leaderboard/perf_series/ | 
 
 ---
 
+### 5.8 ⭐ 每日跨 follower 日報（`filet-daily-report`，含營收關鍵告警推播）
+
+> 編號 `5.8` **附加**在 §5 尾端（不重編既有編號，沿 §5.5.1／§5.7 的插入慣例）。
+
+跨 follower 日報跑在 `filet-engine` 帳號下（**不是** `filet-api`：它要讀 per-follower
+狀態根 `/opt/filet/state/<id>` 做換 leader 對帳，那一層是 `filet-engine:filet-engine 0700`，
+只有引擎帳號讀得到）。它每日算一次北極星（builder fee 增量），並輸出兩類**營收關鍵**
+告警——都會同時進報表檔／`journalctl`，**並推到 Telegram**：
+
+| 告警 | 觸發 | 不推播的後果 |
+|---|---|---|
+| **builder 資格異常** | builder 的 perp 淨值跌破 100 USDC，或 account abstraction mode 非 standard | builder fee **無聲**停止累積：成交照常、log 正常，只有收入曲線悄悄變平 |
+| **換 leader 未生效** | 客戶簽了、API 收了，引擎卻從沒套用（逾時未兌現） | 客戶以為換好了，實際仍跟舊 leader；三種成因（路徑不通／權限錯／引擎沒跑）症狀相同、兩邊 log 都正常 |
+
+> ⭐⭐ 這兩類失效的共同點是「一切看起來正常但錢已經受影響」。推播是唯一能在**當下**
+> 觸達的通道（報表檔與 journal 埋著，沒人會即時去翻）。**部署後務必實測 Telegram 收得到**
+> （下方驗收 3），否則等於沒接。
+
+#### 前置 1：Telegram 憑證檔 `/etc/filet/telegram.env`（**絕不進 repo**）
+
+憑證只放伺服器這個檔，unit 用 `EnvironmentFile=-/etc/filet/telegram.env` 注入
+（`-` 前綴＝檔案不存在也不擋啟動，此時日報降級成不推播、其餘照跑）。**格式如下，值請填
+自己的 bot token 與 chat id——不要把真值寫進任何 repo 檔案或 commit**：
+
+```bash
+# 內容格式（token/chat 為佔位，換成真值）：
+#   COPY_TG_BOT_TOKEN=123456:REPLACE_WITH_BOT_TOKEN
+#   COPY_TG_CHAT_ID=REPLACE_WITH_CHAT_ID
+# （選配）COPY_TG_MUTED=  # critical 永不受靜音影響，日報告警一律送達
+sudo install -m 640 -o root -g filet-engine /dev/null /etc/filet/telegram.env
+sudo -e /etc/filet/telegram.env    # 用編輯器填入上面兩行的真值
+
+# 權限驗證：root:filet-engine 0640——filet-engine 讀得到、其他帳號讀不到
+sudo ls -l /etc/filet/telegram.env
+# 預期：-rw-r----- 1 root filet-engine ... /etc/filet/telegram.env
+```
+
+#### 前置 2：報表與快照的落點（`filet-engine` 可寫，`var/filet` 本身維持 root:root）
+
+日報唯二要**寫**的是報表目錄與 builder accrued 快照。它們在 `/opt/filet/spark/var/filet`
+底下，而該目錄刻意是 `root:root 755`（承載 `leaders.json` 承重點，見 §2）——所以只把這
+**兩個子項**建立成 `filet-engine` 擁有，並在 unit 的 `ReadWritePaths` 精準授權這兩個，
+`var/filet` 目錄本身不放寬（`leaders.json` 644 root:root 仍寫不到）：
+
+```bash
+sudo mkdir -p /opt/filet/spark/var/filet/reports
+sudo chown filet-engine:filet-engine /opt/filet/spark/var/filet/reports
+sudo chmod 700 /opt/filet/spark/var/filet/reports
+
+# 快照檔預先建成合法 JSON（空 builders）並 chown——ReadWritePaths 指向檔案，
+# 檔案必須在 unit 啟動前存在。內容 {"builders": {}} 語意上等同「無檔＝0」，首跑安全。
+echo '{"builders": {}}' | sudo tee /opt/filet/spark/var/filet/builder_accrued_snapshot.json >/dev/null
+sudo chown filet-engine:filet-engine /opt/filet/spark/var/filet/builder_accrued_snapshot.json
+sudo chmod 600 /opt/filet/spark/var/filet/builder_accrued_snapshot.json
+```
+
+#### 安裝與啟用
+
+```bash
+sudo cp /opt/filet/spark/deploy/filet-daily-report.service /etc/systemd/system/
+sudo cp /opt/filet/spark/deploy/filet-daily-report.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# ⚠️ enable --now 的是 **.timer**，不是 .service（enable 錯對象會讓 oneshot 每次
+# 開機跑一次、從此不再定時——症狀是「報表每隔幾天才有一筆」，很久沒人會發現）。
+sudo systemctl enable --now filet-daily-report.timer
+```
+
+#### 驗收（三條都要跑）
+
+```bash
+# 驗收 1：timer 已排程，NEXT 欄有時間（不是 n/a）
+systemctl list-timers 'filet-daily-report*' --all --no-pager
+# 預期：一行，NEXT 落在明天 00:20 UTC 附近（+ 最多 5 分隨機延遲）
+
+# 驗收 2：手動跑一次確認**現在就能成功**（不要等明天才發現 env 或權限錯）
+sudo systemctl start filet-daily-report.service
+systemctl status filet-daily-report.service --no-pager -l   # 預期：SUCCESS（oneshot 跑完 inactive）
+# 產物落地：今天日期的報表檔（版面出自 scripts/filet_daily_report）
+sudo ls -l /opt/filet/spark/var/filet/reports/ | tail -3
+# 預期：有 <YYYY-MM-DD>.md，mtime 是剛才這次執行
+
+# 驗收 3：⭐⭐ **Telegram 真的收得到**（營收關鍵——沒實測過等於沒接）
+# 最可靠的實測：暫時把某個 mainnet builder 的門檻查詢引導到不合規，或直接送一則測試：
+sudo -u filet-engine bash -c 'set -a; . /etc/filet/telegram.env; set +a; \
+  /opt/filet/spark/.venv/bin/python -c "
+from spark.copytrade.notifier import TelegramNotifier
+n = TelegramNotifier.from_env()
+print(\"sent:\", n.critical(\"builder合規\", \"[部署驗收] filet-daily-report 推播測試，收到請忽略\", dedup_key=\"deploy_probe\"))
+"'
+# 預期：印出 sent: True，且該 Telegram 頻道收到一則 [CRIT] builder合規 | ... 訊息。
+# sent: False → 憑證錯／頻道錯，回頭查前置 1（此時日報會靜默不推，最危險的失效方向）。
+```
+
+#### 監控
+
+```bash
+# 有沒有跑失敗（⭐ unit 刻意無 `-` 前綴：失敗會進 failed，這裡就看得到）
+systemctl list-units 'filet-daily-report*' --state=failed --no-pager
+# 最近幾次執行
+sudo journalctl -u filet-daily-report --since '3 days ago' --no-pager | tail -30
+```
+
+---
+
 ## 6. nginx + certbot
 
 ```bash
