@@ -70,3 +70,35 @@
 5. **我**：產 mainnet agent key、建 follower env（含 COPY_TG!）、mainnet 白名單、啟動、一起盯第一輪（可能先空手）
 
 **最重要的收穫：在你把 Filet 指向 Momentum 錢包之前攔下來了。** 那會讓 Filet 去平掉你 Momentum 的實盤倉位。
+
+---
+
+## 🔬 最終複審更新（2026-07-22，Opus 4.8，兩路對抗性 + 指揮官親自查證）
+
+使用者升級到 Opus 4.8 做上線前最後確認。兩路 opus 對抗性複審（執行路徑稽核 + 漏洞/矛盾獵捕）+ 我親自查證,結論:
+
+### 引擎程式碼：無新洞（可上線）
+- 兩路各做變異測試,合計 9 個碰錢/碰安全變異**全部被咬,無裸露不變量**。
+- 五類反覆 bug（混源比較/雙進程推導/保護靜默失效/文件災難/驗證失效）逐一再掃,**engine 內無第 N+1 實例**。
+- 權益基準（sizing/回撤/成本閘分母）**我親查**:全部走同一個 `get_account_value`（只讀主 dex),同源同基準,無多桶混源。
+- **Critical:無。** 六輪審查 + 今晚 testnet 端到端 + 這兩路,引擎硬化到高水準。
+
+### 新發現/更新（全是營運/設定,非碼）
+1. ⚠️ **3662 的 Momentum agent 授權還在鏈上**（到 2026-12-29）——停引擎≠撤授權。**上線前你要去 HL 撤掉**,否則那把 key 是上膛的槍。（我親查 extraAgents 確認）
+2. ⚠️ **伺服器 leaders.json 把 3662 列成 enabled leader**（testnet 遺物）。**主網重建白名單必須剔除 3662**——它要當 follower,不能同時是 leader。（我親查 prod 確認）
+3. ⚠️ **builder 餘額監控目前監控 0 個 builder**（日報只查 mainnet follower 的 builder,而現在 0 個 mainnet follower）。薄 builder 餘額（110）在 mainnet follower 註冊前**完全無監控**,之後也每日才一次。→ builder 加厚到 200+ **且首日人工盯**。
+4. ⭐ **leader 選擇要重新考慮（我親查,最重要）**:`0xf97ad6…ddd1` 最新 crypto 成交 **2026-07-15（6.8 天前）**,近一週只做美股。**follower（crypto-only）跟它會空手很久,可能好幾天。** 選項:(a) 接受長空窗、純觀察系統;(b) 換一個現在正活躍做 crypto 且有 crypto 持倉的 leader。
+
+### 矛盾更正（文件 vs 現實,我親查）
+- **TLS/防火牆**:兩份舊 agent 說「未解決」→ **過期**。今晚已解,真憑證 HTTPS 200。（且明天用本機 onboarding 則與伺服器 TLS 無關）
+- **FILET_LEADERS_PATH**:open-items 說 filet-api 缺 → **過期**,7/21 已補（我親查 unit 有）。
+- **leaders.json「查無此檔」**:指 repo 內（gitignore var/),prod 上**存在**。
+- **leader 活躍度三方矛盾**:執行稽核說「靜默 6 天」把美股混進來了;昨天說「近 7 天 63 筆」高估。**正解:crypto 最新 07-15、近 7 天 25 筆 HYPE 且集中在 7 天前那波。**
+
+### 最終判斷
+**引擎可上線;今天 AS-IS 不能安全 dogfood,阻擋全是營運/設定(與前三份一致):**
+1. ⛔ follower 用乾淨錢包（3662 撤 Momentum agent,或全新錢包）
+2. ⛔ mainnet 設定 onboarding（工具現成,`build_approve_builder_fee` 已參數化 is_mainnet,只需 mainnet 設定跑）+ builder 換 0x81E9 加厚
+3. ⛔ follower env 補 COPY_TG + 重建 mainnet leaders.json（**剔除 3662**）+ 新錢包天然乾淨狀態根
+4. 🟡 builder 首日人工盯（監控空窗）
+5. ⭐ **重新決定 leader**（現任 leader crypto 沉寂,follower 會長空手）
