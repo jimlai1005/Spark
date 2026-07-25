@@ -22,7 +22,7 @@ from spark.filet.leader_perf import compute_perp_performance, jsonable_performan
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WATCHLIST = ("0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1",)  # M1 leader
+DEFAULT_WATCHLIST = ("0xfb9c52f56f03d786ad5d435aa70fe45d80569760",)  # Filet 自營 leader（mainnet 訊號源）
 
 # 績效資料的來源標記（落進快照，讓讀端知道這些數字的 basis 是什麼）。
 # 字串裡明講 perp——快照檔會被人直接打開來看，basis 不該只存在於程式碼裡。

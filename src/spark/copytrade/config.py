@@ -81,7 +81,7 @@ class CopySettings:
     3. 函式層預設（硬編）：px_rel_tol, slippage
     """
     # 刻意覆蓋
-    leader_address: str = "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1"
+    leader_address: str = "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
     live_trading: bool = False  # 紅線 5：刻意覆蓋 hl，預設關
     interval_s: int = 60  # 每分鐘（刻意覆蓋 hl 的 hourly CHECK_MINUTE=55）
     modify_policy: str = "modify-first"  # 或 "cancel-place"；預設不得改（等 T1.3）

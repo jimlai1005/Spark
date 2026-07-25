@@ -69,6 +69,7 @@ export const COPY = {
     risk1: "我了解跟單有虧損風險",
     risk2: "我了解 Filet 僅持有下單權限，無法動用或提領我的資金",
     risk3: "我已閱讀費用說明（每筆成交 0.02%）",
+    risk4: "我聲明本錢包由我本人合法持有，資金來源合法且符合適用的反洗錢（AML）規範；我並非於禁止或限制本類服務的司法管轄區內使用本服務。",
     step3Title: "簽署兩筆授權",
     agentCardName: "ApproveAgent",
     agentCardDesc: "授權 Filet trade-only agent key 代下單，無提款權限。",

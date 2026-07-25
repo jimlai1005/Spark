@@ -14,7 +14,7 @@ class TestCopySettingsDefaults:
         settings = CopySettings.from_env({})
 
         # 硬編值驗證
-        assert settings.leader_address == "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1"
+        assert settings.leader_address == "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
         assert settings.live_trading is False
         assert settings.interval_s == 60
         assert settings.modify_policy == "modify-first"

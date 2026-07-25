@@ -95,8 +95,7 @@ def check_builder_compliance(adapter, builder: str) -> BuilderCompliance:
 
     ⭐ 失敗分類（工程原則 2／5）：這裡把**所有**查詢例外都當成 transient／未知
     （`equity_ok = None`），不區分連線失敗與 schema 錯誤。理由：本函式的下游動作對
-    兩者是同一件事——「說不知道並告警，下一輪日報再查」。重試由 adapter 之下的
-    resilience 邊界負責；本層不重試、也絕不因為查不到就回報合規。
+    兩者是同一件事——「說不知道並告警，下一輪日報再查」。讀取不經 resilience 邊界、不會重試（專案慣例：讀取不進 resilience，見 resilience.py）。網路抖動時本函式會把實際合規的 builder 判為「資格未知」並發告警——方向安全（只會過度告警），且日報一天僅一次，屬可接受的取捨。
 
     `adapter` 只需具備兩個唯讀方法（`get_account_value`／`query_user_abstraction`）；
     刻意不宣告成 `ExchangeAdapter` 型別註記——本模組結構上用不到任何寫入方法，

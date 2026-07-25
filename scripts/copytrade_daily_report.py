@@ -8,7 +8,7 @@
 環境變數:
   SPARK_USER_ADDR      我方地址（必填）
   SPARK_BUILDER_ADDR   builder 地址（必填；accrued 查詢與 CSV 對帳用）
-  COPY_LEADER_ADDRESS  leader 地址（預設 0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1）
+  COPY_LEADER_ADDRESS  leader 地址（預設 0xfb9c52f56f03d786ad5d435aa70fe45d80569760）
   SPARK_NETWORK        網路（預設 testnet）
 
 流程:
@@ -38,7 +38,7 @@ from spark.copytrade.report import build_daily_report, render_report
 from spark.exchange.hyperliquid import HyperliquidAdapter
 from spark.verification.reconcile import reconcile
 
-DEFAULT_LEADER = "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1"
+DEFAULT_LEADER = "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
 VAR_DIR = Path("var/copytrade")
 SNAPSHOT_PATH = VAR_DIR / "accrued_snapshot.json"
 HISTORY_PATH = VAR_DIR / "accrued_history.jsonl"

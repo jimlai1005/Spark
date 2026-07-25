@@ -3,9 +3,9 @@ import { useState } from "react";
 import { COPY } from "@/lib/copy";
 
 export function StepRisk({ onConfirm }: { onConfirm: () => void }) {
-  const [agree, setAgree] = useState([false, false, false]);
+  const [agree, setAgree] = useState([false, false, false, false]);
   const c = COPY.wizard;
-  const rows = [c.risk1, c.risk2, c.risk3];
+  const rows = [c.risk1, c.risk2, c.risk3, c.risk4];
   return (
     <div className="step-card">
       <p className="eyebrow">02・{c.stepNames[1]}</p>

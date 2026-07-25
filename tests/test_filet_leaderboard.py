@@ -6,7 +6,7 @@ from decimal import Decimal
 from spark.filet.leaderboard import (DEFAULT_WATCHLIST, snapshot_watchlist,
                                      write_snapshot)
 
-ADDR1 = "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1"
+ADDR1 = "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
 ADDR2 = "0x" + "22" * 20
 
 STATE1 = {"marginSummary": {"accountValue": "1000.5", "totalMarginUsed": "200",
