@@ -157,3 +157,15 @@
 - 「未解決/部分/已解決」以**程式碼與 commit** 為第一證據，roadmap 勾選框多處落後，不採信其為狀態證據。
 - 本盤點**未實跑** `npm audit`、未 SSH 查證 server 當前 unit 內容（#13/#2）、未確認 I2/I3 修復（#4）——這三處明確標為「需確認」，未當作已完成。
 - 法遵是否構成 dogfood（自有錢包）的 gate 屬判斷題，已標明需律師定位，未自行裁定。
+
+---
+
+## 2026-07-25 mainnet 首航新增（上線當日實測發現）
+
+- **引擎槓桿同步盲區（首航 CRIT 實例）**：`orders.py _set_entry_leverage` 的 `leverage_by_coin`
+  只從 leader **持倉**推導；leader 空手＋純掛單網格時地圖為空 → 靜默跳過 → follower 停在
+  新帳戶預設 20x → 保證金不足，ETH 階梯 6 筆只掛進 1 筆（CRIT「掛單重試後仍不符：缺少 5」）。
+  當日處置：停引擎，走 adapter 代發 `update_leverage`（ETH 25x、BTC 40x cross）後恢復，18/18 掛齊。
+  **修法方向**：leader 槓桿改由 `info` 的 `activeAssetData(user, coin)` 查詢（空手也查得到），
+  對「desired orders 涉及的 coin」逐一同步；leader 有持倉時兩來源應一致（可互為驗證）。
+  註：此為一次性 bootstrap 問題——follower 各 coin 槓桿一旦對齊，後續 leader 開倉路徑會接手同步。
