@@ -155,13 +155,18 @@ class ApiConfig:
         """user-sourced leader registry 落點（filet/user_leaders.py 的格式；
         2026-07-27 自訂 leader spec）。
 
-        由精選白名單路徑推導（同目錄 sibling），**推導的單一定義在
-        user_leaders_path_for**——引擎端（leader_resolve／leader_change_apply）用
-        同一個函式從同一個 FILET_LEADERS_PATH 推導，寫端與讀端結構上指向同一個檔
-        （沿 leader_changes_path 防 C3 漂移的同一套做法）。本檔是**本 API 進程
-        唯一可寫**的白名單類檔案：精選 leaders.json 仍維持管理端人工所有權。
+        ⭐ 錨在**交換目錄** `exchange_dir`（review F2），與 `leader_changes_path`
+        同一個拓撲（API 寫、引擎讀、引擎無寫權）、同一條參數鏈；**推導的單一定義在
+        user_leaders_path_for**——引擎端（leader_change_apply.resolve_user_leaders_path
+        → leader_resolve／leader_change_apply 的接線）用同一個函式從同一個
+        FILET_EXCHANGE_DIR 推導，寫端與讀端結構上指向同一個檔（沿 leader_changes_path
+        防 C3 漂移的同一套做法）。
+        ⚠️ **刻意不是**精選白名單的 sibling：那個佈局迫使本 API 進程取得白名單
+        **目錄**的寫權（原子寫需要），而目錄寫權足以 unlink leaders.json 本身，
+        「filet-api 對白名單無寫權」的承重不變量（leaders.py 檔頭）就破了。
+        精選 leaders.json 仍維持管理端人工所有權。
         """
-        return user_leaders_path_for(self.leaders_path)
+        return user_leaders_path_for(self.exchange_dir)
 
     @property
     def billing_enabled(self) -> bool:

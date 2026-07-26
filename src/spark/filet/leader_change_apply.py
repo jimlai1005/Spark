@@ -180,6 +180,18 @@ def resolve_changes_path(env=None) -> str:
     return leader_changes_path_for(require_exchange_dir(env))
 
 
+def resolve_user_leaders_path(env=None) -> str:
+    """引擎要讀的 user registry 路徑（**啟動時呼叫一次**，未設 env ⇒ 拒絕啟動）。
+
+    與 `resolve_changes_path` **同一條參數鏈**（同一個 `FILET_EXCHANGE_DIR`、同一個
+    require 檢查），推導與 API 寫端共用 `user_leaders_path_for`（單一定義）。
+    錨點是交換目錄而非精選白名單的 sibling（2026-07-27 review F2）：sibling 佈局
+    迫使 filet-api 取得白名單**目錄**的寫權（原子寫需要），而目錄寫權足以 unlink
+    leaders.json 本身——「API 對白名單無寫權」的承重不變量就破了。
+    """
+    return user_leaders_path_for(require_exchange_dir(env))
+
+
 # ⭐ 「已寫入但未被套用」的判定門檻（秒）。一筆記錄落地超過這麼久，引擎的已兌現帳本
 # 卻還沒有對應的 nonce ⇒ 這條鏈路壞了。30 分鐘遠大於引擎的 cycle 間隔（數十秒）與
 # 任何合理的重啟窗，所以逾時不可能是「還沒輪到」；它是真的沒發生。
@@ -413,12 +425,18 @@ class LeaderChangeApplier:
 
     def __init__(self, *, account_id: str, manifest_path: str | Path,
                  leaders_path: str | Path, changes_path: str | Path,
-                 ledger_path: str | Path, notifier: Notifier, now_fn=time.time):
+                 ledger_path: str | Path, notifier: Notifier, now_fn=time.time,
+                 user_leaders_path: str | Path | None = None):
+        # user registry 路徑由呼叫端顯式接線（由 FILET_EXCHANGE_DIR 導出，見
+        # resolve_user_leaders_path；不由 leaders_path 推導 sibling——review F2）。
+        # None＝無 registry（僅精選檔驗證）。
         self._account_id = account_id
         self._manifest_path = Path(manifest_path)
         self._leaders_path = Path(leaders_path)
         self._changes_path = Path(changes_path)
         self._ledger_path = Path(ledger_path)
+        self._user_leaders_path = (None if user_leaders_path is None
+                                   else Path(user_leaders_path))
         self._notifier = notifier
         self._now_fn = now_fn
 
@@ -487,17 +505,22 @@ class LeaderChangeApplier:
         # ⭐ 驗證來源＝精選白名單 ＋ user registry 的**合併清單**（2026-07-27 自訂
         # leader 自動准入）：客戶合法准入的自訂 leader 若不在這裡被看見，簽了、
         # 准入了，套用端卻永遠拒絕。合併優先序（精選一律優先，撤銷不可被繞過）
-        # 的單一定義在 user_leaders.merge_leaders；registry 路徑由白名單路徑推導
-        # （與 leader_resolve／API 共用同一份推導）。
-        user_path = Path(user_leaders_path_for(self._leaders_path))
-        if not self._leaders_path.exists() and not user_path.exists():
+        # 的單一定義在 user_leaders.merge_leaders；registry 路徑由建構端顯式接線
+        # （由 FILET_EXCHANGE_DIR 導出，與 leader_resolve／API 共用同一份推導）。
+        # ⭐ 缺席判準**只看精選檔**（2026-07-27 review F1，與 resolve_leader 同構）：
+        # 精選檔缺失＝驗證來源不完整 → transient（None），不論 registry 是否存在。
+        # 舊版要兩檔皆缺才算——只缺精選檔時合併清單＝僅 user 條目，已套用的精選
+        # override 會被 _current() 誤判成撤銷而受控收尾。讀不到 ≠ 撤銷。
+        if not self._leaders_path.exists():
             return None
         try:
-            return merge_leaders(load_leaders(self._leaders_path),
-                                 load_user_leaders(user_path))
+            return merge_leaders(
+                load_leaders(self._leaders_path),
+                (load_user_leaders(self._user_leaders_path)
+                 if self._user_leaders_path is not None else []))
         except (OSError, ValueError) as e:
             logger.warning("換 leader：白名單讀取失敗（%s／%s）: %r",
-                           self._leaders_path, user_path, e)
+                           self._leaders_path, self._user_leaders_path, e)
             return None
 
     # ---------- 已兌現帳本 ----------

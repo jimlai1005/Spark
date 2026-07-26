@@ -69,8 +69,7 @@ from typing import Callable
 from spark.copytrade.notifier import Notifier
 from spark.filet.followers import FollowerRef, load_followers, normalize_hex_address
 from spark.filet.leaders import is_still_permitted, load_leaders
-from spark.filet.user_leaders import (load_user_leaders, merge_leaders,
-                                      user_leaders_path_for)
+from spark.filet.user_leaders import load_user_leaders, merge_leaders
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +237,8 @@ def _self_addresses(self_address: str, ref: FollowerRef | None) -> set[str]:
 
 def resolve_leader(*, account_id: str | None, manifest_path: str | Path,
                    leaders_path: str | Path, env_default: str,
-                   self_address: str = "") -> LeaderResolution:
+                   self_address: str = "",
+                   user_leaders_path: str | Path | None = None) -> LeaderResolution:
     """解析本 follower 要跟的 leader，並在回傳前過白名單（純函式，只讀檔）。
 
     規則與威脅模型見模組 docstring。任何一條不通過即 raise LeaderResolutionError，
@@ -249,16 +249,22 @@ def resolve_leader(*, account_id: str | None, manifest_path: str | Path,
     # ⭐ 驗證來源＝精選白名單 ＋ user registry 的**合併清單**（2026-07-27 自訂 leader
     # 自動准入）。述詞語義不變（is_still_permitted 仍只看 enabled）；合併優先序
     # （精選條目一律優先，撤銷不可被自訂路徑繞過）的單一定義在 user_leaders.merge_leaders。
-    # registry 路徑由白名單路徑推導（同目錄 sibling）——引擎與 API 共用同一份推導，
-    # 結構上讀的就是 API 寫的那個檔。
-    user_file = Path(user_leaders_path_for(leaders_file))
+    # registry 路徑由呼叫端**顯式接線**（由 FILET_EXCHANGE_DIR 導出，與 API 寫端共用
+    # user_leaders_path_for 單一推導；接線見 run_copytrade.make_leader_resolver）。
+    # ⚠️ 不由 leaders_path 推導 sibling（review F2）：那個佈局迫使 API 取得白名單
+    # 目錄寫權。None（dry/shadow 無 exchange dir）＝無 registry，僅精選檔驗證。
+    user_file = None if user_leaders_path is None else Path(user_leaders_path)
     # 「檔案不存在」與「明確的空清單」是兩種語意，只有前者享有 env 回退豁免。
-    # user registry 存在也算「有明確表態的白名單」：它是自動准入的落點，存在即代表
-    # 這個部署已在策劃（至少自動地）誰可以被跟。
-    allowlist_absent = not leaders_file.exists() and not user_file.exists()
+    # ⭐ 缺席判準**只看精選檔**（2026-07-27 review F1）：精選檔缺失＝驗證來源不完整
+    # →一律 transient，不論 registry 是否存在。舊版要求「兩檔皆缺」才算缺席，於是
+    # 只缺精選檔時合併清單＝僅 user 條目，所有跟精選 leader 的 follower 會被誤判成
+    # 撤銷（平倉＋鎖 kill switch）——「讀不到 ≠ 撤銷」（工程原則事故 #4 的判準），
+    # 檔案層缺失絕不觸發安全動作。registry 缺失則維持合法空狀態（load 回空清單）。
+    allowlist_absent = not leaders_file.exists()
     try:
-        leaders = merge_leaders(load_leaders(leaders_file),
-                                load_user_leaders(user_file))
+        leaders = merge_leaders(
+            load_leaders(leaders_file),
+            load_user_leaders(user_file) if user_file is not None else [])
     except (ValueError, OSError) as e:
         # transient（含 user registry 損毀）：讀不到 ≠ 撤銷——不得升級成
         # LeaderRevokedError（把 IO 打嗝誤判成撤銷＝拿真實平倉成本回應一次檔案損毀）。

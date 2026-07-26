@@ -230,17 +230,33 @@ def test_selecting_the_same_custom_leader_twice_writes_one_entry(tmp_path):
 
 
 def test_registry_write_failure_is_5xx_and_no_change_recorded(tmp_path):
-    """⭐ registry 寫入失敗（落點被目錄佔住 → OSError）→ 5xx 且**不**記錄換
+    """⭐ registry 寫入失敗（lock 落點被目錄佔住 → OSError）→ 5xx 且**不**記錄換
     leader（fail loudly，工程原則 3）：leader 進不了引擎的驗證來源卻記了換手，
-    引擎會永遠拒絕套用一筆客戶已簽章的意圖。"""
-    from pathlib import Path
+    引擎會永遠拒絕套用一筆客戶已簽章的意圖。注入點選 lock 檔（review F3 之後
+    寫入必經之路）：registry 本體仍缺席＝合法空狀態，准入的讀取閘不受影響，
+    失敗確實發生在**寫入**那一步。"""
+    from spark.filet.user_leaders import registry_lock_path
     c, cfg, store, hl = _make(tmp_path)
-    Path(cfg.user_leaders_path).mkdir()              # 讓寫入必然失敗
+    registry_lock_path(cfg.user_leaders_path).mkdir(parents=True)  # 寫入必然失敗
     w = Account.create()
     acct = _login(c, w)
     r = _select_custom(c, hl, w, acct)
     assert r.status_code == 500
     assert load_leader_changes(cfg.leader_changes_path) == []
+
+
+def test_corrupt_registry_makes_admission_a_503_not_an_open_gate(tmp_path):
+    """registry 損毀 → 准入端點 503（transient），**不得**降級成空清單放行：
+    空清單會讓 operator 的停用位暫時隱形，把一次讀取失敗偽裝成「可准入」。"""
+    from pathlib import Path
+    c, cfg, store, hl = _make(tmp_path)
+    _login(c, Account.create())
+    p = Path(cfg.user_leaders_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{ not json")
+    hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
+    r = c.get("/api/leaders/preview", params={"leader_address": _CUSTOM})
+    assert r.status_code == 503
 
 
 def test_already_listed_address_does_not_touch_the_registry(tmp_path):
@@ -255,6 +271,81 @@ def test_already_listed_address_does_not_touch_the_registry(tmp_path):
     assert not Path(cfg.user_leaders_path).exists()
     entries = load_leader_changes(cfg.leader_changes_path)
     assert len(entries) == 1 and entries[0]["leader_address"] == _CURATED
+
+
+# ---------- ⭐ registry 內的 operator kill-switch 對准入可見（review F4） ----------
+# operator 對 user-sourced 條目的停用手段是手編 registry（enabled=false，或
+# accepting_new=false 停收）。准入若只看精選 refs，這個停用位對 preview／message／
+# POST 全部隱形：用戶重選被告知成功（200），意圖卻在引擎端永遠拒絕——「停用了
+# 但看起來能用」比「不能用」更糟。三端點都必須拒絕（reason 沿用 leader_disabled，
+# 維持「停用 vs 暫停」不可分辨的既有政策）。
+
+
+def _seed_registry(cfg, address, **over):
+    """直接落一筆 registry 條目（模擬 operator 手編後的狀態）。"""
+    from pathlib import Path
+    entry = {"address": address, "name": address, "description": "",
+             "enabled": True, "accepting_new": True,
+             "source": "user", "added_by": "f" + "aa" * 20}
+    entry.update(over)
+    p = Path(cfg.user_leaders_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"leaders": [entry]}))
+    return p
+
+
+@pytest.mark.parametrize("flags", [{"enabled": False}, {"accepting_new": False}])
+def test_preview_rejects_a_registry_disabled_address(tmp_path, flags):
+    """preview：registry 條目 enabled=false（安全撤銷）或 accepting_new=false
+    （停收）→ 400 leader_disabled，即使鏈上活躍。"""
+    c, cfg, store, hl = _make(tmp_path)
+    _login(c, Account.create())
+    _seed_registry(cfg, _CUSTOM, **flags)
+    hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
+    r = c.get("/api/leaders/preview", params={"leader_address": _CUSTOM})
+    assert r.status_code == 400
+    assert r.json()["detail"]["reason"] == "leader_disabled"
+
+
+@pytest.mark.parametrize("flags", [{"enabled": False}, {"accepting_new": False}])
+def test_message_rejects_a_registry_disabled_address(tmp_path, flags):
+    """訊息端點同閘：停用位址連待簽原文都不該給（給了就是一份必被拒的簽名陷阱）。"""
+    c, cfg, store, hl = _make(tmp_path)
+    _login(c, Account.create())
+    _seed_registry(cfg, _CUSTOM, **flags)
+    hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
+    r = c.get("/api/leaders/select/message", params={"leader_address": _CUSTOM})
+    assert r.status_code == 400
+    assert r.json()["detail"]["reason"] == "leader_disabled"
+
+
+@pytest.mark.parametrize("flags", [{"enabled": False}, {"accepting_new": False}])
+def test_post_rejects_a_registry_disabled_address_and_never_reenables_it(tmp_path, flags):
+    """⭐ POST：重選一個 registry 停用位址 → 400 leader_disabled、換 leader 記錄
+    不落地，且 registry 檔**一個位元組都不動**——重選絕不得把停用條目改回
+    enabled（冪等寫入本就不覆寫既有條目，這裡連寫入路徑都到不了）。"""
+    c, cfg, store, hl = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, w)
+    p = _seed_registry(cfg, _CUSTOM, **flags)
+    before = p.read_text()
+    hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
+    body = _payload(account_id=acct, leader=_CUSTOM, nonce="deadbeef", wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+    assert r.status_code == 400
+    assert r.json()["detail"]["reason"] == "leader_disabled"
+    assert p.read_text() == before
+    assert load_leader_changes(cfg.leader_changes_path) == []
+
+
+def test_registry_entry_that_is_active_does_not_block_admission(tmp_path):
+    """反向錨定：registry 條目 enabled 且 accepting_new → 准入照常通過（閘門只擋
+    停用位，不是擋「已存在」）——否則重選自己已准入的 leader 會被自己擋掉。"""
+    c, cfg, store, hl = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, w)
+    _seed_registry(cfg, _CUSTOM)                     # enabled=true, accepting_new=true
+    assert _select_custom(c, hl, w, acct).status_code == 200
 
 
 # ---------- 可見性與兩端接線 ----------
@@ -272,16 +363,19 @@ def test_public_directory_excludes_user_sourced_leaders(tmp_path):
     assert [x["address"] for x in r.json()["leaders"]] == [_CURATED]
 
 
-def test_config_registry_path_is_the_engine_visible_sibling(tmp_path):
-    """cfg.user_leaders_path＝精選白名單同目錄的 user_leaders.json（獨立事實的
-    字面推導）——引擎端由同一個 FILET_LEADERS_PATH 推導出同一個檔。"""
+def test_config_registry_path_lives_in_the_exchange_dir(tmp_path):
+    """cfg.user_leaders_path＝**交換目錄**下的 user_leaders.json（2026-07-27
+    review F2）：不再是精選白名單的 sibling——sibling 佈局迫使 API 取得白名單
+    目錄寫權（原子寫需要），破壞「filet-api 對白名單無寫權」的承重不變量。"""
     cfg = make_cfg(tmp_path)
-    assert cfg.user_leaders_path == str(tmp_path / "user_leaders.json")
+    assert cfg.user_leaders_path == str(tmp_path / "exchange" / "user_leaders.json")
+    from pathlib import Path
+    assert Path(cfg.user_leaders_path).parent != Path(cfg.leaders_path).parent
 
 
 def test_engine_resolves_the_leader_the_api_admitted(tmp_path):
     """⭐ end-to-end：API 准入寫入 registry 的自訂 leader，引擎 resolve_leader
-    拿**同一個** leaders_path 推導 registry 後放行——寫端與讀端真的接上，
+    從**同一個交換目錄**接到 registry 後放行——寫端與讀端真的接上，
     合法選定的自訂 leader 不會在引擎層被拒（spec user story 18）。"""
     from spark.filet.leader_resolve import resolve_leader
     c, cfg, store, hl = _make(tmp_path)
@@ -295,5 +389,6 @@ def test_engine_resolves_the_leader_the_api_admitted(tmp_path):
          "label": "", "leader_address": _CUSTOM}]}))
     res = resolve_leader(account_id=acct, manifest_path=manifest,
                          leaders_path=cfg.leaders_path,
+                         user_leaders_path=cfg.user_leaders_path,
                          env_default="", self_address=w.address)
     assert res.address == _CUSTOM

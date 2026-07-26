@@ -31,7 +31,7 @@ from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
                                      MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
-from spark.filet.user_leaders import record_user_leader
+from spark.filet.user_leaders import load_user_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
@@ -476,6 +476,18 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise HTTPException(
                 status_code=503, detail="leader 名單暫時不可用，請稍後重試") from e
 
+    def _load_user_leaders_or_503() -> list[LeaderRef]:
+        """user registry 載入的單一入口（准入閘用，review F4）。壞掉一律 503、
+        **不得**降級成空清單——空清單會讓 operator 手編的停用位（enabled=false）
+        暫時隱形，把一個讀取失敗偽裝成「可准入」。檔案不存在＝合法空 registry
+        （load_user_leaders 既有語意），不在此列。"""
+        try:
+            return load_user_leaders(cfg.user_leaders_path)
+        except (OSError, ValueError) as e:
+            logger.error("user registry 載入失敗 %s: %s", cfg.user_leaders_path, e)
+            raise HTTPException(
+                status_code=503, detail="leader 名單暫時不可用，請稍後重試") from e
+
     # ---------- 自訂 leader 准入（2026-07-27 spec：用戶輸入任意位址） ----------
 
     def _admission_reject(status: int, reason: str, message: str) -> HTTPException:
@@ -521,6 +533,21 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise _admission_reject(
                 400, "leader_disabled",
                 "該位址目前無法透過自訂輸入跟隨（已由平台停用或停止接受新客戶）")
+        # (2.5) user registry 的 operator kill-switch（review F4）：registry 條目
+        #     enabled=false（安全撤銷）或 accepting_new=false（停收）→ 拒絕，
+        #     reason 沿用 leader_disabled（「停用 vs 暫停」不可分辨的既有政策）。
+        #     少了這一擋，operator 對 user-sourced 條目的手編停用對准入**不可見**：
+        #     用戶重選被告知成功（200）、意圖卻在引擎端永遠拒絕——比直接拒絕更糟。
+        #     僅在非精選時檢查：精選條目一律優先（合併語義），精選可選時 registry
+        #     的殘留條目不影響引擎放行。冪等寫入本就不覆寫既有條目，故停用條目
+        #     也絕不會被重選改回 enabled——這一擋讓流程連寫入路徑都到不了。
+        if listed is None:
+            mine = next((r for r in _load_user_leaders_or_503()
+                         if r.address == addr), None)
+            if mine is not None and not (mine.enabled and mine.accepting_new):
+                raise _admission_reject(
+                    400, "leader_disabled",
+                    "該位址目前無法透過自訂輸入跟隨（已由平台停用或停止接受新客戶）")
         # (3) 鏈上存在：走既有 HL gateway（唯讀、冪等 → transient 重試與 502 轉譯
         #     自動繼承，工程原則 5），不另開 HTTP 呼叫路徑。
         account_value, position_count = _chain_activity(hl.clearinghouse_state(addr))

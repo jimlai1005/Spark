@@ -45,12 +45,17 @@ def _leaders(tmp_path, entries):
 
 
 def _resolve(tmp_path, *, manifest=None, leaders=None, env_default=_ENV_DEFAULT,
-             account_id=_ACCT, self_address=_ME):
+             account_id=_ACCT, self_address=_ME, user_leaders=None):
+    # user registry 路徑**顯式傳入**（2026-07-27 review F2：不再由 leaders_path
+    # 推導 sibling；正式接線由 exchange dir 導出）。預設指到 tmp 的慣例落點——
+    # 檔案不存在＝合法空 registry，與不傳同義。
     return resolve_leader(
         account_id=account_id,
         manifest_path=manifest if manifest is not None else tmp_path / "nope.json",
         leaders_path=leaders if leaders is not None else tmp_path / "no-leaders.json",
-        env_default=env_default, self_address=self_address)
+        env_default=env_default, self_address=self_address,
+        user_leaders_path=(user_leaders if user_leaders is not None
+                           else tmp_path / "user_leaders.json"))
 
 
 # ── 快樂路徑：manifest 指定 / env 回退 ──────────────────────────────────
@@ -455,10 +460,22 @@ def test_notifier_failure_during_wind_down_failure_is_still_contained():
 # ── ⭐ user registry 合併（用戶自訂 leader 自動准入，2026-07-27 spec） ──────
 
 def _user_registry(tmp_path, entries):
-    """user_leaders.json 落在 leaders.json 同目錄（user_leaders_path_for 的推導）。"""
+    """user_leaders.json 落在 `_resolve` 預設傳入的路徑（路徑顯式傳遞，見 _resolve）。"""
     p = tmp_path / "user_leaders.json"
     p.write_text(json.dumps({"leaders": entries}))
     return p
+
+
+def test_no_registry_path_means_curated_only_validation(tmp_path):
+    """user_leaders_path=None（dry/shadow 無 exchange dir）→ 只驗精選檔；
+    registry 檔就算躺在 leaders.json 旁邊也**不會**被隱式讀到（review F2 之後
+    路徑不再由 leaders_path 推導——引擎只讀被明確接線的檔）。"""
+    _user_registry(tmp_path, [_user_entry(_LEADER)])
+    with pytest.raises(LeaderRevokedError):
+        resolve_leader(
+            account_id=_ACCT, manifest_path=_manifest(tmp_path, leader=_LEADER),
+            leaders_path=_leaders(tmp_path, [{"address": _OTHER, "name": "Alpha"}]),
+            env_default=_ENV_DEFAULT, self_address=_ME)
 
 
 def _user_entry(address, **over):
@@ -509,4 +526,55 @@ def test_corrupt_user_registry_is_transient_not_a_revocation(tmp_path):
         _resolve(tmp_path,
                  manifest=_manifest(tmp_path, leader=_LEADER),
                  leaders=_leaders(tmp_path, [{"address": _LEADER, "name": "Alpha"}]))
+    assert not isinstance(ei.value, LeaderRevokedError)
+
+
+# ── ⭐⭐ 精選檔缺失 ≠ 撤銷（不論 user registry 是否存在）─────────────────
+# 2026-07-27 review F1：allowlist_absent 原本要**兩檔皆缺**才成立。於是只缺
+# leaders.json（掛載失敗、輪替中、誤刪）而 registry 在時，合併清單＝僅 user 條目，
+# 所有跟精選 leader 的 follower 全部被判成撤銷 → 平倉＋鎖 kill switch。
+# 「讀不到 ≠ 撤銷」（工程原則事故 #4 的判準）：檔案層缺失絕不觸發安全動作。
+
+
+def test_missing_curated_file_with_registry_present_is_transient_not_revocation(tmp_path):
+    """⭐⭐ 精選檔缺、registry 在、manifest 跟的是**精選** leader → transient
+    （LeaderResolutionError），絕不是撤銷——一次檔案缺失不得換來全體受控收尾。"""
+    _user_registry(tmp_path, [_user_entry(_OTHER)])
+    with pytest.raises(LeaderResolutionError) as ei:
+        _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_LEADER))
+    assert not isinstance(ei.value, LeaderRevokedError)
+
+
+def test_missing_curated_file_is_transient_even_when_registry_has_the_leader(tmp_path):
+    """精選檔缺失**一律** transient，registry 剛好列著這個 leader 也不豁免：
+    缺了精選檔就沒有完整的驗證來源，「部分視圖剛好放行」與「部分視圖誤判撤銷」
+    是同一個錯誤的兩面——一律宣告本輪解析沒有結論。"""
+    _user_registry(tmp_path, [_user_entry(_LEADER)])
+    with pytest.raises(LeaderResolutionError) as ei:
+        _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_LEADER))
+    assert not isinstance(ei.value, LeaderRevokedError)
+
+
+def test_missing_curated_file_with_registry_keeps_the_env_fallback_exemption(tmp_path, caplog):
+    """精選檔缺失時 env 回退的向後相容豁免**不因 registry 存在而消失**：
+    豁免的判準只看精選檔（「這個部署尚未策劃白名單」），registry 是自動准入的
+    落點、不是策劃行為的證據——否則第一個自訂 leader 寫入的那一刻，所有還在
+    env 回退的部署會同時翻臉成撤銷收尾。"""
+    _user_registry(tmp_path, [_user_entry(_OTHER)])
+    with caplog.at_level(logging.WARNING):
+        res = _resolve(tmp_path, manifest=_manifest(tmp_path, leader=None))
+    assert res == LeaderResolution(_ENV_DEFAULT, SOURCE_ENV_DEFAULT)
+    assert any("白名單檔不存在" in r.getMessage() for r in caplog.records)
+
+
+def test_lost_registry_with_marker_is_transient_not_revocation(tmp_path):
+    """⭐⭐ 已初始化的 registry（init-marker 在）被刪、manifest 跟自訂 leader →
+    transient（LeaderResolutionError），絕不是撤銷（2026-07-27 二輪 review A）。
+    無標記時「缺席＝合法空」會讓合併清單少掉已准入的 leader → 誤判收尾；
+    標記把「從未初始化」與「遺失」分開，遺失走「讀不到 ≠ 撤銷」路徑。"""
+    from spark.filet.user_leaders import registry_init_marker_path
+    _leaders(tmp_path, [])          # 精選檔存在（缺席豁免不適用，逼出 registry 語意）
+    registry_init_marker_path(tmp_path / "user_leaders.json").touch()
+    with pytest.raises(LeaderResolutionError) as ei:
+        _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_OTHER))
     assert not isinstance(ei.value, LeaderRevokedError)

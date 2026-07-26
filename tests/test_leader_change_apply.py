@@ -69,6 +69,9 @@ class _Env:
         self.leaders = tmp_path / "leaders.json"
         self.set_allowlist(_ALLOWLIST if allowlist is None else allowlist)
         self.changes = tmp_path / "leader_changes.json"
+        # user registry 與 changes 同（交換）目錄，路徑**顯式傳入** applier
+        # （2026-07-27 review F2：不再由 leaders_path 推導 sibling）。
+        self.user_leaders = tmp_path / "user_leaders.json"
         self.ledger = tmp_path / "state" / "leader_change_ledger.json"
         self.notifier = RecordingNotifier()
 
@@ -80,6 +83,7 @@ class _Env:
             account_id=account_id or self.account_id,
             manifest_path=self.manifest, leaders_path=self.leaders,
             changes_path=self.changes, ledger_path=self.ledger,
+            user_leaders_path=self.user_leaders,
             notifier=notifier or self.notifier, now_fn=lambda: now_s)
 
     def write_change(self, *, leader=_NEW_LEADER, nonce="n1", issued_at=None,
@@ -641,6 +645,30 @@ def test_engine_and_api_resolve_the_same_file_from_the_exchange_dir(tmp_path):
     assert Path(api_side).parent != Path("/var/lib/filet-api")
 
 
+def test_engine_and_api_resolve_the_same_registry_file_from_the_exchange_dir(tmp_path):
+    """⭐⭐ user registry 的引擎讀端＝API 寫端，且錨點是**交換目錄**而非精選白名單
+    的 sibling（2026-07-27 review F2）。sibling 佈局迫使 filet-api 取得白名單目錄的
+    寫權（原子寫需要）——目錄寫權可 unlink leaders.json 本身，「API 對白名單無寫權」
+    的承重不變量就破了。交換目錄本就是 API 寫、引擎讀的單向通道（leader_changes.json
+    先例），registry 沿同一條參數鏈傳遞。"""
+    from spark.filet.leader_change_apply import resolve_user_leaders_path
+    from spark.publicapi.config import ApiConfig
+
+    exchange = tmp_path / "filet-exchange"
+    exchange.mkdir()
+    engine_side = resolve_user_leaders_path({"FILET_EXCHANGE_DIR": str(exchange)})
+    cfg = ApiConfig(
+        network="testnet", builder_address="0x" + "b1" * 20,
+        siwe_domain="d", siwe_uri="u", db_path="db", keysvc_sock="s",
+        pending_path="/var/lib/filet-api/pending.json",
+        exchange_dir=str(exchange), state_base=str(tmp_path / "state"),
+        leaders_path=str(tmp_path / "allowlist" / "leaders.json"),
+        admin_addresses=frozenset())
+    assert engine_side == cfg.user_leaders_path == str(exchange / "user_leaders.json")
+    # 且**不**與精選白名單同目錄——那正是被修掉的錨點（API 不得需要白名單目錄寫權）。
+    assert Path(cfg.user_leaders_path).parent != Path(cfg.leaders_path).parent
+
+
 def test_engine_refuses_to_start_without_the_exchange_dir_env():
     """⭐ 半邊漏設必須**大聲失敗**，不得靜默退回某個預設值（opus 審查 I2）。
 
@@ -681,8 +709,8 @@ _USER_LEADER = "0x" + "e5" * 20   # 只在 user registry、不在精選白名單
 
 
 def _user_registry(env, entries):
-    """user_leaders.json 落在 leaders.json 同目錄（user_leaders_path_for 的推導）。"""
-    p = env.tmp / "user_leaders.json"
+    """registry 寫到 applier 被顯式接線的那個路徑（見 _Env.user_leaders）。"""
+    p = env.user_leaders
     p.write_text(json.dumps({"leaders": entries}))
     return p
 
@@ -725,3 +753,45 @@ def test_applied_user_leader_is_revoked_by_registry_killswitch(env):
         {"leaders": [_user_entry(_USER_LEADER, enabled=False)]}))
     with pytest.raises(LeaderRevokedError):
         env.applier().effective(_BASE)
+
+
+# ── ⭐⭐ 精選檔缺失 ≠ 撤銷（不論 user registry 是否存在；review F1）──────
+# 只缺 leaders.json 而 registry 在時，合併清單＝僅 user 條目——套用端若把它當
+# 「白名單明確拒絕」，已套用的精選 override 會被誤判成撤銷 → 平倉＋鎖 kill switch。
+# 「讀不到 ≠ 撤銷」：檔案層缺失一律 transient（沿 resolve 端同一分類）。
+
+
+def test_missing_curated_file_with_registry_present_blocks_without_winding_down(env):
+    """精選檔缺、registry 在 → pending 變更不套用、不收尾、不告警洗版
+    （與既有的「兩檔皆缺」測試同一語義：白名單暫時不可用是 transient）。"""
+    _user_registry(env, [_user_entry(_USER_LEADER)])
+    env.leaders.unlink()
+    env.write_change()
+    assert env.applier().effective(_BASE) == _BASE
+    assert env.crits() == []
+
+
+def test_missing_curated_file_with_registry_present_keeps_an_applied_override(env):
+    """⭐⭐ 已套用（客戶授權）的精選 override 之後精選檔消失、registry 仍在 →
+    **沿用 override**（transient），絕不 LeaderRevokedError：一次檔案缺失
+    不得觸發受控收尾（平倉＋鎖 kill switch 是真實成本）。"""
+    _user_registry(env, [_user_entry(_USER_LEADER)])
+    env.write_change()
+    assert env.applier().effective(_BASE).address == _NEW_LEADER
+    env.leaders.unlink()
+    env.notifier.records.clear()
+    assert env.applier().effective(_BASE).address == _NEW_LEADER
+
+
+def test_lost_registry_with_marker_keeps_an_applied_override(env):
+    """⭐⭐ 已套用（客戶授權）的自訂 leader override，之後 registry（已初始化、
+    init-marker 在）整檔被刪 → **沿用 override**（transient），絕不 LeaderRevokedError
+    （2026-07-27 二輪 review A：redeploy/rsync 漏檔不得觸發平倉＋鎖 kill switch）。"""
+    from spark.filet.user_leaders import registry_init_marker_path
+    registry = _user_registry(env, [_user_entry(_USER_LEADER)])
+    registry_init_marker_path(registry).touch()
+    env.write_change(leader=_USER_LEADER)
+    assert env.applier().effective(_BASE).address == _USER_LEADER
+    registry.unlink()
+    env.notifier.records.clear()
+    assert env.applier().effective(_BASE).address == _USER_LEADER

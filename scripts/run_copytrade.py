@@ -100,6 +100,7 @@ from spark.filet.leader_change_apply import (
     LeaderChangeApplier,
     require_exchange_dir,
     resolve_changes_path,
+    resolve_user_leaders_path,
 )
 from spark.filet.leader_resolve import (
     DEFAULT_MANIFEST_PATH,
@@ -154,11 +155,18 @@ def make_leader_resolver(account_id: str | None, user_addr: str,
     # 不得靜默退回 repo 內的預設檔——那會讓引擎放行的清單與 API／activate 讀的不是
     # 同一份，且錯的方向是 fail-open（已撤銷的 leader 仍被放行）。
     leaders_path = require_leaders_path()
+    # ⭐ user registry 由**交換目錄**導出（review F2；與 leader_changes.json 同一條
+    # 參數鏈、同一個 require 檢查）。受管 follower（有 account_id）必填——漏設就
+    # 拒絕啟動，否則客戶合法准入的自訂 leader 引擎看不見，會被誤判成撤銷。
+    # dry/shadow（無 account_id）沒有受管身分也不強制 exchange dir：無 registry。
+    user_leaders_path = (resolve_user_leaders_path()
+                         if account_id is not None else None)
 
     def _resolve() -> LeaderResolution:
         return resolve_leader(account_id=account_id, manifest_path=manifest_path,
                               leaders_path=leaders_path, env_default=env_default,
-                              self_address=user_addr)
+                              self_address=user_addr,
+                              user_leaders_path=user_leaders_path)
 
     return _resolve
 
@@ -183,6 +191,9 @@ def make_effective_leader_resolver(base_resolve: Callable[[], LeaderResolution],
         manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
         leaders_path=require_leaders_path(),   # 同上：必填無預設
         changes_path=resolve_changes_path(),
+        # user registry 沿 changes_path 的同一條鏈（同一個 FILET_EXCHANGE_DIR）
+        # 導出——review F2：不由 leaders_path 推導 sibling。
+        user_leaders_path=resolve_user_leaders_path(),
         ledger_path=state_root / LEDGER_RELPATH,
         notifier=notifier)
 
