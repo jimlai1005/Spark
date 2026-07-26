@@ -50,19 +50,22 @@
  * 至於「這個客戶有沒有權益」則是後端的授權判斷，前端不做（紅線 4）。
  */
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useSignMessage } from "wagmi";
 import {
   ApiError,
   getBillingPlans,
+  getLeaderPreview,
   getLeaderSelectMessage,
   getLeaders,
   postLeaderSelect,
   type BillingPlansResp,
   type LeaderEntry,
+  type LeaderPreviewResp,
   type LeaderSelectResp,
   type LeadersResp,
 } from "@/lib/api";
+import { runCustomLeaderPreview, validateCustomLeaderInput } from "@/lib/customLeader";
 import { ActivationNotice } from "@/components/ActivationNotice";
 import { COPY } from "@/lib/copy";
 import { NO_VALUE, fmtAmount, fmtRatioPct, shortAddr } from "@/lib/format";
@@ -233,6 +236,13 @@ export default function LeadersPage() {
           onSelect={(leader) => setPhase({ t: "confirming", leader })}
         />
       )}
+
+      {/* ⭐ 自訂 leader：與精選清單**互相獨立**——快照或清單壞掉不影響自訂輸入。 */}
+      <CustomLeaderSection
+        gate={gate}
+        busy={phase.t === "running"}
+        onSelect={(leader) => setPhase({ t: "confirming", leader })}
+      />
 
       {phase.t === "confirming" && (
         <ConfirmDialog
@@ -435,6 +445,199 @@ function LeaderCard({
           {gate.open ? c.select : c.gateBadge}
         </button>
       </div>
+    </section>
+  );
+}
+
+/** HL 官方 leaderboard（外部研究入口；spec 的 hybrid UI 決策）。 */
+const HL_LEADERBOARD_URL = "https://app.hyperliquid.xyz/leaderboard";
+
+/**
+ * 自訂 leader 區塊的預覽狀態機（仿本頁 Phase 的 useState 慣例）。
+ * `rejected`＝准入分類碼對應的拒絕（semantic，使用者改輸入）；
+ * `failed`＝transport／未知錯誤（可重按查詢；查詢唯讀，重按零成本）。
+ */
+type CustomPhase =
+  | { t: "idle" }
+  | { t: "checking" }
+  | { t: "previewed"; preview: LeaderPreviewResp }
+  | { t: "rejected"; message: string; detail?: string }
+  | { t: "failed"; message: string; detail?: string };
+
+/** 預覽 → 既有選擇流程用的 LeaderEntry。⭐ 位址取伺服器回聲（已通過回聲比對）。 */
+function customEntryOf(preview: LeaderPreviewResp): LeaderEntry {
+  return {
+    address: preview.address,
+    name: c.custom.entryName,
+    description: "",
+    account_value: preview.account_value,
+    total_ntl_pos: null,
+    unrealized_pnl: null,
+    position_count: preview.position_count,
+  };
+}
+
+/**
+ * ⭐ 自訂 leader：任意位址輸入（2026-07-27 spec）。
+ *
+ * 閘門順序（每一道未過就零後續動作）：
+ * 1. 本地格式驗證（viem isAddress，strict:false——與後端准入同一把尺，見
+ *    lib/customLeader.ts 檔頭）→ 不合法連「查詢」都按不下去；
+ * 2. 後端准入預覽（格式／自跟／鏈上存在＋精選優先權）→ 被拒按 reason 分類碼
+ *    顯示對應文案，**不對人話字串比對**；
+ * 3. 專屬風險聲明 checkbox（純前端閘門，仿 wizard AML attestation）→ 未勾不得送出；
+ * 4. 之後進**既有**確認框與簽章流程（ConfirmDialog → runLeaderSelectFlow）——
+ *    自訂 leader 的授權安全性與精選完全同一條路，不因來源不同而打折。
+ *
+ * 誠實揭露：預覽卡明說是「查詢當下的鏈上切面」（confirm 沒貼錯位址用），
+ * 無績效快照 → 說「沒有資料」，不畫 0、不畫錯誤（沿本頁缺值不畫 0 的一貫嚴格度）。
+ *
+ * 輸入一變即整組重置（預覽、錯誤、勾選）＋ in-flight 序號防護：舊位址的預覽卡
+ * 留在新位址旁邊，是本區塊最會騙過本人的顯示錯誤（工程原則 1：畫面上的資料
+ * 必須與輸入框裡的位址同源）。
+ */
+function CustomLeaderSection({ gate, busy, onSelect }: {
+  gate: Gate;
+  busy: boolean;
+  onSelect: (leader: LeaderEntry) => void;
+}) {
+  const cc = c.custom;
+  const [input, setInput] = useState("");
+  const [agreed, setAgreed] = useState(false);
+  const [cPhase, setCPhase] = useState<CustomPhase>({ t: "idle" });
+  // in-flight 防護：查詢途中輸入變了，回來的結果屬於舊位址，一律丟棄。
+  const seq = useRef(0);
+
+  const check = validateCustomLeaderInput(input);
+  const showFormatError = !check.ok && !check.empty;
+
+  function onInputChange(v: string) {
+    setInput(v);
+    seq.current += 1;
+    setAgreed(false);
+    setCPhase({ t: "idle" });
+  }
+
+  async function runPreview() {
+    if (!check.ok) return; // 按鈕已 disabled，這裡是第二道（沿 runFlow 的防禦慣例）
+    const mySeq = ++seq.current;
+    setCPhase({ t: "checking" });
+    const r = await runCustomLeaderPreview({ fetchPreview: getLeaderPreview }, input);
+    if (seq.current !== mySeq) return; // 結果屬於舊輸入
+    if (r.ok) {
+      setAgreed(false); // 每一份新預覽都要重新勾選（聲明綁的是「這個位址」）
+      setCPhase({ t: "previewed", preview: r.preview });
+    } else if (r.kind === "rejected") {
+      setCPhase({ t: "rejected", message: cc.reasons[r.reason], detail: r.detail });
+    } else if (r.kind === "address-mismatch") {
+      setCPhase({ t: "failed", message: cc.echoMismatch });
+    } else {
+      const detail = r.error instanceof ApiError ? r.error.detail : undefined;
+      setCPhase({ t: "failed", message: cc.previewFailed, detail });
+    }
+  }
+
+  return (
+    <section className="panel leader-custom">
+      <p className="leader-custom-title">{cc.title}</p>
+      <p className="hint">{cc.subtitle}</p>
+      <p className="hint">
+        {cc.leaderboardLabel}
+        {/* noopener：外部站不得拿到 window.opener（noreferrer 順帶擋 referrer） */}
+        <a href={HL_LEADERBOARD_URL} target="_blank" rel="noopener noreferrer">
+          {cc.leaderboardLinkText}
+        </a>
+      </p>
+
+      <label className="capital-field" htmlFor="custom-leader-address">
+        <span className="capital-field-label">{cc.inputLabel}</span>
+        <input
+          id="custom-leader-address"
+          className="capital-input mono"
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          placeholder={cc.inputPlaceholder}
+          value={input}
+          // 原樣存 state（沿 /capital：輸入框裡的字被程式改掉，最容易騙過本人）；
+          // 小寫正規化只發生在送後端前（lib/customLeader.ts）。
+          onChange={(e) => onInputChange(e.target.value)}
+        />
+        <span className="hint">{cc.inputHint}</span>
+      </label>
+      {showFormatError && (
+        <p className="capital-input-error" role="alert">{cc.formatError}</p>
+      )}
+
+      <button
+        type="button"
+        className="btn btn-ghost"
+        disabled={!check.ok || cPhase.t === "checking" || busy}
+        onClick={() => void runPreview()}
+      >
+        {cPhase.t === "checking" ? cc.checking : cc.check}
+      </button>
+      {cPhase.t === "checking" && <p className="hint" role="status">{cc.checking}</p>}
+
+      {(cPhase.t === "rejected" || cPhase.t === "failed") && (
+        <div className="ops-alert" role="alert">
+          <p className="ops-alert-body">{cPhase.message}</p>
+          {cPhase.detail && <p className="hint mono">{cPhase.detail}</p>}
+        </div>
+      )}
+
+      {cPhase.t === "previewed" && (
+        <div className="leader-custom-preview">
+          <p className="leader-custom-title">{cc.previewTitle}</p>
+          <p className="hint mono leader-addr" title={cPhase.preview.address}>
+            {shortAddr(cPhase.preview.address)}
+          </p>
+          {cPhase.preview.already_listed && (
+            <p className="leader-custom-listed">
+              <span className="plan-badge">{cc.alreadyListedBadge}</span>
+            </p>
+          )}
+          <p className="hint">{cc.previewNote}</p>
+          <dl className="leader-stats">
+            <LeaderStat label={cc.previewAccountValue} hint={cc.previewAccountValueHint}
+              value={fmtAmount(cPhase.preview.account_value)}
+              raw={cPhase.preview.account_value} />
+            <LeaderStat label={cc.previewPositionCount} hint={cc.previewPositionCountHint}
+              value={String(cPhase.preview.position_count)} />
+          </dl>
+
+          {/* ⭐ 無績效快照＝「沒有資料」的狀態區塊——不是錯誤、不是零、不是留白。 */}
+          <div className="leader-perf-state leader-custom-noperf">
+            <p className="leader-perf-state-title">{cc.noPerfTitle}</p>
+            <p className="hint">{cc.noPerfBody}</p>
+          </div>
+
+          {cPhase.preview.already_listed && <p className="hint">{cc.alreadyListedNote}</p>}
+
+          {/* ⭐ 專屬風險聲明：純前端閘門（仿 StepRisk），未勾選送出按鈕不開。 */}
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={agreed}
+              onChange={(e) => setAgreed(e.target.checked)}
+            />
+            <span>{cc.attestation}</span>
+          </label>
+
+          {/* 上界警語與送出按鈕同容器（沿精選卡片的誠信要求 5）。 */}
+          <div className="leader-action">
+            <p className="leader-upper-bound">{c.upperBound}</p>
+            <button
+              type="button"
+              className="btn btn-primary btn-block"
+              disabled={!agreed || !gate.open || busy}
+              onClick={() => onSelect(customEntryOf(cPhase.preview))}
+            >
+              {gate.open ? cc.select : c.gateBadge}
+            </button>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

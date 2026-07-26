@@ -20,13 +20,23 @@ export class ApiError extends Error {
   readonly kind: ApiErrorKind;
   readonly status?: number;
   readonly detail?: string;
+  /**
+   * 機器可判的分類碼——僅在後端 detail 為 `{reason, message}` 物件時存在
+   * （目前只有 /api/leaders/preview 與自訂 leader 准入相關端點）。
+   * ⭐ 呼叫端要分流時看這個欄位，不要對 `detail` 的人話字串做字串比對
+   * （文案會改，分類碼不會——分類在邊界完成，工程原則 5）。
+   */
+  readonly reason?: string;
 
-  constructor(kind: ApiErrorKind, message: string, status?: number, detail?: string) {
+  constructor(
+    kind: ApiErrorKind, message: string, status?: number, detail?: string, reason?: string,
+  ) {
     super(message);
     this.name = "ApiError";
     this.kind = kind;
     this.status = status;
     this.detail = detail;
+    this.reason = reason;
   }
 }
 
@@ -91,17 +101,32 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new ApiError("network", "無法連線到伺服器，請檢查網路後重試");
   }
   if (res.ok) return (await res.json()) as T;
-  const detail = await res
+  const raw = await res
     .json()
-    .then((b: { detail?: string }) => b?.detail)
+    .then((b: { detail?: unknown }) => b?.detail)
     .catch(() => undefined);
-  if (res.status === 401) throw new ApiError("auth", detail ?? "未登入", 401, detail);
+  // 後端 detail 兩種形狀：字串（多數端點）或 `{reason, message}` 物件（自訂 leader
+  // 准入，reason 為機器可判分類碼）。在邊界拆開，呼叫端拿到的 detail 恆為人話字串。
+  const structured =
+    raw !== null && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as { reason?: unknown; message?: unknown })
+      : undefined;
+  const detail =
+    typeof raw === "string"
+      ? raw
+      : structured && typeof structured.message === "string"
+        ? structured.message
+        : undefined;
+  const reason =
+    structured && typeof structured.reason === "string" ? structured.reason : undefined;
+  if (res.status === 401) throw new ApiError("auth", detail ?? "未登入", 401, detail, reason);
   if (res.status === 502 || res.status === 503) {
-    throw new ApiError("upstream", detail ?? "上游服務暫時不可用", res.status, detail);
+    throw new ApiError("upstream", detail ?? "上游服務暫時不可用", res.status, detail, reason);
   }
   // 非 502/503 的其他 5xx（如 500）目前歸類 client：後端現況不產生此類回應，
   // 若未來出現需重新評估歸 upstream（並補對應測試），此處僅記錄現況假設。
-  throw new ApiError("client", detail ?? `請求失敗（HTTP ${res.status}）`, res.status, detail);
+  throw new ApiError(
+    "client", detail ?? `請求失敗（HTTP ${res.status}）`, res.status, detail, reason);
 }
 
 function post<T>(path: string, body?: unknown): Promise<T> {
@@ -332,6 +357,30 @@ export interface LeaderSelectResp {
 /** leader 目錄（需 session）。白名單載入失敗 → 503（kind=upstream）。 */
 export function getLeaders(): Promise<LeadersResp> {
   return request<LeadersResp>("/api/leaders");
+}
+
+/**
+ * 自訂 leader 的准入預覽（2026-07-27 spec；對照 app.py /api/leaders/preview）。
+ * `account_value` 是 Decimal → **string**（落地慣例，不是 number）。
+ * `already_listed=true` ⇒ 位址已在精選清單且可選，後續流程視同選擇精選 leader。
+ */
+export interface LeaderPreviewResp {
+  /** 伺服器正規化（小寫）後的位址——後續簽章流程以此為錨。 */
+  address: string;
+  exists: boolean;
+  account_value: string;
+  position_count: number;
+  already_listed: boolean;
+}
+
+/**
+ * 准入預覽（需 session；唯讀、無副作用）。檢查不過 → 4xx，`ApiError.reason` 帶
+ * 機器可判分類碼（invalid_format／self_follow／not_found／leader_disabled），
+ * `detail` 帶後端的人話說明。分流一律看 reason，不對 detail 做字串比對。
+ */
+export function getLeaderPreview(leaderAddress: string): Promise<LeaderPreviewResp> {
+  const q = new URLSearchParams({ leader_address: leaderAddress });
+  return request<LeaderPreviewResp>(`/api/leaders/preview?${q.toString()}`);
 }
 
 /** 取待簽原文（需 session）。leader 不可選 → 400（kind=client）。 */

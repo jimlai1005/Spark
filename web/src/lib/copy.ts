@@ -847,6 +847,68 @@ export const COPY = {
       "無法確認這個功能是否已推出（方案目錄載入失敗），本頁暫不開放送出。請重新整理再試。",
     empty: "目前沒有可選擇的 leader。",
     loadFailed: "載入 leader 清單失敗，請重新整理本頁。",
+    /**
+     * 自訂 leader 區塊（2026-07-27 spec：用戶輸入任意 wallet address）。
+     * ⭐ 誠實揭露的門檻比精選卡片**更高**：這裡的位址未經平台審核、沒有績效快照。
+     * 三件事是硬性的：
+     * 1. 「平台不背書」講在送出之前——專屬聲明 checkbox 是送出的前置閘門
+     *    （仿 wizard AML attestation 的純前端閘門），未勾不得進確認框。
+     * 2. 預覽卡明說那是「查詢當下的鏈上切面」，用途是確認沒貼錯位址——不是績效、
+     *    不是推薦；無績效快照要說「沒有資料」，不畫 0、不畫錯誤。
+     * 3. 准入被拒的文案按後端 reason 分類碼對應（機器碼分流，不對人話字串比對），
+     *    每句都講清楚使用者現在能做什麼，不洩內部治理細節。
+     */
+    custom: {
+      title: "自訂 leader",
+      subtitle:
+        "除了上方精選清單，你也可以輸入任意錢包位址，跟隨你自己研究過的交易者。"
+        + "此路徑的 leader 未經平台審核、亦無績效快照，是否值得跟隨由你自行判斷。",
+      leaderboardLabel: "研究對象可參考 Hyperliquid 官方排行榜（外部連結，另開新分頁）：",
+      leaderboardLinkText: "app.hyperliquid.xyz/leaderboard",
+      inputLabel: "leader 錢包位址",
+      inputPlaceholder: "0x…",
+      inputHint:
+        "0x 開頭＋40 個十六進位字元。查詢會到鏈上確認此帳戶在 Hyperliquid 有 perp 活動。",
+      formatError: "位址格式不正確：須為 0x 開頭＋40 個十六進位字元。",
+      check: "查詢",
+      checking: "查詢中…",
+      previewTitle: "鏈上預覽",
+      previewNote:
+        "以下是查詢當下的鏈上切面，用途是讓你確認沒有貼錯位址——它不是績效，也不是推薦。",
+      previewAccountValue: "帳戶權益",
+      previewAccountValueHint: "該位址在查詢當下的帳戶權益（鏈上即時讀值，非每日快照）。",
+      previewPositionCount: "持倉數",
+      previewPositionCountHint: "該位址在查詢當下持有的部位數量。",
+      noPerfTitle: "無績效資料",
+      noPerfBody:
+        "自訂 leader 不在平台的績效快照中，本區無法顯示報酬率與回撤。這代表「沒有資料」，"
+        + "不代表「績效為零」——請自行研究這個位址的過往表現後再決定。",
+      alreadyListedBadge: "此位址已在精選清單",
+      alreadyListedNote:
+        "這個位址就是上方精選清單中的 leader，後續流程與選擇精選 leader 相同。"
+        + "由於你走的是自行輸入位址的路徑，以下聲明仍需勾選。",
+      // ⭐ 專屬風險聲明：未勾選不得送出（純前端閘門，仿 wizard AML attestation）。
+      attestation: "我了解此為未審核 leader，非平台精選，績效與風險自負。",
+      select: "選擇此自訂 leader",
+      /** 准入拒絕文案，按後端 reason 分類碼對應（app.py `_admission_reject`）。 */
+      reasons: {
+        invalid_format: "位址格式不正確：須為 0x 開頭＋40 個十六進位字元。",
+        self_follow: "這是你自己的登入位址——不能跟單自己。",
+        not_found:
+          "此位址在 Hyperliquid 上查無 perp 活動（權益為 0 且無持倉）。"
+          + "請確認位址沒有貼錯。",
+        leader_disabled:
+          "此位址目前無法透過自訂輸入跟隨（已由平台停用或停止接受新客戶）。",
+      },
+      // 查詢是唯讀動作，失敗要明說「什麼都沒變」——與換 leader 的失敗文案同一原則。
+      previewFailed: "查詢失敗，這次查詢沒有改變你的跟單設定。請稍後再按一次「查詢」。",
+      // 伺服器回聲位址 ≠ 輸入位址：預覽資料不可信，要求停手（沿 leaderMismatch 的嚴格度）。
+      echoMismatch:
+        "已中止：伺服器回傳的預覽對象與你輸入的位址不符，畫面上不顯示這份預覽。"
+        + "請不要繼續操作，並回報客服。",
+      /** 確認框與成功通知裡顯示的名稱（自訂 leader 沒有策展名）。 */
+      entryName: "自訂 leader",
+    },
     errors: {
       messageFailed: "取得待簽原文失敗，你的 leader 沒有被變更。請稍後再試一次。",
       walletRejected: "你在錢包中取消了簽署。這筆授權沒有送出，你的跟單設定沒有任何變動。",

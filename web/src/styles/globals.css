@@ -784,6 +784,20 @@ main.page {
 .leader-done { border-color: rgba(var(--pos-rgb), .5); margin-top: 16px; }
 .leader-done-title { color: var(--pos); font-size: 14px; margin: 0 0 6px; }
 
+/* ---- 自訂 leader：任意位址輸入（2026-07-27）。輸入框沿 /capital 的表單樣式。 ---- */
+.leader-custom { margin-top: 24px; }
+.leader-custom-title { font-size: 14px; color: var(--text); margin: 0 0 8px; font-weight: 500; }
+.leader-custom > .btn { margin-top: 14px; }
+.leader-custom-preview {
+  border-top: 1px solid var(--border);
+  margin-top: 16px; padding-top: 14px;
+}
+.leader-custom-preview .leader-stats { margin: 12px 0 12px; }
+.leader-custom-listed { margin: 0 0 8px; }
+.leader-custom-noperf { margin: 0 0 12px; }
+.leader-custom-preview .check-row { margin: 12px 0; }
+.leader-custom-preview .leader-action { margin-top: 14px; }
+
 .leader-dialog-backdrop {
   position: fixed; inset: 0; z-index: 20;
   display: flex; align-items: center; justify-content: center; padding: 20px;

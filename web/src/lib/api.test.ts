@@ -160,6 +160,60 @@ describe("端點契約（對照 src/spark/publicapi/app.py）", () => {
   });
 });
 
+/**
+ * 自訂 leader 准入預覽（2026-07-27 spec；對照 app.py 的 /api/leaders/preview）。
+ * ⭐ 這是全 app 第一個 detail 為**物件**（`{reason, message}`）的端點：reason 是
+ * 機器可判的分類碼，message 是人話。分類在邊界完成（工程原則 5）——request()
+ * 把兩者拆進 ApiError 的 `reason`／`detail`，呼叫端不用自己去戳 detail 的形狀。
+ */
+describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
+  it("GET /api/leaders/preview?leader_address=，回傳預覽欄位", async () => {
+    mockFetchJson(200, {
+      address: "0x2222222222222222222222222222222222222222",
+      exists: true, account_value: "5123.45", position_count: 3, already_listed: false,
+    });
+    const r = await api.getLeaderPreview("0x2222222222222222222222222222222222222222");
+    expect(captured[0].url).toBe(
+      "/api/leaders/preview?leader_address=0x2222222222222222222222222222222222222222",
+    );
+    expect(captured[0].init.method).toBeUndefined(); // GET
+    // account_value 是 Decimal → string（落地慣例），不是 number
+    expect(r.account_value).toBe("5123.45");
+    expect(r.position_count).toBe(3);
+    expect(r.already_listed).toBe(false);
+  });
+
+  it("⭐ 4xx 的 detail 是 {reason, message} 物件 → ApiError.reason 帶分類碼、detail 帶人話", async () => {
+    mockFetchJson(400, {
+      detail: { reason: "self_follow", message: "不能跟單自己的登入位址" },
+    });
+    await expect(api.getLeaderPreview("0xAbC0000000000000000000000000000000000001"))
+      .rejects.toMatchObject({
+        kind: "client", status: 400,
+        reason: "self_follow",
+        detail: "不能跟單自己的登入位址",
+        // Error.message 用人話那一份，不是 "[object Object]"
+        message: "不能跟單自己的登入位址",
+      });
+  });
+
+  it("404 not_found 同樣帶 reason（kind=client，不歸 upstream）", async () => {
+    mockFetchJson(404, {
+      detail: { reason: "not_found", message: "該位址在 Hyperliquid 上查無 perp 活動" },
+    });
+    await expect(api.getLeaderPreview("0x3333333333333333333333333333333333333333"))
+      .rejects.toMatchObject({ kind: "client", status: 404, reason: "not_found" });
+  });
+
+  it("既有端點的字串 detail 行為不變：reason 為 undefined", async () => {
+    mockFetchJson(400, { detail: "該 leader 目前不可選擇" });
+    await expect(api.getLeaderSelectMessage("0x1111111111111111111111111111111111111111"))
+      .rejects.toMatchObject({
+        kind: "client", detail: "該 leader 目前不可選擇", reason: undefined,
+      });
+  });
+});
+
 describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3）", () => {
   // 已知合法例外（三支，皆為 EIP-191 personal_sign、原文皆由伺服器產生）：
   //   authVerify（SIWE 登入）、postLeaderSelect（換 leader 授權）、
@@ -189,6 +243,7 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.postBillingPortal(),
       () => api.getLeaders(),
       () => api.getLeaderSelectMessage("0x1111111111111111111111111111111111111111"),
+      () => api.getLeaderPreview("0x2222222222222222222222222222222222222222"),
       () => api.getCapitalSettingsMessage("10000.00", "0.2000"),
     ];
     for (const call of calls) {
@@ -223,7 +278,8 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
   it("反射函式數量與手寫清單一致——手寫清單不會因新函式而過時（保底斷言）", () => {
     // 對照上一個 describe 的 calls 陣列長度：兩者必須同步增減。
     // 2026-07-19：+2（getOpsTradeQuality、getOpsHealth，/ops 兩個新面板）
-    const HAND_WRITTEN_LIST_LENGTH = 21;
+    // 2026-07-27：+1（getLeaderPreview，自訂 leader 准入預覽）
+    const HAND_WRITTEN_LIST_LENGTH = 22;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

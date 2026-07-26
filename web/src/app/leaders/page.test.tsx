@@ -18,6 +18,7 @@ const getLeaders = vi.fn();
 const getBillingPlans = vi.fn();
 const getLeaderSelectMessage = vi.fn();
 const postLeaderSelect = vi.fn();
+const getLeaderPreview = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMe: (...a: unknown[]) => getMe(...a),
@@ -25,6 +26,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getBillingPlans: (...a: unknown[]) => getBillingPlans(...a),
   getLeaderSelectMessage: (...a: unknown[]) => getLeaderSelectMessage(...a),
   postLeaderSelect: (...a: unknown[]) => postLeaderSelect(...a),
+  getLeaderPreview: (...a: unknown[]) => getLeaderPreview(...a),
 }));
 
 const signMessageAsync = vi.fn();
@@ -868,6 +870,203 @@ describe("LeadersPage — 簽章授權流程（沿 approvalFlow 的謹慎度）"
     await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("只能變更自己帳號的 leader");
+  });
+});
+
+/**
+ * ⭐ 自訂 leader（2026-07-27 spec：用戶輸入任意 wallet address）。
+ * 閘門結構：格式驗證（本地、即時）→ 後端准入預覽（權益／持倉）→ 專屬風險聲明
+ * checkbox（純前端閘門，仿 wizard AML attestation）→ 既有確認框與簽章流程。
+ * 每一道閘都要有「未通過就零後續動作」的斷言——這一段的送出終點是真金白銀的跟單。
+ */
+describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
+  const CUSTOM_ADDR = "0x2222222222222222222222222222222222222222";
+  const CUSTOM_PREVIEW = {
+    address: CUSTOM_ADDR, exists: true,
+    account_value: "5123.45", position_count: 3, already_listed: false,
+  };
+  /** 原文含 `Leader: <自訂位址>`——與精選流程同一個伺服器版型（沿 MSG fixture 慣例）。 */
+  const CUSTOM_MSG: LeaderSelectMessageResp = {
+    message:
+      "Filet: change copy-trading leader\n\nAccount: fabc\n"
+      + `Leader: ${CUSTOM_ADDR}\nNonce: n-2`,
+    nonce: "n-2",
+    issued_at: "2026-07-27T00:00:00Z",
+    leader_address: CUSTOM_ADDR,
+    account_id: "fabc",
+  };
+
+  beforeEach(() => {
+    getBillingPlans.mockResolvedValue(catalog(true));
+    getLeaderPreview.mockResolvedValue(CUSTOM_PREVIEW);
+    getLeaderSelectMessage.mockResolvedValue(CUSTOM_MSG);
+  });
+
+  /** 把位址貼進自訂輸入框（paste 而非逐鍵，42 字元逐鍵太慢）。 */
+  async function pasteAddress(addr: string) {
+    const input = await screen.findByLabelText(/leader 錢包位址/);
+    await userEvent.click(input);
+    await userEvent.paste(addr);
+    return input;
+  }
+
+  /** 查詢 → 預覽卡出現。 */
+  async function previewCustom(addr = CUSTOM_ADDR) {
+    await pasteAddress(addr);
+    await userEvent.click(screen.getByRole("button", { name: "查詢" }));
+    await screen.findByText("鏈上預覽");
+  }
+
+  it("區塊存在：輸入框、查詢按鈕、HL 官方 leaderboard 外部連結（新分頁＋noopener）", async () => {
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText("自訂 leader")).toBeInTheDocument();
+    expect(screen.getByLabelText(/leader 錢包位址/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "查詢" })).toBeInTheDocument();
+    const link = screen.getByRole("link", { name: /leaderboard/ });
+    expect(link).toHaveAttribute("href", "https://app.hyperliquid.xyz/leaderboard");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("⭐ 格式錯誤即時回饋：查詢按鈕停用、零 API 呼叫", async () => {
+    render(wrap(<LeadersPage />));
+    await pasteAddress("0x1234");
+
+    expect(await screen.findByText(/位址格式不正確/)).toBeInTheDocument();
+    const btn = screen.getByRole("button", { name: "查詢" });
+    expect(btn).toBeDisabled();
+    await userEvent.click(btn);
+    expect(getLeaderPreview).not.toHaveBeenCalled();
+  });
+
+  it("輸入為空 → 不顯示格式錯誤（「還沒輸入」與「輸入錯了」是兩種狀態）", async () => {
+    render(wrap(<LeadersPage />));
+    await screen.findByLabelText(/leader 錢包位址/);
+
+    expect(screen.queryByText(/位址格式不正確/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "查詢" })).toBeDisabled();
+  });
+
+  it("⭐ 查詢成功 → 預覽卡：帳戶權益、持倉數、位址縮寫、無績效資料說明", async () => {
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    expect(getLeaderPreview).toHaveBeenCalledWith(CUSTOM_ADDR);
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(card.textContent).toContain("帳戶權益");
+    expect(card.textContent).toContain("5,123.45");
+    expect(card.textContent).toContain("持倉數");
+    expect(card.textContent).toContain("3");
+    expect(card.textContent).toContain("0x2222…222");   // shortAddr
+    // ⭐ 自訂 leader 沒有績效快照：明說「無績效資料」，且不是錯誤、不是零
+    expect(card.textContent).toContain("無績效資料");
+    expect(card.textContent).toMatch(/不代表「績效為零」/);
+  });
+
+  it("⭐ checkbox 未勾 → 不能送出（按鈕停用、零對話框、零請求）；勾選後開放", async () => {
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    const select = screen.getByRole("button", { name: "選擇此自訂 leader" });
+    expect(select).toBeDisabled();
+    await userEvent.click(select);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeEnabled();
+  });
+
+  it("⭐ 勾選聲明 → 確認對話框 → 簽章流程走完（原文含自訂位址、整包 payload 回送）", async () => {
+    const SIG_CUSTOM = SIG;
+    signMessageAsync.mockResolvedValue(SIG_CUSTOM);
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    await userEvent.click(screen.getByRole("button", { name: "選擇此自訂 leader" }));
+
+    // 既有確認對話框（成本與生效時機），對象顯示自訂位址
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toContain("0x2222…222");
+    expect(dialog.textContent).toMatch(/平掉目前的部位、依新 leader 開新部位/);
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
+    expect(getLeaderSelectMessage).toHaveBeenCalledWith(CUSTOM_ADDR);
+    expect(signMessageAsync).toHaveBeenCalledWith({ message: CUSTOM_MSG.message });
+    expect(postLeaderSelect).toHaveBeenCalledWith(CUSTOM_MSG, SIG_CUSTOM);
+  });
+
+  it("⭐ already_listed=true → 標示已在精選清單，聲明勾選要求維持", async () => {
+    getLeaderPreview.mockResolvedValue({ ...CUSTOM_PREVIEW, already_listed: true });
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    expect(screen.getByText("此位址已在精選清單")).toBeInTheDocument();
+    // 仍是用戶自行輸入的路徑：checkbox 照樣是送出的前置閘門
+    expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeEnabled();
+  });
+
+  it.each([
+    ["invalid_format", /位址格式不正確/],
+    ["self_follow", /不能跟單自己/],
+    ["not_found", /查無 perp 活動/],
+    ["leader_disabled", /已由平台停用或停止接受新客戶/],
+  ] as const)("⭐ 准入被拒 reason=%s → 對應文案，零預覽卡", async (reason, copyRe) => {
+    getLeaderPreview.mockRejectedValue(
+      new ApiError("client", "後端人話", reason === "not_found" ? 404 : 400, "後端人話", reason),
+    );
+    render(wrap(<LeadersPage />));
+    await pasteAddress(CUSTOM_ADDR);
+    await userEvent.click(screen.getByRole("button", { name: "查詢" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(copyRe);
+    expect(screen.queryByText("鏈上預覽")).not.toBeInTheDocument();
+  });
+
+  it("查詢失敗（上游不可用）→ 明說這次查詢沒有改變跟單設定，且附後端 detail", async () => {
+    getLeaderPreview.mockRejectedValue(
+      new ApiError("upstream", "上游服務暫時不可用", 503, "上游服務暫時不可用"),
+    );
+    render(wrap(<LeadersPage />));
+    await pasteAddress(CUSTOM_ADDR);
+    await userEvent.click(screen.getByRole("button", { name: "查詢" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/查詢失敗/);
+    expect(alert.textContent).toMatch(/沒有改變你的跟單設定/);
+    expect(alert.textContent).toContain("上游服務暫時不可用");
+    expect(screen.queryByText("鏈上預覽")).not.toBeInTheDocument();
+  });
+
+  it("⭐ 預覽後修改輸入 → 預覽卡與勾選立即重置（舊位址的預覽不得留在畫面上）", async () => {
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+
+    // 在輸入框尾端多打一個字元：位址已不是預覽的那一個
+    const input = screen.getByLabelText(/leader 錢包位址/);
+    await userEvent.type(input, "f");
+
+    expect(screen.queryByText("鏈上預覽")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "選擇此自訂 leader" })).not.toBeInTheDocument();
+  });
+
+  it("付費閘門關閉 → 自訂選擇按鈕停用（與精選卡片同一道閘，勾了聲明也一樣）", async () => {
+    getBillingPlans.mockResolvedValue(catalog(false));
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+
+    // 閘門關閉時按鈕顯示「開發中」標籤且停用（沿精選卡片的既有行為）
+    const buttons = screen.getAllByRole("button", { name: "開發中，敬請期待" });
+    for (const b of buttons) expect(b).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "選擇此自訂 leader" })).not.toBeInTheDocument();
+    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
   });
 });
 
