@@ -31,6 +31,7 @@ from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
                                      MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
+from spark.filet.user_leaders import record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
@@ -228,6 +229,26 @@ def _leader_public(ref: LeaderRef, stats: dict | None) -> dict:
     # 沒有績效資料，與「規模欄位為 null」是同一種誠實：不補 0、不補空物件。
     out["performance"] = _leader_perf_public(stats)
     return out
+
+
+def _chain_activity(state) -> tuple[Decimal, int]:
+    """clearinghouseState 原始回應 → （帳戶權益, 持倉數）。
+
+    自訂 leader 准入的「鏈上存在」判準吃這兩個值（權益 > 0 **或** 有持倉＝有 perp
+    活動痕跡；精確錨例見 tests/test_api_leader_preview.py）。形狀不符 → (0, 0)：
+    准入是閘門，猜不出來就**不放行**（fail-closed）——not_found 是安全的一側，
+    擋錯了用戶重試即可，放錯了是跟單一個查無活動的死地址。
+    """
+    if not isinstance(state, dict):
+        return Decimal("0"), 0
+    summary = state.get("marginSummary")
+    try:
+        value = Decimal(str(summary.get("accountValue", "0"))) \
+            if isinstance(summary, dict) else Decimal("0")
+    except (ValueError, ArithmeticError):
+        value = Decimal("0")
+    positions = state.get("assetPositions")
+    return value, (len(positions) if isinstance(positions, list) else 0)
 
 
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
@@ -455,6 +476,80 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise HTTPException(
                 status_code=503, detail="leader 名單暫時不可用，請稍後重試") from e
 
+    # ---------- 自訂 leader 准入（2026-07-27 spec：用戶輸入任意位址） ----------
+
+    def _admission_reject(status: int, reason: str, message: str) -> HTTPException:
+        """准入拒絕 → 4xx，detail 是 `{"reason", "message"}` 物件。
+
+        reason 是**機器可判的分類碼**（spec 的 API 契約：invalid_format /
+        self_follow / not_found / leader_disabled），由伺服器決定、絕不含請求
+        輸入原文（沿 LEADER_CHANGE_DETAIL 分類化訊息的既有政策）。
+        """
+        return HTTPException(status_code=status,
+                             detail={"reason": reason, "message": message})
+
+    def _admit_custom_leader(leader_address: str, session_address: str,
+                             refs: list[LeaderRef]) -> dict:
+        """自訂 leader 的**三道准入檢查**＋精選條目優先權（單一定義）。
+
+        preview 與 select 流程（訊息端點、POST 提交）共用本函式：POST 在驗簽後
+        **重新執行全部檢查**，不信任客戶端曾呼叫 preview（防 TOCTOU）。
+        通過 → 回 preview 資料；不過 → raise（reason-coded 4xx，見 _admission_reject）。
+        """
+        # (1) 格式：0x + 40 hex，小寫正規化（沿全 app 的單一位址基準）。
+        try:
+            addr = normalize_address(leader_address)
+        except ValueError:
+            # 不回顯輸入原文（分類碼政策）；格式細節在訊息裡講規則，不講他送了什麼。
+            raise _admission_reject(
+                400, "invalid_format",
+                "位址格式不正確：須為 0x 開頭＋40 個十六進位字元") from None
+        # (2) 禁止自跟：兩側皆 normalize（session 位址在 auth_verify 已正規化）。
+        #     自我跟單無意義，且會形成回饋迴圈（本方下的單被當成 leader 目標再放大）。
+        if addr == session_address:
+            raise _admission_reject(400, "self_follow",
+                                    "不能跟單自己的登入位址")
+        # 精選條目**一律優先**於自訂路徑（spec 合併優先序）：
+        # - 已列且可選 → already_listed，後續走既有精選流程（不寫 registry）；
+        # - 已列但不可選（enabled=false 安全撤銷 **或** accepting_new=false 例行
+        #   下架）→ 拒絕。兩者共用 leader_disabled 一個 reason：撤銷與停收的分辨
+        #   是內部治理資訊，不外流（沿 /api/leaders 的既有政策）；對用戶的意義
+        #   相同——此位址目前不可經自訂路徑跟隨。少了這一擋，自訂輸入就是繞過
+        #   operator 安全撤銷／停止接客的後門。
+        listed = next((r for r in refs if r.address == addr), None)
+        if listed is not None and not is_selectable(addr, refs):
+            raise _admission_reject(
+                400, "leader_disabled",
+                "該位址目前無法透過自訂輸入跟隨（已由平台停用或停止接受新客戶）")
+        # (3) 鏈上存在：走既有 HL gateway（唯讀、冪等 → transient 重試與 502 轉譯
+        #     自動繼承，工程原則 5），不另開 HTTP 呼叫路徑。
+        account_value, position_count = _chain_activity(hl.clearinghouse_state(addr))
+        exists = account_value > 0 or position_count > 0
+        # 「查無活動」的門檻只施加在**未經審核的自訂位址**（擋死地址與 typo）；
+        # 已列且可選的精選位址是 operator 背書的清單成員，不因鏈上暫時讀不出
+        # 活動而 404——exists 誠實回報，前端據 already_listed 走精選流程。
+        if listed is None and not exists:
+            raise _admission_reject(
+                404, "not_found",
+                "該位址在 Hyperliquid 上查無 perp 活動（權益為 0 且無持倉）——"
+                "請確認位址無誤")
+        return {"address": addr, "exists": exists,
+                "account_value": str(account_value),   # Decimal → str（落地慣例）
+                "position_count": position_count,
+                "already_listed": listed is not None}
+
+    @app.get("/api/leaders/preview")
+    def leaders_preview(leader_address: str,
+                        address: str = Depends(_require_session)):
+        """自訂 leader 的准入檢查 ＋ 鏈上預覽（session 驗證，唯讀、無副作用）。
+
+        回 `{address, exists, account_value, position_count, already_listed}`；
+        檢查不過 → 4xx，detail 帶機器可判的 reason code（見 _admit_custom_leader）。
+        already_listed=true ⇒ 位址已在精選清單且可選，前端後續走既有精選流程。
+        """
+        refs = _load_leaders_or_503()
+        return _admit_custom_leader(leader_address, address, refs)
+
     @app.get("/api/leaders")
     def leaders_directory(address: str = Depends(_require_session)):
         """客戶**現在可以選**的 leader 清單 ＋ 每個 leader 的快照統計。
@@ -549,13 +644,17 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         """
         account_id = derive_account_id(address)
         refs = _load_leaders_or_503()
-        # 不可選（含不在白名單／已撤銷／不收新客戶／位址格式壞）→ 400，且理由不分辨
-        # （治理狀態不外流，沿 /api/leaders 與 select 端點的既有理由）。
-        if not is_selectable(leader_address, refs):
-            raise HTTPException(status_code=400,
-                                detail="該 leader 目前不可選擇，請重新整理 leader 列表")
-        # 走到這裡代表 is_selectable 已在白名單裡找到它 → 位址必然合法可正規化。
-        leader = normalize_address(leader_address)
+        if is_selectable(leader_address, refs):
+            # 精選可選 → 既有流程。走到這裡代表 is_selectable 已在白名單裡找到它
+            # → 位址必然合法可正規化。
+            leader = normalize_address(leader_address)
+        else:
+            # 非精選位址 → 准入前置檢查（2026-07-27 spec：取代原本的一律拒絕）。
+            # 不過即 reason-coded 4xx（invalid_format／self_follow／not_found／
+            # leader_disabled——已列但不可選的位址在這裡被 leader_disabled 擋下，
+            # 自訂路徑不得繞過 operator 的撤銷或停收）。通過的位址之後在 POST
+            # select 會**重新**全查一次（本端點的通過不被信任，防 TOCTOU）。
+            leader = _admit_custom_leader(leader_address, address, refs)["address"]
         # issued_at 版型沿 auth_nonce（帶 Z 的 UTC）——leader_change.parse_issued_at
         # 要求帶時區，naive 時間會被直接拒絕。
         issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -607,16 +706,18 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise HTTPException(status_code=403,
                                 detail="只能變更自己帳號的 leader")
 
-        # 2) leader 必須是**目錄可選**的（is_selectable ＝ enabled 且 accepting_new）。
-        #    ⚠️ 刻意不是 is_still_permitted：那是引擎對「已經在跟的人可否繼續跟」的
-        #    述詞（只看 enabled），用在這裡會讓客戶選中一個已停止接客的 leader。
-        #    兩個旗標的語意差異見 filet/leaders.py 檔頭。
+        # 2) leader 閘門。精選可選（is_selectable ＝ enabled 且 accepting_new）→
+        #    既有精選流程（不寫 registry）。非精選 → **重新執行全部准入檢查**
+        #    （2026-07-27 spec）：不信任客戶端曾呼叫 preview 或訊息端點——那兩次
+        #    通過與這次提交之間，位址可能已被 operator 停用、帳戶可能已清空
+        #    （TOCTOU）。custom=None ⇒ 精選路徑。
+        #    ⚠️ 精選側刻意不是 is_still_permitted：那是引擎對「已經在跟的人可否
+        #    繼續跟」的述詞（只看 enabled），用在這裡會讓客戶選中一個已停止接客
+        #    的 leader。兩個旗標的語意差異見 filet/leaders.py 檔頭。
         refs = _load_leaders_or_503()
+        custom = None
         if not is_selectable(body.leader_address, refs):
-            # 不區分「不在白名單」「已撤銷」「不收新客戶」——後兩者是內部治理資訊
-            # （沿 /api/leaders 不外流治理狀態的既有理由）。
-            raise HTTPException(status_code=400,
-                                detail="該 leader 目前不可選擇，請重新整理 leader 列表")
+            custom = _admit_custom_leader(body.leader_address, address, refs)
 
         # 3) 驗章。⭐ user_address 出自 **session**（可信來源），不是請求內容；
         #    訊息由 verify_leader_change 自己重建，body.message 只是稽核留存。
@@ -659,8 +760,32 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 detail=LEADER_CHANGE_DETAIL.get(e.reason, LEADER_CHANGE_DETAIL_DEFAULT)
             ) from None
 
-        # 4) 落檔。這是唯一的寫入，且必須在**全部驗證通過之後**——驗簽失敗卻留下
-        #    記錄，等於把「被拒絕的請求」偽裝成待套用的意圖。
+        # 4a) 自訂 leader → 先**冪等**寫入 user registry，再落換 leader 記錄。
+        #     順序是刻意的：registry 是引擎驗證的來源，先記錄後寫 registry 的話，
+        #     「寫入失敗」會留下一筆引擎永遠拒絕套用的簽章意圖。反向（registry
+        #     成功、記錄失敗）是安全的：客戶重送同一個 POST，registry 寫入冪等
+        #     跳過，記錄補上。
+        if custom is not None:
+            try:
+                wrote = record_user_leader(cfg.user_leaders_path,
+                                           address=verified.leader_address,
+                                           added_by=account_id)
+            except (OSError, ValueError) as e:
+                # ⭐ 安全動作 fail loudly（工程原則 3）：registry 進不去就**不得**
+                # 記錄換 leader——記了，引擎會拿一筆白名單驗不過的意圖每輪告警；
+                # 吞了，客戶以為換成了。5xx（transient，可重試；寫入冪等）。
+                logger.error("user registry 寫入失敗 account=%s leader=%s path=%s: %s",
+                             account_id, verified.leader_address,
+                             cfg.user_leaders_path, e)
+                raise HTTPException(
+                    status_code=500,
+                    detail="自訂 leader 註冊寫入失敗，變更未生效，請稍後重試") from e
+            if wrote:
+                logger.info("自訂 leader 已寫入 user registry account=%s leader=%s",
+                            account_id, verified.leader_address)
+
+        # 4b) 落檔。此後這是唯一的寫入，且必須在**全部驗證通過之後**——驗簽失敗
+        #    卻留下記錄，等於把「被拒絕的請求」偽裝成待套用的意圖。
         # 落地的是**驗證後的正規化值**（verified.*），不是請求的原樣字串——位址大小寫
         # 在此收斂成單一基準，引擎端不必再猜（工程原則 1）。signature 原樣保留，
         # 引擎重驗時會自己重建訊息，正規化是冪等的，重驗結果相同。

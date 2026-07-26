@@ -69,6 +69,8 @@ from typing import Callable
 from spark.copytrade.notifier import Notifier
 from spark.filet.followers import FollowerRef, load_followers, normalize_hex_address
 from spark.filet.leaders import is_still_permitted, load_leaders
+from spark.filet.user_leaders import (load_user_leaders, merge_leaders,
+                                      user_leaders_path_for)
 
 logger = logging.getLogger(__name__)
 
@@ -244,12 +246,24 @@ def resolve_leader(*, account_id: str | None, manifest_path: str | Path,
     """
     ref = _find_ref(account_id, manifest_path)
     leaders_file = Path(leaders_path)
+    # ⭐ 驗證來源＝精選白名單 ＋ user registry 的**合併清單**（2026-07-27 自訂 leader
+    # 自動准入）。述詞語義不變（is_still_permitted 仍只看 enabled）；合併優先序
+    # （精選條目一律優先，撤銷不可被自訂路徑繞過）的單一定義在 user_leaders.merge_leaders。
+    # registry 路徑由白名單路徑推導（同目錄 sibling）——引擎與 API 共用同一份推導，
+    # 結構上讀的就是 API 寫的那個檔。
+    user_file = Path(user_leaders_path_for(leaders_file))
     # 「檔案不存在」與「明確的空清單」是兩種語意，只有前者享有 env 回退豁免。
-    allowlist_absent = not leaders_file.exists()
+    # user registry 存在也算「有明確表態的白名單」：它是自動准入的落點，存在即代表
+    # 這個部署已在策劃（至少自動地）誰可以被跟。
+    allowlist_absent = not leaders_file.exists() and not user_file.exists()
     try:
-        leaders = load_leaders(leaders_file)
+        leaders = merge_leaders(load_leaders(leaders_file),
+                                load_user_leaders(user_file))
     except (ValueError, OSError) as e:
-        raise LeaderResolutionError(f"leader 白名單無法載入（{leaders_file}）: {e}") from e
+        # transient（含 user registry 損毀）：讀不到 ≠ 撤銷——不得升級成
+        # LeaderRevokedError（把 IO 打嗝誤判成撤銷＝拿真實平倉成本回應一次檔案損毀）。
+        raise LeaderResolutionError(
+            f"leader 白名單無法載入（{leaders_file}／{user_file}）: {e}") from e
 
     if ref is not None and ref.leader_address is not None:
         candidate, source = ref.leader_address, SOURCE_MANIFEST

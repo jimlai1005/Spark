@@ -101,6 +101,8 @@ from spark.filet.leader_resolve import (DEFAULT_EXCHANGE_DIR, SOURCE_CUSTOMER_SI
                                         LeaderResolution, LeaderResolutionError,
                                         LeaderRevokedError)
 from spark.filet.leaders import is_still_permitted, load_leaders
+from spark.filet.user_leaders import (load_user_leaders, merge_leaders,
+                                      user_leaders_path_for)
 
 logger = logging.getLogger(__name__)
 
@@ -482,12 +484,20 @@ class LeaderChangeApplier:
         （沿 leader_resolve 對同一件事的既有分類）。None 的呼叫端一律「不套用／
         沿用現狀」，不升級成收尾。
         """
-        if not self._leaders_path.exists():
+        # ⭐ 驗證來源＝精選白名單 ＋ user registry 的**合併清單**（2026-07-27 自訂
+        # leader 自動准入）：客戶合法准入的自訂 leader 若不在這裡被看見，簽了、
+        # 准入了，套用端卻永遠拒絕。合併優先序（精選一律優先，撤銷不可被繞過）
+        # 的單一定義在 user_leaders.merge_leaders；registry 路徑由白名單路徑推導
+        # （與 leader_resolve／API 共用同一份推導）。
+        user_path = Path(user_leaders_path_for(self._leaders_path))
+        if not self._leaders_path.exists() and not user_path.exists():
             return None
         try:
-            return load_leaders(self._leaders_path)
+            return merge_leaders(load_leaders(self._leaders_path),
+                                 load_user_leaders(user_path))
         except (OSError, ValueError) as e:
-            logger.warning("換 leader：白名單讀取失敗（%s）: %r", self._leaders_path, e)
+            logger.warning("換 leader：白名單讀取失敗（%s／%s）: %r",
+                           self._leaders_path, user_path, e)
             return None
 
     # ---------- 已兌現帳本 ----------

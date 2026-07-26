@@ -163,11 +163,15 @@ def test_second_change_replaces_the_first(tmp_path):
 
 
 def test_rejected_second_change_leaves_the_first_intact(tmp_path):
-    """被拒絕的請求不得動到已落地的記錄（拒絕 ≠ 清空意圖）。"""
+    """被拒絕的請求不得動到已落地的記錄（拒絕 ≠ 清空意圖）。
+
+    2026-07-27 起清單外位址走自訂准入：_UNLISTED 鏈上無活動（FakeHL 預設空帳戶）
+    → 404 not_found。
+    """
     c, cfg, store = _make(tmp_path)
     w = Account.create()
     assert _select(c, store, cfg, w, leader=_A)[0].status_code == 200
-    assert _select(c, store, cfg, w, leader=_UNLISTED)[0].status_code == 400
+    assert _select(c, store, cfg, w, leader=_UNLISTED)[0].status_code == 404
     entries = load_leader_changes(cfg.leader_changes_path)
     assert len(entries) == 1 and entries[0]["leader_address"] == _A
 
@@ -219,27 +223,38 @@ def test_disabled_leader_is_rejected(tmp_path):
     assert load_leader_changes(cfg.leader_changes_path) == []
 
 
-def test_leader_not_in_allowlist_is_rejected(tmp_path):
+def test_leader_not_in_allowlist_and_dead_on_chain_is_rejected(tmp_path):
+    """清單外位址自 2026-07-27 起改走自訂准入（不再一律拒絕）：鏈上無 perp 活動
+    （FakeHL 預設空帳戶）→ 404 not_found，記錄不落地。"""
     c, cfg, store = _make(tmp_path)
     r, _ = _select(c, store, cfg, Account.create(), leader=_UNLISTED)
-    assert r.status_code == 400
+    assert r.status_code == 404
+    assert r.json()["detail"]["reason"] == "not_found"
     assert load_leader_changes(cfg.leader_changes_path) == []
 
 
-def test_rejection_does_not_leak_governance_state(tmp_path):
-    """撤銷／下架／不在名單三種拒絕理由不得分辨——那是內部治理資訊
-    （沿 /api/leaders 不外流 enabled/accepting_new 的既有理由）。"""
+def test_rejection_does_not_distinguish_disabled_from_paused(tmp_path):
+    """撤銷（enabled=false）與例行下架（accepting_new=false）不得分辨——哪個
+    leader「出事了」是內部治理資訊。
+
+    ⚠️ 2026-07-27 自訂 leader spec 後的新契約（沿 test_api_leader_change_message
+    的同名測試）：非精選位址走准入檢查、拒絕帶機器可判 reason code（user story 10
+    明訂要告知「已被平台停用」）。不可分辨的邊界收窄為 disabled vs paused 這一對；
+    「不在清單且鏈上無活動」回 not_found，可與前者分辨。
+    """
     c, cfg, store = _make(tmp_path)
     w = Account.create()
-    details = set()
+    details = []
     for leader in (_B, _C, _UNLISTED):
         acct = _login(c, store, cfg, w)
         nonce = _fresh_nonce(c, w)
         r = c.post("/api/leaders/select",
                    json=_payload(account_id=acct, leader=leader, nonce=nonce,
                                  wallet=w))
-        details.add(r.json()["detail"])
-    assert len(details) == 1
+        details.append(r.json()["detail"])
+    assert details[0] == details[1]                      # disabled vs paused 同一份
+    assert details[0]["reason"] == "leader_disabled"
+    assert details[2]["reason"] == "not_found"
 
 
 def test_broken_allowlist_returns_503_not_a_silent_accept(tmp_path):

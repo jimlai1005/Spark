@@ -81,6 +81,10 @@ class FakeHL:
         # 預設 0＝沒有卡住的錢（多數測試不在意這條路徑）。
         self.spot_usdc: dict[str, Decimal] = {}
         self.spot_error: dict[str, Exception] = {}
+        # 自訂 leader 准入預覽用：per-address clearinghouseState ＋ 可注入失敗。
+        # 預設「空帳戶」（權益 0、無持倉）＝准入檢查的 not_found 那一側。
+        self.clearinghouse: dict[str, dict] = {}
+        self.clearinghouse_error: dict[str, Exception] = {}
         # 預設「塞什麼就回什麼」（多數測試不在意窗口）。收入對帳的窗口正確性測試
         # 需要真的依 [start, end] 過濾——設 True 打開，否則「窗口取錯」在 fake 上
         # 看不出來（正是 opus 對抗審查 Critical 能潛伏的原因）。
@@ -106,6 +110,14 @@ class FakeHL:
         if err is not None:
             raise err
         return self.spot_usdc.get(address.lower(), Decimal("0"))
+
+    def clearinghouse_state(self, address: str) -> dict:
+        err = self.clearinghouse_error.get(address.lower())
+        if err is not None:
+            raise err
+        return self.clearinghouse.get(
+            address.lower(),
+            {"marginSummary": {"accountValue": "0.0"}, "assetPositions": []})
 
     def max_builder_fee(self, user: str, builder: str) -> int:
         return self.max_fees.get((user.lower(), builder.lower()), 0)

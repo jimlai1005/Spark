@@ -673,3 +673,55 @@ def test_dev_exchange_dir_constant_is_absolute_and_repo_anchored():
     assert p.is_absolute()
     assert p.name == "leader_changes.json" and p.parent.name == "filet"
     assert str(p.parent) == DEFAULT_EXCHANGE_DIR
+
+
+# ── ⭐ user registry 合併（用戶自訂 leader 自動准入，2026-07-27 spec） ──────
+
+_USER_LEADER = "0x" + "e5" * 20   # 只在 user registry、不在精選白名單
+
+
+def _user_registry(env, entries):
+    """user_leaders.json 落在 leaders.json 同目錄（user_leaders_path_for 的推導）。"""
+    p = env.tmp / "user_leaders.json"
+    p.write_text(json.dumps({"leaders": entries}))
+    return p
+
+
+def _user_entry(address, **over):
+    base = {"address": address, "name": address, "source": "user",
+            "added_by": "f" + "aa" * 20}
+    base.update(over)
+    return base
+
+
+def test_change_to_a_user_registry_leader_is_applied(env):
+    """⭐ 自訂 leader（只在 user registry）的簽章變更 → 套用。這是自訂 leader
+    end-to-end 的引擎端最後一哩：API 准入＋落記錄之後，引擎的套用閘門看的是
+    合併後清單，否則客戶簽了、准入了，引擎卻永遠拒絕套用。"""
+    _user_registry(env, [_user_entry(_USER_LEADER)])
+    env.write_change(leader=_USER_LEADER)
+    res = env.applier().effective(_BASE)
+    assert res == LeaderResolution(_USER_LEADER, SOURCE_CUSTOMER_SIGNED)
+
+
+def test_curated_revocation_beats_user_registry_at_apply_time(env):
+    """⭐ 精選白名單 enabled=false 優先於 user registry 的同位址條目——套用端
+    也不能讓自訂路徑繞過撤銷 → 不套用、沿用 base。"""
+    env.set_allowlist([{"address": _OLD_LEADER, "name": "Alpha"},
+                       {"address": _NEW_LEADER, "name": "Delta",
+                        "enabled": False}])
+    _user_registry(env, [_user_entry(_NEW_LEADER)])
+    env.write_change(leader=_NEW_LEADER)
+    assert env.applier().effective(_BASE) == _BASE
+
+
+def test_applied_user_leader_is_revoked_by_registry_killswitch(env):
+    """已套用的自訂 leader 被 operator 在 registry 標成 enabled=false →
+    下一輪受控收尾（LeaderRevokedError），kill-switch 語義與精選 leader 一致。"""
+    registry = _user_registry(env, [_user_entry(_USER_LEADER)])
+    env.write_change(leader=_USER_LEADER)
+    assert env.applier().effective(_BASE).address == _USER_LEADER
+    registry.write_text(json.dumps(
+        {"leaders": [_user_entry(_USER_LEADER, enabled=False)]}))
+    with pytest.raises(LeaderRevokedError):
+        env.applier().effective(_BASE)

@@ -450,3 +450,63 @@ def test_notifier_failure_during_wind_down_failure_is_still_contained():
     w = LeaderWatch(_A, _raise(LeaderRevokedError("撤銷")), _ExplodingNotifier(),
                     on_revoked=_raise(OSError("ARM 寫入失敗")))
     assert w.refresh() is None
+
+
+# ── ⭐ user registry 合併（用戶自訂 leader 自動准入，2026-07-27 spec） ──────
+
+def _user_registry(tmp_path, entries):
+    """user_leaders.json 落在 leaders.json 同目錄（user_leaders_path_for 的推導）。"""
+    p = tmp_path / "user_leaders.json"
+    p.write_text(json.dumps({"leaders": entries}))
+    return p
+
+
+def _user_entry(address, **over):
+    base = {"address": address, "name": address, "source": "user",
+            "added_by": "f" + "aa" * 20}
+    base.update(over)
+    return base
+
+
+def test_manifest_leader_in_user_registry_only_is_permitted(tmp_path):
+    """⭐ 合法准入的自訂 leader 不會在引擎層被拒：manifest 指定的 leader 只在
+    user registry（不在精選白名單）→ 解析通過（is_still_permitted 的驗證來源
+    是合併後清單，語義不變、仍只看 enabled）。"""
+    _user_registry(tmp_path, [_user_entry(_LEADER)])
+    res = _resolve(tmp_path,
+                   manifest=_manifest(tmp_path, leader=_LEADER),
+                   leaders=_leaders(tmp_path, [{"address": _OTHER, "name": "Alpha"}]))
+    assert res == LeaderResolution(_LEADER, SOURCE_MANIFEST)
+
+
+def test_curated_revocation_beats_user_registry_entry(tmp_path):
+    """⭐ 精選白名單 enabled=false（安全撤銷）優先於 user registry 的 enabled=true
+    同位址條目——自訂路徑不能成為繞過撤銷的後門 → 引擎收尾（LeaderRevokedError）。"""
+    _user_registry(tmp_path, [_user_entry(_LEADER)])
+    with pytest.raises(LeaderRevokedError):
+        _resolve(tmp_path,
+                 manifest=_manifest(tmp_path, leader=_LEADER),
+                 leaders=_leaders(tmp_path, [{"address": _LEADER, "name": "Bad",
+                                              "enabled": False}]))
+
+
+def test_user_registry_killswitch_revokes_a_user_leader(tmp_path):
+    """operator 對 user-sourced 條目保有同等 kill-switch：registry 內 enabled=false
+    → 引擎收尾，語義與精選白名單的撤銷完全一致。"""
+    _user_registry(tmp_path, [_user_entry(_LEADER, enabled=False)])
+    with pytest.raises(LeaderRevokedError):
+        _resolve(tmp_path,
+                 manifest=_manifest(tmp_path, leader=_LEADER),
+                 leaders=_leaders(tmp_path, [{"address": _OTHER, "name": "Alpha"}]))
+
+
+def test_corrupt_user_registry_is_transient_not_a_revocation(tmp_path):
+    """⭐ registry 壞掉＝讀不到白名單（transient）→ LeaderResolutionError，
+    **不得**升級成 LeaderRevokedError：把 IO 打嗝誤判成撤銷，代價是拿真實的
+    平倉成本回應一次檔案損毀（沿 leader_resolve 既有的失敗分類）。"""
+    (tmp_path / "user_leaders.json").write_text("{ not json")
+    with pytest.raises(LeaderResolutionError) as ei:
+        _resolve(tmp_path,
+                 manifest=_manifest(tmp_path, leader=_LEADER),
+                 leaders=_leaders(tmp_path, [{"address": _LEADER, "name": "Alpha"}]))
+    assert not isinstance(ei.value, LeaderRevokedError)

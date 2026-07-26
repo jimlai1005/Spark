@@ -166,12 +166,22 @@ def test_unselectable_leader_gets_no_message(tmp_path, leader):
     assert "message" not in r.json()
 
 
-def test_rejection_does_not_leak_governance_state(tmp_path):
-    """三種拒絕理由不得分辨（撤銷 vs 下架 vs 不在名單是內部治理資訊）。"""
+def test_rejection_does_not_distinguish_disabled_from_paused(tmp_path):
+    """撤銷（enabled=false）與例行下架（accepting_new=false）不得分辨——哪個 leader
+    「出事了」是內部治理資訊。
+
+    ⚠️ 2026-07-27 自訂 leader spec 後的新契約：非精選位址改走准入檢查，拒絕帶
+    **機器可判的 reason code**（user story 10 明訂要告知「已被平台停用」）。
+    所以「已列但不可選」（leader_disabled）與「不在清單且鏈上無活動」（not_found）
+    **可以**分辨；不可分辨的邊界收窄為 disabled vs paused 這一對。
+    """
     c, _, _ = _make(tmp_path)
     _login(c, Account.create())
-    details = {_ask(c, leader=x).json()["detail"] for x in (_B, _C, _UNLISTED)}
-    assert len(details) == 1
+    rb, rc = _ask(c, leader=_B).json(), _ask(c, leader=_C).json()
+    assert rb["detail"]["reason"] == rc["detail"]["reason"] == "leader_disabled"
+    assert rb["detail"] == rc["detail"]          # 訊息文字也不得分辨
+    r_unlisted = _ask(c, leader=_UNLISTED).json()
+    assert r_unlisted["detail"]["reason"] == "not_found"
 
 
 def test_malformed_leader_address_is_4xx_not_500(tmp_path):
