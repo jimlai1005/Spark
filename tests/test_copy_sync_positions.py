@@ -387,3 +387,92 @@ def test_mixed_sync_multiple_coins():
     assert res["adjusted"] == []
     assert res["flattened"] == [{"coin": "SOL", "side": "short", "size": Decimal("3")}]
     assert ("close_reduce_only", "SOL", True, Decimal("3")) in ex.records
+
+
+# ── 校正腿最小名目 gate（2026-07-28 主網事故回歸）────────────────────
+def test_decrease_below_min_notional_gated_with_warn():
+    # 我 0.1 → 目標 0.096：diff 0.004（4% > 2% 容忍）；
+    # 名目 0.004×2000×0.95 = $7.6 < $10 → 不送單、記 skipped、發 dedup 告警
+    leader = {"ETH": _pos(szi="0.96")}
+    mine = {"ETH": _pos(szi="0.1")}
+    ex, notifier, res = _sync(leader, mine, scale="0.1")
+
+    assert ex.records == []  # 連 close_reduce_only 都不該被呼叫
+    assert res["skipped"] == [{"coin": "ETH", "reason": "min_notional_adjust"}]
+    assert res["adjusted"] == [] and res["failed"] == []
+    warns = _warns(notifier)
+    assert len(warns) == 1
+    assert warns[0][3] == "min_ntl_adjust:ETH"  # dedup_key
+    assert "低於最小單" in warns[0][2]
+
+
+def test_increase_below_min_notional_gated_no_leverage_call():
+    # 我 0.1 → 目標 0.104：diff +0.004（4%）名目 $7.6 < $10 → gate 在
+    # update_leverage 之前，零交易所呼叫
+    leader = {"ETH": _pos(szi="1.04")}
+    mine = {"ETH": _pos(szi="0.1")}
+    ex, notifier, res = _sync(leader, mine, scale="0.1")
+
+    assert ex.records == []
+    assert res["skipped"] == [{"coin": "ETH", "reason": "min_notional_adjust"}]
+    assert _warns(notifier)[0][3] == "min_ntl_adjust:ETH"
+
+
+def test_decrease_at_or_above_min_notional_still_executes():
+    # 名目門檻邊界的另一側：diff 0.02 × 2000 × 0.95 = $38 ≥ $10 → 照常減倉
+    leader = {"ETH": _pos(szi="0.8")}
+    mine = {"ETH": _pos(szi="0.1")}
+    ex, _, res = _sync(leader, mine, scale="0.1")
+
+    assert _ops(ex) == ["close_reduce_only"]
+    assert res["adjusted"][0]["kind"] == "decrease"
+
+
+def test_flatten_below_min_notional_still_closes_full():
+    # ⭐ 全平豁免（主網實測：$5 全平成交、$5 部分減倉被拒）：
+    # leader 已平、我持 0.004 ETH（$8 < $10）→ 仍必須送全平單
+    mine = {"ETH": _pos(szi="0.004")}
+    ex, notifier, res = _sync({}, mine)
+
+    assert _ops(ex) == ["close_reduce_only"]
+    assert ex.records[0] == ("close_reduce_only", "ETH", False, Decimal("0.004"))
+    assert res["flattened"] == [{"coin": "ETH", "side": "long",
+                                 "size": Decimal("0.004")}]
+
+
+def test_flip_close_below_min_notional_still_closes_full():
+    # ⭐ 反轉的全平腿同樣豁免：我多 0.004（$8），leader 反向 → 先全平再反向開
+    leader = {"ETH": _pos(szi="-8")}
+    mine = {"ETH": _pos(szi="0.004")}
+    ex, _, res = _sync(leader, mine, scale="0.1")
+
+    ops = _ops(ex)
+    assert ops[0] == "close_reduce_only"  # 全平腿照送，未被 gate
+    assert ex.records[0] == ("close_reduce_only", "ETH", False, Decimal("0.004"))
+
+
+class _RejectingExecutor(FakeExecutor):
+    """回傳 HL 形狀拒單 raw 的假件——驗證拒因接線。"""
+
+    def close_reduce_only(self, coin, is_buy, size):
+        self.records.append(("close_reduce_only", coin, is_buy, size))
+        return OrderResult(
+            ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"),
+            raw={"status": "ok", "response": {"data": {"statuses": [
+                {"error": "Order must have minimum value of $10."}]}}},
+        )
+
+
+def test_close_failure_warn_includes_exchange_reason_and_notional():
+    # 拒因接線（2026-07-27 事故：原版丟棄 raw，排查只能查交易所 API）
+    ex = _RejectingExecutor()
+    notifier = RecordingNotifier()
+    sync_positions(
+        ex, {}, {"ETH": _pos(szi="1.0")}, Decimal("0.1"),
+        settings=CopySettings(), notifier=notifier, protected=set(),
+        size_decimals=lambda coin: 4, mids={"ETH": Decimal("2000")},
+    )
+    warns = _warns(notifier)
+    assert len(warns) == 1
+    assert "Order must have minimum value of $10." in warns[0][2]
+    assert "名目≈$2000.00" in warns[0][2]
