@@ -629,8 +629,10 @@ def test_fills_query_uses_rolling_window_bounds(tmp_path):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _order(coin="ETH", *, reduce_only=False, oid=1) -> OpenOrder:
-    return OpenOrder(oid=oid, coin=coin, is_buy=True, limit_px=Decimal("2000"),
+def _order(coin="ETH", *, reduce_only=False, oid=1, is_buy=True) -> OpenOrder:
+    # ro 單請配 is_buy=False（方向正確：賣單減多倉 _pos szi=1）。2026-07-28 起
+    # 方向不符的 ro 比照無部位跳過（交易所會修剪到 0），見 test_copy_orders_ro_cap.py。
+    return OpenOrder(oid=oid, coin=coin, is_buy=is_buy, limit_px=Decimal("2000"),
                      sz=Decimal("1"), reduce_only=reduce_only, is_trigger=False,
                      trigger_px=None, tpsl=None)
 
@@ -653,7 +655,8 @@ def test_d5_gated_orders_block_entries_but_pass_reduce_only():
     **絕不把客戶困在部位裡**——熔斷期間 leader 的平倉/止損掛單必須照常複製。
     """
     desired, skipped = _desired(
-        [_order(reduce_only=False, oid=1), _order(reduce_only=True, oid=2)],
+        [_order(reduce_only=False, oid=1),
+         _order(reduce_only=True, oid=2, is_buy=False)],
         no_new_exposure=True)
 
     assert [d.reduce_only for d in desired] == [True], "只有 reduce-only 應通過"
@@ -662,7 +665,8 @@ def test_d5_gated_orders_block_entries_but_pass_reduce_only():
 
 def test_d5_ungated_orders_pass_both():
     desired, skipped = _desired(
-        [_order(reduce_only=False, oid=1), _order(reduce_only=True, oid=2)],
+        [_order(reduce_only=False, oid=1),
+         _order(reduce_only=True, oid=2, is_buy=False)],
         no_new_exposure=False)
     assert len(desired) == 2 and skipped == []
 
@@ -847,7 +851,8 @@ def test_engine_gated_blocks_entry_orders(tmp_path):
 
 def test_engine_gated_still_places_reduce_only_orders(tmp_path):
     """⭐ 引擎層 D5：熔斷中，leader 的 reduce-only（平倉/止損）掛單照常複製。"""
-    report, _n, _ex = _run(_gated_adapter([_order(reduce_only=True)]), tmp_path)
+    report, _n, _ex = _run(_gated_adapter([_order(reduce_only=True, is_buy=False)]),
+                           tmp_path)
     assert report.reconcile.placed == 1, "reduce-only 一律放行——絕不把客戶困在部位裡"
 
 

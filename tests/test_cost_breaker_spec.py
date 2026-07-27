@@ -88,8 +88,9 @@ def _pos(coin="ETH", szi="1", entry_px="2000") -> Position:
                     is_cross=True, unrealized_pnl=Decimal("0"), margin_used=Decimal("0"))
 
 
-def _order(coin="ETH", *, reduce_only=False, oid=1, sz="1", px="2000") -> OpenOrder:
-    return OpenOrder(oid=oid, coin=coin, is_buy=True, limit_px=Decimal(px),
+def _order(coin="ETH", *, reduce_only=False, oid=1, sz="1", px="2000",
+           is_buy=True) -> OpenOrder:
+    return OpenOrder(oid=oid, coin=coin, is_buy=is_buy, limit_px=Decimal(px),
                      sz=Decimal(sz), reduce_only=reduce_only, is_trigger=False,
                      trigger_px=None, tpsl=None)
 
@@ -824,8 +825,10 @@ def test_run_cycle_with_disabled_breaker_leaves_gates_open(tmp_path, monkeypatch
 
 
 def test_reduce_only_order_passes_the_gate():
+    # is_buy=False：方向正確的 ro（賣單減多倉）。2026-07-28 起方向不符的 ro
+    # 比照無部位跳過（交易所會修剪到 0），本測試只驗 D5 閘門放行。
     desired, skipped = _build_desired(
-        [_order("ETH", reduce_only=True)], Decimal("1"),
+        [_order("ETH", reduce_only=True, is_buy=False)], Decimal("1"),
         min_notional=Decimal("10"), size_decimals=lambda c: 4,
         my_positions={"ETH": _pos("ETH")}, protected=set(), no_new_exposure=True)
     assert [o.coin for o in desired] == ["ETH"], "reduce-only 掛單必須照常掛（D5 硬規則）"

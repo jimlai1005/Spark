@@ -22,7 +22,7 @@ from spark.copytrade.orders import (
 )
 from spark.exchange.base import OpenOrder, OrderResult, Position
 
-SETTINGS = CopySettings()  # px_rel_tol=1e-4, size_tolerance=0.02, settle_seconds=2, ttl=120
+SETTINGS = CopySettings()  # px_rel_tol=1e-4, size_tolerance=0.08, settle_seconds=2, ttl=120
 
 
 # ── 測試替身 ─────────────────────────────────────────────────────────
@@ -50,6 +50,9 @@ class FakeExecutor:
             raise self._place_exc
         self.records.append(("place", spec))
         return self._place_ok
+
+    def place_with_reason(self, spec) -> tuple[bool, str]:
+        return self.place(spec), ""
 
     def modify(self, oid, spec) -> bool:
         self.records.append(("modify", oid, spec))

@@ -14,6 +14,11 @@ from spark.copytrade.notifier import RecordingNotifier
 from spark.copytrade.positions import sync_positions
 from spark.exchange.base import OrderResult, Position
 
+# 2026-07-28：CopySettings 預設 size_tolerance 已從 0.02 改為 0.08（見 config.py）。
+# 圍繞 2% 邊界設計的案例（落在 2%~8% 區間、換預設值會翻轉預期）改用本常數
+# 顯式釘住容忍度，保持原測試意圖不變。
+SETTINGS_TOL_2PCT = CopySettings(size_tolerance=Decimal("0.02"))
+
 
 class FakeExecutor:
     """記錄所有呼叫；fail_ops 內的操作回傳失敗（ok=False / False）。"""
@@ -25,6 +30,9 @@ class FakeExecutor:
     def place(self, spec) -> bool:
         self.records.append(("place", spec))
         return "place" not in self.fail_ops
+
+    def place_with_reason(self, spec) -> tuple[bool, str]:
+        return self.place(spec), ""
 
     def modify(self, oid: int, spec) -> bool:
         self.records.append(("modify", oid, spec))
@@ -151,7 +159,7 @@ def test_open_below_min_notional_skipped_silently():
 
 # ── 3. 同向加倉/減倉/容忍帶 ─────────────────────────────────────────
 def test_same_side_increase_opens_diff():
-    # 我 1.0 → 目標 1.5：diff/my = 50% > 2% → market_open 買入差額 0.5
+    # 我 1.0 → 目標 1.5：diff/my = 50% > 8%（預設容忍）→ market_open 買入差額 0.5
     leader = {"ETH": _pos(szi="15", leverage=7)}
     mine = {"ETH": _pos(szi="1.0")}
     ex, _, res = _sync(leader, mine)
@@ -177,7 +185,7 @@ def test_same_side_decrease_closes_diff_reduce_only():
 
 
 def test_within_tolerance_no_action():
-    # 我 1.0 → 目標 1.01：1% ≤ 2% 容忍 → 零動作
+    # 我 1.0 → 目標 1.01：1% ≤ 8% 容忍（預設；在舊預設 2% 內亦成立）→ 零動作
     leader = {"ETH": _pos(szi="10.1")}
     mine = {"ETH": _pos(szi="1.0")}
     ex, notifier, res = _sync(leader, mine)
@@ -189,9 +197,10 @@ def test_within_tolerance_no_action():
 def test_relative_diff_denominator_is_my_size():
     # hl sync.py:125：分母是 my_size。目標 0.9803、我 1.0 → 1.97% < 2% → 零動作。
     # 若分母誤用 target_size：0.0197/0.9803 = 2.01% > 2% 會誤觸發。
+    # 邊界圍繞 2% 設計 → 釘住 tolerance=0.02（預設 8% 下兩種分母都不會觸發，測不出誤用）。
     leader = {"ETH": _pos(szi="9.803")}
     mine = {"ETH": _pos(szi="1.0")}
-    ex, _, res = _sync(leader, mine)
+    ex, _, res = _sync(leader, mine, settings=SETTINGS_TOL_2PCT)
     assert ex.records == []
     assert res["adjusted"] == []
 
@@ -391,11 +400,12 @@ def test_mixed_sync_multiple_coins():
 
 # ── 校正腿最小名目 gate（2026-07-28 主網事故回歸）────────────────────
 def test_decrease_below_min_notional_gated_with_warn():
-    # 我 0.1 → 目標 0.096：diff 0.004（4% > 2% 容忍）；
+    # 我 0.1 → 目標 0.096：diff 0.004（4% > 2% 容忍；釘住 0.02——4% 落在新預設 8% 內，
+    # 不釘住就走不到 min-notional gate）；
     # 名目 0.004×2000×0.95 = $7.6 < $10 → 不送單、記 skipped、發 dedup 告警
     leader = {"ETH": _pos(szi="0.96")}
     mine = {"ETH": _pos(szi="0.1")}
-    ex, notifier, res = _sync(leader, mine, scale="0.1")
+    ex, notifier, res = _sync(leader, mine, scale="0.1", settings=SETTINGS_TOL_2PCT)
 
     assert ex.records == []  # 連 close_reduce_only 都不該被呼叫
     assert res["skipped"] == [{"coin": "ETH", "reason": "min_notional_adjust"}]
@@ -407,11 +417,11 @@ def test_decrease_below_min_notional_gated_with_warn():
 
 
 def test_increase_below_min_notional_gated_no_leverage_call():
-    # 我 0.1 → 目標 0.104：diff +0.004（4%）名目 $7.6 < $10 → gate 在
-    # update_leverage 之前，零交易所呼叫
+    # 我 0.1 → 目標 0.104：diff +0.004（4% > 2%，釘住 0.02，同上）名目 $7.6 < $10
+    # → gate 在 update_leverage 之前，零交易所呼叫
     leader = {"ETH": _pos(szi="1.04")}
     mine = {"ETH": _pos(szi="0.1")}
-    ex, notifier, res = _sync(leader, mine, scale="0.1")
+    ex, notifier, res = _sync(leader, mine, scale="0.1", settings=SETTINGS_TOL_2PCT)
 
     assert ex.records == []
     assert res["skipped"] == [{"coin": "ETH", "reason": "min_notional_adjust"}]

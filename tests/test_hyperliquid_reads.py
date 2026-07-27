@@ -81,6 +81,32 @@ def test_get_open_orders_maps_limit_order():
     assert o.tif == "Gtc"
 
 
+def test_get_open_orders_parses_orig_sz_decimal():
+    # 2026-07-28 事故修法：CRIT extra 側要能顯示「原量」，才看得出 ro 單被交易所
+    # 修剪（sz=剩餘量、origSz=下單原量）。
+    orders_raw = [{
+        "coin": "ETH", "oid": 500, "side": "A", "limitPx": "2000", "sz": "0.0289",
+        "reduceOnly": True, "isTrigger": False, "orderType": "Limit",
+        "triggerPx": "0.0", "tif": "Gtc", "timestamp": 1750000005000,
+        "origSz": "0.0457",
+    }]
+    ad = _adapter(frontend_orders=orders_raw)
+    o = ad.get_open_orders("0xuser")[0]
+    assert o.orig_sz == Decimal("0.0457")
+    assert isinstance(o.orig_sz, Decimal)
+
+
+def test_get_open_orders_missing_orig_sz_maps_none():
+    orders_raw = [{
+        "coin": "ETH", "oid": 501, "side": "B", "limitPx": "1900", "sz": "1.0",
+        "reduceOnly": False, "isTrigger": False, "orderType": "Limit",
+        "triggerPx": "0.0", "tif": "Gtc", "timestamp": 1750000006000,
+        # origSz 缺鍵 → None（不得假造 0 或抄 sz）
+    }]
+    ad = _adapter(frontend_orders=orders_raw)
+    assert ad.get_open_orders("0xuser")[0].orig_sz is None
+
+
 def test_get_open_orders_alo_tif_passes_through():
     # maker 單（Alo = add liquidity only）的 tif 必須原樣傳遞，不得被壓成 Gtc——
     # 否則鏡射會把 leader 的 post-only 單變成可吃單的 Gtc 單。

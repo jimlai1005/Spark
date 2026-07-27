@@ -27,6 +27,8 @@ docstring。
     看到這個原因，見 Task 7 spec）。size<=0 或 px<=0 的邊界情形則維持 hl 的靜默跳過
     （無 SkippedOrder 記錄），因為 hl 這裡本來就沒有分類原因可記。
 """
+import hashlib
+import html
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
@@ -59,7 +61,8 @@ class SkippedOrder:
 
     coin: str
     notional: Decimal
-    reason: str  # ∈ {"small", "spot", "protected", "reduce_only_no_pos", "cost_breaker"}
+    reason: str  # ∈ {"small", "spot", "protected", "reduce_only_no_pos",
+    #                 "cost_breaker", "ro_capped_out"}
 
 
 @dataclass(frozen=True)
@@ -234,11 +237,50 @@ def _build_desired(
          記 SkippedOrder(reason="protected")。
       3. reduce-only 且我方無對應部位（G4：交易所會拒絕這種單）→
          記 SkippedOrder(reason="reduce_only_no_pos")（hl 原本靜默跳過，見模組 docstring）。
+      3.5 reduce-only 非 trigger 且方向與部位不符（ro 賣需多倉、ro 買需空倉）→
+         同樣記 reduce_only_no_pos（交易所會把這種單修剪到 0，語意等同無部位）。
       4. 縮放捨入後 size<=0 或 px<=0 → 靜默跳過（hl 同樣不記錄，無分類原因）。
       5. 縮放後名目值 < min_notional → 記 SkippedOrder(reason="small")，含正確 notional。
+
+    ⭐ reduce-only 每幣累計封頂（spark 新增，非 hl；2026-07-28 00:33 CRIT 事故修法）：
+    Hyperliquid 會把 ro 掛單修剪到「每幣 ro 總量 ≤ 目前部位」（實測：部位 0.0289 時
+    ro 賣單 0.0457 被剪到 0.0289；部位 0.0918 時兩張 0.0456+0.0461=0.0917 全額存活
+    ——累計封頂，非逐單）。desired 若不做同樣封頂，`_verify_diff` 會把同一張單同時
+    判進「缺少」與「多餘」→ 重試 cancel+place 也被同樣修剪 → 誤發 CRIT。
+    修法（工程原則 1 同源同基準——desired 與實際單都以 follower 部位為約束）：
+      - 對每幣的非 trigger ro 期望單，依「越接近成交越優先」分配容量 |部位|：
+        減多倉（賣）價低者先、減空倉（買）價高者先；同價位以原始順序 tie-break
+        （sorted 穩定排序），確保逐輪分配確定性、不產生 modify churn。
+        ⚠️ 多張同時超額時交易所實際的修剪**順序**是推論、未實測——實測證據只
+        涵蓋「單張被剪到部位量」與「未超額全存活」兩種形狀；「接近成交優先」
+        是對交易所行為的合理假設，若日後實測相反，只需改此處排序方向。
+      - `capped_sz = min(rounded_sz, 剩餘容量)`（只縮不放大），容量歸零後的單略過。
+      - 順序是先封頂、再過 min_notional：被封頂成小額的「部分減倉」單交易所照拒
+        （$10 豁免只適用全平），必須用封頂後的名目過濾。
+      - trigger ro（止盈止損）不參與封頂也不消耗容量：修剪實測證據只涵蓋掛在簿上
+        的 ro 限價單；trigger 未觸發前不佔簿，若對其封頂而交易所不剪，反而製造
+        永久 mismatch → churn。
     """
-    desired: list[OrderSpec] = []
+    # entries 以 None 佔位保留原始順序；ro 封頂候選延後統一分配容量。
+    entries: list[OrderSpec | None] = []
     skipped: list[SkippedOrder] = []
+    # coin -> [(entries 索引, 縮放捨入後 sz, 參考價, sz_dec, 原掛單)]
+    ro_pending: dict[str, list[tuple[int, Decimal, Decimal, int, OpenOrder]]] = defaultdict(list)
+
+    def _spec_of(o: OpenOrder, size: Decimal) -> OrderSpec:
+        return OrderSpec(
+            coin=o.coin,
+            is_buy=o.is_buy,
+            sz=size,
+            limit_px=o.limit_px,
+            reduce_only=o.reduce_only,
+            is_trigger=o.is_trigger,
+            tpsl=o.tpsl,
+            trigger_px=o.trigger_px,
+            is_market=o.is_market,  # 1:1 hl orders.py:123——取 leader 掛單實際值
+            tif=o.tif,              # 1:1 hl orders.py:124
+        )
+
     for o in leader_orders:
         coin = o.coin
         if _is_spot_coin(coin):
@@ -262,25 +304,46 @@ def _build_desired(
         px = o.limit_px or o.trigger_px or Decimal("0")
         if size <= 0 or px <= 0:
             continue
+        if o.reduce_only and not o.is_trigger:
+            szi = my_positions[coin].szi
+            direction_ok = (szi < 0) if o.is_buy else (szi > 0)
+            if not direction_ok:
+                # ro 賣配空倉／ro 買配多倉：交易所會修剪到 0，語意等同無部位
+                skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
+                                            reason="reduce_only_no_pos"))
+                continue
+            ro_pending[coin].append((len(entries), size, px, sz_dec, o))
+            entries.append(None)  # 佔位，容量分配後回填
+            continue
         notional = size * px
         if notional < min_notional:
             skipped.append(SkippedOrder(coin=coin, notional=notional, reason="small"))
             continue
-        desired.append(
-            OrderSpec(
-                coin=coin,
-                is_buy=o.is_buy,
-                sz=size,
-                limit_px=o.limit_px,
-                reduce_only=o.reduce_only,
-                is_trigger=o.is_trigger,
-                tpsl=o.tpsl,
-                trigger_px=o.trigger_px,
-                is_market=o.is_market,  # 1:1 hl orders.py:123——取 leader 掛單實際值
-                tif=o.tif,              # 1:1 hl orders.py:124
-            )
-        )
-    return desired, skipped
+        entries.append(_spec_of(o, size))
+
+    # ── reduce-only 每幣累計封頂（僅非 trigger；方向檢查保證同幣候選同方向）──
+    for coin, cands in ro_pending.items():
+        remaining = abs(my_positions[coin].szi)
+        is_buy = cands[0][4].is_buy
+        # 越接近成交越優先：減多倉（賣）價低者先；減空倉（買）價高者先。
+        for idx, size, px, sz_dec, o in sorted(cands, key=lambda c: c[2], reverse=is_buy):
+            capped = min(size, _round_size(remaining, sz_dec))  # 只縮不放大
+            if capped <= 0:
+                # 容量歸零 → 略過，但記錄不靜默（2026-07-28 審查 F4）
+                skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
+                                            reason="ro_capped_out"))
+                continue
+            notional = capped * px
+            if notional < min_notional:
+                # 先封頂、再過名目：封頂後的小額部分減倉單交易所照拒。
+                # 被濾掉的單**不扣容量**（2026-07-28 審查 F1）：它不會被送到
+                # 交易所，交易所端容量完整——先扣會把同幣後續的保護性減倉單無故改小。
+                skipped.append(SkippedOrder(coin=coin, notional=notional, reason="small"))
+                continue
+            remaining -= capped  # 只有真的納入 desired 的單才消耗容量
+            entries[idx] = _spec_of(o, capped)
+
+    return [e for e in entries if e is not None], skipped
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -377,14 +440,94 @@ def _verify_diff(
     return missing, extra
 
 
+# CRIT 訊息上限（2026-07-28 審查 F2）：Telegram sendMessage 超過 4096 字元回 400，
+# notifier 吞掉 False → 最需要告警的場景（整本掛單全 missing）整則 CRIT 靜默消失。
+# 逐類（missing/extra/補單失敗）最多列 _CRIT_MAX_ITEMS 張、其餘「另 M 張」摘要；
+# 全文再保險截斷到 _CRIT_MAX_LEN（留餘裕給 notifier 的前綴與抑制次數後綴）。
+_CRIT_MAX_ITEMS = 5
+_CRIT_MAX_LEN = 3500
+
+
 def _fmt_missing(missing: list[OrderSpec]) -> str:
     return ", ".join(
-        f"{d.coin} {'B' if d.is_buy else 'S'} {d.sz}@{_ref_px(d)}" for d in missing
+        f"{d.coin} {'B' if d.is_buy else 'S'} {d.sz}@{_ref_px(d)}"
+        + (" [ro]" if d.reduce_only else "")
+        for d in missing
     )
 
 
 def _fmt_extra(extra: list[OpenOrder]) -> str:
-    return ", ".join(f"oid={m.oid} {m.coin}" for m in extra)
+    """extra 側逐單：oid 幣 方向 剩餘量@價 [ro] 原量X。
+
+    2026-07-28 事故教訓：原版只印 oid——使用者拿著 CRIT 完全無法判斷那張單是什麼。
+    剩餘量（sz）與原量（origSz）的差正是「被交易所修剪」的觀測點。"""
+    parts = []
+    for m in extra:
+        px = m.trigger_px if m.is_trigger else m.limit_px
+        s = f"oid={m.oid} {m.coin} {'B' if m.is_buy else 'S'} {m.sz}@{px}"
+        if m.reduce_only:
+            s += " [ro]"
+        if m.orig_sz is not None:
+            s += f" 原量{m.orig_sz}"
+        parts.append(s)
+    return ", ".join(parts)
+
+
+def _sync_fail_dedup_key(account: str, missing: list[OrderSpec],
+                         extra: list[OpenOrder]) -> str:
+    """order-sync CRIT 的去重鍵：同一持續狀態重複告警可被 notifier 去重，
+    內容變化時仍會發新告警。
+
+    刻意**不含 oid**（每輪重試 cancel+place 都會換新 oid，含 oid 等於永不去重），
+    也**不含 sz**（兩側皆然，2026-07-28 審查 F3）：missing 的 desired sz 隨
+    scale（leader 權益/weight）每輪微動、extra 的剩餘量隨部位微動——含 sz 會讓
+    同一持續狀態每輪產生新 key，dedup 失效變成告警轟炸。鍵只含 幣/方向/ro/價。"""
+    m_key = sorted(
+        (d.coin, d.is_buy, str(_ref_px(d)), d.reduce_only) for d in missing
+    )
+    e_key = sorted(
+        (o.coin, o.is_buy, str(o.trigger_px if o.is_trigger else o.limit_px),
+         o.reduce_only)
+        for o in extra
+    )
+    digest = hashlib.sha256(repr((account, m_key, e_key)).encode()).hexdigest()[:16]
+    return f"order_sync_failed:{digest}"
+
+
+def _diagnose_trimmed_coins(
+    missing: list[OrderSpec],
+    extra: list[OpenOrder],
+    my_positions: Mapping[str, Position],
+    *,
+    px_rel_tol: Decimal,
+    size_tol: Decimal,
+) -> list[str]:
+    """找出「ro 掛單被交易所修剪至部位上限（部位落後）」形狀的幣，供 CRIT 自動診斷。
+
+    判準（缺一不診斷，避免誤導）：missing 的 ro 單與 extra 的 ro 單以
+    （同幣、同方向、價格在 px_rel_tol 內）配對，extra 剩餘量 < missing 期望量；
+    且該幣 extra 側 ro 剩餘量合計與 |部位| 的相對差在 size_tol 內——
+    這是「每幣累計封頂到部位」的指紋（2026-07-28 實測行為）。"""
+    coins: list[str] = []
+    extra_ro = [o for o in extra if o.reduce_only and not o.is_trigger]
+    for coin in sorted({d.coin for d in missing if d.reduce_only and not d.is_trigger}):
+        pos = my_positions.get(coin)
+        if pos is None:
+            continue
+        paired = any(
+            o.coin == coin and o.is_buy == d.is_buy and o.sz < d.sz
+            and _prices_equal(_ref_px(d), o.limit_px, px_rel_tol)
+            for d in missing
+            if d.coin == coin and d.reduce_only and not d.is_trigger
+            for o in extra_ro
+        )
+        if not paired:
+            continue
+        abs_pos = abs(pos.szi)
+        total = sum((o.sz for o in extra_ro if o.coin == coin), Decimal("0"))
+        if abs(total - abs_pos) <= size_tol * max(abs_pos, Decimal("1e-8")):
+            coins.append(coin)
+    return coins
 
 
 def _reconcile_orders(
@@ -398,6 +541,7 @@ def _reconcile_orders(
     live: bool,
     clock=time.time,
     sleep_fn=time.sleep,
+    my_positions: Mapping[str, Position] | None = None,
 ) -> ReconcileResult:
     """掛單對帳狀態機。port 自 hl orders.py:196-274，影響/風險由小到大：
 
@@ -411,8 +555,11 @@ def _reconcile_orders(
       3. **先 cancel（降級舊單 + to_cancel，釋放保證金）後 place（to_place + 降級新規格）**
          ——順序是紅線（hl orders.py:228-243）。
       4. settle 驗證（僅 live）：sleep → 重抓 → 同容忍度算 missing/extra → 不符則
-         先撤 extra 再補 missing → 再 sleep+重抓再驗 → 仍不符 → sync_failed=True +
-         notifier.critical（工程原則 3：安全關鍵失敗大聲告警，絕不吞掉）。
+         先撤 extra 再補 missing（補單走 `place_with_reason`，拒因收集）→ 再
+         sleep+重抓再驗 → 仍不符 → sync_failed=True + notifier.critical
+         （工程原則 3：安全關鍵失敗大聲告警，絕不吞掉）。CRIT 內容為可自診斷格式
+         （逐單價量方向＋[ro]＋原量、部位行、補單拒因、trim 形狀自動診斷），
+         dedup_key 以內容雜湊（不含 oid）讓同一持續狀態被去重（2026-07-28 事故修法）。
 
     結構偏差（相對 hl，逐項）：
       - `trader.live_trading and my_address`（hl:247）→ 顯式 `live` 參數；
@@ -484,9 +631,13 @@ def _reconcile_orders(
             for m in extra:  # 先撤多（釋放保證金）
                 if ex.cancel(m.coin, m.oid):
                     cancelled += 1
-            for d in missing:  # 再補缺
-                if ex.place(d):
+            place_fails: list[tuple[OrderSpec, str]] = []
+            for d in missing:  # 再補缺；失敗不得靜默，拒因收集進 CRIT（工程原則 3）
+                ok, reason = ex.place_with_reason(d)
+                if ok:
                     placed += 1
+                else:
+                    place_fails.append((d, reason))
 
             sleep_fn(settings.settle_seconds)
             after = ex.get_open_orders()
@@ -495,10 +646,61 @@ def _reconcile_orders(
             )
             if missing or extra:
                 sync_failed = True
+                # ── CRIT 必須可自行診斷（2026-07-28 事故教訓）：逐單價量方向、
+                # 部位快照（本輪既有資料，不新增 API 呼叫）、補單拒因、自動診斷。
+                involved = sorted({d.coin for d in missing} | {o.coin for o in extra})
+                if my_positions is None:
+                    pos_line = "未提供部位快照"
+                else:
+                    pos_line = ", ".join(
+                        f"{c} {my_positions[c].szi}" if c in my_positions
+                        else f"{c} 無部位"
+                        for c in involved
+                    )
+                def _more(n_total: int) -> str:
+                    hidden = n_total - _CRIT_MAX_ITEMS
+                    return f"，另 {hidden} 張" if hidden > 0 else ""
+
+                lines = [
+                    f"掛單重試後仍不符：缺少 {len(missing)}"
+                    f"［{_fmt_missing(missing[:_CRIT_MAX_ITEMS])}{_more(len(missing))}］、"
+                    f"多餘 {len(extra)}"
+                    f"［{_fmt_extra(extra[:_CRIT_MAX_ITEMS])}{_more(len(extra))}］，"
+                    "需人工介入",
+                    f"部位：{pos_line}",
+                ]
+                if place_fails:
+                    # 拒因先 HTML escape：notifier 走 parse_mode=HTML，拒因含 '<'
+                    # 會讓整則 400 消失（2026-07-28 審查改善 c）
+                    lines.append("補單失敗：" + "；".join(
+                        f"{_fmt_missing([d])}："
+                        f"{html.escape(r, quote=False) or '交易所未回原因'}"
+                        for d, r in place_fails[:_CRIT_MAX_ITEMS]
+                    ) + _more(len(place_fails)))
+                trimmed = _diagnose_trimmed_coins(
+                    missing, extra, my_positions or {},
+                    px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance,
+                )
+                if trimmed:
+                    lines.append(
+                        f"診斷：{'、'.join(trimmed)} 的 reduce-only 掛單已被交易所"
+                        "修剪至部位上限（部位落後），屬暫態，通常下一輪自癒；"
+                        "下一輪仍告警才需人工介入"
+                    )
+                elif not place_fails:
+                    lines.append(
+                        "原因未能自動判定，排查：POST /info historicalOrders "
+                        "查被拒單與修剪"
+                    )
+                text = "\n".join(lines)
+                if len(text) > _CRIT_MAX_LEN:  # 保險截斷：寧可少講也要送得出去
+                    text = text[:_CRIT_MAX_LEN] + "…（已截斷）"
                 notifier.critical(
                     "orders",
-                    f"掛單重試後仍不符：缺少 {len(missing)}［{_fmt_missing(missing)}］、"
-                    f"多餘 {len(extra)}［{_fmt_extra(extra)}］，需人工介入",
+                    text,
+                    dedup_key=_sync_fail_dedup_key(
+                        getattr(ex, "my_address", ""), missing, extra
+                    ),
                 )
 
     return ReconcileResult(
@@ -610,6 +812,7 @@ def sync_open_orders(
         live=live,
         clock=clock,
         sleep_fn=sleep_fn,
+        my_positions=my_positions,  # CRIT 自診斷用（本輪快照，不新增 API 呼叫）
     )
     rec = replace(rec, skipped_small=small)
 

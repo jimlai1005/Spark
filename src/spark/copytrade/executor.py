@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from spark.copytrade.instrument import _extract_order_error
 from spark.exchange.base import BuilderCode, Order, OpenOrder, OrderResult, Signer
 
 if TYPE_CHECKING:
@@ -38,6 +39,13 @@ class ExecutorPort(Protocol):
 
     def place(self, spec: "OrderSpec") -> bool:  # noqa: F821
         """掛新單。spec 含幣種、方向、大小、價格等。回傳成功否。"""
+        ...
+
+    def place_with_reason(self, spec: "OrderSpec") -> tuple[bool, str]:  # noqa: F821
+        """掛新單並回傳 (成功否, 失敗原因)。成功或原因不可得時原因為空字串。
+
+        2026-07-28 事故修法（工程原則 3）：`_reconcile_orders` 的重試補單失敗
+        必須把交易所拒因帶進 CRIT 告警，不得只看 bool 就吞掉。"""
         ...
 
     def modify(self, oid: int, spec: "OrderSpec") -> bool:  # noqa: F821
@@ -185,20 +193,37 @@ class ActionExecutor:
 
     # ── 寫入（live gate）──────────────────────────────────────────────
     def place(self, spec: "OrderSpec") -> bool:
+        return self.place_with_reason(spec)[0]
+
+    def place_with_reason(self, spec: "OrderSpec") -> tuple[bool, str]:
+        """掛新單並帶回失敗原因（交易所拒因；成功為空字串）。
+
+        live gate 不變：live=False 走虛擬簿、零 adapter 寫入。拒因萃取比照
+        positions.py `_fail_detail` 的既有模式（`_extract_order_error` 解析
+        交易所回應；adapter 自製失敗讀 raw["error"]）。原因同時記入
+        ActionRecord payload（"error"），shadow 稽核可見。"""
         if spec.is_trigger:
-            return self._skip_trigger("place", spec)
+            self._skip_trigger("place", spec)
+            return False, "trigger 單 M1 尚不支援（adapter 無 trigger 下單）"
         payload = {"is_buy": spec.is_buy, "sz": str(spec.sz),
                    "limit_px": str(spec.limit_px), "reduce_only": spec.reduce_only,
                    "tif": spec.tif}
+        reason = ""
         if self.live:
-            ok = self._adapter.place_order(self._signer, self._order_from(spec),
-                                           self._builder).ok
+            res = self._adapter.place_order(self._signer, self._order_from(spec),
+                                            self._builder)
+            ok = res.ok
+            if not ok:
+                reason = _extract_order_error(res.raw) or (
+                    res.raw.get("error", "") if isinstance(res.raw, dict) else "")
         else:
             payload["oid"] = str(self._book.place(spec))
             ok = True
         payload["ok"] = ok
+        if reason:
+            payload["error"] = reason
         self._record("place", spec.coin, payload)
-        return ok
+        return ok, reason
 
     def modify(self, oid: int, spec: "OrderSpec") -> bool:
         if spec.is_trigger:

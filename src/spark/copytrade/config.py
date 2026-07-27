@@ -73,9 +73,9 @@ class CopySettings:
 
     分三類欄位：
     1. 刻意覆蓋（不讀 hl）：leader_address, live_trading, interval_s, modify_policy,
-       flatten_on_breach, allocated_capital, use_full_equity
+       flatten_on_breach, allocated_capital, use_full_equity, size_tolerance
     2. 照抄 hl 預設值：capital_utilization, position_weight, max_target_leverage,
-       min_order_notional, size_tolerance, max_drawdown_pct, settle_seconds,
+       min_order_notional, max_drawdown_pct, settle_seconds,
        modify_fail_ttl_s, max_consecutive_errors, volatility_weight_enabled,
        holding_protection_enabled
     3. 函式層預設（硬編）：px_rel_tol, slippage
@@ -113,7 +113,14 @@ class CopySettings:
     position_weight: Decimal = Decimal("1.0")  # hl POSITION_WEIGHT
     max_target_leverage: Decimal = Decimal("0")  # hl MAX_TARGET_LEVERAGE
     min_order_notional: Decimal = Decimal("10")  # hl MIN_ORDER_NOTIONAL
-    size_tolerance: Decimal = Decimal("0.02")  # hl SIZE_TOLERANCE
+    # 2026-07-28：預設偏離 hl 的 SIZE_TOLERANCE=0.02，改為 0.08（刻意覆蓋）。
+    # 原因：2% 會讓小錢包的殘量落在「容忍度外、又低於 $10 最小名目」的區間，
+    # 形成每輪重試的 min-notional 死循環；正式機以 COPY_SIZE_TOLERANCE=0.08
+    # 實跑驗證收斂。詳見
+    # docs/superpowers/research/2026-07-28-min-notional-dust-and-scale-drift.md
+    # ⚠️ 本值同時是 positions.py 部位校正的死區（size_diff_pct > tolerance 才校正，
+    # positions.py:273-274）——0.08 等於放寬校正死區到 8%；調整時兩處一起考慮。
+    size_tolerance: Decimal = Decimal("0.08")
     max_drawdown_pct: Decimal = Decimal("0.20")  # hl MAX_DRAWDOWN_PCT
     # ⚠️ **與成本熔斷器耦合（閘門排序的副產物，不是設計意圖）**：`loop.run_cycle` 把
     # 回撤判定排在成本判定**之前**（D8），所以本欄位實際上決定了「成本閘的分母最低

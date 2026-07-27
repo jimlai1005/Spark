@@ -1,6 +1,8 @@
-"""copytrade/orders.py 純函式層 characterization 測試。容忍度數字對齊 CopySettings 預設
-（px_rel_tol=1e-4、size_tolerance=0.02）。#8 的 reduce-only 案例 port 自 hl-copytrader
-tests/test_reduce_only_guard.py。"""
+"""copytrade/orders.py 純函式層 characterization 測試。容忍度以顯式參數傳入 `_plan`：
+px_rel_tol=1e-4 對齊 CopySettings 預設；SIZE_TOL 釘在 0.02（characterization 移植來源
+hl 的值——spark 預設自 2026-07-28 起為 0.08，見 config.py，但本檔的 size 邊界案例
+（1.5% vs 3%）是圍繞 0.02 設計的，釘住以保持測試意圖）。#8 的 reduce-only 案例
+port 自 hl-copytrader tests/test_reduce_only_guard.py。"""
 from decimal import Decimal
 
 from spark.copytrade.orders import (
@@ -290,8 +292,11 @@ def test_build_desired_protected_non_reduce_only_skipped():
 
 
 def test_build_desired_protected_reduce_only_kept():
-    """抗單保護只擋補倉，不擋減倉/止盈止損（reduce-only 仍放行）。"""
-    leader = [_open_order(coin="ETH", reduce_only=True, limit_px="2000", sz="1", oid=1)]
+    """抗單保護只擋補倉，不擋減倉/止盈止損（reduce-only 仍放行）。
+    2026-07-28：夾具改為方向正確的 ro（賣單減多倉）——方向不符的 ro 自當日起
+    比照無部位跳過（交易所會修剪到 0），見 test_copy_orders_ro_cap.py。"""
+    leader = [_open_order(coin="ETH", is_buy=False, reduce_only=True,
+                          limit_px="2000", sz="1", oid=1)]
     desired, skipped = _build_desired(
         leader, scale=Decimal("1"), min_notional=Decimal("10"),
         size_decimals=lambda coin: 4, my_positions={"ETH": _position("ETH")}, protected={"ETH"},

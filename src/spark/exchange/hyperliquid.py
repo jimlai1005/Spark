@@ -134,6 +134,8 @@ class HyperliquidAdapter(ExchangeAdapter):
                 is_market=("Market" in order_type_name) if is_trigger else False,
                 # 1:1 hl monitor.py:205——API tif 欄位，缺鍵/None → "Gtc"。
                 tif=o.get("tif") or "Gtc",
+                # 下單原量（sz 是剩餘量）；缺鍵 → None，不假造。
+                orig_sz=Decimal(str(o["origSz"])) if o.get("origSz") is not None else None,
             ))
         return orders
 

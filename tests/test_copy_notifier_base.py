@@ -94,6 +94,9 @@ class TestExecutorPortProtocol:
             def place(self, spec):
                 return True
 
+            def place_with_reason(self, spec):
+                return True, ""
+
             def modify(self, oid, spec):
                 return True
 

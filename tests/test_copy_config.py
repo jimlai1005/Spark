@@ -26,7 +26,8 @@ class TestCopySettingsDefaults:
         assert settings.position_weight == Decimal("1.0")
         assert settings.max_target_leverage == Decimal("0")
         assert settings.min_order_notional == Decimal("10")
-        assert settings.size_tolerance == Decimal("0.02")
+        # 2026-07-28 起刻意偏離 hl 的 0.02（min-notional 死循環，見 config.py）
+        assert settings.size_tolerance == Decimal("0.08")
         assert settings.max_drawdown_pct == Decimal("0.20")
         assert settings.settle_seconds == 2
         assert settings.modify_fail_ttl_s == 120
