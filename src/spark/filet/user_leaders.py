@@ -238,6 +238,20 @@ def record_user_leader(path: str | Path, *, address: str, added_by: str) -> bool
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(doc, f, ensure_ascii=False, indent=2)
+            # ⭐⭐ mkstemp 建檔是 **0600**（只有 owner 讀得到），但這個檔是**跨 user**
+            # 的：交換目錄 `/var/lib/filet-exchange` 是 `filet-api:filet-engine` 0750
+            # 的單向通道，寫端 filet-api、讀端 filet-engine。留著 0600 的話，上線後
+            # 第一個自訂 leader 一寫進來，引擎每輪 load_user_leaders 就 PermissionError
+            # → OSError → transient → 每個 cycle 一則 critical，且已准入的自訂 leader
+            # 永遠不生效。
+            # ⚠️ 為什麼是 0644 而不是「看起來比較緊」的 0640：該目錄**沒有 setgid**
+            # （RUNBOOK §5.5.1 只 chmod 0750），所以 filet-api 建出來的檔 group 是
+            # **filet-api** 而不是 filet-engine——0640 的 group 位對讀端毫無作用，
+            # 引擎只能靠 other 位讀。真正把外人擋在外面的是**目錄的 0750**（進不了
+            # 目錄就讀不到裡面任何檔），所以檔案上的 other 讀位不擴大暴露面。
+            # 這正是既有 leader_changes.json 的實際狀態（write_text＋umask 022 → 0644）
+            # ——同一個目錄裡的兩個檔用同一套權限，不要各走各的。
+            os.chmod(tmp, 0o644)
             os.replace(tmp, p)
         except BaseException:
             try:

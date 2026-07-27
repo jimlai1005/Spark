@@ -38,6 +38,7 @@ operator 對某個 leader 執行**安全撤銷**的唯一正確做法（冪等�
 import argparse
 import json
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -73,13 +74,39 @@ class RevokeResult:
 
 def _atomic_write_json(path: Path, doc: dict) -> None:
     """temp + os.replace（同目錄 → 同檔案系統）。引擎每輪都在讀這兩個檔，絕不能讓它
-    讀到半份 JSON——半份 JSON 會被 fail-fast 讀成「白名單壞掉」（全體 transient）。"""
+    讀到半份 JSON——半份 JSON 會被 fail-fast 讀成「白名單壞掉」（全體 transient）。
+
+    ⭐⭐ **保留原檔的 mode 與 owner**（2026-07-27 部署前抓到）。本工具由 operator 以
+    **root** 執行，而它改寫的兩個檔平常是別的 user 在讀：
+    - `leaders.json` 是 root:root **0644**，filet-api 與 filet-engine 都靠 other 位讀；
+    - `user_leaders.json` 由 filet-api 建立（0644），引擎同樣靠 other 位讀。
+
+    `os.replace` 換上去的是 **tmp 的 metadata**，而 mkstemp 建檔是 root:root **0600**。
+    不保留的話，跑一次撤銷就把白名單變成只有 root 讀得到：API 的 `_load_leaders_or_503`
+    → 503，引擎的 `load_leaders` → OSError → **transient → 沿用上一個已驗證的 leader**。
+    也就是說——**這支工具會親手廢掉它自己要執行的那次撤銷**，而且自我驗收那一步是以
+    root 身分讀檔，會照樣印出「已撤銷」。這是「安全動作靜默失效」最惡劣的形狀。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    prev = path.stat() if path.exists() else None
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + "-",
                                suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(doc, f, ensure_ascii=False, indent=2)
+        if prev is not None:
+            os.chmod(tmp, stat.S_IMODE(prev.st_mode))
+            try:
+                os.chown(tmp, prev.st_uid, prev.st_gid)
+            except PermissionError:
+                # 非 root 執行（開發機／測試）時 chown 不被允許——此時 owner 本來就
+                # 是同一個人，不需要換。正式機以 root 跑，這一步一定成功。
+                pass
+        else:
+            # 新建檔（該位址是第一筆、白名單檔尚不存在）：用與既有檔一致的 0644，
+            # 理由同 user_leaders.record_user_leader 的註解（目錄 0750 才是防線，
+            # 檔案 other 讀位是引擎唯一的讀取途徑——目錄沒有 setgid）。
+            os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
         try:

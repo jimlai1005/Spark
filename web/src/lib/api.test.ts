@@ -338,7 +338,8 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     // 2026-07-19：+2（getOpsTradeQuality、getOpsHealth，/ops 兩個新面板）
     // 2026-07-27：+1（getLeaderPreview，自訂 leader 准入預覽）
     // 2026-07-27：+1（getMyLeader，「我目前跟誰」——/leaders 頁的現況揭露）
-    const HAND_WRITTEN_LIST_LENGTH = 23;
+    // 2026-07-27：+1（getMyCapital，「投入本金與使用比例生效值」——/capital 頁的現況揭露）
+    const HAND_WRITTEN_LIST_LENGTH = 24;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

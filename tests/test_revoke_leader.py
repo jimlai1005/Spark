@@ -256,3 +256,47 @@ def test_rejects_a_malformed_address(tmp_path):
     with pytest.raises(SystemExit):
         revoke("0xnope", leaders_path=curated, registry_path=registry)
     assert load_leaders(curated)[0].enabled is True
+
+
+# ── (5) 檔案 metadata：撤銷不得把檔案改成只有 root 讀得到 ────────────────
+# 本工具由 operator 以 **root** 執行，而白名單平常是 filet-api（API）與
+# filet-engine（引擎）在讀。os.replace 換上去的是 tmp 的 metadata，而 mkstemp
+# 建檔是 0600——不保留原 mode 的話，跑一次撤銷就讓 API 503、引擎 load_leaders
+# OSError → transient → **沿用上一個已驗證的 leader**，也就是這支工具親手廢掉
+# 它自己要執行的那次撤銷；而自我驗收以 root 讀檔，會照樣印出「已撤銷」。
+
+def test_revoking_preserves_the_curated_file_mode(tmp_path):
+    """⭐⭐ 正式機的 leaders.json 是 0644（API 與引擎都靠 other 位讀）。"""
+    curated, registry = _paths(tmp_path)
+    _write_curated(curated, [{"address": _TARGET, "name": "Alpha"}])
+    curated.chmod(0o644)
+    revoke(_TARGET, leaders_path=curated, registry_path=registry)
+    assert curated.stat().st_mode & 0o777 == 0o644
+
+
+def test_revoking_preserves_a_tighter_curated_file_mode(tmp_path):
+    """保留＝沿用原值，不是硬套 0644：部署若刻意收緊過，撤銷不該把它放寬。"""
+    curated, registry = _paths(tmp_path)
+    _write_curated(curated, [{"address": _TARGET, "name": "Alpha"}])
+    curated.chmod(0o640)
+    revoke(_TARGET, leaders_path=curated, registry_path=registry)
+    assert curated.stat().st_mode & 0o777 == 0o640
+
+
+def test_revoking_preserves_the_registry_file_mode(tmp_path):
+    """registry 由 filet-api 建成 0644，引擎靠 other 位讀——撤銷後必須維持。"""
+    curated, registry = _paths(tmp_path)
+    _write_curated(curated, [])
+    record_user_leader(registry, address=_TARGET, added_by="f" + "11" * 20)
+    assert registry.stat().st_mode & 0o777 == 0o644
+    revoke(_TARGET, leaders_path=curated, registry_path=registry)
+    assert registry.stat().st_mode & 0o777 == 0o644
+
+
+def test_creating_a_fresh_curated_file_is_world_readable(tmp_path):
+    """白名單檔尚不存在時新建的那一筆：0644，不是 mkstemp 的 0600
+    （引擎唯一的讀取途徑是 other 位——交換目錄沒有 setgid）。"""
+    curated, registry = _paths(tmp_path)
+    curated.parent.mkdir(parents=True, exist_ok=True)
+    revoke(_TARGET, leaders_path=curated, registry_path=registry)
+    assert curated.stat().st_mode & 0o777 == 0o644

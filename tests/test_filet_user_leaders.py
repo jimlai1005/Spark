@@ -318,3 +318,23 @@ def test_lock_held_elsewhere_times_out_instead_of_hanging(tmp_path):
             record_user_leader(p, address=_U, added_by=_ACCT)
         assert time.monotonic() - t0 < 10.0
     assert not p.exists()
+
+
+def test_registry_file_is_readable_by_the_engine_user(tmp_path):
+    """⭐⭐ 部署面斷言（單一 user 的測試環境**本身看不見**這件事，所以要用 mode 釘）。
+
+    registry 是跨 user 的檔：交換目錄 `/var/lib/filet-exchange` 是
+    `filet-api:filet-engine` 0750，寫端 filet-api、讀端 filet-engine。mkstemp 建檔
+    是 0600（不吃 umask）→ 引擎 PermissionError → OSError → transient → 每個 cycle
+    一則 critical，且已准入的自訂 leader 永遠不生效。
+
+    為什麼斷言 0644 而不是 0640：該目錄沒有 setgid，filet-api 建的檔 group 是
+    filet-api（不是 filet-engine），所以 group 位對讀端沒有作用，引擎只能靠 other 位。
+    擋外人的是目錄的 0750。同目錄的既有 leader_changes.json 就是 0644——同一個
+    通道裡的檔用同一套權限。"""
+    p = tmp_path / "user_leaders.json"
+    record_user_leader(p, address=_U, added_by=_ACCT)
+    assert p.stat().st_mode & 0o777 == 0o644
+    # 追加寫入（走「檔已存在」分支）之後也必須維持——換檔用的是新的 tmp。
+    record_user_leader(p, address=_CURATED, added_by=_ACCT)
+    assert p.stat().st_mode & 0o777 == 0o644

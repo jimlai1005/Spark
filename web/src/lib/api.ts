@@ -215,6 +215,55 @@ export function getMyLeader(): Promise<MyLeaderResp> {
   return request<MyLeaderResp>("/api/me/leader");
 }
 
+/**
+ * 我目前生效的資金設定（投入本金與使用比例）與待簽署的變更（/api/me/capital）。
+ * 後端回覆 `status` 欄用來區分：
+ * - `effective`：已有生效的設定，本金与使用比例在 `effective` 欄位。
+ * - `unknown`：無法判定（manifest 讀失敗等）。
+ * - `not_activated`：帳號尚未活化。
+ * - `indeterminate`：manifest 有壞條目且該條目可能是本帳號。
+ *
+ * ⚠️ `pending` 永遠不能被畫成「已生效」的樣子——兩者是不同的決定時點。
+ * 讀不到 → 503（kind=upstream）；無查詢權限 → 403。冪等讀取，重試安全。
+ */
+export interface MyCapitalEffective {
+  /** ⭐ `use_full_equity=true` 時後端硬性為 "0"（config.py 的不變量）——那個 0 是
+   *  「不准有值」，不是「本金為零」，顯示層必須改印「使用全部帳戶權益」。 */
+  allocated_capital: string | null;
+  capital_utilization: string | null;
+  use_full_equity: boolean | null;
+  source: "customer_signed" | "env_default";
+  changed_at: string | null;
+  /** ⚠️ **可為 null**：取自 `hb.at`，而 `HeartbeatRead.at` 是 `str | None`
+   *  （filet/engine_health.py：`written_at` 缺席或非字串時回 None）。宣告成非
+   *  nullable 會讓這一格靜靜渲染成空白，正好復活它存在要防的那件事——一份接近
+   *  過期的心跳被當成即時查詢讀。 */
+  as_of: string | null;
+}
+
+export interface MyCapitalPending {
+  allocated_capital: string;
+  capital_utilization: string;
+  use_full_equity: boolean;
+  submitted_at: string | null;
+  state: "not_yet_applied" | "unconfirmed";
+  effective_when: string;
+  note: string;
+}
+
+export interface MyCapitalResp {
+  account_id: string;
+  status: "effective" | "unknown" | "not_activated" | "indeterminate";
+  effective: MyCapitalEffective | null;
+  pending: MyCapitalPending | null;
+  heartbeat: { status: string; at: string | null; age_s: number | null; stale_after_s: number } | null;
+  note: string;
+}
+
+export function getMyCapital(): Promise<MyCapitalResp> {
+  return request<MyCapitalResp>("/api/me/capital");
+}
+
 // ---------- onboarding ----------
 export function createAgent(): Promise<AgentResp> {
   return post<AgentResp>("/api/onboard/agent");
