@@ -6,3 +6,6 @@ uv.lock
 var/
 .env
 .env.*
+
+# macOS
+.DS_Store

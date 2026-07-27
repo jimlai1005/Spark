@@ -49,7 +49,7 @@
  * 也不自行放行；拿不到方案目錄時 **fail closed**（不確定就不給送出）。
  * 至於「這個客戶有沒有權益」則是後端的授權判斷，前端不做（紅線 4）。
  */
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useSignMessage } from "wagmi";
 import {
@@ -58,12 +58,15 @@ import {
   getLeaderPreview,
   getLeaderSelectMessage,
   getLeaders,
+  getMyLeader,
   postLeaderSelect,
   type BillingPlansResp,
   type LeaderEntry,
   type LeaderPreviewResp,
   type LeaderSelectResp,
   type LeadersResp,
+  type MyLeaderPendingChange,
+  type MyLeaderResp,
 } from "@/lib/api";
 import { runCustomLeaderPreview, validateCustomLeaderInput } from "@/lib/customLeader";
 import { ActivationNotice } from "@/components/ActivationNotice";
@@ -130,6 +133,7 @@ type Phase =
 export default function LeadersPage() {
   const me = useMe();
   const { signMessageAsync } = useSignMessage();
+  const queryClient = useQueryClient();
   const [phase, setPhase] = useState<Phase>({ t: "idle" });
 
   const loggedIn = !!me.data;
@@ -165,8 +169,13 @@ export default function LeadersPage() {
       // 指向別人的原文，而流程的其他每一關（recover、後端重建驗簽）都會照樣放行。
       { expectedSigner: me.data.address, expectedLeader: leader.address },
     );
-    if (r.ok) setPhase({ t: "done", resp: r.resp });
-    else setPhase({ t: "error", ...errorCopy(r) });
+    if (r.ok) {
+      setPhase({ t: "done", resp: r.resp });
+      // ⭐ 授權成功 → 重抓「目前跟隨」：後端此刻已有一筆 pending_change，而本頁上方
+      // 若還顯示「沒有待生效的變更」，同一頁就同時說了兩件互相矛盾的事。
+      // （manifest 要到下一個 cycle 才變，所以重抓看到的是 pending，不是新 leader。）
+      void queryClient.invalidateQueries({ queryKey: ["my-leader"] });
+    } else setPhase({ t: "error", ...errorCopy(r) });
   }
 
   if (me.isLoading) {
@@ -193,11 +202,8 @@ export default function LeadersPage() {
         <p className="hint">{perfShown ? c.statsScopeBodyWithPerf : c.statsScopeBody}</p>
       </div>
 
-      {/* 「目前跟隨中」沒有客戶端資料來源——說明缺口，不猜一個標記。 */}
-      <div className="panel ops-notice">
-        <p className="ops-notice-title">{c.currentUnknownTitle}</p>
-        <p className="hint">{c.currentUnknownNote}</p>
-      </div>
+      {/* ⭐ 換 leader 這個決定的左半邊：我現在跟的是誰（spec User Story 12）。 */}
+      <CurrentLeaderPanel />
 
       {/* 未活化就先說——否則使用者會一路簽到最後才撞上「查無 follower」。 */}
       <ActivationNotice />
@@ -241,6 +247,7 @@ export default function LeadersPage() {
       <CustomLeaderSection
         gate={gate}
         busy={phase.t === "running"}
+        listedLeaders={leaders.data?.leaders}
         onSelect={(leader) => setPhase({ t: "confirming", leader })}
       />
 
@@ -275,6 +282,10 @@ function errorCopy(r: Extract<LeaderSelectFlowResult, { ok: false }>):
   if (err instanceof ApiError) {
     if (err.kind === "auth") return { message: COPY.common.notLoggedIn, detail };
     if (err.status === 403) return { message: e.forbidden, detail };
+    // 429 有專屬文案：兩個端點共用同一個查詢額度，所以「查很多位址之後按送出」
+    // 也會撞到。通用的 submitFailed 會說「上一筆簽名已作廢」——這裡根本還沒到
+    // 驗簽，那句話是錯的，且會讓人以為出了更嚴重的事。
+    if (err.status === 429) return { message: e.rateLimited, detail };
     // 待簽原文端點的 400 只有一種語意：這位 leader 不可選（見 app.py）。
     if (err.status === 400 && r.kind === "message-failed") {
       return { message: e.notSelectable, detail };
@@ -296,6 +307,102 @@ function DoneNotice({ resp }: { resp: LeaderSelectResp }) {
       <p className="hint mono" title={resp.leader_address}>
         {c.confirmLeaderLabel}: {shortAddr(resp.leader_address)}
       </p>
+    </div>
+  );
+}
+
+/**
+ * ⭐ 「你目前跟隨的 leader」（`/api/me/leader`；spec User Story 12）。
+ *
+ * 為什麼這一區存在：本頁要客戶簽署一份**換掉**現有 leader 的授權，而「現在跟的是誰」
+ * 是這個決定的左半邊。沒有它，客戶是在不知道現況的情況下被要求簽署變更——尤其自訂
+ * 位址的路徑，選完之後畫面上沒有任何地方看得到自己現在跟誰。
+ *
+ * ⚠️ 這一區的失敗方向**不對稱**，三種狀態因此各有各的畫法：
+ * - 查詢失敗（503／網路）→ 說「暫時讀不到」，**絕不**畫成「你沒在跟單」：後者是一句
+ *   我們沒有根據的斷言，會讓一個正在跟單的客戶以為資金沒在動而不去看它（工程原則 3：
+ *   讀不到 ≠ 沒有）。且本區失敗**不得影響頁面其餘部分**——所以它是獨立的元件與
+ *   獨立的 query，清單、自訂輸入與簽章流程都不經過它。
+ * - `engine_default`（已活化、未指定 leader）與 `not_activated`（尚未活化）刻意不合併：
+ *   前者**正在跟單**，只是對象由部署決定，兩者的處置完全不同（後端也是分兩態回傳）。
+ * - 狀態的**內文**一律用後端 `note` 原文（單一來源）；本頁只提供標題與欄位標籤，
+ *   不在前端另寫一份會過期的說明——這一區的前一版就是這樣過期的。
+ */
+function CurrentLeaderPanel() {
+  // 本元件只在登入分支被渲染（頁面上方的 guard 已擋掉未登入），故不另掛 enabled。
+  const q = useQuery<MyLeaderResp>({ queryKey: ["my-leader"], queryFn: getMyLeader });
+  const cur = c.current;
+
+  if (q.isLoading) {
+    return (
+      <div className="panel ops-notice leader-current">
+        <p className="ops-notice-title">{cur.title}</p>
+        <p className="hint" role="status">{cur.loading}</p>
+      </div>
+    );
+  }
+  // ⭐ 讀不到就說讀不到（含 data 缺席的保底）——不退化成任何一種「你沒有 leader」。
+  if (q.error || !q.data) {
+    return (
+      <div className="panel ops-notice leader-current">
+        <p className="ops-notice-title">{cur.failedTitle}</p>
+        <p className="hint">{cur.failedNote}</p>
+      </div>
+    );
+  }
+
+  const d = q.data;
+  const none = d.leader_address === null ? noneTitleOf(d.status) : null;
+  return (
+    <div className="panel ops-notice leader-current">
+      <p className="ops-notice-title">{cur.title}</p>
+      {d.leader_address !== null ? (
+        // 名稱只是輔助：查無名稱（自訂 leader、或已下架的精選 leader）時位址照樣顯示
+        // ——「沒有名稱」不等於「沒有 leader」。
+        <p className="mono leader-current-addr" title={d.leader_address}>
+          {cur.leaderLabel}: {d.leader_name === null
+            ? shortAddr(d.leader_address)
+            : `${d.leader_name}（${shortAddr(d.leader_address)}）`}
+        </p>
+      ) : (
+        <p className="leader-current-none">{none?.title}</p>
+      )}
+      {/* 後端沒見過的狀態碼原樣顯示（看得懂但陌生），不靜默落進某個既有分支。 */}
+      {none?.unknown === true && (
+        <p className="hint mono">{cur.statusLabel}: {d.status}</p>
+      )}
+      <p className="hint">{d.note}</p>
+      {d.pending_change !== null && <PendingLeaderChange change={d.pending_change} />}
+    </div>
+  );
+}
+
+/** 沒有 leader 位址時的標題；`unknown`＝後端回了預期外的狀態碼（要把它顯示出來）。 */
+function noneTitleOf(status: string): { title: string; unknown: boolean } {
+  const titles: Record<string, string | undefined> = c.current.noneTitles;
+  const title = titles[status];
+  return title === undefined
+    ? { title: c.current.noneTitleFallback, unknown: true }
+    : { title, unknown: false };
+}
+
+/**
+ * 已簽署但尚未生效的換 leader。⭐ 與「目前跟隨」畫在同一區但**分開的區塊**：
+ * 兩者是不同時點的事實（現在跟的 vs 下一個 cycle 會換到的），混在一起會讓客戶以為
+ * 換已經發生了——而換 leader 是有真實成交成本的動作。生效說明用後端原文。
+ */
+function PendingLeaderChange({ change }: { change: MyLeaderPendingChange }) {
+  const cur = c.current;
+  return (
+    <div className="leader-perf-state leader-current-pending">
+      <p className="leader-perf-state-title">{cur.pendingTitle}</p>
+      <p className="hint mono" title={change.leader_address}>
+        {cur.pendingLabel}: {shortAddr(change.leader_address)}
+      </p>
+      {change.issued_at !== null && (
+        <p className="hint mono">{cur.pendingIssuedAtLabel}: {change.issued_at}</p>
+      )}
+      <p className="hint">{change.note}</p>
     </div>
   );
 }
@@ -464,11 +571,38 @@ type CustomPhase =
   | { t: "rejected"; message: string; detail?: string }
   | { t: "failed"; message: string; detail?: string };
 
-/** 預覽 → 既有選擇流程用的 LeaderEntry。⭐ 位址取伺服器回聲（已通過回聲比對）。 */
-function customEntryOf(preview: LeaderPreviewResp): LeaderEntry {
+/**
+ * ⭐ 這個預覽位址在**上方實際渲染的那份清單**裡的條目（找不到 → undefined）。
+ *
+ * 為什麼判定基準是「上方那份清單」而不是後端的 `already_listed` 旗標：後端對
+ * **paused**（`accepting_new=false`）的精選 leader 也回 `already_listed=true`，而
+ * `/api/leaders` 目錄用 `is_selectable` 過濾、**不含** paused leader。用旗標去講
+ * 「這個位址就是上方清單中的 leader」，在 paused 的情況下是一句假話——上方根本沒有它。
+ * 兩個要被拿來比較的事實（畫面上有什麼、文案宣稱有什麼）必須同源（工程原則 1）。
+ * 兩側都 lowercase：後端兩支端點都回小寫，這行是防未來某一側改了大小寫慣例。
+ */
+function listedEntryOf(
+  address: string, leaders: LeaderEntry[] | undefined,
+): LeaderEntry | undefined {
+  const target = address.toLowerCase();
+  return leaders?.find((l) => l.address.toLowerCase() === target);
+}
+
+/**
+ * 預覽 → 既有選擇流程用的 LeaderEntry。⭐ 位址取伺服器回聲（已通過回聲比對）。
+ *
+ * 名稱三段式：上方清單查得到 → 用它的策展名（同一個位址在同一頁只有一個名字）；
+ * 已在平台名單但上方查不到（paused）→ 位址縮寫；真正的自訂位址 → 「自訂 leader」。
+ * ⚠️ 把一個有名字的精選 leader 在確認框顯示成「自訂 leader」，等於在使用者授權的
+ * 最後一步把對象講得比實際更陌生。
+ */
+function customEntryOf(preview: LeaderPreviewResp, listed: LeaderEntry | undefined): LeaderEntry {
+  const name = listed !== undefined
+    ? listed.name
+    : preview.already_listed ? shortAddr(preview.address) : c.custom.entryName;
   return {
     address: preview.address,
-    name: c.custom.entryName,
+    name,
     description: "",
     account_value: preview.account_value,
     total_ntl_pos: null,
@@ -496,9 +630,15 @@ function customEntryOf(preview: LeaderPreviewResp): LeaderEntry {
  * 留在新位址旁邊，是本區塊最會騙過本人的顯示錯誤（工程原則 1：畫面上的資料
  * 必須與輸入框裡的位址同源）。
  */
-function CustomLeaderSection({ gate, busy, onSelect }: {
+function CustomLeaderSection({ gate, busy, listedLeaders, onSelect }: {
   gate: Gate;
   busy: boolean;
+  /**
+   * 上方**實際渲染**的精選清單（載入中／載入失敗 → undefined）。只用於「這個位址是不是
+   * 就是上方那一位」的判定與名稱沿用；本區塊的其餘行為完全不依賴它（清單壞掉不影響
+   * 自訂輸入，見本函式檔頭）。undefined 時一律當作「上方沒有它」——上方確實沒有。
+   */
+  listedLeaders: LeaderEntry[] | undefined;
   onSelect: (leader: LeaderEntry) => void;
 }) {
   const cc = c.custom;
@@ -510,6 +650,10 @@ function CustomLeaderSection({ gate, busy, onSelect }: {
 
   const check = validateCustomLeaderInput(input);
   const showFormatError = !check.ok && !check.empty;
+  // ⭐ 「這個位址是不是就是上方那一位」——判定基準是上方實際渲染的清單（見 listedEntryOf）。
+  const listed = cPhase.t === "previewed"
+    ? listedEntryOf(cPhase.preview.address, listedLeaders)
+    : undefined;
 
   function onInputChange(v: string) {
     setInput(v);
@@ -589,6 +733,8 @@ function CustomLeaderSection({ gate, busy, onSelect }: {
       {cPhase.t === "previewed" && (
         <div className="leader-custom-preview">
           <p className="leader-custom-title">{cc.previewTitle}</p>
+          {/* ⭐ 上方清單查得到就沿用它的策展名：同一個位址在同一頁只能有一個名字。 */}
+          {listed !== undefined && <p className="leader-name">{listed.name}</p>}
           <p className="hint mono leader-addr" title={cPhase.preview.address}>
             {shortAddr(cPhase.preview.address)}
           </p>
@@ -621,13 +767,38 @@ function CustomLeaderSection({ gate, busy, onSelect }: {
               value={String(cPhase.preview.position_count)} />
           </dl>
 
-          {/* ⭐ 無績效快照＝「沒有資料」的狀態區塊——不是錯誤、不是零、不是留白。 */}
-          <div className="leader-perf-state leader-custom-noperf">
-            <p className="leader-perf-state-title">{cc.noPerfTitle}</p>
-            <p className="hint">{cc.noPerfBody}</p>
-          </div>
+          {/*
+            ⭐⭐ 三種情形三段話，**不得**共用一段：
+            1. 上方清單裡就有這個位址 → 績效在上面那張卡片，這裡指過去。此時再說一次
+               「無績效資料」，就是同一頁對同一個位址講兩套話——而使用者會相信離他
+               比較近的那一句（上方那張卡片有完整績效，下方卻說沒有資料）。
+            2. 已在平台名單但上方沒有（paused：`already_listed=true` 而目錄用
+               `is_selectable` 過濾掉了它）→ 說「本頁沒有它的卡片可以對照」，
+               **不能**指向上方（上方根本沒有它）。
+            3. 真正的自訂位址 → 「無績效資料」的原狀態區塊（不是錯誤、不是零、不是留白）。
+          */}
+          {cPhase.preview.already_listed ? (
+            <div className="leader-perf-state leader-custom-perf-ref">
+              <p className="leader-perf-state-title">
+                {listed !== undefined ? cc.perfAboveTitle : cc.perfNotShownTitle}
+              </p>
+              <p className="hint">
+                {listed !== undefined ? cc.perfAboveBody : cc.perfNotShownBody}
+              </p>
+            </div>
+          ) : (
+            <div className="leader-perf-state leader-custom-noperf">
+              <p className="leader-perf-state-title">{cc.noPerfTitle}</p>
+              <p className="hint">{cc.noPerfBody}</p>
+            </div>
+          )}
 
-          {cPhase.preview.already_listed && <p className="hint">{cc.alreadyListedNote}</p>}
+          {/* 「就是上方那一位」只在上方真的有它時才講得出口（paused 的走另一段文案）。 */}
+          {cPhase.preview.already_listed && (
+            <p className="hint">
+              {listed !== undefined ? cc.alreadyListedNote : cc.alreadyListedNoteNotShown}
+            </p>
+          )}
 
           {/* ⭐ 專屬風險聲明：純前端閘門（仿 StepRisk），未勾選送出按鈕不開。 */}
           <label className="check-row">
@@ -646,7 +817,7 @@ function CustomLeaderSection({ gate, busy, onSelect }: {
               type="button"
               className="btn btn-primary btn-block"
               disabled={!agreed || !gate.open || busy}
-              onClick={() => onSelect(customEntryOf(cPhase.preview))}
+              onClick={() => onSelect(customEntryOf(cPhase.preview, listed))}
             >
               {gate.open ? cc.select : c.gateBadge}
             </button>
@@ -915,6 +1086,15 @@ function PerfStat({ name, label, hint, value, raw, note, marker }: {
  * 能反悔的地方，之後就是簽名與真實成交。
  * 刻意不用 window.confirm：它塞不下這些內容，也無法被測試釘住。
  */
+/**
+ * 對話框裡的 leader 標籤。名稱本身就是位址縮寫時（自訂位址在上方清單查不到名稱）
+ * 只顯示一次——`0x2222…222（0x2222…222）` 讀起來像兩個不同的東西。
+ */
+function leaderLabel(leader: LeaderEntry): string {
+  const short = shortAddr(leader.address);
+  return leader.name === short ? short : `${leader.name}（${short}）`;
+}
+
 function ConfirmDialog({ leader, onCancel, onConfirm }: {
   leader: LeaderEntry;
   onCancel: () => void;
@@ -926,7 +1106,7 @@ function ConfirmDialog({ leader, onCancel, onConfirm }: {
            aria-label={c.confirmTitle}>
         <p className="leader-dialog-title">{c.confirmTitle}</p>
         <p className="hint mono" title={leader.address}>
-          {c.confirmLeaderLabel}: {leader.name}（{shortAddr(leader.address)}）
+          {c.confirmLeaderLabel}: {leaderLabel(leader)}
         </p>
         <p className="leader-dialog-body">{c.confirmCost}</p>
         <p className="leader-dialog-body">{c.confirmTiming}</p>

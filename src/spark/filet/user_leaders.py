@@ -49,6 +49,7 @@ import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from spark.filet.followers import normalize_hex_address
@@ -78,6 +79,12 @@ def merge_leaders(curated: list[LeaderRef],
     同位址的 enabled=true 條目若能勝出，自訂路徑就成了繞過撤銷的後門。
     反向（user 條目 enabled=false）同樣有效：operator 可直接編輯 registry 檔
     執行對 user-sourced leader 的撤銷。
+
+    ⚠️ **「刪掉精選條目」不是撤銷**（2026-07-27 Finding 2）：優先權靠的是「精選檔
+    裡有那一筆」，刪掉它就沒有東西壓過 registry 的 `enabled:true` 條目，遞補上來
+    ＝撤銷失效。leaders.py 檔頭早期那條「移除條目 ≡ enabled:false」的等價關係在
+    本函式存在之後只對「不在 registry 的位址」成立。**恆定有效的撤銷 ＝ 確保精選檔
+    裡存在一筆 `enabled:false` 的條目**（`scripts/revoke_leader.py` 冪等執行並自驗）。
     """
     curated_addrs = {r.address for r in curated}
     return list(curated) + [u for u in user if u.address not in curated_addrs]
@@ -169,6 +176,24 @@ def _flock_with_deadline(lock_f, lock_path: Path) -> None:
             time.sleep(_LOCK_POLL_S)
 
 
+@contextmanager
+def registry_lock(path: str | Path):
+    """registry 的 read-modify-write 互斥（**唯一定義**，所有寫者共用）。
+
+    寫者有兩類：API 進程的 `record_user_leader`，與 operator 的撤銷工具
+    （`scripts/revoke_leader.py`）。兩邊各自寫一次 flock 樣板，遲早有一邊漏掉
+    有界等待或鎖錯檔名——所以做成一個進入點：拿得到鎖才進得了 with 區塊
+    （工程原則 5 的互斥版）。逾時 → TimeoutError（OSError 子類），呼叫端既有的
+    「寫入失敗 → 大聲失敗、不宣告成功」路徑自動接手。
+
+    ⚠️ lock 檔永不刪除（理由見模組 docstring）；落點單一定義見 registry_lock_path。
+    """
+    lock_path = registry_lock_path(path)
+    with open(lock_path, "w") as lock_f:
+        _flock_with_deadline(lock_f, lock_path)   # 出 with（close）自動釋放
+        yield
+
+
 def record_user_leader(path: str | Path, *, address: str, added_by: str) -> bool:
     """把一個通過准入檢查的自訂 leader 寫進 registry。**只有 public API 該呼叫**。
 
@@ -195,8 +220,7 @@ def record_user_leader(path: str | Path, *, address: str, added_by: str) -> bool
     # 落點目錄（交換目錄）不存在就建（沿 write_leader_change 對同一目錄的慣例）；
     # 建不出來（路徑被檔案佔住、權限）→ OSError 原樣上拋，呼叫端回 5xx。
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(registry_lock_path(p), "w") as lock_f:
-        _flock_with_deadline(lock_f, registry_lock_path(p))  # 出 with（close）自動釋放
+    with registry_lock(p):   # 互斥的單一定義（operator 撤銷工具走同一把鎖）
         # ⭐ 取得鎖之後才讀：這份內容在寫入落地前不會再被別的持鎖寫者更動。
         existing_raw: list = []
         if p.exists():

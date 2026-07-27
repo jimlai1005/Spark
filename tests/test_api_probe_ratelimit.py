@@ -16,6 +16,7 @@ from eth_account.messages import encode_defunct
 from fastapi.testclient import TestClient
 
 from spark.publicapi.app import PROBE_RATELIMIT_MAX, PROBE_RATELIMIT_WINDOW_S
+from spark.publicapi.config import derive_account_id
 from tests.publicapi_helpers import make_app, make_cfg
 
 _REAL_SOCKET = socket.socket  # import 期捕捉，早於 autouse 斷網（沿 test_api_leaders）
@@ -134,9 +135,12 @@ def test_expired_session_keys_are_reaped(tmp_path):
     assert len(hits) == 1                       # 過期的 5 個 key 已被剔除
 
 
-def test_post_select_is_not_rate_limited(tmp_path):
-    """⭐ POST select **不**受 probe 限流：即使 probe 計數已打滿 429，對精選可選
-    leader 的簽章 POST 仍照常受理（簽章 gated、濫用成本高，不套此限）。"""
+def test_post_select_of_a_curated_leader_is_not_rate_limited(tmp_path):
+    """⭐ **精選**可選 leader 的簽章 POST **不**受 probe 限流：即使 probe 計數已打滿
+    429，這條路徑仍照常受理（不打 HL /info、簽章 gated、濫用成本高，不套此限）。
+
+    ⚠️ 自訂（非精選）位址的 POST 則**受限**——它會跑 _admit_custom_leader（HL 外呼
+    ＋reason-coded 4xx），與 preview／message 同一個探測面（見下一條測試）。"""
     c, clock = _make(tmp_path)
     w = _login(c)
     # 先取一份精選 leader 的待簽原文（算 1 次 probe），供稍後 POST 簽名。
@@ -154,3 +158,50 @@ def test_post_select_is_not_rate_limited(tmp_path):
             "signature": sig, "message": m["message"]}
     r = c.post("/api/leaders/select", json=body)
     assert r.status_code == 200, r.text
+
+
+def _garbage_post(c, acct, addr=_CUSTOM):
+    """簽章必定不合法的 POST select（驗簽在准入**之後**，所以准入照跑）。"""
+    return c.post("/api/leaders/select", json={
+        "account_id": acct, "leader_address": addr, "nonce": "deadbeef",
+        "issued_at": "2026-07-27T00:00:00Z", "signature": "0x" + "11" * 65,
+        "message": ""})
+
+
+def test_post_select_of_a_custom_address_is_rate_limited(tmp_path):
+    """⭐ Finding 1：POST select 的**自訂位址分支**跑 _admit_custom_leader（一次 HL
+    /info ＋ reason-coded 4xx），與 preview／message 是同一個探測面——沒掛限流的話，
+    帶垃圾簽章的迴圈就能無限打上游、並枚舉哪些位址回 leader_disabled（治理資訊）。
+
+    垃圾簽章不影響本測試：限流與准入都在驗簽**之前**（准入失敗不得燒 nonce 的既有
+    順序），所以前 MAX 次停在驗簽的 400，第 MAX+1 次被限流擋在 429。"""
+    c, clock = _make(tmp_path)
+    w = _login(c)
+    acct = derive_account_id(w.address)
+    for i in range(PROBE_RATELIMIT_MAX):
+        assert _garbage_post(c, acct).status_code == 400, i   # 停在驗簽
+    assert _garbage_post(c, acct).status_code == 429
+
+
+def test_custom_post_shares_the_counter_with_preview(tmp_path):
+    """自訂 POST 與 preview／message 共用**同一個** per-session 計數器：preview 用掉
+    額度後，自訂 POST 一樣被擋（分兩個計數器等於把上限開成兩倍）。"""
+    c, clock = _make(tmp_path)
+    w = _login(c)
+    acct = derive_account_id(w.address)
+    for _ in range(PROBE_RATELIMIT_MAX):
+        assert _preview(c).status_code == 200
+    assert _garbage_post(c, acct).status_code == 429
+
+
+def test_rate_limited_custom_post_does_not_leak_governance_reasons(tmp_path):
+    """限流回應是**通用**的 429，不含 reason code：撤銷清單的枚舉正是這道限流要擋的
+    東西，超限後還照回 leader_disabled 就等於沒擋。"""
+    c, clock = _make(tmp_path)
+    w = _login(c)
+    acct = derive_account_id(w.address)
+    for _ in range(PROBE_RATELIMIT_MAX):
+        _garbage_post(c, acct)
+    r = _garbage_post(c, acct)
+    assert r.status_code == 429
+    assert r.json()["detail"] == "查詢過於頻繁，請稍後再試"

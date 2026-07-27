@@ -22,6 +22,19 @@
 **把 leader 整筆從清單移除 等同 enabled:false**（引擎驗不到就是撤銷）——所以例行
 下架請改 `accepting_new`，不要刪條目，否則會意外觸發所有跟隨者的收尾。
 
+⚠️⚠️ 但這條等價關係**只在「本檔是唯一來源」時成立**（2026-07-27 Finding 2）
+----------------------------------------------------------------------
+自從有了 user-sourced registry（`user_leaders.py`），引擎驗的是**合併清單**，而合併
+是「精選優先、缺則由 registry 遞補」（`merge_leaders`）。於是同一個位址若**同時**
+存在於兩檔，刪掉精選那筆並不是撤銷——registry 那筆 `enabled:true` 會遞補上來，
+`is_still_permitted` 從 False 翻回 True，**撤銷靜默失效**（錨定：
+tests/test_filet_user_leaders.py::test_deleting_the_curated_entry_falls_back_to_the_registry_entry）。
+
+所以：**唯一在任何情況下都有效的撤銷，是「確保存在一筆 `enabled:false` 的精選條目」**
+——不是刪條目。不要靠記性做這件事，用 `scripts/revoke_leader.py <address>`：它冪等地
+把該位址在精選檔設成 `enabled:false`（沒有就補一筆）、在 registry 有同位址時一併停用，
+最後**自己重載兩檔合併驗一次** `is_still_permitted is False`，不成立就非零退出。
+
 呼叫端不該自己記得該看哪個旗標，所以本模組**不提供**籠統的 `is_allowed`，
 只提供兩個把用途寫在名字裡的述詞：`is_selectable`（選擇時）與
 `is_still_permitted`（引擎持續驗證時）。
@@ -132,7 +145,9 @@ def is_still_permitted(address: str, leaders: list[LeaderRef]) -> bool:
 
     只看 `enabled`：`accepting_new=False` 是例行下架，對已在跟的人**無影響**
     （硬要把他們趕走等於用一次真實的平倉成本去執行一個純行銷決策）。
-    回 False ＝ 安全撤銷或整筆被移除 → 呼叫端必須受控收尾，不得沿用舊值。
+    回 False ＝ 安全撤銷或整筆不在**傳進來的這份清單**裡 → 呼叫端必須受控收尾，
+    不得沿用舊值。⚠️ 引擎傳進來的是**合併清單**，所以「從精選檔刪掉條目」不等於
+    這裡會回 False（registry 可能有同位址的 enabled:true 條目遞補）——檔頭的但書。
     """
     ref = _lookup(address, leaders)
     return ref is not None and ref.enabled

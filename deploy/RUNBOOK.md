@@ -743,8 +743,13 @@ sudo -u filet-api test -w /opt/filet/spark/var/filet/leaders.json \
 python3 -m json.tool /opt/filet/spark/var/filet/leaders.json > /dev/null && echo "JSON OK"
 ```
 
-- ⚠️ **把條目整筆刪掉 ＝ `enabled: false`**（引擎驗不到就當作撤銷，會觸發所有跟隨者
-  收尾）。例行下架請改 `accepting_new`，**不要刪條目**——條目保留也才有歷史可查。
+- ⚠️⚠️ **「把條目整筆刪掉 ＝ `enabled: false`」只在該位址不在 user registry 時成立**
+  （2026-07-27 Finding 2）。引擎驗的是**合併清單**（精選優先、缺的由
+  `user_leaders.json` 遞補），所以同一位址兩檔都有時，刪掉精選那筆只是把 registry 那筆
+  `enabled: true` 放出來——`is_still_permitted` 從 false 翻回 **true，撤銷靜默失效**，
+  而你手上唯一的回饋是「我已經把他刪掉了」。**唯一恆定有效的撤銷 ＝ 確保精選檔裡存在
+  一筆 `enabled: false` 的條目**（見下一節的 CLI）。例行下架同樣不要刪條目，改
+  `accepting_new`——條目保留也才有歷史可查。
 - 改動**不需要重啟 follower**：引擎每個 cycle 重讀白名單，最遲下一輪生效。
 - `enabled: false` 之後請確認收尾真的發生了（別停在「我已下架＝已止血」的假設上）：
 
@@ -752,6 +757,30 @@ python3 -m json.tool /opt/filet/spark/var/filet/leaders.json > /dev/null && echo
 sudo journalctl -u 'filet-follower@*' --since '10 min ago' | grep -i '撤銷\|leader_revoked'
 ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 ARM 檔
 ```
+
+#### ⭐⭐ 安全撤銷一律跑 `scripts/revoke_leader.py`（不要手改、不要刪條目）
+
+撤銷要同時對付兩個檔（精選白名單 ＋ user registry），而做錯的方向全是 **fail-open**：
+刪精選條目 → registry 遞補（撤銷失效）；只改 registry → 精選那筆優先（撤銷無效）；
+手編 registry 弄丟 `added_by` → 載入 fail-fast，引擎判 transient ⇒ **沿用上一個
+leader 繼續跟**。所以不要靠記性拼步驟——這支 CLI 冪等地做完全部三件事，並且
+**自己重載兩個檔、合併、斷言 `is_still_permitted` 為 false**，任何一步不成立就非零退出：
+
+```bash
+cd /opt/filet/spark
+sudo ./.venv/bin/python -m scripts.revoke_leader <leader 位址> \
+  --leaders  /opt/filet/spark/var/filet/leaders.json \
+  --registry /var/lib/filet-exchange/user_leaders.json
+# 成功時最後一行印：✅ 自我驗收：重載兩檔合併後 is_still_permitted(0x…) = False
+# 失敗一律非零退出（$? != 0）——沒看到那行就是**還沒撤銷**，不要停在這裡。
+```
+
+它做的事：精選檔把該位址設 `enabled:false`（不存在就補一筆撤銷用條目，`name` 標
+`REVOKED`）→ registry 有同位址時一併 `enabled:false`（取 API 寫端**同一把 flock**，
+所以不會被下一次 API 寫入無聲蓋掉）→ 重載驗收。重跑安全（冪等，第二次不動任何位元組）。
+
+> ⚠️ 撤銷的是**白名單狀態**，不是「已止血」。跑完仍要用上面那兩條指令確認引擎真的
+> 收尾了（journalctl 撤銷字樣 ＋ `killswitch.tripped` ARM 檔）。
 
 #### 成本熔斷器的狀態檔 `cost_breaker.json`（在哪、什麼時候清）
 
@@ -1096,22 +1125,57 @@ $FILET_EXCHANGE_DIR/user_leaders.json.init     ← init-marker（區分「空檔
 > ⚠️ `.lock` sidecar **永不刪除**：unlink＋flock 並存會讓兩個持鎖者各鎖到不同 inode，
 > 互斥形同虛設（模組 docstring 明載）。清目錄時不要順手刪它。
 
-#### operator 撤銷某個 user-sourced leader（**先取鎖再編輯**）
+#### operator 撤銷某個 user-sourced leader → **跑 CLI，不要手編**
 
-寫入端以 `flock LOCK_EX` 包住整段 read-modify-write，operator 手編**必須先取同一把鎖**，
-否則你的編輯可能被下一次 API 寫入拿舊快照無聲蓋掉（撤銷失效）。把目標條目改
-`"enabled": false`（安全撤銷；引擎下一輪合併後即不再為新客戶放行該位址）：
+```bash
+cd /opt/filet/spark
+sudo ./.venv/bin/python -m scripts.revoke_leader <leader 位址> \
+  --leaders  /opt/filet/spark/var/filet/leaders.json \
+  --registry /var/lib/filet-exchange/user_leaders.json
+```
+
+它取**同一把 flock**（`user_leaders.json.lock`）包住 read-modify-write、精選檔補上
+承重的 `enabled:false` 條目、最後重載兩檔合併自驗 `is_still_permitted` 為 false，
+失敗非零退出。細節與「為什麼刪條目不是撤銷」見 §5.5 的「安全撤銷一律跑
+`scripts/revoke_leader.py`」小節。
+
+<details>
+<summary>不得已要手編時（CLI 不可用）——<b>先取鎖，且驗收必須用 loader</b></summary>
+
+寫入端以 `flock LOCK_EX` 包住整段 read-modify-write，手編**必須先取同一把鎖**，
+否則你的編輯會被下一次 API 寫入拿舊快照無聲蓋掉（撤銷失效）：
 
 ```bash
 # 以能讀寫該檔的身分（filet-api，或有 sudo 者用 sudo -u filet-api）執行：
 sudo -u filet-api flock /var/lib/filet-exchange/user_leaders.json.lock \
   -c "vi /var/lib/filet-exchange/user_leaders.json"
 # 在編輯器裡把該 leader 條目的 "enabled" 改成 false，存檔離開。
-
-# 驗收：JSON 仍合法（壞檔會讓引擎與 API 端載入 fail-fast，這是刻意的）
-sudo -u filet-api python3 -c \
-  "import json,sys; json.load(open('/var/lib/filet-exchange/user_leaders.json')); print('JSON OK')"
 ```
+
+⚠️⚠️ **驗收不可以只驗 `json.load()`**（2026-07-27 Finding 3）：loader 比 JSON 語法
+**嚴格**——每筆還必須有 `source: "user"` 與非空 `added_by`（稽核欄位，
+`user_leaders._validate_registry_fields`）。手編弄丟 `added_by` 的話，`json.load` 說
+OK，實際上 `load_user_leaders` 會 raise → 引擎判成 **transient**（`LeaderResolutionError`）
+→ `LeaderWatch.refresh` 沿用上一輪結果 ⇒ **繼續跟那個你以為已經撤銷的 leader**
+（雖有 critical 告警，但你已經走人了）。驗收要跑**引擎實際用的那個 loader**，
+並且斷言目標條目真的停用了：
+
+```bash
+cd /opt/filet/spark
+sudo -u filet-api ./.venv/bin/python -c "
+from spark.filet.user_leaders import load_user_leaders
+refs = load_user_leaders('/var/lib/filet-exchange/user_leaders.json')
+target = '<leader 位址小寫>'
+hit = [r for r in refs if r.address == target]
+assert hit, f'{target} 不在 registry —— 你改到別的位址了'
+assert hit[0].enabled is False, f'{target} 仍是 enabled=True —— 撤銷沒生效'
+print('registry OK: 條目載入通過且 enabled=False')"
+# 非零退出 = 還沒撤銷成功，不要停在這裡。
+```
+
+⚠️ 手編**只動 registry 仍不是完整的撤銷**：同位址若也在精選白名單裡，精選那筆優先，
+registry 的 `enabled:false` 壓不過它。完整撤銷請回頭跑 CLI。
+</details>
 
 > ⭐ 冪等寫入**不覆寫**既有條目，所以停用後客戶即使重選同一位址，也不會把 `enabled`
 > 改回 true——這一擋在准入層就把流程擋在寫入路徑之前（reason=`leader_disabled`）。
@@ -1119,23 +1183,31 @@ sudo -u filet-api python3 -c \
 
 #### ✅ 探測面 per-session rate limit（已實作，2026-07-27）
 
-`GET /api/leaders/preview` 與 `GET /api/leaders/select/message` 需要有效 session，
-過去**每個 session 無次數上限**，殘餘兩個枚舉／放大面：
+`GET /api/leaders/preview`、`GET /api/leaders/select/message`，以及
+`POST /api/leaders/select` 的**自訂位址分支**（三者共用同一段准入檢查
+`_admit_custom_leader`）需要有效 session，過去**每個 session 無次數上限**，
+殘餘兩個枚舉／放大面：
 
 - 有 session 者可反覆 probe 不同位址，探測哪些位址回 `leader_disabled`（＝平台安全
   撤銷清單，治理資訊）；
 - 每次 probe 會打一次 Hyperliquid `/info`（clearinghouseState）——對上游是**流量放大**。
 
-**現況**：兩個端點已加 per-session sliding-window 限流——每個 session 位址每
+**現況**：三處已加 per-session sliding-window 限流（同一個計數器）——每個 session 位址每
 **60 秒最多 10 次**，超過回 **429**（`{"detail": "查詢過於頻繁，請稍後再試"}`）。實作
 落在 `create_app`（`src/spark/publicapi/app.py`，常數 `PROBE_RATELIMIT_WINDOW_S=60`／
 `PROBE_RATELIMIT_MAX=10`）：per-address 存請求時間戳、逐出 >60s 的、計數；狀態
 in-memory（per-app，隨進程重啟歸零；多 worker 各自計數，對枚舉緩解仍足夠）；
 `threading.Lock` 包住 read-modify（sync 端點跑 threadpool）。
 
-**刻意不套**的兩處：`POST /api/leaders/select`（簽章 gated、濫用成本高）與
-`GET /api/leaders` 目錄（走離線每日快照、不打 HL）。正常用戶零感知（沒有人一分鐘
-查十個位址）。
+**刻意不套**的兩處：`POST /api/leaders/select` 的**精選分支**（簽章 gated、不打 HL、
+不外洩治理資訊）與 `GET /api/leaders` 目錄（走離線每日快照、不打 HL）。
+
+⚠️ 2026-07-27 Finding 1 修補：POST select 的**自訂分支**原本漏掛——它跑
+`_admit_custom_leader`（一次 HL `/info` ＋ reason-coded 4xx），所以一個帶垃圾簽章的
+迴圈就能無限放大上游流量並枚舉撤銷清單（驗簽在准入**之後**，擋不住它）。限流掛在
+准入之前、驗簽之前：429 與准入失敗一樣**不消耗 nonce**（否則一次限流打嗝就作廢客戶
+手上的授權）。正常換手每次只花 2 次額度（message ＋ POST），離上限很遠；正常用戶
+零感知（沒有人一分鐘查十個位址）。
 
 ---
 

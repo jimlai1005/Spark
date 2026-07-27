@@ -85,6 +85,27 @@ def test_curated_entry_beats_user_entry_for_the_same_address(tmp_path):
     assert is_still_permitted(_U, merged) is False
 
 
+def test_deleting_the_curated_entry_falls_back_to_the_registry_entry(tmp_path):
+    """⭐⭐ **釘住現況真實語義**（2026-07-27 Finding 2）：leaders.py 檔頭那條
+    「把 leader 整筆從清單移除 ≡ enabled:false」在 registry 存在**之後就不再成立**。
+
+    合併是「精選優先、缺則由 registry 遞補」，所以同位址同時在兩檔時，operator 刪掉
+    精選那筆＝把 registry 那筆（enabled=true）放了出來——引擎的 is_still_permitted
+    從 False 翻回 True，撤銷靜默失效（follower 繼續跟一個已出事的 leader）。
+
+    這條測試不是在肯定這個行為好，是在**把它釘在檯面上**：唯一恆定有效的撤銷是
+    「確保存在一筆 enabled:false 的**精選**條目」（scripts/revoke_leader.py 做的事），
+    不是刪條目。哪天合併語義改了，這條會紅——那時請一併改 leaders.py 檔頭與 RUNBOOK。
+    """
+    user = [LeaderRef(_U, _U, "", True, True)]
+    # (1) operator 以精選條目撤銷 → 引擎不再放行（承重點成立）。
+    revoked = [LeaderRef(_U, "Compromised", "", False, True)]
+    assert is_still_permitted(_U, merge_leaders(revoked, user)) is False
+    # (2) 同一位撤銷條目被「整筆刪掉」（舊文件說這也等於撤銷）→ registry 條目遞補上來
+    #     → **True**。刪除不是撤銷。
+    assert is_still_permitted(_U, merge_leaders([], user)) is True
+
+
 def test_user_only_entry_is_permitted_by_the_engine_predicate(tmp_path):
     """⭐ 合法准入的自訂 leader 不會在引擎層被拒：`is_still_permitted` 在合併清單上
     看得到 user 條目（語義不變，仍只看 enabled）。"""
@@ -156,6 +177,43 @@ def test_recording_refuses_to_clobber_a_corrupt_registry(tmp_path):
     with pytest.raises(ValueError):
         record_user_leader(p, address=_U, added_by=_ACCT)
     assert p.read_text() == "{ not json"
+
+
+def test_registry_write_is_atomic_and_leaves_no_tmp(tmp_path):
+    """原子換檔（tmp + os.replace）：落檔後不得留下任何 tmp 殘骸，且內容可讀回
+    （沿帳本 test_save_ledger_is_atomic_and_leaves_no_tmp 的同一組錨定）。
+
+    殘骸不只是髒：交換目錄的 `.tmp` 是**半份 JSON**，會被下一次備份／rsync 一起帶走，
+    而還原時沒有人分得出哪一份才是完整的 registry。"""
+    p = tmp_path / "user_leaders.json"
+    record_user_leader(p, address=_U, added_by=_ACCT)
+    record_user_leader(p, address=_CURATED, added_by=_ACCT)
+    assert [r.address for r in load_user_leaders(p)] == [_U, _CURATED]
+    assert [f.name for f in tmp_path.iterdir() if f.name.endswith(".tmp")] == []
+
+
+def test_registry_is_never_torn_even_when_the_write_crashes(tmp_path, monkeypatch):
+    """⭐ 引擎每輪讀這個檔且**刻意不取鎖**（讀端無鎖是設計），所以寫入必須是
+    「要嘛完整舊版、要嘛完整新版」，中間態不存在。
+
+    在序列化途中炸掉（模擬磁碟滿／進程被砍）：正式檔必須仍是**完整可載入的舊版**——
+    半份 JSON 會讓 load_user_leaders fail-fast，引擎側把那讀成合併清單少了條目
+    ＝集體撤銷（真實的平倉成本）。tmp 也不得留下殘骸。"""
+    p = tmp_path / "user_leaders.json"
+    record_user_leader(p, address=_U, added_by=_ACCT)
+    before = p.read_text()
+    real_dump = json.dump
+
+    def _boom(obj, f, **kw):
+        real_dump(obj, f, **kw)          # 先寫進去（tmp 已有完整內容）…
+        raise OSError("disk full")       # …再炸：os.replace 永遠不會發生
+
+    monkeypatch.setattr("spark.filet.user_leaders.json.dump", _boom)
+    with pytest.raises(OSError):
+        record_user_leader(p, address=_CURATED, added_by=_ACCT)
+    assert p.read_text() == before                     # 舊版一個位元組都沒被動到
+    assert [r.address for r in load_user_leaders(p)] == [_U]
+    assert [f.name for f in tmp_path.iterdir() if f.name.endswith(".tmp")] == []
 
 
 def test_concurrent_recording_loses_no_entries(tmp_path):

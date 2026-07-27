@@ -613,6 +613,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         return {"address": addr, "exists": exists,
                 "account_value": str(account_value),   # Decimal → str（落地慣例）
                 "position_count": position_count,
+                # ⭐ 「在精選白名單裡」，**不是**「可選」：paused（accepting_new=false）
+                # 也算 true。語意與理由見 leaders_preview 的 docstring。
                 "already_listed": listed is not None,
                 # accepting_new=false（例行下架、enabled=true）→ 放行帶此旗標，
                 # 前端據此畫警示但不擋（撤銷是 enabled，已在上面硬擋掉）。
@@ -625,7 +627,18 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
         回 `{address, exists, account_value, position_count, already_listed}`；
         檢查不過 → 4xx，detail 帶機器可判的 reason code（見 _admit_custom_leader）。
-        already_listed=true ⇒ 位址已在精選清單且可選，前端後續走既有精選流程。
+
+        ⭐ `already_listed=true` ⇒ 位址**在精選白名單裡**（`enabled=true`），
+        **不保證可選**——`accepting_new=false` 的 paused leader 也是 true，而
+        `/api/leaders` 用 `is_selectable` 過濾（兩旗標都要過），所以它不在那份目錄裡。
+        兩者刻意不同源：這個旗標回答的是「該位址由精選檔管轄嗎」，不是「它出現在
+        目錄裡嗎」。理由是 Finding 1 的 kill-switch 修復——POST select 對
+        `already_listed=true` 的位址**不寫 user registry**（寫了會留下一筆
+        `enabled:true` 影子條目，日後撤銷精選條目時反而讓引擎繼續跟）。paused 位址
+        本就走自訂分支（is_selectable=false），所以這個旗標必須連 paused 一起涵蓋，
+        否則影子條目照樣被寫出來。`accepting_new` 另以獨立欄位回報，前端據它畫警示
+        （行為錨定：tests/test_api_leader_preview.py::
+        test_paused_curated_leader_is_admitted_with_accepting_new_false）。
 
         ⭐ per-session rate limit（60s 內 10 次）：本端點是非精選位址的探測面，
         且每次會打一次 HL /info——超限回 429（見 _enforce_probe_ratelimit）。
@@ -803,9 +816,20 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         #    ⚠️ 精選側刻意不是 is_still_permitted：那是引擎對「已經在跟的人可否
         #    繼續跟」的述詞（只看 enabled），用在這裡會讓客戶選中一個已停止接客
         #    的 leader。兩個旗標的語意差異見 filet/leaders.py 檔頭。
+        #    ⭐ per-session probe rate limit **只掛在自訂分支**（Finding 1）：走到
+        #    _admit_custom_leader 就是一次 HL /info ＋一組 reason-coded 4xx，與
+        #    preview／message 完全同一個探測面——不掛的話，一個帶垃圾簽章的迴圈就能
+        #    無限放大上游流量、並枚舉哪些位址回 leader_disabled（＝平台撤銷清單，
+        #    治理資訊）。驗簽在後面，擋不住這個迴圈：它根本不打算通過驗簽。
+        #    精選分支不限流（既有保證不變）：那條路不打 HL、也不外洩任何治理資訊。
+        #    ⚠️ 位置刻意在 _admit_custom_leader **之前、驗簽之前**：429 與准入失敗
+        #    一樣都不得消耗 nonce（見 test_admission_failure_does_not_burn_the_nonce
+        #    ——一次限流打嗝作廢客戶手上的授權，等於自我 DoS）。正常流程每次換手
+        #    只花 2 次額度（message ＋ POST），離 10 次上限很遠。
         refs = _load_leaders_or_503()
         custom = None
         if not is_selectable(body.leader_address, refs):
+            _enforce_probe_ratelimit(address)
             custom = _admit_custom_leader(body.leader_address, address, refs)
 
         # 3) 驗章。⭐ user_address 出自 **session**（可信來源），不是請求內容；

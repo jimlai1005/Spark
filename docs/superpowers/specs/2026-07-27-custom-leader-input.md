@@ -12,7 +12,7 @@ leaderboard 上其他優秀交易者的用戶沒有任何管道——清單外�
 
 leaders 頁保留精選卡片清單，另新增「自訂 leader」區塊：用戶可輸入任意 wallet
 address（並附 HL 官方 leaderboard 外部連結供研究）。輸入後即時格式驗證、後端查鏈
-確認該帳戶存在且有 perp 活動並回傳預覽（帳戶權益、持倉數、最近活動），用戶勾選
+回傳預覽（帳戶權益、持倉數；無 perp 活動時顯示警示但不擋），用戶勾選
 「未審核 leader」風險聲明後走既有的簽章選擇流程。通過的位址自動寫入獨立的
 user-sourced 白名單 registry——僅該用戶可用、不進公開目錄，operator 保留 kill-switch。
 跟單邏輯與風險槓桿完全不變。
@@ -23,12 +23,12 @@ user-sourced 白名單 registry——僅該用戶可用、不進公開目錄，o
 2. As a 跟單用戶, I want 頁面上有 HL 官方 leaderboard 的外部連結, so that 我可以自己去找喜歡的 leader 再回來輸入。
 3. As a 跟單用戶, I want 輸入位址時得到即時格式驗證回饋, so that 貼錯格式時立刻知道，不用等送出才失敗。
 4. As a 跟單用戶, I want 送出前看到該位址的鏈上預覽（帳戶權益、持倉數、最近活動）, so that 我能確認自己沒有貼錯位址、跟錯人。
-5. As a 跟單用戶, I want 輸入不存在或沒有 perp 活動的位址時被明確拒絕並說明原因, so that 我不會跟單一個永遠不會有動靜的死地址。
+5. As a 跟單用戶, I want 輸入無 perp 活動的位址時看到警示但仍可繼續, so that 我可以提前完成配置（leader 可能尚未進場），不必等 leader 首筆交易才手忙腳亂追設定。
 6. As a 跟單用戶, I want 輸入自己的登入位址時被擋下, so that 我不會誤設出無意義的自我跟單。
 7. As a 跟單用戶, I want 自訂 leader 必須勾選「我知道此為未審核 leader」專屬聲明才能送出, so that 我清楚知道這個 leader 沒有經過平台審核、風險自負。
 8. As a 跟單用戶, I want 自訂 leader 沿用與精選 leader 相同的簽章確認流程, so that 換 leader 的授權安全性不因來源不同而打折。
 9. As a 跟單用戶, I want 輸入的位址若已在精選清單中則直接視同選擇該精選 leader, so that 同一位址不會出現兩種身分。
-10. As a 跟單用戶, I want 輸入已被平台停用的 leader 位址時被拒絕並告知, so that 我不會繞過平台的安全撤銷去跟一個已知出事的 leader。
+10. As a 跟單用戶, I want 輸入因安全撤銷而被平台禁用的 leader（enabled=false）時被拒絕並告知, so that 我不會繞過平台的安全撤銷去跟一個已知出事的 leader；反之已停止接收新客（accepting_new=false）的位址允許准入但顯示警示。
 11. As a 跟單用戶, I want 自訂 leader 沒有績效快照時看到「無績效資料」而非錯誤, so that 頁面不會因為缺資料而壞掉或誤導。
 12. As a 跟單用戶, I want 選定自訂 leader 後在「我目前跟誰」看到該位址, so that 我隨時能確認目前的跟單對象。
 13. As a 平台 operator, I want 用戶自訂的 leader 不出現在其他用戶的精選清單, so that 策展門面不被任意位址稀釋、平台不為未審核 leader 背書。
@@ -56,18 +56,25 @@ user-sourced 白名單 registry——僅該用戶可用、不進公開目錄，o
   （任何用戶本就可自行輸入同一位址走准入，帳戶級封鎖無安全增量）。
 
 **准入門檻**
-- 三道檢查：(1) 格式——0x + 40 hex，正規化為小寫（與後端既有慣例一致）；
-  (2) 鏈上存在——透過既有 HL gateway 的 clearinghouse 查詢，帳戶須有 perp 活動痕跡
-  （權益 > 0 或有持倉；精確判準以測試錨定）；(3) 禁止自跟——輸入位址不得等於
-  session 登入位址（小寫比對）。
+- 四道檢查：(1) 格式——0x + 40 hex，正規化為小寫（與後端既有慣例一致）；
+  (2) 鏈上查詢——透過既有 HL gateway 的 clearinghouse 查詢帳戶狀態，無 perp 活動時
+  不再拒絕，改為准入並在預覽回傳 `exists: false` 以驅動前端警示（理由：leader 可能
+  尚未進場但用戶希望提前完成配置）；(3) 禁止自跟——輸入位址不得等於 session 登入位址
+  （小寫比對）；(4) 安全撤銷檢查——若位址在精選清單中且 `enabled=false`（安全撤銷狀態）
+  則硬擋。反之 `accepting_new=false`（例行下架）允許准入但前端據 `accepting_new` 欄位
+  顯示警示。
 - 不審查績效——leader 品質判斷歸用戶。
 
 **API 契約**
 - 新增預覽端點：`GET /api/leaders/preview?leader_address=...`（session 驗證）。
-  執行三道准入檢查並回傳預覽資料：`{ address, exists, account_value, position_count,
-  already_listed }`（already_listed = 該位址已在精選清單且可選）。檢查不過回 4xx
-  並附機器可判的 reason code（`invalid_format` / `self_follow` / `not_found` /
-  `leader_disabled`）。
+  執行准入檢查並回傳預覽資料：`{ address, exists, account_value, position_count,
+  already_listed, accepting_new }`（exists = 位址是否有 perp 活動；
+  already_listed = 該位址在精選清單中（包含 accepting_new=false 的 paused leader；
+  見變更 4 註記）；accepting_new = leader 是否接收新跟單）。檢查不過回 4xx
+  並附機器可判的 reason code（`invalid_format` / `self_follow` / `leader_disabled`
+  - 僅 enabled=false 時回傳）。
+- Rate limit：preview、select message、select 提交端點均受 per-session 滑動視窗限流
+  （10 次／60 秒）；超過回 429，目的是抑制位址枚舉與對 HL /info 的外呼放大。
 - 既有換 leader 訊息端點與提交端點放行自訂位址：訊息端點對非精選位址改為執行准入
   前置檢查（取代原本的 is_selectable 拒絕）；提交端點在驗簽通過後**重新執行全部
   准入檢查**（不信任客戶端曾呼叫 preview，防 TOCTOU），通過即冪等寫入 user registry
@@ -125,3 +132,18 @@ user-sourced 白名單 registry——僅該用戶可用、不進公開目錄，o
   測試錨例為準；原則是擋死地址與 typo，不是審查品質。
 - 本 spec 由 grilling 共識產出（2026-07-27 夜間 session），決策鏈：白名單自動准入 →
   格式＋鏈上存在門檻 → hybrid UI → 驗證即預覽 → 僅本人可見 → 專屬風險 checkbox。
+
+**2026-07-27 開發後的決策演進**（四項變更，非原始規格）：
+- 變更 1：無 perp 活動的位址不再拒絕（reason code `not_found` 已移除），改為准入並回傳
+  `exists: false` 驅動前端警示；理由：leader 可能尚未進場，用戶希望提前配置。
+- 變更 2：`enabled=false`（安全撤銷）維持硬擋；`accepting_new=false`（例行下架）改為警示放行。
+  前端據 `accepting_new` 欄位顯示位址是否接收新跟單。
+- 變更 3：preview、select message、select 提交端點新增 per-session 滑動視窗限流
+  （10 次／60 秒、回 429）。
+- 變更 4：`already_listed` 語義澄清為「位址在精選清單中」（包含 `accepting_new=false` 的 paused
+  leader），理由：paused 位址刻意不寫入 user registry 以避免日後 enabled:true 的影子條目。
+
+**撤銷語義但書**：位址同時存在於精選檔與 user registry 時，「刪除精選條目」不等於撤銷。
+唯一恆定有效的撤銷是確保精選條目存在一筆 `enabled:false` 的記錄。
+
+**部署與營運配置**仍列為 out of scope（見「Out of Scope」末項）。

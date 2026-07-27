@@ -161,6 +161,59 @@ describe("端點契約（對照 src/spark/publicapi/app.py）", () => {
 });
 
 /**
+ * 「我目前跟誰」（對照 app.py 的 /api/me/leader）。
+ * ⭐ 端點**沒有任何 account 參數**——account_id 由 session 衍生，結構上不可能查到
+ * 別人的（後端 docstring 明寫）。這裡把「不送參數」當成契約釘住：哪天前端加了一個
+ * `?account_id=`，那條結構保證就從前端這側被打開了。
+ */
+describe("getMyLeader（我目前跟隨的 leader）", () => {
+  it("GET /api/me/leader（零查詢參數），回傳四態 status 與 leader 位址", async () => {
+    mockFetchJson(200, {
+      account_id: "fabc",
+      status: "following",
+      leader_address: "0x1111111111111111111111111111111111111111",
+      leader_name: "Alpha",
+      pending_change: null,
+      note: "這是引擎目前為你跟隨的 leader。",
+    });
+    const r = await api.getMyLeader();
+    expect(captured[0].url).toBe("/api/me/leader");
+    expect(captured[0].init.method).toBeUndefined(); // GET
+    expect(captured[0].init.credentials).toBe("include");
+    expect(r.status).toBe("following");
+    expect(r.leader_address).toBe("0x1111111111111111111111111111111111111111");
+    expect(r.leader_name).toBe("Alpha");
+    expect(r.pending_change).toBeNull();
+  });
+
+  it("pending_change 原樣帶出（leader_address／issued_at／effective／note）", async () => {
+    mockFetchJson(200, {
+      account_id: "fabc",
+      status: "following",
+      leader_address: "0x1111111111111111111111111111111111111111",
+      leader_name: "Alpha",
+      pending_change: {
+        leader_address: "0x2222222222222222222222222222222222222222",
+        issued_at: "2026-07-27T00:00:00Z",
+        effective: "next_engine_cycle",
+        note: "你已簽署換 leader，尚未生效。",
+      },
+      note: "這是引擎目前為你跟隨的 leader。",
+    });
+    const r = await api.getMyLeader();
+    expect(r.pending_change).toMatchObject({
+      leader_address: "0x2222222222222222222222222222222222222222",
+      effective: "next_engine_cycle",
+    });
+  });
+
+  it("manifest 讀不到 → 503 歸 kind=upstream（不得被讀成「你沒在跟單」）", async () => {
+    mockFetchJson(503, { detail: "跟隨狀態暫時不可用，請稍後重試" });
+    await expect(api.getMyLeader()).rejects.toMatchObject({ kind: "upstream", status: 503 });
+  });
+});
+
+/**
  * 自訂 leader 准入預覽（2026-07-27 spec；對照 app.py 的 /api/leaders/preview）。
  * ⭐ 這是全 app 第一個 detail 為**物件**（`{reason, message}`）的端點：reason 是
  * 機器可判的分類碼，message 是人話。分類在邊界完成（工程原則 5）——request()
@@ -235,6 +288,7 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getApproveBuilderFeePayload(42161),
       () => api.getAdminPending(),
       () => api.getMe(),
+      () => api.getMyLeader(),
       () => api.getNonce("0xAbC0000000000000000000000000000000000001", 1),
       () => api.getOpsCustomers({ days: 1 }),
       () => api.getOpsRevenue(0.01),
@@ -283,7 +337,8 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     // 對照上一個 describe 的 calls 陣列長度：兩者必須同步增減。
     // 2026-07-19：+2（getOpsTradeQuality、getOpsHealth，/ops 兩個新面板）
     // 2026-07-27：+1（getLeaderPreview，自訂 leader 准入預覽）
-    const HAND_WRITTEN_LIST_LENGTH = 22;
+    // 2026-07-27：+1（getMyLeader，「我目前跟誰」——/leaders 頁的現況揭露）
+    const HAND_WRITTEN_LIST_LENGTH = 23;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

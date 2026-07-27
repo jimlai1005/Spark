@@ -653,6 +653,12 @@ main.page {
   font-size: 14px; color: var(--text); margin: 0 0 6px;
 }
 
+/* 「你目前跟隨的 leader」：換 leader 這個決定的左半邊，排在清單之前。 */
+.leader-current { margin-top: 16px; }
+.leader-current-addr { margin: 0 0 8px; font-size: 14px; color: var(--text); }
+.leader-current-none { margin: 0 0 8px; font-size: 14px; color: var(--text); }
+.leader-current-pending { margin: 12px 0 0; }
+
 .leader-stats-notice { margin-top: 16px; }
 .leader-stats-meta { margin-top: 16px; }
 .leader-stats-meta .mono { word-break: break-all; }
@@ -795,6 +801,9 @@ main.page {
 .leader-custom-preview .leader-stats { margin: 12px 0 12px; }
 .leader-custom-listed { margin: 0 0 8px; }
 .leader-custom-noperf { margin: 0 0 12px; }
+/* 精選位址的預覽卡：績效在上方那張卡片上，這裡只指過去（不重複顯示、不另算一份）。 */
+.leader-custom-perf-ref { margin: 0 0 12px; }
+.leader-custom-preview .leader-name { margin: 0 0 2px; }
 .leader-custom-preview .check-row { margin: 12px 0; }
 .leader-custom-preview .leader-action { margin-top: 14px; }
 

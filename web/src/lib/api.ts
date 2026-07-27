@@ -155,6 +155,66 @@ export function getMe(): Promise<Me> {
   return request<Me>("/api/me");
 }
 
+/**
+ * 「我目前跟隨的 leader」的四種狀態（後端 `me_leader` 的 `status`，改一邊要改兩邊）。
+ * ⭐ 後端刻意**不用 null 讓前端猜**：`leader_address` 為 null 時只有 `status` 分得出
+ * 「還沒活化」與「已活化但用引擎預設」——後者**是真的在跟單**，只是跟的對象由部署
+ * 決定。把兩者合併成一句「你沒有 leader」，會讓一個正在跟單的客戶以為資金沒在動。
+ */
+export type MyLeaderStatus =
+  /** manifest 明確指定了 leader（`leader_address` 必為非 null）。 */
+  | "following"
+  /** 已活化但未指定 leader，引擎沿用進程 env 的預設——仍在跟單。 */
+  | "engine_default"
+  /** 帳號不在 manifest（活化是人工 CLI 動作）。 */
+  | "not_activated"
+  /** 帳號不在 manifest **且** manifest 有壞條目——壞的那筆可能就是他自己的。 */
+  | "indeterminate";
+
+/**
+ * 已簽署、尚未反映在 manifest 的換 leader 記錄（後端 `_pending_leader_change`）。
+ * ⚠️ 後端只投影這四個欄位——signature 與 message 原文結構上不外流。
+ */
+export interface MyLeaderPendingChange {
+  leader_address: string;
+  issued_at: string | null;
+  /** 機器可讀語意，目前恆為 `next_engine_cycle`。 */
+  effective: string;
+  /** 後端寫給人看的原文；顯示層原樣呈現，不在前端另寫一份。 */
+  note: string;
+}
+
+/**
+ * 我目前跟隨的 leader（`/api/me/leader`）。
+ *
+ * ⭐ `leader_name` 只從精選白名單查得到，查無**不代表位址有問題**——只代表它不在
+ * 目前的可選清單裡（自訂 leader、或已下架的精選 leader 都會是 null）。顯示層因此
+ * 必須能只靠位址把這一區畫完整，不得把「沒有名稱」當成「沒有 leader」。
+ *
+ * ⚠️ 錯誤方向不對稱：manifest 讀不到時後端回 **503**（不是「你沒在跟單」）。
+ * 顯示層對這個錯誤的正確反應是「暫時讀不到」，把它畫成「未在跟單」會讓一個正在
+ * 跟單的客戶以為資金沒在動而不去看它（工程原則 3：讀不到 ≠ 沒有）。
+ */
+export interface MyLeaderResp {
+  account_id: string;
+  status: MyLeaderStatus;
+  /** `following` 以外的狀態恆為 null（後端 `me_leader` 的結構性不變式）。 */
+  leader_address: string | null;
+  leader_name: string | null;
+  pending_change: MyLeaderPendingChange | null;
+  /** 每一種狀態各有一句後端原文；顯示層原樣呈現（單一來源）。 */
+  note: string;
+}
+
+/**
+ * 我目前跟隨的 leader（需 session）。⭐ **沒有任何 account 參數**——account_id 由
+ * session 衍生，所以結構上不可能查到別人的（沿後端「別人不能替你 onboard」的慣例）。
+ * manifest 讀不到 → 503（kind=upstream）。冪等讀取，重試安全。
+ */
+export function getMyLeader(): Promise<MyLeaderResp> {
+  return request<MyLeaderResp>("/api/me/leader");
+}
+
 // ---------- onboarding ----------
 export function createAgent(): Promise<AgentResp> {
   return post<AgentResp>("/api/onboard/agent");

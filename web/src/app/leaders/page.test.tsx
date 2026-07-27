@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,7 @@ import {
   type BillingPlansResp,
   type LeaderSelectMessageResp,
   type LeadersResp,
+  type MyLeaderResp,
 } from "@/lib/api";
 
 const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" };
@@ -19,6 +20,7 @@ const getBillingPlans = vi.fn();
 const getLeaderSelectMessage = vi.fn();
 const postLeaderSelect = vi.fn();
 const getLeaderPreview = vi.fn();
+const getMyLeader = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMe: (...a: unknown[]) => getMe(...a),
@@ -27,6 +29,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getLeaderSelectMessage: (...a: unknown[]) => getLeaderSelectMessage(...a),
   postLeaderSelect: (...a: unknown[]) => postLeaderSelect(...a),
   getLeaderPreview: (...a: unknown[]) => getLeaderPreview(...a),
+  getMyLeader: (...a: unknown[]) => getMyLeader(...a),
 }));
 
 const signMessageAsync = vi.fn();
@@ -181,10 +184,27 @@ const MSG: LeaderSelectMessageResp = {
 };
 const SIG = `0x${"ab".repeat(65)}`;
 
+/**
+ * `/api/me/leader` 的線上形狀（app.py `me_leader`）。四種 `status` 語意不同，
+ * 且 `leader_address` 為 null 時**只能靠 status** 分辨「還沒活化」與「用引擎預設」。
+ */
+function myLeader(over: Partial<MyLeaderResp> = {}): MyLeaderResp {
+  return {
+    account_id: "fabc",
+    status: "following",
+    leader_address: "0x1111111111111111111111111111111111111111",
+    leader_name: "Alpha",
+    pending_change: null,
+    note: "這是引擎目前為你跟隨的 leader。",
+    ...over,
+  } as MyLeaderResp;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   getMe.mockResolvedValue(ME);
   getLeaders.mockResolvedValue(leaders());
+  getMyLeader.mockResolvedValue(myLeader());
   getBillingPlans.mockResolvedValue(catalog(false));
   getLeaderSelectMessage.mockResolvedValue(MSG);
   postLeaderSelect.mockResolvedValue({
@@ -296,9 +316,16 @@ describe("LeadersPage — 誠信揭露 ⭐（本頁最重要的部分）", () =>
     expect(signMessageAsync).not.toHaveBeenCalled();
   });
 
-  it("「目前跟隨中」沒有資料來源 → 明說缺口，不猜、不標示", async () => {
+  /**
+   * ⭐ 2026-07-27：「本頁無法標示你目前跟隨中的 leader」那段缺口說明已作廢——
+   * 後端 `/api/me/leader` 早就存在，本頁改為實際顯示（spec User Story 12）。
+   * 這條改成擋回頭路：那句過時的「查不到」文案不得再出現在畫面上，因為它現在是假的。
+   * 實際顯示行為由下方「目前跟隨的 leader」整個 describe 覆蓋。
+   */
+  it("⭐ 「目前跟隨中」現在有資料來源 → 顯示現況，不得再出現「本頁無法標示」的舊文案", async () => {
     render(wrap(<LeadersPage />));
-    expect(await screen.findByText(/本頁無法標示你目前跟隨中的 leader/)).toBeInTheDocument();
+    expect(await screen.findByText("你目前跟隨的 leader")).toBeInTheDocument();
+    expect(screen.queryByText(/本頁無法標示你目前跟隨中的 leader/)).not.toBeInTheDocument();
   });
 });
 
@@ -871,6 +898,23 @@ describe("LeadersPage — 簽章授權流程（沿 approvalFlow 的謹慎度）"
 
     expect(await screen.findByRole("alert")).toHaveTextContent("只能變更自己帳號的 leader");
   });
+
+  it("送出 429（查詢額度用完）→ 專屬文案，不得說『上一筆簽名已作廢』", async () => {
+    // preview／待簽原文／送出共用同一個 per-session 額度，所以查很多位址之後
+    // 按送出也會撞到 429。通用的 submitFailed 說「上一筆簽名已作廢」，但這個
+    // 情況根本還沒送到驗簽——講作廢是錯的，會讓人以為出了更嚴重的事。
+    postLeaderSelect.mockRejectedValue(
+      new ApiError("client", "查詢過於頻繁，請稍後再試", 429, "查詢過於頻繁，請稍後再試"),
+    );
+    render(wrap(<LeadersPage />));
+    await openConfirm();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("你的 leader 沒有被變更");
+    expect(alert).toHaveTextContent("等約一分鐘");
+    expect(alert).not.toHaveTextContent("已作廢");
+  });
 });
 
 /**
@@ -1011,6 +1055,74 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeEnabled();
   });
 
+  /**
+   * ⭐⭐ already_listed=true ＝ 這個位址**就是上方精選清單裡的那一位**（或是白名單裡
+   * 一個 paused 的條目）。同一頁對同一個位址講兩套話，是本頁誠信揭露標準的直接違反：
+   * 上方卡片有完整績效，下方預覽卻宣稱「無績效資料」，而且名稱寫死成「自訂 leader」。
+   *
+   * ⚠️ 兩個子情形必須分開：後端的 already_listed 對 **paused**（accepting_new=false）
+   * 的精選 leader 也回 true，但 `/api/leaders` 用 `is_selectable` 過濾、**不含** paused
+   * leader——對這種情形說「這個位址就是上方精選清單中的 leader」是一句假話（上方根本
+   * 沒有它）。因此「在不在上方」一律由**上方實際渲染的那份清單**判定（同源比較），
+   * 不由 already_listed 推論。
+   */
+  const LISTED_ADDR = "0x1111111111111111111111111111111111111111"; // 精選清單的 Alpha
+
+  it("⭐ already_listed 且在上方清單中 → 不畫「無績效資料」、顯示精選名稱、指向上方卡片", async () => {
+    getLeaderPreview.mockResolvedValue({
+      ...CUSTOM_PREVIEW, address: LISTED_ADDR, already_listed: true,
+    });
+    render(wrap(<LeadersPage />));
+    await previewCustom(LISTED_ADDR);
+
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(card.textContent).not.toContain("無績效資料");
+    expect(card.textContent).toContain("Alpha");        // 沿用精選名稱，不寫死
+    expect(card.textContent).toMatch(/上方/);            // 指向上方那張有績效的卡片
+  });
+
+  it("⭐ already_listed 且在上方清單中 → 確認框用精選名稱，不是寫死的「自訂 leader」", async () => {
+    getLeaderPreview.mockResolvedValue({
+      ...CUSTOM_PREVIEW, address: LISTED_ADDR, already_listed: true,
+    });
+    render(wrap(<LeadersPage />));
+    await previewCustom(LISTED_ADDR);
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    await userEvent.click(screen.getByRole("button", { name: "選擇此自訂 leader" }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toContain("Alpha");
+    expect(dialog.textContent).toContain("0x1111…111");
+    expect(dialog.textContent).not.toContain("自訂 leader");
+  });
+
+  it("⭐ already_listed 但未列於上方（paused，accepting_new=false）→ 文案不宣稱在上方清單中", async () => {
+    getLeaderPreview.mockResolvedValue({
+      ...CUSTOM_PREVIEW, already_listed: true, accepting_new: false,
+    });
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(card.textContent).not.toContain("無績效資料");
+    expect(card.textContent).not.toMatch(/就是上方精選清單中的 leader/);
+    expect(card.textContent).toMatch(/未列於上方/);
+    // 例行下架的既有警示不受影響（放行帶警示，不是拒絕）
+    expect(card.textContent).toMatch(/未開放接受新跟單者/);
+  });
+
+  it("精選清單載入失敗 → already_listed 的預覽仍可用，且不宣稱在上方清單中", async () => {
+    getLeaders.mockRejectedValue(new ApiError("upstream", "leader 名單暫時不可用", 503));
+    getLeaderPreview.mockResolvedValue({
+      ...CUSTOM_PREVIEW, address: LISTED_ADDR, already_listed: true,
+    });
+    render(wrap(<LeadersPage />));
+    await previewCustom(LISTED_ADDR);
+
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(card.textContent).not.toMatch(/就是上方精選清單中的 leader/);
+  });
+
   it("⭐ exists=false（鏈上無活動）→ 顯示警示但不擋，勾選後可送出走簽章（2026-07-27 裁決）", async () => {
     getLeaderPreview.mockResolvedValue({
       ...CUSTOM_PREVIEW, exists: false, account_value: "0", position_count: 0,
@@ -1109,6 +1221,129 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     for (const b of buttons) expect(b).toBeDisabled();
     expect(screen.queryByRole("button", { name: "選擇此自訂 leader" })).not.toBeInTheDocument();
     expect(getLeaderSelectMessage).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * ⭐ 「我目前跟誰」（spec User Story 12；後端 /api/me/leader）。
+ *
+ * 為什麼這一區的失敗方向特別重要：本頁要客戶簽署一份**換掉**現有 leader 的授權，
+ * 卻沒有左半邊的對照（我現在跟的是誰）。所以這一區的錯誤方向不對稱——
+ * 顯示不出來只是少一個資訊，而把「讀不到」畫成「你沒在跟單」則是一句我們沒有根據
+ * 的斷言（後端因此把 not_activated 與 indeterminate 分成兩態，前端不得合併）。
+ */
+describe("LeadersPage — 目前跟隨的 leader（/api/me/leader）⭐", () => {
+  /** 這一區的 DOM 範圍——精選卡片也會畫同一個位址縮寫，斷言必須限定在本區塊內。 */
+  function currentPanel(): HTMLElement {
+    return document.querySelector(".leader-current")!;
+  }
+
+  it("⭐ status=following → 顯示目前跟隨的位址縮寫與名稱，並附後端原文說明", async () => {
+    render(wrap(<LeadersPage />));
+    await screen.findByText("你目前跟隨的 leader");
+
+    const panel = currentPanel();
+    expect(panel.textContent).toContain("0x1111…111"); // shortAddr
+    expect(panel.textContent).toContain("Alpha");
+    expect(panel.textContent).toContain("這是引擎目前為你跟隨的 leader。");
+  });
+
+  it("leader_name 為 null（不在目前的可選清單）→ 照樣顯示位址，不顯示空名稱", async () => {
+    getMyLeader.mockResolvedValue(myLeader({ leader_name: null }));
+    render(wrap(<LeadersPage />));
+    await screen.findByText("你目前跟隨的 leader");
+
+    expect(currentPanel().textContent).toContain("0x1111…111");
+  });
+
+  it("⭐ 尚未設定 leader（status=engine_default）→ 合理提示＋後端原文，不畫任何位址", async () => {
+    getMyLeader.mockResolvedValue(myLeader({
+      status: "engine_default", leader_address: null, leader_name: null,
+      note: "你已啟用跟單，但尚未指定 leader，引擎沿用部署的預設設定。",
+    }));
+    render(wrap(<LeadersPage />));
+    await screen.findByText("你目前跟隨的 leader");
+
+    const panel = currentPanel();
+    expect(panel.textContent).toMatch(/尚未指定 leader/);
+    expect(panel.textContent).toContain("引擎沿用部署的預設設定");
+    expect(panel.textContent).not.toMatch(/0x/); // 沒有 leader 就不畫位址
+  });
+
+  it("⭐ 帳號尚未啟用（status=not_activated）→ 說明尚未啟用，不宣稱「沒有 leader」", async () => {
+    getMyLeader.mockResolvedValue(myLeader({
+      status: "not_activated", leader_address: null, leader_name: null,
+      note: "你的帳號尚未啟用跟單（啟用是人工作業）。",
+    }));
+    render(wrap(<LeadersPage />));
+    await screen.findByText("你目前跟隨的 leader");
+
+    expect(currentPanel().textContent).toMatch(/尚未啟用跟單/);
+  });
+
+  it("⭐ status=indeterminate → 明說無法確認，不得被讀成「未在跟單」", async () => {
+    getMyLeader.mockResolvedValue(myLeader({
+      status: "indeterminate", leader_address: null, leader_name: null,
+      note: "目前無法確認你的跟隨狀態（帳號清單有無法解析的條目）；請聯絡管理員，"
+        + "不要當作「未在跟單」處理。",
+    }));
+    render(wrap(<LeadersPage />));
+    await screen.findByText("你目前跟隨的 leader");
+
+    const panel = currentPanel();
+    expect(panel.textContent).toMatch(/無法確認你的跟隨狀態/);
+    expect(panel.textContent).toMatch(/不要當作「未在跟單」處理/);
+  });
+
+  it("⭐ pending_change → 一併顯示待生效的目標位址與後端說明", async () => {
+    getMyLeader.mockResolvedValue(myLeader({
+      pending_change: {
+        leader_address: "0x2222222222222222222222222222222222222222",
+        issued_at: "2026-07-27T00:00:00Z",
+        effective: "next_engine_cycle",
+        note: "你已簽署換 leader，尚未生效：引擎會在下一個 cycle 重新驗證後套用。",
+      },
+    }));
+    render(wrap(<LeadersPage />));
+    await screen.findByText("你目前跟隨的 leader");
+
+    const panel = currentPanel();
+    expect(panel.textContent).toContain("0x2222…222");
+    expect(panel.textContent).toMatch(/尚未生效/);
+    expect(panel.textContent).toContain("2026-07-27T00:00:00Z");
+  });
+
+  it("⭐ 簽章成功後重抓本區塊：剛簽的那筆待生效變更要立刻看得到，不必重新整理", async () => {
+    getBillingPlans.mockResolvedValue(catalog(true));
+    render(wrap(<LeadersPage />));
+    await userEvent.click(await screen.findByRole("button", { name: "選擇此 leader" }));
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+    await screen.findByText(/已授權，於引擎的下一個 cycle 生效/);
+
+    // 同一頁不得同時說「已授權」與「沒有待生效的變更」——授權成功後本區塊重抓一次
+    await waitFor(() => expect(getMyLeader.mock.calls.length).toBeGreaterThan(1));
+  });
+
+  it("⭐ 查詢失敗 → 本區塊說明讀不到，頁面其餘部分（精選清單、自訂輸入）仍可用", async () => {
+    getMyLeader.mockRejectedValue(
+      new ApiError("upstream", "跟隨狀態暫時不可用", 503, "跟隨狀態暫時不可用"),
+    );
+    getBillingPlans.mockResolvedValue(catalog(true));
+    render(wrap(<LeadersPage />));
+
+    // 本區塊：說明讀不到，且**不得**宣稱「你沒在跟單」
+    expect(await screen.findByText(/無法讀取你目前的跟隨狀態/)).toBeInTheDocument();
+
+    // 頁面其餘部分照常運作
+    expect(await screen.findByRole("button", { name: "選擇此 leader" })).toBeEnabled();
+    expect(screen.getByLabelText(/leader 錢包位址/)).toBeInTheDocument();
+  });
+
+  it("未登入 → 不打 /api/me/leader（避免必然的 401 噪音）", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    render(wrap(<LeadersPage />, null));
+    await screen.findByText(/尚未登入/);
+    expect(getMyLeader).not.toHaveBeenCalled();
   });
 });
 
