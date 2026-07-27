@@ -82,7 +82,7 @@ class FakeHL:
         self.spot_usdc: dict[str, Decimal] = {}
         self.spot_error: dict[str, Exception] = {}
         # 自訂 leader 准入預覽用：per-address clearinghouseState ＋ 可注入失敗。
-        # 預設「空帳戶」（權益 0、無持倉）＝准入檢查的 not_found 那一側。
+        # 預設「空帳戶」（權益 0、無持倉）＝預覽回 exists=false 的那一側（放行帶警示）。
         self.clearinghouse: dict[str, dict] = {}
         self.clearinghouse_error: dict[str, Exception] = {}
         # 預設「塞什麼就回什麼」（多數測試不在意窗口）。收入對帳的窗口正確性測試

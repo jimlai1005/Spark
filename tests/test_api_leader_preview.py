@@ -1,13 +1,16 @@
 """tests/test_api_leader_preview.py — GET /api/leaders/preview（自訂 leader 准入預覽）。
 
-盯住三道准入檢查（格式／禁止自跟／鏈上存在）與精選條目優先權：
+盯住准入檢查（格式／禁止自跟／operator kill-switch）與精選條目優先權：
 - 檢查不過 → 4xx，detail 帶**機器可判的 reason code**
-  （invalid_format / self_follow / not_found / leader_disabled）；
+  （invalid_format / self_follow / leader_disabled）；
 - operator 在精選檔停用的位址**不可**經自訂路徑准入（kill-switch 不可繞過）；
 - 已在精選清單且可選 → already_listed=true（後續走既有精選流程，不寫 registry）。
 
-HL gateway 一律注入 FakeHL（測試全離線）；鏈上存在的精確判準（權益 > 0 或有持倉）
-以本檔的錨例為準（spec：原則是擋死地址與 typo，不是審查品質）。
+⚠️ 鏈上活動自 2026-07-27 裁決後**不是閘門**：查無活動照樣放行、回 exists=false
+（leader 尚未進場時客戶可先完成配置，進場後引擎自動開始跟）。
+
+HL gateway 一律注入 FakeHL（測試全離線）；鏈上 exists 的精確判準（權益 > 0 或有持倉）
+以本檔的錨例為準（此旗標只作預覽資訊，不再擋准入）。
 """
 import json
 import socket
@@ -76,17 +79,20 @@ def test_active_unlisted_address_previews_with_chain_data(tmp_path):
     assert r.status_code == 200, r.text
     assert r.json() == {"address": _CUSTOM, "exists": True,
                         "account_value": "12345.6", "position_count": 1,
-                        "already_listed": False}
+                        "already_listed": False, "accepting_new": True}
 
 
-def test_dead_address_is_rejected_as_not_found(tmp_path):
-    """鏈上無 perp 活動（權益 0 且無持倉，FakeHL 預設）→ 404 reason=not_found：
-    擋住死地址與 typo，用戶不會跟單一個永遠不會有動靜的位址。"""
+def test_dead_address_is_admitted_with_exists_false(tmp_path):
+    """鏈上無 perp 活動（權益 0 且無持倉，FakeHL 預設）→ 2026-07-27 裁決：**放行**，
+    不再 404。leader 可能尚未進場，客戶想提前完成配置、進場後引擎自動開始跟——
+    此刻鏈上沒活動不該擋下配置。exists 誠實回報 false、權益與持倉照實回。"""
     c, cfg, hl = _make(tmp_path)
     login(c)
     r = _preview(c, _CUSTOM)
-    assert r.status_code == 404
-    assert r.json()["detail"]["reason"] == "not_found"
+    assert r.status_code == 200, r.text
+    assert r.json() == {"address": _CUSTOM, "exists": False,
+                        "account_value": "0.0", "position_count": 0,
+                        "already_listed": False, "accepting_new": True}
 
 
 def test_equity_without_positions_counts_as_existing(tmp_path):
@@ -123,16 +129,19 @@ def test_operator_disabled_leader_cannot_be_admitted(tmp_path):
     assert r.json()["detail"]["reason"] == "leader_disabled"
 
 
-def test_paused_curated_leader_cannot_be_admitted_via_custom_path(tmp_path):
-    """精選 accepting_new=false（例行下架、不收新客）同樣不可經自訂路徑准入——
-    否則自訂輸入就是繞過「停止接客」的後門。reason 同樣是 leader_disabled：
-    撤銷與停收的分辨是內部治理資訊，不外流（沿既有政策）。"""
+def test_paused_curated_leader_is_admitted_with_accepting_new_false(tmp_path):
+    """⭐ 精選 accepting_new=false（例行下架，enabled=true）→ 2026-07-27 使用者裁決：
+    **放行**、回 accepting_new=false（前端據此畫警示但不擋）。例行下架只是暫不收
+    新客，引擎照跟（is_still_permitted 只看 enabled）；客戶堅持要跟就放行——與
+    enabled=false 的安全撤銷（硬擋）分兩支。already_listed 仍為 true（在精選清單）。"""
     c, cfg, hl = _make(tmp_path)
     login(c)
     hl.clearinghouse[_PAUSED] = _ACTIVE_STATE
     r = _preview(c, _PAUSED)
-    assert r.status_code == 400
-    assert r.json()["detail"]["reason"] == "leader_disabled"
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["accepting_new"] is False
+    assert body["already_listed"] is True
 
 
 def test_curated_selectable_address_is_flagged_already_listed(tmp_path):

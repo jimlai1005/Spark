@@ -884,6 +884,7 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
   const CUSTOM_PREVIEW = {
     address: CUSTOM_ADDR, exists: true,
     account_value: "5123.45", position_count: 3, already_listed: false,
+    accepting_new: true,
   };
   /** 原文含 `Leader: <自訂位址>`——與精選流程同一個伺服器版型（沿 MSG fixture 慣例）。 */
   const CUSTOM_MSG: LeaderSelectMessageResp = {
@@ -1010,14 +1011,55 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeEnabled();
   });
 
+  it("⭐ exists=false（鏈上無活動）→ 顯示警示但不擋，勾選後可送出走簽章（2026-07-27 裁決）", async () => {
+    getLeaderPreview.mockResolvedValue({
+      ...CUSTOM_PREVIEW, exists: false, account_value: "0", position_count: 0,
+    });
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    // 警示出現（可繼續配置的措辭：leader 尚未進場、進場後自動開始跟）
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(card.textContent).toMatch(/無 perp 交易活動/);
+    expect(card.textContent).toMatch(/進場後.*自動開始跟單/);
+
+    // checkbox 與送出流程照常可走（警示不是閘門）
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    const select = screen.getByRole("button", { name: "選擇此自訂 leader" });
+    expect(select).toBeEnabled();
+    await userEvent.click(select);
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+    expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
+    expect(getLeaderSelectMessage).toHaveBeenCalledWith(CUSTOM_ADDR);
+  });
+
+  it("⭐ accepting_new=false（例行下架）→ 顯示警示但不擋，勾選後可送出走簽章（2026-07-27 拆旗標）", async () => {
+    getLeaderPreview.mockResolvedValue({ ...CUSTOM_PREVIEW, accepting_new: false });
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    // 警示出現（例行下架措辭：仍可完成配置並跟隨、平台已標記）
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(card.textContent).toMatch(/未開放接受新跟單者/);
+    expect(card.textContent).toMatch(/仍可完成配置並跟隨/);
+
+    // checkbox 與送出流程照常可走（警示不是閘門）
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    const select = screen.getByRole("button", { name: "選擇此自訂 leader" });
+    expect(select).toBeEnabled();
+    await userEvent.click(select);
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+    expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
+    expect(getLeaderSelectMessage).toHaveBeenCalledWith(CUSTOM_ADDR);
+  });
+
   it.each([
     ["invalid_format", /位址格式不正確/],
     ["self_follow", /不能跟單自己/],
-    ["not_found", /查無 perp 活動/],
-    ["leader_disabled", /已由平台停用或停止接受新客戶/],
+    ["leader_disabled", /已被平台安全撤銷/],
   ] as const)("⭐ 准入被拒 reason=%s → 對應文案，零預覽卡", async (reason, copyRe) => {
     getLeaderPreview.mockRejectedValue(
-      new ApiError("client", "後端人話", reason === "not_found" ? 404 : 400, "後端人話", reason),
+      new ApiError("client", "後端人話", 400, "後端人話", reason),
     );
     render(wrap(<LeadersPage />));
     await pasteAddress(CUSTOM_ADDR);

@@ -171,6 +171,7 @@ describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
     mockFetchJson(200, {
       address: "0x2222222222222222222222222222222222222222",
       exists: true, account_value: "5123.45", position_count: 3, already_listed: false,
+      accepting_new: true,
     });
     const r = await api.getLeaderPreview("0x2222222222222222222222222222222222222222");
     expect(captured[0].url).toBe(
@@ -181,6 +182,7 @@ describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
     expect(r.account_value).toBe("5123.45");
     expect(r.position_count).toBe(3);
     expect(r.already_listed).toBe(false);
+    expect(r.accepting_new).toBe(true);
   });
 
   it("⭐ 4xx 的 detail 是 {reason, message} 物件 → ApiError.reason 帶分類碼、detail 帶人話", async () => {
@@ -197,12 +199,14 @@ describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
       });
   });
 
-  it("404 not_found 同樣帶 reason（kind=client，不歸 upstream）", async () => {
+  it("4xx（404）帶 reason 一律 kind=client、reason 原樣穿透（不歸 upstream）", async () => {
+    // 通用傳輸不變式：任何 4xx＋reason 都歸 client、reason 原樣帶出——與具體業務
+    // reason 碼無關（此處用一個佔位 reason；not_found 自 2026-07-27 裁決已不再回傳）。
     mockFetchJson(404, {
-      detail: { reason: "not_found", message: "該位址在 Hyperliquid 上查無 perp 活動" },
+      detail: { reason: "some_reason", message: "任意 4xx 訊息" },
     });
     await expect(api.getLeaderPreview("0x3333333333333333333333333333333333333333"))
-      .rejects.toMatchObject({ kind: "client", status: 404, reason: "not_found" });
+      .rejects.toMatchObject({ kind: "client", status: 404, reason: "some_reason" });
   });
 
   it("既有端點的字串 detail 行為不變：reason 為 undefined", async () => {

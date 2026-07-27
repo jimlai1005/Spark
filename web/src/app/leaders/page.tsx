@@ -592,6 +592,21 @@ function CustomLeaderSection({ gate, busy, onSelect }: {
           <p className="hint mono leader-addr" title={cPhase.preview.address}>
             {shortAddr(cPhase.preview.address)}
           </p>
+          {/* ⭐ 鏈上無活動（exists=false）→ 警示但**不擋**（2026-07-27 裁決）：leader
+              尚未進場時客戶可先完成配置，進場後引擎自動開始跟。不是錯誤、不停送出。 */}
+          {!cPhase.preview.exists && (
+            <div className="ops-alert" role="alert">
+              <p className="ops-alert-body">{cc.noActivityWarning}</p>
+            </div>
+          )}
+          {/* ⭐ accepting_new=false（例行下架）→ 警示但**不擋**（2026-07-27 拆旗標）：
+              只擋新客的行銷狀態，引擎仍照跟；客戶堅持要跟就放行（使用者裁決）。
+              enabled=false 的安全撤銷早在准入層硬擋（leader_disabled），到不了這裡。 */}
+          {!cPhase.preview.accepting_new && (
+            <div className="ops-alert" role="alert">
+              <p className="ops-alert-body">{cc.notAcceptingNewWarning}</p>
+            </div>
+          )}
           {cPhase.preview.already_listed && (
             <p className="leader-custom-listed">
               <span className="plan-badge">{cc.alreadyListedBadge}</span>

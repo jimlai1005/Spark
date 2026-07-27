@@ -2,9 +2,12 @@
  * lib/customLeader.ts — 自訂 leader（任意 wallet address 輸入）的准入預覽編排。
  *
  * 對應 2026-07-27 spec：用戶在 /leaders 輸入任意位址 → 即時格式驗證 → 後端
- * /api/leaders/preview 執行三道准入檢查（格式／自跟／鏈上存在）＋精選優先權
- * → 回鏈上預覽（帳戶權益、持倉數）。通過預覽後走**既有**的換 leader 簽章流程
- * （leaderSelectFlow.ts），本模組不碰簽章。
+ * /api/leaders/preview 執行准入檢查（格式／自跟／operator kill-switch）＋精選優先權
+ * → 回鏈上預覽（帳戶權益、持倉數、exists）。通過預覽後走**既有**的換 leader 簽章
+ * 流程（leaderSelectFlow.ts），本模組不碰簽章。
+ *
+ * ⚠️ 鏈上活動（exists）自 2026-07-27 裁決後**不是閘門**：查無活動照樣放行、
+ * exists=false 誠實回報，顯示層畫警示但不擋（leader 尚未進場時可先完成配置）。
  *
  * 依賴全注入（同 leaderSelectFlow 慣例）：UI 薄殼提供 api 的實作，本模組可離線測試。
  *
@@ -25,9 +28,13 @@
 import { isAddress } from "viem";
 import { ApiError, type LeaderPreviewResp } from "./api";
 
-/** 後端准入的四種拒絕分類碼（app.py `_admission_reject`；改一邊要改兩邊）。 */
+/**
+ * 後端准入的拒絕分類碼（app.py `_admission_reject`；改一邊要改兩邊）。
+ * ⚠️ `not_found` 自 2026-07-27 裁決後**移除**：鏈上無活動不再拒絕，改為放行並回
+ * exists=false（顯示層據此畫警示但不擋，見 page.tsx CustomLeaderSection）。
+ */
 export const CUSTOM_LEADER_REJECT_REASONS = [
-  "invalid_format", "self_follow", "not_found", "leader_disabled",
+  "invalid_format", "self_follow", "leader_disabled",
 ] as const;
 export type CustomLeaderRejectReason = (typeof CUSTOM_LEADER_REJECT_REASONS)[number];
 

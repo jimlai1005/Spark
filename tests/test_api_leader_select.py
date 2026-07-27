@@ -165,13 +165,13 @@ def test_second_change_replaces_the_first(tmp_path):
 def test_rejected_second_change_leaves_the_first_intact(tmp_path):
     """被拒絕的請求不得動到已落地的記錄（拒絕 ≠ 清空意圖）。
 
-    2026-07-27 起清單外位址走自訂准入：_UNLISTED 鏈上無活動（FakeHL 預設空帳戶）
-    → 404 not_found。
+    ⚠️ 2026-07-27 起清單外＋鏈上無活動的位址改為**放行**（不再是拒絕來源），故這裡
+    用 _C（enabled=false，安全撤銷）當被拒的第二筆變更——leader_disabled 仍拒絕。
     """
     c, cfg, store = _make(tmp_path)
     w = Account.create()
     assert _select(c, store, cfg, w, leader=_A)[0].status_code == 200
-    assert _select(c, store, cfg, w, leader=_UNLISTED)[0].status_code == 404
+    assert _select(c, store, cfg, w, leader=_C)[0].status_code == 400
     entries = load_leader_changes(cfg.leader_changes_path)
     assert len(entries) == 1 and entries[0]["leader_address"] == _A
 
@@ -203,16 +203,17 @@ def test_changing_someone_elses_account_is_forbidden(tmp_path):
 
 # ---------- leader 目錄閘門（兩個旗標各自要擋） ----------
 
-def test_leader_not_accepting_new_is_rejected(tmp_path):
-    """⭐ accepting_new=false（例行下架）→ 不可選。
+def test_leader_not_accepting_new_is_admitted_via_custom_path(tmp_path):
+    """⭐ accepting_new=false（例行下架，enabled=true）→ 2026-07-27 使用者裁決：
+    走自訂准入路徑**放行**（客戶堅持要跟就放行），落簽章換 leader 記錄。
 
-    ⚠️ 這條正是 `is_selectable` 與 `is_still_permitted` 的分水嶺：後者只看 enabled，
-    用錯述詞的實作會在這裡放行，客戶被送給一個已經停止接客的 leader。
-    """
+    例行下架只是暫不收新客——引擎照跟正在跟的人（is_still_permitted 只看 enabled）。
+    與 enabled=false 的安全撤銷（test_disabled_leader_is_rejected，硬擋）分兩支。"""
     c, cfg, store = _make(tmp_path)
     r, _ = _select(c, store, cfg, Account.create(), leader=_B)
-    assert r.status_code == 400
-    assert load_leader_changes(cfg.leader_changes_path) == []
+    assert r.status_code == 200, r.text
+    entries = load_leader_changes(cfg.leader_changes_path)
+    assert len(entries) == 1 and entries[0]["leader_address"] == _B
 
 
 def test_disabled_leader_is_rejected(tmp_path):
@@ -223,38 +224,39 @@ def test_disabled_leader_is_rejected(tmp_path):
     assert load_leader_changes(cfg.leader_changes_path) == []
 
 
-def test_leader_not_in_allowlist_and_dead_on_chain_is_rejected(tmp_path):
-    """清單外位址自 2026-07-27 起改走自訂准入（不再一律拒絕）：鏈上無 perp 活動
-    （FakeHL 預設空帳戶）→ 404 not_found，記錄不落地。"""
+def test_leader_not_in_allowlist_and_dead_on_chain_is_admitted(tmp_path):
+    """清單外位址自 2026-07-27 起改走自訂准入，且鏈上無活動**不再擋下**（裁決）：
+    _UNLISTED 鏈上無 perp 活動（FakeHL 預設空帳戶）→ 仍放行 200，換 leader 記錄落地。
+    leader 尚未進場時客戶可先完成配置，進場後引擎自動開始跟。"""
     c, cfg, store = _make(tmp_path)
     r, _ = _select(c, store, cfg, Account.create(), leader=_UNLISTED)
-    assert r.status_code == 404
-    assert r.json()["detail"]["reason"] == "not_found"
-    assert load_leader_changes(cfg.leader_changes_path) == []
+    assert r.status_code == 200, r.text
+    entries = load_leader_changes(cfg.leader_changes_path)
+    assert len(entries) == 1 and entries[0]["leader_address"] == _UNLISTED
 
 
-def test_rejection_does_not_distinguish_disabled_from_paused(tmp_path):
-    """撤銷（enabled=false）與例行下架（accepting_new=false）不得分辨——哪個
-    leader「出事了」是內部治理資訊。
+def test_disabled_is_rejected_but_paused_is_admitted(tmp_path):
+    """⭐ 2026-07-27 拆旗標後的新契約：撤銷（enabled=false）與例行下架
+    （accepting_new=false）**兩支不同**——早期兩者共用 leader_disabled、刻意不可
+    分辨，現在依使用者裁決分流：
 
-    ⚠️ 2026-07-27 自訂 leader spec 後的新契約（沿 test_api_leader_change_message
-    的同名測試）：非精選位址走准入檢查、拒絕帶機器可判 reason code（user story 10
-    明訂要告知「已被平台停用」）。不可分辨的邊界收窄為 disabled vs paused 這一對；
-    「不在清單且鏈上無活動」回 not_found，可與前者分辨。
-    """
+    - _C（enabled=false，安全撤銷）→ 400 leader_disabled，換 leader 記錄不落地；
+    - _B（accepting_new=false，例行下架）→ 200 放行，換 leader 記錄落地。
+
+    「哪個 leader 出事了」仍不外流——但「出事（撤銷）」與「暫不收新客（下架）」對
+    客戶的**後果**本就不同（一個擋死、一個放行），這個差異是設計本身，不是洩密。"""
     c, cfg, store = _make(tmp_path)
-    w = Account.create()
-    details = []
-    for leader in (_B, _C, _UNLISTED):
-        acct = _login(c, store, cfg, w)
-        nonce = _fresh_nonce(c, w)
-        r = c.post("/api/leaders/select",
-                   json=_payload(account_id=acct, leader=leader, nonce=nonce,
-                                 wallet=w))
-        details.append(r.json()["detail"])
-    assert details[0] == details[1]                      # disabled vs paused 同一份
-    assert details[0]["reason"] == "leader_disabled"
-    assert details[2]["reason"] == "not_found"
+
+    # _C 安全撤銷 → 硬擋
+    rc, _ = _select(c, store, cfg, Account.create(), leader=_C)
+    assert rc.status_code == 400
+    assert rc.json()["detail"]["reason"] == "leader_disabled"
+
+    # _B 例行下架 → 放行並落記錄
+    rb, _ = _select(c, store, cfg, Account.create(), leader=_B)
+    assert rb.status_code == 200, rb.text
+    assert [e["leader_address"] for e in load_leader_changes(cfg.leader_changes_path)] \
+        == [_B]
 
 
 def test_broken_allowlist_returns_503_not_a_silent_accept(tmp_path):

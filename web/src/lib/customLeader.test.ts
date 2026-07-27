@@ -13,6 +13,7 @@ const PREVIEW: LeaderPreviewResp = {
   account_value: "5123.45",
   position_count: 3,
   already_listed: false,
+  accepting_new: true,
 };
 
 function deps(over: Partial<CustomLeaderPreviewDeps> = {}): CustomLeaderPreviewDeps {
@@ -52,6 +53,23 @@ describe("runCustomLeaderPreview — 准入預覽編排（依賴注入、離線�
     expect(d.fetchPreview).toHaveBeenCalledWith(ADDR);
   });
 
+  it("⭐ 鏈上無活動（exists=false）→ 仍 ok 放行（2026-07-27 裁決，不再是拒絕）", async () => {
+    const noActivity: LeaderPreviewResp = {
+      ...PREVIEW, exists: false, account_value: "0", position_count: 0,
+    };
+    const d = deps({ fetchPreview: vi.fn(async () => noActivity) });
+    const r = await runCustomLeaderPreview(d, ADDR);
+    // 放行：preview 原樣回，exists=false 交給顯示層畫警示（可繼續配置）。
+    expect(r).toEqual({ ok: true, preview: noActivity });
+  });
+
+  it("⭐ not_found 已不是拒絕碼 → 後端萬一回它會歸 failed（fail closed，不當已知拒絕）", async () => {
+    const err = new ApiError("client", "查無活動", 404, "查無活動", "not_found");
+    const d = deps({ fetchPreview: vi.fn(async () => { throw err; }) });
+    const r = await runCustomLeaderPreview(d, ADDR);
+    expect(r).toEqual({ ok: false, kind: "failed", error: err });
+  });
+
   it("⭐ 格式不合法 → 本地擋下（reason=invalid_format），零網路請求", async () => {
     const d = deps();
     const r = await runCustomLeaderPreview(d, "0x1234");
@@ -59,7 +77,7 @@ describe("runCustomLeaderPreview — 准入預覽編排（依賴注入、離線�
     expect(d.fetchPreview).not.toHaveBeenCalled();
   });
 
-  it.each(["self_follow", "not_found", "leader_disabled"] as const)(
+  it.each(["self_follow", "leader_disabled"] as const)(
     "後端 4xx reason=%s → rejected 帶同一分類碼與後端人話 detail",
     async (reason) => {
       const d = deps({

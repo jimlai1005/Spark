@@ -868,7 +868,8 @@ export const COPY = {
       inputLabel: "leader 錢包位址",
       inputPlaceholder: "0x…",
       inputHint:
-        "0x 開頭＋40 個十六進位字元。查詢會到鏈上確認此帳戶在 Hyperliquid 有 perp 活動。",
+        "0x 開頭＋40 個十六進位字元。查詢會到鏈上讀取此帳戶在 Hyperliquid 的 perp "
+        + "活動；若該位址尚無活動，仍可先完成配置（進場後自動開始跟單）。",
       formatError: "位址格式不正確：須為 0x 開頭＋40 個十六進位字元。",
       check: "查詢",
       checking: "查詢中…",
@@ -894,12 +895,25 @@ export const COPY = {
       reasons: {
         invalid_format: "位址格式不正確：須為 0x 開頭＋40 個十六進位字元。",
         self_follow: "這是你自己的登入位址——不能跟單自己。",
-        not_found:
-          "此位址在 Hyperliquid 上查無 perp 活動（權益為 0 且無持倉）。"
-          + "請確認位址沒有貼錯。",
+        // ⭐ 2026-07-27 拆旗標後 leader_disabled **只**代表安全撤銷（enabled=false）：
+        // 文案收窄為撤銷專屬，不再提「停止接受新客戶」（後者改為 accepting_new=false
+        // 放行帶警示，見 notAcceptingNewWarning）。
         leader_disabled:
-          "此位址目前無法透過自訂輸入跟隨（已由平台停用或停止接受新客戶）。",
+          "該位址已被平台安全撤銷（leader 出事），無法跟隨。",
       },
+      // ⭐ accepting_new=false（例行下架，2026-07-27）：**放行但警示**——不是拒絕、
+      // 不擋 checkbox／送出。leader 仍在跟（引擎照跟正在跟的人），只是平台已標記
+      // 為暫不收新客。客戶堅持要跟就讓他跟（使用者裁決）。
+      notAcceptingNewWarning:
+        "⚠️ 此 leader 目前未開放接受新跟單者（例行下架或名額調整）。"
+        + "你仍可完成配置並跟隨，但這是平台已標記的狀態。",
+      // ⚠️ 鏈上無活動（exists=false）不再是拒絕（2026-07-27 裁決），改為**警示但放行**：
+      // leader 可能尚未進場，客戶可先完成配置，進場後引擎自動開始跟。文案講清楚「現在
+      // 沒動靜、但仍可先配置」，不是錯誤、不擋送出。
+      noActivityWarning:
+        "此位址目前在 Hyperliquid 上無 perp 交易活動（權益為 0 且無持倉）。"
+        + "若該 leader 尚未進場，你可以先完成跟單配置——待其進場後引擎會自動開始跟單。"
+        + "也請再確認一次位址沒有貼錯。",
       // 查詢是唯讀動作，失敗要明說「什麼都沒變」——與換 leader 的失敗文案同一原則。
       previewFailed: "查詢失敗，這次查詢沒有改變你的跟單設定。請稍後再按一次「查詢」。",
       // 伺服器回聲位址 ≠ 輸入位址：預覽資料不可信，要求停手（沿 leaderMismatch 的嚴格度）。

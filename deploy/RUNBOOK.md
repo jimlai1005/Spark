@@ -1068,6 +1068,77 @@ sudo -u filet-api env -u FILET_STATE_BASE \
 
 ---
 
+### 5.5.3 ⭐ 自訂 leader registry（`user_leaders.json`）
+
+客戶在 `/leaders` 頁輸入**任意錢包位址**跟單（非精選清單）時，簽章通過後 filet-api
+會把該位址**冪等**寫進一份 user-sourced registry；引擎每輪與精選白名單合併後讀取。
+這一節講它的落點、operator 如何撤銷某個 user-sourced leader、以及一個已知的殘餘限制。
+
+> ⚠️ **2026-07-27 裁決**：自訂 leader 的准入**不再**因「鏈上查無 perp 活動」而擋下。
+> 客戶可在 leader 尚未進場前先完成配置（preview 回 `exists=false` ＋ 前端警示但放行），
+> 位址寫進本 registry，引擎每輪讀它、無部位時不跟、leader 進場後自動開始跟。仍會被擋
+> 的只有格式錯、跟單自己、以及 operator 停用/停收（見下方撤銷）。
+
+#### 落點（不必手動建，首次寫入時自動生成）
+
+registry 檔釘在**交換目錄** `FILET_EXCHANGE_DIR`（§5.5.1 的 api→engine 根層通道，
+`filet-api:filet-engine 0750`——API 寫、引擎讀），與 `leader_changes.json` 同目錄：
+
+```
+$FILET_EXCHANGE_DIR/user_leaders.json          ← registry 本體（API 寫、引擎讀）
+$FILET_EXCHANGE_DIR/user_leaders.json.lock     ← flock 互斥用的 sidecar（永不刪除）
+$FILET_EXCHANGE_DIR/user_leaders.json.init     ← init-marker（區分「空檔」與「還沒建過」）
+```
+
+實機 `FILET_EXCHANGE_DIR` 即 `/var/lib/filet-exchange`（見 §5.5.1）。三個檔都由
+`record_user_leader` 首次寫入時自動生成，**不需要**在部署階段手動 mkdir/touch。
+
+> ⚠️ `.lock` sidecar **永不刪除**：unlink＋flock 並存會讓兩個持鎖者各鎖到不同 inode，
+> 互斥形同虛設（模組 docstring 明載）。清目錄時不要順手刪它。
+
+#### operator 撤銷某個 user-sourced leader（**先取鎖再編輯**）
+
+寫入端以 `flock LOCK_EX` 包住整段 read-modify-write，operator 手編**必須先取同一把鎖**，
+否則你的編輯可能被下一次 API 寫入拿舊快照無聲蓋掉（撤銷失效）。把目標條目改
+`"enabled": false`（安全撤銷；引擎下一輪合併後即不再為新客戶放行該位址）：
+
+```bash
+# 以能讀寫該檔的身分（filet-api，或有 sudo 者用 sudo -u filet-api）執行：
+sudo -u filet-api flock /var/lib/filet-exchange/user_leaders.json.lock \
+  -c "vi /var/lib/filet-exchange/user_leaders.json"
+# 在編輯器裡把該 leader 條目的 "enabled" 改成 false，存檔離開。
+
+# 驗收：JSON 仍合法（壞檔會讓引擎與 API 端載入 fail-fast，這是刻意的）
+sudo -u filet-api python3 -c \
+  "import json,sys; json.load(open('/var/lib/filet-exchange/user_leaders.json')); print('JSON OK')"
+```
+
+> ⭐ 冪等寫入**不覆寫**既有條目，所以停用後客戶即使重選同一位址，也不會把 `enabled`
+> 改回 true——這一擋在准入層就把流程擋在寫入路徑之前（reason=`leader_disabled`）。
+> 撤銷的是「新客戶經自訂路徑跟隨此位址」，已在跟的 follower 是否收尾另循既有流程。
+
+#### ✅ 探測面 per-session rate limit（已實作，2026-07-27）
+
+`GET /api/leaders/preview` 與 `GET /api/leaders/select/message` 需要有效 session，
+過去**每個 session 無次數上限**，殘餘兩個枚舉／放大面：
+
+- 有 session 者可反覆 probe 不同位址，探測哪些位址回 `leader_disabled`（＝平台安全
+  撤銷清單，治理資訊）；
+- 每次 probe 會打一次 Hyperliquid `/info`（clearinghouseState）——對上游是**流量放大**。
+
+**現況**：兩個端點已加 per-session sliding-window 限流——每個 session 位址每
+**60 秒最多 10 次**，超過回 **429**（`{"detail": "查詢過於頻繁，請稍後再試"}`）。實作
+落在 `create_app`（`src/spark/publicapi/app.py`，常數 `PROBE_RATELIMIT_WINDOW_S=60`／
+`PROBE_RATELIMIT_MAX=10`）：per-address 存請求時間戳、逐出 >60s 的、計數；狀態
+in-memory（per-app，隨進程重啟歸零；多 worker 各自計數，對枚舉緩解仍足夠）；
+`threading.Lock` 包住 read-modify（sync 端點跑 threadpool）。
+
+**刻意不套**的兩處：`POST /api/leaders/select`（簽章 gated、濫用成本高）與
+`GET /api/leaders` 目錄（走離線每日快照、不打 HL）。正常用戶零感知（沒有人一分鐘
+查十個位址）。
+
+---
+
 ### 5.6 activate 一個 follower（人工 CLI）
 
 ⚠️ **必須指定絕對路徑或先 `cd`**：`--pending`／`--manifest` 的預設值是 CWD 相對的，

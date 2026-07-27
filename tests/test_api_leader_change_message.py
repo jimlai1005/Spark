@@ -151,37 +151,66 @@ def test_requires_session(tmp_path):
 
 # ---------- 閘門：不可選的 leader 連原文都不給 ----------
 
-@pytest.mark.parametrize("leader", [_B, _C, _UNLISTED])
-def test_unselectable_leader_gets_no_message(tmp_path, leader):
-    """⭐ 不可選（例行下架／安全撤銷／不在白名單）→ 4xx，不發原文也不發 nonce。
+def test_disabled_leader_gets_no_message(tmp_path):
+    """⭐ enabled=false（安全撤銷：leader 出事了）→ 4xx，不發原文也不發 nonce
+    ——簽完必被 select 拒絕的原文根本不該給。
 
-    ⚠️ 述詞必須是 `is_selectable`（enabled **且** accepting_new），與 select 端點
-    同一個。放寬成引擎的 `is_still_permitted` 會讓 accepting_new=false 的 leader
-    在這裡拿到原文、簽完之後必定被 select 拒絕——白白浪費客戶一次錢包簽名。
-    """
+    ⚠️ 2026-07-27 裁決後仍被擋的只剩 leader_disabled（enabled=false）這一支：
+    _UNLISTED（清單外＋鏈上無活動）改為放行（見 test_unlisted_dead_chain_address_
+    gets_a_message）；_B（accepting_new=false，例行下架）也改為放行帶警示
+    （見 test_paused_leader_gets_a_message）。"""
     c, _, _ = _make(tmp_path)
     _login(c, Account.create())
-    r = _ask(c, leader=leader)
+    r = _ask(c, leader=_C)
     assert 400 <= r.status_code < 500
     assert "message" not in r.json()
+    assert r.json()["detail"]["reason"] == "leader_disabled"
 
 
-def test_rejection_does_not_distinguish_disabled_from_paused(tmp_path):
-    """撤銷（enabled=false）與例行下架（accepting_new=false）不得分辨——哪個 leader
-    「出事了」是內部治理資訊。
-
-    ⚠️ 2026-07-27 自訂 leader spec 後的新契約：非精選位址改走准入檢查，拒絕帶
-    **機器可判的 reason code**（user story 10 明訂要告知「已被平台停用」）。
-    所以「已列但不可選」（leader_disabled）與「不在清單且鏈上無活動」（not_found）
-    **可以**分辨；不可分辨的邊界收窄為 disabled vs paused 這一對。
-    """
+def test_paused_leader_gets_a_message(tmp_path):
+    """⭐ accepting_new=false（例行下架，enabled=true）→ 2026-07-27 使用者裁決：
+    訊息端點**放行**、回正規化位址的待簽原文＋nonce（客戶堅持要跟就放行）。
+    引擎照跟正在跟的人（is_still_permitted 只看 enabled）——與 enabled=false 的
+    安全撤銷（硬擋、不給原文）分兩支。"""
     c, _, _ = _make(tmp_path)
     _login(c, Account.create())
-    rb, rc = _ask(c, leader=_B).json(), _ask(c, leader=_C).json()
-    assert rb["detail"]["reason"] == rc["detail"]["reason"] == "leader_disabled"
-    assert rb["detail"] == rc["detail"]          # 訊息文字也不得分辨
-    r_unlisted = _ask(c, leader=_UNLISTED).json()
-    assert r_unlisted["detail"]["reason"] == "not_found"
+    r = _ask(c, leader=_B)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["leader_address"] == _B and body["message"] and body["nonce"]
+
+
+def test_unlisted_dead_chain_address_gets_a_message(tmp_path):
+    """⭐ 2026-07-27 裁決：清單外＋鏈上無活動的位址改為**放行**——訊息端點回原文與
+    nonce（不再 4xx），客戶可先簽章完成配置，leader 進場後引擎自動開始跟。"""
+    c, _, _ = _make(tmp_path)
+    _login(c, Account.create())
+    r = _ask(c, leader=_UNLISTED)         # FakeHL 預設空帳戶（鏈上無活動）
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["leader_address"] == _UNLISTED and body["message"] and body["nonce"]
+
+
+def test_disabled_blocked_but_paused_gets_a_message(tmp_path):
+    """⭐ 2026-07-27 拆旗標後的新契約：撤銷（enabled=false）與例行下架
+    （accepting_new=false）**兩支不同**——早期兩者共用 leader_disabled、刻意不可
+    分辨，現在依使用者裁決分流：
+
+    - _C（enabled=false，安全撤銷）→ 4xx leader_disabled，不給原文；
+    - _B（accepting_new=false，例行下架）→ 200 放行、回待簽原文。
+
+    「哪個 leader 出事了」仍不外流（撤銷回的是分類碼 leader_disabled，不細說原因），
+    但「出事（撤銷、擋死）」與「暫不收新客（下架、放行）」對客戶的後果本就不同，
+    這個差異是設計本身。"""
+    c, _, _ = _make(tmp_path)
+    _login(c, Account.create())
+    rc = _ask(c, leader=_C)
+    assert 400 <= rc.status_code < 500
+    assert rc.json()["detail"]["reason"] == "leader_disabled"
+    assert "message" not in rc.json()
+    rb = _ask(c, leader=_B)
+    assert rb.status_code == 200, rb.text
+    assert rb.json()["message"] and rb.json()["leader_address"] == _B
 
 
 def test_malformed_leader_address_is_4xx_not_500(tmp_path):

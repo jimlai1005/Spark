@@ -3,6 +3,7 @@ FastAPI app factory。所有外部依賴（store / keysvc client / HL gateway / 
 create_app 注入——測試全離線。onboarding 端點一律綁 session 地址：account_id 由
 session 衍生，端點無 account 參數（紅線 3：別人不能替你 onboard 是結構保證）。"""
 import logging
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -61,6 +62,16 @@ from spark.publicapi.store import ApiStore
 logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "filet_session"
+
+# ⭐ 自訂 leader 探測面的 per-session rate limit（2026-07-27）。preview 與 message
+# 兩個端點是「非精選位址的探測／上游放大」面：有 session 者可反覆查不同位址枚舉
+# 平台的停用清單（治理資訊），且每次查詢會打一次 HL /info（對交易所是流量放大）。
+# sliding-window log：每個 session 位址在 PROBE_RATELIMIT_WINDOW_S 內最多
+# PROBE_RATELIMIT_MAX 次，超過回 429。設成模組常數方便調參。對正常用戶零感知
+# （沒有人一分鐘查十個位址）。POST select 不套（簽章 gated、濫用成本高）、
+# /api/leaders 目錄不套（走離線快照、不打 HL）。
+PROBE_RATELIMIT_WINDOW_S = 60.0
+PROBE_RATELIMIT_MAX = 10
 
 # 換 leader 驗簽失敗 → 回給客戶的**分類化**訊息。key 是 LeaderChangeError.reason
 # （伺服器產生的機器可讀碼），value 是可以安全外顯的固定字串。
@@ -234,10 +245,11 @@ def _leader_public(ref: LeaderRef, stats: dict | None) -> dict:
 def _chain_activity(state) -> tuple[Decimal, int]:
     """clearinghouseState 原始回應 → （帳戶權益, 持倉數）。
 
-    自訂 leader 准入的「鏈上存在」判準吃這兩個值（權益 > 0 **或** 有持倉＝有 perp
-    活動痕跡；精確錨例見 tests/test_api_leader_preview.py）。形狀不符 → (0, 0)：
-    准入是閘門，猜不出來就**不放行**（fail-closed）——not_found 是安全的一側，
-    擋錯了用戶重試即可，放錯了是跟單一個查無活動的死地址。
+    自訂 leader 預覽的 `exists` 旗標吃這兩個值（權益 > 0 **或** 有持倉＝有 perp
+    活動痕跡；精確錨例見 tests/test_api_leader_preview.py）。形狀不符 → (0, 0)＝
+    exists=false（誠實回報「讀不到活動」，前端顯示警示但放行）。⚠️ 自 2026-07-27
+    裁決後 exists 不再是准入閘門，只是預覽資訊；真正的 transient 讀取失敗
+    （clearinghouse_error）仍會上拋 → 502，不會被誤當成 exists=false。
     """
     if not isinstance(state, dict):
         return Decimal("0"), 0
@@ -292,6 +304,39 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     def _require_billing() -> None:
         if billing is None or not cfg.billing_enabled:
             raise HTTPException(status_code=501, detail="計費未啟用")
+
+    # ⭐ per-session 探測面 rate limit（sliding-window log；狀態 per-app）。
+    #   資料結構：address → 該 session 在窗內的請求時間戳列表（逐出過期後計數）。
+    #   時鐘走 now_fn（注入的假時鐘可測，不直接 call time.time）。FastAPI sync 端點
+    #   跑在 threadpool，read-modify-write 用 threading.Lock 包住（否則兩個 worker
+    #   同時通過門檻）。落在此處（create_app 內）→ 狀態隨 app 生死，測試互不汙染。
+    _probe_hits: dict[str, list[float]] = {}
+    _probe_lock = threading.Lock()
+    # 唯讀 introspection seam：讓 reaper 的 dict 大小可被測試斷言（Finding 2 無界
+    # 成長回歸）。同一個 dict 物件，不改變任何行為。
+    app.state.probe_ratelimit_hits = _probe_hits
+
+    def _enforce_probe_ratelimit(address: str) -> None:
+        now = now_fn()
+        cutoff = now - PROBE_RATELIMIT_WINDOW_S
+        with _probe_lock:
+            # ⭐ 每次呼叫順手 reap **所有** key（Finding 2）：把每個位址的時間戳修剪
+            #   掉過期的，列表變空的 key 直接刪除。這讓 dict 大小以「近
+            #   PROBE_RATELIMIT_WINDOW_S 內 probe 過的位址數」為界，堵住「輪替 session
+            #   位址各 probe 一次 → dict 無界成長」（單純修剪單一位址的列表長度不夠，
+            #   key 數才是成長維度）。O(keys) 每次呼叫，本規模零/極少用戶可接受。
+            for k in list(_probe_hits.keys()):
+                kept = [t for t in _probe_hits[k] if t > cutoff]
+                if kept:
+                    _probe_hits[k] = kept
+                else:
+                    del _probe_hits[k]
+            hits = _probe_hits.get(address, [])   # reap 後：本位址的存活窗（或空）
+            if len(hits) >= PROBE_RATELIMIT_MAX:
+                raise HTTPException(status_code=429,
+                                    detail="查詢過於頻繁，請稍後再試")
+            hits.append(now)
+            _probe_hits[address] = hits
 
     # ---------- auth ----------
     @app.get("/api/auth/nonce")
@@ -494,15 +539,21 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         """准入拒絕 → 4xx，detail 是 `{"reason", "message"}` 物件。
 
         reason 是**機器可判的分類碼**（spec 的 API 契約：invalid_format /
-        self_follow / not_found / leader_disabled），由伺服器決定、絕不含請求
-        輸入原文（沿 LEADER_CHANGE_DETAIL 分類化訊息的既有政策）。
+        self_follow / leader_disabled——not_found 自 2026-07-27 裁決後不再是拒絕碼，
+        鏈上無活動改為放行帶 exists=false），由伺服器決定、絕不含請求輸入原文
+        （沿 LEADER_CHANGE_DETAIL 分類化訊息的既有政策）。
         """
         return HTTPException(status_code=status,
                              detail={"reason": reason, "message": message})
 
     def _admit_custom_leader(leader_address: str, session_address: str,
                              refs: list[LeaderRef]) -> dict:
-        """自訂 leader 的**三道准入檢查**＋精選條目優先權（單一定義）。
+        """自訂 leader 的**准入檢查**（格式／禁自跟／operator kill-switch）＋精選條目
+        優先權（單一定義），並附鏈上預覽（權益／持倉／exists）。
+
+        ⚠️ 鏈上活動自 2026-07-27 裁決後**不是閘門**：查無活動的位址照樣放行、
+        exists 誠實回報 false（前端顯示警示但放行）——leader 尚未進場時客戶可先完成
+        配置，進場後引擎自動開始跟。仍會擋下的只有格式錯、自跟、operator 停用/停收。
 
         preview 與 select 流程（訊息端點、POST 提交）共用本函式：POST 在驗簽後
         **重新執行全部檢查**，不信任客戶端曾呼叫 preview（防 TOCTOU）。
@@ -521,49 +572,51 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         if addr == session_address:
             raise _admission_reject(400, "self_follow",
                                     "不能跟單自己的登入位址")
-        # 精選條目**一律優先**於自訂路徑（spec 合併優先序）：
-        # - 已列且可選 → already_listed，後續走既有精選流程（不寫 registry）；
-        # - 已列但不可選（enabled=false 安全撤銷 **或** accepting_new=false 例行
-        #   下架）→ 拒絕。兩者共用 leader_disabled 一個 reason：撤銷與停收的分辨
-        #   是內部治理資訊，不外流（沿 /api/leaders 的既有政策）；對用戶的意義
-        #   相同——此位址目前不可經自訂路徑跟隨。少了這一擋，自訂輸入就是繞過
-        #   operator 安全撤銷／停止接客的後門。
+        # ⭐ 兩個下架旗標分兩支處理（2026-07-27 使用者裁決）——語意本就不同，
+        #   對「自訂路徑准入」的後果也該不同（filet/leaders.py 檔頭的兩旗標語意）：
+        #   - `enabled=false`＝**安全撤銷**（leader 出事）：引擎每輪 is_still_permitted
+        #     只看 enabled，會主動收尾正在跟的人。**硬擋**，reason=leader_disabled。
+        #   - `accepting_new=false`＝**例行下架**（只是暫不收新客）：引擎照跟。
+        #     客戶堅持要跟就**放行**、回 accepting_new=false 讓前端畫警示（不擋）。
+        #   精選條目**一律優先**於 registry（合併語義）：先看精選，命中就以它為準；
+        #   未列才回落 registry。少了 enabled 這一擋，自訂輸入就是繞過安全撤銷的後門。
         listed = next((r for r in refs if r.address == addr), None)
-        if listed is not None and not is_selectable(addr, refs):
-            raise _admission_reject(
-                400, "leader_disabled",
-                "該位址目前無法透過自訂輸入跟隨（已由平台停用或停止接受新客戶）")
-        # (2.5) user registry 的 operator kill-switch（review F4）：registry 條目
-        #     enabled=false（安全撤銷）或 accepting_new=false（停收）→ 拒絕，
-        #     reason 沿用 leader_disabled（「停用 vs 暫停」不可分辨的既有政策）。
-        #     少了這一擋，operator 對 user-sourced 條目的手編停用對准入**不可見**：
-        #     用戶重選被告知成功（200）、意圖卻在引擎端永遠拒絕——比直接拒絕更糟。
-        #     僅在非精選時檢查：精選條目一律優先（合併語義），精選可選時 registry
-        #     的殘留條目不影響引擎放行。冪等寫入本就不覆寫既有條目，故停用條目
-        #     也絕不會被重選改回 enabled——這一擋讓流程連寫入路徑都到不了。
-        if listed is None:
-            mine = next((r for r in _load_user_leaders_or_503()
-                         if r.address == addr), None)
-            if mine is not None and not (mine.enabled and mine.accepting_new):
+        if listed is not None:
+            if not listed.enabled:
                 raise _admission_reject(
                     400, "leader_disabled",
-                    "該位址目前無法透過自訂輸入跟隨（已由平台停用或停止接受新客戶）")
+                    "該位址已被平台安全撤銷（leader 出事）——無法跟隨")
+            accepting_new = listed.accepting_new
+        else:
+            # user registry 的 operator kill-switch（review F4）：僅在非精選時查。
+            # enabled=false（安全撤銷）→ 硬擋；accepting_new=false（停收，enabled=true）
+            # → 放行帶警示。冪等寫入不覆寫既有條目，故 accepting_new=false 的殘留
+            # 條目被重選也不會改回可收新客——但引擎照跟（is_still_permitted 只看
+            # enabled），與精選側一致。未列於 registry → 預設 accepting_new=true。
+            mine = next((r for r in _load_user_leaders_or_503()
+                         if r.address == addr), None)
+            if mine is not None and not mine.enabled:
+                raise _admission_reject(
+                    400, "leader_disabled",
+                    "該位址已被平台安全撤銷（leader 出事）——無法跟隨")
+            accepting_new = mine.accepting_new if mine is not None else True
         # (3) 鏈上存在：走既有 HL gateway（唯讀、冪等 → transient 重試與 502 轉譯
         #     自動繼承，工程原則 5），不另開 HTTP 呼叫路徑。
         account_value, position_count = _chain_activity(hl.clearinghouse_state(addr))
         exists = account_value > 0 or position_count > 0
-        # 「查無活動」的門檻只施加在**未經審核的自訂位址**（擋死地址與 typo）；
-        # 已列且可選的精選位址是 operator 背書的清單成員，不因鏈上暫時讀不出
-        # 活動而 404——exists 誠實回報，前端據 already_listed 走精選流程。
-        if listed is None and not exists:
-            raise _admission_reject(
-                404, "not_found",
-                "該位址在 Hyperliquid 上查無 perp 活動（權益為 0 且無持倉）——"
-                "請確認位址無誤")
+        # 「鏈上無活動」**不再擋下**自訂位址（2026-07-27 使用者裁決）：leader 可能
+        # 宣告即將開始交易，客戶想**提前**完成跟單配置，等 leader 進場後引擎自動
+        # 開始跟——不該因為此刻鏈上沒活動就擋下配置。exists 誠實回報（false 時前端
+        # 顯示警示但放行），account_value／position_count 照實。無安全風險：select
+        # 會把該位址寫進 registry，引擎每輪讀該 leader、無部位時不跟、leader 進場後
+        # 自動開始；格式／禁自跟／operator kill-switch 三道閘門與簽章保護一律照舊。
         return {"address": addr, "exists": exists,
                 "account_value": str(account_value),   # Decimal → str（落地慣例）
                 "position_count": position_count,
-                "already_listed": listed is not None}
+                "already_listed": listed is not None,
+                # accepting_new=false（例行下架、enabled=true）→ 放行帶此旗標，
+                # 前端據此畫警示但不擋（撤銷是 enabled，已在上面硬擋掉）。
+                "accepting_new": accepting_new}
 
     @app.get("/api/leaders/preview")
     def leaders_preview(leader_address: str,
@@ -573,7 +626,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         回 `{address, exists, account_value, position_count, already_listed}`；
         檢查不過 → 4xx，detail 帶機器可判的 reason code（見 _admit_custom_leader）。
         already_listed=true ⇒ 位址已在精選清單且可選，前端後續走既有精選流程。
+
+        ⭐ per-session rate limit（60s 內 10 次）：本端點是非精選位址的探測面，
+        且每次會打一次 HL /info——超限回 429（見 _enforce_probe_ratelimit）。
         """
+        _enforce_probe_ratelimit(address)
         refs = _load_leaders_or_503()
         return _admit_custom_leader(leader_address, address, refs)
 
@@ -668,7 +725,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         同一個述詞：不可選的 leader 連待簽原文都不該給。若這裡放寬成
         `is_still_permitted`（引擎的述詞），客戶會拿到一份能簽、簽了卻必定被
         select 端點拒絕的原文——把一個閘門變成一個只會浪費客戶一次簽名的陷阱。
+
+        ⭐ per-session rate limit（60s 內 10 次，與 preview 同一計數器）：非精選／
+        fresh 位址在此也會打一次 HL /info——超限回 429（見 _enforce_probe_ratelimit）。
         """
+        _enforce_probe_ratelimit(address)
         account_id = derive_account_id(address)
         refs = _load_leaders_or_503()
         if is_selectable(leader_address, refs):
@@ -677,10 +738,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             leader = normalize_address(leader_address)
         else:
             # 非精選位址 → 准入前置檢查（2026-07-27 spec：取代原本的一律拒絕）。
-            # 不過即 reason-coded 4xx（invalid_format／self_follow／not_found／
-            # leader_disabled——已列但不可選的位址在這裡被 leader_disabled 擋下，
-            # 自訂路徑不得繞過 operator 的撤銷或停收）。通過的位址之後在 POST
-            # select 會**重新**全查一次（本端點的通過不被信任，防 TOCTOU）。
+            # 不過即 reason-coded 4xx（invalid_format／self_follow／leader_disabled
+            # ——已列但不可選的位址在這裡被 leader_disabled 擋下，自訂路徑不得繞過
+            # operator 的撤銷或停收）。鏈上無活動**不再擋下**（2026-07-27 裁決）：
+            # 照樣回原文，客戶可先完成配置，leader 進場後引擎自動開始跟。通過的位址
+            # 之後在 POST select 會**重新**全查一次（本端點的通過不被信任，防 TOCTOU）。
             leader = _admit_custom_leader(leader_address, address, refs)["address"]
         # issued_at 版型沿 auth_nonce（帶 Z 的 UTC）——leader_change.parse_issued_at
         # 要求帶時區，naive 時間會被直接拒絕。
@@ -792,7 +854,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         #     「寫入失敗」會留下一筆引擎永遠拒絕套用的簽章意圖。反向（registry
         #     成功、記錄失敗）是安全的：客戶重送同一個 POST，registry 寫入冪等
         #     跳過，記錄補上。
-        if custom is not None:
+        # ⭐ 但**精選位址（already_listed=true）不寫 registry**（Finding 1 kill-switch
+        #    破口）：精選 paused 位址（is_selectable=false → 走 custom 分支）本就經精選
+        #    檔 enabled=true 被引擎放行（is_still_permitted 只看 enabled），寫進 registry
+        #    只是製造一筆 enabled:true 影子條目——日後 operator 用「移除精選條目」撤銷
+        #    （leaders.py 明載＝enabled:false）時，merge 沒有精選條目可壓過影子 → 引擎
+        #    繼續跟一個已撤銷的 leader。只有真正未列的自訂位址（already_listed=false）
+        #    才需要、也才寫 registry。
+        if custom is not None and not custom["already_listed"]:
             try:
                 wrote = record_user_leader(cfg.user_leaders_path,
                                            address=verified.leader_address,

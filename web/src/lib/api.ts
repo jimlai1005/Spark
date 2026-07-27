@@ -371,12 +371,20 @@ export interface LeaderPreviewResp {
   account_value: string;
   position_count: number;
   already_listed: boolean;
+  /**
+   * ⭐ 例行下架旗標（2026-07-27）：false ＝ 此 leader `accepting_new=false`
+   * （名額調整／準備退場，只擋新客戶——引擎照跟）。**放行**、由顯示層畫警示但
+   * 不擋送出。與 `leader_disabled` 的**安全撤銷**（enabled=false，硬拒絕）分兩支。
+   */
+  accepting_new: boolean;
 }
 
 /**
  * 准入預覽（需 session；唯讀、無副作用）。檢查不過 → 4xx，`ApiError.reason` 帶
- * 機器可判分類碼（invalid_format／self_follow／not_found／leader_disabled），
- * `detail` 帶後端的人話說明。分流一律看 reason，不對 detail 做字串比對。
+ * 機器可判分類碼（invalid_format／self_follow／leader_disabled），`detail` 帶後端
+ * 的人話說明。分流一律看 reason，不對 detail 做字串比對。
+ * ⚠️ 鏈上無活動自 2026-07-27 裁決後**不再是 4xx**：回 200 帶 exists=false（放行），
+ * 顯示層據此畫警示但不擋（見 customLeader.ts）。
  */
 export function getLeaderPreview(leaderAddress: string): Promise<LeaderPreviewResp> {
   const q = new URLSearchParams({ leader_address: leaderAddress });

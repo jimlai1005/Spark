@@ -128,23 +128,28 @@ def test_custom_select_writes_registry_then_records_the_change(tmp_path):
 
 # ---------- ⭐ POST 獨立重跑准入（不信任 preview／message，防 TOCTOU） ----------
 
-def test_post_reruns_admission_account_emptied_after_message(tmp_path):
-    """⭐ 訊息端點通過後、提交前帳戶被清空 → POST 重跑准入擋下（404 not_found），
-    registry 與換 leader 記錄**都不落地**——即使簽章完全合法。"""
+def test_post_admits_even_if_account_has_no_chain_activity(tmp_path):
+    """⭐ 2026-07-27 裁決：鏈上無活動不再擋下自訂 leader。訊息端點通過後、提交前
+    帳戶被清空（鏈上無 perp 活動）→ POST 仍**放行**（不再 404 not_found），registry
+    與換 leader 記錄照常落地——leader 尚未進場時客戶可先完成配置，進場後引擎自動跟。
+
+    （TOCTOU 重跑准入的機制本身仍受 test_post_reruns_admission_operator_disables_
+    after_message 覆蓋：operator kill-switch 在提交那一刻仍會擋下。）"""
     c, cfg, store, hl = _make(tmp_path)
     w = Account.create()
     acct = _login(c, w)
     hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
     r0 = c.get("/api/leaders/select/message", params={"leader_address": _CUSTOM})
     assert r0.status_code == 200
-    del hl.clearinghouse[_CUSTOM]                    # 帳戶清空（TOCTOU 窗口）
+    del hl.clearinghouse[_CUSTOM]                    # 帳戶清空（鏈上無活動）
     body = _payload(account_id=acct, leader=_CUSTOM, nonce=r0.json()["nonce"],
                     wallet=w)
     r = c.post("/api/leaders/select", json=body)
-    assert r.status_code == 404
-    assert r.json()["detail"]["reason"] == "not_found"
-    assert load_user_leaders(cfg.user_leaders_path) == []
-    assert load_leader_changes(cfg.leader_changes_path) == []
+    assert r.status_code == 200, r.text
+    (ref,) = load_user_leaders(cfg.user_leaders_path)
+    assert ref.address == _CUSTOM and ref.enabled is True
+    entries = load_leader_changes(cfg.leader_changes_path)
+    assert len(entries) == 1 and entries[0]["leader_address"] == _CUSTOM
 
 
 def test_post_reruns_admission_operator_disables_after_message(tmp_path):
@@ -185,18 +190,26 @@ def test_post_rejects_self_follow_without_needing_preview(tmp_path):
 
 
 def test_admission_failure_does_not_burn_the_nonce(tmp_path):
-    """准入失敗發生在 nonce 消耗之前 → 同一顆 nonce 在位址恢復活躍後仍可完成
-    一次合法變更（否則一次鏈上打嗝就作廢客戶手上的授權，自我 DoS）。"""
+    """准入失敗發生在 nonce 消耗之前 → 同一顆 nonce 在准入恢復後仍可完成一次合法
+    變更（否則一次准入打嗝就作廢客戶手上的授權，自我 DoS）。
+
+    ⚠️ 觸發准入失敗用 operator kill-switch（把該位址列入精選檔並停用）而非鏈上無
+    活動——後者自 2026-07-27 裁決後不再是失敗來源。"""
     c, cfg, store, hl = _make(tmp_path)
     w = Account.create()
     acct = _login(c, w)
     hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
     r0 = c.get("/api/leaders/select/message", params={"leader_address": _CUSTOM})
     nonce = r0.json()["nonce"]
-    del hl.clearinghouse[_CUSTOM]
+    lpath = tmp_path / "leaders.json"
+    lpath.write_text(json.dumps(                       # operator 停用該位址
+        {"leaders": _LEADERS + [{"address": _CUSTOM, "name": "Evil",
+                                 "enabled": False}]}))
     body = _payload(account_id=acct, leader=_CUSTOM, nonce=nonce, wallet=w)
-    assert c.post("/api/leaders/select", json=body).status_code == 404
-    hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE        # 鏈上恢復
+    r = c.post("/api/leaders/select", json=body)
+    assert r.status_code == 400
+    assert r.json()["detail"]["reason"] == "leader_disabled"
+    lpath.write_text(json.dumps({"leaders": _LEADERS}))  # operator 撤下停用（恢復）
     assert c.post("/api/leaders/select", json=body).status_code == 200
 
 
@@ -294,40 +307,41 @@ def _seed_registry(cfg, address, **over):
     return p
 
 
-@pytest.mark.parametrize("flags", [{"enabled": False}, {"accepting_new": False}])
-def test_preview_rejects_a_registry_disabled_address(tmp_path, flags):
-    """preview：registry 條目 enabled=false（安全撤銷）或 accepting_new=false
-    （停收）→ 400 leader_disabled，即使鏈上活躍。"""
+def test_preview_rejects_a_registry_revoked_address(tmp_path):
+    """preview：registry 條目 enabled=false（安全撤銷）→ 400 leader_disabled，
+    即使鏈上活躍。⭐ 2026-07-27 拆旗標：只有 enabled=false（安全撤銷）硬擋；
+    accepting_new=false（例行下架）改為放行帶警示（見
+    test_preview_admits_a_registry_paused_address）。"""
     c, cfg, store, hl = _make(tmp_path)
     _login(c, Account.create())
-    _seed_registry(cfg, _CUSTOM, **flags)
+    _seed_registry(cfg, _CUSTOM, enabled=False)
     hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
     r = c.get("/api/leaders/preview", params={"leader_address": _CUSTOM})
     assert r.status_code == 400
     assert r.json()["detail"]["reason"] == "leader_disabled"
 
 
-@pytest.mark.parametrize("flags", [{"enabled": False}, {"accepting_new": False}])
-def test_message_rejects_a_registry_disabled_address(tmp_path, flags):
-    """訊息端點同閘：停用位址連待簽原文都不該給（給了就是一份必被拒的簽名陷阱）。"""
+def test_message_rejects_a_registry_revoked_address(tmp_path):
+    """訊息端點同閘：enabled=false 的安全撤銷位址連待簽原文都不該給
+    （給了就是一份必被拒的簽名陷阱）。"""
     c, cfg, store, hl = _make(tmp_path)
     _login(c, Account.create())
-    _seed_registry(cfg, _CUSTOM, **flags)
+    _seed_registry(cfg, _CUSTOM, enabled=False)
     hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
     r = c.get("/api/leaders/select/message", params={"leader_address": _CUSTOM})
     assert r.status_code == 400
     assert r.json()["detail"]["reason"] == "leader_disabled"
 
 
-@pytest.mark.parametrize("flags", [{"enabled": False}, {"accepting_new": False}])
-def test_post_rejects_a_registry_disabled_address_and_never_reenables_it(tmp_path, flags):
-    """⭐ POST：重選一個 registry 停用位址 → 400 leader_disabled、換 leader 記錄
-    不落地，且 registry 檔**一個位元組都不動**——重選絕不得把停用條目改回
-    enabled（冪等寫入本就不覆寫既有條目，這裡連寫入路徑都到不了）。"""
+def test_post_rejects_a_registry_revoked_address_and_never_reenables_it(tmp_path):
+    """⭐ POST：重選一個 registry **安全撤銷**（enabled=false）位址 → 400
+    leader_disabled、換 leader 記錄不落地，且 registry 檔**一個位元組都不動**
+    ——重選絕不得把撤銷條目改回 enabled（冪等寫入本就不覆寫既有條目，這裡連
+    寫入路徑都到不了）。"""
     c, cfg, store, hl = _make(tmp_path)
     w = Account.create()
     acct = _login(c, w)
-    p = _seed_registry(cfg, _CUSTOM, **flags)
+    p = _seed_registry(cfg, _CUSTOM, enabled=False)
     before = p.read_text()
     hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
     body = _payload(account_id=acct, leader=_CUSTOM, nonce="deadbeef", wallet=w)
@@ -336,6 +350,98 @@ def test_post_rejects_a_registry_disabled_address_and_never_reenables_it(tmp_pat
     assert r.json()["detail"]["reason"] == "leader_disabled"
     assert p.read_text() == before
     assert load_leader_changes(cfg.leader_changes_path) == []
+
+
+# ---------- ⭐ registry accepting_new=false（例行下架）→ 放行帶警示（2026-07-27） ----------
+
+
+def test_preview_admits_a_registry_paused_address(tmp_path):
+    """⭐ registry 條目 accepting_new=false（例行下架、enabled=true）→ preview
+    **放行**、回 accepting_new=false（前端畫警示但不擋）。與 enabled=false 的
+    安全撤銷分兩支：例行下架只是暫不收新客，引擎照跟。"""
+    c, cfg, store, hl = _make(tmp_path)
+    _login(c, Account.create())
+    _seed_registry(cfg, _CUSTOM, accepting_new=False)
+    hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
+    r = c.get("/api/leaders/preview", params={"leader_address": _CUSTOM})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["accepting_new"] is False
+    assert body["already_listed"] is False    # registry 條目不算精選
+
+
+def test_post_admits_a_registry_paused_address(tmp_path):
+    """⭐ registry accepting_new=false（enabled=true）→ POST 放行、落簽章換 leader
+    記錄；registry 檔冪等不動（該位址已存在，不覆寫）。"""
+    c, cfg, store, hl = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, w)
+    p = _seed_registry(cfg, _CUSTOM, accepting_new=False)
+    before = p.read_text()
+    hl.clearinghouse[_CUSTOM] = _ACTIVE_STATE
+    r0 = c.get("/api/leaders/select/message", params={"leader_address": _CUSTOM})
+    assert r0.status_code == 200, r0.text
+    body = _payload(account_id=acct, leader=_CUSTOM, nonce=r0.json()["nonce"], wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+    assert r.status_code == 200, r.text
+    assert p.read_text() == before             # 冪等：既有條目不覆寫
+    entries = load_leader_changes(cfg.leader_changes_path)
+    assert len(entries) == 1 and entries[0]["leader_address"] == _CUSTOM
+
+
+def test_curated_paused_leader_post_does_not_mirror_into_registry(tmp_path):
+    """⭐ Finding 1（kill-switch 破口修復）：精選 accepting_new=false（例行下架、
+    enabled=true）→ POST 放行、落簽章換 leader 記錄，但**不**鏡射進 user registry。
+
+    精選位址本就經精選檔 enabled=true 被引擎放行（is_still_permitted 只看 enabled），
+    寫進 registry 是多餘且危險的影子條目：日後 operator 用「移除精選條目」撤銷該
+    leader（leaders.py 明載＝enabled:false）時，registry 的 enabled:true 影子會壓過
+    （merge 沒有精選條目可壓）→ 引擎繼續跟一個已撤銷的 leader。守衛加
+    `not already_listed` 後，精選位址（已列）連寫入路徑都到不了。"""
+    from pathlib import Path
+    _PAUSED = "0x" + "d4" * 20
+    c, cfg, store, hl = _make(
+        tmp_path,
+        entries=_LEADERS + [{"address": _PAUSED, "name": "Delta",
+                             "accepting_new": False}])
+    w = Account.create()
+    acct = _login(c, w)
+    r = _select_custom(c, hl, w, acct, leader=_PAUSED)
+    assert r.status_code == 200, r.text
+    assert r.json()["leader_address"] == _PAUSED
+    # registry 不含該精選位址（檔根本不會被建＝合法空狀態）
+    assert not Path(cfg.user_leaders_path).exists()
+    # 換 leader 記錄仍落地
+    entries = load_leader_changes(cfg.leader_changes_path)
+    assert len(entries) == 1 and entries[0]["leader_address"] == _PAUSED
+
+
+def test_removing_curated_paused_entry_revokes_the_leader(tmp_path):
+    """⭐ Finding 1 破口修復證明：精選 paused 位址 POST 後，operator 以「移除精選
+    條目」撤銷（leaders.py 明載＝enabled:false）→ 引擎 is_still_permitted 轉為
+    false（不再放行）。若 POST 錯誤地把 enabled:true 影子寫進 registry，移除精選
+    條目後 merge 會讓影子勝出、is_still_permitted 仍 true——那正是破口。"""
+    from spark.filet.leaders import is_still_permitted, load_leaders
+    from spark.filet.user_leaders import load_user_leaders as _load_ul
+    from spark.filet.user_leaders import merge_leaders
+    _PAUSED = "0x" + "d4" * 20
+    lpath = tmp_path / "leaders.json"
+    c, cfg, store, hl = _make(
+        tmp_path,
+        entries=_LEADERS + [{"address": _PAUSED, "name": "Delta",
+                             "accepting_new": False}])
+    w = Account.create()
+    acct = _login(c, w)
+    assert _select_custom(c, hl, w, acct, leader=_PAUSED).status_code == 200
+    # 跟隨中：精選 enabled=true → 引擎放行
+    merged = merge_leaders(load_leaders(cfg.leaders_path),
+                           _load_ul(cfg.user_leaders_path))
+    assert is_still_permitted(_PAUSED, merged) is True
+    # operator 撤銷＝從精選清單移除該條目
+    lpath.write_text(json.dumps({"leaders": _LEADERS}))
+    merged = merge_leaders(load_leaders(cfg.leaders_path),
+                           _load_ul(cfg.user_leaders_path))
+    assert is_still_permitted(_PAUSED, merged) is False   # 破口已補
 
 
 def test_registry_entry_that_is_active_does_not_block_admission(tmp_path):
