@@ -63,7 +63,7 @@ export function Header() {
         ))}
       </nav>
       {me.data && (
-        <button type="button" className="btn btn-ghost" onClick={handleLogout}>
+        <button type="button" className="btn btn-ghost header-auth" onClick={handleLogout}>
           {COPY.common.logout}
         </button>
       )}

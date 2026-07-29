@@ -43,7 +43,10 @@ input:focus-visible,
 /* ---------- Header / Tabs ---------- */
 .app-header {
   position: sticky; top: 0; z-index: 90;
-  display: flex; align-items: center; justify-content: space-between;
+  /* ⭐ flex-start＋登出鈕 margin-left:auto：tabs 永遠緊貼 wordmark 左側。
+     space-between 會讓 tabs 的位置隨「登出鈕在不在」重新分配（未登入被推到最右、
+     登入後跳回中間），登入前後整排導覽跳動。 */
+  display: flex; align-items: center; justify-content: flex-start;
   gap: 16px;
   padding: 14px 20px;
   background: rgba(var(--surface-rgb), .92);
@@ -61,6 +64,9 @@ input:focus-visible,
 }
 
 .tabs { display: flex; gap: 4px; }
+
+/* 右側帳號區（登出鈕）：pin 到最右，不影響左側 tabs 的定位。 */
+.header-auth { margin-left: auto; }
 
 .tab {
   display: inline-block;
@@ -233,16 +239,19 @@ main.page {
 .chip-neutral { color: var(--text-dim); background: rgba(var(--text-dim-rgb), .12); font-family: var(--font-body); }
 
 /* ---------- 登入頁（全站產品敘事入口） ---------- */
+/* ⭐ landing 有自己的 shell 寬度：全站的 .narrow（420px）是表單寬，敘事頁套它
+   會在桌機上縮成一根手機柱。窄的只該是動作區（.login-actions），不是整頁。 */
+.login-shell { max-width: 880px; margin: 0 auto; }
 .login-inner { padding-top: 8vh; text-align: center; }
 
 .login-hero {
   font-weight: 300;
-  font-size: clamp(1.6rem, 4.4vw, 2.4rem);
+  font-size: clamp(1.6rem, 4vw, 2.9rem);
   line-height: 1.35;
   margin: 0 0 12px;
 }
 
-.subtitle { color: var(--text-dim); font-size: 16px; margin: 0 0 32px; }
+.subtitle { color: var(--text-dim); font-size: clamp(15px, 1.8vw, 17px); margin: 0 0 32px; }
 
 /* 三步旅程：連結錢包並登入 → 完成兩項授權 → 貼上 leader 地址開始跟單。
    數字用純文字（非 ::marker），本頁其餘一律安靜，這裡也不例外。 */
@@ -259,6 +268,23 @@ main.page {
   border: 1px solid var(--border-strong);
 }
 .landing-step-title { font-size: 14.5px; color: var(--text); margin: 0 0 4px; }
+
+/* 桌機：三步並排成三欄，各自頂一條 hairline；直式清單只留給窄螢幕。 */
+@media (min-width: 820px) {
+  .landing-steps {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px;
+    margin: 40px 0 36px;
+  }
+  .landing-step {
+    flex-direction: column; gap: 12px;
+    padding: 20px 0 0; border-bottom: none; border-top: 1px solid var(--border);
+  }
+  .landing-step-title { font-size: 15.5px; }
+}
+
+/* 動作區與備註維持表單寬，置中：敘事寬、動作窄。 */
+.login-actions { max-width: 420px; margin: 0 auto; }
+.login-footnotes { max-width: 640px; margin: 24px auto 0; }
 
 .cta-row { margin: 28px 0 20px; }
 

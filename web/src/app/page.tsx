@@ -69,7 +69,7 @@ export default function LoginPage() {
 
   return (
     <main className="page">
-      <section className="narrow login-inner">
+      <section className="login-shell login-inner">
         <p className="eyebrow">{c.eyebrow}</p>
         <h1 className="login-hero">{c.heroTitle}</h1>
         <p className="subtitle">{c.subtitle}</p>
@@ -86,27 +86,31 @@ export default function LoginPage() {
           ))}
         </ol>
 
-        <div className="cta-row">
-          {loggedIn ? (
-            <button type="button" className="btn btn-primary btn-block"
-              onClick={() => router.push("/onboarding")}>
-              {COPY.wizard.stepNames[0]} ✓ — {COPY.common.next}
-            </button>
-          ) : (
-            <button type="button" className="btn btn-primary btn-block"
-              onClick={handleConnect} disabled={phase !== "idle"}>
-              {phase === "connecting" ? c.connecting : phase === "signing" ? c.signingIn : c.connect}
-            </button>
+        <div className="login-actions">
+          <div className="cta-row">
+            {loggedIn ? (
+              <button type="button" className="btn btn-primary btn-block"
+                onClick={() => router.push("/onboarding")}>
+                {COPY.wizard.stepNames[0]} ✓ — {COPY.common.next}
+              </button>
+            ) : (
+              <button type="button" className="btn btn-primary btn-block"
+                onClick={handleConnect} disabled={phase !== "idle"}>
+                {phase === "connecting" ? c.connecting : phase === "signing" ? c.signingIn : c.connect}
+              </button>
+            )}
+          </div>
+          <p className="hint">{c.signInNote}</p>
+          {error && (
+            <div className="sign-error">
+              <p>{error}</p>
+            </div>
           )}
         </div>
-        <p className="hint">{c.signInNote}</p>
-        {error && (
-          <div className="sign-error">
-            <p>{error}</p>
-          </div>
-        )}
-        <p className="footnote">{c.footnote}</p>
-        <p className="footnote">{COPY.common.nonCustodial}</p>
+        <div className="login-footnotes">
+          <p className="footnote">{c.footnote}</p>
+          <p className="footnote">{COPY.common.nonCustodial}</p>
+        </div>
       </section>
     </main>
   );
