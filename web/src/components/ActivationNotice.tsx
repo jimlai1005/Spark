@@ -4,7 +4,7 @@ import { COPY } from "@/lib/copy";
 import { useMe, useOnboardingStatus } from "@/lib/hooks";
 
 /**
- * 「這個帳號還沒開通完成」的提示，給 /leaders 與 /capital 共用。
+ * 「這個帳號還沒開通完成」的提示，目前由 /leaders 使用。
  *
  * 為什麼需要：這兩頁在未活化狀態下**看起來完全正常**——清單載得出來、滑桿拖得動、
  * 按鈕按得下去。使用者會一路走到錢包簽署，才在最後一步撞上後端的「查無 follower」。

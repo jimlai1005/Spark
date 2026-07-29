@@ -80,6 +80,10 @@ input:focus-visible,
   background: var(--card);
 }
 
+/* 登出鈕：訂閱 chip 下架後（2026-07-30），改由這裡直接吃掉 space-between 的
+   剩餘空間，維持「wordmark＋tabs 靠左、登出鈕靠右」的版面。 */
+.app-header > .btn-ghost { margin-left: auto; }
+
 /* ---------- 版面容器 ---------- */
 main.page {
   max-width: 1080px;
@@ -228,32 +232,33 @@ main.page {
 .chip-down { color: var(--neg); background: rgba(var(--neg-rgb), .14); }
 .chip-neutral { color: var(--text-dim); background: rgba(var(--text-dim-rgb), .12); font-family: var(--font-body); }
 
-/* ---------- 登入頁 ---------- */
+/* ---------- 登入頁（全站產品敘事入口） ---------- */
 .login-inner { padding-top: 8vh; text-align: center; }
 
-.wordmark {
-  font-family: var(--font-display);
-  font-weight: 200;
-  letter-spacing: .3em;
-  font-size: clamp(2.6rem, 9vw, 4.2rem);
-  margin: 0 0 16px;
-  background: var(--brand-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  -webkit-text-fill-color: transparent;
+.login-hero {
+  font-weight: 300;
+  font-size: clamp(1.6rem, 4.4vw, 2.4rem);
+  line-height: 1.35;
+  margin: 0 0 12px;
 }
 
-.subtitle { color: var(--text-dim); font-size: 16px; margin: 0 0 40px; }
+.subtitle { color: var(--text-dim); font-size: 16px; margin: 0 0 32px; }
 
-.login-boundary-wrap {
-  position: relative;
-  left: 50%;
-  transform: translateX(-50%);
-  width: min(600px, calc(100vw - 40px));
-  margin-bottom: 36px;
-  text-align: left;
+/* 三步旅程：連結錢包並登入 → 完成兩項授權 → 貼上 leader 地址開始跟單。
+   數字用純文字（非 ::marker），本頁其餘一律安靜，這裡也不例外。 */
+.landing-steps { text-align: left; margin: 0 0 32px; }
+.landing-step {
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 14px 0; border-bottom: 1px solid var(--border);
 }
+.landing-step:last-child { border-bottom: none; }
+.landing-step-num {
+  flex: none; width: 26px; height: 26px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono); font-size: 12px; color: var(--text-dim);
+  border: 1px solid var(--border-strong);
+}
+.landing-step-title { font-size: 14.5px; color: var(--text); margin: 0 0 4px; }
 
 .cta-row { margin: 28px 0 20px; }
 
@@ -416,11 +421,6 @@ main.page {
 .check-icon { color: var(--pos); font-family: var(--font-mono); flex: none; }
 .deposit-check.is-pending .check-icon { color: var(--text-dim); }
 
-/* ---------- 狀態頁費用卡 ---------- */
-.fee-total { font-size: 2rem; font-weight: 300; color: var(--text); margin: 4px 0 2px; }
-.fee-caption { color: var(--text-dim); font-size: 12.5px; margin-bottom: 14px; }
-.fee-note { color: var(--text-dim); font-size: 12.5px; margin-bottom: 18px; }
-
 /* ---------- Admin 表 ---------- */
 .admin-table { font-size: 13px; }
 .admin-table th {
@@ -577,37 +577,46 @@ main.page {
   box-shadow: inset 3px 0 0 var(--neg);
 }
 
-/* ---------- Pricing / Billing ---------- */
-/* chip 只在已登入且 billing 啟用時渲染；margin-left:auto 讓它與登出鈕成組靠右，
-   未渲染時 header 的 space-between 行為完全不變（不顯示就不影響版面）。 */
-.header-chip { margin-left: auto; text-decoration: none; }
-
-.plan-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 16px;
-  margin-top: 20px;
+/* ---------- /leaders：地址 dock（本頁唯一的跟單入口） ---------- */
+/**
+ * ⭐⭐ 2026-07-30 大幅減法：付費閘門與精選 leader 卡片格線全部下架
+ * （.leader-scope／.leader-gate／.leader-grid／.leader-card／.leader-perf-* 隨之
+ * 移除），本頁只剩一個視覺重拳——地址輸入框。
+ */
+.leader-dock { border-color: rgba(var(--primary-rgb), .35); }
+/* 輸入框＋查詢按鈕同一列，桌機並排、手機降級直疊（見 ≤480px 區塊）。 */
+.leader-dock-row {
+  display: flex; align-items: flex-end; gap: 12px; margin-top: 18px;
 }
-
-.plan-card { display: flex; flex-direction: column; }
-.plan-card.is-purchasable { border-color: rgba(var(--primary-rgb), .45); }
-.plan-name { font-size: 1.2rem; font-weight: 400; margin: 0; color: var(--text); }
-.plan-price { font-size: 2rem; font-weight: 300; color: var(--text); margin: 6px 0 2px; }
-.plan-price-unit { font-size: 13px; color: var(--text-dim); margin-left: 4px; }
-
-.plan-features { list-style: none; padding: 0; margin: 16px 0 20px; flex: 1; }
-.plan-feature {
-  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
-  font-size: 13.5px; color: var(--text); padding: 7px 0;
-  border-bottom: 1px solid rgba(var(--text-dim-rgb), .12);
+.leader-dock-row .addr-field { flex: 1 1 auto; margin: 0; }
+/* 字級明顯大於一般輸入框——這是全頁唯一的「大聲」元素。 */
+.leader-dock .addr-input { font-size: 22px; padding: 16px 18px; letter-spacing: .01em; }
+.leader-dock .addr-input:focus-visible {
+  outline: none; border-color: var(--primary);
+  box-shadow: 0 0 0 4px rgba(var(--primary-rgb), .18);
 }
-.plan-feature:last-child { border-bottom: none; }
-.plan-mark { font-family: var(--font-mono); color: var(--text-dim); flex: none; }
-.plan-mark.is-ok { color: var(--pos); }
-.plan-feature.is-excluded { color: var(--text-dim); opacity: .6; }
-/* 未推出：弱化字色＋徽章，視覺上明顯不同於可用功能（不得只靠徽章文字） */
-.plan-feature.is-unshipped { color: var(--text-dim); }
-.plan-badge {
+.leader-dock-check { flex: none; padding: 16px 22px; font-size: 15px; }
+.addr-field-hint { margin-top: 8px; }
+
+/* 「你目前跟隨的 leader」：換 leader 這個決定的左半邊，安靜地擺在 dock 下方。 */
+.leader-current { margin-top: 16px; }
+.leader-current-addr { margin: 0 0 8px; font-size: 14px; color: var(--text); }
+.leader-current-none { margin: 0 0 8px; font-size: 14px; color: var(--text); }
+.leader-current-pending { margin: 12px 0 0; }
+
+.leader-name { font-size: 1.15rem; font-weight: 400; color: var(--text); margin: 0; }
+.leader-addr { margin: 4px 0 10px; }
+
+/* 位址 dock 的預覽卡（帳戶權益／持倉數，沿用同一組表格樣式）。 */
+.leader-stats {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px; margin: 0 0 16px;
+}
+.leader-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
+.leader-stat dd { margin: 4px 0 0; font-size: 16px; font-weight: 300; color: var(--text); }
+
+/* 「此位址已在精選清單」徽章（原 .plan-badge，方案頁下架後移入本區塊留用）。 */
+.leader-badge {
   font-size: 11px; letter-spacing: .04em;
   color: var(--warn);
   background: rgba(var(--warn-rgb), .12);
@@ -616,167 +625,12 @@ main.page {
   padding: 2px 8px;
 }
 
-.plan-action-note { margin: 0; }
-.plan-unshipped-note { margin-top: 16px; }
-.plan-notice {
-  color: var(--warn);
-  background: rgba(var(--warn-rgb), .1);
-  border: 1px solid rgba(var(--warn-rgb), .35);
-  border-radius: var(--radius);
-  padding: 10px 14px;
-  font-size: 13px;
-}
-.plan-error {
-  color: var(--neg);
-  background: rgba(var(--neg-rgb), .1);
-  border: 1px solid rgba(var(--neg-rgb), .4);
-  border-radius: var(--radius);
-  padding: 10px 14px;
-  font-size: 13px;
-}
-
-.billing-panel { margin-top: 20px; }
-.billing-stats { display: flex; gap: 40px; margin: 0 0 18px; flex-wrap: wrap; }
-.billing-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
-.billing-stat dd { margin: 6px 0 0; font-size: 18px; font-weight: 300; color: var(--text); }
-.billing-manage-note { margin: 12px 0 0; }
-.billing-empty-title { font-size: 15px; color: var(--text); margin: 0 0 4px; }
-.billing-empty .btn { margin-top: 14px; }
-
-/* ---------- /leaders：leader 目錄與換 leader 授權 ---------- */
-.leader-scope { border-color: rgba(var(--warn-rgb), .45); margin-bottom: 16px; }
-.leader-scope-title { color: var(--warn); font-size: 14px; font-weight: 500; margin: 0 0 6px; }
-
-.leader-gate { display: block; }
-.leader-gate-title {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  font-size: 14px; color: var(--text); margin: 0 0 6px;
-}
-
-/* 「你目前跟隨的 leader」：換 leader 這個決定的左半邊，排在清單之前。 */
-.leader-current { margin-top: 16px; }
-.leader-current-addr { margin: 0 0 8px; font-size: 14px; color: var(--text); }
-.leader-current-none { margin: 0 0 8px; font-size: 14px; color: var(--text); }
-.leader-current-pending { margin: 12px 0 0; }
-
-.leader-stats-notice { margin-top: 16px; }
-.leader-stats-meta { margin-top: 16px; }
-.leader-stats-meta .mono { word-break: break-all; }
-
-.leader-grid {
-  display: grid; gap: 16px; margin-top: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-}
-.leader-card { display: flex; flex-direction: column; }
-.leader-name { font-size: 1.15rem; font-weight: 400; color: var(--text); margin: 0; }
-.leader-addr { margin: 4px 0 10px; }
-.leader-desc { font-size: 13.5px; color: var(--text); margin: 0 0 14px; line-height: 1.6; }
-
-.leader-stats {
-  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px 16px; margin: 0 0 16px;
-}
-.leader-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
-.leader-stat dd { margin: 4px 0 0; font-size: 16px; font-weight: 300; color: var(--text); }
-
-/* ---- 卡片下區：績效。⭐ 與上區（規模／曝險）之間有明確分隔線與自己的標題：
-   兩者是不同類的東西，視覺上黏在一起就會被讀成同一類（誠信要求，不是裝飾）。 ---- */
-.leader-perf-notice { margin-top: 16px; }
-.leader-perf {
-  border-top: 1px solid var(--border);
-  padding-top: 14px; margin: 0 0 16px;
-}
-.leader-perf-title {
-  font-size: 13px; font-weight: 500; color: var(--text); margin: 0 0 4px;
-  letter-spacing: .02em;
-}
-.leader-perf-scope { margin: 0 0 10px; }
-/* 上界警語：與績效數字同一個區塊，樣式與按鈕旁那則一致（同等份量，不是小字）。 */
-.leader-perf-upper-bound {
-  font-size: 12.5px; line-height: 1.6; color: var(--text);
-  background: rgba(var(--warn-rgb), .1);
-  border-left: 2px solid rgba(var(--warn-rgb), .6);
-  border-radius: 4px; padding: 8px 10px; margin: 0 0 12px;
-}
-.leader-perf-window {
-  border: 1px solid var(--border); border-radius: 6px;
-  padding: 10px 12px; margin: 0 0 10px;
-}
-.leader-perf-window-head {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px;
-}
-.leader-perf-period { font-size: 12.5px; color: var(--text); }
-/* 揭露層級標籤：每個窗都有，讓「資料還不夠」是一個看得見的狀態而不是空欄位。 */
-.leader-perf-tier {
-  font-size: 10.5px; letter-spacing: .03em; padding: 2px 7px; border-radius: 999px;
-  color: var(--text-dim); border: 1px solid var(--border); background: rgba(var(--bg-rgb), .45);
-}
-.leader-perf-window[data-tier="annualizable"] .leader-perf-tier {
-  color: var(--pos); border-color: rgba(var(--pos-rgb), .5);
-}
-.leader-perf-window[data-tier="insufficient"] .leader-perf-tier,
-.leader-perf-window[data-tier="unknown"] .leader-perf-tier {
-  color: var(--warn); border-color: rgba(var(--warn-rgb), .5);
-}
-/* 資料充足度：與數字同層級的顯示，不是折疊起來的細節。 */
-.leader-perf-sufficiency {
-  display: flex; gap: 14px; flex-wrap: wrap; margin: 0 0 4px;
-  font-size: 11.5px; color: var(--text-dim);
-}
-.leader-perf-suff-item { white-space: nowrap; }
-.leader-perf-suff-note { margin: 0 0 10px; font-size: 11.5px; }
-
-.leader-perf-stats {
-  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px 16px; margin: 0;
-}
-.leader-perf-stat dt { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
-.leader-perf-stat dd { margin: 4px 0 0; font-size: 16px; font-weight: 300; color: var(--text); }
-/* MDD 的取樣警語：與數字同一格，跨滿兩欄，不得被推走。 */
-.leader-perf-stat-max-drawdown { grid-column: 1 / -1; }
-.leader-perf-stat-note {
-  margin: 6px 0 0; font-size: 11.5px; line-height: 1.55; color: var(--text);
-  background: rgba(var(--warn-rgb), .08);
-  border-left: 2px solid rgba(var(--warn-rgb), .5);
-  border-radius: 4px; padding: 6px 8px;
-}
-/* 資料不足／外推標記：與數字同一格、緊貼數字，且用警示色而非 dim 色——
-   它不是次要資訊，它是這個數字唯一的警示載體。 */
-.leader-perf-stat-marker {
-  margin: 4px 0 0; font-size: 11.5px; line-height: 1.5;
-  color: var(--warn); font-weight: 400;
-}
-
-/* ⭐⭐ 年化欄位的視覺弱化（誠信要求，不是版面偏好）。
-   期間報酬是**實際發生過的事**，年化是**外推**：一個 7 天 +3% 的 leader 年化會
-   顯示成 365%，那個數字的錨定效果極強，而它在數學上把 7 天的雜訊放大了 52 倍。
-   若與期間報酬並排等大，最不可靠的數字會拿到最大的視覺份量。所以這裡刻意：
-   1. 另起一區、排在期間報酬**之後**（不是並排的第四格）；
-   2. 數值字級小於上方 stats（16px → 13px）、顏色降到 dim；
-   3. 左側細線與縮排，讀起來像「附註推算」而不是「一項成績」。 */
-.leader-perf-annualized {
-  margin: 10px 0 0; padding: 8px 0 0 10px;
-  border-top: 1px solid var(--border);
-  border-left: 2px solid rgba(var(--warn-rgb), .28);
-}
-.leader-perf-annualized .leader-perf-stat dt { font-size: 10.5px; }
-.leader-perf-annualized .leader-perf-stat dd {
-  font-size: 13px; font-weight: 300; color: var(--text-dim);
-}
-
-/* 「資料不足」「還差幾天」：畫成有內容的狀態區塊——不是一排「—」。 */
+/* 有內容的狀態區塊（例如「已簽署、尚未生效的換 leader」）——不是一排「—」。 */
 .leader-perf-state {
   border: 1px dashed var(--border); border-radius: 6px;
   padding: 10px 12px; margin: 10px 0 0; background: rgba(var(--bg-rgb), .45);
 }
 .leader-perf-state-title { font-size: 12.5px; color: var(--text); margin: 0 0 6px; }
-.leader-perf-state-insufficient { border-color: rgba(var(--warn-rgb), .45); }
-.leader-perf-shortfall {
-  margin: 6px 0 0; font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums;
-}
-.leader-perf-degraded {
-  margin: 10px 0 0; font-size: 12px; line-height: 1.55; color: var(--warn);
-}
 
 /* 上界警語：與按鈕同一個容器，且視覺上不得比按鈕更弱（誠信要求，不是裝飾）。 */
 .leader-action { margin-top: auto; }
@@ -790,19 +644,29 @@ main.page {
 .leader-done { border-color: rgba(var(--pos-rgb), .5); margin-top: 16px; }
 .leader-done-title { color: var(--pos); font-size: 14px; margin: 0 0 6px; }
 
-/* ---- 自訂 leader：任意位址輸入（2026-07-27）。輸入框沿 /capital 的表單樣式。 ---- */
-.leader-custom { margin-top: 24px; }
+/* ---- 位址輸入區（原「自訂 leader」，2026-07-27 表單樣式；欄位命名於 2026-07-30
+   從資金配置頁的同款輸入框樣式改名為 .addr-* 前綴，隨該頁下架遷入本區塊留用）。 ---- */
 .leader-custom-title { font-size: 14px; color: var(--text); margin: 0 0 8px; font-weight: 500; }
-.leader-custom > .btn { margin-top: 14px; }
+.addr-field { display: block; margin: 0; }
+.addr-field-label {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 13px; color: var(--text); margin-bottom: 6px;
+}
+.addr-input {
+  width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 15px;
+  color: var(--text); background: rgba(var(--text-dim-rgb), .08);
+  border: 1px solid rgba(var(--text-dim-rgb), .35); border-radius: 6px;
+}
+.addr-input:focus { outline: 2px solid rgba(var(--primary-rgb), .5); outline-offset: 1px; }
+.addr-input-error {
+  margin: 10px 0 0; font-size: 13px; color: var(--neg); line-height: 1.6;
+}
 .leader-custom-preview {
   border-top: 1px solid var(--border);
   margin-top: 16px; padding-top: 14px;
 }
 .leader-custom-preview .leader-stats { margin: 12px 0 12px; }
 .leader-custom-listed { margin: 0 0 8px; }
-.leader-custom-noperf { margin: 0 0 12px; }
-/* 精選位址的預覽卡：績效在上方那張卡片上，這裡只指過去（不重複顯示、不另算一份）。 */
-.leader-custom-perf-ref { margin: 0 0 12px; }
 .leader-custom-preview .leader-name { margin: 0 0 2px; }
 .leader-custom-preview .check-row { margin: 12px 0; }
 .leader-custom-preview .leader-action { margin-top: 14px; }
@@ -819,100 +683,6 @@ main.page {
 .leader-dialog-actions {
   display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; flex-wrap: wrap;
 }
-
-/* ---------- /capital 資金配置（投入本金 × 使用比例） ---------- */
-.capital-section-title { font-size: 14px; color: var(--text); margin: 0 0 8px; font-weight: 500; }
-.capital-glossary { margin-bottom: 16px; }
-.capital-terms { margin: 0 0 14px; }
-.capital-terms dt {
-  font-size: 13px; color: var(--text); font-weight: 500; margin-top: 10px;
-}
-.capital-terms dt:first-child { margin-top: 0; }
-.capital-terms dd {
-  margin: 4px 0 0; font-size: 13px; color: var(--text-dim); line-height: 1.65;
-}
-.capital-product-title { font-size: 13px; color: var(--text); margin: 0 0 4px; font-weight: 500; }
-.capital-session { margin-top: 16px; }
-.capital-gate { display: block; }
-.capital-gate-title {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  color: var(--text); font-size: 14px; margin: 0 0 6px;
-}
-.capital-form { margin-top: 16px; }
-.capital-field { display: block; margin: 18px 0 0; }
-.capital-field-label {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
-  font-size: 13px; color: var(--text); margin-bottom: 6px;
-}
-.capital-util-value { font-size: 18px; font-weight: 300; color: var(--text); }
-.capital-field .hint { display: block; margin-top: 6px; }
-.capital-input {
-  width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 15px;
-  color: var(--text); background: rgba(var(--text-dim-rgb), .08);
-  border: 1px solid rgba(var(--text-dim-rgb), .35); border-radius: 6px;
-}
-.capital-input:focus { outline: 2px solid rgba(var(--primary-rgb), .5); outline-offset: 1px; }
-.capital-slider { width: 100%; accent-color: var(--primary); }
-/* ⭐ 風險揭露與滑桿同一個容器（不得被推到頁尾）：邊框與底色讓它讀起來像警語。 */
-.capital-risk {
-  margin-top: 18px; padding: 12px 14px; border-radius: 6px;
-  border: 1px solid rgba(var(--warn-rgb), .45); background: rgba(var(--warn-rgb), .08);
-}
-.capital-risk-title { color: var(--warn); font-size: 13.5px; font-weight: 500; margin: 0 0 6px; }
-.capital-risk-body { font-size: 13px; color: var(--text); line-height: 1.65; margin: 0; }
-.capital-basis {
-  display: flex; flex-direction: column; gap: 4px; margin-top: 18px;
-}
-.capital-basis-label { font-size: 11px; color: var(--text-dim); letter-spacing: .04em; }
-.capital-basis-value { font-size: 20px; font-weight: 300; color: var(--text); }
-.capital-input-error {
-  margin: 14px 0 0; font-size: 13px; color: var(--neg); line-height: 1.6;
-}
-.capital-form .btn-block { margin-top: 14px; }
-.capital-diff { margin: 0 0 12px; }
-.capital-diff dt {
-  font-size: 11px; color: var(--text-dim); letter-spacing: .04em; margin-top: 10px;
-}
-.capital-diff dt:first-child { margin-top: 0; }
-.capital-diff dd { margin: 3px 0 0; font-size: 15px; color: var(--text); }
-.capital-diff-new { color: var(--primary); font-size: 17px; }
-.capital-done { border-color: rgba(var(--pos-rgb), .5); margin-top: 16px; }
-.capital-done-title { color: var(--pos); font-size: 14px; margin: 0 0 6px; }
-.capital-dialog .capital-risk-title { margin-top: 14px; }
-
-/* ---- 「你目前生效的資金設定」：押多大這個決定的左半邊，排在表單之前。 ----
-   ⭐ 這一區的視覺分離**是安全性質，不是排版偏好**：面板裡同時放著「現在生效的」與
-   「已提交、還沒生效的」兩組欄位，而兩組的標籤字樣完全一樣（投入本金／使用比例），
-   pending 又排在下面——沒有樣式時，掃視的人會把下面那組讀成比較新的生效值。一個把
-   使用比例從 1.0 調到 0.2 的客戶因此會以為曝險已經降下來，而實際上一點都沒變。
-   作法沿 /leaders 的 .leader-perf-state（有邊框的獨立區塊）與 .leader-current-pending。
-   <!-- 2026-07-27: 這五個 class 原本掛在 DOM 上但零規則，補齊。 --> */
-.capital-current { margin-top: 16px; }
-.capital-current-none { margin: 0 0 8px; font-size: 14px; color: var(--text); }
-.capital-effective-values {
-  border: 1px solid rgba(var(--text-dim-rgb), .3); border-radius: 6px;
-  padding: 10px 12px; margin: 10px 0 0; background: rgba(var(--bg-rgb), .45);
-}
-.capital-effective-values .hint { margin: 8px 0 0; }
-.capital-current-dl {
-  margin: 0; display: grid; grid-template-columns: auto 1fr;
-  gap: 4px 14px; align-items: baseline;
-}
-.capital-current-dl dt { font-size: 11.5px; color: var(--text-dim); letter-spacing: .03em; }
-.capital-current-dl dd {
-  margin: 0; font-size: 13.5px; color: var(--text); font-variant-numeric: tabular-nums;
-  word-break: break-all;
-}
-/* ⭐ pending 讀起來必須是「還沒算數的那一塊」，不是「比較新的生效值」：虛線邊框
-   （＝未定案）＋警示色標題＋數值降到 dim，三者合起來把它與上方的實線區塊拉開。
-   同時整塊縮排，讓它在版面上明確從屬於面板、而不是與生效值並列的第二組現況。 */
-.capital-pending {
-  border: 1px dashed rgba(var(--warn-rgb), .55);
-  background: rgba(var(--warn-rgb), .07);
-  margin: 12px 0 0 12px;
-}
-.capital-pending .capital-section-title { color: var(--warn); }
-.capital-pending .capital-current-dl dd { color: var(--text-dim); }
 
 /* ---------- Responsive：邊界圖直疊（≤620px） ---------- */
 @media (max-width: 620px) {
@@ -935,6 +705,10 @@ main.page {
   .wizard-steps { display: flex; overflow-x: auto; gap: 6px; padding-bottom: 4px; }
   .wizard-steps li { margin-bottom: 0; flex: none; }
   main.page { padding: 28px 14px 60px; }
+  /* 地址 dock 降級：字級縮小、按鈕退到輸入框下方——手機上並排會擠壓到不可用。 */
+  .leader-dock-row { flex-direction: column; align-items: stretch; }
+  .leader-dock .addr-input { font-size: 17px; padding: 12px 14px; }
+  .leader-dock-check { padding: 12px 18px; }
 }
 
 /* ---------- Reduced motion：全動畫停用 ---------- */

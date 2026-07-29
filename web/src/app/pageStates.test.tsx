@@ -17,7 +17,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { BillingPlansResp, LeadersResp, OnboardStatus } from "@/lib/api";
+import type { LeadersResp, OnboardStatus } from "@/lib/api";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn() }),
@@ -38,8 +38,6 @@ vi.mock("@/lib/siwe", () => ({ loginWithSiwe: vi.fn() }));
 const getMe = vi.fn();
 const getStatus = vi.fn();
 const getLeaders = vi.fn();
-const getBillingPlans = vi.fn();
-const getBillingStatus = vi.fn();
 const getAdminPending = vi.fn();
 const getOpsCustomers = vi.fn();
 const getOpsRevenue = vi.fn();
@@ -51,8 +49,6 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getMe: (...a: unknown[]) => getMe(...a),
   getStatus: (...a: unknown[]) => getStatus(...a),
   getLeaders: (...a: unknown[]) => getLeaders(...a),
-  getBillingPlans: (...a: unknown[]) => getBillingPlans(...a),
-  getBillingStatus: (...a: unknown[]) => getBillingStatus(...a),
   getAdminPending: (...a: unknown[]) => getAdminPending(...a),
   getOpsCustomers: (...a: unknown[]) => getOpsCustomers(...a),
   getOpsRevenue: (...a: unknown[]) => getOpsRevenue(...a),
@@ -63,7 +59,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
 
 /** 全部 mock 的集合，供 reset 與批次設定使用（在 factory 之外求值，不受提升影響）。 */
 const api = {
-  getMe, getStatus, getLeaders, getBillingPlans, getBillingStatus, getAdminPending,
+  getMe, getStatus, getLeaders, getAdminPending,
   getOpsCustomers, getOpsRevenue, getOpsSubscriptions, getOpsTradeQuality, getOpsHealth,
 };
 
@@ -71,20 +67,15 @@ import { ApiError } from "@/lib/api";
 import { COPY } from "@/lib/copy";
 import { Header } from "@/components/Header";
 import AdminPage from "./admin/page";
-import BillingPage from "./billing/page";
-import CapitalPage from "./capital/page";
 import LeadersPage from "./leaders/page";
 import LoginPage from "./page";
 import OnboardingPage from "./onboarding/page";
 import OpsPage from "./ops/page";
-import PerformancePage from "./performance/page";
-import PricingPage from "./pricing/page";
 
 const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" };
 
 const unauthorized = () => new ApiError("auth", "未登入", 401, "未登入");
 const forbidden = () => new ApiError("client", "非管理員", 403, "非管理員");
-const billingOff = () => new ApiError("client", "計費未啟用", 501, "計費未啟用");
 
 /** 已登入但**尚未活化**：授權沒簽完、沒入金，後端 /api/onboard/status 照樣回進度物件。 */
 const NOT_ACTIVATED: OnboardStatus = {
@@ -96,24 +87,6 @@ const NOT_ACTIVATED: OnboardStatus = {
   agent_approved: false,
   funded: false,
   state: "IN_PROGRESS",
-};
-
-/** 方案目錄。multiLeader／ratioSlider 已 shipped（後端 commit 0d68fcd）。 */
-const PLANS: BillingPlansResp = {
-  billing_enabled: false,
-  plans: [
-    {
-      id: "pro",
-      name_key: "plans.pro.name",
-      price_display: "USD 29 / 月",
-      purchasable: true,
-      features: [
-        { text_key: "plans.feature.copytrade", included: true, shipped: true },
-        { text_key: "plans.feature.multiLeader", included: true, shipped: true },
-        { text_key: "plans.feature.ratioSlider", included: true, shipped: true },
-      ],
-    },
-  ],
 };
 
 const LEADERS = {
@@ -152,24 +125,18 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/", name: "登入頁", el: () => <LoginPage /> },
   { path: "/onboarding", name: "開通頁", el: () => <OnboardingPage /> },
   { path: "/leaders", name: "跟單對象頁", el: () => <LeadersPage /> },
-  { path: "/capital", name: "資金配置頁", el: () => <CapitalPage /> },
-  { path: "/performance", name: "績效頁", el: () => <PerformancePage /> },
-  { path: "/pricing", name: "方案頁", el: () => <PricingPage /> },
-  { path: "/billing", name: "訂閱管理頁", el: () => <BillingPage /> },
   { path: "/ops", name: "營運頁", el: () => <OpsPage /> },
   { path: "/admin", name: "待核准頁", el: () => <AdminPage /> },
 ];
 
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset();
-  // 方案目錄是公開端點：兩種狀態下都拿得到。
-  api.getBillingPlans.mockResolvedValue(PLANS);
 });
 
 /** 未登入：所有需要 session 的端點一律 401。 */
 function mockLoggedOut() {
   api.getMe.mockRejectedValue(unauthorized());
-  for (const k of ["getStatus", "getLeaders", "getBillingStatus", "getAdminPending",
+  for (const k of ["getStatus", "getLeaders", "getAdminPending",
                    "getOpsCustomers", "getOpsRevenue", "getOpsSubscriptions",
                    "getOpsTradeQuality", "getOpsHealth"] as const) {
     api[k].mockRejectedValue(unauthorized());
@@ -181,7 +148,6 @@ function mockLoggedInNotActivated() {
   api.getMe.mockResolvedValue(ME);
   api.getStatus.mockResolvedValue(NOT_ACTIVATED);
   api.getLeaders.mockResolvedValue(LEADERS);
-  api.getBillingStatus.mockRejectedValue(billingOff());
   api.getAdminPending.mockRejectedValue(forbidden());
   for (const k of ["getOpsCustomers", "getOpsRevenue", "getOpsSubscriptions",
                    "getOpsTradeQuality", "getOpsHealth"] as const) {
@@ -200,8 +166,7 @@ describe("逐頁狀態｜未登入", () => {
   }
 
   it("需要登入的客戶頁一律給「尚未登入」提示，不是空白", async () => {
-    for (const r of ROUTES.filter((x) => ["/onboarding", "/leaders", "/capital",
-                                          "/performance", "/billing"].includes(x.path))) {
+    for (const r of ROUTES.filter((x) => ["/onboarding", "/leaders"].includes(x.path))) {
       const { unmount } = render(wrap(r.el(), null));
       expect(await screen.findByText(COPY.common.notLoggedIn),
              `${r.path} 應顯示尚未登入提示`).toBeInTheDocument();
@@ -217,12 +182,10 @@ describe("逐頁狀態｜未登入", () => {
     expect(await screen.findByText(COPY.common.notLoggedIn)).toBeInTheDocument();
   });
 
-  it("公開頁（/ 與 /pricing）未登入仍正常呈現，不是錯誤畫面", async () => {
+  it("公開頁（/ ）未登入仍正常呈現，不是錯誤畫面", async () => {
     const { unmount } = render(wrap(<LoginPage />, null));
     expect(screen.getByRole("button", { name: COPY.login.connect })).toBeInTheDocument();
     unmount();
-    render(wrap(<PricingPage />, null));
-    expect(await screen.findByText(COPY.billing.pricingTitle)).toBeInTheDocument();
   });
 });
 
@@ -241,31 +204,10 @@ describe("逐頁狀態｜已登入但未活化（沒有 follower）", () => {
     expect(await screen.findByText(COPY.common.notActivated)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: COPY.common.goOnboarding }))
       .toHaveAttribute("href", "/onboarding");
-    // 誠信不變式不受影響：清單照樣呈現，使用者看得到自己在選什麼。
-    expect(screen.getByText("Alpha")).toBeInTheDocument();
+    // 誠信不變式不受影響：地址輸入入口照樣呈現，未活化不等於白畫面。
+    expect(screen.getByLabelText(/leader 錢包位址/)).toBeInTheDocument();
   });
 
-  it("⭐ /capital 未活化 → 明說尚未開通並指路，設定表單仍可瀏覽", async () => {
-    render(wrap(<CapitalPage />, ME));
-    expect(await screen.findByText(COPY.common.notActivated)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: COPY.common.goOnboarding }))
-      .toHaveAttribute("href", "/onboarding");
-  });
-
-  it("/performance 未活化 → 顯示進行中狀態與前往開通的入口，不顯示假數字", async () => {
-    const { container } = render(wrap(<PerformancePage />, ME));
-    expect(await screen.findByText(COPY.perf.stateInProgress)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: COPY.perf.goOnboarding }))
-      .toHaveAttribute("href", "/onboarding");
-    // agent 尚未產生 → 顯示「尚未產生」而不是 null／undefined
-    expect(container.textContent).toContain(COPY.perf.agentNone);
-  });
-
-  it("/billing 在 billing 未啟用（501）→ 降級為未啟用說明，不是錯誤畫面", async () => {
-    render(wrap(<BillingPage />, ME));
-    expect(await screen.findByText(COPY.billing.disabledNote)).toBeInTheDocument();
-    expect(screen.queryByText(COPY.billing.errors.loadFailed)).not.toBeInTheDocument();
-  });
 
   it("一般客戶開 /ops、/admin → 後端 403 → 「僅限管理員」，不是白畫面", async () => {
     const { unmount } = render(wrap(<OpsPage />, ME));

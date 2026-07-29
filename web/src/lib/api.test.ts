@@ -126,38 +126,6 @@ describe("端點契約（對照 src/spark/publicapi/app.py）", () => {
     expect(captured[0].url).toBe("/api/ops/revenue?threshold_pct=0.01");
   });
 
-  it("billing 四端點：路徑、方法、回傳欄位（checkout 回 checkout_url、portal 回 url）", async () => {
-    mockFetchJson(200, { billing_enabled: false, plans: [] });
-    const plans = await api.getBillingPlans();
-    expect(captured[0].url).toBe("/api/billing/plans");
-    expect(captured[0].init.method).toBeUndefined(); // GET
-    expect(plans.billing_enabled).toBe(false);
-
-    mockFetchJson(200, { account_id: "fabc", status: "active", active: true });
-    const st = await api.getBillingStatus();
-    expect(captured[0].url).toBe("/api/billing/status");
-    expect(st.status).toBe("active");
-
-    // ⭐ checkout 的欄位名是 checkout_url，不是 url——兩者不同，型別與測試一起釘住
-    mockFetchJson(200, { checkout_url: "https://checkout.stripe.test/s1" });
-    const co = await api.postBillingCheckout();
-    expect(captured[0]).toMatchObject({
-      url: "/api/billing/checkout", init: expect.objectContaining({ method: "POST" }),
-    });
-    expect(co.checkout_url).toBe("https://checkout.stripe.test/s1");
-
-    mockFetchJson(200, { url: "https://portal.stripe.test/p1" });
-    const po = await api.postBillingPortal();
-    expect(captured[0]).toMatchObject({
-      url: "/api/billing/portal", init: expect.objectContaining({ method: "POST" }),
-    });
-    expect(po.url).toBe("https://portal.stripe.test/p1");
-  });
-
-  it("billing 未啟用 → 501 歸 kind=client 且保留 status（前端據此顯示「即將開放」）", async () => {
-    mockFetchJson(501, { detail: "計費未啟用" });
-    await expect(api.getBillingStatus()).rejects.toMatchObject({ kind: "client", status: 501 });
-  });
 });
 
 /**
@@ -272,11 +240,10 @@ describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
 });
 
 describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3）", () => {
-  // 已知合法例外（三支，皆為 EIP-191 personal_sign、原文皆由伺服器產生）：
-  //   authVerify（SIWE 登入）、postLeaderSelect（換 leader 授權）、
-  //   postCapitalSettings（資金設定授權）——後兩支的後端契約都要求帶簽名。
-  // ⭐ 例外不是豁免：後兩支各有專屬測試釘住「body 欄位集合恰好是契約欄位」
-  //   （見下方兩個 describe），比這裡的黑名單掃描更嚴——r/s/v 與任何多餘欄位都會被抓到。
+  // 已知合法例外（二支，皆為 EIP-191 personal_sign、原文皆由伺服器產生）：
+  //   authVerify（SIWE 登入）、postLeaderSelect（換 leader 授權）。
+  // ⭐ 例外不是豁免：postLeaderSelect 有專屬測試釘住「body 欄位集合恰好是契約欄位」
+  //   （見下方 describe），比這裡的黑名單掃描更嚴——r/s/v 與任何多餘欄位都會被抓到。
   //   HL 的 EIP-712 授權簽名仍然結構上沒有進後端的路（那條走 lib/hl.ts 直送 HL）。
   it("除三支帶簽名的例外外，所有端點的請求 body 不含 signature/r/s/v 欄位", async () => {
     const calls: Array<() => Promise<unknown>> = [
@@ -295,14 +262,9 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getOpsSubscriptions(),
       () => api.getOpsTradeQuality({ days: 1 }),
       () => api.getOpsHealth(),
-      () => api.getBillingPlans(),
-      () => api.getBillingStatus(),
-      () => api.postBillingCheckout(),
-      () => api.postBillingPortal(),
       () => api.getLeaders(),
       () => api.getLeaderSelectMessage("0x1111111111111111111111111111111111111111"),
       () => api.getLeaderPreview("0x2222222222222222222222222222222222222222"),
-      () => api.getCapitalSettingsMessage("10000.00", "0.2000"),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -322,12 +284,11 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
   // 上一個 describe 的 calls 陣列是手寫的：新增一個 api.ts 匯出函式時，容易忘記把它加進去，
   // 讓紅線測試悄悄失去涵蓋。這裡改用 Object.entries 反射列舉「當下實際存在」的匯出函式，
   // 對每一個都自動呼叫並驗證 body——手寫列表漏了誰，這裡都補上。
-  // ApiError 非函式呼叫端點；authVerify、postLeaderSelect 與 postCapitalSettings 是
-  // **僅有的三個**合法帶簽名的端點（皆 EIP-191、原文皆由伺服器產生），各自有專屬測試
-  // 覆蓋——後兩者的專屬測試是「欄位集合恰好等於契約欄位」的白名單，比本掃描的黑名單
-  // 更嚴（見檔案末段兩個 describe）。
+  // ApiError 非函式呼叫端點；authVerify 與 postLeaderSelect 是**僅有的二個**合法帶簽名的
+  // 端點（皆 EIP-191、原文皆由伺服器產生），各自有專屬測試覆蓋——後者的專屬測試是
+  // 「欄位集合恰好等於契約欄位」的白名單，比本掃描的黑名單更嚴（見檔案末段 describe）。
   const EXCLUDED = new Set([
-    "ApiError", "authVerify", "postLeaderSelect", "postCapitalSettings",
+    "ApiError", "authVerify", "postLeaderSelect",
   ]);
   const reflected = Object.entries(api).filter(
     ([name, value]) => typeof value === "function" && !EXCLUDED.has(name),
@@ -338,8 +299,8 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     // 2026-07-19：+2（getOpsTradeQuality、getOpsHealth，/ops 兩個新面板）
     // 2026-07-27：+1（getLeaderPreview，自訂 leader 准入預覽）
     // 2026-07-27：+1（getMyLeader，「我目前跟誰」——/leaders 頁的現況揭露）
-    // 2026-07-27：+1（getMyCapital，「投入本金與使用比例生效值」——/capital 頁的現況揭露）
-    const HAND_WRITTEN_LIST_LENGTH = 24;
+    // 2026-07-30：-7（移除 billing 與 capital：getBillingPlans、getBillingStatus、postBillingCheckout、postBillingPortal、getMyCapital、getCapitalSettingsMessage、postCapitalSettings；postCapitalSettings 原在 EXCLUDED，現刪除後 EXCLUDED 僅剩 authVerify、postLeaderSelect）
+    const HAND_WRITTEN_LIST_LENGTH = 18;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 
@@ -410,65 +371,3 @@ describe("⭐ postLeaderSelect：帶簽名的例外，body 欄位集合精確釘
   });
 });
 
-/**
- * postCapitalSettings 是紅線 3 的第三個已知例外（後端契約要求帶簽名）。同 postLeaderSelect：
- * 例外必須比通則**更嚴**——白名單釘死欄位集合，多一個欄位就失敗。
- *
- * ⭐ 欄位是**七欄**而不是記錄格式的八欄：`action` 刻意不由前端送出（後端
- * build_capital_settings_record 寫死）。讓客戶端指定動作類型，等於把「換 leader 授權
- * 不能被當成資金設定授權」的域分隔交還給請求內容，而請求內容整份都在攻擊者的控制
- * 範圍內（見 filet/capital_settings.py 檔頭的域分隔論證）。多送 action 這件事必須失敗。
- */
-describe("⭐ postCapitalSettings：帶簽名的例外，body 欄位集合精確釘死", () => {
-  const PAYLOAD = {
-    message:
-      "Filet: update copy-trading capital allocation\n\nAccount: fzzz\n" +
-      "Allocated Capital: 10000.00 USDC\nCapital Utilization: 0.2000\nNonce: n-1",
-    nonce: "n-1",
-    issued_at: "2026-07-19T00:00:00Z",
-    account_id: "fzzz",
-    allocated_capital: "10000.00",
-    capital_utilization: "0.2000",
-  };
-  const SIG = `0x${"ab".repeat(65)}`;
-
-  it("欄位集合恰為契約七欄（白名單），且不含 action、r/s/v 或任何多餘欄位", async () => {
-    mockFetchJson(200, { ok: true });
-    await api.postCapitalSettings(PAYLOAD, SIG);
-
-    const body = JSON.parse(captured[0].init.body as string);
-    expect(Object.keys(body).sort()).toEqual([
-      "account_id", "allocated_capital", "capital_utilization",
-      "issued_at", "message", "nonce", "signature",
-    ]);
-    expect(captured[0]).toMatchObject({
-      url: "/api/me/capital", init: expect.objectContaining({ method: "POST" }),
-    });
-  });
-
-  it("⭐ 原文與兩個數值原樣回送，一律取自同一包 payload（不從別處拼）", async () => {
-    mockFetchJson(200, { ok: true });
-    await api.postCapitalSettings(PAYLOAD, SIG);
-
-    const body = JSON.parse(captured[0].init.body as string);
-    // 逐位元組相同：後端會用這些欄位**重建**訊息再 recover，前端重組就會出現
-    // 「簽的是 A、送的是 B」的縫（症狀是本人簽的卻一直被拒，而兩邊 log 都正常）。
-    expect(body.message).toBe(PAYLOAD.message);
-    expect(body.account_id).toBe(PAYLOAD.account_id);
-    expect(body.allocated_capital).toBe(PAYLOAD.allocated_capital);
-    expect(body.capital_utilization).toBe(PAYLOAD.capital_utilization);
-    expect(body.nonce).toBe(PAYLOAD.nonce);
-    expect(body.issued_at).toBe(PAYLOAD.issued_at);
-    expect(body.signature).toBe(SIG);
-  });
-
-  it("getCapitalSettingsMessage：GET /api/me/capital/message?allocated_capital=&capital_utilization=", async () => {
-    mockFetchJson(200, { message: "m", nonce: "n" });
-    await api.getCapitalSettingsMessage("10000.00", "0.2000");
-
-    expect(captured[0].url).toBe(
-      "/api/me/capital/message?allocated_capital=10000.00&capital_utilization=0.2000",
-    );
-    expect(captured[0].init.method).toBeUndefined(); // GET
-  });
-});

@@ -2,14 +2,10 @@
  * lib/api.ts — 後端 Public API 的唯一出口（工程原則 5 的前端鏡射）。
  * 一律同源相對路徑 + credentials:"include"（紅線 5）。
  * 錯誤分類（工程原則 2）：auth(401)/client(4xx)/upstream(502|503)/network。
- * ⭐ 紅線 3：帶簽名的後端呼叫只有三支，三支都是 EIP-191 personal_sign，且三支的
+ * ⭐ 紅線 3：帶簽名的後端呼叫只有二支，兩支都是 EIP-191 personal_sign，且兩支的
  *   **原文都由伺服器產生**（前端不組字串）：
  *     1. authVerify —— SIWE 登入簽名；
- *     2. postLeaderSelect —— 換 leader 授權簽名（原文來自 getLeaderSelectMessage）；
- *     3. postCapitalSettings —— 資金設定授權簽名（原文來自 getCapitalSettingsMessage）。
- *   後兩支的待簽原文**結構上不可能碰撞**（兩個模板的第一行是不同的固定字面量，
- *   見 filet/capital_settings.py 檔頭的域分隔論證），所以一份換 leader 的簽章
- *   兌換不成一次資金設定授權，反向亦然。
+ *     2. postLeaderSelect —— 換 leader 授權簽名（原文來自 getLeaderSelectMessage）。
  *   EIP-712 的鏈上授權簽名走 lib/hl.ts 直送 HL，本模組結構上沒有那條路。
  */
 import type { HlTypedData } from "./hl";
@@ -215,54 +211,6 @@ export function getMyLeader(): Promise<MyLeaderResp> {
   return request<MyLeaderResp>("/api/me/leader");
 }
 
-/**
- * 我目前生效的資金設定（投入本金與使用比例）與待簽署的變更（/api/me/capital）。
- * 後端回覆 `status` 欄用來區分：
- * - `effective`：已有生效的設定，本金与使用比例在 `effective` 欄位。
- * - `unknown`：無法判定（manifest 讀失敗等）。
- * - `not_activated`：帳號尚未活化。
- * - `indeterminate`：manifest 有壞條目且該條目可能是本帳號。
- *
- * ⚠️ `pending` 永遠不能被畫成「已生效」的樣子——兩者是不同的決定時點。
- * 讀不到 → 503（kind=upstream）；無查詢權限 → 403。冪等讀取，重試安全。
- */
-export interface MyCapitalEffective {
-  /** ⭐ `use_full_equity=true` 時後端硬性為 "0"（config.py 的不變量）——那個 0 是
-   *  「不准有值」，不是「本金為零」，顯示層必須改印「使用全部帳戶權益」。 */
-  allocated_capital: string | null;
-  capital_utilization: string | null;
-  use_full_equity: boolean | null;
-  source: "customer_signed" | "env_default";
-  changed_at: string | null;
-  /** ⚠️ **可為 null**：取自 `hb.at`，而 `HeartbeatRead.at` 是 `str | None`
-   *  （filet/engine_health.py：`written_at` 缺席或非字串時回 None）。宣告成非
-   *  nullable 會讓這一格靜靜渲染成空白，正好復活它存在要防的那件事——一份接近
-   *  過期的心跳被當成即時查詢讀。 */
-  as_of: string | null;
-}
-
-export interface MyCapitalPending {
-  allocated_capital: string;
-  capital_utilization: string;
-  use_full_equity: boolean;
-  submitted_at: string | null;
-  state: "not_yet_applied" | "unconfirmed";
-  effective_when: string;
-  note: string;
-}
-
-export interface MyCapitalResp {
-  account_id: string;
-  status: "effective" | "unknown" | "not_activated" | "indeterminate";
-  effective: MyCapitalEffective | null;
-  pending: MyCapitalPending | null;
-  heartbeat: { status: string; at: string | null; age_s: number | null; stale_after_s: number } | null;
-  note: string;
-}
-
-export function getMyCapital(): Promise<MyCapitalResp> {
-  return request<MyCapitalResp>("/api/me/capital");
-}
 
 // ---------- onboarding ----------
 export function createAgent(): Promise<AgentResp> {
@@ -336,8 +284,7 @@ export type LeaderPerf = { [window: string]: LeaderPerfWindow | undefined };
  * ⚠️ 這個改版把最危險的失敗方向從「憑空造出數字」換成了「**把數字送出去而沒有
  * 它的警示**」：一個 7 天 +3% 的 leader，年化會算成 365%，數字本身完全正常，
  * 少掉標記則畫面上完全看不出它是外推的。因此標記是**強制欄位**：
- * `lib/leaderPerf.ts` 的 `perfView()` 拿不到標記就不放行數字（fail closed），
- * `lib/redline.test.ts` 有兩條結構性斷言擋「把標記消音」與「渲染數字卻不讀標記」。
+ * 顯示層拿不到標記就不放行數字（fail closed）。
  *
  * 型別註記（**實測自後端**，不是推測）：後端內部一律 Decimal，
  * `leader_perf.jsonable_performance` 落地時 `str(v) if isinstance(v, Decimal)`，
@@ -911,70 +858,6 @@ export function getOpsHealth(): Promise<OpsHealthResp> {
   return request<OpsHealthResp>("/api/ops/health");
 }
 
-// ---------- billing（M3 計費；對照 src/spark/publicapi/app.py 的四個端點） ----------
-/**
- * 方案目錄的功能列。`included` 與 `shipped` 是**兩個獨立的軸**（後端 billing.py
- * PlanFeature 的鏡射）：付費層可以「包含但尚未推出」——顯示層必須據此標「開發中」
- * 而非假裝可用。前端不得把兩者合併成單一布林（合併就抹掉了誠實揭露的資訊）。
- */
-export interface BillingFeature {
-  /** i18n 鍵（後端不寫死使用者可見文案）；文案在 lib/copy.ts 的 COPY.billing.keys。 */
-  text_key: string;
-  included: boolean;
-  shipped: boolean;
-}
-
-export interface BillingPlan {
-  id: string;
-  name_key: string;
-  /** null = 免費方案，或價格尚未設定 → 顯示「價格待定」，絕不退化成 0。 */
-  price_display: string | null;
-  /** 有 stripe price_id 且 billing 已啟用；免費方案恆 false。 */
-  purchasable: boolean;
-  features: BillingFeature[];
-}
-
-export interface BillingPlansResp {
-  billing_enabled: boolean;
-  plans: BillingPlan[];
-}
-
-/** 後端白名單映射的結果（未知 stripe 狀態一律歸 canceled）；無記錄為 "none"。 */
-export type BillingStatusValue = "active" | "past_due" | "canceled" | "none";
-
-export interface BillingStatusResp {
-  account_id: string;
-  status: BillingStatusValue;
-  /** entitlement 查詢結果（僅供顯示；停用跟單是人工政策決策，前端不得自動化）。 */
-  active: boolean;
-}
-
-/** 方案目錄。⭐ 公開端點：不需 session，未登入的定價頁照樣拿得到。 */
-export function getBillingPlans(): Promise<BillingPlansResp> {
-  return request<BillingPlansResp>("/api/billing/plans");
-}
-
-/** 訂閱狀態（需 session）。billing 未啟用 → 501（kind=client, status=501）。 */
-export function getBillingStatus(): Promise<BillingStatusResp> {
-  return request<BillingStatusResp>("/api/billing/status");
-}
-
-/**
- * 建 Stripe Checkout Session，回 `checkout_url`（⭐ 欄位名不是 `url`——與 portal 不同，
- * 見 app.py billing_checkout）。已有生效訂閱 → 409；billing 未啟用 → 501。
- * 非冪等寫入：呼叫端**不得自動重試**，失敗一律交回使用者重按（人肉重試天然去重）。
- */
-export function postBillingCheckout(): Promise<{ checkout_url: string }> {
-  return post<{ checkout_url: string }>("/api/billing/checkout");
-}
-
-/**
- * 建 Stripe Billing Portal Session，回 `url`。無訂閱記錄 → 409；未啟用 → 501。
- * 同為非冪等寫入，重試政策同上。
- */
-export function postBillingPortal(): Promise<{ url: string }> {
-  return post<{ url: string }>("/api/billing/portal");
-}
 
 /**
  * 每客戶損益。`{ window: "accrued" }` → 與 /api/ops/revenue 同一比較窗口（可相減）；
@@ -993,81 +876,6 @@ export function getOpsRevenue(thresholdPct: number): Promise<OpsRevenueResp> {
   return request<OpsRevenueResp>(`/api/ops/revenue?${q.toString()}`);
 }
 
-// ---------- 資金設定（投入本金與使用比例；對照 app.py 的兩支 /api/me/capital 端點） ----------
-/**
- * 資金設定的 canonical 待簽原文 ＋ 一次性 nonce（原文由伺服器產生，前端不重組）。
- *
- * ⭐ 兩個數值回的是**伺服器 canonical 化後的字串**（本金固定 2 位、比例固定 4 位小數，
- * 見 filet/capital_settings.py 的 CAPITAL_DECIMALS／UTILIZATION_DECIMALS），不是客戶
- * 送過去的原樣字串。客戶端把這兩個值**原樣**回填進 POST，兩邊結構上不可能組出不同
- * 的字串（工程原則 1）。前端要比對它們時，必須先用同一套規則 canonical 化自己這側的
- * 值（lib/capitalValues.ts），否則 `1000` vs `1000.00` 會被判成不符。
- *
- * ⚠️ 一律 string 不是 number：這兩個值直接乘進部位大小，而 0.1 在 float 裡不是 0.1。
- */
-export interface CapitalSettingsMessageResp {
-  message: string;
-  nonce: string;
-  issued_at: string;
-  account_id: string;
-  allocated_capital: string;
-  capital_utilization: string;
-}
-
-/** 設定成功的回應。⭐ `effective`＝機器可讀語意，後兩個字串是後端寫給人看的原文。 */
-export interface CapitalSettingsResp {
-  ok: boolean;
-  account_id: string;
-  allocated_capital: string;
-  capital_utilization: string;
-  effective: string;
-  effective_note: string;
-  consequences: string;
-}
-
-/**
- * 取資金設定的待簽原文（需 session）。
- * ⭐ 邊界在**發原文之前**就檢查：超界 → 400（kind=client），不發 nonce、不給原文
- * （後端刻意如此，見 app.py capital_settings_message——讓客戶簽一份必定被 POST 拒絕
- * 的原文，等於只浪費他一次錢包簽名）。前端另有一道前置阻擋，兩道都不夾取。
- */
-export function getCapitalSettingsMessage(
-  allocatedCapital: string,
-  capitalUtilization: string,
-): Promise<CapitalSettingsMessageResp> {
-  const q = new URLSearchParams({
-    allocated_capital: allocatedCapital,
-    capital_utilization: capitalUtilization,
-  });
-  return request<CapitalSettingsMessageResp>(`/api/me/capital/message?${q.toString()}`);
-}
-
-/**
- * 送出資金設定授權。⭐ 收**整包 payload 物件**而不是散裝欄位，理由同 postLeaderSelect：
- * 伺服器驗簽時會用 account_id／兩個數值／nonce／issued_at **重建**訊息再 recover，
- * 客戶端若從別處拼一個欄位進來，就會出現「簽的是 A、送的是 B」的縫。由本函式從同一個
- * payload 物件取全部欄位＝結構上不可能拼錯（工程原則 1）。`message` 原文原樣回送。
- *
- * `action` 欄位刻意**不送**：它由後端寫死（讓客戶端指定動作類型，等於把換 leader 與
- * 資金設定之間的域分隔交還給請求內容，而請求內容整份都在攻擊者的控制範圍內）。
- *
- * 非冪等寫入 ＋ nonce 一次性：**不得自動重試**。重送同一筆會因 nonce 已消耗而必然
- * 失敗；要重來必須整條流程重跑（重取原文、新 nonce、重簽），由使用者按鈕觸發。
- */
-export function postCapitalSettings(
-  payload: CapitalSettingsMessageResp,
-  signature: string,
-): Promise<CapitalSettingsResp> {
-  return post<CapitalSettingsResp>("/api/me/capital", {
-    account_id: payload.account_id,
-    allocated_capital: payload.allocated_capital,
-    capital_utilization: payload.capital_utilization,
-    nonce: payload.nonce,
-    issued_at: payload.issued_at,
-    signature,
-    message: payload.message,
-  });
-}
 
 /**
  * 訂閱對帳的一列（本地 billing 表 vs Stripe）。

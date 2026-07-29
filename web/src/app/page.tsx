@@ -1,10 +1,16 @@
 "use client";
+/**
+ * `/` — 登入頁，同時是全站的產品敘事入口。
+ *
+ * ⭐ 2026-07-30 大幅減法：SIWE 登入機制與導向行為完全不動（測試契約盡量保留）；
+ * 呈現重構為三步旅程——連結錢包並登入、完成兩項授權（跟單授權＋builder code
+ * 收款授權）、貼上 leader 地址開始跟單。這三步是「綁定錢包」在本產品裡的權威
+ * 定義，文案單一來源見 COPY.login.journey。
+ */
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
-import { Boundary } from "@/components/Boundary";
 import { COPY } from "@/lib/copy";
-import { shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { loginWithSiwe } from "@/lib/siwe";
 
@@ -64,26 +70,21 @@ export default function LoginPage() {
   return (
     <main className="page">
       <section className="narrow login-inner">
-        <h1 className="wordmark">{COPY.common.appName}</h1>
+        <p className="eyebrow">{c.eyebrow}</p>
+        <h1 className="login-hero">{c.heroTitle}</h1>
         <p className="subtitle">{c.subtitle}</p>
 
-        <div className="login-boundary-wrap">
-          <Boundary
-            walletTitle={c.walletPanelTitle}
-            walletItems={[
-              { dt: c.addrLabel, dd: address ? shortAddr(address) : c.notConnected, mono: true },
-              { dt: c.balanceLabel, dd: "—", mono: true },
-            ]}
-            engineTitle={c.enginePanelTitle}
-            engineItems={[
-              { dt: c.strategyLabel, dd: c.strategyValue },
-              { dt: c.engineStateLabel, dd: c.engineStateIdle, mono: true },
-            ]}
-            threadPct={0}
-            pillText={c.pillUnauthorized}
-            pillActive={false}
-          />
-        </div>
+        <ol className="landing-steps">
+          {c.journey.map((step, i) => (
+            <li key={step.title} className="landing-step">
+              <span className="landing-step-num">{i + 1}</span>
+              <div>
+                <p className="landing-step-title">{step.title}</p>
+                <p className="hint">{step.body}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
 
         <div className="cta-row">
           {loggedIn ? (

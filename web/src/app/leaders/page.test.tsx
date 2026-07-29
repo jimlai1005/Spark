@@ -3,10 +3,8 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { NO_VALUE } from "@/lib/format";
 import {
   ApiError,
-  type BillingPlansResp,
   type LeaderSelectMessageResp,
   type LeadersResp,
   type MyLeaderResp,
@@ -16,7 +14,6 @@ const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: 
 
 const getMe = vi.fn();
 const getLeaders = vi.fn();
-const getBillingPlans = vi.fn();
 const getLeaderSelectMessage = vi.fn();
 const postLeaderSelect = vi.fn();
 const getLeaderPreview = vi.fn();
@@ -25,7 +22,6 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMe: (...a: unknown[]) => getMe(...a),
   getLeaders: (...a: unknown[]) => getLeaders(...a),
-  getBillingPlans: (...a: unknown[]) => getBillingPlans(...a),
   getLeaderSelectMessage: (...a: unknown[]) => getLeaderSelectMessage(...a),
   postLeaderSelect: (...a: unknown[]) => postLeaderSelect(...a),
   getLeaderPreview: (...a: unknown[]) => getLeaderPreview(...a),
@@ -48,7 +44,10 @@ function wrap(children: ReactNode, me: typeof ME | null = ME) {
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
-/** 後端 /api/leaders 的形狀：⭐ 只有規模與曝險欄位，沒有任何績效指標。 */
+/**
+ * 後端 /api/leaders 的形狀。⭐ 2026-07-30 起本頁不再把這份目錄畫成卡片格線——
+ * 只用來判定貼上的位址是不是平台已知的 leader（見 page.tsx listedEntryOf）。
+ */
 function leaders(over: Partial<LeadersResp> = {}): LeadersResp {
   return {
     leaders: [
@@ -70,116 +69,27 @@ function leaders(over: Partial<LeadersResp> = {}): LeadersResp {
   } as LeadersResp;
 }
 
-/**
- * 績效窗 fixture。⭐ 依**後端實際線上形狀**：Decimal 欄位序列化後是 **string**
- * （filet/leader_perf.py `jsonable_performance`），`sample_count` 是 number，
- * 三個 `*_insufficient_data` 是**原生 bool**。
- * ⭐⭐ 2026-07-19 改版：資料不足**不再**由缺鍵承載，而是由標記承載，所以數字與
- * 標記一律成對出現——缺一半的 fixture 代表 schema 漂移，是另一組測試在驗的東西。
- */
-const PERF_ANNUALIZABLE = {
-  period: "perpAllTime", basis: "perp", status: "ok", reason: null,
-  disclosure_tier: "annualizable", sample_count: 745, covered_days: "412.5000",
-  first_ts_ms: 1700000000000, last_ts_ms: 1735640000000, skipped_intervals: 0,
-  cum_pnl: "18234.55",
-  twr: "0.3421", twr_insufficient_data: false,
-  max_drawdown: "0.1875", max_drawdown_insufficient_data: false,
-  annualized_return: "0.2938", annualized_return_insufficient_data: false,
-  annualized_return_extrapolated_from_days: "412.5000",
-};
-/** 年化在數學上無定義（1+TWR <= 0）→ 三個 `annualized_*` 鍵**一起**缺席。 */
-const PERF_WINDOW = {
-  period: "perpMonth", basis: "perp", status: "ok", reason: null,
-  disclosure_tier: "window_return", sample_count: 128, covered_days: "45.2000",
-  first_ts_ms: 1731000000000, last_ts_ms: 1734900000000, skipped_intervals: 2,
-  cum_pnl: "820.10",
-  twr: "0.0712", twr_insufficient_data: false,
-  max_drawdown: "0.0304", max_drawdown_insufficient_data: false,
-};
-/** 舊快照：窗口報酬與年化整組缺席，只剩累積損益。 */
-const PERF_PNL_ONLY = {
-  period: "perpMonth", basis: "perp", status: "ok", reason: null,
-  disclosure_tier: "pnl_only", sample_count: 24, covered_days: "6.1000",
-  first_ts_ms: 1734300000000, last_ts_ms: 1734827040000, skipped_intervals: 0,
-  cum_pnl: "310.75",
-};
-/**
- * ⭐⭐ 改版後的主線情境：涵蓋 6 天，**每個數字都在**，每個都帶 `insufficient=true`。
- * 7 天 +3% 年化成 365% 的那個放大效應，就是這組 fixture 要釘住的顯示行為。
- */
-const PERF_THIN = {
-  period: "perpMonth", basis: "perp", status: "ok", reason: null,
-  disclosure_tier: "pnl_only", sample_count: 24, covered_days: "6.0000",
-  first_ts_ms: 1734300000000, last_ts_ms: 1734818400000, skipped_intervals: 0,
-  cum_pnl: "310.75",
-  twr: "0.0300", twr_insufficient_data: true,
-  max_drawdown: "0.0120", max_drawdown_insufficient_data: true,
-  annualized_return: "5.1234", annualized_return_insufficient_data: true,
-  annualized_return_extrapolated_from_days: "6.0000",
-};
-/** 資料不足 → 連 `cum_pnl` 都沒有；covered_days 為 null（後端 `_insufficient` 原形）。 */
-const PERF_INSUFFICIENT = {
-  period: "perpMonth", basis: "perp", status: "insufficient",
-  reason: "need_at_least_two_samples", disclosure_tier: "insufficient",
-  sample_count: 1, covered_days: null, first_ts_ms: null, last_ts_ms: null,
-  skipped_intervals: 0,
-};
+/** 這是平台背景目錄裡已知的位址（Alpha）；用於「已在精選清單」的測試。 */
+const LISTED_ADDR = "0x1111111111111111111111111111111111111111";
 
-const PERF_NOTES = {
-  basis: "後端基準原文",
-  upper_bound: "後端上界原文：leader 的報酬是跟單者的上界，不是期望值。",
-  max_drawdown: "後端回撤原文：MDD 由 15 分鐘取樣推得，系統性低估。",
-  sufficiency: "後端充足度原文：涵蓋天數與樣本點數決定可信度。",
+const CUSTOM_ADDR = "0x2222222222222222222222222222222222222222";
+const CUSTOM_PREVIEW = {
+  address: CUSTOM_ADDR, exists: true,
+  account_value: "5123.45", position_count: 3, already_listed: false,
+  accepting_new: true,
 };
-
-/** 帶績效的目錄回應（`performance_available: true` ＋ 逐 leader 的 `performance`）。 */
-function leadersWithPerf(
-  performance: Record<string, unknown> | null,
-  over: Partial<LeadersResp> = {},
-): LeadersResp {
-  const base = leaders();
-  return {
-    ...base,
-    leaders: [{ ...base.leaders[0], performance }],
-    performance_available: true,
-    performance_basis: "perp",
-    performance_windows: ["perpMonth", "perpAllTime"],
-    performance_notes: PERF_NOTES,
-    ...over,
-  } as LeadersResp;
-}
-
-/** 方案目錄。`shipped` 決定本頁能否送出——前端不硬編。 */
-function catalog(multiLeaderShipped: boolean): BillingPlansResp {
-  return {
-    billing_enabled: true,
-    plans: [
-      {
-        id: "pro",
-        name_key: "plans.pro.name",
-        price_display: "USD 29 / 月",
-        purchasable: true,
-        features: [
-          { text_key: "plans.feature.copytrade", included: true, shipped: true },
-          { text_key: "plans.feature.multiLeader", included: true, shipped: multiLeaderShipped },
-        ],
-      },
-    ],
-  };
-}
-
 /**
  * ⭐ 原文必須含 `Leader: <位址>` 那一行——這不是裝飾，是伺服器版型的一部分
  * （filet/leader_change.py 的 `_message`，位址正規化為小寫），也是前端 leader 預驗
  * 的第二道比對對象。fixture 若省略它，測試就驗不到真實流程會走的那條路徑。
  */
-const MSG: LeaderSelectMessageResp = {
+const CUSTOM_MSG: LeaderSelectMessageResp = {
   message:
-    "Filet: change copy-trading leader\n\nAccount: fabc\n" +
-    "Leader: 0x1111111111111111111111111111111111111111\nNonce: n-1",
-  nonce: "n-1",
-  issued_at: "2026-07-19T00:00:00Z",
-  leader_address: "0x1111111111111111111111111111111111111111",
+    "Filet: change copy-trading leader\n\nAccount: fabc\n"
+    + `Leader: ${CUSTOM_ADDR}\nNonce: n-2`,
+  nonce: "n-2",
+  issued_at: "2026-07-27T00:00:00Z",
+  leader_address: CUSTOM_ADDR,
   account_id: "fabc",
 };
 const SIG = `0x${"ab".repeat(65)}`;
@@ -200,15 +110,38 @@ function myLeader(over: Partial<MyLeaderResp> = {}): MyLeaderResp {
   } as MyLeaderResp;
 }
 
+/** 把位址貼進地址 dock 的輸入框（paste 而非逐鍵，42 字元逐鍵太慢）。 */
+async function pasteAddress(addr: string) {
+  const input = await screen.findByLabelText(/leader 錢包位址/);
+  await userEvent.click(input);
+  await userEvent.paste(addr);
+  return input;
+}
+
+/** 查詢 → 預覽卡出現。 */
+async function previewCustom(addr = CUSTOM_ADDR) {
+  await pasteAddress(addr);
+  await userEvent.click(screen.getByRole("button", { name: "查詢" }));
+  await screen.findByText("鏈上預覽");
+}
+
+/** 預覽 → 勾選聲明 → 開啟確認框（本頁唯一的跟單入口，取代舊版「選擇此 leader」）。 */
+async function openConfirmViaDock(addr = CUSTOM_ADDR) {
+  await previewCustom(addr);
+  await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+  await userEvent.click(screen.getByRole("button", { name: "跟單此地址" }));
+  return screen.getByRole("dialog");
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   getMe.mockResolvedValue(ME);
   getLeaders.mockResolvedValue(leaders());
   getMyLeader.mockResolvedValue(myLeader());
-  getBillingPlans.mockResolvedValue(catalog(false));
-  getLeaderSelectMessage.mockResolvedValue(MSG);
+  getLeaderPreview.mockResolvedValue(CUSTOM_PREVIEW);
+  getLeaderSelectMessage.mockResolvedValue(CUSTOM_MSG);
   postLeaderSelect.mockResolvedValue({
-    ok: true, account_id: "fabc", leader_address: MSG.leader_address,
+    ok: true, account_id: "fabc", leader_address: CUSTOM_MSG.leader_address,
     effective: "next_engine_cycle",
     effective_note: "已記錄，於引擎的下一個 cycle 生效——不是立即生效。",
     consequences: "生效時引擎會把你的部位收斂到新 leader：平掉目前的部位、依新 leader 開新部位。",
@@ -217,755 +150,17 @@ beforeEach(() => {
   recoverPersonalSigner.mockResolvedValue(ME.address.toLowerCase());
 });
 
-/** 開啟確認對話框（閘門必須先是開的）。 */
-async function openConfirm() {
-  const btn = await screen.findByRole("button", { name: "選擇此 leader" });
-  await userEvent.click(btn);
-  return screen.getByRole("dialog");
-}
-
-describe("LeadersPage — 誠信揭露 ⭐（本頁最重要的部分）", () => {
-  it("誠信 1／2：明講數字是規模與曝險而非績效；統計欄位只有後端快照原名的四項", async () => {
-    render(wrap(<LeadersPage />));
-
-    expect(await screen.findByText(/以下數字是規模與當下曝險的快照，不是績效/)).toBeInTheDocument();
-    expect(screen.getByText(/沒有報酬率、沒有回撤、沒有勝率/)).toBeInTheDocument();
-
-    // ⭐ 釘死欄位清單：任何被改名成像績效的欄位、或前端自行算出的比率都會讓這條失敗。
-    const labels = Array.from(document.querySelectorAll(".leader-stat dt")).map((n) => n.textContent);
-    expect(labels).toEqual(["帳戶淨值", "名目部位總額", "未實現損益", "持倉數"]);
-  });
-
-  it("⭐ 誠信 3：stats_available=false → 顯示後端 note，該區塊零數字，全頁不畫任何統計", async () => {
-    getLeaders.mockResolvedValue(
-      leaders({
-        stats_available: false, stats_day: null, stats_as_of: null,
-        note: "績效統計暫時不可用（每日快照尚未產生或讀取失敗）；leader 清單不受影響。",
-        leaders: [{
-          address: "0x1111111111111111111111111111111111111111",
-          name: "Alpha", description: "多幣種網格",
-          account_value: null, total_ntl_pos: null, unrealized_pnl: null, position_count: null,
-        }],
-      }),
-    );
-    render(wrap(<LeadersPage />));
-
-    const notice = await screen.findByText(/每日快照尚未產生或讀取失敗/);
-    const block = notice.closest(".leader-stats-notice")!;
-    // 沿 /ops basis_unknown 的嚴格度：整段不得出現任何數字
-    expect(block.textContent).not.toMatch(/\d/);
-    // 統計欄位一個都不畫（畫成「—」會被讀成「有查到且為零／無部位」）
-    expect(document.querySelectorAll(".leader-stat")).toHaveLength(0);
-    expect(screen.queryByText("帳戶淨值")).not.toBeInTheDocument();
-    // 清單本身照樣可用
-    expect(screen.getByText("Alpha")).toBeInTheDocument();
-  });
-
-  it("誠信 4：stats_day 與 stats_as_of 必須顯示（沒有時點的數字會被當成即時數字讀）", async () => {
-    render(wrap(<LeadersPage />));
-    const meta = await screen.findByText(/2026-07-18T00:10:03/);
-    expect(meta.textContent).toContain("2026-07-18");
-    expect(meta.textContent).toContain("快照日期");
-    expect(meta.textContent).toContain("統計時點");
-    expect(screen.getByText(/不是即時值/)).toBeInTheDocument();
-  });
-
-  it("⭐ 誠信 4 強化：快照可用但兩個時間戳皆缺 → 一樣不畫任何數字", async () => {
-    getLeaders.mockResolvedValue(leaders({ stats_day: null, stats_as_of: null }));
-    render(wrap(<LeadersPage />));
-
-    expect(await screen.findByText(/統計缺少時點，本頁不顯示任何數字/)).toBeInTheDocument();
-    expect(document.querySelectorAll(".leader-stat")).toHaveLength(0);
-  });
-
-  it("⭐ 誠信 5：上界警語與選擇按鈕在同一個容器（不得被推去頁尾當小字）", async () => {
-    getBillingPlans.mockResolvedValue(catalog(true));
-    render(wrap(<LeadersPage />));
-
-    const btn = await screen.findByRole("button", { name: "選擇此 leader" });
-    const action = btn.closest(".leader-action")!;
-    expect(action.textContent).toMatch(/實際結果會低於 leader 的數字/);
-    expect(action.textContent).toMatch(/上界，不是你的期望值/);
-  });
-
-  it("⭐ 誠信 6：確認對話框寫明真實成本與「下一個 cycle 生效」，且開啟前零 API 呼叫", async () => {
-    getBillingPlans.mockResolvedValue(catalog(true));
-    render(wrap(<LeadersPage />));
-    const dialog = await openConfirm();
-
-    // 成本：平舊開新 ＋ 真實交易成本
-    expect(dialog.textContent).toMatch(/平掉目前的部位、依新 leader 開新部位/);
-    expect(dialog.textContent).toMatch(/實際的交易成本/);
-    // 生效時機：下一個 cycle，不是立即
-    expect(dialog.textContent).toMatch(/不是立即生效/);
-    expect(dialog.textContent).toMatch(/下一個 cycle 生效/);
-    // 按下確認之前不得有任何請求（也不得叫錢包）
-    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
-    expect(signMessageAsync).not.toHaveBeenCalled();
-    expect(postLeaderSelect).not.toHaveBeenCalled();
-  });
-
-  it("取消確認 → 對話框關閉，零請求、零簽章", async () => {
-    getBillingPlans.mockResolvedValue(catalog(true));
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-
-    await userEvent.click(screen.getByRole("button", { name: "取消" }));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
-    expect(signMessageAsync).not.toHaveBeenCalled();
-  });
-
-  /**
-   * ⭐ 2026-07-27：「本頁無法標示你目前跟隨中的 leader」那段缺口說明已作廢——
-   * 後端 `/api/me/leader` 早就存在，本頁改為實際顯示（spec User Story 12）。
-   * 這條改成擋回頭路：那句過時的「查不到」文案不得再出現在畫面上，因為它現在是假的。
-   * 實際顯示行為由下方「目前跟隨的 leader」整個 describe 覆蓋。
-   */
-  it("⭐ 「目前跟隨中」現在有資料來源 → 顯示現況，不得再出現「本頁無法標示」的舊文案", async () => {
-    render(wrap(<LeadersPage />));
-    expect(await screen.findByText("你目前跟隨的 leader")).toBeInTheDocument();
-    expect(screen.queryByText(/本頁無法標示你目前跟隨中的 leader/)).not.toBeInTheDocument();
-  });
-});
-
 /**
- * ⭐⭐ 績效揭露。本區每一條都對應一條誠信規則——這一頁的數字會直接決定客戶把錢
- * 投給誰，所以「少顯示」永遠優於「顯示一個看起來正常但是前端造出來的數字」。
+ * ⭐ 地址 dock：本頁唯一的跟單入口（2026-07-27 spec 的准入預覽流程；2026-07-30
+ * 拿掉付費閘門與精選卡片格線後，這是全站唯一能觸發 runFlow／簽章管線的路徑，
+ * 因此原本掛在「簽章授權流程」describe 下的安全性測試一併搬進來，改用本頁
+ * 實際存在的觸發方式（previewCustom → 勾選聲明 → 跟單此地址）。
  */
-describe("LeadersPage — 績效分級揭露 ⭐⭐（缺鍵＝不該顯示，不是顯示為空）", () => {
-  it("⭐ 誠信 1：annualizable → 四個數字都畫；型別是後端的 string（Decimal 序列化）", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
-    render(wrap(<LeadersPage />));
-
-    const block = (await screen.findByLabelText("績效（perp）"));
-    expect(block.textContent).toContain("18,234.55");   // cum_pnl
-    expect(block.textContent).toContain("34.2%");       // twr 0.3421
-    expect(block.textContent).toContain("18.8%");       // max_drawdown 0.1875
-    expect(block.textContent).toContain("29.4%");       // annualized_return 0.2938
-    expect(screen.getByText("年化報酬率")).toBeInTheDocument();
-  });
-
-  it("⭐⭐ 誠信 1：不足 90 天（無 annualized_return 鍵）→ 年化整個欄位不渲染，不畫「—」", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
-    render(wrap(<LeadersPage />));
-
-    const block = await screen.findByLabelText("績效（perp）");
-    // 欄位本身不存在——不是存在但顯示為空
-    expect(document.querySelectorAll(".leader-perf-stat-annualized-return")).toHaveLength(0);
-    expect(screen.queryByText("年化報酬率")).not.toBeInTheDocument();
-    // ⭐ 釘死實際畫出來的格子：只有三格，且沒有任何一格是佔位符。
-    // （刻意驗 dd 而不是整段 textContent——文案裡的破折號是標點，不是佔位符。）
-    const values = Array.from(block.querySelectorAll(".leader-perf-stat dd"))
-      .map((n) => n.textContent);
-    expect(values).toEqual(["820.10", "7.1%", "3.0%"]);
-    expect(values).not.toContain(NO_VALUE);
-  });
-
-  it("⭐⭐ 誠信 1：不足 30 天（無 twr／max_drawdown 鍵）→ 兩個百分比欄位都不渲染", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_PNL_ONLY }));
-    render(wrap(<LeadersPage />));
-
-    const block = await screen.findByLabelText("績效（perp）");
-    expect(document.querySelectorAll(".leader-perf-stat-twr")).toHaveLength(0);
-    expect(document.querySelectorAll(".leader-perf-stat-max-drawdown")).toHaveLength(0);
-    // ⭐ 釘死欄位清單：只有「累積損益」一欄，沒有被補成空欄位。
-    // （驗 dt 而不是全頁文字——說明「為什麼沒有報酬率」的那段本來就會提到這些詞。）
-    const labels = Array.from(block.querySelectorAll(".leader-perf-stat dt"))
-      .map((n) => n.textContent);
-    expect(labels).toEqual(["累積損益"]);
-    const values = Array.from(block.querySelectorAll(".leader-perf-stat dd"))
-      .map((n) => n.textContent);
-    expect(values).toEqual(["310.75"]);
-    expect(values).not.toContain(NO_VALUE);
-    // 不足 30 天 → 整區不得出現任何百分比
-    expect(block.textContent).not.toContain("%");
-  });
-
-  it("⭐ 誠信 1／5：缺一級要說明「缺什麼、為什麼、還差幾天」——不是留白", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
-    render(wrap(<LeadersPage />));
-
-    const gap = (await screen.findByText("尚未提供年化報酬率")).closest(".leader-perf-state")!;
-    expect(gap.textContent).toMatch(/年化需要至少 90 天/);
-    // ⭐ 不是「年化為零」——明說這是資料還不夠的狀態
-    expect(gap.textContent).toMatch(/不是「年化為零」/);
-    // 還差多少天：涵蓋 45.2 天 → 距 90 天還差 44.8 天
-    expect(gap.textContent).toContain("距門檻還差 44.8 天");
-  });
-
-  it("⭐ 誠信 1／5：pnl_only 也要說明還差幾天才有報酬率與回撤", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_PNL_ONLY }));
-    render(wrap(<LeadersPage />));
-
-    const gap = (await screen.findByText("尚未提供報酬率與回撤")).closest(".leader-perf-state")!;
-    expect(gap.textContent).toMatch(/需要至少 30 天/);
-    expect(gap.textContent).toMatch(/不是「報酬為零」或「沒有回撤」/);
-    expect(gap.textContent).toContain("距門檻還差 23.9 天");   // 30 - 6.1
-  });
-
-  /* ────────────────────────────────────────────────────────────────────────
-   * 2026-07-19 揭露模型改版：薄資料**照樣顯示數字**，標記負責說出它有多薄。
-   * 以下這組測試釘住的是「數字給了，但看得出它建立在多少資料上」。
-   * ──────────────────────────────────────────────────────────────────────── */
-
-  it("⭐⭐ 不足 30 天：twr／MDD 照樣顯示，且**緊貼數字**標明資料不足與涵蓋天數", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_THIN }));
-    render(wrap(<LeadersPage />));
-    await screen.findByLabelText("績效（perp）");
-
-    // 數字有給——這正是改版要的行為（舊行為是整格藏起來）
-    const twrCell = document.querySelector(".leader-perf-stat-twr")!;
-    expect(twrCell.textContent).toContain("3.0%");
-    // ⭐ 警示與數字**同一格**：分開放，看到數字的人不一定看得到警示
-    const twrMarker = twrCell.querySelector(".leader-perf-stat-marker")!;
-    expect(twrMarker.textContent).toContain("資料不足");
-    expect(twrMarker.textContent).toContain("6.0 天");   // 實際涵蓋天數
-    expect(twrMarker.textContent).toMatch(/低於 30 天門檻/);
-
-    const mddCell = document.querySelector(".leader-perf-stat-max-drawdown")!;
-    expect(mddCell.textContent).toContain("1.2%");
-    const mddMarker = mddCell.querySelector(".leader-perf-stat-marker")!;
-    expect(mddMarker.textContent).toContain("資料不足");
-    expect(mddMarker.textContent).toContain("6.0 天");
-  });
-
-  it("⭐⭐ 不足 90 天的年化：必須寫明「由 N 天資料外推」（N 取自後端外推天數）", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_THIN }));
-    render(wrap(<LeadersPage />));
-    await screen.findByLabelText("績效（perp）");
-
-    const cell = document.querySelector(".leader-perf-stat-annualized-return")!;
-    expect(cell.textContent).toContain("512.3%");        // 年化 5.1234
-    const marker = cell.querySelector(".leader-perf-stat-marker")!;
-    // ⭐ 這句話是這個數字唯一的警示載體：拿掉它，畫面上就只剩一個 512% 的數字
-    expect(marker.textContent).toContain("由 6.0 天資料外推");
-    expect(marker.textContent).toMatch(/遠低於 90 天門檻/);
-    // 明說它不是對未來一年的預期——年化最常見的誤讀
-    expect(marker.textContent).toMatch(/不是對未來一年的預期/);
-  });
-
-  it("⭐ 資料充足的年化：仍然寫明由幾天外推（年化本質上就是外推）", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
-    render(wrap(<LeadersPage />));
-    await screen.findByLabelText("績效（perp）");
-
-    const marker = document.querySelector(
-      ".leader-perf-stat-annualized-return .leader-perf-stat-marker")!;
-    expect(marker.textContent).toContain("由 412.5 天資料外推");
-  });
-
-  it("⭐⭐ 年化的視覺份量弱於期間報酬：另起次級區塊，不與期間報酬並排等大", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
-    render(wrap(<LeadersPage />));
-    const block = await screen.findByLabelText("績效（perp）");
-
-    // 1. 年化**不在**主要 stats 清單裡（期間報酬才在）
-    const primary = Array.from(block.querySelectorAll(".leader-perf-stats .leader-perf-stat dt"))
-      .map((n) => n.textContent);
-    expect(primary).toEqual(["累積損益", "窗口報酬率（TWR）", "最大回撤（MDD）"]);
-    expect(primary).not.toContain("年化報酬率");
-
-    // 2. 年化在自己的次級容器裡
-    const secondary = block.querySelector(".leader-perf-annualized")!;
-    expect(secondary).not.toBeNull();
-    expect(secondary.textContent).toContain("年化報酬率");
-    expect(secondary.textContent).toContain("29.4%");
-
-    // 3. 次級容器排在主要 stats **之後**（DOM 順序＝閱讀順序）
-    const stats = block.querySelector(".leader-perf-stats")!;
-    expect(stats.compareDocumentPosition(secondary))
-      .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
-
-    // 4. 明說為什麼降階：外推 vs 實際發生的事
-    expect(secondary.textContent).toMatch(/年化是外推出來的推算值/);
-  });
-
-  it("⭐⭐ 年化三鍵一起缺席 → 整個年化欄位不渲染，**不得**只顯示標記", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
-    render(wrap(<LeadersPage />));
-    const block = await screen.findByLabelText("績效（perp）");
-
-    expect(document.querySelectorAll(".leader-perf-annualized")).toHaveLength(0);
-    expect(document.querySelectorAll(".leader-perf-stat-annualized-return")).toHaveLength(0);
-    // ⭐ 標記絕不單獨存在：不得出現「由 N 天外推」卻沒有被外推的那個數字
-    expect(block.textContent).not.toContain("外推");
-  });
-
-  it("⭐⭐ 標記缺席（schema 漂移）→ 數字整格不畫，且大聲說出降級（不靜默當作充足）", async () => {
-    const { twr_insufficient_data: _drop, ...noMarker } = PERF_THIN;
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: noMarker }));
-    render(wrap(<LeadersPage />));
-    const block = await screen.findByLabelText("績效（perp）");
-
-    // 沒有標記就沒有數字：一個沒有警示的薄資料百分比，比不顯示危險得多
-    expect(document.querySelectorAll(".leader-perf-stat-twr")).toHaveLength(0);
-    expect(document.querySelectorAll(".leader-perf-stat-max-drawdown")).toHaveLength(0);
-    expect(block.querySelector(".leader-perf-degraded")).not.toBeNull();
-  });
-
-  it("⭐ 誠信 2：上界警語在績效區塊內（與績效數字同一個容器，不是頁尾小字）", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
-    render(wrap(<LeadersPage />));
-
-    const block = await screen.findByLabelText("績效（perp）");
-    const warn = block.querySelector(".leader-perf-upper-bound")!;
-    expect(warn).toBeTruthy();
-    // 後端原文優先（單一來源）
-    expect(warn.textContent).toContain("上界，不是期望值");
-    // 警語與數字在同一個容器裡
-    expect(block.textContent).toContain("34.2%");
-  });
-
-  it("⭐ 誠信 2：後端沒給上界原文 → 用前端等義文案遞補（數字旁不得沒有警語）", async () => {
-    getLeaders.mockResolvedValue(
-      leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }, { performance_notes: {} }),
-    );
-    render(wrap(<LeadersPage />));
-
-    const block = await screen.findByLabelText("績效（perp）");
-    const warn = block.querySelector(".leader-perf-upper-bound")!;
-    expect(warn.textContent).toMatch(/是跟單者的上界，不是你的期望值/);
-    expect(warn.textContent).toMatch(/你的實際結果會低於這裡的數字/);
-  });
-
-  it("⭐ 誠信 3：MDD 取樣低估的警語與 MDD 數字在**同一格**（不得被拆開）", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
-    render(wrap(<LeadersPage />));
-
-    await screen.findByLabelText("績效（perp）");
-    const cell = document.querySelector(".leader-perf-stat-max-drawdown")!;
-    expect(cell.textContent).toContain("3.0%");             // 數字
-    expect(cell.textContent).toContain("15 分鐘取樣");       // 警語，同一格
-    expect(cell.textContent).toContain("系統性低估");
-  });
-
-  it("⭐ 誠信 3：後端沒給回撤原文 → 前端文案遞補，且點名「回撤看起來小」要存疑", async () => {
-    getLeaders.mockResolvedValue(
-      leadersWithPerf({ perpMonth: PERF_WINDOW }, { performance_notes: {} }),
-    );
-    render(wrap(<LeadersPage />));
-
-    await screen.findByLabelText("績效（perp）");
-    const cell = document.querySelector(".leader-perf-stat-max-drawdown")!;
-    expect(cell.textContent).toMatch(/系統性低估/);
-    expect(cell.textContent).toMatch(/回撤的下界/);
-    expect(cell.textContent).toMatch(/回撤看起來特別小的 leader 尤其要存疑/);
-  });
-
-  it("⭐ 誠信 4：資料充足度（涵蓋天數＋樣本點數）與數字同時顯示", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_WINDOW }));
-    render(wrap(<LeadersPage />));
-
-    await screen.findByLabelText("績效（perp）");
-    const suff = document.querySelector(".leader-perf-sufficiency")!;
-    expect(suff.textContent).toContain("涵蓋天數: 45.2 天");
-    expect(suff.textContent).toContain("樣本點數: 128 點");
-    // 為什麼要看它：涵蓋 31 天與涵蓋兩年的報酬率長得一樣
-    const note = document.querySelector(".leader-perf-suff-note")!;
-    expect(note.textContent).toBeTruthy();
-  });
-
-  it("⭐ 誠信 4：涵蓋天數不同、數字相同的兩個窗，充足度必須看得出差別", async () => {
-    getLeaders.mockResolvedValue(
-      leadersWithPerf({ perpMonth: PERF_WINDOW, perpAllTime: PERF_ANNUALIZABLE }),
-    );
-    render(wrap(<LeadersPage />));
-
-    await screen.findByLabelText("績效（perp）");
-    const suffs = Array.from(document.querySelectorAll(".leader-perf-sufficiency"))
-      .map((n) => n.textContent);
-    expect(suffs).toHaveLength(2);
-    expect(suffs[0]).toContain("45.2 天");
-    expect(suffs[1]).toContain("412.5 天");
-  });
-
-  it("⭐ 誠信 5：每個窗都有揭露層級標籤——「資料不足」是一個狀態，不是幾格空白", async () => {
-    getLeaders.mockResolvedValue(
-      leadersWithPerf({ perpMonth: PERF_PNL_ONLY, perpAllTime: PERF_ANNUALIZABLE }),
-    );
-    render(wrap(<LeadersPage />));
-
-    await screen.findByLabelText("績效（perp）");
-    const tiers = Array.from(document.querySelectorAll(".leader-perf-tier"))
-      .map((n) => n.textContent);
-    // 兩個窗的層級**不同**，且各自說出資料到什麼程度
-    expect(tiers[0]).toBe("僅累積損益：涵蓋不足 30 天，不提供任何百分比");
-    expect(tiers[1]).toBe("可年化：涵蓋 90 天以上");
-    // data-tier 讓兩種狀態在樣式上也分得開（不是同一個樣子少幾個數字）
-    const windows = Array.from(document.querySelectorAll(".leader-perf-window"));
-    expect(windows.map((n) => n.getAttribute("data-tier")))
-      .toEqual(["pnl_only", "annualizable"]);
-  });
-
-  it("⭐ 誠信 5／6：tier=insufficient → 該窗零數字指標，畫成「資料不足」狀態並附原因碼", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpMonth: PERF_INSUFFICIENT }));
-    render(wrap(<LeadersPage />));
-
-    await screen.findByLabelText("績效（perp）");
-    // 一格指標都不畫
-    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
-    const state = (await screen.findByText("資料不足以計算此窗的指標"))
-      .closest(".leader-perf-state")!;
-    expect(state.textContent).toMatch(/連累積損益都不顯示/);
-    // 明說「0」會是資料不足的假象，不是結論
-    expect(state.textContent).toMatch(/資料不足的假象/);
-    expect(state.textContent).toContain("原因碼: need_at_least_two_samples");
-  });
-
-  it("⭐ 誠信 6：performance_available=false → 顯示原因，且該區塊零數字、零績效欄位", async () => {
-    getLeaders.mockResolvedValue(
-      leadersWithPerf(null, { performance_available: false, performance_notes: undefined }),
-    );
-    render(wrap(<LeadersPage />));
-
-    const notice = await screen.findByText(/績效資料暫時不可用/);
-    const block = notice.closest(".leader-perf-notice")!;
-    expect(block.textContent).not.toMatch(/\d/);
-    // 一個績效欄位都不畫（沿 stats_available=false 的嚴格度）
-    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
-    expect(document.querySelectorAll(".leader-perf-window")).toHaveLength(0);
-    // 規模欄位不受影響（兩個旗標獨立，後端明寫不可合併）
-    expect(document.querySelectorAll(".leader-stat")).toHaveLength(4);
-  });
-
-  it("⭐ 誠信 6：leader 缺 performance → 說明沒有資料，不畫任何績效數字", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf(null));
-    render(wrap(<LeadersPage />));
-
-    const state = (await screen.findByText("這位 leader 沒有績效資料"))
-      .closest(".leader-perf-state")!;
-    expect(state.textContent).toMatch(/不代表「績效為零」/);
-    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
-    // 規模照畫
-    expect(document.querySelectorAll(".leader-stat")).toHaveLength(4);
-  });
-
-  it("⭐ 後端宣稱的層級高於實際資料（schema 漂移）→ 出聲，不靜默降級", async () => {
-    // tier 說 annualizable，但 annualized_return 鍵不存在
-    const { annualized_return: _drop, ...drifted } = PERF_ANNUALIZABLE;
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: drifted }));
-    render(wrap(<LeadersPage />));
-
-    await screen.findByLabelText("績效（perp）");
-    expect(screen.queryByText("年化報酬率")).not.toBeInTheDocument();
-    expect(screen.getByText(/後端宣告的揭露層級高於實際附上的資料/)).toBeInTheDocument();
-  });
-
-  it("⭐ 規模／曝險與績效是兩個分開的容器（混在一起會被讀成同一類數字）", async () => {
-    getLeaders.mockResolvedValue(leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }));
-    render(wrap(<LeadersPage />));
-
-    const perf = await screen.findByLabelText("績效（perp）");
-    const stats = document.querySelector(".leader-stats")!;
-    // 兩個容器互不包含
-    expect(perf.contains(stats)).toBe(false);
-    expect(stats.contains(perf)).toBe(false);
-    // 規模那張表仍然只有原本四欄（沒有被塞進績效欄位）
-    const labels = Array.from(stats.querySelectorAll("dt")).map((n) => n.textContent);
-    expect(labels).toEqual(["帳戶淨值", "名目部位總額", "未實現損益", "持倉數"]);
-    // 揭露文案改成描述「畫面上實際有什麼」（顯示績效時不得再宣稱本頁沒有報酬率）
-    expect(screen.getByText(/規模／曝險與績效是兩類不同的數字/)).toBeInTheDocument();
-    expect(screen.queryByText(/沒有報酬率、沒有回撤、沒有勝率/)).not.toBeInTheDocument();
-  });
-
-  it("⭐ 沒有時點 → 連績效也不畫（同一份快照，沒有時點的報酬率一樣會被當成即時值）", async () => {
-    getLeaders.mockResolvedValue(
-      leadersWithPerf({ perpAllTime: PERF_ANNUALIZABLE }, { stats_day: null, stats_as_of: null }),
-    );
-    render(wrap(<LeadersPage />));
-
-    expect(await screen.findByText(/統計缺少時點，本頁不顯示任何數字/)).toBeInTheDocument();
-    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
-    expect(document.querySelectorAll(".leader-stat")).toHaveLength(0);
-    // ⭐ 揭露文案與實際渲染共用同一個判定：這裡沒畫績效，文案就不得宣稱有績效區。
-    // （兩處各算一次的話，會出現「文案說下半部是績效、下半部其實空的」這種各自
-    //   都對、湊起來是假話的狀態。）
-    expect(screen.queryByText(/規模／曝險與績效是兩類不同的數字/)).not.toBeInTheDocument();
-    expect(screen.getByText(/沒有報酬率、沒有回撤、沒有勝率/)).toBeInTheDocument();
-  });
-
-  it("⭐ 不依績效排序：清單順序沿用後端順序（排序＝本頁在替使用者推薦）", async () => {
-    const base = leaders();
-    getLeaders.mockResolvedValue({
-      ...base,
-      performance_available: true,
-      performance_windows: ["perpAllTime"],
-      performance_notes: PERF_NOTES,
-      leaders: [
-        // 後端給的第一位績效較差，第二位較好——畫面**不得**因此把第二位排到前面
-        { ...base.leaders[0], name: "Alpha", performance: { perpAllTime: PERF_WINDOW } },
-        {
-          ...base.leaders[0], address: "0x3333333333333333333333333333333333333333",
-          name: "Zeta", performance: { perpAllTime: PERF_ANNUALIZABLE },
-        },
-      ],
-    } as LeadersResp);
-    render(wrap(<LeadersPage />));
-
-    await screen.findByText("Zeta");
-    const names = Array.from(document.querySelectorAll(".leader-name")).map((n) => n.textContent);
-    expect(names).toEqual(["Alpha", "Zeta"]);
-    // 也不得出現任何績效排序控制項
-    expect(screen.queryByRole("button", { name: /排序/ })).not.toBeInTheDocument();
-  });
-
-  it("後端沒有 performance_available 欄位（舊版）→ fail closed：整區不出現，零績效數字", async () => {
-    render(wrap(<LeadersPage />));   // 預設 fixture 沒有績效欄位
-
-    await screen.findByText("Alpha");
-    expect(document.querySelectorAll(".leader-perf")).toHaveLength(0);
-    expect(document.querySelectorAll(".leader-perf-stat")).toHaveLength(0);
-    // 舊版文案（本頁確實沒有報酬率）仍為真
-    expect(screen.getByText(/沒有報酬率、沒有回撤、沒有勝率/)).toBeInTheDocument();
-  });
-});
-
-describe("LeadersPage — 付費功能閘門（由後端 shipped 驅動）", () => {
-  it("⭐ multiLeader shipped=false → 標「開發中」且**無法送出**（按鈕停用、零請求）", async () => {
-    render(wrap(<LeadersPage />));
-
-    expect(await screen.findByText(/換 leader 尚未推出/)).toBeInTheDocument();
-    const btn = screen.getByRole("button", { name: "開發中，敬請期待" });
-    expect(btn).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "選擇此 leader" })).not.toBeInTheDocument();
-
-    await userEvent.click(btn);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
-    expect(postLeaderSelect).not.toHaveBeenCalled();
-  });
-
-  it("⭐ 方案目錄載入失敗 → fail closed：不確定就不開放送出", async () => {
-    getBillingPlans.mockRejectedValue(new ApiError("network", "無法連線到伺服器"));
-    render(wrap(<LeadersPage />));
-
-    expect(await screen.findByText(/無法確認這個功能是否已推出/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "開發中，敬請期待" })).toBeDisabled();
-    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
-  });
-
-  it("shipped=true → 開放送出（前端不硬編，只跟著後端旗標走）", async () => {
-    getBillingPlans.mockResolvedValue(catalog(true));
-    render(wrap(<LeadersPage />));
-
-    expect(await screen.findByRole("button", { name: "選擇此 leader" })).toBeEnabled();
-    expect(screen.queryByText(/換 leader 尚未推出/)).not.toBeInTheDocument();
-  });
-});
-
-describe("LeadersPage — 簽章授權流程（沿 approvalFlow 的謹慎度）", () => {
-  beforeEach(() => getBillingPlans.mockResolvedValue(catalog(true)));
-
-  it("確認 → 取原文 → 簽原文 → recover 相符 → 原文原樣回送；成功顯示後端生效說明", async () => {
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
-    expect(getLeaderSelectMessage).toHaveBeenCalledWith("0x1111111111111111111111111111111111111111");
-    // ⭐ 簽的是伺服器原文；送出的是同一包 payload（前端不重組字串）
-    expect(signMessageAsync).toHaveBeenCalledWith({ message: MSG.message });
-    expect(postLeaderSelect).toHaveBeenCalledWith(MSG, SIG);
-    // 生效時機與後果顯示後端原文（單一來源）
-    expect(screen.getByText(/不是立即生效/)).toBeInTheDocument();
-  });
-
-  it("⭐ recover 出的簽章者 ≠ 登入地址 → 完全不送出（postLeaderSelect 零呼叫）", async () => {
-    recoverPersonalSigner.mockResolvedValue("0x9999999999999999999999999999999999999999");
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("簽名帳號與登入帳號不符");
-    expect(postLeaderSelect).not.toHaveBeenCalled();
-  });
-
-  it("錢包取消 → 明說沒有送出、跟單設定沒有變動", async () => {
-    signMessageAsync.mockRejectedValue(new Error("User rejected the request"));
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("沒有送出");
-    expect(postLeaderSelect).not.toHaveBeenCalled();
-  });
-
-  it("取原文 400（leader 不可選）→ 顯示不可選文案，不叫錢包", async () => {
-    getLeaderSelectMessage.mockRejectedValue(
-      new ApiError("client", "該 leader 目前不可選擇", 400, "該 leader 目前不可選擇"),
-    );
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("目前不可選擇");
-    expect(signMessageAsync).not.toHaveBeenCalled();
-  });
-
-  it("送出 500（寫檔失敗）→ 明說 leader 沒有被變更，且不自動重試", async () => {
-    postLeaderSelect.mockRejectedValue(
-      new ApiError("client", "變更記錄寫入失敗", 500, "變更記錄寫入失敗"),
-    );
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("你的 leader 沒有被變更");
-    expect(postLeaderSelect).toHaveBeenCalledTimes(1);
-  });
-
-  /**
-   * ⭐ 被打穿的 filet-api 唯一能無中生有一次換手的路徑：使用者點 Alpha，API 回一份
-   * 指向別人的待簽原文。錢包只顯示一串 hex，使用者按下簽署後，那份簽章對後端而言
-   * 完全合法——所以攔截必須發生在**喚起錢包之前**。
-   */
-  it("⭐ Critical：API 回傳的 leader_address ≠ 使用者所選 → 不喚起錢包、不送出", async () => {
-    const EVIL = "0xEEEE000000000000000000000000000000000EEE";
-    getLeaderSelectMessage.mockResolvedValue({
-      ...MSG,
-      leader_address: EVIL,
-      message: MSG.message.replace(MSG.leader_address, EVIL),
-    });
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    // 使用者連一次簽名請求都不該看到（簽了就已經是一份有效授權）
-    expect(await screen.findByRole("alert")).toHaveTextContent("授權對象與你選擇的 leader 不符");
-    expect(signMessageAsync).not.toHaveBeenCalled();
-    expect(postLeaderSelect).not.toHaveBeenCalled();
-  });
-
-  it("⭐ 第二道：leader_address 相符但 message 內含的位址不同 → 同樣中止", async () => {
-    const EVIL = "0xEEEE000000000000000000000000000000000EEE";
-    getLeaderSelectMessage.mockResolvedValue({
-      ...MSG,
-      message: MSG.message.replace(MSG.leader_address, EVIL),
-    });
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("授權對象與你選擇的 leader 不符");
-    expect(signMessageAsync).not.toHaveBeenCalled();
-    expect(postLeaderSelect).not.toHaveBeenCalled();
-  });
-
-  it("⭐ leader 不符的文案要求使用者停手回報，且不提供「重新操作」按鈕", async () => {
-    getLeaderSelectMessage.mockResolvedValue({
-      ...MSG,
-      leader_address: "0xEEEE000000000000000000000000000000000EEE",
-    });
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    const alert = await screen.findByRole("alert");
-    // 明說現況：沒簽、沒送出、設定沒變
-    expect(alert).toHaveTextContent("沒有被簽署");
-    expect(alert).toHaveTextContent("沒有變動");
-    // ⭐ 明確叫使用者不要重試並回報——不得出現誘導重試的字眼
-    expect(alert).toHaveTextContent("請不要重試");
-    expect(alert).toHaveTextContent("回報客服");
-    expect(alert.textContent).not.toMatch(/請稍後再試|重新整理/);
-    // 按鈕是純關閉，不是「重新操作」（否則等於用按鈕收回文案的結論）
-    expect(screen.getByRole("button", { name: "關閉" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "重新操作" })).not.toBeInTheDocument();
-  });
-
-  it("大小寫不同但實為同一位址 → 不得誤擋，流程正常完成", async () => {
-    getLeaderSelectMessage.mockResolvedValue({
-      ...MSG,
-      leader_address: MSG.leader_address.toUpperCase(),
-    });
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
-    expect(signMessageAsync).toHaveBeenCalledTimes(1);
-    expect(postLeaderSelect).toHaveBeenCalledTimes(1);
-  });
-
-  it("送出 403（改別人的帳號）→ 顯示對應文案", async () => {
-    postLeaderSelect.mockRejectedValue(
-      new ApiError("client", "只能變更自己帳號的 leader", 403, "只能變更自己帳號的 leader"),
-    );
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("只能變更自己帳號的 leader");
-  });
-
-  it("送出 429（查詢額度用完）→ 專屬文案，不得說『上一筆簽名已作廢』", async () => {
-    // preview／待簽原文／送出共用同一個 per-session 額度，所以查很多位址之後
-    // 按送出也會撞到 429。通用的 submitFailed 說「上一筆簽名已作廢」，但這個
-    // 情況根本還沒送到驗簽——講作廢是錯的，會讓人以為出了更嚴重的事。
-    postLeaderSelect.mockRejectedValue(
-      new ApiError("client", "查詢過於頻繁，請稍後再試", 429, "查詢過於頻繁，請稍後再試"),
-    );
-    render(wrap(<LeadersPage />));
-    await openConfirm();
-    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
-
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("你的 leader 沒有被變更");
-    expect(alert).toHaveTextContent("等約一分鐘");
-    expect(alert).not.toHaveTextContent("已作廢");
-  });
-});
-
-/**
- * ⭐ 自訂 leader（2026-07-27 spec：用戶輸入任意 wallet address）。
- * 閘門結構：格式驗證（本地、即時）→ 後端准入預覽（權益／持倉）→ 專屬風險聲明
- * checkbox（純前端閘門，仿 wizard AML attestation）→ 既有確認框與簽章流程。
- * 每一道閘都要有「未通過就零後續動作」的斷言——這一段的送出終點是真金白銀的跟單。
- */
-describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
-  const CUSTOM_ADDR = "0x2222222222222222222222222222222222222222";
-  const CUSTOM_PREVIEW = {
-    address: CUSTOM_ADDR, exists: true,
-    account_value: "5123.45", position_count: 3, already_listed: false,
-    accepting_new: true,
-  };
-  /** 原文含 `Leader: <自訂位址>`——與精選流程同一個伺服器版型（沿 MSG fixture 慣例）。 */
-  const CUSTOM_MSG: LeaderSelectMessageResp = {
-    message:
-      "Filet: change copy-trading leader\n\nAccount: fabc\n"
-      + `Leader: ${CUSTOM_ADDR}\nNonce: n-2`,
-    nonce: "n-2",
-    issued_at: "2026-07-27T00:00:00Z",
-    leader_address: CUSTOM_ADDR,
-    account_id: "fabc",
-  };
-
-  beforeEach(() => {
-    getBillingPlans.mockResolvedValue(catalog(true));
-    getLeaderPreview.mockResolvedValue(CUSTOM_PREVIEW);
-    getLeaderSelectMessage.mockResolvedValue(CUSTOM_MSG);
-  });
-
-  /** 把位址貼進自訂輸入框（paste 而非逐鍵，42 字元逐鍵太慢）。 */
-  async function pasteAddress(addr: string) {
-    const input = await screen.findByLabelText(/leader 錢包位址/);
-    await userEvent.click(input);
-    await userEvent.paste(addr);
-    return input;
-  }
-
-  /** 查詢 → 預覽卡出現。 */
-  async function previewCustom(addr = CUSTOM_ADDR) {
-    await pasteAddress(addr);
-    await userEvent.click(screen.getByRole("button", { name: "查詢" }));
-    await screen.findByText("鏈上預覽");
-  }
-
+describe("LeadersPage — 地址 dock（本頁唯一的跟單入口）⭐", () => {
   it("區塊存在：輸入框、查詢按鈕、HL 官方 leaderboard 外部連結（新分頁＋noopener）", async () => {
     render(wrap(<LeadersPage />));
 
-    expect(await screen.findByText("自訂 leader")).toBeInTheDocument();
+    expect(await screen.findByText("跟單對象")).toBeInTheDocument();
     expect(screen.getByLabelText(/leader 錢包位址/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "查詢" })).toBeInTheDocument();
     const link = screen.getByRole("link", { name: /leaderboard/ });
@@ -993,7 +188,7 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     expect(screen.getByRole("button", { name: "查詢" })).toBeDisabled();
   });
 
-  it("⭐ 查詢成功 → 預覽卡：帳戶權益、持倉數、位址縮寫、無績效資料說明", async () => {
+  it("⭐ 查詢成功 → 預覽卡：帳戶權益、持倉數、位址縮寫", async () => {
     render(wrap(<LeadersPage />));
     await previewCustom();
 
@@ -1003,36 +198,27 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     expect(card.textContent).toContain("5,123.45");
     expect(card.textContent).toContain("持倉數");
     expect(card.textContent).toContain("3");
-    expect(card.textContent).toContain("0x2222…222");   // shortAddr
-    // ⭐ 自訂 leader 沒有績效快照：明說「無績效資料」，且不是錯誤、不是零
-    expect(card.textContent).toContain("無績效資料");
-    expect(card.textContent).toMatch(/不代表「績效為零」/);
+    expect(card.textContent).toContain("0x2222…222"); // shortAddr
   });
 
   it("⭐ checkbox 未勾 → 不能送出（按鈕停用、零對話框、零請求）；勾選後開放", async () => {
     render(wrap(<LeadersPage />));
     await previewCustom();
 
-    const select = screen.getByRole("button", { name: "選擇此自訂 leader" });
+    const select = screen.getByRole("button", { name: "跟單此地址" });
     expect(select).toBeDisabled();
     await userEvent.click(select);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(getLeaderSelectMessage).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
-    expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "跟單此地址" })).toBeEnabled();
   });
 
-  it("⭐ 勾選聲明 → 確認對話框 → 簽章流程走完（原文含自訂位址、整包 payload 回送）", async () => {
-    const SIG_CUSTOM = SIG;
-    signMessageAsync.mockResolvedValue(SIG_CUSTOM);
+  it("⭐ 勾選聲明 → 確認對話框 → 簽章流程走完（原文含位址、整包 payload 回送）", async () => {
     render(wrap(<LeadersPage />));
-    await previewCustom();
-    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
-    await userEvent.click(screen.getByRole("button", { name: "選擇此自訂 leader" }));
+    const dialog = await openConfirmViaDock();
 
-    // 既有確認對話框（成本與生效時機），對象顯示自訂位址
-    const dialog = screen.getByRole("dialog");
     expect(dialog.textContent).toContain("0x2222…222");
     expect(dialog.textContent).toMatch(/平掉目前的部位、依新 leader 開新部位/);
     await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
@@ -1040,7 +226,152 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
     expect(getLeaderSelectMessage).toHaveBeenCalledWith(CUSTOM_ADDR);
     expect(signMessageAsync).toHaveBeenCalledWith({ message: CUSTOM_MSG.message });
-    expect(postLeaderSelect).toHaveBeenCalledWith(CUSTOM_MSG, SIG_CUSTOM);
+    expect(postLeaderSelect).toHaveBeenCalledWith(CUSTOM_MSG, SIG);
+  });
+
+  it("取消確認 → 對話框關閉，零請求、零簽章", async () => {
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+
+    await userEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
+    expect(signMessageAsync).not.toHaveBeenCalled();
+  });
+
+  it("⭐ Critical：API 回傳的 leader_address ≠ 使用者所選 → 不喚起錢包、不送出", async () => {
+    const EVIL = "0xEEEE000000000000000000000000000000000EEE";
+    getLeaderSelectMessage.mockResolvedValue({
+      ...CUSTOM_MSG,
+      leader_address: EVIL,
+      message: CUSTOM_MSG.message.replace(CUSTOM_ADDR, EVIL),
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    // 使用者連一次簽名請求都不該看到（簽了就已經是一份有效授權）
+    expect(await screen.findByRole("alert")).toHaveTextContent("授權對象與你選擇的 leader 不符");
+    expect(signMessageAsync).not.toHaveBeenCalled();
+    expect(postLeaderSelect).not.toHaveBeenCalled();
+  });
+
+  it("⭐ 第二道：leader_address 相符但 message 內含的位址不同 → 同樣中止", async () => {
+    const EVIL = "0xEEEE000000000000000000000000000000000EEE";
+    getLeaderSelectMessage.mockResolvedValue({
+      ...CUSTOM_MSG,
+      message: CUSTOM_MSG.message.replace(CUSTOM_ADDR, EVIL),
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("授權對象與你選擇的 leader 不符");
+    expect(signMessageAsync).not.toHaveBeenCalled();
+    expect(postLeaderSelect).not.toHaveBeenCalled();
+  });
+
+  it("⭐ leader 不符的文案要求使用者停手回報，且不提供「重新操作」按鈕", async () => {
+    getLeaderSelectMessage.mockResolvedValue({
+      ...CUSTOM_MSG,
+      leader_address: "0xEEEE000000000000000000000000000000000EEE",
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    const alert = await screen.findByRole("alert");
+    // 明說現況：沒簽、沒送出、設定沒變
+    expect(alert).toHaveTextContent("沒有被簽署");
+    expect(alert).toHaveTextContent("沒有變動");
+    expect(alert).toHaveTextContent("請不要重試");
+    expect(alert).toHaveTextContent("回報客服");
+    expect(alert.textContent).not.toMatch(/請稍後再試|重新整理/);
+    expect(screen.getByRole("button", { name: "關閉" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重新操作" })).not.toBeInTheDocument();
+  });
+
+  it("⭐ recover 出的簽章者 ≠ 登入地址 → 完全不送出（postLeaderSelect 零呼叫）", async () => {
+    recoverPersonalSigner.mockResolvedValue("0x9999999999999999999999999999999999999999");
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("簽名帳號與登入帳號不符");
+    expect(postLeaderSelect).not.toHaveBeenCalled();
+  });
+
+  it("錢包取消 → 明說沒有送出、跟單設定沒有變動", async () => {
+    signMessageAsync.mockRejectedValue(new Error("User rejected the request"));
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("沒有送出");
+    expect(postLeaderSelect).not.toHaveBeenCalled();
+  });
+
+  it("取原文 400（leader 不可選）→ 顯示不可選文案，不叫錢包", async () => {
+    getLeaderSelectMessage.mockRejectedValue(
+      new ApiError("client", "該 leader 目前不可選擇", 400, "該 leader 目前不可選擇"),
+    );
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("目前不可選擇");
+    expect(signMessageAsync).not.toHaveBeenCalled();
+  });
+
+  it("送出 500（寫檔失敗）→ 明說 leader 沒有被變更，且不自動重試", async () => {
+    postLeaderSelect.mockRejectedValue(
+      new ApiError("client", "變更記錄寫入失敗", 500, "變更記錄寫入失敗"),
+    );
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("你的 leader 沒有被變更");
+    expect(postLeaderSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("大小寫不同但實為同一位址 → 不得誤擋，流程正常完成", async () => {
+    getLeaderSelectMessage.mockResolvedValue({
+      ...CUSTOM_MSG,
+      leader_address: CUSTOM_MSG.leader_address.toUpperCase(),
+    });
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
+    expect(signMessageAsync).toHaveBeenCalledTimes(1);
+    expect(postLeaderSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("送出 403（改別人的帳號）→ 顯示對應文案", async () => {
+    postLeaderSelect.mockRejectedValue(
+      new ApiError("client", "只能變更自己帳號的 leader", 403, "只能變更自己帳號的 leader"),
+    );
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("只能變更自己帳號的 leader");
+  });
+
+  it("送出 429（查詢額度用完）→ 專屬文案，不得說『上一筆簽名已作廢』", async () => {
+    postLeaderSelect.mockRejectedValue(
+      new ApiError("client", "查詢過於頻繁，請稍後再試", 429, "查詢過於頻繁，請稍後再試"),
+    );
+    render(wrap(<LeadersPage />));
+    await openConfirmViaDock();
+    await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("你的 leader 沒有被變更");
+    expect(alert).toHaveTextContent("等約一分鐘");
+    expect(alert).not.toHaveTextContent("已作廢");
   });
 
   it("⭐ already_listed=true → 標示已在精選清單，聲明勾選要求維持", async () => {
@@ -1049,26 +380,12 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     await previewCustom();
 
     expect(screen.getByText("此位址已在精選清單")).toBeInTheDocument();
-    // 仍是用戶自行輸入的路徑：checkbox 照樣是送出的前置閘門
-    expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "跟單此地址" })).toBeDisabled();
     await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
-    expect(screen.getByRole("button", { name: "選擇此自訂 leader" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "跟單此地址" })).toBeEnabled();
   });
 
-  /**
-   * ⭐⭐ already_listed=true ＝ 這個位址**就是上方精選清單裡的那一位**（或是白名單裡
-   * 一個 paused 的條目）。同一頁對同一個位址講兩套話，是本頁誠信揭露標準的直接違反：
-   * 上方卡片有完整績效，下方預覽卻宣稱「無績效資料」，而且名稱寫死成「自訂 leader」。
-   *
-   * ⚠️ 兩個子情形必須分開：後端的 already_listed 對 **paused**（accepting_new=false）
-   * 的精選 leader 也回 true，但 `/api/leaders` 用 `is_selectable` 過濾、**不含** paused
-   * leader——對這種情形說「這個位址就是上方精選清單中的 leader」是一句假話（上方根本
-   * 沒有它）。因此「在不在上方」一律由**上方實際渲染的那份清單**判定（同源比較），
-   * 不由 already_listed 推論。
-   */
-  const LISTED_ADDR = "0x1111111111111111111111111111111111111111"; // 精選清單的 Alpha
-
-  it("⭐ already_listed 且在上方清單中 → 不畫「無績效資料」、顯示精選名稱、指向上方卡片", async () => {
+  it("⭐ already_listed 且在背景目錄找得到 → 沿用策展名稱，不誤稱無法核對", async () => {
     getLeaderPreview.mockResolvedValue({
       ...CUSTOM_PREVIEW, address: LISTED_ADDR, already_listed: true,
     });
@@ -1076,27 +393,27 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     await previewCustom(LISTED_ADDR);
 
     const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
-    expect(card.textContent).not.toContain("無績效資料");
-    expect(card.textContent).toContain("Alpha");        // 沿用精選名稱，不寫死
-    expect(card.textContent).toMatch(/上方/);            // 指向上方那張有績效的卡片
+    expect(card.textContent).toContain("Alpha"); // 沿用背景目錄的策展名，不寫死
+    expect(card.textContent).toContain("此位址已在精選清單");
+    expect(card.textContent).not.toMatch(/無法核對/);
   });
 
-  it("⭐ already_listed 且在上方清單中 → 確認框用精選名稱，不是寫死的「自訂 leader」", async () => {
+  it("⭐ already_listed 且在背景目錄找得到 → 確認框用策展名稱，不是寫死的「未審核 leader」", async () => {
     getLeaderPreview.mockResolvedValue({
       ...CUSTOM_PREVIEW, address: LISTED_ADDR, already_listed: true,
     });
     render(wrap(<LeadersPage />));
     await previewCustom(LISTED_ADDR);
     await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
-    await userEvent.click(screen.getByRole("button", { name: "選擇此自訂 leader" }));
+    await userEvent.click(screen.getByRole("button", { name: "跟單此地址" }));
 
     const dialog = screen.getByRole("dialog");
     expect(dialog.textContent).toContain("Alpha");
     expect(dialog.textContent).toContain("0x1111…111");
-    expect(dialog.textContent).not.toContain("自訂 leader");
+    expect(dialog.textContent).not.toContain("未審核 leader");
   });
 
-  it("⭐ already_listed 但未列於上方（paused，accepting_new=false）→ 文案不宣稱在上方清單中", async () => {
+  it("⭐ already_listed 但背景目錄查不到（paused 或未列示）→ 明說無法核對，不誤稱已確認", async () => {
     getLeaderPreview.mockResolvedValue({
       ...CUSTOM_PREVIEW, already_listed: true, accepting_new: false,
     });
@@ -1104,14 +421,12 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     await previewCustom();
 
     const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
-    expect(card.textContent).not.toContain("無績效資料");
-    expect(card.textContent).not.toMatch(/就是上方精選清單中的 leader/);
-    expect(card.textContent).toMatch(/未列於上方/);
+    expect(card.textContent).toMatch(/無法核對/);
     // 例行下架的既有警示不受影響（放行帶警示，不是拒絕）
     expect(card.textContent).toMatch(/未開放接受新跟單者/);
   });
 
-  it("精選清單載入失敗 → already_listed 的預覽仍可用，且不宣稱在上方清單中", async () => {
+  it("背景目錄載入失敗 → already_listed 的預覽仍可用，且不誤稱已核對名單", async () => {
     getLeaders.mockRejectedValue(new ApiError("upstream", "leader 名單暫時不可用", 503));
     getLeaderPreview.mockResolvedValue({
       ...CUSTOM_PREVIEW, address: LISTED_ADDR, already_listed: true,
@@ -1120,7 +435,7 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     await previewCustom(LISTED_ADDR);
 
     const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
-    expect(card.textContent).not.toMatch(/就是上方精選清單中的 leader/);
+    expect(card.textContent).toMatch(/無法核對/);
   });
 
   it("⭐ exists=false（鏈上無活動）→ 顯示警示但不擋，勾選後可送出走簽章（2026-07-27 裁決）", async () => {
@@ -1130,14 +445,12 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     render(wrap(<LeadersPage />));
     await previewCustom();
 
-    // 警示出現（可繼續配置的措辭：leader 尚未進場、進場後自動開始跟）
     const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
     expect(card.textContent).toMatch(/無 perp 交易活動/);
     expect(card.textContent).toMatch(/進場後.*自動開始跟單/);
 
-    // checkbox 與送出流程照常可走（警示不是閘門）
     await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
-    const select = screen.getByRole("button", { name: "選擇此自訂 leader" });
+    const select = screen.getByRole("button", { name: "跟單此地址" });
     expect(select).toBeEnabled();
     await userEvent.click(select);
     await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
@@ -1150,14 +463,12 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     render(wrap(<LeadersPage />));
     await previewCustom();
 
-    // 警示出現（例行下架措辭：仍可完成配置並跟隨、平台已標記）
     const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
     expect(card.textContent).toMatch(/未開放接受新跟單者/);
     expect(card.textContent).toMatch(/仍可完成配置並跟隨/);
 
-    // checkbox 與送出流程照常可走（警示不是閘門）
     await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
-    const select = screen.getByRole("button", { name: "選擇此自訂 leader" });
+    const select = screen.getByRole("button", { name: "跟單此地址" });
     expect(select).toBeEnabled();
     await userEvent.click(select);
     await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
@@ -1207,20 +518,7 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
     await userEvent.type(input, "f");
 
     expect(screen.queryByText("鏈上預覽")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "選擇此自訂 leader" })).not.toBeInTheDocument();
-  });
-
-  it("付費閘門關閉 → 自訂選擇按鈕停用（與精選卡片同一道閘，勾了聲明也一樣）", async () => {
-    getBillingPlans.mockResolvedValue(catalog(false));
-    render(wrap(<LeadersPage />));
-    await previewCustom();
-    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
-
-    // 閘門關閉時按鈕顯示「開發中」標籤且停用（沿精選卡片的既有行為）
-    const buttons = screen.getAllByRole("button", { name: "開發中，敬請期待" });
-    for (const b of buttons) expect(b).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "選擇此自訂 leader" })).not.toBeInTheDocument();
-    expect(getLeaderSelectMessage).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "跟單此地址" })).not.toBeInTheDocument();
   });
 });
 
@@ -1233,7 +531,7 @@ describe("LeadersPage — 自訂 leader（任意位址輸入）⭐", () => {
  * 的斷言（後端因此把 not_activated 與 indeterminate 分成兩態，前端不得合併）。
  */
 describe("LeadersPage — 目前跟隨的 leader（/api/me/leader）⭐", () => {
-  /** 這一區的 DOM 範圍——精選卡片也會畫同一個位址縮寫，斷言必須限定在本區塊內。 */
+  /** 這一區的 DOM 範圍。 */
   function currentPanel(): HTMLElement {
     return document.querySelector(".leader-current")!;
   }
@@ -1314,9 +612,8 @@ describe("LeadersPage — 目前跟隨的 leader（/api/me/leader）⭐", () => 
   });
 
   it("⭐ 簽章成功後重抓本區塊：剛簽的那筆待生效變更要立刻看得到，不必重新整理", async () => {
-    getBillingPlans.mockResolvedValue(catalog(true));
     render(wrap(<LeadersPage />));
-    await userEvent.click(await screen.findByRole("button", { name: "選擇此 leader" }));
+    await openConfirmViaDock();
     await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
     await screen.findByText(/已授權，於引擎的下一個 cycle 生效/);
 
@@ -1324,19 +621,18 @@ describe("LeadersPage — 目前跟隨的 leader（/api/me/leader）⭐", () => 
     await waitFor(() => expect(getMyLeader.mock.calls.length).toBeGreaterThan(1));
   });
 
-  it("⭐ 查詢失敗 → 本區塊說明讀不到，頁面其餘部分（精選清單、自訂輸入）仍可用", async () => {
+  it("⭐ 查詢失敗 → 本區塊說明讀不到，頁面其餘部分（地址 dock）仍可用", async () => {
     getMyLeader.mockRejectedValue(
       new ApiError("upstream", "跟隨狀態暫時不可用", 503, "跟隨狀態暫時不可用"),
     );
-    getBillingPlans.mockResolvedValue(catalog(true));
     render(wrap(<LeadersPage />));
 
     // 本區塊：說明讀不到，且**不得**宣稱「你沒在跟單」
     expect(await screen.findByText(/無法讀取你目前的跟隨狀態/)).toBeInTheDocument();
 
     // 頁面其餘部分照常運作
-    expect(await screen.findByRole("button", { name: "選擇此 leader" })).toBeEnabled();
-    expect(screen.getByLabelText(/leader 錢包位址/)).toBeInTheDocument();
+    expect(await screen.findByLabelText(/leader 錢包位址/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "查詢" })).toBeInTheDocument();
   });
 
   it("未登入 → 不打 /api/me/leader（避免必然的 401 噪音）", async () => {
@@ -1353,33 +649,5 @@ describe("LeadersPage — 其他狀態", () => {
     render(wrap(<LeadersPage />, null));
     expect(await screen.findByText(/尚未登入/)).toBeInTheDocument();
     expect(getLeaders).not.toHaveBeenCalled();
-  });
-
-  it("清單載入失敗 → 顯示載入失敗文案而非空白頁", async () => {
-    getLeaders.mockRejectedValue(new ApiError("upstream", "leader 名單暫時不可用", 503));
-    render(wrap(<LeadersPage />));
-    expect(await screen.findByText("載入 leader 清單失敗，請重新整理本頁。")).toBeInTheDocument();
-  });
-
-  it("清單為空 → 顯示空狀態（不是壞掉的畫面）", async () => {
-    getLeaders.mockResolvedValue(leaders({ leaders: [] }));
-    render(wrap(<LeadersPage />));
-    expect(await screen.findByText("目前沒有可選擇的 leader。")).toBeInTheDocument();
-  });
-
-  it("leader 不在快照中（各欄 null）→ 說明沒有數字，不畫一排「—」", async () => {
-    getLeaders.mockResolvedValue(
-      leaders({
-        leaders: [{
-          address: "0x2222222222222222222222222222222222222222",
-          name: "Beta", description: "測試",
-          account_value: null, total_ntl_pos: null, unrealized_pnl: null, position_count: null,
-        }],
-      }),
-    );
-    render(wrap(<LeadersPage />));
-
-    expect(await screen.findByText(/這位 leader 不在最新快照中/)).toBeInTheDocument();
-    expect(document.querySelectorAll(".leader-stat")).toHaveLength(0);
   });
 });

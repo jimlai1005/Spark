@@ -4,12 +4,16 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { logout } from "@/lib/api";
 import { COPY } from "@/lib/copy";
-import { useBillingStatus, useIsAdmin, useMe } from "@/lib/hooks";
+import { useIsAdmin, useMe } from "@/lib/hooks";
 
 /**
- * 導覽分組。⭐ 全部文案走 COPY.nav（單一來源；先前三個 tab 硬編中文字面值）。
+ * 導覽分組。⭐ 全部文案走 COPY.nav（單一來源）。
  *
- * ⭐⭐ 分組＝可見性，**不是授權**。藏起連結不保護任何東西：/ops、/admin 的端點
+ * ⭐⭐ 2026-07-30 大幅減法：產品收斂成單一入口，付費功能與 資金配置／績效／方案／
+ * 訂閱管理 四頁全部下架——公開 tab 只剩「開始」「綁定錢包」「跟單」三個，訂閱 chip
+ * 隨之整組移除。
+ *
+ * 分組＝可見性，**不是授權**。藏起連結不保護任何東西：/ops、/admin 的端點
  * 各自掛後端 `_require_admin`，手打網址照樣 403。這裡只是不把「點了必然吃閉門羹」
  * 的入口擺在使用者眼前。
  */
@@ -18,12 +22,7 @@ const PUBLIC_TABS = [
   { href: "/", label: COPY.nav.login },
   { href: "/onboarding", label: COPY.nav.onboarding },
   { href: "/leaders", label: COPY.nav.leaders },
-  { href: "/capital", label: COPY.nav.capital },
-  { href: "/performance", label: COPY.nav.performance },
-  { href: "/pricing", label: COPY.nav.pricing },
 ] as const;
-/** 登入後才顯示：未登入點進 /billing 只會看到「尚未登入」，擺出來是死路。 */
-const MEMBER_TABS = [{ href: "/billing", label: COPY.nav.billing }] as const;
 /** 後端放行 admin 端點者才顯示（useIsAdmin 是探測後端，不是前端推論）。 */
 const ADMIN_TABS = [
   { href: "/ops", label: COPY.nav.ops },
@@ -38,12 +37,8 @@ export function Header() {
   const isAdmin = useIsAdmin({ enabled: loggedIn });
   const tabs = [
     ...PUBLIC_TABS,
-    ...(loggedIn ? MEMBER_TABS : []),
     ...(isAdmin ? ADMIN_TABS : []),
   ];
-  // 訂閱 chip：僅在**已登入且 billing 已啟用**時顯示。billing 未啟用時後端回 501，
-  // query 落在 error 而沒有 data → 整組不渲染（不是渲染一個空殼），Header 版面不變形。
-  const billing = useBillingStatus({ enabled: !!me.data });
   const queryClient = useQueryClient();
 
   async function handleLogout() {
@@ -67,18 +62,6 @@ export function Header() {
           </Link>
         ))}
       </nav>
-      {me.data && billing.data && (
-        <Link
-          href="/billing"
-          className={`chip header-chip ${
-            billing.data.status === "active" ? "chip-up" : "chip-neutral"
-          }`}
-        >
-          {billing.data.status === "active"
-            ? COPY.billing.planNameActive
-            : COPY.billing.status[billing.data.status]}
-        </Link>
-      )}
       {me.data && (
         <button type="button" className="btn btn-ghost" onClick={handleLogout}>
           {COPY.common.logout}
