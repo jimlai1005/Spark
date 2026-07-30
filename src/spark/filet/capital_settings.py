@@ -93,7 +93,6 @@ log 都完全正常——與位址大小寫是同一類 bug（leader_change.buil
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -103,6 +102,7 @@ from typing import Callable
 from spark.filet.followers import normalize_hex_address, validate_account_id
 from spark.filet.leader_change import (LEADER_CHANGE_MAX_AGE_S, LeaderChangeError,
                                        parse_issued_at)
+from spark.filet.safe_fs import write_json_atomic
 from spark.filet.signing import recover_personal_sign_address
 
 # ⭐ 動作類型標識。落進記錄、且驗證端**顯式比對**（見檔頭域分隔第 2 層）。
@@ -536,7 +536,5 @@ def write_capital_settings(path: str | Path, record: dict) -> None:
     entries = [e for e in load_capital_settings(p)
                if e.get("account_id") != record["account_id"]]
     entries.append(record)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"settings": entries}, indent=2))
-    os.replace(tmp, p)  # 原子換檔，不留半寫
+    # 0644：讀端 filet-engine 是另一個 user（交換目錄無 setgid，見 user_leaders.py）。
+    write_json_atomic(p, {"settings": entries}, mode=0o644)

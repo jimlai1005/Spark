@@ -46,7 +46,6 @@ nonce 一次性由呼叫端注入的 `consume_nonce` 提供（見該參數說明
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,6 +53,7 @@ from pathlib import Path
 from typing import Callable
 
 from spark.filet.followers import normalize_hex_address, validate_account_id
+from spark.filet.safe_fs import write_json_atomic
 from spark.filet.signing import recover_personal_sign_address
 
 # 簽章時效上限（秒）。客戶簽下的意圖只在這段時間內可兌現——過期的簽章不該還能換
@@ -361,14 +361,13 @@ def remove_satisfied_leader_change(path: str | Path, *, account_id: str,
                     and e.get("leader_address") == leader_address)]
     if len(keep) == len(entries):
         return False
-    tmp = p.with_suffix(f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps({"changes": keep}, indent=2))
-    os.replace(tmp, p)
+    # 走 safe_fs（本檔位在 filet-api 擁有的交換目錄，root watcher 也會寫它）。
+    write_json_atomic(p, {"changes": keep}, mode=0o644)
     return True
 
 
 def write_leader_change(path: str | Path, record: dict) -> None:
-    """落檔（原子換檔，沿 publicapi/pending.py 的 _atomic_write 慣例）。
+    """落檔（原子換檔，走 atomic_json 的單一寫入邊界）。
 
     **同 account_id 覆蓋而非附加**：檔案代表「每位客戶當前的換手意圖」，不是流水帳。
     附加會留下一堆舊意圖，而套用端只要挑錯一筆就是把客戶送回他三天前想離開的
@@ -379,7 +378,5 @@ def write_leader_change(path: str | Path, record: dict) -> None:
     entries = [e for e in load_leader_changes(p)
                if e.get("account_id") != record["account_id"]]
     entries.append(record)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"changes": entries}, indent=2))
-    os.replace(tmp, p)  # 原子換檔，不留半寫
+    # 0644：讀端 filet-engine 是另一個 user，交換目錄無 setgid（見 user_leaders.py）。
+    write_json_atomic(p, {"changes": entries}, mode=0o644)

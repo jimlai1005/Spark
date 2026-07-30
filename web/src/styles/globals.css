@@ -86,10 +86,6 @@ input:focus-visible,
   background: var(--card);
 }
 
-/* 登出鈕：訂閱 chip 下架後（2026-07-30），改由這裡直接吃掉 space-between 的
-   剩餘空間，維持「wordmark＋tabs 靠左、登出鈕靠右」的版面。 */
-.app-header > .btn-ghost { margin-left: auto; }
-
 /* ---------- 版面容器 ---------- */
 main.page {
   max-width: 1080px;
@@ -223,20 +219,6 @@ main.page {
 
 .btn:disabled { opacity: .35; cursor: not-allowed; }
 .btn[disabled] { pointer-events: none; }
-
-/* ---------- Chips ---------- */
-.chip {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-family: var(--font-mono);
-}
-
-.chip-up { color: var(--pos); background: rgba(var(--pos-rgb), .14); }
-.chip-down { color: var(--neg); background: rgba(var(--neg-rgb), .14); }
-.chip-neutral { color: var(--text-dim); background: rgba(var(--text-dim-rgb), .12); font-family: var(--font-body); }
 
 /* ---------- 登入頁（全站產品敘事入口） ---------- */
 /* ⭐ landing 有自己的 shell 寬度：全站的 .narrow（420px）是表單寬，敘事頁套它

@@ -29,6 +29,16 @@ ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.filet_auto_activate \
 # 失敗（任何一個條目啟用失敗、範本佔位符未填）→ exit 1 → unit failed，監控看得見。
 NoNewPrivileges=true
 PrivateTmp=true
+# ⭐ 縱深防禦（2026-07-30 安全審查）：root 進程只該寫這四個路徑。程式端已改用
+# fd-based 原子寫（見 spark/filet/atomic_json.py）擋掉 symlink 提權，這裡再把
+# 「就算被騙也只能寫這幾處」釘死在核心層。
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/filet-api
+ReadWritePaths=/var/lib/filet-exchange
+ReadWritePaths=/etc/filet/followers
+ReadWritePaths=/opt/filet/state
+ReadWritePaths=/opt/filet/spark/var/filet
 
 [Install]
 WantedBy=multi-user.target

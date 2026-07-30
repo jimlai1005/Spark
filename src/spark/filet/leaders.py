@@ -83,7 +83,14 @@ def load_leaders(path: str | Path) -> list[LeaderRef]:
         raise ValueError(f"leader 白名單不是合法 JSON: {p}: {e}") from e
     if not isinstance(data, dict):
         raise ValueError(f"leader 白名單頂層須為物件: {p}")
-    raw = data.get("leaders", [])
+    # ⭐ 缺 `leaders` 鍵＝格式錯誤，不是空清單（2026-07-30 安全審查）：舊寫法
+    # `data.get("leaders", [])` 讓**任何**合法 JSON 物件都被讀成「零個 leader」——
+    # 白名單被別的內容覆寫時不會炸，只會安靜地變成空的，而空的精選清單會讓
+    # user registry 的條目在 merge 後全數遞補上來（＝撤銷失效、放行未審核 leader）。
+    # 與本函式自己宣告的 fail-fast 政策一致：壞掉就大聲炸，不要猜。
+    if "leaders" not in data:
+        raise ValueError(f"leader 白名單缺少 leaders 鍵: {p}")
+    raw = data["leaders"]
     if not isinstance(raw, list):
         raise ValueError(f"leader 白名單的 leaders 須為陣列: {p}")
     leaders: list[LeaderRef] = []

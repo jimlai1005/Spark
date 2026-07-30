@@ -32,7 +32,9 @@ from spark.filet.followers import VALID_NETWORKS, load_followers
 # 會讓「已核可的 leader」與「引擎眼中合法的 leader」悄悄分家（安全關鍵）。
 from spark.filet.leader_resolve import LEADERS_PATH_ENV, require_leaders_path
 from spark.filet.leaders import is_selectable, load_leaders
-from spark.filet.user_leaders import load_user_leaders, merge_leaders
+from spark.filet.safe_fs import write_json_atomic
+from spark.filet.user_leaders import (load_user_leaders, merge_leaders,
+                                      user_leaders_path_for)
 from spark.publicapi.config import normalize_address, derive_account_id
 from spark.publicapi.pending import load_pending, remove_pending_entry
 
@@ -139,10 +141,9 @@ def activate(account_id: str, pending_path: str, manifest_path: str,
         # None → JSON null；load_followers 視為未指定（引擎沿用 env 預設）。
         "leader_address": leader_address,
     })
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = manifest.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    os.replace(tmp, manifest)
+    # 走 safe_fs（唯一寫入邊界）。本檔所在目錄是 root:root 755，沒有 symlink 提權
+    # 的對手，但邊界一旦有例外就不再是邊界——0644 維持既有可讀性（引擎要讀）。
+    write_json_atomic(manifest, data, mode=0o644)
     load_followers(manifest)  # fail-fast 重讀驗證（不回滾——os.replace 已提交；寫壞
                               # 立刻大聲炸，manifest 留新版本、pending 條目留供重跑）
     # remove_pending=False（auto-activate watcher，審查 F2）：pending 是「start 尚未
@@ -167,6 +168,12 @@ def main() -> None:
     ap.add_argument("--leader", default=None,
                     help="覆寫此 follower 跟隨的 leader（須在白名單內）；"
                          "省略則用 pending 條目的 leader_address，兩者皆無則沿用 env 預設")
+    ap.add_argument("--exchange-dir", default=None,
+                    help="filet-exchange 根目錄；給了才把用戶自訂 leader registry "
+                         "併入准入集合。⭐ 客戶透過位址輸入框選的 leader 只存在該 "
+                         "registry 裡，不給這個旗標就會被本 CLI 拒絕（訊息會誤導你去"
+                         "改精選白名單）——當人工後備使用時請比照 auto-activate "
+                         "watcher 傳入同一個目錄，見 RUNBOOK §5.6a。")
     ap.add_argument("--leaders", default=None,
                     help="策劃 leader 白名單路徑（絕對路徑；未給則取 env "
                          "FILET_LEADERS_PATH，兩者皆無則拒絕執行——無預設值）")
@@ -187,8 +194,11 @@ def main() -> None:
         print(__doc__)
         print(f"{e}\n（本 CLI 也可用 --leaders <絕對路徑> 明確指定）")
         raise SystemExit(2) from e
+    user_leaders_path = (user_leaders_path_for(args.exchange_dir)
+                         if args.exchange_dir else None)
     print(activate(args.account_id, args.pending, args.manifest, builder,
-                   start=args.start, leader=args.leader, leaders_path=leaders_path))
+                   start=args.start, leader=args.leader, leaders_path=leaders_path,
+                   user_leaders_path=user_leaders_path))
 
 
 if __name__ == "__main__":

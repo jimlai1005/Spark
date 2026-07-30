@@ -50,7 +50,6 @@ import argparse
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -63,6 +62,8 @@ from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_fo
                                        remove_satisfied_leader_change,
                                        verify_leader_change)
 from spark.filet.leader_resolve import require_leaders_path
+from spark.filet.safe_fs import (ensure_dir_secure, named_owner_ids,
+                                 write_json_atomic, write_text_atomic)
 from spark.filet.user_leaders import user_leaders_path_for
 from spark.publicapi.pending import load_pending, remove_pending_entry
 
@@ -136,30 +137,11 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
     return text + block
 
 
-def _chown_if_root(path: Path, owner: str, group: str) -> None:
-    # 測試在非 root 下執行：chown 必然失敗，跳過——root 下失敗（owner 不存在＝
-    # 部署錯誤）仍然大聲。
-    if os.geteuid() == 0:
-        shutil.chown(path, user=owner, group=group)
-
-
 def _ensure_env_file(env_path: Path, content: str, owner: str, group: str) -> None:
     if env_path.exists():
         return  # 已存在＝上一輪（或人工）建過；不覆寫既有風險參數。
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = env_path.with_name(env_path.name + f".tmp.{os.getpid()}")
-    tmp.write_text(content)
-    os.chmod(tmp, ENV_FILE_MODE)
-    _chown_if_root(tmp, owner, group)
-    os.replace(tmp, env_path)
-
-
-def _ensure_state_dir(account_id: str, state_base: Path,
-                      owner: str, group: str) -> None:
-    d = state_base / account_id
-    d.mkdir(parents=True, exist_ok=True)
-    os.chmod(d, STATE_DIR_MODE)
-    _chown_if_root(d, owner, group)
+    write_text_atomic(env_path, content, mode=ENV_FILE_MODE,
+                      owner_ids=named_owner_ids(owner, group))
 
 
 class WatcherState:
@@ -182,15 +164,14 @@ class WatcherState:
     def note_result(self, account_id: str, result: str) -> bool:
         """記錄本輪結果；回傳「與上一輪不同」（True 才值得記 INFO，F9 防洗版）。"""
         prev = self._data.get(account_id, {}).get("last_result")
+        if prev == result:
+            return False        # 沒變化就不落檔：等待中的條目每分鐘重寫整檔沒有意義
         self._data.setdefault(account_id, {})["last_result"] = result
         self._save()
-        return prev != result
+        return True
 
     def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_name(self._path.name + f".tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(self._data, indent=2))
-        os.replace(tmp, self._path)
+        write_json_atomic(self._path, self._data, mode=0o600)
 
 
 def _manifest_ref(manifest_path: str, account_id: str):
@@ -263,7 +244,8 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                                user_address=entry["user_address"],
                                builder=builder)
     _ensure_env_file(env_dir / f"{account_id}.env", env_content, owner, group)
-    _ensure_state_dir(account_id, state_base, owner, group)
+    ensure_dir_secure(state_base / account_id, mode=STATE_DIR_MODE,
+                      owner_ids=named_owner_ids(owner, group))
 
     # remove_pending=False（F2）：pending 是重試的載體，start 成功前不得清。
     activate(account_id, pending_path, manifest_path, builder,

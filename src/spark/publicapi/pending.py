@@ -4,12 +4,11 @@ Pending follower 佇列（pending.json，filet-api 擁有）——與引擎 foll
 權限拓撲：filet-api 對引擎 manifest 本就不該有寫權。條目的 user_address 綁 SIWE
 session、builder_address 是伺服器常數（app 層保證；CLI 再核對一次）。"""
 import json
-import os
 from pathlib import Path
 
-from spark.filet.followers import normalize_hex_address, validate_account_id
-
-_NETWORKS = {"testnet", "mainnet"}
+from spark.filet.followers import (VALID_NETWORKS, normalize_hex_address,
+                                   validate_account_id)
+from spark.filet.safe_fs import dir_owner_ids, write_json_atomic
 
 
 def load_pending(path: str | Path) -> list[dict]:
@@ -20,21 +19,11 @@ def load_pending(path: str | Path) -> list[dict]:
 
 
 def _atomic_write(p: Path, entries: list[dict]) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    # tmp 名帶 pid（2026-07-30 審查 F8）：本檔如今有兩個寫者（filet-api 與 root 的
-    # auto-activate watcher）。固定 tmp 名時，root crash 殘留的 root:root tmp 會讓
-    # filet-api 之後的寫入 PermissionError——整個 onboarding 寫入停擺。pid 後綴讓
-    # 兩個寫者永不共用 tmp 路徑；read-modify-write 的極窄競態（雙方快照互蓋）已知
-    # 且自癒（verify 可重按、watcher 補救路徑會再清），詳見 auto-activate 檔頭。
-    tmp = p.with_suffix(f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps({"pending": entries}, indent=2))
-    os.replace(tmp, p)  # 原子換檔，不留半寫
-    if os.geteuid() == 0:
-        # root 寫完把所有權還給目錄擁有者（filet-api）並釘住 mode，避免權限拓撲
-        # 隨 root umask 漂移。
-        st = os.stat(p.parent)
-        os.chown(p, st.st_uid, st.st_gid)
-        os.chmod(p, 0o640)
+    # 兩個寫者（filet-api 與 root watcher）＋ filet-api 擁有的目錄 → 走 safe_fs
+    # （symlink 提權，見該檔頭）。root 寫完把 owner 還給 filet-api，否則它下次寫不動。
+    # read-modify-write 的極窄競態（雙方快照互蓋）已知且自癒，見 filet_auto_activate 檔頭。
+    write_json_atomic(p, {"pending": entries}, mode=0o640,
+                      owner_ids=dir_owner_ids(p.parent))
 
 
 def write_pending_entry(path: str | Path, *, account_id: str, user_address: str,
@@ -57,8 +46,8 @@ def write_pending_entry(path: str | Path, *, account_id: str, user_address: str,
     格式驗證則保留：壞格式的位址進了佇列會讓後續每一步都炸，早驗早報。
     """
     validate_account_id(account_id)
-    if network not in _NETWORKS:
-        raise ValueError(f"network 須為 {_NETWORKS}: {network!r}")
+    if network not in VALID_NETWORKS:
+        raise ValueError(f"network 須為 {VALID_NETWORKS}: {network!r}")
     leader = (normalize_hex_address("leader_address", leader_address)
               if leader_address else None)
     p = Path(path)
