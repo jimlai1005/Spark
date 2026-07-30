@@ -265,6 +265,11 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getLeaders(),
       () => api.getLeaderSelectMessage("0x1111111111111111111111111111111111111111"),
       () => api.getLeaderPreview("0x2222222222222222222222222222222222222222"),
+      () => api.getMyRisk(),
+      () => api.postMyRisk({
+        enabled: true, max_drawdown_pct: "0.20",
+        max_total_drawdown_pct: "0.40", flatten_on_breach: true,
+      }),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -300,7 +305,9 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     // 2026-07-27：+1（getLeaderPreview，自訂 leader 准入預覽）
     // 2026-07-27：+1（getMyLeader，「我目前跟誰」——/leaders 頁的現況揭露）
     // 2026-07-30：-7（移除 billing 與 capital：getBillingPlans、getBillingStatus、postBillingCheckout、postBillingPortal、getMyCapital、getCapitalSettingsMessage、postCapitalSettings；postCapitalSettings 原在 EXCLUDED，現刪除後 EXCLUDED 僅剩 authVerify、postLeaderSelect）
-    const HAND_WRITTEN_LIST_LENGTH = 18;
+    // 2026-07-30：+2（getMyRisk、postMyRisk，錢包主人自選風控——注意 postMyRisk
+    //   刻意**不在** EXCLUDED：它不帶任何簽名，body 只有 prefs，該受本掃描約束）
+    const HAND_WRITTEN_LIST_LENGTH = 20;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

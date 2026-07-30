@@ -237,6 +237,53 @@ export function postVerify(): Promise<OnboardStatus> {
   return post<OnboardStatus>("/api/onboard/verify");
 }
 
+// ---------- 風控偏好（錢包主人自選，2026-07-30；對照 publicapi/app.py /api/me/risk）----------
+
+/**
+ * 一個可調參數的規格。⭐ **由後端供給**（`specs`），前端不硬編任何上下界或預設值：
+ * 引擎的合法區間定義在 `src/spark/filet/risk_prefs.py`，前端另存一份的下場是
+ * 「畫面允許 0.01、API 收下、引擎拒絕啟動」，而症狀出現在啟用那一刻。
+ */
+export interface RiskParamSpec {
+  name: "max_drawdown_pct" | "max_total_drawdown_pct" | "flatten_on_breach";
+  env: string;
+  type: "decimal" | "bool";
+  default: string | boolean;
+  min: string | null;
+  max: string | null;
+  label: string;
+  help: string;
+}
+
+export interface RiskPrefs {
+  enabled: boolean;
+  max_drawdown_pct: string;
+  max_total_drawdown_pct: string;
+  flatten_on_breach: boolean;
+}
+
+export interface MyRiskResp {
+  prefs: RiskPrefs;
+  specs: RiskParamSpec[];
+  defaults: RiskPrefs;
+  /**
+   * ⭐ `false` ⇒ 表單必須關掉並顯示 `not_editable_note`。風控偏好只在引擎啟用的
+   * 那一刻寫進 env，之後不會被覆寫——已啟用的帳號在這裡改不會有任何效果，
+   * 讓客戶對著一個按了沒用的開關按第二次比不給選更糟。
+   */
+  editable: boolean;
+  not_editable_reason: string | null;
+  not_editable_note: string | null;
+}
+
+export function getMyRisk(): Promise<MyRiskResp> {
+  return request<MyRiskResp>("/api/me/risk");
+}
+
+export function postMyRisk(prefs: RiskPrefs): Promise<{ ok: true; prefs: RiskPrefs }> {
+  return post<{ ok: true; prefs: RiskPrefs }>("/api/me/risk", { prefs });
+}
+
 export function getApproveAgentPayload(chainId: number): Promise<TypedDataResp> {
   return post<TypedDataResp>("/api/onboard/payload/approve-agent", { chain_id: chainId });
 }

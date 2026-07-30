@@ -21,7 +21,7 @@
  * 錢包 personal_sign → **本地 recover 比對登入地址**（不符零網路請求）→ 原文原樣回送。
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSignMessage } from "wagmi";
 import {
   ApiError,
@@ -29,13 +29,18 @@ import {
   getLeaderSelectMessage,
   getLeaders,
   getMyLeader,
+  getMyRisk,
   postLeaderSelect,
+  postMyRisk,
   type LeaderEntry,
   type LeaderPreviewResp,
   type LeaderSelectResp,
   type LeadersResp,
   type MyLeaderPendingChange,
   type MyLeaderResp,
+  type MyRiskResp,
+  type RiskParamSpec,
+  type RiskPrefs,
 } from "@/lib/api";
 import { runCustomLeaderPreview, validateCustomLeaderInput } from "@/lib/customLeader";
 import Link from "next/link";
@@ -152,6 +157,13 @@ export default function LeadersPage() {
         />
       )}
       {phase.t === "running" && <p className="hint" role="status">{c.signing}</p>}
+
+      {/* ⭐ 風控 opt-in：擺在 dock 下方（選 leader 的同一個決定裡的另一半）。
+          預設不啟用；勾選後才展開細項。與換 leader 的簽章流程刻意**分開**送出——
+          leader 授權的待簽原文是逐位元組驗證的，把風控欄位塞進那份訊息會動到
+          canonical 格式，風險遠高於這個功能的價值。 */}
+      <RiskControlsSection />
+
 
       {/* ⭐ 換 leader 這個決定的左半邊：我現在跟的是誰（spec User Story 12）。安靜地
           擺在 dock 下方。 */}
@@ -546,6 +558,157 @@ function CustomLeaderSection({ busy, listedLeaders, onSelect }: {
           </div>
         </div>
       )}
+    </section>
+  );
+}
+
+/**
+ * 風控 opt-in 區塊（2026-07-30）。
+ *
+ * ⭐ 三個刻意的設計決定：
+ * 1. **上下界與預設值全部來自後端 `specs`**——前端一個數字都不寫死。引擎的合法區間
+ *    在 `filet/risk_prefs.py`；前端另存一份的下場是畫面允許、引擎拒絕啟動。
+ * 2. **比例以百分比呈現、以比例送出**：客戶想的是「跌 20% 就停」，而引擎收的是 0.20。
+ *    換算集中在 `pctToRatio`／`ratioToPct` 兩個函式，不散落在每個 input 的 onChange。
+ * 3. **`editable=false` 時整區唯讀**並顯示後端給的原因：偏好只在引擎啟用那一刻寫進
+ *    env，已啟用的帳號在這裡改不會有任何效果——讓客戶按一個沒有作用的儲存鈕，
+ *    比不給他這個選項更糟。
+ */
+function ratioToPct(v: string): string {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(Math.round(n * 1000) / 10) : "";
+}
+
+function pctToRatio(pct: string): string {
+  const n = Number(pct);
+  // toFixed(4) 後去掉尾零：本區間（0–80%，步進 0.1%）內可精確表示，
+  // 不會出現 0.28999999999999998 這種進 API 的字串。
+  return Number.isFinite(n) ? String(Number((n / 100).toFixed(4))) : pct;
+}
+
+function RiskControlsSection() {
+  const risk = useQuery<MyRiskResp>({ queryKey: ["me-risk"], queryFn: getMyRisk });
+  const [draft, setDraft] = useState<RiskPrefs | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // 伺服器值是唯一的初始來源；載入完成後灌進草稿一次（之後由使用者主導）。
+  useEffect(() => {
+    if (risk.data && draft === null) setDraft(risk.data.prefs);
+  }, [risk.data, draft]);
+
+  if (risk.isLoading) {
+    return (
+      <section className="risk-section">
+        <p className="hint">{COPY.common.loading}</p>
+      </section>
+    );
+  }
+  // 讀不到 ⇒ 只說「讀不到」，不畫一個預設值的表單：那會讓客戶以為他看到的是自己的
+  // 設定，並據此以為風控是關的（或開的）。
+  if (risk.error || !risk.data || !draft) {
+    return (
+      <section className="risk-section">
+        <h2 className="panel-title">{c.risk.title}</h2>
+        <p className="hint">{c.risk.loadError}</p>
+      </section>
+    );
+  }
+
+  const { specs, editable, not_editable_note: lockedNote } = risk.data;
+  const specOf = (name: RiskParamSpec["name"]) => specs.find((s) => s.name === name);
+
+  async function save() {
+    if (!draft) return;
+    setSaving(true);
+    setError(null);
+    setSaved(false);
+    try {
+      await postMyRisk(draft);
+      setSaved(true);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : c.risk.saveError);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="risk-section" aria-label={c.risk.title}>
+      <h2 className="panel-title">{c.risk.title}</h2>
+      <p className="hint">{c.risk.subtitle}</p>
+
+      {!editable && (
+        <div className="risk-locked" role="status">
+          <p className="risk-locked-title">{c.risk.lockedTitle}</p>
+          {lockedNote && <p className="hint">{lockedNote}</p>}
+        </div>
+      )}
+
+      <label className="risk-toggle">
+        <input type="checkbox" checked={draft.enabled} disabled={!editable}
+          onChange={(e) => {
+            setSaved(false);
+            setDraft({ ...draft, enabled: e.target.checked });
+          }} />
+        <span>{c.risk.enableLabel}</span>
+      </label>
+      <p className="hint risk-toggle-help">{c.risk.enableHelp}</p>
+
+      {/* 勾選後才展開細項——沒開風控時這些數字沒有任何意義，擺出來只會讓人以為有。 */}
+      {draft.enabled && (
+        <div className="risk-details">
+          <p className="eyebrow">{c.risk.detailsTitle}</p>
+          {(["max_drawdown_pct", "max_total_drawdown_pct"] as const).map((name) => {
+            const spec = specOf(name);
+            if (!spec) return null;
+            return (
+              <div className="risk-field" key={name}>
+                <label htmlFor={`risk-${name}`}>{spec.label}</label>
+                <div className="risk-input-row">
+                  <input id={`risk-${name}`} type="number" className="mono"
+                    inputMode="decimal" step="1" disabled={!editable}
+                    min={spec.min == null ? undefined : ratioToPct(spec.min)}
+                    max={spec.max == null ? undefined : ratioToPct(spec.max)}
+                    value={ratioToPct(draft[name])}
+                    onChange={(e) => {
+                      setSaved(false);
+                      setDraft({ ...draft, [name]: pctToRatio(e.target.value) });
+                    }} />
+                  <span className="risk-suffix">{c.risk.percentSuffix}</span>
+                </div>
+                <p className="hint">{spec.help}</p>
+              </div>
+            );
+          })}
+          {specOf("flatten_on_breach") && (
+            <div className="risk-field">
+              <label className="risk-toggle">
+                <input type="checkbox" checked={draft.flatten_on_breach}
+                  disabled={!editable}
+                  onChange={(e) => {
+                    setSaved(false);
+                    setDraft({ ...draft, flatten_on_breach: e.target.checked });
+                  }} />
+                <span>{specOf("flatten_on_breach")!.label}</span>
+              </label>
+              <p className="hint">{specOf("flatten_on_breach")!.help}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {editable && (
+        <div className="step-actions">
+          <button type="button" className="btn btn-secondary" disabled={saving}
+            onClick={save}>
+            {saving ? c.risk.saving : c.risk.saveButton}
+          </button>
+        </div>
+      )}
+      {saved && <p className="hint risk-saved" role="status">{c.risk.saved}</p>}
+      {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
     </section>
   );
 }

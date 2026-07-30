@@ -8,6 +8,7 @@ import {
   type LeaderSelectMessageResp,
   type LeadersResp,
   type MyLeaderResp,
+  type MyRiskResp,
 } from "@/lib/api";
 
 const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" };
@@ -18,6 +19,8 @@ const getLeaderSelectMessage = vi.fn();
 const postLeaderSelect = vi.fn();
 const getLeaderPreview = vi.fn();
 const getMyLeader = vi.fn();
+const getMyRisk = vi.fn();
+const postMyRisk = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMe: (...a: unknown[]) => getMe(...a),
@@ -26,6 +29,8 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   postLeaderSelect: (...a: unknown[]) => postLeaderSelect(...a),
   getLeaderPreview: (...a: unknown[]) => getLeaderPreview(...a),
   getMyLeader: (...a: unknown[]) => getMyLeader(...a),
+  getMyRisk: (...a: unknown[]) => getMyRisk(...a),
+  postMyRisk: (...a: unknown[]) => postMyRisk(...a),
 }));
 
 const signMessageAsync = vi.fn();
@@ -133,11 +138,44 @@ async function openConfirmViaDock(addr = CUSTOM_ADDR) {
   return screen.getByRole("dialog");
 }
 
+/**
+ * 後端 /api/me/risk 的形狀。⭐ `specs` 由後端供給——本 fixture 刻意照抄
+ * src/spark/filet/risk_prefs.py 的實際區間，好讓「前端不硬編數字」這件事在
+ * 測試裡也成立（改了後端區間，這裡跟著改，前端 code 不必動）。
+ */
+function myRisk(over: Partial<MyRiskResp> = {}): MyRiskResp {
+  return {
+    prefs: {
+      enabled: false, max_drawdown_pct: "0.20",
+      max_total_drawdown_pct: "0.40", flatten_on_breach: true,
+    },
+    defaults: {
+      enabled: false, max_drawdown_pct: "0.20",
+      max_total_drawdown_pct: "0.40", flatten_on_breach: true,
+    },
+    specs: [
+      { name: "max_drawdown_pct", env: "COPY_MAX_DRAWDOWN_PCT", type: "decimal",
+        default: "0.20", min: "0.05", max: "0.50",
+        label: "7 天滾動回撤上限", help: "跌幅超過此值即熔斷。" },
+      { name: "max_total_drawdown_pct", env: "COPY_MAX_TOTAL_DRAWDOWN_PCT",
+        type: "decimal", default: "0.40", min: "0", max: "0.80",
+        label: "累計回撤上限", help: "0 ＝ 停用這一道。" },
+      { name: "flatten_on_breach", env: "COPY_FLATTEN_ON_BREACH", type: "bool",
+        default: true, min: null, max: null,
+        label: "熔斷時自動平倉", help: "關：只停止交易並告警。" },
+    ],
+    editable: true, not_editable_reason: null, not_editable_note: null,
+    ...over,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   getMe.mockResolvedValue(ME);
   getLeaders.mockResolvedValue(leaders());
   getMyLeader.mockResolvedValue(myLeader());
+  getMyRisk.mockResolvedValue(myRisk());
+  postMyRisk.mockResolvedValue({ ok: true, prefs: myRisk().prefs });
   getLeaderPreview.mockResolvedValue(CUSTOM_PREVIEW);
   getLeaderSelectMessage.mockResolvedValue(CUSTOM_MSG);
   postLeaderSelect.mockResolvedValue({
@@ -649,5 +687,91 @@ describe("LeadersPage — 其他狀態", () => {
     render(wrap(<LeadersPage />, null));
     expect(await screen.findByText(/尚未登入/)).toBeInTheDocument();
     expect(getLeaders).not.toHaveBeenCalled();
+  });
+});
+
+// ── 風控 opt-in（2026-07-30，錢包主人自選）──────────────────────────
+describe("LeadersPage — 風控設定", () => {
+  it("預設不啟用，且細項在勾選前不出現（沒開風控時那些數字沒有意義）", async () => {
+    render(wrap(<LeadersPage />));
+    const toggle = await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ });
+    expect(toggle).not.toBeChecked();
+    expect(screen.queryByLabelText("7 天滾動回撤上限")).not.toBeInTheDocument();
+  });
+
+  it("勾選後展開細項，且上下界取自後端 specs（前端不硬編）", async () => {
+    render(wrap(<LeadersPage />));
+    const toggle = await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ });
+    await userEvent.click(toggle);
+    const dd = screen.getByLabelText("7 天滾動回撤上限");
+    expect(dd).toHaveValue(20);              // 0.20 → 20%
+    expect(dd).toHaveAttribute("min", "5");  // spec.min 0.05 → 5%
+    expect(dd).toHaveAttribute("max", "50");
+    const total = screen.getByLabelText("累計回撤上限");
+    expect(total).toHaveValue(40);
+    expect(total).toHaveAttribute("max", "80");
+  });
+
+  it("儲存：百分比換算回比例送給後端，不送浮點雜訊", async () => {
+    render(wrap(<LeadersPage />));
+    await userEvent.click(
+      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
+    const dd = screen.getByLabelText("7 天滾動回撤上限");
+    await userEvent.clear(dd);
+    await userEvent.type(dd, "29");
+    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
+    await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
+    expect(postMyRisk).toHaveBeenCalledWith(expect.objectContaining({
+      enabled: true, max_drawdown_pct: "0.29",
+    }));
+    expect(await screen.findByText(/風控設定已儲存/)).toBeInTheDocument();
+  });
+
+  it("熔斷自動平倉可以關掉（軟暫停語意）", async () => {
+    render(wrap(<LeadersPage />));
+    await userEvent.click(
+      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /熔斷時自動平倉/ }));
+    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
+    await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
+    expect(postMyRisk).toHaveBeenCalledWith(
+      expect.objectContaining({ flatten_on_breach: false }));
+  });
+
+  it("⭐ 已啟用的帳號：表單唯讀＋說明原因，且沒有儲存鈕（按了沒用比不給選更糟）", async () => {
+    getMyRisk.mockResolvedValue(myRisk({
+      editable: false, not_editable_reason: "not_pending",
+      not_editable_note: "引擎已經啟用；要調整請聯絡我們。",
+    }));
+    render(wrap(<LeadersPage />));
+    expect(await screen.findByText(/風控設定已鎖定/)).toBeInTheDocument();
+    expect(screen.getByText(/要調整請聯絡我們/)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /啟用 Filet 風控系統/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "儲存風控設定" })).not.toBeInTheDocument();
+  });
+
+  it("⭐ 讀不到設定 → 只說讀不到，不畫一個預設值的表單當成客戶的設定", async () => {
+    getMyRisk.mockRejectedValue(new ApiError("upstream", "500", 500));
+    render(wrap(<LeadersPage />));
+    expect(await screen.findByText(/風控設定暫時讀不到/)).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /啟用 Filet 風控系統/ }))
+      .not.toBeInTheDocument();
+  });
+
+  it("儲存失敗 → 顯示後端訊息，不假裝成功", async () => {
+    postMyRisk.mockRejectedValue(
+      new ApiError("client", "這個帳號不在待啟用佇列中。", 409));
+    render(wrap(<LeadersPage />));
+    await userEvent.click(
+      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
+    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
+    expect(await screen.findByText(/不在待啟用佇列中/)).toBeInTheDocument();
+    expect(screen.queryByText(/風控設定已儲存/)).not.toBeInTheDocument();
+  });
+
+  it("文案不得把啟用風控講成保證不虧（誠信紅線）", async () => {
+    render(wrap(<LeadersPage />));
+    const help = await screen.findByText(/開啟後：權益回撤達到你設定的門檻/);
+    expect(help.textContent).toMatch(/並不會讓本金免於虧損/);
   });
 });
