@@ -357,6 +357,12 @@ class ReconcileState:
     模組層全域在測試與多實例下是隱形共享狀態，改為顯式注入。"""
 
     modify_fail_until: dict[str, float] = field(default_factory=dict)  # coin -> epoch
+    # 「風控已由錢包主人關閉」上次告警的 epoch（None＝本進程還沒說過）。
+    # ⭐ 為什麼需要它：風控關閉是**穩定狀態**而非事件，每輪發一則會變成每天數百則
+    # 洗版同一個共用 TG 頻道，而 TelegramNotifier 撞上 429 之後**所有**告警都送不
+    # 出去——那正是這則提醒存在的目的所要保護的東西（審查 F2）。放在跨輪狀態上而
+    # 不是模組層全域：模組層在測試與多實例下是隱形共享狀態（見本類別 docstring）。
+    risk_off_warned_at: float | None = None
 
 
 @dataclass(frozen=True)

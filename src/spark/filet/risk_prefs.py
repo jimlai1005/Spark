@@ -64,6 +64,9 @@ RISK_PARAM_SPECS: tuple[dict, ...] = (
 
 _SPEC_BY_NAME = {s["name"]: s for s in RISK_PARAM_SPECS}
 
+# 比例的最小刻度（0.1%）——與前端百分比輸入的精度對齊，見 `_as_bounded_decimal`。
+_RATIO_STEP = Decimal("0.001")
+
 # watcher 一律代入的風控鍵（含總開關）。範本裡出現任何一個 → 整輪 fail-closed。
 # 理由同 `filet_auto_activate.GENERATED_KEYS`：範本與代入區塊重複定義同一個鍵，
 # 哪個生效取決於 EnvironmentFile 的載入細節——歧義本身就是錯，不留給讀者猜。
@@ -85,8 +88,13 @@ def default_prefs() -> dict:
     細項參數同時帶上預設值——不是因為它們會生效（enabled=False 時引擎根本不執法），
     而是為了讓前端表單在客戶勾選「啟用」的那一刻就有值可顯示，不必自己編一份。
     """
+    # ⭐ 預設值也走 `_as_bounded_decimal`：正規化（對齊刻度、定點格式）後，
+    # 「規格裡的預設」「API 回的值」「env 裡的值」三處是同一個字串。不這樣做的話
+    # 規格寫 "0.20" 而 env 寫 "0.2"，任何字串比對（例如前端判斷「有沒有改過」）
+    # 都會把兩個相同的值看成不同。
     return {"enabled": False,
-            **{s["name"]: (s["default"] if s["type"] == "bool" else str(s["default"]))
+            **{s["name"]: (s["default"] if s["type"] == "bool"
+                           else _as_bounded_decimal(s, s["default"]))
                for s in RISK_PARAM_SPECS}}
 
 
@@ -110,29 +118,52 @@ def _as_bounded_decimal(spec: dict, v) -> str:
     if not (lo <= d <= hi):
         raise RiskPrefsError(f"{name}_out_of_range",
                              f"{name} 必須在 {lo} 與 {hi} 之間（收到 {d}）")
-    return str(d)
+    # 對齊 0.1% 刻度後以**定點**格式輸出。兩個理由：
+    # (a) `str(Decimal("0E+1"))` 會給 "0E+1"，而 env 檔裡一行
+    #     `COPY_MAX_TOTAL_DRAWDOWN_PCT=0E+9` 引擎讀得懂、人讀不懂；
+    # (b) 前端以百分比、最多一位小數呈現，落檔值對齊同一刻度才不會出現
+    #     「畫面 33.3%、實際 0.3333」＝客戶送 A、系統套用 B（審查 F7）。
+    d = d.quantize(_RATIO_STEP).normalize()
+    return f"{d:f}"
 
 
-def canonical_prefs(payload: dict | None) -> dict:
-    """驗證＋正規化客戶送來的偏好；回傳可直接落檔的 dict。
+def canonical_prefs(payload: dict | None, *, base: dict | None = None,
+                    require_enabled: bool = False) -> dict:
+    """驗證＋正規化偏好；回傳可直接落檔的 dict。
 
     `enabled=False` 時**仍然驗證細項**（不是忽略它們）：客戶下次勾選啟用時，
     落檔的就是這些值——現在收下一個超界的數字，等於埋一顆啟用當下才炸的地雷。
-    未提供的鍵取預設值；未知的鍵直接拒絕（打錯字不該被靜默忽略）。
+    未知的鍵直接拒絕（打錯字不該被靜默忽略）。
+
+    ⭐⭐ `base`／`require_enabled` 是為了關掉一條 fail-open 的寫入路徑（審查 F1）：
+    缺鍵補值的來源必須是「**這個帳號目前存的值**」，不是產品預設。否則一個
+    `{"prefs": {}}` 的請求（表單重置、重試掉了 body、第三方呼叫）會把客戶已經
+    開啟的風控靜默關掉，而回應是 200——與 `CopySettings.risk_controls_enabled`
+    的預設 True 所依據的同一條理由相牴觸：**沒設定不該等於沒保護**。
+    - 讀取路徑（顯示、watcher 落檔前重驗）：`base=None` ⇒ 缺鍵補產品預設。
+    - 寫入路徑（API POST）：`base=目前存的偏好`、`require_enabled=True`
+      ⇒ 客戶必須**明確**表達開或關，其餘欄位沿用他既有的值。
     """
     if payload is None:
-        return default_prefs()
+        payload = {}
     if not isinstance(payload, dict):
         raise RiskPrefsError("not_an_object", "風控偏好必須是一個物件")
     allowed = {"enabled", *_SPEC_BY_NAME}
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise RiskPrefsError("unknown_field", f"不認得的欄位：{', '.join(unknown)}")
+    if require_enabled and "enabled" not in payload:
+        raise RiskPrefsError(
+            "enabled_missing",
+            "必須明確指定 enabled（true＝啟用風控、false＝不啟用）——"
+            "省略它會被讀成「關閉」，那不該由一個缺漏的欄位決定")
 
-    out = {"enabled": _as_bool("enabled", payload.get("enabled", False))}
+    fallback = base if base is not None else default_prefs()
+    out = {"enabled": _as_bool("enabled",
+                               payload.get("enabled", fallback["enabled"]))}
     for spec in RISK_PARAM_SPECS:
         name = spec["name"]
-        raw = payload.get(name, spec["default"])
+        raw = payload.get(name, fallback.get(name, spec["default"]))
         out[name] = (_as_bool(name, raw) if spec["type"] == "bool"
                      else _as_bounded_decimal(spec, raw))
     return out

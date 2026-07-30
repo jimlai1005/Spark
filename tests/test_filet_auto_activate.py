@@ -156,8 +156,10 @@ def test_generated_env_has_every_engine_required_var(site):
         # 風控四鍵一律明確寫出（未表達＝產品預設不啟用），理由見 risk_prefs.py：
         # 一顆引擎的風控姿態要能從它自己的 env 讀出來，不必回推當時的預設值。
         "COPY_RISK_CONTROLS_ENABLED": "false",
-        "COPY_MAX_DRAWDOWN_PCT": "0.20",
-        "COPY_MAX_TOTAL_DRAWDOWN_PCT": "0.40",
+        # 值經 risk_prefs 正規化（對齊 0.1% 刻度、定點格式）：規格的 "0.20"
+        # 與 env 的 "0.2" 是同一個值，三處字串一致由 default_prefs 保證。
+        "COPY_MAX_DRAWDOWN_PCT": "0.2",
+        "COPY_MAX_TOTAL_DRAWDOWN_PCT": "0.4",
         "COPY_FLATTEN_ON_BREACH": "true",
     }
     lines = dict(ln.split("=", 1) for ln in text.splitlines()

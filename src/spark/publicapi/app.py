@@ -55,7 +55,8 @@ from spark.publicapi.ops import (accrued_window, accrued_window_note, customer_p
                                  revenue_reconciliation, skipped_path_for,
                                  subscription_drift, trade_quality_rows,
                                  trade_quality_summary, utc_days_in_window)
-from spark.filet.risk_prefs import (RiskPrefsError, canonical_prefs, prefs_summary)
+from spark.filet.risk_prefs import (RiskPrefsError, canonical_prefs, prefs_summary,
+                                    safe_fallback_prefs)
 from spark.publicapi.pending import (load_pending, set_pending_risk,
                                      write_pending_entry)
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
@@ -1462,7 +1463,25 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         不能讓客戶對著一個按了沒用的開關按第二次（沉默的無效比不給選更糟）。
         """
         entry = _my_pending_entry(derive_account_id(address))
-        return {**prefs_summary(entry.get("risk") if entry else None),
+        stored = entry.get("risk") if entry else None
+        # ⭐ 存著的偏好驗不過（手改／舊格式）**不得** 500：那會讓客戶連改回來的
+        # 介面都打不開，而 500 又長得像「稍後重試就好」的暫時故障（工程原則 2）。
+        # 顯示的是 watcher 遇到同一份壞資料時會採用的那一份（風控開啟的安全側），
+        # 並明講「這不是你存的值」——兩邊對同一個壞資料的解讀必須一致，
+        # 否則畫面說關、引擎跑開，客戶無從得知哪個是真的。
+        unreadable = False
+        try:
+            summary = prefs_summary(stored)
+        except RiskPrefsError:
+            logger.warning("風控偏好無法解析，改以安全側顯示 account=%s",
+                           derive_account_id(address))
+            unreadable = True
+            summary = prefs_summary(safe_fallback_prefs())
+        return {**summary,
+                "stored_unreadable": unreadable,
+                "stored_unreadable_note": (
+                    "你先前儲存的風控設定讀取異常，畫面顯示的是系統採用的安全預設"
+                    "（風控開啟）。請重新確認並儲存一次。" if unreadable else None),
                 "editable": entry is not None,
                 "not_editable_reason": None if entry is not None else "not_pending",
                 "not_editable_note": (
@@ -1481,8 +1500,18 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         ⭐ 不在佇列中一律 409（不是靜默 200）：見 `me_risk` 的 `editable` 說明。
         """
         account_id = derive_account_id(address)
+        # ⭐⭐ 缺鍵補值的來源是「這個帳號目前存的值」，不是產品預設，且 `enabled`
+        # 必須明確指定（審查 F1）：否則一個 body 為 `{}` 的請求會把客戶已開啟的
+        # 風控靜默關掉並回 200——「沒設定」絕不等於「不要保護」。
+        entry = _my_pending_entry(account_id)
         try:
-            prefs = canonical_prefs(body.get("prefs") if isinstance(body, dict) else None)
+            # 目前存的值本身可能是壞的；壞的就退到安全側當基底，不拿它當合法基準。
+            try:
+                base = canonical_prefs(entry.get("risk") if entry else None)
+            except RiskPrefsError:
+                base = safe_fallback_prefs()
+            prefs = canonical_prefs(body.get("prefs") if isinstance(body, dict) else None,
+                                    base=base, require_enabled=True)
         except RiskPrefsError as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
         try:

@@ -165,6 +165,7 @@ function myRisk(over: Partial<MyRiskResp> = {}): MyRiskResp {
         label: "熔斷時自動平倉", help: "關：只停止交易並告警。" },
     ],
     editable: true, not_editable_reason: null, not_editable_note: null,
+    stored_unreadable: false, stored_unreadable_note: null,
     ...over,
   };
 }
@@ -773,5 +774,51 @@ describe("LeadersPage — 風控設定", () => {
     render(wrap(<LeadersPage />));
     const help = await screen.findByText(/開啟後：權益回撤達到你設定的門檻/);
     expect(help.textContent).toMatch(/並不會讓本金免於虧損/);
+  });
+});
+
+// 審查修正的回歸釘（2026-07-30 fresh-review F1／F3／F7）
+describe("LeadersPage — 風控設定的審查修正", () => {
+  it("F7：33.33% 的輸入，畫面顯示與送出值必須是同一個數（33.3% / 0.333）", async () => {
+    render(wrap(<LeadersPage />));
+    await userEvent.click(
+      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
+    const dd = screen.getByLabelText("7 天滾動回撤上限");
+    await userEvent.clear(dd);
+    await userEvent.type(dd, "33.33");
+    expect(dd).toHaveValue(33.3);            // 顯示
+    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
+    await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
+    expect(postMyRisk).toHaveBeenCalledWith(
+      expect.objectContaining({ max_drawdown_pct: "0.333" }));  // 送出（同一個數）
+  });
+
+  it("F1：送出的 body 一律帶 enabled（後端據此區分「關閉」與「沒表達」）", async () => {
+    render(wrap(<LeadersPage />));
+    await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ });
+    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
+    await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
+    expect(postMyRisk.mock.calls[0][0]).toHaveProperty("enabled", false);
+  });
+
+  it("F3：儲存值讀取異常 → 明說畫面顯示的是安全預設，且表單仍可編輯", async () => {
+    getMyRisk.mockResolvedValue(myRisk({
+      prefs: {
+        enabled: true, max_drawdown_pct: "0.20",
+        max_total_drawdown_pct: "0.40", flatten_on_breach: true,
+      },
+      stored_unreadable: true,
+      stored_unreadable_note: "你先前儲存的風控設定讀取異常，畫面顯示的是系統採用的安全預設（風控開啟）。",
+    }));
+    render(wrap(<LeadersPage />));
+    expect(await screen.findByText(/讀取異常/)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /啟用 Filet 風控系統/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "儲存風控設定" })).toBeInTheDocument();
+  });
+
+  it("觀察 4：提醒客戶在選定 leader 之前先儲存（啟用後就鎖定）", async () => {
+    render(wrap(<LeadersPage />));
+    expect(await screen.findByText(/請在選定 leader 之前先儲存風控設定/))
+      .toBeInTheDocument();
   });
 });

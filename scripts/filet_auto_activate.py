@@ -310,8 +310,20 @@ def run_once(*, pending_path: str, manifest_path: str, builder: str,
     notifier = notifier or NullNotifier()
     # 範本永遠先驗（F10）：部署錯誤要在安裝當下的驗收就爆，不是第一個用戶出現才爆。
     # 用假值組一次即可觸發兩類範本檢查。
-    _compose_env(env_template, network="mainnet", account_id="f0",
-                 user_address="0x" + "0" * 40, builder=builder)
+    #
+    # ⭐ 失敗必須進告警通道（審查 F4）：範本壞掉＝**沒有任何人會被啟用**，而 journal
+    # 沒人盯。fail-closed 的方向是對的（不碰錢），但「onboarding 全停」屬於必須大聲的
+    # 安裝錯誤（工程原則 3）。告警後原樣上拋，不吞——退出碼與既有行為不變。
+    try:
+        _compose_env(env_template, network="mainnet", account_id="f0",
+                     user_address="0x" + "0" * 40, builder=builder)
+    except SystemExit as e:
+        notifier.critical(
+            "auto-activate",
+            f"env 範本檢查失敗，**本輪沒有任何人被啟用**（新客戶會卡在待啟用佇列）"
+            f"：{e}",
+            dedup_key="auto-activate:bad-template")
+        raise
     entries = load_pending(pending_path)
     if not entries:
         return 0

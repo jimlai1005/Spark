@@ -274,6 +274,13 @@ export interface MyRiskResp {
   editable: boolean;
   not_editable_reason: string | null;
   not_editable_note: string | null;
+  /**
+   * ⭐ `true` ＝存著的偏好驗不過（手改／舊格式），`prefs` 是**系統會採用的安全預設**
+   * （風控開啟）而不是客戶存的值。後端與 watcher 對同一份壞資料的解讀刻意一致，
+   * 否則畫面說關、引擎跑開，客戶無從得知哪個是真的。UI 必須把這件事說出來。
+   */
+  stored_unreadable: boolean;
+  stored_unreadable_note: string | null;
 }
 
 export function getMyRisk(): Promise<MyRiskResp> {

@@ -4,6 +4,7 @@
 """
 import json
 import socket
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -182,6 +183,83 @@ def test_post_risk_when_not_pending_is_409_not_a_silent_success(tmp_path):
     g = client.get("/api/me/risk").json()
     assert g["editable"] is False and g["not_editable_reason"] == "not_pending"
     assert "聯絡我們" in g["not_editable_note"]
+
+
+# ── 4b. 審查修正的回歸釘（2026-07-30 fresh-review F1／F3）──────────────
+def test_empty_body_cannot_silently_disable_an_opt_in(tmp_path):
+    """⭐⭐ F1：`{"prefs": {}}` **不得**被讀成「關閉風控」並回 200。
+    觸發情境：客戶已開啟風控，之後任何一次沒帶 enabled 的 POST（表單重置、
+    重試掉了 body、第三方呼叫）都會把保護靜默關掉——「沒設定」不等於「不要保護」。"""
+    app, cfg, *_ = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    _make_pending(cfg, wallet.address)
+    assert client.post("/api/me/risk", json={"prefs": {
+        "enabled": True, "max_drawdown_pct": "0.15"}}).status_code == 200
+
+    r = client.post("/api/me/risk", json={"prefs": {}})
+    assert r.status_code == 400
+    assert "enabled" in r.json()["detail"]
+    # 儲存值不得被動到
+    assert client.get("/api/me/risk").json()["prefs"]["enabled"] is True
+
+
+def test_partial_update_keeps_my_other_settings(tmp_path):
+    """F1 的另一半：缺鍵補值的來源是「我目前存的值」，不是產品預設。
+    觸發情境：只送 enabled 的請求，不該把我調過的 0.15 重設回 0.2。"""
+    app, cfg, *_ = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    _make_pending(cfg, wallet.address)
+    client.post("/api/me/risk", json={"prefs": {
+        "enabled": True, "max_drawdown_pct": "0.15"}})
+    client.post("/api/me/risk", json={"prefs": {"enabled": False}})
+    got = client.get("/api/me/risk").json()["prefs"]
+    assert got["enabled"] is False
+    assert got["max_drawdown_pct"] == "0.15", "未提及的欄位不得被重設"
+
+
+def test_corrupt_stored_prefs_render_the_safe_side_not_a_500(tmp_path):
+    """⭐ F3：壞掉的偏好不得讓 GET 500——那會讓客戶連改回來的介面都打不開，
+    而 500 又長得像「稍後重試就好」。顯示的必須是 watcher 對同一份壞資料會採用的
+    那一份（風控開啟），並明講「這不是你存的值」。"""
+    app, cfg, *_ = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    account_id = _make_pending(cfg, wallet.address)
+    entries = load_pending(cfg.pending_path)
+    for e in entries:
+        if e["account_id"] == account_id:
+            e["risk"] = {"enabled": True, "max_drawdown_pct": "999"}
+    Path(cfg.pending_path).write_text(json.dumps({"pending": entries}))
+
+    r = client.get("/api/me/risk")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["stored_unreadable"] is True
+    assert body["prefs"]["enabled"] is True, "與 watcher 的 fail-closed 方向一致"
+    assert "安全預設" in body["stored_unreadable_note"]
+    assert body["editable"] is True, "必須留一條讓客戶自己改回來的路"
+
+
+def test_healthy_prefs_are_not_flagged_unreadable(tmp_path):
+    app, cfg, *_ = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    _make_pending(cfg, wallet.address)
+    assert client.get("/api/me/risk").json()["stored_unreadable"] is False
+
+
+def test_ratio_values_are_fixed_point_and_snapped_to_the_display_step():
+    """F7＋觀察 1/2：落檔值對齊 0.1% 刻度且不用科學記號——
+    否則畫面顯示 33.3% 卻套用 0.3333，或 env 出現 `=0E+9` 這種人讀不懂的行。"""
+    p = canonical_prefs({"enabled": True, "max_drawdown_pct": "0.3333",
+                         "max_total_drawdown_pct": "0E+1"})
+    assert p["max_drawdown_pct"] == "0.333"
+    assert p["max_total_drawdown_pct"] == "0"
+    assert canonical_prefs({"enabled": True,
+                            "max_drawdown_pct": "0." + "2" * 5000,
+                            })["max_drawdown_pct"] == "0.222"
 
 
 def test_risk_prefs_are_isolated_between_users(tmp_path):

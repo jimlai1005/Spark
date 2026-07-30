@@ -579,11 +579,16 @@ function ratioToPct(v: string): string {
   return Number.isFinite(n) ? String(Math.round(n * 1000) / 10) : "";
 }
 
+/**
+ * 百分比 → 比例。⭐ **對齊 0.1% 刻度**（與 `ratioToPct` 的顯示精度、以及後端
+ * `risk_prefs._RATIO_STEP` 同一個刻度）：不對齊的話，輸入 33.33 會顯示成 33.3
+ * 卻送出 0.3333——畫面與實際套用值不一致，正是本 codebase 其他地方明文拒絕的
+ * 「客戶送了 A、系統套用了 B」（審查 F7）。
+ */
 function pctToRatio(pct: string): string {
   const n = Number(pct);
-  // toFixed(4) 後去掉尾零：本區間（0–80%，步進 0.1%）內可精確表示，
-  // 不會出現 0.28999999999999998 這種進 API 的字串。
-  return Number.isFinite(n) ? String(Number((n / 100).toFixed(4))) : pct;
+  if (!Number.isFinite(n)) return pct;
+  return String(Number((Math.round(n * 10) / 1000).toFixed(3)));
 }
 
 function RiskControlsSection() {
@@ -638,6 +643,13 @@ function RiskControlsSection() {
     <section className="risk-section" aria-label={c.risk.title}>
       <h2 className="panel-title">{c.risk.title}</h2>
       <p className="hint">{c.risk.subtitle}</p>
+      {editable && <p className="hint">{c.risk.saveFirstNote}</p>}
+
+      {risk.data.stored_unreadable && risk.data.stored_unreadable_note && (
+        <div className="ops-alert" role="alert">
+          <p className="ops-alert-body">{risk.data.stored_unreadable_note}</p>
+        </div>
+      )}
 
       {!editable && (
         <div className="risk-locked" role="status">

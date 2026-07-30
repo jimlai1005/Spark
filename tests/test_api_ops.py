@@ -1570,6 +1570,9 @@ def test_heartbeat_fills_the_panel_when_the_state_root_is_unreadable(tmp_path):
     assert row["leader_source"] == "customer_signed"
     assert row["capital"]["allocated_capital"] == "5000.00"
     assert row["capital"]["capital_utilization"] == "0.4000"
+    # ⭐ 風控總開關同理由：狀態根沒有可讀投影，心跳是面板唯一的來源。釘住它有帶，
+    # 否則哪天投影漏掉，面板會對一顆無風控的引擎完全沉默（審查 F5）。
+    assert row["risk"] == {"controls_enabled": True}
     assert row["capital"]["source"] == "customer_signed"
     assert row["last_cycle"]["result"] == "no_action"
 

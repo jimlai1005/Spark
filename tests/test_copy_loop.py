@@ -157,7 +157,7 @@ def test_risk_controls_off_does_not_trip_on_breach(tmp_path, monkeypatch):
     assert not any(r[3] == "dd_breach" for r in notifier.records)
 
 
-def test_risk_controls_off_says_so_loudly_every_cycle(tmp_path):
+def test_risk_controls_off_says_so_loudly_once_per_process(tmp_path):
     """保護不存在必須大聲（工程原則 3），且訊息與「保護尚未生效」分得開——
     後者是故障，這裡是客戶的選擇；混成一句話會讓真故障被當成選擇而忽略。"""
     fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
@@ -170,6 +170,39 @@ def test_risk_controls_off_says_so_loudly_every_cycle(tmp_path):
     assert "風控已由錢包主人關閉" in disabled[0][2]
     # 不得沿用 coverage 不足那組 key／訊息（那是故障訊號，不是客戶選擇）
     assert not any(r[3] == "equity_coverage_insufficient" for r in notifier.records)
+
+
+def test_risk_off_warning_does_not_flood_the_shared_alert_channel(tmp_path):
+    """⭐⭐ 審查 F2：風控關閉是**穩定狀態**而非事件。每輪一則會變成每天數百則洗版
+    同一個共用 TG 頻道，而 notifier 撞上 429 之後**所有**告警都送不出去——那正是
+    這則提醒要保護的東西。觸發情境：任何風控關閉的 follower（＝預設每一顆）連續跑。
+    """
+    fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
+    _seed_equity_peak(tmp_path, "1000")
+    settings = _settings(risk_controls_enabled=False)
+    notifier = RecordingNotifier()
+    state = ReconcileState()
+    ex = _executor(fa)
+    for _ in range(60):     # 一小時（interval_s=60）
+        run_cycle(fa, ex, settings, notifier, state, tmp_path)
+    disabled = [r for r in notifier.records if r[3] == "risk_controls_disabled"]
+    assert len(disabled) == 1, f"一小時內只該說一次，實際 {len(disabled)} 次"
+    assert "6 小時" in disabled[0][2], "訊息要講明重發節奏，否則讀者會以為只發生一次"
+
+
+def test_risk_off_warning_repeats_after_the_interval(tmp_path):
+    """但也不能只說一次就永遠沉默：跨過重發間隔要再說一次（持續留痕）。"""
+    fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
+    _seed_equity_peak(tmp_path, "1000")
+    settings = _settings(risk_controls_enabled=False)
+    notifier = RecordingNotifier()
+    state = ReconcileState()
+    ex = _executor(fa)
+    run_cycle(fa, ex, settings, notifier, state, tmp_path)
+    # 把上次告警時間往前推超過間隔（等同 6 小時後的那一輪）
+    state.risk_off_warned_at -= loop_mod._RISK_OFF_WARN_INTERVAL_S + 1
+    run_cycle(fa, ex, settings, notifier, state, tmp_path)
+    assert len([r for r in notifier.records if r[3] == "risk_controls_disabled"]) == 2
 
 
 def test_risk_controls_off_keeps_sampling_equity(tmp_path):
