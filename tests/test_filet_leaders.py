@@ -189,14 +189,18 @@ def test_shipped_example_allowlist_parses_and_shows_both_flags():
     """⭐ deploy/leaders.json.example 必須是**合法且可載入**的白名單。
 
     RUNBOOK 叫操作者 `cp` 它當起手式——範例壞掉 = 部署當下才 fail-fast 的地雷。
-    同時釘住三筆範例分別示範了三種狀態（正常／例行下架／安全撤銷），
+    同時釘住四筆範例分別示範了四種狀態（正常／例行下架／安全撤銷／vault），
     因為那正是這份範例存在的教學價值。
     """
     from pathlib import Path
 
     example = Path(__file__).resolve().parents[1] / "deploy" / "leaders.json.example"
     leaders = load_leaders(example)
-    assert len(leaders) == 3
+    assert len(leaders) == 4
+    # vault 示例：kind 標 vault 且 enabled:false（示範條目不可被照抄直接生效）
+    vault = next(x for x in leaders if x.kind == "vault")
+    assert vault.enabled is False
+    assert sum(1 for x in leaders if x.kind == "vault") == 1
     states = {(x.enabled, x.accepting_new) for x in leaders}
     assert (True, True) in states     # 正常營運
     assert (True, False) in states    # 例行下架：已在跟的不受影響

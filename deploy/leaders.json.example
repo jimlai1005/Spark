@@ -22,6 +22,12 @@
     "   `uv run python -m scripts.revoke_leader <address>`（冪等、跨兩檔、自帶驗收）。",
     "   例行下架請改 accepting_new，不要刪條目。",
     "",
+    "kind（可省略）：leader 帳戶形態。合法值只有 'standard' 與 'vault'；缺欄位＝",
+    "  standard（既有條目不用動）。'vault' 會讓 watcher 對新 follower 自動注入",
+    "  20x 槓桿帽與流量中性化、引擎每輪按 kind 自衛。⚠️ vault 上架前必先跑",
+    "  `uv run python -m scripts.vault_preflight <addr>` 六項全 PASS（RUNBOOK §5.5",
+    "  「vault leader 上架前置檢查」）；拼錯值 → loader fail-fast 拒載整檔（保護，非 bug）。",
+    "",
     "格式為 fail-fast：JSON 壞掉／欄位型別錯／位址重複 → 引擎與 activate CLI 都會停，",
     "不會降級成空清單放行。改完務必用 `python -m json.tool` 驗一次再存。",
     "本 _comment 欄位會被 loader 忽略（只讀 leaders 陣列），但正式檔建議刪掉保持乾淨。"
@@ -47,6 +53,14 @@
       "description": "範例：安全撤銷 —— 條目保留供歷史查核，跟隨者已被收尾。",
       "enabled": false,
       "accepting_new": false
+    },
+    {
+      "address": "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+      "name": "Delta Vault",
+      "description": "範例：vault leader —— kind 標 vault（20x 帽＋流量中性化自動生效）。示範用 enabled:false：真實上架前必先跑 vault_preflight 六項全 PASS 再翻 true。",
+      "enabled": false,
+      "accepting_new": false,
+      "kind": "vault"
     }
   ]
 }

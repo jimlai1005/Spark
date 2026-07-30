@@ -771,6 +771,64 @@ sudo journalctl -u 'filet-follower@*' --since '10 min ago' | grep -i '撤銷\|le
 ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 ARM 檔
 ```
 
+#### vault leader 上架前置檢查（2026-07-31）
+
+vault 地址可以直接當 leader 跟單，是因為 vault 的 `accountValue` 可當 sizing 分母
+（TVL 100% 躺在 perp 帳戶）——這條 basis **只對單一 vault（Ultron）實測成立**，而
+equity basis 是「錢包形態專屬」的性質（工程原則 1，事故 #3），所以**每一隻新 vault
+上架前都必須重驗**，不得沿用舊結論。上架三步驟：
+
+**步驟 1：跑 preflight，六項全 PASS 才往下走**（唯讀，不寫任何東西）：
+
+```bash
+cd /opt/filet/spark
+SPARK_NETWORK=mainnet uv run python -m scripts.vault_preflight <vault_addr>
+# 六項全 PASS → exit 0；任一 FAIL → exit 1（不要帶著 FAIL 上架）
+```
+
+| 檢查 | 驗什麼 | FAIL 代表什麼 |
+|---|---|---|
+| `is-vault` | vaultDetails 非空且含 name | 位址根本不是 vault，別上 |
+| `perp-resident-tvl` | `withdrawable == maxDistributable`（截斷級容差） | TVL 有一部分躺在引擎看不到的桶，accountValue 不能當 sizing 分母 |
+| `flow-neutral-pnl` | \|ΔAV − Δpnl − 淨流量\| ≤ max($1, 0.01%×AV)（month 窗同源） | 出入金污染 pnl 序列，流量中性化的恆等式假設不成立 |
+| `no-spot-pollution` | month 與 perpMonth 的 pnl 終值一致 | pnl 有 spot 來源，「每桶恰好算一次」前提破功 |
+| `flow-stats` | 資訊性、恆 PASS；單筆流量 >8% TVL 印 WARN | （不 FAIL）大額進出會放大 sizing 抖動，人工看一眼規模感 |
+| `ledger-type-whitelist` | delta type 全在四型別白名單內 | 出現無法計號的未知流量型別，恆等式基礎不成立，需人工研判 |
+
+**步驟 2：白名單條目加 `"kind": "vault"`**（其餘欄位照舊）：
+
+```json
+{ "address": "0x…", "name": "…", "enabled": true, "accepting_new": true,
+  "kind": "vault" }
+```
+
+缺 `kind` 欄位＝`standard`（既有條目全部不用動）；拼錯值（如 `"Vault"`、`"yolo"`）
+loader 會 **fail-fast 拒載整個檔**——這是保護不是 bug：白名單壞掉的方向必須是全拒，
+不是靜默降級成 standard。改完照常 `python3 -m json.tool` 驗一次。
+
+**步驟 3：不用手動配任何 env**——保護是自動的、雙層的：
+
+- watcher 對「選了 vault leader」的新 follower 自動注入兩鍵：
+  `COPY_MAX_TARGET_LEVERAGE=20` 與 `COPY_LEADER_FLOW_NEUTRALIZATION=true`；
+- 引擎層每輪按本輪解析到的 leader `kind` 自衛（`apply_vault_policy`）——
+  運行中經簽章換手到 vault（watcher 不重寫 env 的路徑）也有保護。
+
+> ⚠️⚠️ **升級既有機器**（照 §5.6a-1 同一模式）：`/etc/filet/follower.env.template`
+> **不得**含 `COPY_MAX_TARGET_LEVERAGE` 或 `COPY_LEADER_FLOW_NEUTRALIZATION` 兩行——
+> 這兩鍵自 2026-07-31 起是 watcher-owned（列入 `GENERATED_KEYS`），範本裡出現任何
+> 一個 → watcher 每輪範本 pre-flight 直接 `SystemExit`，**該機器整輪不會啟用任何人**
+> （fail-closed）。驗收：
+>
+> ```bash
+> sudo grep -cE '^(COPY_MAX_TARGET_LEVERAGE|COPY_LEADER_FLOW_NEUTRALIZATION)=' \
+>   /etc/filet/follower.env.template   # 預期：0
+> ```
+
+> ⚠️ **交叉註記——自訂 leader 路徑（§5.5.3 user registry）沒有 vault 偵測**：
+> owner 在 `/leaders` 頁自行輸入一個 vault 地址，**不會**獲得 20x 帽與流量中性化
+> （registry 條目一律 `kind: "standard"`）。vault 只能走精選白名單上架（本節流程）。
+> 對外開放前必補（見 open-items 2026-07-31 節）。
+
 #### ⭐⭐ 安全撤銷一律跑 `scripts/revoke_leader.py`（不要手改、不要刪條目）
 
 撤銷要同時對付兩個檔（精選白名單 ＋ user registry），而做錯的方向全是 **fail-open**：

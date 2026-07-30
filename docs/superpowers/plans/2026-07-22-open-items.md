@@ -169,3 +169,23 @@
   **修法方向**：leader 槓桿改由 `info` 的 `activeAssetData(user, coin)` 查詢（空手也查得到），
   對「desired orders 涉及的 coin」逐一同步；leader 有持倉時兩來源應一致（可互為驗證）。
   註：此為一次性 bootstrap 問題——follower 各 coin 槓桿一旦對齊，後續 leader 開倉路徑會接手同步。
+
+---
+
+## 2026-07-31 vault leader 支援殘餘（Wave 1-6 落地後的已知債，四筆）
+
+- **自訂 registry 路徑無 vault 偵測 — 對外開放前必補**：owner 在 `/leaders` 頁自行輸入
+  vault 地址走的是 user registry（§5.5.3），條目一律 `kind: "standard"`——**不會**獲得
+  20x 帽與流量中性化；vault 目前僅精選白名單上架（RUNBOOK §5.5「vault leader 上架前置
+  檢查」交叉註記）。與 CLAUDE.md 紅線 5 例外的「對外開放前必須重審」屬同一窗，同窗處理。
+- **follower 側出入金校正債**：follower 自己的出入金仍會被回撤風控視為權益變動
+  （`src/spark/copytrade/equity.py:16`「ledger-aware 的出入金校正延到 public beta」）。
+  本次 leader 側落地的 `get_ledger_flows` ＋ `adjusted_leader_equity`（leader_flow.py）
+  機制可直接複用到 follower 側。
+- **運行中 vault→standard 換手不還原收緊值**：引擎每輪 `apply_vault_policy` 只收緊
+  不放鬆——換回 standard leader 後 20x 帽與中性化不會自動解除。方向是**過度保護、
+  非 fail-open**（錯的代價是保守），還原需要破壞「單一設定物件」不變式，留待使用者裁決。
+- **簽章換手路徑的 transient kind 回退**：白名單暫時讀不到（transient 讀失敗）的窗口內
+  `_kind_of` 查無條目回 `"standard"`（`src/spark/filet/leader_change_apply.py:122-131`
+  註解）——vault 保護可能缺席一輪，下一輪白名單恢復即恢復。已知、方向短暫 fail-open，
+  但窗口為單輪且需與 transient 讀失敗同時發生。
