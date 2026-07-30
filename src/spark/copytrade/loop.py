@@ -49,11 +49,6 @@ logger = logging.getLogger(__name__)
 _EMPTY_RECONCILE = ReconcileResult(placed=0, cancelled=0, modified=0, matched=0,
                                    sync_failed=False, skipped_small=())
 
-# 「風控已關閉」提醒的重發間隔（6 小時）。理由見 run_cycle 內該處註解：
-# 這是穩定狀態而非事件，每輪一則會洗版共用告警頻道並可能觸發 Telegram 429。
-_RISK_OFF_WARN_INTERVAL_S = 6 * 3600
-
-
 def tripped_report() -> CycleReport:
     """零交易動作的一輪。公開（非 _ 前綴）是因為 run_copytrade 的 leader 撤銷路徑
     也要回報「這一輪什麼都沒做」——兩處各造一份會漂移。"""
@@ -106,21 +101,20 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     ev = perp_equity_view(adapter, ex.my_address, root)
     lifetime = update_lifetime_peak(root, ev.current)
     if not settings.risk_controls_enabled:
-        # 保護不存在時必須大聲（工程原則 3），但**風控關閉是穩定狀態、不是事件**：
+        # 保護不存在時必須留痕（工程原則 3），但**風控關閉是穩定狀態、不是事件**：
         # 每輪一則會變成每天數百則洗版共用頻道，而 notifier 撞上 429 之後所有告警
-        # 都送不出去（審查 F2）。所以：每個進程啟動後說一次，之後每 6 小時再說一次
-        # ——足以讓「這顆引擎沒有風控」持續留痕，又不會把告警通道當日誌用。
-        # 持續可見性由心跳的 `risk.controls_enabled` 承擔（面板才是看狀態的地方）。
-        now_s = time.time()
-        last = state.risk_off_warned_at
-        if last is None or now_s - last >= _RISK_OFF_WARN_INTERVAL_S:
-            state.risk_off_warned_at = now_s
+        # 都送不出去。⭐ 2026-07-31 使用者裁決：**每個進程只發一次**（啟動時），
+        # 不再定期重發——「這顆引擎沒有風控」是一個設定事實，適合看面板（心跳的
+        # `risk.controls_enabled` 持續帶著它），不適合佔用告警通道。
+        # 引擎重啟會再發一次，那是有意義的：重啟是風控姿態可能改變的時刻。
+        if state.risk_off_warned_at is None:
+            state.risk_off_warned_at = time.time()
             notifier.warn(
                 "killswitch",
                 "**風控已由錢包主人關閉**：回撤 kill switch 與成本熔斷器均不執法"
                 "（權益取樣仍持續，啟用後立即可用）。"
                 f"目前 perp 淨值 {ev.current}｜7 天窗高水位 {ev.recent_peak}"
-                f"｜本提醒每 {_RISK_OFF_WARN_INTERVAL_S // 3600} 小時重發一次",
+                f"｜本提醒每個引擎進程只發一次；持續狀態請看營運面板",
                 dedup_key="risk_controls_disabled",
             )
     else:

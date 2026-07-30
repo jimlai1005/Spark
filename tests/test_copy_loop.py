@@ -190,21 +190,28 @@ def test_risk_off_warning_does_not_flood_the_shared_alert_channel(tmp_path):
         run_cycle(fa, ex, settings, notifier, state, tmp_path)
     disabled = [r for r in notifier.records if r[3] == "risk_controls_disabled"]
     assert len(disabled) == 1, f"一小時內只該說一次，實際 {len(disabled)} 次"
-    assert "6 小時" in disabled[0][2], "訊息要講明重發節奏，否則讀者會以為只發生一次"
+    assert "只發一次" in disabled[0][2], "訊息要講明節奏，否則讀者會以為它會一直提醒"
 
 
-def test_risk_off_warning_repeats_after_the_interval(tmp_path):
-    """但也不能只說一次就永遠沉默：跨過重發間隔要再說一次（持續留痕）。"""
+def test_risk_off_warning_fires_once_per_process_only(tmp_path):
+    """⭐ 2026-07-31 使用者裁決：**每個進程只發一次**，不定期重發。
+
+    「這顆引擎沒有風控」是設定事實而非事件，適合看面板（心跳持續帶著
+    `risk.controls_enabled`），不適合長期佔用共用告警通道。重啟會再發一次
+    ——那是有意義的，因為重啟正是風控姿態可能改變的時刻（新 state 物件）。
+    """
     fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
     _seed_equity_peak(tmp_path, "1000")
     settings = _settings(risk_controls_enabled=False)
     notifier = RecordingNotifier()
     state = ReconcileState()
     ex = _executor(fa)
-    run_cycle(fa, ex, settings, notifier, state, tmp_path)
-    # 把上次告警時間往前推超過間隔（等同 6 小時後的那一輪）
-    state.risk_off_warned_at -= loop_mod._RISK_OFF_WARN_INTERVAL_S + 1
-    run_cycle(fa, ex, settings, notifier, state, tmp_path)
+    for _ in range(200):        # 遠超過任何合理的重發間隔
+        run_cycle(fa, ex, settings, notifier, state, tmp_path)
+    assert len([r for r in notifier.records if r[3] == "risk_controls_disabled"]) == 1
+
+    # 重啟＝新的 ReconcileState ⇒ 再發一次（風控姿態可能在重啟時改變）
+    run_cycle(fa, ex, settings, notifier, ReconcileState(), tmp_path)
     assert len([r for r in notifier.records if r[3] == "risk_controls_disabled"]) == 2
 
 
