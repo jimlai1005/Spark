@@ -830,7 +830,9 @@ def test_signed_unlock_removes_the_arm_file_in_the_cycle(monkeypatch, tmp_path):
     arm = tmp_path / "state" / ARM_FILE_RELPATH
     arm.parent.mkdir(parents=True, exist_ok=True)
     tripped_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    arm.write_text(json.dumps({"tripped_at": tripped_at, "breached": True}))
+    # reason 必填（審查 F1）：沒有 reason 的鎖檔＝營運端緊急停機，不可自助解除。
+    arm.write_text(json.dumps({"tripped_at": tripped_at, "breached": True,
+                               "reason": "drawdown"}))
     _signed_unlock(tmp_path, wallet)
     _stub_network(monkeypatch)
     seen = []

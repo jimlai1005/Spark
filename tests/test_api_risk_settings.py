@@ -551,7 +551,7 @@ def test_applied_and_halted_come_from_a_fresh_heartbeat(client_wallet):
     client, cfg, wallet = client_wallet
     account_id = derive_account_id(wallet.address)
     write_hb(cfg, account_id, enabled=True, tripped=True,
-             risk_halt={"tripped": True, "reason": "", "resumable": True,
+             risk_halt={"tripped": True, "reason": "drawdown", "resumable": True,
                         "tripped_at": "2026-07-30T02:00:00+00:00"})
     body = client.get("/api/me/risk").json()
     assert body["applied"]["controls_enabled"] is True

@@ -72,6 +72,8 @@ logger = logging.getLogger(__name__)
 # ARM 檔同一個 `var/copytrade` 目錄——兩者都是「這顆引擎的風控狀態」，而且都必須
 # 位於 filet-api 寫不到的地方。
 APPLIED_STATE_RELPATH = Path("var/copytrade/risk_applied.json")
+# 已消化的解鎖請求（一次性護欄，審查 F3）。同樣落在引擎自己的狀態根。
+CONSUMED_UNLOCK_RELPATH = Path("var/copytrade/risk_unlock_consumed.json")
 
 
 def resolve_risk_settings_path(env=None) -> str:
@@ -159,6 +161,7 @@ class RiskSettingsApplier:
         self._settings_path = Path(settings_path)
         self._unlock_path = Path(unlock_path)
         self._state_path = Path(state_root) / APPLIED_STATE_RELPATH
+        self._consumed_path = Path(state_root) / CONSUMED_UNLOCK_RELPATH
         self._notifier = notifier
         self._now_fn = now_fn
         # 目前生效中的客戶簽章設定（跨 cycle 保留：狀態檔讀不到時仍能沿用現狀，
@@ -449,6 +452,33 @@ class RiskSettingsApplier:
 
     # ---------- 立即解除熔斷 ----------
 
+    # ── 已消化的解鎖請求（一次性護欄，審查 F3）──────────────────────────
+    def _load_consumed_unlock(self) -> str | None:
+        """上一次被消化的解鎖請求 `issued_at`；讀不到一律 None（＝不擋）。
+
+        讀不到就不擋的方向是刻意的：這道護欄防的是**重放**，而它讀不到時的替代
+        防線（ARM 檔已刪、請求須晚於 tripped_at、600 秒時效）都還在。若改成讀不到
+        就拒絕，一次檔案權限問題會讓客戶永遠按不動「立即恢復」——那是把防重放
+        升級成阻斷客戶的正當操作。
+        """
+        try:
+            return json.loads(self._consumed_path.read_text()).get("issued_at")
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
+    def _save_consumed_unlock(self, issued_at: str) -> None:
+        """記下已消化的 `issued_at`；寫失敗只 critical，不影響已完成的解鎖。"""
+        try:
+            self._consumed_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._consumed_path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"issued_at": issued_at}))
+            os.replace(tmp, self._consumed_path)
+        except OSError as e:
+            self._critical(
+                f"解除熔斷的一次性記錄寫入失敗（{self._consumed_path}: {e!r}）"
+                f"——鎖已解除，但同一份簽章在時效內可能可以再次解鎖，請留意",
+                dedup_key="risk_unlock_consumed_write_failed")
+
     def consume_unlock_request(self, root: Path) -> bool:
         """消化一筆「立即解除熔斷鎖定」請求；回傳是否真的解除了。**絕不 raise**。
 
@@ -463,10 +493,16 @@ class RiskSettingsApplier:
            客戶自助解除——那是治理動作）。ARM 檔的判定與刪除全在 killswitch，
            本模組只負責證明「這是本人、而且是剛剛簽的」。
 
-        ⚠️ 沒有「已消化」的持久記錄，而是靠 **ARM 檔本身**達成一次性：解除之後 ARM
-        檔不在了，同一筆記錄下一輪就走不到第 4 步（`manual_rearm` 直接回 False）。
-        再下一次熔斷時，那筆舊記錄會被「請求須晚於 tripped_at」擋住，而它本身也早已
-        過了 600 秒時效——三道都指向同一個結論，不需要第四份狀態檔。
+        5. **一次性**：已消化的 `issued_at` 記在引擎自己的狀態根
+           （`risk_unlock_consumed.json`，filet-api 寫不到），同一份簽章只能開一次鎖。
+
+        ⚠️⚠️ 第 5 步是 2026-07-30 獨立審查 F3 的修正。原本靠「ARM 檔已刪」＋
+        「請求須晚於 tripped_at」＋「600 秒時效」三道疊加，以為足夠——**不夠**：
+        `issued_at` 由請求內容決定，而驗章允許它落在未來 600 秒內（時鐘偏移容差）。
+        被打穿的 API 把待簽原文的 `issued_at` 蓋成 +599 秒，客戶按一次正當的
+        「立即恢復」，接下來約十分鐘內**每一次**熔斷都會被同一份記錄自動解開
+        （實測一份記錄連開三次鎖）。待簽原文對客戶承諾的是「This authorises one
+        resume only」，那句承諾必須有東西撐著。
         """
         try:
             rec = self._my_record(self._unlock_path, load_risk_unlocks)
@@ -497,10 +533,22 @@ class RiskSettingsApplier:
                     f"恢復跟單，請他重新取得待簽原文並重簽",
                     dedup_key=f"risk_unlock_verify_failed:{e.reason}")
                 return False
+            # 一次性護欄（見 docstring 第 5 點）：同一份簽章只能開一次鎖。
+            consumed = self._load_consumed_unlock()
+            if consumed is not None and verified.issued_at <= consumed:
+                logger.info("解除熔斷請求已被消化過，維持鎖定 account=%s",
+                            self._account_id)
+                return False
             # ARM 檔那一側的判定與刪除都在 killswitch（誰擁有鎖，誰負責開鎖）。
             # 成功時的 critical 也由它發（連同持久告警檔），這裡不重複發一則。
-            return manual_rearm(root, self._notifier,
-                                requested_at_iso=verified.issued_at)
+            opened = manual_rearm(root, self._notifier,
+                                  requested_at_iso=verified.issued_at)
+            if opened:
+                # ⭐ 落檔在**解鎖成功之後**：寫失敗時最壞情況是同一份簽章還能再開一次
+                # （回到修正前的行為），而先寫後開的最壞情況是「記為已用、實際沒開」
+                # ——客戶按了沒反應且再也按不動，那更糟。
+                self._save_consumed_unlock(verified.issued_at)
+            return opened
         except Exception:  # noqa: BLE001 —— 解鎖管線壞掉絕不能中斷跟單
             logger.exception("解除熔斷請求處理失敗（維持鎖定，跟單不受影響）")
             return False

@@ -121,8 +121,13 @@ class _Env:
         write_risk_unlock(self.unlock_path, rec)
         return rec
 
-    def trip(self, *, reason="", tripped_at=None):
-        """放一份 ARM 檔（kill switch 已觸發）。"""
+    def trip(self, *, reason="drawdown", tripped_at=None):
+        """放一份 ARM 檔（kill switch 已觸發）。
+
+        ⚠️ 預設 `reason="drawdown"`（2026-07-30 審查 F1）：**沒有 reason 的 ARM 檔
+        一律不可恢復**——那是 `panic.py` 等營運端緊急停機的形狀，不該能被客戶按掉。
+        要測那條路徑請顯式傳 `reason=""`。
+        """
         p = self.state_root / ARM_FILE_RELPATH
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = {"tripped_at": tripped_at or _at(-3600),
@@ -547,3 +552,34 @@ def test_unreadable_unlock_file_never_raises(env):
     env.trip()
     env.unlock_path.write_text("{{{")
     assert env.applier().consume_unlock_request(env.state_root) is False
+
+
+def test_one_unlock_signature_cannot_open_two_halts(env):
+    """⭐⭐ 獨立審查 F3 的回歸釘：**一份簽章只能開一次鎖**。
+
+    觸發情境：驗章允許 `issued_at` 落在未來 600 秒內（時鐘偏移容差），而 `issued_at`
+    由請求內容決定。被打穿的 API 把待簽原文的 issued_at 蓋成 +599 秒，客戶按一次
+    正當的「立即恢復」——修正前，接下來十分鐘內每一次熔斷都會被同一份記錄自動解開
+    （實測一份記錄連開三次鎖）。待簽原文對客戶承諾的是「只授權一次恢復」。
+    """
+    env.trip(tripped_at=_at(-3600))
+    env.write_unlock(issued_at=_at(300))        # 未來 5 分鐘（仍在時效容差內）
+    applier = env.applier()
+    assert applier.consume_unlock_request(env.state_root) is True
+
+    # 又熔斷一次，且熔斷時間仍早於那份（未來的）解鎖簽章 → 修正前會再度解開
+    arm = env.trip(tripped_at=_at(60))
+    assert applier.consume_unlock_request(env.state_root) is False, \
+        "同一份簽章不得開第二次鎖"
+    assert arm.exists()
+
+
+def test_one_shot_guard_survives_a_restart(env):
+    """一次性記錄落在引擎自己的狀態根 ⇒ 重啟後仍然擋得住（新建 applier 也一樣）。"""
+    env.trip(tripped_at=_at(-3600))
+    env.write_unlock(issued_at=_at(300))
+    assert env.applier().consume_unlock_request(env.state_root) is True
+
+    arm = env.trip(tripped_at=_at(60))
+    assert env.applier().consume_unlock_request(env.state_root) is False
+    assert arm.exists()

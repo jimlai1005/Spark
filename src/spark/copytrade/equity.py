@@ -135,17 +135,40 @@ def update_lifetime_peak(root: Path, current: Decimal, *, persist: bool = True) 
     return peak
 
 
-def reset_samples(root: Path) -> None:
-    """清空樣本與全期高水位。kill switch 觸發時呼叫——防止人工 re-arm 後被舊 peak 立刻再熔斷。
+def _unlink_quietly(root: Path, rel: Path) -> None:
+    """刪一個狀態檔；**絕不拋例外**。
 
-    **絕不拋例外**：本函式在 `killswitch.trip()` 中位於「ARM 已落地」與「總結 critical
-    告警」之間，若在此拋錯會吃掉那則告警（操作者收不到平倉成敗清單），違反工程原則 3。
+    這些清除動作在 `killswitch.trip()` 中位於「ARM 已落地」與「總結 critical 告警」
+    之間，若在此拋錯會吃掉那則告警（操作者收不到平倉成敗清單），違反工程原則 3。
     """
-    for rel in (SAMPLES_RELPATH, LIFETIME_PEAK_RELPATH):
-        try:
-            (root / rel).unlink(missing_ok=True)
-        except OSError as e:  # noqa: BLE001 — 清理失敗絕不能擋告警，見 docstring
-            logger.warning("清空 %s 失敗（不影響 ARM 鎖定）: %r", rel, e)
+    try:
+        (root / rel).unlink(missing_ok=True)
+    except OSError as e:  # noqa: BLE001 — 清理失敗絕不能擋告警，見 docstring
+        logger.warning("清空 %s 失敗（不影響 ARM 鎖定）: %r", rel, e)
+
+
+def reset_samples(root: Path) -> None:
+    """只清 **7 天滾動樣本**。kill switch 觸發時呼叫——防止恢復後被崩跌前的舊 peak
+    立刻再熔斷（滾動窗量的是「跌得多快」，重新起算才是它的正確語意）。
+
+    ⚠️⚠️ **2026-07-30 起不再連帶清除全期高水位**（獨立審查 F2）。原本兩者一起清，
+    在「人工 re-arm」的世界裡尚可接受；加入冷靜期自動恢復之後，它變成一個棘輪：
+    每次熔斷都把絕對底線的基準重設成崩跌後的權益，12 小時後自動恢復，下一段跌幅
+    又從更低的基底重新起算——實測連續四輪累虧 61%，而「慢速絕對底線」一次都沒有觸發。
+    絕對底線的意義正是**不隨時間重設**；要重設它只能是客戶親自簽章接受新基準
+    （見 `killswitch.manual_rearm` 對 `total_drawdown` 的處理）。
+    """
+    _unlink_quietly(root, SAMPLES_RELPATH)
+
+
+def reset_lifetime_peak(root: Path) -> None:
+    """清除全期高水位＝**接受一個新的絕對底線基準**。
+
+    唯一的合法呼叫點是「客戶親自簽章解除了一次 `total_drawdown` 熔斷」：他看懂了
+    自己已經虧掉多少，並決定以現在的權益為新的起點繼續。系統自己（冷靜期、
+    營運端、任何自動路徑）**不得**呼叫它——那等於替客戶抹掉他的虧損記錄。
+    """
+    _unlink_quietly(root, LIFETIME_PEAK_RELPATH)
 
 
 def perp_equity_view(adapter, address: str, root: Path, *,

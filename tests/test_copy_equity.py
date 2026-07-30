@@ -205,12 +205,25 @@ def test_lifetime_peak_persist_false_does_not_write(tmp_path: Path):
     assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists()
 
 
-def test_reset_samples_clears_lifetime_peak(tmp_path: Path):
-    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
+def test_reset_samples_keeps_the_lifetime_peak(tmp_path: Path):
+    """⭐⭐ 2026-07-30 語意變更（獨立審查 F2）：`reset_samples` **只清 7 天滾動樣本**，
+    全期高水位留著。
+
+    原本兩者一起清，在「re-arm 一律人工」的世界裡尚可接受；加入冷靜期自動恢復之後
+    它變成一個棘輪——每次熔斷都把絕對底線的基準重設成崩跌後的權益，12 小時後自動
+    恢復，下一段跌幅又從更低的基底起算。實測連續四輪累虧 61%，而「慢速絕對底線」
+    一次都沒觸發。絕對底線的意義正是不隨時間重設。
+    """
+    from spark.copytrade.equity import (LIFETIME_PEAK_RELPATH, reset_lifetime_peak,
+                                        update_lifetime_peak)
 
     update_lifetime_peak(tmp_path, Decimal("1000"))
     assert (tmp_path / LIFETIME_PEAK_RELPATH).exists()
     reset_samples(tmp_path)
+    assert (tmp_path / LIFETIME_PEAK_RELPATH).exists(), "全期高水位不得被熔斷清掉"
+
+    # 唯一的合法重置點：客戶親自簽章解除一次 total_drawdown 熔斷（＝接受新基準）。
+    reset_lifetime_peak(tmp_path)
     assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists()
 
 

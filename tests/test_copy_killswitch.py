@@ -23,6 +23,7 @@ from spark.copytrade.killswitch import (
     DrawdownStatus,
     auto_rearm_if_cooled_down,
     check_drawdown,
+    manual_rearm,
     evaluate,
     is_tripped,
     plan_close_actions,
@@ -637,7 +638,9 @@ def test_trip_uses_emergency_slippage(tmp_path):
 
 
 # ── 冷靜期自動恢復（2026-07-30 使用者裁決：保護要提供，但不該把客戶鎖在門外）──
-def _arm(root, *, tripped_at: str, reason: str | None = None):
+def _arm(root, *, tripped_at: str, reason: str | None = "drawdown"):
+    """⚠️ 預設 reason="drawdown"：自 2026-07-30 審查 F1 起，**沒有 reason 的 ARM 檔
+    一律不可恢復**（那是 panic.py 等營運端緊急停機的形狀）。"""
     p = root / ARM_FILE_RELPATH
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {"tripped_at": tripped_at, "current": "700", "peak": "1000",
@@ -718,3 +721,81 @@ def test_unparseable_timestamp_stays_locked(tmp_path):
 
 def test_no_arm_file_is_a_noop(tmp_path):
     assert auto_rearm_if_cooled_down(tmp_path, _settings(), RecordingNotifier()) is False
+
+
+# ── 獨立審查（2026-07-30）F1／F2 的回歸釘 ────────────────────────────────
+def test_operator_panic_halt_never_auto_resumes(tmp_path):
+    """⭐⭐ F1：`scripts/panic.py` 的營運端緊急停機**不傳 reason** → ARM payload 的
+    reason 是空字串。空字串一律不可恢復——否則營運端的緊急鎖 12 小時後自己解開，
+    客戶還能在一分鐘內按掉它。觸發情境：panic.py 鎖死某 follower 後放著不管。"""
+    at, now = _hours_ago(999)
+    arm = _arm(tmp_path, tripped_at=at, reason="")
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is False
+    assert arm.exists()
+    # 客戶自助解除同樣不行（manual 清單也不含空字串）
+    assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is False
+    assert arm.exists()
+
+
+def test_halt_with_unflattened_positions_never_auto_resumes(tmp_path):
+    """⭐⭐ F1-B：熔斷時平倉失敗（ARM payload 有 failures）＝市場上還有沒收乾淨的
+    部位，trip 的告警已寫「需人工處置」。那句話與「12 小時後自動恢復交易」不可能
+    同時成立。觸發情境：回撤熔斷 → close_reduce_only 對 ETH 失敗 → 放著滿 12 小時。"""
+    at, now = _hours_ago(20)
+    p = tmp_path / ARM_FILE_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"tripped_at": at, "reason": "drawdown",
+                             "failures": ["ETH"], "breached": True}))
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is False
+    assert p.exists()
+    assert any("殘留暴險" in r[2] for r in n.records)
+    assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is False
+
+
+def test_orders_not_cancelled_also_blocks_resume(tmp_path):
+    """掛單清單根本沒讀到（orders_not_cancelled）同理：帳戶狀態未知，不得恢復。"""
+    at, now = _hours_ago(20)
+    p = tmp_path / ARM_FILE_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"tripped_at": at, "reason": "cost_breach",
+                             "orders_not_cancelled": True}))
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     RecordingNotifier(), now_s=now) is False
+    assert p.exists()
+
+
+def test_total_drawdown_never_auto_resumes_but_owner_can_rebase(tmp_path):
+    """⭐⭐ F2：絕對底線量的是「總共虧了多少」，時間過去不會讓它變好 → 不自動恢復；
+    但客戶親自簽章可以解除，並**同時**接受以目前權益為新高水位。
+    觸發情境：客戶累虧達 40% 上限熔斷，等 12 小時後不該自己恢復。"""
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
+    at, now = _hours_ago(99)
+    arm = _arm(tmp_path, tripped_at=at, reason="total_drawdown")
+    update_lifetime_peak(tmp_path, Decimal("10000"))
+    n = RecordingNotifier()
+
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is False
+    assert arm.exists(), "絕對底線不得因為時間過去就自動恢復"
+    assert (tmp_path / LIFETIME_PEAK_RELPATH).exists()
+
+    assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is True
+    assert not arm.exists()
+    assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists(), "客戶簽章解除＝接受新基準"
+    assert any("新的高水位基準" in r[2] for r in n.records)
+
+
+def test_rolling_drawdown_resume_keeps_the_lifetime_peak(tmp_path):
+    """對照組：7 天滾動窗的熔斷被解除時**不得**清掉全期高水位——否則絕對底線
+    會變成每次熔斷就重新起算的棘輪（實測四輪累虧 61% 而底線從未觸發）。"""
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
+    at, now = _hours_ago(20)
+    _arm(tmp_path, tripped_at=at, reason="drawdown")
+    update_lifetime_peak(tmp_path, Decimal("10000"))
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     RecordingNotifier(), now_s=now) is True
+    assert (tmp_path / LIFETIME_PEAK_RELPATH).exists(), "全期高水位必須留著"

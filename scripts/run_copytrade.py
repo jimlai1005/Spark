@@ -87,7 +87,8 @@ from spark.config import Settings
 from spark.copytrade.config import CopySettings
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
-from spark.copytrade.killswitch import (ALERTS_LOG_RELPATH, DrawdownStatus,
+from spark.copytrade.killswitch import (ALERTS_LOG_RELPATH, REASON_LEADER_REVOKED,
+                                        DrawdownStatus,
                                         check_drawdown, count_alerts, halt_status,
                                         is_tripped, trip)
 from spark.copytrade.loop import main_loop, run_cycle, tripped_report
@@ -413,7 +414,7 @@ def make_revocation_wind_down(adapter, ex, notifier: Notifier,
         trip(ex, positions, notifier, root,
              DrawdownStatus(current=Decimal("0"), peak=Decimal("0"),
                             drawdown_pct=Decimal("0"), breached=False),
-             reason="leader_revoked")
+             reason=REASON_LEADER_REVOKED)
 
     return _wind_down
 

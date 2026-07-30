@@ -1543,18 +1543,43 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             return None
         return (base + timedelta(hours=float(hours))).isoformat()
 
-    def _halt_note(halt: dict | None) -> str:
+    def _halt_note(halt: dict | None, cooldown_h: str | None = None) -> str:
         """熔斷中的人話說明。⭐ 依「可否自助恢復」分岔，不要用同一句含糊帶過——
         `leader_revoked` 的鎖定簽了也不會解除，把它與一般風險熔斷寫成同一句，
         等於邀請客戶去簽一份注定失敗的請求。"""
         if halt is None:
             return ("你的跟單目前因熔斷而停止交易。這顆引擎回報的版本較舊，"
                     "尚無法確認熔斷原因與能否自助恢復——請稍候重新整理。")
+        reason = halt.get("reason")
         if halt.get("resumable"):
-            return ("你的跟單目前因風控熔斷而停止交易。冷靜期過後會自動恢復；"
-                    "要立即恢復請在本頁簽署一次「恢復跟單」。")
-        return ("你的跟單目前因 leader 被撤銷而停止交易。這不是風控熔斷，"
-                "**無法**由你自助恢復——請聯絡我們。")
+            # ⭐ 冷靜期 0 ＝**不會**自動恢復，不能沿用同一句（審查 F6）：那會讓客戶
+            # 以為只要等就好，而實際上他不按就永遠不會恢復。
+            # ⚠️ 三態，不得把「讀不到」折疊成「0」：0 是客戶的選擇（不自動恢復），
+            # None 是我們不知道他設了多久——後者仍然會自動恢復，只是說不出時間。
+            if cooldown_h == "0":
+                auto = ("你把冷靜期設為 0（不自動恢復），所以只有在本頁簽署一次"
+                        "「立即恢復跟單」才會解除。")
+            elif cooldown_h is None:
+                auto = ("冷靜期屆滿後會自動恢復（目前讀不到你設定的時數）；"
+                        "要立即恢復請在本頁簽署一次「立即恢復跟單」。")
+            else:
+                auto = (f"冷靜期（{cooldown_h} 小時）屆滿後會自動恢復；"
+                        f"要立即恢復請在本頁簽署一次「立即恢復跟單」。")
+            base = ("你的跟單目前因**累計虧損達到你設定的絕對底線**而停止交易。"
+                    if reason == "total_drawdown"
+                    else "你的跟單目前因風控熔斷而停止交易。")
+            return base + auto
+        # ⚠️ 不可自助恢復有三種來源，不得一律說成「leader 被撤銷」（審查 F4）：
+        # 客戶會被告知一件不曾發生的事，並被導去做一個解決不了問題的動作。
+        if reason == "leader_revoked":
+            return ("你的跟單目前因 leader 被撤銷而停止交易。這不是風控熔斷，"
+                    "**無法**由你自助恢復——請聯絡我們。")
+        if reason:
+            return (f"你的跟單目前因 `{reason}` 而停止交易，這個原因**無法**由你"
+                    f"自助恢復（例如營運端的緊急處置，或熔斷時有部位未收乾淨）"
+                    f"——請聯絡我們。")
+        return ("你的跟單目前處於熔斷鎖定，但引擎回報的原因無法判讀"
+                "——為安全起見不提供自助恢復，請聯絡我們。")
 
     def _my_signed_risk_record(account_id: str) -> dict | None:
         """交換目錄 → **只**這一個帳號的風控設定記錄，且**只投影安全欄位**。
@@ -1662,7 +1687,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "cooldown_hours": cooldown_h,
             "resume_at": _resume_at((halt or {}).get("tripped_at"), cooldown_h),
             "as_of": hb.at,
-            "note": (_halt_note(halt) if tripped else "目前沒有熔斷鎖定。"),
+            "note": (_halt_note(halt, cooldown_h) if tripped
+                     else "目前沒有熔斷鎖定。"),
         }
         return {
             **summary,

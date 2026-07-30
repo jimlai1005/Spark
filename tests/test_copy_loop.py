@@ -109,8 +109,8 @@ def test_tripped_short_circuits_with_zero_calls(tmp_path):
 def test_breach_with_flatten_calls_trip(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(loop_mod, "trip",
-                        lambda ex, pos, notifier, root, status: calls.append(
-                            (pos, root, status)))
+                        lambda ex, pos, notifier, root, status, reason="": calls.append(
+                            (pos, root, status, reason)))
     fa = FakeAdapter(
         account_value=Decimal("700"),  # 對照播種的 peak=1000 → dd=0.3
         positions=[Position(coin="ETH", szi=Decimal("1"), entry_px=Decimal("2000"),
@@ -122,8 +122,11 @@ def test_breach_with_flatten_calls_trip(tmp_path, monkeypatch):
 
     assert report.tripped is True
     assert len(calls) == 1
-    pos, root, status = calls[0]
+    pos, root, status, reason = calls[0]
     assert status.breached is True and status.drawdown_pct == Decimal("0.3")
+    # ⭐ reason 必須明講（審查 F1）：沒有 reason 的鎖檔不可自動恢復，而 7 天滾動窗
+    # 的熔斷應該要能在冷靜期後恢復——兩者靠這個字串區分。
+    assert reason == "drawdown"
     assert set(pos) == {"ETH"}
     assert root == tmp_path
     assert any(r[0] == "critical" and r[3] == "dd_breach" for r in notifier.records)

@@ -26,8 +26,10 @@ from typing import Callable
 from spark.copytrade.config import CopySettings
 from spark.copytrade.costbreaker import evaluate_cost
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
-from spark.copytrade.killswitch import (DrawdownStatus, auto_rearm_if_cooled_down,
-                                        evaluate, is_tripped, trip)
+from spark.copytrade.killswitch import (REASON_COST_BREACH, REASON_ROLLING_DRAWDOWN,
+                                        REASON_TOTAL_DRAWDOWN, DrawdownStatus,
+                                        auto_rearm_if_cooled_down, evaluate,
+                                        is_tripped, trip)
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
     CycleReport,
@@ -133,7 +135,11 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             )
             if settings.flatten_on_breach:
                 my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
-                trip(ex, my_positions, notifier, root, status)
+                # ⭐ reason 必須明講是哪一道閘（審查 F1）：兩者的恢復語意不同——
+                # 滾動窗過了冷靜期就自動恢復，絕對底線只能由客戶簽章接受新基準。
+                trip(ex, my_positions, notifier, root, status,
+                     reason=(REASON_TOTAL_DRAWDOWN if status.basis == "lifetime"
+                             else REASON_ROLLING_DRAWDOWN))
             return tripped_report()
 
     # ── 2.5 成本熔斷器（計畫 D8 的優先序在此結構性成立）─────────────────
@@ -164,7 +170,7 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             trip(ex, my_positions, notifier, root,
                  DrawdownStatus(current=ev.current, peak=ev.recent_peak,
                                 drawdown_pct=Decimal("0"), breached=False),
-                 reason="cost_breach")
+                 reason=REASON_COST_BREACH)
         else:
             # 不 trip ⇒ 沒有 ARM 檔、沒有 trip 內建的總結 critical，這則告警是本情境
             # 唯一的留痕，不得省（工程原則 3）。也提醒操作者：沒鎖檔就沒有人工
