@@ -16,7 +16,7 @@ import pytest
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from scripts.filet_auto_activate import GENERATED_KEYS, run_once
+from scripts.filet_auto_activate import GENERATED_KEYS, VAULT_ENV_KEYS, run_once
 from spark.copytrade.notifier import RecordingNotifier
 from spark.filet.leader_change import (build_leader_change_message,
                                        build_leader_change_record,
@@ -187,7 +187,13 @@ def test_generated_env_has_every_engine_required_var(site):
     lines = dict(ln.split("=", 1) for ln in text.splitlines()
                  if "=" in ln and not ln.startswith("#"))
     for key in GENERATED_KEYS:
-        assert lines[key] == expected[key], key
+        if key in VAULT_ENV_KEYS:
+            # vault 兩鍵是**條件式**代入：standard leader 的 env 不得出現
+            # （出現＝對一般錢包 leader 硬套 vault 保護）；vault 情境的完整性
+            # 由 test_vault_leader_env_gets_protection_keys 釘住。
+            assert key not in lines, key
+        else:
+            assert lines[key] == expected[key], key
 
 
 def _env_kv(site) -> dict[str, str]:
@@ -293,6 +299,55 @@ def test_template_containing_spark_keys_fails_closed(site):
     with pytest.raises(SystemExit):
         site.run()
     assert site.manifest_leaders() == {}
+
+
+def _make_leader_vault(site):
+    """把白名單裡的 _LEADER 改標成 vault（kind 語意見 filet/leaders.py Wave 1）。"""
+    site.leaders.write_text(json.dumps(
+        {"leaders": [{"address": _LEADER, "name": "Alpha", "kind": "vault"}]}))
+
+
+def test_vault_leader_env_gets_protection_keys(site):
+    """⭐ vault leader → env 注入兩鍵：槓桿上限 20（owner 裁決 2026-07-31）＋
+    申贖流量中性化開啟。這層是 operator 可稽核的顯式紀錄；引擎層另有每輪自衛
+    （apply_vault_policy），常數同源（不並存兩個 20）。"""
+    _make_leader_vault(site)
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    kv = _env_kv(site)
+    assert kv["COPY_MAX_TARGET_LEVERAGE"] == "20"
+    assert kv["COPY_LEADER_FLOW_NEUTRALIZATION"] == "true"
+
+
+def test_standard_leader_env_has_no_vault_keys(site):
+    """standard leader 的 env **不含**兩鍵：一般錢包 leader 不需要、也不該被
+    套上 vault 保護（env 要能一眼讀出這顆引擎的真實姿態）。"""
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    kv = _env_kv(site)
+    assert "COPY_MAX_TARGET_LEVERAGE" not in kv
+    assert "COPY_LEADER_FLOW_NEUTRALIZATION" not in kv
+
+
+def test_template_containing_vault_key_fails_closed(site):
+    """範本自帶 COPY_MAX_TARGET_LEVERAGE ＝ 與 vault 代入區塊重複定義的歧義
+    → 整輪拒跑（沿 SPARK_* 重複定義的既有 fail-closed 語意）。"""
+    site.template.write_text(_TEMPLATE_OK + "COPY_MAX_TARGET_LEVERAGE=5\n")
+    site.sign_change(leader=_LEADER)
+    with pytest.raises(SystemExit):
+        site.run()
+    assert site.manifest_leaders() == {}
+
+
+def test_corrupt_allowlist_fails_the_round_loudly(site):
+    """⭐ 白名單壞 JSON → 該輪 critical＋上拋，不做半套：讀不到白名單就無法
+    判斷 leader kind，靜默當 standard ＝ vault 保護無聲消失（fail-open）。"""
+    site.leaders.write_text("{not json")
+    site.sign_change(leader=_LEADER)
+    with pytest.raises(ValueError):
+        site.run()
+    assert site.manifest_leaders() == {}
+    assert len(site.crits()) == 1
 
 
 def test_waits_until_leader_selected(site):

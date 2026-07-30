@@ -68,7 +68,7 @@ from typing import Callable
 
 from spark.copytrade.notifier import Notifier
 from spark.filet.followers import FollowerRef, load_followers, normalize_hex_address
-from spark.filet.leaders import is_still_permitted, load_leaders
+from spark.filet.leaders import find_leader, is_still_permitted, load_leaders
 from spark.filet.user_leaders import load_user_leaders, merge_leaders
 
 logger = logging.getLogger(__name__)
@@ -186,7 +186,12 @@ class LeaderResolution:
     """解析結果。address 一律正規化小寫（同基準比較，工程原則 1）。"""
 
     address: str
-    source: str  # SOURCE_MANIFEST | SOURCE_ENV_DEFAULT
+    source: str  # SOURCE_MANIFEST | SOURCE_ENV_DEFAULT | SOURCE_CUSTOMER_SIGNED
+    # leader 種類（"standard"／"vault"，同 leaders.LeaderRef.kind）。引擎每輪
+    # 按**本輪解析出的 kind** 套 vault 保護（apply_vault_policy）——kind 與
+    # 白名單驗證出自同一份合併清單（同源，工程原則 1）。查不到條目（白名單
+    # 缺檔的 env 回退豁免路徑）→ 維持 "standard"。
+    kind: str = "standard"
 
 
 def _find_ref(account_id: str | None, manifest_path: str | Path) -> FollowerRef | None:
@@ -307,7 +312,11 @@ def resolve_leader(*, account_id: str | None, manifest_path: str | Path,
             f"leader {candidate} 等於 follower 自己的位址——拒絕跟單"
             f"（自己跟自己無意義，且會形成回饋迴圈：本方下的單會在下一輪被當成"
             f"leader 目標再放大）")
-    return LeaderResolution(candidate, source)
+    # kind 與上面的白名單驗證同一份合併清單（同源）。allowlist 缺檔的 env 回退
+    # 豁免路徑查不到條目 → "standard"（無白名單即無 vault 標記可言）。
+    ref_hit = find_leader(candidate, leaders)
+    return LeaderResolution(candidate, source,
+                            ref_hit.kind if ref_hit is not None else "standard")
 
 
 class LeaderWatch:

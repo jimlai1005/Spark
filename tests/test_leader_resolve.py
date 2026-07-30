@@ -578,3 +578,39 @@ def test_lost_registry_with_marker_is_transient_not_revocation(tmp_path):
     with pytest.raises(LeaderResolutionError) as ei:
         _resolve(tmp_path, manifest=_manifest(tmp_path, leader=_OTHER))
     assert not isinstance(ei.value, LeaderRevokedError)
+
+
+# ── vault leader：解析結果攜帶 kind（2026-07-31 Wave 2）───────────────────
+# 引擎每輪按本輪解析出的 kind 套保護設定（apply_vault_policy）；kind 判定與
+# 白名單驗證同一份合併清單（同源，工程原則 1）。
+
+def test_manifest_vault_leader_resolves_with_vault_kind(tmp_path):
+    """manifest 指定的 leader 在白名單且 kind=vault → 解析結果 kind='vault'。"""
+    res = _resolve(tmp_path,
+                   manifest=_manifest(tmp_path, leader=_LEADER),
+                   leaders=_leaders(tmp_path, [{"address": _LEADER, "name": "V",
+                                                "kind": "vault"}]))
+    assert res == LeaderResolution(_LEADER, SOURCE_MANIFEST, "vault")
+
+
+def test_standard_allowlist_entry_resolves_with_standard_kind(tmp_path):
+    """白名單條目未標 kind（＝standard）→ 解析結果 kind='standard'。"""
+    res = _resolve(tmp_path,
+                   manifest=_manifest(tmp_path, leader=_LEADER),
+                   leaders=_leaders(tmp_path, [{"address": _LEADER, "name": "Alpha"}]))
+    assert res.kind == "standard"
+
+
+def test_env_default_vault_entry_resolves_with_vault_kind(tmp_path):
+    """env 回退的 leader 在白名單且 kind=vault → 同樣攜帶 vault（回退不豁免）。"""
+    res = _resolve(tmp_path,
+                   manifest=_manifest(tmp_path, leader=None),
+                   leaders=_leaders(tmp_path, [{"address": _ENV_DEFAULT, "name": "V",
+                                                "kind": "vault"}]))
+    assert res == LeaderResolution(_ENV_DEFAULT, SOURCE_ENV_DEFAULT, "vault")
+
+
+def test_env_fallback_without_allowlist_is_standard_kind(tmp_path):
+    """白名單檔不存在的 env 回退豁免路徑：查不到條目 → kind 維持 'standard'。"""
+    res = _resolve(tmp_path, manifest=_manifest(tmp_path, leader=None))
+    assert res == LeaderResolution(_ENV_DEFAULT, SOURCE_ENV_DEFAULT, "standard")

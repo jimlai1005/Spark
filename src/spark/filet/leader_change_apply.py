@@ -100,7 +100,7 @@ from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_fo
 from spark.filet.leader_resolve import (DEFAULT_EXCHANGE_DIR, SOURCE_CUSTOMER_SIGNED,
                                         LeaderResolution, LeaderResolutionError,
                                         LeaderRevokedError)
-from spark.filet.leaders import is_still_permitted, load_leaders
+from spark.filet.leaders import find_leader, is_still_permitted, load_leaders
 from spark.filet.user_leaders import (load_user_leaders, merge_leaders,
                                       user_leaders_path_for)
 
@@ -117,6 +117,18 @@ DEFAULT_LEADER_CHANGES_PATH = leader_changes_path_for(DEFAULT_EXCHANGE_DIR)
 
 # 兩個 unit 都必須宣告的交換目錄環境變數（filet-api 寫、filet-follower@ 讀）。
 EXCHANGE_DIR_ENV = "FILET_EXCHANGE_DIR"
+
+
+def _kind_of(leader_address: str, leaders) -> str:
+    """leader kind（"standard"／"vault"），查同一份合併白名單（同源，工程原則 1）。
+
+    客戶簽章路徑的解析結果**必須**攜帶正確 kind：運行中經簽章換 leader 時
+    watcher 不會重寫 env，引擎每輪的 vault 自衛（apply_vault_policy）是唯一
+    執行點——kind 在這裡丟失＝vault 保護對簽章換手整條失效。查無條目 →
+    "standard"（能走到這裡的 leader 都已通過 is_still_permitted，正常查得到）。
+    """
+    ref = find_leader(leader_address, leaders)
+    return ref.kind if ref is not None else "standard"
 
 
 def require_exchange_dir(env=None) -> Path:
@@ -583,6 +595,10 @@ class LeaderChangeApplier:
             return base
         leaders = self._leaders()
         if leaders is None:
+            # ⚠️ 白名單讀不到 → kind 無從判定，只能暫時當 "standard"（一個
+            # transient 窗口內 vault 保護可能缺席；下一輪白名單恢復即補上）。
+            # 這裡不猜 "vault"：反向錯（對一般 leader 強開流量中性化＋壓槓桿）
+            # 會在一次 IO 打嗝時改變交易行為。
             logger.warning("換 leader：白名單暫時不可用，沿用已套用的 leader %s",
                            applied.leader_address)
             return LeaderResolution(applied.leader_address, SOURCE_CUSTOMER_SIGNED)
@@ -591,7 +607,8 @@ class LeaderChangeApplier:
                 f"客戶簽章授權的 leader {applied.leader_address} 已被白名單撤銷"
                 f"（enabled=false／條目已移除）——拒絕跟單。**不退回 manifest 的舊"
                 f"leader**：那會是一次沒有客戶授權的換手；要換人請由客戶重新簽署")
-        return LeaderResolution(applied.leader_address, SOURCE_CUSTOMER_SIGNED)
+        return LeaderResolution(applied.leader_address, SOURCE_CUSTOMER_SIGNED,
+                                _kind_of(applied.leader_address, leaders))
 
     # ---------- 主流程 ----------
 
@@ -703,7 +720,8 @@ class LeaderChangeApplier:
             dedup_key=f"leader_change_applied:{verified.nonce}")
         logger.info("換 leader 已套用 account=%s %s → %s", self._account_id, old,
                     verified.leader_address)
-        return LeaderResolution(verified.leader_address, SOURCE_CUSTOMER_SIGNED)
+        return LeaderResolution(verified.leader_address, SOURCE_CUSTOMER_SIGNED,
+                                _kind_of(verified.leader_address, leaders))
 
     # ---------- 小工具 ----------
 

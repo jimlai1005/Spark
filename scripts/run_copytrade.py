@@ -94,6 +94,7 @@ from spark.copytrade.killswitch import (ALERTS_LOG_RELPATH, REASON_LEADER_REVOKE
 from spark.copytrade.loop import main_loop, run_cycle, tripped_report
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
+from spark.copytrade.vault_policy import apply_vault_policy
 from spark.exchange.base import BuilderCode
 from spark.filet.capital_settings_apply import (
     LEDGER_RELPATH as CAPITAL_LEDGER_RELPATH,
@@ -577,8 +578,14 @@ def main(argv: list[str] | None = None) -> None:
         # 不變式：resolve_leader_fn() 只會回 LeaderResolution 或 raise，
         # 故此處 resolution 必非 None（見下方 LeaderWatch 前的 assert）。
         assert resolution is not None
-        copy_settings = replace(copy_settings, leader_address=resolution.address)
-        print(f"[leader] {resolution.address}（來源 {resolution.source}）")
+        # vault leader 保護（2026-07-31）：按解析出的 kind 收緊槓桿上限＋強制
+        # 流量中性化（單一常數來源見 vault_policy.py）。塞進同一個指派：本輪
+        # 設定仍只有一個產生點，不並存兩個都自稱設定的物件。
+        copy_settings = apply_vault_policy(
+            replace(copy_settings, leader_address=resolution.address),
+            resolution.kind)
+        print(f"[leader] {resolution.address}（來源 {resolution.source}"
+              f"／kind {resolution.kind}）")
 
     # 網路依賴延後到這裡才 import/建構（import 階段零網路）。
     from hyperliquid.info import Info
@@ -659,8 +666,14 @@ def main(argv: list[str] | None = None) -> None:
             hb["leader"] = res
             # 位址沒變就沿用同一個 settings 物件（避免每輪無謂重建）；變了才 replace，
             # 讓 run_cycle 的 leader 讀取與本輪解析結果同源（工程原則 1）。
-            cs = (copy_settings if res.address == copy_settings.leader_address
-                  else replace(copy_settings, leader_address=res.address))
+            # ⭐ vault 保護**每輪**按本輪解析出的 kind 重套（引擎自衛的不可繞過
+            # 執行點：簽章換 leader 不會重寫 env，watcher 那層對它是盲的）。
+            # apply_vault_policy 對 standard 回原物件、對已套用者 idempotent，
+            # 「沒變就不重建」的性質保持不變；仍是單一設定物件，無中間變數逃逸。
+            cs = apply_vault_policy(
+                copy_settings if res.address == copy_settings.leader_address
+                else replace(copy_settings, leader_address=res.address),
+                res.kind)
             # ⭐ 資金設定疊在**已解析 leader 的** settings 之上。順序與換 leader 無關
             # （兩者改的是不同欄位），但擺在後面讓「本輪最終用的 settings」只有一個
             # 產生點——中間插一個 run_cycle 就會出現兩個都自稱是本輪設定的物件。

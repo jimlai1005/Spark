@@ -60,7 +60,9 @@ from pathlib import Path
 
 from scripts.filet_activate import activate, validate_pending_entry
 from spark.copytrade.notifier import Notifier, NullNotifier, TelegramNotifier
+from spark.copytrade.vault_policy import VAULT_MAX_TARGET_LEVERAGE
 from spark.filet.followers import load_followers_tolerant
+from spark.filet.leaders import LeaderRef, find_leader, load_leaders
 from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_for,
                                        load_leader_changes, parse_issued_at,
                                        remove_satisfied_leader_change,
@@ -72,7 +74,8 @@ from spark.filet.risk_prefs import (RISK_ENV_KEYS, RiskPrefsError, risk_env_line
                                     safe_fallback_prefs)
 from spark.filet.risk_settings import (RiskSettingsError, load_risk_settings,
                                        risk_settings_path_for, verify_risk_settings)
-from spark.filet.user_leaders import user_leaders_path_for
+from spark.filet.user_leaders import (load_user_leaders, merge_leaders,
+                                      user_leaders_path_for)
 from spark.publicapi.pending import load_pending, remove_pending_entry
 
 logger = logging.getLogger("filet.auto_activate")
@@ -88,8 +91,14 @@ STATE_DIR_MODE = 0o700
 # 選擇，不再是全體共用的範本值。範本若還留著 COPY_MAX_DRAWDOWN_PCT 之類的舊行，
 # 整輪 fail-closed——這是刻意的部署耦合：舊範本＋新程式的組合會讓「客戶選的」與
 # 「範本寫的」重複定義同一個鍵，而哪個生效取決於 EnvironmentFile 的載入細節。
+# ⭐ vault leader 保護兩鍵（2026-07-31）：跟 vault leader 的 follower 由 watcher
+# 逐用戶代入（值同源自 vault_policy.VAULT_MAX_TARGET_LEVERAGE，不並存兩個 20）。
+# **條件式**代入：standard leader 的 env 不寫（不對一般錢包 leader 硬套 vault
+# 保護）；仍列入 GENERATED_KEYS——範本自帶即 fail-closed（重複定義歧義，既有語意）。
+VAULT_ENV_KEYS = ("COPY_MAX_TARGET_LEVERAGE", "COPY_LEADER_FLOW_NEUTRALIZATION")
 GENERATED_KEYS = ("SPARK_NETWORK", "SPARK_ACCOUNT_ID",
-                  "SPARK_USER_ADDR", "SPARK_BUILDER_ADDR") + RISK_ENV_KEYS
+                  "SPARK_USER_ADDR", "SPARK_BUILDER_ADDR") \
+    + RISK_ENV_KEYS + VAULT_ENV_KEYS
 
 
 def _latest_signed_leader(records: list[dict], *, account_id: str,
@@ -172,7 +181,8 @@ def _risk_lines(risk_records: list[dict], account_id: str, user_address: str,
 
 def _compose_env(template_path: Path, *, network: str, account_id: str,
                  user_address: str, builder: str,
-                 risk_lines: list[str] | None = None) -> str:
+                 risk_lines: list[str] | None = None,
+                 vault_leader: bool = False) -> str:
     """範本＋watcher 代入的 per-follower 區塊。兩類錯誤整輪 fail-closed：
     - 殘留 REPLACE_WITH：部署者還沒完成安裝，用半成品設定開實盤是拿真錢冒險；
     - 範本自帶 SPARK_*：會與代入區塊重複定義，哪個生效取決於 EnvironmentFile
@@ -204,6 +214,12 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
     # 讓一顆引擎的風控姿態能從它自己的 env 一眼讀出來，不必回頭推敲當時的預設值。
     block += ("# 風控（錢包主人自選；未表達＝產品預設不啟用，見 filet/risk_prefs.py）\n"
               + "".join(f"{ln}\n" for ln in (risk_lines or risk_env_lines(None))))
+    if vault_leader:
+        # vault leader 保護（owner 裁決 2026-07-31）：槓桿上限值 import 自
+        # vault_policy 的單一常數（引擎每輪自衛用同一顆，不並存兩個 20）。
+        block += ("# vault leader 保護（kind=vault；常數同源 copytrade/vault_policy.py）\n"
+                  f"COPY_MAX_TARGET_LEVERAGE={VAULT_MAX_TARGET_LEVERAGE}\n"
+                  "COPY_LEADER_FLOW_NEUTRALIZATION=true\n")
     return text + block
 
 
@@ -263,6 +279,7 @@ def _manifest_ref(manifest_path: str, account_id: str):
 
 def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                   builder: str, leaders_path: str, user_leaders_path: str,
+                  leaders: list[LeaderRef],
                   leader_changes: list[dict], changes_path: str,
                   risk_settings: list[dict],
                   env_dir: Path, env_template: Path,
@@ -308,6 +325,11 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
     if leader is None:
         return "waiting_leader"  # 產品語意：選了 leader 才啟用。
 
+    # vault leader → env 多注入兩鍵保護（kind 查合併白名單，與 activate 的准入
+    # 驗證同一份清單——同源，工程原則 1）。自訂 leader（僅 registry）＝ standard。
+    ref = find_leader(leader, leaders)
+    vault_leader = ref is not None and ref.kind == "vault"
+
     # env 與 state 先就位（unit 起得來的前置條件），manifest 之後、pending 最後——
     # 每一步失敗時，前面的產物都讓下一輪可安全重入。
     env_content = _compose_env(env_template, network=entry["network"],
@@ -316,7 +338,8 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                                builder=builder,
                                risk_lines=_risk_lines(
                                    risk_settings, account_id,
-                                   entry["user_address"], notifier))
+                                   entry["user_address"], notifier),
+                               vault_leader=vault_leader)
     _ensure_env_file(env_dir / f"{account_id}.env", env_content, owner, group)
     ensure_dir_secure(state_base / account_id, mode=STATE_DIR_MODE,
                       owner_ids=named_owner_ids(owner, group))
@@ -366,6 +389,20 @@ def run_once(*, pending_path: str, manifest_path: str, builder: str,
     leader_changes = (load_leader_changes(changes_path)
                       if Path(changes_path).exists() else [])
     user_leaders_path = user_leaders_path_for(exchange_dir)
+    # ⭐ 白名單＋user registry 每輪載入一次（合併語意與引擎同源：merge_leaders）：
+    # process_entry 用它判斷 leader kind（vault → env 注入保護兩鍵）。載入失敗
+    # 照「範本先驗」同級處理（critical＋上拋，該輪不做半套）：讀不到白名單就
+    # 無法判斷 kind，靜默當 standard ＝ vault 保護無聲消失（fail-open 方向）。
+    try:
+        leaders = merge_leaders(load_leaders(leaders_path),
+                                load_user_leaders(user_leaders_path))
+    except (ValueError, OSError) as e:
+        notifier.critical(
+            "auto-activate",
+            f"leader 白名單／registry 無法載入，**本輪沒有任何人被啟用**"
+            f"（新客戶會卡在待啟用佇列）：{e}",
+            dedup_key="auto-activate:bad-leaders")
+        raise
     # 客戶簽章的風控設定（與 leader_changes 同一個交換目錄、同一種載入方式）。
     # 檔案不存在＝還沒有任何人簽過風控設定，是正常狀態（→ 每個人都走產品預設）。
     risk_path = risk_settings_path_for(exchange_dir)
@@ -380,7 +417,7 @@ def run_once(*, pending_path: str, manifest_path: str, builder: str,
             result = process_entry(
                 entry, pending_path=pending_path, manifest_path=manifest_path,
                 builder=builder, leaders_path=leaders_path,
-                user_leaders_path=user_leaders_path,
+                user_leaders_path=user_leaders_path, leaders=leaders,
                 leader_changes=leader_changes, changes_path=changes_path,
                 risk_settings=risk_settings, env_dir=env_dir,
                 env_template=env_template, state_base=state_base,

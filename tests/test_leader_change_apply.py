@@ -795,3 +795,19 @@ def test_lost_registry_with_marker_keeps_an_applied_override(env):
     registry.unlink()
     env.notifier.records.clear()
     assert env.applier().effective(_BASE).address == _USER_LEADER
+
+
+# ── vault leader：客戶簽章路徑也要攜帶 kind（2026-07-31 Wave 2）────────────
+
+def test_signed_change_to_a_vault_leader_carries_vault_kind(env):
+    """⭐ 簽章換到 vault leader → 解析結果 kind='vault'——這正是引擎每輪自衛
+    存在的理由：運行中經簽章換 leader，watcher 不會重寫 env，引擎層若拿不到
+    正確 kind，vault 保護（槓桿上限＋流量中性化）就整條失效。"""
+    env.set_allowlist([{"address": _OLD_LEADER, "name": "Alpha"},
+                       {"address": _NEW_LEADER, "name": "Delta", "kind": "vault"}])
+    env.write_change()
+    res = env.applier().effective(_BASE)
+    assert res == LeaderResolution(_NEW_LEADER, SOURCE_CUSTOMER_SIGNED, "vault")
+    # 已套用的 override 在之後的每一輪（含重啟後）同樣攜帶 vault kind。
+    res2 = env.applier().effective(_BASE)
+    assert res2 == LeaderResolution(_NEW_LEADER, SOURCE_CUSTOMER_SIGNED, "vault")
