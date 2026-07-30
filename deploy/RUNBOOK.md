@@ -238,8 +238,21 @@ readlink -f .venv/bin/python    # 應指向 /opt/filet/python/...，不得出現
 # ⭐ 還原成 root 所有——這一步不是收尾潔癖，是安全邊界：三個 service user 跑的就是
 # 這棵樹底下的程式碼，留成 ubuntu 所有＝任何拿到 ubuntu 的人都能改服務執行的程式碼
 # （不需要 sudo、不會留下 sudo 稽核紀錄）。重新部署跑完 uv sync 後務必回到這一行。
-sudo chown -R root:root /opt/filet/spark
-sudo chmod -R go-w /opt/filet/spark   # 確保 group/other 無寫入權（唯讀給三個 service user）
+# ⚠️⚠️ **必須排除 `var/`**（2026-07-30 實機部署發現）：`var/filet/` 底下有引擎自己
+# 寫入的檔案（`builder_accrued_snapshot.json`，owner `filet-engine`，600）。無差別
+# `chown -R root:root /opt/filet/spark` 會把它收成 root，引擎下次寫 builder 費用
+# 快照就 Permission denied——而那是靜默失敗（快照寫不進去不會擋跟單），要等對帳
+# 對不上才會發現。`var/` 的權限由 §2 權限表與 §5.5 各自規定，部署不該碰它。
+sudo find /opt/filet/spark -path /opt/filet/spark/var -prune -o -print0 \
+  | sudo xargs -0 chown root:root
+sudo find /opt/filet/spark -path /opt/filet/spark/var -prune -o -print0 \
+  | sudo xargs -0 chmod go-w   # group/other 無寫入權（唯讀給三個 service user）
+
+# 驗收：程式碼樹已無非 root 檔案（`.venv/bin` 的幾個 symlink 例外——chown 不跟隨
+# symlink，而它們的所在目錄已是 root 且無群組寫入權，改不動）
+sudo find /opt/filet/spark -path /opt/filet/spark/var -prune -o ! -user root -print | wc -l
+# 驗收：var/ 的 owner 完全沒被動到
+sudo ls -la /opt/filet/spark/var/filet/   # builder_accrued_snapshot.json 應仍是 filet-engine
 
 # 驗收：venv 與 repo 根都已回到 root 所有（重新部署時最容易漏的一步）
 sudo ls -ld /opt/filet/spark /opt/filet/spark/.venv   # 預期：兩行都是 root root
