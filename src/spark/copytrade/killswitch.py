@@ -224,12 +224,16 @@ def halt_status(root: Path) -> dict | None:
         return None
     parsed = _read_arm_payload(arm_path)
     if parsed is None:
-        return {"tripped": True, "reason": None, "tripped_at": None, "resumable": False}
+        return {"tripped": True, "reason": None, "tripped_at": None,
+                "residual_exposure": None, "resumable": False}
     tripped_at, reason, _, residual = parsed
     # `resumable` 回答的是「**客戶自己**能不能解」（頁面上那顆按鈕），所以用 manual
-    # 語意：絕對底線客戶簽章可解、冷靜期不自動解。殘留暴險一律不可解（見上）。
+    # 語意：絕對底線客戶簽章可解、冷靜期不自動解。
+    # ⚠️ 殘留暴險**不影響** resumable（2026-07-31 使用者裁決，見 manual_rearm），
+    # 但必須單獨揭露：客戶按那顆按鈕之前有權知道「熔斷時有部位沒平乾淨」。
     return {"tripped": True, "reason": reason, "tripped_at": tripped_at,
-            "resumable": (not residual) and rearm_allowed_for(reason, manual=True)}
+            "residual_exposure": residual,
+            "resumable": rearm_allowed_for(reason, manual=True)}
 
 
 def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Notifier,
@@ -252,6 +256,8 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
     - **平倉失敗或掛單未撤**（ARM payload 的 `failures`／`orders_not_cancelled`）：
       市場上還有沒收乾淨的部位，trip 的告警已經說了「需人工處置」。自動恢復會讓
       引擎在一個它自己都沒整理乾淨的帳戶上重新開始交易（審查 F1-B）。
+      ⚠️ 這一條**只擋自動恢復**：客戶親自簽章的自助解除不受此限（2026-07-31
+      使用者裁決，見 `manual_rearm`）——差別在於那條路徑有一個知情的人做了決定。
 
     冷靜期結束後只重置**7 天滾動樣本**（`trip()` 已在觸發當下清掉），恢復後不會被
     崩跌前的舊 peak 立刻再熔斷。⚠️ 全期高水位**不清**——絕對底線的意義正是不隨
@@ -349,10 +355,14 @@ def manual_rearm(root: Path, notifier: Notifier, *,
             f"觸發原因為 `{reason or '未標示'}`，不屬於客戶可自助解除的風險事件"
             f"（leader 撤銷、營運端緊急停機等只能人工處理）",
             f"manual_rearm_blocked:{reason}")
-    if residual:
-        return _stay(
-            "熔斷當下有部位平倉失敗或掛單未撤（ARM 檔記有殘留暴險）——"
-            "自助解除不執行，需人工確認帳戶已收乾淨", "manual_rearm_residual")
+    # ⚠️ 殘留暴險（平倉失敗／掛單未撤）**不擋自助解除**（2026-07-31 使用者裁決）。
+    # 我原本擋在這裡，使用者的理由更好：客戶明確要求恢復時，恢復本身就是收拾殘局的
+    # 手段——引擎下一輪的 `sync_positions` 會把殘留部位往 leader 的目標收斂，而維持
+    # 鎖定只會讓那個部位**無人管理**地留在市場上。差別在於這條路徑有人做決定
+    # （而且是簽了章的決定），自動冷靜期那條沒有——所以 `auto_rearm_if_cooled_down`
+    # 仍然擋（見該函式）。客戶按下去之前會在頁面上看到「有部位未平乾淨」的提示
+    # （`halt_status` 的 `residual_exposure`），這是「知情的決定」的那一半。
+    _ = residual
     try:
         requested_s = datetime.fromisoformat(requested_at_iso).timestamp()
     except (ValueError, TypeError):

@@ -748,6 +748,10 @@ function HaltedNotice({ halted, busy, note, error, onResume }: {
       {halted.resume_at !== null
         ? <p className="hint mono">{h.resumeAtLabel}: {halted.resume_at}</p>
         : <p className="hint">{h.noAutoResume}</p>}
+      {/* ⭐ 殘留部位：不擋恢復，但要讓客戶在按下去之前看到（知情的決定）。 */}
+      {halted.residual_exposure === true && (
+        <p className="hint risk-halt-residual">{h.residualNote}</p>
+      )}
       {resumable ? (
         <>
           <p className="hint">{h.resumeNote}</p>

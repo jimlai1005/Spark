@@ -331,6 +331,12 @@ export interface RiskHaltedInfo {
    * `null` ＝引擎版本較舊、判不出來 ⇒ 同樣不給按鈕。
    */
   resumable: boolean | null;
+  /**
+   * ⭐ 熔斷當下有部位未平掉／掛單未撤。**不影響** `resumable`（客戶仍可自助恢復，
+   * 恢復本身就是收拾殘局的手段），但必須顯示出來——客戶按下那顆按鈕之前有權知道
+   * 市場上還留著什麼。`null` ＝引擎版本較舊或讀不到。
+   */
+  residual_exposure: boolean | null;
   /** 熔斷當下生效的冷靜期（小時）；`null` ＝ 讀不到。 */
   cooldown_hours: string | null;
   /** 依冷靜期推算的自動恢復時刻；`null` ＝ 不會自動恢復（冷靜期 0）或算不出來。 */

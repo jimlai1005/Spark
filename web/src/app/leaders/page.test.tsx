@@ -195,7 +195,7 @@ function myRisk(over: Partial<MyRiskResp> = {}): MyRiskResp {
     },
     halted: {
       tripped: false, reason: null, tripped_at: null, resumable: null,
-      cooldown_hours: null, resume_at: null,
+      residual_exposure: null, cooldown_hours: null, resume_at: null,
     },
     editable: true,
     ...over,
@@ -232,6 +232,7 @@ function halted(over: Partial<NonNullable<MyRiskResp["halted"]>> = {}) {
   return myRisk({
     halted: {
       tripped: true, reason: "max_drawdown_pct", resumable: true,
+      residual_exposure: false,
       tripped_at: "2026-07-30T04:00:00Z", cooldown_hours: "12",
       resume_at: "2026-07-30T16:00:00Z", ...over,
     },
@@ -1121,5 +1122,26 @@ describe("LeadersPage — 熔斷與立即恢復跟單", () => {
     await screen.findByRole("checkbox", { name: RISK_TOGGLE });
     expect(screen.queryByText("你的跟單已被風控停止")).not.toBeInTheDocument();
     expect(screen.queryByText(/目前無法確認你的風控是否被觸發/)).not.toBeInTheDocument();
+  });
+});
+
+describe("LeadersPage — 熔斷時的殘留部位（2026-07-31 使用者裁決）", () => {
+  it("⭐⭐ 有殘留部位：**照樣**顯示恢復按鈕，但同時把殘留部位講出來", async () => {
+    // 使用者裁決：殘留部位不擋自助解鎖——恢復本身就是收拾殘局的手段（引擎下一輪
+    // 會把它往 leader 的目標收斂），維持鎖定只會讓那個部位無人管理地留在市場上。
+    // 但客戶按下去之前有權知道市場上還留著什麼。
+    getMyRisk.mockResolvedValue(halted({ residual_exposure: true }));
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText(/有部位未能平倉或掛單未撤/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: RESUME_BUTTON })).toBeInTheDocument();
+  });
+
+  it("沒有殘留部位 → 不顯示那句提示（不製造不存在的疑慮）", async () => {
+    getMyRisk.mockResolvedValue(halted({ residual_exposure: false }));
+    render(wrap(<LeadersPage />));
+
+    await screen.findByRole("button", { name: RESUME_BUTTON });
+    expect(screen.queryByText(/有部位未能平倉或掛單未撤/)).not.toBeInTheDocument();
   });
 });

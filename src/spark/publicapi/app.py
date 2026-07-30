@@ -1551,6 +1551,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             return ("你的跟單目前因熔斷而停止交易。這顆引擎回報的版本較舊，"
                     "尚無法確認熔斷原因與能否自助恢復——請稍候重新整理。")
         reason = halt.get("reason")
+        residual = ("⚠️ 熔斷當下有部位未能平倉或掛單未撤，那些部位仍在市場上。"
+                    "恢復跟單後引擎會在下一輪把它們往 leader 的目標收斂。"
+                    if halt.get("residual_exposure") else "")
         if halt.get("resumable"):
             # ⭐ 冷靜期 0 ＝**不會**自動恢復，不能沿用同一句（審查 F6）：那會讓客戶
             # 以為只要等就好，而實際上他不按就永遠不會恢復。
@@ -1568,7 +1571,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             base = ("你的跟單目前因**累計虧損達到你設定的絕對底線**而停止交易。"
                     if reason == "total_drawdown"
                     else "你的跟單目前因風控熔斷而停止交易。")
-            return base + auto
+            return base + auto + residual
         # ⚠️ 不可自助恢復有三種來源，不得一律說成「leader 被撤銷」（審查 F4）：
         # 客戶會被告知一件不曾發生的事，並被導去做一個解決不了問題的動作。
         if reason == "leader_revoked":
@@ -1682,6 +1685,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "reason": (halt or {}).get("reason"),
             "tripped_at": (halt or {}).get("tripped_at"),
             "resumable": (halt or {}).get("resumable") if tripped else None,
+            # ⭐ 熔斷當下有部位沒平乾淨——**不擋**自助恢復（2026-07-31 使用者裁決），
+            # 但客戶按下那顆按鈕之前有權知道。None ＝ 引擎版本較舊或讀不到。
+            "residual_exposure": (halt or {}).get("residual_exposure"),
             # 冷靜期取自**引擎實際在執法的**那一組（心跳的 applied prefs），不是客戶
             # 剛提交但可能還沒生效的那一份——顯示的恢復時刻必須是真的會發生的那個。
             "cooldown_hours": cooldown_h,

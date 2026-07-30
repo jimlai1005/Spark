@@ -742,7 +742,11 @@ def test_operator_panic_halt_never_auto_resumes(tmp_path):
 def test_halt_with_unflattened_positions_never_auto_resumes(tmp_path):
     """⭐⭐ F1-B：熔斷時平倉失敗（ARM payload 有 failures）＝市場上還有沒收乾淨的
     部位，trip 的告警已寫「需人工處置」。那句話與「12 小時後自動恢復交易」不可能
-    同時成立。觸發情境：回撤熔斷 → close_reduce_only 對 ETH 失敗 → 放著滿 12 小時。"""
+    同時成立。觸發情境：回撤熔斷 → close_reduce_only 對 ETH 失敗 → 放著滿 12 小時。
+
+    ⚠️ 這一條**只擋自動恢復**：客戶親自簽章的自助解除不受此限（2026-07-31 使用者
+    裁決）——見下一個測試。差別在於那條路徑有一個知情的人做了決定。
+    """
     at, now = _hours_ago(20)
     p = tmp_path / ARM_FILE_RELPATH
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -753,7 +757,35 @@ def test_halt_with_unflattened_positions_never_auto_resumes(tmp_path):
                                      n, now_s=now) is False
     assert p.exists()
     assert any("殘留暴險" in r[2] for r in n.records)
-    assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is False
+
+
+def test_owner_can_self_resume_even_with_unflattened_positions(tmp_path):
+    """⭐⭐ 2026-07-31 使用者裁決：殘留部位**不擋**自助解除。
+
+    理由（使用者的，比我原本的擋法更好）：客戶明確要求恢復時，恢復本身就是收拾
+    殘局的手段——引擎下一輪會把殘留部位往 leader 的目標收斂，而維持鎖定只會讓那個
+    部位無人管理地留在市場上。觸發情境：平倉失敗後客戶在頁面上按「立即恢復跟單」。
+    """
+    at, _ = _hours_ago(2)
+    p = tmp_path / ARM_FILE_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"tripped_at": at, "reason": "drawdown",
+                             "failures": ["ETH"], "orders_not_cancelled": True}))
+    n = RecordingNotifier()
+    assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is True
+    assert not p.exists()
+
+
+def test_halt_status_discloses_residual_exposure_without_blocking(tmp_path):
+    """殘留暴險不擋 `resumable`，但必須單獨揭露——客戶按那顆按鈕之前有權知道。"""
+    from spark.copytrade.killswitch import halt_status
+    at, _ = _hours_ago(2)
+    p = tmp_path / ARM_FILE_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"tripped_at": at, "reason": "drawdown",
+                             "failures": ["ETH"]}))
+    st = halt_status(tmp_path)
+    assert st["resumable"] is True and st["residual_exposure"] is True
 
 
 def test_orders_not_cancelled_also_blocks_resume(tmp_path):
