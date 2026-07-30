@@ -881,3 +881,27 @@ def test_heartbeat_never_carries_risk_signature_material(monkeypatch, tmp_path):
     raw = path.read_text()
     assert rec["signature"] not in raw
     assert rec["nonce"] not in raw
+
+
+def test_heartbeat_reports_out_of_customer_range_thresholds(tmp_path):
+    """⭐⭐ 心跳回報的是「引擎**正在執行**什麼」，不是「客戶**可以選**什麼」。
+
+    觸發情境（2026-07-30 部署時在正式機上實際發生）：營運端人工把某 follower 的
+    `COPY_MAX_DRAWDOWN_PCT` 設成 0.99（客戶可選區間是 [0.05, 0.50]）。修正前，投影
+    函式拿客戶區間去驗證它 → 拋例外 → 心跳整格變成 null，面板在最需要看到「這顆
+    引擎的回撤門檻高到形同沒有保護」的時候完全沉默。
+    """
+    from decimal import Decimal
+
+    from scripts.run_copytrade import _risk_prefs_snapshot
+    from spark.copytrade.config import CopySettings
+
+    s = CopySettings(max_drawdown_pct=Decimal("0.99"),      # 遠超客戶可選上界
+                     max_total_drawdown_pct=Decimal("0"),   # 絕對底線停用
+                     size_tolerance=Decimal("0.08"))
+    snap = _risk_prefs_snapshot(s)
+    assert snap is not None, "超出客戶區間不得讓心跳拒絕回報"
+    assert snap["max_drawdown_pct"] == "0.99"
+    assert snap["max_total_drawdown_pct"] == "0"
+    assert snap["flatten_on_breach"] is True
+    assert _risk_prefs_snapshot(None) is None       # settings 未載入 ＝ 未知

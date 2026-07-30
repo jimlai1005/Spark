@@ -381,18 +381,26 @@ def _risk_prefs_snapshot(settings) -> dict | None:
     ⭐ 由 `risk_prefs.RISK_PARAM_SPECS` 驅動（不逐欄位手寫）：新增一個可調參數時，
     心跳會自動跟著帶上它，不必記得回來改這裡——漏掉的症狀是「客戶改了但頁面說
     已生效」，而那正是這一格要修的問題。settings 尚未載入 → None（未知）。
+
+    ⚠️⚠️ **刻意不走 `canonical_prefs`**（2026-07-30 部署時實機發現）：那個函式驗的是
+    「客戶**可以選**什麼」，而這裡回報的是「引擎**正在執行**什麼」——兩者不是同一個
+    問題。營運端人工設定的值合法地可以落在客戶可選區間之外（實例：某 follower 的
+    `COPY_MAX_DRAWDOWN_PCT=0.99`，客戶區間是 [0.05, 0.50]），拿客戶的區間去驗證它
+    會讓心跳整格變成 null——**回報功能因為值「太危險」而拒絕回報那個值**，正好在最
+    需要看到它的時候沉默。格式化用 `f"{v:f}"`（定點、不用科學記號），不做任何判定。
     """
     if settings is None:
         return None
-    from spark.filet.risk_prefs import RISK_PARAM_SPECS, canonical_prefs
+    from spark.filet.risk_prefs import RISK_PARAM_SPECS
     from spark.filet.risk_settings_apply import copy_settings_field
     try:
-        raw = {"enabled": bool(settings.risk_controls_enabled)}
+        out: dict = {"enabled": bool(settings.risk_controls_enabled)}
         for spec in RISK_PARAM_SPECS:
             # spec → CopySettings 欄位名的對映只有一份（copy_settings_field），
             # 這裡不自己再推導一次：兩份推導會在新增參數時安靜地分岔。
-            raw[spec["name"]] = getattr(settings, copy_settings_field(spec))
-        return canonical_prefs(raw)
+            v = getattr(settings, copy_settings_field(spec))
+            out[spec["name"]] = bool(v) if spec["type"] == "bool" else f"{v:f}"
+        return out
     except Exception:  # noqa: BLE001 — 心跳是可觀測性，組不出來不得影響跟單
         logger.warning("風控門檻投影失敗（心跳該格為未知）", exc_info=True)
         return None
