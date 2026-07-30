@@ -782,9 +782,14 @@ equity basis 是「錢包形態專屬」的性質（工程原則 1，事故 #3�
 
 ```bash
 cd /opt/filet/spark
-SPARK_NETWORK=mainnet uv run python -m scripts.vault_preflight <vault_addr>
+sudo -u ubuntu SPARK_NETWORK=mainnet .venv/bin/python -m scripts.vault_preflight <vault_addr>
 # 六項全 PASS → exit 0；任一 FAIL → exit 1（不要帶著 FAIL 上架）
 ```
+
+> ⚠️ 用 `.venv/bin/python` 直跑、**不要用 `uv run`**（2026-07-31 實機部署發現）：
+> 部署後程式碼樹是 root 所有（§3.2 安全邊界），`uv run` 會想重建 editable 安裝
+> → 對 `.venv` 寫入 → Permission denied。服務本身就是用 `.venv/bin/python` 起的，
+> preflight 照同一條路走。
 
 | 檢查 | 驗什麼 | FAIL 代表什麼 |
 |---|---|---|
