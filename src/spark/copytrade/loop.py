@@ -212,25 +212,37 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
                 dedup_key="leader_flow_fetch_failed",
             )
         else:
-            if unknown:
+            # 解讀段自己的 try：同一筆髒 ledger 資料（例如 unknown 含 None 讓
+            # join 炸、flows 帶壞值讓 adjusted 炸）在 36h 窗內每輪都在——若例外
+            # 逃出 run_cycle，連續錯誤計數會把 main_loop 推到 SystemExit 停機。
+            # 解讀失敗與取數失敗同級：降級（本輪退回 raw）＋ warn，不是熔斷。
+            try:
+                if unknown:
+                    notifier.warn(
+                        "leader_flow",
+                        f"leader ledger 出現白名單外型別：{', '.join(unknown)}——"
+                        f"中性化的恆等式基礎可能不成立，請人工核對",
+                        dedup_key="leader_flow_unknown_types",
+                    )
+                adj = adjusted_leader_equity(raw, flows, now_ms, decay_ms)
+                if adj <= 0 < raw:
+                    # 幻影歸零防護：中性化是「計算產物」，不得觸發 scale=0 的全平
+                    # 語意（讀不到錢 ≠ 錢虧光——工程原則，事故 #4 同型）。
+                    notifier.critical(
+                        "leader_flow",
+                        f"中性化後分母 {adj} ≤ 0 而 raw={raw} > 0——流量資料可疑，"
+                        f"本輪退回未中性化分母（拒絕以計算產物觸發 scale=0）",
+                        dedup_key="leader_flow_nonpositive",
+                    )
+                else:
+                    leader_equity = adj
+            except Exception as e:  # noqa: BLE001 —— 解讀失敗是降級不是熔斷
+                leader_equity = raw
                 notifier.warn(
                     "leader_flow",
-                    f"leader ledger 出現白名單外型別：{', '.join(unknown)}——"
-                    f"中性化的恆等式基礎可能不成立，請人工核對",
-                    dedup_key="leader_flow_unknown_types",
+                    f"leader 申贖流量解讀失敗（{e!r}），本輪退回未中性化分母",
+                    dedup_key="leader_flow_interpret_failed",
                 )
-            adj = adjusted_leader_equity(raw, flows, now_ms, decay_ms)
-            if adj <= 0 < raw:
-                # 幻影歸零防護：中性化是「計算產物」，不得觸發 scale=0 的全平
-                # 語意（讀不到錢 ≠ 錢虧光——工程原則，事故 #4 同型）。
-                notifier.critical(
-                    "leader_flow",
-                    f"中性化後分母 {adj} ≤ 0 而 raw={raw} > 0——流量資料可疑，"
-                    f"本輪退回未中性化分母（拒絕以計算產物觸發 scale=0）",
-                    dedup_key="leader_flow_nonpositive",
-                )
-            else:
-                leader_equity = adj
 
     # ── 4. weight / scale ─────────────────────────────────────────────
     if settings.volatility_weight_enabled:

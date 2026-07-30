@@ -61,6 +61,14 @@ def test_returns_decimal_type():
     assert isinstance(_adj([_flow("1000", 0)]), Decimal)
 
 
+def test_decay_ms_zero_returns_raw_without_division_error():
+    """回歸：config 驗 flow_decay_hours > 0，但 int(hours × 3_600_000) 對極小值
+    截斷成 0 → Decimal(age)/Decimal(0) 除零。結構性防護：decay_ms ≤ 0 → 回 raw
+    （零衰減窗＝所有流量視同已完全衰減）。"""
+    assert adjusted_leader_equity(RAW, [_flow("1000", 0)], NOW_MS, 0) == RAW
+    assert adjusted_leader_equity(RAW, [_flow("-500", 0)], NOW_MS, -1) == RAW
+
+
 # ── config 欄位（Wave 4 規格 A）────────────────────────────────────────
 def test_settings_defaults_disabled_and_36h():
     s = CopySettings()

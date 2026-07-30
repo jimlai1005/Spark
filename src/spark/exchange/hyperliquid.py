@@ -307,27 +307,29 @@ class HyperliquidAdapter(ExchangeAdapter):
         flows = []
         unknown_types = set()
 
+        # unknown_types 只放字串：delta 缺 type（None）進 set 會讓下游
+        # sorted/", ".join 混型 TypeError——一筆髒 ledger 資料不得炸掉呼叫端。
         for item in raw:
             delta = item.get("delta", {})
             delta_type = delta.get("type")
             time_ms = int(item.get("time", 0))
 
-            if delta_type == "vaultDeposit":
-                usdc = Decimal(str(delta.get("usdc", "0")))
-                flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
-            elif delta_type == "deposit":
-                usdc = Decimal(str(delta.get("usdc", "0")))
-                flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
-            elif delta_type == "withdraw":
-                usdc = -Decimal(str(delta.get("usdc", "0")))
-                flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
-            elif delta_type == "vaultWithdraw":
-                usdc = -Decimal(str(delta.get("netWithdrawnUsd", "0")))
+            if delta_type in ("vaultDeposit", "deposit", "withdraw", "vaultWithdraw"):
+                amount_field = ("netWithdrawnUsd" if delta_type == "vaultWithdraw"
+                                else "usdc")
+                amount = delta.get(amount_field)
+                if amount is None:
+                    # 白名單型別缺金額欄位：不得靜默補 "0"（無聲少算一筆流量，
+                    # 中性化恆等式基礎悄悄崩掉）——記進 unknown 讓呼叫端告警。
+                    unknown_types.add(f"{delta_type}:missing-amount")
+                    continue
+                sign = 1 if delta_type in ("vaultDeposit", "deposit") else -1
+                usdc = sign * Decimal(str(amount))
                 flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
             else:
-                unknown_types.add(delta_type)
+                unknown_types.add(str(delta_type))
 
-        return flows, sorted(list(unknown_types))
+        return flows, sorted(unknown_types)
 
     # --- writes ---
     # 以下 main_signer / agent_signer 參數為介面文件性質；實際簽章者 = 建構時綁定

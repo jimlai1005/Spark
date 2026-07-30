@@ -540,3 +540,35 @@ def test_get_ledger_flows_collects_unknown_types_deduplicated():
     assert sorted(unknown) == unknown  # 升冪排序
     assert set(unknown) == {"accountTransfer", "feeRebate"}  # 去重
     assert unknown == ["accountTransfer", "feeRebate"]
+
+
+def test_get_ledger_flows_missing_type_is_stringified_not_typeerror():
+    """回歸：delta 缺 type（None）曾原樣進 set → 下游 sorted/join 混型 TypeError。
+    修法：unknown 一律存字串——None 進來變 "None"，排序與 join 永不炸。"""
+    ledger_raw = [
+        {"time": 1000, "delta": {"usdc": "100"}},                    # 缺 type
+        {"time": 2000, "delta": {"type": "deposit", "usdc": "50"}},  # 正常
+    ]
+    ad = _adapter(ledger_updates=ledger_raw)
+    flows, unknown = ad.get_ledger_flows("0xuser", 0)
+    assert len(flows) == 1
+    assert flows[0].usdc == Decimal("50")
+    assert unknown == ["None"]
+    assert all(isinstance(t, str) for t in unknown)
+    ", ".join(unknown)  # 下游 loop 的 join 用法必須可行
+
+
+def test_get_ledger_flows_whitelisted_type_missing_amount_is_flagged_and_skipped():
+    """回歸：白名單型別缺金額欄位曾被靜默補 "0"——無聲少算一筆流量。
+    修法：記 "<type>:missing-amount" 進 unknown（大聲），該筆不入 flows。"""
+    ledger_raw = [
+        {"time": 1000, "delta": {"type": "vaultDeposit"}},              # 缺 usdc
+        {"time": 2000, "delta": {"type": "vaultWithdraw"}},             # 缺 netWithdrawnUsd
+        {"time": 3000, "delta": {"type": "deposit", "usdc": "50"}},     # 正常
+    ]
+    ad = _adapter(ledger_updates=ledger_raw)
+    flows, unknown = ad.get_ledger_flows("0xuser", 0)
+    assert len(flows) == 1  # 缺金額的兩筆不入 flows（也不以 0 偽裝）
+    assert flows[0].usdc == Decimal("50")
+    assert "vaultDeposit:missing-amount" in unknown
+    assert "vaultWithdraw:missing-amount" in unknown

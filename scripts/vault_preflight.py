@@ -113,6 +113,12 @@ def run_checks(data: PreflightData) -> list[CheckResult]:
     month = _window(data.portfolio, "month")
     if month is None:
         out.append(CheckResult("flow-neutral-pnl", False, "portfolio 缺 month 窗"))
+    elif not month.get("accountValueHistory") or not month.get("pnlHistory"):
+        # 新 vault：month 窗存在但樣本為空——[-1] 會 IndexError，閘門腳本不得吐
+        # traceback；歷史不足無法機器判定恆等式，一律 FAIL 交人工。
+        out.append(CheckResult(
+            "flow-neutral-pnl", False,
+            "月窗樣本為空——vault 歷史不足 30 天，恆等式無法機器判定，人工研判"))
     else:
         avh = month["accountValueHistory"]
         d_av = Decimal(str(avh[-1][1])) - Decimal(str(avh[0][1]))
@@ -129,6 +135,10 @@ def run_checks(data: PreflightData) -> list[CheckResult]:
     if month is None or perp_month is None:
         out.append(CheckResult("no-spot-pollution", False,
                                "portfolio 缺 month 或 perpMonth 窗"))
+    elif not month.get("pnlHistory") or not perp_month.get("pnlHistory"):
+        out.append(CheckResult(
+            "no-spot-pollution", False,
+            "月窗樣本為空——vault 歷史不足 30 天，pnl 一致性無法機器判定，人工研判"))
     else:
         pnl_m, pnl_pm = _pnl_end(month), _pnl_end(perp_month)
         out.append(CheckResult(

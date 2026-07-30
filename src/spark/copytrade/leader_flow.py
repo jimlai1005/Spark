@@ -24,6 +24,12 @@ def adjusted_leader_equity(raw: Decimal, flows: list[LedgerFlow],
     - flow.usdc 有號：入金 +（分母扣除）、出金 −（分母加回）。
     - 全程 Decimal；age/decay 用 Decimal 除法（避免 float 二進位噪音進分母）。
     """
+    if decay_ms <= 0:
+        # 結構性防護：config 驗 flow_decay_hours > 0，但 int(hours × 3_600_000)
+        # 對極小值會截斷成 0 → 下方 Decimal(age)/Decimal(decay_ms) 除零。
+        # 截斷後的零衰減窗＝所有流量視同已完全衰減 → 回 raw。
+        # 注意：「關閉中性化」走 enabled flag，不走這裡。
+        return raw
     adjustment = Decimal("0")
     for f in flows:
         age = max(now_ms - f.time_ms, 0)

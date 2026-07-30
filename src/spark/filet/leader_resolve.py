@@ -396,6 +396,16 @@ class LeaderWatch:
             logger.info("leader 位址不變（%s），來源 %s → %s", new.address,
                         self.current.source, new.source)
             self.current = new
+        elif new.kind != self.current.kind:
+            # kind-only 變更（operator 對既有位址補標／改標 vault）不是小事：
+            # 引擎每輪按本輪 kind 套 vault 保護（20x 帽＋流量中性化），丟棄這個
+            # 變更＝保護層靜默失效。必須更新 current（否則每輪重複判為變更）＋大聲。
+            old_kind = self.current.kind
+            self.current = new
+            self._critical(
+                f"**leader kind 變更**：{new.address} {old_kind} → {new.kind}——"
+                f"vault 保護層（20x 帽＋流量中性化）隨之切換",
+                dedup_key=f"leader_kind_changed:{new.address}:{new.kind}")
         return self.current
 
     def _wind_down(self, e: LeaderRevokedError) -> None:

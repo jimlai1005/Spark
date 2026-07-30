@@ -155,6 +155,24 @@ def test_check4_fails_when_perp_month_pnl_off_by_1_dollar():
     assert by["flow-neutral-pnl"].passed  # 恆等式看 month 窗，未被動到
 
 
+def test_empty_month_histories_fail_checks_3_and_4_without_traceback():
+    """回歸：month 窗存在但 history 為空（新 vault 歷史不足）曾讓 avh[-1]
+    IndexError——閘門腳本吐 traceback。修法：檢查 3/4 對空 history 回 FAIL。"""
+    empty = {"accountValueHistory": [], "pnlHistory": [], "vlm": "0.0"}
+    p = [["day", _period("1.0")], ["month", empty], ["perpMonth", empty]]
+    results = run_checks(_data(portfolio=p))  # 不得拋例外
+    by = _by_name(results)
+    assert not by["flow-neutral-pnl"].passed
+    assert "月窗樣本為空" in by["flow-neutral-pnl"].detail
+    assert not by["no-spot-pollution"].passed
+    assert "月窗樣本為空" in by["no-spot-pollution"].detail
+    # 其餘檢查照常執行、不受牽連
+    assert by["is-vault"].passed
+    assert by["perp-resident-tvl"].passed
+    assert by["ledger-type-whitelist"].passed
+    assert [r.name for r in results] == EXPECTED_NAMES
+
+
 def test_check6_fails_on_unknown_ledger_type():
     extra = [{"time": TS0 + 6_000, "hash": "0x6",
               "delta": {"type": "accountClassTransfer", "usdc": "5.0", "toPerp": True}}]

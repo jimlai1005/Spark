@@ -399,6 +399,27 @@ def test_watch_source_only_change_is_not_critical():
     assert n.records == []
 
 
+def test_watch_kind_only_change_updates_current_and_alerts():
+    """⭐ kind-only 變更（operator 對既有位址補標 vault）→ current 必須更新＋critical。
+
+    回歸：舊版 refresh() 只看 address/source，kind-only 變更被丟棄——引擎每輪
+    拿到舊 kind，vault 保護兩層（20x 帽＋流量中性化）皆不生效且無告警。
+    """
+    n = RecordingNotifier()
+    vault = LeaderResolution(_LEADER, SOURCE_MANIFEST, "vault")
+    w = LeaderWatch(_A, lambda: vault, n)   # _A：同位址同來源，kind='standard'
+    got = w.refresh()
+    assert got.kind == "vault"              # 本輪起引擎必須拿到新 kind
+    assert w.current == vault               # current 已更新（不再每輪重複判為變更）
+    crits = _crits(n)
+    assert len(crits) == 1
+    assert "vault" in crits[0][2] and "保護" in crits[0][2]
+    assert crits[0][3] == f"leader_kind_changed:{_LEADER}:vault"
+    # 再 refresh 一次（無變化）→ 不重複告警（結構性 dedup：current 已是新值）
+    assert w.refresh() == vault
+    assert len(_crits(n)) == 1
+
+
 def test_watch_recovers_after_transient_failure(tmp_path):
     """失敗一輪沿用舊值，下一輪解析成功即恢復——失敗不是終態。"""
     n = RecordingNotifier()

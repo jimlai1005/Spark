@@ -189,3 +189,9 @@
   `_kind_of` 查無條目回 `"standard"`（`src/spark/filet/leader_change_apply.py:122-131`
   註解）——vault 保護可能缺席一輪，下一輪白名單恢復即恢復。已知、方向短暫 fail-open，
   但窗口為單輪且需與 transient 讀失敗同時發生。
+- **流量型別映射雙實作**：ledger delta type 的白名單＋計號邏輯在
+  `src/spark/exchange/hyperliquid.py`（`get_ledger_flows`）與
+  `scripts/vault_preflight.py`（`_signed_flow`／`ALLOWED_LEDGER_TYPES`）各自實作——
+  語意目前一致，但一旦漂移，preflight 會繼續 PASS 而引擎算的是另一套。應抽單一函式共用。
+- **heartbeat 未發布 leader kind**：vault 保護（20x 帽＋流量中性化）是否生效沒有觀測面——
+  操作者無法從 heartbeat 確認引擎當下把 leader 當 vault 還是 standard，只能翻 log。

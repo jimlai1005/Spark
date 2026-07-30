@@ -418,6 +418,28 @@ def test_flow_unknown_ledger_types_warn_with_type_names(tmp_path, monkeypatch):
                for r in warns)
 
 
+def test_flow_interpret_failure_falls_back_to_raw_with_warn(tmp_path, monkeypatch):
+    """回歸：解讀段（join／adjusted／guard）曾裸奔在 try 之外——一筆髒 ledger
+    資料（unknown 含 None → join TypeError）會逃出 run_cycle，且同筆資料在 36h
+    窗內每輪都在 → 連續錯誤 → main_loop SystemExit 停機。
+    修法：解讀段自己的 try/except → warn ＋ 本輪退回 raw。"""
+    _pin_clock(monkeypatch)
+
+    class _DirtyLedgerAdapter(FakeAdapter):
+        def get_ledger_flows(self, address, start_ms):
+            return [], [None]  # 髒資料：join(unknown) 會 TypeError
+
+    fa = _DirtyLedgerAdapter(equity=_healthy_equity(), account=_account("1000"))
+    report, notifier, _ = _run(
+        fa, settings=_settings(leader_flow_neutralization_enabled=True),
+        tmp_path=tmp_path)
+    assert report.tripped is False               # run_cycle 正常完成，未逃出例外
+    assert report.scale == Decimal("1")          # raw 分母（my=leader=1000）
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    assert any("本輪退回未中性化分母" in r[2]
+               and r[3] == "leader_flow_interpret_failed" for r in warns)
+
+
 # ── 4. skip_trigger → warn（per-coin dedup）──────────────────────────
 def test_leader_trigger_order_surfaces_as_skip_trigger_warn(tmp_path):
     trigger = OpenOrder(oid=1, coin="ETH", is_buy=False, limit_px=Decimal("1900"),
