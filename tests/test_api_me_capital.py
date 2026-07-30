@@ -83,6 +83,7 @@ def write_hb(cfg, account_id, *, alloc="1000.00", util="0.5000", full=False,
         leader_address=_LEADER, leader_source="manifest",
         allocated_capital=alloc, capital_utilization=util, use_full_equity=full,
         capital_source=source, capital_changed_at=changed_at,
+        risk_controls_enabled=True,
         cycle_result="no_action", cycle_detail=None)
     write_heartbeat(heartbeat_path_for(cfg.exchange_dir, account_id), payload)
 

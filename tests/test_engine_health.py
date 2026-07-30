@@ -42,6 +42,7 @@ def _payload(now_s=_NOW, **over):
                 capital_utilization="0.4000", use_full_equity=False,
                 capital_source="customer_signed",
                 capital_changed_at="2026-07-19T00:00:00+00:00",
+                risk_controls_enabled=True,
                 cycle_result="no_action", cycle_detail=None)
     base.update(over)
     return build_heartbeat(**base)
@@ -100,6 +101,14 @@ def test_heartbeat_field_set_is_pinned_by_the_constant():
     欄位」這件事必須是有人主動做的決定，而不是某次重構的副作用。
     """
     assert tuple(_payload().keys()) == HEARTBEAT_FIELDS
+
+
+def test_risk_controls_flag_rides_the_heartbeat(tmp_path):
+    """⭐ 「這顆引擎沒有任何風控」必須看得見（2026-07-30）：狀態根對 filet-api
+    不可讀，心跳是面板唯一的來源。未知（settings 尚未載入）不得畫成 True。"""
+    assert _payload(risk_controls_enabled=False)["risk"] == {"controls_enabled": False}
+    assert _payload(risk_controls_enabled=True)["risk"] == {"controls_enabled": True}
+    assert _payload(risk_controls_enabled=None)["risk"] == {"controls_enabled": None}
 
 
 def test_coverage_read_error_reports_unknown_not_zero():

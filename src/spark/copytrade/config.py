@@ -89,6 +89,23 @@ class CopySettings:
     # ＋不做任何交易動作，equity 回升到未 breach 即自動恢復跟單——不寫 ARM 檔、
     # 不需人工 re-arm（與 True 的 kill switch 硬鎖死是兩種語意）。
     flatten_on_breach: bool = True
+    # ⭐⭐ 風控總開關（2026-07-30：錢包主人自選）。False ⇒ 回撤 kill switch 與成本
+    # 熔斷器**都不執法**（判定與平倉都不做）；True ⇒ 行為與本旗標存在之前完全相同。
+    #
+    # 為什麼是顯式布林而不是把門檻設成 0／0.99：`max_drawdown_pct` 的驗證是
+    # `0 < x < 1`（0 不合法），而 0.99 是「幾乎不可能觸發」不是「關閉」——兩者在
+    # 日誌與告警裡長得一樣，但一個是客戶的決定、另一個是設定錯誤。本檔對
+    # `allocated_capital` 的那段檢討（見下方）就是同一個教訓：值不該兼任開關。
+    #
+    # ⭐ 預設 True（安全側）刻意與「新錢包預設關」不一致：新錢包的關閉來自 env 範本
+    # （deploy/follower.env.autoactivate.example 的 COPY_RISK_CONTROLS_ENABLED=false），
+    # 而**既有部署的 env 沒有這一行**。若把 dataclass 預設改成 False，那些既有 env
+    # 會在下一次重啟時靜默失去風控——安全保護不該因為「沒設定」而消失（fail-open）。
+    #
+    # ⚠️ 本旗標**關不掉**兩件事，因為它們不是客戶的自我保護：
+    #   1. `killswitch.is_tripped` 的鎖檔短路——已鎖死的交易只能人工 re-arm；
+    #   2. leader 被白名單撤銷時的強制平倉（run_copytrade 層，屬合約與權限）。
+    risk_controls_enabled: bool = True
     # ⭐⭐ 跟單本金的**兩種模式，由顯式旗標選擇**（2026-07-19：解除 `0` 的語意重載）。
     # 舊版讓 `allocated_capital == 0` 兼任「用全部權益」的開關，於是同一個值同時是
     # 「邊界檢查的下界」與「語意開關」——兩者撞在一起的直接後果是：資金設定 API
@@ -209,6 +226,9 @@ class CopySettings:
             modify_policy=_env_str("COPY_MODIFY_POLICY", cls.modify_policy, env),
             flatten_on_breach=_env_bool(
                 "COPY_FLATTEN_ON_BREACH", str(cls.flatten_on_breach).lower(), env
+            ),
+            risk_controls_enabled=_env_bool(
+                "COPY_RISK_CONTROLS_ENABLED", str(cls.risk_controls_enabled).lower(), env
             ),
             allocated_capital=alloc,
             use_full_equity=_env_bool("COPY_USE_FULL_EQUITY",

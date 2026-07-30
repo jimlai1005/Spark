@@ -397,6 +397,8 @@ def _apply_heartbeat(row: dict, hb) -> dict:
     row["leader_address"] = leader.get("address")
     row["leader_source"] = leader.get("source")
     row["capital"] = data.get("capital")
+    # 風控總開關同 `capital`：狀態根沒有可讀投影，心跳是唯一來源。
+    row["risk"] = data.get("risk")
     row["last_cycle"] = data.get("last_cycle")
 
     # ⭐ 告警數：**只補未知的格子**（直讀已經給出數字時不覆蓋——它較新鮮）。

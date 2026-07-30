@@ -135,7 +135,14 @@ def _disabled_status() -> CostStatus:
 
 
 def is_enabled(settings: CopySettings) -> bool:
-    """兩項門檻皆 <= 0 ⇒ 完全停用（行為與加入本功能前完全一致，向後相容）。"""
+    """兩項門檻皆 <= 0 ⇒ 完全停用（行為與加入本功能前完全一致，向後相容）。
+
+    ⭐ 風控總開關關閉時（錢包主人自選，`risk_controls_enabled=False`）本閘一併停用。
+    在**這裡**判斷而不是在 `loop.run_cycle` 加一個 if：這個函式已經是「這道閘要不要
+    執法」的單一判定點（`evaluate_cost` 開頭就問它），多一處判斷就多一條會漂移的路。
+    """
+    if not settings.risk_controls_enabled:
+        return False
     return settings.cost_max_turnover_24h > 0 or settings.cost_max_fills_24h > 0
 
 

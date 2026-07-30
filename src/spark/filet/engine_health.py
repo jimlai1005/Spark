@@ -89,7 +89,7 @@ HEARTBEAT_STALE_S = 600
 # 心跳頂層鍵集（多一個少一個都要有人主動改這行，並被測試逼著解釋為什麼）。
 # 沿 CAPITAL_SETTINGS_FIELDS 的既有慣例：釘住它的是測試，不是註解。
 HEARTBEAT_FIELDS = ("account_id", "written_at", "written_at_s", "killswitch_tripped",
-                    "coverage", "alerts", "leader", "capital", "last_cycle")
+                    "coverage", "alerts", "leader", "capital", "risk", "last_cycle")
 
 # ⭐⭐ 禁止出現在心跳裡的鍵名片段（大小寫不敏感）。命中即拒寫，見
 # `_reject_secret_material`。清單刻意含 `nonce`／`message`：它們本身不是密鑰，
@@ -166,7 +166,8 @@ def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool |
                     leader_address: str | None, leader_source: str | None,
                     allocated_capital: str | None, capital_utilization: str | None,
                     use_full_equity: bool | None, capital_source: str,
-                    capital_changed_at: str | None, cycle_result: str,
+                    capital_changed_at: str | None,
+                    risk_controls_enabled: bool | None, cycle_result: str,
                     cycle_detail: str | None) -> dict:
     """組出一份心跳 payload（**唯一**的產生點，欄位順序＝HEARTBEAT_FIELDS）。
 
@@ -207,6 +208,12 @@ def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool |
                     "use_full_equity": use_full_equity,
                     "source": capital_source,
                     "changed_at": capital_changed_at},
+        # ⭐ 風控總開關（2026-07-30）：`False` ＝ 這顆引擎的回撤 kill switch 與成本
+        # 熔斷器都不執法（錢包主人自選）。放進心跳的理由與 `capital` 相同——狀態根
+        # 對 filet-api 不可讀，面板沒有別的來源；而「這顆引擎沒有任何風控」正是操作者
+        # 掃面板時最需要一眼看到的事。`None` ＝引擎自己也不知道（settings 尚未載入），
+        # 刻意與 False 分開：面板不得把「未知」畫成「有風控」。
+        "risk": {"controls_enabled": risk_controls_enabled},
         "last_cycle": {"result": cycle_result, "detail": cycle_detail},
     }
 

@@ -140,6 +140,67 @@ def test_breach_without_flatten_skips_trip_but_still_tripped_report(tmp_path, mo
     assert any(r[0] == "critical" and r[3] == "dd_breach" for r in notifier.records)
 
 
+# ── 2b. 風控總開關關閉（錢包主人自選，2026-07-30）─────────────────────
+# 關的是**執法**，不是蒐證；而且關不掉鎖檔短路。
+
+
+def test_risk_controls_off_does_not_trip_on_breach(tmp_path, monkeypatch):
+    """同 test_breach_with_flatten_calls_trip 的 breach 情境（dd=0.3 > 0.20），
+    但錢包主人關掉風控 ⇒ 不 trip、不發 dd_breach、本輪照常對帳。"""
+    monkeypatch.setattr(loop_mod, "trip",
+                        lambda *a, **k: pytest.fail("風控關閉時不得呼叫 trip"))
+    fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
+    _seed_equity_peak(tmp_path, "1000")
+    report, notifier, _ = _run(fa, settings=_settings(risk_controls_enabled=False),
+                               tmp_path=tmp_path)
+    assert report.tripped is False, "風控關閉時 breach 不得停止交易"
+    assert not any(r[3] == "dd_breach" for r in notifier.records)
+
+
+def test_risk_controls_off_says_so_loudly_every_cycle(tmp_path):
+    """保護不存在必須大聲（工程原則 3），且訊息與「保護尚未生效」分得開——
+    後者是故障，這裡是客戶的選擇；混成一句話會讓真故障被當成選擇而忽略。"""
+    fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
+    _seed_equity_peak(tmp_path, "1000")
+    _, notifier, _ = _run(fa, settings=_settings(risk_controls_enabled=False),
+                          tmp_path=tmp_path)
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    disabled = [r for r in warns if r[3] == "risk_controls_disabled"]
+    assert len(disabled) == 1
+    assert "風控已由錢包主人關閉" in disabled[0][2]
+    # 不得沿用 coverage 不足那組 key／訊息（那是故障訊號，不是客戶選擇）
+    assert not any(r[3] == "equity_coverage_insufficient" for r in notifier.records)
+
+
+def test_risk_controls_off_keeps_sampling_equity(tmp_path):
+    """⭐ 關執法不關蒐證：樣本與高水位必須續寫，否則客戶勾選啟用的那一刻，
+    回撤保護會因為「樣本覆蓋不足」而實質不存在（開了等於沒開）。"""
+    import json
+
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, SAMPLES_RELPATH
+    fa = FakeAdapter(account_value=Decimal("880"), account=_account("880"))
+    _run(fa, settings=_settings(risk_controls_enabled=False), tmp_path=tmp_path)
+    samples = json.loads((tmp_path / SAMPLES_RELPATH).read_text())
+    assert [s[1] for s in samples] == ["880"], "本輪權益必須進樣本檔"
+    peak = json.loads((tmp_path / LIFETIME_PEAK_RELPATH).read_text())
+    assert Decimal(str(peak["peak"] if isinstance(peak, dict) else peak)) == Decimal("880")
+
+
+def test_risk_controls_off_never_bypasses_the_arm_lock(tmp_path):
+    """⭐ 鎖檔短路不歸這個開關管：已 tripped 的交易只能人工 re-arm。
+    若關風控能繞過 ARM 檔，客戶就有了一個自助解除熔斷的按鈕。"""
+    arm = tmp_path / ARM_FILE_RELPATH
+    arm.parent.mkdir(parents=True)
+    arm.write_text("{}")
+    fa = FakeAdapter()
+    report, notifier, ex = _run(fa, settings=_settings(risk_controls_enabled=False),
+                               tmp_path=tmp_path)
+    assert report.tripped is True
+    assert dict(fa.calls) == {}
+    assert ex.records == []
+    assert any(r[0] == "critical" and r[3] == "tripped" for r in notifier.records)
+
+
 def test_peak_zero_warns_no_data_and_continues(tmp_path):
     """degenerate equity 的 warn 由 killswitch.evaluate() 結構性內建
     （dedup_key="equity_degenerate"）——run_cycle 不得直呼 check_drawdown 繞過它。"""

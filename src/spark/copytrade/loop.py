@@ -86,21 +86,38 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     # ── 2. 回撤判定（同一次 portfolio 回應的 current/peak）─────────────
     # 必須用 evaluate() 而非直呼 check_drawdown（killswitch.py 主迴圈接入接口）：
     # degenerate equity（peak<=0）的 warn 在 evaluate 內結構性內建，不靠這裡記得補。
+    # ⭐⭐ 取樣與判定刻意分開（2026-07-30，風控總開關）：關閉風控時**只停止執法，
+    # 不停止蒐證**——`perp_equity_view` 會續寫 7 天滾動樣本、`update_lifetime_peak`
+    # 會續推高水位。理由：客戶哪天勾選啟用風控，回撤保護必須當場就有足夠樣本可用；
+    # 若連取樣一起停掉，啟用後 `evaluate` 會判定「樣本覆蓋不足 ⇒ 保護尚未生效」並
+    # 發 critical，等於開了也沒有保護，而畫面與設定檔都顯示已開啟。
     ev = perp_equity_view(adapter, ex.my_address, root)
-    cov = sample_coverage(root)
     lifetime = update_lifetime_peak(root, ev.current)
-    status = evaluate(ev, settings, notifier, coverage=cov, lifetime_peak=lifetime)
-    if status.breached:
-        notifier.critical(
+    if not settings.risk_controls_enabled:
+        # 保護不存在時必須大聲（工程原則 3）。訊息與 `evaluate` 的「保護尚未生效」
+        # 刻意分得開：那則是「以為有保護、其實還沒生效」的故障，這則是錢包主人
+        # 主動放棄——把兩者寫成同一句話，會讓真正的故障被當成客戶的選擇而忽略。
+        notifier.warn(
             "killswitch",
-            f"回撤 {status.drawdown_pct} 超過上限 {settings.max_drawdown_pct}"
-            f"（current={status.current} peak={status.peak}）",
-            dedup_key="dd_breach",
+            "**風控已由錢包主人關閉**：回撤 kill switch 與成本熔斷器本輪均不執法"
+            "（權益取樣仍持續，啟用後立即可用）。"
+            f"目前 perp 淨值 {ev.current}｜7 天窗高水位 {ev.recent_peak}",
+            dedup_key="risk_controls_disabled",
         )
-        if settings.flatten_on_breach:
-            my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
-            trip(ex, my_positions, notifier, root, status)
-        return tripped_report()
+    else:
+        cov = sample_coverage(root)
+        status = evaluate(ev, settings, notifier, coverage=cov, lifetime_peak=lifetime)
+        if status.breached:
+            notifier.critical(
+                "killswitch",
+                f"回撤 {status.drawdown_pct} 超過上限 {settings.max_drawdown_pct}"
+                f"（current={status.current} peak={status.peak}）",
+                dedup_key="dd_breach",
+            )
+            if settings.flatten_on_breach:
+                my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
+                trip(ex, my_positions, notifier, root, status)
+            return tripped_report()
 
     # ── 2.5 成本熔斷器（計畫 D8 的優先序在此結構性成立）─────────────────
     # `leader 撤銷` > `kill switch（回撤）` > `成本熔斷器`。前兩者一旦成立，

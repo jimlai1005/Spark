@@ -294,8 +294,11 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
                 leader_source=(leader.source if leader is not None else None),
                 allocated_capital=alloc, capital_utilization=util,
                 use_full_equity=full, capital_source=capital_source,
-                capital_changed_at=changed_at, cycle_result=result,
-                cycle_detail=detail)
+                capital_changed_at=changed_at,
+                # None（不是 True）當 settings 還沒載入：面板不得把「未知」畫成「有風控」。
+                risk_controls_enabled=(bool(settings.risk_controls_enabled)
+                                       if settings is not None else None),
+                cycle_result=result, cycle_detail=detail)
         except Exception:  # noqa: BLE001 — 見 docstring：組不出心跳也不得中斷跟單
             logger.exception("心跳組裝失敗（跟單不受影響）")
             return False

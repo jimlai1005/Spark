@@ -19,6 +19,9 @@ class TestCopySettingsDefaults:
         assert settings.interval_s == 60
         assert settings.modify_policy == "modify-first"
         assert settings.flatten_on_breach is True
+        # ⭐ 預設 True＝安全側。「新錢包預設關風控」由 env 範本達成，不改這個預設：
+        # 既有部署的 env 沒有這一行，改預設會讓它們在下次重啟時靜默失去風控。
+        assert settings.risk_controls_enabled is True
         assert settings.allocated_capital == Decimal("0")
 
         # 照抄 hl 的值驗證
@@ -44,6 +47,11 @@ class TestCopySettingsDefaults:
         monkeypatch.setenv("COPY_LIVE_TRADING", "true")
         settings = CopySettings.from_env({})
         assert settings.live_trading is True
+
+    def test_risk_controls_can_be_turned_off_by_env(self, monkeypatch):
+        """錢包主人自選關閉風控 → 由該 follower 的 env 表達（watcher 於啟用時寫入）。"""
+        monkeypatch.setenv("COPY_RISK_CONTROLS_ENABLED", "false")
+        assert CopySettings.from_env({}).risk_controls_enabled is False
 
     def test_env_override_decimal(self, monkeypatch):
         """Decimal 型別環境變數覆蓋。"""

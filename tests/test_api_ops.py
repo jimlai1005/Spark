@@ -1532,6 +1532,7 @@ def _write_heartbeat(cfg, account_id, *, age_s=5.0, tripped=False, count=12,
         leader_address=leader, leader_source=leader_source,
         allocated_capital=alloc, capital_utilization=util, use_full_equity=False,
         capital_source=capital_source, capital_changed_at=None,
+        risk_controls_enabled=True,
         cycle_result=result, cycle_detail=None)
     p = heartbeat_path_for(cfg.exchange_dir, account_id)
     write_heartbeat(p, payload)

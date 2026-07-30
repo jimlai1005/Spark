@@ -594,6 +594,19 @@ def test_enabled_when_either_threshold_set():
     assert is_enabled(_settings(cost_max_turnover_24h=0, cost_max_fills_24h=1))
 
 
+def test_risk_controls_off_disables_the_cost_gate_too(tmp_path):
+    """風控總開關關閉（錢包主人自選，2026-07-30）⇒ 成本閘一併停用，即使門檻有值。
+    判定點只有 is_enabled 一處（不在 loop 另加 if），所以在這裡驗。"""
+    s = _settings(cost_max_turnover_24h=Decimal("1"), cost_max_fills_24h=1,
+                  risk_controls_enabled=False)
+    assert is_enabled(s) is False
+    fa = FakeAdapter(account_value=Decimal("500"), fills=_fills(50))
+    st, notifier = _eval(fa, tmp_path, settings=s)
+    assert st.breached is False and st.enabled is False
+    assert "get_user_fills" not in fa.calls, "停用時不得多打一次 API"
+    assert not (tmp_path / STATE_RELPATH).exists()
+
+
 def test_negative_thresholds_rejected():
     """負門檻＝任何成交都超標＝靜默停止跟單。拒絕啟動，不靜默挑一邊。"""
     with pytest.raises(ValueError, match="cost_max_turnover_24h"):
