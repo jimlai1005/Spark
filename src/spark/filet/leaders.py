@@ -57,6 +57,7 @@ class LeaderRef:
     # accepting_new=例行下架（只擋新客戶）。搞混的代價是「以為止血了其實沒有」。
     enabled: bool = True
     accepting_new: bool = True
+    kind: str = "standard"  # "standard" 或 "vault"（Wave 1 2026-07-31）
 
 
 def load_leaders(path: str | Path) -> list[LeaderRef]:
@@ -118,22 +119,30 @@ def load_leaders(path: str | Path) -> list[LeaderRef]:
         if not isinstance(accepting_new, bool):
             raise ValueError(
                 f"leaders[{i}].accepting_new 須為布林: {accepting_new!r}")
+        kind = entry.get("kind", "standard")
+        if not isinstance(kind, str) or kind not in {"standard", "vault"}:
+            raise ValueError(
+                f"leaders[{i}].kind 須為 'standard' 或 'vault': {kind!r}")
         seen.add(addr)
-        leaders.append(LeaderRef(addr, name, description, enabled, accepting_new))
+        leaders.append(LeaderRef(addr, name, description, enabled, accepting_new, kind))
     return leaders
 
 
-def _lookup(address: str, leaders: list[LeaderRef]) -> LeaderRef | None:
-    """位址比較一律正規化小寫（同基準，工程原則 1）。
+def find_leader(address: str, leaders: list[LeaderRef]) -> LeaderRef | None:
+    """位址查詢（公開）。位址比較一律正規化小寫（同基準，工程原則 1）。
 
     address 不合法（非 0x + 40 hex）→ None，不 raise：呼叫點是閘門，
-    「不合法」的正確語意就是「查無此人」→ 兩個述詞都會因此回 False（不放行）。
+    「不合法」的正確語意就是「查無此人」。
     """
     try:
         target = normalize_hex_address("address", address)
     except ValueError:
         return None
     return next((x for x in leaders if x.address == target), None)
+
+
+# 向後相容 alias（舊程式碼可能會 import _lookup；新程式碼應改用 find_leader）
+_lookup = find_leader
 
 
 def is_selectable(address: str, leaders: list[LeaderRef]) -> bool:

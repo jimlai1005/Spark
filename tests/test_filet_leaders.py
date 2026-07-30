@@ -7,6 +7,7 @@ import pytest
 
 from spark.filet.leaders import (
     LeaderRef,
+    find_leader,
     is_selectable,
     is_still_permitted,
     load_leaders,
@@ -320,3 +321,85 @@ def test_all_consumers_resolve_to_the_same_single_value(tmp_path, monkeypatch):
     assert err is None and addrs  # 空白名單 → 落回 DEFAULT_WATCHLIST，但沒有錯誤
 
     assert api_value == engine_value == cli_value == str(leaders)
+
+
+# ── Wave 1（2026-07-31）：LeaderRef.kind 欄位 ─────────────────────────────
+
+def test_kind_defaults_to_standard(tmp_path):
+    """kind 欄位缺失 → 預設 "standard"（保住所有既有建構點）。"""
+    leaders = load_leaders(_w(tmp_path, {"leaders": [
+        {"address": _A, "name": "Alpha"}  # 無 kind 欄位
+    ]}))
+    assert leaders[0].kind == "standard"
+
+
+def test_kind_vault_parses(tmp_path):
+    """kind: "vault" → 解析成功。"""
+    leaders = load_leaders(_w(tmp_path, {"leaders": [
+        {"address": _A, "name": "Alpha", "kind": "vault"}
+    ]}))
+    assert leaders[0].kind == "vault"
+
+
+def test_kind_invalid_string_value_raises(tmp_path):
+    """kind 非 {"standard", "vault"} 中的值 → ValueError（訊息含位址）。"""
+    with pytest.raises(ValueError, match="kind"):
+        load_leaders(_w(tmp_path, {"leaders": [
+            {"address": _A, "name": "Alpha", "kind": "yolo"}
+        ]}))
+
+
+def test_kind_non_string_raises(tmp_path):
+    """kind 非 str → ValueError。"""
+    with pytest.raises(ValueError, match="kind"):
+        load_leaders(_w(tmp_path, {"leaders": [
+            {"address": _A, "name": "Alpha", "kind": 1}
+        ]}))
+
+
+def test_find_leader_returns_ref_if_found(tmp_path):
+    """find_leader(address, leaders) 命中時回傳 LeaderRef。"""
+    leaders = load_leaders(_w(tmp_path, {"leaders": [
+        {"address": _A, "name": "Alpha", "kind": "vault"}
+    ]}))
+    ref = find_leader(_A, leaders)
+    assert ref is not None
+    assert ref.address == _A
+    assert ref.kind == "vault"
+
+
+def test_find_leader_returns_none_if_not_found(tmp_path):
+    """find_leader 未命中回 None。"""
+    leaders = load_leaders(_w(tmp_path, {"leaders": [
+        {"address": _A, "name": "Alpha"}
+    ]}))
+    assert find_leader(_B, leaders) is None
+
+
+def test_find_leader_case_insensitive(tmp_path):
+    """find_leader 比較時大小寫不敏感（位址同基準）。"""
+    leaders = load_leaders(_w(tmp_path, {"leaders": [
+        {"address": _A, "name": "Alpha"}
+    ]}))
+    result = find_leader(_A.upper().replace("0X", "0x"), leaders)
+    assert result is not None
+    assert result.address == _A
+
+
+def test_load_user_leaders_with_kind_vault(tmp_path):
+    """load_user_leaders 路徑：registry 檔含 kind: "vault" 條目 → 同語意解析（重用驗證）。"""
+    from spark.filet.user_leaders import load_user_leaders
+
+    user_reg = tmp_path / "user_leaders.json"
+    user_reg.write_text(json.dumps({"leaders": [
+        {
+            "address": _A,
+            "name": "User Leader",
+            "kind": "vault",
+            "source": "user",
+            "added_by": "0x" + "c3" * 20
+        }
+    ]}))
+    leaders = load_user_leaders(user_reg)
+    assert len(leaders) == 1
+    assert leaders[0].kind == "vault"
