@@ -64,6 +64,8 @@ from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_fo
 from spark.filet.leader_resolve import require_leaders_path
 from spark.filet.safe_fs import (ensure_dir_secure, named_owner_ids,
                                  write_json_atomic, write_text_atomic)
+from spark.filet.risk_prefs import (RISK_ENV_KEYS, RiskPrefsError, risk_env_lines,
+                                    safe_fallback_prefs)
 from spark.filet.user_leaders import user_leaders_path_for
 from spark.publicapi.pending import load_pending, remove_pending_entry
 
@@ -76,8 +78,12 @@ STATE_DIR_MODE = 0o700
 # 引擎啟動必填的 per-follower 變數（run_copytrade：缺前兩者 exit 2；live 模式缺
 # ACCOUNT_ID 也 exit 2；NETWORK 不填會**靜默預設 testnet**——LIVE=true 配 testnet
 # 正是審查 F1 指出的靜默壞局，所以四個全列必填、由本 watcher 代入，不留給範本）。
+# ⭐ 風控鍵（RISK_ENV_KEYS）自 2026-07-30 起也由 watcher 逐用戶代入：它們是客戶的
+# 選擇，不再是全體共用的範本值。範本若還留著 COPY_MAX_DRAWDOWN_PCT 之類的舊行，
+# 整輪 fail-closed——這是刻意的部署耦合：舊範本＋新程式的組合會讓「客戶選的」與
+# 「範本寫的」重複定義同一個鍵，而哪個生效取決於 EnvironmentFile 的載入細節。
 GENERATED_KEYS = ("SPARK_NETWORK", "SPARK_ACCOUNT_ID",
-                  "SPARK_USER_ADDR", "SPARK_BUILDER_ADDR")
+                  "SPARK_USER_ADDR", "SPARK_BUILDER_ADDR") + RISK_ENV_KEYS
 
 
 def _latest_signed_leader(records: list[dict], *, account_id: str,
@@ -106,8 +112,35 @@ def _latest_signed_leader(records: list[dict], *, account_id: str,
     return None
 
 
+def _risk_lines(entry: dict, account_id: str, notifier: Notifier) -> list[str]:
+    """該 follower 的風控 env 行（錢包主人自選，2026-07-30）。
+
+    三種輸入、三種結果，刻意分開：
+    - 沒有 `risk` 鍵（客戶從未表達）→ 產品預設＝**不啟用風控**（使用者裁決）。
+      這是合法路徑，不告警：新錢包的預設就是這樣。
+    - 有 `risk` 且驗得過 → 照客戶的選擇。
+    - 有 `risk` 但**驗不過**（被手改／舊格式／型別壞掉）→ 改用安全側（風控**開啟**）
+      並發 critical。「讀不懂」與「客戶不要保護」必須產生不同的結果，否則一次資料
+      損壞就會靜默變成一顆沒有任何保護的實盤引擎（工程原則 3）。
+    """
+    raw = entry.get("risk")
+    if raw is None:
+        return risk_env_lines(None)
+    try:
+        return risk_env_lines(raw)
+    except RiskPrefsError as e:
+        notifier.critical(
+            "auto-activate",
+            f"account={account_id} 的風控偏好無法解析（reason={e.reason}）"
+            f"——已改用**風控開啟**的安全側預設建立 env。這不是客戶的選擇，"
+            f"請人工確認 pending 條目後與客戶核對設定",
+            dedup_key=f"auto-activate:bad-risk:{account_id}")
+        return risk_env_lines(safe_fallback_prefs())
+
+
 def _compose_env(template_path: Path, *, network: str, account_id: str,
-                 user_address: str, builder: str) -> str:
+                 user_address: str, builder: str,
+                 risk_lines: list[str] | None = None) -> str:
     """範本＋watcher 代入的 per-follower 區塊。兩類錯誤整輪 fail-closed：
     - 殘留 REPLACE_WITH：部署者還沒完成安裝，用半成品設定開實盤是拿真錢冒險；
     - 範本自帶 SPARK_*：會與代入區塊重複定義，哪個生效取決於 EnvironmentFile
@@ -129,11 +162,16 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
                 f"env 範本 {template_path} 不得設定 {key}（由 watcher 逐用戶代入）"
                 f"——拒絕啟用任何 follower。")
     block = ("\n# --- 以下由 auto-activate watcher 逐用戶代入（勿手改；"
-             "要改風險參數改上面的範本區）---\n"
+             "要改範本共用參數改上面的範本區）---\n"
              f"SPARK_NETWORK={network}\n"
              f"SPARK_ACCOUNT_ID={account_id}\n"
              f"SPARK_USER_ADDR={user_address}\n"
              f"SPARK_BUILDER_ADDR={builder}\n")
+    # 風控區塊：**每個** follower 都寫（不是只有選了的人才寫），所以這幾個鍵一律
+    # 由 watcher 擁有、範本不得出現（見 GENERATED_KEYS）。「總是明確寫出」是為了
+    # 讓一顆引擎的風控姿態能從它自己的 env 一眼讀出來，不必回頭推敲當時的預設值。
+    block += ("# 風控（錢包主人自選；未表達＝產品預設不啟用，見 filet/risk_prefs.py）\n"
+              + "".join(f"{ln}\n" for ln in (risk_lines or risk_env_lines(None))))
     return text + block
 
 
@@ -242,7 +280,8 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
     env_content = _compose_env(env_template, network=entry["network"],
                                account_id=account_id,
                                user_address=entry["user_address"],
-                               builder=builder)
+                               builder=builder,
+                               risk_lines=_risk_lines(entry, account_id, notifier))
     _ensure_env_file(env_dir / f"{account_id}.env", env_content, owner, group)
     ensure_dir_secure(state_base / account_id, mode=STATE_DIR_MODE,
                       owner_ids=named_owner_ids(owner, group))

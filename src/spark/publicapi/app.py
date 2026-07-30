@@ -55,7 +55,9 @@ from spark.publicapi.ops import (accrued_window, accrued_window_note, customer_p
                                  revenue_reconciliation, skipped_path_for,
                                  subscription_drift, trade_quality_rows,
                                  trade_quality_summary, utc_days_in_window)
-from spark.publicapi.pending import load_pending, write_pending_entry
+from spark.filet.risk_prefs import (RiskPrefsError, canonical_prefs, prefs_summary)
+from spark.publicapi.pending import (load_pending, set_pending_risk,
+                                     write_pending_entry)
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
 
@@ -1440,6 +1442,66 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                 network=cfg.network,
                                 agent_address=p["agent_address"])
         return p
+
+    # ---------- 風控偏好（錢包主人自選，2026-07-30）----------
+    # ⚠️ 本路徑**沒有客戶簽章**，與換 leader／資金設定不同。取捨、邊界與已知缺口
+    # 全文見 `filet/risk_prefs.py` 檔頭；一句話版本：這裡只調保護門檻（不是部位
+    # 大小），且偏好只在啟用那一刻被烙進 env，之後 filet-api 影響不了執行中的引擎。
+
+    def _my_pending_entry(account_id: str) -> dict | None:
+        return next((e for e in load_pending(cfg.pending_path)
+                     if e.get("account_id") == account_id), None)
+
+    @app.get("/api/me/risk")
+    def me_risk(address: str = Depends(_require_session)):
+        """我的風控偏好 ＋ 可調參數規格（前端據此畫表單，不硬編任何數字）。
+
+        ⭐ `editable` 是本回應最重要的欄位：偏好只在啟用那一刻寫進引擎的 env，
+        而 watcher 啟用後會移除 pending 條目、且**不覆寫**既有 env。所以已啟用的
+        帳號在這裡改設定不會有任何效果——前端必須據此把表單關掉並說明原因，
+        不能讓客戶對著一個按了沒用的開關按第二次（沉默的無效比不給選更糟）。
+        """
+        entry = _my_pending_entry(derive_account_id(address))
+        return {**prefs_summary(entry.get("risk") if entry else None),
+                "editable": entry is not None,
+                "not_editable_reason": None if entry is not None else "not_pending",
+                "not_editable_note": (
+                    None if entry is not None else
+                    "這個帳號不在待啟用佇列中（尚未完成綁定，或引擎已經啟用）。"
+                    "風控設定在引擎啟用的那一刻寫入並固定；已啟用的帳號要調整，"
+                    "請聯絡我們（改動需要在伺服器端進行，不經由本頁）。")}
+
+    @app.post("/api/me/risk")
+    def me_risk_submit(body: dict, address: str = Depends(_require_session)):
+        """設定我的風控偏好（寫進**我自己的** pending 條目）。
+
+        失敗分類（工程原則 2）：值超界／欄位不認得／不在佇列中**全是 semantic**
+        （4xx，客戶端不得自動重試）；寫檔失敗才是 transient（5xx）。
+
+        ⭐ 不在佇列中一律 409（不是靜默 200）：見 `me_risk` 的 `editable` 說明。
+        """
+        account_id = derive_account_id(address)
+        try:
+            prefs = canonical_prefs(body.get("prefs") if isinstance(body, dict) else None)
+        except RiskPrefsError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+        try:
+            written = set_pending_risk(cfg.pending_path, account_id, prefs)
+        except OSError as e:
+            logger.error("風控偏好落檔失敗 account=%s: %s", account_id, e)
+            raise HTTPException(status_code=500,
+                                detail="設定寫入失敗，請稍後重試") from e
+        if not written:
+            raise HTTPException(
+                status_code=409,
+                detail="這個帳號不在待啟用佇列中（尚未完成綁定，或引擎已經啟用）。"
+                       "已啟用的帳號要調整風控設定請聯絡我們。")
+        logger.info("風控偏好已更新 account=%s enabled=%s",
+                    account_id, prefs["enabled"])
+        return {"ok": True, "account_id": account_id, "prefs": prefs,
+                "effective": "at_activation",
+                "effective_note": "這份設定會在引擎啟用（約一分鐘內）時寫入並生效；"
+                                  "啟用之後就固定下來，之後要調整請聯絡我們。"}
 
     @app.get("/api/admin/pending")
     def admin_pending(admin: str = Depends(_require_admin)):

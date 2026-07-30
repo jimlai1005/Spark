@@ -24,7 +24,9 @@ from spark.filet.leader_change import (build_leader_change_message,
                                        write_leader_change)
 from spark.filet.user_leaders import record_user_leader, user_leaders_path_for
 from spark.publicapi.config import derive_account_id
-from spark.publicapi.pending import load_pending, write_pending_entry
+from spark.filet.risk_prefs import canonical_prefs
+from spark.publicapi.pending import (load_pending, set_pending_risk,
+                                     write_pending_entry)
 
 _BUILDER = "0x" + "22" * 20
 _LEADER = "0x" + "a1" * 20      # 白名單內
@@ -32,9 +34,9 @@ _CUSTOM = "0x" + "d4" * 20      # 只在 user registry
 _OUTSIDE = "0x" + "e5" * 20     # 兩邊都不在
 _NOW = 1_800_000_000.0
 
+# ⚠️ 風控四鍵自 2026-07-30 起由 watcher 代入，範本不得包含（見 GENERATED_KEYS）。
 _TEMPLATE_OK = (
     "COPY_LIVE_TRADING=true\n"
-    "COPY_MAX_DRAWDOWN_PCT=0.20\n"
     "COPY_TG_BOT_TOKEN=tok\n"
     "COPY_TG_CHAT_ID=123\n")
 
@@ -151,11 +153,59 @@ def test_generated_env_has_every_engine_required_var(site):
         "SPARK_ACCOUNT_ID": site.account_id,
         "SPARK_USER_ADDR": site.user_address,
         "SPARK_BUILDER_ADDR": _BUILDER,
+        # 風控四鍵一律明確寫出（未表達＝產品預設不啟用），理由見 risk_prefs.py：
+        # 一顆引擎的風控姿態要能從它自己的 env 讀出來，不必回推當時的預設值。
+        "COPY_RISK_CONTROLS_ENABLED": "false",
+        "COPY_MAX_DRAWDOWN_PCT": "0.20",
+        "COPY_MAX_TOTAL_DRAWDOWN_PCT": "0.40",
+        "COPY_FLATTEN_ON_BREACH": "true",
     }
     lines = dict(ln.split("=", 1) for ln in text.splitlines()
                  if "=" in ln and not ln.startswith("#"))
     for key in GENERATED_KEYS:
         assert lines[key] == expected[key], key
+
+
+def _env_kv(site) -> dict[str, str]:
+    text = (site.env_dir / f"{site.account_id}.env").read_text()
+    return dict(ln.split("=", 1) for ln in text.splitlines()
+                if "=" in ln and not ln.lstrip().startswith("#"))
+
+
+def test_owner_chosen_risk_settings_land_in_the_env(site):
+    """錢包主人在 leader 頁面選的風控參數，必須原樣進到他自己的 env。"""
+    set_pending_risk(site.pending, site.account_id, canonical_prefs({
+        "enabled": True, "max_drawdown_pct": "0.3",
+        "max_total_drawdown_pct": "0", "flatten_on_breach": False}))
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    kv = _env_kv(site)
+    assert kv["COPY_RISK_CONTROLS_ENABLED"] == "true"
+    assert kv["COPY_MAX_DRAWDOWN_PCT"] == "0.3"
+    assert kv["COPY_MAX_TOTAL_DRAWDOWN_PCT"] == "0"
+    assert kv["COPY_FLATTEN_ON_BREACH"] == "false"
+
+
+def test_unparseable_risk_prefs_fail_closed_to_protection_on(site):
+    """⭐⭐ 壞掉的偏好（手改／舊格式）**不得**沿用「風控關閉」的產品預設——
+    那會讓一次資料損壞靜默變成一顆沒有任何保護的實盤引擎。方向是往保護靠，
+    並且要大聲（工程原則 3）。"""
+    entries = load_pending(site.pending)
+    entries[0]["risk"] = {"enabled": True, "max_drawdown_pct": "999"}  # 超界
+    (site.pending).write_text(json.dumps({"pending": entries}))
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert _env_kv(site)["COPY_RISK_CONTROLS_ENABLED"] == "true"
+    crits = [r for r in site.notifier.records if r[0] == "critical"]
+    assert any("風控偏好無法解析" in r[2] for r in crits)
+
+
+def test_no_risk_choice_means_product_default_off_without_alarm(site):
+    """未表達＝新錢包的產品預設（不啟用），這是合法路徑，不該發 critical。"""
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert _env_kv(site)["COPY_RISK_CONTROLS_ENABLED"] == "false"
+    assert not any(r[0] == "critical" for r in site.notifier.records)
 
 
 def test_template_containing_spark_keys_fails_closed(site):
