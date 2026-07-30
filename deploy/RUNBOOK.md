@@ -821,6 +821,28 @@ sudo cat /opt/filet/state/<account_id>/var/copytrade/cost_breaker.json
 > 清掉的是「我方的判定歷史」，不是磨損本身——原因還在的話下一輪就會再度觸發，
 > 而累犯計數已被你歸零，等於把保護往後推遲了一輪。
 
+#### 成本熔斷：實測紀錄與 per-account 停用方式
+
+**2026-07-28 實盤實測成功**：帳號 `fbac652a…3662` 觸發主閘後，引擎持續跳過 BTC
+進場掛單並發出 `[成本熔斷] 停止開新倉中` 告警（dedup 抑制重複），reduce-only
+掛單不受影響——與設計行為一致。
+
+要對單一帳號**整個停用**熔斷（設計者指定的合法關法，不是後門）：在
+`/etc/filet/followers/<account_id>.env` 加兩行（**缺一項仍視為啟用**），然後重啟：
+
+```bash
+COPY_COST_MAX_TURNOVER_24H=0
+COPY_COST_MAX_FILLS_24H=0
+# 設定不熱載入，必須重啟才生效
+sudo systemctl restart filet-follower@<account_id>
+```
+
+停用後 `is_enabled()` 為 False：不查 fills、不讀寫 `cost_breaker.json`、不再告警，
+主閘「停開新倉」立即解除（狀態檔可留著不刪，停用期間它是死資料）。
+驗證方式：重啟後 `cost_breaker.json` 的 mtime 凍結、`equity_samples.json` 照常
+每輪更新、journal 無「成本熔斷」字樣，且交易所 open orders 出現非 reduce-only 進場單。
+（2026-07-28 已對 `fbac652a…3662` 依此程序停用並逐項驗證通過。）
+
 ### 5.5.1 ⭐⭐ 建立換 leader 交換目錄（不做這步，客戶按「換 leader」永遠不會生效）
 
 > 編號用 `5.5.1` 是刻意的插入步驟——它必須排在 §5.4 拉起服務**之前**做完，
@@ -1318,6 +1340,41 @@ EOF
 
 **通則**：任何改動「資料生產者 → 投影 → API」這條鏈的欄位契約時，部署完都要問一句
 **「磁碟上的資料是舊碼產生的嗎？」**——程式碼對、部署對、資料舊，是這條鏈特有的失效。
+
+### 5.6a ⭐⭐ 自動啟用 watcher（取代人工 activate；2026-07-30 使用者裁決）
+
+產品僅內部使用期間，§5.6 的人工核可由 `filet-auto-activate.timer` 自動化：
+用戶完成綁定＋入金（pending 有條目）**且**已在跟單頁簽章選定 leader → watcher
+自動建 env／state、寫 manifest、`systemctl start`。**三道把關取代人眼**：
+(1) 結構性核對（builder pin／account_id 衍生綁定／network 合法）先於一切；
+(2) 用戶簽章重驗（`verify_leader_change`）——API 被打穿也偽造不了用戶私鑰簽的選擇；
+(3) 白名單 ∪ user registry 准入（`is_selectable`，**選擇時**述詞；引擎持續驗證用的
+是較寬的 `is_still_permitted`——兩者不同是刻意的，見 leaders.py 檔頭）。
+watcher 以私有狀態檔區分「自己啟動的」與「人工啟動／人工停機的」：
+`systemctl stop` 停掉的引擎**不會**被 watcher 復活（用戶重按「完成綁定」只會清佇列＋告警）。
+CLAUDE.md 紅線 5 的例外條款即本路徑（`COPY_LIVE_TRADING=true` 範本）；
+**對外開放前必須回頭重審**：`systemctl disable --now filet-auto-activate.timer`
+即回到 §5.6 人工流程，程式碼零改動。
+
+```bash
+# 1) env 範本（watcher 對 REPLACE_WITH 殘留 fail-closed，填好才會啟用任何人）
+sudo cp deploy/follower.env.autoactivate.example /etc/filet/follower.env.template
+sudo chmod 600 /etc/filet/follower.env.template
+sudo vim /etc/filet/follower.env.template   # 填 TG token / chat id
+
+# 2) 安裝 unit（先填 service 檔裡的 REPLACE_WITH_BUILDER_ADDRESS）
+sudo cp deploy/filet-auto-activate.{service,timer} /etc/systemd/system/
+sudo vim /etc/systemd/system/filet-auto-activate.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now filet-auto-activate.timer
+
+# 3) 驗收：手動跑一輪；有 pending 但沒人選 leader 時應為 0 且無動作
+sudo systemctl start filet-auto-activate.service
+journalctl -u filet-auto-activate.service -n 20
+```
+
+排錯：`journalctl -u filet-auto-activate` 的 `CRITICAL 啟用失敗 account=...` 逐條目
+隔離——單一壞條目不擋其他人，條目保留在 pending 供調查，下輪自動重試。
 
 ### 5.7 ⭐ 兩個定時任務（leaderboard 快照 ＋ 績效序列取樣）
 
