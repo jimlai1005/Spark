@@ -113,14 +113,19 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
       的載入細節——歧義本身就是錯，直接拒收。
     """
     text = template_path.read_text()
-    if "REPLACE_WITH" in text:
+    # ⭐ 只檢查**非註解行**（2026-07-30 實機部署踩到）：範本與部署者的註解本來就會
+    # 提到「REPLACE_WITH」與 SPARK_* 這些字樣（說明它們的存在正是註解的職責），
+    # 全文子字串比對會讓 watcher 被自己的說明文字永久 fail-closed。
+    value_lines = [ln for ln in text.splitlines()
+                   if ln.strip() and not ln.lstrip().startswith("#")]
+    if any("REPLACE_WITH" in ln for ln in value_lines):
         raise SystemExit(
             f"env 範本 {template_path} 仍有 REPLACE_WITH 佔位符未填——"
             f"拒絕啟用任何 follower。請先完成 RUNBOOK §5.6a 的範本設定。")
     for key in GENERATED_KEYS:
-        if key in text:
+        if any(ln.split("=", 1)[0].strip() == key for ln in value_lines):
             raise SystemExit(
-                f"env 範本 {template_path} 不得包含 {key}（由 watcher 逐用戶代入）"
+                f"env 範本 {template_path} 不得設定 {key}（由 watcher 逐用戶代入）"
                 f"——拒絕啟用任何 follower。")
     block = ("\n# --- 以下由 auto-activate watcher 逐用戶代入（勿手改；"
              "要改風險參數改上面的範本區）---\n"

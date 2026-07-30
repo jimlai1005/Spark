@@ -336,6 +336,29 @@ def test_unsatisfied_selection_is_not_recycled(site):
             if r["account_id"] == site.account_id] == [_CUSTOM]
 
 
+def test_shipped_example_template_works_after_filling(site):
+    """⭐ 用**實際出貨的** example 檔走完整流程（2026-07-30 實機部署踩到：合成範本
+    測不到「範本自己的註解含 REPLACE_WITH／SPARK_* 字樣」把檢查誤觸發的情境）。
+    模擬部署步驟：sed 填兩個 TG 佔位符 → 應可正常啟用。"""
+    example = Path(__file__).parent.parent / "deploy" / "follower.env.autoactivate.example"
+    filled = (example.read_text()
+              .replace("REPLACE_WITH_TELEGRAM_BOT_TOKEN", "tok")
+              .replace("REPLACE_WITH_TELEGRAM_CHAT_ID", "123"))
+    site.template.write_text(filled)
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert site.manifest_leaders() == {site.account_id: _LEADER}
+
+
+def test_unfilled_value_line_still_fails_closed(site):
+    """對照組：**值行**的佔位符殘留仍然整輪拒跑（註解行的字樣則不觸發）。"""
+    example = Path(__file__).parent.parent / "deploy" / "follower.env.autoactivate.example"
+    site.template.write_text(example.read_text())   # 兩個 TG 佔位符未填
+    site.sign_change(leader=_LEADER)
+    with pytest.raises(SystemExit):
+        site.run()
+
+
 def test_existing_env_file_not_overwritten(site):
     """已存在的 per-follower env（人工調過的風險參數）不得被範本蓋掉。"""
     site.env_dir.mkdir(parents=True)
