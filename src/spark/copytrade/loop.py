@@ -30,6 +30,7 @@ from spark.copytrade.killswitch import (REASON_COST_BREACH, REASON_ROLLING_DRAWD
                                         REASON_TOTAL_DRAWDOWN, DrawdownStatus,
                                         auto_rearm_if_cooled_down, evaluate,
                                         is_tripped, trip)
+from spark.copytrade.leader_flow import adjusted_leader_equity
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
     CycleReport,
@@ -189,6 +190,48 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
     my_state = adapter.get_account_state(ex.my_address)
 
+    # ── 3.5 leader 申贖流量中性化（vault leader，預設關）────────────────
+    # vault 的 accountValue 會被 depositor 申贖被動改變 → scale 分母跳動 → 跟單
+    # churn。開啟時把 decay 窗內的流量按線性衰減權重從分母扣除（純數學在
+    # leader_flow.py）。關閉時**完全不呼叫** get_ledger_flows——零行為變動。
+    # adjusted 只取代 compute_scale_factor 的 leader_equity 參數（scale 與
+    # max_target_leverage 的 eff_lev 在該函式內共用同一分母，自動同源——工程
+    # 原則 1）；其餘用途（target_notional 等）不變。
+    leader_equity = leader_state.account_value
+    if settings.leader_flow_neutralization_enabled:
+        raw = leader_state.account_value
+        # 時間源與本檔既有慣例一致（time.time，見 risk_off_warned_at）——不混時間源
+        now_ms = int(time.time() * 1000)
+        decay_ms = int(settings.flow_decay_hours * Decimal(3_600_000))
+        try:
+            flows, unknown = adapter.get_ledger_flows(leader, now_ms - decay_ms)
+        except Exception as e:  # noqa: BLE001 —— 取數失敗是降級不是熔斷，本輪退回 raw
+            notifier.warn(
+                "leader_flow",
+                f"leader 申贖流量取數失敗（{e!r}），本輪退回未中性化分母",
+                dedup_key="leader_flow_fetch_failed",
+            )
+        else:
+            if unknown:
+                notifier.warn(
+                    "leader_flow",
+                    f"leader ledger 出現白名單外型別：{', '.join(unknown)}——"
+                    f"中性化的恆等式基礎可能不成立，請人工核對",
+                    dedup_key="leader_flow_unknown_types",
+                )
+            adj = adjusted_leader_equity(raw, flows, now_ms, decay_ms)
+            if adj <= 0 < raw:
+                # 幻影歸零防護：中性化是「計算產物」，不得觸發 scale=0 的全平
+                # 語意（讀不到錢 ≠ 錢虧光——工程原則，事故 #4 同型）。
+                notifier.critical(
+                    "leader_flow",
+                    f"中性化後分母 {adj} ≤ 0 而 raw={raw} > 0——流量資料可疑，"
+                    f"本輪退回未中性化分母（拒絕以計算產物觸發 scale=0）",
+                    dedup_key="leader_flow_nonpositive",
+                )
+            else:
+                leader_equity = adj
+
     # ── 4. weight / scale ─────────────────────────────────────────────
     if settings.volatility_weight_enabled:
         daily = adapter.get_daily_abs_pnl(leader)
@@ -197,8 +240,9 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     else:
         weight = position_weight(settings, None)
     scale = compute_scale_factor(
-        leader_equity=leader_state.account_value,   # 同源：account_state.account_value
-        my_equity=my_state.account_value,           # 同源：account_state.account_value
+        leader_equity=leader_equity,      # 同源：account_state.account_value（中性化
+                                          # 開啟時為其流量調整值，見 3.5 節）
+        my_equity=my_state.account_value,  # 同源：account_state.account_value
         target_notional=leader_state.total_ntl_pos,
         settings=settings,
         weight=weight,

@@ -322,6 +322,102 @@ def test_volatility_disabled_never_fetches_daily_pnl(tmp_path):
     assert fa.calls["get_daily_abs_pnl"] == []
 
 
+# ── 3b. leader 申贖流量中性化接線（Wave 4 規格 C）─────────────────────
+# 時間源與 run_cycle 一致（time.time）；測試釘死 time.time 讓 age 可控。
+_FLOW_NOW_S = 1_753_920_000
+_FLOW_NOW_MS = _FLOW_NOW_S * 1000
+_FLOW_DECAY_MS = 129_600_000  # 36h
+
+
+def _pin_clock(monkeypatch):
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_FLOW_NOW_S))
+
+
+def test_flow_neutralization_scales_off_adjusted_denominator(tmp_path, monkeypatch):
+    """兩組相同現場只差 flows：raw=2000、my=2000、入金 +1000 @ age 0
+    → adjusted=1000 → scale=2；無 flows → scale=1。"""
+    from spark.exchange.base import LedgerFlow
+    _pin_clock(monkeypatch)
+    settings = _settings(leader_flow_neutralization_enabled=True)
+
+    fa = FakeAdapter(equity=_healthy_equity(), account=_account("2000"),
+                     ledger_flows=([LedgerFlow(time_ms=_FLOW_NOW_MS,
+                                               usdc=Decimal("1000"))], []))
+    report, notifier, _ = _run(fa, settings=settings, tmp_path=tmp_path)
+    assert report.scale == Decimal("2")
+    # 取數窗 = now − decay（36h），地址 = leader
+    assert fa.calls["get_ledger_flows"] == [
+        {"address": LEADER, "start_ms": _FLOW_NOW_MS - _FLOW_DECAY_MS}]
+    assert not any(r[1] == "leader_flow" for r in notifier.records)
+
+    fa2 = FakeAdapter(equity=_healthy_equity(), account=_account("2000"),
+                      ledger_flows=([], []))
+    report2, _, _ = _run(fa2, settings=settings, tmp_path=tmp_path)
+    assert report2.scale == Decimal("1")
+
+
+def test_flow_neutralization_disabled_never_fetches_ledger(tmp_path):
+    """enabled=False（預設）⇒ get_ledger_flows 完全不被呼叫（零行為變動證明）。"""
+    fa = FakeAdapter(equity=_healthy_equity(), account=_account("1000"),
+                     ledger_flows=([], ["sentinel_should_not_be_read"]))
+    report, notifier, _ = _run(fa, tmp_path=tmp_path)
+    assert fa.calls["get_ledger_flows"] == []
+    assert report.scale == Decimal("1")
+    assert not any(r[1] == "leader_flow" for r in notifier.records)
+
+
+def test_flow_fetch_exception_falls_back_to_raw_with_warn(tmp_path, monkeypatch):
+    """取數失敗 → 本輪退回未中性化分母（raw）＋ warn；該輪照常完成。"""
+    _pin_clock(monkeypatch)
+
+    class _BoomAdapter(FakeAdapter):
+        def get_ledger_flows(self, address, start_ms):
+            raise RuntimeError("ledger api down")
+
+    fa = _BoomAdapter(equity=_healthy_equity(), account=_account("1000"))
+    report, notifier, _ = _run(
+        fa, settings=_settings(leader_flow_neutralization_enabled=True),
+        tmp_path=tmp_path)
+    assert report.tripped is False
+    assert report.scale == Decimal("1")  # raw 分母（my=leader=1000）
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    assert any("RuntimeError" in r[2] and "本輪退回未中性化分母" in r[2]
+               for r in warns)
+
+
+def test_flow_adjusted_nonpositive_uses_raw_with_critical(tmp_path, monkeypatch):
+    """adjusted ≤ 0 < raw：幻影歸零防護——計算產物不得觸發 scale=0 的全平語意
+    （工程原則：讀不到錢 ≠ 錢虧光）→ critical ＋ 本輪用 raw。"""
+    from spark.exchange.base import LedgerFlow
+    _pin_clock(monkeypatch)
+    fa = FakeAdapter(equity=_healthy_equity(), account=_account("1000"),
+                     ledger_flows=([LedgerFlow(time_ms=_FLOW_NOW_MS,
+                                               usdc=Decimal("5000"))], []))
+    report, notifier, _ = _run(
+        fa, settings=_settings(leader_flow_neutralization_enabled=True),
+        tmp_path=tmp_path)
+    assert report.tripped is False
+    assert report.scale == Decimal("1")  # raw，而非 adjusted(-4000) 的 scale=0
+    crits = [r for r in notifier.records
+             if r[0] == "critical" and r[1] == "leader_flow"]
+    assert len(crits) == 1
+    assert crits[0][3] == "leader_flow_nonpositive"  # dedup_key（TG TTL 去重靠它）
+
+
+def test_flow_unknown_ledger_types_warn_with_type_names(tmp_path, monkeypatch):
+    """白名單外 ledger 型別 → warn 含型別名（恆等式基礎可能不成立）。"""
+    _pin_clock(monkeypatch)
+    fa = FakeAdapter(equity=_healthy_equity(), account=_account("1000"),
+                     ledger_flows=([], ["accountClassTransfer", "spotTransfer"]))
+    report, notifier, _ = _run(
+        fa, settings=_settings(leader_flow_neutralization_enabled=True),
+        tmp_path=tmp_path)
+    assert report.scale == Decimal("1")  # flows 空 → adjusted == raw
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    assert any("accountClassTransfer" in r[2] and "spotTransfer" in r[2]
+               for r in warns)
+
+
 # ── 4. skip_trigger → warn（per-coin dedup）──────────────────────────
 def test_leader_trigger_order_surfaces_as_skip_trigger_warn(tmp_path):
     trigger = OpenOrder(oid=1, coin="ETH", is_buy=False, limit_px=Decimal("1900"),

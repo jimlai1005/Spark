@@ -207,6 +207,14 @@ class CopySettings:
     # 實際仍從最佳價往下吃，寬頻寬只是確保跳空時仍能出場。
     flatten_slippage: Decimal = Decimal("0.30")
 
+    # ── leader 申贖流量中性化（vault leader，2026-07-31 Wave 4）─────────────
+    # vault 的 accountValue（scale 分母）會被 depositor 申贖被動改變，產生跟單
+    # churn。開啟後：流量發生當下全額從分母扣除、之後 flow_decay_hours 線性衰減
+    # 歸零（leader 事後會照新 TVL 調倉，分母須收斂回真實值）。預設關——一般錢包
+    # leader 沒有第三方申贖，不需要也不該多打一個 ledger API。
+    leader_flow_neutralization_enabled: bool = False
+    flow_decay_hours: Decimal = Decimal("36")
+
     @classmethod
     def from_env(
         cls, env: Mapping[str, str] | None = None
@@ -278,6 +286,11 @@ class CopySettings:
             slippage=_env_decimal("COPY_SLIPPAGE", str(cls.slippage), env),
             flatten_slippage=_env_decimal(
                 "COPY_FLATTEN_SLIPPAGE", str(cls.flatten_slippage), env),
+            leader_flow_neutralization_enabled=_env_bool(
+                "COPY_LEADER_FLOW_NEUTRALIZATION",
+                str(cls.leader_flow_neutralization_enabled).lower(), env),
+            flow_decay_hours=_env_decimal(
+                "COPY_FLOW_DECAY_HOURS", str(cls.flow_decay_hours), env),
         )
 
     def __post_init__(self) -> None:
@@ -344,6 +357,12 @@ class CopySettings:
             raise ValueError(
                 "cost_breach_escalate_count must be >= 0, got "
                 f"{self.cost_breach_escalate_count}")
+
+        # 中性化衰減窗：0 或負值會讓 weight 除式退化（除零／每筆流量權重永遠 0 或
+        # 爆表），那不是「關閉」——關閉走 leader_flow_neutralization_enabled=False。
+        if self.flow_decay_hours <= 0:
+            raise ValueError(
+                f"flow_decay_hours must be > 0, got {self.flow_decay_hours}")
 
         # ⭐⭐ 本金模式的不變量：兩個欄位只有**兩種**合法組合（見欄位宣告處）。
         # 兩個方向都檢查是刻意的——只檢查一邊會留下一個「有值卻不生效」的狀態，
