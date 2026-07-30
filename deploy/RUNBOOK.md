@@ -1376,6 +1376,41 @@ journalctl -u filet-auto-activate.service -n 20
 排錯：`journalctl -u filet-auto-activate` 的 `CRITICAL 啟用失敗 account=...` 逐條目
 隔離——單一壞條目不擋其他人，條目保留在 pending 供調查，下輪自動重試。
 
+#### ⚠️⚠️ 5.6a-1 升級既有機器：範本必須先刪掉風控四鍵（2026-07-30，錢包主人自選風控）
+
+風控四鍵自本次改動起**由 watcher 逐用戶代入**（它們是客戶在跟單頁自己選的，
+不再是全體共用的範本值），因此與 `SPARK_*` 同列 `GENERATED_KEYS`：
+
+```
+COPY_RISK_CONTROLS_ENABLED   COPY_MAX_DRAWDOWN_PCT
+COPY_MAX_TOTAL_DRAWDOWN_PCT  COPY_FLATTEN_ON_BREACH
+```
+
+**現行正式機的 `/etc/filet/follower.env.template` 有 `COPY_MAX_DRAWDOWN_PCT=0.20` 這一行**，
+新程式碼會因此在每一輪的範本 pre-flight 直接 `SystemExit`——**沒有人會被啟用**
+（fail-closed，不是壞掉：舊範本＋新程式會讓「客戶選的」與「範本寫的」重複定義同一個鍵，
+而哪個生效取決於 EnvironmentFile 的載入細節）。所以推碼與改範本必須在**同一次**部署完成：
+
+```bash
+# 1) 刪掉範本裡的風控行（只刪這一行；TG token 等其餘內容不動）
+sudo cp -a /etc/filet/follower.env.template \
+           /etc/filet/follower.env.template.bak-$(date -u +%Y%m%dT%H%M%SZ)
+sudo sed -i '/^COPY_MAX_DRAWDOWN_PCT=/d' /etc/filet/follower.env.template
+
+# 2) 驗收：四個鍵在範本裡都必須是 0 個命中（只印計數，不印值）
+sudo grep -cE '^(COPY_RISK_CONTROLS_ENABLED|COPY_MAX_DRAWDOWN_PCT|COPY_MAX_TOTAL_DRAWDOWN_PCT|COPY_FLATTEN_ON_BREACH)=' \
+  /etc/filet/follower.env.template   # 預期：0
+
+# 3) 驗收：手動跑一輪，pre-flight 必須通過（沒有 SystemExit）
+sudo systemctl start filet-auto-activate.service
+journalctl -u filet-auto-activate.service -n 20 --no-pager
+```
+
+**既有正在跑的 follower 不受影響、也不要去動**：他們的 env 已經有自己的
+`COPY_MAX_DRAWDOWN_PCT`，`COPY_RISK_CONTROLS_ENABLED` 缺席時引擎預設 `True`
+（＝維持現有風控，安全側）。要把某個既有客戶改成無風控，必須是**他自己**的決定，
+做法是人工編輯他的 env ＋ `systemctl restart filet-follower@<id>`。
+
 ### 5.7 ⭐ 兩個定時任務（leaderboard 快照 ＋ 績效序列取樣）
 
 > 編號 `5.7` 是**附加**在 §5 尾端的新章節（不重編任何既有編號，程式碼與文件裡對
