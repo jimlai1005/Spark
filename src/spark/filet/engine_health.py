@@ -167,7 +167,9 @@ def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool |
                     allocated_capital: str | None, capital_utilization: str | None,
                     use_full_equity: bool | None, capital_source: str,
                     capital_changed_at: str | None,
-                    risk_controls_enabled: bool | None, cycle_result: str,
+                    risk_controls_enabled: bool | None, risk_source: str,
+                    risk_changed_at: str | None, risk_prefs: dict | None,
+                    risk_halt: dict | None, cycle_result: str,
                     cycle_detail: str | None) -> dict:
     """組出一份心跳 payload（**唯一**的產生點，欄位順序＝HEARTBEAT_FIELDS）。
 
@@ -213,7 +215,22 @@ def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool |
         # 對 filet-api 不可讀，面板沒有別的來源；而「這顆引擎沒有任何風控」正是操作者
         # 掃面板時最需要一眼看到的事。`None` ＝引擎自己也不知道（settings 尚未載入），
         # 刻意與 False 分開：面板不得把「未知」畫成「有風控」。
-        "risk": {"controls_enabled": risk_controls_enabled},
+        # ⭐ `source`／`changed_at` 沿 `capital` 那一格的同一個形狀（2026-07-30，
+        # 客戶簽章的風控設定管線）：`customer_signed` ＝這組門檻是客戶自己簽的，
+        # `env_default` ＝仍是部署當下寫進 env 的值，`unavailable` ＝本輪沒有設定
+        # （引擎還沒解出 settings）。少了它，面板分不出「客戶把回撤上限調到 50%」
+        # 與「部署把它設成 50%」——前者是客戶的決定，後者是我們該去查的事。
+        # `halt`＝`killswitch.halt_status()` 的產物（未熔斷為 None）。它帶著
+        # `resumable`，讓客戶頁面在「leader 被撤銷」的鎖定上**事先**收起自助恢復按鈕，
+        # 而不是讓客戶簽一份注定被引擎拒絕的解鎖請求（見 killswitch.halt_status）。
+        # ⭐ `prefs`＝本輪**實際在執法**的那一組門檻（canonical 字串，與客戶簽的同源）。
+        # 少了它，客戶把回撤上限從 20% 調到 10% 之後，頁面只能比對「風控有沒有開」
+        # ——兩邊都是開，於是顯示「已生效」，而引擎其實還在用舊門檻。那是最常見的
+        # 調整情境，也是這一格存在的唯一理由（工程原則 1：比較的兩個值要同源）。
+        # 門檻值不是授權材料，不觸發 `FORBIDDEN_KEY_PARTS`。
+        "risk": {"controls_enabled": risk_controls_enabled,
+                 "source": risk_source, "changed_at": risk_changed_at,
+                 "prefs": risk_prefs, "halt": risk_halt},
         "last_cycle": {"result": cycle_result, "detail": cycle_detail},
     }
 

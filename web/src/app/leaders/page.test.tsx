@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,8 @@ import {
   type LeadersResp,
   type MyLeaderResp,
   type MyRiskResp,
+  type RiskPrefs,
+  type RiskSettingsMessageResp,
 } from "@/lib/api";
 
 const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" };
@@ -20,7 +22,10 @@ const postLeaderSelect = vi.fn();
 const getLeaderPreview = vi.fn();
 const getMyLeader = vi.fn();
 const getMyRisk = vi.fn();
+const getRiskSettingsMessage = vi.fn();
 const postMyRisk = vi.fn();
+const getRiskUnlockMessage = vi.fn();
+const postRiskUnlock = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMe: (...a: unknown[]) => getMe(...a),
@@ -30,7 +35,10 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getLeaderPreview: (...a: unknown[]) => getLeaderPreview(...a),
   getMyLeader: (...a: unknown[]) => getMyLeader(...a),
   getMyRisk: (...a: unknown[]) => getMyRisk(...a),
+  getRiskSettingsMessage: (...a: unknown[]) => getRiskSettingsMessage(...a),
   postMyRisk: (...a: unknown[]) => postMyRisk(...a),
+  getRiskUnlockMessage: (...a: unknown[]) => getRiskUnlockMessage(...a),
+  postRiskUnlock: (...a: unknown[]) => postRiskUnlock(...a),
 }));
 
 const signMessageAsync = vi.fn();
@@ -143,31 +151,91 @@ async function openConfirmViaDock(addr = CUSTOM_ADDR) {
  * src/spark/filet/risk_prefs.py 的實際區間，好讓「前端不硬編數字」這件事在
  * 測試裡也成立（改了後端區間，這裡跟著改，前端 code 不必動）。
  */
+const RISK_PREFS: RiskPrefs = {
+  enabled: false, size_tolerance: "0.08", max_drawdown_pct: "0.2",
+  max_total_drawdown_pct: "0.4", flatten_on_breach: true, cooldown_hours: "12",
+};
+
 function myRisk(over: Partial<MyRiskResp> = {}): MyRiskResp {
   return {
-    prefs: {
-      enabled: false, max_drawdown_pct: "0.20",
-      max_total_drawdown_pct: "0.40", flatten_on_breach: true,
-    },
-    defaults: {
-      enabled: false, max_drawdown_pct: "0.20",
-      max_total_drawdown_pct: "0.40", flatten_on_breach: true,
-    },
+    prefs: { ...RISK_PREFS },
+    defaults: { ...RISK_PREFS },
     specs: [
+      // ⭐ group="tracking"：不受風控開關影響，UI 必須畫在 checkbox 之外。
+      { name: "size_tolerance", env: "COPY_SIZE_TOLERANCE", type: "decimal",
+        group: "tracking", default: "0.08", recommended: "0.08",
+        min: "0.02", max: "0.25",
+        label: "與 leader 的部位差異容忍度", help: "調小＝跟得更緊，成本上升。" },
       { name: "max_drawdown_pct", env: "COPY_MAX_DRAWDOWN_PCT", type: "decimal",
-        default: "0.20", min: "0.05", max: "0.50",
+        group: "risk", default: "0.2", recommended: "0.2", min: "0.05", max: "0.5",
         label: "7 天滾動回撤上限", help: "跌幅超過此值即熔斷。" },
       { name: "max_total_drawdown_pct", env: "COPY_MAX_TOTAL_DRAWDOWN_PCT",
-        type: "decimal", default: "0.40", min: "0", max: "0.80",
+        type: "decimal", group: "risk", default: "0.4", recommended: "0.4",
+        min: "0", max: "0.8",
         label: "累計回撤上限", help: "0 ＝ 停用這一道。" },
       { name: "flatten_on_breach", env: "COPY_FLATTEN_ON_BREACH", type: "bool",
-        default: true, min: null, max: null,
+        group: "risk", default: true, recommended: true, min: null, max: null,
         label: "熔斷時自動平倉", help: "關：只停止交易並告警。" },
+      // ⭐ unit="hours"：不做百分比換算，刻度是整數小時。
+      { name: "cooldown_hours", env: "COPY_RISK_COOLDOWN_HOURS", type: "decimal",
+        group: "risk", unit: "hours", default: "12", recommended: "12",
+        min: "0", max: "168",
+        label: "熔斷後的冷靜期（小時）", help: "設 0 ＝ 不自動恢復。" },
     ],
-    editable: true, not_editable_reason: null, not_editable_note: null,
-    stored_unreadable: false, stored_unreadable_note: null,
+    submitted: { issued_at: "2026-07-30T00:00:00Z" },
+    applied: {
+      controls_enabled: false, source: "signed_settings",
+      changed_at: "2026-07-30T00:01:00Z",
+      // 引擎實際在執法的門檻＝預設值（與 prefs 一致 ⇒ 「已生效」）
+      prefs: {
+        enabled: false, size_tolerance: "0.08", max_drawdown_pct: "0.2",
+        max_total_drawdown_pct: "0.4", flatten_on_breach: true,
+        cooldown_hours: "12",
+      },
+    },
+    halted: {
+      tripped: false, reason: null, tripped_at: null, resumable: null,
+      cooldown_hours: null, resume_at: null,
+    },
+    editable: true,
     ...over,
   };
+}
+
+/**
+ * 伺服器產生的風控待簽原文。⭐ 版型照抄後端 `build_risk_settings_message`
+ * （filet/risk_settings.py）：每個參數各佔一行、帶單位的附單位詞、總開關那一行的
+ * 標籤是 `Risk Controls`。前端的內容預驗會逐行比對它——fixture 若簡化掉這個形狀，
+ * 測試驗到的就不是真實流程會走的那條路徑。
+ */
+function riskMessageFor(prefs: RiskPrefs): string {
+  return [
+    "Filet: update copy-trading risk settings", "",
+    `Account: ${ME.account_id}`,
+    `Risk Controls: ${prefs.enabled ? "enabled" : "disabled"}`,
+    `size_tolerance: ${prefs.size_tolerance}`,
+    `max_drawdown_pct: ${prefs.max_drawdown_pct}`,
+    `max_total_drawdown_pct: ${prefs.max_total_drawdown_pct}`,
+    `flatten_on_breach: ${prefs.flatten_on_breach}`,
+    `cooldown_hours: ${prefs.cooldown_hours} hours`,
+    "Nonce: n-risk", "Issued At: 2026-07-30T02:00:00Z",
+  ].join("\n");
+}
+
+const UNLOCK_MSG = [
+  "Filet: resume copy-trading after a risk halt", "",
+  `Account: ${ME.account_id}`, "Nonce: n-unlock", "Issued At: 2026-07-30T03:00:00Z",
+].join("\n");
+
+/** 熔斷中（非治理性）的 fixture——`halted.tripped=true` 才會出現恢復按鈕。 */
+function halted(over: Partial<NonNullable<MyRiskResp["halted"]>> = {}) {
+  return myRisk({
+    halted: {
+      tripped: true, reason: "max_drawdown_pct", resumable: true,
+      tripped_at: "2026-07-30T04:00:00Z", cooldown_hours: "12",
+      resume_at: "2026-07-30T16:00:00Z", ...over,
+    },
+  });
 }
 
 beforeEach(() => {
@@ -176,7 +244,23 @@ beforeEach(() => {
   getLeaders.mockResolvedValue(leaders());
   getMyLeader.mockResolvedValue(myLeader());
   getMyRisk.mockResolvedValue(myRisk());
-  postMyRisk.mockResolvedValue({ ok: true, prefs: myRisk().prefs });
+  // 伺服器就客戶送來的偏好產生 canonical 原文並回聲——mock 必須是動態的，否則
+  // 前端的內容預驗（回聲要等於我送出的那一組）會在每一個測試裡把流程擋下來。
+  getRiskSettingsMessage.mockImplementation(async (prefs: RiskPrefs) => ({
+    message: riskMessageFor(prefs), nonce: "n-risk",
+    issued_at: "2026-07-30T02:00:00Z", account_id: ME.account_id, prefs,
+  }));
+  postMyRisk.mockImplementation(async (payload: RiskSettingsMessageResp) => ({
+    ok: true, prefs: payload.prefs,
+    effective_note: "引擎會在下一輪（約一分鐘內）套用這份設定。",
+  }));
+  getRiskUnlockMessage.mockResolvedValue({
+    message: UNLOCK_MSG, nonce: "n-unlock",
+    issued_at: "2026-07-30T03:00:00Z", account_id: ME.account_id,
+  });
+  postRiskUnlock.mockResolvedValue({
+    ok: true, effective_note: "已解除，引擎會在下一輪恢復跟單。",
+  });
   getLeaderPreview.mockResolvedValue(CUSTOM_PREVIEW);
   getLeaderSelectMessage.mockResolvedValue(CUSTOM_MSG);
   postLeaderSelect.mockResolvedValue({
@@ -691,134 +775,351 @@ describe("LeadersPage — 其他狀態", () => {
   });
 });
 
-// ── 風控 opt-in（2026-07-30，錢包主人自選）──────────────────────────
-describe("LeadersPage — 風控設定", () => {
-  it("預設不啟用，且細項在勾選前不出現（沒開風控時那些數字沒有意義）", async () => {
+// ── 風控設定（2026-07-30 改版：slider ＋ 簽章送出 ＋ 自助解除熔斷）────────
+//
+// ⭐ 本區的設計前提（使用者裁決）：風控門檻涉及利益衝突，所以不由我們替客戶決定
+// ——每個參數都給 slider、把我方建議值標在旁邊，最終由客戶自己決定。因此這裡的
+// 測試全部針對「畫面上的數字是不是真的來自後端 specs」與「送出的東西是不是客戶
+// 自己簽的那一份」，而不是針對某個特定的門檻值。
+const RISK_TOGGLE = /啟用 Filet 風控系統/;
+const SAVE_BUTTON = "簽署並儲存風控設定";
+const RESUME_BUTTON = "立即恢復跟單";
+
+async function enableRisk() {
+  await userEvent.click(await screen.findByRole("checkbox", { name: RISK_TOGGLE }));
+}
+
+describe("LeadersPage — 風控設定：分組與顯示", () => {
+  it("⭐ group=tracking 的參數在**未勾選**風控時仍然顯示（它不受風控開關影響）", async () => {
+    // 藏在 checkbox 底下會讓關掉風控的客戶以為自己也關掉了它——而它照樣生效。
     render(wrap(<LeadersPage />));
-    const toggle = await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ });
+    const toggle = await screen.findByRole("checkbox", { name: RISK_TOGGLE });
     expect(toggle).not.toBeChecked();
+    expect(screen.getByLabelText("與 leader 的部位差異容忍度")).toBeInTheDocument();
+  });
+
+  it("group=risk 的參數只有勾選後才出現（沒開風控時這些門檻不會被執法）", async () => {
+    render(wrap(<LeadersPage />));
+    await screen.findByRole("checkbox", { name: RISK_TOGGLE });
     expect(screen.queryByLabelText("7 天滾動回撤上限")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("熔斷後的冷靜期（小時）")).not.toBeInTheDocument();
+
+    await enableRisk();
+    expect(screen.getByLabelText("7 天滾動回撤上限")).toBeInTheDocument();
+    expect(screen.getByLabelText("熔斷後的冷靜期（小時）")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /熔斷時自動平倉/ })).toBeInTheDocument();
   });
 
-  it("勾選後展開細項，且上下界取自後端 specs（前端不硬編）", async () => {
+  it("⭐ 比例參數＝slider，上下界與建議值取自後端 specs（前端不硬編）", async () => {
     render(wrap(<LeadersPage />));
-    const toggle = await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ });
-    await userEvent.click(toggle);
-    const dd = screen.getByLabelText("7 天滾動回撤上限");
-    expect(dd).toHaveValue(20);              // 0.20 → 20%
-    expect(dd).toHaveAttribute("min", "5");  // spec.min 0.05 → 5%
-    expect(dd).toHaveAttribute("max", "50");
-    const total = screen.getByLabelText("累計回撤上限");
-    expect(total).toHaveValue(40);
+    await enableRisk();
+
+    const dd = screen.getByLabelText("7 天滾動回撤上限") as HTMLInputElement;
+    expect(dd).toHaveAttribute("type", "range");
+    expect(dd).toHaveAttribute("min", "5");    // spec.min 0.05 → 5%
+    expect(dd).toHaveAttribute("max", "50");   // spec.max 0.50 → 50%
+    expect(dd.value).toBe("20");               // prefs 0.2 → 20%
+    expect(screen.getByText("20%")).toBeInTheDocument();
+    expect(screen.getByText("建議：20%")).toBeInTheDocument();  // spec.recommended
+
+    const total = screen.getByLabelText("累計回撤上限") as HTMLInputElement;
+    expect(total).toHaveAttribute("min", "0");
     expect(total).toHaveAttribute("max", "80");
+    expect(screen.getByText("建議：40%")).toBeInTheDocument();
+
+    // tracking 組同樣是 slider ＋ 建議值
+    const tol = screen.getByLabelText("與 leader 的部位差異容忍度") as HTMLInputElement;
+    expect(tol).toHaveAttribute("type", "range");
+    expect(tol).toHaveAttribute("min", "2");
+    expect(tol).toHaveAttribute("max", "25");
+    expect(screen.getByText("建議：8%")).toBeInTheDocument();
   });
 
-  it("儲存：百分比換算回比例送給後端，不送浮點雜訊", async () => {
+  it("⭐ unit=hours 的參數以小時呈現、整數刻度（不做百分比換算）", async () => {
     render(wrap(<LeadersPage />));
-    await userEvent.click(
-      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
+    await enableRisk();
+
+    const cd = screen.getByLabelText("熔斷後的冷靜期（小時）") as HTMLInputElement;
+    expect(cd).toHaveAttribute("min", "0");
+    expect(cd).toHaveAttribute("max", "168");
+    expect(cd).toHaveAttribute("step", "1");
+    expect(cd.value).toBe("12");
+    expect(screen.getByText("12小時")).toBeInTheDocument();
+    expect(screen.getByText("建議：12小時")).toBeInTheDocument();
+  });
+
+  it("⭐⭐ 門檻數字全部跟著 specs 走：換一份 specs，畫面就換一組界線與建議值", async () => {
+    // 這條是「不得硬編」的直接證明：前端沒有任何一個數字是自己寫的，改後端區間
+    // 前端不必動——反過來說，硬編了就會在這裡轉紅。
+    const base = myRisk();
+    getMyRisk.mockResolvedValue({
+      ...base,
+      specs: base.specs.map((s) =>
+        s.name === "max_drawdown_pct"
+          ? { ...s, min: "0.1", max: "0.3", recommended: "0.25" }
+          : s),
+    });
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+
     const dd = screen.getByLabelText("7 天滾動回撤上限");
-    await userEvent.clear(dd);
-    await userEvent.type(dd, "29");
-    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
-    await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
-    expect(postMyRisk).toHaveBeenCalledWith(expect.objectContaining({
-      enabled: true, max_drawdown_pct: "0.29",
-    }));
-    expect(await screen.findByText(/風控設定已儲存/)).toBeInTheDocument();
-  });
-
-  it("熔斷自動平倉可以關掉（軟暫停語意）", async () => {
-    render(wrap(<LeadersPage />));
-    await userEvent.click(
-      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
-    await userEvent.click(screen.getByRole("checkbox", { name: /熔斷時自動平倉/ }));
-    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
-    await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
-    expect(postMyRisk).toHaveBeenCalledWith(
-      expect.objectContaining({ flatten_on_breach: false }));
-  });
-
-  it("⭐ 已啟用的帳號：表單唯讀＋說明原因，且沒有儲存鈕（按了沒用比不給選更糟）", async () => {
-    getMyRisk.mockResolvedValue(myRisk({
-      editable: false, not_editable_reason: "not_pending",
-      not_editable_note: "引擎已經啟用；要調整請聯絡我們。",
-    }));
-    render(wrap(<LeadersPage />));
-    expect(await screen.findByText(/風控設定已鎖定/)).toBeInTheDocument();
-    expect(screen.getByText(/要調整請聯絡我們/)).toBeInTheDocument();
-    expect(screen.getByRole("checkbox", { name: /啟用 Filet 風控系統/ })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "儲存風控設定" })).not.toBeInTheDocument();
+    expect(dd).toHaveAttribute("min", "10");
+    expect(dd).toHaveAttribute("max", "30");
+    expect(screen.getByText("建議：25%")).toBeInTheDocument();
   });
 
   it("⭐ 讀不到設定 → 只說讀不到，不畫一個預設值的表單當成客戶的設定", async () => {
     getMyRisk.mockRejectedValue(new ApiError("upstream", "500", 500));
     render(wrap(<LeadersPage />));
     expect(await screen.findByText(/風控設定暫時讀不到/)).toBeInTheDocument();
-    expect(screen.queryByRole("checkbox", { name: /啟用 Filet 風控系統/ }))
-      .not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: RISK_TOGGLE })).not.toBeInTheDocument();
   });
 
-  it("儲存失敗 → 顯示後端訊息，不假裝成功", async () => {
-    postMyRisk.mockRejectedValue(
-      new ApiError("client", "這個帳號不在待啟用佇列中。", 409));
-    render(wrap(<LeadersPage />));
-    await userEvent.click(
-      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
-    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
-    expect(await screen.findByText(/不在待啟用佇列中/)).toBeInTheDocument();
-    expect(screen.queryByText(/風控設定已儲存/)).not.toBeInTheDocument();
-  });
-
-  it("文案不得把啟用風控講成保證不虧（誠信紅線）", async () => {
+  it("文案不得把啟用風控講成不會虧（誠信紅線）", async () => {
     render(wrap(<LeadersPage />));
     const help = await screen.findByText(/開啟後：權益回撤達到你設定的門檻/);
     expect(help.textContent).toMatch(/並不會讓本金免於虧損/);
   });
 });
 
-// 審查修正的回歸釘（2026-07-30 fresh-review F1／F3／F7）
-describe("LeadersPage — 風控設定的審查修正", () => {
-  it("F7：33.33% 的輸入，畫面顯示與送出值必須是同一個數（33.3% / 0.333）", async () => {
+describe("LeadersPage — 風控設定：簽章送出", () => {
+  it("⭐ 儲存＝簽章流程：伺服器原文原樣進錢包，整包 payload 原樣回送", async () => {
     render(wrap(<LeadersPage />));
-    await userEvent.click(
-      await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ }));
-    const dd = screen.getByLabelText("7 天滾動回撤上限");
-    await userEvent.clear(dd);
-    await userEvent.type(dd, "33.33");
-    expect(dd).toHaveValue(33.3);            // 顯示
-    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
+    await enableRisk();
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+
     await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
-    expect(postMyRisk).toHaveBeenCalledWith(
-      expect.objectContaining({ max_drawdown_pct: "0.333" }));  // 送出（同一個數）
+    // 送去換原文的是畫面上的那一份草稿（含 enabled=true 與 tracking 參數）
+    expect(getRiskSettingsMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ enabled: true, size_tolerance: "0.08" }));
+    const payload = await getRiskSettingsMessage.mock.results[0].value;
+    expect(signMessageAsync).toHaveBeenCalledWith({ message: payload.message });
+    expect(postMyRisk).toHaveBeenCalledWith(payload, SIG);
+    // 生效說明用後端原文（單一來源）
+    expect(await screen.findByText(/套用這份設定/)).toBeInTheDocument();
   });
 
-  it("F1：送出的 body 一律帶 enabled（後端據此區分「關閉」與「沒表達」）", async () => {
+  it("⭐ 未啟用風控時照樣能送出：body 一律帶 enabled（後端據此區分「關」與「沒表達」）", async () => {
     render(wrap(<LeadersPage />));
-    await screen.findByRole("checkbox", { name: /啟用 Filet 風控系統/ });
-    await userEvent.click(screen.getByRole("button", { name: "儲存風控設定" }));
-    await waitFor(() => expect(postMyRisk).toHaveBeenCalledTimes(1));
-    expect(postMyRisk.mock.calls[0][0]).toHaveProperty("enabled", false);
+    await screen.findByRole("checkbox", { name: RISK_TOGGLE });
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+
+    await waitFor(() => expect(getRiskSettingsMessage).toHaveBeenCalledTimes(1));
+    expect(getRiskSettingsMessage.mock.calls[0][0]).toHaveProperty("enabled", false);
   });
 
-  it("F3：儲存值讀取異常 → 明說畫面顯示的是安全預設，且表單仍可編輯", async () => {
+  it("拉動 slider：畫面顯示與送出的值是同一個數（33.3% ⇔ 0.333）", async () => {
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+    fireEvent.change(screen.getByLabelText("7 天滾動回撤上限"), {
+      target: { value: "33.3" },
+    });
+    expect(screen.getByText("33.3%")).toBeInTheDocument();          // 顯示
+
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+    await waitFor(() => expect(getRiskSettingsMessage).toHaveBeenCalledTimes(1));
+    expect(getRiskSettingsMessage.mock.calls[0][0])
+      .toMatchObject({ max_drawdown_pct: "0.333" });                // 送出（同一個數）
+  });
+
+  it("冷靜期 slider 以小時送出（不換算成比例）", async () => {
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+    fireEvent.change(screen.getByLabelText("熔斷後的冷靜期（小時）"), {
+      target: { value: "24" },
+    });
+    expect(screen.getByText("24小時")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+    await waitFor(() => expect(getRiskSettingsMessage).toHaveBeenCalledTimes(1));
+    expect(getRiskSettingsMessage.mock.calls[0][0]).toMatchObject({ cooldown_hours: "24" });
+  });
+
+  it("熔斷自動平倉可以關掉（軟暫停語意）", async () => {
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+    await userEvent.click(screen.getByRole("checkbox", { name: /熔斷時自動平倉/ }));
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+
+    await waitFor(() => expect(getRiskSettingsMessage).toHaveBeenCalledTimes(1));
+    expect(getRiskSettingsMessage.mock.calls[0][0])
+      .toMatchObject({ flatten_on_breach: false });
+  });
+
+  it("⭐ recover 出的簽章者 ≠ 登入地址 → 中止，且**零網路請求**（不送出）", async () => {
+    recoverPersonalSigner.mockResolvedValue("0x9999999999999999999999999999999999999999");
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+
+    expect(await screen.findByText(/簽署的錢包與你登入的錢包不是同一個/)).toBeInTheDocument();
+    expect(postMyRisk).not.toHaveBeenCalled();
+  });
+
+  it("⭐ 伺服器回一份指向別組設定的原文 → 進錢包之前擋下（不喚起錢包、不送出）", async () => {
+    // 被打穿的 filet-api 想無中生有一次「把保護關掉」，唯一的著力點就是這裡。
+    getRiskSettingsMessage.mockImplementation(async (prefs: RiskPrefs) => {
+      const evil = { ...prefs, enabled: false };
+      return {
+        message: riskMessageFor(evil), nonce: "n-risk",
+        issued_at: "2026-07-30T02:00:00Z", account_id: ME.account_id, prefs: evil,
+      };
+    });
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+
+    expect(await screen.findByText(/伺服器回傳的待簽內容與你在畫面上設定的不一致/))
+      .toBeInTheDocument();
+    expect(signMessageAsync).not.toHaveBeenCalled();
+    expect(postMyRisk).not.toHaveBeenCalled();
+  });
+
+  it("錢包取消 → 明說設定沒有被變更", async () => {
+    signMessageAsync.mockRejectedValue(new Error("User rejected"));
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+
+    expect(await screen.findByText(/你在錢包取消了簽署/)).toBeInTheDocument();
+    expect(postMyRisk).not.toHaveBeenCalled();
+  });
+
+  it("送出失敗 → 顯示後端訊息，不假裝成功", async () => {
+    postMyRisk.mockRejectedValue(
+      new ApiError("client", "nonce 已被使用", 409, "nonce 已被使用"));
+    render(wrap(<LeadersPage />));
+    await enableRisk();
+    await userEvent.click(screen.getByRole("button", { name: SAVE_BUTTON }));
+
+    expect(await screen.findByText(/nonce 已被使用/)).toBeInTheDocument();
+    expect(screen.queryByText(/風控設定已送出/)).not.toBeInTheDocument();
+  });
+});
+
+describe("LeadersPage — 已提交 vs 已生效", () => {
+  it("已生效值與已提交值一致 → 說一致", async () => {
+    render(wrap(<LeadersPage />));
+    expect(await screen.findByText(/目前生效中的設定與你提交的一致/)).toBeInTheDocument();
+  });
+
+  it("⭐ 已生效值與已提交值不一致 → 「已提交，尚未生效」", async () => {
     getMyRisk.mockResolvedValue(myRisk({
-      prefs: {
-        enabled: true, max_drawdown_pct: "0.20",
-        max_total_drawdown_pct: "0.40", flatten_on_breach: true,
+      prefs: { ...RISK_PREFS, enabled: true },
+      // 引擎仍在用舊門檻（風控未開）⇒ 逐項比對不一致
+      applied: {
+        controls_enabled: false, source: "signed_settings", changed_at: null,
+        prefs: { ...RISK_PREFS, enabled: false },
       },
-      stored_unreadable: true,
-      stored_unreadable_note: "你先前儲存的風控設定讀取異常，畫面顯示的是系統採用的安全預設（風控開啟）。",
     }));
     render(wrap(<LeadersPage />));
-    expect(await screen.findByText(/讀取異常/)).toBeInTheDocument();
-    expect(screen.getByRole("checkbox", { name: /啟用 Filet 風控系統/ })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "儲存風控設定" })).toBeInTheDocument();
+    expect(await screen.findByText(/已提交，尚未生效/)).toBeInTheDocument();
   });
 
-  it("觀察 4：提醒客戶在選定 leader 之前先儲存（啟用後就鎖定）", async () => {
+  it("⭐⭐ applied 為 null（引擎心跳讀不到）→ 說「無法確認」，**不得**畫成「尚未生效」", async () => {
+    getMyRisk.mockResolvedValue(myRisk({ applied: null }));
     render(wrap(<LeadersPage />));
-    expect(await screen.findByText(/請在選定 leader 之前先儲存風控設定/))
-      .toBeInTheDocument();
+    expect(await screen.findByText(/目前生效的設定暫時無法確認/)).toBeInTheDocument();
+    expect(screen.queryByText(/尚未生效/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/目前生效中的設定與你提交的一致/)).not.toBeInTheDocument();
+  });
+
+  it("applied 在但 controls_enabled 為 null → 同樣是「無法確認」", async () => {
+    getMyRisk.mockResolvedValue(myRisk({
+      applied: {
+        controls_enabled: null, source: "unknown", changed_at: null, prefs: null,
+      },
+    }));
+    render(wrap(<LeadersPage />));
+    expect(await screen.findByText(/目前生效的設定暫時無法確認/)).toBeInTheDocument();
+  });
+
+  it("從未提交過 → 明說畫面上是預設值（不謊稱「與你提交的一致」）", async () => {
+    getMyRisk.mockResolvedValue(myRisk({ submitted: { issued_at: null } }));
+    render(wrap(<LeadersPage />));
+    expect(await screen.findByText(/你尚未提交過風控設定/)).toBeInTheDocument();
+  });
+});
+
+describe("LeadersPage — 熔斷與立即恢復跟單", () => {
+  it("⭐ 熔斷中 → 醒目區塊：原因、觸發時間、預計自動恢復時間，並提供恢復按鈕", async () => {
+    getMyRisk.mockResolvedValue(halted());
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText("你的跟單已被風控停止")).toBeInTheDocument();
+    const box = screen.getByText("你的跟單已被風控停止").closest(".risk-halted")!;
+    expect(box.textContent).toContain("max_drawdown_pct");
+    expect(box.textContent).toContain("2026-07-30T04:00:00Z");
+    expect(box.textContent).toContain("2026-07-30T16:00:00Z");
+    expect(screen.getByRole("button", { name: RESUME_BUTTON })).toBeInTheDocument();
+  });
+
+  it("⭐ 按「立即恢復跟單」→ 走 unlock 簽章流程（伺服器原文原樣進錢包）", async () => {
+    getMyRisk.mockResolvedValue(halted());
+    render(wrap(<LeadersPage />));
+    await userEvent.click(await screen.findByRole("button", { name: RESUME_BUTTON }));
+
+    await waitFor(() => expect(postRiskUnlock).toHaveBeenCalledTimes(1));
+    expect(getRiskUnlockMessage).toHaveBeenCalledTimes(1);
+    expect(signMessageAsync).toHaveBeenCalledWith({ message: UNLOCK_MSG });
+    const payload = await getRiskUnlockMessage.mock.results[0].value;
+    expect(postRiskUnlock).toHaveBeenCalledWith(payload, SIG);
+    expect(await screen.findByText(/引擎會在下一輪恢復跟單/)).toBeInTheDocument();
+    // ⭐ 解鎖是一次性動作，且與「調整設定」是兩個域：不得順手送出一份設定
+    expect(postMyRisk).not.toHaveBeenCalled();
+  });
+
+  it("⭐ 恢復流程 recover 不符 → 不送出（零網路請求）", async () => {
+    getMyRisk.mockResolvedValue(halted());
+    recoverPersonalSigner.mockResolvedValue("0x9999999999999999999999999999999999999999");
+    render(wrap(<LeadersPage />));
+    await userEvent.click(await screen.findByRole("button", { name: RESUME_BUTTON }));
+
+    expect(await screen.findByText(/簽署的錢包與你登入的錢包不是同一個/)).toBeInTheDocument();
+    expect(postRiskUnlock).not.toHaveBeenCalled();
+  });
+
+  it("⭐⭐ 不可自助恢復（治理動作）→ **不顯示**恢復按鈕，改顯示說明", async () => {
+    // ⭐ 判定依據是後端的 `resumable`（引擎 rearm_allowed_for 導出），不是前端比對
+    // reason 字串——引擎新增一種不可恢復的原因時，這裡不必跟著改就已經是對的。
+    getMyRisk.mockResolvedValue(
+      halted({ reason: "leader_revoked", resumable: false }));
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText(/已被我們下架/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: RESUME_BUTTON })).not.toBeInTheDocument();
+  });
+
+  it("⭐ resumable 為 null（引擎版本較舊、判不出來）→ 同樣不給按鈕", async () => {
+    getMyRisk.mockResolvedValue(halted({ reason: null, resumable: null }));
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText(/已被我們下架/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: RESUME_BUTTON })).not.toBeInTheDocument();
+  });
+
+  it("冷靜期 0（沒有自動恢復時刻）→ 說明只能自己按，不留白", async () => {
+    getMyRisk.mockResolvedValue(halted({ cooldown_hours: "0", resume_at: null }));
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText(/沒有預計的自動恢復時間/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: RESUME_BUTTON })).toBeInTheDocument();
+  });
+
+  it("⭐⭐ halted 為 null（引擎狀態讀不到）→ 說「無法確認」，**不得**畫成「沒熔斷」", async () => {
+    getMyRisk.mockResolvedValue(myRisk({ halted: null }));
+    render(wrap(<LeadersPage />));
+
+    expect(await screen.findByText(/目前無法確認你的風控是否被觸發/)).toBeInTheDocument();
+    // 讀不到不等於沒事：既不畫熔斷區塊，也不給一顆按了沒意義的恢復按鈕
+    expect(screen.queryByText("你的跟單已被風控停止")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: RESUME_BUTTON })).not.toBeInTheDocument();
+  });
+
+  it("確定沒有熔斷（tripped=false）→ 整區不畫，也不顯示「無法確認」", async () => {
+    render(wrap(<LeadersPage />));
+    await screen.findByRole("checkbox", { name: RISK_TOGGLE });
+    expect(screen.queryByText("你的跟單已被風控停止")).not.toBeInTheDocument();
+    expect(screen.queryByText(/目前無法確認你的風控是否被觸發/)).not.toBeInTheDocument();
   });
 });

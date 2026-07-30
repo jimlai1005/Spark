@@ -2,10 +2,14 @@
  * lib/api.ts — 後端 Public API 的唯一出口（工程原則 5 的前端鏡射）。
  * 一律同源相對路徑 + credentials:"include"（紅線 5）。
  * 錯誤分類（工程原則 2）：auth(401)/client(4xx)/upstream(502|503)/network。
- * ⭐ 紅線 3：帶簽名的後端呼叫只有二支，兩支都是 EIP-191 personal_sign，且兩支的
+ * ⭐ 紅線 3：帶簽名的後端呼叫只有四支，四支都是 EIP-191 personal_sign，且四支的
  *   **原文都由伺服器產生**（前端不組字串）：
  *     1. authVerify —— SIWE 登入簽名；
  *     2. postLeaderSelect —— 換 leader 授權簽名（原文來自 getLeaderSelectMessage）。
+ *     3. postMyRisk —— 風控設定授權簽名（原文來自 getRiskSettingsMessage）；
+ *     4. postRiskUnlock —— 解除熔斷授權簽名（原文來自 getRiskUnlockMessage）。
+ *   後兩支的域分隔（一份「調門檻」的簽章不得被兌換成一次「開熔斷鎖」，反之亦然）
+ *   由伺服器版型的第一行在結構上確立，見 src/spark/filet/risk_settings.py 檔頭。
  *   EIP-712 的鏈上授權簽名走 lib/hl.ts 直送 HL，本模組結構上沒有那條路。
  */
 import type { HlTypedData } from "./hl";
@@ -239,16 +243,38 @@ export function postVerify(): Promise<OnboardStatus> {
 
 // ---------- 風控偏好（錢包主人自選，2026-07-30；對照 publicapi/app.py /api/me/risk）----------
 
+/** 可調參數的識別碼（後端 `RISK_PARAM_SPECS` 的 `name` 欄，改一邊要改兩邊）。 */
+export type RiskParamName =
+  | "size_tolerance"
+  | "max_drawdown_pct"
+  | "max_total_drawdown_pct"
+  | "flatten_on_breach"
+  | "cooldown_hours";
+
 /**
- * 一個可調參數的規格。⭐ **由後端供給**（`specs`），前端不硬編任何上下界或預設值：
- * 引擎的合法區間定義在 `src/spark/filet/risk_prefs.py`，前端另存一份的下場是
- * 「畫面允許 0.01、API 收下、引擎拒絕啟動」，而症狀出現在啟用那一刻。
+ * 一個可調參數的規格。⭐ **由後端供給**（`specs`），前端不硬編任何上下界、預設值
+ * 或建議值：引擎的合法區間定義在 `src/spark/filet/risk_prefs.py`，前端另存一份的
+ * 下場是「畫面允許 0.01、API 收下、引擎拒絕啟動」，而症狀出現在啟用那一刻。
  */
 export interface RiskParamSpec {
-  name: "max_drawdown_pct" | "max_total_drawdown_pct" | "flatten_on_breach";
+  name: RiskParamName;
   env: string;
   type: "decimal" | "bool";
+  /**
+   * ⭐ `tracking` 的參數**不受風控開關影響**，永遠生效——顯示層必須把它畫在啟用
+   * checkbox **之外**。藏在 checkbox 底下會讓關掉風控的客戶以為自己也關掉了它。
+   * `risk` 的參數只有啟用風控時才生效。
+   */
+  group: "tracking" | "risk";
+  /** 目前只有 `hours`；缺席＝比例（顯示層據此決定要不要做百分比換算）。 */
+  unit?: "hours";
   default: string | boolean;
+  /**
+   * ⭐ 我方的建議值。與 `default` 分成兩欄是刻意的：預設值是「沒表達時系統用什麼」，
+   * 建議值是「我們認為你該用什麼」，兩者目前相同但語意不同，顯示層必須顯示這一欄
+   * （客戶自行決定門檻的前提是看得到我們的建議）。
+   */
+  recommended: string | boolean;
   min: string | null;
   max: string | null;
   label: string;
@@ -257,38 +283,173 @@ export interface RiskParamSpec {
 
 export interface RiskPrefs {
   enabled: boolean;
+  size_tolerance: string;
   max_drawdown_pct: string;
   max_total_drawdown_pct: string;
   flatten_on_breach: boolean;
+  cooldown_hours: string;
+}
+
+/** 已簽章提交的那一刻（`null` ＝ 客戶從未提交過任何設定）。 */
+export interface RiskSubmittedInfo {
+  issued_at: string | null;
+}
+
+/**
+ * 引擎**當輪實際採用**的風控姿態（心跳投影）。
+ * ⚠️ 目前只投影總開關（`controls_enabled`）——逐項門檻不在心跳裡，所以顯示層只能
+ * 就這一欄比對「已提交 vs 已生效」，不得宣稱逐項都已生效。
+ * `controls_enabled` 為 null ＝ 心跳在但這一欄讀不到（同樣是「我們不知道」）。
+ */
+export interface RiskAppliedInfo {
+  controls_enabled: boolean | null;
+  /** 這組值從哪來（已簽署的設定／預設值…），由引擎在同一次求值中標記。 */
+  source: string;
+  changed_at: string | null;
+  /**
+   * ⭐ 引擎**實際在執法**的那一組門檻（canonical 字串，與你簽的同源）。
+   * `null` ＝引擎版本較舊、心跳還沒帶這一格 ⇒ 顯示層必須說「無法確認」，
+   * 不得只比對開關就宣稱逐項都已生效（把上限從 20% 調到 10% 時兩邊開關都是
+   * 「開」，只比開關會顯示「已生效」而引擎其實還在用舊門檻）。
+   */
+  prefs: RiskPrefs | null;
+}
+
+/**
+ * 熔斷（kill switch）現況。
+ * ⚠️ `reason === "leader_revoked"` 是**治理動作**（我方撤下 leader），客戶不得自助
+ * 解除——顯示層必須據此**不畫**「立即恢復跟單」按鈕，改顯示說明。
+ */
+export interface RiskHaltedInfo {
+  tripped: boolean;
+  reason: string | null;
+  tripped_at: string | null;
+  /**
+   * ⭐ 這次鎖定可否由你自己解除——由**引擎**的同一份判定（`rearm_allowed_for`）
+   * 導出，顯示層不得自己比對 `reason` 字串（引擎新增一種不可恢復的原因時，
+   * 各自比對的那一邊會給出一顆按了必然失敗的按鈕）。
+   * `null` ＝引擎版本較舊、判不出來 ⇒ 同樣不給按鈕。
+   */
+  resumable: boolean | null;
+  /** 熔斷當下生效的冷靜期（小時）；`null` ＝ 讀不到。 */
+  cooldown_hours: string | null;
+  /** 依冷靜期推算的自動恢復時刻；`null` ＝ 不會自動恢復（冷靜期 0）或算不出來。 */
+  resume_at: string | null;
 }
 
 export interface MyRiskResp {
+  /** 已「簽章提交」的偏好（不是引擎當下採用的值——那是 `applied`）。 */
   prefs: RiskPrefs;
   specs: RiskParamSpec[];
   defaults: RiskPrefs;
+  submitted: RiskSubmittedInfo;
   /**
-   * ⭐ `false` ⇒ 表單必須關掉並顯示 `not_editable_note`。風控偏好只在引擎啟用的
-   * 那一刻寫進 env，之後不會被覆寫——已啟用的帳號在這裡改不會有任何效果，
-   * 讓客戶對著一個按了沒用的開關按第二次比不給選更糟。
+   * ⭐⭐ `null` ＝引擎心跳過期或缺席＝**我們不知道**。顯示層對 null 的正確反應是
+   * 說「暫時無法確認」，**不得**畫成「尚未生效」——後者是一句我們沒有根據的斷言
+   * （工程原則 3：讀不到 ≠ 沒有）。
+   */
+  applied: RiskAppliedInfo | null;
+  /**
+   * ⭐⭐ 同上：`null` **不是**「沒有熔斷」。把「讀不到」畫成「一切正常」，等於在
+   * 客戶的引擎已經停止跟單的當下告訴他一切照常。
+   */
+  halted: RiskHaltedInfo | null;
+  /**
+   * 現在恆為 `true`（設定改為簽章提交後，任何時候都能改，引擎下一輪套用）。
+   * 型別保留這一欄是為了讓後端未來要收回編輯權時，顯示層有地方接住。
    */
   editable: boolean;
-  not_editable_reason: string | null;
-  not_editable_note: string | null;
-  /**
-   * ⭐ `true` ＝存著的偏好驗不過（手改／舊格式），`prefs` 是**系統會採用的安全預設**
-   * （風控開啟）而不是客戶存的值。後端與 watcher 對同一份壞資料的解讀刻意一致，
-   * 否則畫面說關、引擎跑開，客戶無從得知哪個是真的。UI 必須把這件事說出來。
-   */
-  stored_unreadable: boolean;
-  stored_unreadable_note: string | null;
 }
 
 export function getMyRisk(): Promise<MyRiskResp> {
   return request<MyRiskResp>("/api/me/risk");
 }
 
-export function postMyRisk(prefs: RiskPrefs): Promise<{ ok: true; prefs: RiskPrefs }> {
-  return post<{ ok: true; prefs: RiskPrefs }>("/api/me/risk", { prefs });
+/**
+ * 風控設定的 canonical 待簽原文 ＋ 一次性 nonce。⭐ `prefs` 是**伺服器正規化後**的
+ * 偏好回聲（`0.20` → `0.2`）：客戶端必須拿它與自己送出的值逐欄位比對，再比對原文
+ * 本體——伺服器回一份指向別的設定的原文時，必須在**進錢包之前**擋下。
+ */
+export interface RiskSettingsMessageResp {
+  message: string;
+  nonce: string;
+  issued_at: string;
+  account_id: string;
+  prefs: RiskPrefs;
+}
+
+/** 設定生效的回應。`effective_note` 是後端寫給人看的原文（單一來源）。 */
+export interface RiskSettingsResp {
+  ok: boolean;
+  prefs: RiskPrefs;
+  effective_note: string;
+}
+
+/** 解除熔斷的 canonical 待簽原文（一次性動作，**沒有** prefs）。 */
+export interface RiskUnlockMessageResp {
+  message: string;
+  nonce: string;
+  issued_at: string;
+  account_id: string;
+}
+
+export interface RiskUnlockResp {
+  ok: boolean;
+  effective_note: string;
+}
+
+/**
+ * 取風控設定的待簽原文（需 session）。⭐ 本呼叫**不帶簽名**：它只是請伺服器就這組
+ * 偏好產生一份 canonical 原文，值超界 → 400（kind=client）。
+ */
+export function getRiskSettingsMessage(prefs: RiskPrefs): Promise<RiskSettingsMessageResp> {
+  return post<RiskSettingsMessageResp>("/api/me/risk/message", { prefs });
+}
+
+/**
+ * 送出風控設定授權。⭐ 沿 `postLeaderSelect` 的形狀，刻意收**整包 payload 物件**
+ * 而不是散裝欄位：伺服器驗簽時會用 account_id／prefs／nonce／issued_at **重建**
+ * 訊息再 recover，客戶端若從別處（例如畫面上的草稿）拼一個欄位進來，就會出現
+ * 「簽的是 A、送的是 B」的縫——症狀是「我本人簽的卻一直被拒」，而兩邊看起來都
+ * 完全正常。由本函式從同一個 payload 物件取全部欄位＝結構上不可能拼錯（工程原則 1）。
+ *
+ * 非冪等寫入 ＋ nonce 一次性：**不得自動重試**（重送必因 nonce 已消耗而失敗）。
+ */
+export function postMyRisk(
+  payload: RiskSettingsMessageResp,
+  signature: string,
+): Promise<RiskSettingsResp> {
+  return post<RiskSettingsResp>("/api/me/risk", {
+    account_id: payload.account_id,
+    prefs: payload.prefs,
+    nonce: payload.nonce,
+    issued_at: payload.issued_at,
+    signature,
+    message: payload.message,
+  });
+}
+
+/** 取「立即恢復跟單」的待簽原文（需 session）。沒有熔斷時後端回 4xx。 */
+export function getRiskUnlockMessage(): Promise<RiskUnlockMessageResp> {
+  return post<RiskUnlockMessageResp>("/api/me/risk/unlock/message");
+}
+
+/**
+ * 送出解除熔斷授權。⭐ 與 `postMyRisk` 是**兩個端點、兩份原文、兩種動作**：一份
+ * 「調整門檻」的授權絕不能被兌換成一次「把熔斷鎖打開」（反向亦然），域分隔由
+ * 伺服器版型的第一行結構性地確立（filet/risk_settings.py 檔頭）。同樣不得自動重試。
+ */
+export function postRiskUnlock(
+  payload: RiskUnlockMessageResp,
+  signature: string,
+): Promise<RiskUnlockResp> {
+  return post<RiskUnlockResp>("/api/me/risk/unlock", {
+    account_id: payload.account_id,
+    nonce: payload.nonce,
+    issued_at: payload.issued_at,
+    signature,
+    message: payload.message,
+  });
 }
 
 export function getApproveAgentPayload(chainId: number): Promise<TypedDataResp> {

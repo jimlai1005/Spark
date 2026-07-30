@@ -25,8 +25,10 @@ from spark.filet.leader_change import (build_leader_change_message,
 from spark.filet.user_leaders import record_user_leader, user_leaders_path_for
 from spark.publicapi.config import derive_account_id
 from spark.filet.risk_prefs import canonical_prefs
-from spark.publicapi.pending import (load_pending, set_pending_risk,
-                                     write_pending_entry)
+from spark.filet.risk_settings import (build_risk_settings_message,
+                                       build_risk_settings_record,
+                                       risk_settings_path_for, write_risk_settings)
+from spark.publicapi.pending import load_pending, write_pending_entry
 
 _BUILDER = "0x" + "22" * 20
 _LEADER = "0x" + "a1" * 20      # 白名單內
@@ -95,6 +97,24 @@ class _Site:
         write_leader_change(leader_changes_path_for(self.exchange), rec)
         return rec
 
+    def sign_risk(self, prefs=None, *, nonce="r1", issued_at=None, signer=None,
+                  account_id=None, tamper=None):
+        """寫一筆**客戶簽章**的風控設定記錄（真密碼學，沿 sign_change 的形狀）。"""
+        account_id = account_id or self.account_id
+        issued_at = issued_at or _at()
+        prefs = canonical_prefs({"enabled": True} if prefs is None else prefs)
+        msg = build_risk_settings_message(account_id=account_id, prefs=prefs,
+                                          nonce=nonce, issued_at=issued_at)
+        sig = (signer or self.wallet).sign_message(
+            encode_defunct(text=msg)).signature.hex()
+        rec = build_risk_settings_record(
+            account_id=account_id, prefs=prefs, nonce=nonce, issued_at=issued_at,
+            signature=sig, message=msg)
+        if tamper:
+            rec.update(tamper)
+        write_risk_settings(risk_settings_path_for(self.exchange), rec)
+        return rec
+
     def run(self) -> int:
         def _recorder(cmd, check):
             assert check is True
@@ -161,6 +181,8 @@ def test_generated_env_has_every_engine_required_var(site):
         "COPY_MAX_DRAWDOWN_PCT": "0.2",
         "COPY_MAX_TOTAL_DRAWDOWN_PCT": "0.4",
         "COPY_FLATTEN_ON_BREACH": "true",
+        "COPY_SIZE_TOLERANCE": "0.08",      # tracking 組：不受風控開關影響
+        "COPY_RISK_COOLDOWN_HOURS": "12",   # 熔斷後自動恢復的冷靜期
     }
     lines = dict(ln.split("=", 1) for ln in text.splitlines()
                  if "=" in ln and not ln.startswith("#"))
@@ -174,11 +196,13 @@ def _env_kv(site) -> dict[str, str]:
                 if "=" in ln and not ln.lstrip().startswith("#"))
 
 
-def test_owner_chosen_risk_settings_land_in_the_env(site):
-    """錢包主人在 leader 頁面選的風控參數，必須原樣進到他自己的 env。"""
-    set_pending_risk(site.pending, site.account_id, canonical_prefs({
-        "enabled": True, "max_drawdown_pct": "0.3",
-        "max_total_drawdown_pct": "0", "flatten_on_breach": False}))
+def test_owner_signed_risk_settings_land_in_the_env(site):
+    """⭐ 錢包主人**簽章**選的風控參數，必須原樣進到他自己的 env。
+
+    來源刻意是簽章記錄而不是 pending 條目：能寫 pending 的人（filet-api）不該能
+    替客戶關掉風控。"""
+    site.sign_risk({"enabled": True, "max_drawdown_pct": "0.3",
+                    "max_total_drawdown_pct": "0", "flatten_on_breach": False})
     site.sign_change(leader=_LEADER)
     assert site.run() == 0
     kv = _env_kv(site)
@@ -186,20 +210,72 @@ def test_owner_chosen_risk_settings_land_in_the_env(site):
     assert kv["COPY_MAX_DRAWDOWN_PCT"] == "0.3"
     assert kv["COPY_MAX_TOTAL_DRAWDOWN_PCT"] == "0"
     assert kv["COPY_FLATTEN_ON_BREACH"] == "false"
+    assert not any(r[0] == "critical" for r in site.notifier.records)
 
 
-def test_unparseable_risk_prefs_fail_closed_to_protection_on(site):
-    """⭐⭐ 壞掉的偏好（手改／舊格式）**不得**沿用「風控關閉」的產品預設——
-    那會讓一次資料損壞靜默變成一顆沒有任何保護的實盤引擎。方向是往保護靠，
-    並且要大聲（工程原則 3）。"""
-    entries = load_pending(site.pending)
-    entries[0]["risk"] = {"enabled": True, "max_drawdown_pct": "999"}  # 超界
-    (site.pending).write_text(json.dumps({"pending": entries}))
+def test_tampered_risk_record_fails_closed_to_protection_on(site):
+    """⭐⭐ 驗章不過的風控記錄（簽完之後被改值）**不得**沿用「風控關閉」的產品
+    預設——那會讓一次竄改靜默變成一顆沒有任何保護的實盤引擎。方向是往保護靠，
+    並且要大聲（工程原則 3）。
+
+    觸發情境：能寫交換目錄的人把客戶簽過的 `max_drawdown_pct` 從 0.3 改成 0.5
+    （或直接把 enabled 改成 false）——重建訊息後 recover 出的位址對不上。
+    """
+    site.sign_risk({"enabled": True, "max_drawdown_pct": "0.3"},
+                   tamper={"prefs": canonical_prefs(
+                       {"enabled": False, "max_drawdown_pct": "0.5"})})
     site.sign_change(leader=_LEADER)
     assert site.run() == 0
     assert _env_kv(site)["COPY_RISK_CONTROLS_ENABLED"] == "true"
     crits = [r for r in site.notifier.records if r[0] == "critical"]
-    assert any("風控偏好無法解析" in r[2] for r in crits)
+    assert any("風控設定記錄驗章失敗" in r[2] for r in crits)
+    # 簽章材料不得進告警文字（紅線 2）
+    assert not any("0x" in r[2] and len(r[2]) > 300 for r in crits)
+
+
+def test_someone_elses_signature_cannot_set_my_risk(site):
+    """⭐ 別人的私鑰簽出的風控記錄 → 驗章失敗 → 安全側 ＋ critical，
+    絕不是「照著它寫」。這是本管線改讀簽章記錄的全部理由。"""
+    site.sign_risk({"enabled": False}, signer=Account.create())
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert _env_kv(site)["COPY_RISK_CONTROLS_ENABLED"] == "true"
+    assert any("驗章失敗" in r[2] for r in site.notifier.records if r[0] == "critical")
+
+
+def test_unparseable_risk_prefs_fail_closed_to_protection_on(site):
+    """簽章對得上但值超界（規格收窄後的舊記錄）→ 同樣走安全側 ＋ critical。"""
+    rec = site.sign_risk({"enabled": True, "max_drawdown_pct": "0.3"})
+    bad = dict(rec, prefs={**rec["prefs"], "max_drawdown_pct": "999"})
+    write_risk_settings(risk_settings_path_for(site.exchange), bad)
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert _env_kv(site)["COPY_RISK_CONTROLS_ENABLED"] == "true"
+    assert any(r[0] == "critical" for r in site.notifier.records)
+
+
+def test_another_accounts_signed_record_is_not_used(site):
+    """記錄檔是多帳號共用的：只有**這個 account_id** 的那一筆算數。
+    別人的有效記錄不得漏進我的 env，也不該讓我被誤判成「驗章失敗」。"""
+    other = Account.create()
+    site.sign_risk({"enabled": True}, signer=other,
+                   account_id=derive_account_id(other.address))
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert _env_kv(site)["COPY_RISK_CONTROLS_ENABLED"] == "false"
+    assert not any(r[0] == "critical" for r in site.notifier.records)
+
+
+def test_stale_signed_risk_settings_are_still_honoured(site):
+    """⚠️ freshness 刻意放行：風控設定是**持續意圖**。一份三天前簽的「回撤上限 30%」
+    今天仍然是客戶的意圖——因過期而退回產品預設（不啟用）是無聲的降級。"""
+    site.sign_risk({"enabled": True, "max_drawdown_pct": "0.3"},
+                   issued_at=_at(-3 * 86400))
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    kv = _env_kv(site)
+    assert kv["COPY_RISK_CONTROLS_ENABLED"] == "true"
+    assert kv["COPY_MAX_DRAWDOWN_PCT"] == "0.3"
 
 
 def test_no_risk_choice_means_product_default_off_without_alarm(site):

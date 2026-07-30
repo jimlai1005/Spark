@@ -2,9 +2,10 @@
 錢包主人自選的風控偏好（2026-07-30）：**單一定義點**——合法區間、預設值、以及
 它們對應的引擎 env 鍵，全部只在本檔宣告一次。
 
-三個消費端共用本檔，刻意不各自帶一份常數：
-- filet-api（`POST /api/me/risk`）驗證客戶送來的值；
-- auto-activate watcher（`_compose_env`）把偏好變成該 follower 的 env 行；
+四個消費端共用本檔，刻意不各自帶一份常數：
+- filet-api（`POST /api/me/risk/message`／`POST /api/me/risk`）驗證客戶送來的值；
+- 待簽訊息與記錄（`risk_settings.py`）用它正規化每一個要簽的數值；
+- auto-activate watcher（`_compose_env`）把**已驗章**的偏好變成該 follower 的 env 行；
 - 前端由 `GET /api/me/risk` 取得 `specs` 畫表單（不硬編任何數字）。
 三份常數的下場是「畫面允許 0.01、API 收下、引擎拒絕啟動」，而症狀出現在啟用那一刻。
 
@@ -15,18 +16,22 @@
 那裡的 True 保護「env 沒寫這一行」的既有部署（沒設定不該等於沒保護），這裡的 False
 是新錢包的產品預設。兩者都由 watcher 明確寫進 env，不留給任何一邊的隱含預設。
 
-## 信任模型（**已知缺口，對外開放前必須補**）
-本偏好由 filet-api 寫進 pending 條目，**沒有客戶簽章**——與換 leader（`leader_change`）
-和資金設定（`capital_settings`）不同。刻意的取捨與它的邊界：
+## 信任模型（2026-07-30 起：**客戶簽章**）
+本檔只定義「合法的偏好長什麼樣」。**誰有權設定它**由 `risk_settings.py` 回答：
+客戶用自己的私鑰簽一份逐項列出門檻的原文，API（`POST /api/me/risk`）只落一筆
+簽章記錄，引擎與 auto-activate watcher 在採用之前**各自重新驗章**。與換 leader
+（`leader_change`）、資金設定（`capital_settings`）同一套信任錨、同一組原語。
 - 這裡調整的全是**保護門檻**，不是部位大小。「押多大」仍由 `capital_settings` 的
-  簽章路徑決定，本檔動不了它——所以被打穿的 filet-api 能削弱保護，不能直接放大曝險。
-- 偏好只在**啟用那一刻**被讀取並烙進 `/etc/filet/followers/<id>.env`，而該檔對
-  filet-api 不可寫（root/filet-engine）。啟用之後 filet-api 再也影響不了這顆引擎的
-  風控姿態——暴露窗只有「客戶送出偏好」到「watcher 建 env」之間的一分鐘。
-- 引擎**不**在每輪重讀本偏好（那會讓 filet-api 取得對執行中引擎的持續影響力，
-  違反 pending.py 檔頭的權限拓撲）。已啟用的帳號要改風控＝ops 動作，
-  API 因此對這種情形回明確的 409，不假裝寫入成功（見 app.py 的 `/api/me/risk`）。
-⚠️ 對外開放前必須把本路徑升級為簽章記錄（照 `capital_settings.py` 的形狀）。
+  簽章路徑決定，本檔動不了它——被打穿的 filet-api 只能削弱保護，不能直接放大曝險。
+  但削弱保護同樣是真錢，所以防線一樣，不因為「危害小一點」而降級。
+- 改動前的路徑（偏好寫進 pending 條目、無簽章、只在啟用那一刻烙進 env）已移除：
+  它的緩解是「暴露窗只有啟用前的一分鐘」，而要讓**已啟用**的客戶隨時改風控，
+  那個緩解就消失了。移除 `set_pending_risk` 是為了不留下第二份沒有簽章、
+  卻長得同樣權威的意圖（見 pending.py 該處的註記）。
+- 仍然成立的事實：引擎**不重讀 env**。env 裡的風控行是這顆引擎的**啟動姿態**
+  （watcher 建檔時寫一次、`_ensure_env_file` 不覆寫既有檔）；執行期的調整走簽章
+  記錄，由 `risk_settings_apply` 每輪疊在 settings 之上。兩條路徑的值都源自
+  本檔的同一組 spec，所以「畫面允許、引擎拒絕」這類漂移仍然寫不出來。
 """
 from __future__ import annotations
 
@@ -46,20 +51,43 @@ from decimal import Decimal, InvalidOperation
 # - 上界 0.50：本欄位同時決定成本閘分母的下限，誤觸面放大倍率 = 1/(1-dd)
 #   （config.py:125-138）。0.50 已是 2.00×，再高就是拿成本閘的誤觸換回撤的寬容。
 RISK_PARAM_SPECS: tuple[dict, ...] = (
+    # ── group="tracking"：**不受風控開關影響**，永遠生效 ─────────────────
+    # 放在這一組的參數與「要不要風控」無關，UI 也必須畫在 checkbox 之外——
+    # 藏在 checkbox 底下會讓關掉風控的客戶以為自己也關掉了它。
+    {"name": "size_tolerance", "env": "COPY_SIZE_TOLERANCE", "type": "decimal",
+     "group": "tracking", "default": "0.08", "min": "0.02", "max": "0.25",
+     "label": "與 leader 的部位差異容忍度", "recommended": "0.08",
+     "help": "你的部位與 leader（按比例換算後）差異超過此值才會校正。"
+             "調小＝跟得更緊，但校正次數變多、手續費與滑價成本上升；"
+             "調大＝成本低，但你的部位會與 leader 有較大偏離。建議 8%。"},
+    # ── group="risk"：只有啟用風控時才生效 ──────────────────────────────
     {"name": "max_drawdown_pct", "env": "COPY_MAX_DRAWDOWN_PCT", "type": "decimal",
+     "group": "risk", "recommended": "0.20",
      "default": "0.20", "min": "0.05", "max": "0.50",
      "label": "7 天滾動回撤上限",
      "help": "以最近 7 天內的權益高水位為基準；跌幅超過此值即熔斷。"},
     {"name": "max_total_drawdown_pct", "env": "COPY_MAX_TOTAL_DRAWDOWN_PCT",
-     "type": "decimal", "default": "0.40", "min": "0", "max": "0.80",
+     "type": "decimal", "group": "risk", "recommended": "0.40",
+     "default": "0.40", "min": "0", "max": "0.80",
      "label": "累計回撤上限",
      "help": "以開始跟單以來的高水位為基準的絕對底線（0 ＝ 停用這一道）。"
              "慢跌可能每個 7 天窗都不超標卻累積成大額虧損，這一道是為此存在。"},
     {"name": "flatten_on_breach", "env": "COPY_FLATTEN_ON_BREACH", "type": "bool",
+     "group": "risk", "recommended": True,
      "default": True, "min": None, "max": None,
      "label": "熔斷時自動平倉",
-     "help": "開：熔斷即撤單並全平，之後需人工解鎖才恢復跟單。"
-             "關：熔斷只停止交易動作並告警，既有部位留在市場上（軟暫停）。"},
+     "help": "開：熔斷即撤單並全平。關：熔斷只停止交易動作並告警，"
+             "既有部位留在市場上（軟暫停）。"},
+    # ⭐ 冷靜期（2026-07-30 使用者裁決）：熔斷後多久自動恢復跟單。
+    # 以小時為單位（不是比例），所以 `unit` 欄位存在——前端據此決定要不要做
+    # 百分比換算。0 ＝ 只有你自己按「立即恢復」或人工處理才會解鎖。
+    {"name": "cooldown_hours", "env": "COPY_RISK_COOLDOWN_HOURS", "type": "decimal",
+     "group": "risk", "unit": "hours", "recommended": "12",
+     "default": "12", "min": "0", "max": "168",
+     "label": "熔斷後的冷靜期（小時）",
+     "help": "熔斷後經過這段時間就自動恢復跟單，權益基準已在熔斷當下重置。"
+             "建議 12 小時：短到不會把你鎖在門外，長到足以讓觸發熔斷的那段行情過去。"
+             "設 0 ＝ 不自動恢復（只有你按「立即恢復跟單」才解鎖）。"},
 )
 
 _SPEC_BY_NAME = {s["name"]: s for s in RISK_PARAM_SPECS}

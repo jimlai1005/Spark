@@ -872,14 +872,16 @@ sudo systemctl restart filet-follower@<account_id>
 
 | 路徑 | owner:group | mode | 建立方式 | 用途 |
 |---|---|---|---|---|
-| `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ **api→engine** 通道：客戶簽章的共享記錄 `leader_changes.json`（換 leader）＋ `capital_settings.json`（資金設定）。owner 寫、group 讀、other 無 |
+| `/var/lib/filet-exchange` | **`filet-api:filet-engine`** | **`0750`** | 手動 mkdir（本節） | ⭐ **api→engine** 通道：客戶簽章的共享記錄 `leader_changes.json`（換 leader）＋ `capital_settings.json`（資金設定）＋ `risk_settings.json`／`risk_unlock.json`（風控門檻與解除熔斷，2026-07-30）。owner 寫、group 讀、other 無 |
 | `/var/lib/filet-exchange/engine/` | **`filet-engine:filet-api`** | **`0750`** | 手動 mkdir（本節） | ⭐ **engine→api** 通道（**owner/group 剛好對調**）：引擎發布的健康心跳 `engine/health/<account_id>.json`。引擎寫、API 讀 |
 | `/var/lib/filet-exchange/engine/health/` | **`filet-engine:filet-api`** | **`0750`** | 手動 mkdir（本節，2026-07-19 補） | 心跳檔實際落點。⭐ **不要倚賴引擎自建**——它建得出來，但會是 `filet-engine:filet-engine` ＋ umask 決定的 mode（通常 0755，比設計意圖寬），理由見本節下方 |
 
-> 兩份客戶簽章記錄**刻意分開兩個檔**（不是同一個檔多一個欄位）：讀者是兩個獨立的
-> 套用器，共用一個檔會讓其中一方的格式問題連坐另一方——而這兩件事各自都能造成
-> 資金損失，不該共命運（`src/spark/filet/capital_settings.py` 檔頭）。兩者同目錄、
-> 同權限拓撲，所以本節的建立與驗收步驟**一次涵蓋兩者**。
+> 四份客戶簽章記錄**刻意分開四個檔**（不是同一個檔多幾個欄位）：讀者是四個獨立的
+> 套用器，共用一個檔會讓其中一方的格式問題連坐其他方——而這幾件事各自都能造成
+> 資金損失，不該共命運（`src/spark/filet/capital_settings.py` 檔頭）。風控門檻與
+> 解除熔斷再分兩檔的理由是**時效語意相反**（持續意圖 vs 一次性動作，
+> `src/spark/filet/risk_settings.py` 檔頭）。四者同目錄、同權限拓撲，所以本節的
+> 建立與驗收步驟**一次涵蓋全部**。
 
 **⭐⭐ 兩個單向通道，沒有任何雙向可寫的路徑**（`src/spark/filet/engine_health.py` 檔頭）：
 
@@ -887,6 +889,8 @@ sudo systemctl restart filet-follower@<account_id>
 /var/lib/filet-exchange/              filet-api:filet-engine  0750   ← api→engine
 ├── leader_changes.json                                              （API 寫、引擎讀）
 ├── capital_settings.json
+├── risk_settings.json                                               （風控門檻，持續意圖）
+├── risk_unlock.json                                                 （解除熔斷，一次性）
 └── engine/                           filet-engine:filet-api  0750   ← engine→api
     └── health/                                                      （引擎寫、API 讀）
         └── <account_id>.json
@@ -1391,27 +1395,29 @@ journalctl -u filet-auto-activate.service -n 20
 
 #### ⚠️⚠️ 5.6a-1 升級既有機器：範本必須先刪掉風控四鍵（2026-07-30，錢包主人自選風控）
 
-風控四鍵自本次改動起**由 watcher 逐用戶代入**（它們是客戶在跟單頁自己選的，
+風控相關鍵自本次改動起**由 watcher 逐用戶代入**（它們是客戶在跟單頁自己選的，
 不再是全體共用的範本值），因此與 `SPARK_*` 同列 `GENERATED_KEYS`：
 
 ```
-COPY_RISK_CONTROLS_ENABLED   COPY_MAX_DRAWDOWN_PCT
-COPY_MAX_TOTAL_DRAWDOWN_PCT  COPY_FLATTEN_ON_BREACH
+COPY_RISK_CONTROLS_ENABLED   COPY_MAX_DRAWDOWN_PCT       COPY_SIZE_TOLERANCE
+COPY_MAX_TOTAL_DRAWDOWN_PCT  COPY_FLATTEN_ON_BREACH      COPY_RISK_COOLDOWN_HOURS
 ```
 
-**現行正式機的 `/etc/filet/follower.env.template` 有 `COPY_MAX_DRAWDOWN_PCT=0.20` 這一行**，
-新程式碼會因此在每一輪的範本 pre-flight 直接 `SystemExit`——**沒有人會被啟用**
-（fail-closed，不是壞掉：舊範本＋新程式會讓「客戶選的」與「範本寫的」重複定義同一個鍵，
-而哪個生效取決於 EnvironmentFile 的載入細節）。所以推碼與改範本必須在**同一次**部署完成：
+**現行正式機的 `/etc/filet/follower.env.template` 有 `COPY_MAX_DRAWDOWN_PCT` 與
+`COPY_SIZE_TOLERANCE` 兩行**，新程式碼會因此在每一輪的範本 pre-flight 直接 `SystemExit`
+——**沒有人會被啟用**（fail-closed，不是壞掉：舊範本＋新程式會讓「客戶選的」與
+「範本寫的」重複定義同一個鍵，而哪個生效取決於 EnvironmentFile 的載入細節）。
+所以推碼與改範本必須在**同一次**部署完成：
 
 ```bash
-# 1) 刪掉範本裡的風控行（只刪這一行；TG token 等其餘內容不動）
+# 1) 刪掉範本裡的兩行（其餘內容如 TG token、COPY_CAPITAL_UTILIZATION 不動）
 sudo cp -a /etc/filet/follower.env.template \
            /etc/filet/follower.env.template.bak-$(date -u +%Y%m%dT%H%M%SZ)
-sudo sed -i '/^COPY_MAX_DRAWDOWN_PCT=/d' /etc/filet/follower.env.template
+sudo sed -i -E '/^(COPY_MAX_DRAWDOWN_PCT|COPY_SIZE_TOLERANCE)=/d' \
+  /etc/filet/follower.env.template
 
-# 2) 驗收：四個鍵在範本裡都必須是 0 個命中（只印計數，不印值）
-sudo grep -cE '^(COPY_RISK_CONTROLS_ENABLED|COPY_MAX_DRAWDOWN_PCT|COPY_MAX_TOTAL_DRAWDOWN_PCT|COPY_FLATTEN_ON_BREACH)=' \
+# 2) 驗收：六個鍵在範本裡都必須是 0 個命中（只印計數，不印值）
+sudo grep -cE '^(COPY_RISK_CONTROLS_ENABLED|COPY_MAX_DRAWDOWN_PCT|COPY_MAX_TOTAL_DRAWDOWN_PCT|COPY_FLATTEN_ON_BREACH|COPY_SIZE_TOLERANCE|COPY_RISK_COOLDOWN_HOURS)=' \
   /etc/filet/follower.env.template   # 預期：0
 
 # 3) 驗收：手動跑一輪，pre-flight 必須通過（沒有 SystemExit）
@@ -1421,8 +1427,18 @@ journalctl -u filet-auto-activate.service -n 20 --no-pager
 
 **既有正在跑的 follower 不受影響、也不要去動**：他們的 env 已經有自己的
 `COPY_MAX_DRAWDOWN_PCT`，`COPY_RISK_CONTROLS_ENABLED` 缺席時引擎預設 `True`
-（＝維持現有風控，安全側）。要把某個既有客戶改成無風控，必須是**他自己**的決定，
-做法是人工編輯他的 env ＋ `systemctl restart filet-follower@<id>`。
+（＝維持現有風控，安全側）。
+
+⭐ **既有客戶要改風控，不再需要人工編 env**（2026-07-30 起）：客戶在跟單頁自己簽章
+提交，引擎每輪讀取並套用（`src/spark/filet/risk_settings_apply.py`）。簽章記錄落在
+交換目錄的 api→engine 通道（與 `capital_settings.json` 同一格、同樣 0644），
+**不需要任何新的部署步驟**——該目錄在 §5.5.1 已建立。人工編 env 仍然有效，
+但那是後備手段，不是常規路徑。
+
+⭐ **熔斷後的恢復**：客戶可在頁面上按「立即恢復跟單」（簽章 → 引擎下一輪解除鎖定），
+或等冷靜期（`COPY_RISK_COOLDOWN_HOURS`，預設 12 小時）屆滿自動恢復。
+⚠️ 兩條路都**不適用**於 `reason=leader_revoked` 的鎖定——那是治理動作，
+只能由營運端處理（`killswitch.rearm_allowed_for` 結構性保證）。
 
 ### 5.7 ⭐ 兩個定時任務（leaderboard 快照 ＋ 績效序列取樣）
 

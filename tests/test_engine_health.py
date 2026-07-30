@@ -42,7 +42,10 @@ def _payload(now_s=_NOW, **over):
                 capital_utilization="0.4000", use_full_equity=False,
                 capital_source="customer_signed",
                 capital_changed_at="2026-07-19T00:00:00+00:00",
-                risk_controls_enabled=True,
+                risk_controls_enabled=True, risk_source="env_default",
+                risk_changed_at=None,
+                risk_prefs=None,
+                risk_halt=None,
                 cycle_result="no_action", cycle_detail=None)
     base.update(over)
     return build_heartbeat(**base)
@@ -106,9 +109,34 @@ def test_heartbeat_field_set_is_pinned_by_the_constant():
 def test_risk_controls_flag_rides_the_heartbeat(tmp_path):
     """⭐ 「這顆引擎沒有任何風控」必須看得見（2026-07-30）：狀態根對 filet-api
     不可讀，心跳是面板唯一的來源。未知（settings 尚未載入）不得畫成 True。"""
-    assert _payload(risk_controls_enabled=False)["risk"] == {"controls_enabled": False}
-    assert _payload(risk_controls_enabled=True)["risk"] == {"controls_enabled": True}
-    assert _payload(risk_controls_enabled=None)["risk"] == {"controls_enabled": None}
+    assert _payload(risk_controls_enabled=False)["risk"]["controls_enabled"] is False
+    assert _payload(risk_controls_enabled=True)["risk"]["controls_enabled"] is True
+    assert _payload(risk_controls_enabled=None)["risk"]["controls_enabled"] is None
+
+
+def test_risk_source_and_changed_at_ride_the_heartbeat():
+    """⭐ 風控那一格要帶來源與變更時刻（沿 `capital` 的同一個形狀，2026-07-30）。
+
+    少了它，面板分不出「客戶自己把回撤上限調到 50%」與「部署把它設成 50%」——
+    前者是客戶的決定，後者是我們該去查的事。
+    """
+    hb = _payload(risk_source="customer_signed",
+                  risk_changed_at="2026-07-30T01:00:00+00:00")["risk"]
+    assert hb["source"] == "customer_signed"
+    assert hb["changed_at"] == "2026-07-30T01:00:00+00:00"
+    env = _payload(risk_source="env_default", risk_changed_at=None)["risk"]
+    assert env == {"controls_enabled": True, "source": "env_default",
+                   "changed_at": None, "prefs": None, "halt": None}
+
+
+def test_halt_reason_rides_the_heartbeat_with_resumable(tmp_path):
+    """⭐ 熔斷原因與「客戶能不能自助恢復」必須一起發布（2026-07-30）：客戶頁面上的
+    「立即恢復跟單」是一次真實簽章，前端不知道原因就只能讓他簽一份注定被拒的請求。
+    `resumable` 由引擎端的 `rearm_allowed_for` 導出，前端不自己比對字串。"""
+    halt = {"tripped": True, "reason": "leader_revoked",
+            "tripped_at": "2026-07-30T02:00:00+00:00", "resumable": False}
+    assert _payload(risk_halt=halt)["risk"]["halt"] == halt
+    assert _payload(risk_halt=None)["risk"]["halt"] is None
 
 
 def test_coverage_read_error_reports_unknown_not_zero():

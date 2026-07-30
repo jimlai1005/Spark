@@ -19,11 +19,13 @@ Hyperliquid builder-code 基礎設施 + copytrade orchestrator（Filet M1）。P
    的用戶，自動建 env（`COPY_LIVE_TRADING=true`）並啟動引擎——僅此一條路徑豁免；
    對外開放前必須重審本例外。
    ⚠️ 2026-07-30 追加：新錢包**預設不啟用任何風控**（回撤 kill switch ＋ 成本熔斷），
-   由錢包主人在跟單頁自行勾選啟用（`GET/POST /api/me/risk` → pending 條目 → watcher
-   寫進該 follower 的 env）。此路徑**沒有客戶簽章**（換 leader 與資金設定都有）——
-   取捨、邊界與已知缺口見 `src/spark/filet/risk_prefs.py` 檔頭；**對外開放前必須
-   升級為簽章記錄**。既有正在跑的 follower 一律不動（缺 `COPY_RISK_CONTROLS_ENABLED`
-   時引擎預設 True＝維持風控）。
+   由錢包主人在跟單頁自行勾選啟用。此路徑已於同日**升級為客戶簽章記錄**
+   （`POST /api/me/risk/message` 取原文 → `POST /api/me/risk` 落簽章記錄 →
+   watcher 建 env 與引擎每輪套用各自重新驗章；解除熔斷同形狀走 `/api/me/risk/unlock`）
+   ——原本「寫進 pending 條目、無簽章」的路徑已移除。設計見
+   `src/spark/filet/risk_settings.py` 檔頭；**對外開放前仍必須重審本例外**。
+   既有正在跑的 follower 一律不動（缺 `COPY_RISK_CONTROLS_ENABLED` 時引擎預設
+   True＝維持風控）。
 6. 測試全離線：autouse socket-ban（tests/conftest.py）；新測試不得連網、不得真發通知。
 7. **撤銷 leader 一律跑 `scripts/revoke_leader.py`**（冪等、跨精選白名單＋user registry 兩檔、自我驗收 `is_still_permitted` 為 False）。
    ⚠️ 自 2026-07-27 起「刪除白名單條目」**不再等於** `enabled:false`：位址若也在 `user_leaders.json`，刪精選條目只會讓 registry 那筆遞補上來＝撤銷靜默失效。

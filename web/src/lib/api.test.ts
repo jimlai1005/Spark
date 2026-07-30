@@ -266,10 +266,14 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       () => api.getLeaderSelectMessage("0x1111111111111111111111111111111111111111"),
       () => api.getLeaderPreview("0x2222222222222222222222222222222222222222"),
       () => api.getMyRisk(),
-      () => api.postMyRisk({
-        enabled: true, max_drawdown_pct: "0.20",
-        max_total_drawdown_pct: "0.40", flatten_on_breach: true,
+      // 取待簽原文的兩支**不帶簽名**（只是請伺服器產生 canonical 原文），所以照樣
+      // 受本掃描約束；真正帶簽名的 postMyRisk／postRiskUnlock 在 EXCLUDED，各有
+      // 專屬的白名單測試（見檔案末段）。
+      () => api.getRiskSettingsMessage({
+        enabled: true, size_tolerance: "0.08", max_drawdown_pct: "0.20",
+        max_total_drawdown_pct: "0.40", flatten_on_breach: true, cooldown_hours: "12",
       }),
+      () => api.getRiskUnlockMessage(),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -292,8 +296,13 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
   // ApiError 非函式呼叫端點；authVerify 與 postLeaderSelect 是**僅有的二個**合法帶簽名的
   // 端點（皆 EIP-191、原文皆由伺服器產生），各自有專屬測試覆蓋——後者的專屬測試是
   // 「欄位集合恰好等於契約欄位」的白名單，比本掃描的黑名單更嚴（見檔案末段 describe）。
+  // ⭐ 2026-07-30：風控設定改為簽章提交後，合法帶簽名的端點從二支變成四支。
+  // postMyRisk／postRiskUnlock 是後端契約要求帶簽名的（EIP-191、原文皆由伺服器產生，
+  // 見 filet/risk_settings.py），所以它們必然含 `signature` 欄位、必然會被本黑名單
+  // 掃描判紅——例外不是豁免：兩支各有一條**白名單**測試（body 欄位集合恰為契約
+  // 欄位，多一個就失敗，見檔案末段），比本掃描更嚴。
   const EXCLUDED = new Set([
-    "ApiError", "authVerify", "postLeaderSelect",
+    "ApiError", "authVerify", "postLeaderSelect", "postMyRisk", "postRiskUnlock",
   ]);
   const reflected = Object.entries(api).filter(
     ([name, value]) => typeof value === "function" && !EXCLUDED.has(name),
@@ -305,9 +314,11 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     // 2026-07-27：+1（getLeaderPreview，自訂 leader 准入預覽）
     // 2026-07-27：+1（getMyLeader，「我目前跟誰」——/leaders 頁的現況揭露）
     // 2026-07-30：-7（移除 billing 與 capital：getBillingPlans、getBillingStatus、postBillingCheckout、postBillingPortal、getMyCapital、getCapitalSettingsMessage、postCapitalSettings；postCapitalSettings 原在 EXCLUDED，現刪除後 EXCLUDED 僅剩 authVerify、postLeaderSelect）
-    // 2026-07-30：+2（getMyRisk、postMyRisk，錢包主人自選風控——注意 postMyRisk
-    //   刻意**不在** EXCLUDED：它不帶任何簽名，body 只有 prefs，該受本掃描約束）
-    const HAND_WRITTEN_LIST_LENGTH = 20;
+    // 2026-07-30：+2（getMyRisk、postMyRisk，錢包主人自選風控）
+    // 2026-07-30（同日，風控改簽章提交）：+3 匯出（getRiskSettingsMessage、
+    //   getRiskUnlockMessage、postRiskUnlock），其中 postRiskUnlock 與改為帶簽名的
+    //   postMyRisk 一起進 EXCLUDED ⇒ 反射清單淨增 1（20 → 21）。
+    const HAND_WRITTEN_LIST_LENGTH = 21;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 
@@ -375,6 +386,79 @@ describe("⭐ postLeaderSelect：帶簽名的例外，body 欄位集合精確釘
     expect(body.nonce).toBe(PAYLOAD.nonce);
     expect(body.issued_at).toBe(PAYLOAD.issued_at);
     expect(body.signature).toBe(SIG);
+  });
+});
+
+/**
+ * 風控設定與解除熔斷：紅線 3 的第三、第四個已知例外（2026-07-30）。同樣用**白名單**
+ * 釘死 body 欄位集合——例外必須比通則更嚴。
+ *
+ * ⭐ 兩支各有各的端點與各自的欄位集合，這是**域分隔**在前端這一側的體現：
+ * 一份「調整門檻」的授權絕不能被兌換成一次「把熔斷鎖打開」（反向亦然）。
+ * unlock 的 body **沒有 prefs**——型別上就送不出去。
+ */
+describe("⭐ 風控的兩支簽章端點：body 欄位集合精確釘死", () => {
+  const PREFS = {
+    enabled: true, size_tolerance: "0.08", max_drawdown_pct: "0.2",
+    max_total_drawdown_pct: "0.4", flatten_on_breach: true, cooldown_hours: "12",
+  };
+  const SETTINGS_PAYLOAD = {
+    message: "Filet: update copy-trading risk settings\n\nAccount: fzzz\nNonce: n-9",
+    nonce: "n-9",
+    issued_at: "2026-07-30T00:00:00Z",
+    account_id: "fzzz",
+    prefs: PREFS,
+  };
+  const UNLOCK_PAYLOAD = {
+    message: "Filet: resume copy-trading after a risk halt\n\nAccount: fzzz\nNonce: n-10",
+    nonce: "n-10",
+    issued_at: "2026-07-30T00:01:00Z",
+    account_id: "fzzz",
+  };
+  const SIG = `0x${"cd".repeat(65)}`;
+
+  it("getRiskSettingsMessage：POST /api/me/risk/message，body 只有 prefs（不帶簽名）", async () => {
+    mockFetchJson(200, { message: "m", nonce: "n", issued_at: "t", account_id: "f", prefs: PREFS });
+    await api.getRiskSettingsMessage(PREFS);
+    expect(captured[0].url).toBe("/api/me/risk/message");
+    expect(captured[0].init.method).toBe("POST");
+    expect(Object.keys(JSON.parse(captured[0].init.body as string))).toEqual(["prefs"]);
+  });
+
+  it("getRiskUnlockMessage：POST /api/me/risk/unlock/message，零 body（account 由 session 衍生）", async () => {
+    mockFetchJson(200, { message: "m", nonce: "n", issued_at: "t", account_id: "f" });
+    await api.getRiskUnlockMessage();
+    expect(captured[0].url).toBe("/api/me/risk/unlock/message");
+    expect(captured[0].init.method).toBe("POST");
+    expect(captured[0].init.body).toBeUndefined();
+  });
+
+  it("postMyRisk：欄位集合恰為契約六欄，且原文與各欄位取自同一包 payload", async () => {
+    mockFetchJson(200, { ok: true });
+    await api.postMyRisk(SETTINGS_PAYLOAD, SIG);
+
+    expect(captured[0].url).toBe("/api/me/risk");
+    const body = JSON.parse(captured[0].init.body as string);
+    expect(Object.keys(body).sort()).toEqual(
+      ["account_id", "issued_at", "message", "nonce", "prefs", "signature"],
+    );
+    // 送出的 prefs 是**伺服器回聲**那一份（已通過內容預驗），不是畫面上的草稿
+    expect(body.prefs).toEqual(SETTINGS_PAYLOAD.prefs);
+    expect(body.message).toBe(SETTINGS_PAYLOAD.message);
+    expect(body.signature).toBe(SIG);
+  });
+
+  it("postRiskUnlock：欄位集合恰為契約五欄，**沒有 prefs**（域分隔）", async () => {
+    mockFetchJson(200, { ok: true });
+    await api.postRiskUnlock(UNLOCK_PAYLOAD, SIG);
+
+    expect(captured[0].url).toBe("/api/me/risk/unlock");
+    const body = JSON.parse(captured[0].init.body as string);
+    expect(Object.keys(body).sort()).toEqual(
+      ["account_id", "issued_at", "message", "nonce", "signature"],
+    );
+    expect(body).not.toHaveProperty("prefs");
+    expect(body.message).toBe(UNLOCK_PAYLOAD.message);
   });
 });
 

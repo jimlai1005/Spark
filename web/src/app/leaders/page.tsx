@@ -30,8 +30,11 @@ import {
   getLeaders,
   getMyLeader,
   getMyRisk,
+  getRiskSettingsMessage,
+  getRiskUnlockMessage,
   postLeaderSelect,
   postMyRisk,
+  postRiskUnlock,
   type LeaderEntry,
   type LeaderPreviewResp,
   type LeaderSelectResp,
@@ -39,6 +42,7 @@ import {
   type MyLeaderPendingChange,
   type MyLeaderResp,
   type MyRiskResp,
+  type RiskParamName,
   type RiskParamSpec,
   type RiskPrefs,
 } from "@/lib/api";
@@ -49,6 +53,11 @@ import { COPY } from "@/lib/copy";
 import { fmtAmount, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { runLeaderSelectFlow, type LeaderSelectFlowResult } from "@/lib/leaderSelectFlow";
+import {
+  runRiskSettingsFlow,
+  runRiskUnlockFlow,
+  type RiskFlowFailure,
+} from "@/lib/riskSettingsFlow";
 import { recoverPersonalSigner } from "@/lib/sign";
 
 const c = COPY.leaders;
@@ -563,16 +572,23 @@ function CustomLeaderSection({ busy, listedLeaders, onSelect }: {
 }
 
 /**
- * 風控 opt-in 區塊（2026-07-30）。
+ * 風控區塊（2026-07-30 改版：slider ＋ 簽章送出 ＋ 自助解除熔斷）。
  *
- * ⭐ 三個刻意的設計決定：
- * 1. **上下界與預設值全部來自後端 `specs`**——前端一個數字都不寫死。引擎的合法區間
- *    在 `filet/risk_prefs.py`；前端另存一份的下場是畫面允許、引擎拒絕啟動。
- * 2. **比例以百分比呈現、以比例送出**：客戶想的是「跌 20% 就停」，而引擎收的是 0.20。
+ * ⭐ 五個刻意的設計決定：
+ * 1. **上下界、預設值、建議值全部來自後端 `specs`**——前端一個門檻數字都不寫死。
+ *    引擎的合法區間在 `filet/risk_prefs.py`；前端另存一份的下場是畫面允許、
+ *    引擎拒絕啟動，而症狀出現在啟用那一刻。
+ * 2. **每個參數都是 slider ＋ 我方建議值**（使用者裁決）：風控門檻涉及利益衝突
+ *    （守的是「客戶資金被交易磨損的速度」，而磨損的受益方是我方），所以設計不是
+ *    替客戶決定，而是把建議標出來、讓客戶自己決定。
+ * 3. **比例以百分比呈現、以比例送出**：客戶想的是「跌 20% 就停」，而引擎收的是 0.20。
  *    換算集中在 `pctToRatio`／`ratioToPct` 兩個函式，不散落在每個 input 的 onChange。
- * 3. **`editable=false` 時整區唯讀**並顯示後端給的原因：偏好只在引擎啟用那一刻寫進
- *    env，已啟用的帳號在這裡改不會有任何效果——讓客戶按一個沒有作用的儲存鈕，
- *    比不給他這個選項更糟。
+ *    `unit="hours"` 的參數不換算（小時就是小時），由 spec 的 `unit` 欄決定。
+ * 4. **`group="tracking"` 的參數畫在啟用 checkbox 之外**：它不管風控開關都生效，
+ *    藏在 checkbox 底下會讓關掉風控的客戶以為自己也關掉了它。
+ * 5. **儲存＝簽章授權**（見 lib/riskSettingsFlow.ts）：能改門檻的人就能把一道保護
+ *    整個拿掉，所以與換 leader 同一個等級的防線——伺服器原文原樣進錢包、進錢包
+ *    之前先驗內容、本地 recover 比對登入地址。
  */
 function ratioToPct(v: string): string {
   const n = Number(v);
@@ -591,12 +607,188 @@ function pctToRatio(pct: string): string {
   return String(Number((Math.round(n * 10) / 1000).toFixed(3)));
 }
 
+/**
+ * 一個 decimal 參數的**顯示基準**：比例（以百分比呈現）或小時。
+ * ⭐ 由 spec 的 `unit` 決定，不是由參數名稱猜——後端新增一個帶單位的參數時，
+ * 前端不必改任何一行就會用對基準（工程原則 1：換算只有一處）。
+ * `step` 是**顯示刻度**（0.1% ／ 1 小時），不是門檻：門檻（min／max）一律取自 spec。
+ */
+function scaleOf(spec: RiskParamSpec): {
+  toDisplay: (raw: string) => string;
+  fromDisplay: (shown: string) => string;
+  step: string;
+  suffix: string;
+} {
+  return spec.unit === "hours"
+    ? { toDisplay: (v) => v, fromDisplay: (v) => v, step: "1", suffix: c.risk.hoursSuffix }
+    : {
+        toDisplay: ratioToPct, fromDisplay: pctToRatio,
+        // 0.1% ＝後端 `risk_prefs._RATIO_STEP` 的同一個刻度（見 pctToRatio 註解）。
+        step: "0.1", suffix: c.risk.percentSuffix,
+      };
+}
+
+/** `RiskPrefs` 的動態存取（spec 驅動的渲染需要用名字取值）。 */
+function prefValue(prefs: RiskPrefs, name: RiskParamName): string | boolean {
+  return (prefs as unknown as Record<string, string | boolean>)[name];
+}
+
+function withPref(prefs: RiskPrefs, name: RiskParamName, v: string | boolean): RiskPrefs {
+  return { ...prefs, [name]: v } as RiskPrefs;
+}
+
+/**
+ * 一個參數的控制項。⭐ decimal ⇒ slider（使用者裁決：門檻由客戶自己決定，我們只
+ * 標建議值）；bool ⇒ checkbox。上下界、建議值、標籤、說明**全部**取自 spec。
+ */
+function RiskParamField({ spec, prefs, onChange }: {
+  spec: RiskParamSpec;
+  prefs: RiskPrefs;
+  onChange: (next: RiskPrefs) => void;
+}) {
+  const v = prefValue(prefs, spec.name);
+  if (spec.type === "bool") {
+    return (
+      <div className="risk-field">
+        <label className="risk-toggle">
+          <input type="checkbox" checked={v === true}
+            onChange={(e) => onChange(withPref(prefs, spec.name, e.target.checked))} />
+          <span>{spec.label}</span>
+        </label>
+        <p className="hint risk-recommended">
+          {c.risk.recommendedLabel}：
+          {spec.recommended === true ? c.risk.boolOn : c.risk.boolOff}
+        </p>
+        <p className="hint">{spec.help}</p>
+      </div>
+    );
+  }
+  const s = scaleOf(spec);
+  const shown = s.toDisplay(String(v));
+  return (
+    <div className="risk-field">
+      <label htmlFor={`risk-${spec.name}`}>{spec.label}</label>
+      <div className="risk-slider-row">
+        <input
+          id={`risk-${spec.name}`}
+          type="range"
+          className="risk-slider"
+          min={spec.min == null ? undefined : s.toDisplay(spec.min)}
+          max={spec.max == null ? undefined : s.toDisplay(spec.max)}
+          step={s.step}
+          value={shown}
+          onChange={(e) => onChange(withPref(prefs, spec.name, s.fromDisplay(e.target.value)))}
+        />
+        <span className="risk-value mono">{shown}{s.suffix}</span>
+      </div>
+      <p className="hint risk-recommended">
+        {c.risk.recommendedLabel}：{s.toDisplay(String(spec.recommended))}{s.suffix}
+      </p>
+      <p className="hint">{spec.help}</p>
+    </div>
+  );
+}
+
+/**
+ * 「已提交 vs 已生效」。⚠️ 順序刻意把「讀不到」排在最前：`applied` 為 null ＝引擎
+ * 心跳過期或缺席＝**我們不知道**，任何一句更具體的話（「尚未生效」「已生效」）
+ * 都是我們沒有根據的斷言（工程原則 3：讀不到 ≠ 沒有）。
+ * 比對只就 `controls_enabled` 一欄——心跳裡沒有逐項門檻，不得宣稱逐項都已生效。
+ */
+function appliedNoteOf(d: MyRiskResp): string {
+  const a = d.applied;
+  if (a === null || a.controls_enabled === null) return c.risk.applied.unknown;
+  if (d.submitted.issued_at === null) return c.risk.applied.notSubmitted;
+  // ⭐ 逐項比對「引擎實際在執法的門檻」與「我提交的門檻」（2026-07-30 心跳補上
+  // `prefs` 之後才做得到）。只比 `controls_enabled` 的話，把回撤上限從 20% 調到
+  // 10%（開關兩邊都是「開」）會顯示「已生效」，而引擎其實還在用舊門檻——那正是
+  // 最常見的調整情境。心跳沒帶 `prefs`（舊版引擎）⇒ 說「無法確認」，不猜。
+  if (a.prefs === null || a.prefs === undefined) return c.risk.applied.unknown;
+  const applied = a.prefs;
+  const same = (Object.keys(d.prefs) as Array<keyof RiskPrefs>).every(
+    (k) => String(applied[k]) === String(d.prefs[k]),
+  );
+  return same ? c.risk.applied.inSync : c.risk.applied.pending;
+}
+
+/**
+ * 熔斷區塊。⚠️ 三種畫法對應三種事實，不得互相代用：
+ * - `halted === null` ⇒ 讀不到，說「無法確認」。**不得**什麼都不畫：不畫等於畫成
+ *   「沒有熔斷」，那會在客戶已經停止跟單的當下告訴他一切照常。
+ * - `tripped === false` ⇒ 確定沒有熔斷，整區不畫（這才是「沒事」的合法畫法）。
+ * - `tripped === true` ⇒ 醒目區塊 ＋ 自助恢復按鈕，但 `reason === "leader_revoked"`
+ *   是我方的治理動作，客戶不得自助解除 → **不給按鈕**，改給說明。
+ */
+function HaltedNotice({ halted, busy, note, error, onResume }: {
+  halted: MyRiskResp["halted"];
+  busy: boolean;
+  note: string | null;
+  error: string | null;
+  onResume: () => void;
+}) {
+  const h = c.risk.halted;
+  if (halted === null) {
+    return <p className="hint risk-halt-unknown" role="status">{h.unknown}</p>;
+  }
+  if (!halted.tripped) return null;
+  // ⭐ 用後端的 `resumable`（引擎以 `killswitch.rearm_allowed_for` 導出）而不是在
+  // 這裡比對 reason 字串：「哪些原因可以恢復」只能有一個定義點，前端各自比對的話，
+  // 引擎哪天新增一種不可恢復的原因，這裡會照樣給出一顆按了必然失敗的按鈕。
+  // `resumable === null`（舊版引擎的心跳沒有這一格）＝未知 ⇒ 同樣不給按鈕。
+  const resumable = halted.resumable === true;
+  return (
+    <div className="ops-alert risk-halted" role="alert">
+      <p className="ops-alert-body">{h.title}</p>
+      <p className="hint">{h.body}</p>
+      <p className="hint mono">{h.reasonLabel}: {halted.reason ?? h.unknownValue}</p>
+      <p className="hint mono">{h.trippedAtLabel}: {halted.tripped_at ?? h.unknownValue}</p>
+      <p className="hint mono">
+        {h.cooldownLabel}: {halted.cooldown_hours ?? h.unknownValue}
+      </p>
+      {halted.resume_at !== null
+        ? <p className="hint mono">{h.resumeAtLabel}: {halted.resume_at}</p>
+        : <p className="hint">{h.noAutoResume}</p>}
+      {resumable ? (
+        <>
+          <p className="hint">{h.resumeNote}</p>
+          <button type="button" className="btn btn-secondary" disabled={busy}
+            onClick={onResume}>
+            {busy ? h.resuming : h.resumeButton}
+          </button>
+        </>
+      ) : (
+        <p className="hint risk-halt-governance">{h.leaderRevokedNote}</p>
+      )}
+      {note && <p className="hint risk-resumed" role="status">{note}</p>}
+      {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
+    </div>
+  );
+}
+
+/** 簽章流程的失敗文案（沿本頁 errorCopy 的原則：每一條都說出「現在的狀態」）。 */
+function riskErrorCopy(r: RiskFlowFailure): string {
+  const e = c.risk.errors;
+  if (r.kind === "wallet-rejected") return e.walletRejected;
+  if (r.kind === "signer-mismatch") return e.signerMismatch;
+  if (r.kind === "content-mismatch") return e.contentMismatch;
+  const base = r.kind === "message-failed" ? e.messageFailed : e.submitFailed;
+  // 後端 detail 原樣附上（供回報問題用），不對字串比對推測原因。
+  const detail = r.error instanceof ApiError ? r.error.detail : undefined;
+  return detail ? `${base}（${detail}）` : base;
+}
+
 function RiskControlsSection() {
+  const me = useMe();
+  const { signMessageAsync } = useSignMessage();
+  const queryClient = useQueryClient();
   const risk = useQuery<MyRiskResp>({ queryKey: ["me-risk"], queryFn: getMyRisk });
   const [draft, setDraft] = useState<RiskPrefs | null>(null);
   const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [savedNote, setSavedNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [unlocking, setUnlocking] = useState(false);
+  const [unlockNote, setUnlockNote] = useState<string | null>(null);
+  const [unlockError, setUnlockError] = useState<string | null>(null);
 
   // 伺服器值是唯一的初始來源；載入完成後灌進草稿一次（之後由使用者主導）。
   useEffect(() => {
@@ -621,105 +813,130 @@ function RiskControlsSection() {
     );
   }
 
-  const { specs, editable, not_editable_note: lockedNote } = risk.data;
-  const specOf = (name: RiskParamSpec["name"]) => specs.find((s) => s.name === name);
+  const data = risk.data;
+  const tracking = data.specs.filter((s) => s.group === "tracking");
+  const riskParams = data.specs.filter((s) => s.group === "risk");
+
+  function edit(next: RiskPrefs) {
+    setSavedNote(null);
+    setError(null);
+    setDraft(next);
+  }
 
   async function save() {
-    if (!draft) return;
+    if (!draft || !me.data) return;
     setSaving(true);
     setError(null);
-    setSaved(false);
-    try {
-      await postMyRisk(draft);
-      setSaved(true);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : c.risk.saveError);
-    } finally {
-      setSaving(false);
-    }
+    setSavedNote(null);
+    const target = draft;
+    const r = await runRiskSettingsFlow(
+      {
+        fetchMessage: () => getRiskSettingsMessage(target),
+        // 原文原樣進錢包：不加工、不重組（後端會用自己重建的版本驗簽）。
+        signMessage: (message) => signMessageAsync({ message }),
+        recover: recoverPersonalSigner,
+        submit: postMyRisk,
+      },
+      // ⭐ expectedPrefs＝畫面上這一份草稿。沒有它，被打穿的 API 可以回一份把保護
+      // 關掉的原文，而流程的其他每一關（recover、後端重建驗簽）都會照樣放行。
+      {
+        expectedSigner: me.data.address,
+        expectedAccountId: me.data.account_id,
+        expectedPrefs: target,
+      },
+    );
+    setSaving(false);
+    if (r.ok) {
+      // 生效說明一律用後端原文（單一來源，不在前端另寫一份會過期的說明）。
+      setSavedNote(r.resp.effective_note);
+      void queryClient.invalidateQueries({ queryKey: ["me-risk"] });
+    } else setError(riskErrorCopy(r));
+  }
+
+  async function resume() {
+    if (!me.data) return;
+    setUnlocking(true);
+    setUnlockError(null);
+    setUnlockNote(null);
+    const r = await runRiskUnlockFlow(
+      {
+        fetchMessage: getRiskUnlockMessage,
+        signMessage: (message) => signMessageAsync({ message }),
+        recover: recoverPersonalSigner,
+        submit: postRiskUnlock,
+      },
+      {
+        expectedSigner: me.data.address,
+        expectedAccountId: me.data.account_id,
+        // 域分隔預驗的比對清單取自後端 specs（不是前端硬編）——後端新增參數時
+        // 這道防線自動跟上（見 lib/riskSettingsFlow.ts 檔頭）。
+        riskParamNames: data.specs.map((s) => s.name),
+      },
+    );
+    setUnlocking(false);
+    if (r.ok) {
+      setUnlockNote(r.resp.effective_note);
+      void queryClient.invalidateQueries({ queryKey: ["me-risk"] });
+    } else setUnlockError(riskErrorCopy(r));
   }
 
   return (
     <section className="risk-section" aria-label={c.risk.title}>
       <h2 className="panel-title">{c.risk.title}</h2>
       <p className="hint">{c.risk.subtitle}</p>
-      {editable && <p className="hint">{c.risk.saveFirstNote}</p>}
+      <p className="hint">{c.risk.applyNote}</p>
 
-      {risk.data.stored_unreadable && risk.data.stored_unreadable_note && (
-        <div className="ops-alert" role="alert">
-          <p className="ops-alert-body">{risk.data.stored_unreadable_note}</p>
-        </div>
-      )}
+      <HaltedNotice halted={data.halted} busy={unlocking} note={unlockNote}
+        error={unlockError} onResume={() => void resume()} />
 
-      {!editable && (
-        <div className="risk-locked" role="status">
-          <p className="risk-locked-title">{c.risk.lockedTitle}</p>
-          {lockedNote && <p className="hint">{lockedNote}</p>}
+      {/* ⭐ group="tracking"：**不受風控開關影響**，所以畫在 checkbox 之外、永遠顯示。
+          藏進下面的展開區，會讓關掉風控的客戶以為自己也關掉了它。 */}
+      {tracking.length > 0 && (
+        <div className="risk-tracking">
+          <p className="eyebrow">{c.risk.trackingTitle}</p>
+          <p className="hint">{c.risk.trackingSubtitle}</p>
+          {tracking.map((spec) => (
+            <RiskParamField key={spec.name} spec={spec} prefs={draft!} onChange={edit} />
+          ))}
         </div>
       )}
 
       <label className="risk-toggle">
-        <input type="checkbox" checked={draft.enabled} disabled={!editable}
-          onChange={(e) => {
-            setSaved(false);
-            setDraft({ ...draft, enabled: e.target.checked });
-          }} />
+        <input type="checkbox" checked={draft.enabled}
+          onChange={(e) => edit({ ...draft!, enabled: e.target.checked })} />
         <span>{c.risk.enableLabel}</span>
       </label>
       <p className="hint risk-toggle-help">{c.risk.enableHelp}</p>
 
-      {/* 勾選後才展開細項——沒開風控時這些數字沒有任何意義，擺出來只會讓人以為有。 */}
+      {/* 勾選後才展開細項——沒開風控時這些門檻不會被執法，擺出來只會讓人以為有。 */}
       {draft.enabled && (
         <div className="risk-details">
           <p className="eyebrow">{c.risk.detailsTitle}</p>
-          {(["max_drawdown_pct", "max_total_drawdown_pct"] as const).map((name) => {
-            const spec = specOf(name);
-            if (!spec) return null;
-            return (
-              <div className="risk-field" key={name}>
-                <label htmlFor={`risk-${name}`}>{spec.label}</label>
-                <div className="risk-input-row">
-                  <input id={`risk-${name}`} type="number" className="mono"
-                    inputMode="decimal" step="1" disabled={!editable}
-                    min={spec.min == null ? undefined : ratioToPct(spec.min)}
-                    max={spec.max == null ? undefined : ratioToPct(spec.max)}
-                    value={ratioToPct(draft[name])}
-                    onChange={(e) => {
-                      setSaved(false);
-                      setDraft({ ...draft, [name]: pctToRatio(e.target.value) });
-                    }} />
-                  <span className="risk-suffix">{c.risk.percentSuffix}</span>
-                </div>
-                <p className="hint">{spec.help}</p>
-              </div>
-            );
-          })}
-          {specOf("flatten_on_breach") && (
-            <div className="risk-field">
-              <label className="risk-toggle">
-                <input type="checkbox" checked={draft.flatten_on_breach}
-                  disabled={!editable}
-                  onChange={(e) => {
-                    setSaved(false);
-                    setDraft({ ...draft, flatten_on_breach: e.target.checked });
-                  }} />
-                <span>{specOf("flatten_on_breach")!.label}</span>
-              </label>
-              <p className="hint">{specOf("flatten_on_breach")!.help}</p>
-            </div>
-          )}
+          {riskParams.map((spec) => (
+            <RiskParamField key={spec.name} spec={spec} prefs={draft!} onChange={edit} />
+          ))}
         </div>
       )}
 
-      {editable && (
-        <div className="step-actions">
-          <button type="button" className="btn btn-secondary" disabled={saving}
-            onClick={save}>
-            {saving ? c.risk.saving : c.risk.saveButton}
-          </button>
-        </div>
+      <p className="hint risk-applied" role="status">{appliedNoteOf(data)}</p>
+      {data.applied !== null && (
+        <p className="hint mono">
+          {c.risk.applied.sourceLabel}: {data.applied.source}
+          {data.applied.changed_at !== null
+            && `　${c.risk.applied.changedAtLabel}: ${data.applied.changed_at}`}
+        </p>
       )}
-      {saved && <p className="hint risk-saved" role="status">{c.risk.saved}</p>}
+
+      <div className="step-actions">
+        <button type="button" className="btn btn-secondary" disabled={saving}
+          onClick={() => void save()}>
+          {saving ? c.risk.saving : c.risk.saveButton}
+        </button>
+      </div>
+      <p className="hint">{c.risk.signNote}</p>
+      {savedNote && (
+        <p className="hint risk-saved" role="status">{c.risk.saved} {savedNote}</p>
+      )}
       {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
     </section>
   );

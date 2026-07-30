@@ -106,6 +106,13 @@ class CopySettings:
     #   1. `killswitch.is_tripped` 的鎖檔短路——已鎖死的交易只能人工 re-arm；
     #   2. leader 被白名單撤銷時的強制平倉（run_copytrade 層，屬合約與權限）。
     risk_controls_enabled: bool = True
+    # 熔斷後的冷靜期（小時）。屆滿即自動恢復跟單（`killswitch.auto_rearm_if_cooled_down`）。
+    # `0` ＝不自動恢復（只有人工刪 ARM 檔才恢復），那是客戶明確選擇「鎖死等我處理」。
+    # ⭐ 預設 12 而不是 0（2026-07-30 使用者裁決）：把「什麼時候恢復」的決定權交回
+    # 客戶手上。願意付錢限制自己的人不多，我們能做的是提供保護，不是替他上鎖。
+    # ⚠️ 本值不受 `risk_controls_enabled` 影響：它管的是**恢復**，不是執法。客戶關掉
+    # 風控之後，先前留下的鎖檔仍應照冷靜期自動解除，否則他等於被一個已停用的機制鎖住。
+    risk_cooldown_hours: Decimal = Decimal("12")
     # ⭐⭐ 跟單本金的**兩種模式，由顯式旗標選擇**（2026-07-19：解除 `0` 的語意重載）。
     # 舊版讓 `allocated_capital == 0` 兼任「用全部權益」的開關，於是同一個值同時是
     # 「邊界檢查的下界」與「語意開關」——兩者撞在一起的直接後果是：資金設定 API
@@ -230,6 +237,9 @@ class CopySettings:
             risk_controls_enabled=_env_bool(
                 "COPY_RISK_CONTROLS_ENABLED", str(cls.risk_controls_enabled).lower(), env
             ),
+            risk_cooldown_hours=_env_decimal(
+                "COPY_RISK_COOLDOWN_HOURS", str(cls.risk_cooldown_hours), env
+            ),
             allocated_capital=alloc,
             use_full_equity=_env_bool("COPY_USE_FULL_EQUITY",
                                       str(alloc <= 0).lower(), env),
@@ -290,6 +300,11 @@ class CopySettings:
             raise ValueError(
                 f"max_drawdown_pct must be in (0, 1), got {self.max_drawdown_pct}"
             )
+
+        if self.risk_cooldown_hours < 0:
+            raise ValueError(
+                f"risk_cooldown_hours must be >= 0 (0=不自動恢復), "
+                f"got {self.risk_cooldown_hours}")
 
         if self.modify_policy not in ("modify-first", "cancel-place"):
             raise ValueError(

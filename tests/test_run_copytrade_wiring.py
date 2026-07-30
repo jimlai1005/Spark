@@ -714,3 +714,168 @@ def test_dry_run_without_account_id_publishes_no_heartbeat(monkeypatch, tmp_path
 
     from spark.filet.engine_health import heartbeat_dir_for
     assert not heartbeat_dir_for(_exchange_dir(tmp_path)).exists()
+
+
+# ── ⭐⭐ 客戶簽章的風控設定與自助解鎖：從記錄檔一路到 run_cycle 的接縫 ────────
+# 同上兩段的理由：模組單元測試（tests/test_risk_settings_apply.py）證明 applier 本身
+# 對，這裡證明它真的被接進 main() 的 cycle。少了它，把 make_risk_settings_applier
+# 從 cycle() 拿掉會全綠通過——症狀是「客戶按了調整、API 回 200、永遠不生效」。
+
+
+def _signed_risk(tmp_path, wallet, *, prefs=None, account_id="alice", nonce="r1",
+                 issued_at=None):
+    """簽一筆合法的風控設定記錄並落到交換目錄（API 慣例的位置）。"""
+    from datetime import datetime, timezone
+
+    from eth_account.messages import encode_defunct
+
+    from spark.filet.risk_prefs import default_prefs
+    from spark.filet.risk_settings import (build_risk_settings_message,
+                                           build_risk_settings_record,
+                                           risk_settings_path_for,
+                                           write_risk_settings)
+
+    issued_at = issued_at or datetime.now(timezone.utc).isoformat()
+    prefs = {**default_prefs(), "enabled": True, **(prefs or {})}
+    msg = build_risk_settings_message(account_id=account_id, prefs=prefs,
+                                      nonce=nonce, issued_at=issued_at)
+    sig = wallet.sign_message(encode_defunct(text=msg)).signature.hex()
+    rec = build_risk_settings_record(account_id=account_id, prefs=prefs, nonce=nonce,
+                                     issued_at=issued_at, signature=sig, message=msg)
+    exchange = _exchange_dir(tmp_path)
+    write_risk_settings(risk_settings_path_for(exchange), rec)
+    return exchange
+
+
+def _signed_unlock(tmp_path, wallet, *, account_id="alice", nonce="u1"):
+    from datetime import datetime, timezone
+
+    from eth_account.messages import encode_defunct
+
+    from spark.filet.risk_settings import (build_risk_unlock_message,
+                                           build_risk_unlock_record,
+                                           risk_unlock_path_for, write_risk_unlock)
+
+    issued_at = datetime.now(timezone.utc).isoformat()
+    msg = build_risk_unlock_message(account_id=account_id, nonce=nonce,
+                                    issued_at=issued_at)
+    sig = wallet.sign_message(encode_defunct(text=msg)).signature.hex()
+    rec = build_risk_unlock_record(account_id=account_id, nonce=nonce,
+                                   issued_at=issued_at, signature=sig, message=msg)
+    write_risk_unlock(risk_unlock_path_for(_exchange_dir(tmp_path)), rec)
+
+
+def _record_risk(monkeypatch, seen):
+    """把 run_cycle 換成記錄「本輪拿到的風控設定」的替身。"""
+    def _fake_run_cycle(adapter, ex, settings, notifier, state, root):
+        seen.append((settings.risk_controls_enabled, settings.max_drawdown_pct,
+                     settings.flatten_on_breach))
+        return "report"
+
+    monkeypatch.setattr(rc, "run_cycle", _fake_run_cycle)
+
+
+def test_signed_risk_settings_reach_run_cycle(monkeypatch, tmp_path):
+    """⭐⭐ 客戶簽章的風控門檻必須真的變成 run_cycle 拿去判定風險的那一組。"""
+    from decimal import Decimal
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_risk(tmp_path, wallet,
+                 prefs={"max_drawdown_pct": "0.35", "flatten_on_breach": False})
+    _stub_network(monkeypatch)
+    seen = []
+    _record_risk(monkeypatch, seen)
+
+    rc.main(["--once"])
+
+    assert seen == [(True, Decimal("0.35"), False)]
+
+
+def test_risk_settings_are_idempotent_across_cycles(monkeypatch, tmp_path):
+    """⭐ 持續意圖：記錄檔每輪都在，每輪都套用同一組值，但狀態檔只寫一次。"""
+    from decimal import Decimal
+
+    from spark.filet.risk_settings_apply import APPLIED_STATE_RELPATH
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_risk(tmp_path, wallet, prefs={"max_drawdown_pct": "0.30"})
+    _stub_network(monkeypatch)
+    seen = []
+    _record_risk(monkeypatch, seen)
+    state = tmp_path / "state" / APPLIED_STATE_RELPATH
+    snapshots = []
+
+    def _fake_main_loop(mk_cycle, settings, notifier):
+        for _ in range(3):
+            mk_cycle()
+            snapshots.append(state.read_text())
+
+    monkeypatch.setattr(rc, "main_loop", _fake_main_loop)
+    rc.main([])
+
+    assert seen == [(True, Decimal("0.30"), True)] * 3
+    assert len(set(snapshots)) == 1              # ⭐ 狀態檔只被寫過一次
+
+
+def test_signed_unlock_removes_the_arm_file_in_the_cycle(monkeypatch, tmp_path):
+    """⭐⭐ 客戶按下「立即恢復」→ 本輪就解鎖，不必等下一輪（接線順序的證據）。"""
+    from datetime import datetime, timedelta, timezone
+
+    from spark.copytrade.killswitch import ARM_FILE_RELPATH
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    arm = tmp_path / "state" / ARM_FILE_RELPATH
+    arm.parent.mkdir(parents=True, exist_ok=True)
+    tripped_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    arm.write_text(json.dumps({"tripped_at": tripped_at, "breached": True}))
+    _signed_unlock(tmp_path, wallet)
+    _stub_network(monkeypatch)
+    seen = []
+    _record_risk(monkeypatch, seen)
+
+    rc.main(["--once"])
+
+    assert not arm.exists()                     # 鎖已解除
+    assert seen                                 # 而且本輪就進了 run_cycle
+
+
+def test_heartbeat_reports_the_risk_source(monkeypatch, tmp_path):
+    """⭐ 心跳的風控那一格要分得出「客戶自己簽的」與「部署寫死的」。"""
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _stub_network(monkeypatch)
+    _record_risk(monkeypatch, [])
+
+    rc.main(["--once"])
+    hb, _ = _read_hb(tmp_path)
+    assert hb["risk"]["source"] == "env_default"
+    assert hb["risk"]["changed_at"] is None
+
+    _signed_risk(tmp_path, wallet, prefs={"max_drawdown_pct": "0.30"})
+    rc.main(["--once"])
+    hb, _ = _read_hb(tmp_path)
+    assert hb["risk"]["source"] == "customer_signed"
+    assert hb["risk"]["changed_at"] is not None
+    assert hb["risk"]["controls_enabled"] is True
+
+
+def test_heartbeat_never_carries_risk_signature_material(monkeypatch, tmp_path):
+    """⭐⭐ 走完一次真實的風控簽章套用之後，心跳檔裡不得有簽章的任何一段。"""
+    from spark.filet.risk_settings import load_risk_settings, risk_settings_path_for
+
+    wallet = _wire_signed(monkeypatch, tmp_path,
+                          allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _signed_risk(tmp_path, wallet, prefs={"max_drawdown_pct": "0.30"})
+    _stub_network(monkeypatch)
+    _record_risk(monkeypatch, [])
+
+    rc.main(["--once"])
+
+    rec = load_risk_settings(risk_settings_path_for(_exchange_dir(tmp_path)))[0]
+    _, path = _read_hb(tmp_path)
+    raw = path.read_text()
+    assert rec["signature"] not in raw
+    assert rec["nonce"] not in raw

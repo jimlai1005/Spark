@@ -1532,7 +1532,10 @@ def _write_heartbeat(cfg, account_id, *, age_s=5.0, tripped=False, count=12,
         leader_address=leader, leader_source=leader_source,
         allocated_capital=alloc, capital_utilization=util, use_full_equity=False,
         capital_source=capital_source, capital_changed_at=None,
-        risk_controls_enabled=True,
+        risk_controls_enabled=True, risk_source="env_default",
+        risk_changed_at=None,
+        risk_prefs=None,
+        risk_halt=None,
         cycle_result=result, cycle_detail=None)
     p = heartbeat_path_for(cfg.exchange_dir, account_id)
     write_heartbeat(p, payload)
@@ -1572,7 +1575,10 @@ def test_heartbeat_fills_the_panel_when_the_state_root_is_unreadable(tmp_path):
     assert row["capital"]["capital_utilization"] == "0.4000"
     # ⭐ 風控總開關同理由：狀態根沒有可讀投影，心跳是面板唯一的來源。釘住它有帶，
     # 否則哪天投影漏掉，面板會對一顆無風控的引擎完全沉默（審查 F5）。
-    assert row["risk"] == {"controls_enabled": True}
+    # `source`／`changed_at` 自 2026-07-30 起同行（客戶簽章的風控設定管線）：面板
+    # 必須分得出「客戶自己調的」與「部署寫死的」。
+    assert row["risk"] == {"controls_enabled": True, "source": "env_default",
+                           "changed_at": None, "prefs": None, "halt": None}
     assert row["capital"]["source"] == "customer_signed"
     assert row["last_cycle"]["result"] == "no_action"
 

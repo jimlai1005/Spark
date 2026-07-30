@@ -57,8 +57,15 @@ from spark.publicapi.ops import (accrued_window, accrued_window_note, customer_p
                                  trade_quality_summary, utc_days_in_window)
 from spark.filet.risk_prefs import (RiskPrefsError, canonical_prefs, prefs_summary,
                                     safe_fallback_prefs)
-from spark.publicapi.pending import (load_pending, set_pending_risk,
-                                     write_pending_entry)
+from spark.filet.risk_settings import (RISK_SETTINGS_MAX_AGE_S, RiskSettingsError,
+                                       build_risk_settings_message,
+                                       build_risk_settings_record,
+                                       build_risk_unlock_message,
+                                       build_risk_unlock_record,
+                                       load_risk_settings, verify_risk_settings,
+                                       verify_risk_unlock, write_risk_settings,
+                                       write_risk_unlock)
+from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
 
@@ -110,6 +117,28 @@ CAPITAL_SETTINGS_DETAIL = {
     "signer_mismatch": "簽章者不是本帳號的持有人",
     "nonce_unusable": "這份授權已被使用或已過期，請重新取得待簽原文並重簽",
 }
+
+
+# 風控設定／解除熔斷驗簽失敗 → 回給客戶的分類化訊息。第三張表（不與資金設定共用）：
+# reason 集合雖然目前相同，但兩者的**可行動建議**不同（一邊是「重新設定門檻」、
+# 一邊是「重新按恢復跟單」），而共用一張表會讓其中一邊的文案改動靜默改掉另一邊。
+# ⭐ 同樣刻意不是 `str(e)`：例外訊息為了除錯內嵌了 nonce／issued_at 原值。
+# ⚠️ **偏好值的區間錯誤不走這張表**（走 `RiskPrefsError` 的 `str(e)`）：那類訊息必須
+# 說得出合法區間才有辦法讓客戶改對，而它只含參數名與數值——不含任何授權材料。
+RISK_SETTINGS_DETAIL_DEFAULT = "風控設定驗證失敗，請重新取得待簽原文並重簽"
+RISK_SETTINGS_DETAIL = {
+    "malformed": "請求欄位格式不正確，請重新取得待簽原文並重簽",
+    "account_mismatch": "請求的帳號與登入身分不符",
+    "action_mismatch": "這份簽章不是風控設定授權，請重新取得待簽原文並重簽",
+    "expired": "簽章已過期，請重新取得待簽原文並重簽",
+    "bad_signature": "簽章無法驗證，請重新簽署",
+    "signer_mismatch": "簽章者不是本帳號的持有人",
+    "nonce_unusable": "這份授權已被使用或已過期，請重新取得待簽原文並重簽",
+}
+RISK_UNLOCK_DETAIL_DEFAULT = "解除熔斷驗證失敗，請重新取得待簽原文並重簽"
+RISK_UNLOCK_DETAIL = {**RISK_SETTINGS_DETAIL,
+                      "action_mismatch": "這份簽章不是解除熔斷的授權，"
+                                         "請重新取得待簽原文並重簽"}
 
 
 class VerifyBody(BaseModel):
@@ -170,6 +199,47 @@ class CapitalSettingsBody(BaseModel):
     # 預設 False＝固定本金模式，也就是**限制較嚴**的那一邊：舊版客戶端不送這個欄位
     # 時行為與改動前完全相同，且漏送不可能放行一筆「用全部權益」的授權。
     use_full_equity: bool = False
+
+
+class RiskSettingsMessageBody(BaseModel):
+    """`POST /api/me/risk/message` 的 body——只有待簽的偏好本身。"""
+
+    prefs: dict
+
+
+class RiskSettingsBody(BaseModel):
+    """客戶簽章的風控設定請求（欄位＝filet/risk_settings.py 的記錄格式減去 action）。
+
+    `action` 刻意**不收**、`account_id` 顯式收下再與 session 衍生值比對（不符 403），
+    兩者的理由與 `CapitalSettingsBody` 逐字相同——先讀那份 docstring。
+
+    `prefs` 收 `dict`（值一律是字串或 bool，不是 float）：比例值直接決定熔斷門檻，
+    而 float 進不了 Decimal 的精確世界。正規化與區間的單一定義點在
+    `risk_prefs.canonical_prefs`，本模型只負責把它原樣接下來。
+    """
+
+    account_id: str
+    prefs: dict
+    nonce: str
+    issued_at: str
+    signature: str
+    # 客戶端實際簽的原文。**驗證完全不看它**（伺服器重建自己的版本）——僅原樣留存。
+    message: str = ""
+
+
+class RiskUnlockBody(BaseModel):
+    """客戶簽章的「立即解除熔斷鎖定」請求（記錄格式減去 action）。
+
+    ⭐ 這是**一次性動作**：與 `RiskSettingsBody` 分成兩個模型、兩個端點、兩個檔，
+    因為一份「調整門檻」的授權絕不能被兌換成一次「把熔斷鎖打開」（反向亦然）。
+    結構性的分隔在待簽訊息的第一行（見 filet/risk_settings.py 檔頭的域分隔論證）。
+    """
+
+    account_id: str
+    nonce: str
+    issued_at: str
+    signature: str
+    message: str = ""
 
 
 # leader 目錄要外流的**快照統計欄位白名單**。watchlist 快照存的是一日一點的資產負債
@@ -1444,93 +1514,378 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                 agent_address=p["agent_address"])
         return p
 
-    # ---------- 風控偏好（錢包主人自選，2026-07-30）----------
-    # ⚠️ 本路徑**沒有客戶簽章**，與換 leader／資金設定不同。取捨、邊界與已知缺口
-    # 全文見 `filet/risk_prefs.py` 檔頭；一句話版本：這裡只調保護門檻（不是部位
-    # 大小），且偏好只在啟用那一刻被烙進 env，之後 filet-api 影響不了執行中的引擎。
+    # ---------- 風控設定（客戶簽章；2026-07-30）----------
+    # ⭐⭐ 本路徑與換 leader／資金設定**同一套信任錨**：客戶用自己的私鑰簽一份逐項
+    # 列出門檻的原文，API 只落記錄，引擎在套用前自己重新驗章。威脅模型與「為什麼
+    # 風控設定也必須簽章」的全文見 `filet/risk_settings.py` 檔頭。
+    # 兩個動作、兩份記錄、兩個檔（時效語意相反）：
+    #   - 風控設定＝**持續意圖**（引擎每輪讀，不檢查時效）；
+    #   - 解除熔斷＝**一次性動作**（強制時效，一份三天前的解鎖記錄若還能生效，
+    #     等於客戶簽一次就永久放棄了熔斷保護）。
+    # ⚠️ API 端**兩者都強制時效**（`RISK_SETTINGS_MAX_AGE_S`）：這裡驗的是「客戶
+    # 剛剛按下的那一次」，nonce 也是本進程幾分鐘前才發的。放行時效的是引擎端。
 
-    def _my_pending_entry(account_id: str) -> dict | None:
-        return next((e for e in load_pending(cfg.pending_path)
-                     if e.get("account_id") == account_id), None)
+    def _resume_at(tripped_at: str | None, cooldown_hours: str | None) -> str | None:
+        """自動恢復的時刻＝熔斷時刻 ＋ 冷靜期；算不出來一律 None。
+
+        `None` 的三種來源刻意不分開（對客戶都是「沒有可顯示的自動恢復時刻」）：
+        讀不到熔斷時刻、讀不到冷靜期、或冷靜期為 0（＝不自動恢復）。前端對
+        `null` 的正確反應是顯示「不會自動恢復／無法確認」，而不是留白。
+        """
+        if not tripped_at or cooldown_hours is None:
+            return None
+        try:
+            hours = Decimal(str(cooldown_hours))
+            if hours <= 0:
+                return None
+            base = datetime.fromisoformat(tripped_at)
+        except (ValueError, TypeError, ArithmeticError):
+            return None
+        return (base + timedelta(hours=float(hours))).isoformat()
+
+    def _halt_note(halt: dict | None) -> str:
+        """熔斷中的人話說明。⭐ 依「可否自助恢復」分岔，不要用同一句含糊帶過——
+        `leader_revoked` 的鎖定簽了也不會解除，把它與一般風險熔斷寫成同一句，
+        等於邀請客戶去簽一份注定失敗的請求。"""
+        if halt is None:
+            return ("你的跟單目前因熔斷而停止交易。這顆引擎回報的版本較舊，"
+                    "尚無法確認熔斷原因與能否自助恢復——請稍候重新整理。")
+        if halt.get("resumable"):
+            return ("你的跟單目前因風控熔斷而停止交易。冷靜期過後會自動恢復；"
+                    "要立即恢復請在本頁簽署一次「恢復跟單」。")
+        return ("你的跟單目前因 leader 被撤銷而停止交易。這不是風控熔斷，"
+                "**無法**由你自助恢復——請聯絡我們。")
+
+    def _my_signed_risk_record(account_id: str) -> dict | None:
+        """交換目錄 → **只**這一個帳號的風控設定記錄，且**只投影安全欄位**。
+
+        兩層窄化都是結構性的，理由與 `_load_own_capital_record` 逐字相同：
+        多帳號清單的生命週期不離開本函式；`signature`／`message` 原文結構上到不了
+        回應。記錄壞掉／讀不到一律回 None（＝「尚無已簽章的設定」），**不 raise**。
+        """
+        try:
+            records = load_risk_settings(cfg.risk_settings_path)
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            logger.error("風控設定記錄讀取失敗 %s: %r", cfg.risk_settings_path, e)
+            return None
+        mine = [r for r in records if isinstance(r, dict)
+                and r.get("account_id") == account_id]
+        if not mine:
+            return None
+        # write_risk_settings 是「同 account 覆蓋」，正常至多一筆；取最後一筆＝取最新
+        # 意圖（沿引擎 applier 的同一個選法，兩邊看的是同一筆）。
+        rec = mine[-1]
+        issued_at = rec.get("issued_at")
+        return {"prefs": rec.get("prefs"),
+                "submitted_at": issued_at if isinstance(issued_at, str) else None}
+
+    def _risk_base_prefs(account_id: str) -> dict:
+        """局部更新的補值基底＝**這個帳號目前已簽章的值**，不是產品預設（審查 F1）。
+
+        否則一份只寫 `{"enabled": true}` 的請求會把客戶調過的門檻靜默重設回預設值。
+        目前存的值本身壞掉時退到安全側（風控開啟），不拿壞資料當合法基準。
+        """
+        rec = _my_signed_risk_record(account_id)
+        try:
+            return canonical_prefs(rec["prefs"] if rec else None)
+        except RiskPrefsError:
+            return safe_fallback_prefs()
 
     @app.get("/api/me/risk")
     def me_risk(address: str = Depends(_require_session)):
-        """我的風控偏好 ＋ 可調參數規格（前端據此畫表單，不硬編任何數字）。
+        """我的風控設定：**已提交**（簽章記錄）、**已生效**（引擎心跳）與熔斷狀態。
 
-        ⭐ `editable` 是本回應最重要的欄位：偏好只在啟用那一刻寫進引擎的 env，
-        而 watcher 啟用後會移除 pending 條目、且**不覆寫**既有 env。所以已啟用的
-        帳號在這裡改設定不會有任何效果——前端必須據此把表單關掉並說明原因，
-        不能讓客戶對著一個按了沒用的開關按第二次（沉默的無效比不給選更糟）。
+        ⭐⭐ `prefs`（已提交）與 `applied`（已生效）刻意分成兩格，理由與
+        `/api/me/capital` 的 pending/effective 完全相同：記錄只代表「客戶簽了、
+        API 收了」，引擎可能還沒套用、也可能因為驗章或邊界檢查而永遠不會套用。
+        把記錄當成生效值顯示，會讓一個剛把回撤上限調低的客戶以為保護已經生效。
+        生效值的唯一來源是**引擎自己發布的心跳**（`read_heartbeat` 在心跳過期時
+        結構性地不回傳 payload ⇒ 過期的值到不了這裡）。
+
+        ⭐ `halted`：這顆引擎是不是正在熔斷鎖定中——`null` ＝**無從得知**
+        （心跳缺席／過期／引擎自己也不知道），絕不畫成「沒有熔斷」。前端據此顯示
+        「無法確認」而不是一個令人安心的綠燈。
+
+        ⭐ `editable` **恆為 true**（2026-07-30 改版）：偏好改成執行期套用之後，
+        已啟用的帳號同樣能改——引擎每輪重讀簽章記錄。舊版的 `not_editable_reason`
+        與 409 分支隨舊的「啟用當下烙進 env」路徑一起移除。
         """
-        entry = _my_pending_entry(derive_account_id(address))
-        stored = entry.get("risk") if entry else None
+        account_id = derive_account_id(address)
+        rec = _my_signed_risk_record(account_id)
         # ⭐ 存著的偏好驗不過（手改／舊格式）**不得** 500：那會讓客戶連改回來的
         # 介面都打不開，而 500 又長得像「稍後重試就好」的暫時故障（工程原則 2）。
-        # 顯示的是 watcher 遇到同一份壞資料時會採用的那一份（風控開啟的安全側），
+        # 顯示的是引擎遇到同一份壞資料時會採用的那一份（風控開啟的安全側），
         # 並明講「這不是你存的值」——兩邊對同一個壞資料的解讀必須一致，
         # 否則畫面說關、引擎跑開，客戶無從得知哪個是真的。
         unreadable = False
         try:
-            summary = prefs_summary(stored)
+            summary = prefs_summary(rec["prefs"] if rec else None)
         except RiskPrefsError:
-            logger.warning("風控偏好無法解析，改以安全側顯示 account=%s",
-                           derive_account_id(address))
+            logger.warning("風控設定記錄無法解析，改以安全側顯示 account=%s",
+                           account_id)
             unreadable = True
             summary = prefs_summary(safe_fallback_prefs())
-        return {**summary,
-                "stored_unreadable": unreadable,
-                "stored_unreadable_note": (
-                    "你先前儲存的風控設定讀取異常，畫面顯示的是系統採用的安全預設"
-                    "（風控開啟）。請重新確認並儲存一次。" if unreadable else None),
-                "editable": entry is not None,
-                "not_editable_reason": None if entry is not None else "not_pending",
-                "not_editable_note": (
-                    None if entry is not None else
-                    "這個帳號不在待啟用佇列中（尚未完成綁定，或引擎已經啟用）。"
-                    "風控設定在引擎啟用的那一刻寫入並固定；已啟用的帳號要調整，"
-                    "請聯絡我們（改動需要在伺服器端進行，不經由本頁）。")}
 
-    @app.post("/api/me/risk")
-    def me_risk_submit(body: dict, address: str = Depends(_require_session)):
-        """設定我的風控偏好（寫進**我自己的** pending 條目）。
+        hb = _read_heartbeat(account_id, now_fn())
+        # ⭐ `hb.data` 只有在心跳新鮮時才非 None（engine_health 的結構性保證）。
+        risk = (hb.data or {}).get("risk") or {}
+        applied = None
+        if risk.get("source") in ("customer_signed", "env_default"):
+            applied = {
+                "controls_enabled": risk.get("controls_enabled"),
+                # `customer_signed` ＝這組門檻是客戶自己簽的；`env_default` ＝仍是
+                # 部署當下寫進 env 的值。少了它，客戶分不出「我的設定生效了」與
+                # 「我看到的是部署預設」。
+                "source": risk.get("source"),
+                "changed_at": risk.get("changed_at"),
+                # 這組值是引擎在哪一刻回報的——沒有這個時間戳，一份接近過期的心跳
+                # 會被當成即時查詢讀（工程原則 1 的變形：連時點都不同源）。
+                "as_of": hb.at,
+            }
+        tripped = (hb.data or {}).get("killswitch_tripped")
+        # ⭐ 熔斷原因與「可否自助恢復」取自心跳的 `risk.halt`（引擎以
+        # `killswitch.halt_status` 產出，`resumable` 由 `rearm_allowed_for` 導出）。
+        # 沒有這一格的話，前端只能讓客戶對一個 `leader_revoked` 的鎖定簽一份注定被
+        # 引擎拒絕的解鎖請求——白費一次真實簽章，而失敗訊息出現在他按下之後。
+        # 心跳是舊版引擎寫的（沒有 `halt` 這一格）時 → `resumable` 為 None ＝未知，
+        # 前端據此顯示「無法確認」而不是給出可能錯誤的按鈕。
+        halt = risk.get("halt") if isinstance(risk.get("halt"), dict) else None
+        applied_prefs = risk.get("prefs") if isinstance(risk.get("prefs"), dict) else None
+        cooldown_h = (applied_prefs or {}).get("cooldown_hours")
+        halted = None if tripped is None else {
+            "tripped": bool(tripped),
+            "reason": (halt or {}).get("reason"),
+            "tripped_at": (halt or {}).get("tripped_at"),
+            "resumable": (halt or {}).get("resumable") if tripped else None,
+            # 冷靜期取自**引擎實際在執法的**那一組（心跳的 applied prefs），不是客戶
+            # 剛提交但可能還沒生效的那一份——顯示的恢復時刻必須是真的會發生的那個。
+            "cooldown_hours": cooldown_h,
+            "resume_at": _resume_at((halt or {}).get("tripped_at"), cooldown_h),
+            "as_of": hb.at,
+            "note": (_halt_note(halt) if tripped else "目前沒有熔斷鎖定。"),
+        }
+        return {
+            **summary,
+            "stored_unreadable": unreadable,
+            "stored_unreadable_note": (
+                "你先前儲存的風控設定讀取異常，畫面顯示的是系統採用的安全預設"
+                "（風控開啟）。請重新確認並儲存一次。" if unreadable else None),
+            # 「已提交」的時刻。與 `applied.changed_at`（引擎**實際套用**的時刻）
+            # 是兩個不同的問題，刻意不合併成一格。
+            "submitted": {"issued_at": rec["submitted_at"] if rec else None},
+            "applied": applied,
+            "halted": halted,
+            "heartbeat": {"status": hb.status, "at": hb.at, "age_s": hb.age_s,
+                          "stale_after_s": HEARTBEAT_STALE_S},
+            "editable": True,
+            "note": ("這是你已簽署的風控設定。引擎會在下一輪（約一分鐘內）重新驗證"
+                     "你的簽章後套用；「目前生效」那一格才是引擎實際在執法的值。"
+                     if applied is not None else
+                     "目前無法確認生效中的風控設定（引擎的健康心跳缺席或已過期）。"
+                     "**請不要**把已提交的數值當成生效值。"),
+        }
 
-        失敗分類（工程原則 2）：值超界／欄位不認得／不在佇列中**全是 semantic**
-        （4xx，客戶端不得自動重試）；寫檔失敗才是 transient（5xx）。
+    def _consume_risk_nonce(address: str):
+        """本節兩個 POST 端點共用的 nonce 消耗式（與換 leader／資金設定同一張表）。
 
-        ⭐ 不在佇列中一律 409（不是靜默 200）：見 `me_risk` 的 `editable` 說明。
+        兩道要求同 `leaders_select` 的 `_consume`：nonce 必須是**發給本人**的，且
+        必須是**這個 chain_id 域**發的（擋 SIWE 登入 nonce 被挪用）。
+        ⚠️ 這裡**不**分辨「哪個端點發的」——分辨動作的是**簽章本身**：客戶簽的原文
+        第一行寫死了動作類型，拿風控設定的 nonce 配解除熔斷的簽章，重建出來的訊息
+        對不上任何一邊（完整論證見 filet/risk_settings.py 檔頭的域分隔）。
+        """
+        def _consume(nonce: str) -> bool:
+            rec = store.consume_nonce(nonce, now_s=now_fn())
+            return (rec is not None and rec.address == address
+                    and rec.chain_id == _LEADER_CHANGE_CHAIN_ID)
+        return _consume
+
+    @app.post("/api/me/risk/message")
+    def risk_settings_message(body: RiskSettingsMessageBody,
+                              address: str = Depends(_require_session)):
+        """回傳風控設定的 **canonical 待簽原文** ＋ 配套的一次性 nonce。
+
+        ⭐ 為什麼是 **POST 而不是 GET**（與資金設定的 GET 版刻意不同）：待簽的偏好
+        有五個欄位（含 bool 與比例字串），塞進 query string 既難讀、又多一層編碼／
+        解碼——而伺服器重建原文用的是解碼後的值，任何一個編碼差異都會產生「客戶
+        簽的字串」與「伺服器驗的字串」不同的縫（工程原則 1）。本端點唯一的副作用
+        是簽發一顆 nonce（沿 capital／leader 兩個 message 端點的既有慣例），
+        不改變任何狀態，所以用 POST 承載 body 不牴觸它的語意。
+
+        ⭐ 邊界在**發原文之前**就檢查（超界 → 400，不發 nonce、不給原文）：
+        讓客戶簽一份必定被 POST 拒絕的原文，是把閘門變成一個只會浪費他一次錢包
+        簽名的陷阱。
+
+        ⭐ 回傳的 `prefs` 是 **canonical 化後**的值，客戶端**原樣回填**進 POST body
+        ——兩邊結構上不可能組出不同的字串（同 capital 回 canonical 金額字串）。
+        缺鍵補值的來源是他目前已簽章的值（`_risk_base_prefs`），且 `enabled` 必須
+        明確指定：省略它會被讀成「關閉」，而那不該由一個缺漏的欄位決定。
         """
         account_id = derive_account_id(address)
-        # ⭐⭐ 缺鍵補值的來源是「這個帳號目前存的值」，不是產品預設，且 `enabled`
-        # 必須明確指定（審查 F1）：否則一個 body 為 `{}` 的請求會把客戶已開啟的
-        # 風控靜默關掉並回 200——「沒設定」絕不等於「不要保護」。
-        entry = _my_pending_entry(account_id)
         try:
-            # 目前存的值本身可能是壞的；壞的就退到安全側當基底，不拿它當合法基準。
-            try:
-                base = canonical_prefs(entry.get("risk") if entry else None)
-            except RiskPrefsError:
-                base = safe_fallback_prefs()
-            prefs = canonical_prefs(body.get("prefs") if isinstance(body, dict) else None,
-                                    base=base, require_enabled=True)
+            prefs = canonical_prefs(body.prefs, base=_risk_base_prefs(account_id),
+                                    require_enabled=True)
+        except RiskPrefsError as e:
+            # ⭐ 這裡回 `str(e)`（與驗簽失敗的分類化訊息不同）：客戶要改對數值就必須
+            # 看到合法區間，而這類訊息只含參數名與數值，不含任何授權材料。
+            raise HTTPException(status_code=400, detail=str(e)) from None
+
+        issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        nonce = store.issue_nonce(address, _LEADER_CHANGE_CHAIN_ID, issued_at,
+                                  now_s=now_fn(), ttl_s=cfg.nonce_ttl_s)
+        message = build_risk_settings_message(account_id=account_id, prefs=prefs,
+                                              nonce=nonce, issued_at=issued_at)
+        return {"message": message, "nonce": nonce, "issued_at": issued_at,
+                "account_id": account_id, "prefs": prefs}
+
+    @app.post("/api/me/risk")
+    def me_risk_submit(body: RiskSettingsBody,
+                       address: str = Depends(_require_session)):
+        """客戶**自己簽章**調整風控門檻 → 寫一筆簽章記錄。
+
+        ⭐ 本端點**不改任何引擎設定**，只落一筆記錄。引擎在套用前自己重新驗章、
+        自己重新檢查邊界——繞過那道驗證等於把整套簽章設計降級成裝飾。
+
+        失敗分類（工程原則 2）：驗簽失敗、動作類型不符、超界、session 不符
+        **全是 semantic**（4xx，不得自動重試）；寫檔失敗才是 transient（5xx）。
+        ⚠️ 驗簽失敗一律 **400 而非 401**：客戶的 session 是有效的（他已通過 SIWE），
+        壞掉的是這一份請求內容——401 會讓前端把客戶登出，而那對他毫無幫助。
+        """
+        # 1) 只能改自己的（同 leaders_select：403 而非 404，不洩漏帳號是否存在）。
+        account_id = derive_account_id(address)
+        if body.account_id != account_id:
+            raise HTTPException(status_code=403, detail="只能變更自己帳號的風控設定")
+
+        # 2) 邊界（政策）。⭐ 超界一律 4xx，**不夾取**：夾取會讓流程順利跑完，
+        #    代價是客戶簽了 A、系統執行了 B，而且沒有人會知道。
+        #    ⚠️ 這裡**不**帶 base：記錄必須是自洽的（引擎只看記錄，不知道 API 這側
+        #    存了什麼）。客戶端回填的是 message 端點給的完整 canonical prefs。
+        try:
+            canonical_prefs(body.prefs, require_enabled=True)
         except RiskPrefsError as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
+
+        # 3) 驗章。user_address 出自 **session**（可信來源），不是請求內容。
         try:
-            written = set_pending_risk(cfg.pending_path, account_id, prefs)
-        except OSError as e:
-            logger.error("風控偏好落檔失敗 account=%s: %s", account_id, e)
-            raise HTTPException(status_code=500,
-                                detail="設定寫入失敗，請稍後重試") from e
-        if not written:
+            record = build_risk_settings_record(
+                account_id=body.account_id, prefs=body.prefs, nonce=body.nonce,
+                issued_at=body.issued_at, signature=body.signature,
+                message=body.message)
+            verified = verify_risk_settings(
+                record, account_id=account_id, user_address=address,
+                now_s=now_fn(), consume_nonce=_consume_risk_nonce(address),
+                # ⭐ API 端**強制時效**（引擎端刻意放行，見 risk_settings.py）：
+                # 這裡驗的是「客戶剛剛按下的那一次」，nonce 也才剛發出去。
+                max_age_s=RISK_SETTINGS_MAX_AGE_S)
+        except RiskSettingsError as e:
+            # 稽核痕跡（偽造探測）：記 reason 與帳號，**不記** signature／message
+            # 原文，也不記偏好值（來路不明的內容不進 log）。
+            logger.warning("風控設定驗簽失敗 account=%s reason=%s", account_id, e.reason)
             raise HTTPException(
-                status_code=409,
-                detail="這個帳號不在待啟用佇列中（尚未完成綁定，或引擎已經啟用）。"
-                       "已啟用的帳號要調整風控設定請聯絡我們。")
-        logger.info("風控偏好已更新 account=%s enabled=%s",
-                    account_id, prefs["enabled"])
-        return {"ok": True, "account_id": account_id, "prefs": prefs,
-                "effective": "at_activation",
-                "effective_note": "這份設定會在引擎啟用（約一分鐘內）時寫入並生效；"
-                                  "啟用之後就固定下來，之後要調整請聯絡我們。"}
+                status_code=400,
+                detail=RISK_SETTINGS_DETAIL.get(e.reason,
+                                                RISK_SETTINGS_DETAIL_DEFAULT)
+            ) from None
+
+        # 4) 落檔（唯一的寫入，且在**全部驗證通過之後**）。落地的每一個欄位都取自
+        #    **verified**（通過驗證的那一份），不是 body——否則落地的記錄可以與客戶
+        #    簽的原文不一致。
+        record = build_risk_settings_record(
+            account_id=verified.account_id, prefs=verified.prefs,
+            nonce=verified.nonce, issued_at=verified.issued_at,
+            signature=body.signature, message=body.message)
+        try:
+            write_risk_settings(cfg.risk_settings_path, record)
+        except OSError as e:
+            logger.error("風控設定記錄落檔失敗 account=%s path=%s: %s",
+                         account_id, cfg.risk_settings_path, e)
+            raise HTTPException(status_code=500,
+                                detail="設定記錄寫入失敗，請稍後重試") from e
+        logger.info("風控設定記錄已落地 account=%s enabled=%s",
+                    account_id, verified.prefs["enabled"])
+
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "prefs": verified.prefs,
+            "effective": "next_engine_cycle",
+            "effective_note": "已記錄，於引擎的下一個 cycle 生效——不是立即生效；"
+                              "引擎會在下一輪（約一分鐘內）**自己重新驗證你的簽章**"
+                              "與數值範圍後套用，驗證不過則不會套用。",
+        }
+
+    @app.post("/api/me/risk/unlock/message")
+    def risk_unlock_message(address: str = Depends(_require_session)):
+        """回傳「立即解除熔斷鎖定」的待簽原文 ＋ 一次性 nonce（**無 body**）。
+
+        用 POST 而非 GET 與 `/api/me/risk/message` 同一個理由（副作用是簽發 nonce，
+        且與它成對出現的端點形狀一致）；本端點沒有任何輸入——要解除的永遠是
+        **這個 session 的**帳號，沒有任何請求參數能指到別人的引擎。
+        """
+        account_id = derive_account_id(address)
+        issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        nonce = store.issue_nonce(address, _LEADER_CHANGE_CHAIN_ID, issued_at,
+                                  now_s=now_fn(), ttl_s=cfg.nonce_ttl_s)
+        message = build_risk_unlock_message(account_id=account_id, nonce=nonce,
+                                            issued_at=issued_at)
+        return {"message": message, "nonce": nonce, "issued_at": issued_at,
+                "account_id": account_id}
+
+    @app.post("/api/me/risk/unlock")
+    def me_risk_unlock(body: RiskUnlockBody,
+                       address: str = Depends(_require_session)):
+        """客戶**自己簽章**要求立即恢復跟單（解除熔斷鎖定）→ 寫一筆一次性記錄。
+
+        ⭐ 這是客戶**自己拿掉一道保護**的動作，所以走與門檻設定完全相同的信任錨，
+        但兩者的記錄、檔案與待簽原文全部分開：一份「調整門檻」的簽章絕不能被兌換成
+        一次解鎖（否則攻擊者只要等客戶下次調整風控，就能拿那份簽章把熔斷鎖打開）。
+
+        時效**強制**（`verify_risk_unlock` 的預設）：一份三天前簽的解鎖記錄若還能
+        生效，等於客戶簽一次就永久放棄了熔斷保護。
+        """
+        account_id = derive_account_id(address)
+        if body.account_id != account_id:
+            raise HTTPException(status_code=403, detail="只能解除自己帳號的熔斷鎖定")
+
+        try:
+            record = build_risk_unlock_record(
+                account_id=body.account_id, nonce=body.nonce,
+                issued_at=body.issued_at, signature=body.signature,
+                message=body.message)
+            verified = verify_risk_unlock(
+                record, account_id=account_id, user_address=address,
+                now_s=now_fn(), consume_nonce=_consume_risk_nonce(address))
+        except RiskSettingsError as e:
+            logger.warning("解除熔斷驗簽失敗 account=%s reason=%s", account_id, e.reason)
+            raise HTTPException(
+                status_code=400,
+                detail=RISK_UNLOCK_DETAIL.get(e.reason, RISK_UNLOCK_DETAIL_DEFAULT)
+            ) from None
+
+        record = build_risk_unlock_record(
+            account_id=verified.account_id, nonce=verified.nonce,
+            issued_at=verified.issued_at, signature=body.signature,
+            message=body.message)
+        try:
+            write_risk_unlock(cfg.risk_unlock_path, record)
+        except OSError as e:
+            logger.error("解除熔斷記錄落檔失敗 account=%s path=%s: %s",
+                         account_id, cfg.risk_unlock_path, e)
+            raise HTTPException(status_code=500,
+                                detail="記錄寫入失敗，請稍後重試") from e
+        logger.info("解除熔斷記錄已落地 account=%s", account_id)
+
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "effective": "next_engine_cycle",
+            "effective_note": "已記錄。引擎會在下一輪（約一分鐘內）重新驗證你的簽章，"
+                              "通過後解除鎖定並恢復跟單——恢復後可能立刻依你的 leader "
+                              "開新部位。權益基準已在熔斷當下重置，所以不會馬上再被"
+                              "同一段跌幅熔斷一次。"
+                              "⚠️ 若熔斷的原因是你的 leader 被撤銷，這份簽章**不會**"
+                              "解除它（那需要你先選一個新的 leader）。",
+        }
 
     @app.get("/api/admin/pending")
     def admin_pending(admin: str = Depends(_require_admin)):

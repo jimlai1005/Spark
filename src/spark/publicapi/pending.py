@@ -63,28 +63,11 @@ def write_pending_entry(path: str | Path, *, account_id: str, user_address: str,
     _atomic_write(p, entries)
 
 
-def set_pending_risk(path: str | Path, account_id: str, prefs: dict) -> bool:
-    """把錢包主人自選的風控偏好寫進他**尚未啟用**的 pending 條目。
-
-    回傳 True＝已寫入；False＝佇列裡沒有這個 account（尚未完成綁定，**或已經啟用**
-    ——watcher 啟用後會移除條目）。呼叫端必須把 False 轉成明確的錯誤回應：
-    已啟用的引擎其 env 不會再被覆寫（filet_auto_activate._ensure_env_file），
-    在這裡靜默回 200 等於告訴客戶「已儲存」而實際上什麼都沒發生。
-
-    `prefs` 必須是 `risk_prefs.canonical_prefs` 的產物（呼叫端先驗）。本函式與
-    `write_pending_entry` 同樣只做格式層的事，不重複驗值——但**會**把它原樣落檔，
-    所以驗證是呼叫端不可省的責任。
-    """
-    p = Path(path)
-    entries = load_pending(p)
-    found = False
-    for e in entries:
-        if e.get("account_id") == account_id:
-            e["risk"] = prefs
-            found = True
-    if found:
-        _atomic_write(p, entries)
-    return found
+# ⚠️ 這裡曾有一個 `set_pending_risk`（把風控偏好寫進 pending 條目），2026-07-30
+# 隨「客戶簽章的風控設定」上線後移除。理由是**單一來源**：風控意圖現在住在
+# `filet/risk_settings.py` 的簽章記錄裡（API 寫、引擎每輪讀並重新驗章），pending
+# 條目再存一份就會與它漂移，而漂移的那一份沒有簽章、卻長得同樣權威。
+# 要改風控 → `POST /api/me/risk`（見 app.py 該節）。
 
 
 def remove_pending_entry(path: str | Path, account_id: str) -> None:

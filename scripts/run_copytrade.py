@@ -47,6 +47,18 @@ leader 解析（per-follower ＋ 白名單二次驗證）:
   **撤銷優先**：同一輪既有撤銷又有合法變更時，先收尾、不套用變更。
   威脅模型見 spark/filet/leader_change_apply.py 檔頭。
 
+客戶簽章的風控設定與自助解除熔斷（2026-07-30）:
+  記錄檔＝交換目錄下的 risk_settings.json（持續意圖）與 risk_unlock.json（一次性
+  動作），與換 leader／資金設定共用同一個 FILET_EXCHANGE_DIR（漏設即拒絕啟動）。
+  引擎每輪自己重新驗章（user_address 取自 manifest），通過後**再驗一次數值邊界**
+  （risk_prefs 的合法區間），超界一律拒絕、絕不夾取。冪等靠**單調 issued_at 護欄**
+  （<FILET_STATE_DIR>/var/copytrade/risk_applied.json，引擎自己的狀態根）：較舊的
+  記錄被放回去＝回滾攻擊，拒絕並 critical。
+  ⚠️ 本管線失效的安全方向是**沿用現狀**（不像資金設定會讓本輪零交易動作）——
+  現狀是上一份客戶簽過的門檻或部署當下依客戶偏好寫入的 env 值，兩者都仍在執法。
+  解鎖請求強制 600 秒時效，且必須晚於 ARM 檔的 tripped_at；leader 撤銷造成的鎖定
+  不得由客戶自助解除。威脅模型見 spark/filet/risk_settings_apply.py 檔頭。
+
 keystore 選擇:
   FILET_KEYSTORE   缺省／keychain → MacKeychainBackend（Mac 開發）；
                     envfile → EnvFileKeyStore(FILET_KEYS_DIR，預設 /etc/filet/keys，VPS 用)。
@@ -76,7 +88,8 @@ from spark.copytrade.config import CopySettings
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
 from spark.copytrade.killswitch import (ALERTS_LOG_RELPATH, DrawdownStatus,
-                                        check_drawdown, count_alerts, is_tripped, trip)
+                                        check_drawdown, count_alerts, halt_status,
+                                        is_tripped, trip)
 from spark.copytrade.loop import main_loop, run_cycle, tripped_report
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
@@ -109,6 +122,11 @@ from spark.filet.leader_resolve import (
     LeaderWatch,
     require_leaders_path,
     resolve_leader,
+)
+from spark.filet.risk_settings_apply import (
+    RiskSettingsApplier,
+    resolve_risk_settings_path,
+    resolve_risk_unlock_path,
 )
 from spark.filet.tagged_notifier import TaggedNotifier
 from spark.keystore.base import KeyStore
@@ -225,6 +243,31 @@ def make_capital_settings_applier(*, account_id: str | None, notifier: Notifier,
         notifier=notifier)
 
 
+def make_risk_settings_applier(*, account_id: str | None, notifier: Notifier,
+                               state_root: Path):
+    """建立每 cycle 套用「客戶簽章風控設定」的 applier；無 account_id → None。
+
+    形狀與資金設定的 applier 一致（同一條 `FILET_EXCHANGE_DIR` 參數鏈、同一個
+    manifest 信任錨），差別有二，都寫在 `risk_settings_apply` 檔頭：
+    (a) 本 applier **絕不 raise**——風控管線失效的安全方向是「沿用現狀」（上一份
+        客戶簽過的門檻，或部署當下依客戶偏好寫進 env 的值），不是停止跟單；
+    (b) 冪等靠**單調 issued_at 護欄**（狀態檔落在引擎自己的狀態根），不是 nonce 帳本
+        ——風控設定是持續意圖，同一筆記錄每輪都會被讀到。
+
+    `account_id` 為 None（dry/shadow 無身分）→ 回 None（沿同檔其他 factory 的決定：
+    沒有帳號就沒有「哪一筆記錄是我的」，也沒有可信的 user_address 可比對簽章者）。
+    """
+    if account_id is None:
+        return None
+    return RiskSettingsApplier(
+        account_id=account_id,
+        manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
+        settings_path=resolve_risk_settings_path(),
+        unlock_path=resolve_risk_unlock_path(),
+        state_root=state_root,
+        notifier=notifier)
+
+
 def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
                              now_fn=time.time):
     """建立「每 cycle 發布一份健康摘要到交換目錄」的閉包；無 account_id → None。
@@ -246,7 +289,7 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
         return None
     path = heartbeat_path_for(require_exchange_dir(), account_id)
 
-    def _publish(*, leader, settings, applied_capital, result: str,
+    def _publish(*, leader, settings, applied_capital, applied_risk, result: str,
                  detail: str | None) -> bool:
         """⚠️ **絕不 raise**：心跳是可觀測性，不是安全關鍵路徑（工程原則 3 的邊界）。
 
@@ -262,6 +305,12 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
                 tripped = bool(is_tripped(state_root))
             except OSError:
                 tripped = None
+            # 熔斷原因與「客戶能不能自助恢復」一併發布（見 killswitch.halt_status）。
+            # 讀不到一律 None ＝未知，與上面 tripped 同一個方向。
+            try:
+                risk_halt = halt_status(state_root)
+            except OSError:
+                risk_halt = None
             try:
                 cov = sample_coverage(state_root, now_fn=lambda: now_s)
             except OSError:
@@ -275,7 +324,18 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
             full = None
             capital_source = "unavailable"
             changed_at = None
+            # 風控那一格的來源標記與 `capital` 同形狀：`applied_risk` 非 None ⇒ 這組
+            # 門檻是客戶自己簽的；None 且本輪有 settings ⇒ 仍是部署時寫進 env 的值。
+            # 兩者都必須與**本輪真正用來判定風險的那組 settings** 出自同一次求值
+            # （工程原則 1，見 RiskSettingsApplier.last_applied）。
+            risk_source = "unavailable"
+            risk_changed_at = None
             if settings is not None:
+                risk_source = ("customer_signed" if applied_risk is not None
+                               else "env_default")
+                if applied_risk is not None:
+                    risk_changed_at = datetime.fromtimestamp(
+                        applied_risk.applied_at, timezone.utc).isoformat()
                 # canonical 化：與客戶簽章記錄／帳本裡的字串形式同一個產生器，
                 # 兩邊結構上不可能組出不同的字串（工程原則 1）——`/api/me/capital`
                 # 要拿它與「已提交但未套用」的記錄相減，兩側必須同基準。
@@ -298,6 +358,12 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
                 # None（不是 True）當 settings 還沒載入：面板不得把「未知」畫成「有風控」。
                 risk_controls_enabled=(bool(settings.risk_controls_enabled)
                                        if settings is not None else None),
+                risk_source=risk_source, risk_changed_at=risk_changed_at,
+                # ⭐ 本輪**實際在執法**的門檻（見 engine_health 該欄位的註解）。
+                # 來源刻意是 `settings`（產生本輪 CopySettings 的同一個物件），
+                # 不是重讀狀態檔——重讀會讓心跳宣稱一組本輪沒被用到的門檻。
+                risk_prefs=_risk_prefs_snapshot(settings),
+                risk_halt=risk_halt,
                 cycle_result=result, cycle_detail=detail)
         except Exception:  # noqa: BLE001 — 見 docstring：組不出心跳也不得中斷跟單
             logger.exception("心跳組裝失敗（跟單不受影響）")
@@ -305,6 +371,30 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
         return publish_heartbeat(path, payload)
 
     return _publish
+
+
+
+def _risk_prefs_snapshot(settings) -> dict | None:
+    """本輪生效中的風控門檻，投影成與客戶簽章記錄同形狀的 canonical 字串 dict。
+
+    ⭐ 由 `risk_prefs.RISK_PARAM_SPECS` 驅動（不逐欄位手寫）：新增一個可調參數時，
+    心跳會自動跟著帶上它，不必記得回來改這裡——漏掉的症狀是「客戶改了但頁面說
+    已生效」，而那正是這一格要修的問題。settings 尚未載入 → None（未知）。
+    """
+    if settings is None:
+        return None
+    from spark.filet.risk_prefs import RISK_PARAM_SPECS, canonical_prefs
+    from spark.filet.risk_settings_apply import copy_settings_field
+    try:
+        raw = {"enabled": bool(settings.risk_controls_enabled)}
+        for spec in RISK_PARAM_SPECS:
+            # spec → CopySettings 欄位名的對映只有一份（copy_settings_field），
+            # 這裡不自己再推導一次：兩份推導會在新增參數時安靜地分岔。
+            raw[spec["name"]] = getattr(settings, copy_settings_field(spec))
+        return canonical_prefs(raw)
+    except Exception:  # noqa: BLE001 — 心跳是可觀測性，組不出來不得影響跟單
+        logger.warning("風控門檻投影失敗（心跳該格為未知）", exc_info=True)
+        return None
 
 
 def make_revocation_wind_down(adapter, ex, notifier: Notifier,
@@ -535,6 +625,8 @@ def main(argv: list[str] | None = None) -> None:
                             adapter, ex, notifier, state_root))
     capital_applier = make_capital_settings_applier(
         account_id=account_id, notifier=notifier, state_root=state_root)
+    risk_applier = make_risk_settings_applier(
+        account_id=account_id, notifier=notifier, state_root=state_root)
     publish_hb = make_heartbeat_publisher(account_id=account_id,
                                           state_root=state_root)
 
@@ -544,7 +636,7 @@ def main(argv: list[str] | None = None) -> None:
         # 這件事本身也會被發布出去，而不是變成一段沉默）。
         # `settings` 與 `capital` **一起**在同一行設定：來源標記必須與本輪真正用來
         # 下單的那組值出自同一次求值（工程原則 1，見 CapitalSettingsApplier.last_applied）。
-        hb = {"leader": None, "settings": None, "capital": None,
+        hb = {"leader": None, "settings": None, "capital": None, "risk": None,
               "result": "error", "detail": "本輪未完成（例外中斷）"}
         try:
             res = watch.refresh()
@@ -574,9 +666,21 @@ def main(argv: list[str] | None = None) -> None:
                     hb["detail"] = ("資金設定無法判定（帳本遺失／讀不到／內容超界），"
                                     "本輪零交易動作")
                     return tripped_report()
+            # ⭐ 客戶簽章的風控設定（2026-07-30）。兩件事的順序是刻意的：
+            # (1) 先消化「立即解除熔斷」請求——它必須在 run_cycle 的 kill switch
+            #     短路**之前**發生，否則客戶按下恢復之後還要白白多等一輪
+            #     （沿 loop.run_cycle 把 auto_rearm 排在 is_tripped 之前的同一個理由）。
+            # (2) 再套用門檻，疊在資金設定之後，讓「本輪最終用的 settings」只有一個
+            #     產生點。本 applier **絕不 raise**（風控管線失效的安全方向是沿用
+            #     現狀，見 risk_settings_apply 檔頭），所以這裡沒有 except 分支。
+            if risk_applier is not None:
+                risk_applier.consume_unlock_request(state_root)
+                cs = risk_applier.effective(cs)
             hb["settings"] = cs
             hb["capital"] = (capital_applier.last_applied
                              if capital_applier is not None else None)
+            hb["risk"] = (risk_applier.last_applied
+                          if risk_applier is not None else None)
             start = len(ex.records)
             report = run_cycle(adapter, ex, cs, notifier, state, state_root)
             if args.shadow:
@@ -593,8 +697,8 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             if publish_hb is not None:
                 publish_hb(leader=hb["leader"], settings=hb["settings"],
-                           applied_capital=hb["capital"], result=hb["result"],
-                           detail=hb["detail"])
+                           applied_capital=hb["capital"], applied_risk=hb["risk"],
+                           result=hb["result"], detail=hb["detail"])
 
     if args.once:
         print(cycle())

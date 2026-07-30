@@ -26,7 +26,8 @@ from typing import Callable
 from spark.copytrade.config import CopySettings
 from spark.copytrade.costbreaker import evaluate_cost
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
-from spark.copytrade.killswitch import DrawdownStatus, evaluate, is_tripped, trip
+from spark.copytrade.killswitch import (DrawdownStatus, auto_rearm_if_cooled_down,
+                                        evaluate, is_tripped, trip)
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
     CycleReport,
@@ -72,6 +73,11 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
       的 portfolio 資料源含 spot，會稀釋熔斷保護（findings F1）。
     """
     records_start = len(ex.records)
+
+    # ── 0. 冷靜期屆滿 → 自動恢復（2026-07-30 使用者裁決）─────────────────
+    # 排在 is_tripped 之前：本輪就恢復交易，而不是白等一輪。函式本身對
+    # 「leader 撤銷」「時間戳讀不到」「冷靜期設 0」三種情形 fail-closed（見其 docstring）。
+    auto_rearm_if_cooled_down(root, settings, notifier)
 
     # ── 1. killswitch 短路：tripped 只讀報狀態，零交易動作 ─────────────
     if is_tripped(root):

@@ -462,23 +462,26 @@ main.page {
   display: grid; gap: 18px;
 }
 
-.risk-field > label { display: block; font-size: 13.5px; margin-bottom: 6px; }
-.risk-input-row { display: flex; align-items: center; gap: 6px; }
-.risk-input-row input {
-  width: 92px; padding: 8px 10px;
-  background: var(--bg); color: var(--text);
-  border: 1px solid var(--border-strong); border-radius: var(--radius);
+/* ⭐ tracking 組畫在啟用 checkbox 之外（它不受風控開關影響），視覺上也要自成一區
+   ——擺在展開區裡會讓關掉風控的客戶以為自己也關掉了它。 */
+.risk-tracking {
+  margin-top: 18px; padding-top: 16px;
+  border-top: 1px solid var(--border);
+  display: grid; gap: 18px;
 }
-.risk-suffix { color: var(--text-dim); font-size: 13px; }
 
-.risk-locked {
-  margin-top: 14px; padding: 12px 14px;
-  border-radius: var(--radius);
-  border: 1px solid rgba(var(--text-dim-rgb), .35);
-  background: rgba(var(--text-dim-rgb), .08);
-}
-.risk-locked-title { font-size: 13.5px; margin: 0 0 4px; }
-.risk-saved { color: var(--pos); }
+.risk-field > label { display: block; font-size: 13.5px; margin-bottom: 6px; }
+.risk-slider-row { display: flex; align-items: center; gap: 12px; }
+.risk-slider { flex: 1 1 auto; min-width: 0; accent-color: var(--primary); }
+.risk-value { flex: none; min-width: 74px; text-align: right; font-size: 14px; }
+.risk-recommended { margin: 6px 0 0; }
+
+.risk-applied { margin-top: 18px; }
+.risk-halt-unknown { margin-top: 14px; color: var(--warn); }
+.risk-halted { margin-top: 14px; }
+.risk-halted .btn { margin-top: 8px; }
+.risk-halt-governance { color: var(--warn); }
+.risk-resumed, .risk-saved { color: var(--pos); }
 
 /* ---------- Admin 表 ---------- */
 .admin-table { font-size: 13px; }

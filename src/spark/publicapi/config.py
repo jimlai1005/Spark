@@ -15,6 +15,7 @@ from spark.filet.followers import validate_account_id
 from spark.filet.capital_settings import capital_settings_path_for
 from spark.filet.leader_change import leader_changes_path_for
 from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH, require_leaders_path
+from spark.filet.risk_settings import risk_settings_path_for, risk_unlock_path_for
 from spark.filet.user_leaders import user_leaders_path_for
 
 _HEX = set("0123456789abcdefABCDEF")
@@ -149,6 +150,28 @@ class ApiConfig:
         一方的格式問題連坐另一方，而這兩件事各自都能造成資金損失。
         """
         return capital_settings_path_for(self.exchange_dir)
+
+    @property
+    def risk_settings_path(self) -> str:
+        """客戶簽章的風控設定記錄落點（filet/risk_settings.py 的格式）。
+
+        與 `capital_settings_path` 同一個交換目錄、同一個權限拓撲（API 寫、引擎讀），
+        **各自一個檔**：三份記錄（換 leader／資金／風控）的讀者是三個獨立的套用器，
+        共用一個檔會讓其中一方的格式問題連坐另外兩方，而它們各自都能造成資金損失。
+        推導的單一定義在 `risk_settings_path_for`——引擎端（run_copytrade 的
+        `resolve_risk_settings_path`）用同一個函式從同一個 FILET_EXCHANGE_DIR 推導。
+        """
+        return risk_settings_path_for(self.exchange_dir)
+
+    @property
+    def risk_unlock_path(self) -> str:
+        """客戶簽章的「立即解除熔斷鎖定」記錄落點。
+
+        ⭐ 與 `risk_settings_path` **分開一個檔**（見 risk_settings.py 的
+        `risk_unlock_path_for`）：一個是持續意圖、一個是一次性動作，時效語意相反；
+        同一個檔會讓兩種語意共命運，而弄錯的方向是 fail-open。
+        """
+        return risk_unlock_path_for(self.exchange_dir)
 
     @property
     def user_leaders_path(self) -> str:

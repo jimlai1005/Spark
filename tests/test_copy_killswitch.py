@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from spark.copytrade.killswitch import (
     ARM_FILE_RELPATH,
     CloseAction,
     DrawdownStatus,
+    auto_rearm_if_cooled_down,
     check_drawdown,
     evaluate,
     is_tripped,
@@ -28,6 +30,11 @@ from spark.copytrade.killswitch import (
 )
 from spark.copytrade.notifier import RecordingNotifier
 from spark.exchange.base import EquityView, OpenOrder, OrderResult, Position
+
+
+def _settings(**kw) -> CopySettings:
+    """本檔的 CopySettings 工廠（冷靜期測試用；其餘測試沿用各自的建構方式）。"""
+    return CopySettings(**kw)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -627,3 +634,87 @@ def test_trip_uses_emergency_slippage(tmp_path):
                         drawdown_pct=Decimal("0.2"), breached=True),
          sleep_fn=lambda s: None)
     assert seen.get("emergency") is True, "trip 必須以 emergency=True 平倉"
+
+
+# ── 冷靜期自動恢復（2026-07-30 使用者裁決：保護要提供，但不該把客戶鎖在門外）──
+def _arm(root, *, tripped_at: str, reason: str | None = None):
+    p = root / ARM_FILE_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"tripped_at": tripped_at, "current": "700", "peak": "1000",
+               "drawdown_pct": "0.3", "breached": True}
+    if reason is not None:
+        payload["reason"] = reason
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def _hours_ago(h: float) -> tuple[str, float]:
+    """回 (ISO 時間戳, 現在的 epoch)——把「現在」顯式傳進被測函式，不依賴真實時鐘。"""
+    now = 1_800_000_000.0
+    return (datetime.fromtimestamp(now - h * 3600, timezone.utc).isoformat(), now)
+
+
+def test_cooldown_expired_auto_rearms(tmp_path):
+    at, now = _hours_ago(13)
+    arm = _arm(tmp_path, tripped_at=at)
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is True
+    assert not arm.exists(), "冷靜期滿必須解除鎖定"
+    assert any(r[0] == "critical" and "已自動恢復跟單" in r[2] for r in n.records)
+
+
+def test_within_cooldown_stays_locked_and_quiet(tmp_path):
+    at, now = _hours_ago(3)
+    arm = _arm(tmp_path, tripped_at=at)
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is False
+    assert arm.exists()
+    assert n.records == [], "冷靜期內不該每輪吵——tripped 的提醒由呼叫端負責"
+
+
+def test_cooldown_zero_means_manual_only(tmp_path):
+    """0 ＝ 客戶明確選擇「鎖死等我處理」，再久也不自動恢復。"""
+    at, now = _hours_ago(999)
+    arm = _arm(tmp_path, tripped_at=at)
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("0")),
+                                     RecordingNotifier(), now_s=now) is False
+    assert arm.exists()
+
+
+def test_leader_revoked_never_auto_rearms(tmp_path):
+    """⭐ leader 被撤銷是**治理動作**，不是等 12 小時就作廢的風險事件——
+    自動恢復等於讓引擎回去跟一個已撤銷的 leader。"""
+    at, now = _hours_ago(999)
+    arm = _arm(tmp_path, tripped_at=at, reason="leader_revoked")
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is False
+    assert arm.exists()
+    assert any("不屬於可自動恢復" in r[2] for r in n.records)
+
+
+def test_cost_breach_does_auto_rearm(tmp_path):
+    """成本熔斷屬於風險事件，適用冷靜期。"""
+    at, now = _hours_ago(20)
+    arm = _arm(tmp_path, tripped_at=at, reason="cost_breach")
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     RecordingNotifier(), now_s=now) is True
+    assert not arm.exists()
+
+
+def test_unparseable_timestamp_stays_locked(tmp_path):
+    """⭐ 讀不到觸發時間 ≠ 冷靜期已過。無法證明就不解鎖（fail-closed）。"""
+    arm = tmp_path / ARM_FILE_RELPATH
+    arm.parent.mkdir(parents=True, exist_ok=True)
+    arm.write_text("{ 這不是合法 JSON")
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=1_800_000_000.0) is False
+    assert arm.exists()
+    assert any("無法解析" in r[2] for r in n.records)
+
+
+def test_no_arm_file_is_a_noop(tmp_path):
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(), RecordingNotifier()) is False
