@@ -12,6 +12,7 @@ function status(over: Partial<OnboardStatus> = {}): OnboardStatus {
     address: "0xabc", account_id: "fabc", agent_address: null,
     agent_generated: false, builder_fee_approved: false,
     agent_approved: false, funded: false, state: "IN_PROGRESS",
+    perp_account_value: "0", min_deposit: "100", deposit_shortfall: "100",
     ...over,
   };
 }

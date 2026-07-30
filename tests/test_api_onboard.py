@@ -156,6 +156,55 @@ def test_status_funding_below_floor_not_ready(tmp_path):
     assert s["funded"] is False and s["state"] == "IN_PROGRESS"
 
 
+# ── ⭐ 入金判定值外流（2026-07-30）：`funded=False` 單獨出現時客戶無法自我診斷，
+# 而最常見的原因是「錢在 spot、perp 是 0」。判定用的 perp 淨值與門檻必須一起回，
+# 且必須是**同一次讀取的同一個值**（工程原則 1）——否則畫面寫 105、系統說不足。
+
+
+def test_status_exposes_the_perp_value_that_decided_funded(tmp_path):
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    agent = client.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, wallet.address, agent)
+    hl.account_values[wallet.address.lower()] = Decimal("99.25")
+    s = client.get("/api/onboard/status").json()
+    assert s["funded"] is False
+    # 顯示值 == 判定值（不是另一個欄位、不是另一次讀取）
+    assert s["perp_account_value"] == "99.25"
+    assert s["min_deposit"] == str(cfg.min_user_deposit)
+    assert s["deposit_shortfall"] == "0.75"
+
+
+def test_status_shortfall_is_zero_once_funded(tmp_path):
+    """已達標 ⇒ 差額為 "0"（不是負數——前端會把它當成一句話印出來）。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    wallet = login(client)
+    agent = client.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, wallet.address, agent)   # 150 USDC
+    s = client.get("/api/onboard/status").json()
+    assert s["funded"] is True
+    assert s["perp_account_value"] == "150"
+    assert s["deposit_shortfall"] == "0"
+
+
+def test_perp_value_read_failure_is_502_not_a_zero_balance(tmp_path):
+    """⭐ 讀不到錢 ≠ 錢不存在。餘額查詢失敗必須讓整個端點 502（既有行為），
+    **不得**被吞成 0 而讓 funded=False——那會把「我們查不到」偽裝成「你沒錢」，
+    客戶照著畫面再存一次錢也不會有任何改變。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    login(client)
+
+    def _boom(*a, **kw):
+        raise ConnectionError("HL unreachable")
+    hl.get_account_value = _boom
+    r = client.get("/api/onboard/status")
+    assert r.status_code == 502
+    assert "perp_account_value" not in r.text
+
+
 def test_status_isolated_between_users(tmp_path):
     """紅線 3：account 由 session 衍生——另一個使用者看不到、也影響不了你的進度。"""
     app, *_ = make_app(tmp_path)

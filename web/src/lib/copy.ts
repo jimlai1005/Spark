@@ -103,11 +103,24 @@ export const COPY = {
     reconnectHint: "你的登入仍有效，但瀏覽器錢包目前未連接（可能已上鎖）。請解鎖錢包並重新連接後繼續簽署；你的進度不會遺失。",
     reconnectButton: "重新連接錢包",
     step4Title: "入金檢查",
-    // 「100 USDC」須與後端門檻同源：src/spark/config.py 的 MIN_BUILDER_BALANCE
-    // （經 ApiConfig.min_user_deposit 生效於 /api/onboard/status 的 funded）。
-    // 後端常數若改，這兩句文案要同步改——Task 14 review 檢查點。
-    depositDetected: "已偵測到足額資金（≥ 100 USDC）",
-    depositPending: "尚未偵測到足額資金（需 ≥ 100 USDC）。請將 USDC 轉入你自己的 Hyperliquid 帳戶（與登入錢包同一地址）；資金全程留在你的帳戶，Filet 無法動用或提領。",
+    // ⭐ 門檻金額**不再寫進文案**（2026-07-30）。原本這兩句各自硬編「100 USDC」，
+    // 而真正生效的門檻在後端（src/spark/config.py 的 MIN_BUILDER_BALANCE 經
+    // ApiConfig.min_user_deposit）——兩份常數改一邊忘另一邊，症狀是畫面寫 100、
+    // 系統擋在別的數字。現在數字一律取自 `/api/onboard/status` 的 `min_deposit`
+    // 與 `perp_account_value`（見 StepDeposit 的餘額區塊），文案只講「該做什麼」。
+    depositPerpLabel: "perps 帳戶餘額",
+    depositThresholdLabel: "開通門檻",
+    depositShortfallLabel: "還差",
+    depositDetected: "已偵測到足額資金，你的 perps 帳戶餘額已達開通門檻。",
+    // ⭐ 明講「perps 錢包」而不只是「你的 Hyperliquid 帳戶」（2026-07-30）：
+    // 後端的 funded 判定查的是 perp 帳戶淨值，錢放在 spot 錢包一樣被擋。原文案
+    // 只說「轉入你自己的 Hyperliquid 帳戶」，客戶照做（轉到 spot）卻依然過不了，
+    // 而畫面沒有任何線索指向真正的原因。
+    depositPending:
+      "尚未偵測到足額資金。請把 USDC 存入你自己 Hyperliquid 帳戶的「perps（永續合約）」"
+      + "錢包（與登入錢包同一地址）——跟單只使用 perps 錢包，放在 spot 錢包的資金"
+      + "不計入開通門檻，也不會被跟單。若你的資金已經在 spot 錢包，請在 Hyperliquid "
+      + "介面把它劃轉到 perps。資金全程留在你的帳戶，Filet 無法動用或提領。",
     /**
      * ⭐ 錢卡在 spot 錢包的提示（後端 `/api/onboard/status` 的 `spot_stranded`）。
      * 存在的理由：我方只鏡像 **perp**。客戶從 CEX 提幣或走橋入金時錢會落在 spot，

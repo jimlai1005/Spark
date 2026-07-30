@@ -429,6 +429,16 @@ main.page {
 .check-icon { color: var(--pos); font-family: var(--font-mono); flex: none; }
 .deposit-check.is-pending .check-icon { color: var(--text-dim); }
 
+/* 入金餘額事實列：判定值（perp 淨值）／門檻／差額並排，讓被擋的客戶自己看出差在哪。 */
+.deposit-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin: -8px 0 24px;
+}
+.deposit-facts dt { color: var(--text-dim); font-size: 12px; margin-bottom: 2px; }
+.deposit-facts dd { margin: 0; font-size: 15px; }
+
 /* ---------- Admin 表 ---------- */
 .admin-table { font-size: 13px; }
 .admin-table th {

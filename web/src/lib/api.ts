@@ -67,6 +67,18 @@ export interface OnboardStatus {
   agent_approved: boolean;
   funded: boolean;
   /**
+   * ⭐ `funded` 判定所用的 **perp 帳戶淨值**（marginSummary.accountValue，字串以
+   * 免精度損失）與門檻，由後端同一次讀取產出——顯示這個數字而不是自己另外查，
+   * 是為了讓畫面上的餘額與擋下客戶的那個值結構上不可能不一致（工程原則 1）。
+   *
+   * ⭐ 兩者**永不為 null**：後端讀不到餘額時整個端點回 502（把「讀不到」吞成 0
+   * 會讓它偽裝成「沒錢」），所以前端不必畫「未知餘額」狀態。
+   */
+  perp_account_value: string;
+  min_deposit: string;
+  /** 還差多少才達門檻（後端以 Decimal 算，已達標為 `"0"`）。 */
+  deposit_shortfall: string;
+  /**
    * `null` ＝ 沒有卡住的錢**或**查詢失敗——後端刻意把兩者合成同一個值
    * （`_spot_stranded` 對查詢失敗 fail-silent：對一個已正常跟單的客戶顯示
    * 「你的錢卡在 spot」是純粹的困惑，假警報比沒提示糟）。

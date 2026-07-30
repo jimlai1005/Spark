@@ -86,6 +86,9 @@ const NOT_ACTIVATED: OnboardStatus = {
   builder_fee_approved: false,
   agent_approved: false,
   funded: false,
+  perp_account_value: "0",
+  min_deposit: "100",
+  deposit_shortfall: "100",
   state: "IN_PROGRESS",
 };
 

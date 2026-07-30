@@ -1385,7 +1385,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         agent_address = store.get_agent_address(account_id)
         builder_fee_approved = hl.max_builder_fee(address, cfg.builder_address) != 0
         agent_approved = bool(agent_address) and agent_address in hl.agent_addresses(address)
-        funded = hl.get_account_value(address) >= cfg.min_user_deposit  # 常數單一來源（M4）
+        # ⭐ 一次讀取、兩處使用（工程原則 1）：擋下客戶的那個數字與顯示給他看的
+        # 那個數字**必須是同一個**。為顯示另讀一次（或改用 withdrawable 之類的
+        # 別的欄位）會產生「畫面寫 105、系統仍說不足」這種無法自我診斷的客服問題。
+        perp_account_value = hl.get_account_value(address)
+        funded = perp_account_value >= cfg.min_user_deposit  # 常數單一來源（M4）
         ready = bool(agent_address) and builder_fee_approved and agent_approved and funded
         return {
             "address": address, "account_id": account_id,
@@ -1394,8 +1398,25 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "builder_fee_approved": builder_fee_approved,
             "agent_approved": agent_approved,
             "funded": funded,
+            # ⭐⭐ 判定用的**同一個**數字原樣外流（2026-07-30）。存在的理由與
+            # `spot_stranded` 同一類：`funded=False` 單獨出現時客戶無法自我診斷，
+            # 而入金被擋最常見的原因就是「錢在 spot，perp 是 0」。把判定值與門檻
+            # 並排顯示，客戶自己就看得出差在哪，不必開客服單。
+            #
+            # ⭐ 這兩個欄位**沒有** null 的情形：`get_account_value` 讀取失敗即拋
+            # （經 resilience 邊界重試後仍失敗 → 全域 handler → 502），本函式刻意
+            # 不攔。攔下來吞成 0 會讓「讀不到」偽裝成「沒錢」而使 funded=False，
+            # 那是本專案明令禁止的方向（讀不到錢 ≠ 錢不存在）；整頁 502 才是誠實的
+            # 失敗。前端因此不需要處理「未知餘額」狀態。
+            "perp_account_value": str(perp_account_value),   # Decimal → str（落地慣例）
+            "min_deposit": str(cfg.min_user_deposit),
+            # 「還差多少」在**後端**用 Decimal 算完才外流（專案慣例：內部一律 Decimal）。
+            # 交給前端做 `Number(a) - Number(b)` 會把兩個無損字串轉成 float 再相減，
+            # 畫面上遲早出現 1.9999999997 這種數字。已達標時為 "0"。
+            "deposit_shortfall": str(max(Decimal("0"),
+                                         cfg.min_user_deposit - perp_account_value)),
             # None ＝ 已入金、沒有卡住的錢、或查不到（對前端是同一件事：不顯示提示）。
-            # ⭐ funded 傳入而非重算：與上一行同一次讀取的結果，同基準（工程原則 1）。
+            # ⭐ funded 傳入而非重算：與上面同一次讀取的結果，同基準（工程原則 1）。
             "spot_stranded": _spot_stranded(address, funded=funded),
             "state": "READY" if ready else "IN_PROGRESS",
         }
