@@ -35,7 +35,7 @@ describe("AdminPage", () => {
     // XSS：label 文字原樣顯示、不注入 DOM
     expect(screen.getByText("<script>alert(1)</script>")).toBeInTheDocument();
     expect(container.querySelector("script")).toBeNull();
-    expect(screen.getByText(/人工 CLI/)).toBeInTheDocument();
+    expect(screen.getByText(/auto-activate watcher/)).toBeInTheDocument();
   });
 
   it("403 → 僅限管理員文案", async () => {

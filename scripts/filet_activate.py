@@ -27,20 +27,30 @@ import os
 import subprocess
 from pathlib import Path
 
-from spark.filet.followers import load_followers
+from spark.filet.followers import VALID_NETWORKS, load_followers
 # 白名單路徑的取得與檢查與引擎共用單一定義：CLI 驗一份檔、引擎驗另一份檔的漂移，
 # 會讓「已核可的 leader」與「引擎眼中合法的 leader」悄悄分家（安全關鍵）。
 from spark.filet.leader_resolve import LEADERS_PATH_ENV, require_leaders_path
 from spark.filet.leaders import is_selectable, load_leaders
+from spark.filet.user_leaders import load_user_leaders, merge_leaders
 from spark.publicapi.config import normalize_address, derive_account_id
 from spark.publicapi.pending import load_pending, remove_pending_entry
 
 
-def _resolve_leader(entry: dict, override: str | None, leaders_path: str) -> str | None:
-    """決定寫進 manifest 的 leader，並擋下不在白名單的地址。
+def _resolve_leader(entry: dict, override: str | None, leaders_path: str,
+                    user_leaders_path: str | None = None) -> str | None:
+    """決定寫進 manifest 的 leader，並擋下不在准入集合內的地址。
 
     來源優先序：CLI --leader（管理端當下的明確指示）> pending 條目的 leader_address
     （客戶在 web 層選的）。兩者皆無 → None，引擎沿用 env COPY_LEADER_ADDRESS（向後相容）。
+
+    `user_leaders_path`（2026-07-30，auto-activate watcher 用）：給了才把 user-sourced
+    registry 併入准入集合——合併用引擎同一個 merge_leaders；述詞用**選擇時**的
+    is_selectable（引擎持續驗證用較寬的 is_still_permitted，兩者不同是刻意的，
+    見 leaders.py 檔頭），不在這裡另造准入邏輯。預設 None＝行為與過去完全相同：人工 CLI
+    只認策劃白名單。⚠️ registry 是 filet-api 可寫的檔，單靠它不足以擋 API 被打穿的
+    情境——watcher 端必須另以 verify_leader_change 重驗用戶簽章（authenticity 綁定），
+    兩道合起來才等價於原本人工審核的把關。
 
     ⭐ 白名單是硬閘：pending 條目由 filet-api 寫入，該進程被打穿即可在條目裡塞任意
     leader（瘋狂交易榨 builder fee／反向交易）。白名單檔只有管理端能寫，所以這裡
@@ -60,16 +70,49 @@ def _resolve_leader(entry: dict, override: str | None, leaders_path: str) -> str
     # 用 is_selectable（**選擇時**的述詞，enabled 與 accepting_new 都要過），不是引擎
     # 持續驗證用的 is_still_permitted——例行下架（accepting_new=false）的 leader
     # 不該再收新客戶，但已在跟的人不受影響（兩個旗標的分工見 leaders.py 檔頭）。
-    if not is_selectable(leader, load_leaders(leaders_path)):
+    admissible = load_leaders(leaders_path)
+    if user_leaders_path is not None:
+        admissible = merge_leaders(admissible, load_user_leaders(user_leaders_path))
+    if not is_selectable(leader, admissible):
         raise SystemExit(
-            f"leader {leader} 不在策劃白名單（{leaders_path}）、已被撤銷或已停止收新客戶"
-            f" —— 拒絕啟用。要新增 leader 請由管理端編輯白名單檔，不要繞過本檢查")
+            f"leader {leader} 不在准入集合（白名單 {leaders_path}"
+            f"{'' if user_leaders_path is None else f' ∪ registry {user_leaders_path}'}）、"
+            f"已被撤銷或已停止收新客戶 —— 拒絕啟用。"
+            f"要新增精選 leader 請由管理端編輯白名單檔，不要繞過本檢查")
     return leader
+
+
+def validate_pending_entry(entry: dict, account_id: str,
+                           expected_builder: str) -> None:
+    """pending 條目的三道結構性核對——**寫 manifest／碰任何特權資源之前**呼叫。
+
+    抽成獨立函式（2026-07-30 審查 F5/F6）：auto-activate watcher 必須在驗章與
+    root 建檔之前先過這三道；activate() 內部同樣走這裡（單一定義）。
+    1. builder pin：pending 由 filet-api 寫入，被打穿即可注入指向攻擊者的 builder。
+    2. account_id ↔ user_address 衍生綁定：這是後續簽章驗證拿 entry["user_address"]
+       當可信來源的**前提**——沒有這道，攻擊者可用自己的錢包簽別人的 account_id。
+    3. network 合法性：壞值一旦寫進 manifest，所有 fail-fast 讀取端（引擎啟動、
+       其他條目的啟用）全體連坐；os.replace 提交後不回滾，必須在寫之前擋。
+    """
+    if normalize_address(entry["builder_address"]) != normalize_address(expected_builder):
+        raise SystemExit(
+            f"builder_address 不符！pending={entry['builder_address']} "
+            f"期望={expected_builder} —— 條目可疑，拒絕啟用（條目保留供調查）")
+    derived_account_id = derive_account_id(entry["user_address"])
+    if account_id != derived_account_id:
+        raise SystemExit(
+            f"account_id 不符！pending={account_id} "
+            f"衍生={derived_account_id} —— 條目可疑，拒絕啟用（條目保留供調查）")
+    if entry.get("network") not in VALID_NETWORKS:
+        raise SystemExit(
+            f"network 不合法: {entry.get('network')!r}（須為 {VALID_NETWORKS}）"
+            f" —— 條目可疑，拒絕啟用（條目保留供調查）")
 
 
 def activate(account_id: str, pending_path: str, manifest_path: str,
              expected_builder: str, *, start: bool, leader: str | None = None,
-             leaders_path: str) -> str:
+             leaders_path: str, user_leaders_path: str | None = None,
+             remove_pending: bool = True) -> str:
     # `leaders_path` 刻意**無預設值**（2026-07-20，同 exchange_dir／state_base 的處理）：
     # 留一個預設，任何呼叫端（含測試）就會靜默拿到它，而白名單是安全關鍵的硬閘——
     # 「拿哪一份白名單把關」必須是每個呼叫端明講的事。解析在 main() 走
@@ -79,19 +122,10 @@ def activate(account_id: str, pending_path: str, manifest_path: str,
     if not matches:
         raise SystemExit(f"pending 中找不到 account_id={account_id}")
     entry = matches[0]
-    # ⭐ 結構性核對（紅線 6）：builder 必須等於部署設定常數；比對前同 normalize 基準。
-    if normalize_address(entry["builder_address"]) != normalize_address(expected_builder):
-        raise SystemExit(
-            f"builder_address 不符！pending={entry['builder_address']} "
-            f"期望={expected_builder} —— 條目可疑，拒絕啟用（條目保留供調查）")
-    # ⭐ 結構性核對：account_id 必須是 user_address 衍生物。
-    derived_account_id = derive_account_id(entry["user_address"])
-    if account_id != derived_account_id:
-        raise SystemExit(
-            f"account_id 不符！pending={account_id} "
-            f"衍生={derived_account_id} —— 條目可疑，拒絕啟用（條目保留供調查）")
+    # ⭐ 三道結構性核對（紅線 6 ＋ 審查 F5/F6）：單一定義見 validate_pending_entry。
+    validate_pending_entry(entry, account_id, expected_builder)
     # ⭐ 白名單硬閘：在碰 manifest 之前擋掉，與上面兩道核對同一失敗語意。
-    leader_address = _resolve_leader(entry, leader, leaders_path)
+    leader_address = _resolve_leader(entry, leader, leaders_path, user_leaders_path)
     manifest = Path(manifest_path)
     data = json.loads(manifest.read_text()) if manifest.exists() else {"followers": []}
     if any(f.get("account_id") == account_id for f in data["followers"]):
@@ -111,7 +145,10 @@ def activate(account_id: str, pending_path: str, manifest_path: str,
     os.replace(tmp, manifest)
     load_followers(manifest)  # fail-fast 重讀驗證（不回滾——os.replace 已提交；寫壞
                               # 立刻大聲炸，manifest 留新版本、pending 條目留供重跑）
-    remove_pending_entry(pending_path, account_id)
+    # remove_pending=False（auto-activate watcher，審查 F2）：pending 是「start 尚未
+    # 確認成功」的重試載體，由呼叫端在 start 成功後自行清除。人工 CLI 維持預設 True。
+    if remove_pending:
+        remove_pending_entry(pending_path, account_id)
     cmd = f"systemctl start filet-follower@{account_id}"
     if start:
         subprocess.run(["systemctl", "start", f"filet-follower@{account_id}"],

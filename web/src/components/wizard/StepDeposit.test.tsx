@@ -23,18 +23,20 @@ function status(over: Partial<OnboardStatus> = {}): OnboardStatus {
 beforeEach(() => vi.clearAllMocks());
 
 describe("StepDeposit", () => {
-  it("未入金：顯示待入金文案、送審鈕 disabled", () => {
+  it("未入金：顯示待入金文案、完成綁定鈕 disabled", () => {
     render(<StepDeposit status={status()} refetchStatus={() => undefined} />);
     expect(screen.getByText(/尚未偵測到足額資金/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "送出審核" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "完成綁定" })).toBeDisabled();
   });
 
-  it("已入金：送審 → READY → 顯示已送審文案（設計定案 5：非「啟用」）", async () => {
+  it("已入金：完成綁定 → READY → 顯示自動啟用說明＋前往選 leader（2026-07-30 移除人工審核）", async () => {
     postVerify.mockResolvedValue({ state: "READY" });
     render(<StepDeposit status={status({ funded: true, state: "READY" })}
       refetchStatus={() => undefined} />);
-    await userEvent.click(screen.getByRole("button", { name: "送出審核" }));
-    expect(await screen.findByText(/已送出審核。管理員核准後開始跟單/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "完成綁定" }));
+    expect(await screen.findByText(/選定後系統會在約一分鐘內自動開始跟單/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "前往選擇 leader" }))
+      .toHaveAttribute("href", "/leaders");
     expect(postVerify).toHaveBeenCalledTimes(1);
   });
 });

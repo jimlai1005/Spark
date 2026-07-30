@@ -334,6 +334,39 @@ def load_leader_changes(path: str | Path) -> list[dict]:
     return json.loads(p.read_text()).get("changes", [])
 
 
+def remove_satisfied_leader_change(path: str | Path, *, account_id: str,
+                                   leader_address: str) -> bool:
+    """移除「意圖已滿足」的變更記錄：該帳號的記錄目標 == 當前 manifest leader 時回收。
+
+    2026-07-30 auto-activate 審查 F7A：watcher 啟用時把記錄裡的 leader 直接寫進
+    manifest（刻意放行 freshness），但引擎的「leader 相同 → 忽略」守門是 **nonce
+    已兌現**，不是 manifest 比對——一筆超過時效窗的記錄會讓引擎每 cycle 發
+    `expired` critical、每日對帳永久列 `not_redeemed`，而事實上 leader 完全正確。
+    修法＝啟用成功後回收已消化的記錄（本函式），引擎從此看不到它。
+
+    判定是**狀態述詞**（目標 == 現值），不是流程旗標：
+    - 目標不同（用戶啟用期間又換了別人）→ 一律不動，那是真的待套用意圖；
+    - 目標相同但簽章偽造 → 刪掉同樣無害（它本來就只會被引擎忽略或拒絕）。
+    冪等；tmp 名帶 pid（本檔因此有 API 與 root watcher 兩個寫者，
+    沿 publicapi/pending.py 2026-07-30 的同款理由）。回傳是否有移除。
+
+    ⚠️ 已知且接受的極窄競態：本函式 read-modify-write 期間 API 恰好寫入一筆
+    **不同 leader** 的新選擇，可能被舊快照蓋掉——後果是用戶在前端看不到
+    pending change、重按一次即自癒（與 pending.json 的競態同一接受理由）。
+    """
+    p = Path(path)
+    entries = load_leader_changes(p)
+    keep = [e for e in entries
+            if not (e.get("account_id") == account_id
+                    and e.get("leader_address") == leader_address)]
+    if len(keep) == len(entries):
+        return False
+    tmp = p.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps({"changes": keep}, indent=2))
+    os.replace(tmp, p)
+    return True
+
+
 def write_leader_change(path: str | Path, record: dict) -> None:
     """落檔（原子換檔，沿 publicapi/pending.py 的 _atomic_write 慣例）。
 

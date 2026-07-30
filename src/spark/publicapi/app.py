@@ -1406,8 +1406,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
     @app.post("/api/onboard/verify")
     def onboard_verify(address: str = Depends(_require_session)):
-        """檢查全過 → 寫 pending 條目（等管理端人工 CLI 核准；spec：activate 不做成
-        API 端點）。未全過 → 回進度供斷點續走（冪等，可重跑）。"""
+        """檢查全過 → 寫 pending 條目（由 auto-activate watcher 於用戶簽章選定
+        leader 後自動啟用；人工後備 scripts/filet_activate.py。spec 的「activate
+        不做成 API 端點」仍成立——本端點只寫佇列，無 systemd/寫 manifest 權）。
+        未全過 → 回進度供斷點續走（冪等，可重跑）。"""
         p = _progress(address)
         if p["state"] == "READY":
             # ⭐ user_address 出自 session、builder_address 出自伺服器設定（紅線 6）
@@ -1420,8 +1422,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
     @app.get("/api/admin/pending")
     def admin_pending(admin: str = Depends(_require_admin)):
-        """管理端唯讀：檢視 pending 清單（逐筆核對 builder_address 用）。啟用走人工
-        CLI scripts/filet_activate.py，web 層無任何 systemd/寫 manifest 權。"""
+        """管理端唯讀：檢視 pending 佇列。啟用由 auto-activate watcher（root timer，
+        scripts/filet_auto_activate.py）自動處理；人工後備為 scripts/filet_activate.py。
+        web 層無任何 systemd/寫 manifest 權——這一點在自動化後**仍然為真**。"""
         return {"pending": load_pending(cfg.pending_path)}
 
     # ---------- 營運後台 /ops（admin only；全 repo 唯一的跨客戶聚合） ----------

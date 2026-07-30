@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _NETWORKS = {"testnet", "mainnet"}
+# 公開別名：activate／auto-activate 在寫 manifest **之前**的前置驗證用（單一定義；
+# 2026-07-30 審查 F5——壞 network 條目一旦寫進 manifest，fail-fast 讀取端全體連坐）。
+VALID_NETWORKS = _NETWORKS
 _HEX = set("0123456789abcdefABCDEF")
 _ACCOUNT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 

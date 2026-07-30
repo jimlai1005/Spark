@@ -1,0 +1,34 @@
+[Unit]
+Description=Filet auto-activate watcher (pending + signed leader selection -> activate & start follower)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# ⭐ root：本 unit 是人工核可 CLI 的自動化替身（2026-07-30 使用者裁決，僅內部使用），
+# 需要 systemctl start、寫 /etc/filet/followers、寫 follower manifest 與 state 目錄——
+# 這些正是刻意不給 filet-api 的權限（權限拓撲不變：API 仍寫不到 manifest）。
+User=root
+WorkingDirectory=/opt/filet/spark
+# watcher 私有狀態檔的所在（記錄哪些帳號由 watcher 啟動——區分「可重試 start」與
+# 「人工停機不得復活」的唯一依據）。
+StateDirectory=filet-auto-activate
+Environment=FILET_BUILDER_ADDR=REPLACE_WITH_BUILDER_ADDRESS
+# 白名單與其他 unit 逐字元相同（單一來源，見 filet-daily-report.service 的同款註解）。
+Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
+# 告警通道與 filet-daily-report 同源；檔案允許不存在（`-`）→ notifier 全靜默，
+# 但啟用失敗仍會讓 unit 進 failed（journal 可查）。
+EnvironmentFile=-/etc/filet/telegram.env
+ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.filet_auto_activate \
+    --pending /var/lib/filet-api/pending.json \
+    --manifest /opt/filet/spark/var/filet/followers.json \
+    --exchange-dir /var/lib/filet-exchange \
+    --env-template /etc/filet/follower.env.template \
+    --env-dir /etc/filet/followers \
+    --state-base /opt/filet/state \
+    --state-file /var/lib/filet-auto-activate/state.json
+# 失敗（任何一個條目啟用失敗、範本佔位符未填）→ exit 1 → unit failed，監控看得見。
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

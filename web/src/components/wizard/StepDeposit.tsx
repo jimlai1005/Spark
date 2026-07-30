@@ -1,4 +1,5 @@
 "use client";
+import Link from "next/link";
 import { useState } from "react";
 import { postVerify, type OnboardStatus } from "@/lib/api";
 import { COPY } from "@/lib/copy";
@@ -36,7 +37,12 @@ export function StepDeposit({ status, refetchStatus }: {
         <span>{status.funded ? c.depositDetected : c.depositPending}</span>
       </div>
       {submitted ? (
-        <p>{c.submitted}</p>
+        <>
+          <p>{c.submitted}</p>
+          <div className="step-actions">
+            <Link className="btn btn-primary" href="/leaders">{c.goFollow}</Link>
+          </div>
+        </>
       ) : (
         <div className="step-actions">
           <button type="button" className="btn btn-primary"

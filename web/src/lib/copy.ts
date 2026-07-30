@@ -129,8 +129,11 @@ export const COPY = {
       + "因此無法替你操作，本頁也不會出現替你操作的按鈕。",
     spotStrandedLink: "前往 Hyperliquid 進行劃轉",
     spotStrandedLinkHref: "https://app.hyperliquid.xyz/balances",
-    submitReview: "送出審核",
-    submitted: "已送出審核。管理員核准後開始跟單；你隨時可回到本頁或績效頁查看狀態。",
+    // 2026-07-30 移除人工審核（auto-activate watcher）：完成綁定＝進啟用佇列，
+    // 選定 leader 後自動開始跟單，文案不再出現「審核」。
+    submitReview: "完成綁定",
+    submitted: "綁定完成。前往跟單頁選擇 leader——選定後系統會在約一分鐘內自動開始跟單。",
+    goFollow: "前往選擇 leader",
     fundsWarning:
       "跟單期間請勿將資金從永續合約（perp）帳戶轉出。系統以 perp 帳戶淨值計算回撤保護，" +
       "轉出資金會被視為虧損，可能觸發保護性平倉。若要調整資金請先在此頁停止跟單。",
@@ -149,7 +152,9 @@ export const COPY = {
     title: "待核准清單",
     empty: "目前沒有待核准的項目。",
     forbidden: "此頁僅限管理員。",
-    note: "核准動作走人工 CLI（scripts/filet_activate.py），本頁唯讀。逐筆核對 builder_address。",
+    note: "啟用由 auto-activate watcher 自動處理（選定 leader 後約一分鐘生效）；"
+      + "本頁唯讀，用於觀察佇列——長期滯留的條目代表該用戶尚未選 leader 或啟用失敗"
+      + "（查 journalctl -u filet-auto-activate）。",
     cols: {
       account: "account_id",
       user: "user_address",

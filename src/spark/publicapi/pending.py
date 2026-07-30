@@ -21,9 +21,20 @@ def load_pending(path: str | Path) -> list[dict]:
 
 def _atomic_write(p: Path, entries: list[dict]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
+    # tmp 名帶 pid（2026-07-30 審查 F8）：本檔如今有兩個寫者（filet-api 與 root 的
+    # auto-activate watcher）。固定 tmp 名時，root crash 殘留的 root:root tmp 會讓
+    # filet-api 之後的寫入 PermissionError——整個 onboarding 寫入停擺。pid 後綴讓
+    # 兩個寫者永不共用 tmp 路徑；read-modify-write 的極窄競態（雙方快照互蓋）已知
+    # 且自癒（verify 可重按、watcher 補救路徑會再清），詳見 auto-activate 檔頭。
+    tmp = p.with_suffix(f".tmp.{os.getpid()}")
     tmp.write_text(json.dumps({"pending": entries}, indent=2))
     os.replace(tmp, p)  # 原子換檔，不留半寫
+    if os.geteuid() == 0:
+        # root 寫完把所有權還給目錄擁有者（filet-api）並釘住 mode，避免權限拓撲
+        # 隨 root umask 漂移。
+        st = os.stat(p.parent)
+        os.chown(p, st.st_uid, st.st_gid)
+        os.chmod(p, 0o640)
 
 
 def write_pending_entry(path: str | Path, *, account_id: str, user_address: str,

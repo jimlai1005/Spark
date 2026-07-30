@@ -1,0 +1,11 @@
+[Unit]
+Description=Run filet auto-activate watcher every minute
+
+[Timer]
+# 每分鐘掃一次 pending：用戶「選完 leader → 開始跟單」的最壞等待約 1-2 分鐘。
+# 一次性掃描本身冪等（已啟用者只做補救檢查），頻率不影響正確性。
+OnBootSec=2min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target

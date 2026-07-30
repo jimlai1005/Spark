@@ -14,6 +14,10 @@ Hyperliquid builder-code 基礎設施 + copytrade orchestrator（Filet M1）。P
 3. `ExchangeAdapter` 不含 withdraw/transfer（非託管不變量，tests/test_base_types.py 結構性斷言）。
 4. 所有會產生掛單的寫入必帶 builder 參數（SDK `modify_order` 無此欄位為已知例外）。
 5. copytrade `live_trading` 預設 False；任何主網寫入（下單/開平倉）是人工決策，不得自動開啟。
+   例外（2026-07-30 使用者裁決，產品僅內部使用）：auto-activate watcher 對完成綁定、
+   **曾通過入金檢查**（寫入 pending 當下驗過鏈上入金，啟用時不重驗）且已簽章選定 leader
+   的用戶，自動建 env（`COPY_LIVE_TRADING=true`）並啟動引擎——僅此一條路徑豁免；
+   對外開放前必須重審本例外。
 6. 測試全離線：autouse socket-ban（tests/conftest.py）；新測試不得連網、不得真發通知。
 7. **撤銷 leader 一律跑 `scripts/revoke_leader.py`**（冪等、跨精選白名單＋user registry 兩檔、自我驗收 `is_still_permitted` 為 False）。
    ⚠️ 自 2026-07-27 起「刪除白名單條目」**不再等於** `enabled:false`：位址若也在 `user_leaders.json`，刪精選條目只會讓 registry 那筆遞補上來＝撤銷靜默失效。
