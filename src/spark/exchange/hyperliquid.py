@@ -9,7 +9,7 @@ from spark.config import CSV_BASE_URLS
 from spark.exchange.base import (
     USER_FILLS_PAGE_LIMIT, ExchangeAdapter, FillsTruncatedError, Order, BuilderCode,
     Fill, TxResult, OrderResult, Signer,
-    OpenOrder, Position, AccountSnapshot, EquityView, UserFill,
+    OpenOrder, Position, AccountSnapshot, EquityView, UserFill, LedgerFlow,
 )
 from spark.exchange.csv_fills import parse_builder_fills
 from spark.resilience import ResilientExchange
@@ -296,6 +296,38 @@ class HyperliquidAdapter(ExchangeAdapter):
         if coin not in self._sz_decimals_cache:
             raise ValueError(f"get_size_decimals: 未知幣種 {coin!r}（不在 meta() universe 內）")
         return self._sz_decimals_cache[coin]
+
+    def get_ledger_flows(self, address: str, start_ms: int) -> tuple[list[LedgerFlow], list[str]]:
+        """申贖流量：起始時間（毫秒）起的進出帳記錄。
+
+        回傳 (LedgerFlow 清單, 白名單外 delta type 清單【去重、升冪排序】)。
+        """
+        raw = self._info.post("/info", {"type": "userNonFundingLedgerUpdates",
+                                        "user": address, "startTime": start_ms})
+        flows = []
+        unknown_types = set()
+
+        for item in raw:
+            delta = item.get("delta", {})
+            delta_type = delta.get("type")
+            time_ms = int(item.get("time", 0))
+
+            if delta_type == "vaultDeposit":
+                usdc = Decimal(str(delta.get("usdc", "0")))
+                flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
+            elif delta_type == "deposit":
+                usdc = Decimal(str(delta.get("usdc", "0")))
+                flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
+            elif delta_type == "withdraw":
+                usdc = -Decimal(str(delta.get("usdc", "0")))
+                flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
+            elif delta_type == "vaultWithdraw":
+                usdc = -Decimal(str(delta.get("netWithdrawnUsd", "0")))
+                flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
+            else:
+                unknown_types.add(delta_type)
+
+        return flows, sorted(list(unknown_types))
 
     # --- writes ---
     # 以下 main_signer / agent_signer 參數為介面文件性質；實際簽章者 = 建構時綁定

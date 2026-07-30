@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from spark.exchange.base import (
     ExchangeAdapter, Order, BuilderCode, Fill, TxResult, OrderResult,
-    OpenOrder, Position, AccountSnapshot, EquityView, UserFill,
+    OpenOrder, Position, AccountSnapshot, EquityView, UserFill, LedgerFlow,
 )
 
 _DEFAULT_SIZE_DECIMALS = 4
@@ -30,7 +30,7 @@ class FakeAdapter(ExchangeAdapter):
                  mids=None, sz_decimals=None, daily_abs_pnl=(),
                  cancel_ok=True, modify_ok=True, market_open_ok=True,
                  close_reduce_only_ok=True, update_leverage_ok=True, extra_agents=(),
-                 user_abstraction="disabled"):
+                 user_abstraction="disabled", ledger_flows=None):
         self._account_value = Decimal(account_value)
         self._account_values = dict(account_values or {})
         self._max_fee = 0
@@ -54,6 +54,8 @@ class FakeAdapter(ExchangeAdapter):
         self._mids = dict(mids or {})
         self._sz_decimals = dict(sz_decimals or {})
         self._daily_abs_pnl = list(daily_abs_pnl or [])
+        # 申贖流量：預設 ([], [])；否則存 tuple 原樣回傳。
+        self._ledger_flows = ledger_flows if ledger_flows is not None else ([], [])
         # writes（M1 補齊）：可注入的成功/失敗結果，預設成功。
         self._cancel_ok = cancel_ok
         self._modify_ok = modify_ok
@@ -167,3 +169,7 @@ class FakeAdapter(ExchangeAdapter):
     def get_daily_abs_pnl(self, address: str) -> list[Decimal]:
         self.calls["get_daily_abs_pnl"].append({"address": address})
         return list(self._daily_abs_pnl)
+
+    def get_ledger_flows(self, address: str, start_ms: int) -> tuple[list[LedgerFlow], list[str]]:
+        self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
+        return self._ledger_flows

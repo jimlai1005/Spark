@@ -140,6 +140,13 @@ class UserFill:
     builder_fee: Decimal = Decimal("0")   # 該筆成交歸屬我方 builder 的費用（HL fills 的 builderFee；無此欄位視為 0）
 
 
+@dataclass(frozen=True)
+class LedgerFlow:
+    """申贖流量紀錄：入金 (+usdc) 或出金 (-usdc)。"""
+    time_ms: int
+    usdc: Decimal
+
+
 class ExchangeAdapter(ABC):
     # --- reads ---
     @abstractmethod
@@ -190,6 +197,15 @@ class ExchangeAdapter(ABC):
     def get_daily_abs_pnl(self, address: str) -> list[Decimal]:
         """帳戶每日 |PnL| 數列，時間升冪、最後一筆為今日。供 sizing.compute_volatility_stats
         的呼叫端注入使用（Task 12 loop.py）。"""
+        ...
+    @abstractmethod
+    def get_ledger_flows(self, address: str, start_ms: int) -> tuple[list[LedgerFlow], list[str]]:
+        """帳戶的申贖流量（起始時間毫秒起）。
+
+        回傳 (流量清單, 白名單外的 delta type 名稱清單——去重、穩定排序)。
+        白名單 delta type：vaultDeposit, deposit, withdraw, vaultWithdraw。
+        呼叫端負責判定未知型別是否觸發告警。
+        """
         ...
 
     # --- writes（approve_* 概念上屬主錢包；Phase 1 testnet 由 test harness 簽）---

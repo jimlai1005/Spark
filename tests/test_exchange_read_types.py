@@ -1,11 +1,11 @@
-"""讀側型別（OpenOrder/Position/AccountSnapshot/EquityView/UserFill）與 ExchangeAdapter
+"""讀側型別（OpenOrder/Position/AccountSnapshot/EquityView/UserFill/LedgerFlow）與 ExchangeAdapter
 新增抽象讀取方法。frozen dataclass、全 Decimal 欄位；FakeAdapter 需回傳注入值。"""
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from decimal import Decimal
 import pytest
 from spark.exchange.base import (
-    OpenOrder, Position, AccountSnapshot, EquityView, UserFill, ExchangeAdapter,
+    OpenOrder, Position, AccountSnapshot, EquityView, UserFill, ExchangeAdapter, LedgerFlow,
 )
 from spark.exchange.fakes import FakeAdapter
 
@@ -123,3 +123,36 @@ def test_fake_adapter_returns_injected_mids_and_size_decimals():
     assert fa.get_all_mids() == {"ETH": Decimal("2000")}
     assert fa.get_size_decimals("ETH") == 4
     assert fa.get_size_decimals("BTC") == 4  # 未知幣種回退預設 4
+
+
+# --- LedgerFlow 讀側 ---
+
+def test_ledger_flow_frozen_decimal():
+    lf = LedgerFlow(time_ms=1626998400000, usdc=Decimal("100.50"))
+    with pytest.raises(FrozenInstanceError):
+        lf.time_ms = 0
+    assert isinstance(lf.usdc, Decimal)
+    assert lf.usdc > 0  # 入金為正
+
+
+def test_ledger_flow_withdrawal_negative():
+    lf = LedgerFlow(time_ms=1626998400000, usdc=Decimal("-50.25"))
+    assert isinstance(lf.usdc, Decimal)
+    assert lf.usdc < 0  # 出金為負
+
+
+def test_fake_adapter_ledger_flows_defaults_empty():
+    fa = FakeAdapter()
+    flows, unknown = fa.get_ledger_flows("0xuser", 0)
+    assert flows == []
+    assert unknown == []
+
+
+def test_fake_adapter_ledger_flows_returns_injected_value():
+    lf1 = LedgerFlow(time_ms=1000, usdc=Decimal("100"))
+    lf2 = LedgerFlow(time_ms=2000, usdc=Decimal("-50"))
+    fa = FakeAdapter(ledger_flows=([lf1, lf2], ["accountTransfer"]))
+    flows, unknown = fa.get_ledger_flows("0xuser", 1000)
+    assert flows == [lf1, lf2]
+    assert unknown == ["accountTransfer"]
+    assert fa.calls["get_ledger_flows"] == [{"address": "0xuser", "start_ms": 1000}]

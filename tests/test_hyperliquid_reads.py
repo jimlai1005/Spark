@@ -17,13 +17,14 @@ class FakeInfo:
     """七個讀側方法各自需要的假回應；呼叫次數計數供快取/同源測試使用。"""
 
     def __init__(self, frontend_orders=None, user_state_resp=None, portfolio_resp=None,
-                 fills=None, mids=None, meta_resp=None):
+                 fills=None, mids=None, meta_resp=None, ledger_updates=None):
         self._frontend_orders = frontend_orders if frontend_orders is not None else []
         self._user_state_resp = user_state_resp
         self._portfolio_resp = portfolio_resp if portfolio_resp is not None else []
         self._fills = fills if fills is not None else []
         self._mids = mids if mids is not None else {}
         self._meta_resp = meta_resp if meta_resp is not None else {"universe": []}
+        self._ledger_updates = ledger_updates if ledger_updates is not None else []
         self.portfolio_calls = 0
         self.meta_calls = 0
         self.user_fills_by_time_calls = []
@@ -48,6 +49,11 @@ class FakeInfo:
     def meta(self):
         self.meta_calls += 1
         return self._meta_resp
+
+    def post(self, endpoint, body):
+        if endpoint == "/info" and body.get("type") == "userNonFundingLedgerUpdates":
+            return self._ledger_updates
+        raise NotImplementedError(f"FakeInfo.post({endpoint}, {body})")
 
 
 def _adapter(**fake_kwargs):
@@ -493,3 +499,44 @@ def test_get_size_decimals_unknown_after_refresh_raises_and_retries_next_call():
     with pytest.raises(ValueError):
         ad.get_size_decimals("XYZ")
     assert ad._info.meta_calls == 3  # 失敗不入快取：下次同 coin 呼叫再重試 meta
+
+
+# --- 8. get_ledger_flows ---
+
+def test_get_ledger_flows_maps_four_whitelisted_types():
+    """四種白名單型別：vaultDeposit (+), deposit (+), withdraw (-), vaultWithdraw (-)."""
+    ledger_raw = [
+        {"time": 1626998400000, "delta": {"type": "vaultDeposit", "usdc": "100.50"}},
+        {"time": 1626998401000, "delta": {"type": "deposit", "usdc": "50.00"}},
+        {"time": 1626998402000, "delta": {"type": "withdraw", "usdc": "30.25"}},
+        {"time": 1626998403000, "delta": {"type": "vaultWithdraw", "netWithdrawnUsd": "20.75"}},
+    ]
+    ad = _adapter(ledger_updates=ledger_raw)
+    flows, unknown = ad.get_ledger_flows("0xuser", 0)
+
+    assert len(flows) == 4
+    assert flows[0].time_ms == 1626998400000
+    assert flows[0].usdc == Decimal("100.50")
+    assert flows[1].usdc == Decimal("50.00")
+    assert flows[2].usdc == Decimal("-30.25")  # withdraw 為負
+    assert flows[3].usdc == Decimal("-20.75")  # vaultWithdraw 為負
+    assert all(isinstance(f.usdc, Decimal) for f in flows)
+    assert unknown == []
+
+
+def test_get_ledger_flows_collects_unknown_types_deduplicated():
+    """未知型別收進第二回傳值、去重、升冪排序。"""
+    ledger_raw = [
+        {"time": 1000, "delta": {"type": "vaultDeposit", "usdc": "100"}},
+        {"time": 2000, "delta": {"type": "accountTransfer", "amount": "50"}},
+        {"time": 3000, "delta": {"type": "withdraw", "usdc": "30"}},
+        {"time": 4000, "delta": {"type": "accountTransfer", "amount": "25"}},  # 重複
+        {"time": 5000, "delta": {"type": "feeRebate", "amount": "5"}},
+    ]
+    ad = _adapter(ledger_updates=ledger_raw)
+    flows, unknown = ad.get_ledger_flows("0xuser", 0)
+
+    assert len(flows) == 2  # 只有白名單 2 種
+    assert sorted(unknown) == unknown  # 升冪排序
+    assert set(unknown) == {"accountTransfer", "feeRebate"}  # 去重
+    assert unknown == ["accountTransfer", "feeRebate"]
