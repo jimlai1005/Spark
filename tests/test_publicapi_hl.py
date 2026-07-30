@@ -207,3 +207,28 @@ def test_spot_usdc_balance_degrades_to_zero_never_raises(payload):
     gw = HLGateway("https://x", post_fn=_FakePost([payload]),
                    sleep_fn=lambda s: None)
     assert gw.spot_usdc_balance("0x" + "ab" * 20) == Decimal("0")
+
+
+def test_vault_details_and_ledger_updates_post_correct_bodies():
+    """vault preflight 的兩個唯讀查詢：請求體逐欄位正確、只打 /info、原樣回傳。"""
+    vault = "0x" + "ab" * 20
+    ledger = [{"time": 1782774120062, "hash": "0x1",
+               "delta": {"type": "deposit", "usdc": "500"}}]
+    post = _FakePost([{"name": "Ultron", "maxDistributable": 645277.220236}, ledger])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    assert gw.vault_details(vault) == {"name": "Ultron", "maxDistributable": 645277.220236}
+    assert gw.non_funding_ledger_updates(vault, 1782774120062) == ledger
+    assert post.calls == [
+        ("https://x/info", {"type": "vaultDetails", "vaultAddress": vault}),
+        ("https://x/info", {"type": "userNonFundingLedgerUpdates",
+                            "user": vault, "startTime": 1782774120062}),
+    ]
+
+
+def test_vault_reads_retry_transient():
+    """兩個新方法走同一條 _info 邊界（idempotent read → transient 重試）。"""
+    post = _FakePost([RuntimeError("Server error '503 Service Unavailable' for url"),
+                      {"name": "Ultron"}])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    assert gw.vault_details("0x" + "ab" * 20) == {"name": "Ultron"}
+    assert len(post.calls) == 2

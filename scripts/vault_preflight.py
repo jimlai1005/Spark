@@ -1,0 +1,202 @@
+"""scripts/vault_preflight.py
+vault leader 上架前的**唯讀** preflight——驗證跟單引擎的兩條假設在「這隻」vault 成立：
+(1) vault 的 accountValue 可當 sizing 分母（TVL 100% 躺在 perp 帳戶）；
+(2) pnlHistory 流量中性（入金／出金不污染 pnl 序列）。
+
+這兩條對單一 vault（Ultron）已實測成立，但 equity basis 是「錢包形態專屬」的性質
+（工程原則 1，事故 #3）：**每隻**新 vault 上架前必須重跑本腳本，不得沿用舊結論。
+
+用法（spec §5、施工計畫 Wave 5）：
+  [SPARK_NETWORK=mainnet] uv run python -m scripts.vault_preflight 0xVAULT [--window-days 30]
+
+行為：
+  - 唯讀：四份資料全走 HLGateway 的 /info（單一 resilience 邊界，transient 自動重試）；
+    本腳本無任何寫入面。
+  - 檢查邏輯是純函式 `run_checks(data) -> list[CheckResult]`（離線可測）；
+    main() 只負責解析 args、抓資料、印表、exit code。
+  - 每檢查印一行 `PASS/FAIL name — detail`；六項全過 exit 0，任一 FAIL exit 1。
+  - import 階段零網路（HLGateway 延後 import＋延後建線，照 watchlist_snapshot 慣例）。
+"""
+import argparse
+import os
+import time
+from dataclasses import dataclass
+from decimal import Decimal
+
+# ── 閾值常數（來源：spec §3.4；錨例＝Ultron 實測，2026-07-31）──────────────────
+# 字串小數位截斷等級的絕對容差：恆等式兩側都是 API 原文數字，理論殘差為 0。
+ABS_TOL_USD = Decimal("0.01")
+# 流量中性殘差容差：max($1, 0.01% × accountValue)。Ultron 實測殘差 ~$0.08。
+FLOW_TOL_MIN_USD = Decimal("1")
+FLOW_TOL_REL = Decimal("0.0001")
+# 單筆流量佔 TVL 超過 8% 印 WARN（引擎 size_tolerance 預設；僅資訊性，不 FAIL）。
+SIZE_TOLERANCE_PCT = Decimal("0.08")
+# 恆等式的型別基礎：這四型別以外的 delta 出現＝恆等式不保證成立，需人工研判。
+ALLOWED_LEDGER_TYPES = ("deposit", "vaultDeposit", "withdraw", "vaultWithdraw")
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class PreflightData:
+    """四份 /info 原始回應（gateway 原樣回傳；語意判讀集中在 run_checks）。"""
+    clearinghouse_state: dict
+    vault_details: dict
+    portfolio: list
+    ledger_updates: list
+
+
+def _window(portfolio: list, period: str) -> dict | None:
+    """portfolio 形狀 `[[period, {...}], ...]`——按名字挑窗，不靠位置。"""
+    for item in portfolio or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == period:
+            return item[1]
+    return None
+
+
+def _signed_flow(delta: dict) -> Decimal | None:
+    """白名單內型別 → 有號 USD 流量（入 +、出 −）；白名單外 → None（檢查 6 負責 FAIL）。
+    ⚠️ vaultWithdraw 用 `netWithdrawnUsd` 而**不是** `requestedUsd`：requested 含
+    commission，而 commission 是 vault 內部再分配（付給 leader），**不離開帳戶**——
+    誤用 requested 會把留在帳內的錢當成流出，恆等式殘差立刻爆容差。"""
+    t = delta.get("type")
+    if t in ("deposit", "vaultDeposit"):
+        return Decimal(str(delta["usdc"]))
+    if t == "withdraw":
+        return -Decimal(str(delta["usdc"]))
+    if t == "vaultWithdraw":
+        return -Decimal(str(delta["netWithdrawnUsd"]))
+    return None
+
+
+def _pnl_end(window: dict) -> Decimal:
+    return Decimal(str(window["pnlHistory"][-1][1]))
+
+
+def run_checks(data: PreflightData) -> list[CheckResult]:
+    """六項檢查（spec §3.4）。純函式：不做 IO，輸入即四份原始回應。"""
+    out: list[CheckResult] = []
+    vd = data.vault_details if isinstance(data.vault_details, dict) else {}
+    chs = data.clearinghouse_state
+    account_value = Decimal(str(chs["marginSummary"]["accountValue"]))
+
+    # 1. is-vault：vaultDetails 非空且含 name（非 vault 位址查 vaultDetails 得空回應）。
+    is_vault = bool(vd.get("name"))
+    out.append(CheckResult(
+        "is-vault", is_vault,
+        (f"name={vd.get('name')} leaderFraction={vd.get('leaderFraction')} "
+         f"followers={len(vd.get('followers') or [])} isClosed={vd.get('isClosed')}")
+        if is_vault else "vaultDetails 空或缺 name——位址不是 vault"))
+
+    # 2. perp-resident TVL：withdrawable == maxDistributable ⇒ TVL 100% 躺 perp 帳戶，
+    #    accountValue 可當 sizing 分母。兩值都是 API 原文（同一時刻抓），容差只留截斷級。
+    withdrawable = Decimal(str(chs["withdrawable"]))
+    max_distributable = Decimal(str(vd.get("maxDistributable", "0")))
+    tvl_diff = abs(withdrawable - max_distributable)
+    out.append(CheckResult(
+        "perp-resident-tvl", tvl_diff <= ABS_TOL_USD,
+        f"withdrawable={withdrawable} maxDistributable={max_distributable} |diff|={tvl_diff}"))
+
+    # 帳本流量（檢查 3/5/6 共用；白名單外型別不入淨流量，由檢查 6 專責 FAIL）。
+    flows = [f for e in data.ledger_updates
+             if (f := _signed_flow(e.get("delta") or {})) is not None]
+    net_flow = sum(flows, Decimal("0"))
+
+    # 3. flow-neutral pnl 恆等式：|ΔaccountValue − Δpnl − 淨流量| ≤ max($1, 0.01%×AV)。
+    #    pnl 取窗內末點減首點（首點依 API 建構為 0.0，相減防禦非零首樣本——與
+    #    ΔaccountValue 同窗同算法，工程原則 1 同源）。
+    month = _window(data.portfolio, "month")
+    if month is None:
+        out.append(CheckResult("flow-neutral-pnl", False, "portfolio 缺 month 窗"))
+    else:
+        avh = month["accountValueHistory"]
+        d_av = Decimal(str(avh[-1][1])) - Decimal(str(avh[0][1]))
+        d_pnl = _pnl_end(month) - Decimal(str(month["pnlHistory"][0][1]))
+        residual = abs(d_av - d_pnl - net_flow)
+        tol = max(FLOW_TOL_MIN_USD, FLOW_TOL_REL * account_value)
+        out.append(CheckResult(
+            "flow-neutral-pnl", residual <= tol,
+            f"ΔAV={d_av} Δpnl={d_pnl} 淨流量={net_flow} 殘差={residual} 容差={tol}"))
+
+    # 4. 無 spot 污染：month 與 perpMonth 的 pnl 終值一致 ⇒ pnl 全來自 perp，
+    #    spot 桶不存在（equity basis 每桶恰好算一次的前提）。
+    perp_month = _window(data.portfolio, "perpMonth")
+    if month is None or perp_month is None:
+        out.append(CheckResult("no-spot-pollution", False,
+                               "portfolio 缺 month 或 perpMonth 窗"))
+    else:
+        pnl_m, pnl_pm = _pnl_end(month), _pnl_end(perp_month)
+        out.append(CheckResult(
+            "no-spot-pollution", abs(pnl_m - pnl_pm) <= ABS_TOL_USD,
+            f"month pnl={pnl_m} perpMonth pnl={pnl_pm} |diff|={abs(pnl_m - pnl_pm)}"))
+
+    # 5. 流量統計：資訊性、恆為 PASS——給人看規模感；單筆 > 8% TVL 印 WARN
+    #    （大額進出會放大 sizing 抖動，值得人工看一眼，但不構成 NO-GO）。
+    max_single = max((abs(f) for f in flows), default=Decimal("0"))
+    if account_value > 0:
+        max_pct = max_single / account_value
+        net_pct = net_flow / account_value
+        warn = "（WARN：單筆超過 8% TVL）" if max_pct > SIZE_TOLERANCE_PCT else ""
+        stat = (f"筆數={len(flows)} 最大單筆={max_single} ({max_pct * 100:.2f}% TVL) "
+                f"淨流量={net_flow} ({net_pct * 100:.2f}% TVL){warn}")
+    else:
+        stat = f"筆數={len(flows)} 最大單筆={max_single} 淨流量={net_flow}（accountValue 非正）"
+    out.append(CheckResult("flow-stats", True, stat))
+
+    # 6. ledger 型別白名單：四型別以外出現任何 delta type → FAIL。
+    #    恆等式的成立建立在「所有流量都被正確計號」上；未知型別無法計號。
+    unknown = sorted({t for e in data.ledger_updates
+                      if (t := (e.get("delta") or {}).get("type"))
+                      not in ALLOWED_LEDGER_TYPES})
+    out.append(CheckResult(
+        "ledger-type-whitelist", not unknown,
+        "全部型別在白名單內" if not unknown
+        else f"白名單外型別：{', '.join(unknown)}——恆等式基礎不成立，需人工研判"))
+
+    return out
+
+
+def main(argv=None, gateway=None) -> None:
+    """CLI 入口。gateway 可注入（測試離線）；不注入則按 SPARK_NETWORK 建 HLGateway。"""
+    ap = argparse.ArgumentParser(
+        prog="vault_preflight",
+        description="vault leader 上架前唯讀 preflight（六檢查；全過 exit 0，否則 1）")
+    ap.add_argument("vault_address", help="vault 位址（0x…）")
+    ap.add_argument("--window-days", type=int, default=30,
+                    help="ledger 回看天數後備值——僅當 portfolio month 窗為空時使用；"
+                         "正常情況查詢窗＝month 窗首點時間戳（預設 30）")
+    args = ap.parse_args(argv)
+
+    if gateway is None:  # 延後 import＋延後建線：import 階段零網路（watchlist 慣例）
+        from spark.config import API_URLS
+        from spark.publicapi.hl import HLGateway
+        network = os.environ.get("SPARK_NETWORK", "mainnet")
+        if network not in API_URLS:
+            raise SystemExit(f"unknown SPARK_NETWORK: {network!r}")
+        gateway = HLGateway(API_URLS[network])
+
+    addr = args.vault_address
+    chs = gateway.clearinghouse_state(addr)
+    vd = gateway.vault_details(addr)
+    pf = gateway.portfolio(addr)
+    # ledger 查詢窗＝month 窗首點時間戳（檢查 3 的 ΔAV 與淨流量必須同窗——同源）。
+    month = _window(pf, "month")
+    if month and month.get("accountValueHistory"):
+        start_ms = int(month["accountValueHistory"][0][0])
+    else:
+        start_ms = int(time.time() * 1000) - args.window_days * 86_400_000
+    ledger = gateway.non_funding_ledger_updates(addr, start_ms)
+
+    results = run_checks(PreflightData(chs, vd, pf, ledger))
+    for r in results:
+        print(f"{'PASS' if r.passed else 'FAIL'} {r.name} — {r.detail}")
+    raise SystemExit(0 if all(r.passed for r in results) else 1)
+
+
+if __name__ == "__main__":
+    main()

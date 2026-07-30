@@ -110,6 +110,23 @@ class HLGateway:
                     return Decimal("0")
         return Decimal("0")
 
+    def vault_details(self, vault_address: str) -> dict:
+        """vault 的公開細節（name/leaderFraction/maxDistributable/followers/isClosed…）
+        （唯讀、冪等 → transient 重試）。vault preflight（scripts/vault_preflight.py）用：
+        is-vault 驗身＋ maxDistributable 與 clearinghouseState.withdrawable 的恆等式。
+        ⚠️ 請求鍵是 `vaultAddress`，不是其他 /info 查詢慣用的 `user`。"""
+        return self._info({"type": "vaultDetails", "vaultAddress": vault_address},
+                          "HL vaultDetails 查詢")
+
+    def non_funding_ledger_updates(self, user: str, start_ms: int) -> list:
+        """非資金費的帳本流水（deposit/withdraw/vaultDeposit/vaultWithdraw…）
+        （唯讀、冪等 → transient 重試）。回**原始**清單，不在這裡挑型別或算淨流量：
+        流量語意（哪個欄位是真流出、白名單外型別怎麼辦）屬呼叫端（preflight 檢查層），
+        gateway 只負責 IO 與重試——與 `portfolio` 不挑窗同一條理由。"""
+        return self._info({"type": "userNonFundingLedgerUpdates",
+                           "user": user, "startTime": start_ms},
+                          "HL userNonFundingLedgerUpdates 查詢")
+
     def max_builder_fee(self, user: str, builder: str) -> int:
         """使用者已核給 builder 的費率上限（十分之一 bp；0 = 未核）。verify/status 用
         != 0 判 builder fee approval 已上鏈；同時是 maxFeeRate 生效的鏈上真相。"""
