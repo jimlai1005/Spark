@@ -30,7 +30,7 @@ class FakeAdapter(ExchangeAdapter):
                  mids=None, sz_decimals=None, daily_abs_pnl=(),
                  cancel_ok=True, modify_ok=True, market_open_ok=True,
                  close_reduce_only_ok=True, update_leverage_ok=True, extra_agents=(),
-                 user_abstraction="disabled", ledger_flows=None):
+                 user_abstraction="disabled", ledger_flows=None, active_asset_leverage=None):
         self._account_value = Decimal(account_value)
         self._account_values = dict(account_values or {})
         self._max_fee = 0
@@ -56,6 +56,8 @@ class FakeAdapter(ExchangeAdapter):
         self._daily_abs_pnl = list(daily_abs_pnl or [])
         # 申贖流量：預設 ([], [])；否則存 tuple 原樣回傳。
         self._ledger_flows = ledger_flows if ledger_flows is not None else ([], [])
+        # 槓桿查詢：dict {coin: (leverage, is_cross)} 或 None（查無 coin → raise）。
+        self._active_asset_leverage = dict(active_asset_leverage or {})
         # writes（M1 補齊）：可注入的成功/失敗結果，預設成功。
         self._cancel_ok = cancel_ok
         self._modify_ok = modify_ok
@@ -173,3 +175,9 @@ class FakeAdapter(ExchangeAdapter):
     def get_ledger_flows(self, address: str, start_ms: int) -> tuple[list[LedgerFlow], list[str]]:
         self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
         return self._ledger_flows
+
+    def get_active_asset_leverage(self, address: str, coin: str) -> tuple[int, bool]:
+        self.calls["get_active_asset_leverage"].append({"address": address, "coin": coin})
+        if coin not in self._active_asset_leverage:
+            raise ValueError(f"activeAssetData 回應形狀不符（coin={coin}）: coin not in registry")
+        return self._active_asset_leverage[coin]

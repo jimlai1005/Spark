@@ -207,6 +207,19 @@ class ExchangeAdapter(ABC):
         呼叫端負責判定未知型別是否觸發告警。
         """
         ...
+    @abstractmethod
+    def get_active_asset_leverage(self, address: str, coin: str) -> tuple[int, bool]:
+        """查詢帳戶對該幣的槓桿設定。
+
+        即便該幣無持倉（空手），API 仍回傳該帳戶現行的槓桿設定。
+        走 HL `activeAssetData` endpoint，對空手幣也能查得到。
+
+        回傳 (槓桿倍數, is_cross)。is_cross=True 時為全倉、False 為逐倉。
+
+        回應缺鍵或形狀不符 → raise ValueError（含幣名於訊息），
+        呼叫端負責捕獲後降級與告警。
+        """
+        ...
 
     # --- writes（approve_* 概念上屬主錢包；Phase 1 testnet 由 test harness 簽）---
     @abstractmethod

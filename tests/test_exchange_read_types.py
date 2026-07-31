@@ -56,7 +56,7 @@ def test_user_fill_frozen_decimal():
 def test_abc_has_read_methods_and_still_no_withdraw():
     for m in ("get_open_orders", "get_positions", "get_account_state",
               "get_equity_view", "get_user_fills", "get_all_mids",
-              "get_size_decimals"):
+              "get_size_decimals", "get_active_asset_leverage"):
         assert getattr(ExchangeAdapter, m).__isabstractmethod__
     assert not hasattr(ExchangeAdapter, "withdraw")
     assert not hasattr(ExchangeAdapter, "transfer")
@@ -156,3 +156,28 @@ def test_fake_adapter_ledger_flows_returns_injected_value():
     assert flows == [lf1, lf2]
     assert unknown == ["accountTransfer"]
     assert fa.calls["get_ledger_flows"] == [{"address": "0xuser", "start_ms": 1000}]
+
+
+# --- get_active_asset_leverage 讀側 ---
+
+def test_fake_adapter_active_asset_leverage_returns_injected_value_and_records_call():
+    """FakeAdapter 注入 {coin: (leverage, is_cross)} 後回傳該 coin 的槓桿。"""
+    fa = FakeAdapter(active_asset_leverage={"ETH": (25, True), "DOGE": (10, False)})
+    lev, is_cross = fa.get_active_asset_leverage("0xuser", "ETH")
+    assert lev == 25
+    assert is_cross is True
+    assert fa.calls["get_active_asset_leverage"] == [{"address": "0xuser", "coin": "ETH"}]
+
+
+def test_fake_adapter_active_asset_leverage_missing_coin_raises():
+    """未注入某 coin → raise ValueError（模擬壞回應）。"""
+    fa = FakeAdapter(active_asset_leverage={"ETH": (25, True)})
+    with pytest.raises(ValueError):
+        fa.get_active_asset_leverage("0xuser", "BTC")
+
+
+def test_fake_adapter_active_asset_leverage_none_raises_on_query():
+    """active_asset_leverage 未注入（None）時、查詢任何 coin 皆 raise ValueError。"""
+    fa = FakeAdapter()
+    with pytest.raises(ValueError):
+        fa.get_active_asset_leverage("0xuser", "ETH")

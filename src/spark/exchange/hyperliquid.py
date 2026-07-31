@@ -330,6 +330,23 @@ class HyperliquidAdapter(ExchangeAdapter):
 
         return flows, sorted(unknown_types)
 
+    def get_active_asset_leverage(self, address: str, coin: str) -> tuple[int, bool]:
+        """查詢帳戶對該幣的槓桿設定（空手幣也查得到）。
+
+        走 HL `activeAssetData` endpoint，回傳該幣的現行槓桿設定。
+        """
+        try:
+            raw = self._info.post("/info", {"type": "activeAssetData",
+                                             "user": address, "coin": coin})
+            lev_obj = raw["leverage"]
+            lev_val = int(lev_obj["value"])
+            is_cross = lev_obj["type"] == "cross"
+            return lev_val, is_cross
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(
+                f"activeAssetData 回應形狀不符（coin={coin}）: {e!r}"
+            )
+
     # --- writes ---
     # 以下 main_signer / agent_signer 參數為介面文件性質；實際簽章者 = 建構時綁定
     # self._exchange 的錢包。onboarding 必須注入 main-bound Exchange 呼叫

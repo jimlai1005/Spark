@@ -14,10 +14,10 @@ from spark.resilience import _is_transient_error
 
 
 class FakeInfo:
-    """七個讀側方法各自需要的假回應；呼叫次數計數供快取/同源測試使用。"""
+    """八個讀側方法各自需要的假回應；呼叫次數計數供快取/同源測試使用。"""
 
     def __init__(self, frontend_orders=None, user_state_resp=None, portfolio_resp=None,
-                 fills=None, mids=None, meta_resp=None, ledger_updates=None):
+                 fills=None, mids=None, meta_resp=None, ledger_updates=None, active_asset_leverage=None):
         self._frontend_orders = frontend_orders if frontend_orders is not None else []
         self._user_state_resp = user_state_resp
         self._portfolio_resp = portfolio_resp if portfolio_resp is not None else []
@@ -25,6 +25,7 @@ class FakeInfo:
         self._mids = mids if mids is not None else {}
         self._meta_resp = meta_resp if meta_resp is not None else {"universe": []}
         self._ledger_updates = ledger_updates if ledger_updates is not None else []
+        self._active_asset_leverage = active_asset_leverage
         self.portfolio_calls = 0
         self.meta_calls = 0
         self.user_fills_by_time_calls = []
@@ -53,6 +54,8 @@ class FakeInfo:
     def post(self, endpoint, body):
         if endpoint == "/info" and body.get("type") == "userNonFundingLedgerUpdates":
             return self._ledger_updates
+        if endpoint == "/info" and body.get("type") == "activeAssetData":
+            return self._active_asset_leverage
         raise NotImplementedError(f"FakeInfo.post({endpoint}, {body})")
 
 
@@ -572,3 +575,41 @@ def test_get_ledger_flows_whitelisted_type_missing_amount_is_flagged_and_skipped
     assert flows[0].usdc == Decimal("50")
     assert "vaultDeposit:missing-amount" in unknown
     assert "vaultWithdraw:missing-amount" in unknown
+
+
+# --- 9. get_active_asset_leverage ---
+
+def test_get_active_asset_leverage_cross_position():
+    """空手幣的 activeAssetData 回傳該帳戶現行槓桿設定（不限持倉）。"""
+    resp = {"leverage": {"type": "cross", "value": 25}}
+    ad = _adapter(active_asset_leverage=resp)
+    lev, is_cross = ad.get_active_asset_leverage("0xuser", "ETH")
+    assert lev == 25
+    assert is_cross is True
+
+
+def test_get_active_asset_leverage_isolated_position():
+    """isolated 槓桿回傳 (value, False)。"""
+    resp = {"leverage": {"type": "isolated", "value": 10}}
+    ad = _adapter(active_asset_leverage=resp)
+    lev, is_cross = ad.get_active_asset_leverage("0xuser", "DOGE")
+    assert lev == 10
+    assert is_cross is False
+
+
+def test_get_active_asset_leverage_missing_leverage_key_raises():
+    """回應缺 leverage 鍵 → raise ValueError（呼叫端負責降級與告警）。"""
+    resp = {}
+    ad = _adapter(active_asset_leverage=resp)
+    with pytest.raises(ValueError) as ei:
+        ad.get_active_asset_leverage("0xuser", "ETH")
+    assert "ETH" in str(ei.value)
+
+
+def test_get_active_asset_leverage_missing_type_or_value_raises():
+    """leverage 物件缺鍵（type 或 value）→ raise ValueError。"""
+    resp = {"leverage": {"type": "cross"}}  # 缺 value
+    ad = _adapter(active_asset_leverage=resp)
+    with pytest.raises(ValueError) as ei:
+        ad.get_active_asset_leverage("0xuser", "BTC")
+    assert "BTC" in str(ei.value)
