@@ -65,9 +65,14 @@ from spark.filet.risk_settings import (RISK_SETTINGS_MAX_AGE_S, RiskSettingsErro
                                        load_risk_settings, verify_risk_settings,
                                        verify_risk_unlock, write_risk_settings,
                                        write_risk_unlock)
+from spark.copytrade.notifier import NullNotifier, TelegramNotifier
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
 from spark.publicapi.store import ApiStore
+# vault advisory 檢查的**單一實作**（2026-07-31 Wave 2）：檢查（run_checks）與資料
+# 抓取（fetch_preflight_data）都 import preflight 腳本的定義，app 端不得重寫任何一項
+# ——恆等式若在兩處各寫一份，漂移的症狀是「腳本說 PASS、准入說 FAIL」而兩邊都自信。
+from scripts.vault_preflight import fetch_preflight_data, run_checks
 
 logger = logging.getLogger(__name__)
 
@@ -337,9 +342,17 @@ def _chain_activity(state) -> tuple[Decimal, int]:
 
 
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
-               billing=None) -> FastAPI:
+               billing=None, notifier=None) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
+
+    # 營運告警通道（vault 准入 advisory FAIL 用；CLAUDE.md：通知一律走 Notifier 注入）。
+    # 未注入 → 由 cfg 建預設：TG 兩鍵齊 → TelegramNotifier；否則 NullNotifier
+    # （log-only——告警點本就同步 logger.warning，缺 TG 只是少一條外送通道，不得炸）。
+    if notifier is None:
+        notifier = (TelegramNotifier(token=cfg.tg_bot_token, chat_id=cfg.tg_chat_id)
+                    if cfg.tg_bot_token and cfg.tg_chat_id else NullNotifier())
+    app.state.notifier = notifier   # 唯讀 introspection seam（沿 probe_ratelimit_hits）
 
     # 單一邊界（工程原則 5）：HL resilience 重試耗盡後上拋的 transient 例外，
     # 統一轉譯成 502（而非通用 500），供前端判斷「稍後重試」。逐端點不再各自 try/except。
@@ -675,8 +688,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             accepting_new = mine.accepting_new if mine is not None else True
         # (3) 鏈上存在：走既有 HL gateway（唯讀、冪等 → transient 重試與 502 轉譯
         #     自動繼承，工程原則 5），不另開 HTTP 呼叫路徑。
-        account_value, position_count = _chain_activity(hl.clearinghouse_state(addr))
+        state = hl.clearinghouse_state(addr)
+        account_value, position_count = _chain_activity(state)
         exists = account_value > 0 or position_count > 0
+        # (4) vault 自動偵測＋advisory 檢查（2026-07-31 owner 裁決：vault 也要無痛
+        #     低門檻上線）。transient 例外照 _chain_activity 同語意上拋（502）：
+        #     「讀不到鏈」≠「不是 vault」，靜默當 standard 會讓 vault 保護整條缺席。
+        kind, vault_checks = _detect_vault(addr, state)
         # 「鏈上無活動」**不再擋下**自訂位址（2026-07-27 使用者裁決）：leader 可能
         # 宣告即將開始交易，客戶想**提前**完成跟單配置，等 leader 進場後引擎自動
         # 開始跟——不該因為此刻鏈上沒活動就擋下配置。exists 誠實回報（false 時前端
@@ -691,7 +709,49 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 "already_listed": listed is not None,
                 # accepting_new=false（例行下架、enabled=true）→ 放行帶此旗標，
                 # 前端據此畫警示但不擋（撤銷是 enabled，已在上面硬擋掉）。
-                "accepting_new": accepting_new}
+                "accepting_new": accepting_new,
+                # 跨 wave 契約（2026-07-31）：kind＝"standard"｜"vault"；
+                # vault_checks 僅 kind=="vault" 時非 null，failures 只列 FAIL 項。
+                "kind": kind, "vault_checks": vault_checks}
+
+    def _detect_vault(addr: str, state) -> tuple[str, dict | None]:
+        """vaultDetails 驗身＋advisory 六項檢查 → (kind, vault_checks)。
+
+        ⭐ **advisory，不是閘門**（2026-07-31 owner 裁決）：任一 FAIL 都**不擋**
+        用戶——preview 顯示警語、工程判斷交給用戶；同時 notifier.critical＋
+        logger.warning 讓營運人工介入（告警不影響回應）。檢查與資料抓取一律
+        import vault_preflight 的單一實作（見檔頭 import 的同源理由）。
+
+        transient 例外（vault_details／portfolio／ledger 讀取失敗）原樣上拋 → 502
+        （工程原則 2：讀不到 ≠ 不是 vault）；檢查層自身的形狀炸裂（KeyError 等
+        semantic）→ 記一筆 check-error FAIL＋告警，仍不擋用戶——檢查掛掉不等於
+        vault 有問題，但一定要有人看（工程原則 3：不靜默）。
+        """
+        vd = hl.vault_details(addr)
+        if not isinstance(vd, dict) or not vd.get("name"):
+            return "standard", None    # 非 vault（真實 API 回 JSON null → None）
+        try:
+            data = fetch_preflight_data(hl, addr, clearinghouse_state=state,
+                                        vault_details=vd)
+            results = run_checks(data)
+            failures = [{"name": r.name, "detail": r.detail}
+                        for r in results if not r.passed]
+        except (ConnectionError, TimeoutError):
+            raise                      # transient → 上層轉 502（同 _chain_activity）
+        except Exception as e:  # noqa: BLE001 — semantic 形狀炸裂不得擋用戶（advisory）
+            failures = [{"name": "check-error",
+                         "detail": f"檢查執行失敗（{type(e).__name__}: {e}）——"
+                                   f"資料形狀不符 preflight 假設，需人工重跑 preflight"}]
+        if failures:
+            fail_txt = "；".join(f"{f['name']}: {f['detail']}" for f in failures)
+            logger.warning("自訂 vault leader 准入檢查 FAIL leader=%s failures=%s",
+                           addr, fail_txt)
+            notifier.critical(
+                "vault_admission",
+                f"自訂 vault leader 准入檢查 FAIL：{addr}｜{fail_txt}｜"
+                f"advisory 模式未擋下——用戶可能已繼續跟單，請人工核對此 vault",
+                dedup_key=f"vault_admission_fail:{addr}")
+        return "vault", {"passed": not failures, "failures": failures}
 
     @app.get("/api/leaders/preview")
     def leaders_preview(leader_address: str,
@@ -962,7 +1022,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             try:
                 wrote = record_user_leader(cfg.user_leaders_path,
                                            address=verified.leader_address,
-                                           added_by=account_id)
+                                           added_by=account_id,
+                                           kind=custom["kind"])
             except (OSError, ValueError) as e:
                 # ⭐ 安全動作 fail loudly（工程原則 3）：registry 進不去就**不得**
                 # 記錄換 leader——記了，引擎會拿一筆白名單驗不過的意圖每輪告警；

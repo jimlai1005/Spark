@@ -194,8 +194,14 @@ def registry_lock(path: str | Path):
         yield
 
 
-def record_user_leader(path: str | Path, *, address: str, added_by: str) -> bool:
+def record_user_leader(path: str | Path, *, address: str, added_by: str,
+                       kind: str = "standard") -> bool:
     """把一個通過准入檢查的自訂 leader 寫進 registry。**只有 public API 該呼叫**。
+
+    kind（"standard"｜"vault"，2026-07-31 Wave 2）：准入時 vaultDetails 自動偵測的
+    結果。條目落了 kind 之後，既有雙層保護（watcher env 注入＋引擎每輪
+    apply_vault_policy）對 vault leader 自動生效。⚠️ 冪等分支**不回填**既有條目的
+    kind（行為不變）——存量條目的補標是 backfill CLI 的職責，不是重選的副作用。
 
     回傳 True＝已寫入；False＝同位址已存在（**冪等**：跳過，不動既有檔——客戶
     重送同一個 POST 不得產生第二筆，也不得覆寫第一筆的 added_by 稽核欄位）。
@@ -217,6 +223,8 @@ def record_user_leader(path: str | Path, *, address: str, added_by: str) -> bool
     addr = normalize_hex_address("address", address)
     if not isinstance(added_by, str) or not added_by.strip():
         raise ValueError(f"added_by 不得為空: {added_by!r}（稽核欄位，缺了整筆免談）")
+    if kind not in ("standard", "vault"):   # 與 leaders.load_leaders 的枚舉同源
+        raise ValueError(f"kind 須為 'standard' 或 'vault': {kind!r}")
     # 落點目錄（交換目錄）不存在就建（沿 write_leader_change 對同一目錄的慣例）；
     # 建不出來（路徑被檔案佔住、權限）→ OSError 原樣上拋，呼叫端回 5xx。
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -230,7 +238,7 @@ def record_user_leader(path: str | Path, *, address: str, added_by: str) -> bool
                 return False
             existing_raw = json.loads(p.read_text()).get("leaders", [])
         entry = {"address": addr, "name": addr, "description": "",
-                 "enabled": True, "accepting_new": True,
+                 "enabled": True, "accepting_new": True, "kind": kind,
                  "source": USER_SOURCE, "added_by": added_by}
         doc = {"leaders": existing_raw + [entry]}
         fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".user_leaders-",

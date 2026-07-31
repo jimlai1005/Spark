@@ -85,6 +85,15 @@ class FakeHL:
         # 預設「空帳戶」（權益 0、無持倉）＝預覽回 exists=false 的那一側（放行帶警示）。
         self.clearinghouse: dict[str, dict] = {}
         self.clearinghouse_error: dict[str, Exception] = {}
+        # vault 自動偵測用：per-address vaultDetails fixture ＋ 可注入失敗。
+        # ⭐ 預設 **None**——真實 API 對非 vault 位址回 JSON null（_info → None），
+        # 這正是「絕大多數位址不是 vault」的那一側；vault 情境由測試顯式注入。
+        self.vaults: dict[str, dict] = {}
+        self.vault_details_error: dict[str, Exception] = {}
+        # vault advisory 檢查的資料面（同 preflight）：portfolio ＋ ledger fixture。
+        # 預設空（塞什麼回什麼的既有慣例）；只有 vault 位址會被查到這兩份。
+        self.portfolios: dict[str, list] = {}
+        self.ledger_updates: dict[str, list] = {}
         # 預設「塞什麼就回什麼」（多數測試不在意窗口）。收入對帳的窗口正確性測試
         # 需要真的依 [start, end] 過濾——設 True 打開，否則「窗口取錯」在 fake 上
         # 看不出來（正是 opus 對抗審查 Critical 能潛伏的原因）。
@@ -119,6 +128,18 @@ class FakeHL:
             address.lower(),
             {"marginSummary": {"accountValue": "0.0"}, "assetPositions": []})
 
+    def vault_details(self, vault_address: str):
+        err = self.vault_details_error.get(vault_address.lower())
+        if err is not None:
+            raise err
+        return self.vaults.get(vault_address.lower())   # 非 vault → None（真實 API 行為）
+
+    def portfolio(self, address: str) -> list:
+        return self.portfolios.get(address.lower(), [])
+
+    def non_funding_ledger_updates(self, user: str, start_ms: int) -> list:
+        return self.ledger_updates.get(user.lower(), [])
+
     def max_builder_fee(self, user: str, builder: str) -> int:
         return self.max_fees.get((user.lower(), builder.lower()), 0)
 
@@ -126,13 +147,17 @@ class FakeHL:
         return [a.lower() for a in self.agents.get(user.lower(), [])]
 
 
-def make_app(tmp_path, cfg=None, billing=None, now_fn=None):
-    """now_fn 可注入假時鐘（TTL 類測試用）——不給就走 create_app 的預設 time.time。"""
+def make_app(tmp_path, cfg=None, billing=None, now_fn=None, notifier=None):
+    """now_fn 可注入假時鐘（TTL 類測試用）——不給就走 create_app 的預設 time.time。
+    notifier 可注入 RecordingNotifier（vault advisory 告警測試用）——不給就走
+    create_app 的預設（TG 鍵缺席 → NullNotifier，log-only）。"""
     cfg = cfg or make_cfg(tmp_path)
     store = ApiStore(cfg.db_path)
     keysvc, hl = FakeKeysvc(), FakeHL()
     kw = {"billing": billing} if now_fn is None else {"billing": billing,
                                                       "now_fn": now_fn}
+    if notifier is not None:
+        kw["notifier"] = notifier
     return create_app(cfg, store, keysvc, hl, **kw), cfg, store, keysvc, hl
 
 

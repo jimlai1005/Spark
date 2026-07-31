@@ -479,6 +479,88 @@ def test_config_registry_path_lives_in_the_exchange_dir(tmp_path):
     assert Path(cfg.user_leaders_path).parent != Path(cfg.leaders_path).parent
 
 
+# ---------- ⭐ vault 自動偵測：registry 條目寫 kind（2026-07-31 Wave 2） ----------
+# registry 條目多了 kind 之後，既有雙層保護（watcher env 注入＋引擎每輪
+# apply_vault_policy）對 vault leader 自動生效——這裡盯「寫端真的落了 kind」。
+
+_VAULT = "0x" + "f6" * 20
+_T0, _T1 = 1_700_000_000_000, 1_702_000_000_000
+_VAULT_STATE = {"marginSummary": {"accountValue": "1000.0"},
+                "withdrawable": "800.0",
+                "assetPositions": [{"position": {"coin": "ETH", "szi": "1.5"},
+                                    "type": "oneWay"}]}
+_VAULT_DETAILS = {"name": "Test Vault", "leaderFraction": 0.05,
+                  "maxDistributable": "800.0", "followers": [], "isClosed": False}
+_VAULT_PORTFOLIO = [
+    ["month", {"accountValueHistory": [[_T0, "900.0"], [_T1, "1000.0"]],
+               "pnlHistory": [[_T0, "0.0"], [_T1, "50.0"]]}],
+    ["perpMonth", {"accountValueHistory": [[_T0, "900.0"], [_T1, "1000.0"]],
+                   "pnlHistory": [[_T0, "0.0"], [_T1, "50.0"]]}],
+]
+_VAULT_LEDGER = [{"time": _T0 + 1000, "delta": {"type": "deposit", "usdc": "50.0"}}]
+
+
+def _seed_vault(hl, addr=_VAULT, *, details=None):
+    hl.clearinghouse[addr] = _VAULT_STATE
+    hl.vaults[addr] = details if details is not None else _VAULT_DETAILS
+    hl.portfolios[addr] = _VAULT_PORTFOLIO
+    hl.ledger_updates[addr] = _VAULT_LEDGER
+
+
+def test_vault_select_writes_kind_vault_into_the_registry(tmp_path):
+    """⭐ vault 位址（六項全 PASS）select 成功 → registry 條目含 "kind":"vault"
+    （讀檔斷言原文＋load_user_leaders 的 LeaderRef.kind）——引擎的 vault 雙層
+    保護吃的就是這個欄位。"""
+    from pathlib import Path
+    c, cfg, store, hl = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, w)
+    _seed_vault(hl)
+    r = _select_custom(c, hl, w, acct, leader=_VAULT, chain_state="none")
+    assert r.status_code == 200, r.text
+    raw = json.loads(Path(cfg.user_leaders_path).read_text())["leaders"][0]
+    assert raw["kind"] == "vault"
+    (ref,) = load_user_leaders(cfg.user_leaders_path)
+    assert ref.address == _VAULT and ref.kind == "vault"
+
+
+def test_standard_select_writes_kind_standard_into_the_registry(tmp_path):
+    """非 vault 自訂位址 select → registry 條目 "kind":"standard"（欄位必寫，
+    不留缺席讓讀端猜預設）。"""
+    from pathlib import Path
+    c, cfg, store, hl = _make(tmp_path)
+    w = Account.create()
+    acct = _login(c, w)
+    r = _select_custom(c, hl, w, acct)
+    assert r.status_code == 200, r.text
+    raw = json.loads(Path(cfg.user_leaders_path).read_text())["leaders"][0]
+    assert raw["kind"] == "standard"
+
+
+def test_vault_check_failure_does_not_block_select_but_alerts(tmp_path):
+    """⭐ advisory 裁決的承重測試：恆等式 FAIL 的 vault，用戶仍可完成 select
+    （200、registry 落 kind:"vault"、換 leader 記錄照落），notifier 收到 critical
+    且訊息含位址——工程判斷交給用戶，營運靠告警人工介入。"""
+    from spark.copytrade.notifier import RecordingNotifier
+    p = tmp_path / "leaders.json"
+    p.write_text(json.dumps({"leaders": _LEADERS}))
+    cfg = make_cfg(tmp_path, leaders_path=str(p))
+    notifier = RecordingNotifier()
+    app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg, notifier=notifier)
+    c = TestClient(app, base_url="https://testserver")
+    w = Account.create()
+    acct = _login(c, w)
+    _seed_vault(hl, details={**_VAULT_DETAILS, "maxDistributable": "700.0"})
+    r = _select_custom(c, hl, w, acct, leader=_VAULT, chain_state="none")
+    assert r.status_code == 200, r.text
+    (ref,) = load_user_leaders(cfg.user_leaders_path)
+    assert ref.kind == "vault"
+    entries = load_leader_changes(cfg.leader_changes_path)
+    assert len(entries) == 1 and entries[0]["leader_address"] == _VAULT
+    crits = [rec for rec in notifier.records if rec[0] == "critical"]
+    assert crits and _VAULT in crits[0][2]
+
+
 def test_engine_resolves_the_leader_the_api_admitted(tmp_path):
     """⭐ end-to-end：API 准入寫入 registry 的自訂 leader，引擎 resolve_leader
     從**同一個交換目錄**接到 registry 後放行——寫端與讀端真的接上，

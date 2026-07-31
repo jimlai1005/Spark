@@ -295,3 +295,24 @@ def test_key_not_in_config_repr():
                                   FILET_STRIPE_PRICE_ID="price_x"))
     assert "sk_test_secret123" not in repr(cfg)
     assert "whsec_secret456" not in repr(cfg)
+
+
+def test_tg_keys_default_to_empty_strings():
+    """FILET_API_TG_BOT_TOKEN/FILET_API_TG_CHAT_ID 未設 → 空字串（notifier 落到
+    log-only fallback，不擋啟動——營運告警是加值，不是啟動前置條件）。"""
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.tg_bot_token == ""
+    assert cfg.tg_chat_id == ""
+
+
+def test_tg_keys_read_from_env():
+    cfg = ApiConfig.from_env(_env(FILET_API_TG_BOT_TOKEN="123:abc",
+                                  FILET_API_TG_CHAT_ID="-100999"))
+    assert cfg.tg_bot_token == "123:abc"
+    assert cfg.tg_chat_id == "-100999"
+
+
+def test_tg_token_not_in_config_repr():
+    """bot token 是 secret：不進 repr/log（沿 stripe key 的同一遮蔽慣例）。"""
+    cfg = ApiConfig.from_env(_env(FILET_API_TG_BOT_TOKEN="123:secret-token"))
+    assert "secret-token" not in repr(cfg)

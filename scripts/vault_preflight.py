@@ -162,6 +162,32 @@ def run_checks(data: PreflightData) -> list[CheckResult]:
     return out
 
 
+def fetch_preflight_data(gateway, address: str, *, window_days: int = 30,
+                         clearinghouse_state: dict | None = None,
+                         vault_details: dict | None = None) -> PreflightData:
+    """四份 /info 資料 → PreflightData（**唯一**的資料抓取定義；2026-07-31 Wave 2）。
+
+    preflight 腳本（main）與 public API 的准入 advisory 檢查共用本函式——同源原則：
+    檢查（run_checks）與餵給檢查的資料抓取都只有一份實作，app 端不得自行拼資料面。
+    已抓過的 clearinghouse_state／vault_details 可傳入避免重複查詢（app 端准入流程
+    在呼叫前已各查過一次）；未傳入則由本函式經同一 gateway 抓。
+    ledger 查詢窗＝month 窗首點時間戳（檢查 3 的 ΔAV 與淨流量必須同窗——同源）；
+    month 窗缺樣本才回退 now − window_days。transient 例外由 gateway 的 resilience
+    邊界重試、耗盡後原樣上拋（呼叫端自行轉譯：腳本吐 traceback、API 轉 502）。
+    """
+    chs = (clearinghouse_state if clearinghouse_state is not None
+           else gateway.clearinghouse_state(address))
+    vd = vault_details if vault_details is not None else gateway.vault_details(address)
+    pf = gateway.portfolio(address)
+    month = _window(pf, "month")
+    if month and month.get("accountValueHistory"):
+        start_ms = int(month["accountValueHistory"][0][0])
+    else:
+        start_ms = int(time.time() * 1000) - window_days * 86_400_000
+    ledger = gateway.non_funding_ledger_updates(address, start_ms)
+    return PreflightData(chs, vd, pf, ledger)
+
+
 def main(argv=None, gateway=None) -> None:
     """CLI 入口。gateway 可注入（測試離線）；不注入則按 SPARK_NETWORK 建 HLGateway。"""
     ap = argparse.ArgumentParser(
@@ -181,19 +207,9 @@ def main(argv=None, gateway=None) -> None:
             raise SystemExit(f"unknown SPARK_NETWORK: {network!r}")
         gateway = HLGateway(API_URLS[network])
 
-    addr = args.vault_address
-    chs = gateway.clearinghouse_state(addr)
-    vd = gateway.vault_details(addr)
-    pf = gateway.portfolio(addr)
-    # ledger 查詢窗＝month 窗首點時間戳（檢查 3 的 ΔAV 與淨流量必須同窗——同源）。
-    month = _window(pf, "month")
-    if month and month.get("accountValueHistory"):
-        start_ms = int(month["accountValueHistory"][0][0])
-    else:
-        start_ms = int(time.time() * 1000) - args.window_days * 86_400_000
-    ledger = gateway.non_funding_ledger_updates(addr, start_ms)
-
-    results = run_checks(PreflightData(chs, vd, pf, ledger))
+    data = fetch_preflight_data(gateway, args.vault_address,
+                                window_days=args.window_days)
+    results = run_checks(data)
     for r in results:
         print(f"{'PASS' if r.passed else 'FAIL'} {r.name} — {r.detail}")
     raise SystemExit(0 if all(r.passed for r in results) else 1)

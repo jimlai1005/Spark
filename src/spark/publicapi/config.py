@@ -107,6 +107,12 @@ class ApiConfig:
     # 它只是顯示用字串，缺了不影響任何金流路徑（plan_catalog 回 price_display=None，
     # 前端顯示「價格待定」）。價格數字使用者尚未拍板 → 走設定不寫死在程式碼。
     stripe_price_display: str | None = None
+    # --- 營運告警（自訂 vault 准入 advisory FAIL → TG critical；2026-07-31 Wave 2）---
+    # 兩鍵齊 → create_app 建 TelegramNotifier；任一缺 → NullNotifier（log-only）。
+    # 刻意**不必填**：告警是加值不是啟動前置條件，缺鍵不得擋 API 啟動。
+    # token 是 secret → repr=False（沿 stripe key 的遮蔽慣例；紅線 2）。
+    tg_bot_token: str = field(default="", repr=False)
+    tg_chat_id: str = ""
 
     def __post_init__(self):
         if self.stripe_secret_key is not None and \
@@ -277,4 +283,6 @@ class ApiConfig:
                    stripe_price_id=stripe_env["FILET_STRIPE_PRICE_ID"],
                    # 獨立讀取（不進 stripe_env）：納入 stripe_env 會被上面的
                    # 「三個一起設」檢查算成第四個成員，讓純顯示字串能擋下啟動
-                   stripe_price_display=env.get("FILET_STRIPE_PRICE_DISPLAY") or None)
+                   stripe_price_display=env.get("FILET_STRIPE_PRICE_DISPLAY") or None,
+                   tg_bot_token=env.get("FILET_API_TG_BOT_TOKEN", ""),
+                   tg_chat_id=env.get("FILET_API_TG_CHAT_ID", ""))
