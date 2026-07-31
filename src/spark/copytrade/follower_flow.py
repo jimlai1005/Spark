@@ -24,6 +24,7 @@ from pathlib import Path
 
 from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, SAMPLES_RELPATH, _load, _save
 from spark.copytrade.notifier import Notifier
+from spark.exchange.base import LedgerFlow
 
 STATE_RELPATH = Path("var/copytrade/follower_flow.json")
 
@@ -72,8 +73,19 @@ def save_marker(root: Path, last_processed_ms: int) -> bool:
         return False
 
 
-def _shift_samples(root: Path, net: Decimal) -> None:
-    """滾動樣本檔全部 value `+net`（時間戳不動；讀-改-寫，_save 原子）。
+def _shift_samples(root: Path, flows: list[LedgerFlow]) -> None:
+    """ts-aware 平移：每筆樣本只吸收**晚於它**的流量（時間戳不動；讀-改-寫，_save 原子）。
+
+    每筆樣本的平移量 = Σ{flow.usdc : flow.time_ms > 樣本 ts×1000}——早於流量的
+    樣本尚未含該流量，要平移；晚於流量的樣本（例如 breach 二次確認時，檔內已有
+    步驟 2 寫下的「流量之後」樣本）**已經含流量，不得再平移**（2026-08-01 第三批
+    審查 F2：全檔平移會把它再平移一次、永久偏離真值 net）。
+
+    單位換算只在此一處做清楚：樣本 ts 是**秒**（float，本機時鐘）、流量 time_ms
+    是**毫秒**（交易所時鐘）；比較前把樣本 ts 轉 ms，兩邊同單位再比。
+    跨源比較的已知極限（誠實標註）：本機與交易所時鐘的 NTP 偏移可能讓「恰落在
+    流量時點附近」的邊界樣本被誤分類；影響上限＝單筆樣本的平移量，且樣本隨
+    7 天窗輪替自癒，方向不偏（可偏嚴也可偏鬆一筆樣本），可接受。
 
     檔案缺失／壞檔（_load 回空）＝無基準可校 → 跳過；之後的樣本由校正後的
     current 重建，天然一致。
@@ -82,11 +94,21 @@ def _shift_samples(root: Path, net: Decimal) -> None:
     samples = _load(path)
     if not samples:
         return
-    _save(path, [(ts, str(Decimal(v) + net)) for ts, v in samples])
+    shifted: list[tuple[float, str]] = []
+    for ts, v in samples:
+        ts_ms = ts * 1000.0
+        shift = sum((f.usdc for f in flows if f.time_ms > ts_ms), Decimal("0"))
+        shifted.append((ts, str(Decimal(v) + shift)))
+    _save(path, shifted)
 
 
 def _shift_lifetime_peak(root: Path, net: Decimal) -> None:
     """lifetime peak `+net` 後 floor 於 0（原子寫，同 update_lifetime_peak 格式）。
+
+    ⭐ 與 _shift_samples 的 ts-aware 不同，peak **維持收 full net**：peak 是單一
+    數值、無時間戳，無從按 ts 分段。已接受的過度保守小邊角：入金恰好在縫隙裡
+    創出新高時，peak 會被 full net 推高一點點（dd 偏嚴＝fail-safe 方向），
+    窗口輪替與下一輪 update_lifetime_peak 自然收斂。
 
     檔案缺失＝尚無高水位 → 跳過（下一輪 update_lifetime_peak 會以校正後的
     current 重建）。floor 0 的語意：出金超過歷史高點時，「絕對底線」已無參考
@@ -168,7 +190,7 @@ def apply_follower_flows(root: Path, adapter, address: str, notifier: Notifier,
         return
 
     try:
-        _shift_samples(root, net)
+        _shift_samples(root, fresh)   # ts-aware：每筆樣本只吸收晚於它的流量
     except OSError as e:
         # 與 _shift_lifetime_peak 的 OSError 語意對稱：標記已推進 → 本批整批跳過
         # ＝漏校正（出金被誤判成虧損，今天的 fail-safe 行為），絕不讓例外穿出

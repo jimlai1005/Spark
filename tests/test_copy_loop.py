@@ -508,16 +508,24 @@ def _follower_flow_adapter(flows, *, value="900"):
 
 def test_follower_flow_correction_corrects_baseline_in_cycle(tmp_path, monkeypatch):
     """run_cycle 接線：出金 300 → 樣本與 lifetime peak 皆平移 -300，
-    perp_equity_view 於**校正後**追加 current 樣本 → 出金不被誤判為回撤。"""
+    perp_equity_view 於**校正後**追加 current 樣本 → 出金不被誤判為回撤。
+
+    2026-08-01 起 _shift_samples 是 ts-aware 的（第三批審查 F2）：流量時間戳
+    必須**晚於**既有樣本才會平移它們（真實時序——樣本是前幾輪寫的、流量是本輪
+    縫隙才發生的）。故本組改釘**真實 now**，不用 _FLOW_NOW_S（那會讓流量比
+    真實時間戳的樣本早一年、一筆都平移不到）。"""
+    import time as _time
+
     from spark.exchange.base import LedgerFlow
-    last_ms = _FLOW_NOW_MS - 60_000
+    now_s = int(_time.time())
+    last_ms = now_s * 1000 - 60_000
     _seed_follower_flow_state(          # 先播種再釘時鐘：helper 的樣本戳要真實時間
         tmp_path, last_ms=last_ms,
         samples=[(600, "1000"), (300, "1200")],
         peak="1200")
-    _pin_clock(monkeypatch)
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(now_s))
     fa = _follower_flow_adapter(
-        [LedgerFlow(time_ms=_FLOW_NOW_MS - 30_000, usdc=Decimal("-300"))])
+        [LedgerFlow(time_ms=now_s * 1000 - 30_000, usdc=Decimal("-300"))])
     report, notifier, _ = _run(fa, tmp_path=tmp_path)
 
     assert report.tripped is False
@@ -532,15 +540,19 @@ def test_follower_flow_correction_corrects_baseline_in_cycle(tmp_path, monkeypat
 def test_follower_flow_correction_runs_even_with_risk_controls_disabled(
         tmp_path, monkeypatch):
     """risk_controls_enabled=False 仍校正——與「樣本照常累積」同一理由：
-    客戶哪天開啟風控，基準必須已經是對的。"""
+    客戶哪天開啟風控，基準必須已經是對的。
+    （時鐘釘真實 now：ts-aware 平移的時序要求，同上一個測試的 docstring。）"""
+    import time as _time
+
     from spark.exchange.base import LedgerFlow
+    now_s = int(_time.time())
     _seed_follower_flow_state(          # 先播種再釘時鐘（同上）
-        tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
+        tmp_path, last_ms=now_s * 1000 - 60_000,
         samples=[(600, "1000"), (300, "1200")],
         peak="1200")
-    _pin_clock(monkeypatch)
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(now_s))
     fa = _follower_flow_adapter(
-        [LedgerFlow(time_ms=_FLOW_NOW_MS - 30_000, usdc=Decimal("-300"))])
+        [LedgerFlow(time_ms=now_s * 1000 - 30_000, usdc=Decimal("-300"))])
     report, _, _ = _run(fa, settings=_settings(risk_controls_enabled=False),
                         tmp_path=tmp_path)
 
@@ -593,18 +605,29 @@ def _ticking_clock(monkeypatch, start_s=_FLOW_NOW_S, step_s=1.0):
 class _TwoPhaseLedgerAdapter(FakeAdapter):
     """get_ledger_flows 序列回覆（fakes.py 不支援 side-effect 序列，依計畫在測試
     subclass）：第一次回空（步驟 1.5 查無流量），之後回吐指定 net 的單筆流量，
-    時間戳＝start_ms（＝marker+1，必落在 (last, now_ms] 窗內，不依賴時鐘細節）。"""
+    時間戳＝reveal_time_ms。2026-08-01 起 _shift_samples 是 ts-aware 的，流量
+    時間戳必須落在「歷史樣本之後、步驟 2 追加的樣本之前」（縫隙的真實時序）——
+    測試用 `int((time.time() - 100) * 1000)`（於上假時鐘**之前**取真實時間，
+    介於 helper 播種的 -600s/-300s 歷史樣本與 step-2 append 的 now 之間），
+    同時仍 > 步驟 1.5 寫下的標記（釘死時鐘的 _FLOW_NOW_MS 遠小於真實時間）。"""
 
-    def __init__(self, *a, reveal_usdc, **kw):
+    def __init__(self, *a, reveal_usdc, reveal_time_ms, **kw):
         super().__init__(*a, **kw)
         self._reveal_usdc = reveal_usdc
+        self._reveal_time_ms = reveal_time_ms
 
     def get_ledger_flows(self, address, start_ms):
         from spark.exchange.base import LedgerFlow
         self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
         if len(self.calls["get_ledger_flows"]) == 1:
             return [], []
-        return [LedgerFlow(time_ms=start_ms, usdc=self._reveal_usdc)], []
+        return [LedgerFlow(time_ms=self._reveal_time_ms, usdc=self._reveal_usdc)], []
+
+
+def _gap_flow_ms() -> int:
+    """縫隙流量的時間戳：真實 now − 100s（呼叫時機必須在上假時鐘之前）。"""
+    import time
+    return int((time.time() - 100) * 1000)
 
 
 class _RecheckBoomAdapter(FakeAdapter):
@@ -626,31 +649,38 @@ def _trip_recorder(monkeypatch):
 
 
 def test_breach_recheck_averts_phantom_drawdown_from_withdrawal(tmp_path, monkeypatch):
-    """幻影攔截：步驟 1.5 查無流量、AV 已扣掉出金 300（peak 1000 → current 700，
-    dd=0.3 假破線）→ 二次確認吐出該筆出金 → 基準校正 → 不 trip、無 dd_breach
-    critical、收 averted warn、本輪照常續行。"""
+    """幻影攔截（既有錨例，攔截語意不變）：步驟 1.5 查無流量、AV 已扣掉出金 300
+    （peak 1000 → current 700，dd=0.3 假破線）→ 二次確認吐出該筆出金 → 基準校正
+    → 不 trip、無 dd_breach critical、收 averted warn、本輪照常續行。
+
+    2026-08-01 F1/F2 修法後的檔面差異（語意不變、機制修正）：
+    - step-2 追加的樣本（700）已含出金，**不再**被平移——舊斷言裡的 "400"
+      正是 F2 雙重平移值；
+    - 重判改走 recompute_view，不再 append 第四筆樣本（F1 修法）。"""
     _seed_follower_flow_state(          # 先播種再上假時鐘（helper 樣本戳要真實時間）
         tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
         samples=[(600, "1000"), (300, "1000")],
         peak="1000")
+    reveal_ms = _gap_flow_ms()          # 真實時間，必須在上假時鐘之前取
     _ticking_clock(monkeypatch)
     trips = _trip_recorder(monkeypatch)
     fa = _TwoPhaseLedgerAdapter(account_value="700", equity=_healthy_equity(),
                                 account=_account("700"),
-                                reveal_usdc=Decimal("-300"))
+                                reveal_usdc=Decimal("-300"),
+                                reveal_time_ms=reveal_ms)
     report, notifier, _ = _run(fa, tmp_path=tmp_path)
 
     assert trips == [], "假破線經二次校正後不得 trip"
     assert report.tripped is False
     assert not any(r[0] == "critical" and r[3] == "dd_breach"
-                   for r in notifier.records), "false alarm 連 critical 都要攔"
+                   for r in notifier.records), "false alarm 的 dd_breach critical 要攔"
     warns = [r for r in notifier.records if r[0] == "warn"]
     assert any(r[3] == "dd_breach_averted" for r in warns)
     assert len(fa.calls["get_ledger_flows"]) == 2  # 步驟 1.5 ＋ 二次確認各一次
-    # 樣本/peak 檔已校正：既有樣本與步驟 2 追加的 current 皆平移 -300，
-    # 二次確認的 perp_equity_view 再追加校正後 current（已接受的副作用）。
+    # 樣本/peak 檔已校正：歷史樣本（早於流量）平移 -300；step-2 樣本（晚於流量、
+    # 已含出金）不動；重判不 append。
     vals, peak = _follower_flow_files(tmp_path)
-    assert vals == ["700", "700", "400", "700"]
+    assert vals == ["700", "700", "700"]
     assert peak == "700"
     assert fa.calls["get_open_orders"], "averted 後本輪必須照常續行（掛單同步照跑）"
 
@@ -723,16 +753,19 @@ def test_breach_recheck_averts_phantom_lifetime_breach(tmp_path, monkeypatch):
     縫隙出金 160 → AV 700 → rolling dd=160/860≈0.186 未破、total dd=600/1300
     ≈0.4615 破 0.40 假破線 → 二次確認校正（peak→1140、total dd≈0.386）→ 攔截。
     告警面殘留：evaluate 內建的 equity_total_drawdown critical 在一次判定時已發出，
-    二次確認救不回（不在本任務範圍）；它不觸發任何動作且吃 TTL 去重，可接受。"""
+    二次確認救不回（不在本任務範圍）；它不觸發任何動作且吃 TTL 去重，可接受。
+    檔面斷言同 phantom 錨例的 2026-08-01 修正：step-2 樣本不平移、重判不 append。"""
     _seed_follower_flow_state(
         tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
         samples=[(600, "860"), (300, "860")],
         peak="1300")
+    reveal_ms = _gap_flow_ms()
     _ticking_clock(monkeypatch)
     trips = _trip_recorder(monkeypatch)
     fa = _TwoPhaseLedgerAdapter(account_value="700", equity=_healthy_equity(),
                                 account=_account("700"),
-                                reveal_usdc=Decimal("-160"))
+                                reveal_usdc=Decimal("-160"),
+                                reveal_time_ms=reveal_ms)
     report, notifier, _ = _run(fa, tmp_path=tmp_path)
 
     assert trips == [], "lifetime 假破線經二次校正後不得 trip"
@@ -745,8 +778,101 @@ def test_breach_recheck_averts_phantom_lifetime_breach(tmp_path, monkeypatch):
     assert any(r[0] == "warn" and r[3] == "dd_breach_averted"
                for r in notifier.records)
     vals, peak = _follower_flow_files(tmp_path)
-    assert vals == ["700", "700", "540", "700"]
+    assert vals == ["700", "700", "700"]
     assert peak == "1140"
+
+
+def test_breach_recheck_deposit_in_gap_must_not_wash_out_real_breach(
+        tmp_path, monkeypatch):
+    """⭐ 第三批審查 F1（fail-open）迴歸：樣本檔只有 **1 筆歷史**（trip 後 reset
+    重建的頭幾輪——正是二次回撤最可能的時候）＋縫隙**入金** 100、真虧損
+    current=700 → 校正後 peak=1100、dd=400/1100≈36.4% 仍破線 → **trip 必須
+    被呼叫**。
+
+    修復前的 fail-open 機轉：重判走 perp_equity_view 再 append 一筆 current，
+    樣本數 2→3 跨過 _WICK_GUARD_MIN_SAMPLES，peak 從最高值降級成次高值 →
+    真破線被 averted 洗掉。"""
+    _seed_follower_flow_state(
+        tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
+        samples=[(600, "1000")], peak="1000")
+    reveal_ms = _gap_flow_ms()
+    _ticking_clock(monkeypatch)
+    trips = _trip_recorder(monkeypatch)
+    fa = _TwoPhaseLedgerAdapter(account_value="700", equity=_healthy_equity(),
+                                account=_account("700"),
+                                reveal_usdc=Decimal("100"),
+                                reveal_time_ms=reveal_ms)
+    report, notifier, _ = _run(fa, tmp_path=tmp_path)
+
+    assert len(trips) == 1, "真破線不得被重判的 +1 樣本洗掉（F1 fail-open）"
+    status, reason = trips[0]
+    assert status.breached is True and reason == "drawdown"
+    assert status.peak == Decimal("1100")  # 歷史樣本 1000 平移 +100
+    assert status.drawdown_pct == Decimal("400") / Decimal("1100")  # ≈36.4%
+    assert report.tripped is True
+    assert any(r[0] == "critical" and r[3] == "dd_breach" for r in notifier.records)
+    assert not any(r[3] == "dd_breach_averted" for r in notifier.records)
+    vals, _pk = _follower_flow_files(tmp_path)
+    assert vals == ["1100", "700"]  # hist 平移 +100；step-2 樣本不動；重判不 append
+
+
+def test_breach_recheck_withdrawal_plus_real_loss_no_double_shift(
+        tmp_path, monkeypatch):
+    """⭐ F1/F2 迴歸：1 筆歷史 [1000]、縫隙**出金** 100、current=700（出金之外
+    另有真虧損）→ hist 平移至 900、step-2 樣本（已含出金）**不動**（F2：全檔
+    平移會把它再平移一次、永久偏離真值）→ dd=200/900≈22.2% 破線 → trip 照常。
+
+    修復前：全檔平移成 [900, 600]＋重判 append 700 → 3 樣本 wick-guard 取
+    次高 700 → dd=0 → averted（fail-open）。"""
+    _seed_follower_flow_state(
+        tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
+        samples=[(600, "1000")], peak="1000")
+    reveal_ms = _gap_flow_ms()
+    _ticking_clock(monkeypatch)
+    trips = _trip_recorder(monkeypatch)
+    fa = _TwoPhaseLedgerAdapter(account_value="700", equity=_healthy_equity(),
+                                account=_account("700"),
+                                reveal_usdc=Decimal("-100"),
+                                reveal_time_ms=reveal_ms)
+    report, notifier, _ = _run(fa, tmp_path=tmp_path)
+
+    assert len(trips) == 1, "出金校正後仍破線的真虧損必須 trip"
+    status, reason = trips[0]
+    assert status.breached is True and reason == "drawdown"
+    assert status.peak == Decimal("900")
+    assert status.drawdown_pct == Decimal("200") / Decimal("900")  # ≈22.2%
+    assert report.tripped is True
+    vals, peak = _follower_flow_files(tmp_path)
+    assert vals == ["900", "700"], "出現 600/800 之類的值＝雙重平移（F2）"
+    assert peak == "900"
+
+
+def test_breach_recheck_internal_error_fails_closed_with_warn(tmp_path, monkeypatch):
+    """O4：二次確認內部炸掉（recompute_view 拋例外）→ warn（dedup）＋**沿用原
+    status 照常進 trip 路徑**（fail-closed）——IO 例外不得在 critical/trip 之前
+    炸掉本輪（炸掉＝本輪不 trip、破線期間多跑一輪交易）。"""
+    _seed_follower_flow_state(
+        tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
+        samples=[(600, "1000"), (300, "1000")], peak="1000")
+    reveal_ms = _gap_flow_ms()
+    _ticking_clock(monkeypatch)
+    trips = _trip_recorder(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("recompute boom")
+
+    monkeypatch.setattr(loop_mod, "recompute_view", _boom)
+    fa = _TwoPhaseLedgerAdapter(account_value="700", equity=_healthy_equity(),
+                                account=_account("700"),
+                                reveal_usdc=Decimal("-300"),
+                                reveal_time_ms=reveal_ms)
+    report, notifier, _ = _run(fa, tmp_path=tmp_path)
+
+    assert report.tripped is True
+    assert len(trips) == 1
+    assert trips[0][0].drawdown_pct == Decimal("0.3")  # 沿用一次判定的原 status
+    assert any(r[0] == "warn" and r[3] == "dd_recheck_failed"
+               for r in notifier.records)
 
 
 # ── 4. skip_trigger → warn（per-coin dedup）──────────────────────────

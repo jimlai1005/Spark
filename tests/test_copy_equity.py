@@ -273,3 +273,51 @@ def test_wick_guard_active_at_threshold(tmp_path: Path):
         ts += 60
     ev = perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda t=ts: t)
     assert ev.recent_peak == Decimal("1000"), "3 筆以上時插針必須被排除"
+
+
+# ── recompute_view（2026-08-01 第三批審查 F1 修法：breach 二次確認重判專用）──
+def test_recompute_view_does_not_append_and_keeps_true_peak(tmp_path: Path):
+    """F1 機制單元級：檔內 [1000, 700]（1 筆歷史＋step-2 current）、重判 current=700
+    → recompute 不 append，樣本數維持 2（< wick-guard 門檻）→ peak 維持最高值
+    1000。對照：perp_equity_view 會 append 湊滿 3 筆、peak 降級成次高值 700。"""
+    import json
+
+    from spark.copytrade.equity import SAMPLES_RELPATH, recompute_view
+
+    perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda: 1000.0)
+    perp_equity_view(_FakeAdapter("700"), "0xabc", tmp_path, now_fn=lambda: 2000.0)
+    rv = recompute_view(tmp_path, Decimal("700"), now_fn=lambda: 3000.0)
+    assert rv.current == Decimal("700")
+    assert rv.recent_peak == Decimal("1000"), "重判不得因樣本 +1 讓 wick-guard 洗掉真 peak"
+    assert len(json.loads((tmp_path / SAMPLES_RELPATH).read_text())) == 2, "不 append"
+    # 對照組（見 docstring）：perp_equity_view 對同一檔案會把 peak 降級成 700
+    pv = perp_equity_view(_FakeAdapter("700"), "0xabc", tmp_path,
+                          now_fn=lambda: 3000.0, persist=False)
+    assert pv.recent_peak == Decimal("700")
+
+
+def test_recompute_view_matches_perp_view_when_samples_sufficient(tmp_path: Path):
+    """等價性：樣本 >= 3 筆時，recompute_view 與 perp_equity_view（same 檔案＋
+    same current）的 peak 一致——兩者共用同一段窗過濾＋wick-guard 實作。"""
+    from spark.copytrade.equity import recompute_view
+
+    ts = 1000.0
+    for v in ("1000", "1400", "1000"):  # 中間那筆是插針
+        perp_equity_view(_FakeAdapter(v), "0xabc", tmp_path, now_fn=lambda t=ts: t)
+        ts += 60
+    for cur in ("800", "1200", "1500"):  # 低於次高／介於／創新高
+        rv = recompute_view(tmp_path, Decimal(cur), now_fn=lambda t=ts: t)
+        pv = perp_equity_view(_FakeAdapter(cur), "0xabc", tmp_path,
+                              now_fn=lambda t=ts: t, persist=False)
+        assert rv.recent_peak == pv.recent_peak, f"current={cur} 時兩視圖 peak 不一致"
+        assert rv.current == pv.current == Decimal(cur)
+
+
+def test_recompute_view_applies_same_window_filter(tmp_path: Path):
+    """出窗樣本同樣被過濾（與 perp_equity_view 同一段窗過濾）。"""
+    from spark.copytrade.equity import WINDOW_S, recompute_view
+
+    perp_equity_view(_FakeAdapter("1000"), "0xabc", tmp_path, now_fn=lambda: 0.0)
+    rv = recompute_view(tmp_path, Decimal("600"),
+                        now_fn=lambda: float(WINDOW_S + 200))
+    assert rv.recent_peak == Decimal("600"), "窗外舊高點 1000 不得進 peak"

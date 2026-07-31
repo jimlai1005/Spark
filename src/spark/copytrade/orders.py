@@ -427,6 +427,17 @@ def _set_entry_leverage(
                 dedup_key=f"lev_fallback_fail:{desired.coin}",
             )
             return
+        # O2（2026-08-01 第三批審查）：fallback 回傳驗證——lev <= 0 是壞值，
+        # 視同查詢失敗（warn＋跳過），不得送進 update_leverage：dry 模式的
+        # 同值快取會把壞值記成「已設定」，之後連真值都不再送（靜默卡死）。
+        if pair[0] <= 0:
+            notifier.warn(
+                "orders",
+                f"leader 槓桿查詢回傳壞值 {desired.coin}（leverage={pair[0]}），"
+                f"視同查詢失敗、該幣本輪不設槓桿",
+                dedup_key=f"lev_fallback_fail:{desired.coin}",
+            )
+            return
     leverage, is_cross = pair
     ok = ex.update_leverage(desired.coin, leverage, is_cross)
     if not ok:

@@ -25,8 +25,9 @@ from typing import Callable
 
 from spark.copytrade.config import CopySettings
 from spark.copytrade.costbreaker import evaluate_cost
-from spark.copytrade.equity import (SAMPLES_RELPATH, perp_equity_view,
-                                    sample_coverage, update_lifetime_peak)
+from spark.copytrade.equity import (SAMPLES_RELPATH, _load, perp_equity_view,
+                                    recompute_view, sample_coverage,
+                                    update_lifetime_peak)
 from spark.copytrade.follower_flow import apply_follower_flows
 from spark.copytrade.killswitch import (REASON_COST_BREACH, REASON_ROLLING_DRAWDOWN,
                                         REASON_TOTAL_DRAWDOWN, DrawdownStatus,
@@ -135,59 +136,78 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     else:
         cov = sample_coverage(root)
         status = evaluate(ev, settings, notifier, coverage=cov, lifetime_peak=lifetime)
-        # ── 2.1 破線二次確認（2026-07-31 Wave 3：關掉單輪幻影回撤窗口）──────
+        # ── 2.1 破線二次確認（2026-07-31 Wave 3；2026-08-01 第三批審查 F1/F2/O4 修正）
         # 出金若恰落在步驟 1.5 校正之後、上面取樣之前的縫隙，本輪是拿**未校正
         # 基準**在判回撤（幻影破線；total_drawdown 一旦 trip 還要客戶簽章解鎖）。
-        # 修法：判定破線後、下面的 critical 與 flatten **之前**（false alarm 連
-        # critical 都要攔），重呼一次校正＋重判——縫隙裡的流量落在 1.5 寫下的
-        # 標記之後，重呼看得到；exactly-once 由標記天然保證（1.5 已套用過的
-        # 流量不會被再套一次）。
+        # 修法：判定破線後、下面的 dd_breach critical 與 flatten **之前**，重呼
+        # 一次校正＋重判——縫隙裡的流量落在 1.5 寫下的標記之後，重呼看得到；
+        # exactly-once 由標記天然保證（1.5 已套用過的流量不會被再套一次）。
         #
-        # ⭐ fail-closed 方向：二次確認的任何失敗都不得阻止 trip——
+        # ⭐ 已知殘留（F3，誠實標註）：本區塊攔得住的是 dd_breach critical 與
+        # trip/flatten。evaluate 內建的 equity_total_drawdown critical 在上面
+        # 一次判定時**已經發出**，幻影情境下救不回——它吃 TTL 去重、不觸發任何
+        # 動作，可接受；要攔它需把該告警搬進 killswitch 的動作路徑，另案。
+        #
+        # ⭐ fail-closed 方向（O4）：二次確認的任何失敗都不得阻止 trip——
         #   - 取數失敗被 apply_follower_flows 內部吞成 warn → 標記與基準皆不動
         #     → 下面的門檻（樣本檔無變化）不成立 → 維持原判、照常 trip；
-        #   - 重算／重判若拋例外，這裡刻意**不另捕**：上拋給 main_loop 計連續
-        #     錯誤（本輪零交易動作，下輪以校正後基準重判仍會破線），絕不吞成
-        #     「當作沒破線」繼續交易。
+        #   - 重算／重判拋例外 → 外層 except 收束成 warn（dedup）＋**沿用原
+        #     status 照常進 trip 路徑**。IO 例外不得在 critical/trip 之前炸掉
+        #     本輪（炸掉＝本輪不 trip、破線期間多跑一輪交易，方向 fail-open）。
         #
-        # ⭐ 只有校正**真的落地**（樣本檔內容改變）才重判。無流量時重判不是
-        # 無害的重算：perp_equity_view 每呼叫必 append 一筆 current（低點），
-        # 樣本數 2→3 會讓 wick-guard（次高值）生效、把單樣本的真 peak 降級成
-        # wick → dd 歸零 → **真虧損被洗掉**（fail-open，實測會翻掉既有
-        # test_breach_with_flatten_calls_trip）。樣本檔是正確的門檻訊號：
+        # ⭐ 重判不重取樣（F1）：重判走 recompute_view（不重讀 AV、不 append）。
+        # perp_equity_view 每呼叫必 append 一筆 current（低點），樣本檔只有
+        # 1 筆歷史時（trip 後 reset 重建的頭幾輪——正是二次回撤最可能的時候），
+        # 重判那筆會讓樣本數跨過 wick-guard 門檻、peak 從最高值降級成次高值，
+        # **真**破線被洗掉（fail-open）。
+        #
+        # ⭐ recheck 窗上界＝樣本檔最新一筆的 ts（＝步驟 2 AV 快照當下），不是
+        # fresh time：晚於 AV 快照的流量尚未反映在 current 裡，本輪套了會拿
+        # 「已含流量的基準」對「未含流量的 current」混判——留給下一輪 step 1.5
+        # （current 與基準的因果一致；marker 的 max clamp 已保證不倒退）。
+        #
+        # 只有校正**真的落地**（樣本檔內容改變）才重判；樣本檔是正確的門檻訊號：
         # apply 內 _shift_samples 先於 _shift_lifetime_peak 且失敗即中止，
         # 而 breach 當輪樣本檔必非空（步驟 2 剛 persist 過 current）。
-        #
-        # 已接受的副作用（頻率＝breach 事件，非每輪）：多一次 get_ledger_flows；
-        # 真有校正時再多一筆低點樣本＋一次 get_account_value——低點樣本不影響
-        # wick-guard 的高點邏輯（上面的門檻擋掉了唯一的例外情境）。
+        # 已接受的副作用（頻率＝breach 事件，非每輪）：多一次 get_ledger_flows。
         if status.breached and settings.follower_flow_correction_enabled:
-            samples_path = root / SAMPLES_RELPATH
-            before = samples_path.read_bytes() if samples_path.exists() else None
-            # 時間源與步驟 1.5 同慣例（time.time）、fresh now_ms：縫隙流量的
-            # 時間戳 > 1.5 的標記，必落在新窗 (last, now_ms] 內。
-            apply_follower_flows(root, adapter, ex.my_address, notifier,
-                                 now_ms=int(time.time() * 1000))
-            after = samples_path.read_bytes() if samples_path.exists() else None
-            if after != before:
-                ev = perp_equity_view(adapter, ex.my_address, root)
-                lifetime = update_lifetime_peak(root, ev.current)
-                cov = sample_coverage(root)
-                status2 = evaluate(ev, settings, notifier, coverage=cov,
-                                   lifetime_peak=lifetime)
-                if status2.breached:
-                    # 校正後仍破線＝真虧損（或校正不足以翻案）：用校正後的較準
-                    # 數字進既有路徑（critical 的數字、trip 的 ARM payload）。
-                    status = status2
-                else:
-                    notifier.warn(
-                        "killswitch",
-                        f"回撤破線經二次校正判定為出入金造成"
-                        f"（校正後 current={status2.current} peak={status2.peak} "
-                        f"dd={status2.drawdown_pct}），本輪不觸發熔斷",
-                        dedup_key="dd_breach_averted",
-                    )
-                    status = status2  # not breached → 不進下方 breach 分支，本輪續行
+            try:
+                samples_path = root / SAMPLES_RELPATH
+                samples = _load(samples_path)
+                if samples:
+                    before = samples_path.read_bytes()
+                    recheck_now_ms = int(max(ts for ts, _ in samples) * 1000)
+                    apply_follower_flows(root, adapter, ex.my_address, notifier,
+                                         now_ms=recheck_now_ms)
+                    after = (samples_path.read_bytes()
+                             if samples_path.exists() else None)
+                    if after != before:
+                        ev = recompute_view(root, ev.current)
+                        lifetime = update_lifetime_peak(root, ev.current)
+                        cov = sample_coverage(root)
+                        status2 = evaluate(ev, settings, notifier, coverage=cov,
+                                           lifetime_peak=lifetime)
+                        if status2.breached:
+                            # 校正後仍破線＝真虧損（或校正不足以翻案）：用校正後
+                            # 的較準數字進既有路徑（critical 的數字、ARM payload）。
+                            status = status2
+                        else:
+                            notifier.warn(
+                                "killswitch",
+                                f"回撤破線經二次校正判定為出入金造成"
+                                f"（校正後 current={status2.current} "
+                                f"peak={status2.peak} "
+                                f"dd={status2.drawdown_pct}），本輪不觸發熔斷",
+                                dedup_key="dd_breach_averted",
+                            )
+                            status = status2  # not breached → 本輪照常續行
+            except Exception as e:  # noqa: BLE001 — fail-closed：失敗沿用原判照常熔斷
+                notifier.warn(
+                    "killswitch",
+                    f"破線二次確認失敗（{e!r}），沿用原判定照常進入熔斷路徑"
+                    f"（fail-closed；本則之後的 dd_breach critical 數字為未校正值）",
+                    dedup_key="dd_recheck_failed",
+                )
         if status.breached:
             notifier.critical(
                 "killswitch",

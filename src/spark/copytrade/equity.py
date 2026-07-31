@@ -184,21 +184,35 @@ def perp_equity_view(adapter, address: str, root: Path, *,
     """
     current = adapter.get_account_value(address)
     now = float(now_fn())
-    path = root / SAMPLES_RELPATH
-    # `0 <= age` 不可省：時鐘前跳／NTP 校正會寫下未來戳，`now - ts` 為負而恆滿足
-    # 上界，該樣本將永不出窗（污染期＝跳動幅度＋window）。未來戳一律丟棄。
-    samples = [(ts, v) for ts, v in _load(path) if 0 <= now - ts <= window_s]
+    samples = _windowed_samples(root, now, window_s)
     samples.append((now, str(current)))
     if persist:
-        _save(path, samples)
-    # I2 插針防護：樣本充足時取**次高值**——單一樣本的價格插針（unrealizedPnl 受 mark
-    # price 影響，冷門幣插針即可造成）不會成為 peak 並污染整個窗；真實的持續高點必然
-    # 有多筆樣本，次高值≈最高值。
-    # **門檻 3 筆**：少於 3 筆時無從判斷「哪一筆是離群值」（2 筆取次高＝取最低，會直接
-    # 摧毀真實 peak 使回撤歸零），故退回最高值。此區間覆蓋度告警本來就在提醒
-    # 「回撤保護尚未生效」，不會讓操作者誤以為有保護。
-    # 最後與 current 取 max：維持「peak 為高水位」慣例；current 若本身是插針，當輪
-    # dd≈0 無害，下一輪該樣本會被次高值邏輯排除。
+        _save(root / SAMPLES_RELPATH, samples)
+    return EquityView(current=current, recent_peak=_peak_from(samples, current))
+
+
+def _windowed_samples(root: Path, now: float, window_s: int) -> list[tuple[float, str]]:
+    """讀樣本檔並套出窗過濾（perp_equity_view / recompute_view 共用同一段）。
+
+    `0 <= age` 不可省：時鐘前跳／NTP 校正會寫下未來戳，`now - ts` 為負而恆滿足
+    上界，該樣本將永不出窗（污染期＝跳動幅度＋window）。未來戳一律丟棄。
+    """
+    path = root / SAMPLES_RELPATH
+    return [(ts, v) for ts, v in _load(path) if 0 <= now - ts <= window_s]
+
+
+def _peak_from(samples: list[tuple[float, str]], current: Decimal) -> Decimal:
+    """窗內樣本 ∪ current → peak（wick-guard；兩個視圖函式共用的唯一實作）。
+
+    I2 插針防護：樣本充足時取**次高值**——單一樣本的價格插針（unrealizedPnl 受 mark
+    price 影響，冷門幣插針即可造成）不會成為 peak 並污染整個窗；真實的持續高點必然
+    有多筆樣本，次高值≈最高值。
+    **門檻 3 筆**：少於 3 筆時無從判斷「哪一筆是離群值」（2 筆取次高＝取最低，會直接
+    摧毀真實 peak 使回撤歸零），故退回最高值。此區間覆蓋度告警本來就在提醒
+    「回撤保護尚未生效」，不會讓操作者誤以為有保護。
+    最後與 current 取 max：維持「peak 為高水位」慣例；current 若本身是插針，當輪
+    dd≈0 無害，下一輪該樣本會被次高值邏輯排除。
+    """
     _vals = sorted((Decimal(v) for _, v in samples), reverse=True)
     if len(_vals) >= _WICK_GUARD_MIN_SAMPLES:
         _base = _vals[1]
@@ -206,5 +220,21 @@ def perp_equity_view(adapter, address: str, root: Path, *,
         _base = _vals[0]
     else:
         _base = current
-    peak = max(_base, current)
-    return EquityView(current=current, recent_peak=peak)
+    return max(_base, current)
+
+
+def recompute_view(root: Path, current: Decimal, *,
+                   now_fn=time.time, window_s: int = WINDOW_S) -> EquityView:
+    """免取樣的重算視圖——**breach 二次確認的重判專用**（2026-08-01 審查 F1）。
+
+    與 perp_equity_view 的差異只有兩點：current 由呼叫端傳入（不重讀 AV，
+    維持與一次判定同一快照——工程原則 1 同源），且**不 append 樣本**。
+    樣本數不得因重判 +1：樣本檔只有 1 筆歷史時（trip 後 reset 重建的頭幾輪
+    ——正是二次回撤最可能的時候），重判 append 的那筆 current 會讓樣本數跨過
+    _WICK_GUARD_MIN_SAMPLES，peak 從最高值降級成次高值，**真**破線被洗掉
+    （fail-open）。窗過濾與 wick-guard 與 perp_equity_view 共用同一實作
+    （_windowed_samples／_peak_from），不存在第二份邏輯。
+    """
+    now = float(now_fn())
+    samples = _windowed_samples(root, now, window_s)
+    return EquityView(current=current, recent_peak=_peak_from(samples, current))

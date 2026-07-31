@@ -606,6 +606,17 @@ def test_get_active_asset_leverage_missing_leverage_key_raises():
     assert "ETH" in str(ei.value)
 
 
+def test_get_active_asset_leverage_unknown_type_raises():
+    """O6（2026-08-01 第三批審查）：leverage.type 不在 {cross, isolated} →
+    ValueError——不得靜默當 isolated（`== "cross"` 的布林降級會把未知型別
+    映成 isolated 送進 update_leverage）。"""
+    resp = {"leverage": {"type": "weird", "value": 10}}
+    ad = _adapter(active_asset_leverage=resp)
+    with pytest.raises(ValueError) as ei:
+        ad.get_active_asset_leverage("0xuser", "ETH")
+    assert "weird" in str(ei.value)
+
+
 def test_get_active_asset_leverage_missing_type_or_value_raises():
     """leverage 物件缺鍵（type 或 value）→ raise ValueError。"""
     resp = {"leverage": {"type": "cross"}}  # 缺 value

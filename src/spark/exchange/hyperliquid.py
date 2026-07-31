@@ -340,8 +340,12 @@ class HyperliquidAdapter(ExchangeAdapter):
                                              "user": address, "coin": coin})
             lev_obj = raw["leverage"]
             lev_val = int(lev_obj["value"])
-            is_cross = lev_obj["type"] == "cross"
-            return lev_val, is_cross
+            lev_type = lev_obj["type"]
+            # O6（2026-08-01 第三批審查）：type 白名單——未知型別不得靜默映成
+            # isolated（`== "cross"` 的布林降級）送進 update_leverage。
+            if lev_type not in ("cross", "isolated"):
+                raise ValueError(f"leverage.type 未知: {lev_type!r}")
+            return lev_val, lev_type == "cross"
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(
                 f"activeAssetData 回應形狀不符（coin={coin}）: {e!r}"

@@ -367,6 +367,22 @@ def test_set_entry_leverage_fallback_error_warns_and_skips():
     assert "ETH" in warns[0][3]  # dedup key 含 coin
 
 
+def test_set_entry_leverage_fallback_nonpositive_treated_as_failure():
+    """O2（2026-08-01 第三批審查）：fallback 回 (0, True) 之類的壞值 → 視同查詢
+    失敗：warn（dedup 含 coin）＋跳過該幣，**不得**把 lev<=0 送進 update_leverage
+    ——dry 模式的同值快取會把壞值記成「已設定」，之後真值也不再送。"""
+    ex = FakeExecutor()
+    notifier = RecordingNotifier()
+    _set_entry_leverage(ex, _spec(coin="ETH"), {}, notifier,
+                        leverage_fallback=lambda coin: (0, True))
+    assert ex.records == []  # update_leverage 不得被呼叫
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    assert len(warns) == 1
+    assert warns[0][1] == "orders"
+    assert "ETH" in warns[0][2]
+    assert "ETH" in warns[0][3]  # dedup key 含 coin
+
+
 def test_set_entry_leverage_failure_warns_with_dedup_key():
     """update_leverage 回 False → warn 告警（不吞），流程繼續（best-effort）。"""
     ex = FakeExecutor(update_leverage_ok=False)

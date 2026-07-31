@@ -271,6 +271,40 @@ def test_clock_step_back_does_not_regress_marker_or_double_apply(tmp_path):
     assert _marker(tmp_path) == NOW_MS + 60_000
 
 
+# ── ts-aware 平移（2026-08-01 第三批審查 F2 修法）─────────────────────────
+def test_shift_is_ts_aware_only_samples_before_flow_shift(tmp_path):
+    """晚於流量的樣本已含流量，**不得**再平移（F2 雙重平移迴歸）。
+    典型情境：breach 二次確認時，檔內已有 step-2 寫下的「流量之後」樣本。"""
+    post_flow_ts = NOW_MS / 1000 - 10.0   # 晚於 FLOW_MS（-30s）的樣本
+    _seed_samples(tmp_path, [(T1_S, "1000"), (T2_S, "1200"), (post_flow_ts, "700")])
+    _seed_peak(tmp_path, "1200")
+    _seed_marker(tmp_path, LAST_MS)
+    fa = _flows_adapter(LedgerFlow(time_ms=FLOW_MS, usdc=Decimal("-300")))
+    _apply(tmp_path, fa)
+
+    # 早於流量的兩筆平移 -300；晚於流量的那筆不動（雙重平移＝400）
+    assert _sample_values(tmp_path) == [Decimal("700"), Decimal("900"), Decimal("700")]
+    assert _sample_ts(tmp_path) == [T1_S, T2_S, post_flow_ts]
+    assert _peak(tmp_path) == Decimal("900")  # lifetime peak 收 full net（無時間戳）
+
+
+def test_shift_multiple_flows_each_apply_by_timestamp(tmp_path):
+    """多筆流量各自按 ts 生效：每筆樣本只吸收「晚於自己」的流量。"""
+    mid_ts = NOW_MS / 1000 - 20.0     # 介於兩筆流量之間的樣本
+    flow1_ms = NOW_MS - 30_000        # 早於 mid_ts
+    flow2_ms = NOW_MS - 10_000        # 晚於 mid_ts
+    _seed_samples(tmp_path, [(T1_S, "1000"), (mid_ts, "800")])
+    _seed_peak(tmp_path, "1200")
+    _seed_marker(tmp_path, LAST_MS)
+    fa = _flows_adapter(LedgerFlow(time_ms=flow1_ms, usdc=Decimal("-300")),
+                        LedgerFlow(time_ms=flow2_ms, usdc=Decimal("100")))
+    _apply(tmp_path, fa)
+
+    # T1 樣本吸收兩筆（-300+100=-200）→ 800；mid 樣本只吸收 flow2（+100）→ 900
+    assert _sample_values(tmp_path) == [Decimal("800"), Decimal("900")]
+    assert _peak(tmp_path) == Decimal("1000")  # 1200 + full net（-200）
+
+
 def test_account_class_transfer_out_shifts_baseline(tmp_path):
     """F2 錨例（2026-07-21 實測情境：owner perp→spot 劃轉 100）：
     accountClassTransfer usdc=100 toPerp=false → net=-100 →
