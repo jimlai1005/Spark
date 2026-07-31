@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -730,18 +731,30 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         vd = hl.vault_details(addr)
         if not isinstance(vd, dict) or not vd.get("name"):
             return "standard", None    # 非 vault（真實 API 回 JSON null → None）
+        # check-error 的 detail 淨化：只含例外型別名、**不含** str(e)——底層例外
+        # 訊息常帶內部 URL（httpx 的 "for url 'http://…'"），不得回顯給客戶端。
+        def _check_error_failures(e: Exception) -> list[dict]:
+            return [{"name": "check-error",
+                     "detail": f"檢查執行失敗（{type(e).__name__}）——"
+                               f"資料形狀不符 preflight 假設，需人工重跑 preflight"}]
+
         try:
             data = fetch_preflight_data(hl, addr, clearinghouse_state=state,
                                         vault_details=vd)
             results = run_checks(data)
             failures = [{"name": r.name, "detail": r.detail}
                         for r in results if not r.passed]
+        except httpx.HTTPStatusError as e:
+            # HL 5xx＝上游暫時性故障（resilience 邊界按訊息分類重試、耗盡後把
+            # HTTPStatusError 原樣上拋到這裡）——是 transient，不是「vault 檢查
+            # FAIL」；誤入 check-error 會產生假 FAIL＋假 critical（工程原則 2）。
+            if e.response.status_code >= 500:
+                raise ConnectionError(f"HL {e.response.status_code}") from e
+            failures = _check_error_failures(e)  # 4xx＝semantic → advisory check-error
         except (ConnectionError, TimeoutError):
             raise                      # transient → 上層轉 502（同 _chain_activity）
         except Exception as e:  # noqa: BLE001 — semantic 形狀炸裂不得擋用戶（advisory）
-            failures = [{"name": "check-error",
-                         "detail": f"檢查執行失敗（{type(e).__name__}: {e}）——"
-                                   f"資料形狀不符 preflight 假設，需人工重跑 preflight"}]
+            failures = _check_error_failures(e)
         if failures:
             fail_txt = "；".join(f"{f['name']}: {f['detail']}" for f in failures)
             logger.warning("自訂 vault leader 准入檢查 FAIL leader=%s failures=%s",

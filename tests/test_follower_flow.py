@@ -16,6 +16,7 @@ from spark.copytrade.killswitch import check_drawdown, evaluate
 from spark.copytrade.notifier import RecordingNotifier
 from spark.exchange.base import EquityView, LedgerFlow
 from spark.exchange.fakes import FakeAdapter
+from spark.exchange.ledger_flows import signed_flow
 
 ADDR = "0xfollower"
 NOW_MS = 1_753_920_000_000
@@ -244,6 +245,67 @@ def test_future_timestamped_flow_deferred_not_double_applied(tmp_path):
 
     _apply(tmp_path, fa, now_ms=NOW_MS + 120_000)  # 再下輪不重套
     assert _sample_values(tmp_path) == [Decimal("700"), Decimal("900")]
+
+
+def test_clock_step_back_does_not_regress_marker_or_double_apply(tmp_path):
+    """F1 回歸：時鐘回跳（NTP step）時標記絕不倒退——倒退＝已處理流量重新落窗＝
+    下輪重套同批（閘變鈍，fail-open）。三輪：正常套用 → 回跳 120s（無新流量）→
+    回正；斷言樣本與 peak 只被調整一次、標記單調不減。"""
+    _seed_baseline(tmp_path)
+    fa = _flows_adapter(LedgerFlow(time_ms=FLOW_MS, usdc=Decimal("-300")))
+
+    # 輪 1：正常套用一次
+    _apply(tmp_path, fa, now_ms=NOW_MS)
+    assert _sample_values(tmp_path) == [Decimal("700"), Decimal("900")]
+    assert _marker(tmp_path) == NOW_MS
+
+    # 輪 2：時鐘回跳 120s（無新流量）——標記必須單調不減
+    _apply(tmp_path, fa, now_ms=NOW_MS - 120_000)
+    assert _marker(tmp_path) == NOW_MS
+    assert _sample_values(tmp_path) == [Decimal("700"), Decimal("900")]
+
+    # 輪 3：時鐘回正——FLOW_MS 仍在標記之下，不得重套（雙套＝樣本 [400,600]）
+    _apply(tmp_path, fa, now_ms=NOW_MS + 60_000)
+    assert _sample_values(tmp_path) == [Decimal("700"), Decimal("900")]
+    assert _peak(tmp_path) == Decimal("900")
+    assert _marker(tmp_path) == NOW_MS + 60_000
+
+
+def test_account_class_transfer_out_shifts_baseline(tmp_path):
+    """F2 錨例（2026-07-21 實測情境：owner perp→spot 劃轉 100）：
+    accountClassTransfer usdc=100 toPerp=false → net=-100 →
+    樣本 [1000,1200]→[900,1100]、peak 1200→1100。
+    流量號取自 ledger_flows.signed_flow（型別映射唯一定義點，同源）。"""
+    _seed_baseline(tmp_path)
+    usdc = signed_flow({"type": "accountClassTransfer", "usdc": "100",
+                        "toPerp": False})
+    assert usdc == Decimal("-100")
+    fa = _flows_adapter(LedgerFlow(time_ms=FLOW_MS, usdc=usdc))
+    _apply(tmp_path, fa)
+
+    assert _sample_values(tmp_path) == [Decimal("900"), Decimal("1100")]
+    assert _peak(tmp_path) == Decimal("1100")
+
+
+def test_samples_write_failure_warns_and_skips_batch_without_raising(tmp_path,
+                                                                     monkeypatch):
+    """觀察 (b)：樣本檔寫失敗（OSError）→ warn＋本批跳過（標記已推進＝漏校正，
+    fail-safe），例外**不得**穿出——run_cycle 直呼本函式，穿出＝整輪熔斷路徑中斷。
+    語意與 _shift_lifetime_peak 的 OSError 處理對稱。"""
+    _seed_baseline(tmp_path)
+
+    def _boom(path, samples):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("spark.copytrade.follower_flow._save", _boom)
+    fa = _flows_adapter(LedgerFlow(time_ms=FLOW_MS, usdc=Decimal("-300")))
+    notifier = _apply(tmp_path, fa)          # 不得拋
+
+    assert _marker(tmp_path) == NOW_MS       # 標記已推進（順序鐵則不變）
+    assert _sample_values(tmp_path) == [Decimal("1000"), Decimal("1200")]  # 本批跳過
+    assert _peak(tmp_path) == Decimal("1200")  # 整批一致跳過，不留半套狀態
+    assert any(r[0] == "warn" and r[3] == "follower_flow_samples_write_failed"
+               for r in notifier.records)
 
 
 def test_anomalies_warn_with_type_names(tmp_path):

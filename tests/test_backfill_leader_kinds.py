@@ -292,6 +292,56 @@ def test_output_format_shows_each_entry(registry_path):
     assert "changed" in msg.lower() or "vault" in msg.lower()
 
 
+# ── F4：探測一次到位（鎖外）＋鎖內重讀防護 ──────────────────────────────────
+
+def test_probes_each_entry_exactly_once(registry_path):
+    """F4：每條目**恰好一次**網路探測——自我驗收改用段 1 的快取結果比對重載內容，
+    不得重新探測（原實作驗收重探＝API 呼叫加倍）。"""
+    record_user_leader(registry_path, address=_TARGET, added_by=_ACCT)
+    record_user_leader(registry_path, address=_OTHER, added_by=_ACCT)
+
+    fake_gw = FakeGateway()
+    fake_gw.vault_addresses[_TARGET] = {"name": "Vault A"}
+    fake_gw.vault_addresses[_OTHER] = {"name": "Vault B"}
+
+    result = backfill(registry_path, gateway=fake_gw)
+
+    assert result.changed == 2 and result.exit_code == 0
+    assert len(fake_gw.calls) == 2  # == 條目數（含驗收在內總共一輪探測）
+
+
+class _ConcurrentWriteGateway(FakeGateway):
+    """段 1（鎖外探測）期間，第三方把條目改成 kind:vault——模擬「探測與取鎖之間
+    檔案被他人改寫」。段 2 鎖內重讀必須看到新狀態、冪等不重寫。"""
+
+    def __init__(self, registry_path):
+        super().__init__()
+        self._registry_path = registry_path
+
+    def vault_details(self, address: str):
+        result = super().vault_details(address)
+        raw = json.loads(self._registry_path.read_text())
+        for e in raw["leaders"]:
+            e["kind"] = "vault"
+        self._registry_path.write_text(json.dumps(raw))
+        return result
+
+
+def test_concurrent_kind_write_between_probe_and_lock_is_idempotent(registry_path):
+    """F4：探測（鎖外）之後、取鎖之前條目已被他人改成 vault → 鎖內重讀看到新值，
+    零改寫（冪等；不得拿鎖外快照覆蓋鎖內現實）。"""
+    record_user_leader(registry_path, address=_TARGET, added_by=_ACCT)
+    gw = _ConcurrentWriteGateway(registry_path)
+    gw.vault_addresses[_TARGET] = {"name": "Vault A"}
+
+    result = backfill(registry_path, gateway=gw)
+
+    assert result.exit_code == 0
+    assert result.changed == 0  # 鎖內重讀已見 vault → 不重寫
+    raw = json.loads(registry_path.read_text())["leaders"]
+    assert raw[0]["kind"] == "vault"
+
+
 # ── 自我驗收：真的驗，不是假驗 ───────────────────────────────────────────────
 
 def test_verification_fails_if_kind_not_actually_written(registry_path):

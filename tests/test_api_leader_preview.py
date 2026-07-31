@@ -326,6 +326,46 @@ def test_vault_details_transient_failure_is_a_502(tmp_path):
     assert _preview(c, _CUSTOM).status_code == 502
 
 
+def _http_status_error(code):
+    """重試耗盡後由 resilience 邊界原樣上拋的 httpx.HTTPStatusError（訊息帶內部 URL，
+    照 httpx 真實格式——F3 的 detail 淨化就是要擋這個不外洩）。"""
+    import httpx
+    req = httpx.Request("POST", "http://hl-internal:3001/info")
+    resp = httpx.Response(code, request=req)
+    return httpx.HTTPStatusError(
+        f"Server error '{code}' for url 'http://hl-internal:3001/info'",
+        request=req, response=resp)
+
+
+def test_hl_5xx_on_vault_checks_is_a_502_not_a_fake_fail(tmp_path):
+    """F3：portfolio 拋 5xx HTTPStatusError（transient 重試耗盡）→ 502（稍後重試），
+    **不得** 200＋假 check-error FAIL、**不得**發 critical（工程原則 2：
+    transient 與 semantic 不得混淆）。"""
+    c, cfg, hl, notifier = _make_recording(tmp_path)
+    login(c)
+    _seed_vault(hl)
+    hl.portfolio_error[_VAULT] = _http_status_error(503)
+    assert _preview(c, _VAULT).status_code == 502
+    assert [rec for rec in notifier.records if rec[0] == "critical"] == []
+
+
+def test_hl_4xx_on_vault_checks_is_check_error_without_url_echo(tmp_path):
+    """F3：4xx（semantic）→ advisory check-error FAIL（200 照回），但 detail
+    **淨化**——只含例外型別名，不得回顯內部 URL。"""
+    c, cfg, hl, notifier = _make_recording(tmp_path)
+    login(c)
+    _seed_vault(hl)
+    hl.portfolio_error[_VAULT] = _http_status_error(422)
+    r = _preview(c, _VAULT)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["vault_checks"]["passed"] is False
+    assert [f["name"] for f in body["vault_checks"]["failures"]] == ["check-error"]
+    detail = body["vault_checks"]["failures"][0]["detail"]
+    assert "http://" not in detail and "https://" not in detail
+    assert "hl-internal" not in detail and "/info" not in detail
+
+
 def test_vault_check_crash_is_advisory_check_error_not_a_500(tmp_path):
     """檢查資料面形狀壞掉（clearinghouseState 缺 withdrawable → run_checks 內
     KeyError）→ advisory 原則不變：**不擋用戶**（200），failures 記 check-error

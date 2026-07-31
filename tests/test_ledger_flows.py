@@ -88,6 +88,40 @@ class TestFlowAnomaly:
         assert flow_anomaly({"type": "vaultWithdraw", "netWithdrawnUsd": "20"}) is None
 
 
+class TestAccountClassTransfer:
+    """F2：accountClassTransfer（perp↔spot 內部劃轉，owner 出金必經）。
+
+    金額欄位 usdc、號**不固定**——方向由 toPerp 決定（truthy → +usdc 進 perp；
+    falsy → −usdc 出 perp）。缺欄位不得猜號：signed_flow 回 None、flow_anomaly
+    記 missing-amount／missing-direction。
+    """
+
+    def test_to_perp_true_is_inflow(self):
+        d = {"type": "accountClassTransfer", "usdc": "100.5", "toPerp": True}
+        assert signed_flow(d) == Decimal("100.5")
+
+    def test_to_perp_false_is_outflow(self):
+        d = {"type": "accountClassTransfer", "usdc": "100", "toPerp": False}
+        assert signed_flow(d) == Decimal("-100")
+
+    def test_complete_entry_is_not_anomalous(self):
+        assert flow_anomaly({"type": "accountClassTransfer", "usdc": "100",
+                             "toPerp": False}) is None
+        assert flow_anomaly({"type": "accountClassTransfer", "usdc": "1",
+                             "toPerp": True}) is None
+
+    def test_missing_usdc_is_anomaly_and_no_flow(self):
+        d = {"type": "accountClassTransfer", "toPerp": True}
+        assert signed_flow(d) is None
+        assert flow_anomaly(d) == "accountClassTransfer:missing-amount"
+
+    def test_missing_direction_is_anomaly_and_no_flow(self):
+        """缺 toPerp **鍵**（方向不明）→ 不得猜號。"""
+        d = {"type": "accountClassTransfer", "usdc": "100"}
+        assert signed_flow(d) is None
+        assert flow_anomaly(d) == "accountClassTransfer:missing-direction"
+
+
 class TestSourceUnification:
     """同源釘死測試：映射字面只能存在於 ledger_flows.py。"""
 

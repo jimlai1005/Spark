@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 
-from spark.exchange.ledger_flows import signed_flow
+from spark.exchange.ledger_flows import flow_anomaly, signed_flow
 
 # ── 閾值常數（來源：spec §3.4；錨例＝Ultron 實測，2026-07-31）──────────────────
 # 字串小數位截斷等級的絕對容差：恆等式兩側都是 API 原文數字，理論殘差為 0。
@@ -33,8 +33,8 @@ FLOW_TOL_MIN_USD = Decimal("1")
 FLOW_TOL_REL = Decimal("0.0001")
 # 單筆流量佔 TVL 超過 8% 印 WARN（引擎 size_tolerance 預設；僅資訊性，不 FAIL）。
 SIZE_TOLERANCE_PCT = Decimal("0.08")
-# 恆等式的型別基礎：這四型別以外的 delta 出現＝恆等式不保證成立，需人工研判。
-ALLOWED_LEDGER_TYPES = ("deposit", "vaultDeposit", "withdraw", "vaultWithdraw")
+# 恆等式的型別基礎（白名單）唯一定義在 spark.exchange.ledger_flows；
+# 檢查 6 取道 flow_anomaly 判定，本檔不得自建型別清單。
 
 
 @dataclass(frozen=True)
@@ -149,15 +149,16 @@ def run_checks(data: PreflightData) -> list[CheckResult]:
         stat = f"筆數={len(flows)} 最大單筆={max_single} 淨流量={net_flow}（accountValue 非正）"
     out.append(CheckResult("flow-stats", True, stat))
 
-    # 6. ledger 型別白名單：四型別以外出現任何 delta type → FAIL。
-    #    恆等式的成立建立在「所有流量都被正確計號」上；未知型別無法計號。
-    unknown = sorted({t for e in data.ledger_updates
-                      if (t := (e.get("delta") or {}).get("type"))
-                      not in ALLOWED_LEDGER_TYPES})
+    # 6. ledger 型別白名單：白名單外型別、或白名單內缺金額／方向欄位 → FAIL。
+    #    恆等式的成立建立在「所有流量都被正確計號」上；未知型別無法計號，
+    #    缺欄位的白名單型別會被 signed_flow 靜默漏計（回 None）——兩者同罪。
+    #    異常分類取道 ledger_flows.flow_anomaly（唯一定義點）。
+    anomalies = sorted({a for e in data.ledger_updates
+                        if (a := flow_anomaly(e.get("delta") or {})) is not None})
     out.append(CheckResult(
-        "ledger-type-whitelist", not unknown,
-        "全部型別在白名單內" if not unknown
-        else f"白名單外型別：{', '.join(unknown)}——恆等式基礎不成立，需人工研判"))
+        "ledger-type-whitelist", not anomalies,
+        "全部型別在白名單內且欄位齊全" if not anomalies
+        else f"流量異常：{', '.join(anomalies)}——恆等式基礎不成立，需人工研判"))
 
     return out
 

@@ -147,14 +147,19 @@ def apply_follower_flows(root: Path, adapter, address: str, notifier: Notifier,
     fresh = [f for f in flows if last < f.time_ms <= now_ms]
     net = sum((f.usdc for f in fresh), Decimal("0"))
     if not fresh or net == 0:
-        save_marker(root, now_ms)
+        # max(last, now_ms)：時鐘回跳（NTP step）時標記絕不倒退——倒退＝已處理
+        # 流量重新落窗＝下輪重套同批（fail-open）。:121 的初始化分支無 last
+        # 可比，維持寫 now_ms 不變。
+        save_marker(root, max(last, now_ms))
         return
 
     # ⭐⭐ 順序鐵則：**先寫標記（推進 now_ms）、再做調整**。crash 落在兩步之間的
     # 最壞方向＝該批流量沒校正（出金被視為虧損＝今天的 fail-safe 行為）；反過來
     # （先調整後標記）crash 會讓下輪重套同批流量＝樣本被平移兩次、閘變鈍
     # （fail-open），絕對不可。標記寫失敗同理：沒有標記就不准調整。
-    if not save_marker(root, now_ms):
+    # max(last, now_ms) 同上：時鐘回跳時標記絕不倒退（此分支 fresh 非空 ⇒
+    # now_ms > last，max 是防禦性等價寫法，兩處寫點語意一致）。
+    if not save_marker(root, max(last, now_ms)):
         notifier.warn(
             "follower_flow",
             "follower_flow 標記寫入失敗，本輪放棄校正（防雙重套用）；下輪重試",
@@ -162,7 +167,18 @@ def apply_follower_flows(root: Path, adapter, address: str, notifier: Notifier,
         )
         return
 
-    _shift_samples(root, net)
+    try:
+        _shift_samples(root, net)
+    except OSError as e:
+        # 與 _shift_lifetime_peak 的 OSError 語意對稱：標記已推進 → 本批整批跳過
+        # ＝漏校正（出金被誤判成虧損，今天的 fail-safe 行為），絕不讓例外穿出
+        # run_cycle、也不留「peak 平移了、樣本沒平移」的半套狀態。
+        notifier.warn(
+            "follower_flow",
+            f"樣本平移寫入失敗（{e!r}）——標記已推進，本批校正跳過（fail-safe）",
+            dedup_key="follower_flow_samples_write_failed",
+        )
+        return
     _shift_lifetime_peak(root, net)
     notifier.warn(
         "follower_flow",

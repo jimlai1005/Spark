@@ -4,11 +4,11 @@ vault leader 上架前 preflight 六檢查——fixture 數字取自 Ultron vaul
 import pytest
 
 from scripts.vault_preflight import (
-    ALLOWED_LEDGER_TYPES,
     PreflightData,
     main,
     run_checks,
 )
+from spark.exchange.ledger_flows import ACCOUNT_CLASS_TRANSFER, FLOW_FIELDS
 
 # Ultron month 窗首末點時間戳（實測）
 TS0 = 1782774120062
@@ -175,12 +175,35 @@ def test_empty_month_histories_fail_checks_3_and_4_without_traceback():
 
 def test_check6_fails_on_unknown_ledger_type():
     extra = [{"time": TS0 + 6_000, "hash": "0x6",
-              "delta": {"type": "accountClassTransfer", "usdc": "5.0", "toPerp": True}}]
+              "delta": {"type": "spotTransfer", "usdc": "5.0"}}]
     by = _by_name(run_checks(_data(ledger_updates=_ledger(extra))))
     assert not by["ledger-type-whitelist"].passed
-    assert "accountClassTransfer" in by["ledger-type-whitelist"].detail
+    assert "spotTransfer" in by["ledger-type-whitelist"].detail
     # 未知型別不計入淨流量：恆等式不因此翻船（檢查 6 已負責把人叫來）
     assert by["flow-neutral-pnl"].passed
+
+
+def test_check6_passes_on_complete_account_class_transfer():
+    """F2 同步：accountClassTransfer（perp↔spot 劃轉）已入白名單——欄位齊全時
+    檢查 6 PASS，且流量**計入**恆等式（+5 遠小於容差 ~$90，檢查 3 仍 PASS）。"""
+    extra = [{"time": TS0 + 6_000, "hash": "0x6",
+              "delta": {"type": "accountClassTransfer", "usdc": "5.0", "toPerp": True}}]
+    by = _by_name(run_checks(_data(ledger_updates=_ledger(extra))))
+    assert by["ledger-type-whitelist"].passed
+    assert by["flow-neutral-pnl"].passed
+
+
+def test_check6_fails_on_whitelisted_type_with_missing_fields():
+    """觀察 (a)：白名單內但缺金額／方向欄位＝該筆流量被靜默漏計（signed_flow 回
+    None）——檢查 6 必須 FAIL，不得 PASS（改用 flow_anomaly 判定後涵蓋）。"""
+    extra = [{"time": TS0 + 6_000, "hash": "0x6",
+              "delta": {"type": "accountClassTransfer", "usdc": "5.0"}},  # 缺 toPerp
+             {"time": TS0 + 6_500, "hash": "0x6b",
+              "delta": {"type": "deposit"}}]                              # 缺 usdc
+    by = _by_name(run_checks(_data(ledger_updates=_ledger(extra))))
+    assert not by["ledger-type-whitelist"].passed
+    assert "accountClassTransfer:missing-direction" in by["ledger-type-whitelist"].detail
+    assert "deposit:missing-amount" in by["ledger-type-whitelist"].detail
 
 
 # ── 檢查 5：資訊性，恆為 PASS，超標印 WARN ───────────────────────────────
@@ -206,7 +229,10 @@ def test_check5_no_warn_on_baseline():
 
 
 def test_allowed_ledger_types_frozen():
-    assert set(ALLOWED_LEDGER_TYPES) == {"deposit", "vaultDeposit", "withdraw", "vaultWithdraw"}
+    """白名單釘死（唯一定義點在 ledger_flows；F2 起含 accountClassTransfer）。"""
+    assert set(FLOW_FIELDS) | {ACCOUNT_CLASS_TRANSFER} == {
+        "deposit", "vaultDeposit", "withdraw", "vaultWithdraw",
+        "accountClassTransfer"}
 
 
 # ── main：exit code 與 ledger 查詢窗 ─────────────────────────────────────

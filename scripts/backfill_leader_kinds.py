@@ -4,13 +4,13 @@ backfill 既有 user registry 的 kind 欄位：探測哪些位址是 vault、�
 動機：registry 既有條目都沒有 kind 鍵（預設 standard），若其中有 vault 位址，
 雙層保護不會生效；record_user_leader 的冪等分支不回填，所以需要一次性 backfill CLI。
 
-沿 scripts/revoke_leader.py 形狀：
-- registry_lock 內 read-modify-write
-- 逐條目探測 HLGateway.vault_details
-- 是 vault（回 dict）→ 改寫 kind:vault；非 vault（回 None）→ 不寫
-- 原子寫（tempfile + os.replace，保留 mode）
-- 自我驗收：重載 load_user_leaders + merge_leaders，斷言每筆 kind 與探測結果一致
-- 冪等：重跑零改動
+沿 scripts/revoke_leader.py 形狀，但**兩段式**（2026-07-31 F4：registry 鎖不得
+跨網路探測持有——API 寫端搶鎖有 2s 死線）：
+- 段 1（鎖外）：逐條目探測 HLGateway.vault_details → 結果表 {address: is_vault}
+- 段 2（鎖內）：registry_lock 內重讀 raw、只改「判 vault 且現值 != vault」的條目、
+  原子寫（tempfile + os.replace，保留 mode）
+- 自我驗收：重載 load_user_leaders，比對**段 1 的快取結果**（不重新探測）
+- 冪等：重跑零改動；段 1 後被他人改成 vault 的條目，鎖內重讀看到即不重寫
 - 網路失敗：該條目記 error、繼續其餘、結尾非零退出（部分成功要看得出來）
 
 使用方式:
@@ -85,6 +85,11 @@ def backfill(registry_path: str | Path, *, gateway: "HLGateway | None" = None,
     Returns:
         BackfillResult，包含改動數、error 數、exit code、每條目訊息。
         exit_code=0：全部成功或零改動；非零：任何 error 條目。
+
+    兩段式（2026-07-31 F4）：**registry 鎖不得跨網路探測持有**——API 寫端
+    （record_user_leader）搶同一把鎖有 2s 死線，逐條目探測 N 次網路會把寫端
+    打爆。段 1 在**鎖外**探測出結果表；段 2 才進鎖重讀、只改該改的、原子寫；
+    自我驗收比對段 1 的**快取結果**與重載內容，不重新探測（重探＝API 呼叫加倍）。
     """
     p = Path(registry_path)
     result = BackfillResult()
@@ -96,62 +101,79 @@ def backfill(registry_path: str | Path, *, gateway: "HLGateway | None" = None,
     if not p.exists():
         return result
 
+    # ── 段 1（鎖外）：讀條目快照、逐條目探測 → 結果表 {normalized: is_vault} ──
+    probed: dict[str, bool] = {}
+    try:
+        load_user_leaders(p)  # fail-fast：壞檔直接停（段 2 進鎖後會再驗一次）
+        snapshot = _load_raw_entries(p)
+    except (OSError, ValueError) as e:
+        result.errors += 1
+        result.report["_error"] = f"registry 處理失敗: {e}"
+        result.exit_code = 1
+        return result
+
+    for e in snapshot:
+        addr = e.get("address", "")
+
+        # 正規化位址（工程原則 1）
+        try:
+            normalized = normalize_hex_address("address", addr)
+        except ValueError:
+            result.report[addr] = "error: 位址不合法"
+            result.errors += 1
+            continue
+
+        # 已是 kind:vault → skip（不探測）
+        if e.get("kind") == "vault":
+            result.report[normalized] = "skip (already vault)"
+            continue
+
+        # 探測 vault_details
+        try:
+            vault_info = gateway.vault_details(normalized)
+        except Exception as ex:
+            result.report[normalized] = f"error: {type(ex).__name__}: {ex}"
+            result.errors += 1
+            continue
+
+        is_vault = bool(vault_info is not None and isinstance(vault_info, dict)
+                        and vault_info.get("name"))
+        probed[normalized] = is_vault
+        if not is_vault:
+            # 非 vault → 條目一律不動（任務書規定；顯式 kind:"standard" 是
+            # record_user_leader 的合法寫入，不是誤寫，backfill 無權整理它）
+            result.report[normalized] = "skip (not vault)"
+
+    # ── 段 2（鎖內）：重讀 raw、只改「判 vault 且現值 != vault」、原子寫 ──
     try:
         with registry_lock(p):
-            # 取得鎖之後才讀
             load_user_leaders(p)  # fail-fast：壞檔不得被覆寫
             entries = _load_raw_entries(p)
 
             updated = []
             for e in entries:
                 addr = e.get("address", "")
-                kind_in_json = e.get("kind")  # 原始 JSON 裡的 kind（可能缺）
-
-                # 正規化位址（工程原則 1）
                 try:
                     normalized = normalize_hex_address("address", addr)
                 except ValueError:
-                    result.report[addr] = "error: 位址不合法"
-                    result.errors += 1
-                    updated.append(e)
+                    updated.append(e)  # 段 1 已記 error；條目不動
                     continue
 
-                # 已是 kind:vault → skip
-                if kind_in_json == "vault":
-                    result.report[normalized] = "skip (already vault)"
-                    updated.append(e)
-                    continue
-
-                # 探測 vault_details
-                try:
-                    vault_info = gateway.vault_details(normalized)
-                except Exception as ex:
-                    result.report[normalized] = f"error: {type(ex).__name__}: {ex}"
-                    result.errors += 1
-                    updated.append(e)
-                    continue
-
-                # 決策：是 vault 嗎？
-                is_vault = vault_info is not None and isinstance(vault_info, dict) and vault_info.get("name")
-
-                if is_vault:
-                    # 是 vault → 補寫 kind:vault
-                    if kind_in_json != "vault":
-                        updated.append({**e, "kind": "vault"})
-                        result.changed += 1
-                        result.report[normalized] = f"changed: {kind_in_json or 'None'} → vault"
-                    else:
-                        updated.append(e)
+                kind_in_json = e.get("kind")
+                if probed.get(normalized) and kind_in_json != "vault":
+                    updated.append({**e, "kind": "vault"})
+                    result.changed += 1
+                    result.report[normalized] = f"changed: {kind_in_json or 'None'} → vault"
                 else:
-                    # 非 vault → 條目一律不動（任務書規定；顯式 kind:"standard" 是
-                    # record_user_leader 的合法寫入，不是誤寫，backfill 無權整理它）
-                    result.report[normalized] = "skip (not vault)"
+                    # 含「段 1 探測後、取鎖前被他人改成 vault」：鎖內重讀看到
+                    # 新值 → 冪等不重寫（不得拿鎖外快照覆蓋鎖內現實）。
+                    if probed.get(normalized) and kind_in_json == "vault":
+                        result.report[normalized] = "skip (already vault)"
                     updated.append(e)
 
             # 寫入（非 dry-run）
             if result.changed > 0 and not dry_run:
-                doc = {"leaders": updated}
-                _atomic_write_json(p, doc)
+                _atomic_write_json(p, {"leaders": updated})
                 # 寫出去的必須通過自己的載入器
                 load_user_leaders(p)
 
@@ -161,20 +183,13 @@ def backfill(registry_path: str | Path, *, gateway: "HLGateway | None" = None,
         result.exit_code = 1
         return result
 
-    # 自我驗收：重新載入並驗證（dry-run 時跳過，因為檔沒變）
+    # 自我驗收：重載內容 vs 段 1 快取結果——**不重新探測**（dry-run 時跳過，檔沒變）
     if result.changed > 0 and not dry_run:
         try:
             reloaded = load_user_leaders(p)
             for entry in reloaded:
                 addr_norm = normalize_hex_address("address", entry.address)
-                try:
-                    vault_info = gateway.vault_details(addr_norm)
-                except Exception:
-                    # 驗收時網路失敗 → 略過（已經改了，再嘗試驗是浪費時間）
-                    continue
-
-                is_vault = vault_info is not None and isinstance(vault_info, dict) and vault_info.get("name")
-                if is_vault and entry.kind != "vault":
+                if probed.get(addr_norm) and entry.kind != "vault":
                     result.exit_code = 1
                     result.report["_verification"] = (
                         f"驗收失敗: {addr_norm} 應為 kind:vault 但實際 {entry.kind}")

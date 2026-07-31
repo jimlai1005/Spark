@@ -93,6 +93,7 @@ class FakeHL:
         # vault advisory 檢查的資料面（同 preflight）：portfolio ＋ ledger fixture。
         # 預設空（塞什麼回什麼的既有慣例）；只有 vault 位址會被查到這兩份。
         self.portfolios: dict[str, list] = {}
+        self.portfolio_error: dict[str, Exception] = {}
         self.ledger_updates: dict[str, list] = {}
         # 預設「塞什麼就回什麼」（多數測試不在意窗口）。收入對帳的窗口正確性測試
         # 需要真的依 [start, end] 過濾——設 True 打開，否則「窗口取錯」在 fake 上
@@ -135,6 +136,9 @@ class FakeHL:
         return self.vaults.get(vault_address.lower())   # 非 vault → None（真實 API 行為）
 
     def portfolio(self, address: str) -> list:
+        err = self.portfolio_error.get(address.lower())
+        if err is not None:
+            raise err
         return self.portfolios.get(address.lower(), [])
 
     def non_funding_ledger_updates(self, user: str, start_ms: int) -> list:
