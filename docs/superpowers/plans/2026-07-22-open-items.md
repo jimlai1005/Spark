@@ -187,6 +187,12 @@
   `_kind_of` 查無條目回 `"standard"`（`src/spark/filet/leader_change_apply.py:122-131`
   註解）——vault 保護可能缺席一輪，下一輪白名單恢復即恢復。已知、方向短暫 fail-open，
   但窗口為單輪且需與 transient 讀失敗同時發生。
+- **follower 校正的單輪幻影回撤窗口**（2026-07-31 第二批 opus 審查觀察）：
+  出入金校正是反應式（每輪先查 ledger 再讀淨值）——出金若恰落在「本輪 ledger 已查完」
+  與「讀淨值」之間，該輪以未校正基準判回撤，下一輪才校正。窗口＝單輪內的次秒級，
+  但後果嚴重（誤觸 flatten；total_drawdown 還要簽章解鎖）。修法方向：**breach 路徑上
+  的二次確認**——判定破線後、執行 flatten 前，重查一次 ledger 確認非流量所致
+  （只在 breach 路徑多一次查詢，成本近零）。前端「大額轉出前先停跟單」的建議維持。
 - ~~**流量型別映射雙實作**~~ **已償（2026-07-31 第二批，commit 見 git log）**：
   ledger delta type 白名單＋計號邏輯抽為單一共用實作，preflight 與引擎同源。
 - ~~**heartbeat 未發布 leader kind**~~ **已償（2026-07-31 第二批，commit 見 git log）**：
