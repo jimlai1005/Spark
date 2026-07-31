@@ -12,6 +12,7 @@ from spark.exchange.base import (
     OpenOrder, Position, AccountSnapshot, EquityView, UserFill, LedgerFlow,
 )
 from spark.exchange.csv_fills import parse_builder_fills
+from spark.exchange.ledger_flows import signed_flow, flow_anomaly
 from spark.resilience import ResilientExchange
 
 logger = logging.getLogger(__name__)
@@ -301,6 +302,9 @@ class HyperliquidAdapter(ExchangeAdapter):
         """申贖流量：起始時間（毫秒）起的進出帳記錄。
 
         回傳 (LedgerFlow 清單, 白名單外 delta type 清單【去重、升冪排序】)。
+
+        流量型別映射的唯一定義點是 ledger_flows 模組；改動時需同時驗證
+        vault_preflight 與 follower_flow 的測試。
         """
         raw = self._info.post("/info", {"type": "userNonFundingLedgerUpdates",
                                         "user": address, "startTime": start_ms})
@@ -311,23 +315,18 @@ class HyperliquidAdapter(ExchangeAdapter):
         # sorted/", ".join 混型 TypeError——一筆髒 ledger 資料不得炸掉呼叫端。
         for item in raw:
             delta = item.get("delta", {})
-            delta_type = delta.get("type")
             time_ms = int(item.get("time", 0))
 
-            if delta_type in ("vaultDeposit", "deposit", "withdraw", "vaultWithdraw"):
-                amount_field = ("netWithdrawnUsd" if delta_type == "vaultWithdraw"
-                                else "usdc")
-                amount = delta.get(amount_field)
-                if amount is None:
-                    # 白名單型別缺金額欄位：不得靜默補 "0"（無聲少算一筆流量，
-                    # 中性化恆等式基礎悄悄崩掉）——記進 unknown 讓呼叫端告警。
-                    unknown_types.add(f"{delta_type}:missing-amount")
-                    continue
-                sign = 1 if delta_type in ("vaultDeposit", "deposit") else -1
-                usdc = sign * Decimal(str(amount))
+            # 檢查異常（白名單外、或白名單內但缺欄位）
+            anomaly = flow_anomaly(delta)
+            if anomaly is not None:
+                unknown_types.add(anomaly)
+                continue
+
+            # 白名單內且欄位齊全 → 取有號流量
+            usdc = signed_flow(delta)
+            if usdc is not None:
                 flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
-            else:
-                unknown_types.add(str(delta_type))
 
         return flows, sorted(unknown_types)
 

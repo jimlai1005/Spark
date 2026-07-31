@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 
+from spark.exchange.ledger_flows import signed_flow
+
 # ── 閾值常數（來源：spec §3.4；錨例＝Ultron 實測，2026-07-31）──────────────────
 # 字串小數位截斷等級的絕對容差：恆等式兩側都是 API 原文數字，理論殘差為 0。
 ABS_TOL_USD = Decimal("0.01")
@@ -59,19 +61,8 @@ def _window(portfolio: list, period: str) -> dict | None:
     return None
 
 
-def _signed_flow(delta: dict) -> Decimal | None:
-    """白名單內型別 → 有號 USD 流量（入 +、出 −）；白名單外 → None（檢查 6 負責 FAIL）。
-    ⚠️ vaultWithdraw 用 `netWithdrawnUsd` 而**不是** `requestedUsd`：requested 含
-    commission，而 commission 是 vault 內部再分配（付給 leader），**不離開帳戶**——
-    誤用 requested 會把留在帳內的錢當成流出，恆等式殘差立刻爆容差。"""
-    t = delta.get("type")
-    if t in ("deposit", "vaultDeposit"):
-        return Decimal(str(delta["usdc"]))
-    if t == "withdraw":
-        return -Decimal(str(delta["usdc"]))
-    if t == "vaultWithdraw":
-        return -Decimal(str(delta["netWithdrawnUsd"]))
-    return None
+# 流量型別映射的唯一定義點：spark.exchange.ledger_flows
+_signed_flow = signed_flow
 
 
 def _pnl_end(window: dict) -> Decimal:
