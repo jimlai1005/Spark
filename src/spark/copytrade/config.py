@@ -215,6 +215,14 @@ class CopySettings:
     leader_flow_neutralization_enabled: bool = False
     flow_decay_hours: Decimal = Decimal("36")
 
+    # ── follower 出入金校正（2026-07-31 Wave 5）────────────────────────────
+    # follower（我方錢包）的入出金會等額平移回撤基準（滾動樣本＋lifetime peak），
+    # 不再被熔斷器當成虧損／獲利。這是**正確性修復，預設開**；本鍵是逃生閥——
+    # 校正邏輯若出問題可暫時關閉，回到「出金被視為虧損」的 fail-safe 舊行為。
+    # 語意與 leader 側 36h 衰減刻意不同：follower 回撤量的是交易損益，
+    # 流量**永久**排除、不衰減（見 follower_flow.py 模組 docstring）。
+    follower_flow_correction_enabled: bool = True
+
     @classmethod
     def from_env(
         cls, env: Mapping[str, str] | None = None
@@ -291,6 +299,9 @@ class CopySettings:
                 str(cls.leader_flow_neutralization_enabled).lower(), env),
             flow_decay_hours=_env_decimal(
                 "COPY_FLOW_DECAY_HOURS", str(cls.flow_decay_hours), env),
+            follower_flow_correction_enabled=_env_bool(
+                "COPY_FOLLOWER_FLOW_CORRECTION",
+                str(cls.follower_flow_correction_enabled).lower(), env),
         )
 
     def __post_init__(self) -> None:

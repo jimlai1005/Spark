@@ -26,6 +26,7 @@ from typing import Callable
 from spark.copytrade.config import CopySettings
 from spark.copytrade.costbreaker import evaluate_cost
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
+from spark.copytrade.follower_flow import apply_follower_flows
 from spark.copytrade.killswitch import (REASON_COST_BREACH, REASON_ROLLING_DRAWDOWN,
                                         REASON_TOTAL_DRAWDOWN, DrawdownStatus,
                                         auto_rearm_if_cooled_down, evaluate,
@@ -90,6 +91,18 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             dedup_key="tripped",
         )
         return tripped_report()
+
+    # ── 1.5 follower 出入金校正（2026-07-31 Wave 5）────────────────────
+    # 必須在 perp_equity_view 取樣**之前**：樣本與 lifetime peak 先平移，
+    # 本輪的取樣與回撤判定才建立在校正後的基準上。也必須在 risk-off 分支
+    # 之前——`risk_controls_enabled=False` 時照跑，理由與下方「取樣與判定
+    # 分開」相同：樣本照常累積，客戶哪天開啟風控，基準必須已經是對的。
+    # 語意與 3.5 節 leader 中性化刻意不同：follower 回撤量的是交易損益，
+    # 流量**永久**排除、不衰減（見 follower_flow.py 模組 docstring）。
+    if settings.follower_flow_correction_enabled:
+        # 時間源與本檔既有慣例一致（time.time，見 3.5 節）
+        apply_follower_flows(root, adapter, ex.my_address, notifier,
+                             now_ms=int(time.time() * 1000))
 
     # ── 2. 回撤判定（同一次 portfolio 回應的 current/peak）─────────────
     # 必須用 evaluate() 而非直呼 check_drawdown（killswitch.py 主迴圈接入接口）：

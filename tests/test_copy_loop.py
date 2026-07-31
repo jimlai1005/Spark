@@ -440,6 +440,104 @@ def test_flow_interpret_failure_falls_back_to_raw_with_warn(tmp_path, monkeypatc
                and r[3] == "leader_flow_interpret_failed" for r in warns)
 
 
+# ── 3c. follower 出入金校正接線（Wave 5）──────────────────────────────
+# 校正必須發生在 perp_equity_view 取樣**之前**（樣本先平移、再追加本輪 current），
+# 且 risk_controls_enabled=False 也要跑（樣本照常累積的同一理由）。
+# ⚠️ 樣本時間戳用**真實** time.time：_pin_clock 只 patch loop_mod.time，
+# perp_equity_view 用 equity 模組自己的 time.time——用釘死的假戳會讓樣本
+# 因超齡出窗被丟棄（apply 的流量窗運算則走 loop 的釘死時鐘，兩者互不相干）。
+def _seed_follower_flow_state(root, *, last_ms, samples, peak):
+    import json
+    import time
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, SAMPLES_RELPATH
+    from spark.copytrade.follower_flow import STATE_RELPATH
+    now = time.time()
+    sp = root / SAMPLES_RELPATH
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(json.dumps([[now - age_s, v] for age_s, v in samples]))
+    (root / LIFETIME_PEAK_RELPATH).write_text(json.dumps(peak))
+    (root / STATE_RELPATH).write_text(json.dumps({"last_processed_ms": last_ms}))
+
+
+def _follower_flow_files(root):
+    import json
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, SAMPLES_RELPATH
+    vals = [v for _, v in json.loads((root / SAMPLES_RELPATH).read_text())]
+    peak = json.loads((root / LIFETIME_PEAK_RELPATH).read_text())
+    return vals, peak
+
+
+def _follower_flow_adapter(flows, *, value="900"):
+    return FakeAdapter(account_value=value, equity=_healthy_equity(),
+                       account=_account(value), ledger_flows=(flows, []))
+
+
+def test_follower_flow_correction_corrects_baseline_in_cycle(tmp_path, monkeypatch):
+    """run_cycle 接線：出金 300 → 樣本與 lifetime peak 皆平移 -300，
+    perp_equity_view 於**校正後**追加 current 樣本 → 出金不被誤判為回撤。"""
+    from spark.exchange.base import LedgerFlow
+    last_ms = _FLOW_NOW_MS - 60_000
+    _seed_follower_flow_state(          # 先播種再釘時鐘：helper 的樣本戳要真實時間
+        tmp_path, last_ms=last_ms,
+        samples=[(600, "1000"), (300, "1200")],
+        peak="1200")
+    _pin_clock(monkeypatch)
+    fa = _follower_flow_adapter(
+        [LedgerFlow(time_ms=_FLOW_NOW_MS - 30_000, usdc=Decimal("-300"))])
+    report, notifier, _ = _run(fa, tmp_path=tmp_path)
+
+    assert report.tripped is False
+    assert fa.calls["get_ledger_flows"] == [
+        {"address": MY_ADDR, "start_ms": last_ms + 1}]
+    vals, peak = _follower_flow_files(tmp_path)
+    assert vals[:2] == ["700", "900"]  # 既有樣本平移 -300
+    assert vals[2] == "900"            # 校正後追加的本輪 current
+    assert peak == "900"               # 1200-300；update_lifetime_peak(900) 不再推高
+
+
+def test_follower_flow_correction_runs_even_with_risk_controls_disabled(
+        tmp_path, monkeypatch):
+    """risk_controls_enabled=False 仍校正——與「樣本照常累積」同一理由：
+    客戶哪天開啟風控，基準必須已經是對的。"""
+    from spark.exchange.base import LedgerFlow
+    _seed_follower_flow_state(          # 先播種再釘時鐘（同上）
+        tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
+        samples=[(600, "1000"), (300, "1200")],
+        peak="1200")
+    _pin_clock(monkeypatch)
+    fa = _follower_flow_adapter(
+        [LedgerFlow(time_ms=_FLOW_NOW_MS - 30_000, usdc=Decimal("-300"))])
+    report, _, _ = _run(fa, settings=_settings(risk_controls_enabled=False),
+                        tmp_path=tmp_path)
+
+    assert report.tripped is False
+    vals, peak = _follower_flow_files(tmp_path)
+    assert vals[:2] == ["700", "900"]
+    assert peak == "900"
+
+
+def test_follower_flow_escape_valve_skips_fetch_and_adjustment(tmp_path, monkeypatch):
+    """逃生閥 follower_flow_correction_enabled=False ⇒ get_ledger_flows 零呼叫、
+    檔案零平移（回到今天「出金視為虧損」的 fail-safe 行為）。"""
+    from spark.exchange.base import LedgerFlow
+    _seed_follower_flow_state(          # 先播種再釘時鐘（同上）
+        tmp_path, last_ms=_FLOW_NOW_MS - 60_000,
+        samples=[(600, "1000"), (300, "1200")],
+        peak="1200")
+    _pin_clock(monkeypatch)
+    fa = _follower_flow_adapter(
+        [LedgerFlow(time_ms=_FLOW_NOW_MS - 30_000, usdc=Decimal("-300"))])
+    report, _, _ = _run(
+        fa, settings=_settings(follower_flow_correction_enabled=False),
+        tmp_path=tmp_path)
+
+    assert report.tripped is False
+    assert fa.calls["get_ledger_flows"] == []
+    vals, peak = _follower_flow_files(tmp_path)
+    assert vals[:2] == ["1000", "1200"]  # 零平移；vals[2] 為本輪追加的 current
+    assert peak == "1200"
+
+
 # ── 4. skip_trigger → warn（per-coin dedup）──────────────────────────
 def test_leader_trigger_order_surfaces_as_skip_trigger_warn(tmp_path):
     trigger = OpenOrder(oid=1, coin="ETH", is_buy=False, limit_px=Decimal("1900"),
