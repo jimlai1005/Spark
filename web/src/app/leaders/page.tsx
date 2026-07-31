@@ -527,6 +527,28 @@ function CustomLeaderSection({ busy, listedLeaders, onSelect }: {
               <span className="leader-badge">{cc.alreadyListedBadge}</span>
             </p>
           )}
+          {/* ⭐ vault 位址（2026-07-31 契約）：**資訊性標示，不是警告**——badge＋中性
+              說明，不新增任何步驟（checkbox／送出照舊）。舊後端不回 kind → 當 standard。 */}
+          {cPhase.preview.kind === "vault" && (
+            <>
+              <p className="leader-custom-listed">
+                <span className="leader-badge">{cc.vaultBadge}</span>
+              </p>
+              <p className="hint">{cc.vaultNote}</p>
+            </>
+          )}
+          {/* advisory 檢查有 FAIL → 警語列出每項 name＋detail（advisory：只告知，
+              不擋送出——與 exists／accepting_new 兩個警示同一「放行帶警示」原則）。 */}
+          {cPhase.preview.vault_checks && !cPhase.preview.vault_checks.passed && (
+            <div className="ops-alert" role="alert">
+              {cPhase.preview.vault_checks.failures.map((f) => (
+                <p key={f.name} className="ops-alert-body">
+                  <span className="mono">{f.name}</span>：{f.detail}
+                </p>
+              ))}
+              <p className="ops-alert-body">{cc.vaultCheckWarning}</p>
+            </div>
+          )}
           <p className="hint">{cc.previewNote}</p>
           <dl className="leader-stats">
             <LeaderStat label={cc.previewAccountValue} hint={cc.previewAccountValueHint}

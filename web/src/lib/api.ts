@@ -666,6 +666,21 @@ export interface LeaderPreviewResp {
    * 不擋送出。與 `leader_disabled` 的**安全撤銷**（enabled=false，硬拒絕）分兩支。
    */
   accepting_new: boolean;
+  /**
+   * vault 契約（2026-07-31 跨 wave 契約）：此位址是不是 Hyperliquid vault。
+   * **資訊性標示，不是警告**——顯示層加標示與說明，不新增任何步驟、不擋送出。
+   * optional：舊後端不回此欄，undefined 一律當 "standard"。
+   */
+  kind?: "standard" | "vault";
+  /**
+   * advisory 檢查結果；契約規定僅 kind=="vault" 時非 null，failures 只列 FAIL 項
+   * （PASS 不回細節；資訊性 WARN 不算 FAIL）。optional 同上：undefined 當無檢查。
+   * 只有 `passed=false` 才由顯示層畫警語——同樣不擋送出（advisory，非閘門）。
+   */
+  vault_checks?: null | {
+    passed: boolean;
+    failures: { name: string; detail: string }[];
+  };
 }
 
 /**

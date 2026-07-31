@@ -90,6 +90,8 @@ const CUSTOM_PREVIEW = {
   address: CUSTOM_ADDR, exists: true,
   account_value: "5123.45", position_count: 3, already_listed: false,
   accepting_new: true,
+  // 2026-07-31 vault 契約：standard 位址 kind="standard"、vault_checks=null。
+  kind: "standard" as const, vault_checks: null,
 };
 /**
  * ⭐ 原文必須含 `Leader: <位址>` 那一行——這不是裝飾，是伺服器版型的一部分
@@ -598,6 +600,77 @@ describe("LeadersPage — 地址 dock（本頁唯一的跟單入口）⭐", () =
     await userEvent.click(screen.getByRole("button", { name: "確認並簽署" }));
     expect(await screen.findByText(/已授權，於引擎的下一個 cycle 生效/)).toBeInTheDocument();
     expect(getLeaderSelectMessage).toHaveBeenCalledWith(CUSTOM_ADDR);
+  });
+
+  it("⭐ kind=vault 且檢查全過 → Vault 標示＋中性說明，零警語、不擋送出（資訊性標示）", async () => {
+    getLeaderPreview.mockResolvedValue({
+      ...CUSTOM_PREVIEW, kind: "vault",
+      vault_checks: { passed: true, failures: [] },
+    });
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(screen.getByText("Vault")).toBeInTheDocument();
+    expect(card.textContent).toMatch(/20x 槓桿上限/);
+    expect(card.textContent).toMatch(/申購.*贖回.*中性化/);
+    // 全 PASS → 不顯示 advisory 警語。
+    expect(card.textContent).not.toMatch(/帳本形態/);
+
+    // 不新增任何步驟：勾選聲明後照舊可送出。
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    expect(screen.getByRole("button", { name: "跟單此地址" })).toBeEnabled();
+  });
+
+  it("⭐ kind=vault 且檢查有 FAIL → 警語列出 failure 的 name＋detail 與風險收尾句，仍不擋送出", async () => {
+    getLeaderPreview.mockResolvedValue({
+      ...CUSTOM_PREVIEW, kind: "vault",
+      vault_checks: {
+        passed: false,
+        failures: [
+          { name: "equity-basis", detail: "帳戶權益含無法歸類的資金流" },
+          { name: "flow-window", detail: "近 7 天申贖筆數超出可中性化範圍" },
+        ],
+      },
+    });
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(screen.getByText("Vault")).toBeInTheDocument();
+    expect(card.textContent).toContain("equity-basis");
+    expect(card.textContent).toContain("帳戶權益含無法歸類的資金流");
+    expect(card.textContent).toContain("flow-window");
+    expect(card.textContent).toContain("近 7 天申贖筆數超出可中性化範圍");
+    expect(card.textContent).toMatch(/帳本形態.*可能無法精確計算/);
+    expect(card.textContent).toMatch(/繼續前請理解風險/);
+
+    // advisory ＝ 不擋：勾選聲明後照舊可送出，無新增步驟。
+    await userEvent.click(screen.getByRole("checkbox", { name: /未審核 leader/ }));
+    expect(screen.getByRole("button", { name: "跟單此地址" })).toBeEnabled();
+  });
+
+  it("kind=standard → 零 vault 元素（不多渲染任何東西）", async () => {
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(screen.queryByText("Vault")).not.toBeInTheDocument();
+    expect(card.textContent).not.toMatch(/槓桿上限/);
+    expect(card.textContent).not.toMatch(/帳本形態/);
+  });
+
+  it("舊後端回應缺 kind／vault_checks 兩欄位 → 當 standard，預覽卡照常、零 vault 元素", async () => {
+    const { kind: _k, vault_checks: _v, ...legacy } = CUSTOM_PREVIEW;
+    getLeaderPreview.mockResolvedValue(legacy);
+    render(wrap(<LeadersPage />));
+    await previewCustom();
+
+    const card = screen.getByText("鏈上預覽").closest(".leader-custom-preview")!;
+    expect(card.textContent).toContain("5,123.45");
+    expect(screen.queryByText("Vault")).not.toBeInTheDocument();
+    expect(card.textContent).not.toMatch(/槓桿上限/);
+    expect(card.textContent).not.toMatch(/帳本形態/);
   });
 
   it.each([
