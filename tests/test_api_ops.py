@@ -1508,7 +1508,8 @@ def test_absent_state_root_is_distinguished_from_unreadable(tmp_path):
 
 def _write_heartbeat(cfg, account_id, *, age_s=5.0, tripped=False, count=12,
                      newest_age_s=20.0, leader="0x" + "d4" * 20,
-                     leader_source="manifest", alloc="5000.00", util="0.4000",
+                     leader_source="manifest", leader_kind="standard",
+                     alloc="5000.00", util="0.4000",
                      capital_source="customer_signed", result="no_action",
                      alerts_count=0):
     """以引擎的**同一個產生器**寫一份心跳（測試不自己拼 JSON——自己拼的話，
@@ -1530,6 +1531,7 @@ def _write_heartbeat(cfg, account_id, *, age_s=5.0, tripped=False, count=12,
         account_id=account_id, now_s=now - age_s, killswitch_tripped=tripped,
         coverage=_Cov(), alerts_count=alerts_count,
         leader_address=leader, leader_source=leader_source,
+        leader_kind=leader_kind,
         allocated_capital=alloc, capital_utilization=util, use_full_equity=False,
         capital_source=capital_source, capital_changed_at=None,
         risk_controls_enabled=True, risk_source="env_default",
@@ -1581,6 +1583,32 @@ def test_heartbeat_fills_the_panel_when_the_state_root_is_unreadable(tmp_path):
                            "changed_at": None, "prefs": None, "halt": None}
     assert row["capital"]["source"] == "customer_signed"
     assert row["last_cycle"]["result"] == "no_action"
+
+
+def test_leader_kind_projection_tolerates_old_heartbeats(tmp_path):
+    """⭐ leader kind 上呈面板（2026-07-31 第二批），且**容忍舊引擎的心跳**。
+
+    新心跳：`leader.kind` 原樣上呈——vault 保護是否生效，這是面板唯一的來源。
+    舊心跳（升級窗口內引擎還沒滾動重啟）：沒有 `kind` 欄位 → `leader_kind: null`
+    （未知），其餘欄位照常，不得因缺欄位把整列打壞。
+    """
+    client, cfg = _h_app(tmp_path)
+    root = _unreadable_state_root(cfg, ACCT_A)
+    p = _write_heartbeat(cfg, ACCT_A, leader_kind="vault")
+    try:
+        row = client.get("/api/ops/health").json()["followers"][0]
+        assert row["leader_kind"] == "vault"
+
+        # 模擬舊引擎發布的心跳：同一份 payload，但 leader 那一格沒有 kind。
+        data = json.loads(p.read_text())
+        del data["leader"]["kind"]
+        p.write_text(json.dumps(data))
+        row = client.get("/api/ops/health").json()["followers"][0]
+        assert row["leader_kind"] is None
+        assert row["leader_address"] == "0x" + "d4" * 20   # 其餘欄位不受影響
+        assert row["leader_source"] == "manifest"
+    finally:
+        root.chmod(0o755)
 
 
 def test_stale_heartbeat_is_never_shown_as_current_state(tmp_path):

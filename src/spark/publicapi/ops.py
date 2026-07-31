@@ -396,6 +396,9 @@ def _apply_heartbeat(row: dict, hb) -> dict:
     leader = data.get("leader") or {}
     row["leader_address"] = leader.get("address")
     row["leader_source"] = leader.get("source")
+    # `kind`（2026-07-31 第二批）：vault 保護是否生效的唯一觀測面。舊引擎的心跳
+    # 沒有這一格 → `.get` 回 None（未知），升級窗口內不炸也不猜。
+    row["leader_kind"] = leader.get("kind")
     row["capital"] = data.get("capital")
     # 風控總開關同 `capital`：狀態根沒有可讀投影，心跳是唯一來源。
     row["risk"] = data.get("risk")
@@ -462,6 +465,7 @@ def follower_health(ref, state_root, *, now_fn, coverage_fn, killswitch_fn,
                  # 心跳專屬的格子先給明確的 None（不是缺鍵）：缺鍵在 JSON 上與
                  # 「值為 null」對前端是兩種形狀，而這一列每一欄都該恆定存在。
                  "leader_address": None, "leader_source": None,
+                 "leader_kind": None,
                  "capital": None, "last_cycle": None}
 
     # ⭐⭐ 先探測可讀性（見 state_root_status）：狀態根讀不到時，底下每一個

@@ -38,7 +38,8 @@ class _Cov:
 def _payload(now_s=_NOW, **over):
     base = dict(account_id=ACCT, now_s=now_s, killswitch_tripped=False,
                 coverage=_Cov(), alerts_count=0, leader_address="0x" + "d4" * 20,
-                leader_source="customer_signed", allocated_capital="5000.00",
+                leader_source="customer_signed", leader_kind="standard",
+                allocated_capital="5000.00",
                 capital_utilization="0.4000", use_full_equity=False,
                 capital_source="customer_signed",
                 capital_changed_at="2026-07-19T00:00:00+00:00",
@@ -88,7 +89,7 @@ def test_heartbeat_carries_every_summary_field(tmp_path):
     assert data["coverage"] == {"known": True, "count": 12, "oldest_age_s": 900.0,
                                 "newest_age_s": 30.0, "sufficient": True}
     assert data["leader"] == {"address": "0x" + "d4" * 20,
-                              "source": "customer_signed"}
+                              "source": "customer_signed", "kind": "standard"}
     assert data["capital"]["allocated_capital"] == "5000.00"
     assert data["capital"]["capital_utilization"] == "0.4000"
     assert data["capital"]["use_full_equity"] is False
@@ -104,6 +105,18 @@ def test_heartbeat_field_set_is_pinned_by_the_constant():
     欄位」這件事必須是有人主動做的決定，而不是某次重構的副作用。
     """
     assert tuple(_payload().keys()) == HEARTBEAT_FIELDS
+
+
+def test_leader_kind_rides_the_heartbeat():
+    """⭐ leader 種類（standard／vault）隨心跳發布（2026-07-31 第二批）。
+
+    vault 保護（20x 帽＋流量中性化）是否正在生效，面板唯一的觀測面就是這一格——
+    少了它，操作者只能翻引擎 log 才知道引擎當下把 leader 當 vault 還是 standard。
+    None ＝本輪沒有 leader（例如已撤銷），與 "standard" 分開：未知不得畫成已知。
+    """
+    assert _payload(leader_kind="vault")["leader"]["kind"] == "vault"
+    assert _payload(leader_kind="standard")["leader"]["kind"] == "standard"
+    assert _payload(leader_kind=None)["leader"]["kind"] is None
 
 
 def test_risk_controls_flag_rides_the_heartbeat(tmp_path):

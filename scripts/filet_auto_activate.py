@@ -326,7 +326,8 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
         return "waiting_leader"  # 產品語意：選了 leader 才啟用。
 
     # vault leader → env 多注入兩鍵保護（kind 查合併白名單，與 activate 的准入
-    # 驗證同一份清單——同源，工程原則 1）。自訂 leader（僅 registry）＝ standard。
+    # 驗證同一份清單——同源，工程原則 1）。registry 條目可帶 kind（自訂 vault
+    # 由 filet-api 准入時自動偵測寫入，2026-07-31 第二批），這裡一視同仁。
     ref = find_leader(leader, leaders)
     vault_leader = ref is not None and ref.kind == "vault"
 

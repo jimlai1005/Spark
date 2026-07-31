@@ -174,14 +174,12 @@
 
 ## 2026-07-31 vault leader 支援殘餘（Wave 1-6 落地後的已知債，四筆）
 
-- **自訂 registry 路徑無 vault 偵測 — 對外開放前必補**：owner 在 `/leaders` 頁自行輸入
-  vault 地址走的是 user registry（§5.5.3），條目一律 `kind: "standard"`——**不會**獲得
-  20x 帽與流量中性化；vault 目前僅精選白名單上架（RUNBOOK §5.5「vault leader 上架前置
-  檢查」交叉註記）。與 CLAUDE.md 紅線 5 例外的「對外開放前必須重審」屬同一窗，同窗處理。
-- **follower 側出入金校正債**：follower 自己的出入金仍會被回撤風控視為權益變動
-  （`src/spark/copytrade/equity.py:16`「ledger-aware 的出入金校正延到 public beta」）。
-  本次 leader 側落地的 `get_ledger_flows` ＋ `adjusted_leader_equity`（leader_flow.py）
-  機制可直接複用到 follower 側。
+- ~~**自訂 registry 路徑無 vault 偵測**~~ **已償（2026-07-31 第二批，commit 見 git log）**：
+  filet-api 准入時以 vaultDetails 自動偵測寫入 registry `kind`（advisory 檢查 FAIL
+  不擋用戶但發 TG＋log），一次性 backfill CLI＝`scripts/backfill_leader_kinds.py`。
+- ~~**follower 側出入金校正債**~~ **已償（2026-07-31 第二批，commit 見 git log）**：
+  follower 自身出入金以 ledger flows 校正回撤基準（`COPY_FOLLOWER_FLOW_CORRECTION`
+  預設 true，設 false 關閉），複用 leader 側 `get_ledger_flows` 機制。
 - **運行中 vault→standard 換手不還原收緊值**：引擎每輪 `apply_vault_policy` 只收緊
   不放鬆——換回 standard leader 後 20x 帽與中性化不會自動解除。方向是**過度保護、
   非 fail-open**（錯的代價是保守），還原需要破壞「單一設定物件」不變式，留待使用者裁決。
@@ -189,9 +187,8 @@
   `_kind_of` 查無條目回 `"standard"`（`src/spark/filet/leader_change_apply.py:122-131`
   註解）——vault 保護可能缺席一輪，下一輪白名單恢復即恢復。已知、方向短暫 fail-open，
   但窗口為單輪且需與 transient 讀失敗同時發生。
-- **流量型別映射雙實作**：ledger delta type 的白名單＋計號邏輯在
-  `src/spark/exchange/hyperliquid.py`（`get_ledger_flows`）與
-  `scripts/vault_preflight.py`（`_signed_flow`／`ALLOWED_LEDGER_TYPES`）各自實作——
-  語意目前一致，但一旦漂移，preflight 會繼續 PASS 而引擎算的是另一套。應抽單一函式共用。
-- **heartbeat 未發布 leader kind**：vault 保護（20x 帽＋流量中性化）是否生效沒有觀測面——
-  操作者無法從 heartbeat 確認引擎當下把 leader 當 vault 還是 standard，只能翻 log。
+- ~~**流量型別映射雙實作**~~ **已償（2026-07-31 第二批，commit 見 git log）**：
+  ledger delta type 白名單＋計號邏輯抽為單一共用實作，preflight 與引擎同源。
+- ~~**heartbeat 未發布 leader kind**~~ **已償（2026-07-31 第二批，commit 見 git log）**：
+  心跳 `leader.kind` ＝本輪 apply_vault_policy 同源的 kind，面板 `leader_kind`
+  投影＋vault 標示（舊心跳缺欄位＝null，不炸）。

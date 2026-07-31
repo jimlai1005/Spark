@@ -100,7 +100,7 @@ def write_hb(cfg, account_id, *, enabled=True, source="customer_signed",
     payload = build_heartbeat(
         account_id=account_id, now_s=(now_s or time.time()) - age_s,
         killswitch_tripped=tripped, coverage=None, alerts_count=0,
-        leader_address=_LEADER, leader_source="manifest",
+        leader_address=_LEADER, leader_source="manifest", leader_kind="standard",
         allocated_capital="1000.00", capital_utilization="0.5000",
         use_full_equity=False, capital_source="customer_signed",
         capital_changed_at=None,

@@ -164,6 +164,7 @@ def _reject_secret_material(payload: object, *, path: str = "") -> None:
 def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool | None,
                     coverage, alerts_count: int | None,
                     leader_address: str | None, leader_source: str | None,
+                    leader_kind: str | None,
                     allocated_capital: str | None, capital_utilization: str | None,
                     use_full_equity: bool | None, capital_source: str,
                     capital_changed_at: str | None,
@@ -204,7 +205,13 @@ def build_heartbeat(*, account_id: str, now_s: float, killswitch_tripped: bool |
         "killswitch_tripped": killswitch_tripped,
         "coverage": cov,
         "alerts": {"known": alerts_count is not None, "count": alerts_count},
-        "leader": {"address": leader_address, "source": leader_source},
+        # ⭐ `kind`（"standard"／"vault"，2026-07-31 第二批）＝本輪 apply_vault_policy
+        # 真正拿去套保護的那個 kind（呼叫端從同一個 LeaderResolution 取值，同源，
+        # 工程原則 1）——vault 保護是否生效，面板唯一的觀測面。None ＝本輪沒有
+        # leader（例如已撤銷）。讀端（publicapi.ops）以 `.get("kind")` 投影，
+        # 舊引擎的心跳沒有這一格 → 面板回 null（未知），不炸。
+        "leader": {"address": leader_address, "source": leader_source,
+                   "kind": leader_kind},
         "capital": {"allocated_capital": allocated_capital,
                     "capital_utilization": capital_utilization,
                     "use_full_equity": use_full_equity,

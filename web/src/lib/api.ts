@@ -1034,6 +1034,9 @@ export interface OpsHealthFollower {
   /** 以下四項**只可能來自心跳**（狀態根沒有可讀投影）；心跳非 ok 時一律 null。 */
   leader_address: string | null;
   leader_source: string | null;
+  /** leader 種類（"standard"／"vault"）＝ vault 保護是否生效的唯一觀測面
+   *（2026-07-31 第二批）。null＝未知（舊引擎的心跳沒有這一格，或心跳非 ok）。 */
+  leader_kind: string | null;
   capital: OpsHealthCapital | null;
   last_cycle: OpsHealthLastCycle | null;
   coverage_known: boolean;

@@ -636,7 +636,8 @@ grep FILET_KEYSVC_ALLOWED_UIDS /etc/systemd/system/filet-keysvc.service   # 驗�
 
 ### 5.3 其餘環境變數佔位符
 
-`filet-api.service` 還有五個佔位符要填（同樣用 `systemctl edit --full filet-api.service`）：
+`filet-api.service` 還有五個佔位符要填（同樣用 `systemctl edit --full filet-api.service`）；
+另有兩個**選配**的告警鍵（非佔位符，unit 檔預設沒有這兩行）一併列於表尾：
 
 | 變數 | 填入值 |
 |---|---|
@@ -645,6 +646,8 @@ grep FILET_KEYSVC_ALLOWED_UIDS /etc/systemd/system/filet-keysvc.service   # 驗�
 | `FILET_SIWE_DOMAIN` | `FILET_DOMAIN_PLACEHOLDER` 實際網域 |
 | `FILET_SIWE_URI` | `https://FILET_DOMAIN_PLACEHOLDER` |
 | `FILET_ADMIN_ADDRESSES` | `FILET_ADMIN_ADDRESSES_PLACEHOLDER`（附錄 A，逗號分隔） |
+| `FILET_API_TG_BOT_TOKEN` | 選配（2026-07-31 第二批）：filet-api 的營運告警通道——自訂 vault 准入 advisory 檢查 FAIL 時發 TG critical（見 §5.5「自訂 leader 路徑已支援自動偵測」）。unit 檔沒有這一行，需要時自行加 `Environment=` 行 |
+| `FILET_API_TG_CHAT_ID` | 同上，與 token 成對設定。**兩鍵任缺一 ＝ log-only**（NullNotifier）：API 照常服務、不擋任何請求，但 advisory 告警只進 journal，不會主動送達任何人 |
 
 > `FILET_API_NETWORK` 一列補於 2026-07-19（**實機重新部署發現**）：它已改為佔位符，
 > 但本表漏列，照本表填完會留下 `REPLACE_WITH_NETWORK`，API 直接拒絕啟動
@@ -829,10 +832,33 @@ loader 會 **fail-fast 拒載整個檔**——這是保護不是 bug：白名單
 >   /etc/filet/follower.env.template   # 預期：0
 > ```
 
-> ⚠️ **交叉註記——自訂 leader 路徑（§5.5.3 user registry）沒有 vault 偵測**：
-> owner 在 `/leaders` 頁自行輸入一個 vault 地址，**不會**獲得 20x 帽與流量中性化
-> （registry 條目一律 `kind: "standard"`）。vault 只能走精選白名單上架（本節流程）。
-> 對外開放前必補（見 open-items 2026-07-31 節）。
+> ⭐ **交叉註記——自訂 leader 路徑（§5.5.3 user registry）已支援自動偵測**
+> （2026-07-31 第二批；原「registry 條目一律 standard、vault 只能走精選白名單上架」
+> 的限制已解除）：owner 在 `/leaders` 頁自行輸入 vault 地址時，filet-api 以
+> vaultDetails 驗身自動判 `kind: "vault"` 寫進 registry 條目，watcher／引擎按
+> 同一套 kind 機制注入雙層保護（20x 帽＋流量中性化）。准入同時跑六項 preflight
+> 同款檢查，但模式是 **advisory，不是閘門**：任一 FAIL 都**不擋用戶**（用戶可能
+> 已繼續跟單），只發 TG critical＋log。**operator 收到 advisory FAIL 告警時必須
+> 人工核對該 vault**：跑本節步驟 1 的 `scripts.vault_preflight` 復驗，FAIL 屬實
+> 就按下一節的 `revoke_leader.py` 撤銷。告警通道＝ §5.3 表尾的
+> `FILET_API_TG_BOT_TOKEN`／`FILET_API_TG_CHAT_ID`（缺鍵＝log-only，
+> 告警只進 journal——上線機器建議兩鍵都設好）。
+>
+> ⭐ **升級既有機器的一次性 backfill**（2026-07-31 第二批）：本功能上線**前**寫入
+> registry 的條目全是 `kind: "standard"`——其中若有 vault 地址，雙層保護不會生效。
+> 升級後跑一次回填（探測每個 registry 位址的 vaultDetails、是 vault 才補寫
+> `kind: "vault"`；冪等，重跑零改動；部分失敗以非零退出碼收尾）：
+>
+> ```bash
+> cd /opt/filet/spark
+> # 先 dry-run 看會改哪些條目（只印不寫）
+> sudo -u ubuntu .venv/bin/python -m scripts.backfill_leader_kinds \
+>   --registry <FILET_EXCHANGE_DIR>/user_leaders.json --dry-run
+> # 確認清單無誤後實跑（<FILET_EXCHANGE_DIR> ＝ unit 檔的實際值，
+> # repo 版為 /var/lib/filet-exchange）
+> sudo -u ubuntu .venv/bin/python -m scripts.backfill_leader_kinds \
+>   --registry <FILET_EXCHANGE_DIR>/user_leaders.json
+> ```
 
 #### ⭐⭐ 安全撤銷一律跑 `scripts/revoke_leader.py`（不要手改、不要刪條目）
 

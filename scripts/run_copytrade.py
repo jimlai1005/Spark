@@ -354,6 +354,9 @@ def make_heartbeat_publisher(*, account_id: str | None, state_root: Path,
                 coverage=cov, alerts_count=alerts_count,
                 leader_address=(leader.address if leader is not None else None),
                 leader_source=(leader.source if leader is not None else None),
+                # kind 與 apply_vault_policy 同一個 LeaderResolution（同源，
+                # 工程原則 1）：心跳宣稱的 kind ＝ 本輪真正拿去套 vault 保護的 kind。
+                leader_kind=(leader.kind if leader is not None else None),
                 allocated_capital=alloc, capital_utilization=util,
                 use_full_equity=full, capital_source=capital_source,
                 capital_changed_at=changed_at,

@@ -404,7 +404,7 @@ function EngineStateRow({ row }: { row: OpsHealthFollower }) {
       <td className="mono" title={row.leader_address ?? undefined}>
         {row.leader_address ?? NO_VALUE}
       </td>
-      <td className="mono">{row.leader_source ?? NO_VALUE}</td>
+      <td className="mono">{row.leader_source ?? NO_VALUE}{row.leader_kind === "vault" ? " · vault" : ""}</td>
       <td className="mono">{fmtAmount(cap?.allocated_capital)}</td>
       <td className="mono">{fmtRatioPct(cap?.capital_utilization)}</td>
       <td className="mono">

@@ -606,6 +606,26 @@ def test_engine_publishes_a_heartbeat_each_cycle(monkeypatch, tmp_path):
     assert hb["last_cycle"]["result"] in {"ok", "no_action", "tripped"}
 
 
+def test_heartbeat_carries_this_cycles_leader_kind(monkeypatch, tmp_path):
+    """⭐ 心跳帶**本輪解析出的** leader kind（2026-07-31 第二批）。
+
+    kind 與 apply_vault_policy 出自同一個 LeaderResolution（同源，工程原則 1）：
+    這一格是「vault 保護（20x 帽＋流量中性化）正在生效」在面板上唯一的證據——
+    心跳若自己重查白名單，兩次讀取之間白名單可能已變，於是它會宣稱一個本輪
+    根本沒被拿去套保護的 kind。
+    """
+    _wire_signed(monkeypatch, tmp_path,
+                 allowlist=[{"address": _LEADER, "name": "Alpha",
+                             "kind": "vault"}])
+    _stub_network(monkeypatch)
+    _record_capital(monkeypatch, [])
+
+    rc.main(["--once"])
+
+    hb, _ = _read_hb(tmp_path)
+    assert hb["leader"]["kind"] == "vault"
+
+
 def test_heartbeat_reports_env_default_capital_source(monkeypatch, tmp_path):
     """沒有客戶簽章時來源是 `env_default`——與 `customer_signed` 分得開。
 
@@ -697,6 +717,7 @@ def test_heartbeat_records_a_zero_action_cycle_after_revocation(monkeypatch, tmp
     assert seen == []                                   # 確實零交易動作
     assert hb["last_cycle"]["result"] == "revoked"
     assert hb["leader"]["address"] is None
+    assert hb["leader"]["kind"] is None      # 沒有 leader 就沒有 kind，不謊報 standard
     assert hb["capital"]["source"] == "unavailable"     # 不謊報一組沒在用的數值
     assert hb["capital"]["allocated_capital"] is None
 

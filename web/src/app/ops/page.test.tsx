@@ -176,6 +176,7 @@ const H_ROW: OpsHealthFollower = {
   basis: "heartbeat",
   leader_address: "0xlead000000000000000000000000000000000001",
   leader_source: "signed",
+  leader_kind: "standard",
   capital: {
     allocated_capital: "10000.00",
     capital_utilization: "0.2500",
@@ -209,6 +210,7 @@ const H_ROW_UNKNOWN: OpsHealthFollower = {
   basis: "unreadable",
   leader_address: null,
   leader_source: null,
+  leader_kind: null,
   capital: null,
   last_cycle: null,
   coverage_known: false,
@@ -783,7 +785,8 @@ describe("OpsPage", () => {
   it("健康：心跳新鮮 → 列出目前 leader、來源與引擎當輪採用的資金設定", async () => {
     getOpsRevenue.mockResolvedValue(REVENUE_OK);
     getOpsCustomers.mockResolvedValue(CUSTOMERS);
-    getOpsHealth.mockResolvedValue(healthWith([H_ROW], {
+    // leader_kind: vault → 來源欄多標 vault（vault 保護是否生效的唯一觀測面）
+    getOpsHealth.mockResolvedValue(healthWith([{ ...H_ROW, leader_kind: "vault" }], {
       heartbeat_ok_count: 1, engine_alive_count: 1,
     }));
     render(wrap(<OpsPage />));
@@ -791,7 +794,7 @@ describe("OpsPage", () => {
     const section = await screen.findByRole("region", { name: "系統健康" });
     const row = rowOf(section, H_ROW.account_id, 1);   // 引擎現況表
     expect(row.textContent).toContain("0xlead000000000000000000000000000000000001");
-    expect(row.textContent).toMatch(/signed/);
+    expect(row.textContent).toMatch(/signed · vault/);
     // ⚠️ 兩個資金數值直接乘進部位大小：本金以字串來、顯示層只在最後一刻格式化
     expect(row.textContent).toMatch(/10,000\.00/);
     expect(row.textContent).toMatch(/25\.0%/);
