@@ -282,9 +282,14 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
                       "holding_protection_enabled=true 但 M1 尚無資料源支援，"
                       "本輪以無保護執行", dedup_key="hp_unsupported")
 
-    # leader 有部位的 coin 才有已知槓桿；其餘 coin 交由 _set_entry_leverage
-    # 的「map 查無 → 靜默跳過」降級路徑（orders.py docstring）。
+    # 槓桿雙源（2026-07-25 首航 CRIT 修法）：持倉幣用 leader 部位欄位（本輪已在手，
+    # 免額外查詢）；map 查無的幣（leader 空手純掛單——首航盲區本體）由 fallback 查
+    # activeAssetData 補缺（空手幣也查得到帳戶現行設定）。刻意**不做**持倉幣的雙源
+    # 交叉驗證——省每輪 N 次查詢；兩源同出交易所帳戶狀態，分歧只可能是快照時差。
     leverage_by_coin = {c: (p.leverage, p.is_cross) for c, p in leader_positions.items()}
+
+    def _leader_leverage(coin: str) -> tuple[int, bool]:
+        return adapter.get_active_asset_leverage(leader, coin)
 
     # ── 6. A 段掛單對帳 + B 段部位安全網 ──────────────────────────────
     def _safety_net() -> dict:
@@ -304,6 +309,7 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         settings=settings, notifier=notifier, state=state, live=ex.live,
         protected=set(protected), no_new_exposure=cost.breached,
         leverage_by_coin=leverage_by_coin,
+        leverage_fallback=_leader_leverage,
         safety_net=_safety_net,
     )
 

@@ -314,10 +314,57 @@ def test_set_entry_leverage_uses_mapping_values():
     assert notifier.records == []  # 成功不告警
 
 
-def test_set_entry_leverage_unknown_coin_is_noop():
+def test_set_entry_leverage_unknown_coin_without_fallback_is_noop():
+    """相容路徑：`leverage_fallback=None`（預設）時 map 查無維持既有靜默跳過語意。"""
     ex = FakeExecutor()
-    _set_entry_leverage(ex, _spec(coin="SOL"), {"ETH": (10, True)}, RecordingNotifier())
+    _set_entry_leverage(ex, _spec(coin="SOL"), {"ETH": (10, True)}, RecordingNotifier(),
+                        leverage_fallback=None)
     assert ex.records == []
+
+
+def test_set_entry_leverage_unknown_coin_uses_fallback():
+    """2026-07-25 首航盲區修法本體：map 查無 → 查 fallback（activeAssetData）→ 照設。"""
+    ex = FakeExecutor()
+    notifier = RecordingNotifier()
+    calls: list[str] = []
+
+    def fb(coin):
+        calls.append(coin)
+        return (25, True)
+
+    _set_entry_leverage(ex, _spec(coin="ETH"), {}, notifier, leverage_fallback=fb)
+    assert calls == ["ETH"]
+    assert ex.records == [("update_leverage", "ETH", 25, True)]
+    assert notifier.records == []  # 成功不告警
+
+
+def test_set_entry_leverage_map_hit_never_calls_fallback():
+    """持倉 map 優先：命中就不查 fallback（省查詢，值也同源於部位欄位）。"""
+    ex = FakeExecutor()
+
+    def fb(coin):
+        raise AssertionError("map 命中時不得查 fallback")
+
+    _set_entry_leverage(ex, _spec(coin="ETH"), {"ETH": (10, False)}, RecordingNotifier(),
+                        leverage_fallback=fb)
+    assert ex.records == [("update_leverage", "ETH", 10, False)]
+
+
+def test_set_entry_leverage_fallback_error_warns_and_skips():
+    """fallback 拋例外 → warn（dedup 含 coin）＋跳過該幣，不吞、不炸整輪。"""
+    ex = FakeExecutor()
+    notifier = RecordingNotifier()
+
+    def fb(coin):
+        raise ValueError(f"activeAssetData missing leverage for {coin}")
+
+    _set_entry_leverage(ex, _spec(coin="ETH"), {}, notifier, leverage_fallback=fb)
+    assert ex.records == []  # 該幣本輪不設槓桿
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    assert len(warns) == 1
+    assert warns[0][1] == "orders"
+    assert "ETH" in warns[0][2] and "槓桿" in warns[0][2]
+    assert "ETH" in warns[0][3]  # dedup key 含 coin
 
 
 def test_set_entry_leverage_failure_warns_with_dedup_key():
@@ -395,13 +442,14 @@ def test_settle_extra_only_after_retry_sets_sync_failed_and_criticals():
 # ── sync_open_orders ─────────────────────────────────────────────────
 def _run_sync(ex, leader_orders, my_orders, *, my_positions=None, scale=Decimal("1"),
               settings=SETTINGS, notifier=None, state=None, live=False,
-              protected=frozenset(), leverage_by_coin=None, safety_net=None,
-              skip_safety_net=False, sleeps=None) -> CycleReport:
+              protected=frozenset(), leverage_by_coin=None, leverage_fallback=None,
+              safety_net=None, skip_safety_net=False, sleeps=None) -> CycleReport:
     return sync_open_orders(
         ex, leader_orders, my_orders, my_positions or {}, scale,
         settings=settings, notifier=notifier or RecordingNotifier(),
         state=state or ReconcileState(), live=live, protected=protected,
-        leverage_by_coin=leverage_by_coin, safety_net=safety_net,
+        leverage_by_coin=leverage_by_coin, leverage_fallback=leverage_fallback,
+        safety_net=safety_net,
         skip_safety_net=skip_safety_net, clock=FakeClock(),
         sleep_fn=(sleeps.append if sleeps is not None else lambda s: None),
     )
@@ -471,6 +519,65 @@ def test_sync_without_leverage_map_sets_no_leverage():
     ex = FakeExecutor()
     _run_sync(ex, leader, [], leverage_by_coin=None)
     assert all(r[0] != "update_leverage" for r in ex.records)
+
+
+# ── sync_open_orders：槓桿 fallback（2026-07-25 首航盲區修復）─────────
+def test_sync_first_voyage_regression_empty_map_uses_fallback():
+    """首航回歸（2026-07-25 主網 CRIT 根因）：leader 空手＋純掛單網格 → map 空 →
+    舊版靜默跳過設槓桿、follower 停在帳戶預設 → 保證金不足、ETH 階梯 6 筆只進 1。
+    修法後：fallback 查 activeAssetData → 槓桿先設好、掛單照常送出。"""
+    leader = [_open_order(coin="ETH", limit_px="2000", sz="1", oid=1)]
+    ex = FakeExecutor()
+    report = _run_sync(ex, leader, [], leverage_by_coin={},
+                       leverage_fallback=lambda c: (25, True))
+
+    assert ("update_leverage", "ETH", 25, True) in ex.records
+    ops = [r[0] for r in ex.records]
+    assert ops.index("update_leverage") < ops.index("place")  # 設槓桿先於下單
+    assert report.reconcile.placed == 1  # 掛單照常
+
+
+def test_sync_fallback_error_warns_and_other_coins_still_set():
+    """fallback 對 ETH 拋例外 → warn（含 coin）＋ETH 不設槓桿；BTC 照常設、兩單照掛。"""
+    leader = [
+        _open_order(coin="ETH", limit_px="2000", sz="1", oid=1),
+        _open_order(coin="BTC", limit_px="50000", sz="0.5", oid=2),
+    ]
+    ex = FakeExecutor()
+    notifier = RecordingNotifier()
+
+    def fb(coin):
+        if coin == "ETH":
+            raise ValueError("bad activeAssetData payload")
+        return (20, False)
+
+    report = _run_sync(ex, leader, [], notifier=notifier, leverage_by_coin={},
+                       leverage_fallback=fb)
+
+    lev_calls = [r for r in ex.records if r[0] == "update_leverage"]
+    assert lev_calls == [("update_leverage", "BTC", 20, False)]
+    warns = [r for r in notifier.records if r[0] == "warn"]
+    assert len(warns) == 1
+    assert "ETH" in warns[0][2] and "ETH" in warns[0][3]
+    assert report.reconcile.placed == 2  # 槓桿查詢失敗不阻擋下單（best-effort 沿用）
+
+
+def test_sync_fallback_queried_at_most_once_per_coin():
+    """同幣多筆 desired → seen 去重 → fallback 每幣每輪至多查一次。"""
+    leader = [
+        _open_order(coin="ETH", limit_px="2000", sz="1", oid=1),
+        _open_order(coin="ETH", limit_px="2100", sz="1", oid=2),
+        _open_order(coin="ETH", limit_px="2200", sz="1", oid=3),
+    ]
+    ex = FakeExecutor()
+    calls: list[str] = []
+
+    def fb(coin):
+        calls.append(coin)
+        return (25, True)
+
+    _run_sync(ex, leader, [], leverage_by_coin={}, leverage_fallback=fb)
+    assert calls == ["ETH"]
 
 
 # ── sync_open_orders：end-to-end 串接 _build_desired → _reconcile ────

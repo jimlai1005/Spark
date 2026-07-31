@@ -390,14 +390,22 @@ class CycleReport:
 
 
 def _set_entry_leverage(
-    ex, desired: OrderSpec, leverage_by_coin: Mapping[str, tuple[int, bool]], notifier
+    ex,
+    desired: OrderSpec,
+    leverage_by_coin: Mapping[str, tuple[int, bool]],
+    notifier,
+    leverage_fallback: Callable[[str], tuple[int, bool]] | None = None,
 ) -> None:
     """進場單（非 reduce-only）下單前設定名目槓桿。port 自 hl orders.py:187-193。
 
     結構偏差：hl 從 `trader.entry_leverage(coin)`/`trader.entry_is_cross(coin)` 現算
     （內部查 meta 快取，hl trader.py:81-108）；spark 由呼叫端預算好 `leverage_by_coin`
-    （coin -> (leverage, is_cross)）注入。coin 不在 map 內 → 靜默跳過（呼叫端沒給
-    就是不設，等同 hl dry-run 無 info 時的降級路徑）。
+    （coin -> (leverage, is_cross)）注入。coin 不在 map 內 → 查 `leverage_fallback`
+    （loop 接 `activeAssetData`，leader 空手的幣也查得到）；fallback 未注入（None）
+    才維持舊語意靜默跳過（相容路徑）。fallback 查詢失敗 → warn（dedup 含 coin）＋
+    跳過該幣——2026-07-25 首航 CRIT 修法：leader 空手＋純掛單網格時 map 為空，舊版
+    靜默跳過設槓桿 → follower 停在帳戶預設 → 保證金不足、掛單缺漏（ETH 階梯 6 筆
+    只進 1）。「查無就是不設」升級為「查無走 fallback，查詢失敗才大聲跳過」。
 
     失敗處理（比照 positions.py `_try_update_leverage`；hl 在 Trader.set_leverage 內
     自行 tg.alert，hl trader.py:127）：`ex.update_leverage` 回 False → warn 告警但
@@ -407,7 +415,18 @@ def _set_entry_leverage(
         return
     pair = leverage_by_coin.get(desired.coin)
     if pair is None:
-        return
+        if leverage_fallback is None:
+            return
+        try:
+            pair = leverage_fallback(desired.coin)
+        except Exception as e:  # noqa: BLE001 —— 查詢失敗是降級不是熔斷：大聲＋跳過該幣
+            notifier.warn(
+                "orders",
+                f"leader 槓桿查詢失敗 {desired.coin}（{e!r}），該幣本輪不設槓桿——"
+                f"若掛單因保證金不足被拒，此為根因",
+                dedup_key=f"lev_fallback_fail:{desired.coin}",
+            )
+            return
     leverage, is_cross = pair
     ok = ex.update_leverage(desired.coin, leverage, is_cross)
     if not ok:
@@ -733,6 +752,7 @@ def sync_open_orders(
     protected: set[str] = frozenset(),
     no_new_exposure: bool = False,
     leverage_by_coin: Mapping[str, tuple[int, bool]] | None = None,
+    leverage_fallback: Callable[[str], tuple[int, bool]] | None = None,
     safety_net: Callable[[], dict] | None = None,
     skip_safety_net: bool = False,
     clock=time.time,
@@ -806,7 +826,8 @@ def sync_open_orders(
             if d.reduce_only or d.coin in seen:
                 continue
             seen.add(d.coin)
-            _set_entry_leverage(ex, d, leverage_by_coin, notifier)
+            _set_entry_leverage(ex, d, leverage_by_coin, notifier,
+                                leverage_fallback=leverage_fallback)
 
     rec = _reconcile_orders(
         ex,

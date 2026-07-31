@@ -275,7 +275,8 @@ def test_normal_path_passes_scale_live_state_to_sync(tmp_path, monkeypatch):
                      positions=[Position(coin="BTC", szi=Decimal("2"),
                                          entry_px=Decimal("50000"), leverage=7,
                                          is_cross=False, unrealized_pnl=Decimal("0"),
-                                         margin_used=Decimal("0"))])
+                                         margin_used=Decimal("0"))],
+                     active_asset_leverage={"ETH": (25, True)})
     state = ReconcileState()
     report, notifier, ex = _run(fa, state=state, tmp_path=tmp_path)
 
@@ -290,12 +291,45 @@ def test_normal_path_passes_scale_live_state_to_sync(tmp_path, monkeypatch):
     assert captured["protected"] == set()  # holding protection 預設關 → 空集合
     # leader 有部位的 coin → leverage map（取 leader 部位欄位）
     assert captured["leverage_by_coin"] == {"BTC": (7, False)}
+    # map 查無的幣（leader 空手）→ fallback 查 activeAssetData，地址用 leader
+    #（2026-07-25 首航盲區修法接線）
+    assert captured["leverage_fallback"]("ETH") == (25, True)
+    assert fa.calls["get_active_asset_leverage"] == [
+        {"address": LEADER, "coin": "ETH"}]
     # safety_net 已接線且回傳 dict（fake_sync 內已實際呼叫一次）
     assert isinstance(report.safety_net, dict)
     assert set(report.safety_net) >= {"opened", "flattened", "failed"}
     # 讀取地址正確：leader 與 my 各讀了 orders/positions/account
     addrs = [c["address"] for c in fa.calls["get_account_state"]]
     assert addrs == [LEADER, MY_ADDR]
+
+
+def test_leverage_fallback_wired_end_to_end_through_run_cycle(tmp_path):
+    """首航盲區 loop 整合（不 mock sync）：leader 持倉 BTC → BTC 用持倉欄位值；
+    ETH 空手純掛單 → 用 activeAssetData fallback 值。兩張掛單照常送出。"""
+    btc_pos = Position(coin="BTC", szi=Decimal("2"), entry_px=Decimal("50000"),
+                       leverage=7, is_cross=False, unrealized_pnl=Decimal("0"),
+                       margin_used=Decimal("0"))
+    leader_orders = [
+        OpenOrder(oid=1, coin="ETH", is_buy=True, limit_px=Decimal("2000"),
+                  sz=Decimal("1"), reduce_only=False, is_trigger=False,
+                  trigger_px=None, tpsl=None),
+        OpenOrder(oid=2, coin="BTC", is_buy=True, limit_px=Decimal("50000"),
+                  sz=Decimal("1"), reduce_only=False, is_trigger=False,
+                  trigger_px=None, tpsl=None),
+    ]
+    fa = FakeAdapter(equity=_healthy_equity(), account=_account("1000"),
+                     open_orders=leader_orders, positions=[btc_pos],
+                     active_asset_leverage={"ETH": (25, True)})
+    report, notifier, ex = _run(fa, tmp_path=tmp_path)
+
+    lev = [(r.coin, r.payload["leverage"], r.payload["is_cross"])
+           for r in ex.records if r.kind == "update_leverage"]
+    assert sorted(lev) == [("BTC", "7", False), ("ETH", "25", True)]
+    # fallback 只對 map 查無的 ETH 查一次，地址是 leader
+    assert fa.calls["get_active_asset_leverage"] == [
+        {"address": LEADER, "coin": "ETH"}]
+    assert report.reconcile.placed == 2  # 兩張掛單照常送出
 
 
 def test_volatility_weight_scales_down_via_leader_daily_pnl(tmp_path, monkeypatch):
