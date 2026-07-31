@@ -162,7 +162,10 @@
 
 ## 2026-07-25 mainnet 首航新增（上線當日實測發現）
 
-- **引擎槓桿同步盲區（首航 CRIT 實例）**：`orders.py _set_entry_leverage` 的 `leverage_by_coin`
+- ~~**引擎槓桿同步盲區（首航 CRIT 實例）**~~ **已償（2026-07-31 第三批，commit 見 git log）**：
+  `leverage_by_coin` 查無的幣改查 `activeAssetData`（空手也查得到，2026-07-31 主網
+  probe 實證）；fallback 查詢失敗 → warn（含「掛單被拒的根因」提示）＋跳過該幣。
+  持倉幣不做雙源交叉驗證（省每輪 N 次查詢）。原始事故紀錄保留於下：`orders.py _set_entry_leverage` 的 `leverage_by_coin`
   只從 leader **持倉**推導；leader 空手＋純掛單網格時地圖為空 → 靜默跳過 → follower 停在
   新帳戶預設 20x → 保證金不足，ETH 階梯 6 筆只掛進 1 筆（CRIT「掛單重試後仍不符：缺少 5」）。
   當日處置：停引擎，走 adapter 代發 `update_leverage`（ETH 25x、BTC 40x cross）後恢復，18/18 掛齊。
@@ -187,7 +190,11 @@
   `_kind_of` 查無條目回 `"standard"`（`src/spark/filet/leader_change_apply.py:122-131`
   註解）——vault 保護可能缺席一輪，下一輪白名單恢復即恢復。已知、方向短暫 fail-open，
   但窗口為單輪且需與 transient 讀失敗同時發生。
-- **follower 校正的單輪幻影回撤窗口**（2026-07-31 第二批 opus 審查觀察）：
+- ~~**follower 校正的單輪幻影回撤窗口**~~ **已償（2026-07-31 第三批，commit 見 git log）**：
+  breach 二次確認——判定破線後、critical 與 flatten 前，重呼 apply_follower_flows；
+  **只有校正真的落地（樣本檔改變）才重判**（無條件重判會多寫樣本觸發 wick-guard、
+  把真破線洗掉＝fail-open，實測證實）；取數失敗＝基準不變＝照常 trip（fail-closed）。
+  原始描述保留於下：
   出入金校正是反應式（每輪先查 ledger 再讀淨值）——出金若恰落在「本輪 ledger 已查完」
   與「讀淨值」之間，該輪以未校正基準判回撤，下一輪才校正。窗口＝單輪內的次秒級，
   但後果嚴重（誤觸 flatten；total_drawdown 還要簽章解鎖）。修法方向：**breach 路徑上
