@@ -2,14 +2,20 @@
  * lib/api.ts — 後端 Public API 的唯一出口（工程原則 5 的前端鏡射）。
  * 一律同源相對路徑 + credentials:"include"（紅線 5）。
  * 錯誤分類（工程原則 2）：auth(401)/client(4xx)/upstream(502|503)/network。
- * ⭐ 紅線 3：帶簽名的後端呼叫只有四支，四支都是 EIP-191 personal_sign，且四支的
+ * ⭐ 紅線 3：帶簽名的後端呼叫共**五支**，全都是 EIP-191 personal_sign，且五支的
  *   **原文都由伺服器產生**（前端不組字串）：
  *     1. authVerify —— SIWE 登入簽名；
  *     2. postLeaderSelect —— 換 leader 授權簽名（原文來自 getLeaderSelectMessage）。
  *     3. postMyRisk —— 風控設定授權簽名（原文來自 getRiskSettingsMessage）；
- *     4. postRiskUnlock —— 解除熔斷授權簽名（原文來自 getRiskUnlockMessage）。
- *   後兩支的域分隔（一份「調門檻」的簽章不得被兌換成一次「開熔斷鎖」，反之亦然）
- *   由伺服器版型的第一行在結構上確立，見 src/spark/filet/risk_settings.py 檔頭。
+ *     4. postRiskUnlock —— 解除熔斷授權簽名（原文來自 getRiskUnlockMessage）；
+ *     5. postCapitalSettings —— 資金配置（投入比例／本金模式）授權簽名（原文來自
+ *        getCapitalSettingsMessage）——2026-08-28 主線程裁決新增（Task 10b）：
+ *        `allocated_capital`／`capital_utilization` 直接乘進部位大小
+ *        （`sizing.compute_scale_factor`），與換 leader 同級危害，同樣需要簽章
+ *        （見 `src/spark/filet/capital_settings.py` 檔頭）。
+ *   4／5 兩支的域分隔（一份「調門檻」或「改資金配置」的簽章不得被兌換成另一種
+ *   動作，任兩兩之間皆然）由各自伺服器版型的第一行在結構上確立，見
+ *   src/spark/filet/risk_settings.py 與 capital_settings.py 檔頭。
  *   EIP-712 的鏈上授權簽名走 lib/hl.ts 直送 HL，本模組結構上沒有那條路。
  */
 import type { HlTypedData } from "./hl";
@@ -451,6 +457,121 @@ export function postRiskUnlock(
 ): Promise<RiskUnlockResp> {
   return post<RiskUnlockResp>("/api/me/risk/unlock", {
     account_id: payload.account_id,
+    nonce: payload.nonce,
+    issued_at: payload.issued_at,
+    signature,
+    message: payload.message,
+  });
+}
+
+// ---------- 資金配置（投入比例／本金模式，2026-08-28 Task 10b；對照
+// publicapi/app.py /api/me/capital，同一套威脅模型見 filet/capital_settings.py 檔頭）----------
+
+/** 目前生效中的資金配置（引擎心跳投影）。任一欄位缺席（心跳過期／缺席）→ null。 */
+export interface CapitalEffective {
+  allocated_capital: string | null;
+  capital_utilization: string | null;
+  use_full_equity: boolean | null;
+  /** 這組值的來源（`customer_signed`／`env_default`）。 */
+  source: string;
+  /** 引擎**實際套用**的時刻；env 預設值為 null。 */
+  changed_at: string | null;
+  /** 心跳回報的時刻——與 `changed_at` 不同源，顯示層不得混用（工程原則 1）。 */
+  as_of: string;
+}
+
+/** 已提交但尚未確認生效的那一筆（已生效的一律不出現在這裡）。 */
+export interface CapitalPending {
+  allocated_capital: string;
+  capital_utilization: string;
+  use_full_equity: boolean;
+  submitted_at: string | null;
+  /** `not_yet_applied`＝生效值已知且與提交值不同；`unconfirmed`＝生效值不可知。 */
+  state: "not_yet_applied" | "unconfirmed";
+  effective_when: string;
+  note: string;
+}
+
+export type MyCapitalStatus = "effective" | "unknown" | "not_activated" | "indeterminate";
+
+/**
+ * 「已提交」與「已生效」分開的資金配置查詢（唯讀，需 session，無簽章）。
+ * 形狀沿 `MyRiskResp` 的同一個決定：`effective` 只在心跳新鮮時非 null，
+ * `pending` 只在尚未確認套用時非 null（見後端 `_capital_pending` 檔頭）。
+ */
+export interface MyCapitalResp {
+  account_id: string;
+  status: MyCapitalStatus;
+  effective: CapitalEffective | null;
+  pending: CapitalPending | null;
+  heartbeat: { status: string; at: string; age_s: number; stale_after_s: number } | null;
+  note: string;
+}
+
+export function getMyCapital(): Promise<MyCapitalResp> {
+  return request<MyCapitalResp>("/api/me/capital");
+}
+
+/**
+ * 資金配置的 canonical 待簽原文 ＋ 一次性 nonce（需 session）。⭐ GET＋query
+ * string（沿 `getLeaderSelectMessage`／`getLeaderPreview` 的形狀，而非 risk 的
+ * POST body）——與後端端點形狀一致（`app.py::capital_settings_message` 收
+ * query 參數）。邊界在發原文之前就檢查（超界 → 400，不發 nonce）。
+ * 三個位置參數（而非物件）：沿本檔其餘 GET 端點的既有慣例（`getLeaderPreview`
+ * 等皆位置式參數），也讓 `api.test.ts` 的反射式結構掃描能用位置假值安全呼叫。
+ */
+export function getCapitalSettingsMessage(
+  allocatedCapital: string,
+  capitalUtilization: string,
+  useFullEquity: boolean,
+): Promise<CapitalSettingsMessageResp> {
+  const q = new URLSearchParams({
+    allocated_capital: allocatedCapital,
+    capital_utilization: capitalUtilization,
+    use_full_equity: String(useFullEquity),
+  });
+  return request<CapitalSettingsMessageResp>(`/api/me/capital/message?${q.toString()}`);
+}
+
+export interface CapitalSettingsMessageResp {
+  message: string;
+  nonce: string;
+  issued_at: string;
+  account_id: string;
+  /** 伺服器 canonical 化後的回聲（客戶端原樣回填進 POST body，工程原則 1）。 */
+  allocated_capital: string;
+  capital_utilization: string;
+  use_full_equity: boolean;
+}
+
+/** 送出結果。`effective_note`／`consequences` 為後端寫給人看的原文，單一來源。 */
+export interface CapitalSettingsResp {
+  ok: boolean;
+  account_id: string;
+  allocated_capital: string;
+  capital_utilization: string;
+  use_full_equity: boolean;
+  /** 機器可讀語意，目前恆為 `next_engine_cycle`。 */
+  effective: string;
+  effective_note: string;
+  consequences: string;
+}
+
+/**
+ * 送出資金配置授權。⭐ 刻意收**整包 payload 物件**（沿 `postLeaderSelect`／
+ * `postMyRisk` 的同一個理由）：伺服器驗簽時用 account_id／金額／nonce／issued_at
+ * **重建**訊息再 recover，客戶端從別處拼一個欄位進來就會出現「簽的是 A、送的是
+ * B」的縫。非冪等寫入 ＋ nonce 一次性：**不得自動重試**。
+ */
+export function postCapitalSettings(
+  payload: CapitalSettingsMessageResp,
+  signature: string,
+): Promise<CapitalSettingsResp> {
+  return post<CapitalSettingsResp>("/api/me/capital", {
+    account_id: payload.account_id,
+    allocated_capital: payload.allocated_capital,
+    capital_utilization: payload.capital_utilization,
+    use_full_equity: payload.use_full_equity,
     nonce: payload.nonce,
     issued_at: payload.issued_at,
     signature,

@@ -45,7 +45,6 @@ type ConnectPhase = "idle" | "connecting" | "signing";
 const SCALE_MIN = 5;
 const SCALE_MAX = 100;
 const SCALE_DEFAULT = 25;
-const LEV_MIN = 1;
 const DD_MIN = 5;
 const DD_MAX = 50;
 const DD_DEFAULT = 20;
@@ -133,9 +132,9 @@ export default function StrategyDetailPage() {
   const [phase, setPhase] = useState<ConnectPhase>("idle");
   const [error, setError] = useState<string | null>(null);
 
-  // 三個 slider（NOTE 07：未連錢包即可調）。
+  // 兩個 slider（NOTE 07：未連錢包即可調）。槓桿上限 Task 10b 起改唯讀資訊列
+  // （無 per-user 簽章通道，見 StepRiskLimits.tsx 檔頭），不再是使用者可調的值。
   const [scalePct, setScalePct] = useState(SCALE_DEFAULT);
-  const [leverage, setLeverage] = useState(LEV_MIN);
   const [ddEnabled, setDdEnabled] = useState(false); // 裁決 1：預設關閉
   const [ddPct, setDdPct] = useState(DD_DEFAULT);
 
@@ -161,9 +160,6 @@ export default function StrategyDetailPage() {
   }
 
   const m = strategy.metrics;
-  const maxLevRaw = strategy.max_leverage ? Number(strategy.max_leverage) : 3;
-  const maxLev = Number.isFinite(maxLevRaw) && maxLevRaw >= LEV_MIN ? maxLevRaw : 3;
-  const leverageClamped = Math.min(leverage, maxLev);
   const explorerHref = `https://app.hyperliquid.xyz/explorer/address/${strategy.leader_address}`;
   const asOf = formatUpdatedAt(strategy.methodology.updated_at);
 
@@ -174,7 +170,6 @@ export default function StrategyDetailPage() {
     const p = new URLSearchParams();
     p.set("strategy", strategy!.slug);
     p.set("scale", String(scalePct));
-    p.set("lev", String(leverageClamped));
     if (ddEnabled) p.set("dd", String(ddPct));
     return p.toString();
   }
@@ -358,21 +353,24 @@ export default function StrategyDetailPage() {
               />
             </div>
 
+            {/*
+              ⭐ Task 10b（主線程裁決 2026-08-28）：槓桿上限改唯讀資訊列——沒有
+              per-user 可簽的槓桿上限通道（`COPY_MAX_TARGET_LEVERAGE` 是引擎 env
+              靜態值），slider 會讓客戶誤以為自己設定了什麼，故移除；`lev` 查詢
+              參數同步移除（見 buildQuery）。
+            */}
             <div className="risk-field">
               <div className="risk-slider-row">
-                <label htmlFor="leverage-slider">{c.panel.leverageLabel}</label>
-                <span className="mono risk-value">{leverageClamped}x</span>
+                <span>{c.panel.leverageLabel}</span>
+                <span className="mono risk-value">
+                  {strategy.max_leverage ? `${strategy.max_leverage}x` : NO_VALUE}
+                </span>
               </div>
-              <input
-                id="leverage-slider"
-                type="range"
-                className="risk-slider"
-                min={LEV_MIN}
-                max={maxLev}
-                step={0.5}
-                value={leverageClamped}
-                onChange={(e) => setLeverage(Number(e.target.value))}
-              />
+              <p className="hint">
+                {COPY.wizard.leverageInfoPrefix}
+                {strategy.max_leverage ? `${strategy.max_leverage}x` : NO_VALUE}
+                {COPY.wizard.leverageInfoSuffix}
+              </p>
             </div>
 
             <div className="risk-field">

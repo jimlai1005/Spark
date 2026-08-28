@@ -227,6 +227,11 @@ export const COPY_ZH = {
     step3Body: "這些數值會寫進 agent 授權範圍。Filet 無法超出這些限制下單；你之後可以隨時調低。",
     step3NextButton: "前往費用與風險確認",
     ddSaving: "簽署送出中…",
+    // ⭐ Task 10b（主線程裁決 2026-08-28）：投入比例改真實簽章流，槓桿改唯讀。
+    capitalEffectiveLabel: "目前生效",
+    capitalPendingLabel: "已提交，待引擎套用",
+    leverageInfoPrefix: "本策略槓桿上限 ",
+    leverageInfoSuffix: "（平台層強制，非使用者可調）",
     // ---- step 4：費用與風險確認（NOTE 12：三條 checkbox 逐字） ----
     step4Title: "確認",
     step4Body: "最後一步：確認費用與風險揭露，全部勾選後即可完成開通。",
@@ -1048,17 +1053,19 @@ export const COPY_ZH = {
     sub: "兩筆錢包簽名都不上鏈、不花 gas。以下是 agent 權限的精確邊界。",
     canTitle: "可以",
     cannotTitle: "不能",
+    // ⭐ Task 10b（主線程裁決 2026-08-28）：三處共用同一份 key（首頁／策略詳情頁／
+    // onboarding 授權卡皆掛 CapabilityMatrix），改一次全站同步。
     can: [
       "依策略訊號在你的帳戶下單、加倉、平倉",
       "使用你設定範圍內的可動用資金（投入比例上限）",
-      "在你簽署的槓桿上限內調整倉位",
+      "在策略標示的槓桿上限內執行（平台層強制）",
       "依已簽署的費率上限（0.02%）收取 builder fee",
     ],
     cannot: [
       "提領你的資金到任何地址",
       "轉帳或在錢包之間移動資產",
       "取得你的私鑰或助記詞（永遠不會索取）",
-      "超出你設定的投入比例、槓桿與最大回撤",
+      "超出你簽署的投入比例；超出策略標示的槓桿上限；觸發你啟用的最大回撤而不停止",
     ],
     revocable:
       "授權為你單方可撤銷：Dashboard 一鍵暫停跟單（停止新開倉），或撤銷 agent（Filet 立即失去下單能力）。"
@@ -1340,6 +1347,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       + "you can always lower them later.",
     step3NextButton: "Continue to fees & risk confirmation",
     ddSaving: "Submitting signature…",
+    capitalEffectiveLabel: "Currently in effect",
+    capitalPendingLabel: "Submitted, pending engine application",
+    leverageInfoPrefix: "This strategy's leverage cap is ",
+    leverageInfoSuffix: " (platform-enforced, not user-adjustable)",
     step4Title: "Confirm",
     step4Body: "Last step: confirm fees and risk disclosures. Check all boxes to complete setup.",
     step4CheckLoss: "I understand I may lose money",
@@ -2015,14 +2026,15 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     can: [
       "Place, add to, and close orders in your account based on strategy signals",
       "Use margin within the range you set (allocation share cap)",
-      "Adjust positions within the leverage cap you signed",
+      "Execute within the strategy's stated leverage cap (platform-enforced)",
       "Collect builder fee up to the rate cap you signed (0.02%)",
     ],
     cannot: [
       "Withdraw your funds to any address",
       "Transfer or move assets between wallets",
       "Obtain your private key or seed phrase (never requested)",
-      "Exceed the allocation share, leverage, or max drawdown you set",
+      "Exceed the allocation share you signed; exceed the strategy's stated leverage cap; "
+        + "breach the max drawdown you enabled without stopping",
     ],
     revocable: "Authorization is unilaterally revocable by you: pause following from the Dashboard with one click "
       + "(stops new order placement), or revoke the agent (Filet immediately loses order authority). Revocation "

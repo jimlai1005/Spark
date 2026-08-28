@@ -38,7 +38,6 @@ import { clearWizardProgress, deriveStep, loadWizardProgress, saveWizardProgress
 
 const ADVANCED_PREFIX = "advanced:";
 const SCALE_DEFAULT = 25;
-const LEV_DEFAULT = 1;
 const DD_DEFAULT = 20;
 
 export default function OnboardingPage() {
@@ -84,29 +83,26 @@ export default function OnboardingPage() {
   const maxLeverage = !isAdvanced && detail?.max_leverage ? Number(detail.max_leverage) : null;
 
   const [scale, setScale] = useState(SCALE_DEFAULT);
-  const [lev, setLev] = useState(LEV_DEFAULT);
   const [ddEnabled, setDdEnabled] = useState(false);
   const [ddPct, setDdPct] = useState(DD_DEFAULT);
   const [step3Confirmed, setStep3Confirmed] = useState(false);
 
   // 斷點續作：me/strategy 就緒後讀一次 localStorage；找不到相符進度就沿用查詢
-  // 參數／預設值（URL 帶來的 scale/lev/dd 只在「第一次進來、還沒有本地進度」時採用）。
+  // 參數／預設值（URL 帶來的 scale/dd 只在「第一次進來、還沒有本地進度」時採用；
+  // `lev` 查詢參數已移除——槓桿改唯讀資訊列，不再是使用者可調的值，Task 10b）。
   useEffect(() => {
     if (!me.data || !strategyParam) return;
     const saved = loadWizardProgress(me.data.address, strategyParam);
     if (saved) {
       setScale(saved.scale);
-      setLev(saved.lev);
       setDdEnabled(saved.ddEnabled);
       setDdPct(saved.ddPct);
       setStep3Confirmed(saved.step3Confirmed);
       return;
     }
     const qScale = Number(searchParams.get("scale"));
-    const qLev = Number(searchParams.get("lev"));
     const qDd = searchParams.get("dd");
     if (Number.isFinite(qScale) && qScale > 0) setScale(qScale);
-    if (Number.isFinite(qLev) && qLev > 0) setLev(qLev);
     if (qDd != null) {
       const n = Number(qDd);
       if (Number.isFinite(n) && n > 0) {
@@ -128,14 +124,13 @@ export default function OnboardingPage() {
 
   function persist(next: Partial<StepRiskLimitsValues & { step3Confirmed: boolean }>) {
     saveWizardProgress({
-      address, strategy: strategyParam, scale, lev, ddEnabled, ddPct, step3Confirmed,
+      address, strategy: strategyParam, scale, ddEnabled, ddPct, step3Confirmed,
       ...next,
     });
   }
 
   function handleStep3Next(values: StepRiskLimitsValues) {
     setScale(values.scale);
-    setLev(values.lev);
     setDdEnabled(values.ddEnabled);
     setDdPct(values.ddPct);
     setStep3Confirmed(true);
@@ -189,7 +184,7 @@ export default function OnboardingPage() {
           <StepRiskLimits
             me={me.data}
             maxLeverage={maxLeverage}
-            initial={{ scale, lev, ddEnabled, ddPct }}
+            initial={{ scale, ddEnabled, ddPct }}
             onBack={() => router.push("/strategies")}
             onNext={handleStep3Next}
           />

@@ -274,6 +274,11 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
         max_total_drawdown_pct: "0.40", flatten_on_breach: true, cooldown_hours: "12",
       }),
       () => api.getRiskUnlockMessage(),
+      // 2026-08-28（Task 10b）：資金配置查詢＋取待簽原文，同 risk 的模式——
+      // 兩支不帶簽名；真正帶簽名的 postCapitalSettings 在 EXCLUDED，專屬白名單測試
+      // 見檔案末段。
+      () => api.getMyCapital(),
+      () => api.getCapitalSettingsMessage("0", "0.25", true),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -301,8 +306,13 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
   // 見 filet/risk_settings.py），所以它們必然含 `signature` 欄位、必然會被本黑名單
   // 掃描判紅——例外不是豁免：兩支各有一條**白名單**測試（body 欄位集合恰為契約
   // 欄位，多一個就失敗，見檔案末段），比本掃描更嚴。
+  // ⭐ 2026-08-28（Task 10b，主線程裁決）：postCapitalSettings 是第五支合法例外
+  // ——`allocated_capital`／`capital_utilization` 直接乘進部位大小，危害與換
+  // leader 同級，同樣需要簽章（見 filet/capital_settings.py 檔頭）。同樣有專屬
+  // 白名單測試（見檔案末段）。
   const EXCLUDED = new Set([
     "ApiError", "authVerify", "postLeaderSelect", "postMyRisk", "postRiskUnlock",
+    "postCapitalSettings",
   ]);
   const reflected = Object.entries(api).filter(
     ([name, value]) => typeof value === "function" && !EXCLUDED.has(name),
@@ -318,7 +328,10 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     // 2026-07-30（同日，風控改簽章提交）：+3 匯出（getRiskSettingsMessage、
     //   getRiskUnlockMessage、postRiskUnlock），其中 postRiskUnlock 與改為帶簽名的
     //   postMyRisk 一起進 EXCLUDED ⇒ 反射清單淨增 1（20 → 21）。
-    const HAND_WRITTEN_LIST_LENGTH = 21;
+    // 2026-08-28（Task 10b，主線程裁決）：+3 匯出（getMyCapital、
+    //   getCapitalSettingsMessage、postCapitalSettings），其中 postCapitalSettings
+    //   進 EXCLUDED（帶簽名）⇒ 反射清單淨增 2（21 → 23）。
+    const HAND_WRITTEN_LIST_LENGTH = 23;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 
@@ -459,6 +472,67 @@ describe("⭐ 風控的兩支簽章端點：body 欄位集合精確釘死", () =
     );
     expect(body).not.toHaveProperty("prefs");
     expect(body.message).toBe(UNLOCK_PAYLOAD.message);
+  });
+});
+
+/**
+ * 資金配置：紅線 3 的第五個已知例外（2026-08-28，Task 10b，主線程裁決）。
+ * `allocated_capital`／`capital_utilization` 直接乘進部位大小，危害與換 leader
+ * 同級——同樣用**白名單**釘死 body 欄位集合。
+ */
+describe("⭐ postCapitalSettings：帶簽名的例外，body 欄位集合精確釘死", () => {
+  const PAYLOAD = {
+    message: "Filet: update copy-trading capital allocation\n\nAccount: fzzz\nNonce: n-11",
+    nonce: "n-11",
+    issued_at: "2026-08-28T00:00:00Z",
+    account_id: "fzzz",
+    allocated_capital: "0.00",
+    capital_utilization: "0.2500",
+    use_full_equity: true,
+  };
+  const SIG = `0x${"ef".repeat(65)}`;
+
+  it("getMyCapital：GET /api/me/capital，零 body（唯讀查詢，不帶簽名）", async () => {
+    mockFetchJson(200, {
+      account_id: "f", status: "not_activated", effective: null, pending: null,
+      heartbeat: null, note: "n",
+    });
+    await api.getMyCapital();
+    expect(captured[0].url).toBe("/api/me/capital");
+    expect(captured[0].init.method).toBeUndefined(); // GET
+    expect(captured[0].init.body).toBeUndefined();
+  });
+
+  it("getCapitalSettingsMessage：GET /api/me/capital/message?…，query string 帶三個參數", async () => {
+    mockFetchJson(200, {
+      message: "m", nonce: "n", issued_at: "t", account_id: "f",
+      allocated_capital: "0.00", capital_utilization: "0.2500", use_full_equity: true,
+    });
+    await api.getCapitalSettingsMessage("0", "0.25", true);
+    expect(captured[0].url).toBe(
+      "/api/me/capital/message?allocated_capital=0&capital_utilization=0.25&use_full_equity=true",
+    );
+    expect(captured[0].init.method).toBeUndefined(); // GET
+    expect(captured[0].init.body).toBeUndefined();
+  });
+
+  it("postCapitalSettings：欄位集合恰為契約八欄，且原文與各欄位取自同一包 payload", async () => {
+    mockFetchJson(200, { ok: true });
+    await api.postCapitalSettings(PAYLOAD, SIG);
+
+    expect(captured[0].url).toBe("/api/me/capital");
+    const body = JSON.parse(captured[0].init.body as string);
+    expect(Object.keys(body).sort()).toEqual([
+      "account_id", "allocated_capital", "capital_utilization", "issued_at",
+      "message", "nonce", "signature", "use_full_equity",
+    ]);
+    // 送出的每個欄位都取自**同一包**伺服器回聲的 payload（不是畫面上的草稿），
+    // 與 postLeaderSelect／postMyRisk 同一個理由（工程原則 1）。
+    expect(body.allocated_capital).toBe(PAYLOAD.allocated_capital);
+    expect(body.capital_utilization).toBe(PAYLOAD.capital_utilization);
+    expect(body.use_full_equity).toBe(PAYLOAD.use_full_equity);
+    expect(body.message).toBe(PAYLOAD.message);
+    expect(body.signature).toBe(SIG);
   });
 });
 

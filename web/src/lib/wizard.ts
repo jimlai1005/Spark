@@ -4,8 +4,10 @@
  *
  * 四步（設計稿 §05）：01 選擇策略（進頁即完成態，不參與本狀態機）→
  * 02 連接與授權（agent＋builder fee 簽署＋入金檢查，鏈上事實＝`OnboardStatus.state`）
- * → 03 風險限制（投入比例／槓桿上限本地調整＋回撤自動停止 opt-in 簽章，完成與否
- * 是本地旗標，沒有對應的伺服器欄位）→ 04 確認（費用試算＋三條 checkbox＋送出）。
+ * → 03 風險限制（投入比例接真實 `/api/me/capital` 簽章流——Task 10b 主線程裁決；
+ * 槓桿上限改唯讀資訊列，非使用者可調；回撤自動停止 opt-in 簽章。step3 完成與否
+ * 是本地旗標，沒有對應的伺服器欄位——已簽章的事實一律以伺服器狀態為準）
+ * → 04 確認（費用試算＋三條 checkbox＋送出）。
  *
  * ⭐ NOTE 11（斷點續作）：localStorage 只存 **UI 進度**（目前到第幾步、滑桿數值、
  * 是否已完成 step3），**不存簽章內容**——已簽章的事實一律以伺服器狀態
@@ -40,7 +42,6 @@ export interface WizardProgress {
   /** 目前 onboarding 的策略參數（slug 或 `advanced:0x…`），續作前必須一致。 */
   strategy: string;
   scale: number;
-  lev: number;
   ddEnabled: boolean;
   ddPct: number;
   step3Confirmed: boolean;
@@ -73,12 +74,12 @@ export function loadWizardProgress(address: string, strategy: string): WizardPro
   if (
     typeof p.address !== "string" || typeof p.strategy !== "string"
     || p.address.toLowerCase() !== address.toLowerCase() || p.strategy !== strategy
-    || typeof p.scale !== "number" || typeof p.lev !== "number"
+    || typeof p.scale !== "number"
     || typeof p.ddEnabled !== "boolean" || typeof p.ddPct !== "number"
     || typeof p.step3Confirmed !== "boolean"
   ) return null;
   return {
-    address: p.address.toLowerCase(), strategy: p.strategy, scale: p.scale, lev: p.lev,
+    address: p.address.toLowerCase(), strategy: p.strategy, scale: p.scale,
     ddEnabled: p.ddEnabled, ddPct: p.ddPct, step3Confirmed: p.step3Confirmed,
   };
 }

@@ -3,17 +3,18 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useSignMessage } from "wagmi";
 import {
+  getMyCapital, getCapitalSettingsMessage, postCapitalSettings,
   getMyRisk, getRiskSettingsMessage, postMyRisk,
-  type MyRiskResp, type RiskPrefs,
+  type MyCapitalResp, type MyRiskResp, type RiskPrefs,
 } from "@/lib/api";
 import { useCopy } from "@/lib/lang";
-import { NO_VALUE } from "@/lib/format";
+import { fmtRatioPct, NO_VALUE } from "@/lib/format";
 import { recoverPersonalSigner } from "@/lib/sign";
+import { runCapitalSettingsFlow, type CapitalFlowFailure } from "@/lib/capitalSettingsFlow";
 import { runRiskSettingsFlow, type RiskFlowFailure } from "@/lib/riskSettingsFlow";
 
 const SCALE_MIN = 5;
 const SCALE_MAX = 100;
-const LEV_MIN = 1;
 // 後端 spec 讀到之前的保守 fallback（僅用於畫面刻度，門檻仍以 spec 為準才會真正送出）。
 const DD_MIN_FALLBACK = 5;
 const DD_MAX_FALLBACK = 50;
@@ -46,9 +47,19 @@ function riskErrorCopy(r: RiskFlowFailure, c: ReturnType<typeof useCopy>["wizard
   }
 }
 
+function capitalErrorCopy(r: CapitalFlowFailure, c: ReturnType<typeof useCopy>["wizard"]): string {
+  const e = c.errors;
+  switch (r.kind) {
+    case "wallet-rejected": return e.walletRejected;
+    case "signer-mismatch": return e.signerMismatch;
+    case "content-mismatch": return e.contentMismatch;
+    case "message-failed": return e.payloadFailed;
+    case "submit-failed": return e.submitFailed;
+  }
+}
+
 export interface StepRiskLimitsValues {
   scale: number;
-  lev: number;
   ddEnabled: boolean;
   ddPct: number;
 }
@@ -56,17 +67,27 @@ export interface StepRiskLimitsValues {
 /**
  * StepRiskLimits — onboarding step 3（設計稿 §05：「設定你的風險限制」）。
  *
- * 投入比例／槓桿上限：**純本地 UI 狀態**，不接任何簽章端點——與策略詳情頁
- * （Task 9）右欄的同名 slider 同一個定位：純預覽／預填數字，跟單規模由引擎依
- * 既有邏輯核算，這裡不新增一個「客戶簽章授權曝險倍數」的端點（`api.ts` 檔頭
- * 明列的四支簽章端點之外，本 task 檔案範圍也不含後端）。
+ * ⭐ Task 10b（主線程裁決 2026-08-28，取代 Task 10 的原判斷）：投入比例**不是**
+ * 純 UI 狀態——`allocated_capital`／`capital_utilization` 直接乘進部位大小
+ * （`src/spark/copytrade/sizing.py::compute_scale_factor`），引擎套用前自行
+ * 重新驗章，是真實綁定機制。若前端只留一顆好看的 slider 不接這條簽章流，
+ * 等於告訴使用者「已設限」而實際上什麼都沒送出——比不做這個功能更糟。
+ * 送出走 `GET /api/me/capital/message?allocated_capital=0&capital_utilization={x}
+ * &use_full_equity=true` → 錢包簽名 → `POST /api/me/capital`（伺服器簽文原樣
+ * 簽，不變量 1；`runCapitalSettingsFlow`，同 `runRiskSettingsFlow` 的謹慎度）。
+ * `use_full_equity=true + capital_utilization=x` 對應「淨值 x%」——已對照
+ * `sizing.resolve_capital`／`compute_scale_factor` 驗證語義相符（`cap =
+ * max(my_equity, 0)`，`scale = cap * capital_utilization * weight / leader_equity`，
+ * 與「本金 = 淨值、乘上使用率 x」等價）。
  *
- * 最大回撤自動停止：唯一在本步驟走**既有**簽章流程的欄位（裁決 1）——
- * 預設關閉；只有使用者主動開啟才呼叫 `/api/me/risk/message` → `/api/me/risk`
- * （`runRiskSettingsFlow`，與 `web/src/app/leaders/page.tsx` 的
- * `RiskControlsSection` 共用同一個 lib，未複製簽章邏輯本身）。關閉時
- * **不對 risk API 發出任何請求**（含唯讀的 `getMyRisk`——只在使用者開啟開關時
- * 才查真實門檻，紅線 5 語義：連「順便查一下現況」都不做，關閉就是完全不碰）。
+ * 槓桿上限：**不是**使用者可簽的值——引擎的 `COPY_MAX_TARGET_LEVERAGE` 是
+ * env 靜態值，沒有 per-user 簽章通道（Task 10 的觀察在這點成立）。原本的
+ * slider 因此移除，改唯讀資訊列，誠實呈現平台層強制的上限；per-user 可簽槓桿
+ * 上限列 backlog。
+ *
+ * 最大回撤自動停止：唯一維持 opt-in 的欄位（裁決 1）——預設關閉，只有使用者
+ * 主動開啟才呼叫 `/api/me/risk/message` → `/api/me/risk`。關閉時**不對 risk
+ * API 發出任何請求**（含唯讀的 `getMyRisk`）。
  */
 export function StepRiskLimits({ me, maxLeverage, initial, onBack, onNext }: {
   me: { address: string; account_id: string };
@@ -79,13 +100,15 @@ export function StepRiskLimits({ me, maxLeverage, initial, onBack, onNext }: {
   const c = COPY.wizard;
   const { signMessageAsync } = useSignMessage();
 
-  const maxLev = maxLeverage != null && maxLeverage >= LEV_MIN ? maxLeverage : 3;
   const [scale, setScale] = useState(initial.scale);
-  const [lev, setLev] = useState(Math.min(initial.lev, maxLev));
   const [ddEnabled, setDdEnabled] = useState(initial.ddEnabled);
   const [ddPct, setDdPct] = useState(initial.ddPct);
   const [signing, setSigning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // ⭐ 投入比例是本步的必要簽章流，一律查（不像回撤是 opt-in）：畫面需要
+  // effective/pending 兩態才能誠實呈現「目前生效值」與「已提交待套用」。
+  const capital = useQuery<MyCapitalResp>({ queryKey: ["me-capital"], queryFn: getMyCapital });
 
   // ⭐ 只在使用者開啟回撤開關後才查（`enabled: ddEnabled`）——關閉時對 risk API
   // 零請求，包含這支唯讀查詢。
@@ -100,12 +123,34 @@ export function StepRiskLimits({ me, maxLeverage, initial, onBack, onNext }: {
 
   async function handleNext() {
     setError(null);
-    if (!ddEnabled) {
-      onNext({ scale, lev, ddEnabled, ddPct });
+    setSigning(true);
+
+    const capitalUtilization = pctToRatio(String(scale));
+    const capResult = await runCapitalSettingsFlow(
+      {
+        fetchMessage: () => getCapitalSettingsMessage("0", capitalUtilization, true),
+        signMessage: (message) => signMessageAsync({ message }),
+        recover: recoverPersonalSigner,
+        submit: postCapitalSettings,
+      },
+      {
+        expectedSigner: me.address, expectedAccountId: me.account_id,
+        expectedAllocatedCapital: "0", expectedCapitalUtilization: capitalUtilization,
+        expectedUseFullEquity: true,
+      },
+    );
+    if (!capResult.ok) {
+      setSigning(false);
+      setError(capitalErrorCopy(capResult, c));
       return;
     }
-    if (!risk.data) return; // 按鈕在讀取完成前 disabled，理論上到不了這裡
-    setSigning(true);
+
+    if (!ddEnabled) {
+      setSigning(false);
+      onNext({ scale, ddEnabled, ddPct });
+      return;
+    }
+    if (!risk.data) { setSigning(false); return; } // 按鈕在讀取完成前 disabled，理論上到不了這裡
     const target: RiskPrefs = {
       ...risk.data.prefs, enabled: true, max_drawdown_pct: pctToRatio(String(ddClamped)),
     };
@@ -119,7 +164,7 @@ export function StepRiskLimits({ me, maxLeverage, initial, onBack, onNext }: {
       { expectedSigner: me.address, expectedAccountId: me.account_id, expectedPrefs: target },
     );
     setSigning(false);
-    if (r.ok) onNext({ scale, lev, ddEnabled, ddPct: ddClamped });
+    if (r.ok) onNext({ scale, ddEnabled, ddPct: ddClamped });
     else setError(riskErrorCopy(r, c));
   }
 
@@ -137,16 +182,31 @@ export function StepRiskLimits({ me, maxLeverage, initial, onBack, onNext }: {
         <input id="onboard-scale-slider" type="range" className="risk-slider"
           min={SCALE_MIN} max={SCALE_MAX} step={1} value={scale}
           onChange={(e) => setScale(Number(e.target.value))} />
+        {capital.data && (
+          <div className="inset">
+            {capital.data.effective?.capital_utilization != null && (
+              <p className="hint mono">
+                {c.capitalEffectiveLabel}：{fmtRatioPct(capital.data.effective.capital_utilization)}
+              </p>
+            )}
+            {capital.data.pending && (
+              <p className="hint" role="status">{c.capitalPendingLabel}</p>
+            )}
+            <p className="hint">{capital.data.note}</p>
+          </div>
+        )}
       </div>
 
       <div className="risk-field">
         <div className="risk-slider-row">
-          <label htmlFor="onboard-lev-slider">{COPY.strategyDetail.panel.leverageLabel}</label>
-          <span className="mono risk-value">{lev}x</span>
+          <span>{COPY.strategyDetail.panel.leverageLabel}</span>
+          <span className="mono risk-value">
+            {maxLeverage != null ? `${maxLeverage}x` : NO_VALUE}
+          </span>
         </div>
-        <input id="onboard-lev-slider" type="range" className="risk-slider"
-          min={LEV_MIN} max={maxLev} step={0.5} value={lev}
-          onChange={(e) => setLev(Number(e.target.value))} />
+        <p className="hint">
+          {c.leverageInfoPrefix}{maxLeverage != null ? `${maxLeverage}x` : NO_VALUE}{c.leverageInfoSuffix}
+        </p>
       </div>
 
       <p className="hint">{c.fundsWarning}</p>

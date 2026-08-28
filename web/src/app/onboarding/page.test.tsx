@@ -38,6 +38,9 @@ const createAgent = vi.fn();
 const getMyRisk = vi.fn();
 const getRiskSettingsMessage = vi.fn();
 const postMyRisk = vi.fn();
+const getMyCapital = vi.fn();
+const getCapitalSettingsMessage = vi.fn();
+const postCapitalSettings = vi.fn();
 const getLeaderSelectMessage = vi.fn();
 const postLeaderSelect = vi.fn();
 const postVerify = vi.fn();
@@ -47,6 +50,9 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getMyRisk: (...a: unknown[]) => getMyRisk(...a),
   getRiskSettingsMessage: (...a: unknown[]) => getRiskSettingsMessage(...a),
   postMyRisk: (...a: unknown[]) => postMyRisk(...a),
+  getMyCapital: (...a: unknown[]) => getMyCapital(...a),
+  getCapitalSettingsMessage: (...a: unknown[]) => getCapitalSettingsMessage(...a),
+  postCapitalSettings: (...a: unknown[]) => postCapitalSettings(...a),
   getLeaderSelectMessage: (...a: unknown[]) => getLeaderSelectMessage(...a),
   postLeaderSelect: (...a: unknown[]) => postLeaderSelect(...a),
   postVerify: (...a: unknown[]) => postVerify(...a),
@@ -57,6 +63,25 @@ vi.mock("@/lib/publicApi", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getPublicStrategy: (...a: unknown[]) => getPublicStrategy(...a),
 }));
+
+const recoverPersonalSigner = vi.fn();
+vi.mock("@/lib/sign", () => ({
+  recoverPersonalSigner: (...a: unknown[]) => recoverPersonalSigner(...a),
+}));
+
+/** 逐字照抄後端 `build_capital_settings_message`（filet/capital_settings.py）版型。 */
+function buildCapMessage(
+  accountId: string, allocatedCapital: string, capitalUtilization: string, useFullEquity: boolean,
+): string {
+  const capLine = useFullEquity ? "full account equity" : `${allocatedCapital} USDC`;
+  return [
+    "Filet: update copy-trading capital allocation", "",
+    `Account: ${accountId}`,
+    `Allocated Capital: ${capLine}`,
+    `Capital Utilization: ${capitalUtilization}`,
+    "Nonce: n-cap", "Issued At: 2026-08-28T00:00:00Z",
+  ].join("\n");
+}
 
 import OnboardingPage from "./page";
 
@@ -137,6 +162,28 @@ beforeEach(() => {
   createAgent.mockResolvedValue({ agent_address: "0xa" });
   getPublicStrategy.mockResolvedValue(STRATEGY_DETAIL);
   getMyRisk.mockResolvedValue(RISK);
+  recoverPersonalSigner.mockResolvedValue(ADDR.toLowerCase());
+  signMessageAsync.mockResolvedValue(`0x${"ab".repeat(65)}`);
+  getMyCapital.mockResolvedValue({
+    account_id: "fabc", status: "not_activated", effective: null, pending: null,
+    heartbeat: null, note: "尚未活化，之後這裡會顯示引擎採用的資金配置。",
+  });
+  // ⭐ 動態回聲：不論呼叫端送出什麼 scale，都原樣回聲對應的待簽原文——這是
+  // 「內容預驗必須通過」的前提（見 lib/capitalSettingsFlow.ts），而非投入比例
+  // 這條測試本身要驗的東西。
+  getCapitalSettingsMessage.mockImplementation(
+    async (allocatedCapital: string, capitalUtilization: string, useFullEquity: boolean) => ({
+      message: buildCapMessage("fabc", allocatedCapital, capitalUtilization, useFullEquity),
+      nonce: "n-cap", issued_at: "2026-08-28T00:00:00Z", account_id: "fabc",
+      allocated_capital: allocatedCapital, capital_utilization: capitalUtilization,
+      use_full_equity: useFullEquity,
+    }),
+  );
+  postCapitalSettings.mockResolvedValue({
+    ok: true, account_id: "fabc", allocated_capital: "0.00", capital_utilization: "0.2500",
+    use_full_equity: true, effective: "next_engine_cycle", effective_note: "下一輪生效。",
+    consequences: "不會立即強制再平衡。",
+  });
 });
 
 describe("OnboardingPage — guard（NOTE 10）", () => {
@@ -184,7 +231,7 @@ describe("OnboardingPage — step 3 風險限制（裁決 1：opt-in）", () => 
 describe("OnboardingPage — step 4 費用與風險確認（NOTE 12）", () => {
   function seedAtStep4() {
     localStorage.setItem("filet_onboarding", JSON.stringify({
-      address: ADDR, strategy: "core", scale: 25, lev: 3,
+      address: ADDR, strategy: "core", scale: 25,
       ddEnabled: false, ddPct: 20, step3Confirmed: true,
     }));
     mockStatus = { data: READY_STATUS, refetch: () => undefined };
@@ -206,7 +253,7 @@ describe("OnboardingPage — step 4 費用與風險確認（NOTE 12）", () => {
 describe("OnboardingPage — localStorage 續作（NOTE 11）", () => {
   it("已存的 step3Confirmed=true → 重新進入直接停在 step 4（不必重簽風險限制）", async () => {
     localStorage.setItem("filet_onboarding", JSON.stringify({
-      address: ADDR, strategy: "core", scale: 40, lev: 2,
+      address: ADDR, strategy: "core", scale: 40,
       ddEnabled: false, ddPct: 15, step3Confirmed: true,
     }));
     mockStatus = { data: READY_STATUS, refetch: () => undefined };
@@ -217,7 +264,7 @@ describe("OnboardingPage — localStorage 續作（NOTE 11）", () => {
 
   it("續作進度不含任何簽章欄位（不變量 1 的前端鏡射）", () => {
     localStorage.setItem("filet_onboarding", JSON.stringify({
-      address: ADDR, strategy: "core", scale: 40, lev: 2,
+      address: ADDR, strategy: "core", scale: 40,
       ddEnabled: false, ddPct: 15, step3Confirmed: true,
     }));
     const raw = localStorage.getItem("filet_onboarding")!;
@@ -260,5 +307,66 @@ describe("OnboardingPage — 資金卡在 spot 的提示（沿舊版語意）", 
     expect(box.querySelectorAll("button")).toHaveLength(0);
     const link = screen.getByRole("link", { name: "前往 Hyperliquid 進行劃轉" });
     expect(link).toHaveAttribute("target", "_blank");
+  });
+});
+
+describe("OnboardingPage — step 3 投入比例（Task 10b：真實簽章流）", () => {
+  it("送出走 getCapitalSettingsMessage → 簽名 → postCapitalSettings，簽文原樣傳遞", async () => {
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+    const nextBtn = await screen.findByRole("button", { name: "前往費用與風險確認" });
+    await userEvent.click(nextBtn);
+
+    await waitFor(() => expect(postCapitalSettings).toHaveBeenCalledTimes(1));
+    expect(getCapitalSettingsMessage).toHaveBeenCalledWith("0", "0.25", true);
+    const [payload, sig] = postCapitalSettings.mock.calls[0];
+    const expectedMessage = buildCapMessage("fabc", "0", "0.25", true);
+    // ⭐ 伺服器回聲的原文原樣進錢包、原樣送出——不變量 1（前端不組字串、不改一個字元）。
+    expect(payload.message).toBe(expectedMessage);
+    expect(signMessageAsync).toHaveBeenCalledWith({ message: expectedMessage });
+    expect(sig).toBe(await signMessageAsync.mock.results[0].value);
+  });
+
+  it("槓桿改唯讀資訊列——onboarding step 3 不存在任何槓桿 slider", async () => {
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+    await screen.findByRole("heading", { name: "設定你的風險限制" });
+    expect(document.getElementById("onboard-lev-slider")).toBeNull();
+    expect(document.querySelectorAll('input[type="range"]')).toHaveLength(2); // 投入比例 + 回撤
+    expect(screen.getByText(/本策略槓桿上限 3x/)).toBeInTheDocument();
+  });
+
+  it("GET /api/me/capital 顯示 effective 狀態——生效值以後端投影為準", async () => {
+    getMyCapital.mockResolvedValue({
+      account_id: "fabc", status: "effective",
+      effective: {
+        allocated_capital: "0.00", capital_utilization: "0.3000", use_full_equity: true,
+        source: "customer_signed", changed_at: "2026-08-27T00:00:00Z", as_of: "2026-08-28T00:00:00Z",
+      },
+      pending: null, heartbeat: { status: "fresh", at: "2026-08-28T00:00:00Z", age_s: 5, stale_after_s: 120 },
+      note: "這是引擎目前實際採用的本金與使用比例。",
+    });
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+    await screen.findByRole("heading", { name: "設定你的風險限制" });
+    expect(await screen.findByText(/30\.0%/)).toBeInTheDocument();
+    expect(screen.queryByText("已提交，待引擎套用")).not.toBeInTheDocument();
+  });
+
+  it("GET /api/me/capital 顯示 pending 狀態——已提交但尚未確認生效", async () => {
+    getMyCapital.mockResolvedValue({
+      account_id: "fabc", status: "not_activated",
+      effective: null,
+      pending: {
+        allocated_capital: "0.00", capital_utilization: "0.2500", use_full_equity: true,
+        submitted_at: "2026-08-28T00:00:00Z", state: "unconfirmed",
+        effective_when: "next_engine_cycle", note: "已簽署，尚未確認生效。",
+      },
+      heartbeat: null, note: "你的帳號尚未啟用跟單，因此還沒有生效中的資金設定。",
+    });
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+    await screen.findByRole("heading", { name: "設定你的風險限制" });
+    expect(await screen.findByText("已提交，待引擎套用")).toBeInTheDocument();
   });
 });

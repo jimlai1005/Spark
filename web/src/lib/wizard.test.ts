@@ -21,7 +21,7 @@ function status(over: Partial<OnboardStatus> = {}): OnboardStatus {
 function progress(over: Partial<WizardProgress> = {}): WizardProgress {
   return {
     address: "0xabc0000000000000000000000000000000000001",
-    strategy: "core", scale: 25, lev: 3, ddEnabled: false, ddPct: 20,
+    strategy: "core", scale: 25, ddEnabled: false, ddPct: 20,
     step3Confirmed: false,
     ...over,
   };

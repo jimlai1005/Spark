@@ -146,6 +146,26 @@ describe("StrategyDetailPage", () => {
     expect(url).toMatch(/dd=\d+/);
   });
 
+  // ⭐ Task 10b（主線程裁決 2026-08-28）：槓桿沒有 per-user 簽章通道，slider 移除、
+  // 改唯讀資訊列；CTA 查詢字串同步移除 `lev` 參數，只剩 scale／(選填) dd。
+  it("槓桿改唯讀資訊列（無 slider），CTA 查詢字串只剩 scale/dd，不含 lev", async () => {
+    getMe.mockResolvedValue({ address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" });
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+
+    expect(screen.queryByRole("slider", { name: COPY.strategyDetail.panel.leverageLabel }))
+      .not.toBeInTheDocument();
+    expect(screen.getByText("3x")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText(COPY.strategyDetail.panel.ddEnableLabel));
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
+    await waitFor(() => expect(push).toHaveBeenCalled());
+    const url = push.mock.calls[0][0] as string;
+    const params = new URLSearchParams(url.split("?")[1]);
+    expect([...params.keys()].sort()).toEqual(["dd", "scale", "strategy"]);
+  });
+
   it("未登入點 CTA → 觸發連接錢包＋SIWE 登入，成功後帶參數導向 /onboarding", async () => {
     getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
     stubFetch(() => jsonResponse(DETAIL));
