@@ -22,7 +22,7 @@
  * `/api/onboard/status` 為準（`lib/wizard.ts`）。
  */
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import { useAccount } from "wagmi";
 import { ReconnectGate } from "@/components/wizard/ReconnectGate";
 import { StepConfirm } from "@/components/wizard/StepConfirm";
@@ -40,7 +40,18 @@ const ADVANCED_PREFIX = "advanced:";
 const SCALE_DEFAULT = 25;
 const DD_DEFAULT = 20;
 
+/** `useSearchParams()` 在 build 期 prerender 需要 Suspense 邊界（Next.js
+ * missing-suspense-with-csr-bailout），故 default export 只包一層 Suspense，
+ * 頁面本體在 OnboardingInner。fallback 留空：本頁全 client 資料，無首繪內容可給。 */
 export default function OnboardingPage() {
+  return (
+    <Suspense fallback={null}>
+      <OnboardingInner />
+    </Suspense>
+  );
+}
+
+function OnboardingInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const strategyParam = searchParams.get("strategy") ?? "";

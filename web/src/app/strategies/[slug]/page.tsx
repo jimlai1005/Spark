@@ -61,7 +61,7 @@ function metricText(value: string | null, insufficient: boolean, suffix = ""): s
  * 回傳 `null`＝樣本不足或數學上無定義（帳戶歸零，`1+r<=0`），呼叫端一律顯示
  * 「樣本不足」，不強行印出一個沒有意義的數字。
  */
-export function computeCagrPct(
+function computeCagrPct(
   totalReturnPct: string | null,
   insufficient: boolean,
   liveDays: number,
@@ -81,7 +81,7 @@ export function computeCagrPct(
  * `equity_index` 首尾比值 → 起點／終點淨值。任一輸入缺席或首點為 0（無法取
  * 比值）→ `null`（樣本不足）。
  */
-export function computeStartEndEquity(
+function computeStartEndEquity(
   methodology: PublicStrategyMethodology,
   equityIndex: string[],
 ): { start: string; end: string } | null {
