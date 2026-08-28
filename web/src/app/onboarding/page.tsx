@@ -7,7 +7,7 @@ import { StepDeposit } from "@/components/wizard/StepDeposit";
 import { StepRisk } from "@/components/wizard/StepRisk";
 import { StepSign } from "@/components/wizard/StepSign";
 import type { SpotStranded } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 import { fmtAmount, shortAddr } from "@/lib/format";
 import { useMe, useOnboardingStatus } from "@/lib/hooks";
 import { deriveStep, getRiskConfirmed, setRiskConfirmed, threadPercent } from "@/lib/wizard";
@@ -18,6 +18,7 @@ export default function OnboardingPage() {
   const me = useMe();
   const loggedIn = !!me.data;
   const status = useOnboardingStatus({ enabled: loggedIn, pollMs: 5000 });
+  const COPY = useCopy();
   const [, bump] = useReducer((x: number) => x + 1, 0); // risk 勾選後重算 deriveStep
   // Minor（opus Finding 5）：穩定 refetchStatus 參考，避免輪詢 re-render 讓
   // StepSign 的 ensure-agent effect 重跑而冗餘 POST /api/onboard/agent。
@@ -128,6 +129,7 @@ export default function OnboardingPage() {
  * 星號。此處改用等義的前端文案，數字仍然只有後端這一個來源。
  */
 function SpotStrandedNotice({ info }: { info: SpotStranded }) {
+  const COPY = useCopy();
   const c = COPY.wizard;
   return (
     <section className="spot-stranded" role="status" aria-label={c.spotStrandedTitle}>

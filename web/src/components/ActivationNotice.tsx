@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 import { useMe, useOnboardingStatus } from "@/lib/hooks";
 
 /**
@@ -19,6 +19,7 @@ import { useMe, useOnboardingStatus } from "@/lib/hooks";
  */
 export function ActivationNotice() {
   const me = useMe();
+  const COPY = useCopy();
   const status = useOnboardingStatus({ enabled: !!me.data, pollMs: false });
 
   if (!status.data || status.data.state === "READY") return null;

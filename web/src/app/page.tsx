@@ -10,7 +10,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 import { useMe } from "@/lib/hooks";
 import { loginWithSiwe } from "@/lib/siwe";
 
@@ -25,6 +25,7 @@ export default function LoginPage() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
 
+  const COPY = useCopy();
   const c = COPY.login;
   const loggedIn = !!me.data;
 

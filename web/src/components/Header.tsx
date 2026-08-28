@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { logout } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { COPY_ZH as COPY } from "@/lib/copy";
 import { useIsAdmin, useMe } from "@/lib/hooks";
 
 /**

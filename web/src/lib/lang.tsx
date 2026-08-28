@@ -31,7 +31,10 @@ interface LangContextValue {
   setLang: (lang: Lang) => void;
 }
 
-const LangContext = createContext<LangContextValue | undefined>(undefined);
+const LangContext = createContext<LangContextValue>({
+  lang: "zh",
+  setLang: () => {},
+});
 
 function isLang(value: unknown): value is Lang {
   return value === "zh" || value === "en";
@@ -66,7 +69,6 @@ export function LangProvider({ children }: { children: ReactNode }) {
 
 export function useLang(): LangContextValue {
   const ctx = useContext(LangContext);
-  if (!ctx) throw new Error("useLang must be used within a LangProvider");
   return ctx;
 }
 

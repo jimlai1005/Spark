@@ -64,7 +64,7 @@ const api = {
 };
 
 import { ApiError } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { COPY_ZH as COPY } from "@/lib/copy";
 import { Header } from "@/components/Header";
 import AdminPage from "./admin/page";
 import LeadersPage from "./leaders/page";

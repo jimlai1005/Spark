@@ -27,7 +27,7 @@ import type {
   OpsHealthSummary,
   OpsUnappliedLeaderChange,
 } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { COPY_ZH as COPY } from "@/lib/copy";
 import { fmtAmount, fmtRatioPct, NO_VALUE } from "@/lib/format";
 
 const h = COPY.ops.health;

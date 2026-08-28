@@ -2,13 +2,14 @@
 import Link from "next/link";
 import { useState } from "react";
 import { postVerify, type OnboardStatus } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 import { fmtAmount } from "@/lib/format";
 
 export function StepDeposit({ status, refetchStatus }: {
   status: OnboardStatus;
   refetchStatus: () => void;
 }) {
+  const COPY = useCopy();
   const c = COPY.wizard;
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);

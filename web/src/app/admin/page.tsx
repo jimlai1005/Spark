@@ -1,9 +1,10 @@
 "use client";
 import { useQuery } from "@tanstack/react-query";
 import { ApiError, getAdminPending } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 
 export default function AdminPage() {
+  const COPY = useCopy();
   const c = COPY.admin;
   const q = useQuery({ queryKey: ["admin-pending"], queryFn: getAdminPending });
 

@@ -1,8 +1,9 @@
 "use client";
 import { useConnect } from "wagmi";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 
 export function ReconnectGate() {
+  const COPY = useCopy();
   const c = COPY.wizard;
   const { connect, connectors, isPending } = useConnect();
   const injected = connectors[0];

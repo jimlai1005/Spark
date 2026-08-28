@@ -49,7 +49,7 @@ import {
 import { runCustomLeaderPreview, validateCustomLeaderInput } from "@/lib/customLeader";
 import Link from "next/link";
 import { ActivationNotice } from "@/components/ActivationNotice";
-import { COPY } from "@/lib/copy";
+import { COPY_ZH as COPY } from "@/lib/copy";
 import { fmtAmount, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { runLeaderSelectFlow, type LeaderSelectFlowResult } from "@/lib/leaderSelectFlow";

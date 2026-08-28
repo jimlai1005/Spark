@@ -1603,6 +1603,3 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     },
   },
 };
-
-/** 過渡別名（Task 3 移除）：未遷移到 useCopy() 的元件仍可 `import { COPY }`。 */
-export const COPY = COPY_ZH;

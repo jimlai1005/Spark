@@ -6,7 +6,7 @@ import {
   type OnboardStatus,
 } from "@/lib/api";
 import { runApprovalFlow, type ApprovalResult } from "@/lib/approvalFlow";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 import { shortAddr } from "@/lib/format";
 import { recoverSigner, submitToHl, type HlTypedData } from "@/lib/hl";
 
@@ -23,6 +23,7 @@ interface StepSignProps {
 }
 
 export function StepSign({ status, loginAddress, refetchStatus }: StepSignProps) {
+  const COPY = useCopy();
   const c = COPY.wizard;
   const { address, chainId } = useAccount();
   const { data: client } = useConnectorClient();
@@ -109,17 +110,6 @@ export function StepSign({ status, loginAddress, refetchStatus }: StepSignProps)
   );
 }
 
-function errorCopy(r: Extract<ApprovalResult, { ok: false }>): string {
-  const e = COPY.wizard.errors;
-  switch (r.kind) {
-    case "payload-failed": return e.payloadFailed;
-    case "wallet-rejected": return e.walletRejected;
-    case "signer-mismatch": return e.signerMismatch;
-    case "hl-transient": return e.hlTransient;
-    case "hl-semantic": return e.hlSemantic;
-  }
-}
-
 function SignCard(p: {
   name: string;
   desc: string;
@@ -127,8 +117,20 @@ function SignCard(p: {
   disabled: boolean;
   run: () => Promise<ApprovalResult>;
 }) {
+  const COPY = useCopy();
   const c = COPY.wizard;
   const [phase, setPhase] = useState<CardPhase>({ t: "idle" });
+
+  const errorCopy = (r: Extract<ApprovalResult, { ok: false }>): string => {
+    const e = COPY.wizard.errors;
+    switch (r.kind) {
+      case "payload-failed": return e.payloadFailed;
+      case "wallet-rejected": return e.walletRejected;
+      case "signer-mismatch": return e.signerMismatch;
+      case "hl-transient": return e.hlTransient;
+      case "hl-semantic": return e.hlSemantic;
+    }
+  };
 
   async function handleSign() {
     setPhase({ t: "awaiting" });

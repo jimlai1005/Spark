@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createElement } from "react";
 import { describe, expect, it } from "vitest";
-import { COPY, COPY_EN, COPY_ZH } from "./copy";
+import { COPY_ZH as COPY, COPY_EN, COPY_ZH } from "./copy";
 import { LangProvider, useCopy, useLang } from "./lang";
 
 function allStrings(node: unknown, acc: string[] = []): string[] {

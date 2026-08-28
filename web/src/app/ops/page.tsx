@@ -25,7 +25,7 @@ import {
   type OpsSubscriptionsResp,
   type OpsTradeQualityResp,
 } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { COPY_ZH as COPY } from "@/lib/copy";
 import { fmtAmount, fmtRatioPct, NO_VALUE, shortAddr } from "@/lib/format";
 import { HealthBlock } from "./HealthPanel";
 import { TradeQualityBlock } from "./TradeQualityPanel";

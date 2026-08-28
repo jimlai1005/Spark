@@ -15,7 +15,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
 }));
 
 import { ApiError } from "@/lib/api";
-import { COPY } from "@/lib/copy";
+import { COPY_ZH as COPY } from "@/lib/copy";
 import { Header } from "./Header";
 
 function wrap(children: ReactNode, qc: QueryClient) {

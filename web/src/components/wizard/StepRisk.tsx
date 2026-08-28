@@ -1,9 +1,10 @@
 "use client";
 import { useState } from "react";
-import { COPY } from "@/lib/copy";
+import { useCopy } from "@/lib/lang";
 
 export function StepRisk({ onConfirm }: { onConfirm: () => void }) {
   const [agree, setAgree] = useState([false, false, false, false]);
+  const COPY = useCopy();
   const c = COPY.wizard;
   const rows = [c.risk1, c.risk2, c.risk3, c.risk4];
   return (
