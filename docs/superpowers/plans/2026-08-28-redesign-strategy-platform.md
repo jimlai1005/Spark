@@ -302,6 +302,24 @@ mean=0.0083333、s=0.0125831、SR=**12.6526**、SE=**12.1798**、σ_ann=**0.2404
 
 **驗收：** `npm test` 全綠；`grep -rn "90 天\|90 days" web/src` 輸出 0。
 
+### Task 10b @inline：投入比例接真實簽章流＋槓桿改誠實呈現（主線程裁決 2026-08-28）
+
+> 背景：Task 10 實作時把投入比例做成純 UI 狀態、未接 `/api/me/capital`。主線程查證
+> 後裁決如下（事實：`capital_settings.py` 檔頭明言 allocated_capital/capital_utilization
+> **直接乘進部位大小**（sizing.compute_scale_factor），且引擎套用前自行驗章——這是
+> 真實綁定機制，UI 不接等於騙用戶「已設限」；槓桿帽 `COPY_MAX_TARGET_LEVERAGE`
+> 存在於引擎 config，但目前是 env 靜態值、無用戶簽章通道）。
+
+**Files:** 改 `web/src/components/wizard/StepRiskLimits.tsx`、`web/src/app/onboarding/page.tsx`、`web/src/app/strategies/[slug]/page.tsx`、`web/src/lib/api.ts`（新增 capital 簽章流包裝——api.ts 檔頭「四支簽章端點」註解更新為五支並說明）、`copy.ts`。
+
+**規格：**
+1. **投入比例＝真實簽章流**：step 3 的投入比例送出走 `GET /api/me/capital/message?allocated_capital=0&capital_utilization={x}&use_full_equity=true` → 錢包簽名 → `POST /api/me/capital`（伺服器簽文原樣簽，不變量 1）。實作前先讀 `src/spark/copytrade/sizing.py` 的 compute_scale_factor 確認 use_full_equity 語義（若「淨值 X%」的正確組合不是 use_full_equity=true + utilization=x，以 sizing 實際語義為準並回報）。UI 顯示 `GET /api/me/capital` 的 effective/pending 兩態（該端點自帶此語義），pending 時標「已提交，待引擎套用」。
+2. **槓桿改資訊呈現**：step 3 與策略頁面板的「槓桿上限」slider 移除，改為唯讀資訊列「本策略槓桿上限 {max_leverage}x（平台層強制）＋策略歷史平均槓桿（若 API 有）」；`lev` query 參數移除。per-user 可簽槓桿上限列 backlog。
+3. **能力矩陣文案校正**（三處共用 key，一次改）：「使用你設定範圍內的保證金（投入比例上限）」保留（現在為真）；「在你簽署的槓桿上限內調整倉位」改為「在策略標示的槓桿上限內執行（平台層強制）」；不能側「超出你設定的投入比例、槓桿與最大回撤」改為「超出你簽署的投入比例；超出策略標示的槓桿上限；觸發你啟用的最大回撤而不停止」（zh/en 同步）。
+4. 測試：step3 送出呼叫 capital message+POST（mock 斷言簽文原樣傳遞）；pending/effective 兩態渲染；槓桿 slider 不存在（斷言）；策略頁 CTA 參數只剩 scale/dd。
+
+**驗收：** `npm test` 全綠；`grep -n "lev=" web/src/app/strategies` 無 CTA 參數殘留；commit `fix: wire allocation to signed capital flow + honest leverage presentation`。
+
 ### Task 11 @inline：進階模式 /advanced
 
 **Files:** 新 `web/src/app/advanced/page.tsx`（自 `web/src/app/leaders/page.tsx` 遷移重構）；`leaders/page.tsx` 改為 redirect `/advanced`；改 `copy.ts`。
@@ -403,6 +421,7 @@ mean=0.0083333、s=0.0125831、SR=**12.6526**、SE=**12.1798**、σ_ann=**0.2404
 - 紅線對照：這兩個動作都是**錢包主人主動觸發**且方向為收窄/退出，不屬「自動開啟主網寫入」；平倉走既有 reduce-only 收尾路徑（紅線 5 精神）。引擎測試全離線（假 adapter）。
 - 測試：pause 旗標寫入/讀取；引擎 paused 跳過開倉、放行減倉（假訊號注入斷言下單集合）；旗標讀取 IO error → 當 paused＋alert；close-all 簽章驗證（壞簽章 401）；請求檔觸發收尾路徑（mock 既有收尾函式被呼叫）；resume 後恢復。
 - RUNBOOK 增補：旗標檔位置、owner 觸發收尾後的人工 re-arm 程序（沿用既有 halt re-arm 慣例）。
+- **15b（主線程裁決 2026-08-28 追加）**：watcher 建 env 時，若該 follower 的 leader 在 leaders.json 有 `max_leverage` 欄位，注入 `COPY_MAX_TARGET_LEVERAGE={max_leverage}`（沿 vault kind 20x 帽的既有注入模式）；讓策略卡「槓桿 ≤ Nx」chip 成為引擎層事實。測試：有欄位注入、無欄位不注入、vault kind 既有 20x 帽語義不被覆蓋（取兩者較嚴者）。
 
 - [ ] 失敗測試 → 實作 → 綠 → Commit `feat: owner kill switch — pause + signed close-all`
 
