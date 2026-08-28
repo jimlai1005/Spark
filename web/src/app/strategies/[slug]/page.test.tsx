@@ -58,9 +58,9 @@ const DETAIL = {
   status: "running", listable: true, live_days: 72, follower_count: 3,
   min_notional_usd: "500", max_leverage: "3",
   metrics: {
-    total_return_pct: "20.35", total_return_pct_insufficient: false,
+    total_return_pct: "17.77", total_return_pct_insufficient: false,
     max_drawdown_pct: "-0.80", max_drawdown_pct_insufficient: false,
-    sharpe: "10.24", sharpe_insufficient: false,
+    sharpe: "5.55", sharpe_insufficient: false,
     sharpe_se: "3.36", sharpe_se_insufficient: false,
     win_rate_pct: "64.86", win_rate_pct_insufficient: false,
     annualized_vol_pct: "18.05", annualized_vol_pct_insufficient: false,
