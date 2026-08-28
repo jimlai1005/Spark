@@ -1,15 +1,20 @@
 "use client";
 import Link from "next/link";
-import type { DashboardGuard, DashboardStatus } from "@/lib/api";
+import { useState } from "react";
+import type { DashboardGuard, DashboardPosition, DashboardStatus } from "@/lib/api";
+import { postPause } from "@/lib/api";
 import { NO_VALUE } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
+import { CloseAllModal } from "./CloseAllModal";
 
 /**
- * Kill switch 兩顆按鈕（暫停跟單／平倉並撤銷授權）的 UI 與 handler 接口本 task
- * 就緒，但實際生效（寫 pause 旗標／簽章 close-all）在 Task 15。旗標關閉時本區塊
- * 完全不渲染——不是 disabled 灰階，是不存在（Task 14 規格：以 feature flag 隱藏）。
+ * Kill switch 兩顆按鈕（暫停跟單／平倉並撤銷授權）——Task 15：真的接上
+ * `POST /api/me/pause`（暫停/恢復，無需簽章）與簽章的「平倉並撤銷」流程
+ * （`CloseAllModal`，`lib/closeAllFlow.ts`）。`state==="halted"` 時兩顆按鈕
+ * 讓位給「至 Hyperliquid 官方介面移除 API wallet」指引卡（v1 不代發撤銷交易，
+ * 見 plan 0.2）。
  */
-export const KILL_SWITCH_ENABLED = false;
+export const KILL_SWITCH_ENABLED = true;
 
 const WARN_RATIO = 0.8;
 
@@ -45,9 +50,29 @@ function GuardRow({ label, guard }: { label: string; guard: DashboardGuard }) {
   );
 }
 
-export function StatusCard({ status }: { status: DashboardStatus | null }) {
+export function StatusCard({
+  status, me, positions, closeAllPending, onActionSettled, onCloseAllSubmitted,
+}: {
+  status: DashboardStatus | null;
+  /** 登入身分——kill switch 動作皆需要（暫停/恢復不簽章，平倉並撤銷需要它比對
+   * 簽章者）。`null`＝呼叫端尚未確認登入態，兩顆按鈕不渲染。 */
+  me: { address: string; account_id: string } | null;
+  /** 將列進「平倉並撤銷」確認 modal 的目前持倉（來自同一份 dashboard 回應）。 */
+  positions: DashboardPosition[] | null;
+  /** 平倉並撤銷已送出、正在等待引擎收尾完成（呼叫端輪詢 dashboard 直到 halted）。 */
+  closeAllPending: boolean;
+  /** 暫停/恢復送出成功後呼叫——讓呼叫端立即重新整理 dashboard 資料，不必等下一次
+   * 自然輪詢週期。 */
+  onActionSettled: () => void;
+  /** 平倉並撤銷簽章送出成功後呼叫——與 `onActionSettled` 分開，因為呼叫端要對它
+   * 額外開始輪詢（`closeAllPending`），暫停/恢復不需要這個副作用。 */
+  onCloseAllSubmitted: () => void;
+}) {
   const COPY = useCopy();
   const c = COPY.dashboard.status;
+  const [pauseBusy, setPauseBusy] = useState(false);
+  const [pauseError, setPauseError] = useState<string | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
 
   const state = status?.state ?? "inactive";
   const stateLabel = {
@@ -69,6 +94,23 @@ export function StatusCard({ status }: { status: DashboardStatus | null }) {
     drawdown: { now: null, max: null, enabled: null },
   };
 
+  async function togglePause() {
+    setPauseError(null);
+    setPauseBusy(true);
+    try {
+      await postPause(state === "paused" ? "resume" : "pause");
+      onActionSettled();
+    } catch {
+      setPauseError(c.pauseErrorNote);
+    } finally {
+      setPauseBusy(false);
+    }
+  }
+
+  // 只在「有引擎在追蹤這個帳號」時才提供動作（following/paused）——inactive
+  // 沒有東西可暫停/撤銷，halted 讓位給下面的完成指引卡。
+  const showActions = me != null && (state === "following" || state === "paused");
+
   return (
     <div className="card dash-card" style={{ borderColor: "rgba(70, 214, 179, 0.24)" }}>
       <div className="dash-status-head">
@@ -80,17 +122,38 @@ export function StatusCard({ status }: { status: DashboardStatus | null }) {
           </div>
           <div className="dash-status-sub">{subtitleParts.join(" · ")}</div>
         </div>
-        {KILL_SWITCH_ENABLED && (
+        {showActions && (
           <div className="dash-status-actions">
-            <button type="button" className="dash-btn-pause" onClick={() => {}}>
-              {c.pauseBtn}
+            <button type="button" className="dash-btn-pause" onClick={() => void togglePause()}
+              disabled={pauseBusy}>
+              {state === "paused" ? c.resumeBtn : c.pauseBtn}
             </button>
-            <button type="button" className="dash-btn-close" onClick={() => {}}>
+            <button type="button" className="dash-btn-close" onClick={() => setModalOpen(true)}
+              disabled={pauseBusy}>
               {c.closeAllBtn}
             </button>
           </div>
         )}
       </div>
+      {pauseError && <p className="dash-status-error">{pauseError}</p>}
+      {closeAllPending && state !== "halted" && (
+        <div className="dash-progress-card">
+          <strong>{c.closeAllProgress.title}</strong>
+          <p style={{ margin: "4px 0 0" }}>{c.closeAllProgress.note}</p>
+        </div>
+      )}
+      {state === "halted" && (
+        <div className="dash-guide-card">
+          <h4>{c.closeAllDone.title}</h4>
+          <p className="hint">{c.closeAllDone.note}</p>
+          <ol>
+            {c.closeAllDone.steps.map((step) => <li key={step}>{step}</li>)}
+          </ol>
+          <a href="https://app.hyperliquid.xyz/API" target="_blank" rel="noreferrer">
+            {c.closeAllDone.linkLabel}
+          </a>
+        </div>
+      )}
       <div className="dash-divider" />
       <div className="dash-guards-heading">{c.guardsHeading}</div>
       <div className="dash-guards">
@@ -109,6 +172,17 @@ export function StatusCard({ status }: { status: DashboardStatus | null }) {
           </div>
         )}
       </div>
+      {modalOpen && me != null && (
+        <CloseAllModal
+          me={me}
+          positions={positions}
+          onClose={() => setModalOpen(false)}
+          onSubmitted={() => {
+            setModalOpen(false);
+            onCloseAllSubmitted();
+          }}
+        />
+      )}
     </div>
   );
 }

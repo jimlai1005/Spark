@@ -16,6 +16,7 @@ from spark.filet.capital_settings import capital_settings_path_for
 from spark.filet.leader_change import leader_changes_path_for
 from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH, require_leaders_path
 from spark.filet.risk_settings import risk_settings_path_for, risk_unlock_path_for
+from spark.filet.close_all import close_all_path_for
 from spark.filet.user_leaders import user_leaders_path_for
 
 _HEX = set("0123456789abcdefABCDEF")
@@ -178,6 +179,17 @@ class ApiConfig:
         同一個檔會讓兩種語意共命運，而弄錯的方向是 fail-open。
         """
         return risk_unlock_path_for(self.exchange_dir)
+
+    @property
+    def close_all_path(self) -> str:
+        """客戶簽章的「平倉並撤銷」一次性請求落點（filet/close_all.py 的格式；
+        Task 15 kill switch 第二級）。
+
+        與 `risk_unlock_path` 同一個交換目錄、同一種一次性動作語意（強制時效），
+        **各自一個檔**：兩者的觸發動作方向相反（解鎖 vs 主動收尾），共用一個檔
+        會讓其中一方的格式問題連坐另一方，而兩者都能造成不可逆的資金操作。
+        """
+        return close_all_path_for(self.exchange_dir)
 
     @property
     def user_leaders_path(self) -> str:

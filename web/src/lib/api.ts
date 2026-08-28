@@ -2,7 +2,7 @@
  * lib/api.ts — 後端 Public API 的唯一出口（工程原則 5 的前端鏡射）。
  * 一律同源相對路徑 + credentials:"include"（紅線 5）。
  * 錯誤分類（工程原則 2）：auth(401)/client(4xx)/upstream(502|503)/network。
- * ⭐ 紅線 3：帶簽名的後端呼叫共**五支**，全都是 EIP-191 personal_sign，且五支的
+ * ⭐ 紅線 3：帶簽名的後端呼叫共**六支**，全都是 EIP-191 personal_sign，且六支的
  *   **原文都由伺服器產生**（前端不組字串）：
  *     1. authVerify —— SIWE 登入簽名；
  *     2. postLeaderSelect —— 換 leader 授權簽名（原文來自 getLeaderSelectMessage）。
@@ -13,9 +13,13 @@
  *        `allocated_capital`／`capital_utilization` 直接乘進部位大小
  *        （`sizing.compute_scale_factor`），與換 leader 同級危害，同樣需要簽章
  *        （見 `src/spark/filet/capital_settings.py` 檔頭）。
- *   4／5 兩支的域分隔（一份「調門檻」或「改資金配置」的簽章不得被兌換成另一種
- *   動作，任兩兩之間皆然）由各自伺服器版型的第一行在結構上確立，見
- *   src/spark/filet/risk_settings.py 與 capital_settings.py 檔頭。
+ *     6. postCloseAll —— 「平倉並撤銷」授權簽名（原文來自 getCloseAllMessage）
+ *        ——2026-08-28 Task 15 kill switch 第二級：一次性、不可逆動作，形狀沿
+ *        postRiskUnlock（見 `src/spark/filet/close_all.py` 檔頭）。kill switch
+ *        第一級（暫停）刻意**不簽章**（`postPause`，見該函式註解）。
+ *   4／5／6 三支的域分隔（一份「調門檻」「改資金配置」或「平倉並撤銷」的簽章
+ *   不得被兌換成另一種動作，任兩兩之間皆然）由各自伺服器版型的第一行在結構上
+ *   確立，見 src/spark/filet/risk_settings.py／capital_settings.py／close_all.py 檔頭。
  *   EIP-712 的鏈上授權簽名走 lib/hl.ts 直送 HL，本模組結構上沒有那條路。
  */
 import type { HlTypedData } from "./hl";
@@ -456,6 +460,64 @@ export function postRiskUnlock(
   signature: string,
 ): Promise<RiskUnlockResp> {
   return post<RiskUnlockResp>("/api/me/risk/unlock", {
+    account_id: payload.account_id,
+    nonce: payload.nonce,
+    issued_at: payload.issued_at,
+    signature,
+    message: payload.message,
+  });
+}
+
+// ---------- owner kill switch（Task 15：暫停／平倉並撤銷，對照
+// publicapi/app.py POST /api/me/pause、GET+POST /api/me/close-all(/message)）----------
+
+/** 暫停/恢復跟單的回應。`effective_note` 是後端寫給人看的原文（單一來源）。 */
+export interface PauseResp {
+  ok: boolean;
+  paused: boolean;
+  effective: string;
+  effective_note: string;
+}
+
+/**
+ * 暫停或恢復跟單（kill switch 第一級）。**無需簽章**——登入 session 即可：兩個
+ * 方向都只在既有授權範圍內收窄（暫停）或恢復（resume）活動，不是新增任何主網
+ * 寫入權限（見後端 `me_pause` 端點註解，對照專案 CLAUDE.md 紅線 5）。
+ */
+export function postPause(action: "pause" | "resume"): Promise<PauseResp> {
+  return post<PauseResp>("/api/me/pause", { action });
+}
+
+/** 「平倉並撤銷」的待簽原文（一次性動作，**沒有** prefs——形狀同 `RiskUnlockMessageResp`）。 */
+export interface CloseAllMessageResp {
+  message: string;
+  nonce: string;
+  issued_at: string;
+  account_id: string;
+}
+
+export interface CloseAllResp {
+  ok: boolean;
+  account_id: string;
+  effective: string;
+  effective_note: string;
+}
+
+/** 取「平倉並撤銷」的待簽原文（需 session，無 body）。 */
+export function getCloseAllMessage(): Promise<CloseAllMessageResp> {
+  return request<CloseAllMessageResp>("/api/me/close-all/message");
+}
+
+/**
+ * 送出「平倉並撤銷」授權。⭐ 一次性、**不可逆**動作——與 `postRiskUnlock` 同一個
+ * 信任錨、同一種域分隔（一份其他動作的授權絕不能被兌換成一次平倉並撤銷，反向
+ * 亦然），見 `src/spark/filet/close_all.py` 檔頭。不得自動重試。
+ */
+export function postCloseAll(
+  payload: CloseAllMessageResp,
+  signature: string,
+): Promise<CloseAllResp> {
+  return post<CloseAllResp>("/api/me/close-all", {
     account_id: payload.account_id,
     nonce: payload.nonce,
     issued_at: payload.issued_at,

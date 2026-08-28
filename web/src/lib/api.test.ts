@@ -279,6 +279,11 @@ describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3�
       // 見檔案末段。
       () => api.getMyCapital(),
       () => api.getCapitalSettingsMessage("0", "0.25", true),
+      // 2026-08-28（Task 15）：暫停/恢復**不帶簽名**（登入 session 即可，見
+      // publicapi/app.py me_pause 端點註解）；取「平倉並撤銷」待簽原文也不帶簽名。
+      // 真正帶簽名的 postCloseAll 在 EXCLUDED，專屬白名單測試見檔案末段。
+      () => api.postPause("pause"),
+      () => api.getCloseAllMessage(),
     ];
     for (const call of calls) {
       mockFetchJson(200, { pending: [], typed_data: {}, nonce: "n", message: "m" });
@@ -310,9 +315,13 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
   // ——`allocated_capital`／`capital_utilization` 直接乘進部位大小，危害與換
   // leader 同級，同樣需要簽章（見 filet/capital_settings.py 檔頭）。同樣有專屬
   // 白名單測試（見檔案末段）。
+  // ⭐ 2026-08-28（Task 15）：postCloseAll 是第六支合法例外——「平倉並撤銷」一次性
+  // 不可逆動作，形狀沿 postRiskUnlock（見 filet/close_all.py 檔頭）。同樣有專屬
+  // 白名單測試（見檔案末段）；kill switch 第一級（暫停，postPause）刻意**不**
+  // 帶簽名，不進本清單——它照樣受下面的黑名單掃描約束。
   const EXCLUDED = new Set([
     "ApiError", "authVerify", "postLeaderSelect", "postMyRisk", "postRiskUnlock",
-    "postCapitalSettings",
+    "postCapitalSettings", "postCloseAll",
   ]);
   const reflected = Object.entries(api).filter(
     ([name, value]) => typeof value === "function" && !EXCLUDED.has(name),
@@ -333,7 +342,10 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     //   進 EXCLUDED（帶簽名）⇒ 反射清單淨增 2（21 → 23）。
     // 2026-08-28（Task 14）：+1 匯出（getDashboard，`/dashboard` 六塊資料源，不帶
     //   簽名、不進 EXCLUDED）⇒ 反射清單淨增 1（23 → 24）。
-    const HAND_WRITTEN_LIST_LENGTH = 24;
+    // 2026-08-28（Task 15）：+3 匯出（postPause、getCloseAllMessage、
+    //   postCloseAll），其中 postCloseAll 進 EXCLUDED（帶簽名）⇒ 反射清單淨增 2
+    //   （24 → 26）。
+    const HAND_WRITTEN_LIST_LENGTH = 26;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 
@@ -533,6 +545,52 @@ describe("⭐ postCapitalSettings：帶簽名的例外，body 欄位集合精確
     expect(body.allocated_capital).toBe(PAYLOAD.allocated_capital);
     expect(body.capital_utilization).toBe(PAYLOAD.capital_utilization);
     expect(body.use_full_equity).toBe(PAYLOAD.use_full_equity);
+    expect(body.message).toBe(PAYLOAD.message);
+    expect(body.signature).toBe(SIG);
+  });
+});
+
+/**
+ * owner kill switch（Task 15）：暫停/恢復（`postPause`，**不帶簽名**——登入
+ * session 即可，見 publicapi/app.py `me_pause` 端點註解）＋「平倉並撤銷」
+ * （`postCloseAll`，紅線 3 的第六個已知例外，一次性不可逆動作，白名單釘死欄位集合，
+ * 形狀沿 postRiskUnlock）。
+ */
+describe("⭐ postPause：無需簽章的暫停/恢復", () => {
+  it("body 只有 action 一個欄位，不含 signature", async () => {
+    mockFetchJson(200, { ok: true, paused: true, effective: "next_engine_cycle", effective_note: "" });
+    await api.postPause("pause");
+    expect(captured[0].url).toBe("/api/me/pause");
+    expect(Object.keys(JSON.parse(captured[0].init.body as string))).toEqual(["action"]);
+  });
+});
+
+describe("⭐ postCloseAll：帶簽名的例外，body 欄位集合精確釘死", () => {
+  const PAYLOAD = {
+    message: "Filet: close all positions and revoke copy-trading\n\nAccount: fzzz\nNonce: n-12",
+    nonce: "n-12",
+    issued_at: "2026-08-28T00:00:00Z",
+    account_id: "fzzz",
+  };
+  const SIG = `0x${"12".repeat(65)}`;
+
+  it("getCloseAllMessage：GET /api/me/close-all/message，零 body（不帶簽名）", async () => {
+    mockFetchJson(200, { message: "m", nonce: "n", issued_at: "t", account_id: "f" });
+    await api.getCloseAllMessage();
+    expect(captured[0].url).toBe("/api/me/close-all/message");
+    expect(captured[0].init.method).toBeUndefined(); // GET
+    expect(captured[0].init.body).toBeUndefined();
+  });
+
+  it("postCloseAll：欄位集合恰為契約五欄（同 postRiskUnlock 形狀，沒有 prefs）", async () => {
+    mockFetchJson(200, { ok: true });
+    await api.postCloseAll(PAYLOAD, SIG);
+
+    expect(captured[0].url).toBe("/api/me/close-all");
+    const body = JSON.parse(captured[0].init.body as string);
+    expect(Object.keys(body).sort()).toEqual(
+      ["account_id", "issued_at", "message", "nonce", "signature"],
+    );
     expect(body.message).toBe(PAYLOAD.message);
     expect(body.signature).toBe(SIG);
   });

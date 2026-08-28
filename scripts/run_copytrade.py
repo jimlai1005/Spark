@@ -59,6 +59,19 @@ leader 解析（per-follower ＋ 白名單二次驗證）:
   解鎖請求強制 600 秒時效，且必須晚於 ARM 檔的 tripped_at；leader 撤銷造成的鎖定
   不得由客戶自助解除。威脅模型見 spark/filet/risk_settings_apply.py 檔頭。
 
+owner kill switch（暫停／平倉並撤銷，2026-08-28 Task 15）:
+  暫停旗標＝交換目錄下 <user_address>/pause.json（**不**與換 leader 等三份記錄
+  同一種佈局——它不是需要驗章的意圖記錄，是登入 session 直接寫入的布林狀態，見
+  spark/filet/pause_flag.py）。引擎每輪讀取，讀不到旗標本身不算異常（未暫停過），
+  但**讀取失敗**（IO/格式錯）fail-safe 視為暫停。暫停不 trip、不寫 ARM 檔，只把
+  no_new_exposure 疊上（跳過新開倉/加倉，放行減倉/平倉）。
+  平倉並撤銷＝交換目錄下 owner_close.json（一次性簽章請求，強制 600 秒時效，形狀
+  同 risk_unlock 但方向相反——見 spark/filet/close_all.py 檔頭）。引擎每輪自己
+  重新驗章，通過即重用既有 make_revocation_wind_down（reason=owner_close）觸發
+  受控收尾（撤單→reduce-only 全平→halt，killswitch.trip）。冪等靠 is_tripped，
+  不需要獨立的一次性消耗檔。owner_close 不進任何 rearm 清單，恢復僅能人工處理
+  （見 deploy/RUNBOOK.md）。
+
 keystore 選擇:
   FILET_KEYSTORE   缺省／keychain → MacKeychainBackend（Mac 開發）；
                     envfile → EnvFileKeyStore(FILET_KEYS_DIR，預設 /etc/filet/keys，VPS 用)。
@@ -88,7 +101,7 @@ from spark.copytrade.config import CopySettings
 from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lifetime_peak
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
 from spark.copytrade.killswitch import (ALERTS_LOG_RELPATH, REASON_LEADER_REVOKED,
-                                        DrawdownStatus,
+                                        REASON_OWNER_CLOSE, DrawdownStatus,
                                         check_drawdown, count_alerts, halt_status,
                                         is_tripped, trip)
 from spark.copytrade.loop import main_loop, run_cycle, tripped_report
@@ -99,6 +112,8 @@ from spark.exchange.base import BuilderCode
 from spark.filet.capital_settings_apply import (
     LEDGER_RELPATH as CAPITAL_LEDGER_RELPATH,
 )
+from spark.filet.close_all_apply import CloseAllApplier, resolve_close_all_path
+from spark.filet.pause_flag import read_pause_flag_for_engine
 from spark.filet.capital_settings import canonical_capital_values
 from spark.filet.capital_settings_apply import (
     CapitalSettingsApplier,
@@ -410,25 +425,66 @@ def _risk_prefs_snapshot(settings) -> dict | None:
         return None
 
 
-def make_revocation_wind_down(adapter, ex, notifier: Notifier,
-                              root: Path) -> Callable[[], None]:
-    """leader 被白名單撤銷時的**受控收尾**閉包（交給 LeaderWatch 在偵測到撤銷時呼叫）。
+def make_revocation_wind_down(adapter, ex, notifier: Notifier, root: Path, *,
+                              reason: str = REASON_LEADER_REVOKED
+                              ) -> Callable[[], None]:
+    """**受控收尾**閉包（交給 LeaderWatch 在偵測到撤銷時呼叫；2026-08-28 起
+    Task 15 的「平倉並撤銷」收尾也重用本函式，只換 `reason`——見
+    `make_close_all_applier` 的呼叫端，兩者共用同一條收尾路徑，不新造平倉邏輯）。
 
     ⭐ 刻意重用 `killswitch.trip`，不另寫一套收尾：trip 的順序（lock-first 寫 ARM →
     撤全部掛單 → reduce-only 全平 → 覆寫 ARM → 持久告警）是紅線，兩套實作必然漂移，
     而漂移的那一套只在真出事時才會被執行到——那正是最不能出錯的時刻。
 
-    reason="leader_revoked" 讓 ARM 檔寫出鎖死的真正理由（回撤數字在這條路徑上全是 0，
-    沒有 reason 的話操作者只會看到一份看不出所以然的 payload）。
+    `reason` 讓 ARM 檔寫出鎖死的真正理由（回撤數字在這條路徑上全是 0，沒有 reason
+    的話操作者只會看到一份看不出所以然的 payload）。預設 `leader_revoked`（既有
+    行為不變）；`owner_close`＝客戶簽章要求平倉並撤銷（見 killswitch.py 的
+    `REASON_OWNER_CLOSE` 常數與其恢復語意——不進任何 rearm 清單，只能人工處理）。
     """
     def _wind_down() -> None:
         positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
         trip(ex, positions, notifier, root,
              DrawdownStatus(current=Decimal("0"), peak=Decimal("0"),
                             drawdown_pct=Decimal("0"), breached=False),
-             reason=REASON_LEADER_REVOKED)
+             reason=reason)
 
     return _wind_down
+
+
+def make_close_all_applier(*, account_id: str | None, notifier: Notifier):
+    """建立每 cycle 消化「客戶簽章的平倉並撤銷」請求的 applier；無 account_id → None。
+
+    形狀與 `make_risk_settings_applier` 一致（同一個「dry/shadow 無身分就沒有可信
+    比對基準」的決定）。落點（`resolve_close_all_path`）與換 leader／資金／風控
+    設定同一個 `FILET_EXCHANGE_DIR`，各自一個檔（見 `filet/close_all.py` 檔頭）。
+    """
+    if account_id is None:
+        return None
+    return CloseAllApplier(
+        account_id=account_id,
+        manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
+        request_path=resolve_close_all_path(),
+        notifier=notifier)
+
+
+def make_pause_reader(*, account_id: str | None, user_addr: str
+                      ) -> Callable[[Notifier], bool] | None:
+    """建立每 cycle 讀「owner 暫停旗標」的閉包；無 account_id → None（沿同檔其他
+    factory 的既有決定：dry/shadow 沒有受管身分，本旗標只服務受管 follower）。
+
+    刻意回傳「吃 notifier」的閉包而非直接吃 notifier 綁死：呼叫端（`cycle()`）
+    每輪用的是同一個已包好 `TaggedNotifier` 的 notifier 物件，讓它在呼叫點傳入，
+    與其餘 applier 的建構期綁定方式不同純粹是因為 `read_pause_flag_for_engine`
+    是純函式（無需要跨輪保留的內部狀態），沒有理由多包一層 class。
+    """
+    if account_id is None:
+        return None
+    exchange_dir = require_exchange_dir()
+
+    def _read(notifier: Notifier) -> bool:
+        return read_pause_flag_for_engine(exchange_dir, user_addr, notifier)
+
+    return _read
 
 
 def wrap_notifier(inner: Notifier, account_id: str | None) -> Notifier:
@@ -646,6 +702,13 @@ def main(argv: list[str] | None = None) -> None:
         account_id=account_id, notifier=notifier, state_root=state_root)
     risk_applier = make_risk_settings_applier(
         account_id=account_id, notifier=notifier, state_root=state_root)
+    # ⭐ Task 15 kill switch 第二級（平倉並撤銷）：重用 make_revocation_wind_down，
+    # 只換 reason——同一條收尾路徑，不新造平倉邏輯（見該函式 docstring）。
+    close_all_applier = make_close_all_applier(account_id=account_id, notifier=notifier)
+    owner_close_wind_down = make_revocation_wind_down(
+        adapter, ex, notifier, state_root, reason=REASON_OWNER_CLOSE)
+    # 第一級（暫停）：純讀檔閉包，見 make_pause_reader docstring。
+    pause_reader = make_pause_reader(account_id=account_id, user_addr=user_addr)
     publish_hb = make_heartbeat_publisher(account_id=account_id,
                                           state_root=state_root)
 
@@ -667,6 +730,13 @@ def main(argv: list[str] | None = None) -> None:
                 hb["detail"] = "leader 已被撤銷，收尾已執行；本輪起零交易動作"
                 return tripped_report()
             hb["leader"] = res
+            # ⭐ Task 15 kill switch 第二級：owner 簽章的「平倉並撤銷」請求，優先序
+            # 緊接在 leader 撤銷之後（同一種「客戶／治理層主動要求退出」，見
+            # loop.py 檔頭對三道閘門優先序的說明）。刻意**不**在此提前 return——
+            # `wind_down()` 成功會寫下 ARM 檔，下面 `run_cycle` 開頭的 `is_tripped`
+            # 短路會自然接手（結構性冪等，不必在這裡另開一條「本輪已收尾」分支）。
+            if close_all_applier is not None:
+                close_all_applier.consume(state_root, owner_close_wind_down)
             # 位址沒變就沿用同一個 settings 物件（避免每輪無謂重建）；變了才 replace，
             # 讓 run_cycle 的 leader 讀取與本輪解析結果同源（工程原則 1）。
             # ⭐ vault 保護**每輪**按本輪解析出的 kind 重套（引擎自衛的不可繞過
@@ -701,6 +771,11 @@ def main(argv: list[str] | None = None) -> None:
             if risk_applier is not None:
                 risk_applier.consume_unlock_request(state_root)
                 cs = risk_applier.effective(cs)
+            # ⭐ Task 15 kill switch 第一級（暫停）：疊在最後，讓「本輪最終用的
+            # settings」仍只有一個產生點（同資金/風控設定的既有順序理由）。
+            # `pause_reader` 內部對 IO 錯誤 fail-safe 視為暫停（見 pause_flag.py）。
+            if pause_reader is not None:
+                cs = replace(cs, paused=pause_reader(notifier))
             hb["settings"] = cs
             hb["capital"] = (capital_applier.last_applied
                              if capital_applier is not None else None)

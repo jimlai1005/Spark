@@ -774,6 +774,24 @@ sudo journalctl -u 'filet-follower@*' --since '10 min ago' | grep -i '撤銷\|le
 ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 ARM 檔
 ```
 
+#### `max_leverage` 展示欄位（可選；2026-08-28 Task 15b 起也是引擎層事實）
+
+`leaders.json` 每筆條目可選填 `"max_leverage": "<字串數字>"`（Task 5 引入，原本純
+展示——策略卡「槓桿 ≤ Nx」chip）。**Task 15b 起**，auto-activate watcher 建 follower
+env 時會依它注入 `COPY_MAX_TARGET_LEVERAGE`（`scripts/filet_auto_activate._resolve_leverage_cap`）：
+
+- `kind` 為 `vault` 且有 `max_leverage`：取與 vault 保護常數（20）**較嚴者**
+  （`min(20, max_leverage)`），絕不放寬 vault 保護。
+- `kind` 非 vault 且有 `max_leverage`：直接注入該值（過去 standard leader 從不注入
+  這個鍵，這是新行為）。
+- 未填 `max_leverage`：不注入，沿用引擎自身預設（0＝不強制）。
+
+⚠️ **只影響新啟用的 follower**（`_ensure_env_file` 不覆寫既有 env）：改一筆
+`max_leverage` 不會回頭改動已在跑的引擎，需要營運端手動更新該 follower 的 env 檔並
+重啟（同其餘 env 變更的既有慣例）。填入非數字字串會被 watcher 忽略（log 一則
+warning，不整輪 fail-closed——這是策展資料的手誤，不比照 SPARK_*/範本佔位符的
+fail-closed 力度）。
+
 #### vault leader 上架前置檢查（2026-07-31）
 
 vault 地址可以直接當 leader 跟單，是因為 vault 的 `accountValue` 可當 sizing 分母
@@ -1336,6 +1354,77 @@ in-memory（per-app，隨進程重啟歸零；多 worker 各自計數，對枚�
 准入之前、驗簽之前：429 與准入失敗一樣**不消耗 nonce**（否則一次限流打嗝就作廢客戶
 手上的授權）。正常換手每次只花 2 次額度（message ＋ POST），離上限很遠；正常用戶
 零感知（沒有人一分鐘查十個位址）。
+
+---
+
+### 5.5.4 ⭐⭐ owner kill switch：暫停／平倉並撤銷（2026-08-28 Task 15）
+
+錢包主人在 `/dashboard` 有兩顆動作按鈕，兩者的信任錨、旗標檔位置、與 operator
+的介入方式完全不同——分開記，別混著查。
+
+#### 第一級：暫停跟單（`POST /api/me/pause`，無需簽章）
+
+旗標檔：`$FILET_EXCHANGE_DIR/<user_address 小寫>/pause.json`（**注意路徑鍵是
+user_address，不是 account_id**——與換 leader／資金／風控三份記錄的佈局不同，見
+`src/spark/filet/pause_flag.py` 檔頭）。內容 `{"paused": bool, "ts": epoch秒, "by": "owner"}`。
+
+- 引擎每輪讀取（`scripts/run_copytrade.cycle()`），套進 `CopySettings.paused`：
+  `True` ⇒ 跳過新開倉與加倉，**照常**處理減倉/平倉與既有風控動作（reduce-only
+  全平、撤單）——與成本熔斷器共用同一個 `no_new_exposure` 旗標，**不 trip、不寫
+  ARM 檔**，純粹是「本輪少做一種動作」。
+- 旗標檔**讀取失敗**（IO 錯誤／JSON 壞掉）→ 引擎 fail-safe **視為暫停** ＋
+  critical（dedup_key `pause_flag_unreadable`／`pause_flag_malformed`）——查到這則
+  告警代表交換目錄的檔案系統或權限有問題，不是客戶主動暫停。
+- **人工排查**：
+
+```bash
+cat $FILET_EXCHANGE_DIR/<user_address>/pause.json   # 目前的暫停狀態
+# state 面板同步反映在 /api/me/dashboard → status.state == "paused"
+```
+
+暫停沒有「re-arm」的概念——客戶自己按「恢復跟單」（`POST /api/me/pause`
+`{"action":"resume"}`）即可，旗標檔案權限正常的情況下 operator 不需要介入。
+
+#### 第二級：平倉並撤銷（`POST /api/me/close-all`，簽章、一次性、不可逆）
+
+請求檔：`$FILET_EXCHANGE_DIR/owner_close.json`（同帳號覆蓋，格式見
+`src/spark/filet/close_all.py`）。與 `risk_unlock.json` 同一種一次性動作語意
+（強制 600 秒時效），但**方向相反**：解鎖是拿掉一道保護，這個是主動要求引擎進入
+受控收尾。
+
+- 引擎每輪自己重新驗章（不信任 filet-api 已驗過，同換 leader／資金/風控設定的
+  既有信任模型），通過 → 重用**既有**受控收尾路徑（`killswitch.trip`，
+  `reason="owner_close"`）：撤全部掛單 → reduce-only 全平 → 覆寫 ARM 檔 → critical。
+  **不是另一套平倉邏輯**——與 leader 被白名單撤銷（`reason="leader_revoked"`）走
+  同一個 `killswitch.trip()`，兩者的差別只在 ARM payload 的 `reason`。
+- **冪等靠 `is_tripped`**：一旦 ARM 檔寫下，同一份簽章（或任何後續 cycle）都不會
+  再觸發第二次收尾，不需要另一層一次性消耗檔。
+- `owner_close` **不進任何 rearm 清單**（`killswitch._AUTO_REARM_REASONS` 與
+  `_MANUAL_REARM_REASONS` 皆不含它）——沒有冷靜期自動恢復、也沒有客戶自助解鎖的
+  簽章路徑。這是刻意的：客戶已經明確選擇退出這顆引擎。
+
+#### owner 收尾後的人工 re-arm 程序
+
+平倉並撤銷完成後，該 follower 的引擎會**永久停在 tripped 狀態**，直到 operator
+人工介入。標準程序（**只有客戶明確要求恢復跟單時才做**，否則保持停機）：
+
+```bash
+# 1. 確認 ARM payload 確實是 owner_close（不是誤觸別的熔斷路徑）
+cat /opt/filet/state/<account_id>/var/copytrade/killswitch.tripped
+# 應看到 "reason": "owner_close"
+
+# 2. 確認客戶真的要恢復（他已經簽過一次「不可逆」的平倉並撤銷——多數情況下
+#    正確的下一步是引導他重新走一次 onboarding，而不是恢復這顆舊引擎）。
+
+# 3. 若確定要恢復同一顆引擎：刪 ARM 檔（同其餘 kill switch 路徑的既有 re-arm 慣例）
+sudo -u filet-engine rm /opt/filet/state/<account_id>/var/copytrade/killswitch.tripped
+sudo systemctl restart filet-follower@<account_id>   # 非必要，但建議乾淨重啟一次
+```
+
+⚠️ **前端指引卡不代發鏈上撤銷**（plan 0.2 明文，v1 範圍）：客戶頁面在收尾完成
+（`status.state == "halted"`）後只顯示「請至 Hyperliquid 官方介面移除 API wallet」
+的說明卡＋外連 `https://app.hyperliquid.xyz/API`，不由本站自動送出撤銷交易——
+operator 不需要（也不能）代勞這一步。
 
 ---
 

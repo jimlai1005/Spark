@@ -10,6 +10,13 @@ run_cycle 順序（killswitch docstring 的主迴圈接入接口 + Task 12 spec�
 > `成本熔斷器`。前面的閘一旦成立就已 return，後面的走不到——優先序由位置保證，
 不是靠呼叫端記得檢查旗標。
 
+⭐ owner 暫停旗標（Task 15，kill switch 第一級）不是另一道「閘」——它不 trip、
+不 return，只把 `settings.paused` 併入成本熔斷器已有的 `no_new_exposure` 旗標
+（見 2.6），跳過新開倉與加倉、放行減倉/平倉。第二級（平倉並撤銷）走既有的
+`leader 撤銷` 收尾路徑（`killswitch.trip`，reason=`owner_close`），由
+`run_copytrade.cycle()` 在呼叫 `run_cycle` 之前觸發，一旦寫下 ARM 檔，本函式
+步驟 1 的 `is_tripped` 短路自然接手，不需要在此另開分支。
+
 main_loop 排程（port hl-copytrader main.py:122-131 的分鐘鍵防重跑與
 :291-292,351-363 的連續錯誤熔斷；頻率由 CopySettings.interval_s 決定，
 刻意覆蓋 hl 的 hourly——見 config.py）。
@@ -267,6 +274,16 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             )
         return tripped_report()
 
+    # ── 2.6 owner 暫停旗標（Task 15 kill switch 第一級）──────────────────
+    # ⭐ 與成本熔斷器共用**同一個** `no_new_exposure` 旗標（工程原則 1：一個「只減
+    # 不開」的語意只有一個實作，見 orders.py/positions.py 的 `no_new_exposure`
+    # docstring）——跳過新開倉與加倉，**放行**跟隨 leader 的減倉/平倉與既有風控
+    # 動作（reduce-only 全平、撤單）。`settings.paused` 由呼叫端（run_copytrade.
+    # cycle()）讀 `FILET_EXCHANGE_DIR/<addr>/pause.json` 後疊上 CopySettings
+    # （IO 錯誤 fail-safe 視為 paused，見 filet/pause_flag.py），不在本函式內讀檔
+    # ——run_cycle 不知道交換目錄在哪，讀檔的責任留在呼叫端（分層一致）。
+    no_new_exposure = cost.breached or settings.paused
+
     # ── 3. leader / my 狀態讀取 ────────────────────────────────────────
     leader = settings.leader_address
     leader_orders = adapter.get_open_orders(leader)
@@ -375,13 +392,13 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             ex, leader_positions, pos, scale,
             settings=settings, notifier=notifier, protected=set(protected),
             size_decimals=ex.get_size_decimals, mids=adapter.get_all_mids(),
-            no_new_exposure=cost.breached,
+            no_new_exposure=no_new_exposure,
         )
 
     report = sync_open_orders(
         ex, leader_orders, my_orders, my_positions, scale,
         settings=settings, notifier=notifier, state=state, live=ex.live,
-        protected=set(protected), no_new_exposure=cost.breached,
+        protected=set(protected), no_new_exposure=no_new_exposure,
         leverage_by_coin=leverage_by_coin,
         leverage_fallback=_leader_leverage,
         safety_net=_safety_net,

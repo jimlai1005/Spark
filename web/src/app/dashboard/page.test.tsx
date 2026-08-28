@@ -1,13 +1,15 @@
 /**
- * `/dashboard` — 六塊 Dashboard 測試（Task 14）。
+ * `/dashboard` — 六塊 Dashboard 測試（Task 14）＋ kill switch 暫停/平倉並撤銷
+ * （Task 15，接上 KILL_SWITCH_ENABLED 後的真實行為）。
  * 涵蓋：未登入 redirect；六塊渲染假資料；`available_pct` 0.05 告警閾值翻轉；
- * 全 null 塊渲染「—」不炸；kill switch 兩顆按鈕在 feature flag 關閉時不出現。
+ * 全 null 塊渲染「—」不炸；kill switch 兩顆按鈕的渲染條件、暫停/恢復呼叫、
+ * halted 態的官方介面指引卡、平倉並撤銷 modal 的二次確認閘門。
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { DashboardResp } from "@/lib/api";
+import type { CloseAllMessageResp, CloseAllResp, DashboardResp, PauseResp } from "@/lib/api";
 
 const push = vi.fn();
 vi.mock("next/navigation", () => ({
@@ -20,9 +22,24 @@ vi.mock("@/lib/hooks", () => ({
 }));
 
 const getDashboard = vi.fn();
+const postPause = vi.fn<[string], Promise<PauseResp>>();
+const getCloseAllMessage = vi.fn<[], Promise<CloseAllMessageResp>>();
+const postCloseAll = vi.fn<[CloseAllMessageResp, string], Promise<CloseAllResp>>();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getDashboard: (...a: unknown[]) => getDashboard(...a),
+  postPause: (...a: [string]) => postPause(...a),
+  getCloseAllMessage: (...a: []) => getCloseAllMessage(...a),
+  postCloseAll: (...a: [CloseAllMessageResp, string]) => postCloseAll(...a),
+}));
+
+const signMessageAsync = vi.fn(async () => `0x${"ab".repeat(65)}`);
+vi.mock("wagmi", () => ({
+  useSignMessage: () => ({ signMessageAsync }),
+}));
+
+vi.mock("@/lib/sign", () => ({
+  recoverPersonalSigner: vi.fn(async () => ADDR.toLowerCase()),
 }));
 
 import { COPY_ZH as COPY } from "@/lib/copy";
@@ -95,6 +112,10 @@ const ALL_NULL: DashboardResp = {
 beforeEach(() => {
   push.mockReset();
   getDashboard.mockReset();
+  postPause.mockReset();
+  getCloseAllMessage.mockReset();
+  postCloseAll.mockReset();
+  signMessageAsync.mockClear();
   mockMe = { data: { address: ADDR, account_id: "fabc" }, isLoading: false };
 });
 
@@ -160,14 +181,185 @@ describe("DashboardPage — 全 null 塊不炸（不變量 6）", () => {
   });
 });
 
-describe("DashboardPage — kill switch（Task 15 未完成前 feature flag 隱藏）", () => {
-  it("暫停跟單／平倉並撤銷授權兩顆按鈕不渲染", async () => {
+describe("DashboardPage — kill switch 按鈕渲染條件（Task 15）", () => {
+  it("state=following → 暫停跟單／平倉並撤銷授權兩顆按鈕都渲染", async () => {
     getDashboard.mockResolvedValue(FULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    expect(screen.getByRole("button", { name: COPY.dashboard.status.pauseBtn }))
+      .toBeInTheDocument();
+    expect(screen.getByRole("button", { name: COPY.dashboard.status.closeAllBtn }))
+      .toBeInTheDocument();
+  });
+
+  it("state=paused → 顯示「恢復跟單」而非「暫停跟單」", async () => {
+    getDashboard.mockResolvedValue({
+      ...FULL, status: { ...FULL.status!, state: "paused" },
+    });
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    expect(screen.getByRole("button", { name: COPY.dashboard.status.resumeBtn }))
+      .toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.dashboard.status.pauseBtn }))
+      .not.toBeInTheDocument();
+  });
+
+  it("state=inactive → 兩顆按鈕都不渲染（沒有引擎可操作）", async () => {
+    getDashboard.mockResolvedValue(ALL_NULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(COPY.dashboard.status.stateInactive, { exact: false });
+    expect(screen.queryByRole("button", { name: COPY.dashboard.status.pauseBtn }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.dashboard.status.closeAllBtn }))
+      .not.toBeInTheDocument();
+  });
+
+  it("state=halted → 兩顆按鈕不渲染，改顯示官方介面指引卡", async () => {
+    getDashboard.mockResolvedValue({
+      ...FULL, status: { ...FULL.status!, state: "halted" },
+    });
     render(wrap(<DashboardPage />));
     await screen.findByText(/Filet Core/);
     expect(screen.queryByRole("button", { name: COPY.dashboard.status.pauseBtn }))
       .not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: COPY.dashboard.status.closeAllBtn }))
       .not.toBeInTheDocument();
+    expect(screen.getByText(COPY.dashboard.status.closeAllDone.title)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: COPY.dashboard.status.closeAllDone.linkLabel }))
+      .toHaveAttribute("href", "https://app.hyperliquid.xyz/API");
+  });
+});
+
+describe("DashboardPage — 暫停/恢復（無需簽章，Task 15）", () => {
+  it("點擊「暫停跟單」→ 呼叫 postPause('pause')，成功後重新整理 dashboard", async () => {
+    getDashboard.mockResolvedValue({
+      ...FULL, status: { ...FULL.status!, state: "following" },
+    });
+    postPause.mockResolvedValue({
+      ok: true, paused: true, effective: "next_engine_cycle", effective_note: "",
+    });
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    const callsBefore = getDashboard.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.pauseBtn }));
+
+    await waitFor(() => expect(postPause).toHaveBeenCalledWith("pause"));
+    await waitFor(() =>
+      expect(getDashboard.mock.calls.length).toBeGreaterThan(callsBefore));
+  });
+
+  it("點擊「恢復跟單」→ 呼叫 postPause('resume')", async () => {
+    getDashboard.mockResolvedValue({
+      ...FULL, status: { ...FULL.status!, state: "paused" },
+    });
+    postPause.mockResolvedValue({
+      ok: true, paused: false, effective: "next_engine_cycle", effective_note: "",
+    });
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.resumeBtn }));
+
+    await waitFor(() => expect(postPause).toHaveBeenCalledWith("resume"));
+  });
+
+  it("postPause 失敗 → 顯示錯誤文案，不悄悄吞掉", async () => {
+    getDashboard.mockResolvedValue({
+      ...FULL, status: { ...FULL.status!, state: "following" },
+    });
+    postPause.mockRejectedValue(new Error("500"));
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.pauseBtn }));
+
+    expect(await screen.findByText(COPY.dashboard.status.pauseErrorNote)).toBeInTheDocument();
+  });
+});
+
+describe("DashboardPage — 平倉並撤銷 modal（Task 15 kill switch 第二級）", () => {
+  function openModal() {
+    fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.closeAllBtn }));
+  }
+
+  it("點擊「平倉並撤銷授權」→ 開啟 modal，列出目前持倉＋不可逆警語", async () => {
+    getDashboard.mockResolvedValue(FULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+
+    openModal();
+
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.getByText(COPY.dashboard.status.closeAllModal.title)).toBeInTheDocument();
+    expect(dialog.getByText(COPY.dashboard.status.closeAllModal.warning)).toBeInTheDocument();
+    expect(dialog.getByText(/ETH/)).toBeInTheDocument(); // FULL.positions[0].symbol
+  });
+
+  it("⭐ 二次確認閘門：勾選前確認鈕 disabled，勾選後才能點", async () => {
+    getDashboard.mockResolvedValue(FULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    openModal();
+
+    const confirmBtn = screen.getByRole("button", { name: COPY.dashboard.status.closeAllModal.confirmBtn });
+    expect(confirmBtn).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("checkbox"));
+    expect(confirmBtn).not.toBeDisabled();
+  });
+
+  it("取消按鈕關閉 modal，不呼叫任何簽章流程", async () => {
+    getDashboard.mockResolvedValue(FULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    openModal();
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.closeAllModal.cancelBtn }));
+
+    expect(screen.queryByText(COPY.dashboard.status.closeAllModal.title)).not.toBeInTheDocument();
+    expect(getCloseAllMessage).not.toHaveBeenCalled();
+  });
+
+  it("⭐⭐ 完整簽署流程：勾選 → 確認 → 簽名 → 送出成功 → modal 關閉並開始輪詢進度卡", async () => {
+    getDashboard.mockResolvedValue(FULL);
+    const message =
+      "Filet: close all positions and revoke copy-trading\n\nAccount: fabc\nNonce: n1\nIssued At: 2026-08-28T00:00:00Z";
+    getCloseAllMessage.mockResolvedValue({
+      message, nonce: "n1", issued_at: "2026-08-28T00:00:00Z", account_id: "fabc",
+    });
+    postCloseAll.mockResolvedValue({
+      ok: true, account_id: "fabc", effective: "next_engine_cycle", effective_note: "",
+    });
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    openModal();
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.closeAllModal.confirmBtn }));
+
+    await waitFor(() => expect(postCloseAll).toHaveBeenCalledWith(
+      { message, nonce: "n1", issued_at: "2026-08-28T00:00:00Z", account_id: "fabc" },
+      `0x${"ab".repeat(65)}`,
+    ));
+    await waitFor(() =>
+      expect(screen.queryByText(COPY.dashboard.status.closeAllModal.title)).not.toBeInTheDocument());
+    expect(await screen.findByText(COPY.dashboard.status.closeAllProgress.title)).toBeInTheDocument();
+  });
+
+  it("簽章者與登入帳號不符 → content-mismatch，不喚起錢包（域分隔前端防線）", async () => {
+    getDashboard.mockResolvedValue(FULL);
+    getCloseAllMessage.mockResolvedValue({
+      message: "Filet: close all positions and revoke copy-trading\n\nAccount: fother\nNonce: n1\nIssued At: x",
+      nonce: "n1", issued_at: "x", account_id: "fother", // 帳號不是我
+    });
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    openModal();
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.closeAllModal.confirmBtn }));
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(signMessageAsync).not.toHaveBeenCalled();
+    expect(postCloseAll).not.toHaveBeenCalled();
   });
 });

@@ -1039,7 +1039,34 @@ export const COPY_ZH = {
       signalOk: "訊號來源正常",
       signalUnknown: "訊號來源狀態未知",
       pauseBtn: "暫停跟單",
+      resumeBtn: "恢復跟單",
       closeAllBtn: "平倉並撤銷授權",
+      pauseErrorNote: "操作失敗，請稍後重試。",
+      closeAllModal: {
+        title: "確認：平倉並撤銷授權",
+        warning: "此操作將以市價平倉你目前所有跟單部位並停止跟單，且不可逆。",
+        positionsHeading: "將平倉部位",
+        noPositions: "目前無持倉。",
+        ackLabel: "我理解此操作不可逆，且完成後不會自動恢復跟單。",
+        confirmBtn: "確認平倉並撤銷",
+        cancelBtn: "取消",
+        signingNote: "請在錢包中簽署…",
+      },
+      closeAllProgress: {
+        title: "收尾進行中",
+        note: "引擎已收到請求，正在撤單並平倉，請稍候（約一分鐘內完成，此區塊會自動更新）。",
+      },
+      closeAllDone: {
+        title: "已完成平倉並撤銷",
+        note: "跟單已停止，且不會自動恢復。此動作未撤銷 API wallet 的鏈上權限，"
+             + "請至 Hyperliquid 官方介面自行移除。",
+        linkLabel: "前往 Hyperliquid 官方介面移除 API wallet",
+        steps: [
+          "登入 app.hyperliquid.xyz",
+          "進入「API」設定頁面",
+          "找到本站建立的 API wallet 並移除其權限",
+        ],
+      },
       guardsHeading: "風險護欄（設定值 vs 目前）",
       guardScale: "投入比例",
       guardLeverage: "槓桿",
@@ -2008,7 +2035,39 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       signalOk: "Signal source healthy",
       signalUnknown: "Signal source status unknown",
       pauseBtn: "Pause following",
+      resumeBtn: "Resume following",
       closeAllBtn: "Close all & revoke authorization",
+      pauseErrorNote: "Action failed, please try again later.",
+      closeAllModal: {
+        title: "Confirm: close all & revoke authorization",
+        warning: "This will close all of your current copy-trading positions at market "
+                + "and stop following. This action is irreversible.",
+        positionsHeading: "Positions to be closed",
+        noPositions: "No open positions.",
+        ackLabel: "I understand this is irreversible and following will not resume "
+                 + "automatically after this completes.",
+        confirmBtn: "Confirm close all & revoke",
+        cancelBtn: "Cancel",
+        signingNote: "Please sign in your wallet…",
+      },
+      closeAllProgress: {
+        title: "Winding down",
+        note: "The engine has received your request and is cancelling orders and closing "
+             + "positions — this usually finishes within a minute; this panel updates "
+             + "automatically.",
+      },
+      closeAllDone: {
+        title: "Close all & revoke complete",
+        note: "Following has stopped and will not resume automatically. This action did "
+             + "not revoke the API wallet's on-chain permissions — please remove it "
+             + "yourself on the official Hyperliquid interface.",
+        linkLabel: "Go to Hyperliquid to remove the API wallet",
+        steps: [
+          "Sign in at app.hyperliquid.xyz",
+          "Open the \"API\" settings page",
+          "Find the API wallet created by this site and remove its permissions",
+        ],
+      },
       guardsHeading: "Risk guardrails (set vs current)",
       guardScale: "Allocation",
       guardLeverage: "Leverage",

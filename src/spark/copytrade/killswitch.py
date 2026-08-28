@@ -157,6 +157,12 @@ REASON_ROLLING_DRAWDOWN = "drawdown"          # 7 天滾動窗：跌得太快
 REASON_TOTAL_DRAWDOWN = "total_drawdown"      # 絕對底線：自開始跟單以來虧太多
 REASON_COST_BREACH = "cost_breach"            # 成本熔斷累犯升級
 REASON_LEADER_REVOKED = "leader_revoked"      # 治理動作（平台撤銷 leader）
+# ⭐ 2026-08-28（Task 15 kill switch 第二級）：owner 自己簽章要求「平倉並撤銷」。
+# 與 `leader_revoked` 同一個恢復語意——**不進任何 rearm 清單**：owner 已經明確
+# 選擇退出這顆引擎，不該有冷靜期自動恢復、也不該有「立即恢復跟單」的自助解鎖
+# （那支簽章的域與這裡完全不同，見 filet/close_all.py）。恢復只能是人工
+# re-arm（見 deploy/RUNBOOK.md 新增節）。
+REASON_OWNER_CLOSE = "owner_close"
 
 # 冷靜期屆滿可**自動**恢復的原因：只有「跌得快」與「交易太密集」這兩種——
 # 它們量的是**速度**，等一段時間確實會改變事實。
@@ -165,7 +171,8 @@ _AUTO_REARM_REASONS = (REASON_ROLLING_DRAWDOWN, REASON_COST_BREACH)
 # 客戶**親自簽章**可以恢復的原因 ＝ 上面兩種 ＋ 絕對底線。絕對底線不自動恢復
 # （時間過去不會讓已經虧掉的錢回來），但客戶有權在看懂之後自己接受一個新基準
 # ——那正是「保護要提供，但保留客戶該有的權力」的界線所在。
-# ⚠️ 兩張清單都不含 `leader_revoked`（治理動作）與 `""`（營運端緊急停機）。
+# ⚠️ 三張清單都不含 `leader_revoked`（治理動作）、`owner_close`（owner 主動退出，
+# 見上）與 `""`（營運端緊急停機）。
 _MANUAL_REARM_REASONS = _AUTO_REARM_REASONS + (REASON_TOTAL_DRAWDOWN,)
 
 

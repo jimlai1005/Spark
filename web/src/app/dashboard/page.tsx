@@ -10,7 +10,7 @@
  * guard 用 effect 避免在 render 期間呼叫 router.push）。
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { EquityCard } from "@/components/dashboard/EquityCard";
 import { ExposureCard } from "@/components/dashboard/ExposureCard";
@@ -40,6 +40,12 @@ export default function DashboardPage() {
   const c = COPY.dashboard;
   const queryClient = useQueryClient();
 
+  // ⭐ Task 15：平倉並撤銷送出後開始輪詢，直到 status.state 變成 "halted"
+  // 才停下——收尾是引擎下一輪（約一分鐘）才會完成的非同步動作，客戶要能看到
+  // 進度而不是送出後畫面一片空白。其餘時間維持一次性讀取（不背景輪詢），
+  // 不對未觸發 kill switch 的使用者加無謂的背景請求。
+  const [awaitingHalt, setAwaitingHalt] = useState(false);
+
   const dash = useQuery<DashboardResp>({
     queryKey: ["me-dashboard"],
     queryFn: async () => {
@@ -53,7 +59,12 @@ export default function DashboardPage() {
       }
     },
     enabled: loggedIn,
+    refetchInterval: awaitingHalt ? 5000 : false,
   });
+
+  useEffect(() => {
+    if (dash.data?.status?.state === "halted") setAwaitingHalt(false);
+  }, [dash.data?.status?.state]);
 
   // 未登入一律 redirect /strategies（不在 render 期間呼叫 router.push，guard 用 effect，
   // 與 onboarding/page.tsx NOTE 10 同慣例）。
@@ -94,7 +105,17 @@ export default function DashboardPage() {
       </div>
 
       <div className="dash-row1">
-        <StatusCard status={data?.status ?? null} />
+        <StatusCard
+          status={data?.status ?? null}
+          me={me.data}
+          positions={data?.positions ?? null}
+          closeAllPending={awaitingHalt}
+          onActionSettled={() => void dash.refetch()}
+          onCloseAllSubmitted={() => {
+            setAwaitingHalt(true);
+            void dash.refetch();
+          }}
+        />
         <EquityCard equity={data?.equity ?? null} />
       </div>
 

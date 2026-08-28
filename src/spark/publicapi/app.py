@@ -74,6 +74,10 @@ from spark.filet.risk_settings import (RISK_SETTINGS_MAX_AGE_S, RiskSettingsErro
                                        load_risk_settings, verify_risk_settings,
                                        verify_risk_unlock, write_risk_settings,
                                        write_risk_unlock)
+from spark.filet.close_all import (CloseAllError, build_close_all_message,
+                                   build_close_all_record, verify_close_all,
+                                   write_close_all_request)
+from spark.filet.pause_flag import pause_flag_path_for, write_pause_flag
 from spark.copytrade.notifier import NullNotifier, TelegramNotifier
 from spark.publicapi.pending import load_pending, write_pending_entry
 from spark.publicapi.siwe import build_siwe_message, recover_siwe_signer
@@ -153,6 +157,13 @@ RISK_UNLOCK_DETAIL_DEFAULT = "解除熔斷驗證失敗，請重新取得待簽�
 RISK_UNLOCK_DETAIL = {**RISK_SETTINGS_DETAIL,
                       "action_mismatch": "這份簽章不是解除熔斷的授權，"
                                          "請重新取得待簽原文並重簽"}
+
+# 「平倉並撤銷」驗簽失敗 → 回給客戶的分類化訊息（第四張表：獨立的可行動建議，
+# 同 RISK_UNLOCK_DETAIL 不與資金/風控共用一張表的理由）。
+CLOSE_ALL_DETAIL_DEFAULT = "平倉並撤銷驗證失敗，請重新取得待簽原文並重簽"
+CLOSE_ALL_DETAIL = {**RISK_SETTINGS_DETAIL,
+                    "action_mismatch": "這份簽章不是平倉並撤銷的授權，"
+                                       "請重新取得待簽原文並重簽"}
 
 
 class VerifyBody(BaseModel):
@@ -254,6 +265,30 @@ class RiskUnlockBody(BaseModel):
     issued_at: str
     signature: str
     message: str = ""
+
+
+class CloseAllBody(BaseModel):
+    """客戶簽章的「平倉並撤銷」請求（記錄格式減去 action）。
+
+    ⭐ 一次性、不可逆動作——形狀沿 `RiskUnlockBody`（同一個信任錨），但**獨立**
+    一個模型、一個端點、一個檔：一份「立即恢復跟單」的授權絕不能被兌換成一次
+    「平倉並撤銷」（反向亦然）。結構性分隔在待簽訊息的第一行（見
+    `filet/close_all.py` 檔頭的域分隔論證）。
+    """
+
+    account_id: str
+    nonce: str
+    issued_at: str
+    signature: str
+    message: str = ""
+
+
+class PauseBody(BaseModel):
+    """暫停/恢復跟單（Task 15 kill switch 第一級）。**無需簽章**——兩個方向都只在
+    既有授權範圍內收窄/恢復活動（見專案 CLAUDE.md 紅線 5 對照）。"""
+
+    action: str  # "pause" | "resume"（見 me_pause 的顯式驗證，不用 Literal 以維持
+                 # 與其餘 4xx 分類化訊息一致的錯誤處理風格）
 
 
 # leader 目錄要外流的**快照統計欄位白名單**。watchlist 快照存的是一日一點的資產負債
@@ -478,14 +513,15 @@ def _dashboard_exposure(acct: dict, positions: list[dict] | None) -> dict:
 
 
 def _read_pause_flag(exchange_dir: str, user_address: str) -> tuple[bool | None, bool]:
-    """暫停旗標（Task 15 寫入，路徑 `FILET_EXCHANGE_DIR/<addr>/pause.json`；
-    本 task 只讀）。回傳 `(paused, unknown)`：
+    """暫停旗標（路徑 `pause_flag_path_for`，寫端見 `POST /api/me/pause`）。
+    回傳 `(paused, unknown)`：
     - 檔案不存在 → `(False, False)`（讀不到檔案視為未暫停，Task 13 規格明文）。
     - 讀出來但格式不對／IO 失敗 → `(None, True)`——**不**比照引擎側 fail-safe
-      當成「視為暫停」（那是 Task 15 引擎動作側的方向，本端點只是顯示層）；
-      呼叫端改用別的訊號判定 `state`，並在 `signal_source_ok` 反映這裡讀不準。
+      當成「視為暫停」（那是 Task 15 引擎動作側的方向，見 `filet/pause_flag.py`
+      檔頭；本端點只是顯示層）；呼叫端改用別的訊號判定 `state`，並在
+      `signal_source_ok` 反映這裡讀不準。
     """
-    p = Path(exchange_dir) / user_address / "pause.json"
+    p = Path(pause_flag_path_for(exchange_dir, user_address))
     if not p.exists():
         return False, False
     try:
@@ -2532,6 +2568,118 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                               "同一段跌幅熔斷一次。"
                               "⚠️ 若熔斷的原因是你的 leader 被撤銷，這份簽章**不會**"
                               "解除它（那需要你先選一個新的 leader）。",
+        }
+
+    # ---------- owner kill switch（Task 15：暫停／平倉並撤銷）----------
+
+    @app.post("/api/me/pause")
+    def me_pause(body: PauseBody, address: str = Depends(_require_session)):
+        """暫停或恢復跟單（kill switch 第一級）。**無需簽章**——登入 session 即可：
+        兩個方向都只在既有授權範圍內收窄（暫停）或恢復（resume）活動，不是新增
+        任何主網寫入權限（專案 CLAUDE.md 紅線 5 對照）。
+
+        寫入路徑 `pause_flag_path_for(cfg.exchange_dir, address)`——與引擎讀端
+        （`spark/filet/pause_flag.py::read_pause_flag_for_engine`）共用同一個
+        推導函式，兩端不可能各拼一份路徑而漂移（工程原則 1）。`address` 取自
+        session（可信來源），不是請求內容——結構上不可能暫停別人的引擎。
+
+        引擎每輪重讀（見 `scripts/run_copytrade.cycle()`），效果與資金/風控設定
+        同一個「下一個 cycle 生效」語意，故本端點沒有寫死重試/冪等的額外機制：
+        重複呼叫同一個 action 只是把同一份布林再寫一次，天然冪等。
+        """
+        if body.action not in ("pause", "resume"):
+            raise HTTPException(status_code=400,
+                                detail="action 必須是 'pause' 或 'resume'")
+        path = pause_flag_path_for(cfg.exchange_dir, address)
+        try:
+            write_pause_flag(path, paused=(body.action == "pause"), now_s=now_fn())
+        except OSError as e:
+            logger.error("暫停旗標落檔失敗 address=%s path=%s: %s", address, path, e)
+            raise HTTPException(status_code=500,
+                                detail="設定寫入失敗，請稍後重試") from e
+        paused = body.action == "pause"
+        logger.info("暫停旗標已更新 address=%s paused=%s", address, paused)
+        return {
+            "ok": True,
+            "paused": paused,
+            "effective": "next_engine_cycle",
+            "effective_note": ("已記錄。引擎會在下一輪（約一分鐘內）跳過新開倉與"
+                               "加倉，但仍會處理減倉/平倉與既有風控動作。"
+                               if paused else
+                               "已記錄。引擎會在下一輪（約一分鐘內）恢復正常跟單。"),
+        }
+
+    @app.get("/api/me/close-all/message")
+    def close_all_message(address: str = Depends(_require_session)):
+        """回傳「平倉並撤銷」的待簽原文 ＋ 一次性 nonce（**無 body**，形狀沿
+        `/api/me/risk/unlock/message`——本端點沒有任何輸入，要平倉的永遠是**這個
+        session 的**帳號，沒有任何請求參數能指到別人的引擎）。
+        """
+        account_id = derive_account_id(address)
+        issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        nonce = store.issue_nonce(address, _LEADER_CHANGE_CHAIN_ID, issued_at,
+                                  now_s=now_fn(), ttl_s=cfg.nonce_ttl_s)
+        message = build_close_all_message(account_id=account_id, nonce=nonce,
+                                          issued_at=issued_at)
+        return {"message": message, "nonce": nonce, "issued_at": issued_at,
+                "account_id": account_id}
+
+    @app.post("/api/me/close-all")
+    def close_all_submit(body: CloseAllBody, address: str = Depends(_require_session)):
+        """客戶**自己簽章**要求平倉並撤銷 → 寫一筆一次性請求。
+
+        ⭐ 本端點**不直接平倉**，只落一筆記錄——引擎在套用前自己重新驗章（同換
+        leader／資金／風控設定的既有信任模型）。真正的收尾動作（撤單→reduce-only
+        全平→halt）由引擎重用既有的 `killswitch.trip` 路徑執行，**不新造平倉邏輯**
+        （CLAUDE.md 本 task 派工的明文要求）。
+
+        失敗分類（工程原則 2）：驗簽失敗、動作類型不符、超期、session 不符全是
+        semantic（4xx，不得自動重試）；寫檔失敗才是 transient（5xx）。驗簽失敗
+        一律 400 而非 401（session 本身有效，壞的是這份請求內容）。
+        """
+        account_id = derive_account_id(address)
+        if body.account_id != account_id:
+            raise HTTPException(status_code=403, detail="只能平倉並撤銷自己的帳號")
+
+        try:
+            record = build_close_all_record(
+                account_id=body.account_id, nonce=body.nonce,
+                issued_at=body.issued_at, signature=body.signature,
+                message=body.message)
+            verified = verify_close_all(
+                record, account_id=account_id, user_address=address,
+                now_s=now_fn(), consume_nonce=_consume_risk_nonce(address))
+        except CloseAllError as e:
+            logger.warning("平倉並撤銷驗簽失敗 account=%s reason=%s",
+                           account_id, e.reason)
+            raise HTTPException(
+                status_code=400,
+                detail=CLOSE_ALL_DETAIL.get(e.reason, CLOSE_ALL_DETAIL_DEFAULT)
+            ) from None
+
+        record = build_close_all_record(
+            account_id=verified.account_id, nonce=verified.nonce,
+            issued_at=verified.issued_at, signature=body.signature,
+            message=body.message)
+        try:
+            write_close_all_request(cfg.close_all_path, record)
+        except OSError as e:
+            logger.error("平倉並撤銷請求落檔失敗 account=%s path=%s: %s",
+                         account_id, cfg.close_all_path, e)
+            raise HTTPException(status_code=500,
+                                detail="請求寫入失敗，請稍後重試") from e
+        logger.info("平倉並撤銷請求已落地 account=%s", account_id)
+
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "effective": "next_engine_cycle",
+            "effective_note": "已記錄。引擎會在下一輪（約一分鐘內）重新驗證你的"
+                              "簽章，通過後觸發受控收尾：撤銷全部掛單、以市價"
+                              "reduce-only 平掉全部部位，完成後停止跟單且**不會"
+                              "自動恢復**。此動作不可逆，且不會撤銷 API wallet 的"
+                              "鏈上權限——收尾完成後請至 Hyperliquid 官方介面"
+                              "自行移除。",
         }
 
     @app.get("/api/me/dashboard")

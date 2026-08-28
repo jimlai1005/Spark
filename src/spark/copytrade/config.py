@@ -223,6 +223,19 @@ class CopySettings:
     # 流量**永久**排除、不衰減（見 follower_flow.py 模組 docstring）。
     follower_flow_correction_enabled: bool = True
 
+    # ── owner 暫停旗標（Task 15 kill switch 第一級，2026-08-28）───────────
+    # ⭐ 刻意**不是** env 欄位（`from_env` 不讀它，永遠取預設 False）：這是一個
+    # per-cycle 的執行期訊號（`FILET_EXCHANGE_DIR/<addr>/pause.json` 每輪重讀），
+    # 不是部署當下寫死的配置。`scripts/run_copytrade.cycle()` 讀旗標後用
+    # `dataclasses.replace(cs, paused=...)` 疊上去——與資金/風控設定同一個「疊在
+    # base CopySettings 之上」的模式，讓 `run_cycle` 的呼叫簽名不必為了這個訊號
+    # 多長一個參數（沿用既有測試對 `run_cycle` 呼叫形狀的既有假設，工程原則 1：
+    # 一個布林只有一個居住的地方）。
+    # 語意（`loop.run_cycle` 生效點）：True ⇒ 併入 `no_new_exposure`（與成本熔斷器
+    # 的 `cost.breached` 同一個旗標），跳過新開倉與加倉、**放行**跟隨 leader 的
+    # 減倉/平倉與既有風控動作（reduce-only 全平、撤單）。
+    paused: bool = False
+
     @classmethod
     def from_env(
         cls, env: Mapping[str, str] | None = None
