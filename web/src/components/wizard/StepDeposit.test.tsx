@@ -60,14 +60,15 @@ describe("StepDeposit", () => {
     expect(screen.queryByText("還差")).not.toBeInTheDocument();
   });
 
-  it("已入金：完成綁定 → READY → 顯示自動啟用說明＋前往選 leader（2026-07-30 移除人工審核）", async () => {
+  // ⭐ Task 10：不再有「前往選擇 leader」的站外連結——leader（即所選策略）已在
+  // onboarding step 1 決定，父層頁面會依伺服器 state 自動把使用者帶往 step 3。
+  it("已入金：完成綁定 → READY → 顯示完成訊息，不含任何導出連結", async () => {
     postVerify.mockResolvedValue({ state: "READY" });
     render(<StepDeposit status={status({ funded: true, state: "READY" })}
       refetchStatus={() => undefined} />);
     await userEvent.click(screen.getByRole("button", { name: "完成綁定" }));
-    expect(await screen.findByText(/選定後系統會在約一分鐘內自動開始跟單/)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "前往選擇 leader" }))
-      .toHaveAttribute("href", "/leaders");
+    expect(await screen.findByRole("status")).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(postVerify).toHaveBeenCalledTimes(1);
   });
 });

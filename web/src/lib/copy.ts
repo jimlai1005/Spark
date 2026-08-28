@@ -138,14 +138,18 @@ export const COPY_ZH = {
     footnote: "每筆成交收取 0.02%（2bp）builder fee，鏈上可驗。跟單有虧損風險，過往績效不代表未來結果。",
   },
   wizard: {
-    stepNames: ["連接錢包", "風險確認", "簽署授權", "入金啟用"],
-    step1Title: "錢包已連接",
-    step2Title: "請確認以下事項",
-    risk1: "我了解跟單有虧損風險",
-    risk2: "我了解 Filet 僅持有下單權限，無法動用或提領我的資金",
-    risk3: "我已閱讀費用說明（每筆成交 0.02%）",
-    risk4: "我聲明本錢包由我本人合法持有，資金來源合法且符合適用的反洗錢（AML）規範；我並非於禁止或限制本類服務的司法管轄區內使用本服務。",
-    step3Title: "簽署兩筆授權",
+    // Task 10：統一 onboarding 四步（取代舊版「連接錢包／風險確認／簽署授權／入金啟用」）。
+    stepNames: ["選擇策略", "連接與授權", "風險限制", "確認"],
+    backButton: "上一步",
+    // ---- step 1：選擇策略（進頁即完成態，見 onboarding/page.tsx） ----
+    step1Eyebrow: "已選擇策略",
+    step1Back: "返回改選",
+    step1AdvancedLabel: "進階模式（無背書）",
+    step1AdvancedBody: "此位址不在 Filet 精選清單內，未經任何盡職審查或背書——請自行評估風險後再繼續。",
+    step1NotFound: "找不到這個策略——它可能已下架或網址有誤，請回到策略列表重新選擇。",
+    // ---- step 2：連接與授權（StepSign 簽署＋StepDeposit 入金檢查合併於此步） ----
+    step2Title: "連接與授權",
+    step2Body: "兩筆錢包簽名都不上鏈、不花 gas；資金入帳後即可進入下一步。",
     agentCardName: "ApproveAgent",
     agentCardDesc: "授權 Filet trade-only agent key 代下單，無提款權限。",
     feeCardName: "ApproveBuilderFee",
@@ -162,7 +166,9 @@ export const COPY_ZH = {
     reconnectTitle: "錢包未連接",
     reconnectHint: "你的登入仍有效，但瀏覽器錢包目前未連接（可能已上鎖）。請解鎖錢包並重新連接後繼續簽署；你的進度不會遺失。",
     reconnectButton: "重新連接錢包",
-    step4Title: "入金檢查",
+    // ⭐ Task 10：不再是獨立步驟的標題（原「04・入金檢查」），改成 step 2 內部
+    // 一個子區塊的小標——StepDeposit 現在巢狀顯示於 StepSign 之下（見 StepConnect）。
+    step2DepositSubheading: "入金檢查",
     // ⭐ 門檻金額**不再寫進文案**（2026-07-30）。原本這兩句各自硬編「100 USDC」，
     // 而真正生效的門檻在後端（src/spark/config.py 的 MIN_BUILDER_BALANCE 經
     // ApiConfig.min_user_deposit）——兩份常數改一邊忘另一邊，症狀是畫面寫 100、
@@ -205,8 +211,10 @@ export const COPY_ZH = {
     // 2026-07-30 移除人工審核（auto-activate watcher）：完成綁定＝進啟用佇列，
     // 選定 leader 後自動開始跟單，文案不再出現「審核」。
     submitReview: "完成綁定",
-    submitted: "綁定完成。前往跟單頁選擇 leader——選定後系統會在約一分鐘內自動開始跟單。",
-    goFollow: "前往選擇 leader",
+    // ⭐ Task 10：不再顯示「前往選擇 leader」的站外導出連結——leader（即所選策略）
+    // 已在 step 1 選定，本頁 step 4 送出時會直接完成選定，不需要使用者中途跳出精靈
+    // 另外操作（舊版 goFollow 連結因此移除；見 StepDeposit.tsx 檔頭）。
+    submitted: "已偵測到入金，正在為你進入下一步…",
     // ⚠️ 2026-07-31 更新：引擎已上線出入金自動校正（follower flow correction）——
     // 出入金不再被回撤保護視為虧損，「視為虧損」的舊句子刪除。但轉出的提醒本身
     // 仍然成立：perp 淨值是跟單規模的分母，轉出會即時等比縮小所有跟單倉位。
@@ -214,6 +222,19 @@ export const COPY_ZH = {
       "跟單期間出入金會自動校正回撤基準，不會被視為虧損；但系統以 perp 帳戶淨值" +
       "計算跟單規模，轉出資金會即時等比縮小你的跟單倉位（產生實際交易成本）。" +
       "大額調整資金前建議先在此頁停止跟單。",
+    // ---- step 3：風險限制（投入比例／槓桿上限本地調整＋回撤自動停止 opt-in 簽章） ----
+    step3Title: "設定你的風險限制",
+    step3Body: "這些數值會寫進 agent 授權範圍。Filet 無法超出這些限制下單；你之後可以隨時調低。",
+    step3NextButton: "前往費用與風險確認",
+    ddSaving: "簽署送出中…",
+    // ---- step 4：費用與風險確認（NOTE 12：三條 checkbox 逐字） ----
+    step4Title: "確認",
+    step4Body: "最後一步：確認費用與風險揭露，全部勾選後即可完成開通。",
+    step4CheckLoss: "我理解可能虧損",
+    step4CheckFee: "我理解費用為 0.02% 每筆",
+    step4CheckRevoke: "我理解可隨時撤銷",
+    step4SubmitButton: "確認並開始跟單",
+    step4Submitting: "送出中…",
     errors: {
       walletRejected: "簽署被拒絕——請在錢包中重試。Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
       signerMismatch: "簽名帳號與登入帳號不符——請在錢包中切回登入時使用的帳號後重試。這筆簽名不會被送出。",
@@ -223,6 +244,8 @@ export const COPY_ZH = {
       hlSemantic: "Hyperliquid 拒絕了這筆授權。請點「重試」重新取得待簽內容再簽一次。",
       builderPaused: "系統暫停開通中，請聯絡我們再試。",
       verifyIncomplete: "尚有條件未完成（授權或資金未確認），請依畫面提示補齊後再送出。",
+      contentMismatch: "伺服器回傳的內容與你送出的設定不符，為安全起見已中止——請重新整理頁面後再試一次。",
+      submitFailed: "送出失敗，請稍後重試；尚未成功的簽署不會被重複計費或重複套用。",
     },
   },
   admin: {
@@ -1255,16 +1278,17 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     footnote: "A builder fee of 0.02% (2bp) is charged per fill, verifiable on-chain. Copy trading carries risk of loss; past performance does not guarantee future results.",
   },
   wizard: {
-    stepNames: ["Connect wallet", "Confirm risks", "Sign authorizations", "Deposit & activate"],
-    step1Title: "Wallet connected",
-    step2Title: "Please confirm the following",
-    risk1: "I understand that copy trading carries risk of loss",
-    risk2: "I understand Filet only holds order-placement rights and cannot move or withdraw my funds",
-    risk3: "I have read the fee disclosure (0.02% per fill)",
-    risk4: "I declare that this wallet is legally held by me, that its funds are of legal origin and comply with applicable "
-      + "anti-money-laundering (AML) regulations, and that I am not using this service from a jurisdiction where it is "
-      + "prohibited or restricted.",
-    step3Title: "Sign two authorizations",
+    stepNames: ["Select strategy", "Connect & authorize", "Risk limits", "Confirm"],
+    backButton: "Back",
+    step1Eyebrow: "Strategy selected",
+    step1Back: "Change selection",
+    step1AdvancedLabel: "Advanced mode (unendorsed)",
+    step1AdvancedBody: "This address is not on Filet's curated list and has not undergone any due diligence or endorsement "
+      + "— please assess the risk yourself before continuing.",
+    step1NotFound: "This strategy could not be found — it may have been delisted, or the link is incorrect. Please go "
+      + "back to the strategy list and pick again.",
+    step2Title: "Connect & authorize",
+    step2Body: "Neither wallet signature goes on-chain or costs gas; once funds arrive you can proceed to the next step.",
     agentCardName: "ApproveAgent",
     agentCardDesc: "Authorizes Filet's trade-only agent key to place orders on your behalf, with no withdrawal rights.",
     feeCardName: "ApproveBuilderFee",
@@ -1282,7 +1306,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     reconnectHint: "Your session is still valid, but your browser wallet is currently disconnected (it may be locked). "
       + "Please unlock your wallet and reconnect to continue signing; your progress won't be lost.",
     reconnectButton: "Reconnect wallet",
-    step4Title: "Deposit check",
+    step2DepositSubheading: "Deposit check",
     depositPerpLabel: "Perps account balance",
     depositThresholdLabel: "Activation threshold",
     depositShortfallLabel: "Remaining",
@@ -1305,14 +1329,24 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     spotStrandedLink: "Go to Hyperliquid to transfer",
     spotStrandedLinkHref: "https://app.hyperliquid.xyz/balances",
     submitReview: "Complete setup",
-    submitted: "Setup complete. Go to the copy trade page to choose a leader — copy trading starts automatically within "
-      + "about a minute of selecting one.",
-    goFollow: "Go choose a leader",
+    submitted: "Funds detected — taking you to the next step…",
     fundsWarning:
       "During copy trading, deposits and withdrawals automatically recalibrate the drawdown baseline and are not treated " +
       "as losses; but the system sizes your copy-trade positions from your perp account equity, so withdrawing funds will " +
       "immediately scale down all your copy-trade positions proportionally (incurring real trading costs). Before making " +
       "a large withdrawal, we recommend stopping copy trading on this page first.",
+    step3Title: "Set your risk limits",
+    step3Body: "These values are written into the agent's authorization scope. Filet cannot trade beyond these limits; "
+      + "you can always lower them later.",
+    step3NextButton: "Continue to fees & risk confirmation",
+    ddSaving: "Submitting signature…",
+    step4Title: "Confirm",
+    step4Body: "Last step: confirm fees and risk disclosures. Check all boxes to complete setup.",
+    step4CheckLoss: "I understand I may lose money",
+    step4CheckFee: "I understand the fee is 0.02% per fill",
+    step4CheckRevoke: "I understand I can revoke at any time",
+    step4SubmitButton: "Confirm & start copy trading",
+    step4Submitting: "Submitting…",
     errors: {
       walletRejected: "Signature rejected — please try again in your wallet. Filet will never ask for your private key or "
         + "seed phrase; signing only happens in your own wallet.",
@@ -1326,6 +1360,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       builderPaused: "The system is currently pausing activations, please contact us and try again.",
       verifyIncomplete: "Some conditions are still unmet (authorization or funds not yet confirmed) — please follow the "
         + "on-screen prompts to complete them before submitting.",
+      contentMismatch: "The content returned by the server doesn't match what you submitted, so this was stopped for "
+        + "safety — please refresh the page and try again.",
+      submitFailed: "Submission failed, please try again later; a signature that didn't succeed won't be charged or "
+        + "applied twice.",
     },
   },
   admin: {

@@ -1,5 +1,4 @@
 "use client";
-import Link from "next/link";
 import { useState } from "react";
 import { postVerify, type OnboardStatus } from "@/lib/api";
 import { useCopy } from "@/lib/lang";
@@ -32,8 +31,9 @@ export function StepDeposit({ status, refetchStatus }: {
 
   return (
     <div className="step-card">
-      <p className="eyebrow">04・{c.stepNames[3]}</p>
-      <h2>{c.step4Title}</h2>
+      {/* ⭐ Task 10：獨立步驟標題（原「04・入金檢查」）移除，改為 step 2 內的
+          子區塊小標——外層 StepConnect 已統一呈現本步驟唯一的 eyebrow+標題。 */}
+      <p className="eyebrow">{c.step2DepositSubheading}</p>
       <div className={`deposit-check${status.funded ? "" : " is-pending"}`}>
         <span className="check-icon">{status.funded ? "✓" : "…"}</span>
         <span>{status.funded ? c.depositDetected : c.depositPending}</span>
@@ -67,12 +67,10 @@ export function StepDeposit({ status, refetchStatus }: {
         )}
       </dl>
       {submitted ? (
-        <>
-          <p>{c.submitted}</p>
-          <div className="step-actions">
-            <Link className="btn btn-primary" href="/leaders">{c.goFollow}</Link>
-          </div>
-        </>
+        // ⭐ Task 10：不再導出到 /leaders——leader（＝所選策略）已在 step 1 決定，
+        // 父層 onboarding/page.tsx 會依伺服器 state 自動把使用者帶到 step 3，
+        // 這裡只需要一句「已完成、準備繼續」，不放任何會讓人離開精靈的連結。
+        <p role="status">{c.submitted}</p>
       ) : (
         <div className="step-actions">
           <button type="button" className="btn btn-primary"

@@ -69,8 +69,11 @@ export function StepSign({ status, loginAddress, refetchStatus }: StepSignProps)
 
   return (
     <div className="step-card">
-      <p className="eyebrow">03・{c.stepNames[2]}</p>
-      <h2>{c.step3Title}</h2>
+      {/*
+        ⭐ Task 10：本元件的標題（原「03・簽署授權」）改由外層的 StepConnect 統一
+        呈現一次（設計稿 §05 每個步驟面板只有一個 eyebrow+標題）——StepSign 現在
+        巢狀顯示在 step 2「連接與授權」之下，簽署邏輯本身完全不變。
+      */}
       {status.agent_address ? (
         <p className="hint">
           {c.agentLabel}：<span className="mono">{shortAddr(status.agent_address)}</span>

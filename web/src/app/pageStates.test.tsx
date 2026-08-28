@@ -19,9 +19,14 @@ import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LeadersResp, OnboardStatus } from "@/lib/api";
 
+const routerPush = vi.fn();
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn() }),
+  useRouter: () => ({ push: routerPush }),
   usePathname: () => "/",
+  // ⭐ Task 10：OnboardingPage 改讀 `?strategy=`；本檔的通用 ROUTES 迴圈不帶任何
+  // 查詢參數，這對 /onboarding 剛好是它自己的「無 strategy 參數」guard 路徑
+  // （見下方對 /onboarding 的排除說明與專屬斷言）。
+  useSearchParams: () => new URLSearchParams(),
 }));
 
 vi.mock("wagmi", () => ({
@@ -155,6 +160,7 @@ const PENDING_ROUTES = new Set(["/dashboard", "/settings", "/docs"]);
 
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset();
+  routerPush.mockReset();
 });
 
 /** 未登入：所有需要 session 的端點一律 401。 */
@@ -190,12 +196,19 @@ describe("逐頁狀態｜未登入", () => {
   }
 
   it("需要登入的客戶頁一律給「尚未登入」提示，不是空白", async () => {
-    for (const r of ROUTES.filter((x) => ["/onboarding", "/leaders"].includes(x.path))) {
+    // ⭐ Task 10：/onboarding 不再是這個模式——未登入直接 redirect /strategies
+    // （NOTE 10，不再有站內提示＋返回按鈕），改在下一個 it 裡單獨驗證。
+    for (const r of ROUTES.filter((x) => ["/leaders"].includes(x.path))) {
       const { unmount } = render(wrap(r.el(), null));
       expect(await screen.findByText(COPY.common.notLoggedIn),
              `${r.path} 應顯示尚未登入提示`).toBeInTheDocument();
       unmount();
     }
+  });
+
+  it("⭐ Task 10／NOTE 10：/onboarding 未登入 → redirect /strategies（不留白畫面、不留返回按鈕）", async () => {
+    render(wrap(<OnboardingPage />, null));
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/strategies"));
   });
 
   it("管理端頁未登入 → 顯示提示（後端 401；前端不自行判斷授權）", async () => {

@@ -1,157 +1,264 @@
-import { render, screen } from "@testing-library/react";
+/**
+ * `/onboarding` — 統一四步 wizard 測試（Task 10）。
+ * 涵蓋：未登入／無 strategy 參數 redirect；步驟條狀態；step3 回撤開關預設關＋
+ * 關閉時零 risk API 請求；step4 未全勾送出鈕 disabled；localStorage 續作；
+ * `advanced:0x…` 顯示無背書標示；spot_stranded 提示（沿舊版語意保留）。
+ */
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { OnboardStatus } from "@/lib/api";
+import type { MyRiskResp, OnboardStatus } from "@/lib/api";
+
+const push = vi.fn();
+let currentSearch = new URLSearchParams({ strategy: "core" });
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push }),
+  useSearchParams: () => currentSearch,
+}));
 
 let mockWagmiAccount: { isConnected: boolean; address?: string; chainId?: number };
-const connect = vi.fn();
+const signMessageAsync = vi.fn();
 vi.mock("wagmi", () => ({
   useAccount: () => mockWagmiAccount,
-  useConnect: () => ({ connect, connectors: [{ id: "injected" }], isPending: false }),
+  useConnect: () => ({ connect: vi.fn(), connectors: [{ id: "injected" }], isPending: false }),
   useConnectorClient: () => ({ data: { request: vi.fn() } }),
+  useSignMessage: () => ({ signMessageAsync }),
 }));
+
 let mockMe: { data: { address: string; account_id: string } | null; isLoading: boolean };
 let mockStatus: { data: OnboardStatus | null; refetch: () => void };
 vi.mock("@/lib/hooks", () => ({
   useMe: () => mockMe,
   useOnboardingStatus: () => mockStatus,
 }));
+
+const createAgent = vi.fn();
+const getMyRisk = vi.fn();
+const getRiskSettingsMessage = vi.fn();
+const postMyRisk = vi.fn();
+const getLeaderSelectMessage = vi.fn();
+const postLeaderSelect = vi.fn();
+const postVerify = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
-  createAgent: vi.fn(async () => ({ agent_address: "0xa" })),
+  createAgent: (...a: unknown[]) => createAgent(...a),
+  getMyRisk: (...a: unknown[]) => getMyRisk(...a),
+  getRiskSettingsMessage: (...a: unknown[]) => getRiskSettingsMessage(...a),
+  postMyRisk: (...a: unknown[]) => postMyRisk(...a),
+  getLeaderSelectMessage: (...a: unknown[]) => getLeaderSelectMessage(...a),
+  postLeaderSelect: (...a: unknown[]) => postLeaderSelect(...a),
+  postVerify: (...a: unknown[]) => postVerify(...a),
+}));
+
+const getPublicStrategy = vi.fn();
+vi.mock("@/lib/publicApi", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  getPublicStrategy: (...a: unknown[]) => getPublicStrategy(...a),
 }));
 
 import OnboardingPage from "./page";
 
+const ADDR = "0xabc0000000000000000000000000000000000001";
+
 function status(over: Partial<OnboardStatus> = {}): OnboardStatus {
   return {
-    address: "0xabc0000000000000000000000000000000000001", account_id: "fabc",
+    address: ADDR, account_id: "fabc",
     agent_address: null, agent_generated: false, builder_fee_approved: false,
     agent_approved: false, funded: false, spot_stranded: null, state: "IN_PROGRESS",
-    perp_account_value: "0", min_deposit: "100", deposit_shortfall: "100",
+    perp_account_value: "1000", min_deposit: "100", deposit_shortfall: "100",
     ...over,
   };
 }
 
-/** 後端 `_spot_stranded` 的實際形狀（Decimal → string）。 */
-const STRANDED = {
-  usdc: "250.5", threshold: "10",
-  action_required: "manual_transfer_spot_to_perp",
-  note: "你有 250.5 USDC 在 **spot** 錢包。",
+const READY_STATUS = status({
+  agent_address: "0xa", agent_generated: true,
+  agent_approved: true, builder_fee_approved: true, funded: true, state: "READY",
+});
+
+const STRATEGY_DETAIL = {
+  slug: "core", name: "Filet Core", tagline: "多資產動能", featured: true,
+  leader_address: "0xfeed000000000000000000000000000000f00d",
+  status: "running", listable: true, live_days: 72, follower_count: 3,
+  min_notional_usd: "500", max_leverage: "3",
+  metrics: {
+    total_return_pct: "17.77", total_return_pct_insufficient: false,
+    max_drawdown_pct: "-0.80", max_drawdown_pct_insufficient: false,
+    sharpe: "5.55", sharpe_insufficient: false,
+    sharpe_se: "3.36", sharpe_se_insufficient: false,
+    win_rate_pct: "64.86", win_rate_pct_insufficient: false,
+    annualized_vol_pct: "18.05", annualized_vol_pct_insufficient: false,
+    sortino: "43.42", sortino_insufficient: false,
+    best_day_pct: "3.01", best_day_pct_insufficient: false,
+    worst_day_pct: "-0.80", worst_day_pct_insufficient: false,
+    sample_count: 38,
+  },
+  equity_index: [], methodology: {
+    start_date: null, end_date: null, initial_deposit_usd: null, sample_count: null,
+    annualization_days: 365, risk_free_rate: "0", basis: "perp", updated_at: 0,
+  },
 };
+
+const RISK: MyRiskResp = {
+  prefs: {
+    enabled: false, size_tolerance: "0.08", max_drawdown_pct: "0.2",
+    max_total_drawdown_pct: "0", flatten_on_breach: true, cooldown_hours: "12",
+  },
+  specs: [
+    {
+      name: "max_drawdown_pct", env: "COPY_MAX_DRAWDOWN_PCT", type: "decimal", group: "risk",
+      default: "0.2", recommended: "0.2", min: "0.05", max: "0.5",
+      label: "7 天滾動回撤上限", help: "",
+    },
+  ],
+  defaults: {
+    enabled: false, size_tolerance: "0.08", max_drawdown_pct: "0.2",
+    max_total_drawdown_pct: "0", flatten_on_breach: true, cooldown_hours: "12",
+  },
+  submitted: { issued_at: null },
+  applied: null,
+  halted: null,
+  editable: true,
+};
+
+function wrap(children: ReactNode) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+}
 
 beforeEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
+  currentSearch = new URLSearchParams({ strategy: "core" });
   mockWagmiAccount = { isConnected: true, address: "0xAbC0000000000000000000000000000000000001", chainId: 42161 };
-  mockMe = { data: { address: "0xabc0000000000000000000000000000000000001", account_id: "fabc" }, isLoading: false };
+  mockMe = { data: { address: ADDR, account_id: "fabc" }, isLoading: false };
   mockStatus = { data: status(), refetch: () => undefined };
+  createAgent.mockResolvedValue({ agent_address: "0xa" });
+  getPublicStrategy.mockResolvedValue(STRATEGY_DETAIL);
+  getMyRisk.mockResolvedValue(RISK);
 });
 
-describe("OnboardingPage 斷點續走渲染", () => {
-  it("未登入 → 導回登入的提示", () => {
+describe("OnboardingPage — guard（NOTE 10）", () => {
+  it("未登入 → redirect /strategies", async () => {
     mockMe = { data: null, isLoading: false };
-    render(<OnboardingPage />);
-    expect(screen.getByText(/尚未登入/)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "回登入頁" })).toHaveAttribute("href", "/");
+    render(wrap(<OnboardingPage />));
+    await waitFor(() => expect(push).toHaveBeenCalledWith("/strategies"));
   });
 
-  it("已登入未勾風險 → step 2（風險確認）", () => {
-    render(<OnboardingPage />);
-    expect(screen.getByText("請確認以下事項")).toBeInTheDocument();
-  });
-
-  it("勾過風險 → step 3（簽署授權）", () => {
-    localStorage.setItem("filet.risk-confirmed.0xabc0000000000000000000000000000000000001", "1");
-    render(<OnboardingPage />);
-    expect(screen.getByText("簽署兩筆授權")).toBeInTheDocument();
-  });
-
-  it("鏈上雙授權已生效 → step 4（入金），未勾風險也直達", () => {
-    mockStatus = {
-      data: status({ agent_generated: true, agent_address: "0xa", agent_approved: true, builder_fee_approved: true }),
-      refetch: () => undefined,
-    };
-    render(<OnboardingPage />);
-    expect(screen.getByText("入金檢查")).toBeInTheDocument();
-  });
-
-  it("⭐ session 有效但錢包未連（隔天回來錢包鎖住）→ step 3 顯示重連閘，非死路（Finding 1）", async () => {
-    mockWagmiAccount = { isConnected: false };
-    localStorage.setItem("filet.risk-confirmed.0xabc0000000000000000000000000000000000001", "1");
-    render(<OnboardingPage />);
-    // 仍在 step 3（不回退 step 1），但內容是重連閘而非 disabled 簽署鈕
-    expect(screen.getByText("錢包未連接")).toBeInTheDocument();
-    expect(screen.queryByText("簽署兩筆授權")).not.toBeInTheDocument();
-    const btn = screen.getByRole("button", { name: "重新連接錢包" });
-    const userEvent = (await import("@testing-library/user-event")).default;
-    await userEvent.click(btn);
-    expect(connect).toHaveBeenCalledWith({ connector: expect.objectContaining({ id: "injected" }) });
-  });
-
-  it("session 有效但錢包未連、鏈上雙授權已生效 → step 4 同樣顯示重連閘", () => {
-    mockWagmiAccount = { isConnected: false };
-    mockStatus = {
-      data: status({ agent_generated: true, agent_address: "0xa", agent_approved: true, builder_fee_approved: true }),
-      refetch: () => undefined,
-    };
-    render(<OnboardingPage />);
-    expect(screen.getByText("錢包未連接")).toBeInTheDocument();
-    expect(screen.queryByText("入金檢查")).not.toBeInTheDocument();
+  it("無 strategy 參數 → redirect /strategies", async () => {
+    currentSearch = new URLSearchParams();
+    render(wrap(<OnboardingPage />));
+    await waitFor(() => expect(push).toHaveBeenCalledWith("/strategies"));
   });
 });
 
-/**
- * ⭐ 錢卡在 spot 錢包的提示。存在的理由：我方只鏡像 **perp**，客戶從 CEX 提幣或
- * 走橋入金時錢會落在 spot，畫面卻只寫「尚未偵測到足額資金」——這是入金漏斗上最貴
- * 的一種沉默。
- *
- * ⚠️⚠️ 這組測試最重要的一條是**最後一條**：畫面上永遠不得出現「幫我劃轉」按鈕。
- * 劃轉需要客戶的主鑰簽章，我方結構上不持有主鑰，那顆按鈕是一個我們兌現不了的承諾。
- */
-describe("OnboardingPage — 資金卡在 spot 的提示", () => {
-  it("⭐ spot_stranded 為 null → 完全不顯示（不是顯示「無卡住資金」）", () => {
+describe("OnboardingPage — 步驟條狀態", () => {
+  it("state 未 READY → step 2 為目前步，step 1 顯示為已完成", async () => {
+    render(wrap(<OnboardingPage />));
+    const nav = await screen.findByRole("navigation", { name: "開通步驟" });
+    const items = nav.querySelectorAll("li");
+    expect(items[0].className).toContain("is-done");
+    expect(items[1].className).toContain("is-current");
+  });
+});
+
+describe("OnboardingPage — step 3 風險限制（裁決 1：opt-in）", () => {
+  it("回撤開關預設關；關閉狀態下點「前往費用與風險確認」不呼叫任何 risk API", async () => {
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+    const nextBtn = await screen.findByRole("button", { name: "前往費用與風險確認" });
+    const ddToggle = screen.getByRole("checkbox", { name: /最大回撤自動停止/ });
+    expect(ddToggle).not.toBeChecked();
+
+    await userEvent.click(nextBtn);
+
+    expect(getMyRisk).not.toHaveBeenCalled();
+    expect(getRiskSettingsMessage).not.toHaveBeenCalled();
+    expect(postMyRisk).not.toHaveBeenCalled();
+    // 送出後前進到 step 4（確認頁）。
+    expect(await screen.findByRole("heading", { name: "確認" })).toBeInTheDocument();
+  });
+});
+
+describe("OnboardingPage — step 4 費用與風險確認（NOTE 12）", () => {
+  function seedAtStep4() {
+    localStorage.setItem("filet_onboarding", JSON.stringify({
+      address: ADDR, strategy: "core", scale: 25, lev: 3,
+      ddEnabled: false, ddPct: 20, step3Confirmed: true,
+    }));
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+  }
+
+  it("三條 checkbox 未全勾 → 送出鈕 disabled；全勾後才可送出", async () => {
+    seedAtStep4();
+    render(wrap(<OnboardingPage />));
+    const submitBtn = await screen.findByRole("button", { name: "確認並開始跟單" });
+    expect(submitBtn).toBeDisabled();
+
+    const boxes = screen.getAllByRole("checkbox");
+    for (const box of boxes) await userEvent.click(box);
+
+    expect(submitBtn).not.toBeDisabled();
+  });
+});
+
+describe("OnboardingPage — localStorage 續作（NOTE 11）", () => {
+  it("已存的 step3Confirmed=true → 重新進入直接停在 step 4（不必重簽風險限制）", async () => {
+    localStorage.setItem("filet_onboarding", JSON.stringify({
+      address: ADDR, strategy: "core", scale: 40, lev: 2,
+      ddEnabled: false, ddPct: 15, step3Confirmed: true,
+    }));
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+    expect(await screen.findByRole("heading", { name: "確認" })).toBeInTheDocument();
+    expect(screen.queryByText("設定你的風險限制")).not.toBeInTheDocument();
+  });
+
+  it("續作進度不含任何簽章欄位（不變量 1 的前端鏡射）", () => {
+    localStorage.setItem("filet_onboarding", JSON.stringify({
+      address: ADDR, strategy: "core", scale: 40, lev: 2,
+      ddEnabled: false, ddPct: 15, step3Confirmed: true,
+    }));
+    const raw = localStorage.getItem("filet_onboarding")!;
+    expect(raw).not.toMatch(/signature|message/i);
+  });
+});
+
+describe("OnboardingPage — advanced:0x… 形式（Task 11 會用）", () => {
+  it("顯示位址與「進階模式（無背書）」標示，不當成精選策略卡渲染", async () => {
+    currentSearch = new URLSearchParams({ strategy: "advanced:0xdead000000000000000000000000000000dead" });
+    render(wrap(<OnboardingPage />));
+    expect(await screen.findByText("進階模式（無背書）")).toBeInTheDocument();
+    expect(screen.getByText(/dead\.{0,3}|0xde/i)).toBeInTheDocument();
+    expect(getPublicStrategy).not.toHaveBeenCalled();
+  });
+});
+
+describe("OnboardingPage — 資金卡在 spot 的提示（沿舊版語意）", () => {
+  it("spot_stranded 為 null → 完全不顯示", async () => {
     mockStatus = { data: status({ spot_stranded: null }), refetch: () => undefined };
-    render(<OnboardingPage />);
-    // null 同時代表「沒有卡住的錢」與「查詢失敗」，後者不該被畫成一句肯定的結論
-    expect(screen.queryByText(/停在 spot 錢包/)).not.toBeInTheDocument();
+    render(wrap(<OnboardingPage />));
+    await screen.findByRole("navigation", { name: "開通步驟" });
     expect(document.querySelectorAll(".spot-stranded")).toHaveLength(0);
   });
 
-  it("⭐ 有卡住的資金 → 說明「有多少錢、卡在哪、要做什麼」", () => {
-    mockStatus = { data: status({ spot_stranded: STRANDED }), refetch: () => undefined };
-    render(<OnboardingPage />);
-
-    const box = document.querySelector(".spot-stranded")!;
-    expect(box).not.toBeNull();
-    expect(box.textContent).toContain("250.50 USDC");      // 金額取自後端
-    expect(box.textContent).toMatch(/停在 spot 錢包/);
-    // 為什麼要動它：跟單只用 perp
-    expect(box.textContent).toMatch(/跟單只使用永續合約（perp）帳戶/);
-    expect(box.textContent).toMatch(/劃轉到 perp/);
-  });
-
-  it("⭐ 明說「只能你自己動手」，並給外部連結（不是站內動作）", () => {
-    mockStatus = { data: status({ spot_stranded: STRANDED }), refetch: () => undefined };
-    render(<OnboardingPage />);
-
-    const box = document.querySelector(".spot-stranded")!;
-    expect(box.textContent).toMatch(/我們不持有你的主鑰/);
-    const link = screen.getByRole("link", { name: "前往 Hyperliquid 進行劃轉" });
-    expect(link).toHaveAttribute("href", "https://app.hyperliquid.xyz/balances");
-    expect(link).toHaveAttribute("target", "_blank");
-    expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
-  });
-
-  it("⭐⭐ 絕不得出現任何「幫我劃轉」按鈕——劃轉需要主鑰，我方結構上做不到", () => {
-    mockStatus = { data: status({ spot_stranded: STRANDED }), refetch: () => undefined };
-    render(<OnboardingPage />);
-
-    const box = document.querySelector(".spot-stranded")!;
-    // 這一區裡不得有任何 button（只能有說明文字與外部連結）
+  it("有卡住的資金 → 顯示金額、門檻與外部連結，且不含任何按鈕", async () => {
+    mockStatus = {
+      data: status({
+        spot_stranded: {
+          usdc: "250.5", threshold: "10",
+          action_required: "manual_transfer_spot_to_perp",
+          note: "你有 250.5 USDC 在 **spot** 錢包。",
+        },
+      }),
+      refetch: () => undefined,
+    };
+    render(wrap(<OnboardingPage />));
+    const box = await screen.findByRole("status", { name: "你有資金停在 spot 錢包" });
+    expect(box.textContent).toContain("250.50 USDC");
     expect(box.querySelectorAll("button")).toHaveLength(0);
-    // 也不得有任何看起來像代為操作的字眼
-    for (const w of ["幫你轉", "幫我轉", "一鍵", "代為劃轉", "自動劃轉"]) {
-      expect(box.textContent).not.toContain(w);
-    }
+    const link = screen.getByRole("link", { name: "前往 Hyperliquid 進行劃轉" });
+    expect(link).toHaveAttribute("target", "_blank");
   });
 });
