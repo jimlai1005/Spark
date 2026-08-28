@@ -4,7 +4,7 @@
  * 最終任務再全 repo grep 雙保險。
  * 文案原則：非託管講清楚；不出現 固定收益/保證/存款/代操。
  */
-export const COPY = {
+export const COPY_ZH = {
   common: {
     appName: "FILET",
     next: "下一步",
@@ -881,3 +881,728 @@ export const COPY = {
     },
   },
 } as const;
+
+/**
+ * DeepString<T> — 把 typeof COPY_ZH 的每個字面字串型別展開回 `string`（其餘結構原樣保留，
+ * 包含陣列與巢狀物件）。COPY_ZH 用 `as const` 讓每個文案值成為字面型別，若 COPY_EN 直接標
+ * `typeof COPY_ZH` 會因為值不同而型別不符；用這個 mapped type 才能「結構對稱由型別強制」，
+ * 同時允許兩邊文案內容不同。
+ */
+export type DeepString<T> = T extends string
+  ? string
+  : T extends readonly (infer U)[]
+    ? readonly DeepString<U>[]
+    : T extends object
+      ? { [K in keyof T]: DeepString<T[K]> }
+      : T;
+
+/**
+ * COPY_EN — 英文文案，key 結構與 COPY_ZH 完全對稱（由 DeepString<typeof COPY_ZH> 型別強制＋
+ * copy.test.ts 的遞迴 key 比對雙重把關）。專有名詞（Hyperliquid、builder fee、agent、leader）
+ * 保留英文；語氣對齊 zh 版的直接與精確，不用行銷腔。
+ */
+export const COPY_EN: DeepString<typeof COPY_ZH> = {
+  common: {
+    appName: "FILET",
+    next: "Next",
+    retry: "Retry",
+    loading: "Loading…",
+    notLoggedIn: "You're not signed in — please go back to the login page and connect your wallet.",
+    backToLogin: "Back to login",
+    logout: "Log out",
+    nonCustodial: "Filet will never ask for your private key or seed phrase; all signing happens only in your own wallet.",
+    notActivated: "This account hasn't finished activation yet — please go back to the onboarding page to complete authorization and deposit.",
+    goOnboarding: "Go to onboarding",
+  },
+  nav: {
+    login: "Start",
+    onboarding: "Connect Wallet",
+    leaders: "Copy Trade",
+    ops: "Ops",
+    admin: "Pending",
+  },
+  login: {
+    eyebrow: "FILET",
+    heroTitle: "Paste an address, start copy trading on Hyperliquid",
+    subtitle: "Your funds stay in your own wallet. The strategy still executes.",
+    journey: [
+      {
+        title: "Connect and sign in with your wallet",
+        body: "Connect using your own browser wallet and sign one free login message — no on-chain transaction, no gas.",
+      },
+      {
+        title: "Complete two authorizations",
+        body: "Sign two messages in your wallet, also free and gas-less: copy-trade authorization (Filet can only place orders "
+          + "on your behalf and can never move or withdraw funds) and builder code fee authorization (a fee is charged per fill "
+          + "up to the rate cap you sign, verifiable on-chain).",
+      },
+      {
+        title: "Paste a leader's address to start copy trading",
+        body: "Go to the copy trade page, paste any Hyperliquid wallet address, and start copy trading once it passes the admission check.",
+      },
+    ],
+    connect: "Connect wallet",
+    connecting: "Connecting…",
+    signingIn: "Please sign the login message in your wallet…",
+    signInNote: "Signing in requires one free message signature (no on-chain transaction, no gas).",
+    noWallet: "No browser wallet detected. Please install MetaMask and refresh this page. Filet will never ask for your private key or seed phrase.",
+    rejected: "You canceled the signature in your wallet. Click \"Connect wallet\" again when you're ready.",
+    loginFailed: "Login failed, please try again later.",
+    walletPanelTitle: "Your wallet",
+    enginePanelTitle: "Filet engine",
+    addrLabel: "Address",
+    strategyLabel: "Strategy",
+    strategyValue: "Grid · Multi-asset",
+    pillUnauthorized: "Not authorized",
+    pillAuthorized: "Trade-only · no withdrawal rights",
+    footnote: "A builder fee of 0.02% (2bp) is charged per fill, verifiable on-chain. Copy trading carries risk of loss; past performance does not guarantee future results.",
+  },
+  wizard: {
+    stepNames: ["Connect wallet", "Confirm risks", "Sign authorizations", "Deposit & activate"],
+    step1Title: "Wallet connected",
+    step2Title: "Please confirm the following",
+    risk1: "I understand that copy trading carries risk of loss",
+    risk2: "I understand Filet only holds order-placement rights and cannot move or withdraw my funds",
+    risk3: "I have read the fee disclosure (0.02% per fill)",
+    risk4: "I declare that this wallet is legally held by me, that its funds are of legal origin and comply with applicable "
+      + "anti-money-laundering (AML) regulations, and that I am not using this service from a jurisdiction where it is "
+      + "prohibited or restricted.",
+    step3Title: "Sign two authorizations",
+    agentCardName: "ApproveAgent",
+    agentCardDesc: "Authorizes Filet's trade-only agent key to place orders on your behalf, with no withdrawal rights.",
+    feeCardName: "ApproveBuilderFee",
+    feeCardDesc: "Authorizes a builder fee cap of 0.1%; the actual rate charged per fill is 0.02%.",
+    signWithWallet: "Sign with wallet",
+    stateUnsigned: "Not signed",
+    stateAwaitingWallet: "Confirm in your wallet…",
+    stateSubmitting: "Submitting…",
+    stateSubmitted: "Submitted, awaiting on-chain confirmation…",
+    stateConfirmed: "Active",
+    stateRejected: "Rejected",
+    agentPreparing: "Preparing agent key…",
+    agentLabel: "Agent address",
+    reconnectTitle: "Wallet not connected",
+    reconnectHint: "Your session is still valid, but your browser wallet is currently disconnected (it may be locked). "
+      + "Please unlock your wallet and reconnect to continue signing; your progress won't be lost.",
+    reconnectButton: "Reconnect wallet",
+    step4Title: "Deposit check",
+    depositPerpLabel: "Perps account balance",
+    depositThresholdLabel: "Activation threshold",
+    depositShortfallLabel: "Remaining",
+    depositDetected: "Sufficient funds detected — your perps account balance has reached the activation threshold.",
+    depositPending:
+      "No sufficient funds detected yet. Please deposit USDC into the \"perps\" (perpetuals) wallet of your own Hyperliquid "
+      + "account (same address as your login wallet) — copy trading only uses the perps wallet; funds held in the spot wallet "
+      + "don't count toward the activation threshold and won't be copy-traded. If your funds are already in the spot wallet, "
+      + "please transfer them to perps in the Hyperliquid interface. Your funds always remain in your own account; Filet "
+      + "cannot move or withdraw them.",
+    spotStrandedTitle: "You have funds stranded in your spot wallet",
+    spotStrandedBody:
+      "Copy trading only uses the perpetuals (perp) account; funds stranded in the spot wallet won't be copy-traded and "
+      + "won't count toward the amount required for activation. Please transfer these funds to perp in the Hyperliquid interface.",
+    spotStrandedAmountLabel: "Spot balance",
+    spotStrandedThresholdLabel: "Notice threshold",
+    spotStrandedManualNote:
+      "This step can only be completed by you: the transfer requires your main wallet's signature, and we don't hold your "
+      + "main key, so we can't do it for you — this page will never show a button that does it for you.",
+    spotStrandedLink: "Go to Hyperliquid to transfer",
+    spotStrandedLinkHref: "https://app.hyperliquid.xyz/balances",
+    submitReview: "Complete setup",
+    submitted: "Setup complete. Go to the copy trade page to choose a leader — copy trading starts automatically within "
+      + "about a minute of selecting one.",
+    goFollow: "Go choose a leader",
+    fundsWarning:
+      "During copy trading, deposits and withdrawals automatically recalibrate the drawdown baseline and are not treated " +
+      "as losses; but the system sizes your copy-trade positions from your perp account equity, so withdrawing funds will " +
+      "immediately scale down all your copy-trade positions proportionally (incurring real trading costs). Before making " +
+      "a large withdrawal, we recommend stopping copy trading on this page first.",
+    errors: {
+      walletRejected: "Signature rejected — please try again in your wallet. Filet will never ask for your private key or "
+        + "seed phrase; signing only happens in your own wallet.",
+      signerMismatch: "The signing account doesn't match your login account — please switch your wallet back to the "
+        + "account you logged in with and try again. This signature was not submitted.",
+      agentUnavailable: "The key service is temporarily unavailable, please try again later.",
+      payloadFailed: "Failed to fetch the content to sign, please try again later.",
+      hlTransient: "The network was unstable while submitting the authorization — it's safe to retry; resubmitting the "
+        + "same signature won't create a duplicate authorization.",
+      hlSemantic: "Hyperliquid rejected this authorization. Click \"Retry\" to fetch new content to sign and sign again.",
+      builderPaused: "The system is currently pausing activations, please contact us and try again.",
+      verifyIncomplete: "Some conditions are still unmet (authorization or funds not yet confirmed) — please follow the "
+        + "on-screen prompts to complete them before submitting.",
+    },
+  },
+  admin: {
+    title: "Pending approvals",
+    empty: "No items pending approval.",
+    forbidden: "This page is admin-only.",
+    note: "Activation is handled automatically by the auto-activate watcher (effective about a minute after a leader is "
+      + "selected); this page is read-only, for observing the queue — entries stuck here for a long time usually mean the "
+      + "user hasn't picked a leader yet, or activation failed (check journalctl -u filet-auto-activate).",
+    cols: {
+      account: "account_id",
+      user: "user_address",
+      agent: "agent_address",
+      builder: "builder_address",
+      network: "network",
+      label: "label",
+    },
+  },
+  ops: {
+    title: "Ops dashboard",
+    eyebrow: "OPS",
+    forbidden: "This page is admin-only.",
+    window: {
+      sharedTitle: "The two tables below use the same comparison window",
+      sharedNote:
+        "Revenue reconciliation and per-customer P&L are taken from the same set of snapshot moments (the backend derives "
+        + "both windows from a shared function), so builder fees in the two tables can be directly compared.",
+      label: "Comparison window",
+      mismatchTitle: "The two tables' comparison windows don't match — the numbers cannot be subtracted",
+      mismatchBody:
+        "Revenue reconciliation and per-customer P&L should share the same window, but the two windows received are "
+        + "actually different — subtracting builder fees between the two tables in this state produces a false "
+        + "discrepancy (a one-day window offset once made a healthy account look like a massive shortfall). Please check "
+        + "whether the backend window derivation has regressed; do not draw reconciliation conclusions from this page "
+        + "until it's fixed.",
+      revenueLabel: "Revenue reconciliation window",
+      customersLabel: "Per-customer P&L window",
+      tradeQualityLabel: "Trade quality window",
+      tradeQualityShared: "The trade quality panel is also taken from the same set of snapshot moments, so all three "
+        + "tables can be compared side by side.",
+      tqMismatchTitle: "Trade quality's comparison window doesn't match the reconciliation tables — the numbers cannot "
+        + "be compared side by side",
+      tqMismatchBody:
+        "Trade quality should share the same window derivation function as revenue reconciliation, but the window "
+        + "received is actually different — reading delay and slippage alongside the other two tables in this state "
+        + "would treat two different time periods as the same batch. Please check whether the backend window derivation "
+        + "has regressed; do not compare these tables side by side until it's fixed.",
+    },
+    revenue: {
+      title: "Revenue reconciliation",
+      note: "Attributed = sum of builder fees attributed to each customer's fills; actual = today-minus-yesterday delta "
+        + "of the builder address's on-chain accrual (queried once, not derived from the customer rows). The gap between "
+        + "the two is the reconciliation signal.",
+      attributed: "Attributed (owed)",
+      accruedDelta: "Actual (on-chain delta)",
+      discrepancy: "Discrepancy (actual − attributed)",
+      discrepancyPct: "Discrepancy %",
+      threshold: "Alert threshold",
+      window: "Reconciliation window",
+      rowsCounted: "Customer rows included in attribution",
+      ok: "Discrepancy within threshold.",
+      alertTitle: "Revenue reconciliation exceeds threshold",
+      alertBody:
+        "The attribution analysis doesn't match the on-chain actual — please check the day's fill details before "
+        + "adjusting attribution. Common causes: "
+        + "(1) fills routed via the modify path carry no builder field and earn no fee; "
+        + "(2) fills not routed through us (self-directed customer orders) count toward equity but generate no builder fee; "
+        + "(3) on-chain accrual posts with a delay, causing temporary misalignment across UTC day boundaries.",
+      insufficient: "Historical data is still accumulating; at least two daily snapshots are needed to reconcile.",
+      insufficientNote:
+        "Actual delta = the difference between today's and yesterday's snapshot; with only one snapshot there's no way "
+        + "to know the single-day delta. We deliberately don't show 0 here — treating the whole accumulated total as a "
+        + "single day's delta would produce an astronomically false discrepancy. The daily report script keeps "
+        + "accumulating snapshots.",
+      pctUnavailable: "Attributed is 0, so the percentage can't be calculated (see the amount column directly).",
+      basisUnknown: "Snapshot moments could not be aligned; reconciliation skipped for this day.",
+      basisUnknownNote:
+        "Both ends of the comparison window can only come from snapshot moments; when one is missing or out of order, "
+        + "any window would be a guess. We deliberately show no amount or range here — a reconciliation number offset by "
+        + "a day would send someone chasing a problem that doesn't exist.",
+    },
+    customers: {
+      title: "Per-customer P&L",
+      note: "This table uses the same comparison window as revenue reconciliation above (the same set of snapshot "
+        + "moments), so builder fees in both tables can be directly compared.",
+      daysNote:
+        "Free-range window: this table uses \"now minus N days,\" a different basis from the reconciliation window "
+        + "above (snapshot moments) — the numbers in the two tables cannot be directly subtracted. Switch back to "
+        + "\"reconciliation window\" to compare side by side.",
+      basisUnknown: "Snapshot moments could not be aligned; calculation skipped for this table.",
+      basisUnknownNote:
+        "Both ends of the reconciliation window can only come from snapshot moments; when one is missing or out of "
+        + "order, any window would be a guess. We deliberately show no customer numbers here — P&L on a different basis "
+        + "than revenue reconciliation would be misread as subtractable. To view customer details first, use the "
+        + "free-range window above (which uses a different basis than the reconciliation table).",
+      empty: "No customer data available.",
+      rangeLabel: "Reporting period",
+      ranges: { accrued: "Reconciliation window (matched basis)", d1: "1 day", d7: "7 days", d30: "30 days" },
+      manifestErrors: "The manifest has invalid entries that were skipped; the following items are not included in "
+        + "this table (other customers display normally):",
+      rowError: "This row failed to query:",
+      rowErrorHint: "A single customer query failure only affects this row; the numbers for other customers remain valid.",
+      cols: {
+        account: "Account",
+        address: "Address",
+        fills: "Fill count",
+        notional: "Routed notional",
+        builderFee: "Attributed builder fee",
+        takerShare: "Taker share",
+        accountValue: "Account equity",
+        subscription: "Subscription status",
+      },
+    },
+    tradeQuality: {
+      title: "Trade quality",
+      note:
+        "Pairing delay = the time difference between our fill and the leader's corresponding fill; slippage is in bp, "
+        + "with positive values meaning the fill price was unfavorable to the follower. These figures call the same "
+        + "formula as the daily reconciliation report, not a separately computed copy (if the two formulas drifted, the "
+        + "two tables side by side wouldn't reveal they'd diverged).",
+      sameWindowNote: "This table is taken from the same set of snapshot moments as revenue reconciliation and "
+        + "per-customer P&L above, so all three tables can be compared side by side.",
+      daysWindowNote:
+        "Free-range window: this table uses \"now minus N days,\" a different basis from revenue reconciliation's "
+        + "window above (snapshot moments) — the two cannot be compared side by side. Switch back to \"reconciliation "
+        + "window\" to compare all three tables side by side.",
+      basisUnknown: "Snapshot moments could not be aligned; trade quality calculation skipped this time.",
+      basisUnknownNote:
+        "Both ends of the comparison window can only come from snapshot moments; when one is missing or out of order, "
+        + "any window would be a guess. We deliberately show no quality numbers here — delay and slippage on a "
+        + "different basis than other tables would be misread as directly comparable.",
+      loadFailed: "Trade quality failed to load; this section's numbers are unavailable (other sections are unaffected):",
+      empty: "No customers with computable trade quality.",
+      summaryTitle: "Cross-customer summary (worst value, not average)",
+      summaryNote:
+        "The summary only covers customers for whom a value could be computed, and the sample size is listed alongside "
+        + "— showing only a single worst value would make \"1 of 10 customers has data\" look identical to \"all 10 "
+        + "have data\" on screen. A median of medians is not a median, so we deliberately don't provide an average.",
+      stats: {
+        followers: "Follower count",
+        qualityAvailable: "Customers with quality data",
+        teAvailable: "Pairable customers (known who they follow)",
+        skippedAvailable: "Customers with skipped-small-order data",
+        worstDelay: "Worst median pairing delay (seconds)",
+        delaySample: "Delay sample size (customers)",
+        worstSlippage: "Worst median taker slippage (bp)",
+        slippageSample: "Slippage sample size (customers)",
+      },
+      cols: {
+        account: "Account",
+        fills: "Our fill count",
+        takerShare: "Taker share",
+        pairCount: "Paired fill count",
+        medianDelay: "Median pairing delay (seconds)",
+        slippage: "Median taker slippage (bp)",
+        skippedNotional: "Skipped small-order notional",
+        skippedRatio: "Skipped-small-order ratio",
+      },
+      teUnavailable: "Cannot pair",
+      teUnavailableHint: "It's unknown who this customer is following (manifest doesn't record leader_address), so "
+        + "delay and slippage cannot be computed — we deliberately don't fill in 0, since \"0 second delay\" reads as "
+        + "perfect copy-trade quality.",
+      skippedUnavailable: "Unreadable",
+      skippedUnavailableHint: "The skipped-small-order log couldn't be read (or the window covers days for which only "
+        + "some have log files). The total for partial days will read low, and a low number happens to look exactly "
+        + "like \"the engine isn't skipping any orders.\"",
+      ratioIncomparable: "Cannot be computed for this window",
+      ratioIncomparableHint: "Skipped-small-order data is logged per full calendar day (no per-fill timestamps in the "
+        + "file), while routed notional is filtered by window. When the window isn't a full UTC day, the numerator and "
+        + "denominator of this ratio are on different bases — the resulting quotient would look exactly like a normal "
+        + "ratio, so we deliberately don't compute it. The notional figure is still meaningful; see the column on the left.",
+      skippedDaysLabel: "Days logged for skipped-small-orders (the ratio's denominator basis)",
+      rowError: "This row failed to query:",
+      rowErrorHint: "A single customer query failure only affects this row; the quality numbers for other customers "
+        + "remain valid.",
+      window: "This table's window",
+    },
+    health: {
+      title: "System health",
+      note: "A cross-customer sweep of engine status. Every cell has an \"unknown\" state — anything that can't be "
+        + "read is marked unknown and never falls back to a value that looks safe. It's intentional that \"unknown\" "
+        + "looks jarring.",
+      loadFailed: "System health failed to load; this section's status is unavailable (other sections are unaffected):",
+      empty: "No customers to check.",
+      checkedAtLabel: "Checked at",
+      staleAfterLabel: "Heartbeat considered stale after this many seconds",
+      basisTitle: "\"Equity sample\" is a proxy metric, not a process liveness check",
+      basisBody: "That column looks at whether the engine has recently written an equity sample (one per cycle). A "
+        + "process that's still writing files but no longer placing orders would show green in that column. True "
+        + "process liveness is managed by systemd (see \"systemctl status\" in the RUNBOOK) — don't use this column "
+        + "as a substitute for it.",
+      basisLabel: "Sampling basis",
+      basisEquitySample: "Equity sample (engine writes one per cycle)",
+      basisUnknownPrefix: "Basis code reported by the backend (no matching explanation on this page yet):",
+      sourceTitle: "Where this table's data comes from",
+      sourceBody: "The engine's state directory is only readable by the engine itself (0700); the panel runs under a "
+        + "different account. So the panel's data comes from a narrow summary (heartbeat) that the engine actively "
+        + "publishes every cycle; for a few cells the panel can read directly. Each row's \"source\" column notes "
+        + "which side its kill switch and coverage figures came from — direct reads are fresher.",
+      sourceLabel: "Source",
+      sources: {
+        state_root: "Direct state-root read",
+        heartbeat: "Engine heartbeat",
+        absent: "State root doesn't exist",
+        unreadable: "State root unreadable",
+      },
+      sourceUnknownPrefix: "Source code reported by the backend (no matching explanation on this page yet):",
+      heartbeat: {
+        ok: "Heartbeat fresh",
+        stale: "Heartbeat stale",
+        missing: "Never received a heartbeat",
+        unreadable: "Heartbeat unreadable",
+        unknownPrefix: "Heartbeat status code reported by the backend (no matching explanation on this page yet):",
+        okHint: "The engine wrote a heartbeat within the threshold window, so this row's leader and capital settings have values.",
+        staleHint: "The engine hasn't written a heartbeat past the threshold — it may not be running, or it may be "
+          + "running but unable to write to the exchange directory. None of the values in the heartbeat are shown as "
+          + "current (the backend structurally omits them once stale).",
+        missingHint: "This customer has never had a heartbeat file. Most likely just activated and the engine hasn't "
+          + "run its first cycle yet, or the exchange directory's subchannel hasn't been set up yet (deployment TODO).",
+        unreadableHint: "The heartbeat file exists but couldn't be read (malformed, or timestamped in the future). "
+          + "This row's status is entirely unconfirmed.",
+      },
+      state: {
+        alive: "All good",
+        stale: "Sample stale",
+        engineUnknown: "Sample unknown",
+        tripped: "Tripped",
+        armed: "Not tripped",
+        killswitchUnknown: "Status unknown",
+        covered: "In effect",
+        insufficient: "Not yet in effect",
+        coverageUnknown: "Coverage unknown",
+        unknown: "Unknown",
+      },
+      engineStateTitle: "Engine state (unknown whenever heartbeat isn't fresh)",
+      engineStateNote: "These are the values actually used by the engine in its last cycle. When the heartbeat is "
+        + "stale or unreachable, these cells are always \"unknown\" — the backend structurally omits these values "
+        + "once the heartbeat is stale, so this page can never present a setting from tens of minutes ago as if it "
+        + "were currently in effect.",
+      engineStateCols: {
+        account: "Account",
+        leader: "Current leader",
+        leaderSource: "Leader source",
+        allocated: "Allocated capital",
+        utilization: "Utilization",
+        fullEquity: "Uses full equity",
+        capitalSource: "Capital source",
+        lastCycle: "Last cycle",
+      },
+      yes: "Yes",
+      no: "No",
+      staleTitle: "Some customers' engine heartbeats are stale",
+      staleBody: "These customers' engines have gone past the threshold without writing a heartbeat. A stopped "
+        + "heartbeat doesn't mean positions were closed, but it does mean drawdown protection and copy trading may "
+        + "both have stopped working — the last-heartbeat time in the table below is \"last seen,\" not its current status.",
+      trippedTitle: "Some customers' kill switch has tripped, and these customers have stopped copy trading",
+      trippedBody: "Drawdown protection has tripped and closed positions for these customers' accounts; the engine "
+        + "will not copy trade for them again until manually re-armed. Please confirm the customer has been notified "
+        + "before following the RUNBOOK to re-enable.",
+      unknownTitle: "Some cells are unreadable; the status of these items is unconfirmed",
+      unknownBody: "These counts don't mean \"no problem,\" they mean \"can't see it\" — the most common cause is "
+        + "filet-api lacking read permission on the engine's state directory (the state root is 0700, crossing a "
+        + "permission boundary). While unreadable, whether the kill switch has tripped or drawdown protection is "
+        + "active is unknown; fix the permission issue first before reading this table.",
+      cols: {
+        account: "Account",
+        heartbeat: "Engine heartbeat",
+        lastBeat: "Last heartbeat",
+        engine: "Equity sample",
+        coverage: "Drawdown protection coverage",
+        killswitch: "Kill switch",
+        alerts: "Alert count",
+        source: "Source",
+      },
+      stats: {
+        followers: "Follower count",
+        heartbeatOk: "Heartbeat OK",
+        heartbeatStale: "Heartbeat stale",
+        heartbeatMissing: "Heartbeat never written",
+        engineAlive: "Equity sample alive",
+        engineStale: "Equity sample stale",
+        engineUnknown: "Equity sample unreadable",
+        killswitchTripped: "Kill switch tripped",
+        killswitchUnknown: "Kill switch unreadable",
+        coverageInsufficient: "Drawdown protection sample insufficient",
+        coverageUnknown: "Drawdown protection unreadable",
+        alertsTotal: "Total alerts",
+        alertsUnknown: "Alert count unreadable",
+        backlog: "Pending leader-switch backlog",
+      },
+      units: { sec: "s", min: "min", hour: "hr", day: "d" },
+      ageSuffix: "ago",
+      lastBeatNever: "Never received a heartbeat",
+      lastBeatNeverHint: "This customer's state directory has no equity samples at all. May have just activated and "
+        + "the engine hasn't run its first cycle yet, or the engine may have never come up — this page can't tell "
+        + "the two apart, so it doesn't guess.",
+      coverageInsufficientHint: "Sample is under one hour or fewer than two points: drawdown protection's peak "
+        + "doesn't yet have enough history, so protection isn't truly active yet. This is a definite answer, not \"unreadable.\"",
+      rowError: "This row failed to load:",
+      backlogTitle: "Leader switch: written but never applied by the engine",
+      backlogNote: "The customer signed, the API accepted it and replied \"effective next cycle,\" but the engine "
+        + "never applied it — this chain spans two processes and two permission sets, and its failures are silent "
+        + "(both sides' logs look fine, and the customer thinks the switch went through). This check calls the same "
+        + "function as the daily reconciliation report, not a separate one.",
+      backlogEmpty: "No pending leader-switch backlog.",
+      backlogUnknownTitle: "Leader-switch backlog is unknown",
+      backlogUnknownBody: "This chain can't be checked (the exchange directory isn't set up, or the log file is "
+        + "unreadable), so this page shows no backlog count. We deliberately don't show 0 here — 0 would be read as "
+        + "\"no backlog,\" when it actually means \"unknown whether there's a backlog,\" and those are opposites. "
+        + "Reasons below:",
+      backlogCols: { account: "Account", nonce: "nonce", age: "Record age", reason: "Reason" },
+      reasons: {
+        not_redeemed: "The record has expired with no redemption in the engine's ledger — the customer signed, but "
+          + "the engine never applied it",
+        bad_issued_at: "The record's issued_at is invalid; the engine will reject this change",
+        ledger_unreadable: "The engine ledger is unreadable, so it can't be confirmed whether this was applied (not "
+          + "the same as \"not applied\")",
+      },
+      reasonUnknownPrefix: "Reason code reported by the backend (no matching explanation on this page yet):",
+      manifestErrors: "The manifest has invalid entries that were skipped; the following items are not included in "
+        + "this section (other customers are checked normally):",
+    },
+    subscriptions: {
+      title: "Subscription reconciliation",
+      note: "Local billing table vs. Stripe's real status. The webhook is the sole writer of the local table; missing "
+        + "one message causes permanent drift, and this table is the only way to notice it.",
+      detectOnly: "This section only detects, it does not fix: overwriting locally with Stripe as the source of truth "
+        + "would directly change billing and entitlements, which is a human decision. If you see drift, first confirm "
+        + "the truth in the Stripe dashboard before deciding how to handle it.",
+      clean: "All four drift categories are zero; local and Stripe match.",
+      counts: {
+        inSync: "In sync",
+        drift: "Total drift",
+        stripe: "Stripe subscriptions",
+        local: "Local records",
+        superseded: "Superseded (returning customers)",
+      },
+      supersededNote: "\"Superseded\" is a historical subscription for the same customer, not drift, and isn't "
+        + "counted in total drift.",
+      truncatedTitle: "Sample incomplete, this section's conclusions are unreliable",
+      truncatedBody: "The Stripe subscription list hit its 1000-record limit, so a complete sample wasn't retrieved. "
+        + "In this state, \"missing from Stripe\"-type findings may all be false drift (the subscription actually "
+        + "exists, it just wasn't fetched). Please don't disable any customer based on this section — narrow the "
+        + "query range first, or confirm directly in the Stripe dashboard row by row.",
+      lists: {
+        stripeActiveLocalNot: {
+          title: "Customer paid but didn't get entitlements (highest harm)",
+          desc: "Stripe shows the subscription active, but locally there's no record or it's non-active — the "
+            + "customer is paying but not receiving the paid features. Handle first.",
+        },
+        localActiveStripeNot: {
+          title: "Still providing service but not getting paid (revenue leak)",
+          desc: "Local is active, but on Stripe it's non-active or the subscription doesn't exist — service "
+            + "continues to be delivered, but the payment never arrived.",
+        },
+        statusMismatch: {
+          title: "Status mismatch between the two sides (needs manual review)",
+          desc: "Both sides have a record but the status doesn't match (e.g., local is past_due while Stripe shows "
+            + "canceled); entitlement decisions follow the local value, which may not be the current truth.",
+        },
+        orphanStripe: {
+          title: "Stripe subscriptions with no matching local account (non-active)",
+          desc: "Mostly manually created externally or leftover test data. Non-active, so no immediate entitlement "
+            + "impact, but it will make billing reports not reconcile.",
+        },
+      },
+      empty: "None",
+      cols: {
+        account: "account_id",
+        local: "Local status",
+        stripe: "Stripe status (normalized)",
+        raw: "Stripe raw value",
+        subId: "stripe_subscription_id",
+        matchedBy: "Matched by",
+      },
+    },
+  },
+  leaders: {
+    eyebrow: "Copy Trade",
+    title: "Paste an address, follow the trade",
+    subtitle: "Paste any Hyperliquid wallet address and start copy trading once it passes the admission check.",
+    fundsWarning:
+      "Reminder: during copy trading, deposits and withdrawals automatically recalibrate the drawdown baseline and "
+      + "are not treated as losses; but withdrawing funds will immediately scale down your copy-trade positions "
+      + "proportionally. We recommend stopping copy trading before making a large adjustment.",
+    risk: {
+      title: "Risk controls",
+      subtitle: "No risk controls are enabled by default — the system only copies the leader's actions and won't "
+        + "stop-loss or trip a breaker for you. Every threshold is yours to decide: we mark our suggested values "
+        + "alongside, but the final setting is your choice.",
+      applyNote: "Every adjustment will ask you to sign a message in your wallet; once submitted, the engine applies "
+        + "it on the next cycle (within about a minute).",
+      trackingTitle: "Tracking precision",
+      trackingSubtitle: "This item is unrelated to the risk-control toggle and takes effect whether or not you've "
+        + "enabled risk controls.",
+      enableLabel: "Enable Filet risk controls",
+      enableHelp: "When enabled: once equity drawdown reaches the threshold you set, the system stops copy trading "
+        + "(and closes positions if you chose to). This limits the exposure of \"continuing to follow\" — by the "
+        + "time it triggers, that loss has usually already happened, and it does not protect your principal from "
+        + "loss. When disabled, the system doesn't intervene at all and purely copies trades.",
+      detailsTitle: "Risk control details",
+      percentSuffix: "%",
+      hoursSuffix: "hours",
+      recommendedLabel: "Suggested",
+      boolOn: "On",
+      boolOff: "Off",
+      saveButton: "Sign and save risk settings",
+      saving: "Waiting for wallet signature…",
+      saved: "Risk settings submitted.",
+      loadError: "Risk settings are temporarily unreadable (this doesn't affect choosing a leader). Please reload "
+        + "this page later.",
+      saveError: "Failed to save risk settings",
+      signNote: "Next you'll be asked to sign a message in your wallet (no on-chain transaction, no gas). Filet will "
+        + "never ask for your private key or seed phrase; signing only happens in your own wallet.",
+      errors: {
+        walletRejected: "You canceled the signature in your wallet; risk settings were not changed.",
+        signerMismatch: "The signing wallet doesn't match the wallet you're logged in with, so the settings weren't "
+          + "submitted. Please switch back to your login wallet and try again.",
+        contentMismatch: "The content the server returned to sign doesn't match what you configured on screen, so it "
+          + "was aborted for you — no signature was submitted. Please don't retry, and report this to us.",
+        messageFailed: "Failed to fetch the content to sign; risk settings were not changed. Please try again later.",
+        submitFailed: "Submission failed; risk settings were not changed. The previous signature has been voided, "
+          + "please try again.",
+      },
+      applied: {
+        pending: "Submitted, not yet in effect (the engine applies it within about a minute).",
+        inSync: "The currently active settings match what you submitted.",
+        unknown: "The currently active settings can't be confirmed right now (the engine's status is unreadable).",
+        notSubmitted: "You haven't submitted any risk settings yet; what's shown on screen is the system default.",
+        sourceLabel: "Source",
+        changedAtLabel: "Effective at",
+      },
+      halted: {
+        title: "Your copy trading has been stopped by risk controls",
+        body: "A risk-control threshold was tripped, and the engine has stopped copy trading. By the time it "
+          + "triggers, that loss has usually already happened — what's stopped is the exposure of \"continuing to follow.\"",
+        reasonLabel: "Trigger reason",
+        trippedAtLabel: "Tripped at",
+        cooldownLabel: "Cooldown",
+        resumeAtLabel: "Expected auto-resume",
+        noAutoResume: "No expected auto-resume time (cooldown is set to 0, or currently uncalculable) — use the "
+          + "button below to resume copy trading.",
+        unknownValue: "(unreadable)",
+        resumeButton: "Resume copy trading now",
+        resuming: "Waiting for wallet signature…",
+        resumed: "Resume request submitted; the engine will resume copy trading on the next cycle.",
+        residualNote: "⚠️ If any positions failed to close or orders failed to cancel at the moment of the trip, "
+          + "they remain open in the market. After resuming, the engine will converge them toward the leader's "
+          + "target on the next cycle.",
+        resumeNote: "After resuming, the engine rebuilds positions to match the leader on the next cycle. The "
+          + "equity baseline was already reset at the moment of the trip, so it won't immediately trip again "
+          + "because of the drawdown before the trip.",
+        leaderRevokedNote: "This stop happened because the leader you were following was delisted by us, not "
+          + "because your risk-control threshold was tripped. This type cannot be self-resolved — please choose a "
+          + "different leader instead.",
+        unknown: "Whether your risk controls have tripped can't be confirmed right now (the engine's status is unreadable).",
+      },
+    },
+    upperBound: "A follower's actual results will fall below the leader's numbers: entry/exit delay, slippage, and "
+      + "differences in capital size will continuously erode copy-trade results. The leader's numbers are an upper "
+      + "bound, not your expected return. Copy trading carries risk of loss.",
+    current: {
+      title: "The leader you're currently following",
+      loading: "Loading your current follow status…",
+      leaderLabel: "Currently following",
+      failedTitle: "Unable to read your current follow status right now",
+      failedNote: "This query failure only affects this section's display: it doesn't change your copy-trade "
+        + "settings, and it doesn't mean you're not copy trading. The rest of this page is unaffected; please "
+        + "reload this page and try again.",
+      noneTitles: {
+        engine_default: "Copy trading is enabled, but no leader is specified yet",
+        not_activated: "Your account hasn't activated copy trading yet",
+        indeterminate: "Your follow status can't be confirmed right now",
+      },
+      noneTitleFallback: "No follow target to display right now",
+      statusLabel: "Status code",
+      pendingTitle: "There's a signed, not-yet-effective leader switch",
+      pendingLabel: "Switching to",
+      pendingIssuedAtLabel: "Signed at",
+    },
+    confirmTitle: "Confirm switching to this leader?",
+    confirmLeaderLabel: "Leader to switch to",
+    confirmCost: "Switching leaders has a real cost: when it takes effect, the engine converges your positions to "
+      + "the new leader — closing your current positions and opening new ones per the new leader. These are real "
+      + "fills and incur real trading costs (taker fees and slippage).",
+    confirmTiming: "This does not take effect immediately: once the authorization is recorded, it takes effect on "
+      + "the engine's next cycle. Before applying it, the engine re-verifies your signature and the allowlist on "
+      + "its own; if verification fails, it won't be applied.",
+    confirmSignNote: "Next you'll be asked to sign a message in your wallet (no on-chain transaction, no gas). "
+      + "Filet will never ask for your private key or seed phrase; signing only happens in your own wallet.",
+    confirmOk: "Confirm and sign",
+    confirmCancel: "Cancel",
+    signing: "Please sign in your wallet…",
+    submitting: "Submitting…",
+    doneTitle: "Authorized — effective on the engine's next cycle",
+    custom: {
+      title: "Who to follow",
+      subtitle: "Paste any wallet address to start copy trading. Pasted addresses receive no additional platform "
+        + "vetting — whether it's worth following is your own judgment.",
+      leaderboardLabel: "For research, you can refer to Hyperliquid's official leaderboard (external link, opens "
+        + "in a new tab):",
+      leaderboardLinkText: "app.hyperliquid.xyz/leaderboard",
+      inputLabel: "Leader wallet address",
+      inputPlaceholder: "0x…",
+      inputHint: "0x followed by 40 hex characters. The query reads this account's on-chain Hyperliquid perp "
+        + "activity; if the address has no activity yet, you can still complete setup (copy trading starts "
+        + "automatically once it becomes active).",
+      formatError: "Invalid address format: must be 0x followed by 40 hex characters.",
+      check: "Check",
+      checking: "Checking…",
+      previewTitle: "On-chain preview",
+      previewNote: "This is an on-chain snapshot at the time of the query, meant to help you confirm the address "
+        + "wasn't mistyped — it is not performance, and it is not a recommendation.",
+      previewAccountValue: "Account equity",
+      previewAccountValueHint: "This address's account equity at the time of the query (a live on-chain read, not "
+        + "a daily snapshot).",
+      previewPositionCount: "Position count",
+      previewPositionCountHint: "The number of positions this address held at the time of the query.",
+      alreadyListedBadge: "This address is on the curated list",
+      vaultBadge: "Vault",
+      vaultNote: "This address is a Hyperliquid vault. When copy trading it, the engine automatically applies a 20x "
+        + "leverage cap and neutralizes the vault's deposit/redemption flows (so subscriptions/redemptions aren't "
+        + "mistaken for trading P&L).",
+      vaultCheckWarning: "The engine may not be able to precisely account for this vault's ledger shape — please "
+        + "understand the risk before continuing.",
+      alreadyListedNote: "This address is already on the platform's curated leader list; the rest of the flow is "
+        + "the same as for any other address. Since you're using the address-input box, the declaration below is "
+        + "still required.",
+      alreadyListedNoteNotShown: "This address is already on the platform's leader list, but whether it's currently "
+        + "open to copy trading can't be confirmed right now (for example, it may have paused new followers, or the "
+        + "list is temporarily unreadable). The rest of the flow is the same as for any other address; since you're "
+        + "using the address-input box, the declaration below is still required.",
+      attestation: "I understand this is an unvetted leader and I bear the risk myself.",
+      select: "Follow this address",
+      reasons: {
+        invalid_format: "Invalid address format: must be 0x followed by 40 hex characters.",
+        self_follow: "This is your own login address — you can't follow yourself.",
+        leader_disabled: "This address has been safety-revoked by the platform (leader incident) and can't be followed.",
+      },
+      notAcceptingNewWarning: "⚠️ This leader is currently not accepting new followers (routine delisting or slot "
+        + "adjustment). You can still complete setup and follow — this is just a status the platform has flagged.",
+      noActivityWarning: "This address currently has no perp trading activity on Hyperliquid (zero equity and no "
+        + "positions). If this leader hasn't entered the market yet, you can complete copy-trade setup now — the "
+        + "engine will start copy trading automatically once they enter. Please also double-check the address "
+        + "wasn't mistyped.",
+      previewFailed: "Query failed; this query didn't change your copy-trade settings. Please click \"Check\" again later.",
+      echoMismatch: "Aborted: the preview the server returned doesn't match the address you entered, so this "
+        + "preview is not displayed. Please stop and report this to support.",
+      entryName: "Unvetted leader",
+    },
+    errors: {
+      messageFailed: "Failed to fetch the content to sign; your leader was not changed. Please try again later.",
+      walletRejected: "You canceled the signature in your wallet. This authorization was not submitted, and your "
+        + "copy-trade settings were not changed.",
+      signerMismatch: "The signing account doesn't match your login account — please switch your wallet back to "
+        + "the account you logged in with and try again. This signature was not submitted.",
+      leaderMismatch: "Aborted: the authorization target the server returned doesn't match the leader you "
+        + "selected. This authorization was never sent to your wallet, never signed, never submitted, and your "
+        + "copy-trade settings were not changed at all. Please do not retry — retrying will just fetch the same "
+        + "mismatched authorization request again. Please screenshot this screen and report it to support; until "
+        + "this is resolved, do not sign any leader-switch request.",
+      notSelectable: "This leader currently can't be selected (it may have just been delisted). Please reload this "
+        + "page and try again.",
+      forbidden: "You can only change the leader on your own account. Please log in again and try again.",
+      rateLimited: "Too many queries and submissions in a short time; this one was not submitted, and your leader "
+        + "was not changed. Please wait about a minute and try again.",
+      submitFailed: "Failed to submit the authorization; your leader was not changed. Please try again — this will "
+        + "fetch new content to sign and ask you to sign again (the previous signature is voided and won't be "
+        + "double-applied).",
+      retry: "Try again",
+      dismiss: "Dismiss",
+    },
+  },
+};
+
+/** 過渡別名（Task 3 移除）：未遷移到 useCopy() 的元件仍可 `import { COPY }`。 */
+export const COPY = COPY_ZH;
