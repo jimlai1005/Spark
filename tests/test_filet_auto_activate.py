@@ -329,6 +329,57 @@ def test_standard_leader_env_has_no_vault_keys(site):
     assert "COPY_LEADER_FLOW_NEUTRALIZATION" not in kv
 
 
+def _make_leader_max_leverage(site, *, max_leverage: str, kind: str | None = None):
+    """把白名單裡的 _LEADER 加上 `max_leverage` 展示欄位（Task 5），選配 `kind`。"""
+    entry = {"address": _LEADER, "name": "Alpha", "max_leverage": max_leverage}
+    if kind is not None:
+        entry["kind"] = kind
+    site.leaders.write_text(json.dumps({"leaders": [entry]}))
+
+
+def test_standard_leader_with_max_leverage_field_gets_injected(site):
+    """⭐ Task 15b：standard leader 若在 leaders.json 標了 max_leverage，watcher
+    把它注入 COPY_MAX_TARGET_LEVERAGE——策略卡「槓桿 ≤ Nx」chip 成為引擎層事實，
+    不再只是展示用字串。"""
+    _make_leader_max_leverage(site, max_leverage="3")
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    kv = _env_kv(site)
+    assert kv["COPY_MAX_TARGET_LEVERAGE"] == "3"
+    assert "COPY_LEADER_FLOW_NEUTRALIZATION" not in kv  # 仍非 vault，不套流量中性化
+
+
+def test_leader_without_max_leverage_field_gets_no_injection(site):
+    """無 max_leverage 欄位（既有白名單條目，回歸驗證）→ 不注入，引擎沿用其
+    自身預設（0＝停用）。與 `test_standard_leader_env_has_no_vault_keys` 同一件
+    事，這裡從「欄位缺席」的角度重新斷言，區分「缺席」與「注入」兩條路徑。"""
+    site.leaders.write_text(json.dumps(
+        {"leaders": [{"address": _LEADER, "name": "Alpha"}]}))
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert "COPY_MAX_TARGET_LEVERAGE" not in _env_kv(site)
+
+
+def test_vault_leader_max_leverage_takes_the_stricter_of_the_two(site):
+    """⭐⭐ vault kind 既有 20x 帽語義不被覆蓋：leaders.json 的 max_leverage 與
+    vault 保護常數兩者**取較嚴者**。"""
+    # 較嚴的策略層設定（5 < 20）→ 收緊到 5。
+    _make_leader_max_leverage(site, max_leverage="5", kind="vault")
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    kv = _env_kv(site)
+    assert kv["COPY_MAX_TARGET_LEVERAGE"] == "5"
+    assert kv["COPY_LEADER_FLOW_NEUTRALIZATION"] == "true"
+
+
+def test_vault_leader_looser_max_leverage_does_not_widen_the_cap(site):
+    """較鬆的策略層設定（25 > 20）→ 仍收緊在 vault 保護的 20，不被放寬。"""
+    _make_leader_max_leverage(site, max_leverage="25", kind="vault")
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert _env_kv(site)["COPY_MAX_TARGET_LEVERAGE"] == "20"
+
+
 def test_template_containing_vault_key_fails_closed(site):
     """範本自帶 COPY_MAX_TARGET_LEVERAGE ＝ 與 vault 代入區塊重複定義的歧義
     → 整輪拒跑（沿 SPARK_* 重複定義的既有 fail-closed 語意）。"""

@@ -56,6 +56,7 @@ import logging
 import os
 import subprocess
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from scripts.filet_activate import activate, validate_pending_entry
@@ -179,14 +180,53 @@ def _risk_lines(risk_records: list[dict], account_id: str, user_address: str,
     return risk_env_lines(safe_fallback_prefs())
 
 
+def _resolve_leverage_cap(*, vault_leader: bool, max_leverage: str | None) -> str | None:
+    """算出要注入 `COPY_MAX_TARGET_LEVERAGE` 的值（字串）；`None` ＝不注入。
+
+    ⭐ Task 15b（主線程裁決 2026-08-28）：策略層展示欄位 `leaders.json` 的
+    `max_leverage`（Task 5 引入，原本純展示）現在也是引擎層事實的來源——四種組合：
+    - vault ＋ 有 max_leverage → **取較嚴者**（`min(20, max_leverage)`，不覆蓋
+      vault 保護語意——owner 選了更保守的上限就尊重它，絕不放寬，同
+      `vault_policy.apply_vault_policy` 的既有 min 語意）。
+    - vault ＋ 無 max_leverage → 沿用既有行為（20）。
+    - standard ＋ 有 max_leverage → 直接注入該值（**新行為**：standard leader
+      過去從不注入這個鍵，watcher 從不干涉一般錢包 leader 的槓桿）。
+    - standard ＋ 無 max_leverage → 不注入（既有行為，引擎沿用其自身預設 0＝停用）。
+
+    `max_leverage` 格式不合法（非數字字串，理論上不該發生——Task 5 的 loader 只驗
+    型別是字串，不驗數值）→ 視為未設，只 log，**不讓整輪 fail-closed**：這是
+    admin 維護的白名單資料，不是使用者輸入，用「新客戶全部卡在待啟用佇列」去擋
+    一個展示用欄位的手誤不成比例；漏注入的後果止於「chip 顯示的上限未被引擎強制」
+    ，比其餘 fail-closed 情境（範本殘留佔位符等）輕得多。
+    """
+    parsed = None
+    if max_leverage is not None:
+        try:
+            parsed = Decimal(max_leverage)
+        except InvalidOperation:
+            logger.warning("leaders.json max_leverage 格式不合法（%r），"
+                           "本次不注入 COPY_MAX_TARGET_LEVERAGE", max_leverage)
+            parsed = None
+    if vault_leader:
+        cap = VAULT_MAX_TARGET_LEVERAGE
+        if parsed is not None:
+            cap = min(cap, parsed)
+        return str(cap)
+    return str(parsed) if parsed is not None else None
+
+
 def _compose_env(template_path: Path, *, network: str, account_id: str,
                  user_address: str, builder: str,
                  risk_lines: list[str] | None = None,
-                 vault_leader: bool = False) -> str:
+                 vault_leader: bool = False,
+                 max_leverage: str | None = None) -> str:
     """範本＋watcher 代入的 per-follower 區塊。兩類錯誤整輪 fail-closed：
     - 殘留 REPLACE_WITH：部署者還沒完成安裝，用半成品設定開實盤是拿真錢冒險；
     - 範本自帶 SPARK_*：會與代入區塊重複定義，哪個生效取決於 EnvironmentFile
       的載入細節——歧義本身就是錯，直接拒收。
+
+    `max_leverage`：`leaders.json` 展示欄位（Task 5），Task 15b 起也決定
+    `COPY_MAX_TARGET_LEVERAGE` 的注入值（見 `_resolve_leverage_cap`）。
     """
     text = template_path.read_text()
     # ⭐ 只檢查**非註解行**（2026-07-30 實機部署踩到）：範本與部署者的註解本來就會
@@ -214,12 +254,21 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
     # 讓一顆引擎的風控姿態能從它自己的 env 一眼讀出來，不必回頭推敲當時的預設值。
     block += ("# 風控（錢包主人自選；未表達＝產品預設不啟用，見 filet/risk_prefs.py）\n"
               + "".join(f"{ln}\n" for ln in (risk_lines or risk_env_lines(None))))
+    cap = _resolve_leverage_cap(vault_leader=vault_leader, max_leverage=max_leverage)
     if vault_leader:
         # vault leader 保護（owner 裁決 2026-07-31）：槓桿上限值 import 自
-        # vault_policy 的單一常數（引擎每輪自衛用同一顆，不並存兩個 20）。
-        block += ("# vault leader 保護（kind=vault；常數同源 copytrade/vault_policy.py）\n"
-                  f"COPY_MAX_TARGET_LEVERAGE={VAULT_MAX_TARGET_LEVERAGE}\n"
+        # vault_policy 的單一常數（引擎每輪自衛用同一顆，不並存兩個 20）；
+        # Task 15b 起若該 leader 另有更嚴格的 max_leverage，取較嚴者（見
+        # `_resolve_leverage_cap`，`cap` 恆非 None——vault 分支保底 20）。
+        block += (f"# vault leader 保護（kind=vault；常數同源 copytrade/vault_policy.py"
+                  f"；取與策略層 max_leverage 較嚴者）\n"
+                  f"COPY_MAX_TARGET_LEVERAGE={cap}\n"
                   "COPY_LEADER_FLOW_NEUTRALIZATION=true\n")
+    elif cap is not None:
+        # ⭐ Task 15b：standard leader 若在 leaders.json 標了 max_leverage，一併
+        # 強制成引擎層事實（策略卡「槓桿 ≤ Nx」chip 不再只是展示）。
+        block += ("# 策略層強制槓桿帽（leaders.json max_leverage 同源；Task 15b）\n"
+                  f"COPY_MAX_TARGET_LEVERAGE={cap}\n")
     return text + block
 
 
@@ -330,6 +379,9 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
     # 由 filet-api 准入時自動偵測寫入，2026-07-31 第二批），這裡一視同仁。
     ref = find_leader(leader, leaders)
     vault_leader = ref is not None and ref.kind == "vault"
+    # Task 15b：策略層展示的槓桿上限（leaders.json 可選欄位），無論 leader kind
+    # 皆一併帶進 _compose_env——vault/standard 的取捨在 `_resolve_leverage_cap`。
+    max_leverage = ref.max_leverage if ref is not None else None
 
     # env 與 state 先就位（unit 起得來的前置條件），manifest 之後、pending 最後——
     # 每一步失敗時，前面的產物都讓下一輪可安全重入。
@@ -340,7 +392,8 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                                risk_lines=_risk_lines(
                                    risk_settings, account_id,
                                    entry["user_address"], notifier),
-                               vault_leader=vault_leader)
+                               vault_leader=vault_leader,
+                               max_leverage=max_leverage)
     _ensure_env_file(env_dir / f"{account_id}.env", env_content, owner, group)
     ensure_dir_secure(state_base / account_id, mode=STATE_DIR_MODE,
                       owner_ids=named_owner_ids(owner, group))
