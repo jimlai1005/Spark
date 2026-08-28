@@ -4,6 +4,16 @@
  * 最終任務再全 repo grep 雙保險。
  * 文案原則：非託管講清楚；不出現 固定收益/保證/存款/代操。
  */
+
+/**
+ * 語言切換鈕的原生語言名稱（「繁中」「EN」）——刻意**不**跟著 useCopy() 的當前語言
+ * 翻譯：這是「切到哪個語言」的鈕本身，不管畫面目前是中文還是英文，鈕的字樣永遠是
+ * 該語言的原生名稱。獨立於 COPY_ZH/COPY_EN 之外（不進 DeepString 鏡射結構、
+ * 不受 en 值零 CJK 的測試約束），單一來源仍在本檔，元件只 import 這個常數，
+ * 不在 Header.tsx 內嵌中文字面值。
+ */
+export const LANG_LABELS: Record<"zh" | "en", string> = { zh: "繁中", en: "EN" };
+
 export const COPY_ZH = {
   common: {
     appName: "FILET",
@@ -21,20 +31,70 @@ export const COPY_ZH = {
    * 導覽列文案（單一來源）。⭐ 這裡刻意收齊**全部** tab 的字面值——元件不得內嵌
    * 中文字面值，改文案只改這一處。
    *
-   * ⭐⭐ 2026-07-30 大幅減法：產品收斂成單一入口（綁定錢包 → 跟單），付費功能與
-   * 舊有的 資金配置／績效／方案／訂閱管理 四頁全部下架，`PUBLIC` 只剩三個 tab。
-   * 分組的意義是 **UX 可見性，不是授權**（紅線 3）：
-   *   - `PUBLIC`：任何人都看得到，頁面自己各有登入 guard。
-   *   - `ADMIN`：只有後端真的放行 /api/admin/pending 的人才顯示（見 hooks.useIsAdmin）。
-   * 藏起連結**不構成任何保護**——/ops 與 /admin 的每一支端點都掛著後端 `_require_admin`，
-   * 手打網址進來照樣吃 403 並顯示「此頁僅限管理員」。前端只負責不把死路擺在人眼前。
+   * ⭐⭐ 2026-08-28 導覽狀態機重寫（Task 7，顧問 P1）：未登入與已登入不再是同一份
+   * tab 清單加減，而是**兩組完全不同的頁籤**——未登入時「綁定錢包」「跟單」不
+   * 渲染，`nav.onboarding`／`nav.leaders`／`nav.login`（原「開始」自我連結）三個
+   * 舊 key 隨之刪除，改採：
+   *   - 未登入：策略／運作方式／安全性／文件 ＋ 單一 CTA「查看策略與風險」。
+   *   - 已登入：Dashboard／策略／設定／文件 ＋ 跟單狀態 pill ＋ 地址縮寫。
+   * `ADMIN` 分組沿用（後端真的放行 /api/admin/pending 才顯示，見 hooks.useIsAdmin）。
+   * 分組的意義是 **UX 可見性，不是授權**（紅線 3）：藏起連結**不構成任何保護**——
+   * /ops 與 /admin 的每一支端點都掛著後端 `_require_admin`，手打網址進來照樣吃
+   * 403 並顯示「此頁僅限管理員」。前端只負責不把死路擺在人眼前。
    */
   nav: {
-    login: "開始",
-    onboarding: "綁定錢包",
-    leaders: "跟單",
+    ariaLabel: "頁面切換",
+    strategies: "策略",
+    how: "運作方式",
+    security: "安全性",
+    docs: "文件",
+    dashboard: "Dashboard",
+    settings: "設定",
     ops: "營運",
     admin: "待核准",
+    cta: "查看策略與風險",
+    langToggleLabel: "語言切換",
+    /**
+     * 跟單狀態 pill（三態）。⭐ 2026-08-28：資料源尚未接上（Task 13 的
+     * `/api/me/dashboard` 摘要才有真實旗標）——`/api/me` 目前只有
+     * `{address, account_id}`，沒有跟單狀態欄位可推。Header 目前恆顯示
+     * `pillNotFollowing`，不得偽造成 `pillFollowing`（工程原則：讀不到 ≠ 安全態，
+     * 寧可顯示保守值也不要顯示一個沒有根據的綠燈）。
+     */
+    pillFollowing: "跟單中",
+    pillPaused: "已暫停",
+    pillNotFollowing: "未跟單",
+  },
+  /**
+   * Footer 文案（Task 7）。四欄＋系統狀態燈——資料來自 `/api/public/status`
+   * （見 lib/publicApi.ts），只讀一次不輪詢。法務欄連向 /terms /privacy /risk
+   * 三頁（Task 12 建立）與 contact@filet.trade；免責文字對照設計稿 §03 L412。
+   */
+  footer: {
+    brandTagline: "Hyperliquid 上的非保管策略執行。資金留在你的錢包，授權可隨時撤銷。",
+    statusOk: "系統運作正常",
+    statusDegraded: "系統部分功能異常",
+    statusUnknown: "狀態未知",
+    productTitle: "產品",
+    productStrategies: "策略",
+    productHow: "運作方式",
+    productFees: "費用",
+    productDocs: "文件",
+    verifiableTitle: "可驗證",
+    verifiableLeaderAccounts: "Leader 帳戶（鏈上）",
+    verifiableBuilderFee: "Builder code 費率",
+    verifiableMethodology: "績效方法論",
+    verifiableStatus: "系統狀態",
+    legalTitle: "法務與聯絡",
+    legalTerms: "服務條款",
+    legalPrivacy: "隱私政策",
+    legalRisk: "風險揭露",
+    legalContact: "contact@filet.trade",
+    disclaimer:
+      "跟單交易具有虧損風險，過往績效不代表未來結果，你可能損失全部投入資金。"
+      + "Filet 不提供投資建議，不保管用戶資產。所有簽署僅在你自己的錢包中完成；"
+      + "Filet 永遠不會索取私鑰或助記詞。",
+    copyright: "© 2026 Filet",
   },
   login: {
     // ⭐ 2026-07-30：單一入口產品敘事。eyebrow／heroTitle 是登入頁的論點；
@@ -915,11 +975,46 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     goOnboarding: "Go to onboarding",
   },
   nav: {
-    login: "Start",
-    onboarding: "Connect Wallet",
-    leaders: "Copy Trade",
+    ariaLabel: "Page navigation",
+    strategies: "Strategies",
+    how: "How it works",
+    security: "Security",
+    docs: "Docs",
+    dashboard: "Dashboard",
+    settings: "Settings",
     ops: "Ops",
     admin: "Pending",
+    cta: "View strategies & risks",
+    langToggleLabel: "Language",
+    pillFollowing: "Copying",
+    pillPaused: "Paused",
+    pillNotFollowing: "Not copying",
+  },
+  footer: {
+    brandTagline: "Non-custodial strategy execution on Hyperliquid. Your funds stay in your wallet; authorization can be revoked anytime.",
+    statusOk: "All systems operational",
+    statusDegraded: "Some systems degraded",
+    statusUnknown: "Status unknown",
+    productTitle: "Product",
+    productStrategies: "Strategies",
+    productHow: "How it works",
+    productFees: "Fees",
+    productDocs: "Docs",
+    verifiableTitle: "Verifiable",
+    verifiableLeaderAccounts: "Leader accounts (on-chain)",
+    verifiableBuilderFee: "Builder code fee rate",
+    verifiableMethodology: "Performance methodology",
+    verifiableStatus: "System status",
+    legalTitle: "Legal & contact",
+    legalTerms: "Terms of service",
+    legalPrivacy: "Privacy policy",
+    legalRisk: "Risk disclosure",
+    legalContact: "contact@filet.trade",
+    disclaimer:
+      "Copy trading carries risk of loss; past performance does not guarantee future results and you may lose your "
+      + "entire investment. Filet does not provide investment advice and does not custody user assets. All signing "
+      + "happens only in your own wallet; Filet will never ask for your private key or seed phrase.",
+    copyright: "© 2026 Filet",
   },
   login: {
     eyebrow: "FILET",

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { JetBrains_Mono, Noto_Sans_TC } from "next/font/google";
+import { Footer } from "@/components/Footer";
 import { Header } from "@/components/Header";
 import { Providers } from "./providers";
 import "@/styles/globals.css";
@@ -33,6 +34,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <Providers>
           <Header />
           {children}
+          <Footer />
         </Providers>
       </body>
     </html>
