@@ -71,6 +71,7 @@ import LeadersPage from "./leaders/page";
 import HomePage from "./page";
 import OnboardingPage from "./onboarding/page";
 import OpsPage from "./ops/page";
+import StrategiesPage from "./strategies/page";
 
 const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" };
 
@@ -136,6 +137,7 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/leaders", name: "跟單對象頁", el: () => <LeadersPage /> },
   { path: "/ops", name: "營運頁", el: () => <OpsPage /> },
   { path: "/admin", name: "待核准頁", el: () => <AdminPage /> },
+  { path: "/strategies", name: "策略列表頁", el: () => <StrategiesPage /> },
 ];
 
 /**
@@ -145,8 +147,11 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
  * 完整規格衝突）。這裡用顯式白名單把它們從「導覽涵蓋率」豁免，不是把測試改鬆
  * 讓錯誤靜默過關：白名單本身就是待辦清單，對應 task 完成時必須把該路由搬進
  * 上面的 ROUTES 並補上逐頁狀態測試，屆時本白名單應該清空。
+ *
+ * ⭐ Task 9：`/strategies` 頁面元件已建立並搬進上面的 ROUTES，白名單清掉這一筆。
+ * `/dashboard`／`/settings`／`/docs` 仍待 Task 13/14、16、12。
  */
-const PENDING_ROUTES = new Set(["/dashboard", "/strategies", "/settings", "/docs"]);
+const PENDING_ROUTES = new Set(["/dashboard", "/settings", "/docs"]);
 
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset();

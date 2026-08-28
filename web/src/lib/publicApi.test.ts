@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { getPublicStats, getPublicStatus, getPublicStrategies } from "./publicApi";
+import { getPublicStats, getPublicStatus, getPublicStrategies, getPublicStrategy } from "./publicApi";
 
 function mockFetchOnce(impl: () => Response | Promise<Response>) {
   vi.stubGlobal("fetch", vi.fn(impl));
@@ -88,6 +88,65 @@ describe("getPublicStrategies", () => {
     mockFetchOnce(() => jsonResponse({ strategies: "not-an-array" }));
     const r = await getPublicStrategies();
     expect(r.strategies).toEqual([]);
+  });
+});
+
+describe("getPublicStrategy", () => {
+  const DETAIL = {
+    slug: "core", name: "Filet Core", tagline: "多資產動能 · 永續合約", featured: true,
+    leader_address: "0xfeed000000000000000000000000000000f00d",
+    status: "running", listable: true, live_days: 72, follower_count: 3,
+    min_notional_usd: "500", max_leverage: "3",
+    metrics: {
+      total_return_pct: "20.35", total_return_pct_insufficient: false,
+      max_drawdown_pct: "-0.80", max_drawdown_pct_insufficient: false,
+      sharpe: "10.24", sharpe_insufficient: false,
+      sharpe_se: "3.36", sharpe_se_insufficient: false,
+      win_rate_pct: "64.86", win_rate_pct_insufficient: false,
+      annualized_vol_pct: "18.05", annualized_vol_pct_insufficient: false,
+      sortino: "43.42", sortino_insufficient: false,
+      best_day_pct: "3.01", best_day_pct_insufficient: false,
+      worst_day_pct: "-0.80", worst_day_pct_insufficient: false,
+      sample_count: 38,
+    },
+    equity_index: ["1", "1.01", "1.206"],
+    methodology: {
+      start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
+      sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
+      updated_at: 999,
+    },
+  };
+
+  it("原樣回傳策略詳情", async () => {
+    mockFetchOnce(() => jsonResponse(DETAIL));
+    const r = await getPublicStrategy("core");
+    expect(r).toEqual(DETAIL);
+  });
+
+  it("404 → null（呼叫端渲染空態，不偽造策略物件）", async () => {
+    mockFetchOnce(() => jsonResponse({ detail: "策略不存在" }, false));
+    const r = await getPublicStrategy("nope");
+    expect(r).toBeNull();
+  });
+
+  it("網路例外 → null", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("network down"); }));
+    const r = await getPublicStrategy("core");
+    expect(r).toBeNull();
+  });
+
+  it("回應缺 slug → null", async () => {
+    mockFetchOnce(() => jsonResponse({ name: "broken" }));
+    const r = await getPublicStrategy("core");
+    expect(r).toBeNull();
+  });
+
+  it("metrics／methodology 缺席 → 降級為空殼而非拋錯", async () => {
+    mockFetchOnce(() => jsonResponse({ slug: "core", name: "Filet Core" }));
+    const r = await getPublicStrategy("core");
+    expect(r?.metrics.sharpe_insufficient).toBe(true);
+    expect(r?.methodology.initial_deposit_usd).toBeNull();
+    expect(r?.equity_index).toEqual([]);
   });
 });
 

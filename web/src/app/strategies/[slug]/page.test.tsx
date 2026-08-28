@@ -1,0 +1,184 @@
+/**
+ * `/strategies/[slug]` — 策略詳情頁測試（Task 9）。
+ *
+ * 涵蓋：404 空態、insufficient 指標「樣本不足」、slider 未連錢包可互動、
+ * CTA 依登入狀態分流（未登入→connect+SIWE→帶參數導向；已登入→直接導向）、
+ * 回撤開關預設關＋關閉時查詢字串不帶 dd、listable:false 的 CTA disabled 態。
+ */
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { COPY_ZH as COPY } from "@/lib/copy";
+
+const push = vi.fn();
+let paramsSlug = "core";
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push }),
+  useParams: () => ({ slug: paramsSlug }),
+}));
+
+const connectAsync = vi.fn();
+const signMessageAsync = vi.fn();
+let accountState: { address?: string; chainId?: number; isConnected: boolean } = { isConnected: false };
+vi.mock("wagmi", () => ({
+  useAccount: () => accountState,
+  useConnect: () => ({ connectAsync, connectors: [{ id: "injected" }] }),
+  useSignMessage: () => ({ signMessageAsync }),
+}));
+
+const loginWithSiwe = vi.fn();
+vi.mock("@/lib/siwe", () => ({ loginWithSiwe: (...a: unknown[]) => loginWithSiwe(...a) }));
+
+const getMe = vi.fn();
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  getMe: (...a: unknown[]) => getMe(...a),
+}));
+
+import { ApiError } from "@/lib/api";
+import StrategyDetailPage from "./page";
+
+function jsonResponse(body: unknown, ok = true, status = 200): Response {
+  return { ok, status, json: async () => body } as Response;
+}
+
+function stubFetch(impl: () => Response) {
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(impl())));
+}
+
+function wrap(children: ReactNode) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+}
+
+const DETAIL = {
+  slug: "core", name: "Filet Core", tagline: "多資產動能 · 永續合約", featured: true,
+  leader_address: "0xfeed000000000000000000000000000000f00d",
+  status: "running", listable: true, live_days: 72, follower_count: 3,
+  min_notional_usd: "500", max_leverage: "3",
+  metrics: {
+    total_return_pct: "20.35", total_return_pct_insufficient: false,
+    max_drawdown_pct: "-0.80", max_drawdown_pct_insufficient: false,
+    sharpe: "10.24", sharpe_insufficient: false,
+    sharpe_se: "3.36", sharpe_se_insufficient: false,
+    win_rate_pct: "64.86", win_rate_pct_insufficient: false,
+    annualized_vol_pct: "18.05", annualized_vol_pct_insufficient: false,
+    sortino: "43.42", sortino_insufficient: false,
+    best_day_pct: "3.01", best_day_pct_insufficient: false,
+    worst_day_pct: "-0.80", worst_day_pct_insufficient: false,
+    sample_count: 38,
+  },
+  equity_index: Array.from({ length: 38 }, (_, i) => String(1 + i * 0.005)),
+  methodology: {
+    start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
+    sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
+    updated_at: 1756000000,
+  },
+};
+
+beforeEach(() => {
+  paramsSlug = "core";
+  push.mockReset();
+  connectAsync.mockReset();
+  signMessageAsync.mockReset();
+  loginWithSiwe.mockReset();
+  getMe.mockReset();
+  accountState = { isConnected: false };
+});
+
+describe("StrategyDetailPage", () => {
+  it("404 → 顯示空態與回列表連結", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({ detail: "策略不存在" }, false, 404));
+    render(wrap(<StrategyDetailPage />));
+    expect(await screen.findByText(COPY.strategyDetail.notFoundTitle)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: COPY.strategyDetail.backToList }))
+      .toHaveAttribute("href", "/strategies");
+  });
+
+  it("insufficient 指標 → 渲染「樣本不足」而非數字", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({
+      ...DETAIL,
+      metrics: { ...DETAIL.metrics, sharpe: null, sharpe_insufficient: true, sharpe_se: null, sharpe_se_insufficient: true },
+    }));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    expect(screen.getAllByText(COPY.strategyDetail.metrics.insufficientLabel).length).toBeGreaterThan(0);
+  });
+
+  it("slider 未連錢包（未登入）仍可互動", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    const scaleSlider = screen.getByLabelText(COPY.strategyDetail.panel.scaleLabel) as HTMLInputElement;
+    fireEvent.change(scaleSlider, { target: { value: "60" } });
+    expect(screen.getByText("60%")).toBeInTheDocument();
+  });
+
+  it("最大回撤開關預設關閉；關閉狀態下 CTA 導向的查詢字串不含 dd", async () => {
+    getMe.mockResolvedValue({ address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" });
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    const ddToggle = screen.getByLabelText(COPY.strategyDetail.panel.ddEnableLabel) as HTMLInputElement;
+    expect(ddToggle.checked).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
+    await waitFor(() => expect(push).toHaveBeenCalled());
+    const url = push.mock.calls[0][0] as string;
+    expect(url).toMatch(/^\/onboarding\?/);
+    expect(url).not.toMatch(/dd=/);
+    expect(url).toMatch(/scale=25/);
+  });
+
+  it("啟用回撤開關後，CTA 查詢字串帶 dd", async () => {
+    getMe.mockResolvedValue({ address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" });
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    fireEvent.click(screen.getByLabelText(COPY.strategyDetail.panel.ddEnableLabel));
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
+    await waitFor(() => expect(push).toHaveBeenCalled());
+    const url = push.mock.calls[0][0] as string;
+    expect(url).toMatch(/dd=\d+/);
+  });
+
+  it("未登入點 CTA → 觸發連接錢包＋SIWE 登入，成功後帶參數導向 /onboarding", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse(DETAIL));
+    connectAsync.mockResolvedValue({ accounts: ["0xabc"], chainId: 1 });
+    loginWithSiwe.mockResolvedValue({ address: "0xabc", account_id: "fabc" });
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
+    await waitFor(() => expect(loginWithSiwe).toHaveBeenCalled());
+    await waitFor(() => expect(push).toHaveBeenCalled());
+    const url = push.mock.calls[0][0] as string;
+    expect(url).toMatch(/^\/onboarding\?strategy=core/);
+  });
+
+  it("已登入點 CTA → 不觸發連線/簽署，直接帶參數導向", async () => {
+    getMe.mockResolvedValue({ address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" });
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
+    await waitFor(() => expect(push).toHaveBeenCalled());
+    expect(connectAsync).not.toHaveBeenCalled();
+    expect(loginWithSiwe).not.toHaveBeenCalled();
+  });
+
+  it("listable:false → CTA disabled＋「樣本累積中」，不出現可跟單按鈕", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({ ...DETAIL, listable: false }));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    expect(screen.queryByRole("button", { name: COPY.strategyDetail.panel.cta })).not.toBeInTheDocument();
+    const disabledBtn = screen.getByTestId("follow-panel-disabled");
+    expect(disabledBtn).toBeDisabled();
+    expect(screen.getByText(COPY.strategyDetail.panel.pendingNote)).toBeInTheDocument();
+  });
+});
