@@ -2,11 +2,12 @@
 FastAPI app factory。所有外部依賴（store / keysvc client / HL gateway / 時鐘）由
 create_app 注入——測試全離線。onboarding 端點一律綁 session 地址：account_id 由
 session 衍生，端點無 account 參數（紅線 3：別人不能替你 onboard 是結構保證）。"""
+import json
 import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 import httpx
@@ -24,7 +25,8 @@ from spark.filet.capital_settings import (CapitalSettingsError,
                                           verify_capital_settings,
                                           write_capital_settings)
 from spark.filet.capital_settings_apply import capital_fingerprint
-from spark.filet.followers import load_followers_tolerant
+from spark.filet.aggregate import collect_follower_summary
+from spark.filet.followers import FollowerRef, load_followers_tolerant
 from spark.filet.leader_change import (LeaderChangeError, build_leader_change_message,
                                        build_leader_change_record,
                                        load_leader_changes, verify_leader_change,
@@ -56,7 +58,8 @@ from spark.filet.leader_change_apply import LEDGER_RELPATH as LC_LEDGER_RELPATH
 from spark.filet.leader_change_apply import scan_unapplied_leader_changes
 from spark.publicapi.ops import ENGINE_STALE_S
 from spark.publicapi.ops import (accrued_window, accrued_window_note, customer_pnl,
-                                 follower_health, health_summary, jsonable,
+                                 follower_health, follower_trade_quality,
+                                 health_summary, jsonable,
                                  load_accrued_series, load_skipped_notional,
                                  revenue_reconciliation, skipped_path_for,
                                  subscription_drift, trade_quality_rows,
@@ -345,6 +348,368 @@ def _chain_activity(state) -> tuple[Decimal, int]:
         value = Decimal("0")
     positions = state.get("assetPositions")
     return value, (len(positions) if isinstance(positions, list) else 0)
+
+
+# ---------- /api/me/dashboard（Task 13：客戶儀表板唯一資料源）純函式層 ----------
+# ⭐ 全部模組層、不吃 create_app 的閉包，方便單元測試直接餵固定資料算錨例
+# （available_pct 等），也讓 `_safe_block` 能把任何一塊的例外獨立隔離。
+
+def _safe_block(label: str, fn, *args, **kwargs):
+    """每一塊獨立 nullable 的**單一實作**：子資料源丟例外 → 該塊回 None，端點
+    絕不因此 500（Task 13 規格：六塊各自獨立失敗，其餘照常）。"""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001 — 區塊級隔離是本函式存在的唯一理由
+        logger.warning("dashboard 區塊 %s 計算失敗: %r", label, e)
+        return None
+
+
+def _dashboard_account_snapshot(state: dict) -> dict | None:
+    """clearinghouseState 原始回應 → equity 摘要。**單一次呼叫**取出的四個欄位
+    （accountValue／totalMarginUsed／withdrawable／totalNtlPos）互為同源同基準
+    （工程原則 1；plan 不變量 2）——本函式不接受第二個資料來源做混算。
+    形狀不符 → None（讀不到 ≠ 危險態，不變量 7：顯示「—」，不觸發任何動作）。
+    """
+    if not isinstance(state, dict):
+        return None
+    ms = state.get("marginSummary")
+    if not isinstance(ms, dict):
+        return None
+    try:
+        return {
+            "account_value": Decimal(str(ms["accountValue"])),
+            "margin_used": Decimal(str(ms["totalMarginUsed"])),
+            "withdrawable": Decimal(str(state["withdrawable"])),
+            "total_ntl_pos": Decimal(str(ms["totalNtlPos"])),
+        }
+    except (KeyError, ValueError, ArithmeticError, TypeError):
+        return None
+
+
+def _available_pct(withdrawable: Decimal, margin_used: Decimal) -> Decimal | None:
+    """可用保證金（withdrawable）佔已用保證金（margin_used）之比；分母 ≤0 → None
+    （不得除零；沿全 repo「分母 0 → null」的既有慣例）。"""
+    if margin_used <= 0:
+        return None
+    return (withdrawable / margin_used).quantize(Decimal("0.0001"),
+                                                  rounding=ROUND_HALF_UP)
+
+
+def _dashboard_positions_raw(state: dict) -> list[dict] | None:
+    """assetPositions → 逐倉位摘要（Decimal 值）。
+
+    ⭐ `value`／`mark` 是**同一次** clearinghouseState 內既有欄位的代數推導，
+    不是新引入一個從未在本 repo 驗證過的欄位名（`positionValue`／`markPx`
+    全 repo 搜尋皆無出現——letter-to-future-sessions 的教訓：欄位名是假設，
+    不是事實，未經驗證的欄位名與未經驗證的公式同樣可疑）：
+    - `value = marginUsed × leverage`（HL 對 leverage 的定義即 notional/marginUsed，
+      兩個因子同出這一次回應，見 hyperliquid.py／leaderboard.py 對這兩個既有
+      欄位的用法）。
+    - `mark = entryPx + unrealizedPnl / szi`（HL 對 unrealizedPnl 的定義即
+      szi × (markPx − entryPx)，多空同一式，非近似）。
+    """
+    if not isinstance(state, dict):
+        return None
+    raw = state.get("assetPositions")
+    if not isinstance(raw, list):
+        return None
+    out: list[dict] = []
+    try:
+        for item in raw:
+            pos = item["position"]
+            szi = Decimal(str(pos["szi"]))
+            if szi == 0:
+                continue
+            entry_px_raw = pos["entryPx"]
+            entry_px = (Decimal(str(entry_px_raw)) if entry_px_raw is not None
+                       else Decimal("0"))
+            leverage = pos["leverage"]
+            lev_val = Decimal(str(leverage["value"]))
+            margin_used = Decimal(str(pos["marginUsed"]))
+            upnl = Decimal(str(pos["unrealizedPnl"]))
+            out.append({
+                "coin": pos["coin"],
+                "side": "long" if szi > 0 else "short",
+                "leverage": lev_val,
+                "margin_mode": ("cross" if leverage.get("type") == "cross"
+                               else "isolated"),
+                "value": margin_used * lev_val,
+                "upnl": upnl,
+                "entry": entry_px,
+                "mark": entry_px + (upnl / szi),
+            })
+    except (KeyError, ValueError, ArithmeticError, TypeError):
+        return None
+    return out
+
+
+def _dashboard_exposure(acct: dict, positions: list[dict] | None) -> dict:
+    """曝險摘要：`notional`／`leverage` 取自 acct（同一次 clearinghouseState，
+    工程原則 1）；多空占比與最大倉位需要逐倉位 `value`——`positions` 解析失敗
+    （None）時這幾格個別回 None，其餘照常（不因持倉明細壞掉而連坐帳戶級數字）。
+    """
+    av = acct["account_value"]
+    leverage = ((acct["total_ntl_pos"] / av).quantize(Decimal("0.01"),
+                                                       rounding=ROUND_HALF_UP)
+               if av > 0 else None)
+    long_pct = short_pct = max_position = None
+    if positions is not None:
+        total_value = sum((p["value"] for p in positions), Decimal("0"))
+        if total_value > 0:
+            long_value = sum((p["value"] for p in positions if p["side"] == "long"),
+                             Decimal("0"))
+            short_value = total_value - long_value
+            long_pct = (long_value / total_value * 100).quantize(
+                Decimal("0.1"), rounding=ROUND_HALF_UP)
+            short_pct = (short_value / total_value * 100).quantize(
+                Decimal("0.1"), rounding=ROUND_HALF_UP)
+            biggest = max(positions, key=lambda p: p["value"])
+            max_position = {
+                "symbol": biggest["coin"],
+                "pct": (biggest["value"] / total_value * 100).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP),
+            }
+    return {
+        "notional": acct["total_ntl_pos"], "leverage": leverage,
+        "long_pct": long_pct, "short_pct": short_pct,
+        "position_count": len(positions) if positions is not None else None,
+        "max_position": max_position,
+    }
+
+
+def _read_pause_flag(exchange_dir: str, user_address: str) -> tuple[bool | None, bool]:
+    """暫停旗標（Task 15 寫入，路徑 `FILET_EXCHANGE_DIR/<addr>/pause.json`；
+    本 task 只讀）。回傳 `(paused, unknown)`：
+    - 檔案不存在 → `(False, False)`（讀不到檔案視為未暫停，Task 13 規格明文）。
+    - 讀出來但格式不對／IO 失敗 → `(None, True)`——**不**比照引擎側 fail-safe
+      當成「視為暫停」（那是 Task 15 引擎動作側的方向，本端點只是顯示層）；
+      呼叫端改用別的訊號判定 `state`，並在 `signal_source_ok` 反映這裡讀不準。
+    """
+    p = Path(exchange_dir) / user_address / "pause.json"
+    if not p.exists():
+        return False, False
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError) as e:
+        logger.warning("dashboard: pause 旗標讀取失敗 address=%s: %r", user_address, e)
+        return None, True
+    if not isinstance(data, dict):
+        return None, True
+    return bool(data.get("paused")), False
+
+
+def _dashboard_guards(hb: "HeartbeatRead", mine, acct: dict | None,
+                      leaders_path: str) -> dict:
+    """設定 vs 目前三條護欄。**max** 全部取自各自的權威來源（心跳＝引擎實際套用值、
+    leaders.json＝策略層強制槓桿帽），**now** 取自同一次 clearinghouseState（acct）。
+
+    ⭐⭐ `drawdown.now` 刻意恆為 `None`：唯一可信的「目前回撤」基準是引擎自己的
+    7 天滾動高水位樣本（`copytrade.equity`），只活在引擎狀態根，filet-api 讀不到。
+    改用這裡能拿到的 30D 窗權益指數自算「現在的回撤」，是拿另一個 basis 冒充它
+    ——與 equity 事故 #2/#4/#5 同一種陷阱（比較的兩側必須同源同基準）。寧可顯示
+    「—」，不自組一個看起來像對的數字（plan 不變量 7）。
+    """
+    scale_max = lev_max = dd_max = dd_enabled = None
+    if hb.fresh:
+        data = hb.data or {}
+        cap = data.get("capital") or {}
+        if cap.get("source") in ("customer_signed", "env_default"):
+            util = cap.get("capital_utilization")
+            if util is not None:
+                try:
+                    scale_max = Decimal(str(util))
+                except (ValueError, ArithmeticError):
+                    scale_max = None
+        risk = data.get("risk") or {}
+        if risk.get("source") in ("customer_signed", "env_default"):
+            dd_enabled = risk.get("controls_enabled")
+            mdd = (risk.get("prefs") or {}).get("max_drawdown_pct")
+            if mdd is not None:
+                try:
+                    dd_max = -Decimal(str(mdd))
+                except (ValueError, ArithmeticError):
+                    dd_max = None
+    if mine is not None and mine.leader_address:
+        try:
+            entry = next((r for r in load_leaders(leaders_path)
+                         if r.address == mine.leader_address), None)
+        except ValueError:
+            entry = None
+        if entry is not None and entry.max_leverage is not None:
+            try:
+                lev_max = Decimal(entry.max_leverage)
+            except (ValueError, ArithmeticError):
+                lev_max = None
+    now_scale = now_lev = None
+    if acct is not None and acct["account_value"] > 0:
+        now_scale = (acct["margin_used"] / acct["account_value"]).quantize(
+            Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        now_lev = (acct["total_ntl_pos"] / acct["account_value"]).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return {
+        "scale": {"now": now_scale, "max": scale_max},
+        "leverage": {"now": now_lev, "max": lev_max},
+        "drawdown": {"now": None, "max": dd_max, "enabled": dd_enabled},
+    }
+
+
+def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
+                      leaders_path: str, exchange_dir: str) -> dict:
+    """狀態塊：state 四態＋護欄。`mine is None`（未活化）→ `inactive`，其餘全
+    null——沒有引擎在追蹤這個帳號，任何跟單相關的數字都無從談起。"""
+    if mine is None:
+        return {
+            "strategy_name": None, "state": "inactive", "following_days": None,
+            "signal_source_ok": None,
+            "guards": {"scale": {"now": None, "max": None},
+                      "leverage": {"now": None, "max": None},
+                      "drawdown": {"now": None, "max": None, "enabled": None}},
+        }
+    strategy_name = None
+    if mine.leader_address:
+        try:
+            strategy_name = next((r.name for r in load_leaders(leaders_path)
+                                  if r.address == mine.leader_address), None)
+        except ValueError:
+            logger.error("dashboard: leader 白名單載入失敗（僅影響顯示名稱） %s",
+                        leaders_path)
+    tripped = (hb.data or {}).get("killswitch_tripped") if hb.fresh else None
+    paused, pause_unknown = _read_pause_flag(exchange_dir, mine.user_address)
+    if tripped is True:
+        state = "halted"
+    elif paused is True:
+        state = "paused"
+    else:
+        state = "following"
+    last_cycle_ok = ((hb.data or {}).get("last_cycle") or {}).get("result") == "ok"
+    return {
+        "strategy_name": strategy_name, "state": state, "following_days": None,
+        "signal_source_ok": bool(hb.fresh and not pause_unknown and last_cycle_ok),
+        "guards": _dashboard_guards(hb, mine, acct, leaders_path),
+    }
+
+
+def _dashboard_sync(ref: FollowerRef, hl, mine, now_s: float) -> dict:
+    """同步誤差塊：過濾自 `follower_trade_quality`——與 `/api/ops/trade-quality`
+    完全**同一個純函式**，只餵這個帳號自己（不變量 4 的同型：不得跨客戶）。
+    窗口固定近 24 小時，對應 `missed_signals_24h` 命名的語意窗。
+
+    latency_p95_ms／unsynced_positions／scale_deviation_pct／missed_signals_24h／
+    missed_reason／last_recon_ts：`compute_trade_quality`／`TradeQuality` 未產出
+    這些量（全 repo 搜尋確認），沒有既有來源 → 維持 `None`，不新造公式。
+    """
+    end = datetime.fromtimestamp(now_s, timezone.utc)
+    start = end - timedelta(hours=24)
+    leader_fills = None
+    if mine is not None and mine.leader_address:
+        try:
+            leader_fills = hl.get_user_fills(mine.leader_address, start, end)
+        except Exception as e:  # noqa: BLE001 — leader 查詢失敗只讓 TE 未知
+                                # （沿 ops_trade_quality 的既有隔離慣例）
+            logger.warning("dashboard sync: leader 成交查詢失敗 account=%s: %r",
+                          ref.account_id, e)
+    row = follower_trade_quality(ref, hl, start, end, leader_fills=leader_fills,
+                                 skipped_notional=None, skipped_ratio_comparable=False)
+    latency_median_ms = None
+    delay_s = row.get("median_delay_s")
+    if delay_s is not None:
+        latency_median_ms = int((delay_s * 1000).to_integral_value())
+    return {
+        "latency_median_ms": latency_median_ms, "latency_p95_ms": None,
+        "price_diff_bp": row.get("taker_slippage_bp_median"),
+        "unsynced_positions": None, "scale_deviation_pct": None,
+        "missed_signals_24h": None, "missed_reason": None, "last_recon_ts": None,
+    }
+
+
+def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float) -> dict:
+    """本月路由量與費用：與 `/api/ops/revenue`／`customer_pnl` 同一個函式
+    （`collect_follower_summary`），只過濾到這個帳號自己（同源同函式，不各自
+    複製公式）。`daily_bars`：逐日重呼同一函式取當日 builder_fee，某日失敗
+    只跳過那一根 bar，不連坐整月彙總（本函式的失敗——`summary.error`——才連坐
+    整塊，由呼叫端的 `_safe_block` 統一處理）。
+    """
+    now_dt = datetime.fromtimestamp(now_s, timezone.utc)
+    month_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
+    summary = collect_follower_summary(ref, hl, month_start, now_dt)
+    if summary.error is not None:
+        raise RuntimeError(summary.error)
+    fill_count, routed_volume, builder_fees = (
+        summary.fills, summary.notional, summary.builder_fee)
+    avg_fee = ((builder_fees / fill_count).quantize(Decimal("0.01"),
+                                                     rounding=ROUND_HALF_UP)
+              if fill_count > 0 else None)
+    effective_rate_bps = (((builder_fees / routed_volume) * 10000).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP) if routed_volume > 0 else None)
+    daily_bars = []
+    day = month_start
+    while day.date() <= now_dt.date():
+        day_end = min(day + timedelta(days=1), now_dt)
+        day_summary = collect_follower_summary(ref, hl, day, day_end)
+        if day_summary.error is None:
+            daily_bars.append([day.date().isoformat(), day_summary.builder_fee])
+        day += timedelta(days=1)
+    return {
+        "routed_volume": routed_volume, "builder_fees": builder_fees,
+        "fill_count": fill_count, "avg_fee": avg_fee,
+        "effective_rate_bps": effective_rate_bps, "daily_bars": daily_bars,
+    }
+
+
+def _dashboard_pnl_and_return(ref: FollowerRef, hl, positions: list[dict] | None
+                              ) -> tuple[dict, "Decimal | None"]:
+    """淨 PnL 區塊 ＋ 30D 報酬（equity 塊用）。**同一個 `portfolio()` 回應**餵出
+    兩邊，不重複打點（Task 13 規格：30D 報酬與 PnL series 走同一條 leader_perf
+    管線、餵 follower 位址）。
+
+    ⭐ `net`／`fees_paid`／`fee_share_of_pnl_pct` 三者同窗口（perpMonth 的
+    `[first_ts_ms, last_ts_ms]`）：dollar PnL 出自 HL `pnlHistory`（`cum_pnl`），
+    fee 出自**同窗口**的 `collect_follower_summary`（與 billing／ops 同一個函式），
+    `net = cum_pnl − fees_paid`。`realized` 是本函式對「已實現」唯一的近似
+    （`cum_pnl − 目前未實現快照`，兩者理論上共同構成 cum_pnl；快照與窗口終點的
+    幾分鐘落差是已知誤差來源，已在回報中說明）。`closed_positions`：無既有
+    來源，維持 None（不新造公式）。
+    """
+    rows = hl.portfolio(ref.user_address)
+    series = None
+    window = extract_window(rows, "perpMonth")
+    if window is not None:
+        av, _pnl = window
+        series = [[ts, v] for ts, v in av]
+
+    perf = compute_window_performance(rows, "perpMonth")
+    net = realized = fees_paid = fee_share = win_rate = mdd = None
+    ret_30d = None
+    unrealized = (sum((p["upnl"] for p in positions), Decimal("0"))
+                 if positions is not None else None)
+    if perf.get("status") == "ok":
+        cum_pnl = perf["cum_pnl"]
+        ret_30d = (perf["twr"] * 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        mdd = (-(perf["max_drawdown"] * 100)).quantize(Decimal("0.01"),
+                                                        rounding=ROUND_HALF_UP)
+        if "win_rate" in perf:
+            win_rate = (perf["win_rate"] * 100).quantize(Decimal("0.01"),
+                                                          rounding=ROUND_HALF_UP)
+        if unrealized is not None:
+            realized = cum_pnl - unrealized
+        start = datetime.fromtimestamp(perf["first_ts_ms"] / 1000, timezone.utc)
+        end = datetime.fromtimestamp(perf["last_ts_ms"] / 1000, timezone.utc)
+        summary = collect_follower_summary(ref, hl, start, end)
+        if summary.error is None:
+            fees_paid = summary.builder_fee
+            net = cum_pnl - fees_paid
+            denom = abs(net + fees_paid)
+            if denom != 0:
+                fee_share = ((fees_paid / denom) * 100).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    pnl_block = {
+        "net": net, "realized": realized, "unrealized": unrealized,
+        "fees_paid": fees_paid, "fee_share_of_pnl_pct": fee_share,
+        "win_rate_pct": win_rate, "closed_positions": None,
+        "max_drawdown_pct": mdd, "series": series,
+    }
+    return pnl_block, ret_30d
 
 
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
@@ -2168,6 +2533,75 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                               "⚠️ 若熔斷的原因是你的 leader 被撤銷，這份簽章**不會**"
                               "解除它（那需要你先選一個新的 leader）。",
         }
+
+    @app.get("/api/me/dashboard")
+    def me_dashboard(address: str = Depends(_require_session)):
+        """使用者 Dashboard 六塊 ＋ 持倉的**唯一資料源**（Task 13）。每一塊獨立
+        nullable：子資料源丟例外只讓對應塊回 `None`，端點本身絕不 500。
+
+        equity basis＝`accountValue`（同一次 clearinghouseState 內的
+        accountValue/totalMarginUsed/withdrawable/totalNtlPos 互為同源，工程原則
+        1；不變量 2）；PnL／30D 報酬走 follower 自己的 `portfolio()` 管線（同
+        leader_perf，Task 13 規格明文授權「同管線餵 follower 位址」）；同步誤差
+        過濾自 `/api/ops/trade-quality` 的同一個純函式，只餵這個帳號自己。找不到
+        既有來源的欄位一律 `null`，不新造公式（不變量 6）。只回登入 session 自己
+        的資料：`account_id`／`ref.user_address` 全部由 session 衍生，結構上沒有
+        任何 account 參數（沿 `/api/me/leader`／`/api/me/capital` 的既有慣例）。
+        """
+        account_id = derive_account_id(address)
+        now_s = now_fn()
+        mine, _manifest_degraded = _load_own_follower(account_id)
+        hb = _read_heartbeat(account_id, now_s)
+        ref = FollowerRef(account_id=account_id, user_address=address,
+                          builder_address=cfg.builder_address, network=cfg.network)
+
+        state_raw = _safe_block("account_state", hl.clearinghouse_state, address)
+        acct = _dashboard_account_snapshot(state_raw) if state_raw is not None else None
+        positions = (_dashboard_positions_raw(state_raw)
+                    if state_raw is not None else None)
+
+        equity_block = None
+        if acct is not None:
+            equity_block = {
+                "account_value": acct["account_value"],
+                "margin_used": acct["margin_used"],
+                "withdrawable": acct["withdrawable"],
+                "available_pct": _available_pct(acct["withdrawable"],
+                                                acct["margin_used"]),
+                "ret_30d_pct": None,
+            }
+        exposure_block = (_dashboard_exposure(acct, positions)
+                          if acct is not None else None)
+        positions_block = None
+        if positions is not None:
+            positions_block = [
+                {"symbol": p["coin"], "side": p["side"], "leverage": p["leverage"],
+                 "margin_mode": p["margin_mode"], "value": p["value"],
+                 "upnl": p["upnl"], "entry": p["entry"], "mark": p["mark"],
+                 "deviation_pct": None}
+                for p in positions
+            ]
+
+        pnl_and_ret = _safe_block("pnl", _dashboard_pnl_and_return, ref, hl,
+                                  positions)
+        pnl_block = None
+        if pnl_and_ret is not None:
+            pnl_block, ret_30d = pnl_and_ret
+            if equity_block is not None:
+                equity_block["ret_30d_pct"] = ret_30d
+
+        status_block = _safe_block("status", _dashboard_status, mine, hb, acct,
+                                   cfg.leaders_path, cfg.exchange_dir)
+        sync_block = _safe_block("sync", _dashboard_sync, ref, hl, mine, now_s)
+        fees_month_block = _safe_block("fees_month", _dashboard_fees_month,
+                                       ref, hl, now_s)
+
+        return jsonable({
+            "status": status_block, "equity": equity_block,
+            "exposure": exposure_block, "pnl": pnl_block, "sync": sync_block,
+            "fees_month": fees_month_block, "positions": positions_block,
+            "updated_at": int(now_s),
+        })
 
     @app.get("/api/admin/pending")
     def admin_pending(admin: str = Depends(_require_admin)):
