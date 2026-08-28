@@ -411,6 +411,11 @@ mean=0.0083333、s=0.0125831、SR=**12.6526**、SE=**12.1798**、σ_ann=**0.2404
 
 **驗收：** `npm test` 全綠。
 
+> **主線程裁決（2026-08-28，Task 14 期間）**：語言紅線禁詞「保證」改為「保證(?!金)」式比對
+> （copy.test.ts 與 redline.test.ts 兩處同步）——「保證金」為 margin 的標準中文，設計稿 §06
+> 權威文案必用；禁詞意圖是擋承諾語（保證收益／保證獲利），此修正屬移除假陽性而非放寬紅線，
+> 承諾語仍全數被擋。測試註解需寫明此例外的理由與殘餘風險（「保證金額」類片語會漏接，靠 review 把關）。
+
 ### Task 15 @inline：Kill switch（暫停／平倉並撤銷）⚠️ 引擎敏感
 
 **Files:** 改 `src/spark/publicapi/app.py`；改 copytrade 引擎主循環（實作時先讀 `src/spark/copytrade/` 找每輪入口與既有受控收尾/風控 halt 機制）；新 `tests/test_kill_switch.py`；改 `web/src/app/dashboard/page.tsx` 接上按鈕；改 `deploy/RUNBOOK.md`（新增運維說明一節）。
