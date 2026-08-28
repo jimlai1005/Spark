@@ -38,6 +38,17 @@ tests/test_filet_user_leaders.py::test_deleting_the_curated_entry_falls_back_to_
 呼叫端不該自己記得該看哪個旗標，所以本模組**不提供**籠統的 `is_allowed`，
 只提供兩個把用途寫在名字裡的述詞：`is_selectable`（選擇時）與
 `is_still_permitted`（引擎持續驗證時）。
+
+⭐ 展示欄位＝白名單內可選欄位，清單外仍拒載（2026-08-28，Task 5 策略平台改版）
+----------------------------------------------------------------------
+新增 `slug`／`tagline`／`featured`／`min_notional_usd`／`max_leverage` 五個**可選**
+欄位供 `/api/public/strategies*` 投影用（見 `filet/strategies.py`）。這是本檔第一次
+需要「允許新欄位、但不能放鬆 fail-fast」：新增可選欄位的同時，本模組**新增**了
+「entry 的鍵集合必須是已知欄位的子集」這條檢查（先前沒有——任何未列舉的鍵會被
+`.get()` 靜默略過）。理由：這份檔案是資安邊界，展示欄位的拼字錯誤
+（`sulg`／`min_notinal_usd`）過去會被靜默吃掉，客戶端永遠拿不到那個值卻沒有任何
+錯誤訊息；現在會在載入時就拒載整份白名單，逼操作者發現拼字錯誤，而不是事後納悶
+「為什麼這個策略卡沒有 tagline」。
 """
 import json
 from dataclasses import dataclass
@@ -58,6 +69,25 @@ class LeaderRef:
     enabled: bool = True
     accepting_new: bool = True
     kind: str = "standard"  # "standard" 或 "vault"（Wave 1 2026-07-31）
+    # ── 策略平台展示欄位（全部可選，2026-08-28 Task 5）──────────────────────
+    slug: str | None = None          # URL id；缺席時 filet.strategies 回退用 address
+    tagline: str = ""                # 一行文案（如「多資產動能 · 永續合約」）
+    featured: bool = False           # 首頁主推 badge
+    min_notional_usd: str | None = None  # 展示用門檻（字串，內部一律 Decimal 的邊界）
+    max_leverage: str | None = None      # 展示用槓桿上限（字串，同上）
+
+
+# entry 的合法鍵集合（單一來源；load_leaders 的未知欄位檢查與本檔頭「白名單內可選
+# 欄位」的宣告都指這一個常數，不重抄一份字串——見檔頭「展示欄位」段）。
+# ⭐ `source`／`added_by` 不是精選白名單自己的欄位，是 `user_leaders.py` 的
+# registry 專屬欄位——但 `load_user_leaders` **直接呼叫本函式**解析 registry 檔
+# （「基礎欄位的形狀驗證與正規化沿用單一定義，不重抄」，見該模組 docstring），
+# 所以這兩個鍵必須留在允許集合裡，否則本次改版會讓每一份 user registry 檔
+# 一律拒載（`_validate_registry_fields` 是載入之後才跑的第二輪檢查，救不了
+# 已經在這裡被拒絕的請求）。
+_ENTRY_ALLOWED_KEYS = {"address", "name", "description", "enabled", "accepting_new",
+                      "kind", "slug", "tagline", "featured", "min_notional_usd",
+                      "max_leverage", "source", "added_by"}
 
 
 def load_leaders(path: str | Path) -> list[LeaderRef]:
@@ -96,9 +126,17 @@ def load_leaders(path: str | Path) -> list[LeaderRef]:
         raise ValueError(f"leader 白名單的 leaders 須為陣列: {p}")
     leaders: list[LeaderRef] = []
     seen: set[str] = set()
+    seen_slugs: set[str] = set()
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ValueError(f"leaders[{i}] 須為物件: {entry!r}")
+        # ⭐ 未知欄位一律拒載（見檔頭「展示欄位＝白名單內可選欄位」）：拼字錯誤的
+        # 展示欄位過去會被 `.get()` 靜默略過，現在載入當下就大聲炸。
+        unknown = set(entry) - _ENTRY_ALLOWED_KEYS
+        if unknown:
+            raise ValueError(
+                f"leaders[{i}] 含未知欄位（可能是拼字錯誤，允許的欄位見 "
+                f"_ENTRY_ALLOWED_KEYS）: {sorted(unknown)}")
         addr = normalize_hex_address(f"leaders[{i}].address", entry.get("address", ""))
         if addr in seen:
             # 重複條目 = 兩筆可能矛盾的 enabled 狀態（一筆下架一筆啟用），
@@ -123,8 +161,32 @@ def load_leaders(path: str | Path) -> list[LeaderRef]:
         if not isinstance(kind, str) or kind not in {"standard", "vault"}:
             raise ValueError(
                 f"leaders[{i}].kind 須為 'standard' 或 'vault': {kind!r}")
+        slug = entry.get("slug")
+        if slug is not None:
+            if not isinstance(slug, str) or not slug.strip():
+                raise ValueError(f"leaders[{i}].slug 須為非空字串或省略: {slug!r}")
+            if slug in seen_slugs:
+                # 同 address 重複的理由：兩個策略共用一個 URL id，其中一個永遠
+                # 打不到（/api/public/strategies/{slug} 只會回第一個命中的）。
+                raise ValueError(f"leaders[{i}] slug 重複: {slug!r}")
+            seen_slugs.add(slug)
+        tagline = entry.get("tagline", "")
+        if not isinstance(tagline, str):
+            raise ValueError(f"leaders[{i}].tagline 須為字串: {tagline!r}")
+        featured = entry.get("featured", False)
+        if not isinstance(featured, bool):
+            raise ValueError(f"leaders[{i}].featured 須為布林: {featured!r}")
+        min_notional_usd = entry.get("min_notional_usd")
+        if min_notional_usd is not None and not isinstance(min_notional_usd, str):
+            raise ValueError(
+                f"leaders[{i}].min_notional_usd 須為字串或省略: {min_notional_usd!r}")
+        max_leverage = entry.get("max_leverage")
+        if max_leverage is not None and not isinstance(max_leverage, str):
+            raise ValueError(
+                f"leaders[{i}].max_leverage 須為字串或省略: {max_leverage!r}")
         seen.add(addr)
-        leaders.append(LeaderRef(addr, name, description, enabled, accepting_new, kind))
+        leaders.append(LeaderRef(addr, name, description, enabled, accepting_new, kind,
+                                 slug, tagline, featured, min_notional_usd, max_leverage))
     return leaders
 
 

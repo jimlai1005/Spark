@@ -30,9 +30,12 @@ from spark.filet.leader_change import (LeaderChangeError, build_leader_change_me
                                        load_leader_changes, verify_leader_change,
                                        write_leader_change)
 from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
-                                     MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE)
+                                     MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE,
+                                     compute_window_performance, extract_window)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
+from spark.filet.strategies import (build_equity_index, build_methodology,
+                                    build_strategy_view)
 from spark.filet.user_leaders import load_user_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
@@ -853,6 +856,131 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                "**不會**有 `annualized_return` 這個欄位。",
             },
         }
+
+    # ---------- /api/public/strategies*（策略平台，2026-08-28 改版 Task 5）----------
+    # ⭐ 無需登入、無 cookie 副作用（不變量 0.3.5）：首頁／策略頁在客戶連錢包之前
+    # 就要能渲染。上游（HL portfolio）走 60s in-process cache——這是公開端點，
+    # 流量放大到交易所的風險與 /api/leaders/preview 同型，但這裡連 session 探測面
+    # rate limit 都沒有（真的不需要登入），快取是唯一的節流手段。
+    _strategy_portfolio_cache: dict[str, tuple[float, list]] = {}
+    _strategy_portfolio_lock = threading.Lock()
+    STRATEGY_PORTFOLIO_CACHE_TTL_S = 60.0
+
+    def _cached_strategy_portfolio(address: str) -> list | None:
+        """`hl.portfolio()` 的 60s 快取。上游任何失敗（transient 或 schema 漂移）
+        → `None`，**不快取失敗**（下次請求照樣重試，不必等 TTL 過期）——呼叫端
+        把它降級成該策略的 perf 缺席，不得讓一個 leader 的上游故障拖垮整份清單
+        （沿 /api/leaders 目錄「個別 leader 統計為 null」的既有降級精神）。
+        """
+        now = now_fn()
+        with _strategy_portfolio_lock:
+            cached = _strategy_portfolio_cache.get(address)
+        if cached is not None and now - cached[0] < STRATEGY_PORTFOLIO_CACHE_TTL_S:
+            return cached[1]
+        try:
+            rows = hl.portfolio(address)
+        except Exception as e:  # noqa: BLE001 — 公開端點：上游任何失敗都不得 500
+            logger.error("策略績效上游查詢失敗 leader=%s: %s", address, e)
+            return None
+        with _strategy_portfolio_lock:
+            _strategy_portfolio_cache[address] = (now, rows)
+        return rows
+
+    def _strategy_perf_for(address: str) -> dict | None:
+        """位址 → `perpAllTime` 窗的績效（策略卡固定只用這一窗：首頁/詳情頁要的
+        是「這個策略整體值不值得跟」，不是逐窗比較）。上游或計算失敗 → None，
+        `strategies.build_strategy_view` 對 None 的處理＝該策略全部指標 insufficient。
+        """
+        rows = _cached_strategy_portfolio(address)
+        if rows is None:
+            return None
+        try:
+            return compute_window_performance(rows, "perpAllTime")
+        except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整份清單
+            logger.error("策略績效計算失敗 leader=%s: %s", address, e)
+            return None
+
+    def _strategy_follower_counts() -> dict[str, int] | None:
+        """位址（小寫）→ 目前 active 跟隨的 follower 數。
+
+        「active」＝ followers manifest 條目**明確指定**該位址為 `leader_address`
+        （不含落回引擎預設 `COPY_LEADER_ADDRESS` 的隱含跟隨——manifest 本身看不出
+        那份對應關係，見 `filet/followers.py` 的 `leader_address` 語意；`me_leader`
+        端點的 `engine_default` 狀態就是這個缺口的既有先例）。
+
+        manifest 讀不到／JSON 壞掉 → `None`（**全域**降級：呼叫端把每個策略的
+        `follower_count` 一起設為 null，不得因為一個聚合失敗就讓整份策略清單
+        500——不變量 4 只禁止外流 follower 個資，沒禁止在聚合失敗時誠實說「不知道」）。
+        """
+        try:
+            refs, _errors = load_followers_tolerant(cfg.followers_path)
+        except (OSError, ValueError) as e:
+            logger.error("follower 聚合失敗（策略 follower_count 全數降級為 null）"
+                         " %s: %s", cfg.followers_path, e)
+            return None
+        counts: dict[str, int] = {}
+        for r in refs:
+            if r.leader_address:
+                counts[r.leader_address] = counts.get(r.leader_address, 0) + 1
+        return counts
+
+    def _public_strategy_entries() -> list[LeaderRef]:
+        """精選白名單中 `enabled=True` 的條目（`enabled=False` 的安全撤銷條目
+        連 slug／address 都不得外流，沿 `_leader_public` 的既有理由）。"""
+        return [r for r in _load_leaders_or_503() if r.enabled]
+
+    @app.get("/api/public/strategies")
+    def public_strategies_list():
+        """策略平台首頁／列表頁餵資料的公開端點。無需登入。
+
+        `listable=False` 的條目（樣本未滿 60 天，或 `accepting_new=False`）**仍然
+        出現**在清單裡——前端據 `listable` 畫「樣本累積中／未開放跟單」的 disabled
+        態，不是用這個端點過濾（見 plan §0.2）。只有 `enabled=False` 的安全撤銷
+        條目才整筆不出現。
+        """
+        counts = _strategy_follower_counts()
+        strategies = []
+        for entry in _public_strategy_entries():
+            perf = _strategy_perf_for(entry.address)
+            view = build_strategy_view(entry, perf)
+            # ⭐ 缺鍵＝「這個 leader 目前沒有任何 active follower」，不是「不知道」
+            # ——聚合成功時一律回真正的整數（`.get(addr, 0)`），只有 counts 整體
+            # 為 None（資料源不可用）才回 null。用 `.get(addr)` 少寫預設值會把
+            # 兩種完全不同的處境（0 個／不知道）疊成同一個 None（工程原則 1）。
+            view["follower_count"] = (counts.get(entry.address, 0)
+                                      if counts is not None else None)
+            strategies.append(view)
+        return {"strategies": strategies, "updated_at": int(now_fn())}
+
+    @app.get("/api/public/strategies/{slug}")
+    def public_strategy_detail(slug: str):
+        """策略詳情頁。`slug` 比對 `entry.slug`，缺 slug 的條目回退比對完整位址
+        （沿 `strategies.build_strategy_view` 的同一個回退規則）。
+
+        404：slug 不存在，或條目 `enabled=False`（安全撤銷——不得讓客戶用舊連結
+        繞過「連 address 都不外流」的既有政策）。
+        """
+        entry = next((r for r in _public_strategy_entries()
+                     if (r.slug or r.address) == slug), None)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="策略不存在")
+        perf = _strategy_perf_for(entry.address)
+        view = build_strategy_view(entry, perf)
+        counts = _strategy_follower_counts()
+        view["follower_count"] = (counts.get(entry.address, 0)
+                                  if counts is not None else None)
+        view["equity_index"] = build_equity_index(perf)
+        initial_deposit_usd = None
+        rows = _cached_strategy_portfolio(entry.address)
+        if rows is not None:
+            window = extract_window(rows, "perpAllTime")
+            if window is not None:
+                av, _pnl = window
+                if av:
+                    initial_deposit_usd = av[0][1]
+        view["methodology"] = build_methodology(
+            perf, initial_deposit_usd=initial_deposit_usd, updated_at=int(now_fn()))
+        return view
 
     # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce
     # 空間，見 leaders_select 的 _consume）——刻意不另開一套機具：兩套一次性表格

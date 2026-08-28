@@ -28,8 +28,15 @@
     "  `uv run python -m scripts.vault_preflight <addr>` 六項全 PASS（RUNBOOK §5.5",
     "  「vault leader 上架前置檢查」）；拼錯值 → loader fail-fast 拒載整檔（保護，非 bug）。",
     "",
-    "格式為 fail-fast：JSON 壞掉／欄位型別錯／位址重複 → 引擎與 activate CLI 都會停，",
-    "不會降級成空清單放行。改完務必用 `python -m json.tool` 驗一次再存。",
+    "策略平台展示欄位（全部可省略，2026-08-28 改版）：slug（URL id，缺省時前端用完整",
+    "  位址當 id）／tagline（策略卡一行文案）／featured（首頁主推 badge，bool）／",
+    "  min_notional_usd／max_leverage（展示用字串，不影響引擎實際下單邏輯）。",
+    "  這五個是**白名單內可選欄位**——不在這份清單、也不在 address/name/description/",
+    "  enabled/accepting_new/kind 之內的鍵一律拒載整檔（防拼字錯誤，見",
+    "  spark/filet/leaders.py 檔頭「展示欄位」段）。",
+    "",
+    "格式為 fail-fast：JSON 壞掉／欄位型別錯／位址重複／未知欄位 → 引擎與 activate",
+    "CLI 都會停，不會降級成空清單放行。改完務必用 `python -m json.tool` 驗一次再存。",
     "本 _comment 欄位會被 loader 忽略（只讀 leaders 陣列），但正式檔建議刪掉保持乾淨。"
   ],
   "leaders": [
@@ -38,7 +45,12 @@
       "name": "Alpha Trend",
       "description": "範例：中頻趨勢跟隨。正常營運中，開放新客戶。",
       "enabled": true,
-      "accepting_new": true
+      "accepting_new": true,
+      "slug": "alpha-trend",
+      "tagline": "多資產動能 · 永續合約",
+      "featured": true,
+      "min_notional_usd": "500",
+      "max_leverage": "3"
     },
     {
       "address": "0x2222222222222222222222222222222222222222",
