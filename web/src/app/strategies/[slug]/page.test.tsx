@@ -97,6 +97,14 @@ describe("StrategyDetailPage", () => {
       .toHaveAttribute("href", "/strategies");
   });
 
+  it("Task 17：策略載入後 document.title 更新為 `{name}｜Filet`", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<StrategyDetailPage />));
+    await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+    expect(document.title).toBe("Filet Core｜Filet");
+  });
+
   it("insufficient 指標 → 渲染「樣本不足」而非數字", async () => {
     getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
     stubFetch(() => jsonResponse({

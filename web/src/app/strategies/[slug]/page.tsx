@@ -124,6 +124,13 @@ export default function StrategyDetailPage() {
     };
   }, [slug]);
 
+  // Task 17（SEO）：動態 slug 頁沒有 SSR metadata（client component 不能
+  // export generateMetadata），策略載入後在 client 端補上 `%s｜Filet` 標題；
+  // 載入中／404 維持 `strategies/layout.tsx` 給的預設標題，不覆蓋成空字串。
+  useEffect(() => {
+    if (strategy) document.title = `${strategy.name}｜Filet`;
+  }, [strategy]);
+
   const me = useMe();
   const loggedIn = !!me.data;
   const { address, chainId, isConnected } = useAccount();
