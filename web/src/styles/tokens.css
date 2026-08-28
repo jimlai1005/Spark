@@ -1,29 +1,56 @@
-/* Filet design tokens — v2 深海軍藍定案
-   來源：docs/superpowers/design/2026-07-17-m2-dashboard-prototype-v2.html :root
-   （--banner-h 為原型示意條專屬，不抽）。 */
+/* Filet design tokens — v3 深色改版
+   來源：docs/superpowers/specs/2026-08-28-redesign-design.html
+   §07 交付規格 L861-905（palette／字級／圓角／間距）＋ 資料段 tokens L986-998。
+   沿用既有 CSS 變數命名（--bg/--text/--primary/…），值換成新 palette；
+   缺的變數（--inset、字級/圓角/間距 tokens）新增，不動既有頁面的 class 結構。 */
 :root {
   color-scheme: dark;
-  --bg:#07111F;            --bg-rgb:7,17,31;
-  --surface:#0E1B2A;       --surface-rgb:14,27,42;
-  --card:#142334;          --card-rgb:20,35,52;
-  --card-hover:#1A2C40;    --card-hover-rgb:26,44,64;
-  --primary:#19D3AE;       --primary-rgb:25,211,174;
-  --secondary:#528BFF;     --secondary-rgb:82,139,255;
-  --accent:#8B7CFF;        --accent-rgb:139,124,255;
-  --text:#F3F7FA;          --text-rgb:243,247,250;
-  --text-dim:#91A2B5;      --text-dim-rgb:145,162,181;
-  --pos:#2DD4A7;           --pos-rgb:45,212,167;
-  --neg:#FF647C;           --neg-rgb:255,100,124;
-  --warn:#F5B942;          --warn-rgb:245,185,66;
-  --info:#58A6FF;          --info-rgb:88,166,255;
-  --pending:#A78BFA;       --pending-rgb:167,139,250;
-  --brand-gradient: linear-gradient(135deg,#16D6A3 0%,#4C8DFF 55%,#8B5CF6 100%);
 
-  --radius: 10px;
-  --border: #26384A;
+  /* ---- palette（設計稿 07 tokens）---- */
+  --bg:#07080a;             --bg-rgb:7,8,10;                 /* 頁底 / canvas */
+  --surface:#0e1013;        --surface-rgb:14,16,19;          /* 區塊底 / section */
+  --card:#101317;           --card-rgb:16,19,23;             /* 卡片底 / card */
+  --card-hover:#161a1f;     --card-hover-rgb:22,26,31;       /* 卡片 hover（設計稿未列，取比 card 略亮） */
+  --inset:#0a0c0e;          --inset-rgb:10,12,14;             /* 內層底 / inset（新） */
+  --primary:#46d6b3;        --primary-rgb:70,214,179;        /* 主色 accent */
+  --secondary:#528BFF;      --secondary-rgb:82,139,255;
+  --accent:#8B7CFF;         --accent-rgb:139,124,255;
+  --text:#e9ecef;           --text-rgb:233,236,239;          /* 主文字 */
+  --text-dim:#868f99;       --text-dim-rgb:134,143,153;      /* 次文字 */
+  --pos:#3ecf8e;            --pos-rgb:62,207,142;             /* 獲利 / positive */
+  --neg:#f2666b;            --neg-rgb:242,102,107;            /* 風險 / negative */
+  --warn:#e9b872;           --warn-rgb:233,184,114;           /* 警示 / warning */
+  --info:#58A6FF;           --info-rgb:88,166,255;
+  --pending:#A78BFA;        --pending-rgb:167,139,250;
+  --brand-gradient: linear-gradient(135deg,#46d6b3 0%,#3ecf8e 100%);
+
+  --border: #232830;
   --border-strong: rgba(var(--text-rgb), .22);
 
-  --font-display: "Avenir Next", "Futura", "PingFang TC", sans-serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
-  --font-body: -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+  /* ---- 圓角（設計稿：卡 14 / 內層 10 / 按鈕 9 / 標籤 5）---- */
+  --radius: 10px;               /* 沿用既有泛用圓角（既有 .panel/.card 類共用，不動舊頁視覺） */
+  --radius-card: 14px;
+  --radius-inset: 10px;
+  --radius-btn: 9px;
+  --radius-pill: 5px;
+
+  /* ---- 字級階（52/34/30/22/17/15/13/11）---- */
+  --fs-display: 52px;
+  --fs-h1: 34px;
+  --fs-h2: 30px;
+  --fs-h3: 22px;
+  --fs-body-lg: 17px;
+  --fs-body: 15px;
+  --fs-small: 13px;
+  --fs-micro: 11px;
+
+  /* ---- 間距（卡間 12px、頁邊 44px）---- */
+  --gap-card: 12px;
+  --gutter-page: 44px;
+
+  /* ---- 字體：next/font/google 注入的 CSS 變數（見 app/layout.tsx），
+     未注入時（例如純樣式預覽）退回系統字堆。介面＝Noto Sans TC，數字＝JetBrains Mono。 ---- */
+  --font-display: var(--font-noto-sans-tc), "PingFang TC", "Noto Sans TC", sans-serif;
+  --font-body: var(--font-noto-sans-tc), -apple-system, "PingFang TC", "Noto Sans TC", sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, "SF Mono", Menlo, monospace;
 }

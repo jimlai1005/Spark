@@ -24,6 +24,29 @@ table { border-collapse: collapse; width: 100%; }
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .nowrap { white-space: nowrap; }
 
+/* ---------- 改版 utility（tokens.css §07 交付規格）---------- */
+/* 層級靠 border + 底色，不用陰影：.card 疊 .inset 就是「卡片內再一層」。 */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: none;
+}
+
+.inset {
+  background: var(--inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-inset);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-micro);
+  letter-spacing: .04em;
+}
+
 .visually-hidden {
   position: absolute; width: 1px; height: 1px;
   padding: 0; margin: -1px; overflow: hidden;
