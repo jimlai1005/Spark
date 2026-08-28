@@ -72,6 +72,7 @@ import { ApiError } from "@/lib/api";
 import { COPY_ZH as COPY } from "@/lib/copy";
 import { Header } from "@/components/Header";
 import AdminPage from "./admin/page";
+import AdvancedPage from "./advanced/page";
 import LeadersPage from "./leaders/page";
 import HomePage from "./page";
 import OnboardingPage from "./onboarding/page";
@@ -132,14 +133,16 @@ function assertReadable(container: HTMLElement) {
 /**
  * 導覽列點得到的路由 → 本檔受測的頁面元件。新增路由必須同步加進來。
  *
- * ⭐ /onboarding、/leaders 頁面元件本身未變（Task 10/11 才會改），只是 Task 7
- * 的新導覽不再把它們掛在 nav 上——保留在本表是為了維持這兩頁既有的逐頁狀態
- * 覆蓋，不是漏改。
+ * ⭐ /onboarding 頁面元件本身未變（Task 10 已完成），只是 Task 7 的新導覽不再把它
+ * 掛在 nav 上——保留在本表是為了維持這頁既有的逐頁狀態覆蓋，不是漏改。
+ * ⭐ Task 11：`/leaders` 改為純 redirect（見 `../leaders/page.test.tsx` 專屬測試），
+ * 功能遷移至 `/advanced`，本表新增一筆。
  */
 const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/", name: "首頁", el: () => <HomePage /> },
   { path: "/onboarding", name: "開通頁", el: () => <OnboardingPage /> },
-  { path: "/leaders", name: "跟單對象頁", el: () => <LeadersPage /> },
+  { path: "/leaders", name: "跟單對象頁（舊路由，redirect）", el: () => <LeadersPage /> },
+  { path: "/advanced", name: "進階模式頁", el: () => <AdvancedPage /> },
   { path: "/ops", name: "營運頁", el: () => <OpsPage /> },
   { path: "/admin", name: "待核准頁", el: () => <AdminPage /> },
   { path: "/strategies", name: "策略列表頁", el: () => <StrategiesPage /> },
@@ -195,21 +198,25 @@ describe("逐頁狀態｜未登入", () => {
     });
   }
 
-  it("需要登入的客戶頁一律給「尚未登入」提示，不是空白", async () => {
-    // ⭐ Task 10：/onboarding 不再是這個模式——未登入直接 redirect /strategies
-    // （NOTE 10，不再有站內提示＋返回按鈕），改在下一個 it 裡單獨驗證。
-    for (const r of ROUTES.filter((x) => ["/leaders"].includes(x.path))) {
-      const { unmount } = render(wrap(r.el(), null));
-      expect(await screen.findByText(COPY.common.notLoggedIn),
-             `${r.path} 應顯示尚未登入提示`).toBeInTheDocument();
-      unmount();
-    }
-  });
-
   it("⭐ Task 10／NOTE 10：/onboarding 未登入 → redirect /strategies（不留白畫面、不留返回按鈕）", async () => {
     render(wrap(<OnboardingPage />, null));
     await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/strategies"));
   });
+
+  it("⭐ Task 11：/leaders 舊路由未登入照樣 redirect /advanced（功能已遷移，見該頁專屬測試）",
+    async () => {
+      render(wrap(<LeadersPage />, null));
+      await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/advanced"));
+    });
+
+  it("⭐ Task 11：/advanced 未登入 → 顯示說明＋登入 CTA，不 redirect（進階用戶的直達入口）",
+    async () => {
+      render(wrap(<AdvancedPage />, null));
+      expect(await screen.findByText(COPY.advanced.notLoggedIn.title)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: COPY.advanced.notLoggedIn.cta }))
+        .toBeInTheDocument();
+      expect(routerPush).not.toHaveBeenCalled();
+    });
 
   it("管理端頁未登入 → 顯示提示（後端 401；前端不自行判斷授權）", async () => {
     const { unmount } = render(wrap(<OpsPage />, null));
@@ -237,12 +244,15 @@ describe("逐頁狀態｜已登入但未活化（沒有 follower）", () => {
     });
   }
 
-  it("⭐ /leaders 未活化 → 明說尚未開通並指路，同時仍看得到 leader 清單", async () => {
+  it("⭐ Task 11：/leaders 舊路由已登入未活化照樣 redirect /advanced", async () => {
     render(wrap(<LeadersPage />, ME));
-    expect(await screen.findByText(COPY.common.notActivated)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: COPY.common.goOnboarding }))
-      .toHaveAttribute("href", "/onboarding");
-    // 誠信不變式不受影響：地址輸入入口照樣呈現，未活化不等於白畫面。
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/advanced"));
+  });
+
+  it("⭐ Task 11：/advanced 已登入未活化 → 地址輸入入口照樣呈現，不是白畫面", async () => {
+    render(wrap(<AdvancedPage />, ME));
+    expect(await screen.findByText(COPY.advanced.gate.title)).toBeInTheDocument();
+    // 未活化不等於白畫面：輸入框存在（不依賴 /api/onboard/status），只是待勾選聲明後才可用。
     expect(screen.getByLabelText(/leader 錢包位址/)).toBeInTheDocument();
   });
 

@@ -664,187 +664,53 @@ export const COPY_ZH = {
    * 2. 跟單者的實際結果**低於**貼上的這個地址的表現（延遲、滑價、資金規模差異）——
    *    這句話必須貼著送出按鈕，不是頁尾小字。
    */
-  leaders: {
-    eyebrow: "跟單",
-    title: "貼上地址，跟上交易",
-    subtitle: "貼上任一 Hyperliquid 錢包位址，通過准入檢查即可跟單。",
+  /**
+   * `/advanced` — 進階模式（Task 11，設計稿 §03 進階模式卡＋NOTE 05；自舊版
+   * `/leaders` 遷移，該路由現改為單純 redirect）。
+   *
+   * ⭐⭐ 與舊版 `/leaders` 最大的行為差異：選定位址後**不在本頁簽章**，而是
+   * `router.push` 帶 `advanced:0x…` 進 `/onboarding`——真正的「選定 leader＋
+   * 伺服器簽文」流程已在 Task 10 統一到 onboarding step 4（`StepConfirm`，
+   * 原樣沿用 `runLeaderSelectFlow`／`postLeaderSelect`，結構未改）。因此舊版
+   * 「目前跟隨的 leader」面板與風控設定區塊**不在本頁**——前者本 plan 未指定
+   * 新去處（既有落地缺口，未列入 Task 11 範圍）；後者已明確搬到 Task 16
+   * `/settings`（沿用 onboarding step3 元件）。本頁保留的四項既有功能：
+   * 地址輸入、准入檢查、鏈上預覽（含績效欄位）、以及選定動作本身
+   * （只是動作內容從「簽章」變成「導向開通流程」）。
+   */
+  advanced: {
+    eyebrow: "進階模式",
+    title: "進階模式：貼上任一位址跟單",
+    subtitle: "跳過精選清單，直接對任一 Hyperliquid 錢包位址開始跟單設定。",
     // ⭐ 安全揭露：與 wizard 開通頁的同義句（COPY.wizard.fundsWarning）各自成立、
-    // 互不取代。
-    // ⚠️ 2026-07-31 更新：出入金自動校正上線——「轉出被視為虧損」的舊敘述刪除，
-    // 改為說明轉出對跟單規模的即時影響（那是正確行為，不是誤判）。
+    // 互不取代（沿舊版 /leaders 原樣保留，copy.test.ts 語言紅線測試釘住這條）。
     fundsWarning:
       "提醒：跟單期間出入金會自動校正回撤基準，不會被視為虧損；但轉出資金會即時"
       + "等比縮小跟單倉位。大額調整前建議先停止跟單。",
-    /**
-     * ⭐ 風控 opt-in（2026-07-30，錢包主人自選）。預設**不啟用**任何風控。
-     *
-     * ⚠️ 文案紅線：不得把「啟用風控」講成「保證不會虧」。回撤熔斷是在跌幅達到你設的
-     * 門檻時**停止跟單並平倉**，它限制的是繼續跟下去的曝險，不是保證你的本金安全；
-     * 觸發時通常已經實現了那筆虧損。把它寫成保障，客戶會據此放大本金。
-     *
-     * ⚠️ 數字（上下界、預設值）一律來自後端 `specs`，這裡不寫死任何一個——
-     * 引擎的合法區間定義在 src/spark/filet/risk_prefs.py。
-     */
-    risk: {
-      title: "風控設定",
-      subtitle:
-        "預設不啟用任何風控——系統只按 leader 的動作跟單，不會替你停損或熔斷。"
-        + "每個門檻都由你自己決定：我們把建議值標在旁邊，最終要設多少是你的選擇。",
-      // ⭐ 時序：設定隨時可改（每一次改動都要你簽一次名），引擎下一輪套用。
-      applyNote:
-        "每一次調整都會請你在錢包簽署一則訊息，送出後引擎會在下一輪（約一分鐘內）套用。",
-      /**
-       * ⭐ tracking 組：**不受風控開關影響**，永遠生效。獨立成一區、畫在啟用
-       * checkbox 之外——藏在 checkbox 底下會讓關掉風控的客戶以為自己也關掉了它。
-       */
-      trackingTitle: "跟單精度",
-      trackingSubtitle:
-        "這一項與風控開關無關，無論你有沒有啟用風控都會生效。",
-      enableLabel: "啟用 Filet 風控系統",
-      // ⚠️ 措辭受語言紅線約束（copy.test.ts 的禁詞掃描：固定收益／保證／存款／代操）
-      // ——連「不是保證本金安全」這種否定句也不能寫，因為掃描是子字串比對。
-      // 這裡改用「不會讓本金免於虧損」表達同一件事。
-      enableHelp:
-        "開啟後：權益回撤達到你設定的門檻時，系統會停止跟單（並依你的選擇平倉）。"
-        + "這限制的是「繼續跟下去」的曝險——觸發時該筆虧損通常已經發生，"
-        + "並不會讓本金免於虧損。關閉時系統完全不介入，僅純粹跟單。",
-      detailsTitle: "風控細項",
-      percentSuffix: "%",
-      hoursSuffix: "小時",
-      /** 每個參數旁邊都要出現：客戶自訂門檻的前提是看得到我們的建議。 */
-      recommendedLabel: "建議",
-      /** 布林參數的建議值要用人話講（`true` 對客戶不是資訊）。 */
-      boolOn: "開啟",
-      boolOff: "關閉",
-      saveButton: "簽署並儲存風控設定",
-      saving: "等待錢包簽署…",
-      saved: "風控設定已送出。",
-      loadError: "風控設定暫時讀不到（不影響你選 leader）。請稍後重新載入本頁。",
-      saveError: "風控設定儲存失敗",
-      signNote:
-        "接下來會請你在錢包簽署一則訊息（不上鏈、不花費 gas）。"
-        + "Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
-      /** 簽章流程的失敗分類（沿本頁 errors 的寫法：每一條都要說「現在的狀態」）。 */
-      errors: {
-        walletRejected: "你在錢包取消了簽署，風控設定沒有被變更。",
-        signerMismatch:
-          "簽署的錢包與你登入的錢包不是同一個，設定沒有被送出。"
-          + "請切換回登入的錢包後再試一次。",
-        contentMismatch:
-          "伺服器回傳的待簽內容與你在畫面上設定的不一致，已為你中止，"
-          + "沒有送出任何簽署。請不要重試，並回報這個狀況給我們。",
-        messageFailed: "無法取得待簽內容，風控設定沒有被變更。請稍後再試一次。",
-        submitFailed:
-          "送出失敗，風控設定沒有被變更。上一筆簽署已作廢，請重新操作一次。",
-      },
-      /**
-       * ⭐ 「已提交」vs「已生效」。⚠️ `applied` 為 null ＝引擎心跳讀不到＝**我們不
-       * 知道**——文案必須說「暫時無法確認」，不得說「尚未生效」（那是一句我們沒有
-       * 根據的斷言）。
-       */
-      applied: {
-        pending: "已提交，尚未生效（引擎約一分鐘內套用）。",
-        inSync: "目前生效中的設定與你提交的一致。",
-        unknown: "目前生效的設定暫時無法確認（引擎狀態讀不到）。",
-        notSubmitted: "你尚未提交過風控設定；畫面上顯示的是系統預設值。",
-        sourceLabel: "來源",
-        changedAtLabel: "生效時間",
-      },
-      /**
-       * ⭐ 熔斷區塊。⚠️ 兩個方向都要照著寫：
-       * - `halted` 為 null ＝讀不到，**不是**「沒有熔斷」——把讀不到畫成一切正常，
-       *   等於在客戶已經停止跟單的當下告訴他照常運作。
-       * - `reason === "leader_revoked"` 是我方的治理動作，客戶**不能**自助解除，
-       *   所以那一種不給按鈕，改給說明。
-       */
-      halted: {
-        title: "你的跟單已被風控停止",
-        body:
-          "風控門檻被觸發，引擎已停止繼續跟單。觸發時那筆虧損通常已經發生——"
-          + "停止的是「繼續跟下去」的曝險。",
-        reasonLabel: "觸發原因",
-        trippedAtLabel: "觸發時間",
-        cooldownLabel: "冷靜期",
-        resumeAtLabel: "預計自動恢復",
-        noAutoResume:
-          "沒有預計的自動恢復時間（冷靜期設為 0，或目前算不出來）——"
-          + "要恢復跟單請按下方按鈕。",
-        unknownValue: "（讀不到）",
-        resumeButton: "立即恢復跟單",
-        resuming: "等待錢包簽署…",
-        resumed: "已送出恢復請求，引擎會在下一輪恢復跟單。",
-        residualNote:
-        "⚠️ 熔斷當下有部位未能平倉或掛單未撤，那些部位仍留在市場上。"
-        + "恢復跟單後，引擎會在下一輪把它們往 leader 的目標收斂。",
-      resumeNote:
-          "恢復後引擎會在下一輪重新依 leader 建立部位。權益基準已在熔斷當下重置，"
-          + "所以不會因為熔斷前的那段跌幅立刻再停一次。",
-        /** 治理性熔斷：客戶不得自助解除，且必須說清楚為什麼沒有按鈕。 */
-        leaderRevokedNote:
-          "這次停止是因為你跟隨的 leader 已被我們下架，不是你的風控門檻被觸發。"
-          + "這一種無法自助恢復——請改為選擇另一位 leader。",
-        unknown: "目前無法確認你的風控是否被觸發（引擎狀態讀不到）。",
-      },
+    /** ⭐ NOTE 05：頁首顯著聲明，勾選前地址輸入框 disabled（見 page.tsx gate）。 */
+    gate: {
+      title: "在你開始之前",
+      body:
+        "進階模式下，Filet 不對此位址的策略品質、風控或存續做任何背書——"
+        + "你貼上的位址未經平台額外審核，是否值得跟隨由你自行判斷。",
+      checkboxLabel: "我理解 Filet 不對此地址的策略品質、風控或存續做任何背書。",
+    },
+    /** 未登入：顯示說明＋登入 CTA，不 redirect（進階用戶的直達入口）。 */
+    notLoggedIn: {
+      title: "請先登入以繼續",
+      body: "進階模式需要先連接錢包並登入，才能查詢位址與繼續開通流程。",
+      cta: "連接錢包並登入",
+      connecting: "連接中…",
+      signing: "請在錢包中簽署登入訊息…",
     },
     // ⭐ 誠信要求：必須貼著送出按鈕出現。
     upperBound:
       "跟單者的實際結果會低於 leader 的數字：進出場延遲、滑價與資金規模差異會持續侵蝕"
       + "跟單結果。leader 的數字是上界，不是你的期望值。跟單有虧損風險。",
     /**
-     * ⭐ 「我目前跟誰」（/api/me/leader）。本頁要客戶簽署一份**換掉**現有 leader 的
-     * 授權，所以「現在跟的是誰」是這個決定的左半邊——缺了它，客戶是在不知道現況的
-     * 情況下被要求簽署變更。
-     *
-     * ⚠️ 這一區的錯誤方向不對稱，文案必須照著寫：
-     * - 讀不到（503、網路）＝「暫時讀不到」，**不是**「你沒在跟單」。後者是一句我們
-     *   沒有根據的斷言，會讓一個正在跟單的客戶以為資金沒在動而不去看它。
-     * - `engine_default`＝**已經在跟單**，只是對象由部署決定；與 `not_activated`
-     *   （還沒啟用）是完全不同的處境，兩者的文案不得互相代用。
-     * 狀態的**內文**一律用後端 note 原文（單一來源）；本檔只提供標題與欄位標籤。
-     */
-    current: {
-      title: "你目前跟隨的 leader",
-      loading: "讀取你目前的跟隨狀態…",
-      leaderLabel: "目前跟隨",
-      failedTitle: "目前無法讀取你目前的跟隨狀態",
-      failedNote:
-        "這次查詢失敗只影響本區塊的顯示：它不會改變你的跟單設定，也不代表你沒有在跟單。"
-        + "本頁其餘功能不受影響；請重新整理本頁再試一次。",
-      /** 沒有 leader 位址可顯示的三種狀態各有一個標題；內文用後端 note 原文。 */
-      noneTitles: {
-        engine_default: "你已啟用跟單，但尚未指定 leader",
-        not_activated: "你的帳號尚未啟用跟單",
-        indeterminate: "目前無法確認你的跟隨狀態",
-      },
-      /** 後端回了預期外的狀態碼時的標題——原樣顯示狀態碼，不猜它是哪一種。 */
-      noneTitleFallback: "目前沒有可顯示的跟隨對象",
-      statusLabel: "狀態碼",
-      pendingTitle: "有一筆已簽署、尚未生效的換 leader",
-      pendingLabel: "將換到",
-      pendingIssuedAtLabel: "簽署時間",
-    },
-    // ⭐ 誠信要求 6：確認對話框必須寫明成本與生效時機。
-    confirmTitle: "確認要換到這位 leader？",
-    confirmLeaderLabel: "要換到的 leader",
-    confirmCost:
-      "換 leader 有真實成本：生效時引擎會把你的部位收斂到新 leader——平掉目前的部位、"
-      + "依新 leader 開新部位。這是真實成交，會產生實際的交易成本（taker 費用與滑價）。",
-    confirmTiming:
-      "不是立即生效：授權記錄下來後，於引擎的下一個 cycle 生效。引擎在套用前會自己"
-      + "重新驗證你的簽章與白名單，驗證不過就不會套用。",
-    confirmSignNote:
-      "接下來會請你在錢包簽署一則訊息（不上鏈、不花費 gas）。"
-      + "Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
-    confirmOk: "確認並簽署",
-    confirmCancel: "取消",
-    signing: "請在錢包中簽署…",
-    submitting: "送出中…",
-    doneTitle: "已授權，於引擎的下一個 cycle 生效",
-    /**
-     * 位址輸入區。⭐ 這是本頁**唯一**的跟單入口（原「自訂 leader」；2026-07-27 spec
-     * 的准入預覽流程原樣適用，沒有精選卡片可對照）。三件事是硬性的：
-     * 1. 「平台不背書」講在送出之前——專屬聲明 checkbox 是送出的前置閘門
-     *    （仿 wizard AML attestation 的純前端閘門），未勾不得進確認框。
+     * 位址輸入區。⭐ 這是本頁**唯一**的入口（原「自訂 leader」；2026-07-27 spec
+     * 的准入預覽流程原樣適用）。三件事是硬性的：
+     * 1. 「平台不背書」講在查詢之前——上方 gate checkbox 是輸入框的前置閘門。
      * 2. 預覽卡明說那是「查詢當下的鏈上切面」，用途是確認沒貼錯位址——不是推薦。
      * 3. 准入被拒的文案按後端 reason 分類碼對應（機器碼分流，不對人話字串比對），
      *    每句都講清楚使用者現在能做什麼，不洩內部治理細節。
@@ -897,7 +763,9 @@ export const COPY_ZH = {
         + "由於你是透過位址輸入框操作，以下聲明仍需勾選。",
       // ⭐ 專屬風險聲明：未勾選不得送出（純前端閘門，仿 wizard AML attestation）。
       attestation: "我了解此為未審核 leader，風險自負。",
-      select: "跟單此地址",
+      // ⭐ Task 11：本頁不再現場簽章——按下後導向 /onboarding 帶 advanced:0x… 參數，
+      // 真正的選定簽章在 onboarding step 4 完成（見本檔 advanced 檔頭）。
+      select: "前往開通",
       /** 准入拒絕文案，按後端 reason 分類碼對應（app.py `_admission_reject`）。 */
       reasons: {
         invalid_format: "位址格式不正確：須為 0x 開頭＋40 個十六進位字元。",
@@ -934,38 +802,6 @@ export const COPY_ZH = {
        * 正在授權的對象講得比實際更陌生。
        */
       entryName: "未審核 leader",
-    },
-    errors: {
-      messageFailed: "取得待簽原文失敗，你的 leader 沒有被變更。請稍後再試一次。",
-      walletRejected: "你在錢包中取消了簽署。這筆授權沒有送出，你的跟單設定沒有任何變動。",
-      signerMismatch:
-        "簽名帳號與登入帳號不符——請在錢包中切回登入時使用的帳號後重試。這筆簽名不會被送出。",
-      // ⭐ 這不是一般的失敗，是「伺服器要你授權的對象，跟你點的那個不是同一個」。
-      // 文案的工作是讓使用者**停手並回報**，不是讓他再按一次：能發生這件事就代表
-      // 後端或連線可能已遭竄改，重試只會讓他再看到同一份被動過的授權請求。
-      // 因此刻意不寫「請稍後再試」「請重新整理」這類會誘導重試的句子。
-      leaderMismatch:
-        "已中止：伺服器回傳的授權對象與你選擇的 leader 不符。這筆授權沒有進到你的錢包、"
-        + "沒有被簽署、沒有送出，你的跟單設定完全沒有變動。"
-        + "請不要重試——重試會再次拿到同一份不符的授權請求。"
-        + "請截圖本畫面並回報客服，在問題釐清之前，不要簽署任何換 leader 的請求。",
-      notSelectable: "這位 leader 目前不可選擇（可能剛下架）。請重新整理本頁後再試。",
-      forbidden: "只能變更自己帳號的 leader。請重新登入後再試。",
-      // 429（查詢額度用完）：後端對 preview／待簽原文／送出共用同一個 per-session
-      // 額度，所以連續查很多位址之後按送出也可能撞到。要明講「沒有被變更」與
-      // 「可以直接重試」——通用的 submitFailed 會說「上一筆簽名已作廢」，
-      // 但這個情況根本還沒送到驗簽，講作廢是錯的。
-      rateLimited:
-        "查詢與送出的次數在短時間內太多，這次沒有送出，你的 leader 沒有被變更。"
-        + "請等約一分鐘後重新操作一次。",
-      // 送出失敗一律明講「沒有被變更」：這是安全關鍵動作，使用者必須知道現在的狀態。
-      submitFailed:
-        "送出授權失敗，你的 leader 沒有被變更。請重新操作一次——會重新取得待簽原文並"
-        + "請你重簽一次（上一筆簽名已作廢，不會被重複套用）。",
-      retry: "重新操作",
-      // leader 不符時按鈕改成純關閉：把「重新操作」擺在一個要求使用者停手的訊息
-      // 底下，等於用按鈕把文案的結論收回去。
-      dismiss: "關閉",
     },
   },
   /**
@@ -1752,124 +1588,33 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       },
     },
   },
-  leaders: {
-    eyebrow: "Copy Trade",
-    title: "Paste an address, follow the trade",
-    subtitle: "Paste any Hyperliquid wallet address and start copy trading once it passes the admission check.",
+  advanced: {
+    eyebrow: "Advanced mode",
+    title: "Advanced mode: follow any address",
+    subtitle: "Skip the curated list and set up copy trading directly for any Hyperliquid wallet address.",
     fundsWarning:
       "Reminder: during copy trading, deposits and withdrawals automatically recalibrate the drawdown baseline and "
       + "are not treated as losses; but withdrawing funds will immediately scale down your copy-trade positions "
       + "proportionally. We recommend stopping copy trading before making a large adjustment.",
-    risk: {
-      title: "Risk controls",
-      subtitle: "No risk controls are enabled by default — the system only copies the leader's actions and won't "
-        + "stop-loss or trip a breaker for you. Every threshold is yours to decide: we mark our suggested values "
-        + "alongside, but the final setting is your choice.",
-      applyNote: "Every adjustment will ask you to sign a message in your wallet; once submitted, the engine applies "
-        + "it on the next cycle (within about a minute).",
-      trackingTitle: "Tracking precision",
-      trackingSubtitle: "This item is unrelated to the risk-control toggle and takes effect whether or not you've "
-        + "enabled risk controls.",
-      enableLabel: "Enable Filet risk controls",
-      enableHelp: "When enabled: once equity drawdown reaches the threshold you set, the system stops copy trading "
-        + "(and closes positions if you chose to). This limits the exposure of \"continuing to follow\" — by the "
-        + "time it triggers, that loss has usually already happened, and it does not protect your principal from "
-        + "loss. When disabled, the system doesn't intervene at all and purely copies trades.",
-      detailsTitle: "Risk control details",
-      percentSuffix: "%",
-      hoursSuffix: "hours",
-      recommendedLabel: "Suggested",
-      boolOn: "On",
-      boolOff: "Off",
-      saveButton: "Sign and save risk settings",
-      saving: "Waiting for wallet signature…",
-      saved: "Risk settings submitted.",
-      loadError: "Risk settings are temporarily unreadable (this doesn't affect choosing a leader). Please reload "
-        + "this page later.",
-      saveError: "Failed to save risk settings",
-      signNote: "Next you'll be asked to sign a message in your wallet (no on-chain transaction, no gas). Filet will "
-        + "never ask for your private key or seed phrase; signing only happens in your own wallet.",
-      errors: {
-        walletRejected: "You canceled the signature in your wallet; risk settings were not changed.",
-        signerMismatch: "The signing wallet doesn't match the wallet you're logged in with, so the settings weren't "
-          + "submitted. Please switch back to your login wallet and try again.",
-        contentMismatch: "The content the server returned to sign doesn't match what you configured on screen, so it "
-          + "was aborted for you — no signature was submitted. Please don't retry, and report this to us.",
-        messageFailed: "Failed to fetch the content to sign; risk settings were not changed. Please try again later.",
-        submitFailed: "Submission failed; risk settings were not changed. The previous signature has been voided, "
-          + "please try again.",
-      },
-      applied: {
-        pending: "Submitted, not yet in effect (the engine applies it within about a minute).",
-        inSync: "The currently active settings match what you submitted.",
-        unknown: "The currently active settings can't be confirmed right now (the engine's status is unreadable).",
-        notSubmitted: "You haven't submitted any risk settings yet; what's shown on screen is the system default.",
-        sourceLabel: "Source",
-        changedAtLabel: "Effective at",
-      },
-      halted: {
-        title: "Your copy trading has been stopped by risk controls",
-        body: "A risk-control threshold was tripped, and the engine has stopped copy trading. By the time it "
-          + "triggers, that loss has usually already happened — what's stopped is the exposure of \"continuing to follow.\"",
-        reasonLabel: "Trigger reason",
-        trippedAtLabel: "Tripped at",
-        cooldownLabel: "Cooldown",
-        resumeAtLabel: "Expected auto-resume",
-        noAutoResume: "No expected auto-resume time (cooldown is set to 0, or currently uncalculable) — use the "
-          + "button below to resume copy trading.",
-        unknownValue: "(unreadable)",
-        resumeButton: "Resume copy trading now",
-        resuming: "Waiting for wallet signature…",
-        resumed: "Resume request submitted; the engine will resume copy trading on the next cycle.",
-        residualNote: "⚠️ If any positions failed to close or orders failed to cancel at the moment of the trip, "
-          + "they remain open in the market. After resuming, the engine will converge them toward the leader's "
-          + "target on the next cycle.",
-        resumeNote: "After resuming, the engine rebuilds positions to match the leader on the next cycle. The "
-          + "equity baseline was already reset at the moment of the trip, so it won't immediately trip again "
-          + "because of the drawdown before the trip.",
-        leaderRevokedNote: "This stop happened because the leader you were following was delisted by us, not "
-          + "because your risk-control threshold was tripped. This type cannot be self-resolved — please choose a "
-          + "different leader instead.",
-        unknown: "Whether your risk controls have tripped can't be confirmed right now (the engine's status is unreadable).",
-      },
+    gate: {
+      title: "Before you continue",
+      body: "In advanced mode, Filet makes no endorsement of this address's strategy quality, risk controls, or "
+        + "continuity — the address you paste receives no additional platform vetting, and whether it's worth "
+        + "following is your own judgment.",
+      checkboxLabel: "I understand Filet makes no endorsement of this address's strategy quality, risk controls, "
+        + "or continuity.",
+    },
+    notLoggedIn: {
+      title: "Please log in to continue",
+      body: "Advanced mode requires connecting your wallet and logging in before you can look up an address and "
+        + "continue onboarding.",
+      cta: "Connect wallet and log in",
+      connecting: "Connecting…",
+      signing: "Please sign the login message in your wallet…",
     },
     upperBound: "A follower's actual results will fall below the leader's numbers: entry/exit delay, slippage, and "
       + "differences in capital size will continuously erode copy-trade results. The leader's numbers are an upper "
       + "bound, not your expected return. Copy trading carries risk of loss.",
-    current: {
-      title: "The leader you're currently following",
-      loading: "Loading your current follow status…",
-      leaderLabel: "Currently following",
-      failedTitle: "Unable to read your current follow status right now",
-      failedNote: "This query failure only affects this section's display: it doesn't change your copy-trade "
-        + "settings, and it doesn't mean you're not copy trading. The rest of this page is unaffected; please "
-        + "reload this page and try again.",
-      noneTitles: {
-        engine_default: "Copy trading is enabled, but no leader is specified yet",
-        not_activated: "Your account hasn't activated copy trading yet",
-        indeterminate: "Your follow status can't be confirmed right now",
-      },
-      noneTitleFallback: "No follow target to display right now",
-      statusLabel: "Status code",
-      pendingTitle: "There's a signed, not-yet-effective leader switch",
-      pendingLabel: "Switching to",
-      pendingIssuedAtLabel: "Signed at",
-    },
-    confirmTitle: "Confirm switching to this leader?",
-    confirmLeaderLabel: "Leader to switch to",
-    confirmCost: "Switching leaders has a real cost: when it takes effect, the engine converges your positions to "
-      + "the new leader — closing your current positions and opening new ones per the new leader. These are real "
-      + "fills and incur real trading costs (taker fees and slippage).",
-    confirmTiming: "This does not take effect immediately: once the authorization is recorded, it takes effect on "
-      + "the engine's next cycle. Before applying it, the engine re-verifies your signature and the allowlist on "
-      + "its own; if verification fails, it won't be applied.",
-    confirmSignNote: "Next you'll be asked to sign a message in your wallet (no on-chain transaction, no gas). "
-      + "Filet will never ask for your private key or seed phrase; signing only happens in your own wallet.",
-    confirmOk: "Confirm and sign",
-    confirmCancel: "Cancel",
-    signing: "Please sign in your wallet…",
-    submitting: "Submitting…",
-    doneTitle: "Authorized — effective on the engine's next cycle",
     custom: {
       title: "Who to follow",
       subtitle: "Paste any wallet address to start copy trading. Pasted addresses receive no additional platform "
@@ -1908,7 +1653,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         + "list is temporarily unreadable). The rest of the flow is the same as for any other address; since you're "
         + "using the address-input box, the declaration below is still required.",
       attestation: "I understand this is an unvetted leader and I bear the risk myself.",
-      select: "Follow this address",
+      select: "Continue to onboarding",
       reasons: {
         invalid_format: "Invalid address format: must be 0x followed by 40 hex characters.",
         self_follow: "This is your own login address — you can't follow yourself.",
@@ -1924,28 +1669,6 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       echoMismatch: "Aborted: the preview the server returned doesn't match the address you entered, so this "
         + "preview is not displayed. Please stop and report this to support.",
       entryName: "Unvetted leader",
-    },
-    errors: {
-      messageFailed: "Failed to fetch the content to sign; your leader was not changed. Please try again later.",
-      walletRejected: "You canceled the signature in your wallet. This authorization was not submitted, and your "
-        + "copy-trade settings were not changed.",
-      signerMismatch: "The signing account doesn't match your login account — please switch your wallet back to "
-        + "the account you logged in with and try again. This signature was not submitted.",
-      leaderMismatch: "Aborted: the authorization target the server returned doesn't match the leader you "
-        + "selected. This authorization was never sent to your wallet, never signed, never submitted, and your "
-        + "copy-trade settings were not changed at all. Please do not retry — retrying will just fetch the same "
-        + "mismatched authorization request again. Please screenshot this screen and report it to support; until "
-        + "this is resolved, do not sign any leader-switch request.",
-      notSelectable: "This leader currently can't be selected (it may have just been delisted). Please reload this "
-        + "page and try again.",
-      forbidden: "You can only change the leader on your own account. Please log in again and try again.",
-      rateLimited: "Too many queries and submissions in a short time; this one was not submitted, and your leader "
-        + "was not changed. Please wait about a minute and try again.",
-      submitFailed: "Failed to submit the authorization; your leader was not changed. Please try again — this will "
-        + "fetch new content to sign and ask you to sign again (the previous signature is voided and won't be "
-        + "double-applied).",
-      retry: "Try again",
-      dismiss: "Dismiss",
     },
   },
   home: {

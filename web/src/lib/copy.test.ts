@@ -54,7 +54,8 @@ describe("語言紅線（spec 不變量 4：2026-06-18 沿用）", () => {
     expect(COPY.wizard.fundsWarning).toMatch(/轉出/);
     // ⭐ 2026-07-30：/performance 頁下架，此警語搬到 /leaders（客戶查看與管理
     // 跟單狀態的地方），與 wizard 開通頁的同義句各自成立、互不取代。
-    expect(COPY.leaders.fundsWarning).toMatch(/轉出/);
+    // ⭐ Task 11（2026-08-28）：/leaders 遷移為 /advanced，警語隨遷移。
+    expect(COPY.advanced.fundsWarning).toMatch(/轉出/);
   });
 });
 
