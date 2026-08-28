@@ -36,6 +36,7 @@ from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_addre
 from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
 from spark.filet.strategies import (build_equity_index, build_methodology,
                                     build_strategy_view)
+from spark.publicapi import public_stats
 from spark.filet.user_leaders import load_user_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
@@ -49,7 +50,8 @@ from spark.publicapi.config import ApiConfig, derive_account_id, normalize_addre
 from spark.copytrade.equity import sample_coverage
 from spark.copytrade.killswitch import ALERTS_LOG_RELPATH, is_tripped
 from spark.filet.engine_health import (HEARTBEAT_STALE_S, HeartbeatRead,
-                                       heartbeat_path_for, read_heartbeat)
+                                       heartbeat_dir_for, heartbeat_path_for,
+                                       read_heartbeat)
 from spark.filet.leader_change_apply import LEDGER_RELPATH as LC_LEDGER_RELPATH
 from spark.filet.leader_change_apply import scan_unapplied_leader_changes
 from spark.publicapi.ops import ENGINE_STALE_S
@@ -981,6 +983,52 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         view["methodology"] = build_methodology(
             perf, initial_deposit_usd=initial_deposit_usd, updated_at=int(now_fn()))
         return view
+
+    # ---------- /api/public/stats、/api/public/status（策略平台 Task 6）----------
+    # ⭐ 兩端點共用同一種 60s in-process cache 機制（`public_stats.TTLCache`），
+    # 各自一個獨立實例——一端資料源掛掉不得拖累另一端的快取新鮮度。
+    _public_stats_cache = public_stats.TTLCache(now_fn=now_fn)
+    _public_status_cache = public_stats.TTLCache(now_fn=now_fn)
+
+    @app.get("/api/public/stats")
+    def public_stats_endpoint():
+        """首頁證據列用的公開統計。無需登入。**任一子項取不到 → 該欄 null，
+        端點仍 200**（不變量：狀態/統計端點本身要比被監控對象可靠）。
+
+        ⭐ 這裡再包一層防禦：即使 `public_stats.build_stats_payload` 本身已對
+        每個子來源 try/except，路由層仍不放心讓任何未預期例外冒泡成 500——
+        公開端點的可靠度是它存在的唯一理由。
+        """
+        def _compute():
+            return public_stats.build_stats_payload(
+                accrued_history_path=cfg.accrued_history_path,
+                entries=_public_strategy_entries(),
+                perf_for=_strategy_perf_for,
+                now_fn=now_fn)
+        try:
+            return _public_stats_cache.get(_compute)
+        except Exception as e:  # noqa: BLE001 — 公開端點：絕不 500
+            logger.error("/api/public/stats 計算失敗（全欄降級為 null）: %r", e)
+            return {"routed_volume_usd_total": None,
+                    "builder_fee_bps": public_stats.BUILDER_FEE_BPS,
+                    "live_days": None, "updated_at": int(now_fn())}
+
+    @app.get("/api/public/status")
+    def public_status_endpoint():
+        """footer／`/status` 頁用的系統狀態燈。無需登入。`engine` 元件由 heartbeat
+        檔案 mtime 新鮮度判定，**不揭露 follower 數與身分**（不變量 4：只讀檔名／
+        mtime，不解析心跳內容）。"""
+        def _compute():
+            return public_stats.build_status_payload(
+                heartbeat_dir=heartbeat_dir_for(cfg.exchange_dir), now_fn=now_fn)
+        try:
+            return _public_status_cache.get(_compute)
+        except Exception as e:  # noqa: BLE001 — 公開端點：絕不 500
+            logger.error("/api/public/status 計算失敗（降級為 unknown）: %r", e)
+            return {"status": "unknown",
+                    "components": [{"name": "api", "status": "ok"},
+                                   {"name": "engine", "status": "unknown"}],
+                    "updated_at": int(now_fn())}
 
     # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce
     # 空間，見 leaders_select 的 _consume）——刻意不另開一套機具：兩套一次性表格
