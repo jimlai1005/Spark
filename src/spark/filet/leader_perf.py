@@ -101,6 +101,12 @@ DENOMINATOR_FLOOR = Decimal("100")
 MIN_DAYS_FOR_RETURN = Decimal("30")        # < 30 天：%報酬率噪音 >> 訊號 → 標記不足
 MIN_DAYS_FOR_ANNUALIZATION = Decimal("90")  # < 90 天：年化是激進外推 → 標記不足
 
+# 比率型指標（Sharpe/Sortino/年化波動）的資料充足度門檻。這三個指標比 TWR/MDD
+# 對樣本數更敏感（標準差在薄樣本下噪音極大），門檻獨立於上面兩個、且值更嚴格。
+RATIO_MIN_DAYS = Decimal("60")             # < 60 天：比率指標噪音 >> 訊號 → 標記不足
+
+DAYS_PER_YEAR_SQRT = DAYS_PER_YEAR.sqrt()   # √365，比率指標公式共用，避免重複開方
+
 MDD_SAMPLING_NOTE = (
     "MDD 由 15 分鐘取樣的權益指數推得，取樣間隔內的來回不可見 → "
     "**系統性低估**，應讀作回撤的下界而非精確值。")
@@ -216,6 +222,62 @@ def extract_window(portfolio_rows: Any, period: str
     return None
 
 
+def compute_ratio_metrics(returns: list[Decimal]) -> dict[str, Any]:
+    """由日報酬樣本 `r_i` 算比率型指標（Sharpe/Sortino/年化波動/日勝率/最佳最差日）。
+
+    **純函式**：只管公式，不管「多少天算充足」的閘門——那是 `RATIO_MIN_DAYS` 由
+    呼叫端（`compute_window_performance`）套用的事。規格與數值錨例見
+    `docs/superpowers/plans/2026-08-28-redesign-strategy-platform.md` Task 4。
+
+    慣例：365 日/年、無風險利率 0%、樣本標準差 ddof=1、Sortino 分母為**全樣本**
+    （對 0 門檻的下檔平方平均，不是只在虧損日取樣）。
+
+    \\( SR = \\frac{\\bar r}{s}\\sqrt{365} \\)，
+    \\( SE(SR) = \\sqrt{\\frac{1+SR_d^2/2}{N}}\\sqrt{365} \\)（\\(SR_d=\\bar r/s\\)，日頻），
+    \\( \\sigma_{ann} = s\\sqrt{365} \\)，
+    \\( Sortino = \\frac{\\bar r}{DD}\\sqrt{365} \\)，
+    \\( DD = \\sqrt{\\frac{1}{N}\\sum_i \\min(r_i,0)^2} \\)。
+
+    只回傳**數學上算得出來**的鍵——分母為 0（或樣本數不足以定義該分母）的指標，
+    整組（數值＋它自己的不足標記，由呼叫端加）一起缺席，沿用本檔 `_annualize` 的
+    「標記絕不單獨存在」慣例（工程原則 1 的同源要求）：
+    - `N < 2`（樣本標準差 ddof=1 需要至少 2 點）或樣本標準差 `s == 0`
+      （Sharpe 分母為 0）→ `sharpe`／`sharpe_se`／`annualized_vol` 三鍵一起缺席。
+    - 全樣本無下檔日（`DD == 0`，Sortino 分母為 0）→ `sortino` 缺席。
+    - `win_rate`／`best_day_return`／`worst_day_return`：`N >= 1` 即可，
+      **不設任何門檻**（plan 明載「勝率與最佳最差日不設閘」）。
+    """
+    n = len(returns)
+    out: dict[str, Any] = {"sample_count": n}
+    if n == 0:
+        return out
+
+    out["win_rate"] = Decimal(sum(1 for r in returns if r > 0)) / Decimal(n)
+    out["best_day_return"] = max(returns)
+    out["worst_day_return"] = min(returns)
+
+    mean = sum(returns, Decimal("0")) / Decimal(n)
+
+    # --- Sortino：全樣本分母，對 0 門檻。分母為 0（無下檔日）→ 沒有數字可標。 ---
+    downside_sq_sum = sum(min(r, Decimal("0")) ** 2 for r in returns)
+    dd = (downside_sq_sum / Decimal(n)).sqrt()
+    if dd != 0:
+        out["sortino"] = (mean / dd) * DAYS_PER_YEAR_SQRT
+
+    # --- Sharpe / SE / 年化波動：樣本標準差 ddof=1，需要 N>=2 且 s!=0。 ---
+    if n >= 2:
+        variance = sum((r - mean) ** 2 for r in returns) / Decimal(n - 1)
+        s = variance.sqrt()
+        out["annualized_vol"] = s * DAYS_PER_YEAR_SQRT
+        if s != 0:
+            sr_daily = mean / s
+            out["sharpe"] = sr_daily * DAYS_PER_YEAR_SQRT
+            out["sharpe_se"] = (
+                (Decimal("1") + sr_daily ** 2 / Decimal("2")) / Decimal(n)
+            ).sqrt() * DAYS_PER_YEAR_SQRT
+    return out
+
+
 def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, Any]:
     """單一 perp 窗的績效計算。**純函式、不觸網**。
 
@@ -226,6 +288,10 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
     - `status == "ok"`：`cum_pnl`／`twr`／`max_drawdown`／`equity_index` **恆存在**，
       各自帶 `*_insufficient_data` 標記；`annualized_return` 存在（除非數學上無定義），
       帶 `annualized_return_insufficient_data` ＋ `annualized_return_extrapolated_from_days`。
+      `win_rate`／`best_day_return`／`worst_day_return`：N>=1 即存在，不設閘。
+      `sharpe`／`sharpe_se`／`annualized_vol`／`sortino`：見 `compute_ratio_metrics`——
+      數學上算不出來的（N<2、標準差=0、DD=0）整組（含 `*_insufficient_data`）缺席；
+      算得出來的一律帶 `*_insufficient_data`＝`covered_days < RATIO_MIN_DAYS`（60 天）。
 
     ⭐ 為什麼標記做在**每個指標**上而不是只有 `disclosure_tier` 一個全域欄位：
     前端不保證整組一起渲染——只顯示 MDD 的卡片、只顯示年化的排行榜列，都會讓一個
@@ -311,6 +377,27 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
     out["max_drawdown"] = _max_drawdown(equity_index)
     out["twr_insufficient_data"] = thin_return
     out["max_drawdown_insufficient_data"] = thin_return
+
+    # --- 比率型指標（Sharpe/Sortino/年化波動/日勝率/最佳最差日）---
+    # r_i 直接由權益指數推導（沿用既有日對齊邏輯）：equity_index 已把分母地板
+    # 跳過的區間就地補 0（見上面 `skipped` 迴圈），所以這裡不必另外處理跳過段。
+    ratio_returns = [equity_index[i] / equity_index[i - 1] - Decimal("1")
+                     for i in range(1, len(equity_index))]
+    ratio = compute_ratio_metrics(ratio_returns)
+    ratio_thin = covered_days < RATIO_MIN_DAYS   # 獨立門檻，見 RATIO_MIN_DAYS 註解
+    for key in ("win_rate", "best_day_return", "worst_day_return"):
+        if key in ratio:
+            out[key] = ratio[key]
+    if "annualized_vol" in ratio:
+        out["annualized_vol"] = ratio["annualized_vol"]
+        out["annualized_vol_insufficient_data"] = ratio_thin
+    if "sharpe" in ratio:
+        out["sharpe"] = ratio["sharpe"]
+        out["sharpe_se"] = ratio["sharpe_se"]
+        out["sharpe_insufficient_data"] = ratio_thin
+    if "sortino" in ratio:
+        out["sortino"] = ratio["sortino"]
+        out["sortino_insufficient_data"] = ratio_thin
 
     annualized = _annualize(equity_index[-1], covered_days)
     if annualized is None:
