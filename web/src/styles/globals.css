@@ -2,7 +2,10 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
-html, body { height: 100%; }
+/* min-height 而非 height：height:100% 會在 html/body 帶 overflow-x:hidden（見檔尾
+   全站防護）時把 overflow-y 強制算成 auto，html 被鎖在視窗高、body 變成內層捲動
+   容器——window.scrollTo 失效、full-page 截圖折頁下全黑（2026-08-29 Task 19 實測）。 */
+html, body { min-height: 100%; }
 
 body {
   margin: 0;
