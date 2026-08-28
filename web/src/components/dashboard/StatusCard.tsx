@@ -112,7 +112,7 @@ export function StatusCard({
   const showActions = me != null && (state === "following" || state === "paused");
 
   return (
-    <div className="card dash-card" style={{ borderColor: "rgba(70, 214, 179, 0.24)" }}>
+    <div className="card dash-card dash-card-status" style={{ borderColor: "rgba(70, 214, 179, 0.24)" }}>
       <div className="dash-status-head">
         <div>
           <div className="dash-card-label">{c.label}</div>

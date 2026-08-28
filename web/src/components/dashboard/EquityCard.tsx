@@ -32,7 +32,7 @@ export function EquityCard({ equity }: { equity: DashboardEquity | null }) {
     && Number.isFinite(availablePctNum) && availablePctNum < LOW_MARGIN_THRESHOLD;
 
   return (
-    <div className="card dash-card">
+    <div className="card dash-card dash-card-equity">
       <div className="dash-card-label">{c.label}</div>
       <div className="dash-equity-head">
         <span className="mono dash-equity-value">{accountValue}</span>

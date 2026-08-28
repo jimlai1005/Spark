@@ -1262,3 +1262,98 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-fees-row { display: flex; justify-content: space-between; font-size: var(--fs-small); padding: 10px 20px; border-top: 1px solid var(--border); }
 .dash-fees-row:first-child { border-top: none; }
 
+/* ==================== Task 18：響應式 1024 / 390 全站 pass（設計稿 §07 L933-934） ==================== */
+
+/* 全站防護：body 不得橫向捲動（局部元件自己的 overflow-x:auto 不受影響，
+   它們是各自 scroll container，跟 html/body 的 overflow-x 無關）。 */
+html, body { overflow-x: hidden; }
+
+/* ---------- 1024：策略頁右欄→底部 sticky bar（Task 9 已做）；Dashboard 六塊→兩欄
+   （既有 row1/row2/row3 本來就是雙欄 grid，1024 沿用不變，這裡只防止邊界擠壓）。 ---------- */
+@media (max-width: 1024px) {
+  .dash-row1, .dash-row2, .dash-row3 { grid-template-columns: 1fr 1fr; }
+  .dash-guards { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+}
+
+/* ---------- 390：六塊單欄（順序＝狀態/kill switch → 淨值 → PnL → 曝險 → 同步 → 費用）；
+   持倉表→卡片式；kill switch 常駐底部；首頁/策略頁單欄；可點區域 ≥44px；
+   表格容器 overflow-x:auto。 ---------- */
+@media (max-width: 480px) {
+  /* main.home-page 的 padding 在原始碼順序上晚於 main.page 的行動版 padding 規則，
+     同 specificity 下會覆蓋掉窄邊界——這裡補一條晚於兩者的規則收斂回窄邊距。 */
+  main.home-page { padding-left: 14px; padding-right: 14px; }
+
+  /* -- 可點區域 ≥44px -- */
+  .tab, .lang-btn, .dash-tab, .footer-col-list a, .evidence-link,
+  .home-strategies-viewall, .cagr-toggle, .equity-period-btn, .header-addr,
+  .btn, .btn-ghost, .dash-btn-pause, .dash-btn-close,
+  .wizard-steps .step-btn, .check-row, .risk-toggle {
+    min-height: 44px;
+  }
+  .tab, .lang-btn, .dash-tab, .footer-col-list a, .evidence-link,
+  .home-strategies-viewall, .cagr-toggle, .equity-period-btn, .header-addr {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* -- 真實 <table>（/admin、/ops）容器可橫向捲動，不撐開 body -- */
+  table { display: block; overflow-x: auto; max-width: 100%; }
+
+  /* -- 策略詳情頁指標卡：4→2 col 已由 1024 斷點處理，390 維持 2 col 即可讀 -- */
+
+  /* -- Dashboard：六塊改單欄＋指定順序，持倉表改卡片式，kill switch 常駐底部 -- */
+  main.dash-page {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap-card);
+    padding-bottom: 100px; /* 留給常駐底部的 kill switch bar */
+  }
+  .dash-row1, .dash-row2, .dash-row3 { display: contents; }
+
+  .dash-card-status { order: 1; }
+  .dash-card-equity { order: 2; }
+  .dash-card-pnl { order: 3; }
+  .dash-card-exposure { order: 4; }
+  .dash-card-sync { order: 5; }
+  .dash-card-fees { order: 6; }
+  .dash-positions-block { order: 7; }
+
+  .dash-guards { grid-template-columns: 1fr; gap: 14px; }
+  .dash-sync-metrics { grid-template-columns: 1fr; }
+  .dash-pnl-metrics { grid-template-columns: repeat(2, 1fr); }
+
+  /* kill switch 常駐底部：脫離文件流固定在視窗底部，寬度撐滿、按鈕各佔一半。 */
+  .dash-status-actions {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 45;
+    margin: 0;
+    gap: 10px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+    background: var(--card);
+    border-top: 1px solid var(--border-strong);
+  }
+  .dash-status-actions .dash-btn-pause,
+  .dash-status-actions .dash-btn-close {
+    flex: 1 1 0;
+    justify-content: center;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* 持倉表→卡片式：隱藏表頭，每列變成獨立卡片（不再是固定寬度的橫向表格）。 */
+  .dash-table-head { display: none; }
+  .dash-table-row {
+    min-width: 0;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px 14px;
+    margin: 10px 14px;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+  }
+  .dash-table-row:first-child { margin-top: 14px; }
+  .dash-table-row > div:not(:first-child) { text-align: left; }
+  .dash-table-row > .dash-table-symbol { grid-column: 1 / -1; }
+}
+

@@ -16,7 +16,7 @@ export function SyncCard({ sync }: { sync: DashboardSync | null }) {
   const c = COPY.dashboard.sync;
 
   return (
-    <div className="card dash-card">
+    <div className="card dash-card dash-card-sync">
       <div className="dash-sync-head">
         <div className="dash-card-label" style={{ marginBottom: 0 }}>{c.label}</div>
       </div>

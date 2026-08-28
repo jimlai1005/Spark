@@ -20,7 +20,7 @@ export function FeesCard({ feesMonth }: { feesMonth: DashboardFeesMonth | null }
   const maxVal = values.length > 0 ? Math.max(...values, 0) : 0;
 
   return (
-    <div className="card dash-card">
+    <div className="card dash-card dash-card-fees">
       <div className="dash-card-label">{c.label}</div>
       <div className="dash-fee-metrics">
         <div>

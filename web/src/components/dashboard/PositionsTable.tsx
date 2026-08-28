@@ -30,7 +30,7 @@ export function PositionsTable({
   const [tab, setTab] = useState<Tab>("positions");
 
   return (
-    <div>
+    <div className="dash-positions-block">
       <div className="dash-tabs">
         <button
           type="button"

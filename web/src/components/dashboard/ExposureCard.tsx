@@ -28,7 +28,7 @@ export function ExposureCard({ exposure }: { exposure: DashboardExposure | null 
   const c = COPY.dashboard.exposure;
 
   return (
-    <div className="card dash-card">
+    <div className="card dash-card dash-card-exposure">
       <div className="dash-card-label">{c.label}</div>
       <div className="dash-exposure-head">
         <span className="mono dash-exposure-value">

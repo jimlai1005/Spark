@@ -47,7 +47,7 @@ export function PnlCard({ pnl }: { pnl: DashboardPnl | null }) {
   const sign = net == null ? undefined : Number(net) < 0 ? "neg" : "pos";
 
   return (
-    <div className="card dash-card">
+    <div className="card dash-card dash-card-pnl">
       <div className="dash-pnl-head">
         <div>
           <div className="dash-card-label">{c.label}</div>
