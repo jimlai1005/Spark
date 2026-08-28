@@ -1149,6 +1149,164 @@ export const COPY_ZH = {
     },
   },
   /**
+   * `/settings`（Task 16）：登入後的設定中樞。把 Task 11 遷移舊 `/leaders` 時
+   * 暫時落掉的「目前跟隨的 leader」面板與風控設定區塊（`leaders.risk`／
+   * `leaders.current`，均已隨舊頁重寫移除）以新視覺復活，另加資金配置與
+   * 授權管理（agent 位址／builder fee／暫停跟單／平倉並撤銷）。四段各自獨立
+   * 查詢、獨立失敗處理——任一段讀不到不擋其餘三段（沿舊版 CurrentLeaderPanel
+   * 的既定原則：讀不到≠沒有，工程原則 3）。
+   */
+  settings: {
+    eyebrow: "設定",
+    title: "帳戶設定",
+    subtitle: "調整風控門檻、資金配置與授權；查看目前跟隨的策略。",
+    loadingNote: "讀取設定中…",
+    /** ⭐ 風控 opt-in（裁決 1）：預設不啟用，數字全來自後端 specs，不寫死任何門檻。 */
+    risk: {
+      title: "風控設定",
+      subtitle:
+        "預設不啟用任何風控——系統只按 leader 的動作跟單，不會替你停損或熔斷。"
+        + "每個門檻都由你自己決定：我們把建議值標在旁邊，最終要設多少是你的選擇。",
+      applyNote:
+        "每一次調整都會請你在錢包簽署一則訊息，送出後引擎會在下一輪（約一分鐘內）套用。",
+      trackingTitle: "跟單精度",
+      trackingSubtitle: "這一項與風控開關無關，無論你有沒有啟用風控都會生效。",
+      enableLabel: "啟用 Filet 風控系統",
+      enableHelp:
+        "開啟後：權益回撤達到你設定的門檻時，系統會停止跟單（並依你的選擇平倉）。"
+        + "這限制的是「繼續跟下去」的曝險——觸發時該筆虧損通常已經發生，"
+        + "並不會讓本金免於虧損。關閉時系統完全不介入，僅純粹跟單。",
+      detailsTitle: "風控細項",
+      percentSuffix: "%",
+      hoursSuffix: "小時",
+      recommendedLabel: "建議",
+      boolOn: "開啟",
+      boolOff: "關閉",
+      saveButton: "簽署並儲存風控設定",
+      saving: "等待錢包簽署…",
+      saved: "風控設定已送出。",
+      loadError: "風控設定暫時讀不到，請稍後重新整理本頁。",
+      signNote:
+        "接下來會請你在錢包簽署一則訊息（不上鏈、不花費 gas）。"
+        + "Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
+      errors: {
+        walletRejected: "你在錢包取消了簽署，風控設定沒有被變更。",
+        signerMismatch:
+          "簽署的錢包與你登入的錢包不是同一個，設定沒有被送出。"
+          + "請切換回登入的錢包後再試一次。",
+        contentMismatch:
+          "伺服器回傳的待簽內容與你在畫面上設定的不一致，已為你中止，"
+          + "沒有送出任何簽署。請不要重試，並回報這個狀況給我們。",
+        messageFailed: "無法取得待簽內容，風控設定沒有被變更。請稍後再試一次。",
+        submitFailed:
+          "送出失敗，風控設定沒有被變更。上一筆簽署已作廢，請重新操作一次。",
+      },
+      applied: {
+        pending: "已提交，尚未生效（引擎約一分鐘內套用）。",
+        inSync: "目前生效中的設定與你提交的一致。",
+        unknown: "目前生效的設定暫時無法確認（引擎狀態讀不到）。",
+        notSubmitted: "你尚未提交過風控設定；畫面上顯示的是系統預設值。",
+        sourceLabel: "來源",
+        changedAtLabel: "生效時間",
+      },
+      halted: {
+        title: "你的跟單已被風控停止",
+        body:
+          "風控門檻被觸發，引擎已停止繼續跟單。觸發時那筆虧損通常已經發生——"
+          + "停止的是「繼續跟下去」的曝險。",
+        reasonLabel: "觸發原因",
+        trippedAtLabel: "觸發時間",
+        cooldownLabel: "冷靜期",
+        resumeAtLabel: "預計自動恢復",
+        noAutoResume:
+          "沒有預計的自動恢復時間（冷靜期設為 0，或目前算不出來）——"
+          + "要恢復跟單請按下方按鈕。",
+        unknownValue: "（讀不到）",
+        resumeButton: "立即恢復跟單",
+        resuming: "等待錢包簽署…",
+        resumed: "已送出恢復請求，引擎會在下一輪恢復跟單。",
+        residualNote:
+          "熔斷當下有部位未能平倉或掛單未撤，那些部位仍留在市場上。"
+          + "恢復跟單後，引擎會在下一輪把它們往 leader 的目標收斂。",
+        resumeNote:
+          "恢復後引擎會在下一輪重新依 leader 建立部位。權益基準已在熔斷當下重置，"
+          + "所以不會因為熔斷前的那段跌幅立刻再停一次。",
+        leaderRevokedNote:
+          "這次停止是因為你跟隨的 leader 已被我們下架，不是你的風控門檻被觸發。"
+          + "這一種無法自助恢復——請改為選擇另一位 leader。",
+        unknown: "目前無法確認你的風控是否被觸發（引擎狀態讀不到）。",
+      },
+    },
+    /** ⭐ Task 10b：投入比例直接乘進部位大小，與換 leader 同級的簽章防線。 */
+    capital: {
+      title: "資金配置",
+      subtitle: "投入比例直接乘進你的跟單部位大小，調整前請先確認你理解影響。",
+      scaleLabel: "投入比例（佔帳戶淨值）",
+      effectiveLabel: "目前生效",
+      pendingLabel: "已提交，待引擎套用",
+      saveButton: "簽署並儲存資金配置",
+      saving: "等待錢包簽署…",
+      saved: "資金配置已送出。",
+      loadError: "資金配置暫時讀不到，請稍後重新整理本頁。",
+      signNote:
+        "接下來會請你在錢包簽署一則訊息（不上鏈、不花費 gas）。"
+        + "Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
+      errors: {
+        walletRejected: "你在錢包取消了簽署，資金配置沒有被變更。",
+        signerMismatch:
+          "簽署的錢包與你登入的錢包不是同一個，設定沒有被送出。"
+          + "請切換回登入的錢包後再試一次。",
+        contentMismatch:
+          "伺服器回傳的待簽內容與你在畫面上設定的不一致，已為你中止，"
+          + "沒有送出任何簽署。請不要重試，並回報這個狀況給我們。",
+        messageFailed: "無法取得待簽內容，資金配置沒有被變更。請稍後再試一次。",
+        submitFailed:
+          "送出失敗，資金配置沒有被變更。上一筆簽署已作廢，請重新操作一次。",
+      },
+    },
+    /** agent 位址／builder fee／暫停跟單／平倉並撤銷（複用 Task 15 kill switch）。 */
+    auth: {
+      title: "授權管理",
+      subtitle: "你目前授權給 Filet 的 agent 資訊，以及暫停跟單／平倉並撤銷入口。",
+      agentAddressLabel: "Agent 位址",
+      agentAddressMissing: "尚未產生 Agent",
+      builderFeeLabel: "Builder fee 上限已核准",
+      agentApprovedLabel: "Agent 授權狀態",
+      approvedYes: "已核准",
+      approvedNo: "尚未核准",
+      loadError: "授權資訊暫時讀不到，請稍後重新整理本頁。",
+      pauseHeading: "跟單開關",
+      pauseBtn: "暫停跟單",
+      resumeBtn: "恢復跟單",
+      closeAllBtn: "平倉並撤銷授權",
+      pauseErrorNote: "操作失敗，請稍後重試。",
+      noEngineNote: "此帳號目前沒有在運作的引擎，沒有可操作的動作。",
+      closeAllPendingNote: "已送出，引擎正在收尾，請至 Dashboard 查看進度。",
+    },
+    /** ⭐ 「目前跟隨的 leader」——沿舊版 `leaders.current` 的既定誠實揭露原則。 */
+    leader: {
+      title: "目前跟隨的策略",
+      loading: "讀取你目前的跟隨狀態…",
+      leaderLabel: "目前跟隨",
+      failedTitle: "目前無法讀取你目前的跟隨狀態",
+      failedNote:
+        "這次查詢失敗只影響本區塊的顯示：它不會改變你的跟單設定，也不代表你沒有在跟單。"
+        + "本頁其餘功能不受影響；請重新整理本頁再試一次。",
+      noneTitles: {
+        engine_default: "你已啟用跟單，但尚未指定 leader",
+        not_activated: "你的帳號尚未啟用跟單",
+        indeterminate: "目前無法確認你的跟隨狀態",
+      },
+      noneTitleFallback: "目前沒有可顯示的跟隨對象",
+      statusLabel: "狀態碼",
+      pendingTitle: "有一筆已簽署、尚未生效的換 leader",
+      pendingLabel: "將換到",
+      pendingIssuedAtLabel: "簽署時間",
+      changeStrategyBtn: "更換策略",
+      advancedModeBtn: "進階模式",
+    },
+  },
+  /**
    * `/status` 頁（Task 12）：讀 `/api/public/status` 渲染整體狀態＋components＋
    * updated_at。法務內容 spec（legal-copy-zh.md）只涵蓋 /docs，不涵蓋 /status，
    * 這幾個 key 因此是本頁專屬的新文案；三態字樣復用 `footer.status*`（同一套狀態
@@ -2148,6 +2306,155 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       date: "Date",
       fee: "Builder fee",
       empty: "No fills this month yet.",
+    },
+  },
+  settings: {
+    eyebrow: "Settings",
+    title: "Account settings",
+    subtitle: "Adjust risk limits, capital allocation and authorization; check which strategy you're following.",
+    loadingNote: "Loading settings…",
+    risk: {
+      title: "Risk controls",
+      subtitle:
+        "No risk controls are enabled by default — the system only follows the leader's actions and won't "
+        + "stop-loss or trip a breaker for you. Every threshold is yours to set: we mark our recommended "
+        + "value next to it, but the final call is yours.",
+      applyNote:
+        "Every change asks you to sign a message in your wallet; once submitted, the engine applies it on "
+        + "its next cycle (within about a minute).",
+      trackingTitle: "Tracking precision",
+      trackingSubtitle: "This one is independent of the risk-control switch — it applies whether or not risk controls are enabled.",
+      enableLabel: "Enable Filet risk controls",
+      enableHelp:
+        "When on: once equity drawdown reaches your threshold, the system stops following (and closes "
+        + "positions if you chose that). This limits the exposure of \"continuing to follow\" — by the time "
+        + "it trips, that loss has usually already happened, so it does not shield your principal from loss. "
+        + "When off, the system never intervenes and simply mirrors trades.",
+      detailsTitle: "Risk control details",
+      percentSuffix: "%",
+      hoursSuffix: " hours",
+      recommendedLabel: "Recommended",
+      boolOn: "On",
+      boolOff: "Off",
+      saveButton: "Sign & save risk controls",
+      saving: "Waiting for wallet signature…",
+      saved: "Risk controls submitted.",
+      loadError: "Risk controls could not be loaded right now. Please reload this page later.",
+      signNote:
+        "Next you'll be asked to sign a message in your wallet (no on-chain transaction, no gas). Filet will "
+        + "never ask for your private key or seed phrase; signing happens only in your own wallet.",
+      errors: {
+        walletRejected: "You cancelled the signature in your wallet — risk controls were not changed.",
+        signerMismatch:
+          "The wallet that signed isn't the one you're logged in with, so nothing was submitted. Please "
+          + "switch back to your logged-in wallet and try again.",
+        contentMismatch:
+          "The content returned by the server didn't match what you set on screen, so this was aborted — "
+          + "nothing was signed. Please don't retry, and report this to us.",
+        messageFailed: "Couldn't fetch the content to sign — risk controls were not changed. Please try again shortly.",
+        submitFailed: "Submission failed — risk controls were not changed. The previous signature is now void; please try again.",
+      },
+      applied: {
+        pending: "Submitted, not yet in effect (the engine applies it within about a minute).",
+        inSync: "The currently effective settings match what you submitted.",
+        unknown: "The currently effective settings can't be confirmed right now (engine status unavailable).",
+        notSubmitted: "You haven't submitted risk controls yet; the values shown are system defaults.",
+        sourceLabel: "Source",
+        changedAtLabel: "Effective since",
+      },
+      halted: {
+        title: "Your following has been stopped by risk controls",
+        body:
+          "A risk threshold was tripped and the engine has stopped following further. By the time it trips, "
+          + "that loss has usually already happened — what's stopped is the exposure of continuing to follow.",
+        reasonLabel: "Trigger reason",
+        trippedAtLabel: "Tripped at",
+        cooldownLabel: "Cooldown",
+        resumeAtLabel: "Expected auto-resume",
+        noAutoResume:
+          "No scheduled auto-resume time (cooldown is set to 0, or it can't be computed right now) — use the "
+          + "button below to resume.",
+        unknownValue: "(unavailable)",
+        resumeButton: "Resume following now",
+        resuming: "Waiting for wallet signature…",
+        resumed: "Resume request submitted; the engine will resume following on its next cycle.",
+        residualNote:
+          "Some positions or open orders were not closed/cancelled when this tripped and remain in the "
+          + "market. After you resume, the engine will converge them toward the leader's targets on its next cycle.",
+        resumeNote:
+          "After resuming, the engine rebuilds positions from the leader on its next cycle. The equity "
+          + "baseline was reset at the moment this tripped, so it won't immediately trip again from the drop "
+          + "that preceded it.",
+        leaderRevokedNote:
+          "This stopped because the leader you were following was delisted by us, not because your risk "
+          + "threshold was tripped. This kind can't be resumed by yourself — please choose another leader instead.",
+        unknown: "Whether your risk controls have tripped can't be confirmed right now (engine status unavailable).",
+      },
+    },
+    capital: {
+      title: "Capital allocation",
+      subtitle: "Your allocation ratio multiplies directly into your position sizes — please confirm you understand the impact before changing it.",
+      scaleLabel: "Allocation ratio (of account equity)",
+      effectiveLabel: "Currently in effect",
+      pendingLabel: "Submitted, pending engine application",
+      saveButton: "Sign & save capital allocation",
+      saving: "Waiting for wallet signature…",
+      saved: "Capital allocation submitted.",
+      loadError: "Capital allocation could not be loaded right now. Please reload this page later.",
+      signNote:
+        "Next you'll be asked to sign a message in your wallet (no on-chain transaction, no gas). Filet will "
+        + "never ask for your private key or seed phrase; signing happens only in your own wallet.",
+      errors: {
+        walletRejected: "You cancelled the signature in your wallet — capital allocation was not changed.",
+        signerMismatch:
+          "The wallet that signed isn't the one you're logged in with, so nothing was submitted. Please "
+          + "switch back to your logged-in wallet and try again.",
+        contentMismatch:
+          "The content returned by the server didn't match what you set on screen, so this was aborted — "
+          + "nothing was signed. Please don't retry, and report this to us.",
+        messageFailed: "Couldn't fetch the content to sign — capital allocation was not changed. Please try again shortly.",
+        submitFailed: "Submission failed — capital allocation was not changed. The previous signature is now void; please try again.",
+      },
+    },
+    auth: {
+      title: "Authorization",
+      subtitle: "The agent information you've authorized Filet to use, plus the pause-following and close-all entry points.",
+      agentAddressLabel: "Agent address",
+      agentAddressMissing: "No agent generated yet",
+      builderFeeLabel: "Builder fee cap approved",
+      agentApprovedLabel: "Agent authorization status",
+      approvedYes: "Approved",
+      approvedNo: "Not yet approved",
+      loadError: "Authorization info could not be loaded right now. Please reload this page later.",
+      pauseHeading: "Following switch",
+      pauseBtn: "Pause following",
+      resumeBtn: "Resume following",
+      closeAllBtn: "Close all & revoke authorization",
+      pauseErrorNote: "Action failed, please try again later.",
+      noEngineNote: "There is no engine currently running for this account, so there's nothing to act on.",
+      closeAllPendingNote: "Submitted — the engine is winding down; check the Dashboard for progress.",
+    },
+    leader: {
+      title: "Strategy you're currently following",
+      loading: "Loading your current following status…",
+      leaderLabel: "Currently following",
+      failedTitle: "Your current following status can't be loaded right now",
+      failedNote:
+        "This failed query only affects what's shown in this section: it doesn't change your copy-trading "
+        + "settings, and it doesn't mean you're not following. The rest of this page is unaffected — please "
+        + "reload this page and try again.",
+      noneTitles: {
+        engine_default: "Following is enabled, but no leader is specified yet",
+        not_activated: "This account hasn't enabled following yet",
+        indeterminate: "Your following status can't be confirmed right now",
+      },
+      noneTitleFallback: "There's no following target to show right now",
+      statusLabel: "Status code",
+      pendingTitle: "There's a signed, not-yet-effective leader change",
+      pendingLabel: "Switching to",
+      pendingIssuedAtLabel: "Signed at",
+      changeStrategyBtn: "Change strategy",
+      advancedModeBtn: "Advanced mode",
     },
   },
   status: {

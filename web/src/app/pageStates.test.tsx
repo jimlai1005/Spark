@@ -50,6 +50,9 @@ const getOpsSubscriptions = vi.fn();
 const getOpsTradeQuality = vi.fn();
 const getOpsHealth = vi.fn();
 const getDashboard = vi.fn();
+const getMyRisk = vi.fn();
+const getMyCapital = vi.fn();
+const getMyLeader = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMe: (...a: unknown[]) => getMe(...a),
@@ -62,13 +65,16 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getOpsTradeQuality: (...a: unknown[]) => getOpsTradeQuality(...a),
   getOpsHealth: (...a: unknown[]) => getOpsHealth(...a),
   getDashboard: (...a: unknown[]) => getDashboard(...a),
+  getMyRisk: (...a: unknown[]) => getMyRisk(...a),
+  getMyCapital: (...a: unknown[]) => getMyCapital(...a),
+  getMyLeader: (...a: unknown[]) => getMyLeader(...a),
 }));
 
 /** 全部 mock 的集合，供 reset 與批次設定使用（在 factory 之外求值，不受提升影響）。 */
 const api = {
   getMe, getStatus, getLeaders, getAdminPending,
   getOpsCustomers, getOpsRevenue, getOpsSubscriptions, getOpsTradeQuality, getOpsHealth,
-  getDashboard,
+  getDashboard, getMyRisk, getMyCapital, getMyLeader,
 };
 
 import { ApiError, type DashboardResp } from "@/lib/api";
@@ -82,6 +88,7 @@ import LeadersPage from "./leaders/page";
 import HomePage from "./page";
 import OnboardingPage from "./onboarding/page";
 import OpsPage from "./ops/page";
+import SettingsPage from "./settings/page";
 import StrategiesPage from "./strategies/page";
 
 const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" };
@@ -160,6 +167,9 @@ function assertReadable(container: HTMLElement) {
  * 掛在 nav 上——保留在本表是為了維持這頁既有的逐頁狀態覆蓋，不是漏改。
  * ⭐ Task 11：`/leaders` 改為純 redirect（見 `../leaders/page.test.tsx` 專屬測試），
  * 功能遷移至 `/advanced`，本表新增一筆。
+ * ⭐ Task 16：`/settings` 頁面元件已建立並搬進本表——原本用來豁免尚未建立頁面的
+ * 導覽涵蓋率白名單機制（其註解自述白名單即待辦，對應 task 完成時要清空）隨之
+ * 整段移除，見下方「導覽涵蓋率」測試。
  */
 const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/", name: "首頁", el: () => <HomePage /> },
@@ -171,23 +181,8 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/strategies", name: "策略列表頁", el: () => <StrategiesPage /> },
   { path: "/docs", name: "文件頁", el: () => <DocsPage /> },
   { path: "/dashboard", name: "Dashboard 頁", el: () => <DashboardPage /> },
+  { path: "/settings", name: "設定頁", el: () => <SettingsPage /> },
 ];
-
-/**
- * ⭐⭐ Task 7 導覽狀態機重寫：nav 現在連到 /dashboard／/strategies／/settings／
- * /docs，但這幾頁的頁面元件分別排在 Task 13/14、Task 9、Task 16、Task 12 才會
- * 建立——本任務只動 Header／Footer，不得越權建立這些頁面（會跟後續 task 的
- * 完整規格衝突）。這裡用顯式白名單把它們從「導覽涵蓋率」豁免，不是把測試改鬆
- * 讓錯誤靜默過關：白名單本身就是待辦清單，對應 task 完成時必須把該路由搬進
- * 上面的 ROUTES 並補上逐頁狀態測試，屆時本白名單應該清空。
- *
- * ⭐ Task 9：`/strategies` 頁面元件已建立並搬進上面的 ROUTES，白名單清掉這一筆。
- * ⭐ Task 12：`/docs` 頁面元件已建立（未登入可直接開啟，無 guard）並搬進上面的
- * ROUTES，白名單清掉這一筆。
- * ⭐ Task 14：`/dashboard` 頁面元件已建立並搬進上面的 ROUTES，白名單清掉這一筆。
- * `/settings` 仍待 Task 16。
- */
-const PENDING_ROUTES = new Set(["/settings"]);
 
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset();
@@ -199,13 +194,17 @@ function mockLoggedOut() {
   api.getMe.mockRejectedValue(unauthorized());
   for (const k of ["getStatus", "getLeaders", "getAdminPending",
                    "getOpsCustomers", "getOpsRevenue", "getOpsSubscriptions",
-                   "getOpsTradeQuality", "getOpsHealth", "getDashboard"] as const) {
+                   "getOpsTradeQuality", "getOpsHealth", "getDashboard",
+                   "getMyRisk", "getMyCapital", "getMyLeader"] as const) {
     api[k].mockRejectedValue(unauthorized());
   }
 }
 
 /** 已登入的一般客戶，尚未活化：session 有效，但沒有 follower、非管理員。
- * `/api/me/dashboard` 照樣 200＋全塊 null（見 DASHBOARD_INACTIVE 註解）。 */
+ * `/api/me/dashboard` 照樣 200＋全塊 null（見 DASHBOARD_INACTIVE 註解）。
+ * `/settings` 的三段自有查詢（風控／資金配置／目前跟隨的 leader）在這個狀態下
+ * 一律回 403（沿 `/ops`、`/admin` 未活化客戶的既有慣例：session 有效但功能性
+ * 端點對還沒完成開通的帳號回拒），驗的是「讀不到不炸」，不是這幾段的正常路徑。 */
 function mockLoggedInNotActivated() {
   api.getMe.mockResolvedValue(ME);
   api.getStatus.mockResolvedValue(NOT_ACTIVATED);
@@ -213,7 +212,8 @@ function mockLoggedInNotActivated() {
   api.getDashboard.mockResolvedValue(DASHBOARD_INACTIVE);
   api.getAdminPending.mockRejectedValue(forbidden());
   for (const k of ["getOpsCustomers", "getOpsRevenue", "getOpsSubscriptions",
-                   "getOpsTradeQuality", "getOpsHealth"] as const) {
+                   "getOpsTradeQuality", "getOpsHealth",
+                   "getMyRisk", "getMyCapital", "getMyLeader"] as const) {
     api[k].mockRejectedValue(forbidden());
   }
 }
@@ -309,7 +309,6 @@ describe("導覽涵蓋率（與 Header 對齊）", () => {
     expect(hrefs.length).toBeGreaterThan(0);
     const tested = new Set(ROUTES.map((r) => r.path));
     for (const h of hrefs) {
-      if (h !== null && PENDING_ROUTES.has(h)) continue; // 見上方 PENDING_ROUTES 註解
       expect(tested, `導覽列有 ${h} 但本檔未測`).toContain(h);
     }
   });
