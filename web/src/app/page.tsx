@@ -1,116 +1,255 @@
 "use client";
 /**
- * `/` — 登入頁，同時是全站的產品敘事入口。
+ * `/` — 首頁（策略優先 + 證據層，Task 8，設計稿 §03）。
  *
- * ⭐ 2026-07-30 大幅減法：SIWE 登入機制與導向行為完全不動（測試契約盡量保留）；
- * 呈現重構為三步旅程——連結錢包並登入、完成兩項授權（跟單授權＋builder code
- * 收款授權）、貼上 leader 地址開始跟單。這三步是「綁定錢包」在本產品裡的權威
- * 定義，文案單一來源見 COPY.login.journey。
+ * ⭐⭐ 2026-08-28 大改版：舊版首頁是 SIWE 登入頁（連結錢包→簽署→導向 /onboarding）。
+ * 顧問 P1/P2 核心是「第一屏不再要求任何簽名」（NOTE 01）——本頁**完全不 import
+ * wagmi**，沒有任何錢包連線按鈕。順序：hero（零錢包 CTA）→ 證據列（接
+ * `/api/public/stats`）→ 可跟單策略（接 `/api/public/strategies`）→ 授權能力矩陣
+ * （`#security` 錨點）→ 費用試算 → 開始跟單四步驟（`#how` 錨點）→ Footer（Task 7，
+ * 掛在 layout.tsx，不在本頁渲染）。
+ *
+ * 舊版的 SIWE 連線流程（`useConnect`/`useSignMessage`/`loginWithSiwe`）將在
+ * Task 9 搬到策略詳情頁的跟單面板 CTA；本頁不再擁有登入職責。
  */
-import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { useAccount, useConnect, useSignMessage } from "wagmi";
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { CapabilityMatrix } from "@/components/CapabilityMatrix";
+import { FeeCalculator } from "@/components/FeeCalculator";
+import { StrategyCard } from "@/components/StrategyCard";
+import { fmtUsdCompact, NO_VALUE, shortAddr } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
-import { useMe } from "@/lib/hooks";
-import { loginWithSiwe } from "@/lib/siwe";
+import {
+  getPublicStats,
+  getPublicStrategies,
+  type PublicStats,
+  type PublicStrategy,
+} from "@/lib/publicApi";
 
-type Phase = "idle" | "connecting" | "signing";
+const EMPTY_STATS: PublicStats = {
+  routed_volume_usd_total: null,
+  builder_fee_bps: null,
+  live_days: null,
+  updated_at: 0,
+};
 
-export default function LoginPage() {
-  const router = useRouter();
-  const { address, chainId, isConnected } = useAccount();
-  const { connectAsync, connectors } = useConnect();
-  const { signMessageAsync } = useSignMessage();
-  const me = useMe();
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [error, setError] = useState<string | null>(null);
+function pickFeatured(strategies: PublicStrategy[]): PublicStrategy | null {
+  if (strategies.length === 0) return null;
+  return strategies.find((s) => s.featured) ?? strategies[0];
+}
 
+/** metrics 顯示：insufficient → NO_VALUE；否則附上尾綴（例如 %）。 */
+function metricText(value: string | null, insufficient: boolean, suffix = ""): string {
+  if (insufficient || value == null) return NO_VALUE;
+  return `${value}${suffix}`;
+}
+
+export default function HomePage() {
   const COPY = useCopy();
-  const c = COPY.login;
-  const loggedIn = !!me.data;
+  const home = COPY.home;
 
-  async function handleConnect() {
-    setError(null);
-    try {
-      let addr = address;
-      let cid = chainId;
-      if (!isConnected) {
-        const injected = connectors[0];
-        if (!injected) {
-          setError(c.noWallet);
-          return;
-        }
-        setPhase("connecting");
-        const result = await connectAsync({ connector: injected });
-        addr = result.accounts[0];
-        cid = result.chainId;
-      }
-      if (!addr || !cid) {
-        setError(c.noWallet);
-        return;
-      }
-      setPhase("signing");
-      await loginWithSiwe({
-        address: addr,
-        chainId: cid,
-        signMessage: (message) => signMessageAsync({ message }),
-      });
-      router.push("/onboarding");
-    } catch (err) {
-      const e = err as { name?: string; code?: number; message?: string } | undefined;
-      const isRejected =
-        e?.name === "UserRejectedRequestError" ||
-        e?.code === 4001 ||
-        /reject|denied|cancel/i.test(String(e?.message ?? ""));
-      setError(isRejected ? c.rejected : c.loginFailed);
-    } finally {
-      setPhase("idle");
-    }
-  }
+  const [stats, setStats] = useState<PublicStats>(EMPTY_STATS);
+  const [strategies, setStrategies] = useState<PublicStrategy[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getPublicStats().then((s) => {
+      if (!cancelled) setStats(s);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    getPublicStrategies().then((r) => {
+      if (!cancelled) setStrategies(r.strategies);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const featured = pickFeatured(strategies);
+  const explorerBase = "https://app.hyperliquid.xyz/explorer/address";
+  const leaderExplorerHref = featured ? `${explorerBase}/${featured.leader_address}` : "https://app.hyperliquid.xyz";
+
+  const builderFeeDisplay =
+    stats.builder_fee_bps == null ? NO_VALUE : `${(stats.builder_fee_bps / 100).toFixed(2)}%`;
+
+  const evidence = [
+    {
+      key: "routed",
+      value: fmtUsdCompact(stats.routed_volume_usd_total),
+      label: home.evidence.routedVolumeLabel,
+      link: home.evidence.routedVolumeLink,
+      href: leaderExplorerHref,
+    },
+    {
+      key: "live_days",
+      value: stats.live_days == null ? NO_VALUE : `${stats.live_days}${home.evidence.liveDaysSuffix}`,
+      label: home.evidence.liveDaysLabel,
+      link: home.evidence.liveDaysLink,
+      href: leaderExplorerHref,
+    },
+    {
+      key: "builder_fee",
+      value: builderFeeDisplay,
+      label: home.evidence.builderFeeLabel,
+      link: home.evidence.builderFeeLink,
+      href: "/docs#fees",
+    },
+    {
+      key: "custody",
+      value: home.evidence.custodyValue,
+      label: home.evidence.custodyLabel,
+      link: home.evidence.custodyLink,
+      href: "/docs#custody",
+    },
+  ];
 
   return (
-    <main className="page">
-      <section className="login-shell login-inner">
-        <p className="eyebrow">{c.eyebrow}</p>
-        <h1 className="login-hero">{c.heroTitle}</h1>
-        <p className="subtitle">{c.subtitle}</p>
-
-        <ol className="landing-steps">
-          {c.journey.map((step, i) => (
-            <li key={step.title} className="landing-step">
-              <span className="landing-step-num">{i + 1}</span>
-              <div>
-                <p className="landing-step-title">{step.title}</p>
-                <p className="hint">{step.body}</p>
-              </div>
-            </li>
-          ))}
-        </ol>
-
-        <div className="login-actions">
-          <div className="cta-row">
-            {loggedIn ? (
-              <button type="button" className="btn btn-primary btn-block"
-                onClick={() => router.push("/onboarding")}>
-                {COPY.wizard.stepNames[0]} ✓ — {COPY.common.next}
-              </button>
-            ) : (
-              <button type="button" className="btn btn-primary btn-block"
-                onClick={handleConnect} disabled={phase !== "idle"}>
-                {phase === "connecting" ? c.connecting : phase === "signing" ? c.signingIn : c.connect}
-              </button>
-            )}
+    <main className="page home-page">
+      {/* ---------- hero ---------- */}
+      <section className="home-hero">
+        <div className="home-hero-copy">
+          <div className="pill home-badge">
+            <span className="home-badge-dot" aria-hidden="true" />
+            <span>{home.hero.badge}</span>
           </div>
-          <p className="hint">{c.signInNote}</p>
-          {error && (
-            <div className="sign-error">
-              <p>{error}</p>
-            </div>
+          <h1 className="home-hero-title">{home.hero.title}</h1>
+          <p className="home-hero-sub">{home.hero.sub}</p>
+          <div className="home-hero-cta-row">
+            <Link href="/strategies" className="btn btn-primary">
+              {home.hero.ctaPrimary}
+            </Link>
+            <a href="#security" className="btn btn-secondary">
+              {home.hero.ctaSecondary}
+            </a>
+          </div>
+          <p className="home-hero-note">{home.hero.microNote}</p>
+        </div>
+
+        <div className="card home-hero-featured">
+          {featured ? (
+            <>
+              <div className="home-hero-featured-head">
+                <div>
+                  <div className="home-hero-featured-name">
+                    {featured.name}
+                    {featured.tagline ? ` · ${featured.tagline}` : ""}
+                  </div>
+                  <div className="mono home-hero-featured-addr">
+                    {home.hero.featuredCard.leaderPrefix}
+                    {shortAddr(featured.leader_address)}
+                    {home.hero.featuredCard.leaderLinkSuffix}
+                  </div>
+                </div>
+                <span className="pill follow-pill" data-state={featured.status === "running" ? "following" : "paused"}>
+                  <span className="follow-pill-dot" aria-hidden="true" />
+                  {featured.status === "running"
+                    ? home.hero.featuredCard.statusRunning
+                    : home.hero.featuredCard.statusPaused}
+                </span>
+              </div>
+              <div className="home-hero-featured-metrics">
+                <div>
+                  <div className="strategy-metric-label">
+                    {home.hero.featuredCard.returnLabelPrefix}
+                    {featured.live_days}
+                    {home.hero.featuredCard.returnLabelSuffix}
+                  </div>
+                  <div className="mono home-hero-featured-value pos">
+                    {metricText(featured.metrics.total_return_pct, featured.metrics.total_return_pct_insufficient, "%")}
+                  </div>
+                </div>
+                <div>
+                  <div className="strategy-metric-label">{home.hero.featuredCard.drawdownLabel}</div>
+                  <div className="mono home-hero-featured-value neg">
+                    {metricText(featured.metrics.max_drawdown_pct, featured.metrics.max_drawdown_pct_insufficient, "%")}
+                  </div>
+                </div>
+                <div>
+                  <div className="strategy-metric-label">{home.hero.featuredCard.liveDaysLabel}</div>
+                  <div className="mono home-hero-featured-value">{featured.live_days}</div>
+                </div>
+                <div>
+                  <div className="strategy-metric-label">{home.hero.featuredCard.followerCountLabel}</div>
+                  <div className="mono home-hero-featured-value">
+                    {featured.follower_count == null ? NO_VALUE : featured.follower_count}
+                  </div>
+                </div>
+              </div>
+              <div className="home-hero-featured-footnote">
+                {home.hero.featuredCard.sampleNotePrefix}
+                {featured.live_days}
+                {home.hero.featuredCard.sampleNoteSuffix}{" "}
+                <Link href={`/strategies/${featured.slug}`}>{home.hero.featuredCard.methodologyLink}</Link>
+              </div>
+            </>
+          ) : (
+            <p className="hint">{home.hero.featuredCard.noDataNote}</p>
           )}
         </div>
-        <div className="login-footnotes">
-          <p className="footnote">{c.footnote}</p>
-          <p className="footnote">{COPY.common.nonCustodial}</p>
+      </section>
+
+      {/* ---------- 證據列（NOTE 02） ---------- */}
+      <section className="evidence-row">
+        {evidence.map((item) => (
+          <div key={item.key} className="evidence-item">
+            <div className="mono evidence-value">{item.value}</div>
+            <div className="evidence-label">{item.label}</div>
+            <a href={item.href} className="mono evidence-link">
+              {item.link}
+            </a>
+          </div>
+        ))}
+      </section>
+
+      {/* ---------- 策略區 ---------- */}
+      <section className="home-strategies">
+        <div className="home-strategies-head">
+          <div>
+            <h2>{home.strategies.heading}</h2>
+            <p className="section-sub">{home.strategies.sub}</p>
+          </div>
+          <Link href="/strategies" className="home-strategies-viewall">
+            {home.strategies.viewAll}
+          </Link>
+        </div>
+        <div className="strategy-grid">
+          {strategies.map((s) => (
+            <StrategyCard key={s.slug} strategy={s} />
+          ))}
+          {strategies.length === 0 && <p className="hint">{home.strategies.empty}</p>}
+          <div className="card strategy-card strategy-card-advanced">
+            <div className="strategy-card-name">{home.strategies.advancedTitle}</div>
+            <p className="strategy-card-advanced-body">{home.strategies.advancedBody}</p>
+            <Link href="/advanced" className="btn btn-secondary btn-block">
+              {home.strategies.advancedCta}
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      {/* ---------- 授權能力矩陣 ---------- */}
+      <CapabilityMatrix id="security" />
+
+      {/* ---------- 費用試算 ---------- */}
+      <FeeCalculator />
+
+      {/* ---------- 開始跟單的四個步驟 ---------- */}
+      <section id="how" className="home-steps">
+        <h2>{home.steps.heading}</h2>
+        <div className="home-steps-grid">
+          {home.steps.items.map((step) => (
+            <div key={step.n} className="card home-step-card">
+              <div className="mono home-step-num">STEP {step.n}</div>
+              <div className="home-step-title">{step.t}</div>
+              <div className="home-step-desc">{step.d}</div>
+            </div>
+          ))}
         </div>
       </section>
     </main>

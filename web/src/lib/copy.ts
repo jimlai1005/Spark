@@ -940,6 +940,117 @@ export const COPY_ZH = {
       dismiss: "關閉",
     },
   },
+  /**
+   * 首頁（Task 8，設計稿 §03「首頁（策略優先 + 證據層）」）。⭐ 第一屏零錢包按鈕
+   * （NOTE 01）：hero CTA 與 header CTA 一律指向 /strategies，本頁不觸發任何
+   * wagmi 連線。`hero.title`／`sub`／`ctaPrimary` 三個值照文案對照表 L999-1006
+   * 的 new 欄逐字採用；`strategies.*`／`evidence.*`／`steps.*` 照 §03 內文。
+   */
+  home: {
+    hero: {
+      badge: "非保管 · 資金不離開你的錢包",
+      title: "讓你的 Hyperliquid 帳戶，自動跟隨量化策略",
+      sub: "資金始終留在你的錢包。Filet 只能依你設定的風險限制下單，不能提領或轉帳，你可以隨時暫停或撤銷授權。",
+      ctaPrimary: "查看策略與風險",
+      ctaSecondary: "授權能做什麼？",
+      microNote: "不需要註冊、不需要 email。連接錢包只發生在你選好策略之後。",
+      featuredCard: {
+        statusRunning: "運行中",
+        statusPaused: "已暫停",
+        leaderPrefix: "leader ",
+        leaderLinkSuffix: " · 鏈上可驗",
+        returnLabelPrefix: "樣本 ",
+        returnLabelSuffix: " 天全期報酬",
+        drawdownLabel: "期間最大回撤",
+        liveDaysLabel: "實盤天數",
+        followerCountLabel: "目前跟單人數",
+        sampleNotePrefix: "樣本 ",
+        sampleNoteSuffix: " 交易日，樣本數偏小、指標帶寬較寬。",
+        methodologyLink: "完整方法論揭露 →",
+        noDataNote: "目前尚無足夠資料可顯示主推策略卡，請直接查看策略清單。",
+      },
+    },
+    /** 證據列四格（NOTE 02）：全部接 `/api/public/stats`，取不到 → 顯示 `—` 並
+     * 保留欄位；`custody` 為託管資產永遠是 0，屬靜態陳述，不接任何 API 欄位。 */
+    evidence: {
+      routedVolumeLabel: "累計路由交易量",
+      routedVolumeLink: "hyperliquid explorer ↗",
+      liveDaysLabel: "自營策略連續實盤",
+      liveDaysSuffix: " 天",
+      liveDaysLink: "leader 帳戶 ↗",
+      builderFeeLabel: "Builder fee（每筆成交）",
+      builderFeeLink: "builder code ↗",
+      custodyLabel: "託管資產（永遠）",
+      custodyValue: "0",
+      custodyLink: "授權範圍說明 ↗",
+    },
+    strategies: {
+      heading: "可跟單策略",
+      sub: "每個策略的績效都來自 Hyperliquid 鏈上帳戶，任何人都能自行核對。上架門檻：連續實盤 ≥ 60 天。",
+      viewAll: "全部策略 →",
+      featuredBadge: "主推",
+      pendingBadge: "樣本累積中",
+      metricTotalReturn: "總報酬",
+      metricMaxDrawdown: "最大回撤",
+      metricSharpe: "Sharpe",
+      metricWinRate: "日勝率",
+      insufficientLabel: "樣本不足",
+      leveragePrefix: "槓桿 ≤ ",
+      minNotionalPrefix: "最低跟單 $",
+      cta: "查看策略與風險",
+      pendingNote: "未達 60 天上架門檻，僅供觀察，暫不開放跟單。",
+      empty: "目前沒有可跟單的策略，請稍後再回來查看。",
+      advancedTitle: "進階模式",
+      advancedBody:
+        "已經有指定的 leader 地址？可跟單任一 Hyperliquid 錢包。此模式下 Filet 不對該地址的策略品質、"
+        + "風控或存續做任何背書，需另外勾選風險確認。",
+      advancedCta: "進入進階模式",
+    },
+    steps: {
+      heading: "開始跟單的四個步驟",
+      items: [
+        { n: "01", t: "選擇策略", d: "看完績效、回撤與方法論揭露後再決定。" },
+        { n: "02", t: "連接錢包並授權", d: "兩筆免費簽名：agent 下單權與 builder fee 費率上限，均不上鏈。" },
+        { n: "03", t: "設定風險限制", d: "投入比例、槓桿上限、最大回撤自動停止。" },
+        { n: "04", t: "進入 Dashboard", d: "同步狀態、曝險、PnL、費用一頁看完，隨時可暫停。" },
+      ],
+    },
+  },
+  /**
+   * 授權能力矩陣（單一來源，首頁／策略頁授權說明／onboarding 授權卡三處共用，
+   * 見 plan Task 8）。`can`／`cannot` 各四條，`revocable` 為單方可撤銷段。
+   */
+  auth: {
+    heading: "授權之後，Filet 能做什麼、不能做什麼",
+    sub: "兩筆錢包簽名都不上鏈、不花 gas。以下是 agent 權限的精確邊界。",
+    canTitle: "可以",
+    cannotTitle: "不能",
+    can: [
+      "依策略訊號在你的帳戶下單、加倉、平倉",
+      "使用你設定範圍內的可動用資金（投入比例上限）",
+      "在你簽署的槓桿上限內調整倉位",
+      "依已簽署的費率上限（0.02%）收取 builder fee",
+    ],
+    cannot: [
+      "提領你的資金到任何地址",
+      "轉帳或在錢包之間移動資產",
+      "取得你的私鑰或助記詞（永遠不會索取）",
+      "超出你設定的投入比例、槓桿與最大回撤",
+    ],
+    revocable:
+      "授權為你單方可撤銷：Dashboard 一鍵暫停跟單（停止新開倉），或撤銷 agent（Filet 立即失去下單能力）。"
+      + "撤銷不需要 Filet 同意，也不需要我們在線。",
+  },
+  /** 費用試算區（NOTE 06）。slider 邏輯在 `FeeCalculator.tsx`，本區只放靜態文案。 */
+  fee: {
+    heading: "費用：每筆成交 0.02%",
+    body: "沒有月費、沒有分潤、沒有提領費。builder fee 直接記在鏈上，每一筆都能核對。",
+    note: "此費率為你在授權時簽署的上限，我們無法單方調高。Hyperliquid 本身的交易手續費與資金費率另計。",
+    calcLabel: "試算：倉位規模",
+    openLabel: "建倉 builder fee",
+    closeLabel: "平倉 builder fee",
+    totalLabel: "一次完整交易合計",
+  },
 } as const;
 
 /**
@@ -1696,5 +1807,107 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       retry: "Try again",
       dismiss: "Dismiss",
     },
+  },
+  home: {
+    hero: {
+      badge: "Non-custodial · funds never leave your wallet",
+      title: "Let your Hyperliquid account automatically follow quant strategies",
+      sub: "Your funds always stay in your own wallet. Filet can only place orders within the risk limits you set — "
+        + "it can never withdraw or transfer — and you can pause or revoke authorization at any time.",
+      ctaPrimary: "View strategies & risks",
+      ctaSecondary: "What can authorization do?",
+      microNote: "No sign-up, no email required. Connecting a wallet only happens after you pick a strategy.",
+      featuredCard: {
+        statusRunning: "Running",
+        statusPaused: "Paused",
+        leaderPrefix: "leader ",
+        leaderLinkSuffix: " · verifiable on-chain",
+        returnLabelPrefix: "Sample ",
+        returnLabelSuffix: "-day full-period return",
+        drawdownLabel: "Max drawdown (period)",
+        liveDaysLabel: "Days live",
+        followerCountLabel: "Current followers",
+        sampleNotePrefix: "Sample ",
+        sampleNoteSuffix: " trading days; small sample, wider metric bands.",
+        methodologyLink: "Full methodology disclosure →",
+        noDataNote: "No featured strategy card available yet — please browse the strategy list directly.",
+      },
+    },
+    evidence: {
+      routedVolumeLabel: "Total routed volume",
+      routedVolumeLink: "hyperliquid explorer ↗",
+      liveDaysLabel: "Consecutive days live (in-house strategy)",
+      liveDaysSuffix: " days",
+      liveDaysLink: "leader account ↗",
+      builderFeeLabel: "Builder fee (per fill)",
+      builderFeeLink: "builder code ↗",
+      custodyLabel: "Assets in custody (always)",
+      custodyValue: "0",
+      custodyLink: "authorization scope ↗",
+    },
+    strategies: {
+      heading: "Strategies you can follow",
+      sub: "Every strategy's performance comes from a Hyperliquid on-chain account that anyone can independently "
+        + "verify. Listing threshold: at least 60 consecutive days live.",
+      viewAll: "All strategies →",
+      featuredBadge: "Featured",
+      pendingBadge: "Accumulating sample",
+      metricTotalReturn: "Total return",
+      metricMaxDrawdown: "Max drawdown",
+      metricSharpe: "Sharpe",
+      metricWinRate: "Daily win rate",
+      insufficientLabel: "Insufficient sample",
+      leveragePrefix: "Leverage ≤ ",
+      minNotionalPrefix: "Min. follow $",
+      cta: "View strategy & risks",
+      pendingNote: "Not yet at the 60-day listing threshold — for observation only, not open to follow yet.",
+      empty: "No strategies are open to follow right now — please check back later.",
+      advancedTitle: "Advanced mode",
+      advancedBody: "Already have a leader address in mind? You can follow any Hyperliquid wallet. In this mode "
+        + "Filet makes no endorsement of that address's strategy quality, risk controls, or continuity — an extra "
+        + "risk acknowledgement is required.",
+      advancedCta: "Enter advanced mode",
+    },
+    steps: {
+      heading: "Four steps to start following",
+      items: [
+        { n: "01", t: "Choose a strategy", d: "Decide only after reviewing performance, drawdown, and methodology disclosure." },
+        { n: "02", t: "Connect wallet & authorize", d: "Two free signatures: agent order authority and the builder fee rate cap — neither goes on-chain." },
+        { n: "03", t: "Set risk limits", d: "Allocation share, leverage cap, and max-drawdown auto-stop." },
+        { n: "04", t: "Enter Dashboard", d: "Sync status, exposure, PnL, and fees on one page — pause anytime." },
+      ],
+    },
+  },
+  auth: {
+    heading: "What Filet can — and can't — do after authorization",
+    sub: "Neither wallet signature goes on-chain or costs gas. Here is the exact boundary of agent permissions.",
+    canTitle: "Can",
+    cannotTitle: "Can't",
+    can: [
+      "Place, add to, and close orders in your account based on strategy signals",
+      "Use margin within the range you set (allocation share cap)",
+      "Adjust positions within the leverage cap you signed",
+      "Collect builder fee up to the rate cap you signed (0.02%)",
+    ],
+    cannot: [
+      "Withdraw your funds to any address",
+      "Transfer or move assets between wallets",
+      "Obtain your private key or seed phrase (never requested)",
+      "Exceed the allocation share, leverage, or max drawdown you set",
+    ],
+    revocable: "Authorization is unilaterally revocable by you: pause following from the Dashboard with one click "
+      + "(stops new order placement), or revoke the agent (Filet immediately loses order authority). Revocation "
+      + "needs neither Filet's consent nor Filet to be online.",
+  },
+  fee: {
+    heading: "Fee: 0.02% per fill",
+    body: "No monthly fee, no profit share, no withdrawal fee. The builder fee is recorded on-chain, and every "
+      + "fill can be verified.",
+    note: "This rate is the cap you signed at authorization — we cannot raise it unilaterally. Hyperliquid's own "
+      + "trading fees and funding rates are separate.",
+    calcLabel: "Estimate: position size",
+    openLabel: "Open builder fee",
+    closeLabel: "Close builder fee",
+    totalLabel: "Total for one round trip",
   },
 };

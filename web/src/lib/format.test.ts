@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fmtAmount, fmtRatioPct, NO_VALUE, shortAddr } from "./format";
+import { fmtAmount, fmtRatioPct, fmtUsdCompact, NO_VALUE, shortAddr } from "./format";
 
 describe("shortAddr", () => {
   it("縮寫成 0x5579…B5d 形式（前 6 + 後 3，照 v1 原型）", () => {
@@ -26,6 +26,26 @@ describe("fmtAmount", () => {
     expect(fmtAmount(undefined)).toBe(NO_VALUE);
     expect(fmtAmount("")).toBe(NO_VALUE);
     expect(fmtAmount("not-a-number")).toBe(NO_VALUE);
+  });
+});
+
+describe("fmtUsdCompact", () => {
+  it("百萬級縮寫為 $X.XXM（首頁證據列錨例）", () => {
+    expect(fmtUsdCompact("4280000")).toBe("$4.28M");
+  });
+  it("千級縮寫為 $X.XXK", () => {
+    expect(fmtUsdCompact("12345")).toBe("$12.35K");
+  });
+  it("千以下顯示完整金額", () => {
+    expect(fmtUsdCompact("42.5")).toBe("$42.50");
+  });
+  it("負值保留正負號", () => {
+    expect(fmtUsdCompact("-2000000")).toBe("-$2.00M");
+  });
+  it("缺值 → 佔位符", () => {
+    expect(fmtUsdCompact(null)).toBe(NO_VALUE);
+    expect(fmtUsdCompact(undefined)).toBe(NO_VALUE);
+    expect(fmtUsdCompact("not-a-number")).toBe(NO_VALUE);
   });
 });
 

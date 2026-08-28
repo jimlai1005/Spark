@@ -68,7 +68,7 @@ import { COPY_ZH as COPY } from "@/lib/copy";
 import { Header } from "@/components/Header";
 import AdminPage from "./admin/page";
 import LeadersPage from "./leaders/page";
-import LoginPage from "./page";
+import HomePage from "./page";
 import OnboardingPage from "./onboarding/page";
 import OpsPage from "./ops/page";
 
@@ -131,7 +131,7 @@ function assertReadable(container: HTMLElement) {
  * 覆蓋，不是漏改。
  */
 const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
-  { path: "/", name: "登入頁", el: () => <LoginPage /> },
+  { path: "/", name: "首頁", el: () => <HomePage /> },
   { path: "/onboarding", name: "開通頁", el: () => <OnboardingPage /> },
   { path: "/leaders", name: "跟單對象頁", el: () => <LeadersPage /> },
   { path: "/ops", name: "營運頁", el: () => <OpsPage /> },
@@ -201,9 +201,10 @@ describe("逐頁狀態｜未登入", () => {
     expect(await screen.findByText(COPY.common.notLoggedIn)).toBeInTheDocument();
   });
 
-  it("公開頁（/ ）未登入仍正常呈現，不是錯誤畫面", async () => {
-    const { unmount } = render(wrap(<LoginPage />, null));
-    expect(screen.getByRole("button", { name: COPY.login.connect })).toBeInTheDocument();
+  it("公開頁（/ ）未登入仍正常呈現，不是錯誤畫面；且無任何錢包連線按鈕（Task 8：首頁改版）", async () => {
+    const { unmount } = render(wrap(<HomePage />, null));
+    expect(screen.getByRole("heading", { level: 1, name: COPY.home.hero.title })).toBeInTheDocument();
+    expect(screen.queryAllByRole("button").length).toBe(0);
     unmount();
   });
 });

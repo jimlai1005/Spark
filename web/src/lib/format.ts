@@ -30,3 +30,19 @@ export function fmtRatioPct(v: string | null | undefined, dp = 1): string {
   if (!Number.isFinite(n)) return NO_VALUE;
   return `${(n * 100).toFixed(dp)}%`;
 }
+
+/**
+ * USD 金額 → 縮寫顯示（首頁證據列，設計稿 §03 錨例 $4.28M）。
+ * ≥ 1,000,000 → `$X.XXM`；≥ 1,000 → `$X.XXK`；否則 `$X.XX`。
+ * null／空／非數字 → NO_VALUE（不得寫死假數字，見不變量 0.3.6）。
+ */
+export function fmtUsdCompact(v: string | null | undefined): string {
+  if (v == null || v === "") return NO_VALUE;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return NO_VALUE;
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `${sign}$${(abs / 1_000).toFixed(2)}K`;
+  return `${sign}$${abs.toFixed(2)}`;
+}
