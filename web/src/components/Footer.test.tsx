@@ -63,6 +63,15 @@ describe("Footer", () => {
     expect(await screen.findByText(COPY_ZH.footer.statusUnknown)).toBeInTheDocument();
   });
 
+  it("Task 12：文件／系統狀態／績效方法論已接上真實連結", () => {
+    stubStatus("unknown");
+    renderFooter();
+    expect(screen.getByRole("link", { name: COPY_ZH.footer.productDocs })).toHaveAttribute("href", "/docs");
+    expect(screen.getByRole("link", { name: COPY_ZH.footer.verifiableMethodology }))
+      .toHaveAttribute("href", "/docs#methodology");
+    expect(screen.getByRole("link", { name: COPY_ZH.footer.verifiableStatus })).toHaveAttribute("href", "/status");
+  });
+
   it("載入完成後 data-status 反映後端回應（供樣式掛鉤）", async () => {
     stubStatus("degraded");
     const { container } = renderFooter();

@@ -73,6 +73,7 @@ import { COPY_ZH as COPY } from "@/lib/copy";
 import { Header } from "@/components/Header";
 import AdminPage from "./admin/page";
 import AdvancedPage from "./advanced/page";
+import DocsPage from "./docs/page";
 import LeadersPage from "./leaders/page";
 import HomePage from "./page";
 import OnboardingPage from "./onboarding/page";
@@ -146,6 +147,7 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/ops", name: "營運頁", el: () => <OpsPage /> },
   { path: "/admin", name: "待核准頁", el: () => <AdminPage /> },
   { path: "/strategies", name: "策略列表頁", el: () => <StrategiesPage /> },
+  { path: "/docs", name: "文件頁", el: () => <DocsPage /> },
 ];
 
 /**
@@ -157,9 +159,10 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
  * 上面的 ROUTES 並補上逐頁狀態測試，屆時本白名單應該清空。
  *
  * ⭐ Task 9：`/strategies` 頁面元件已建立並搬進上面的 ROUTES，白名單清掉這一筆。
- * `/dashboard`／`/settings`／`/docs` 仍待 Task 13/14、16、12。
+ * ⭐ Task 12：`/docs` 頁面元件已建立（未登入可直接開啟，無 guard）並搬進上面的
+ * ROUTES，白名單清掉這一筆。`/dashboard`／`/settings` 仍待 Task 13/14、16。
  */
-const PENDING_ROUTES = new Set(["/dashboard", "/settings", "/docs"]);
+const PENDING_ROUTES = new Set(["/dashboard", "/settings"]);
 
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset();

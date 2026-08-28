@@ -13,8 +13,12 @@ import { getPublicStatus, type PublicComponentStatus } from "@/lib/publicApi";
  * （讀不到 ≠ 系統健康，工程原則 3 的前端鏡射）。
  *
  * 法務欄連向 /terms /privacy /risk（Task 12 建立的實體頁）與
- * mailto:contact@filet.trade；產品／可驗證兩欄目前只是文字（對應頁面/錨點多數
- * 尚未存在，見設計稿 §03 L399-405 的靜態 mock，本任務不擅自發明路由）。
+ * mailto:contact@filet.trade；產品／可驗證兩欄大多仍是純文字（對應頁面/錨點多數
+ * 尚未存在，見設計稿 §03 L399-405 的靜態 mock，本任務不擅自發明路由）——
+ * ⭐ Task 12 順帶把**已經有真實去處**的三項接上連結：文件 → `/docs`、
+ * 系統狀態 → `/status`、績效方法論 → `/docs#methodology`（三者都是本 task
+ * 建立的頁面／錨點）。其餘項目（策略、運作方式、費用、leader 帳戶、builder
+ * fee 費率）仍無對應路由/錨點，維持純文字。
  */
 export function Footer() {
   const COPY = useCopy();
@@ -51,7 +55,7 @@ export function Footer() {
             <span>{c.productStrategies}</span>
             <span>{c.productHow}</span>
             <span>{c.productFees}</span>
-            <span>{c.productDocs}</span>
+            <Link href="/docs">{c.productDocs}</Link>
           </div>
         </div>
         <div>
@@ -59,8 +63,8 @@ export function Footer() {
           <div className="footer-col-list">
             <span>{c.verifiableLeaderAccounts}</span>
             <span>{c.verifiableBuilderFee}</span>
-            <span>{c.verifiableMethodology}</span>
-            <span>{c.verifiableStatus}</span>
+            <Link href="/docs#methodology">{c.verifiableMethodology}</Link>
+            <Link href="/status">{c.verifiableStatus}</Link>
           </div>
         </div>
         <div>

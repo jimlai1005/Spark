@@ -1,0 +1,26 @@
+/** `/risk` 頁測試（Task 12）：渲染標題與至少 3 個 section 標題，內容取自 content/legal.ts。 */
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { LEGAL_ZH } from "@/content/legal";
+import RiskPage from "./page";
+
+describe("RiskPage", () => {
+  it("渲染標題與生效日期", () => {
+    render(<RiskPage />);
+    expect(screen.getByRole("heading", { level: 1, name: LEGAL_ZH.risk.title })).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(LEGAL_ZH.risk.effectiveDate))).toBeInTheDocument();
+  });
+
+  it("渲染至少 3 個 section 標題", () => {
+    render(<RiskPage />);
+    const headings = LEGAL_ZH.risk.sections.slice(0, 3);
+    for (const s of headings) {
+      expect(screen.getByRole("heading", { level: 2, name: s.heading })).toBeInTheDocument();
+    }
+  });
+
+  it("內容逐字命中（抽查第一節開場句）", () => {
+    render(<RiskPage />);
+    expect(screen.getByText(LEGAL_ZH.risk.sections[0].paragraphs[0])).toBeInTheDocument();
+  });
+});

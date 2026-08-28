@@ -986,6 +986,13 @@ export const COPY_ZH = {
       conventionPrefix: "指標以 ",
       conventionMid: " 日/年、無風險利率 ",
       conventionSuffix: " 之加密慣例年化。",
+      /**
+       * ⭐ Task 12（/docs 頁「績效方法論」段）新增：spec 要求揭露「perp 基準」
+       * 這條慣例，但既有欄位裡沒有一句現成的話講到它（`methodology.basis` 這個
+       * API 欄位本身也從未在任何頁面被渲染過，見 publicApi.ts）。這是本任務唯一
+       * 新增的一句話；其餘 /docs 段落全部複用既有 key，不重複定義語義。
+       */
+      basisNote: "指標以 perp（永續合約）帳戶淨值為計算基準。",
     },
     panel: {
       heading: "跟隨此策略",
@@ -1007,6 +1014,19 @@ export const COPY_ZH = {
       pendingCta: "樣本累積中",
       pendingNote: "此策略尚未達 60 天上架門檻，暫不開放跟單。",
     },
+  },
+  /**
+   * `/status` 頁（Task 12）：讀 `/api/public/status` 渲染整體狀態＋components＋
+   * updated_at。法務內容 spec（legal-copy-zh.md）只涵蓋 /docs，不涵蓋 /status，
+   * 這幾個 key 因此是本頁專屬的新文案；三態字樣復用 `footer.status*`（同一套狀態
+   * 語彙同時用在頁尾狀態燈與本頁，避免同一個系統狀態有兩種說法）。
+   */
+  status: {
+    heading: "系統狀態",
+    sub: "各項服務元件目前的運作狀態，資料來自 /api/public/status（不需登入）。",
+    componentsHeading: "元件",
+    empty: "目前沒有可顯示的元件狀態。",
+    loadFailedNote: "狀態讀取失敗或逾時，以下顯示為保守值（未知），不代表系統健康。",
   },
 } as const;
 
@@ -1839,6 +1859,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       conventionPrefix: "Metrics are annualized using the crypto convention of ",
       conventionMid: " days/year, risk-free rate ",
       conventionSuffix: ".",
+      basisNote: "Metrics are computed on a perp (perpetual futures) account equity basis.",
     },
     panel: {
       heading: "Follow this strategy",
@@ -1862,5 +1883,12 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       pendingCta: "Accumulating sample",
       pendingNote: "This strategy hasn't reached the 60-day listing threshold yet — not open to follow.",
     },
+  },
+  status: {
+    heading: "System status",
+    sub: "Current operating status of each service component, sourced from /api/public/status (no login required).",
+    componentsHeading: "Components",
+    empty: "No component status to display right now.",
+    loadFailedNote: "Status could not be loaded or timed out; the values below are conservative (unknown) and do not imply system health.",
   },
 };
