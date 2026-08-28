@@ -159,7 +159,7 @@ src/spark/copytrade/…               改：pause 旗標與 owner close 請求�
 - **樣本閘門：`RATIO_MIN_DAYS = 60`**——covered_days < 60 時 sharpe/sortino/年化波動回 `*_insufficient_data` 旗標（沿用檔內既有 insufficient 模式）；勝率與最佳最差日不設閘（樣本數照回）。
 
 **數值錨例（測試必含，精度 1e-4）：** r = [0.01, -0.005, 0.02]（N=3，僅為公式錨，繞過 60 天閘門測純函式）：
-mean=0.0083333、s=0.0125831、SR=**12.6535**、SE=**12.1800**、σ_ann=**0.2404**（24.04%）、Sortino=**55.1513**（DD=0.0028868）、勝率=2/3、best=0.02、worst=-0.005。
+mean=0.0083333、s=0.0125831、SR=**12.6526**、SE=**12.1798**、σ_ann=**0.2404**（24.04%）、Sortino=**55.1513**（DD=0.0028868）、勝率=2/3、best=0.02、worst=-0.005。<!-- 2026-08-28: SR/SE 錨值由 Decimal 50 位重算修正（原 12.6535/12.1800 為手算滑差），Task 4 實作與測試已用修正值 -->
 
 - [ ] 寫錨例失敗測試 → 純函式實作（獨立小函式，`compute_window_performance` 組裝）→ 綠
 - [ ] 閘門測試：covered_days 59 → insufficient；60 → 有值
