@@ -8,13 +8,15 @@ vi.mock("next/navigation", () => ({ usePathname: () => "/strategies" }));
 
 const logout = vi.fn();
 const getAdminPending = vi.fn();
+const getDashboard = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   logout: (...a: unknown[]) => logout(...a),
   getAdminPending: (...a: unknown[]) => getAdminPending(...a),
+  getDashboard: (...a: unknown[]) => getDashboard(...a),
 }));
 
-import { ApiError } from "@/lib/api";
+import { ApiError, type DashboardResp, type DashboardStatus } from "@/lib/api";
 import { COPY_EN, COPY_ZH } from "@/lib/copy";
 import { LangProvider } from "@/lib/lang";
 import { Header } from "./Header";
@@ -38,10 +40,29 @@ function navLabels(): string[] {
   return within(nav).getAllByRole("link").map((a) => a.textContent ?? "");
 }
 
+/** 固定其餘欄位、只變動 `status.state`，供 pill 三態測試使用。 */
+function dashboardWithState(state: DashboardStatus["state"]): DashboardResp {
+  return {
+    status: {
+      strategy_name: "Filet Core", state, following_days: null, signal_source_ok: true,
+      guards: {
+        scale: { now: null, max: null }, leverage: { now: null, max: null },
+        drawdown: { now: null, max: null, enabled: null },
+      },
+    },
+    equity: null, exposure: null, pnl: null, sync: null, fees_month: null,
+    positions: null, updated_at: 1724800000,
+  };
+}
+
 beforeEach(() => {
   getAdminPending.mockReset();
   // 預設：一般客戶（後端 403）——ops／admin 連結不該出現
   getAdminPending.mockRejectedValue(new ApiError("client", "非管理員", 403, "非管理員"));
+  // 預設：尚未活化（state="inactive"）→ pill 保守顯示「未跟單」；下方 pill 三態
+  // 測試個別覆寫 mockResolvedValue 驗證 following／paused 兩個非預設狀態。
+  getDashboard.mockReset();
+  getDashboard.mockResolvedValue(dashboardWithState("inactive"));
 });
 
 describe("Header — 未登入導覽（顧問 P1：導覽是信任訊號）", () => {
@@ -138,6 +159,32 @@ describe("Header — 已登入導覽", () => {
     expect(screen.queryByRole("link", { name: COPY_ZH.nav.ops })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: COPY_ZH.nav.admin })).not.toBeInTheDocument();
   });
+});
+
+describe("Header — 跟單狀態 pill 接上 /api/me/dashboard（Task 14）", () => {
+  it("state=following → 「跟單中」", async () => {
+    getDashboard.mockResolvedValue(dashboardWithState("following"));
+    render(wrap(<Header />, qcWithMe({ address: "0xabc", account_id: "fabc" })));
+    expect(await screen.findByText(COPY_ZH.nav.pillFollowing)).toBeInTheDocument();
+    expect(screen.queryByText(COPY_ZH.nav.pillNotFollowing)).not.toBeInTheDocument();
+  });
+
+  it("state=paused → 「已暫停」", async () => {
+    getDashboard.mockResolvedValue(dashboardWithState("paused"));
+    render(wrap(<Header />, qcWithMe({ address: "0xabc", account_id: "fabc" })));
+    expect(await screen.findByText(COPY_ZH.nav.pillPaused)).toBeInTheDocument();
+  });
+
+  it.each(["halted", "inactive"] as const)(
+    "state=%s → 保守顯示「未跟單」（不是 following／paused 就不偽造綠燈）",
+    async (state) => {
+      getDashboard.mockResolvedValue(dashboardWithState(state));
+      render(wrap(<Header />, qcWithMe({ address: "0xabc", account_id: "fabc" })));
+      await screen.findByText(COPY_ZH.nav.pillNotFollowing);
+      expect(screen.queryByText(COPY_ZH.nav.pillFollowing)).not.toBeInTheDocument();
+      expect(screen.queryByText(COPY_ZH.nav.pillPaused)).not.toBeInTheDocument();
+    },
+  );
 });
 
 describe("Header — 語言切換", () => {

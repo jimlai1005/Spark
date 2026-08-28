@@ -2,7 +2,13 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-const BANNED = ["固定收益", "保證", "存款", "代操"];
+// ⭐ 2026-08-28（主線程裁決，Task 14 收尾，與 copy.test.ts 同步）：「保證」原本是
+// 純 substring 禁詞，意圖擋**承諾語**（保證收益／保證獲利／保證回本），但連帶擋下
+// 「保證金」——HL/期貨語境的標準中文詞（margin），非承諾語。改用 `保證(?!金)`
+// 豁免「保證金」，其餘「保證 X」維持零容忍。殘餘風險（已知、接受）：「保證」與
+// 「金」之間隔著其他字的片語（如「保證金額」）不會被 lookahead 攔到，目前 repo
+// 內無此寫法，日後新增此類文案靠 review 把關，不靠本規則機械擋下。
+const BANNED: RegExp[] = [/固定收益/, /保證(?!金)/, /存款/, /代操/];
 const ROOTS = ["src/app", "src/components", "src/lib"];
 
 function walk(dir: string): string[] {
@@ -21,7 +27,7 @@ describe("language red-line (file-level)", () => {
     const hits: string[] = [];
     for (const f of files) {
       const src = readFileSync(f, "utf8");
-      for (const w of BANNED) if (src.includes(w)) hits.push(`${f}: ${w}`);
+      for (const w of BANNED) if (w.test(src)) hits.push(`${f}: ${w}`);
     }
     expect(hits).toEqual([]);
   });

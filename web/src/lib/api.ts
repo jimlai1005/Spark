@@ -1298,3 +1298,100 @@ export interface OpsSubscriptionsResp {
 export function getOpsSubscriptions(): Promise<OpsSubscriptionsResp> {
   return request<OpsSubscriptionsResp>("/api/ops/subscriptions");
 }
+
+// ---------- Dashboard（Task 14；後端 GET /api/me/dashboard，Task 13）----------
+/**
+ * 六塊 Dashboard 的**唯一資料源**型別。⭐⭐ 每一塊都可能整塊為 `null`（子資料源丟例外，
+ * 見 `app.py::_safe_block`）；塊內個別欄位另有各自的 `null` 語意（沿全 repo「取不到 →
+ * null，不新造公式」慣例，不變量 6）。顯示層一律：整塊 null → 該區塊顯示保守空態；
+ * 塊內單一欄位 null → 該格顯示「—」（`format.NO_VALUE`），不得渲染 `undefined`/`NaN`。
+ */
+export interface DashboardGuard { now: string | null; max: string | null }
+export interface DashboardDrawdownGuard extends DashboardGuard { enabled: boolean | null }
+export interface DashboardGuards {
+  scale: DashboardGuard;
+  leverage: DashboardGuard;
+  drawdown: DashboardDrawdownGuard;
+}
+/** `state` 型別刻意為字面量聯集（後端四態封閉、非開放列舉，見 app.py::_dashboard_status）。 */
+export interface DashboardStatus {
+  strategy_name: string | null;
+  state: "following" | "paused" | "halted" | "inactive";
+  following_days: number | null;
+  signal_source_ok: boolean | null;
+  guards: DashboardGuards;
+}
+export interface DashboardEquity {
+  account_value: string;
+  margin_used: string;
+  withdrawable: string;
+  available_pct: string | null;
+  ret_30d_pct: string | null;
+}
+export interface DashboardMaxPosition { symbol: string; pct: string }
+export interface DashboardExposure {
+  notional: string;
+  leverage: string | null;
+  long_pct: string | null;
+  short_pct: string | null;
+  position_count: number | null;
+  max_position: DashboardMaxPosition | null;
+}
+/** `series`：`[epoch_ms, value_str][]`——與 `equity_index`（策略頁正規化序列）不同形狀，
+ * 這裡是真實美元 PnL 隨時間的點列（見 app.py::_dashboard_pnl_and_return）。 */
+export interface DashboardPnl {
+  net: string | null;
+  realized: string | null;
+  unrealized: string | null;
+  fees_paid: string | null;
+  fee_share_of_pnl_pct: string | null;
+  win_rate_pct: string | null;
+  closed_positions: number | null;
+  max_drawdown_pct: string | null;
+  series: [number, string][] | null;
+}
+export interface DashboardSync {
+  latency_median_ms: number | null;
+  latency_p95_ms: number | null;
+  price_diff_bp: string | null;
+  unsynced_positions: number | null;
+  scale_deviation_pct: string | null;
+  missed_signals_24h: number | null;
+  missed_reason: string | null;
+  last_recon_ts: number | null;
+}
+/** `daily_bars`：`[YYYY-MM-DD, builder_fee_str][]`。 */
+export interface DashboardFeesMonth {
+  routed_volume: string;
+  builder_fees: string;
+  fill_count: number;
+  avg_fee: string | null;
+  effective_rate_bps: string | null;
+  daily_bars: [string, string][];
+}
+export interface DashboardPosition {
+  symbol: string;
+  side: "long" | "short";
+  leverage: string;
+  margin_mode: "cross" | "isolated";
+  value: string;
+  upnl: string;
+  entry: string;
+  mark: string;
+  deviation_pct: string | null;
+}
+export interface DashboardResp {
+  status: DashboardStatus | null;
+  equity: DashboardEquity | null;
+  exposure: DashboardExposure | null;
+  pnl: DashboardPnl | null;
+  sync: DashboardSync | null;
+  fees_month: DashboardFeesMonth | null;
+  positions: DashboardPosition[] | null;
+  updated_at: number;
+}
+
+/** 使用者 Dashboard 六塊＋持倉（需登入 session）。冪等讀取，重試安全。 */
+export function getDashboard(): Promise<DashboardResp> {
+  return request<DashboardResp>("/api/me/dashboard");
+}

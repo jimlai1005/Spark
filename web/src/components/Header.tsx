@@ -1,8 +1,8 @@
 "use client";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { logout } from "@/lib/api";
+import { getDashboard, logout, type DashboardResp } from "@/lib/api";
 import { LANG_LABELS } from "@/lib/copy";
 import { shortAddr } from "@/lib/format";
 import { useIsAdmin, useMe } from "@/lib/hooks";
@@ -57,12 +57,21 @@ export function Header() {
   const tabs = loggedIn ? memberTabs : guestTabs;
 
   /**
-   * 跟單狀態三態。⭐ TODO(Task 13)：接上 `/api/me/dashboard` 摘要後改為真實值。
-   * `/api/me` 目前只有 `{address, account_id}`，沒有任何欄位可以推出跟單狀態——
-   * 這裡刻意恆定為 `not_following`，不偽造一個沒有根據的「跟單中」綠燈
-   * （讀不到 ≠ 安全態；寧可顯示保守值也不猜）。
+   * 跟單狀態三態，接上 `/api/me/dashboard`（Task 14；資料源 Task 13）。
+   * `dashboard.status.state` 四態 → 三態 pill：`following`→跟單中；`paused`→已暫停；
+   * 其餘（`halted`／`inactive`／載入中／讀取失敗）一律 `not_following`——讀不到 ≠
+   * 安全態，寧可顯示保守值也不偽造一個沒有根據的「跟單中」綠燈。
+   * `staleTime` 給一點餘裕：Header 在多數頁面掛載，不必每次切頁都重新打一次。
    */
-  const followStatus: "following" | "paused" | "not_following" = "not_following";
+  const dash = useQuery<DashboardResp>({
+    queryKey: ["me-dashboard"],
+    queryFn: getDashboard,
+    enabled: loggedIn,
+    staleTime: 30_000,
+  });
+  const state = dash.data?.status?.state;
+  const followStatus: "following" | "paused" | "not_following" =
+    state === "following" ? "following" : state === "paused" ? "paused" : "not_following";
   const followLabel = {
     following: COPY.nav.pillFollowing,
     paused: COPY.nav.pillPaused,

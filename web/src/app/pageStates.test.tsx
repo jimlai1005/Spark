@@ -49,6 +49,7 @@ const getOpsRevenue = vi.fn();
 const getOpsSubscriptions = vi.fn();
 const getOpsTradeQuality = vi.fn();
 const getOpsHealth = vi.fn();
+const getDashboard = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMe: (...a: unknown[]) => getMe(...a),
@@ -60,19 +61,22 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getOpsSubscriptions: (...a: unknown[]) => getOpsSubscriptions(...a),
   getOpsTradeQuality: (...a: unknown[]) => getOpsTradeQuality(...a),
   getOpsHealth: (...a: unknown[]) => getOpsHealth(...a),
+  getDashboard: (...a: unknown[]) => getDashboard(...a),
 }));
 
 /** 全部 mock 的集合，供 reset 與批次設定使用（在 factory 之外求值，不受提升影響）。 */
 const api = {
   getMe, getStatus, getLeaders, getAdminPending,
   getOpsCustomers, getOpsRevenue, getOpsSubscriptions, getOpsTradeQuality, getOpsHealth,
+  getDashboard,
 };
 
-import { ApiError } from "@/lib/api";
+import { ApiError, type DashboardResp } from "@/lib/api";
 import { COPY_ZH as COPY } from "@/lib/copy";
 import { Header } from "@/components/Header";
 import AdminPage from "./admin/page";
 import AdvancedPage from "./advanced/page";
+import DashboardPage from "./dashboard/page";
 import DocsPage from "./docs/page";
 import LeadersPage from "./leaders/page";
 import HomePage from "./page";
@@ -98,6 +102,24 @@ const NOT_ACTIVATED: OnboardStatus = {
   min_deposit: "100",
   deposit_shortfall: "100",
   state: "IN_PROGRESS",
+};
+
+/**
+ * 已登入但未活化：`/api/me/dashboard` 照樣回 200＋全塊 null（`mine is None` 分支，
+ * app.py::_dashboard_status），不是 401——只有真的沒登入才 401。用來覆蓋 Task 14
+ * 的「null 塊顯示『—』不炸」驗收條件。
+ */
+const DASHBOARD_INACTIVE: DashboardResp = {
+  status: {
+    strategy_name: null, state: "inactive", following_days: null,
+    signal_source_ok: null,
+    guards: {
+      scale: { now: null, max: null }, leverage: { now: null, max: null },
+      drawdown: { now: null, max: null, enabled: null },
+    },
+  },
+  equity: null, exposure: null, pnl: null, sync: null, fees_month: null,
+  positions: null, updated_at: 1724800000,
 };
 
 const LEADERS = {
@@ -148,6 +170,7 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/admin", name: "待核准頁", el: () => <AdminPage /> },
   { path: "/strategies", name: "策略列表頁", el: () => <StrategiesPage /> },
   { path: "/docs", name: "文件頁", el: () => <DocsPage /> },
+  { path: "/dashboard", name: "Dashboard 頁", el: () => <DashboardPage /> },
 ];
 
 /**
@@ -160,9 +183,11 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
  *
  * ⭐ Task 9：`/strategies` 頁面元件已建立並搬進上面的 ROUTES，白名單清掉這一筆。
  * ⭐ Task 12：`/docs` 頁面元件已建立（未登入可直接開啟，無 guard）並搬進上面的
- * ROUTES，白名單清掉這一筆。`/dashboard`／`/settings` 仍待 Task 13/14、16。
+ * ROUTES，白名單清掉這一筆。
+ * ⭐ Task 14：`/dashboard` 頁面元件已建立並搬進上面的 ROUTES，白名單清掉這一筆。
+ * `/settings` 仍待 Task 16。
  */
-const PENDING_ROUTES = new Set(["/dashboard", "/settings"]);
+const PENDING_ROUTES = new Set(["/settings"]);
 
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset();
@@ -174,16 +199,18 @@ function mockLoggedOut() {
   api.getMe.mockRejectedValue(unauthorized());
   for (const k of ["getStatus", "getLeaders", "getAdminPending",
                    "getOpsCustomers", "getOpsRevenue", "getOpsSubscriptions",
-                   "getOpsTradeQuality", "getOpsHealth"] as const) {
+                   "getOpsTradeQuality", "getOpsHealth", "getDashboard"] as const) {
     api[k].mockRejectedValue(unauthorized());
   }
 }
 
-/** 已登入的一般客戶，尚未活化：session 有效，但沒有 follower、非管理員。 */
+/** 已登入的一般客戶，尚未活化：session 有效，但沒有 follower、非管理員。
+ * `/api/me/dashboard` 照樣 200＋全塊 null（見 DASHBOARD_INACTIVE 註解）。 */
 function mockLoggedInNotActivated() {
   api.getMe.mockResolvedValue(ME);
   api.getStatus.mockResolvedValue(NOT_ACTIVATED);
   api.getLeaders.mockResolvedValue(LEADERS);
+  api.getDashboard.mockResolvedValue(DASHBOARD_INACTIVE);
   api.getAdminPending.mockRejectedValue(forbidden());
   for (const k of ["getOpsCustomers", "getOpsRevenue", "getOpsSubscriptions",
                    "getOpsTradeQuality", "getOpsHealth"] as const) {

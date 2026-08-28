@@ -331,7 +331,9 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     // 2026-08-28（Task 10b，主線程裁決）：+3 匯出（getMyCapital、
     //   getCapitalSettingsMessage、postCapitalSettings），其中 postCapitalSettings
     //   進 EXCLUDED（帶簽名）⇒ 反射清單淨增 2（21 → 23）。
-    const HAND_WRITTEN_LIST_LENGTH = 23;
+    // 2026-08-28（Task 14）：+1 匯出（getDashboard，`/dashboard` 六塊資料源，不帶
+    //   簽名、不進 EXCLUDED）⇒ 反射清單淨增 1（23 → 24）。
+    const HAND_WRITTEN_LIST_LENGTH = 24;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 
