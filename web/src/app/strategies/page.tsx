@@ -4,7 +4,8 @@
  * `StrategyCard`，這裡不重複卡片內部規格）。
  *
  * ⭐ 與首頁「可跟單策略」區塊刻意共用文案（`COPY.home.strategies.*`）：兩處呈現
- * 同一批資料、同一套規則（60 天上架門檻），拆兩份文案只會製造不同步的風險。
+ * 同一批資料、同一套規則（`listable`＝`enabled` 且 `accepting_new`），拆兩份
+ * 文案只會製造不同步的風險。
  */
 import Link from "next/link";
 import { useEffect, useState } from "react";

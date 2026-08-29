@@ -199,7 +199,7 @@ describe("StrategyDetailPage", () => {
     expect(loginWithSiwe).not.toHaveBeenCalled();
   });
 
-  it("listable:false → CTA disabled＋「樣本累積中」，不出現可跟單按鈕", async () => {
+  it("listable:false → CTA disabled＋「暫不開放新跟單」，不出現可跟單按鈕", async () => {
     getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
     stubFetch(() => jsonResponse({ ...DETAIL, listable: false }));
     render(wrap(<StrategyDetailPage />));

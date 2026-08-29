@@ -51,7 +51,7 @@ describe("StrategyCard", () => {
     expect(screen.getByText(COPY.home.strategies.featuredBadge)).toBeInTheDocument();
   });
 
-  it("listable=false → disabled 態：無可跟單連結，顯示樣本累積中＋說明", () => {
+  it("listable=false → disabled 態：無可跟單連結，顯示暫不開放新跟單＋說明", () => {
     const pending: PublicStrategy = {
       ...BASE,
       listable: false,

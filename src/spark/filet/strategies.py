@@ -23,11 +23,10 @@ from typing import Any
 
 from spark.filet.leaders import LeaderRef
 
-# 策略要能「上架可跟單」（listable）所需的最低涵蓋天數。刻意與 leader_perf 的
-# RATIO_MIN_DAYS（60 天）同值：一個 listable 的策略，比率型指標（Sharpe/Sortino/
-# 年化波動）必然已經跨過各自的充足度門檻——這個對齊不是巧合，是「能上架＝
-# 卡片上每個數字都經得起看」的設計意圖。
-STRATEGY_MIN_LIVE_DAYS = Decimal("60")
+# ⚠️ 2026-08-29 使用者裁決移除「60 天上架閘門」（曾用 STRATEGY_MIN_LIVE_DAYS）：
+# 免責已講清楚、平台本就不審查跟單來源（進階模式即明證）。listable 不再看
+# covered_days。leader_perf 的 RATIO_MIN_DAYS（60 天，Sharpe/Sortino/年化波動
+# 樣本充足度）**不受影響**——那是誠實統計揭露，不是准入門檻。見 plan §0.1 裁決 5。
 
 _TWO_DP = Decimal("0.01")
 
@@ -97,7 +96,9 @@ def build_strategy_view(entry: LeaderRef, perf: dict[str, Any] | None) -> dict[s
     測試裡不落地任何檔案就直接餵假 perf 驗證計算邏輯（工程原則同型：職責邊界
     strutural 分開，而不是靠呼叫端記得「這裡不能傳跨客戶資料」）。
 
-    `listable`＝`enabled` 且 `accepting_new` 且 `covered_days >= STRATEGY_MIN_LIVE_DAYS`。
+    `listable`＝`enabled` 且 `accepting_new`（2026-08-29 裁決移除 60 天涵蓋天數
+    門檻，見模組檔頭）。`live_days` 仍由 perf 的 `covered_days` 算出，純展示用，
+    不再影響 `listable`。
     `status`：`accepting_new` → `"running"`；否則（例行下架、仍在跟的不受影響）→
     `"paused"`（沿 `leaders.py` 檔頭的旗標語意，這裡只是把它投影成展示用字串）。
     """
@@ -107,8 +108,7 @@ def build_strategy_view(entry: LeaderRef, perf: dict[str, Any] | None) -> dict[s
         if isinstance(cd, Decimal):
             covered_days = cd
     live_days = int(covered_days)
-    listable = bool(entry.enabled and entry.accepting_new
-                    and covered_days >= STRATEGY_MIN_LIVE_DAYS)
+    listable = bool(entry.enabled and entry.accepting_new)
     status = "running" if entry.accepting_new else "paused"
     slug = entry.slug or entry.address
     return {

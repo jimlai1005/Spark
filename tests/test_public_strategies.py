@@ -146,7 +146,8 @@ def test_build_metrics_status_insufficient_is_all_insufficient():
 
 
 # ============================================================
-# 純函式：build_strategy_view（60 天閘門、slug 回退、status 投影）
+# 純函式：build_strategy_view（listable＝enabled∧accepting_new、slug 回退、
+# status 投影）——2026-08-29 裁決移除 60 天涵蓋天數閘門，見模組檔頭。
 # ============================================================
 
 def _entry(**over):
@@ -155,17 +156,11 @@ def _entry(**over):
     return LeaderRef(**base)
 
 
-def test_listable_true_at_exactly_60_days():
-    view = build_strategy_view(_entry(), _ok_perf(covered_days=Decimal("60.0000")))
+def test_listable_true_at_58_days_when_accepting_new():
+    """曾經卡在 60 天閘門下的 58 天樣本：裁決後 accepting_new 就 listable。"""
+    view = build_strategy_view(_entry(), _ok_perf(covered_days=Decimal("58.0000")))
     assert view["listable"] is True
-    assert view["live_days"] == 60
-
-
-def test_listable_false_at_59_days_9999():
-    """59.9999 天（剛好差一點）→ 不可跟單。錨定門檻在天數這一側，不是四捨五入。"""
-    view = build_strategy_view(_entry(), _ok_perf(covered_days=Decimal("59.9999")))
-    assert view["listable"] is False
-    assert view["live_days"] == 59
+    assert view["live_days"] == 58
 
 
 def test_listable_false_when_not_accepting_new_even_with_enough_days():
@@ -190,10 +185,12 @@ def test_slug_used_when_present():
     assert view["slug"] == "core"
 
 
-def test_no_perf_at_all_gives_zero_live_days_and_not_listable():
+def test_no_perf_at_all_gives_zero_live_days_but_still_listable():
+    """沒有 perf 資料不影響 listable（只受 enabled/accepting_new 控制）；
+    live_days 純展示，缺資料時降級為 0。"""
     view = build_strategy_view(_entry(), None)
     assert view["live_days"] == 0
-    assert view["listable"] is False
+    assert view["listable"] is True
 
 
 def test_view_never_includes_follower_count_key():
@@ -246,9 +243,9 @@ def test_list_no_auth_required_and_shape(tmp_path):
     assert r.cookies.get("filet_session") is None      # 無 cookie 副作用
 
 
-def test_listable_flips_below_60_days(tmp_path):
-    """60 天閘門在端點層級的翻轉：不足 60 天 → listable=False，但條目仍在清單裡
-    （前端畫 disabled 態，不是被過濾掉——見 plan §0.2）。"""
+def test_listable_true_below_60_days_when_accepting_new(tmp_path):
+    """2026-08-29 裁決移除 60 天閘門：涵蓋天數不足不再擋 listable，只要
+    enabled 且 accepting_new。live_days 純展示，照樣如實反映樣本天數。"""
     cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
         {"address": _A, "name": "Alpha", "slug": "alpha"}]))
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
@@ -257,9 +254,21 @@ def test_listable_flips_below_60_days(tmp_path):
                                         [[0, "0"], [t, "50"]])
     body = _client(app).get("/api/public/strategies").json()
     row = body["strategies"][0]
-    assert row["slug"] == "alpha"          # 仍出現
-    assert row["listable"] is False
+    assert row["slug"] == "alpha"
+    assert row["listable"] is True
     assert row["live_days"] == 10
+
+
+def test_listable_false_when_accepting_new_false(tmp_path):
+    """accepting_new=False 仍然是唯一能讓 listable 翻假的旗標。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha", "accepting_new": False}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    hl.portfolios[_A] = sixty_day_rows()
+    body = _client(app).get("/api/public/strategies").json()
+    row = body["strategies"][0]
+    assert row["listable"] is False
+    assert row["status"] == "paused"
 
 
 def test_enabled_false_hidden_from_list(tmp_path):
@@ -326,7 +335,7 @@ def test_detail_no_perf_still_200_with_empty_equity_index(tmp_path):
     body = r.json()
     assert body["equity_index"] == []
     assert body["methodology"]["initial_deposit_usd"] is None
-    assert body["listable"] is False
+    assert body["listable"] is True   # 缺 perf 不再擋 listable（僅 enabled/accepting_new）
 
 
 # ============================================================
@@ -441,7 +450,8 @@ def test_upstream_portfolio_called_once_within_60s_cache_window(tmp_path):
 
 def test_upstream_failure_degrades_that_leader_not_whole_list(tmp_path):
     """上游查詢失敗（transient）→ 該策略的指標全 insufficient，其他策略／整個
-    端點不受影響（不得 500/502——公開清單本身要比被監控的上游更可靠）。"""
+    端點不受影響（不得 500/502——公開清單本身要比被監控的上游更可靠）。
+    listable 不受 perf 缺席影響（2026-08-29 裁決僅看 enabled/accepting_new）。"""
     cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
         {"address": _A, "name": "Alpha", "slug": "alpha"},
         {"address": _B, "name": "Beta", "slug": "beta"}]))
@@ -452,5 +462,5 @@ def test_upstream_failure_degrades_that_leader_not_whole_list(tmp_path):
     assert r.status_code == 200, r.text
     by_slug = {s["slug"]: s for s in r.json()["strategies"]}
     assert by_slug["alpha"]["metrics"]["sharpe_insufficient"] is True
-    assert by_slug["alpha"]["listable"] is False
+    assert by_slug["alpha"]["listable"] is True
     assert by_slug["beta"]["listable"] is True

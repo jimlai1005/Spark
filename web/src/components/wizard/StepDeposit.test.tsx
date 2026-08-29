@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { OnboardStatus } from "@/lib/api";
+import { ApiError, type OnboardStatus } from "@/lib/api";
 
 const postVerify = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
@@ -70,5 +70,52 @@ describe("StepDeposit", () => {
     expect(await screen.findByRole("status")).toBeInTheDocument();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(postVerify).toHaveBeenCalledTimes(1);
+  });
+
+  // ⭐ 2026-08-29 裁決 6：完成綁定失敗逐條列出未滿足條件，取代單句籠統紅字。
+  it("未 READY 且僅 agent 未核准 → 只顯示 agent 授權尚未生效", async () => {
+    postVerify.mockResolvedValue(status({
+      funded: true, agent_approved: false, builder_fee_approved: true,
+      state: "IN_PROGRESS",
+    }));
+    render(<StepDeposit status={status({ funded: true })} refetchStatus={() => undefined} />);
+    await userEvent.click(screen.getByRole("button", { name: "完成綁定" }));
+    expect(await screen.findByText("agent 授權尚未生效")).toBeInTheDocument();
+    expect(screen.queryByText("builder fee 尚未核准")).not.toBeInTheDocument();
+    expect(screen.queryByText("入金未達門檻")).not.toBeInTheDocument();
+  });
+
+  it("未 READY 且多項未滿足 → 逐條全部顯示", async () => {
+    postVerify.mockResolvedValue(status({
+      funded: false, agent_approved: false, builder_fee_approved: false,
+      state: "IN_PROGRESS",
+    }));
+    render(<StepDeposit status={status({ funded: true })} refetchStatus={() => undefined} />);
+    await userEvent.click(screen.getByRole("button", { name: "完成綁定" }));
+    expect(await screen.findByText("agent 授權尚未生效")).toBeInTheDocument();
+    expect(screen.getByText("builder fee 尚未核准")).toBeInTheDocument();
+    expect(screen.getByText("入金未達門檻")).toBeInTheDocument();
+  });
+
+  it("送出失敗（伺服器拒絕）且送出前三旗標皆已滿足 → 顯示伺服器 detail 原文", async () => {
+    postVerify.mockRejectedValue(new ApiError("client", "帳號已被停用", 403, "帳號已被停用"));
+    render(<StepDeposit
+      status={status({ funded: true, agent_approved: true, builder_fee_approved: true })}
+      refetchStatus={() => undefined} />);
+    await userEvent.click(screen.getByRole("button", { name: "完成綁定" }));
+    expect(await screen.findByText("帳號已被停用")).toBeInTheDocument();
+    expect(screen.queryByText("agent 授權尚未生效")).not.toBeInTheDocument();
+  });
+
+  it("送出失敗且送出前有未滿足旗標（builder fee）→ 仍逐條列出未滿足條件（不是伺服器原文）", async () => {
+    // ⭐ 按鈕的 disabled 條件只看 `status.funded`（既有行為），所以 funded 維持
+    // true，用 builder_fee_approved=false 測「送出前已知有旗標未滿足」的分支。
+    postVerify.mockRejectedValue(new ApiError("client", "拒絕", 400, "拒絕"));
+    render(<StepDeposit
+      status={status({ funded: true, agent_approved: true, builder_fee_approved: false })}
+      refetchStatus={() => undefined} />);
+    await userEvent.click(screen.getByRole("button", { name: "完成綁定" }));
+    expect(await screen.findByText("builder fee 尚未核准")).toBeInTheDocument();
+    expect(screen.queryByText("拒絕")).not.toBeInTheDocument();
   });
 });

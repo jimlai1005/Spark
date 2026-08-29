@@ -249,9 +249,20 @@ export const COPY_ZH = {
       hlSemantic: "Hyperliquid 拒絕了這筆授權。請點「重試」重新取得待簽內容再簽一次。",
       builderPaused: "系統暫停開通中，請聯絡我們再試。",
       verifyIncomplete: "尚有條件未完成（授權或資金未確認），請依畫面提示補齊後再送出。",
+      // ⭐ 2026-08-29 裁決 6：完成綁定失敗改逐條列出未滿足條件，不再用單句籠統紅字。
+      verifyAgentPending: "agent 授權尚未生效",
+      verifyBuilderFeePending: "builder fee 尚未核准",
+      verifyNotFunded: "入金未達門檻",
       contentMismatch: "伺服器回傳的內容與你送出的設定不符，為安全起見已中止——請重新整理頁面後再試一次。",
       submitFailed: "送出失敗，請稍後重試；尚未成功的簽署不會被重複計費或重複套用。",
     },
+    // ⭐ 2026-08-29 裁決 6：已跟單同策略的短路面板（bodyPrefix/bodySuffix 圍住
+    // 動態策略名，沿 leverageInfoPrefix/Suffix 既有慣例，不用字串樣板替換）。
+    alreadyFollowingTitle: "已在跟單此策略",
+    alreadyFollowingBodyPrefix: "你目前已在跟單「",
+    alreadyFollowingBodySuffix: "」，不需要重新開通。",
+    alreadyFollowingDashboardCta: "前往 Dashboard",
+    alreadyFollowingOtherCta: "查看其他策略",
   },
   admin: {
     title: "待核准清單",
@@ -850,10 +861,10 @@ export const COPY_ZH = {
     },
     strategies: {
       heading: "可跟單策略",
-      sub: "每個策略的績效都來自 Hyperliquid 鏈上帳戶，任何人都能自行核對。上架門檻：連續實盤 ≥ 60 天。",
+      sub: "每個策略的績效都來自 Hyperliquid 鏈上帳戶，任何人都能自行核對。",
       viewAll: "全部策略 →",
       featuredBadge: "主推",
-      pendingBadge: "樣本累積中",
+      pendingBadge: "暫不開放新跟單",
       metricTotalReturn: "總報酬",
       metricMaxDrawdown: "最大回撤",
       metricSharpe: "Sharpe",
@@ -862,7 +873,7 @@ export const COPY_ZH = {
       leveragePrefix: "槓桿 ≤ ",
       minNotionalPrefix: "最低跟單 $",
       cta: "查看策略與風險",
-      pendingNote: "未達 60 天上架門檻，僅供觀察，暫不開放跟單。",
+      pendingNote: "此策略目前暫不開放新跟單，既有跟單者不受影響。",
       empty: "目前沒有可跟單的策略，請稍後再回來查看。",
       advancedTitle: "進階模式",
       advancedBody:
@@ -1013,8 +1024,8 @@ export const COPY_ZH = {
       ctaConnecting: "連接中…",
       ctaSigning: "請在錢包中簽署登入訊息…",
       footnote: "下一步僅為免費簽名（不上鏈、不花 gas），你會在授權前看到完整權限說明與費用確認。",
-      pendingCta: "樣本累積中",
-      pendingNote: "此策略尚未達 60 天上架門檻，暫不開放跟單。",
+      pendingCta: "暫不開放新跟單",
+      pendingNote: "此策略目前暫不開放新跟單，既有跟單者不受影響。",
     },
   },
   /**
@@ -1527,11 +1538,21 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       builderPaused: "The system is currently pausing activations, please contact us and try again.",
       verifyIncomplete: "Some conditions are still unmet (authorization or funds not yet confirmed) — please follow the "
         + "on-screen prompts to complete them before submitting.",
+      // ⭐ 2026-08-29 decision 6: itemized "complete setup" failure instead of one blanket message.
+      verifyAgentPending: "Agent authorization not yet in effect",
+      verifyBuilderFeePending: "Builder fee not yet approved",
+      verifyNotFunded: "Deposit below threshold",
       contentMismatch: "The content returned by the server doesn't match what you submitted, so this was stopped for "
         + "safety — please refresh the page and try again.",
       submitFailed: "Submission failed, please try again later; a signature that didn't succeed won't be charged or "
         + "applied twice.",
     },
+    // ⭐ 2026-08-29 decision 6: short-circuit panel for already-active followers.
+    alreadyFollowingTitle: "Already following this strategy",
+    alreadyFollowingBodyPrefix: "You're currently following \"",
+    alreadyFollowingBodySuffix: "\" — no need to set up again.",
+    alreadyFollowingDashboardCta: "Go to Dashboard",
+    alreadyFollowingOtherCta: "View other strategies",
   },
   admin: {
     title: "Pending approvals",
@@ -2031,10 +2052,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     strategies: {
       heading: "Strategies you can follow",
       sub: "Every strategy's performance comes from a Hyperliquid on-chain account that anyone can independently "
-        + "verify. Listing threshold: at least 60 consecutive days live.",
+        + "verify.",
       viewAll: "All strategies →",
       featuredBadge: "Featured",
-      pendingBadge: "Accumulating sample",
+      pendingBadge: "Not open to new followers",
       metricTotalReturn: "Total return",
       metricMaxDrawdown: "Max drawdown",
       metricSharpe: "Sharpe",
@@ -2043,7 +2064,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       leveragePrefix: "Leverage ≤ ",
       minNotionalPrefix: "Min. follow $",
       cta: "View strategy & risks",
-      pendingNote: "Not yet at the 60-day listing threshold — for observation only, not open to follow yet.",
+      pendingNote: "This strategy is not currently open to new followers. Existing followers are unaffected.",
       empty: "No strategies are open to follow right now — please check back later.",
       advancedTitle: "Advanced mode",
       advancedBody: "Already have a leader address in mind? You can follow any Hyperliquid wallet. In this mode "
@@ -2182,8 +2203,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       ctaSigning: "Please sign the login message in your wallet…",
       footnote: "The next step is just a free signature (no on-chain transaction, no gas). You'll see the full "
         + "permission scope and fee confirmation before authorizing.",
-      pendingCta: "Accumulating sample",
-      pendingNote: "This strategy hasn't reached the 60-day listing threshold yet — not open to follow.",
+      pendingCta: "Not open to new followers",
+      pendingNote: "This strategy is not currently open to new followers. Existing followers are unaffected.",
     },
   },
   dashboard: {

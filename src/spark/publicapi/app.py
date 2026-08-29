@@ -1402,10 +1402,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     def public_strategies_list():
         """策略平台首頁／列表頁餵資料的公開端點。無需登入。
 
-        `listable=False` 的條目（樣本未滿 60 天，或 `accepting_new=False`）**仍然
-        出現**在清單裡——前端據 `listable` 畫「樣本累積中／未開放跟單」的 disabled
-        態，不是用這個端點過濾（見 plan §0.2）。只有 `enabled=False` 的安全撤銷
-        條目才整筆不出現。
+        `listable=False` 的條目（`accepting_new=False`——2026-08-29 裁決移除 60 天
+        涵蓋天數閘門，見 `filet.strategies` 檔頭）**仍然出現**在清單裡——前端據
+        `listable` 畫「暫不開放新跟單」的 disabled 態，不是用這個端點過濾（見
+        plan §0.2）。只有 `enabled=False` 的安全撤銷條目才整筆不出現。
         """
         counts = _strategy_follower_counts()
         strategies = []

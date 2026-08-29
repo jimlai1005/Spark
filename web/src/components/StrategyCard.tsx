@@ -15,8 +15,9 @@ interface CardMetric {
 /**
  * StrategyCard — 策略卡（Task 8，設計稿 §03「策略區」＋ Task 9 策略列表頁復用）。
  *
- * `listable=false`（未達 60 天上架門檻或例行下架）→ disabled 態：不渲染任何可跟單
- * CTA 連結，改顯示「樣本累積中」badge＋說明文字（NOTE 04：上架門檻是程式邏輯，
+ * `listable=false`（`accepting_new=false`，例行下架——2026-08-29 裁決移除 60 天
+ * 涵蓋天數閘門，見後端 `filet.strategies` 檔頭）→ disabled 態：不渲染任何可跟單
+ * CTA 連結，改顯示「暫不開放新跟單」badge＋說明文字（listable 是程式邏輯，
  * 不是前端自己判斷——這裡完全信任後端算好的 `listable` 旗標）。
  *
  * **CAGR 不出現在這張卡上**（NOTE 03）：只呈現 API 提供的 total_return / max_drawdown /

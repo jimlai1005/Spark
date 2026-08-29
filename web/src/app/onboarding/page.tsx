@@ -21,6 +21,7 @@
  * `localStorage.filet_onboarding`，**不存任何簽章內容**——已簽章的事實一律以
  * `/api/onboard/status` 為準（`lib/wizard.ts`）。
  */
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { useAccount } from "wagmi";
@@ -29,9 +30,9 @@ import { StepConfirm } from "@/components/wizard/StepConfirm";
 import { StepConnect } from "@/components/wizard/StepConnect";
 import { StepRiskLimits, type StepRiskLimitsValues } from "@/components/wizard/StepRiskLimits";
 import { StepSelectStrategy } from "@/components/wizard/StepSelectStrategy";
-import type { SpotStranded } from "@/lib/api";
+import { getMyLeader, type MyLeaderResp, type SpotStranded } from "@/lib/api";
 import { useCopy } from "@/lib/lang";
-import { fmtAmount } from "@/lib/format";
+import { fmtAmount, shortAddr } from "@/lib/format";
 import { useMe, useOnboardingStatus } from "@/lib/hooks";
 import { getPublicStrategy, type PublicStrategyDetail } from "@/lib/publicApi";
 import { clearWizardProgress, deriveStep, loadWizardProgress, saveWizardProgress } from "@/lib/wizard";
@@ -102,6 +103,33 @@ function OnboardingInner() {
   const leaderAddress = isAdvanced ? (advancedAddress || null) : (detail?.leader_address ?? null);
   const maxLeverage = !isAdvanced && detail?.max_leverage ? Number(detail.max_leverage) : null;
 
+  // ⭐ 2026-08-29 裁決 6：已跟單同策略的短路——進頁即查一次 `/api/me/leader`，
+  // 若目前 leader 與本次選定的策略一致就不進 wizard（見下方 render 期 early
+  // return）。讀不到（503/網路）→ 保持 null，不擋流程（讀不到 ≠ 沒有，但也不
+  // 該把人鎖在門外，故意 fail-open 到「照常進 wizard」而非 fail-closed）。
+  const [myLeader, setMyLeader] = useState<MyLeaderResp | null>(null);
+  useEffect(() => {
+    if (!me.data) return;
+    let cancelled = false;
+    getMyLeader()
+      .then((r) => {
+        if (!cancelled) setMyLeader(r);
+      })
+      .catch(() => {
+        if (!cancelled) setMyLeader(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me.data?.address]);
+
+  const alreadyFollowingSameStrategy =
+    myLeader?.status === "following" &&
+    !!myLeader.leader_address &&
+    !!leaderAddress &&
+    myLeader.leader_address.toLowerCase() === leaderAddress.toLowerCase();
+
   const [scale, setScale] = useState(SCALE_DEFAULT);
   const [ddEnabled, setDdEnabled] = useState(false);
   const [ddPct, setDdPct] = useState(DD_DEFAULT);
@@ -135,6 +163,30 @@ function OnboardingInner() {
 
   if (me.isLoading || !me.data || !strategyParam) {
     return <main className="page"><p className="hint">{COPY.common.loading}</p></main>;
+  }
+
+  if (alreadyFollowingSameStrategy) {
+    const strategyName = isAdvanced
+      ? shortAddr(advancedAddress ?? "")
+      : (detail?.name ?? shortAddr(leaderAddress ?? ""));
+    return (
+      <main className="page">
+        <div className="card onboard-already-following">
+          <h1>{c.alreadyFollowingTitle}</h1>
+          <p>
+            {c.alreadyFollowingBodyPrefix}
+            {strategyName}
+            {c.alreadyFollowingBodySuffix}
+          </p>
+          <div className="step-actions">
+            <button type="button" className="btn btn-primary" onClick={() => router.push("/dashboard")}>
+              {c.alreadyFollowingDashboardCta}
+            </button>
+            <Link className="btn btn-ghost" href="/strategies">{c.alreadyFollowingOtherCta}</Link>
+          </div>
+        </div>
+      </main>
+    );
   }
 
   const address = me.data.address;

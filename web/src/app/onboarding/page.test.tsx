@@ -44,6 +44,7 @@ const postCapitalSettings = vi.fn();
 const getLeaderSelectMessage = vi.fn();
 const postLeaderSelect = vi.fn();
 const postVerify = vi.fn();
+const getMyLeader = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   createAgent: (...a: unknown[]) => createAgent(...a),
@@ -56,6 +57,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getLeaderSelectMessage: (...a: unknown[]) => getLeaderSelectMessage(...a),
   postLeaderSelect: (...a: unknown[]) => postLeaderSelect(...a),
   postVerify: (...a: unknown[]) => postVerify(...a),
+  getMyLeader: (...a: unknown[]) => getMyLeader(...a),
 }));
 
 const getPublicStrategy = vi.fn();
@@ -183,6 +185,12 @@ beforeEach(() => {
     ok: true, account_id: "fabc", allocated_capital: "0.00", capital_utilization: "0.2500",
     use_full_equity: true, effective: "next_engine_cycle", effective_note: "下一輪生效。",
     consequences: "不會立即強制再平衡。",
+  });
+  // ⭐ 裁決 6 短路測試前設預設值：未活化、無 leader——不觸發短路，既有測試維持
+  // 進 wizard 的行為不變。
+  getMyLeader.mockResolvedValue({
+    account_id: "fabc", status: "not_activated", leader_address: null,
+    leader_name: null, pending_change: null, note: "尚未活化。",
   });
 });
 
@@ -384,6 +392,60 @@ describe("OnboardingPage — step 3 投入比例（Task 10b：真實簽章流）
     render(wrap(<OnboardingPage />));
     await screen.findByRole("heading", { name: "設定你的風險限制" });
     expect(await screen.findByText("已提交，待引擎套用")).toBeInTheDocument();
+  });
+});
+
+describe("OnboardingPage — 已跟單同策略短路（裁決 6）", () => {
+  it("status=following 且 leader 與所選策略一致（大小寫不敏感）→ 短路面板，不進 wizard", async () => {
+    getMyLeader.mockResolvedValue({
+      account_id: "fabc", status: "following",
+      leader_address: STRATEGY_DETAIL.leader_address.toUpperCase(),
+      leader_name: "Filet Core", pending_change: null, note: "跟單中。",
+    });
+    render(wrap(<OnboardingPage />));
+    expect(await screen.findByText("已在跟單此策略")).toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "開通步驟" })).not.toBeInTheDocument();
+  });
+
+  it("短路面板「前往 Dashboard」→ router.push('/dashboard')", async () => {
+    getMyLeader.mockResolvedValue({
+      account_id: "fabc", status: "following",
+      leader_address: STRATEGY_DETAIL.leader_address,
+      leader_name: "Filet Core", pending_change: null, note: "跟單中。",
+    });
+    render(wrap(<OnboardingPage />));
+    const btn = await screen.findByRole("button", { name: "前往 Dashboard" });
+    await userEvent.click(btn);
+    expect(push).toHaveBeenCalledWith("/dashboard");
+  });
+
+  it("短路面板提供「查看其他策略」連結到 /strategies", async () => {
+    getMyLeader.mockResolvedValue({
+      account_id: "fabc", status: "following",
+      leader_address: STRATEGY_DETAIL.leader_address,
+      leader_name: "Filet Core", pending_change: null, note: "跟單中。",
+    });
+    render(wrap(<OnboardingPage />));
+    const link = await screen.findByRole("link", { name: "查看其他策略" });
+    expect(link).toHaveAttribute("href", "/strategies");
+  });
+
+  it("status=following 但 leader 不同 → 照常進 wizard（合法換策略路徑）", async () => {
+    getMyLeader.mockResolvedValue({
+      account_id: "fabc", status: "following",
+      leader_address: "0xother00000000000000000000000000000other",
+      leader_name: "Other Strategy", pending_change: null, note: "跟單中。",
+    });
+    render(wrap(<OnboardingPage />));
+    expect(await screen.findByRole("navigation", { name: "開通步驟" })).toBeInTheDocument();
+    expect(screen.queryByText("已在跟單此策略")).not.toBeInTheDocument();
+  });
+
+  it("getMyLeader 讀取失敗（503）→ 不擋流程，照常進 wizard", async () => {
+    getMyLeader.mockRejectedValue(new Error("upstream 503"));
+    render(wrap(<OnboardingPage />));
+    expect(await screen.findByRole("navigation", { name: "開通步驟" })).toBeInTheDocument();
+    expect(screen.queryByText("已在跟單此策略")).not.toBeInTheDocument();
   });
 });
 
