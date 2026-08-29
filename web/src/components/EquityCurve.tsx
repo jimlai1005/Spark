@@ -121,7 +121,10 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
   const points = useMemo(() => toPoints(sliced), [sliced]);
 
   const depositNum = initialDepositUsd == null ? null : Number(initialDepositUsd);
-  const hasDeposit = depositNum != null && Number.isFinite(depositNum) && values.length > 0 && values[0] !== 0;
+  // depositNum > 0：首快照為 0 的帳戶換算出全 $0 的 y 軸（2026-08-29 真資料驗證），
+  // 此時退回指數刻度而非假裝有美元金額。
+  const hasDeposit = depositNum != null && Number.isFinite(depositNum) && depositNum > 0
+    && values.length > 0 && values[0] !== 0;
   const dollarSliced = useMemo(() => {
     if (!hasDeposit) return sliced;
     return sliced.map((v) => (depositNum as number) * (v / values[0]));

@@ -977,6 +977,8 @@ export const COPY_ZH = {
       unavailable: "方法論資料暫不可用。",
       depositPrefix: "以真實入金本金 $",
       depositSuffix: " 起算（鏈上 deposit 可驗證），涵蓋 ",
+      /** 首快照為 0 時省略入金句，改由此開頭（誠實顯示，2026-08-29）。 */
+      rangePrefix: "涵蓋 ",
       daysSuffix: " 個交易日（",
       rangeSuffix: "）。",
       sharpePrefix: "Sharpe ",
@@ -2148,6 +2150,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       unavailable: "Methodology data is not available right now.",
       depositPrefix: "Computed from a real deposit of $",
       depositSuffix: " (verifiable on-chain), covering ",
+      /** Mirrors zh rangePrefix: opening used when the deposit clause is omitted. */
+      rangePrefix: "Covering ",
       daysSuffix: " trading days (",
       rangeSuffix: ").",
       sharpePrefix: "Sharpe ",

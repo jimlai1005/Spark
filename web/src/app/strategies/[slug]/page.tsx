@@ -87,7 +87,8 @@ function computeStartEndEquity(
 ): { start: string; end: string } | null {
   const depositNum = methodology.initial_deposit_usd == null
     ? null : Number(methodology.initial_deposit_usd);
-  if (depositNum == null || !Number.isFinite(depositNum) || equityIndex.length === 0) return null;
+  if (depositNum == null || !Number.isFinite(depositNum) || depositNum <= 0
+    || equityIndex.length === 0) return null;
   const first = Number(equityIndex[0]);
   const last = Number(equityIndex[equityIndex.length - 1]);
   if (!Number.isFinite(first) || !Number.isFinite(last) || first === 0) return null;
@@ -498,7 +499,11 @@ function MethodologyCard({ methodology, metrics, copy }: {
   metrics: PublicStrategyDetail["metrics"];
   copy: MethodologyCopy;
 }) {
-  const hasDeposit = methodology.initial_deposit_usd != null;
+  // 首個鏈上快照為 0（錢包晚於序列起點入金）時，「以 $0 起算」是誤導不是揭露 →
+  // 整句省略，改由 rangePrefix 開頭（2026-08-29 真資料驗證發現）。
+  const depositNum = Number(methodology.initial_deposit_usd);
+  const hasDeposit = methodology.initial_deposit_usd != null
+    && Number.isFinite(depositNum) && depositNum > 0;
   const hasRange = methodology.start_date != null && methodology.end_date != null
     && methodology.sample_count != null;
   const hasSharpe = !metrics.sharpe_insufficient && metrics.sharpe != null
@@ -519,6 +524,7 @@ function MethodologyCard({ methodology, metrics, copy }: {
           )}
           {hasRange && (
             <>
+              {!hasDeposit && copy.rangePrefix}
               {methodology.sample_count}
               {copy.daysSuffix}
               {methodology.start_date} → {methodology.end_date}
