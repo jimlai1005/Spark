@@ -36,7 +36,9 @@ from typing import Callable
 from spark.copytrade.killswitch import is_tripped
 from spark.copytrade.notifier import Notifier
 from spark.filet.close_all import (CloseAllError, close_all_path_for,
-                                   load_close_all_requests, verify_close_all)
+                                   close_all_result_path_for,
+                                   load_close_all_requests, read_close_all_result,
+                                   verify_close_all, write_close_all_result)
 from spark.filet.followers import load_followers
 from spark.filet.leader_change_apply import require_exchange_dir
 
@@ -52,16 +54,47 @@ def resolve_close_all_path(env=None) -> str:
     return close_all_path_for(require_exchange_dir(env))
 
 
+def resolve_close_all_result_path(account_id: str, env=None) -> Path:
+    """引擎要寫的 result 標記檔路徑（**啟動時呼叫一次**，同一個
+    `FILET_EXCHANGE_DIR`、同一段「漏設就拒絕啟動」的理由，見 `resolve_close_all_path`）。
+    """
+    return close_all_result_path_for(require_exchange_dir(env), account_id)
+
+
 class CloseAllApplier:
     """每 cycle 消化一筆「平倉並撤銷」請求；命中即觸發受控收尾。"""
 
     def __init__(self, *, account_id: str, manifest_path: str | Path,
-                request_path: str | Path, notifier: Notifier, now_fn=time.time):
+                request_path: str | Path, notifier: Notifier,
+                result_path: str | Path | None = None, now_fn=time.time):
+        """`result_path` 不給 → 由 `request_path` 的父目錄（即 `FILET_EXCHANGE_DIR`，
+        `close_all_path_for` 的既有拼法）導出，與 `resolve_close_all_result_path`
+        同一條推導鏈——呼叫端只在自訂交換目錄拓撲時才需要顯式傳入。"""
         self._account_id = account_id
         self._manifest_path = Path(manifest_path)
         self._request_path = Path(request_path)
+        self._result_path = Path(result_path) if result_path is not None else \
+            close_all_result_path_for(self._request_path.parent, account_id)
         self._notifier = notifier
         self._now_fn = now_fn
+
+    def _record_result(self, status: str, request_issued_at: str) -> None:
+        """發布處理結果標記（**寫入失敗不得中斷跟單**，同心跳的既有慣例）。"""
+        try:
+            write_close_all_result(self._result_path, status=status,
+                                   request_issued_at=request_issued_at,
+                                   now_s=float(self._now_fn()))
+        except OSError as e:
+            logger.warning("平倉並撤銷結果標記寫入失敗（%s）: %r",
+                          self._result_path, e)
+
+    def _already_recorded(self, status: str, request_issued_at: str) -> bool:
+        """這筆請求（以 `issued_at` 識別，見 `close_all.py` 檔頭）是否已經發過同一種
+        結果——防洗版：expired 每輪都會重新判定同一筆舊請求，沒有這道檢查會每輪
+        critical 一次。"""
+        existing = read_close_all_result(self._result_path)
+        return (existing is not None and existing.get("status") == status
+                and existing.get("request_issued_at") == request_issued_at)
 
     def _critical(self, text: str, *, dedup_key: str) -> None:
         """發 critical，且**告警失敗不得中斷跟單**（沿 RiskSettingsApplier._critical
@@ -123,11 +156,23 @@ class CloseAllApplier:
                                  now_s=float(self._now_fn()),
                                  consume_nonce=lambda _n: True)
             except CloseAllError as e:
+                issued_at = rec.get("issued_at") if isinstance(rec, dict) else None
                 if e.reason == "expired":
                     # 過期是**預期會發生的常態**（記錄沒人清、客戶很久以前按過一次），
-                    # 不是事故 → 只 log，避免每輪 critical 洗版把真事件淹掉。
+                    # 但客戶簽了章、引擎卻始終沒處理，仍是使用者需要知道的一次失敗
+                    # （工程原則 3：安全動作失敗不得靜默）——發**一次** critical，
+                    # 靠 result 標記防同一筆舊請求每輪洗版（見 `_already_recorded`）。
                     logger.info("平倉並撤銷請求已過期，本輪不處理 account=%s",
                                self._account_id)
+                    if isinstance(issued_at, str) and not self._already_recorded(
+                            "expired", issued_at):
+                        self._critical(
+                            f"**平倉並撤銷請求已過期未處理**（account={self._account_id}，"
+                            f"簽署於 {issued_at}）——引擎在時限內沒有看到這筆請求"
+                            f"（可能離線／逾時）。客戶的授權與部位狀態未變；若仍要"
+                            f"平倉並撤銷，需要客戶重新取得待簽原文並重簽",
+                            dedup_key="close_all_expired")
+                        self._record_result("expired", issued_at)
                     return False
                 logger.error("平倉並撤銷請求驗簽失敗 account=%s reason=%s",
                             self._account_id, e.reason)
@@ -143,6 +188,9 @@ class CloseAllApplier:
                 f"reason=owner_close）。恢復僅能由人工 re-arm（見 RUNBOOK）",
                 dedup_key="close_all_triggered")
             wind_down()
+            issued_at = rec.get("issued_at") if isinstance(rec, dict) else None
+            if isinstance(issued_at, str):
+                self._record_result("completed", issued_at)
             return True
         except Exception:  # noqa: BLE001 —— 處理層壞掉絕不能中斷跟單
             logger.exception("平倉並撤銷請求處理失敗（跟單不受影響）")

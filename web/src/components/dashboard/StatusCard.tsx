@@ -51,7 +51,7 @@ function GuardRow({ label, guard }: { label: string; guard: DashboardGuard }) {
 }
 
 export function StatusCard({
-  status, me, positions, closeAllPending, onActionSettled, onCloseAllSubmitted,
+  status, me, positions, closeAllPending, closeAllFailed, onActionSettled, onCloseAllSubmitted,
 }: {
   status: DashboardStatus | null;
   /** 登入身分——kill switch 動作皆需要（暫停/恢復不簽章，平倉並撤銷需要它比對
@@ -61,6 +61,9 @@ export function StatusCard({
   positions: DashboardPosition[] | null;
   /** 平倉並撤銷已送出、正在等待引擎收尾完成（呼叫端輪詢 dashboard 直到 halted）。 */
   closeAllPending: boolean;
+  /** 輪詢逾時或後端判定請求過期（opus 審查 Critical 2c）——停止暗示「即將完成」，
+   * 改顯示明確失敗卡＋官方介面自助指引。 */
+  closeAllFailed: boolean;
   /** 暫停/恢復送出成功後呼叫——讓呼叫端立即重新整理 dashboard 資料，不必等下一次
    * 自然輪詢週期。 */
   onActionSettled: () => void;
@@ -136,7 +139,16 @@ export function StatusCard({
         )}
       </div>
       {pauseError && <p className="dash-status-error">{pauseError}</p>}
-      {closeAllPending && state !== "halted" && (
+      {closeAllFailed && state !== "halted" && (
+        <div className="dash-guide-card">
+          <h4>{c.closeAllFailed.title}</h4>
+          <p className="hint">{c.closeAllFailed.note}</p>
+          <a href="https://app.hyperliquid.xyz/API" target="_blank" rel="noreferrer">
+            {c.closeAllFailed.linkLabel}
+          </a>
+        </div>
+      )}
+      {closeAllPending && !closeAllFailed && state !== "halted" && (
         <div className="dash-progress-card">
           <strong>{c.closeAllProgress.title}</strong>
           <p style={{ margin: "4px 0 0" }}>{c.closeAllProgress.note}</p>

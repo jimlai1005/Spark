@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from spark.filet.engine_health import engine_publish_dir_for
 from spark.filet.followers import normalize_hex_address, validate_account_id
 from spark.filet.leader_change import LeaderChangeError, parse_issued_at
 from spark.filet.safe_fs import write_json_atomic
@@ -213,3 +214,60 @@ def write_close_all_request(path: str | Path, record: dict) -> None:
               if e.get("account_id") != record["account_id"]]
     entries.append(record)
     write_json_atomic(p, {"requests": entries}, mode=0o644)
+
+
+# ── 處理結果標記（2026-08-29，opus 審查 Critical 2）─────────────────────────
+# 修復前：`consume()` 對 expired 只 `logger.info`，前端 dashboard 對 awaitingHalt
+# 無限輪詢——客戶簽了章、引擎剛好離線／逾時，兩端都沒有任何大聲的失敗訊號
+# （違反工程原則 3）。本節讓引擎把處理結果（expired／completed）發布成一份
+# **窄的產物**（同 `engine_health.py` 的既有模式：引擎寫、API 讀，兩個單向通道
+# 之一），放在 engine→api 通道底下（`engine_publish_dir_for`）——這條路徑在生產
+# 環境已經是引擎可寫、API 可讀（見該檔頭的 systemd ReadWritePaths），不需要
+# 額外的部署權限變更。
+#
+# ⭐ 也順帶回答「這筆殘留是已經處理過的，還是從未被引擎看過」（RUNBOOK re-arm
+# 步驟需要這個區分，見 deploy/RUNBOOK.md）：result 檔存在＋`request_issued_at`
+# 與目前請求的 `issued_at` 相同 ⇒ 這筆已經有過結果；不存在或 issued_at 不同 ⇒
+# 從未處理過（或客戶重新簽了一筆新的）。
+#
+# 內容刻意只放 status/ts/request_issued_at：不含 signature/nonce/message
+# （沿 `engine_health.FORBIDDEN_KEY_PARTS` 同一個理由——這些是授權憑證的一部分，
+# 面板與 RUNBOOK 判讀都不需要它們）。
+CLOSE_ALL_RESULT_DIRNAME = "close_all_result"
+
+
+def close_all_result_dir_for(exchange_dir: str | Path) -> Path:
+    """result 標記檔的根目錄（engine→api 通道底下，見上方模組註解）。"""
+    return engine_publish_dir_for(exchange_dir) / CLOSE_ALL_RESULT_DIRNAME
+
+
+def close_all_result_path_for(exchange_dir: str | Path, account_id: str) -> Path:
+    """單一帳號的 result 標記檔（**寫端**引擎、**讀端** API 的單一定義）。"""
+    validate_account_id(account_id)
+    return close_all_result_dir_for(exchange_dir) / f"{account_id}.json"
+
+
+def write_close_all_result(path: str | Path, *, status: str,
+                           request_issued_at: str, now_s: float) -> None:
+    """原子落檔 `{"status": "expired"|"completed", "ts": epoch 秒,
+    "request_issued_at": 該筆請求的 issued_at}`。**引擎端呼叫**——寫入失敗不得
+    中斷跟單，由呼叫端（`close_all_apply.py`）吞例外只 log（同心跳的既有慣例）。
+    """
+    write_json_atomic(Path(path), {
+        "status": status, "ts": now_s, "request_issued_at": request_issued_at,
+    }, mode=0o644)
+
+
+def read_close_all_result(path: str | Path) -> dict | None:
+    """讀 result 標記；不存在或讀取/格式失敗 → `None`（**顯示層**：API 端呼叫，
+    讀不到就是「還沒有結果」，不是錯誤——沿 `_read_pause_flag` 顯示層的既有方向，
+    不在這裡做任何 fail-safe 動作）。
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None

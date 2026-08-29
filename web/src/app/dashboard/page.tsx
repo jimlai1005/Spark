@@ -42,6 +42,10 @@ function relativeAgo(updatedAt: number, nowS: number, copy: { justNow: string; s
   return d.toISOString().slice(0, 10);
 }
 
+// 平倉並撤銷輪詢逾時上限（opus 審查 Critical 2c）——模組層常數，不隨 render 重建，
+// 不需要出現在 effect 的依賴陣列裡。
+const AWAIT_TIMEOUT_MS = 15 * 60 * 1000;
+
 export default function DashboardPage() {
   const router = useRouter();
   const me = useMe();
@@ -54,7 +58,15 @@ export default function DashboardPage() {
   // 才停下——收尾是引擎下一輪（約一分鐘）才會完成的非同步動作，客戶要能看到
   // 進度而不是送出後畫面一片空白。其餘時間維持一次性讀取（不背景輪詢），
   // 不對未觸發 kill switch 的使用者加無謂的背景請求。
+  //
+  // ⭐⭐ opus 審查 Critical 2(c)：過去無限輪詢，引擎離線或請求過期時畫面永遠
+  // 卡在「約一分鐘內完成」——安全動作的失敗不能只有前端沉默轉圈（工程原則 3）。
+  // 現在有兩條停止條件：`close_request.state === "expired"`（後端已判定過期，
+  // 見 app.py::_dashboard_close_request）與 15 分鐘逾時上限；命中任一條就停止
+  // 輪詢並顯示明確失敗卡，不再暗示「即將完成」。
   const [awaitingHalt, setAwaitingHalt] = useState(false);
+  const [closeAllFailed, setCloseAllFailed] = useState(false);
+  const [awaitingSince, setAwaitingSince] = useState<number | null>(null);
 
   const dash = useQuery<DashboardResp>({
     queryKey: ["me-dashboard"],
@@ -69,12 +81,26 @@ export default function DashboardPage() {
       }
     },
     enabled: loggedIn,
-    refetchInterval: awaitingHalt ? 5000 : false,
+    refetchInterval: awaitingHalt ? 10_000 : false,
   });
 
   useEffect(() => {
-    if (dash.data?.status?.state === "halted") setAwaitingHalt(false);
-  }, [dash.data?.status?.state]);
+    if (!awaitingHalt) return;
+    if (dash.data?.status?.state === "halted") {
+      setAwaitingHalt(false);
+      return;
+    }
+    const closeState = dash.data?.status?.close_request?.state;
+    if (closeState === "expired") {
+      setAwaitingHalt(false);
+      setCloseAllFailed(true);
+      return;
+    }
+    if (awaitingSince != null && Date.now() - awaitingSince > AWAIT_TIMEOUT_MS) {
+      setAwaitingHalt(false);
+      setCloseAllFailed(true);
+    }
+  }, [awaitingHalt, awaitingSince, dash.data?.status?.state, dash.data?.status?.close_request?.state]);
 
   // 未登入一律 redirect /strategies（不在 render 期間呼叫 router.push，guard 用 effect，
   // 與 onboarding/page.tsx NOTE 10 同慣例）。
@@ -121,9 +147,12 @@ export default function DashboardPage() {
           me={me.data}
           positions={data?.positions ?? null}
           closeAllPending={awaitingHalt}
+          closeAllFailed={closeAllFailed}
           onActionSettled={() => void dash.refetch()}
           onCloseAllSubmitted={() => {
             setAwaitingHalt(true);
+            setCloseAllFailed(false);
+            setAwaitingSince(Date.now());
             void dash.refetch();
           }}
         />

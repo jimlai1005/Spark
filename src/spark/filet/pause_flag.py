@@ -10,6 +10,16 @@ owner 暫停旗標（Task 15 kill switch 第一級）——路徑慣例、寫入
 （`scripts/run_copytrade.py` 經本檔 `read_pause_flag_for_engine`）都呼叫它，
 兩端不可能各拼一份路徑而漂移（工程原則 1，同 leader_changes_path_for 的既有模式）。
 
+⭐⭐ 位址正規化（2026-08-29，opus 審查 Critical 1）：`pause_flag_path_for` 對
+`user_address` 若符合標準 `0x` + 40 hex 格式一律轉小寫再拼路徑（呼叫
+`spark.filet.followers.normalize_hex_address`）——寫端（`app.py` session 位址，
+已小寫）與讀端（引擎 `SPARK_USER_ADDR` env，可能是使用者貼入的 EIP-55 checksum
+混大小寫）過去各自拼出不同大小寫的路徑，導致「使用者按了暫停、面板顯示已停，
+引擎因為讀到另一條（不存在的）路徑而視為未暫停、繼續開倉」的 fail-open（工程
+原則 1：同一份值要有同一個正規化基準）。**非標準格式**（例如本檔既有測試用的
+`"0xabc"` 短字串）刻意不正規化、原樣拼入——那不是真實地址，是路徑慣例測試的
+假位址，維持既有行為避免動到已釘住的測試。
+
 ⭐⭐ 兩側的失敗方向刻意不同（都寫在各自函式的 docstring）：
 - 引擎側（`read_pause_flag_for_engine`）：IO/格式失敗 → **視為 paused** ＋ critical
   （fail-safe 朝「少動作」，plan 不變量 7：「讀不到 ≠ 進入危險態」的鏡像——這裡反過來，
@@ -21,31 +31,44 @@ owner 暫停旗標（Task 15 kill switch 第一級）——路徑慣例、寫入
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 
+from spark.filet.followers import normalize_hex_address
+from spark.filet.safe_fs import write_json_atomic
+
 
 def pause_flag_path_for(exchange_dir: str, user_address: str) -> str:
-    """暫停旗標的路徑（寫端與讀端的單一定義）。"""
-    return str(Path(exchange_dir) / user_address / "pause.json")
+    """暫停旗標的路徑（寫端與讀端的單一定義）。
+
+    `user_address` 若是標準 `0x` + 40 hex 位址一律先正規化為小寫（見檔頭
+    Critical 1 說明）；非標準格式原樣拼入（向後相容既有以短假字串為 fixture
+    的測試）。
+    """
+    try:
+        addr = normalize_hex_address("user_address", user_address)
+    except ValueError:
+        addr = user_address
+    return str(Path(exchange_dir) / addr / "pause.json")
 
 
 def write_pause_flag(path: str, *, paused: bool, by: str = "owner",
                      now_s: float | None = None) -> None:
-    """原子落檔 `{"paused": bool, "ts": epoch 秒, "by": "owner"}`。
+    """原子落檔 `{"paused": bool, "ts": epoch 秒, "by": "owner"}`（走 `safe_fs`，
+    沿 `write_risk_settings` 的既有慣例——2026-08-29 opus 審查 Warning 2：本函式
+    過去手寫 tmp→`os.replace`，繞過了 `safe_fs.py` 檔頭記載的 symlink 攻擊防禦
+    （tmp 路徑無 `O_EXCL`、chmod 走路徑而非 fd）。
 
     `by` 恆為 `"owner"`（本旗標目前只有一條寫入路徑：登入使用者自己按按鈕）；
     保留欄位是為了與換 leader／風控設定等記錄格式一致（稽核時一眼看出誰動的），
     也讓未來若加入營運端緊急暫停時不必改格式。
+
+    0644：讀端 filet-engine 是另一個 user（交換目錄無 setgid，見
+    `user_leaders.py` 的既有理由，同 `risk_settings.write_risk_settings`）。
     """
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
     payload = {"paused": paused, "ts": now_s if now_s is not None else time.time(),
               "by": by}
-    tmp = p.parent / f"{p.name}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(payload, ensure_ascii=False))
-    os.replace(tmp, p)
+    write_json_atomic(Path(path), payload, mode=0o644)
 
 
 def read_pause_flag_for_engine(exchange_dir: str, user_address: str, notifier) -> bool:

@@ -1068,6 +1068,12 @@ export const COPY_ZH = {
           "找到本站建立的 API wallet 並移除其權限",
         ],
       },
+      closeAllFailed: {
+        title: "處理逾時",
+        note: "引擎未在時限內處理平倉請求，可能暫時離線。你的授權與部位狀態未變，"
+             + "請稍後重試，或直接至 Hyperliquid 官方介面移除 API wallet 並自行平倉。",
+        linkLabel: "前往 Hyperliquid 官方介面移除 API wallet",
+      },
       guardsHeading: "風險護欄（設定值 vs 目前）",
       guardScale: "投入比例",
       guardLeverage: "槓桿",
@@ -2227,6 +2233,14 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
           "Open the \"API\" settings page",
           "Find the API wallet created by this site and remove its permissions",
         ],
+      },
+      closeAllFailed: {
+        title: "Processing timed out",
+        note: "The engine did not process your close-all request in time — it may be "
+             + "temporarily offline. Your authorization and position status are unchanged. "
+             + "Please try again later, or go to the official Hyperliquid interface to "
+             + "remove the API wallet and close your positions yourself.",
+        linkLabel: "Go to Hyperliquid to remove the API wallet",
       },
       guardsHeading: "Risk guardrails (set vs current)",
       guardScale: "Allocation",

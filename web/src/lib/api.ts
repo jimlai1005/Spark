@@ -1375,12 +1375,20 @@ export interface DashboardGuards {
   leverage: DashboardGuard;
   drawdown: DashboardDrawdownGuard;
 }
+/** 「平倉並撤銷」請求的處理狀態（opus 審查 Critical 2b，見 app.py::_dashboard_close_request）
+ * ——`null` ＝從未提出過請求（多數帳號的正常狀態）。 */
+export interface DashboardCloseRequest {
+  state: "pending" | "expired" | "completed";
+}
 /** `state` 型別刻意為字面量聯集（後端四態封閉、非開放列舉，見 app.py::_dashboard_status）。 */
 export interface DashboardStatus {
   strategy_name: string | null;
   state: "following" | "paused" | "halted" | "inactive";
   following_days: number | null;
   signal_source_ok: boolean | null;
+  /** 選填（非 optional 會讓既有 mock fixture 缺這個鍵時編不過）——執行期永遠由
+   * 後端帶上，缺席只在測試假資料裡發生，呼叫端一律用 `?? null` 兜底。 */
+  close_request?: DashboardCloseRequest | null;
   guards: DashboardGuards;
 }
 export interface DashboardEquity {

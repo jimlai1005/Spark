@@ -75,8 +75,10 @@ from spark.filet.risk_settings import (RISK_SETTINGS_MAX_AGE_S, RiskSettingsErro
                                        verify_risk_unlock, write_risk_settings,
                                        write_risk_unlock)
 from spark.filet.close_all import (CloseAllError, build_close_all_message,
-                                   build_close_all_record, verify_close_all,
-                                   write_close_all_request)
+                                   build_close_all_record, close_all_path_for,
+                                   close_all_result_path_for,
+                                   load_close_all_requests, read_close_all_result,
+                                   verify_close_all, write_close_all_request)
 from spark.filet.pause_flag import pause_flag_path_for, write_pause_flag
 from spark.copytrade.notifier import NullNotifier, TelegramNotifier
 from spark.publicapi.pending import load_pending, write_pending_entry
@@ -534,6 +536,40 @@ def _read_pause_flag(exchange_dir: str, user_address: str) -> tuple[bool | None,
     return bool(data.get("paused")), False
 
 
+def _dashboard_close_request(exchange_dir: str, account_id: str) -> dict | None:
+    """「平倉並撤銷」請求塊（opus 審查 Critical 2b）：`{"state": "pending"|
+    "expired"|"completed"}`；本帳號從未提出過請求 → `None`（多數帳號的正常狀態，
+    前端不顯示這塊）。
+
+    state 判定（單一定義，`close_all_apply.CloseAllApplier` 是唯一寫端）：
+    - 查無本帳號的請求 → `None`。
+    - 有請求，但 result 標記不存在，或其 `request_issued_at` 跟這筆請求的
+      `issued_at` 不同（客戶重簽過新的一筆，舊標記還沒被蓋掉）→ `pending`：
+      引擎還沒處理過**這一筆**（不能拿舊標記冒充新請求已處理）。
+    - 標記存在且 `request_issued_at` 相符 → 標記的 `status`。
+
+    讀取/格式失敗一律回 `None`（顯示層失敗方向，同 `_read_pause_flag`——這裡沒有
+    安全動作可做，只有「不確定」可以誠實回報）。
+    """
+    try:
+        requests = load_close_all_requests(close_all_path_for(exchange_dir))
+        mine = [r for r in requests
+               if isinstance(r, dict) and r.get("account_id") == account_id]
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        logger.warning("dashboard: 平倉並撤銷請求讀取失敗 account=%s: %r",
+                       account_id, e)
+        return None
+    if not mine:
+        return None
+    issued_at = mine[-1].get("issued_at")
+    result = read_close_all_result(close_all_result_path_for(exchange_dir, account_id))
+    if (result is not None and isinstance(issued_at, str)
+            and result.get("request_issued_at") == issued_at
+            and result.get("status") in ("expired", "completed")):
+        return {"state": result["status"]}
+    return {"state": "pending"}
+
+
 def _dashboard_guards(hb: "HeartbeatRead", mine, acct: dict | None,
                       leaders_path: str) -> dict:
     """設定 vs 目前三條護欄。**max** 全部取自各自的權威來源（心跳＝引擎實際套用值、
@@ -596,7 +632,7 @@ def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
     if mine is None:
         return {
             "strategy_name": None, "state": "inactive", "following_days": None,
-            "signal_source_ok": None,
+            "signal_source_ok": None, "close_request": None,
             "guards": {"scale": {"now": None, "max": None},
                       "leverage": {"now": None, "max": None},
                       "drawdown": {"now": None, "max": None, "enabled": None}},
@@ -621,6 +657,7 @@ def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
     return {
         "strategy_name": strategy_name, "state": state, "following_days": None,
         "signal_source_ok": bool(hb.fresh and not pause_unknown and last_cycle_ok),
+        "close_request": _dashboard_close_request(exchange_dir, mine.account_id),
         "guards": _dashboard_guards(hb, mine, acct, leaders_path),
     }
 
@@ -658,13 +695,36 @@ def _dashboard_sync(ref: FollowerRef, hl, mine, now_s: float) -> dict:
     }
 
 
-def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float) -> dict:
+# ⭐ Warning 1（opus 審查 2026-08-29）：`daily_bars` 逐日重呼 `collect_follower_summary`
+# ——一次 dashboard 請求觸發約「月內天數＋1」次 `get_user_fills`（月中約 15 次、
+# 月底約 31 次），直接打在 Hyperliquid 上游 API，且 dashboard 是客戶最常開的頁面。
+# per-account **in-process** 快取（TTL 300s）把同一帳號 5 分鐘內的重複請求收斂成
+# 一次計算——費用數字反映的是歷史成交，5 分鐘內「本月至今」窗口右端點的偏移對
+# 顯示用途可忽略。快取鍵是 `ref.account_id`；TTL 判定用呼叫端傳入的 `now_s`
+# （與整個 dashboard 端點共用同一個時鐘，可測試注入，不另外硬綁 `time.time()`）。
+# ⚠️ 多 worker 部署下每個 process 各自一份快取（in-process，非共享）——這裡刻意
+# 不做跨 process 一致性：費用顯示不是安全關鍵路徑，worst case 是不同 worker 在
+# TTL 內回應略舊的數字，不是資料損毀或資金風險。
+_FEES_MONTH_CACHE_TTL_S = 300.0
+_fees_month_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float, *,
+                          cache: dict[str, tuple[float, dict]] | None = None) -> dict:
     """本月路由量與費用：與 `/api/ops/revenue`／`customer_pnl` 同一個函式
     （`collect_follower_summary`），只過濾到這個帳號自己（同源同函式，不各自
     複製公式）。`daily_bars`：逐日重呼同一函式取當日 builder_fee，某日失敗
     只跳過那一根 bar，不連坐整月彙總（本函式的失敗——`summary.error`——才連坐
     整塊，由呼叫端的 `_safe_block` 統一處理）。
+
+    `cache` 不給 → 用模組層共用字典（正式路徑）；測試可傳一份乾淨字典避免
+    跨測試汙染（見上方模組註解的快取語意）。**只快取成功結果**——失敗（拋例外）
+    不寫入快取，下一次請求會照常重試，不會把一次暫時性故障釘住 300 秒。
     """
+    cache = _fees_month_cache if cache is None else cache
+    cached = cache.get(ref.account_id)
+    if cached is not None and (now_s - cached[0]) < _FEES_MONTH_CACHE_TTL_S:
+        return cached[1]
     now_dt = datetime.fromtimestamp(now_s, timezone.utc)
     month_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
     summary = collect_follower_summary(ref, hl, month_start, now_dt)
@@ -685,11 +745,13 @@ def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float) -> dict:
         if day_summary.error is None:
             daily_bars.append([day.date().isoformat(), day_summary.builder_fee])
         day += timedelta(days=1)
-    return {
+    result = {
         "routed_volume": routed_volume, "builder_fees": builder_fees,
         "fill_count": fill_count, "avg_fee": avg_fee,
         "effective_rate_bps": effective_rate_bps, "daily_bars": daily_bars,
     }
+    cache[ref.account_id] = (now_s, result)
+    return result
 
 
 def _dashboard_pnl_and_return(ref: FollowerRef, hl, positions: list[dict] | None
@@ -701,10 +763,16 @@ def _dashboard_pnl_and_return(ref: FollowerRef, hl, positions: list[dict] | None
     ⭐ `net`／`fees_paid`／`fee_share_of_pnl_pct` 三者同窗口（perpMonth 的
     `[first_ts_ms, last_ts_ms]`）：dollar PnL 出自 HL `pnlHistory`（`cum_pnl`），
     fee 出自**同窗口**的 `collect_follower_summary`（與 billing／ops 同一個函式），
-    `net = cum_pnl − fees_paid`。`realized` 是本函式對「已實現」唯一的近似
-    （`cum_pnl − 目前未實現快照`，兩者理論上共同構成 cum_pnl；快照與窗口終點的
-    幾分鐘落差是已知誤差來源，已在回報中說明）。`closed_positions`：無既有
-    來源，維持 None（不新造公式）。
+    `net = cum_pnl − fees_paid`。
+
+    ⭐⭐ `realized` 恆為 `None`（2026-08-29 opus 審查 Warning 5，工程原則 1）：
+    過去算成 `cum_pnl − unrealized`，但 `cum_pnl` 是 30 天窗（`perpMonth`）內的
+    累積值，`unrealized` 卻是**目前所有持倉自各自開倉以來**的未實現損益快照
+    ——兩者基準不同源（一個有窗口起點、一個沒有），對長期持倉可以錯到反號
+    （例如一筆 40 天前開倉、近期才轉盈的部位：30 天窗的 cum_pnl 可能是負值，
+    減去它「開倉以來」的正 unrealized，會算出一個更負的假「已實現虧損」）。
+    找不到同窗口的已實現數字就是找不到，不拼湊一個異基準的近似值冒充——前端
+    對 `null` 顯示「—」。`closed_positions`：無既有來源，同理維持 `None`。
     """
     rows = hl.portfolio(ref.user_address)
     series = None
@@ -726,8 +794,6 @@ def _dashboard_pnl_and_return(ref: FollowerRef, hl, positions: list[dict] | None
         if "win_rate" in perf:
             win_rate = (perf["win_rate"] * 100).quantize(Decimal("0.01"),
                                                           rounding=ROUND_HALF_UP)
-        if unrealized is not None:
-            realized = cum_pnl - unrealized
         start = datetime.fromtimestamp(perf["first_ts_ms"] / 1000, timezone.utc)
         end = datetime.fromtimestamp(perf["last_ts_ms"] / 1000, timezone.utc)
         summary = collect_follower_summary(ref, hl, start, end)

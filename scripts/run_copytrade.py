@@ -112,7 +112,8 @@ from spark.exchange.base import BuilderCode
 from spark.filet.capital_settings_apply import (
     LEDGER_RELPATH as CAPITAL_LEDGER_RELPATH,
 )
-from spark.filet.close_all_apply import CloseAllApplier, resolve_close_all_path
+from spark.filet.close_all_apply import (CloseAllApplier, resolve_close_all_path,
+                                         resolve_close_all_result_path)
 from spark.filet.pause_flag import read_pause_flag_for_engine
 from spark.filet.capital_settings import canonical_capital_values
 from spark.filet.capital_settings_apply import (
@@ -464,6 +465,7 @@ def make_close_all_applier(*, account_id: str | None, notifier: Notifier):
         account_id=account_id,
         manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
         request_path=resolve_close_all_path(),
+        result_path=resolve_close_all_result_path(account_id),
         notifier=notifier)
 
 

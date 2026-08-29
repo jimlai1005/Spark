@@ -1403,6 +1403,16 @@ cat $FILET_EXCHANGE_DIR/<user_address>/pause.json   # 目前的暫停狀態
   `_MANUAL_REARM_REASONS` 皆不含它）——沒有冷靜期自動恢復、也沒有客戶自助解鎖的
   簽章路徑。這是刻意的：客戶已經明確選擇退出這顆引擎。
 
+⭐ **result 標記檔**（2026-08-29 opus 審查 Critical 2/Suggestion 1 新增）：引擎每次
+處理一筆平倉並撤銷請求（過期或成功收尾）都會在 engine→api 通道（`engine_health.py`
+檔頭同一個拓撲，引擎可寫、filet-api 只讀）落一份
+`$FILET_EXCHANGE_DIR/engine/close_all_result/<account_id>.json`，內容
+`{"status": "expired"|"completed", "ts": ..., "request_issued_at": ...}`——
+`/api/me/dashboard` 的 `status.close_request` 就是讀這份標記＋`owner_close.json`
+的最新請求比對 `request_issued_at` 算出 `pending`/`expired`/`completed`。這份標記
+**只在有新請求時被覆寫**，不會自己過期，所以「已處理過的殘留」與「客戶從未
+重簽過」在檔案系統上分得清楚——這正是本節第 4 步要清乾淨它的原因。
+
 #### owner 收尾後的人工 re-arm 程序
 
 平倉並撤銷完成後，該 follower 的引擎會**永久停在 tripped 狀態**，直到 operator
@@ -1419,6 +1429,28 @@ cat /opt/filet/state/<account_id>/var/copytrade/killswitch.tripped
 # 3. 若確定要恢復同一顆引擎：刪 ARM 檔（同其餘 kill switch 路徑的既有 re-arm 慣例）
 sudo -u filet-engine rm /opt/filet/state/<account_id>/var/copytrade/killswitch.tripped
 sudo systemctl restart filet-follower@<account_id>   # 非必要，但建議乾淨重啟一次
+
+# 4. 清掉這個帳號在 owner_close.json 的請求條目與 result 標記檔（見上方「result
+#    標記檔」說明）——不清的話，/api/me/dashboard 的 status.close_request 會
+#    永遠停在 completed，客戶若之後又走一次 onboarding、重新開始跟單，畫面上
+#    仍會顯示「已完成平倉並撤銷」的舊痕跡，混淆這是不是同一顆引擎的新狀態。
+sudo -u filet-api /opt/filet/spark/.venv/bin/python - <<'EOF'
+import json
+from pathlib import Path
+from spark.filet.close_all import close_all_path_for, close_all_result_path_for
+
+exchange_dir = "/opt/filet/exchange"  # 換成實際 FILET_EXCHANGE_DIR
+account_id = "<account_id>"           # 換成實際 account_id
+
+p = Path(close_all_path_for(exchange_dir))
+if p.exists():
+    doc = json.loads(p.read_text())
+    doc["requests"] = [r for r in doc.get("requests", [])
+                        if r.get("account_id") != account_id]
+    p.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
+
+Path(close_all_result_path_for(exchange_dir, account_id)).unlink(missing_ok=True)
+EOF
 ```
 
 ⚠️ **前端指引卡不代發鏈上撤銷**（plan 0.2 明文，v1 範圍）：客戶頁面在收尾完成
