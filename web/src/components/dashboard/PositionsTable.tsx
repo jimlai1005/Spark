@@ -6,11 +6,13 @@ import { useCopy } from "@/lib/lang";
 
 type Tab = "positions" | "fees" | "history";
 
+/** upnl 一律兩位小數（Task 19 修正）——`fmtAmount` 對 |v|<1 預設放到 4 位（給
+ * 對帳欄位用），持倉表不是對帳欄位，-$0.1600 這種尾數只是雜訊，固定 `dp=2`。 */
 function signedAmount(v: string): string {
   const n = Number(v);
   if (!Number.isFinite(n)) return NO_VALUE;
   const sign = n >= 0 ? "+" : "-";
-  return `${sign}$${fmtAmount(String(Math.abs(n)))}`;
+  return `${sign}$${fmtAmount(String(Math.abs(n)), 2)}`;
 }
 
 /**

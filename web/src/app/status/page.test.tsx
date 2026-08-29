@@ -64,4 +64,34 @@ describe("StatusPage", () => {
     expect(screen.getByRole("heading", { level: 1, name: COPY.status.heading })).toBeInTheDocument();
     expect(screen.getByText(COPY.footer.statusUnknown)).toBeInTheDocument();
   });
+
+  it("卡片列表化（Task 19 修正）：每個元件列有燈點＋mono 名稱＋pill 狀態", async () => {
+    stubFetch(() => jsonResponse({
+      status: "ok",
+      components: [{ name: "engine", status: "ok" }],
+      updated_at: 1724805063,
+    }));
+    const { container } = render(<StatusPage />);
+    await screen.findAllByText(COPY.footer.statusOk);
+    const row = container.querySelector(".status-component-row");
+    expect(row).not.toBeNull();
+    expect(row?.querySelector(".status-dot")).not.toBeNull();
+    expect(row?.querySelector(".mono")?.textContent).toBe("engine");
+    const pill = row?.querySelector(".pill.status-component-pill");
+    expect(pill).not.toBeNull();
+    expect(pill?.textContent).toBe(COPY.footer.statusOk);
+    expect(container.querySelector(".status-overall .status-dot-lg")).not.toBeNull();
+  });
+
+  it("updated_at 格式為 YYYY-MM-DD HH:mm UTC", async () => {
+    stubFetch(() => jsonResponse({
+      status: "ok",
+      components: [],
+      updated_at: 1724805063,
+    }));
+    const { container } = render(<StatusPage />);
+    await screen.findAllByText(COPY.footer.statusOk);
+    const el = container.querySelector(".status-updated-at");
+    expect(el?.textContent).toMatch(/2024-08-28 \d{2}:\d{2} UTC$/);
+  });
 });

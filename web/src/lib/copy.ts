@@ -1025,6 +1025,7 @@ export const COPY_ZH = {
     heading: "Dashboard",
     lastSyncPrefix: "最後同步 ",
     lastSyncSuffix: " 前",
+    lastSyncJustNow: "剛剛",
     liveBadge: "即時",
     loadingNote: "讀取 Dashboard 資料中…",
     status: {
@@ -2179,6 +2180,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     heading: "Dashboard",
     lastSyncPrefix: "Last synced ",
     lastSyncSuffix: " ago",
+    lastSyncJustNow: "just now",
     liveBadge: "Live",
     loadingNote: "Loading dashboard data…",
     status: {

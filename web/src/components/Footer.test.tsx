@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { COPY_ZH } from "@/lib/copy";
@@ -80,5 +82,15 @@ describe("Footer", () => {
     expect(wrapper).not.toBeNull();
     expect(wrapper).toHaveAttribute("data-status", "degraded");
     expect(container.querySelectorAll(".footer-status").length).toBe(1);
+  });
+
+  it("390 斷點（Task 19 修正）：.footer-cols 在 ≤480px 收斂為單欄，欄間距 24px", () => {
+    const css = readFileSync(
+      path.resolve(__dirname, "../styles/globals.css"),
+      "utf-8",
+    );
+    const mediaBlock = css.match(/@media \(max-width: 480px\) \{[\s\S]*?\n\}/);
+    expect(mediaBlock).not.toBeNull();
+    expect(mediaBlock?.[0]).toMatch(/\.footer-cols\s*\{[^}]*grid-template-columns:\s*1fr[^}]*gap:\s*24px/);
   });
 });

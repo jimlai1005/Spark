@@ -320,7 +320,12 @@ export default function StrategyDetailPage() {
 
       <div className="strategy-detail-grid">
         <div className="strategy-detail-left">
-          <EquityCurve equityIndex={strategy.equity_index} />
+          <EquityCurve
+            equityIndex={strategy.equity_index}
+            initialDepositUsd={strategy.methodology.initial_deposit_usd}
+            startDate={strategy.methodology.start_date}
+            endDate={strategy.methodology.end_date}
+          />
 
           <div className="metric-grid">
             {metricCards.map((card) => (

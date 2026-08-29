@@ -8,7 +8,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CloseAllMessageResp, CloseAllResp, DashboardResp, PauseResp } from "@/lib/api";
 
 const push = vi.fn();
@@ -148,6 +148,38 @@ describe("DashboardPage — 六塊渲染假資料", () => {
     expect(screen.getByText("$25.66")).toBeInTheDocument();
     // 持倉表
     expect(screen.getByText("ETH")).toBeInTheDocument();
+  });
+});
+
+describe("DashboardPage — 最後同步顯示（Task 19 修正）", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("<60s → 顯示「剛剛」，不帶「Xs 前」", async () => {
+    vi.setSystemTime((FULL.updated_at + 30) * 1000);
+    getDashboard.mockResolvedValue(FULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    expect(screen.getByText(`${COPY.dashboard.lastSyncPrefix}${COPY.dashboard.lastSyncJustNow}`)).toBeInTheDocument();
+  });
+
+  it("介於 1 分鐘到 24 小時 → 顯示「Xm 前」/「Xh 前」", async () => {
+    vi.setSystemTime((FULL.updated_at + 3 * 3600) * 1000);
+    getDashboard.mockResolvedValue(FULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    expect(screen.getByText(`${COPY.dashboard.lastSyncPrefix}3h${COPY.dashboard.lastSyncSuffix}`)).toBeInTheDocument();
+  });
+
+  it(">24h → 顯示日期（YYYY-MM-DD），不是「8766h 前」", async () => {
+    vi.setSystemTime((FULL.updated_at + 8766 * 3600) * 1000);
+    getDashboard.mockResolvedValue(FULL);
+    render(wrap(<DashboardPage />));
+    await screen.findByText(/Filet Core/);
+    const expectedDate = new Date(FULL.updated_at * 1000).toISOString().slice(0, 10);
+    expect(screen.getByText(`${COPY.dashboard.lastSyncPrefix}${expectedDate}`)).toBeInTheDocument();
+    expect(screen.queryByText(/8766h/)).not.toBeInTheDocument();
   });
 });
 

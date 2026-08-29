@@ -49,7 +49,7 @@ export default function StatusPage() {
       </header>
 
       <section className="card status-overall" data-status={status.status}>
-        <span className="status-dot" aria-hidden="true" />
+        <span className="status-dot status-dot-lg" aria-hidden="true" />
         <span>{statusLabel}</span>
       </section>
 
@@ -70,8 +70,11 @@ export default function StatusPage() {
                     : footer.statusUnknown;
               return (
                 <li key={comp.name} className="card status-component-row" data-status={comp.status}>
-                  <span className="mono">{comp.name}</span>
-                  <span>{label}</span>
+                  <span className="status-component-left">
+                    <span className="status-dot" aria-hidden="true" />
+                    <span className="mono">{comp.name}</span>
+                  </span>
+                  <span className="pill status-component-pill" data-status={comp.status}>{label}</span>
                 </li>
               );
             })}

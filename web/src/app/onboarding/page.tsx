@@ -173,9 +173,11 @@ function OnboardingInner() {
               <li key={name} className={n === step ? "is-current" : done ? "is-done" : ""}>
                 <button type="button" className="step-btn" disabled={n > step}
                   aria-current={n === step ? "step" : undefined}>
-                  <span className="step-num">{String(n).padStart(2, "0")}</span>
+                  <span className="step-num">
+                    <span className="step-num-digit">{String(n).padStart(2, "0")}</span>
+                    <span className="step-check">✓</span>
+                  </span>
                   <span className="step-name">{name}</span>
-                  <span className="step-check">✓</span>
                 </button>
               </li>
             );

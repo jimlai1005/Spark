@@ -21,8 +21,12 @@ interface CardMetric {
  *
  * **CAGR 不出現在這張卡上**（NOTE 03）：只呈現 API 提供的 total_return / max_drawdown /
  * sharpe(±se) / win_rate 四格，沒有任何年化外推欄位。
+ *
+ * `summary`（Task 19 修正）：onboarding step1（`StepSelectStrategy`）已選卡復用本
+ * 元件顯示摘要，不該再出現「查看策略與風險」CTA——傳 `summary` 時整個底部 CTA
+ * 區塊（含 listable=false 的樣本累積中按鈕）都不渲染。
  */
-export function StrategyCard({ strategy }: { strategy: PublicStrategy }) {
+export function StrategyCard({ strategy, summary }: { strategy: PublicStrategy; summary?: boolean }) {
   const COPY = useCopy();
   const c = COPY.home.strategies;
   const m = strategy.metrics;
@@ -108,7 +112,7 @@ export function StrategyCard({ strategy }: { strategy: PublicStrategy }) {
         )}
       </div>
 
-      {strategy.listable ? (
+      {summary ? null : strategy.listable ? (
         <Link href={`/strategies/${strategy.slug}`} className="btn btn-primary btn-block">
           {c.cta}
         </Link>

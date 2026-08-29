@@ -79,4 +79,15 @@ describe("StrategyCard", () => {
     expect(screen.getByText(/槓桿 ≤ 3x/)).toBeInTheDocument();
     expect(screen.getByText(/最低跟單 \$500/)).toBeInTheDocument();
   });
+
+  it("summary=true（Task 19 修正）：不渲染 CTA（listable 與 non-listable 皆不出現）", () => {
+    render(<StrategyCard strategy={BASE} summary />);
+    expect(screen.queryByRole("link", { name: COPY.home.strategies.cta })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("strategy-card-disabled")).not.toBeInTheDocument();
+
+    const pending: PublicStrategy = { ...BASE, listable: false };
+    render(<StrategyCard strategy={pending} summary />);
+    expect(screen.queryByText(COPY.home.strategies.pendingNote)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("strategy-card-disabled")).not.toBeInTheDocument();
+  });
 });

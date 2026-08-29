@@ -24,12 +24,22 @@ import { shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 
-/** `updated_at`（epoch 秒）→「Xs 前」/「Xm 前」/「Xh 前」，供頂欄「最後同步」用。 */
-function relativeAgo(updatedAt: number, nowS: number): string {
+/**
+ * `updated_at`（epoch 秒）→ 頂欄「最後同步」顯示字串（Task 19 修正）：
+ * <60s 顯示 `justNow`（不帶「Xs 前」，太精確反而像在騙人準）；
+ * <24h 顯示「Xm 前」/「Xh 前」；≥24h 直接顯示日期（`YYYY-MM-DD`）——
+ * 「8766h 前」這種數字對使用者沒有意義，日期才有。
+ * 回傳值已含 suffix（呼叫端不用再另外接 `lastSyncSuffix`），日期態與 justNow
+ * 態都不该接 suffix，故 suffix 由本函式決定要不要帶。
+ */
+function relativeAgo(updatedAt: number, nowS: number, copy: { justNow: string; suffix: string }): string {
   const diff = Math.max(0, Math.floor(nowS - updatedAt));
-  if (diff < 60) return `${diff}s`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
-  return `${Math.floor(diff / 3600)}h`;
+  if (diff < 60) return copy.justNow;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m${copy.suffix}`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h${copy.suffix}`;
+  const d = new Date(updatedAt * 1000);
+  if (Number.isNaN(d.getTime())) return copy.justNow;
+  return d.toISOString().slice(0, 10);
 }
 
 export default function DashboardPage() {
@@ -94,7 +104,8 @@ export default function DashboardPage() {
         {data && (
           <div className="dash-sync-meta">
             <span>
-              {c.lastSyncPrefix}{relativeAgo(data.updated_at, nowS)}{c.lastSyncSuffix}
+              {c.lastSyncPrefix}
+              {relativeAgo(data.updated_at, nowS, { justNow: c.lastSyncJustNow, suffix: c.lastSyncSuffix })}
             </span>
             <span className="dash-live-pill">
               <span className="dash-live-dot" aria-hidden="true" />

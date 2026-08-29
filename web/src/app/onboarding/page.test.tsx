@@ -208,6 +208,22 @@ describe("OnboardingPage — 步驟條狀態", () => {
     expect(items[0].className).toContain("is-done");
     expect(items[1].className).toContain("is-current");
   });
+
+  it("已選卡摘要模式（Task 19 修正）：不出現「查看策略與風險」CTA", async () => {
+    render(wrap(<OnboardingPage />));
+    await screen.findByRole("navigation", { name: "開通步驟" });
+    expect(screen.queryByRole("link", { name: "查看策略與風險" })).not.toBeInTheDocument();
+  });
+
+  it("水平步驟條（Task 19 修正）：圓圈編號含 digit＋check 兩態節點", async () => {
+    render(wrap(<OnboardingPage />));
+    const nav = await screen.findByRole("navigation", { name: "開通步驟" });
+    const items = nav.querySelectorAll("li");
+    const doneNum = items[0].querySelector(".step-num");
+    expect(doneNum?.querySelector(".step-num-digit")).not.toBeNull();
+    expect(doneNum?.querySelector(".step-check")).not.toBeNull();
+    expect(doneNum?.querySelector(".step-check")?.textContent).toBe("✓");
+  });
 });
 
 describe("OnboardingPage — step 3 風險限制（裁決 1：opt-in）", () => {
@@ -368,5 +384,19 @@ describe("OnboardingPage — step 3 投入比例（Task 10b：真實簽章流）
     render(wrap(<OnboardingPage />));
     await screen.findByRole("heading", { name: "設定你的風險限制" });
     expect(await screen.findByText("已提交，待引擎套用")).toBeInTheDocument();
+  });
+});
+
+describe("OnboardingPage — 步驟條 390 收斂（Task 19 修正）", () => {
+  it("≤480px：非當前步驟的 step-name 隱藏，只留圓圈＋連接線", async () => {
+    const { readFileSync } = await import("node:fs");
+    const path = await import("node:path");
+    const css = readFileSync(
+      path.resolve(__dirname, "../../styles/globals.css"),
+      "utf-8",
+    );
+    const mediaBlock = css.match(/@media \(max-width: 480px\) \{[\s\S]*?\n\}/);
+    expect(mediaBlock).not.toBeNull();
+    expect(mediaBlock?.[0]).toMatch(/\.wizard-steps li:not\(\.is-current\) \.step-name\s*\{\s*display:\s*none/);
   });
 });

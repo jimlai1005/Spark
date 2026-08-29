@@ -37,7 +37,7 @@ export function StepSelectStrategy({ isAdvanced, advancedAddress, detail }: {
       ) : detail === null ? (
         <p className="hint">{c.step1NotFound}</p>
       ) : (
-        <StrategyCard strategy={detail} />
+        <StrategyCard strategy={detail} summary />
       )}
       <Link className="btn btn-ghost" href="/strategies">{c.step1Back}</Link>
     </div>

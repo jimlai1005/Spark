@@ -262,6 +262,58 @@ input:focus-visible,
   margin: 0;
 }
 
+/* ---------- /status 頁（Task 19 修正批次：卡片列表化） ---------- */
+.status-page-head { margin-bottom: 24px; }
+
+.status-overall {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 22px;
+  margin-bottom: 24px;
+  font-size: var(--fs-body-lg);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--text-dim);
+}
+.status-dot-lg { width: 12px; height: 12px; }
+
+.status-overall[data-status="ok"] .status-dot,
+.status-component-row[data-status="ok"] .status-dot { background: var(--pos); }
+.status-overall[data-status="degraded"] .status-dot,
+.status-component-row[data-status="degraded"] .status-dot { background: var(--warn); }
+.status-overall[data-status="unknown"] .status-dot,
+.status-component-row[data-status="unknown"] .status-dot { background: var(--text-dim); }
+
+.status-components ul { display: grid; gap: 10px; }
+
+.status-component-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+}
+
+.status-component-left { display: flex; align-items: center; gap: 10px; }
+
+.status-component-pill {
+  padding: 4px 10px;
+  font-size: var(--fs-micro);
+  color: var(--text-dim);
+  background: var(--card-hover);
+  border: 1px solid var(--border);
+}
+.status-component-pill[data-status="ok"] { color: var(--pos); border-color: rgba(var(--pos-rgb), .28); background: rgba(var(--pos-rgb), .1); }
+.status-component-pill[data-status="degraded"] { color: var(--warn); border-color: rgba(var(--warn-rgb), .28); background: rgba(var(--warn-rgb), .1); }
+.status-component-pill[data-status="unknown"] { color: var(--text-dim); border-color: rgba(var(--text-dim-rgb), .22); background: rgba(var(--text-dim-rgb), .08); }
+
+.status-updated-at { margin-top: 20px; font-size: 12px; color: var(--text-dim); }
+
 /* ---------- 版面容器 ---------- */
 main.page {
   max-width: 1080px;
@@ -465,47 +517,86 @@ main.page {
   align-items: start;
 }
 
-.wizard-steps li { margin-bottom: 4px; }
+/* 水平步驟條（Task 19 修正：設計稿 §05 L570-584——圓圈編號＋標題＋連接線）。
+   `.wizard-steps` 本身是 `<ol>`，每個 `<li>` 佔一等份，除最後一個外用 ::after
+   畫連接線，避免多加 DOM 節點。 */
+.wizard-steps {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-bottom: 30px;
+}
+
+.wizard-steps li {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.wizard-steps li:not(:last-child)::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+  margin: 0 12px;
+}
+
+.wizard-steps li:last-child { flex: none; }
 
 .wizard-steps .step-btn {
-  width: 100%;
   display: flex;
   align-items: center;
   gap: 10px;
   text-align: left;
-  padding: 12px 14px;
-  border-radius: var(--radius);
-  border: 1px solid transparent;
+  padding: 0;
+  border: none;
   background: transparent;
   cursor: pointer;
   color: var(--text-dim);
+  white-space: nowrap;
 }
 
-.wizard-steps .step-btn:disabled { cursor: not-allowed; opacity: .4; }
+.wizard-steps .step-btn:disabled { cursor: not-allowed; }
 
-.wizard-steps li.is-current .step-btn {
-  background: var(--card);
-  border-color: var(--border-strong);
-  color: var(--text);
-}
-
-.wizard-steps li.is-done .step-btn { color: var(--pos); }
-
-.step-num { font-family: var(--font-mono); font-size: 12px; width: 22px; flex: none; }
-
-.wizard-steps li.is-current .step-num,
-.wizard-steps li.is-done .step-num { color: inherit; }
-
-.step-name { font-size: 13.5px; }
-
-.step-check {
-  margin-left: auto;
+.step-num {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  font-family: var(--font-mono);
   font-size: 12px;
-  color: var(--pos);
-  visibility: hidden;
+  font-weight: 700;
+  border: 1px solid var(--border);
+  background: var(--inset);
+  color: var(--text-dim);
 }
 
-.wizard-steps li.is-done .step-check { visibility: visible; }
+.wizard-steps li.is-current .step-num {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--bg);
+}
+
+.wizard-steps li.is-done .step-num {
+  background: var(--pos);
+  border-color: var(--pos);
+  color: var(--bg);
+}
+
+.step-name { font-size: 13px; color: inherit; }
+
+.wizard-steps li.is-current .step-name { color: var(--text); }
+.wizard-steps li.is-done .step-name { color: var(--pos); }
+
+/* 完成態：圓圈裡的數字換成 ✓（`.step-check` 疊在 `.step-num` 之上，數字本身
+   靠 `.step-num-digit` 隱藏，避免疊字）。 */
+.step-check { display: none; }
+.wizard-steps li.is-done .step-num-digit { display: none; }
+.wizard-steps li.is-done .step-check { display: inline; }
 
 .wizard-panel { min-width: 0; }
 
@@ -940,13 +1031,19 @@ main.page {
 /* ---------- Responsive ≤480px ---------- */
 @media (max-width: 480px) {
   .wizard-layout { grid-template-columns: 1fr; }
-  .wizard-steps { display: flex; overflow-x: auto; gap: 6px; padding-bottom: 4px; }
-  .wizard-steps li { margin-bottom: 0; flex: none; }
+  /* 步驟條在 390 收斂為緊湊橫排：只留圓圈＋連接線＋當前步標題，其餘步驟名隱藏
+     （Task 19 修正——全部展開的水平版在窄螢幕會擠壓/截斷）。 */
+  .wizard-steps { gap: 0; margin-bottom: 22px; }
+  .wizard-steps li { flex: none; }
+  .wizard-steps li:not(.is-current) .step-name { display: none; }
+  .wizard-steps li:not(:last-child)::after { margin: 0 6px; }
   main.page { padding: 28px 14px 60px; }
   /* 地址 dock 降級：字級縮小、按鈕退到輸入框下方——手機上並排會擠壓到不可用。 */
   .leader-dock-row { flex-direction: column; align-items: stretch; }
   .leader-dock .addr-input { font-size: 17px; padding: 12px 14px; }
   .leader-dock-check { padding: 12px 18px; }
+  /* Footer 四欄在 390 寬擠壓重疊（contact email 被截）→ 單欄堆疊（Task 19 修正）。 */
+  .footer-cols { grid-template-columns: 1fr; gap: 24px; }
 }
 
 /* ---------- Reduced motion：全動畫停用 ---------- */
@@ -1109,6 +1206,28 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .equity-overlay-item input:disabled { cursor: not-allowed; }
 .equity-overlay-swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
 .equity-curve-svg { width: 100%; height: 230px; display: block; }
+
+/* 軸標（Task 19 修正：設計稿 §04 L474-491）——左 52px 固定寬給 y 軸金額刻度，
+   右側撐滿放圖表＋x 軸日期列。 */
+.equity-curve-body { display: grid; grid-template-columns: 52px 1fr; gap: 10px; }
+.equity-curve-yaxis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-align: right;
+  height: 230px;
+  padding-bottom: 20px;
+}
+.equity-curve-chart { min-width: 0; }
+.equity-curve-xaxis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 8px;
+}
 
 .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .metric-card { padding: 16px 18px; }
