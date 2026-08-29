@@ -361,6 +361,11 @@ sudo chown -R ubuntu:ubuntu /opt/filet/spark/web
 cd /opt/filet/spark/web
 npm ci    # 需要已 commit 的 package-lock.json；若尚無 lock 檔，改用 npm install 並在
           # 部署後把產生的 package-lock.json commit 回 repo（鎖版本，避免下次部署解出不同版本）
+
+# ⭐ 2026-08-29 改版起：canonical / OG / sitemap 的對外主機名由 build 期環境變數
+# 注入（NEXT_PUBLIC_* 是「烤進 bundle」的值，改它必須重 build，改 systemd env 無效）。
+# 未設定時預設 https://app.filet.trade（web/src/lib/siteOrigin.ts）。換網域時：
+export NEXT_PUBLIC_SITE_ORIGIN="https://app.filet.trade"
 npm run build   # 驗收：`.next/` 產出，無 build error
 ```
 
@@ -773,6 +778,17 @@ python3 -m json.tool /opt/filet/spark/var/filet/leaders.json > /dev/null && echo
 sudo journalctl -u 'filet-follower@*' --since '10 min ago' | grep -i '撤銷\|leader_revoked'
 ls -l /opt/filet/state/*/var/copytrade/killswitch.tripped   # 收尾完成的 ARM 檔
 ```
+
+#### ⚠️ 2026-08-29 起：白名單條目**未知欄位拒載**（編輯前先讀這段）
+
+改版（Task 5）把 loader 從「未列舉的鍵靜默略過」改為「鍵集合必須是已知欄位子集，
+否則整檔拒載」——防展示欄位拼字錯誤靜默失效（`taglne` 過去會被無聲吞掉）。這改變
+了編輯 prod `leaders.json` 的風險形狀：**多打一個沒人認識的鍵＝引擎與 activate CLI
+一起 fail-fast 停下**（方向刻意如此，但要知道）。目前合法欄位：
+`address / name / description / enabled / accepting_new / kind`＋展示欄位
+`slug / tagline / featured / min_notional_usd / max_leverage`（registry 檔另加
+`source / added_by`）。`slug` 全檔不得重複（同樣 fail-fast）。改完照舊
+`python -m json.tool` 驗一次再存，並確認引擎下一輪心跳正常。
 
 #### `max_leverage` 展示欄位（可選；2026-08-28 Task 15b 起也是引擎層事實）
 

@@ -36,3 +36,4 @@ Hyperliquid builder-code 基礎設施 + copytrade orchestrator（Filet M1）。P
 - 文件流：docs/superpowers/{specs,plans,research}/，檔名 YYYY-MM-DD-<slug>.md。
 - Commit 格式：feat:/fix:/test:/docs: 一行敘述（見 git log）。
 - 通知一律走 `spark.copytrade.notifier.Notifier` 注入，引擎不 import 具體實作。
+- 前端（2026-08-29 改版後）：文案雙語單一來源 `web/src/lib/copy.ts`（COPY_ZH/COPY_EN 結構對稱、元件經 `useCopy()` 取用，禁內嵌中文；法務長文在 `web/src/content/legal.ts` 同紀律）。公開路由 `/ /strategies /strategies/[slug] /advanced /docs /terms /privacy /risk /status`；登入後 `/onboarding /dashboard /settings`。對外主機名走 build 期 `NEXT_PUBLIC_SITE_ORIGIN`（RUNBOOK §4.2）。
