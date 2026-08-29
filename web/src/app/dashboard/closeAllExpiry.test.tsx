@@ -23,9 +23,9 @@ vi.mock("@/lib/hooks", () => ({
 }));
 
 const getDashboard = vi.fn();
-const postPause = vi.fn<[string], Promise<PauseResp>>();
-const getCloseAllMessage = vi.fn<[], Promise<CloseAllMessageResp>>();
-const postCloseAll = vi.fn<[CloseAllMessageResp, string], Promise<CloseAllResp>>();
+const postPause = vi.fn<(a0: string) => Promise<PauseResp>>();
+const getCloseAllMessage = vi.fn<() => Promise<CloseAllMessageResp>>();
+const postCloseAll = vi.fn<(a0: CloseAllMessageResp, a1: string) => Promise<CloseAllResp>>();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getDashboard: (...a: unknown[]) => getDashboard(...a),

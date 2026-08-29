@@ -33,7 +33,7 @@ const getMyCapital = vi.fn();
 const getStatus = vi.fn();
 const getDashboard = vi.fn();
 const getMyLeader = vi.fn();
-const postPause = vi.fn<[string], Promise<PauseResp>>();
+const postPause = vi.fn<(a0: string) => Promise<PauseResp>>();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMyRisk: (...a: unknown[]) => getMyRisk(...a),
