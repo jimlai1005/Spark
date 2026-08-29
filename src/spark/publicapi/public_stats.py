@@ -39,13 +39,22 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
+from spark.config import Settings
 from spark.publicapi.ops import load_accrued_series
 
 logger = logging.getLogger(__name__)
 
 # 本站對外公告的固定 builder 費率（bps）。與 routed_volume 反推公式共用同一個
 # 常數（見檔頭），故只能在此定義一次。
-BUILDER_FEE_BPS = 2
+#
+# ⭐ 2026-08-29 opus 審查 Suggestion 2：改由 `spark.config.Settings.f`（實收
+# builder fee 的單一事實來源，`ExchangeAdapter`/`BuilderCode` 也讀它）導出，
+# 不再自己另立一個 `= 2` 常數——兩處各自寫一次同一個費率，日後調費率只改掉
+# 一邊就會讓 `/api/public/stats` 的揭露值與引擎實際收費不同源（工程原則 1）。
+# `Settings.f` 是 dataclass 欄位的**類別層級預設值**（無 default_factory，
+# 不需要實例化即可讀到），單位是「十分之一 bp」（`f=20` 對照 `Settings.__post_init__`
+# 的 `charged_pct = f/1000` 得 0.02%＝2bp）；bps＝十分之一 bp 值再除以 10。
+BUILDER_FEE_BPS = Settings.f // 10
 _BPS_DENOMINATOR = Decimal(10000)
 
 # engine 元件的心跳過期門檻。與 `filet.engine_health.HEARTBEAT_STALE_S` /

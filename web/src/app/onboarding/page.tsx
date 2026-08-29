@@ -39,6 +39,15 @@ import { clearWizardProgress, deriveStep, loadWizardProgress, saveWizardProgress
 const ADVANCED_PREFIX = "advanced:";
 const SCALE_DEFAULT = 25;
 const DD_DEFAULT = 20;
+// 投入比例合法範圍（同 StepRiskLimits.tsx 的 SCALE_MIN/SCALE_MAX，即滑桿實際
+// 可調範圍）——query string 帶進來的 `scale` 未經任何驗證，`?scale=999` 這種
+// 值原樣會進 UI（opus 審查 S5）；夾在這個範圍內，超界的值退回可用範圍的邊界。
+const SCALE_MIN = 5;
+const SCALE_MAX = 100;
+
+function clampScale(n: number): number {
+  return Math.min(SCALE_MAX, Math.max(SCALE_MIN, n));
+}
 
 /** `useSearchParams()` 在 build 期 prerender 需要 Suspense 邊界（Next.js
  * missing-suspense-with-csr-bailout），故 default export 只包一層 Suspense，
@@ -113,7 +122,7 @@ function OnboardingInner() {
     }
     const qScale = Number(searchParams.get("scale"));
     const qDd = searchParams.get("dd");
-    if (Number.isFinite(qScale) && qScale > 0) setScale(qScale);
+    if (Number.isFinite(qScale) && qScale > 0) setScale(clampScale(qScale));
     if (qDd != null) {
       const n = Number(qDd);
       if (Number.isFinite(n) && n > 0) {

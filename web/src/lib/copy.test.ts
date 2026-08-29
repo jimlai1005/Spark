@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { createElement } from "react";
 import { describe, expect, it } from "vitest";
 import { COPY_ZH as COPY, COPY_EN, COPY_ZH } from "./copy";
+import { LEGAL_EN } from "@/content/legal";
 import { LangProvider, useCopy, useLang } from "./lang";
 
 function allStrings(node: unknown, acc: string[] = []): string[] {
@@ -103,5 +104,37 @@ describe("i18n（Task 2：雙語 copy 基礎）", () => {
     await user.click(screen.getByText("switch"));
     expect(screen.getByTestId("next").textContent).toBe(COPY_EN.common.next);
     expect(screen.getByTestId("appName").textContent).toBe(COPY_EN.common.appName);
+  });
+});
+
+describe("語言紅線（S4：opus 審查——英文承諾語禁詞掃描）", () => {
+  // 中文禁詞掃描（上面第一個 describe）只掃 `COPY`（=COPY_ZH）；en 字典與法務
+  // en 全文從未被同一道閘檢查過。清單刻意窄（只挑「對報酬做保證」這一類最容易
+  // 出現在英文行銷語氣裡的承諾語），不是要重建中文那份禁詞表的英文對照——
+  // 中文禁詞表對應的是中文語境特有的用詞（存款/代操等），英文語境的對應風險
+  // 主要是「guaranteed return/profit」「risk-free」「fixed income」這幾類。
+  // `risk-?free(?! rate)`：豁免 "risk-free rate"（Sharpe ratio 計算慣例用語的
+  // 標準金融詞彙，不是對本產品的承諾語），沿 COPY_ZH 那組「保證(?!金)」同一個
+  // 「詞彙有正當技術語境例外」的既有模式。
+  const englishBanned: RegExp[] = [
+    /guaranteed (return|profit|yield)/i,
+    /risk-?free(?! rate)/i,
+    /fixed income/i,
+  ];
+
+  it("COPY_EN 全部文案禁詞零命中", () => {
+    for (const s of allStrings(COPY_EN)) {
+      for (const b of englishBanned) {
+        expect(s, `en 文案含禁詞「${b}」: ${s}`).not.toMatch(b);
+      }
+    }
+  });
+
+  it("法務 en 全文禁詞零命中", () => {
+    for (const s of allStrings(LEGAL_EN)) {
+      for (const b of englishBanned) {
+        expect(s, `法務 en 文案含禁詞「${b}」: ${s}`).not.toMatch(b);
+      }
+    }
   });
 });
