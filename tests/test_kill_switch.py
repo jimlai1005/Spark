@@ -410,8 +410,11 @@ def test_close_all_applier_bad_signature_does_not_trigger_and_alerts(tmp_path):
     assert any("close_all_verify_failed" in (r[3] or "") for r in crits)
 
 
-def test_close_all_applier_expired_request_no_critical_only_quiet_skip(tmp_path):
-    """過期是預期會發生的常態（記錄沒人清）——只 log，不 critical 洗版。"""
+def test_close_all_applier_expired_request_alerts_once_but_never_winds_down(tmp_path):
+    """過期不得觸發收尾，但**必須大聲一次**（2026-08-29 opus 審查 C2 裁決推翻原
+    「只 log 不告警」設計：安全動作失敗的靜默違反工程原則 3——客戶簽了平倉、引擎
+    離線超過時效，過去前後端都無人知曉）。防洗版由 result 標記檔負責（同一筆請求
+    只發一次），完整行為釘在 tests/test_close_all_result_marker.py。"""
     wallet = Account.create()
     account_id = _acct(wallet)
     manifest = _manifest(tmp_path, account_id=account_id, user_address=wallet.address)
@@ -427,7 +430,7 @@ def test_close_all_applier_expired_request_no_critical_only_quiet_skip(tmp_path)
 
     assert triggered is False
     assert calls == []
-    assert notifier.records == []
+    assert len(notifier.records) == 1  # 一次 critical，不再靜默（C2）
 
 
 def test_close_all_applier_no_manifest_entry_alerts_and_skips(tmp_path):
