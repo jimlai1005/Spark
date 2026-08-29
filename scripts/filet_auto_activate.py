@@ -198,15 +198,27 @@ def _resolve_leverage_cap(*, vault_leader: bool, max_leverage: str | None) -> st
     admin 維護的白名單資料，不是使用者輸入，用「新客戶全部卡在待啟用佇列」去擋
     一個展示用欄位的手誤不成比例；漏注入的後果止於「chip 顯示的上限未被引擎強制」
     ，比其餘 fail-closed 情境（範本殘留佔位符等）輕得多。
+
+    ⭐ 2026-08-29 opus 審查 Warning 4：`parsed` 還必須 `> 0` 才採信——`min(20, -1)`
+    ／`min(20, 0)` 會把 vault 帽**放寬**成「幾乎任何槓桿都通過」（負值／0 讓
+    `min()` 挑到那個荒謬值，而不是被擋下），方向與整條函式的『不放寬 vault 保護
+    語意』直接相反。非正值視同格式不合法，同一套「只 log、不 fail-closed」處理。
     """
     parsed = None
     if max_leverage is not None:
         try:
-            parsed = Decimal(max_leverage)
+            candidate = Decimal(max_leverage)
         except InvalidOperation:
             logger.warning("leaders.json max_leverage 格式不合法（%r），"
                            "本次不注入 COPY_MAX_TARGET_LEVERAGE", max_leverage)
-            parsed = None
+        else:
+            if candidate > 0:
+                parsed = candidate
+            else:
+                logger.warning(
+                    "leaders.json max_leverage 非正值（%r），本次不注入"
+                    " COPY_MAX_TARGET_LEVERAGE（絕不能用它放寬 vault 帽）",
+                    max_leverage)
     if vault_leader:
         cap = VAULT_MAX_TARGET_LEVERAGE
         if parsed is not None:

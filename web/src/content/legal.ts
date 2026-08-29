@@ -50,9 +50,10 @@ export const LEGAL_ZH = {
         paragraphs: [
           "你透過錢包簽署建立一組僅能下單的 agent 授權。在此授權下，本服務：",
           "可以：依策略訊號在你的帳戶下單、加倉、平倉；使用你設定範圍內的保證金；"
-            + "在你簽署的槓桿上限內調整倉位；依你簽署的費率上限收取 builder fee。",
+            + "在策略標示的槓桿上限內執行（平台層強制）；依你簽署的費率上限收取 builder fee。",
           "不能：提領你的資金到任何地址；轉帳或在錢包之間移動資產；"
-            + "取得你的私鑰或助記詞（我們永遠不會索取）；超出你設定的投入比例與槓桿上限。",
+            + "取得你的私鑰或助記詞（我們永遠不會索取）；超出你簽署的投入比例，"
+            + "或超出策略標示的槓桿上限。",
           "授權為你單方可撤銷：你可以隨時暫停跟單或撤銷 agent 授權，撤銷不需要本服務同意，"
             + "也不需要本服務在線。",
         ],
@@ -265,12 +266,13 @@ export const LEGAL_EN: DeepString<typeof LEGAL_ZH> = {
           "You create a trade-only agent authorization by signing with your wallet. "
             + "Under this authorization, the Service:",
           "Can: place orders, increase, and close positions in your account according to "
-            + "strategy signals; use margin within the range you have configured; adjust "
-            + "positions within the leverage cap you have signed; and charge builder fees "
-            + "up to the rate cap you have signed.",
+            + "strategy signals; use margin within the range you have configured; execute "
+            + "within the leverage cap posted for the strategy (enforced at the platform "
+            + "level); and charge builder fees up to the rate cap you have signed.",
           "Cannot: withdraw your funds to any address; transfer or move assets between "
             + "wallets; obtain your private key or seed phrase (we will never ask for "
-            + "them); or exceed the capital allocation or leverage cap you have set.",
+            + "them); exceed the capital allocation you have signed; or exceed the "
+            + "leverage cap posted for the strategy.",
           "The authorization is unilaterally revocable by you: you may pause copy trading "
             + "or revoke the agent authorization at any time, without needing the "
             + "Service's consent or the Service being online.",
