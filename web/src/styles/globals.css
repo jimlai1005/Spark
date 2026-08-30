@@ -1354,7 +1354,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .modal-card > * { margin: 0; }
 .modal-card h3 { margin-top: 0; }
 .modal-card ul { margin: 8px 0; padding-left: 18px; font-size: var(--fs-small); }
-.modal-card .step-actions { margin-top: 0; }
+.modal-card .step-actions { margin-top: 0; display: flex; gap: 12px; }
 
 .dash-equity-value { font-family: var(--font-mono); font-size: var(--fs-h1); font-weight: 700; letter-spacing: -0.02em; }
 .dash-equity-ret { font-family: var(--font-mono); font-size: var(--fs-small); }
