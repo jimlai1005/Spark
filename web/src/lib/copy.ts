@@ -1522,7 +1522,7 @@ export const COPY_ZH = {
     windows: { d7: "7D", d30: "30D", d90: "90D", all: "全部" },
     windowComingSoon: "即將推出",
     filters: {
-      sample: "僅顯示達樣本門檻（≥ 60 交易日 · ≥ 200 筆成交）",
+      sample: "僅顯示達樣本門檻（實盤 ≥ 60 天 · ≥ 200 筆成交）",
       maxDd: "最大回撤 < 30%",
       concentrated: "排除單一幣種 > 90%",
     },
@@ -2862,7 +2862,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     windows: { d7: "7D", d30: "30D", d90: "90D", all: "All" },
     windowComingSoon: "Coming soon",
     filters: {
-      sample: "Only show accounts meeting the sample threshold (≥ 60 trading days · ≥ 200 fills)",
+      sample: "Only show accounts meeting the sample threshold (live ≥ 60 days · ≥ 200 fills)",
       maxDd: "Max drawdown < 30%",
       concentrated: "Exclude single-coin concentration > 90%",
     },
