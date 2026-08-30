@@ -112,12 +112,14 @@ export function Header() {
 
   const guestTabs = [
     { href: "/#strategies", label: COPY.nav.strategies },
+    { href: "/explore", label: COPY.nav.explore },
     { href: "/#how", label: COPY.nav.how },
     { href: "/#security", label: COPY.nav.security },
   ];
   const memberTabs = [
     { href: "/dashboard", label: COPY.nav.dashboard },
     { href: "/#strategies", label: COPY.nav.strategies },
+    { href: "/explore", label: COPY.nav.explore },
     { href: "/settings", label: COPY.nav.settings },
     ...(isAdmin
       ? [

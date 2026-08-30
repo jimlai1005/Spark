@@ -8,8 +8,13 @@ import { ApiError, type LeadersResp } from "@/lib/api";
 const ME = { address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" };
 
 const routerPush = vi.fn();
+// `mockLeaderQuery`：`?leader=` 預填測試用（M3 round3 Task 4，D9）；vitest 對
+// `vi.mock` 工廠內引用的變數，只要前綴是 `mock` 就會與 `vi.mock` 一起被提升，
+// 可在宣告位置之後才賦值（同檔既有 `mockConnected` 慣例）。
+let mockLeaderQuery = "";
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: routerPush }),
+  useSearchParams: () => new URLSearchParams(mockLeaderQuery),
 }));
 
 const getMe = vi.fn();
@@ -96,6 +101,7 @@ async function previewCustom(addr = CUSTOM_ADDR) {
 beforeEach(() => {
   vi.clearAllMocks();
   mockConnected = false;
+  mockLeaderQuery = "";
   getMe.mockResolvedValue(ME);
   getLeaders.mockResolvedValue(leaders());
   getLeaderPreview.mockResolvedValue(CUSTOM_PREVIEW);
@@ -120,6 +126,25 @@ describe("AdvancedPage — 無背書閘門（NOTE 05）", () => {
     await userEvent.click(input);
     await userEvent.paste(CUSTOM_ADDR);
     await waitFor(() => expect(screen.getByRole("button", { name: "查詢" })).not.toBeDisabled());
+  });
+});
+
+describe("AdvancedPage — `?leader=` 預填（M3 round3 Task 4，D9：/explore「跟單 →」帶入）", () => {
+  it("⭐ 帶 ?leader= 進頁、勾選聲明後 → 輸入框已預填該地址（風險勾選仍照舊、不自動送出）", async () => {
+    mockLeaderQuery = `leader=${CUSTOM_ADDR}`;
+    render(wrap(<AdvancedPage />));
+    await agreeGate();
+    const input = await screen.findByLabelText(/leader 錢包位址/);
+    expect(input).toHaveValue(CUSTOM_ADDR);
+    // 預填不等於自動查詢／自動送出——查詢按鈕仍需使用者自己按。
+    expect(getLeaderPreview).not.toHaveBeenCalled();
+  });
+
+  it("沒有 ?leader= → 輸入框維持空白（既有行為不變）", async () => {
+    render(wrap(<AdvancedPage />));
+    await agreeGate();
+    const input = await screen.findByLabelText(/leader 錢包位址/);
+    expect(input).toHaveValue("");
   });
 });
 

@@ -21,9 +21,15 @@
  * **不 redirect**——本頁是進階用戶的直達入口，不強迫先繞去 /strategies。
  * 登入成功後只 invalidate `["me"]`（不 `router.push`）：使用者應留在本頁繼續
  * 輸入位址，而不是被導去別處重新找路。
+ *
+ * `?leader=<address>` 預填（M3 round3 Task 4，D9）：`/explore` 表格「跟單 →」
+ * 帶地址參數導來這裡，僅**預填**輸入框——本地格式驗證／後端准入預覽／專屬風險
+ * 聲明勾選全部照舊（不因為來源是 explore 就跳過任何一道閘門）。未登入時看不到
+ * 輸入框（沿既有 gate），登入後才會用這個值初始化 `CustomLeaderSection` 的
+ * `input` state。
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useRef, useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
 import {
@@ -49,6 +55,11 @@ export default function AdvancedPage() {
   const loggedIn = !!me.data;
   const queryClient = useQueryClient();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  // ⭐ D9：只讀一次當初始值——`useState` 的初始 initializer 只在首次 render 求值，
+  // 之後即使網址列的 query 變了也不會覆寫使用者正在輸入的內容，符合「預填」語意
+  // （不是「持續同步」）。
+  const leaderParam = searchParams.get("leader") ?? undefined;
 
   const { address, chainId, isConnected } = useAccount();
   const { connectAsync, connectors } = useConnect();
@@ -144,6 +155,7 @@ export default function AdvancedPage() {
             gateAgreed={gateAgreed}
             listedLeaders={leaders.data?.leaders}
             onProceed={handleProceed}
+            initialAddress={leaderParam}
           />
           {/* ⭐ 沿舊版 /leaders 原樣保留：與 wizard 開通頁的同義句各自成立、互不
               取代（copy.test.ts 語言紅線測試釘住這條）。 */}
@@ -214,15 +226,17 @@ function listedEntryOf(
  *    `/onboarding?strategy=advanced:{address}`（Task 11 與舊版最大差異：不在
  *    本頁簽章）。
  */
-function CustomLeaderSection({ gateAgreed, listedLeaders, onProceed }: {
+function CustomLeaderSection({ gateAgreed, listedLeaders, onProceed, initialAddress }: {
   gateAgreed: boolean;
   listedLeaders: LeaderEntry[] | undefined;
   onProceed: (address: string) => void;
+  /** `?leader=` 預填（D9），見本檔檔頭。 */
+  initialAddress?: string;
 }) {
   const COPY = useCopy();
   const c = COPY.advanced;
   const cc = c.custom;
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(initialAddress ?? "");
   const [agreed, setAgreed] = useState(false);
   const [cPhase, setCPhase] = useState<CustomPhase>({ t: "idle" });
   // in-flight 防護：查詢途中輸入變了，回來的結果屬於舊位址，一律丟棄。

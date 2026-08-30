@@ -45,6 +45,7 @@ export const COPY_ZH = {
   nav: {
     ariaLabel: "頁面切換",
     strategies: "策略",
+    explore: "探索",
     how: "運作方式",
     security: "安全性",
     docs: "文件",
@@ -1404,6 +1405,56 @@ export const COPY_ZH = {
     empty: "目前沒有可顯示的排行榜資料。",
   },
   /**
+   * `/explore`（M3 round3 Task 4，設計審查 R2·A）：把「鯨魚 PnL 榜」重構成
+   * 「可跟單對象探索」，資料來自 `/api/public/explore`（無需登入，`hl_explore.py`）。
+   * 排序／資格過濾全在後端（R2-01），本頁只送布林 chip 開關；building 態與 fetch
+   * 失敗態分開處理（見 `explore/page.tsx` 檔頭）。
+   */
+  explore: {
+    heading: "探索跟單對象",
+    disclaimerBadge: "Filet 不對清單上任何地址背書",
+    sub: "資料全部來自 Hyperliquid 公開鏈上紀錄，每 5 分鐘更新。排序預設為風險調整後報酬（報酬率 ÷ 最大回撤），而非絕對獲利金額——大額帳戶的 PnL 無法被小額帳戶複製。",
+    windows: { d7: "7D", d30: "30D", d90: "90D", all: "全部" },
+    windowComingSoon: "即將推出",
+    filters: {
+      sample: "僅顯示達樣本門檻（≥ 60 交易日 · ≥ 200 筆成交）",
+      maxDd: "最大回撤 < 30%",
+      concentrated: "排除單一幣種 > 90%",
+    },
+    countPrefix: "",
+    countMid: " 個帳戶 → 符合 ",
+    countSuffix: "",
+    table: {
+      rank: "#",
+      account: "帳戶",
+      sparkline: "30D 淨值",
+      ret: "30D 報酬率",
+      dd: "最大回撤",
+      days: "交易日",
+      winRate: "結倉勝率",
+      exposure: "目前曝險",
+      actions: "",
+    },
+    tags: { lowDrawdown: "低回撤", concentrated: "集中度高" },
+    subSep: " · 帳戶 ",
+    copyAddress: "複製地址",
+    copied: "已複製",
+    view: "查看",
+    follow: "跟單 →",
+    building: "探索榜建置中，約數分鐘後就緒",
+    errorPrefix: "探索榜讀取失敗 · ",
+    empty: "目前沒有符合條件的地址。",
+    pagination: {
+      showing: "顯示 ",
+      rangeSep: "–",
+      ofTotal: " / ",
+      perPagePrefix: " · 每頁 ",
+      perPageSuffix: " 列",
+      prev: "上一頁",
+      next: "下一頁",
+    },
+  },
+  /**
    * `/traders/[address]`（M3 round2 Task 6）：leaderboard 任意地址的詳情頁。
    * 指標卡／CAGR／方法論文案沿用 `strategyDetail.metrics`／`.cagr`／`.methodology`
    * （通用績效用語，非策略專屬），本區塊只放這頁自己的殼與「非精選、不背書」的
@@ -1469,6 +1520,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
   nav: {
     ariaLabel: "Page navigation",
     strategies: "Strategies",
+    explore: "Explore",
     how: "How it works",
     security: "Security",
     docs: "Docs",
@@ -2643,6 +2695,50 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     loading: "Loading leaderboard…",
     error: "Failed to load the leaderboard. Please try again later.",
     empty: "No leaderboard data to display right now.",
+  },
+  explore: {
+    heading: "Explore traders to copy",
+    disclaimerBadge: "Filet does not endorse any address on this list",
+    sub: "Data is sourced entirely from Hyperliquid's public on-chain records, updated every 5 minutes. Default sort is risk-adjusted return (return ÷ max drawdown), not absolute PnL — a large account's PnL can't be replicated by a small account.",
+    windows: { d7: "7D", d30: "30D", d90: "90D", all: "All" },
+    windowComingSoon: "Coming soon",
+    filters: {
+      sample: "Only show accounts meeting the sample threshold (≥ 60 trading days · ≥ 200 fills)",
+      maxDd: "Max drawdown < 30%",
+      concentrated: "Exclude single-coin concentration > 90%",
+    },
+    countPrefix: "",
+    countMid: " accounts → ",
+    countSuffix: " qualify",
+    table: {
+      rank: "#",
+      account: "Account",
+      sparkline: "30D equity",
+      ret: "30D return",
+      dd: "Max drawdown",
+      days: "Trading days",
+      winRate: "Close win rate",
+      exposure: "Current exposure",
+      actions: "",
+    },
+    tags: { lowDrawdown: "Low drawdown", concentrated: "High concentration" },
+    subSep: " · Account ",
+    copyAddress: "Copy address",
+    copied: "Copied",
+    view: "View",
+    follow: "Copy →",
+    building: "Building the explore index, ready in a few minutes",
+    errorPrefix: "Failed to load the explore index · ",
+    empty: "No addresses match the current filters.",
+    pagination: {
+      showing: "Showing ",
+      rangeSep: "–",
+      ofTotal: " / ",
+      perPagePrefix: " · ",
+      perPageSuffix: " per page",
+      prev: "Previous",
+      next: "Next",
+    },
   },
   traders: {
     breadcrumb: "Trader",

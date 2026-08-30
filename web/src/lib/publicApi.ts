@@ -317,6 +317,117 @@ export async function getPublicLeaderboard(
 }
 
 /**
+ * `/api/public/explore`（M3 round3 Task 1／4：可跟單對象探索榜，`hl_explore.py`
+ * `ExploreRow.to_dict()`）。排序與資格過濾全在後端（R2-01）；本頁只送三個布林
+ * chip 開關（window 本輪固定 `30d`，其餘視窗前端 disabled，見 explore/page.tsx）。
+ */
+export interface ExploreRow {
+  address: string;
+  display_name: string | null;
+  label: string;
+  coins: string[];
+  account_bucket: string;
+  spark: number[];
+  ret_30d_pct: number;
+  max_dd_30d_pct: number;
+  trading_days: number;
+  fill_count_30d: number;
+  close_win_rate_pct: number | null;
+  concentration_pct: number | null;
+  exposure: { dir: string | null; pct: number | null };
+  tags: string[];
+}
+
+export interface ExploreResp {
+  rows: ExploreRow[];
+  page: number;
+  page_size: number;
+  total_qualified: number;
+  total_scanned: number;
+  updated_at: number | null;
+  building: boolean;
+}
+
+export interface ExploreFilters {
+  qualified: boolean;
+  maxDd: boolean;
+  excludeConcentrated: boolean;
+}
+
+function toNumberOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function normalizeExploreRow(v: unknown): ExploreRow | null {
+  if (v == null || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  if (typeof r.address !== "string" || r.address === "") return null;
+  const exposure = (r.exposure && typeof r.exposure === "object")
+    ? r.exposure as Record<string, unknown>
+    : {};
+  return {
+    address: r.address,
+    display_name: typeof r.display_name === "string" ? r.display_name : null,
+    label: typeof r.label === "string" ? r.label : r.address,
+    coins: Array.isArray(r.coins) ? r.coins.filter((c): c is string => typeof c === "string") : [],
+    account_bucket: typeof r.account_bucket === "string" ? r.account_bucket : NO_VALUE_PLACEHOLDER,
+    spark: Array.isArray(r.spark)
+      ? r.spark.filter((n): n is number => typeof n === "number" && Number.isFinite(n))
+      : [],
+    ret_30d_pct: toNumberOrNull(r.ret_30d_pct) ?? 0,
+    max_dd_30d_pct: toNumberOrNull(r.max_dd_30d_pct) ?? 0,
+    trading_days: typeof r.trading_days === "number" ? r.trading_days : 0,
+    fill_count_30d: typeof r.fill_count_30d === "number" ? r.fill_count_30d : 0,
+    close_win_rate_pct: toNumberOrNull(r.close_win_rate_pct),
+    concentration_pct: toNumberOrNull(r.concentration_pct),
+    exposure: {
+      dir: typeof exposure.dir === "string" ? exposure.dir : null,
+      pct: toNumberOrNull(exposure.pct),
+    },
+    tags: Array.isArray(r.tags) ? r.tags.filter((t): t is string => typeof t === "string") : [],
+  };
+}
+
+// 後端 `_account_bucket` 讀不到 accountValue 時本身就回傳 "—"；這裡只是型別上的
+// 保底字面值（正常情況不會走到），避免與 `NO_VALUE`（`lib/format.ts`）耦合造成
+// 這個檔案額外 import 一個純顯示常數。
+const NO_VALUE_PLACEHOLDER = "—";
+
+/**
+ * 讀取 `/api/public/explore`。與 `getPublicLeaderboard` 同一套「不吞錯」設計：
+ * 連線失敗、非 200、格式異常一律 throw——呼叫端（explore 頁）需要區分
+ * 「fetch 失敗」（R2·C 態三：時間戳＋重試）與「成功但 `building:true`」
+ * （R2·C 態二：建置中）两種不同的空狀態，吞掉會讓兩者在 UI 上無法分辨。
+ */
+export async function getPublicExplore(
+  page: number, filters: ExploreFilters,
+): Promise<ExploreResp> {
+  const params = new URLSearchParams({
+    window: "30d",
+    page: String(page),
+    qualified: filters.qualified ? "1" : "0",
+    max_dd: filters.maxDd ? "1" : "0",
+    exclude_concentrated: filters.excludeConcentrated ? "1" : "0",
+  });
+  const res = await fetch(`/api/public/explore?${params.toString()}`);
+  if (!res.ok) throw new Error(`explore fetch failed: ${res.status}`);
+  const body = (await res.json()) as Partial<ExploreResp> | null;
+  if (body == null || !Array.isArray(body.rows)) {
+    throw new Error("explore: unexpected response shape");
+  }
+  const rows = body.rows.map(normalizeExploreRow).filter((r): r is ExploreRow => r !== null);
+  return {
+    rows,
+    page: typeof body.page === "number" ? body.page : page,
+    page_size: typeof body.page_size === "number" ? body.page_size : rows.length,
+    total_qualified: typeof body.total_qualified === "number" ? body.total_qualified : 0,
+    total_scanned: typeof body.total_scanned === "number" ? body.total_scanned : 0,
+    updated_at: typeof body.updated_at === "number" ? body.updated_at : null,
+    building: !!body.building,
+  };
+}
+
+/**
  * `/api/public/traders/{address}`（M3 round2 Task 6：交易員詳情頁）。任意 HL
  * 地址的鏈上績效——**不受精選白名單管轄**，`metrics`／`equity_index`／
  * `methodology` 與 `/api/public/strategies/{slug}` 同一份形狀（後端共用同一批

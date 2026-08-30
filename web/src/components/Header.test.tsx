@@ -91,6 +91,7 @@ describe("Header — 未登入導覽（顧問 P1：導覽是信任訊號）", ()
     expect(wordmark.closest("a")).toHaveAttribute("href", "/");
     expect(navLabels()).toEqual([
       COPY_ZH.nav.strategies,
+      COPY_ZH.nav.explore,
       COPY_ZH.nav.how,
       COPY_ZH.nav.security,
     ]);
@@ -139,6 +140,7 @@ describe("Header — 已登入導覽", () => {
     expect(navLabels()).toEqual([
       COPY_ZH.nav.dashboard,
       COPY_ZH.nav.strategies,
+      COPY_ZH.nav.explore,
       COPY_ZH.nav.settings,
     ]);
     // TODO(Task 13) 之前，跟單狀態恆為保守值，不得偽造成「跟單中」。
@@ -279,14 +281,14 @@ describe("Header — 語言切換", () => {
     const user = userEvent.setup();
     render(wrap(<Header />, qcWithMe(null)));
     expect(navLabels()).toEqual([
-      COPY_ZH.nav.strategies, COPY_ZH.nav.how, COPY_ZH.nav.security,
+      COPY_ZH.nav.strategies, COPY_ZH.nav.explore, COPY_ZH.nav.how, COPY_ZH.nav.security,
     ]);
 
     await user.click(screen.getByRole("button", { name: "EN" }));
 
     const enNav = screen.getByRole("navigation", { name: COPY_EN.nav.ariaLabel });
     expect(within(enNav).getAllByRole("link").map((a) => a.textContent ?? "")).toEqual([
-      COPY_EN.nav.strategies, COPY_EN.nav.how, COPY_EN.nav.security,
+      COPY_EN.nav.strategies, COPY_EN.nav.explore, COPY_EN.nav.how, COPY_EN.nav.security,
     ]);
     expect(screen.getByRole("button", { name: COPY_EN.nav.cta })).toBeInTheDocument();
 

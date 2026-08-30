@@ -6,7 +6,7 @@ describe("sitemap.ts（Task 17）", () => {
     expect(SITEMAP_ROUTES).toEqual([
       "/",
       "/strategies",
-      "/leaderboard",
+      "/explore",
       "/advanced",
       "/docs",
       "/terms",

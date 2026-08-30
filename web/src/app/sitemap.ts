@@ -9,7 +9,7 @@ import { canonicalUrl } from "@/lib/siteOrigin";
 export const SITEMAP_ROUTES: readonly string[] = [
   "/",
   "/strategies",
-  "/leaderboard",
+  "/explore",
   "/advanced",
   "/docs",
   "/terms",

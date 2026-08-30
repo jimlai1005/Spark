@@ -84,6 +84,7 @@ import AdminPage from "./admin/page";
 import AdvancedPage from "./advanced/page";
 import DashboardPage from "./dashboard/page";
 import DocsPage from "./docs/page";
+import ExplorePage from "./explore/page";
 import LeadersPage from "./leaders/page";
 import HomePage from "./page";
 import OnboardingPage from "./onboarding/page";
@@ -171,12 +172,18 @@ function assertReadable(container: HTMLElement) {
  * ⭐ Task 16：`/settings` 頁面元件已建立並搬進本表——原本用來豁免尚未建立頁面的
  * 導覽涵蓋率白名單機制（其註解自述白名單即待辦，對應 task 完成時要清空）隨之
  * 整段移除，見下方「導覽涵蓋率」測試。
+ * ⭐ M3 round3 Task 4：`/explore` 取代 `/leaderboard`（見 `../leaderboard/
+ * page.test.tsx` 專屬 redirect 測試）加入 nav，本表新增一筆。`ExplorePage` 直接
+ * 打 `fetch`（`lib/publicApi.getPublicExplore`，不吞錯）——本檔全域 `beforeEach`
+ * 已把 `fetch` stub 成必炸（`vitest.setup.ts`），頁面自己的 `.catch()` 會把它折成
+ * 「讀取失敗」的可讀畫面，不需要另外個別 mock。
  */
 const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
   { path: "/", name: "首頁", el: () => <HomePage /> },
   { path: "/onboarding", name: "開通頁", el: () => <OnboardingPage /> },
   { path: "/leaders", name: "跟單對象頁（舊路由，redirect）", el: () => <LeadersPage /> },
   { path: "/advanced", name: "進階模式頁", el: () => <AdvancedPage /> },
+  { path: "/explore", name: "探索頁", el: () => <ExplorePage /> },
   { path: "/ops", name: "營運頁", el: () => <OpsPage /> },
   { path: "/admin", name: "待核准頁", el: () => <AdminPage /> },
   { path: "/strategies", name: "策略列表頁", el: () => <StrategiesPage /> },
