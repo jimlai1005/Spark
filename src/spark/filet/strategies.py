@@ -25,8 +25,9 @@ from spark.filet.leaders import LeaderRef
 
 # ⚠️ 2026-08-29 使用者裁決移除「60 天上架閘門」（曾用 STRATEGY_MIN_LIVE_DAYS）：
 # 免責已講清楚、平台本就不審查跟單來源（進階模式即明證）。listable 不再看
-# covered_days。leader_perf 的 RATIO_MIN_DAYS（60 天，Sharpe/Sortino/年化波動
-# 樣本充足度）**不受影響**——那是誠實統計揭露，不是准入門檻。見 plan §0.1 裁決 5。
+# covered_days。leader_perf 的 RATIO_MIN_DAYS（原 60 天，2026-08-30 D15 裁決降為
+# 30 天，Sharpe/Sortino/年化波動樣本充足度）**不受影響**——那是誠實統計揭露，
+# 不是准入門檻。見 plan §0.1 裁決 5。
 
 _TWO_DP = Decimal("0.01")
 
@@ -126,16 +127,19 @@ def build_strategy_view(entry: LeaderRef, perf: dict[str, Any] | None) -> dict[s
     }
 
 
-# ⭐ M3 round3 Task 3（D5 數字一致性）：CAGR 是策略詳情頁專屬的樣本閘（60 天），
+# ⭐ M3 round3 Task 3（D5 數字一致性）：CAGR 是策略詳情頁專屬的樣本閘（原 60 天，
+# ⚠️ 2026-08-30 使用者裁決 D15 降為 30 天——目的是讓自營策略〔59 天實盤〕能在
+# 站上完整呈現指標並可跟單，全鏈路（explore 30 天、本閘、leader_perf 的
+# RATIO_MIN_DAYS、前端 TRADER_SAMPLE_THRESHOLD_DAYS）同步降為 30。
 # **與 leader_perf 自己的 `annualized_return_insufficient_data`（90 天，
 # `MIN_DAYS_FOR_ANNUALIZATION`）刻意不同一個門檻**——後者是「年化外推可信度」的
 # 通用揭露分級，這裡是策略卡「要不要秀這張大字卡」的產品決策，兩者服務不同用途，
-# 混用會讓 60–89 天之間的策略卡看到「有 annualized_return 但被前者的旗標關掉」
+# 混用會讓 30–89 天之間的策略卡看到「有 annualized_return 但被前者的旗標關掉」
 # 這種前端要另外判斷的岔路。呼叫端（`publicapi/app.py`）以 `live_days`（＝
 # `int(covered_days)`，與 `build_strategy_view` 算 `live_days` 同一個值、同源）
 # 對照本常數做結構性 gating：`sample_days < CAGR_SAMPLE_THRESHOLD_DAYS` 時
 # 呼叫端整個不放 `cagr_pct` 鍵進回應（不是放 null），前端因此不必自己判斷門檻。
-CAGR_SAMPLE_THRESHOLD_DAYS = 60
+CAGR_SAMPLE_THRESHOLD_DAYS = 30
 
 
 def build_cagr_pct(perf: dict[str, Any] | None) -> str | None:

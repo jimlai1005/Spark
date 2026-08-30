@@ -103,7 +103,9 @@ MIN_DAYS_FOR_ANNUALIZATION = Decimal("90")  # < 90 天：年化是激進外推 �
 
 # 比率型指標（Sharpe/Sortino/年化波動）的資料充足度門檻。這三個指標比 TWR/MDD
 # 對樣本數更敏感（標準差在薄樣本下噪音極大），門檻獨立於上面兩個、且值更嚴格。
-RATIO_MIN_DAYS = Decimal("60")             # < 60 天：比率指標噪音 >> 訊號 → 標記不足
+# ⚠️ 2026-08-30 使用者裁決 D15：原 60 天降為 30 天（自營策略 59 天實盤，目的是讓它
+# 能完整呈現指標並可跟單），與 strategies.py 的 CAGR_SAMPLE_THRESHOLD_DAYS 同步降為 30。
+RATIO_MIN_DAYS = Decimal("30")             # < 30 天：比率指標噪音 >> 訊號 → 標記不足
 
 DAYS_PER_YEAR_SQRT = DAYS_PER_YEAR.sqrt()   # √365，比率指標公式共用，避免重複開方
 
@@ -291,7 +293,7 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
       `win_rate`／`best_day_return`／`worst_day_return`：N>=1 即存在，不設閘。
       `sharpe`／`sharpe_se`／`annualized_vol`／`sortino`：見 `compute_ratio_metrics`——
       數學上算不出來的（N<2、標準差=0、DD=0）整組（含 `*_insufficient_data`）缺席；
-      算得出來的一律帶 `*_insufficient_data`＝`covered_days < RATIO_MIN_DAYS`（60 天）。
+      算得出來的一律帶 `*_insufficient_data`＝`covered_days < RATIO_MIN_DAYS`（30 天）。
 
     ⭐ 為什麼標記做在**每個指標**上而不是只有 `disclosure_tier` 一個全域欄位：
     前端不保證整組一起渲染——只顯示 MDD 的卡片、只顯示年化的排行榜列，都會讓一個

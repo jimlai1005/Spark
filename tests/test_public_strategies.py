@@ -68,6 +68,21 @@ def sixty_day_rows(start_av="1000", end_av="1200"):
     return _portfolio_rows([[0, start_av], [t, end_av]], [[0, "0"], [t, delta]])
 
 
+def thirty_day_rows(start_av="1000", end_av="1200"):
+    """跨 30 整天、雙點序列：⚠️ 2026-08-30 D15 裁決——`CAGR_SAMPLE_THRESHOLD_DAYS`／
+    `RATIO_MIN_DAYS` 原 60 降為 30，本 helper 專供「恰在新門檻」邊界測試使用。"""
+    t = 30 * _DAY_MS
+    delta = str(Decimal(end_av) - Decimal(start_av))
+    return _portfolio_rows([[0, start_av], [t, end_av]], [[0, "0"], [t, delta]])
+
+
+def twenty_nine_day_rows(start_av="1000", end_av="1200"):
+    """跨 29 整天：新門檻（30 天）下方差一天的邊界，供「未達門檻」測試使用。"""
+    t = 29 * _DAY_MS
+    delta = str(Decimal(end_av) - Decimal(start_av))
+    return _portfolio_rows([[0, start_av], [t, end_av]], [[0, "0"], [t, delta]])
+
+
 # ============================================================
 # 純函式：build_metrics（perf → 策略卡 metrics 子物件）
 # ============================================================
@@ -498,21 +513,35 @@ def test_list_as_of_present_even_when_upstream_returns_empty(tmp_path):
 # ============================================================
 
 def test_detail_sample_days_and_cagr_present_at_threshold(tmp_path):
-    """恰好 60 天（`CAGR_SAMPLE_THRESHOLD_DAYS`）：`sample_days`／
-    `sample_threshold` 恆回傳，`cagr_pct` 因為門檻已達而出現。"""
+    """恰好 30 天（`CAGR_SAMPLE_THRESHOLD_DAYS`，2026-08-30 D15 裁決原 60 降為
+    30）：`sample_days`／`sample_threshold` 恆回傳，`cagr_pct` 因為門檻已達
+    而出現。"""
     cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
         {"address": _A, "name": "Alpha", "slug": "alpha"}]))
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
-    hl.portfolios[_A] = sixty_day_rows()
+    hl.portfolios[_A] = thirty_day_rows()
     body = _client(app).get("/api/public/strategies/alpha").json()
-    assert body["sample_days"] == 60
-    assert body["sample_threshold"] == 60
+    assert body["sample_days"] == 30
+    assert body["sample_threshold"] == 30
     assert "cagr_pct" in body
     assert Decimal(body["cagr_pct"]) > 0
 
 
+def test_detail_cagr_key_absent_one_day_below_threshold(tmp_path):
+    """29 天樣本（差新門檻 30 天一天）：`cagr_pct` 鍵**整個不存在**（結構性
+    防呆，不是存在但值為 null）——前端因此不必自己判斷門檻。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    hl.portfolios[_A] = twenty_nine_day_rows()
+    body = _client(app).get("/api/public/strategies/alpha").json()
+    assert body["sample_days"] == 29
+    assert body["sample_threshold"] == 30
+    assert "cagr_pct" not in body
+
+
 def test_detail_cagr_key_absent_below_threshold(tmp_path):
-    """10 天樣本（< 60）：`cagr_pct` 鍵**整個不存在**（結構性防呆，不是
+    """10 天樣本（遠低於 30）：`cagr_pct` 鍵**整個不存在**（結構性防呆，不是
     存在但值為 null）——前端因此不必自己判斷門檻。"""
     cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
         {"address": _A, "name": "Alpha", "slug": "alpha"}]))
@@ -522,7 +551,7 @@ def test_detail_cagr_key_absent_below_threshold(tmp_path):
                                         [[0, "0"], [t, "50"]])
     body = _client(app).get("/api/public/strategies/alpha").json()
     assert body["sample_days"] == 10
-    assert body["sample_threshold"] == 60
+    assert body["sample_threshold"] == 30
     assert "cagr_pct" not in body
 
 
@@ -534,7 +563,7 @@ def test_detail_cagr_key_absent_when_no_perf(tmp_path):
     app, *_ = make_app(tmp_path, cfg=cfg)
     body = _client(app).get("/api/public/strategies/alpha").json()
     assert body["sample_days"] == 0
-    assert body["sample_threshold"] == 60
+    assert body["sample_threshold"] == 30
     assert "cagr_pct" not in body
 
 

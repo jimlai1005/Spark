@@ -45,7 +45,7 @@ def _mixed_returns_points(last_day: Decimal) -> list[tuple[int, str, str]]:
     return _MIXED_RETURNS + [(int(last_day), "1089", "89")]
 
 
-# --- 錨例（純函式，繞過 60 天閘門）------------------------------------------
+# --- 錨例（純函式，繞過 30 天閘門——2026-08-30 D15 裁決原 60 降為 30）--------
 
 def test_anchor_ratio_metrics_match_plan_spec():
     """r = [0.01, -0.005, 0.02]（N=3）——見檔頭「錨例校正說明」。"""
@@ -102,12 +102,18 @@ def test_empty_returns_only_has_sample_count():
     assert r == {"sample_count": 0}
 
 
-# --- 樣本閘門：covered_days < RATIO_MIN_DAYS(60) → *_insufficient_data=True ---
+# --- 樣本閘門：covered_days < RATIO_MIN_DAYS(30) → *_insufficient_data=True ---
+# ⚠️ 2026-08-30 D15 裁決原 60 降為 30。邊界固定用三點序列（day0/day15/day{N}）
+# 而非 `_mixed_returns_points`（其固定第三點在 day35，比新門檻 30 還晚，
+# 不能用來組出 29/30 天的邊界），維持「恰在門檻」與「差一天」兩側都釘死。
 
-def test_ratio_metrics_below_60_days_flagged_insufficient():
-    r = compute_window_performance(rows(_mixed_returns_points(Decimal("59"))),
-                                    "perpMonth")
-    assert r["covered_days"] == Decimal("59.0000")
+def _boundary_points(last_day: int) -> list[tuple[int, str, str]]:
+    return [(0, "1000", "0"), (15, "1100", "100"), (last_day, "990", "-10")]
+
+
+def test_ratio_metrics_below_30_days_flagged_insufficient():
+    r = compute_window_performance(rows(_boundary_points(29)), "perpMonth")
+    assert r["covered_days"] == Decimal("29.0000")
     assert r["covered_days"] < RATIO_MIN_DAYS
     # 數字要給（沿用既有「顯示但註記」慣例）
     assert "sharpe" in r and "sortino" in r and "annualized_vol" in r
@@ -119,10 +125,9 @@ def test_ratio_metrics_below_60_days_flagged_insufficient():
     assert "win_rate_insufficient_data" not in r
 
 
-def test_ratio_metrics_at_60_days_not_flagged_insufficient():
-    r = compute_window_performance(rows(_mixed_returns_points(Decimal("60"))),
-                                    "perpMonth")
-    assert r["covered_days"] == Decimal("60.0000")
+def test_ratio_metrics_at_30_days_not_flagged_insufficient():
+    r = compute_window_performance(rows(_boundary_points(30)), "perpMonth")
+    assert r["covered_days"] == Decimal("30.0000")
     assert not (r["covered_days"] < RATIO_MIN_DAYS)
     assert r["sharpe_insufficient_data"] is False
     assert r["sortino_insufficient_data"] is False

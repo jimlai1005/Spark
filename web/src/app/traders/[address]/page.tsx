@@ -36,8 +36,9 @@
  * 本 task 檔案範圍不含後端，不新增端點欄位）——改用同一份 `metrics.
  * sample_count`（已有欄位，`build_metrics` 對兩個端點同源同義：N 個日報酬
  * 樣本，見 copy.ts `winRateNotePrefix`「N=」的既有用法）當門檻判斷依據，
- * 門檻值沿用與後端 `CAGR_SAMPLE_THRESHOLD_DAYS` 相同的 60（沒有可讀的後端
- * 欄位可用，故在此鏡射一份常數，而非重新發明門檻）。
+ * 門檻值沿用與後端 `CAGR_SAMPLE_THRESHOLD_DAYS` 相同的 30（⚠️ 2026-08-30 使用者
+ * 裁決 D15：原 60 降為 30，全鏈路同步——沒有可讀的後端欄位可用，故在此鏡射一份
+ * 常數，而非重新發明門檻）。
  */
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
@@ -53,7 +54,7 @@ import { computeStartEndEquity, metricText } from "@/lib/strategyMetrics";
 
 type ConnectPhase = "idle" | "connecting" | "signing";
 
-const TRADER_SAMPLE_THRESHOLD_DAYS = 60;
+const TRADER_SAMPLE_THRESHOLD_DAYS = 30;
 
 export default function TraderDetailPage() {
   const params = useParams<{ address: string }>();

@@ -66,23 +66,23 @@ const DETAIL = {
     sortino: "43.42", sortino_insufficient: false,
     best_day_pct: "3.01", best_day_pct_insufficient: false,
     worst_day_pct: "-0.80", worst_day_pct_insufficient: false,
-    sample_count: 38,
+    sample_count: 29,
   },
-  equity_index: Array.from({ length: 38 }, (_, i) => String(1 + i * 0.005)),
+  equity_index: Array.from({ length: 29 }, (_, i) => String(1 + i * 0.005)),
   methodology: {
     start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
-    sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
+    sample_count: 29, annualization_days: 365, risk_free_rate: "0", basis: "perp",
     updated_at: 1756000000,
   },
 };
 
 // ⭐ Task 7：`metrics.sample_count` 用來當本頁的門檻判斷依據（`/api/public/traders`
-// 沒有 `sample_days`／`sample_threshold`，見 page.tsx 檔頭）。DETAIL 的
-// `sample_count:38` < 60（門檻），刻意用來驗證「摺疊」是預設路徑；
-// `DETAIL_FULL_SAMPLE` 覆寫成 ≥60 驗證「完整格」路徑。
+// 沒有 `sample_days`／`sample_threshold`，見 page.tsx 檔頭）。⚠️ 2026-08-30 D15
+// 裁決門檻原 60 降為 30。DETAIL 的 `sample_count:29`（差門檻一天）刻意用來驗證
+// 「摺疊」是預設路徑；`DETAIL_FULL_SAMPLE` 覆寫成 30（恰在門檻）驗證「完整格」路徑。
 const DETAIL_FULL_SAMPLE = {
   ...DETAIL,
-  metrics: { ...DETAIL.metrics, sample_count: 72 },
+  metrics: { ...DETAIL.metrics, sample_count: 30 },
 };
 
 beforeEach(() => {
@@ -207,16 +207,17 @@ describe("TraderDetailPage", () => {
   });
 
   // ⭐ M3 round3 Task 7：比照 `/strategies/[slug]` 的指標收斂，本頁用
-  // `metrics.sample_count` ＋本地鏡射常數 60 當門檻（無 sample_days 欄位）。
+  // `metrics.sample_count` ＋本地鏡射常數 30 當門檻（無 sample_days 欄位）。
+  // ⚠️ 2026-08-30 D15 裁決原 60 降為 30。
   describe("Task 7：指標收斂（比照策略詳情頁）", () => {
-    it("sample_count < 60（DETAIL 預設 38）→ 摺成一行小字，個別小卡只剩 3 張", async () => {
+    it("sample_count < 30（DETAIL 預設 29，差門檻一天）→ 摺成一行小字，個別小卡只剩 3 張", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL));
       render(wrap(<TraderDetailPage />));
       await screen.findByRole("heading", { level: 1 });
       const c = COPY.strategyDetail.metrics;
-      const expectedNote = `${c.insufficientGroupLabel}${c.insufficientGroupPrefix}38`
-        + `${c.insufficientGroupMid}60${c.insufficientGroupSuffix}`;
+      const expectedNote = `${c.insufficientGroupLabel}${c.insufficientGroupPrefix}29`
+        + `${c.insufficientGroupMid}30${c.insufficientGroupSuffix}`;
       expect(screen.getByText((_, node) => node?.textContent === expectedNote)).toBeInTheDocument();
       expect(screen.queryByText(c.sharpeLabel)).not.toBeInTheDocument();
       expect(screen.queryByText(c.sortinoLabel)).not.toBeInTheDocument();
@@ -228,7 +229,7 @@ describe("TraderDetailPage", () => {
       expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
     });
 
-    it("sample_count ≥ 60 → 恢復完整格，不出現摺疊行", async () => {
+    it("sample_count ≥ 30（恰在門檻 30）→ 恢復完整格，不出現摺疊行", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL_FULL_SAMPLE));
       render(wrap(<TraderDetailPage />));

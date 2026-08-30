@@ -10,8 +10,9 @@
  * 跳轉，不重複走一次連線/簽名。
  *
  * ⭐ M3 round3 Task 7（D5 數字一致性）：CAGR 不再是前端自算——後端
- * `/api/public/strategies/{slug}` 直接供給 `cagr_pct`（`sample_days<60` 時該鍵
- * 整個不回傳，結構性防呆），本頁只依「鍵是否存在」決定是否渲染 `CagrCard`，
+ * `/api/public/strategies/{slug}` 直接供給 `cagr_pct`（`sample_days<30`——
+ * 2026-08-30 D15 裁決原 60 降為 30——時該鍵整個不回傳，結構性防呆），
+ * 本頁只依「鍵是否存在」決定是否渲染 `CagrCard`，
  * 不再重算年化外推（見 `lib/strategyMetrics.ts` 檔頭，工程原則 1：同一個值
  * 只能有一個計算來源）。「起訖淨值」仍是前端用 `methodology.
  * initial_deposit_usd`（真實入金）與 `equity_index` 首尾比值換算（不是統計
@@ -309,8 +310,9 @@ export default function StrategyDetailPage() {
             </p>
           )}
 
-          {/* ⭐ D5：後端 `sample_days<60` 時 `cagr_pct` 鍵整個不存在——結構性
-              防呆，前端只需判斷「有沒有這個值」，不必自己重算門檻。 */}
+          {/* ⭐ D5：後端 `sample_days<sample_threshold`（30，2026-08-30 D15 裁決
+              原 60 降為 30）時 `cagr_pct` 鍵整個不存在——結構性防呆，前端只需
+              判斷「有沒有這個值」，不必自己重算門檻。 */}
           {strategy.cagr_pct != null && (
             <CagrCard cagr={strategy.cagr_pct} sampleDays={strategy.sample_days} copy={c.cagr} />
           )}
@@ -439,7 +441,8 @@ export default function StrategyDetailPage() {
 
 /**
  * ⭐ Task 7：呼叫端已用 `strategy.cagr_pct != null` 守門——本元件只在後端明確
- * 給出 CAGR 值時才被渲染（`sample_days<60` 時整個 `<CagrCard>` 不出現在 DOM，
+ * 給出 CAGR 值時才被渲染（`sample_days<sample_threshold`〔30，2026-08-30 D15
+ * 裁決原 60 降為 30〕時整個 `<CagrCard>` 不出現在 DOM，
  * 不再有「樣本不足」灰字佔位）。`cagr` 因此恆為非 null 字串。
  */
 function CagrCard({ cagr, sampleDays, copy }: {
