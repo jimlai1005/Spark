@@ -58,12 +58,18 @@ def test_upstream_portfolio_failure_is_503(tmp_path):
 
 def test_not_whitelisted_address_still_returns_200(tmp_path):
     """核心行為：leaderboard 任意地址（不在精選白名單、也不在 user registry）
-    照樣能看到詳情頁——本端點結構上不 import `leaders.py`。"""
+    照樣能看到詳情頁——本端點結構上不 import `leaders.py`。
+
+    ⭐ M3 round4 Task R4-2：`initial_deposit_usd` 改由
+    `hl.non_funding_ledger_updates()`（真實 deposit 加總）供給，不再是
+    `accountValueHistory` 首點；`start_equity_usd`／`end_equity_usd` 為新增欄位。"""
     cfg = make_cfg(tmp_path)  # 空白名單
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
     hl.portfolios[_A] = sixty_day_rows()
     hl.clearinghouse[_A] = {"marginSummary": {"accountValue": "5000.00"},
                             "assetPositions": []}
+    hl.ledger_updates[_A] = [{"time": 0, "hash": "0x1",
+                              "delta": {"type": "deposit", "usdc": "1000.0"}}]
     r = _client(app).get(f"/api/public/traders/{_A}")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -73,10 +79,28 @@ def test_not_whitelisted_address_still_returns_200(tmp_path):
     assert body["metrics"]["total_return_pct"] == "20.00"
     assert body["metrics"]["total_return_pct_insufficient"] is False
     meth = body["methodology"]
-    assert meth["initial_deposit_usd"] == "1000"
+    assert meth["initial_deposit_usd"] == "1000.0"   # 真實 ledger deposit 加總
+    assert meth["start_equity_usd"] == "1000"        # av[0]（同一次 portfolio 回應）
+    assert meth["end_equity_usd"] == "1200"          # av[-1]
     assert set(meth) == {"start_date", "end_date", "initial_deposit_usd",
+                         "start_equity_usd", "end_equity_usd",
                          "sample_count", "annualization_days", "risk_free_rate",
                          "basis", "updated_at"}
+
+
+def test_ledger_deposit_failure_degrades_to_null_not_503(tmp_path):
+    """真實入金查詢（`hl.non_funding_ledger_updates`）上游失敗，是與 portfolio／
+    account_value 都不同的第三個來源（工程原則 1）——它失敗只降級
+    `initial_deposit_usd`，equity/metrics/account_value 照樣可用。"""
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    hl.portfolios[_A] = sixty_day_rows()
+    hl.ledger_updates_error[_A] = ConnectionError("hl 5xx")
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["methodology"]["initial_deposit_usd"] is None
+    assert body["methodology"]["start_equity_usd"] == "1000"
+    assert body["equity_index"] == ["1", "1.2"]
 
 
 def test_account_value_failure_degrades_to_null_not_503(tmp_path):

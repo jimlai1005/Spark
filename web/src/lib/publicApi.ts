@@ -89,6 +89,11 @@ export interface PublicStrategyMethodology {
   start_date: string | null;
   end_date: string | null;
   initial_deposit_usd: string | null;
+  /** M3 round4 Task R4-2：`accountValueHistory` 首個非零值（前導 0 點跳過）。
+   * 與 `end_equity_usd` 同源同一次 `hl.portfolio()` 回應。 */
+  start_equity_usd: string | null;
+  /** 同一份 `accountValueHistory` 的最後一點（不過濾，可能是 0）。 */
+  end_equity_usd: string | null;
   sample_count: number | null;
   annualization_days: number;
   risk_free_rate: string;
@@ -100,6 +105,8 @@ const EMPTY_METHODOLOGY: PublicStrategyMethodology = {
   start_date: null,
   end_date: null,
   initial_deposit_usd: null,
+  start_equity_usd: null,
+  end_equity_usd: null,
   sample_count: null,
   annualization_days: 365,
   risk_free_rate: "0",
@@ -154,6 +161,8 @@ function normalizeMethodology(v: unknown): PublicStrategyMethodology {
     start_date: m.start_date ?? null,
     end_date: m.end_date ?? null,
     initial_deposit_usd: m.initial_deposit_usd ?? null,
+    start_equity_usd: m.start_equity_usd ?? null,
+    end_equity_usd: m.end_equity_usd ?? null,
     sample_count: typeof m.sample_count === "number" ? m.sample_count : null,
     annualization_days: typeof m.annualization_days === "number" ? m.annualization_days : 365,
     risk_free_rate: typeof m.risk_free_rate === "string" ? m.risk_free_rate : "0",

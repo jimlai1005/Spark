@@ -119,6 +119,7 @@ describe("getPublicStrategy", () => {
     equity_index: ["1", "1.01", "1.206"],
     methodology: {
       start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
+      start_equity_usd: "1000", end_equity_usd: "1200",
       sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
       updated_at: 999,
     },
@@ -247,6 +248,7 @@ describe("getPublicTraderDetail", () => {
     equity_index: ["1", "1.2"],
     methodology: {
       start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
+      start_equity_usd: "1000", end_equity_usd: "1200",
       sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
       updated_at: 999,
     },

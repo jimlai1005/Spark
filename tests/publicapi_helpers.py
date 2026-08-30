@@ -95,6 +95,10 @@ class FakeHL:
         self.portfolios: dict[str, list] = {}
         self.portfolio_error: dict[str, Exception] = {}
         self.ledger_updates: dict[str, list] = {}
+        # M3 round4 Task R4-2（真實入金查詢）：per-address 可注入失敗，同其他
+        # 查詢的既有 `_error` 慣例——上游任何失敗只降級 `initial_deposit_usd`
+        # 為 None，不得拖累整頁。
+        self.ledger_updates_error: dict[str, Exception] = {}
         # 預設「塞什麼就回什麼」（多數測試不在意窗口）。收入對帳的窗口正確性測試
         # 需要真的依 [start, end] 過濾——設 True 打開，否則「窗口取錯」在 fake 上
         # 看不出來（正是 opus 對抗審查 Critical 能潛伏的原因）。
@@ -156,6 +160,9 @@ class FakeHL:
         return self.portfolios.get(address.lower(), [])
 
     def non_funding_ledger_updates(self, user: str, start_ms: int) -> list:
+        err = self.ledger_updates_error.get(user.lower())
+        if err is not None:
+            raise err
         return self.ledger_updates.get(user.lower(), [])
 
     def max_builder_fee(self, user: str, builder: str) -> int:

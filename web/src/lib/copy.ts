@@ -1045,7 +1045,11 @@ export const COPY_ZH = {
       unavailable: "方法論資料暫不可用。",
       depositPrefix: "以真實入金本金 $",
       depositSuffix: " 起算（鏈上 deposit 可驗證），涵蓋 ",
-      /** 首快照為 0 時省略入金句，改由此開頭（誠實顯示，2026-08-29）。 */
+      /** M3 round4 Task R4-2：查無鏈上真實入金紀錄時的替代句——改以帳戶淨值
+       * 快照起算（不是「入金」，是「有記錄以來第一次看到非零餘額」）。 */
+      startEquityPrefix: "以起始權益 $",
+      startEquitySuffix: " 起算（鏈上首個非零淨值快照），涵蓋 ",
+      /** 首快照為 0 且查無真實入金時省略前兩句，改由此開頭（誠實顯示，2026-08-29）。 */
       rangePrefix: "涵蓋 ",
       daysSuffix: " 個交易日（",
       rangeSuffix: "）。",
@@ -2450,7 +2454,12 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       unavailable: "Methodology data is not available right now.",
       depositPrefix: "Computed from a real deposit of $",
       depositSuffix: " (verifiable on-chain), covering ",
-      /** Mirrors zh rangePrefix: opening used when the deposit clause is omitted. */
+      /** M3 round4 Task R4-2: fallback when no on-chain deposit record is found —
+       * starts from an equity snapshot instead (not a "deposit", the first
+       * non-zero balance ever recorded). */
+      startEquityPrefix: "Computed from a starting equity of $",
+      startEquitySuffix: " (first non-zero on-chain snapshot), covering ",
+      /** Mirrors zh rangePrefix: opening used when both clauses above are omitted. */
       rangePrefix: "Covering ",
       daysSuffix: " trading days (",
       rangeSuffix: ").",

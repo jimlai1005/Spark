@@ -101,8 +101,9 @@ function toPoints(values: number[]): string {
  */
 export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate }: {
   equityIndex: string[];
-  /** 有值時 y 軸刻度換算成美元金額（= 本值 × 首點比值 × 入金額，同
-   * `computeStartEndEquity` 的換算式）；缺席則顯示原始 index 值。 */
+  /** 有值時 y 軸刻度換算成美元金額（= 本值 × 首點比值 × 入金額）；缺席則顯示
+   * 原始 index 值。M3 round4 Task R4-2 起，這個值來自鏈上真實入金
+   * （`userNonFundingLedgerUpdates`），不再是 `accountValueHistory` 首點。 */
   initialDepositUsd?: string | null;
   /** x 軸日期標籤來源（`methodology.start_date`/`end_date`）；缺席則退化為
    * 相對天數 `D1…Dn`。 */

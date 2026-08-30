@@ -37,8 +37,9 @@ from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, find_leader, is_selectable, load_leaders
 from spark.filet.strategies import (CAGR_SAMPLE_THRESHOLD_DAYS, build_cagr_pct,
-                                    build_equity_index, build_metrics,
-                                    build_methodology, build_strategy_view)
+                                    build_equity_index, build_equity_range,
+                                    build_metrics, build_methodology,
+                                    build_strategy_view, sum_ledger_deposits)
 from spark.publicapi import hl_explore, hl_leaderboard, public_stats
 from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
@@ -1820,9 +1821,40 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
     def _cached_strategy_portfolio(address: str) -> list | None:
         """`_cached_strategy_portfolio_with_ts` 的薄包裝，只要 rows 不要時間戳
-        （既有呼叫點——`initial_deposit_usd` 推導——不需要 as_of）。"""
+        （既有呼叫點——起訖淨值推導——不需要 as_of）。"""
         result = _cached_strategy_portfolio_with_ts(address)
         return result[0] if result is not None else None
+
+    # ⭐ M3 round4 Task R4-2：真實入金本金（`hl.non_funding_ledger_updates()`）的
+    # 60s per-address 快取。與 `_strategy_portfolio_cache` **分開**一個 dict、沒有
+    # LRU 上限——理由同 `_strategy_portfolio_cache` 檔頭：本區塊的位址空間是精選
+    # 白名單（有限集合），不是任意鏈上地址，不需要 `/api/public/traders/{address}`
+    # 那種按 client 計費的 rate limit 與合併快取（那是為了防「任意位址枚舉」放大
+    # 攻擊面，這裡的攻擊面天生有界）。
+    _strategy_ledger_deposit_cache: dict[str, tuple[float, Decimal | None]] = {}
+    _strategy_ledger_deposit_lock = threading.Lock()
+    STRATEGY_LEDGER_DEPOSIT_CACHE_TTL_S = 60.0
+
+    def _cached_ledger_deposit(address: str) -> Decimal | None:
+        """真實入金本金（USD）。上游任何失敗（transient 或 schema 漂移）→
+        `None`，**不快取失敗**（下次請求照樣重試，沿 `_cached_strategy_portfolio_
+        with_ts` 同一條「不快取失敗」的既有慣例）——查不到與查到 $0 不是同一件
+        事，這裡回 `None` 讓 methodology 的起訖淨值仍能單獨由
+        `build_equity_range` 供給，不因為 ledger 查詢失敗就整段掉資料。"""
+        now = now_fn()
+        with _strategy_ledger_deposit_lock:
+            cached = _strategy_ledger_deposit_cache.get(address)
+        if cached is not None and now - cached[0] < STRATEGY_LEDGER_DEPOSIT_CACHE_TTL_S:
+            return cached[1]
+        try:
+            raw = hl.non_funding_ledger_updates(address, 0)
+            deposit = sum_ledger_deposits(raw)
+        except Exception as e:  # noqa: BLE001 — 公開端點：上游任何失敗都不得 500
+            logger.error("策略真實入金查詢失敗 leader=%s: %s", address, e)
+            return None
+        with _strategy_ledger_deposit_lock:
+            _strategy_ledger_deposit_cache[address] = (now, deposit)
+        return deposit
 
     def _strategy_perf_with_as_of(address: str) -> tuple[dict | None, int | None]:
         """位址 → `(perf, as_of)`。`perf`＝`perpAllTime` 窗的績效（策略卡固定只用
@@ -1939,16 +1971,26 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             if cagr_pct is not None:
                 view["cagr_pct"] = cagr_pct
         view["equity_index"] = build_equity_index(perf)
-        initial_deposit_usd = None
+        # ⭐ M3 round4 Task R4-2：起訖淨值改用同一份 `accountValueHistory` 的首個
+        # 非零值／末值（`build_equity_range`），不再是「首點原樣值」——首點常態
+        # 性是 0（錢包晚於序列起點入金），硬印它會讓「起訖淨值」整卡顯示樣本不足
+        # 或誤導的 $0 起算。`initial_deposit_usd` 改由鏈上真實入金（ledger）供給，
+        # 兩者刻意分開兩個不同資料源：前者是「帳戶淨值快照」，後者是「真的存進來
+        # 多少錢」，語意不同，見 `strategies.build_equity_range`／
+        # `sum_ledger_deposits` 檔頭。
+        start_equity_usd = None
+        end_equity_usd = None
         rows = _cached_strategy_portfolio(entry.address)
         if rows is not None:
             window = extract_window(rows, "perpAllTime")
             if window is not None:
                 av, _pnl = window
-                if av:
-                    initial_deposit_usd = av[0][1]
+                start_equity_usd, end_equity_usd = build_equity_range(av)
+        initial_deposit_usd = _cached_ledger_deposit(entry.address)
         view["methodology"] = build_methodology(
-            perf, initial_deposit_usd=initial_deposit_usd, updated_at=int(now_fn()))
+            perf, initial_deposit_usd=initial_deposit_usd,
+            start_equity_usd=start_equity_usd, end_equity_usd=end_equity_usd,
+            updated_at=int(now_fn()))
         return view
 
     # ---------- /api/public/stats、/api/public/status（策略平台 Task 6）----------
@@ -2090,7 +2132,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     # 有快取、account_value 卻是無底洞的放大面）。修法：併入同一個快取條目，
     # tuple 多存一個 account_value 欄位；`_enforce_probe_ratelimit` 只在這次
     # 合併 miss 呼叫一次。
-    _trader_portfolio_cache: dict[str, tuple[float, list, str | None]] = {}
+    _trader_portfolio_cache: dict[str, tuple[float, list, str | None, Decimal | None]] = {}
     _trader_portfolio_lock = threading.Lock()
     TRADER_PORTFOLIO_CACHE_TTL_S = 300.0  # 5 分鐘（plan 明訂）
     TRADER_PORTFOLIO_CACHE_MAX = 256      # 上限地址數（防濫用，plan 明訂）
@@ -2106,15 +2148,21 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     _trader_portfolio_negative_cache: dict[str, float] = {}
     TRADER_PORTFOLIO_NEGATIVE_TTL_S = 60.0
 
-    def _cached_trader_data(address: str, ratelimit_key: str) -> tuple[list | None, str | None]:
-        """`hl.portfolio()` ＋ `hl.clearinghouse_state()` 的 5 分鐘 per-address
-        **合併**快取，上限 256 個地址。同一次 cache miss 把兩個上游一起抓、
-        `_enforce_probe_ratelimit` 只計費一次（見 [8b-1]）——`account_value`
-        （clearinghouseState）失敗只讓它降級為 `None`，不影響 `rows`（portfolio，
-        equity 曲線與 metrics 的唯一資料源）是否成功快取；`rows` 失敗才走負面
-        快取短路整個條目（工程原則 1：兩個來源分別展示各自的數字，不混進同一個
-        對比，但**快取時機**合併不影響這條原則——兩個欄位在回應裡仍各自標明
-        來源、各自可能為 `None`）。
+    def _cached_trader_data(
+        address: str, ratelimit_key: str
+    ) -> tuple[list | None, str | None, Decimal | None]:
+        """`hl.portfolio()` ＋ `hl.clearinghouse_state()` ＋
+        `hl.non_funding_ledger_updates()` 的 5 分鐘 per-address **合併**快取，
+        上限 256 個地址。同一次 cache miss 把三個上游一起抓、
+        `_enforce_probe_ratelimit` 只計費一次（見 [8b-1]；M3 round4 Task R4-2
+        沿用同一條理由把真實入金查詢併進來——任意位址皆可查的端點多開一個不受
+        限流保護的上游呼叫，就是重新製造一次 [8b-1] 那種放大面）——
+        `account_value`（clearinghouseState）與真實入金（ledger）失敗都只讓
+        各自欄位降級為 `None`，不影響 `rows`（portfolio，equity 曲線與 metrics
+        的唯一資料源）是否成功快取；`rows` 失敗才走負面快取短路整個條目
+        （工程原則 1：三個來源分別展示各自的數字，不混進同一個對比，但**快取
+        時機**合併不影響這條原則——三個欄位在回應裡仍各自標明來源、各自可能
+        為 `None`）。
 
         超過上限時淘汰最舊一筆（近似 LRU）；`rows` 失敗改記負面快取（見上）而非
         完全不快取——同一壞地址在 60s 內重打會直接短路，不再二次打上游。
@@ -2127,9 +2175,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             cached = _trader_portfolio_cache.get(address)
             failed_at = _trader_portfolio_negative_cache.get(address)
         if cached is not None and now - cached[0] < TRADER_PORTFOLIO_CACHE_TTL_S:
-            return cached[1], cached[2]
+            return cached[1], cached[2], cached[3]
         if failed_at is not None and now - failed_at < TRADER_PORTFOLIO_NEGATIVE_TTL_S:
-            return None, None
+            return None, None, None
         # ⭐ [C1] per-client rate limit：只在真的要打上游（快取未命中、負面快取也
         # 已過期）這一刻才計費——cache/negative-cache 命中不消耗額度，因為那兩條
         # 路徑本來就不會產生上游流量，計費在那兩條路徑上只會誤傷正常瀏覽。
@@ -2140,13 +2188,19 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             logger.error("交易員績效上游查詢失敗 address=%s: %s", address, e)
             with _trader_portfolio_lock:
                 _trader_portfolio_negative_cache[address] = now
-            return None, None
+            return None, None, None
         account_value = None
         try:
             cs = hl.clearinghouse_state(address)
             account_value = cs.get("marginSummary", {}).get("accountValue")
         except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
             logger.error("交易員 account_value 查詢失敗 address=%s: %s", address, e)
+        deposit = None
+        try:
+            ledger_raw = hl.non_funding_ledger_updates(address, 0)
+            deposit = sum_ledger_deposits(ledger_raw)
+        except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
+            logger.error("交易員真實入金查詢失敗 address=%s: %s", address, e)
         with _trader_portfolio_lock:
             _trader_portfolio_negative_cache.pop(address, None)
             if (address not in _trader_portfolio_cache
@@ -2154,8 +2208,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 oldest = min(_trader_portfolio_cache,
                             key=lambda k: _trader_portfolio_cache[k][0])
                 del _trader_portfolio_cache[oldest]
-            _trader_portfolio_cache[address] = (now, rows, account_value)
-        return rows, account_value
+            _trader_portfolio_cache[address] = (now, rows, account_value, deposit)
+        return rows, account_value, deposit
 
     def _trader_follow_blocked(addr: str) -> bool:
         """[W4] 已被安全撤銷（`enabled=false`）的 leader 不該在交易員詳情頁看到
@@ -2204,7 +2258,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise HTTPException(status_code=422, detail="位址格式不合法（需 0x 開頭 + 40 hex）")
 
         client_host = request.client.host if request.client else "unknown"
-        rows, account_value = _cached_trader_data(addr, _TRADER_PROBE_KEY_PREFIX + client_host)
+        rows, account_value, initial_deposit_usd = _cached_trader_data(
+            addr, _TRADER_PROBE_KEY_PREFIX + client_host)
         if rows is None:
             raise HTTPException(status_code=503, detail="鏈上績效查詢暫時不可用，請稍後重試")
 
@@ -2214,12 +2269,16 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             logger.error("交易員績效計算失敗 address=%s: %s", addr, e)
             perf = None
 
-        initial_deposit_usd = None
+        # ⭐ M3 round4 Task R4-2：起訖淨值改用同一份 `accountValueHistory` 的首個
+        # 非零值／末值（`build_equity_range`）——理由與 `/api/public/strategies/
+        # {slug}` 同一套，見該端點註解。`initial_deposit_usd` 已在
+        # `_cached_trader_data` 併入同一次快取抓好，這裡不重打上游。
+        start_equity_usd = None
+        end_equity_usd = None
         window = extract_window(rows, "perpAllTime")
         if window is not None:
             av, _pnl = window
-            if av:
-                initial_deposit_usd = av[0][1]
+            start_equity_usd, end_equity_usd = build_equity_range(av)
 
         return {
             "address": addr,
@@ -2228,7 +2287,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "metrics": build_metrics(perf),
             "equity_index": build_equity_index(perf),
             "methodology": build_methodology(
-                perf, initial_deposit_usd=initial_deposit_usd, updated_at=int(now_fn())),
+                perf, initial_deposit_usd=initial_deposit_usd,
+                start_equity_usd=start_equity_usd, end_equity_usd=end_equity_usd,
+                updated_at=int(now_fn())),
         }
 
     # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce

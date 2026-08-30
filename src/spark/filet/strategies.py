@@ -18,9 +18,10 @@ compute_window_performance` 的輸出）→ `/api/public/strategies*` 的策略�
 的既有契約不同層級、不同用途。
 """
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from spark.exchange.ledger_flows import FLOW_FIELDS
 from spark.filet.leaders import LeaderRef
 
 # ⚠️ 2026-08-29 使用者裁決移除「60 天上架閘門」（曾用 STRATEGY_MIN_LIVE_DAYS）：
@@ -179,12 +180,88 @@ def _ms_to_date(ms: Any) -> str | None:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
 
 
+def build_equity_range(
+    account_value_history: Any,
+) -> tuple[Decimal | None, Decimal | None]:
+    """`hl.portfolio()` 的原始 `accountValueHistory`（`leader_perf.extract_window`
+    回傳的 `av`，形狀 `[[ts_ms, value_str], ...]`）→ `(start_equity_usd,
+    end_equity_usd)`。
+
+    起點＝**首個非零值**（前導 0 點跳過——錢包晚於序列起點入金時，首點常是
+    0，「以 $0 起算」是誤導不是揭露，2026-08-30 使用者裁決）；終點＝序列**最後
+    一點**（不過濾，即使剛好是 0 也照實顯示——那是真實的期末餘額，不是「無
+    資料」）。
+
+    整條序列從頭到尾都是 0（或序列為空／形狀不符）→ `(None, None)`：沒有任何
+    一刻是「真的有本金」的快照，null 比硬印 $0 起算更誠實。"""
+    if not isinstance(account_value_history, (list, tuple)) or not account_value_history:
+        return None, None
+    start: Decimal | None = None
+    for row in account_value_history:
+        try:
+            v = Decimal(str(row[1]))
+        except (InvalidOperation, ValueError, IndexError, TypeError):
+            continue
+        if v != 0:
+            start = v
+            break
+    if start is None:
+        return None, None
+    try:
+        end = Decimal(str(account_value_history[-1][1]))
+    except (InvalidOperation, ValueError, IndexError, TypeError):
+        return None, None
+    return start, end
+
+
+def sum_ledger_deposits(ledger_updates: Any) -> Decimal | None:
+    """`hl.non_funding_ledger_updates()` 的原始清單 → 真實入金本金（USD）。
+
+    只加總 `delta.type == "deposit"` 的金額（`spark.exchange.ledger_flows.
+    FLOW_FIELDS["deposit"]` 是欄位名的唯一定義點——不在這裡另猜一次，工程原則
+    5）。**不含** `send`／`accountClassTransfer`／`vaultDeposit` 等：那些是同一
+    帳戶內部（spot↔perp、跨 dex）的資金搬動，不是新增本金（2026-08-30 對
+    `0xfB9C…9760` 主網 probe 實測：這顆帳戶的 ledger 有 1 筆 `deposit`（真實外部
+    入金）＋ 3 筆 `send`（同位址 spot→perp 內部轉帳），只有前者代表真金白銀
+    進來過）。
+
+    有多筆 `deposit` → 全部加總（真實入金本金 = 這個帳戶史上總共存入過多少）。
+    形狀不符／查無任何 `deposit` 紀錄 → `None`（不猜；起訖淨值仍由
+    `build_equity_range` 單獨供給，見 `publicapi/app.py` 呼叫端）。"""
+    if not isinstance(ledger_updates, list):
+        return None
+    amount_field, sign = FLOW_FIELDS["deposit"]
+    total = Decimal("0")
+    found = False
+    for item in ledger_updates:
+        if not isinstance(item, dict):
+            continue
+        delta = item.get("delta")
+        if not isinstance(delta, dict) or delta.get("type") != "deposit":
+            continue
+        amount = delta.get(amount_field)
+        if amount is None:
+            continue
+        try:
+            total += sign * Decimal(str(amount))
+        except (InvalidOperation, ValueError):
+            continue
+        found = True
+    return total if found else None
+
+
 def build_methodology(perf: dict[str, Any] | None, *,
                       initial_deposit_usd: Decimal | None,
+                      start_equity_usd: Decimal | None = None,
+                      end_equity_usd: Decimal | None = None,
                       updated_at: int) -> dict[str, Any]:
     """策略詳情頁的方法論與樣本揭露段。`initial_deposit_usd` 由呼叫端傳入
-    （取自同一次 `hl.portfolio()` 回應的 `accountValueHistory` 首點——本模組
-    不重新觸網，見 `publicapi/app.py` 的 detail 端點）。
+    （2026-08-30 起改取自 `hl.non_funding_ledger_updates()` 的真實入金加總
+    ——`sum_ledger_deposits`，不再是 `accountValueHistory` 首點；那個首點常態
+    性是 0，見 `build_equity_range` 檔頭）。`start_equity_usd`／
+    `end_equity_usd` 同樣由呼叫端傳入（`build_equity_range` 算好），與
+    `initial_deposit_usd` 同源自呼叫端同一次 `hl.portfolio()` 回應，本模組不
+    重新觸網。
 
     `risk_free_rate`／`annualization_days`／`basis` 是 leader_perf 全模組通用的
     計算慣例（365 日/年、無風險利率 0%、perp only），寫死在這裡是把「這份文案
@@ -200,6 +277,10 @@ def build_methodology(perf: dict[str, Any] | None, *,
         "end_date": _ms_to_date(last_ms),
         "initial_deposit_usd": (str(initial_deposit_usd)
                                 if initial_deposit_usd is not None else None),
+        "start_equity_usd": (str(start_equity_usd)
+                             if start_equity_usd is not None else None),
+        "end_equity_usd": (str(end_equity_usd)
+                           if end_equity_usd is not None else None),
         "sample_count": sample_count if isinstance(sample_count, int) else None,
         "annualization_days": 365,
         "risk_free_rate": "0",

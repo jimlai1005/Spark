@@ -14,7 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from spark.filet.leaders import LeaderRef
-from spark.filet.strategies import build_metrics, build_strategy_view
+from spark.filet.strategies import (build_equity_range, build_metrics,
+                                    build_strategy_view, sum_ledger_deposits)
 from spark.publicapi.app import create_app
 from spark.publicapi.store import ApiStore
 from tests.publicapi_helpers import FakeHL, FakeKeysvc, make_app, make_cfg
@@ -158,6 +159,85 @@ def test_build_metrics_status_insufficient_is_all_insufficient():
     m = build_metrics({"status": "insufficient", "sample_count": 1})
     assert m["total_return_pct"] is None
     assert m["sample_count"] == 1
+
+
+# ============================================================
+# 純函式：build_equity_range（accountValueHistory → 起訖淨值，M3 round4
+# Task R4-2：起訖淨值改用同一份 accountValueHistory 的首個非零值與末值）
+# ============================================================
+
+def test_build_equity_range_leading_zero_skipped_start_takes_first_nonzero():
+    """前導 0（錢包晚於序列起點入金）→ start 取首個非零值，end 取序列最後一點。"""
+    av = [[0, "0.0"], [1000, "50.705371"], [2000, "80.612619"]]
+    start, end = build_equity_range(av)
+    assert start == Decimal("50.705371")
+    assert end == Decimal("80.612619")
+
+
+def test_build_equity_range_all_zero_returns_none():
+    """整條序列全為 0 → (None, None)：沒有任何一刻是真的有本金的快照。"""
+    av = [[0, "0.0"], [1000, "0.0"], [2000, "0.0"]]
+    assert build_equity_range(av) == (None, None)
+
+
+def test_build_equity_range_no_leading_zero_start_is_first_point():
+    """沒有前導 0 → start 就是第一點本身（不是只有前導 0 情境才能取值）。"""
+    av = [[0, "1000"], [1000, "1200"]]
+    assert build_equity_range(av) == (Decimal("1000"), Decimal("1200"))
+
+
+def test_build_equity_range_end_can_be_zero_not_filtered():
+    """末值即使剛好是 0（帳戶清空）也照實回傳——那是真實期末餘額，不是「無資料」。"""
+    av = [[0, "1000"], [1000, "0.0"]]
+    assert build_equity_range(av) == (Decimal("1000"), Decimal("0.0"))
+
+
+@pytest.mark.parametrize("av", [[], None, "not-a-list"])
+def test_build_equity_range_empty_or_malformed_returns_none(av):
+    assert build_equity_range(av) == (None, None)
+
+
+# ============================================================
+# 純函式：sum_ledger_deposits（userNonFundingLedgerUpdates → 真實入金本金，
+# M3 round4 Task R4-2。欄位形狀 2026-08-30 對 `0xfB9C…9760` 主網 probe 實測：
+# deposit 型別的金額欄位是 `usdc`，見 strategies.py 檔頭。）
+# ============================================================
+
+def test_sum_ledger_deposits_single_deposit():
+    raw = [{"time": 1782906861118, "hash": "0x1",
+           "delta": {"type": "deposit", "usdc": "1000.0"}}]
+    assert sum_ledger_deposits(raw) == Decimal("1000.0")
+
+
+def test_sum_ledger_deposits_sums_multiple_deposits():
+    raw = [
+        {"time": 1, "delta": {"type": "deposit", "usdc": "1000.0"}},
+        {"time": 2, "delta": {"type": "deposit", "usdc": "500.0"}},
+    ]
+    assert sum_ledger_deposits(raw) == Decimal("1500.0")
+
+
+def test_sum_ledger_deposits_ignores_send_and_other_types():
+    """`send`（同帳戶 spot↔perp 內部轉帳，2026-08-30 主網 probe 實測到的真實
+    型別）與 `withdraw`／`accountClassTransfer` 皆非新增本金，不得計入。"""
+    raw = [
+        {"time": 1, "delta": {"type": "deposit", "usdc": "1000.0"}},
+        {"time": 2, "delta": {"type": "send", "user": "0xa1", "destination": "0xa1",
+                              "sourceDex": "spot", "destinationDex": "",
+                              "token": "USDC", "amount": "1000.0", "usdcValue": "1000.0"}},
+        {"time": 3, "delta": {"type": "withdraw", "usdc": "200.0"}},
+    ]
+    assert sum_ledger_deposits(raw) == Decimal("1000.0")
+
+
+def test_sum_ledger_deposits_no_deposit_entries_returns_none():
+    raw = [{"time": 1, "delta": {"type": "send", "usdcValue": "1000.0"}}]
+    assert sum_ledger_deposits(raw) is None
+
+
+@pytest.mark.parametrize("raw", [[], None, "not-a-list"])
+def test_sum_ledger_deposits_empty_or_malformed_returns_none(raw):
+    assert sum_ledger_deposits(raw) is None
 
 
 # ============================================================
@@ -318,10 +398,16 @@ def test_detail_404_for_disabled_slug(tmp_path):
 
 
 def test_detail_shape_includes_equity_index_and_methodology(tmp_path):
+    """⭐ M3 round4 Task R4-2：`initial_deposit_usd` 改由
+    `hl.non_funding_ledger_updates()`（真實 deposit 加總）供給，不再是
+    `accountValueHistory` 首點；`start_equity_usd`／`end_equity_usd` 是新增
+    欄位，取同一份 `accountValueHistory` 的首個非零值與末值。"""
     cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
         {"address": _A, "name": "Alpha", "slug": "alpha"}]))
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
     hl.portfolios[_A] = sixty_day_rows()
+    hl.ledger_updates[_A] = [{"time": 0, "hash": "0x1",
+                              "delta": {"type": "deposit", "usdc": "1000.0"}}]
     r = _client(app).get("/api/public/strategies/alpha")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -329,15 +415,54 @@ def test_detail_shape_includes_equity_index_and_methodology(tmp_path):
     assert body["equity_index"] == ["1", "1.2"]
     meth = body["methodology"]
     assert set(meth) == {"start_date", "end_date", "initial_deposit_usd",
+                         "start_equity_usd", "end_equity_usd",
                          "sample_count", "annualization_days", "risk_free_rate",
                          "basis", "updated_at"}
     assert meth["annualization_days"] == 365
     assert meth["risk_free_rate"] == "0"
     assert meth["basis"] == "perp"
-    assert meth["initial_deposit_usd"] == "1000"     # av[0]（同一次 portfolio 回應）
+    assert meth["initial_deposit_usd"] == "1000.0"   # 真實 ledger deposit 加總
+    assert meth["start_equity_usd"] == "1000"        # av[0]（同一次 portfolio 回應）
+    assert meth["end_equity_usd"] == "1200"          # av[-1]
     assert meth["start_date"] == "1970-01-01"
     expected_end = datetime.fromtimestamp(60 * 86400, tz=timezone.utc).date().isoformat()
     assert meth["end_date"] == expected_end
+
+
+def test_detail_leading_zero_snapshot_still_yields_start_equity(tmp_path):
+    """⭐ D5 修復核心場景（2026-08-30 使用者裁決 5）：真實帳戶首個
+    `accountValueHistory` 快照常態性是 0（錢包晚於序列起點入金）——修法前這會讓
+    `initial_deposit_usd` 印成字面 "0.0"、前端「起訖淨值」整卡判「樣本不足」；
+    修法後 `start_equity_usd` 跳過前導 0、取首個非零快照，不再誤判。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    hl.portfolios[_A] = _portfolio_rows(
+        [[0, "0.0"], [1000, "50.705371"], [60 * _DAY_MS, "80.612619"]],
+        [[0, "0"], [1000, "50.705371"], [60 * _DAY_MS, "80.612619"]],
+    )
+    r = _client(app).get("/api/public/strategies/alpha")
+    assert r.status_code == 200, r.text
+    meth = r.json()["methodology"]
+    assert meth["start_equity_usd"] == "50.705371"
+    assert meth["end_equity_usd"] == "80.612619"
+    assert meth["initial_deposit_usd"] is None   # 未塞 ledger fixture：查無真實入金
+
+
+def test_detail_ledger_deposit_failure_degrades_to_null_not_500(tmp_path):
+    """真實入金查詢上游失敗 → `initial_deposit_usd` 降級為 null，不拖累整頁
+    （起訖淨值仍由 `accountValueHistory` 單獨供給）。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    hl.portfolios[_A] = sixty_day_rows()
+    hl.ledger_updates_error[_A] = ConnectionError("hl 5xx")
+    r = _client(app).get("/api/public/strategies/alpha")
+    assert r.status_code == 200, r.text
+    meth = r.json()["methodology"]
+    assert meth["initial_deposit_usd"] is None
+    assert meth["start_equity_usd"] == "1000"
+    assert meth["end_equity_usd"] == "1200"
 
 
 def test_detail_no_perf_still_200_with_empty_equity_index(tmp_path):
@@ -350,6 +475,8 @@ def test_detail_no_perf_still_200_with_empty_equity_index(tmp_path):
     body = r.json()
     assert body["equity_index"] == []
     assert body["methodology"]["initial_deposit_usd"] is None
+    assert body["methodology"]["start_equity_usd"] is None
+    assert body["methodology"]["end_equity_usd"] is None
     assert body["listable"] is True   # 缺 perf 不再擋 listable（僅 enabled/accepting_new）
 
 

@@ -14,9 +14,11 @@
  * 2026-08-30 D15 裁決原 60 降為 30——時該鍵整個不回傳，結構性防呆），
  * 本頁只依「鍵是否存在」決定是否渲染 `CagrCard`，
  * 不再重算年化外推（見 `lib/strategyMetrics.ts` 檔頭，工程原則 1：同一個值
- * 只能有一個計算來源）。「起訖淨值」仍是前端用 `methodology.
- * initial_deposit_usd`（真實入金）與 `equity_index` 首尾比值換算（不是統計
- * 外推，是後端已供給兩個真實原始值的另一種呈現，詳見 `strategyMetrics.ts`）。
+ * 只能有一個計算來源）。⭐ M3 round4 Task R4-2：「起訖淨值」改為直接格式化
+ * 後端供給的 `methodology.start_equity_usd`／`end_equity_usd`（同一份鏈上
+ * `accountValueHistory` 的首個非零值與末值），不再用 `initial_deposit_usd` ×
+ * `equity_index` 比值推算——真實帳戶的首點常態性是 0，比值法會誤判成樣本
+ * 不足（詳見 `strategyMetrics.ts` 檔頭）。
  *
  * ⭐ Task 7（R2-P0）指標收斂：8 張指標卡中只有總報酬／策略期間回撤／日勝率／
  * 最佳最差日維持個別小卡；Sharpe／Sortino／年化波動／起訖淨值在
@@ -37,7 +39,7 @@ import {
   type PublicStrategyMethodology,
 } from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
-import { computeStartEndEquity, metricText } from "@/lib/strategyMetrics";
+import { formatStartEndEquity, metricText } from "@/lib/strategyMetrics";
 import type { COPY_ZH, DeepString } from "@/lib/copy";
 
 type CagrCopy = DeepString<typeof COPY_ZH.strategyDetail.cagr>;
@@ -120,7 +122,7 @@ export default function StrategyDetailPage() {
   // （那是每次請求各自的 `now_fn()`，即使算同一份快照也會逐請求前進——正是
   // 「數字不一致」的根因之一）。
   const asOf = fmtUpdatedAtUtc(strategy.as_of ?? 0);
-  const startEnd = computeStartEndEquity(strategy.methodology, strategy.equity_index, fmtAmount);
+  const startEnd = formatStartEndEquity(strategy.methodology, fmtAmount);
   const sampleInsufficient = strategy.sample_days < strategy.sample_threshold;
 
   function buildQuery(): string {
@@ -478,16 +480,21 @@ function MethodologyCard({ methodology, metrics, copy }: {
   metrics: PublicStrategyDetail["metrics"];
   copy: MethodologyCopy;
 }) {
-  // 首個鏈上快照為 0（錢包晚於序列起點入金）時，「以 $0 起算」是誤導不是揭露 →
-  // 整句省略，改由 rangePrefix 開頭（2026-08-29 真資料驗證發現）。
+  // ⭐ M3 round4 Task R4-2：查無鏈上真實入金（`initial_deposit_usd` 現在來自
+  // `userNonFundingLedgerUpdates`，查無 deposit 紀錄 → null）時，改以起始權益
+  // （`start_equity_usd`，同一份 accountValueHistory 首個非零快照）起算；兩者
+  // 皆無才整句省略、改由 rangePrefix 開頭（2026-08-29 真資料驗證發現、裁決 5）。
   const depositNum = Number(methodology.initial_deposit_usd);
   const hasDeposit = methodology.initial_deposit_usd != null
     && Number.isFinite(depositNum) && depositNum > 0;
+  const startEquityNum = Number(methodology.start_equity_usd);
+  const hasStartEquity = !hasDeposit && methodology.start_equity_usd != null
+    && Number.isFinite(startEquityNum);
   const hasRange = methodology.start_date != null && methodology.end_date != null
     && methodology.sample_count != null;
   const hasSharpe = !metrics.sharpe_insufficient && metrics.sharpe != null
     && !metrics.sharpe_se_insufficient && metrics.sharpe_se != null;
-  const hasData = hasDeposit || hasRange || hasSharpe;
+  const hasData = hasDeposit || hasStartEquity || hasRange || hasSharpe;
 
   return (
     <div className="inset methodology-card">
@@ -501,9 +508,16 @@ function MethodologyCard({ methodology, metrics, copy }: {
               {copy.depositSuffix}
             </>
           )}
+          {hasStartEquity && (
+            <>
+              {copy.startEquityPrefix}
+              {fmtAmount(methodology.start_equity_usd, 0)}
+              {copy.startEquitySuffix}
+            </>
+          )}
           {hasRange && (
             <>
-              {!hasDeposit && copy.rangePrefix}
+              {!hasDeposit && !hasStartEquity && copy.rangePrefix}
               {methodology.sample_count}
               {copy.daysSuffix}
               {methodology.start_date} → {methodology.end_date}

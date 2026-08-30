@@ -10,7 +10,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COPY_ZH as COPY } from "@/lib/copy";
-import { fmtUpdatedAtUtc } from "@/lib/format";
+import { fmtAmount, fmtUpdatedAtUtc } from "@/lib/format";
 
 const push = vi.fn();
 let paramsSlug = "core";
@@ -299,6 +299,40 @@ describe("StrategyDetailPage", () => {
       await screen.findByRole("heading", { level: 1, name: "Filet Core" });
       expect(COPY.strategyDetail.metrics.maxDrawdownLabel).toBe("策略期間回撤");
       expect(screen.getByText("策略期間回撤")).toBeInTheDocument();
+    });
+  });
+
+  // ⭐ M3 round4 Task R4-2：起訖淨值方法論句型——有真實入金優先顯示入金句；
+  // 查無入金（`initial_deposit_usd: null`，鏈上查無 deposit 紀錄）時改顯示
+  // 起始權益句（`start_equity_usd`），不再整段落空或誤印 $0。
+  describe("Task R4-2：方法論句型依 deposit 有無切換", () => {
+    const mc = COPY.strategyDetail.methodology;
+
+    it("有真實入金 → 顯示入金句，不顯示起始權益句", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      const { container } = render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      const body = container.querySelector(".methodology-body")?.textContent ?? "";
+      expect(body).toContain(`${mc.depositPrefix}${fmtAmount("1000", 0)}${mc.depositSuffix}`);
+      expect(body).not.toContain(mc.startEquityPrefix);
+    });
+
+    it("查無真實入金（initial_deposit_usd: null）但有 start_equity_usd → 句型切換為起始權益", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        methodology: {
+          ...DETAIL.methodology,
+          initial_deposit_usd: null,
+          start_equity_usd: "500", end_equity_usd: "620",
+        },
+      }));
+      const { container } = render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      const body = container.querySelector(".methodology-body")?.textContent ?? "";
+      expect(body).toContain(`${mc.startEquityPrefix}${fmtAmount("500", 0)}${mc.startEquitySuffix}`);
+      expect(body).not.toContain(mc.depositPrefix);
     });
   });
 });

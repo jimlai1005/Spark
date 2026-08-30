@@ -50,7 +50,7 @@ import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 import { getPublicTraderDetail, type PublicTraderDetail } from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
-import { computeStartEndEquity, metricText } from "@/lib/strategyMetrics";
+import { formatStartEndEquity, metricText } from "@/lib/strategyMetrics";
 
 type ConnectPhase = "idle" | "connecting" | "signing";
 
@@ -112,7 +112,7 @@ export default function TraderDetailPage() {
   const m = trader.metrics;
   const explorerHref = `https://app.hyperliquid.xyz/explorer/address/${trader.address}`;
   const asOf = fmtUpdatedAtUtc(trader.methodology.updated_at);
-  const startEnd = computeStartEndEquity(trader.methodology, trader.equity_index, fmtAmount);
+  const startEnd = formatStartEndEquity(trader.methodology, fmtAmount);
 
   function buildQuery(): string {
     return `strategy=advanced:${trader!.address}`;
