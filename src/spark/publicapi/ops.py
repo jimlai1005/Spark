@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from spark.copytrade.killswitch import count_alerts
-from spark.copytrade.report import compute_trade_quality
+from spark.copytrade.report import compute_trade_quality, pair_fills
 from spark.filet.aggregate import collect_follower_summary
 from spark.filet.engine_health import HEARTBEAT_STALE_S
 from spark.publicapi.billing import map_stripe_status
@@ -189,6 +189,23 @@ def _window_is_whole_utc_days(start: datetime, end: datetime) -> bool:
             datetime.min.time() and end > start)
 
 
+def _percentile_p95(values: list[Decimal]) -> Decimal | None:
+    """p95（奈斯排名法 nearest-rank）：由小到大排序，取第 `⌈0.95×n⌉` 個（1-based）；
+    空列表 → `None`。
+
+    ⭐ 小樣本（`n < 20`）時 p95 常與最大值相同——這是奈斯排名法在稀疏樣本下的
+    正常性質（百分位本來就無法比樣本數分得更細），不是公式錯誤，也不代表「延遲
+    最差的一筆代表了 95% 分位」這種誤讀；面板顯示時應理解為「目前樣本裡最差的
+    那一端」。
+    """
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    idx = -(-(95 * n) // 100) - 1   # ceil(0.95*n) 的 0-based index（整數運算，避免 float）
+    return s[min(max(idx, 0), n - 1)]
+
+
 def follower_trade_quality(ref, adapter, start: datetime, end: datetime, *,
                            leader_fills, skipped_notional,
                            skipped_ratio_comparable: bool) -> dict:
@@ -203,6 +220,14 @@ def follower_trade_quality(ref, adapter, start: datetime, end: datetime, *,
     時間戳），成交名目卻依窗口過濾。兩者只有在窗口恰好是整個 UTC 日時才同基準
     （`_window_is_whole_utc_days`）。不同基準時比例一律回 `None` ＋ note，
     **不硬算**——那個商看起來完全像一個正常的比例，沒有人會發現它是錯的。
+
+    ⭐ `delay_p95_s`／`missed_signal_count`（2026-08-30，M3 R4-1，供
+    `publicapi.app._compute_dashboard_sync` 的同步誤差塊使用）：兩者都只在
+    `te_available` 時可算，且**重用同一個** `pair_fills` 配對（與 `median_delay_s`
+    同一份配對結果，不是另一套配對邏輯——避免「兩邊都叫配對，數字卻對不上」）。
+    `missed_signal_count` ＝ leader 這一窗口的成交筆數減去配對到的筆數（leader
+    有成交、follower 這一窗口內找不到對應的那些筆），**不區分原因**（子單／視窗
+    邊界／其他）——沒有既有來源能診斷「為什麼」，不新造一個看似合理的分類。
     """
     errors: list[str] = []
     try:
@@ -219,6 +244,12 @@ def follower_trade_quality(ref, adapter, start: datetime, end: datetime, *,
     q = compute_trade_quality(leader_fills or [], my_fills,
                               [("", skipped_notional)]
                               if skipped_notional is not None else [])
+    delay_p95_s = None
+    missed_signal_count = None
+    if te_available:
+        paired, _unpaired_mine = pair_fills(leader_fills, my_fills)
+        delay_p95_s = _percentile_p95([p.delay_s for p in paired])
+        missed_signal_count = len(leader_fills) - len(paired)
     row = {
         "account_id": ref.account_id,
         "label": ref.label,
@@ -231,7 +262,9 @@ def follower_trade_quality(ref, adapter, start: datetime, end: datetime, *,
         "te_available": te_available,
         "pair_count": q.pair_count if te_available else None,
         "median_delay_s": q.median_delay_s if te_available else None,
+        "delay_p95_s": delay_p95_s,
         "taker_slippage_bp_median": q.taker_slippage_bp_median if te_available else None,
+        "missed_signal_count": missed_signal_count,
         "skipped_available": skipped_notional is not None,
         "skipped_small_notional": (q.skipped_small_notional
                                    if skipped_notional is not None else None),

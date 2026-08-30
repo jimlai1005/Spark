@@ -663,61 +663,207 @@ def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
     }
 
 
+def _delay_s_to_ms(delay_s: "Decimal | None") -> "int | None":
+    """秒（Decimal，可能含小數）→ 毫秒（int，四捨五入）；`None` 原樣穿透。"""
+    if delay_s is None:
+        return None
+    return int((delay_s * 1000).to_integral_value())
+
+
+def _sync_scale_from_heartbeat(hb: "HeartbeatRead") -> "Decimal | None":
+    """同步偏差比較用的『scale』：唯一既有來源是引擎心跳的
+    `capital.capital_utilization`——與 `/api/me/capital` 判定「生效值」同一道
+    gate（心跳新鮮 `hb.data is not None` 且 `capital.source` 屬
+    `customer_signed`／`env_default` 才可信，見 `me_capital` docstring），
+    只是這裡只投影單一數值。
+
+    ⚠️ 誠實標註：這不是完整的 sizing 公式——`sizing.compute_scale_factor` 還乘了
+    逐幣 `weight`（依波動度算，逐幣逐輪變動）並除以下單當下的 `leader_equity`
+    （逐輪變動），兩者本函式都沒有既有來源可讀（心跳只投影 `capital_utilization`
+    這一個純量）。這是用既有資料能做到的近似值，不重新推導完整公式（不變量：
+    沒有既有來源不新造公式）——`_position_sync_deviation` 算出的偏差因此只是
+    「與資金使用率的粗略對照」，不是「與引擎實際下單目標的精確對照」。
+    讀不到 → `None`。
+    """
+    data = hb.data
+    if data is None:
+        return None
+    cap = data.get("capital") or {}
+    if cap.get("source") not in ("customer_signed", "env_default"):
+        return None
+    util = cap.get("capital_utilization")
+    if util is None:
+        return None
+    try:
+        return Decimal(str(util))
+    except (ValueError, ArithmeticError, TypeError):
+        return None
+
+
+def _position_sync_deviation(
+    leader_positions: "list[dict] | None", follower_positions: "list[dict] | None",
+    scale: "Decimal | None") -> "tuple[int | None, Decimal | None]":
+    """未同步倉位數與部位比例偏差（兩側**當前**持倉 × `scale` 對比，
+    `_dashboard_positions_raw` 同一個形狀：`coin`／`side`／`value`）。
+
+    - 任一側倉位讀不到（`None`）→ `(None, None)`（不造數）。
+    - `unsynced_positions`：某 coin 只出現在一側、或兩側方向相反（多／空對沖）
+      視為未同步；兩側**同方向**持有同一 coin 不算未同步——即使名目差很多，
+      那反映在 `scale_deviation_pct`，不是「沒跟上」。
+    - `scale_deviation_pct`：只在兩側同方向持有同一 coin **且** `scale` 已知時
+      可算：單 coin 偏差 ＝ `|follower_notional − leader_notional×scale| /
+      |leader_notional×scale| × 100`；多個可比 coin 時取**最差值**（沿
+      `ops.trade_quality_summary` 的既有慣例——回最差值不是平均，面板要回答
+      「偏最多的那個倉位差多少」）。`scale` 未知或沒有任何可比對的 coin → `None`。
+    """
+    if leader_positions is None or follower_positions is None:
+        return None, None
+
+    def _directed(rows: "list[dict]") -> "dict[str, Decimal]":
+        out: dict[str, Decimal] = {}
+        for p in rows:
+            v = p["value"] if p["side"] == "long" else -p["value"]
+            out[p["coin"]] = out.get(p["coin"], Decimal("0")) + v
+        return out
+
+    lp, fp = _directed(leader_positions), _directed(follower_positions)
+    unsynced = 0
+    worst_dev: "Decimal | None" = None
+    for coin in set(lp) | set(fp):
+        lv, fv = lp.get(coin, Decimal("0")), fp.get(coin, Decimal("0"))
+        if lv == 0 or fv == 0:
+            if lv != fv:
+                unsynced += 1
+            continue
+        if (lv > 0) != (fv > 0):
+            unsynced += 1
+            continue
+        if scale is not None and scale > 0:
+            expected = lv * scale
+            if expected != 0:
+                dev = (abs(fv - expected) / abs(expected) * 100).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                if worst_dev is None or dev > worst_dev:
+                    worst_dev = dev
+    return unsynced, worst_dev
+
+
+# 同步誤差塊的 60s in-process 快取：沿 `_fees_month_cache` 同一款既有模式
+# （module-level dict + 呼叫端注入的 `now_s` 比較，TTL 判定不偷用 `time.time()`）
+# ——保護 HL 額度（leader/follower 近 24h fills、leader clearinghouseState 皆在
+# `_compute_dashboard_sync` 內發生），且**只快取記憶體、零落盤**：使用者裁決
+# 2026-08-30——同步誤差改為請求時從鏈上計算，明確禁止「存入主機再累積」，
+# in-memory 短 TTL 快取保護額度可以，落盤不行。
+_SYNC_CACHE_TTL_S = 60.0
+_dashboard_sync_cache: "dict[str, tuple[float, dict | None]]" = {}
+
+
 def _dashboard_sync(ref: FollowerRef, hl, mine, hb: "HeartbeatRead",
-                    now_s: float) -> dict:
-    """同步誤差塊：過濾自 `follower_trade_quality`——與 `/api/ops/trade-quality`
-    完全**同一個純函式**，只餵這個帳號自己（不變量 4 的同型：不得跨客戶）。
-    窗口固定近 24 小時，對應 `missed_signals_24h` 命名的語意窗。
+                    follower_positions: "list[dict] | None", now_s: float, *,
+                    cache: "dict[str, tuple[float, dict | None]] | None" = None
+                    ) -> "dict | None":
+    """同步誤差塊：`_compute_dashboard_sync` 的 60s 快取層（計算細節見該函式
+    docstring）。快取鍵＝`account_id`；`cache` 不給 → 用模組層共用字典（正式
+    路徑），測試可傳一份乾淨字典避免跨測試汙染（沿 `_dashboard_fees_month`
+    既有慣例）。**只快取成功結果**：`_compute_dashboard_sync` 內部子查詢的例外
+    已由自己的 try/except 吸收（回傳一份欄位為 null 的字典，而不是拋出），
+    所以快取進去的一律是完整結果，不會有半成品。
+    """
+    cache = _dashboard_sync_cache if cache is None else cache
+    cached = cache.get(ref.account_id)
+    if cached is not None and (now_s - cached[0]) < _SYNC_CACHE_TTL_S:
+        return cached[1]
+    result = _compute_dashboard_sync(ref, hl, mine, hb, follower_positions, now_s)
+    cache[ref.account_id] = (now_s, result)
+    return result
 
-    latency_p95_ms／unsynced_positions／scale_deviation_pct／missed_signals_24h／
-    missed_reason／last_recon_ts：`compute_trade_quality`／`TradeQuality` 未產出
-    這些量（全 repo 搜尋確認），沒有既有來源 → 維持 `None`，不新造公式
-    （R2·C／M3 round3 Task 3：無樣本一律 `None`，絕不送 `0` 冒充「零誤差」）。
 
-    ⭐ M3 round3 Task 3：`data_state` 三態——
+def _compute_dashboard_sync(ref: FollowerRef, hl, mine, hb: "HeartbeatRead",
+                            follower_positions: "list[dict] | None",
+                            now_s: float) -> "dict | None":
+    """同步誤差塊：**請求時直接向鏈上抓資料計算**（使用者裁決 2026-08-30，明確
+    禁止「存入主機再累積」）；過濾自 `follower_trade_quality`——與
+    `/api/ops/trade-quality` 完全**同一個純函式**，只餵這個帳號自己（不變量 4
+    的同型：不得跨客戶）。窗口固定近 24 小時，對應 `missed_signals_24h` 命名的
+    語意窗。**零落盤**：本函式與呼叫鏈上沒有任何檔案寫入，落盤禁令由外層
+    `_dashboard_sync` 的 in-memory TTL 快取層滿足額度保護。
+
+    `mine is None`（尚未活化／未跟單）→ 整塊 `None`：leader 地址的唯一來源是
+    manifest（與 `/api/me/leader` 同一份 `_load_own_follower` 產物），沒有
+    `mine` 就沒有任何東西可比，不留一個看起來有資料的空殼物件。
+
+    latency_median_ms／latency_p95_ms／price_diff_bp：`follower_trade_quality`
+    的 `median_delay_s`／`delay_p95_s`／`taker_slippage_bp_median`（後兩者
+    2026-08-30 新增，p95 見 `ops._percentile_p95`）。missed_signals_24h：
+    leader 24h 內的成交筆數減去配對到的筆數（`ops.follower_trade_quality` 的
+    `missed_signal_count`）。`missed_reason`：沒有任何既有來源能診斷「為什麼」
+    漏配（子單／視窗邊界／其他成因），維持 `None`——不造一個看似合理的分類。
+
+    unsynced_positions／scale_deviation_pct：`_position_sync_deviation`
+    （兩側**當前**持倉，不是 24h 窗口內的成交）；`scale` 讀既有 capital
+    effective（心跳，見 `_sync_scale_from_heartbeat`）。兩欄判準不同——即使
+    `scale` 未知，只要兩側持倉都讀得到，`unsynced_positions` 仍可算，只有
+    `scale_deviation_pct` 落 `None`。
+
+    ⚠️ 工程原則事故 #5（多 dex／多子帳本）：`userFillsByTime` 回**所有** dex 的
+    成交，`clearinghouseState` 只反映預設 dex 的持倉。leader 與 follower 兩側
+    在本函式裡都是呼叫**同一個**端點家族、以同一種方式（不帶 dex 參數）取得，
+    涵蓋範圍兩側對稱（工程原則 1）；本產品目前無多 dex 場景需要另外過濾。
+
+    `last_recon_ts`：本次計算時刻（epoch 秒）——欄位語意由「引擎本機對帳時戳」
+    改為「本次鏈上比對時刻」，引擎本機對帳時戳不再出現於此欄。
+
+    `data_state` 三態（M3 round3 Task 3 既有語意，未變）：
     - `"error"`：這個帳號**自己**的成交查詢失敗（`follower_trade_quality` 內部
       已把 `adapter.get_user_fills` 的例外吞成 `quality_available=False`，不是
-      拋出來——這裡把它投影成一個前端看得懂的狀態，而不是假裝「這一輪沒有樣本」）。
-    - `"warming"`：這個帳號的引擎**從未**發布過心跳（`hb.status == "missing"`，
-      見 `engine_health.HeartbeatRead` 檔頭「剛 activate」）——結構上就是「還沒
-      有時間累積」，不是資料源壞了。
-    - `"ok"`：其餘情況，即使個別欄位仍是 `None`（例如 manifest 未記
-      `leader_address`、或 leader 24h 內沒有成交）——那是「這個來源本來就沒有
-      這個量」，與「還在暖機」是不同的處境，不可疊成同一個狀態（工程原則 1）。
-
-    `since_ts`（跟單啟動時間）：全 repo 沒有既有來源（manifest／心跳都不記
-    follower 首次被引擎追蹤的時刻——`_dashboard_status` 的 `following_days`
-    留 `None` 是同一個既有缺口）。沿用本函式檔頭「沒有既有來源不新造公式」的
-    既有慣例，本輪維持 `None`；`data_state="warming"` 已足以讓前端畫出
-    「跟單啟動後 24h 內開始累積」這句固定文案，不需要精確的起算時刻。
+      拋出來）。
+    - `"warming"`：這個帳號的引擎**從未**發布過心跳（`hb.status == "missing"`）
+      ——結構上就是「還沒有時間累積」，不是資料源壞了。
+    - `"ok"`：其餘情況，即使個別欄位仍是 `None`（那是「這個來源本來就沒有這個
+      量」，與「還在暖機」是不同的處境，不可疊成同一個狀態，工程原則 1）。
     """
+    if mine is None:
+        return None
     end = datetime.fromtimestamp(now_s, timezone.utc)
     start = end - timedelta(hours=24)
     leader_fills = None
-    if mine is not None and mine.leader_address:
+    leader_positions = None
+    if mine.leader_address:
         try:
             leader_fills = hl.get_user_fills(mine.leader_address, start, end)
         except Exception as e:  # noqa: BLE001 — leader 查詢失敗只讓 TE 未知
                                 # （沿 ops_trade_quality 的既有隔離慣例）
             logger.warning("dashboard sync: leader 成交查詢失敗 account=%s: %r",
                           ref.account_id, e)
+        try:
+            leader_state = hl.clearinghouse_state(mine.leader_address)
+            leader_positions = _dashboard_positions_raw(leader_state)
+        except Exception as e:  # noqa: BLE001 — 同上：leader 持倉查詢失敗只讓
+                                # unsynced/scale_deviation 未知，不影響其餘欄位
+            logger.warning("dashboard sync: leader 持倉查詢失敗 account=%s: %r",
+                          ref.account_id, e)
+
     row = follower_trade_quality(ref, hl, start, end, leader_fills=leader_fills,
                                  skipped_notional=None, skipped_ratio_comparable=False)
-    latency_median_ms = None
-    delay_s = row.get("median_delay_s")
-    if delay_s is not None:
-        latency_median_ms = int((delay_s * 1000).to_integral_value())
     if not row.get("quality_available", True):
         data_state = "error"
     elif hb.status == "missing":
         data_state = "warming"
     else:
         data_state = "ok"
+
+    scale = _sync_scale_from_heartbeat(hb)
+    unsynced_positions, scale_deviation_pct = _position_sync_deviation(
+        leader_positions, follower_positions, scale)
+
     return {
-        "latency_median_ms": latency_median_ms, "latency_p95_ms": None,
+        "latency_median_ms": _delay_s_to_ms(row.get("median_delay_s")),
+        "latency_p95_ms": _delay_s_to_ms(row.get("delay_p95_s")),
         "price_diff_bp": row.get("taker_slippage_bp_median"),
-        "unsynced_positions": None, "scale_deviation_pct": None,
-        "missed_signals_24h": None, "missed_reason": None, "last_recon_ts": None,
+        "unsynced_positions": unsynced_positions,
+        "scale_deviation_pct": scale_deviation_pct,
+        "missed_signals_24h": row.get("missed_signal_count"), "missed_reason": None,
+        "last_recon_ts": int(now_s),
         "data_state": data_state, "since_ts": None,
     }
 
@@ -3396,7 +3542,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
         status_block = _safe_block("status", _dashboard_status, mine, hb, acct,
                                    cfg.leaders_path, cfg.exchange_dir)
-        sync_block = _safe_block("sync", _dashboard_sync, ref, hl, mine, hb, now_s)
+        sync_block = _safe_block("sync", _dashboard_sync, ref, hl, mine, hb,
+                                 positions, now_s)
         fees_month_block = _safe_block("fees_month", _dashboard_fees_month,
                                        ref, hl, now_s)
         # ⭐ M3 round3 Task 3（D5 風險護欄）：`risk_controls_enabled` 恆為布林
