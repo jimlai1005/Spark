@@ -101,9 +101,9 @@ def _row(**over):
     呼叫端逐一覆寫想測的欄位）。"""
     base = dict(address=_A, display_name=None, label="0xaaaa…aaaa", coins=(),
                account_bucket="<$10K", spark=(), ret_30d_pct=10.0,
-               max_dd_30d_pct=-5.0, trading_days=60, fill_count_30d=200,
+               max_dd_30d_pct=-5.0, live_days=60, fill_count_30d=200,
                close_win_rate_pct=50.0, concentration_pct=10.0,
-               exposure_dir=None, exposure_pct=None, tags=())
+               exposure_dir=None, exposure_pct=None, tags=(), fills_truncated=False)
     base.update(over)
     return ExploreRow(**base)
 
@@ -138,13 +138,75 @@ def test_win_rate_boundary_100_and_0_are_valid():
 
 
 # ============================================================
+# 純函式：_calendar_span_days（W1：live_days 對取樣密度穩健）
+# ============================================================
+
+def test_calendar_span_days_uses_first_last_point_span_not_distinct_count():
+    """W1 數值錨例：稀疏（雙週間隔）序列，5 點跨 60 天 → live_days=60
+    （不是 distinct 點數 5，也不受中間取樣密度影響——只看首末兩點）。"""
+    two_weeks_ms = 15 * 86_400_000
+    points = [(i * two_weeks_ms, Decimal("1000")) for i in range(5)]  # 天數: 0,15,30,45,60
+    assert hl_explore._calendar_span_days(points) == 60
+
+
+def test_calendar_span_days_dense_daily_series_matches_point_count_minus_one():
+    points = [(i * 86_400_000, Decimal("1000")) for i in range(65)]  # 逐日 65 點
+    assert hl_explore._calendar_span_days(points) == 64
+
+
+def test_calendar_span_days_empty_series_is_zero():
+    assert hl_explore._calendar_span_days([]) == 0
+
+
+# ============================================================
+# 純函式：_fills_stats 滿頁偵測（W2 最小版：R-A 分頁 helper 落地前）
+# ============================================================
+
+def _synthetic_fill(coin="BTC", px="100", sz="1", closed_pnl="1"):
+    return {"coin": coin, "px": px, "sz": sz, "closed_pnl": closed_pnl}
+
+
+def test_fills_stats_full_page_marks_truncated_and_fill_count_is_lower_bound():
+    fills = [_synthetic_fill() for _ in range(hl_explore.FILLS_PAGE_LIMIT)]
+    fill_count, _win_rate, _concentration, _coins, truncated = hl_explore._fills_stats(fills)
+    assert fill_count == hl_explore.FILLS_PAGE_LIMIT
+    assert truncated is True
+
+
+def test_fills_stats_under_page_limit_is_not_truncated():
+    fills = [_synthetic_fill() for _ in range(5)]
+    *_rest, truncated = hl_explore._fills_stats(fills)
+    assert truncated is False
+
+
+def test_fills_stats_empty_is_not_truncated():
+    fill_count, win_rate, concentration, coins, truncated = hl_explore._fills_stats([])
+    assert (fill_count, win_rate, concentration, coins, truncated) == (0, None, None, (), False)
+
+
+def test_enrich_candidate_propagates_fills_truncated_flag_end_to_end():
+    """滿頁 fills → `ExploreRow.fills_truncated=True`，`qualify` 的 `>=` 比較
+    不受影響（真實筆數只會 ≥ 這個下限，見 hl_explore.py `_fills_stats` 檔頭）。"""
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    fills = [_synthetic_fill() for _ in range(hl_explore.FILLS_PAGE_LIMIT)]
+    row = enrich_candidate(_A, None, portfolio_raw, fills, _ch_state())
+    assert row is not None
+    assert row.fills_truncated is True
+    assert row.fill_count_30d == hl_explore.FILLS_PAGE_LIMIT
+    cfg = ExploreConfig(min_trading_days=0, min_fills=hl_explore.FILLS_PAGE_LIMIT)
+    # exclude_concentrated 關掉：這裡的合成 fills 全是同一幣種（單純測滿頁/
+    # fill_count 下限語意），不是本測試要驗的東西。
+    assert qualify(row, cfg, exclude_concentrated=False) is True
+
+
+# ============================================================
 # 純函式：enrich_candidate（含共用 fills fixture）
 # ============================================================
 
-def test_enrich_candidate_computes_return_drawdown_trading_days_and_win_rate():
+def test_enrich_candidate_computes_return_drawdown_live_days_and_win_rate():
     portfolio_raw = _portfolio_raw(
         month_values=[1000, 900, 1100],       # 首900跌至900（-10%）後回升至1100（+10%）
-        alltime_values=[1000] * 65,             # 65 個 distinct UTC 天
+        alltime_values=[1000] * 65,             # 65 個逐日點（1 天一點，跨 64 天）
     )
     fills = _sample_fills()                     # 2 筆，closedPnl 皆 >0 → 勝率 100%
     ch_state = _ch_state(account_value="50000", positions=[_position("BTC", "1.5")])
@@ -157,12 +219,14 @@ def test_enrich_candidate_computes_return_drawdown_trading_days_and_win_rate():
     assert row.label == "Alice"
     assert row.ret_30d_pct == 10.0                     # (1100/1000 - 1) * 100
     assert row.max_dd_30d_pct == -10.0                  # 900/1000 - 1
-    assert row.trading_days == 65
+    assert row.live_days == 64                          # W1：首末點日曆跨距（65 點、
+                                                          # 逐日一點 → 首末相差 64 天）
     assert row.fill_count_30d == 2
     assert row.close_win_rate_pct == 100.0
     assert row.account_bucket == "$10K–$100K"
     assert row.exposure_dir == "long"
     assert len(row.spark) == 3
+    assert row.fills_truncated is False
 
 
 def test_enrich_candidate_label_falls_back_to_abbreviated_address_when_no_display_name():
@@ -211,24 +275,24 @@ def test_enrich_candidate_short_exposure_when_short_dominant():
 # 純函式：qualify — 資格過濾邊界（等號行為釘死）
 # ============================================================
 
-def test_qualify_trading_days_exactly_at_threshold_passes():
+def test_qualify_live_days_exactly_at_threshold_passes():
     cfg = ExploreConfig(min_trading_days=60, min_fills=0)
-    assert qualify(_row(trading_days=60, fill_count_30d=0), cfg) is True
+    assert qualify(_row(live_days=60, fill_count_30d=0), cfg) is True
 
 
-def test_qualify_trading_days_one_below_threshold_fails():
+def test_qualify_live_days_one_below_threshold_fails():
     cfg = ExploreConfig(min_trading_days=60, min_fills=0)
-    assert qualify(_row(trading_days=59, fill_count_30d=0), cfg) is False
+    assert qualify(_row(live_days=59, fill_count_30d=0), cfg) is False
 
 
 def test_qualify_fill_count_exactly_at_threshold_passes():
     cfg = ExploreConfig(min_trading_days=0, min_fills=200)
-    assert qualify(_row(trading_days=0, fill_count_30d=200), cfg) is True
+    assert qualify(_row(live_days=0, fill_count_30d=200), cfg) is True
 
 
 def test_qualify_fill_count_one_below_threshold_fails():
     cfg = ExploreConfig(min_trading_days=0, min_fills=200)
-    assert qualify(_row(trading_days=0, fill_count_30d=199), cfg) is False
+    assert qualify(_row(live_days=0, fill_count_30d=199), cfg) is False
 
 
 def test_qualify_drawdown_exactly_at_cap_passes():
@@ -259,7 +323,7 @@ def test_qualify_concentration_none_passes_no_evidence_no_penalty():
 def test_qualify_chips_can_be_toggled_off_independently():
     cfg = ExploreConfig(min_trading_days=60, min_fills=200,
                         max_drawdown_pct=Decimal("30"), max_concentration_pct=Decimal("90"))
-    bad_row = _row(trading_days=1, fill_count_30d=1, max_dd_30d_pct=-99.0,
+    bad_row = _row(live_days=1, fill_count_30d=1, max_dd_30d_pct=-99.0,
                    concentration_pct=99.0)
     assert qualify(bad_row, cfg, require_sample=False, max_dd_filter=False,
                   exclude_concentrated=False) is True
@@ -475,6 +539,47 @@ def test_call_hl_non_429_error_still_skips_only_that_address_not_whole_build():
     assert _A not in addrs
     assert _B in addrs
     assert result["building"] is False
+
+
+def test_call_hl_non_429_exception_still_sleeps_the_throttle_interval():
+    """C4 殘洞修法：`_call_hl` 的節流不再只掛在成功路徑——上游丟出非 429 的
+    錯誤（例如連線重置／5xx，`_is_rate_limited` 判斷為 False，立即上拋、不
+    重試）時，也必須先睡滿一次 `enrich_call_interval_s` 才離開這個函式，
+    否則地址與地址之間的節流在上游故障時會退化回無節流的 burst（見模組
+    檔頭 C4 記錄）。"""
+    sleeps: list[float] = []
+
+    def always_fails():
+        raise ConnectionError("connection reset by peer")
+
+    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
+                         excluded_fn=lambda: set(),
+                         cfg=ExploreConfig(enrich_call_interval_s=0.7),
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
+
+    with pytest.raises(ConnectionError):
+        index._call_hl(always_fails, what="test address=0xabc")
+
+    assert sleeps == [0.7]
+
+
+def test_call_hl_rate_limited_abort_path_still_sleeps_the_throttle_interval():
+    """同一條 finally 保底也涵蓋 429 退避耗盡的 `_RateLimitedAbort` 路徑。"""
+    sleeps: list[float] = []
+
+    def always_429():
+        raise RuntimeError(_429_MESSAGE)
+
+    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
+                         excluded_fn=lambda: set(),
+                         cfg=ExploreConfig(enrich_call_interval_s=0.7),
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
+
+    with pytest.raises(hl_explore._RateLimitedAbort):
+        index._call_hl(always_429, what="test address=0xabc")
+
+    # 三次退避延遲（2s/8s/30s）之後，finally 補一次節流間隔（0.7s）。
+    assert sleeps == [2.0, 8.0, 30.0, 0.7]
 
 
 def test_index_query_never_built_returns_building_true_and_empty_rows_without_blocking():

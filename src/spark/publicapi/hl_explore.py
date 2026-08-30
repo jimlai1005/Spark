@@ -43,9 +43,37 @@
    limited`。單一地址的**非** 429 錯誤（真的讀不到、格式錯誤…）維持原本
    「跳過該列」語意，不觸發中止。
 
+⚠️ 2026-08-30 review 修正輪殘洞（C4）：上一版 `_call_hl` 的節流只掛在成功路徑
+（`fn()` 不丟例外才 `_sleep_fn`）。上游若大量回連線重置／5xx 這類**非** 429 的
+錯誤，地址的第一個 HL 呼叫就失敗、立刻 `raise` 出去給 `_enrich_one` 跳過整列，
+`_call_hl` 從未走到那行 sleep——節流形同虛設，退化回 burst（與本節開頭那次
+事故同一種症狀，只是觸發條件從「429」換成「非 429 的 transient 故障」）。
+修法：節流改掛在 `finally`，包住整個 `_call_hl` 呼叫（含其內部的 429 重試
+迴圈）——不論最終是成功回傳、非 429 例外原樣往上拋、還是 429 退避耗盡拋出
+`_RateLimitedAbort`，離開這個函式之前都會先睡滿一次
+`enrich_call_interval_s`，讓節流不再取決於「這次呼叫有沒有成功」。
+
+W1（trading_days → live_days）：`trading_days` 原本量 perpAllTime 降採樣序列
+的 distinct UTC 曆日數——但 `leader_perf.py` 檔頭已言明長帳戶的降採樣間隔約
+兩週一點，distinct 日數會隨上游取樣密度漂移（同一顆帳戶，取樣變稀疏，這個
+數字就跟著掉，門檻判斷因此不穩），且新開倉、不動帳戶只要序列裡有夠多稀疏
+的舊點也可能拿到偏高的值。改為**首末點的日曆跨距天數**（只依賴序列的頭尾
+兩個時間戳，對中間取樣密度不敏感），欄位改名 `live_days`，語意＝「這顆帳戶
+從第一筆到最後一筆觀測，已經實盤了多少天」；`EXPLORE_MIN_TRADING_DAYS` 門檻
+語意同步改成「實盤 ≥ 60 天」（env var 名稱本身保留，見 `ExploreConfig`）。
+
+W2（`_fills_stats` 分頁上限最小版）：本函式建立在 `hl.get_fills_detail()`
+單次呼叫（HL `userFillsByTime` 單頁上限 2000 筆）上，卻標「近 30D」。R-A
+（`hl.py`）落地分頁 helper 前的最小版修法：偵測滿頁（`len(fills) >= 2000`）
+→ `fill_count_30d`／勝率／集中度標記為「基於已抓到的樣本」的下限值，
+`ExploreRow.fills_truncated=True`；`qualify()` 的 `fill_count_30d >= min_fills`
+仍成立（真實筆數只會 ≥ 回傳筆數，不會把不合格的地址誤判為合格）。
+**TODO**：R-A 分頁 helper（`FILET_FILLS_MAX_PAGES`）落地後，本模組應改用它
+翻到頁數上限，而不是自己在這裡重複實作分頁。
+
 工程原則 1（同源同基準）的落地：`ret_30d_pct`／`max_dd_30d_pct`／`spark` 三者
 出自**同一次** `portfolio()` 回應的**同一個** perpMonth `accountValueHistory`
-序列；`trading_days` 出自同一次回應的 perpAllTime 序列；三者不混用不同窗口
+序列；`live_days` 出自同一次回應的 perpAllTime 序列首末點；三者不混用不同窗口
 或不同端點的資料。曝險（`exposure`）與帳戶規模 bucket 出自**同一次**
 `clearinghouse_state()` 回應。
 """
@@ -81,6 +109,9 @@ ENRICH_CACHE_TTL_S = 1800.0  # 30 分鐘 per-address enrich 快取（D1）
 ENRICH_CACHE_MAX = 256       # LRU 上限（D1）
 FILLS_WINDOW_DAYS = 30
 SPARK_POINTS = 30
+# HL `userFillsByTime` 單頁上限（W2 最小版：R-A 分頁 helper 落地前，本模組
+# 只打一頁，滿頁時把 fill_count_30d 等欄位降級成下限值，見模組檔頭 W2 記錄）。
+FILLS_PAGE_LIMIT = 2000
 # 風險調整排序鍵的回撤下限（D2）：回撤為 0 時代入，避免除零把新帳戶推上榜首。
 _DD_FLOOR_PCT = Decimal("0.5")
 
@@ -114,6 +145,11 @@ def _is_rate_limited(exc: Exception) -> bool:
 @dataclass(frozen=True)
 class ExploreConfig:
     candidate_pool: int = DEFAULT_CANDIDATE_POOL
+    # W1（2026-08-30 review 修正輪）：語意已從「distinct 交易日數」改為
+    # 「perpAllTime 首末點日曆跨距天數」（`ExploreRow.live_days`），
+    # 門檻語意＝「實盤 ≥ min_trading_days 天」。屬性名與 env var 名稱
+    # （`EXPLORE_MIN_TRADING_DAYS`）保留不改，避免無謂的批次改名——
+    # 這裡是唯一需要知道新語意的地方。
     min_trading_days: int = DEFAULT_MIN_TRADING_DAYS
     min_fills: int = DEFAULT_MIN_FILLS
     max_drawdown_pct: Decimal = DEFAULT_MAX_DRAWDOWN_PCT
@@ -143,6 +179,8 @@ class ExploreConfig:
 
         return cls(
             candidate_pool=_int("EXPLORE_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL),
+            # 名稱保留（見 ExploreConfig.min_trading_days 欄位註記），語意已改
+            # 為「live_days（日曆跨距）門檻」。
             min_trading_days=_int("EXPLORE_MIN_TRADING_DAYS", DEFAULT_MIN_TRADING_DAYS),
             min_fills=_int("EXPLORE_MIN_FILLS", DEFAULT_MIN_FILLS),
             max_drawdown_pct=_dec("EXPLORE_MAX_DRAWDOWN_PCT", DEFAULT_MAX_DRAWDOWN_PCT),
@@ -167,7 +205,7 @@ class ExploreRow:
     spark: tuple[float, ...]       # perpMonth accountValueHistory downsample（≤30 點）
     ret_30d_pct: float
     max_dd_30d_pct: float          # 負值或 0；絕對值愈大回撤愈深
-    trading_days: int
+    live_days: int                 # W1：perpAllTime 首末點日曆跨距天數（非 distinct 日數）
     fill_count_30d: int
     close_win_rate_pct: float | None   # None＝資料錯誤或無足夠樣本（R2-02）
     concentration_pct: float | None
@@ -176,6 +214,8 @@ class ExploreRow:
     exposure_pct: float | None
     tags: tuple[str, ...] = ()     # 子集 {"low_drawdown", "concentrated"}（D14：
                                     # locale 中性代碼，前端自行對映顯示文案）
+    fills_truncated: bool = False  # W2：近 30D fills 讀到單頁上限（見 _fills_stats）
+                                    # → fill_count_30d/勝率/集中度是下限值/樣本估計
 
     def to_dict(self) -> dict:
         return {
@@ -187,12 +227,13 @@ class ExploreRow:
             "spark": list(self.spark),
             "ret_30d_pct": self.ret_30d_pct,
             "max_dd_30d_pct": self.max_dd_30d_pct,
-            "trading_days": self.trading_days,
+            "live_days": self.live_days,
             "fill_count_30d": self.fill_count_30d,
             "close_win_rate_pct": self.close_win_rate_pct,
             "concentration_pct": self.concentration_pct,
             "exposure": {"dir": self.exposure_dir, "pct": self.exposure_pct},
             "tags": list(self.tags),
+            "fills_truncated": self.fills_truncated,
         }
 
 
@@ -224,11 +265,20 @@ def _return_and_drawdown(av_points: list[tuple[int, Decimal]]
     return ret_pct, min_dd * 100
 
 
-def _distinct_utc_days(av_points: list[tuple[int, Decimal]]) -> int:
-    """D2：交易日＝perpAllTime accountValueHistory 的 distinct UTC 日數。"""
-    days = {datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date()
-            for ts, _ in av_points}
-    return len(days)
+def _calendar_span_days(av_points: list[tuple[int, Decimal]]) -> int:
+    """W1（2026-08-30 review 修正輪，取代舊版 distinct-day 計法）：`live_days`
+    ＝perpAllTime accountValueHistory **首末點的日曆跨距天數**
+    `(最後一點日期 - 第一點日期).days`。只依賴序列頭尾兩個時間戳，對中間
+    取樣密度不敏感——舊版數 distinct UTC 曆日會隨上游降採樣間隔（長帳戶約
+    兩週一點，見 `leader_perf.py` 檔頭）漂移，同一顆帳戶换一次取樣密度，
+    這個數字就跟著變，門檻判斷因此不穩定（見模組檔頭 W1 記錄）。
+    空序列（理論上不會發生，`enrich_candidate` 已在呼叫前確認 perpAllTime
+    視窗存在）→ 0，不拋例外。"""
+    if not av_points:
+        return 0
+    first_date = datetime.fromtimestamp(av_points[0][0] / 1000, tz=timezone.utc).date()
+    last_date = datetime.fromtimestamp(av_points[-1][0] / 1000, tz=timezone.utc).date()
+    return (last_date - first_date).days
 
 
 def _downsample_floats(values: list[Decimal], n: int = SPARK_POINTS) -> list[float]:
@@ -259,18 +309,25 @@ def _win_rate_pct(wins: int, closed: int) -> float | None:
 
 
 def _fills_stats(fills: list[dict]) -> tuple[int, float | None, float | None,
-                                              tuple[str, ...]]:
+                                              tuple[str, ...], bool]:
     """近 30D fills（`hl.get_fills_detail()` 的輸出形狀：coin/px/sz/closed_pnl
-    等鍵，見 `hl.py`）→ `(fill_count, close_win_rate_pct, concentration_pct, coins)`。
+    等鍵，見 `hl.py`）→
+    `(fill_count, close_win_rate_pct, concentration_pct, coins, truncated)`。
 
     - fill_count：窗內全部成交筆數（含開倉與結倉），對齊 D3 `EXPLORE_MIN_FILLS`
       門檻的樣本量語意。
     - 結倉勝率：`closedPnl != 0` 的結倉 fill 中 `closedPnl > 0` 的占比（D2）。
     - 集中度：成交額（`abs(px*sz)`）最大幣種占全部成交額之比（D2）。
     - coins：成交額前 2-3 名幣種（降冪），不足則全部列出。
+    - truncated（W2 最小版）：`len(fills) >= FILLS_PAGE_LIMIT`——`hl.
+      get_fills_detail()` 目前只打一頁（單頁上限 2000 筆），滿頁代表窗內
+      實際筆數可能更多。`True` 時上面的 `fill_count`／勝率／集中度都只是
+      「已抓到樣本」的下限值／估計值，不是完整窗口真值（見模組檔頭 W2
+      記錄；qualify 的 `fill_count_30d >= min_fills` 比較不受影響——真實筆數
+      只會 ≥ 這裡回傳的下限）。
     """
     if not fills:
-        return 0, None, None, ()
+        return 0, None, None, (), False
     wins = closed = 0
     notional_by_coin: dict[str, Decimal] = {}
     total_notional = Decimal("0")
@@ -303,7 +360,8 @@ def _fills_stats(fills: list[dict]) -> tuple[int, float | None, float | None,
                               .quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
     coins = tuple(c for c, _ in sorted(notional_by_coin.items(),
                                        key=lambda kv: kv[1], reverse=True)[:3])
-    return len(fills), win_rate, concentration, coins
+    truncated = len(fills) >= FILLS_PAGE_LIMIT
+    return len(fills), win_rate, concentration, coins, truncated
 
 
 def _account_value(ch_state: dict) -> Decimal | None:
@@ -407,10 +465,10 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     if all_time is None:
         return None
     av_all, _ = all_time
-    trading_days = _distinct_utc_days(av_all)
+    live_days = _calendar_span_days(av_all)
 
     spark = _downsample_floats([v for _, v in av_month])
-    fill_count, win_rate, concentration, coins = _fills_stats(fills or [])
+    fill_count, win_rate, concentration, coins, fills_truncated = _fills_stats(fills or [])
     account_value = _account_value(ch_state)
     bucket = _account_bucket(account_value)
     positions = _parse_positions(ch_state)
@@ -425,13 +483,14 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
         spark=tuple(spark),
         ret_30d_pct=float(ret_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
         max_dd_30d_pct=float(dd_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-        trading_days=trading_days,
+        live_days=live_days,
         fill_count_30d=fill_count,
         close_win_rate_pct=win_rate,
         concentration_pct=concentration,
         exposure_dir=exp_dir,
         exposure_pct=exp_pct,
         tags=(),
+        fills_truncated=fills_truncated,
     )
 
 
@@ -465,15 +524,18 @@ def qualify(row: ExploreRow, cfg: ExploreConfig, *, require_sample: bool = True,
 
     邊界（equal 一律算通過——常數描述的是「上限」/「下限」，卡在門檻上不該被
     無聲刷掉；本模組唯一的權威定義，測試逐條釘死）：
-    - 樣本門檻：`trading_days >= min_trading_days` 且 `fill_count_30d >= min_fills`
-      （下限，"至少"語意，等於門檻通過）。
+    - 樣本門檻：`live_days >= min_trading_days`（W1：live_days＝perpAllTime
+      首末點日曆跨距天數，門檻語意＝「實盤 ≥ min_trading_days 天」）且
+      `fill_count_30d >= min_fills`（下限，"至少"語意，等於門檻通過；W2：
+      `fills_truncated=True` 時 `fill_count_30d` 本身是下限值，真實筆數只會
+      更多，這條比較方向不受影響）。
     - 回撤上限：`abs(max_dd_30d_pct) <= max_drawdown_pct`（等於門檻通過）。
     - 集中度上限：`concentration_pct <= max_concentration_pct`（等於門檻通過；
       `None`＝無成交量資料可算集中度，視為通過——沒有證據代表集中，不得因為
       缺資料就先假設它超標）。
     """
     if require_sample:
-        if row.trading_days < cfg.min_trading_days:
+        if row.live_days < cfg.min_trading_days:
             return False
         if row.fill_count_30d < cfg.min_fills:
             return False
@@ -581,35 +643,47 @@ class ExploreIndex:
 
     def _call_hl(self, fn: Callable[[], object], *, what: str) -> object:
         """單一 HL 呼叫的節流＋429 退避重試邊界（見類別所在模組檔頭 2026-08-30
-        事故記錄）。每個請求之間（不是每個地址之間）睡 `cfg.enrich_call_interval_s`，
-        保護與實盤引擎共用的 HL 額度。
+        事故記錄＋ review 修正輪 C4 殘洞記錄）。每個請求之間（不是每個地址之間）
+        睡 `cfg.enrich_call_interval_s`，保護與實盤引擎共用的 HL 額度。
 
         429（rate limited；讀操作冪等 → 視為 transient，工程原則 2）→ 指數退避
         `RATE_LIMIT_RETRY_DELAYS_S`（2s/8s/30s）；退避耗盡仍 429 → `_RateLimitedAbort`
         （額度已被打穿，往上傳給 `build_sync` 中止整輪建置，不是跳過這一個地址）。
         非 429 的其他錯誤 → 不重試，直接上拋（呼叫端 `_enrich_one` 既有的
         「跳過該列」語意，不變）。
+
+        ⭐ C4 殘洞修法：節流 sleep 掛在 `finally`，包住**整個** `_call_hl`
+        呼叫（含內部的 429 重試迴圈），而不是只掛在成功的那一行。這樣不論
+        最終走哪條退出路徑——`fn()` 成功回傳、非 429 例外原樣往上拋、還是
+        429 退避耗盡拋出 `_RateLimitedAbort`——離開這個函式之前都會先睡滿
+        一次 `enrich_call_interval_s`。舊版把 sleep 放在 try 區塊內「成功」
+        分支的最後一行，非 429 例外會直接從 `except` 的 `raise` 跳出整個
+        函式、完全不經過那一行，節流因此對這條路徑形同不存在（見模組檔頭
+        C4 記錄）。429 重試迴圈內部各次退避已有自己的延遲（2s/8s/30s，遠大於
+        `enrich_call_interval_s`），多睡一次介於 finally 的間隔不影響整體
+        退避節奏，只是多一層保底。
         """
         delays = RATE_LIMIT_RETRY_DELAYS_S
-        for attempt in range(len(delays) + 1):
-            try:
-                result = fn()
-            except Exception as e:
-                if not _is_rate_limited(e):
-                    raise
-                if attempt == len(delays):
-                    logger.error(
-                        "build aborted: rate limited（%s，退避 %d 次仍 429）", what, len(delays))
-                    raise _RateLimitedAbort(what) from e
-                delay = delays[attempt]
-                logger.warning(
-                    "explore %s：429 rate limited（第 %d/%d 次退避），%.0fs 後重試",
-                    what, attempt + 1, len(delays), delay)
-                self._sleep_fn(delay)
-                continue
+        try:
+            for attempt in range(len(delays) + 1):
+                try:
+                    return fn()
+                except Exception as e:
+                    if not _is_rate_limited(e):
+                        raise
+                    if attempt == len(delays):
+                        logger.error(
+                            "build aborted: rate limited（%s，退避 %d 次仍 429）",
+                            what, len(delays))
+                        raise _RateLimitedAbort(what) from e
+                    delay = delays[attempt]
+                    logger.warning(
+                        "explore %s：429 rate limited（第 %d/%d 次退避），%.0fs 後重試",
+                        what, attempt + 1, len(delays), delay)
+                    self._sleep_fn(delay)
+            raise RuntimeError("unreachable")  # pragma: no cover
+        finally:
             self._sleep_fn(self._cfg.enrich_call_interval_s)
-            return result
-        raise RuntimeError("unreachable")  # pragma: no cover
 
     def _enrich_one(self, address: str, display_name: str | None) -> ExploreRow | None:
         """per-address enrich，帶 30 分鐘 TTL、LRU 256 上限快取（近似 LRU：
