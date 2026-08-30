@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAccount, useConnectorClient } from "wagmi";
 import {
   ApiError, createAgent, getApproveAgentPayload, getApproveBuilderFeePayload,
@@ -16,6 +16,14 @@ type CardPhase =
   | { t: "submitted" }
   | { t: "error"; message: string; retrySubmit?: () => Promise<unknown> };
 
+/**
+ * agent 準備錯誤——兩種需要區分（2026-08-29 M3 round2 Task 3）：
+ * - "unavailable"（502，keysvc 打不通/掛了）：可重試，故帶重試按鈕。
+ * - "conflict"（409 + code=="agent_conflict"，keystore 與 DB 狀態不一致且
+ *   自癒失敗）：重試無法自己修好，需人工介入，不給重試按鈕。
+ */
+type AgentErrorState = { kind: "unavailable" | "conflict"; message: string } | null;
+
 interface StepSignProps {
   status: OnboardStatus;
   loginAddress: string;      // session 地址（recover 預驗基準）
@@ -27,21 +35,38 @@ export function StepSign({ status, loginAddress, refetchStatus }: StepSignProps)
   const c = COPY.wizard;
   const { address, chainId } = useAccount();
   const { data: client } = useConnectorClient();
-  const [agentError, setAgentError] = useState<string | null>(null);
+  const [agentError, setAgentError] = useState<AgentErrorState>(null);
   const ensuring = useRef(false);
 
-  // 進入本步自動確保 agent 存在（設計定案 15）；409（已有 agent）視為成功。
-  useEffect(() => {
-    if (status.agent_generated || ensuring.current) return;
+  // 確保 agent 存在（設計定案 15）。409 分兩種語意（app.py::onboard_agent）：
+  // code=="agent_exists"（或向後相容的無 code 409）＝ 已有 agent，視為成功；
+  // code=="agent_conflict" ＝ keystore 與 DB 不一致且自癒失敗，是真失敗，
+  // 之前兩者被無條件當成功是隱藏 bug（使用者看不到「金鑰狀態異常」的事實）。
+  const attemptCreateAgent = useCallback(() => {
+    if (ensuring.current) return Promise.resolve();
     ensuring.current = true;
-    createAgent()
+    setAgentError(null);
+    return createAgent()
       .then(() => refetchStatus())
       .catch((e: unknown) => {
-        if (e instanceof ApiError && e.status === 409) refetchStatus();
-        else setAgentError(c.errors.agentUnavailable);
+        if (e instanceof ApiError && e.status === 409) {
+          if (e.code === "agent_conflict") {
+            setAgentError({ kind: "conflict", message: c.errors.agentConflict });
+          } else {
+            refetchStatus();
+          }
+        } else {
+          setAgentError({ kind: "unavailable", message: c.errors.agentUnavailable });
+        }
       })
       .finally(() => { ensuring.current = false; });
-  }, [status.agent_generated, refetchStatus, c.errors.agentUnavailable]);
+  }, [refetchStatus, c.errors.agentConflict, c.errors.agentUnavailable]);
+
+  useEffect(() => {
+    if (status.agent_generated) return;
+    void attemptCreateAgent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status.agent_generated]);
 
   function signRaw(typedDataJson: string): Promise<string> {
     if (!client || !address) return Promise.reject(new Error("wallet not ready"));
@@ -82,7 +107,15 @@ export function StepSign({ status, loginAddress, refetchStatus }: StepSignProps)
         <p className="hint">{c.agentPreparing}</p>
       )}
       {agentError && (
-        <div className="sign-error"><p>{agentError}</p></div>
+        <div className="sign-error">
+          <p>{agentError.message}</p>
+          {agentError.kind === "unavailable" && (
+            <button type="button" className="btn btn-ghost"
+              onClick={() => void attemptCreateAgent()}>
+              {COPY.common.retry}
+            </button>
+          )}
+        </div>
       )}
       <SignCard
         name={c.agentCardName} desc={c.agentCardDesc}

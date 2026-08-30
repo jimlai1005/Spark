@@ -92,12 +92,6 @@ export function PnlCard({ pnl }: { pnl: DashboardPnl | null }) {
             {pnl?.max_drawdown_pct != null ? `${pnl.max_drawdown_pct}%` : NO_VALUE}
           </div>
         </div>
-        <div>
-          <div className="dash-pnl-metric-label">{c.feeShare}</div>
-          <div className="mono dash-pnl-metric-value">
-            {pnl?.fee_share_of_pnl_pct != null ? `${pnl.fee_share_of_pnl_pct}%` : NO_VALUE}
-          </div>
-        </div>
       </div>
     </div>
   );

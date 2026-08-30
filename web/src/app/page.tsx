@@ -208,13 +208,13 @@ export default function HomePage() {
       </section>
 
       {/* ---------- 策略區 ---------- */}
-      <section className="home-strategies">
+      <section className="home-strategies" id="strategies">
         <div className="home-strategies-head">
           <div>
             <h2>{home.strategies.heading}</h2>
             <p className="section-sub">{home.strategies.sub}</p>
           </div>
-          <Link href="/strategies" className="home-strategies-viewall">
+          <Link href="/leaderboard" className="home-strategies-viewall">
             {home.strategies.viewAll}
           </Link>
         </div>

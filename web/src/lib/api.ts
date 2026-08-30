@@ -37,9 +37,17 @@ export class ApiError extends Error {
    * （文案會改，分類碼不會——分類在邊界完成，工程原則 5）。
    */
   readonly reason?: string;
+  /**
+   * 第二種機器可判分類碼——與 `reason` 同源機制（後端 detail 為結構化物件時才有值），
+   * 但欄位名分開：`reason` 是自訂 leader 准入既有慣例，`code` 是
+   * `/api/onboard/agent` 兩種 409 的區分碼（"agent_exists" 成功義／"agent_conflict"
+   * 失敗義——2026-08-29 M3 round2 Task 3，修「兩種 409 前端無法區分」的隱藏 bug）。
+   */
+  readonly code?: string;
 
   constructor(
     kind: ApiErrorKind, message: string, status?: number, detail?: string, reason?: string,
+    code?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -47,6 +55,7 @@ export class ApiError extends Error {
     this.status = status;
     this.detail = detail;
     this.reason = reason;
+    this.code = code;
   }
 }
 
@@ -127,11 +136,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     .json()
     .then((b: { detail?: unknown }) => b?.detail)
     .catch(() => undefined);
-  // 後端 detail 兩種形狀：字串（多數端點）或 `{reason, message}` 物件（自訂 leader
-  // 准入，reason 為機器可判分類碼）。在邊界拆開，呼叫端拿到的 detail 恆為人話字串。
+  // 後端 detail 三種形狀：字串（多數端點）、`{reason, message}` 物件（自訂 leader
+  // 准入，reason 為機器可判分類碼）、`{code, message}` 物件（/api/onboard/agent
+  // 的兩種 409，code 為機器可判分類碼）。在邊界拆開，呼叫端拿到的 detail 恆為人話字串。
   const structured =
     raw !== null && typeof raw === "object" && !Array.isArray(raw)
-      ? (raw as { reason?: unknown; message?: unknown })
+      ? (raw as { reason?: unknown; message?: unknown; code?: unknown })
       : undefined;
   const detail =
     typeof raw === "string"
@@ -141,14 +151,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         : undefined;
   const reason =
     structured && typeof structured.reason === "string" ? structured.reason : undefined;
-  if (res.status === 401) throw new ApiError("auth", detail ?? "未登入", 401, detail, reason);
+  const code =
+    structured && typeof structured.code === "string" ? structured.code : undefined;
+  if (res.status === 401) {
+    throw new ApiError("auth", detail ?? "未登入", 401, detail, reason, code);
+  }
   if (res.status === 502 || res.status === 503) {
-    throw new ApiError("upstream", detail ?? "上游服務暫時不可用", res.status, detail, reason);
+    throw new ApiError(
+      "upstream", detail ?? "上游服務暫時不可用", res.status, detail, reason, code);
   }
   // 非 502/503 的其他 5xx（如 500）目前歸類 client：後端現況不產生此類回應，
   // 若未來出現需重新評估歸 upstream（並補對應測試），此處僅記錄現況假設。
   throw new ApiError(
-    "client", detail ?? `請求失敗（HTTP ${res.status}）`, res.status, detail, reason);
+    "client", detail ?? `請求失敗（HTTP ${res.status}）`, res.status, detail, reason, code);
 }
 
 function post<T>(path: string, body?: unknown): Promise<T> {
@@ -1464,4 +1479,63 @@ export interface DashboardResp {
 /** 使用者 Dashboard 六塊＋持倉（需登入 session）。冪等讀取，重試安全。 */
 export function getDashboard(): Promise<DashboardResp> {
   return request<DashboardResp>("/api/me/dashboard");
+}
+
+// ---------- 成交記錄・授權歷程（M3 round2 Task 7；對照 publicapi/app.py
+// GET /api/me/fills、GET /api/me/authorizations）----------
+// ⭐ 兩者資料**直取 Hyperliquid**（userFillsByTime／explorer userDetails），
+// 結構上不讀自家 DB（per 使用者要求）。上游失敗一律 503（kind=upstream），
+// 顯示層不得 fallback 顯示任何自家資料。
+
+/**
+ * 一筆成交明細（`/api/me/fills`）。金額一律 string（後端不轉 float，前端只在
+ * 顯示層 `fmtAmount` 才轉數值，沿全站 Decimal 慣例）。`hash` 連
+ * `https://app.hyperliquid.xyz/explorer/tx/{hash}`。
+ */
+export interface MyFillRow {
+  time: number;
+  coin: string;
+  side: string;
+  px: string;
+  sz: string;
+  fee: string;
+  closed_pnl: string;
+  hash: string;
+}
+
+/**
+ * 近 N 天成交（需 session）。`days` 須介於 1~90，超界 → 400（kind=client）；
+ * 上游查詢失敗 → 503（kind=upstream，不 fallback 自家 DB）。冪等讀取。
+ */
+export function getMyFills(days: number = 30): Promise<{ fills: MyFillRow[] }> {
+  const q = new URLSearchParams({ days: String(days) });
+  return request<{ fills: MyFillRow[] }>(`/api/me/fills?${q.toString()}`);
+}
+
+/**
+ * 一筆授權動作（`/api/me/authorizations`）。`action_type` 目前見過
+ * `approveAgent`／`approveBuilderFee`（2026-08-29 curl 對 explorer `userDetails`
+ * 實測；後端已過濾出只有這兩類）。
+ *
+ * ⭐ [W2] 2026-08-29 opus 審查修正：後端不再吐中文摘要字串——結構化欄位
+ * （`agent_address`／`builder`／`max_fee_rate`），組字（含 ZH/EN 對稱）移到
+ * `PositionsTable.tsx` 用 `copy.ts` 的 `dashboard.history.action*` 文案。
+ * 依 `action_type` 只會填其中一組（approveAgent → `agent_address`；
+ * approveBuilderFee → `builder`／`max_fee_rate`），其餘為 `null`。
+ */
+export interface MyAuthorizationRow {
+  time: number;
+  action_type: string;
+  agent_address: string | null;
+  builder: string | null;
+  max_fee_rate: string | null;
+  hash: string;
+}
+
+/**
+ * 授權歷程（需 session，最新 100 筆）。上游查詢失敗 → 503（kind=upstream，
+ * 不 fallback 自家 DB）。冪等讀取。
+ */
+export function getMyAuthorizations(): Promise<{ authorizations: MyAuthorizationRow[] }> {
+  return request<{ authorizations: MyAuthorizationRow[] }>("/api/me/authorizations");
 }

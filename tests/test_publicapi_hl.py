@@ -232,3 +232,69 @@ def test_vault_reads_retry_transient():
     gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
     assert gw.vault_details("0x" + "ab" * 20) == {"name": "Ultron"}
     assert len(post.calls) == 2
+
+
+# ── 自助查帳 tab：成交明細 ＋ explorer 授權歷程（M3 round2 Task 7） ─────────
+
+def test_get_fills_detail_parses_real_sample_shape():
+    """欄位對齊 2026-08-29 curl 對 userFillsByTime 的實測樣本（見
+    tests/fixtures/hl_user_fills_sample.json）：coin/px/sz/side/time/closedPnl/
+    fee/hash 皆存在，金額保留字串（不在 gateway 層轉 float）。"""
+    raw = [{"coin": "ETH", "px": "2074.9", "sz": "41.4803", "side": "B",
+           "time": 1774926504932, "closedPnl": "217.356772",
+           "hash": "0x317e78012add56b532f80438128ac402033900e6c5d07587d5472353e9d1309f",
+           "oid": 365940279977, "crossed": False, "fee": "-2.582024"}]
+    post = _FakePost([raw])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    from datetime import datetime, timezone
+    start = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    detail = gw.get_fills_detail("0x" + "ab" * 20, start, end)
+    assert detail == [{
+        "time": 1774926504932, "coin": "ETH", "side": "B", "px": "2074.9",
+        "sz": "41.4803", "fee": "-2.582024", "closed_pnl": "217.356772",
+        "hash": "0x317e78012add56b532f80438128ac402033900e6c5d07587d5472353e9d1309f",
+    }]
+    url, body = post.calls[0]
+    assert url == "https://x/info"  # 唯讀：只 POST /info
+    assert body["type"] == "userFillsByTime"
+
+
+def test_get_fills_detail_missing_fee_and_closed_pnl_default_to_zero_string():
+    raw = [{"coin": "ETH", "px": "1", "sz": "1", "side": "B", "time": 1, "hash": "0x1"}]
+    post = _FakePost([raw])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    from datetime import datetime, timezone
+    detail = gw.get_fills_detail("0x" + "ab" * 20,
+                                 datetime(2026, 1, 1, tzinfo=timezone.utc),
+                                 datetime(2026, 1, 2, tzinfo=timezone.utc))
+    assert detail[0]["fee"] == "0"
+    assert detail[0]["closed_pnl"] == "0"
+
+
+def test_user_details_posts_to_explorer_domain_not_info():
+    """domain 與 /info 不同（rpc.hyperliquid.xyz/explorer vs api.hyperliquid.xyz/info）
+    ——不走 base_url 組裝，直接打絕對的 EXPLORER_URL。"""
+    from spark.publicapi.hl import EXPLORER_URL
+    payload = {"type": "userDetails", "txs": [
+        {"time": 1787752386163, "user": "0x85ec",
+         "action": {"type": "approveAgent", "agentAddress": "0xaf22"},
+         "block": 1, "hash": "0xdeadbeef", "error": None},
+    ]}
+    post = _FakePost([payload])
+    gw = HLGateway("https://api.hyperliquid.xyz", post_fn=post, sleep_fn=lambda s: None)
+    result = gw.user_details("0x85ec")
+    assert result == payload
+    url, body = post.calls[0]
+    assert url == EXPLORER_URL
+    assert url != "https://api.hyperliquid.xyz/info"
+    assert body == {"type": "userDetails", "user": "0x85ec"}
+
+
+def test_user_details_retries_transient():
+    payload = {"type": "userDetails", "txs": []}
+    post = _FakePost([RuntimeError("Server error '503 Service Unavailable' for url"),
+                      payload])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    assert gw.user_details("0xabc") == payload
+    assert len(post.calls) == 2

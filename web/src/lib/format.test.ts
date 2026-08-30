@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { fmtAmount, fmtRatioPct, fmtUsdCompact, NO_VALUE, shortAddr } from "./format";
+import {
+  fmtAmount, fmtBp, fmtRatioPct, fmtUpdatedAtUtc, fmtUsdCompact, NO_VALUE, shortAddr,
+} from "./format";
 
 describe("shortAddr", () => {
   it("縮寫成 0x5579…B5d 形式（前 6 + 後 3，照 v1 原型）", () => {
@@ -56,5 +58,32 @@ describe("fmtRatioPct", () => {
   });
   it("null → 佔位符（不顯示 0%）", () => {
     expect(fmtRatioPct(null)).toBe(NO_VALUE);
+  });
+});
+
+describe("fmtBp", () => {
+  it("全精度字串截斷為 2 位小數＋bp 後綴（實例：後端曾回傳撐爆卡片的長字串）", () => {
+    expect(fmtBp("36.25872425025574226880295914")).toBe("36.26bp");
+  });
+  it("一般短字串照常格式化", () => {
+    expect(fmtBp("2.3")).toBe("2.30bp");
+  });
+  it("缺值／非有限值 → 佔位符", () => {
+    expect(fmtBp(null)).toBe(NO_VALUE);
+    expect(fmtBp(undefined)).toBe(NO_VALUE);
+    expect(fmtBp("")).toBe(NO_VALUE);
+    expect(fmtBp("not-a-number")).toBe(NO_VALUE);
+  });
+});
+
+describe("fmtUpdatedAtUtc", () => {
+  it("epoch 秒 → YYYY-MM-DD HH:mm UTC", () => {
+    expect(fmtUpdatedAtUtc(1756000000)).toBe("2025-08-24 01:46 UTC");
+  });
+  it("0 → 佔位符（沒有時間戳，不臆造）", () => {
+    expect(fmtUpdatedAtUtc(0)).toBe(NO_VALUE);
+  });
+  it("NaN → 佔位符", () => {
+    expect(fmtUpdatedAtUtc(NaN)).toBe(NO_VALUE);
   });
 });

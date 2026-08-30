@@ -136,6 +136,10 @@ input:focus-visible,
 
 .header-cta { padding: 8px 13px; font-size: 12px; }
 
+/* Task 2（2026-08-29）：CTA 改按鈕後可能顯示拒簽/失敗文案，直排在按鈕下方避免撐開整列。 */
+.header-cta-group { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.header-cta-error { font-size: 11px; color: var(--neg); max-width: 220px; text-align: right; margin: 0; }
+
 .header-addr {
   font-size: 12px;
   padding: 7px 12px;
@@ -606,6 +610,13 @@ main.page {
   border-radius: var(--radius);
   padding: 28px;
 }
+
+/* 2026-08-29 M3 round2 Task 3：StepSign／StepDeposit 各自渲染獨立的 `.step-card`
+   （StepConnect.tsx 刻意不再包一層外框，見該檔註解），但兩個 div 本身無 margin，
+   直接相鄰時邊框貼在一起、視覺上像同一張卡。用卡間標準間距 token 補上
+   （tokens.css：`--gap-card` 即設計稿定義的「卡間 12px」，dashboard/strategy grid
+   的卡片間距同一個值），與同頁其他 section 的間距一致。 */
+.step-card + .step-card { margin-top: var(--gap-card); }
 
 .step-card h2 { font-size: 1.4rem; color: var(--text); }
 .step-card h2:focus { outline: none; }
@@ -1352,10 +1363,12 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-pnl-metric-value { font-family: var(--font-mono); font-size: var(--fs-body-lg); font-weight: 700; }
 
 .dash-sync-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
-.dash-sync-metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
-.dash-sync-metric { background: var(--inset); border-radius: 10px; padding: 13px 14px; }
-.dash-sync-metric-label { font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 6px; }
-.dash-sync-metric-value { font-family: var(--font-mono); font-size: var(--fs-body-lg); font-weight: 700; }
+/* auto-fit + min-width：卡片變窄時欄位改為換行（2/1 欄）而非硬擠成 3 欄，
+   避免中文標籤（如「未同步倉位」）被壓成一字一行直排。 */
+.dash-sync-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 14px; margin-bottom: 18px; }
+.dash-sync-metric { background: var(--inset); border-radius: 10px; padding: 13px 14px; min-width: 0; }
+.dash-sync-metric-label { font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 6px; white-space: nowrap; }
+.dash-sync-metric-value { font-family: var(--font-mono); font-size: var(--fs-body-lg); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dash-sync-metric-note { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
 
 .dash-fee-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
@@ -1372,7 +1385,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-table { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; }
 .dash-table-head, .dash-table-row { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1fr 1fr 1fr; gap: 16px; padding: 12px 20px; min-width: 560px; }
 .dash-table-head { background: var(--inset); font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim); letter-spacing: 0.06em; }
-.dash-table-row { border-top: 1px solid var(--border); align-items: center; }
+.dash-table-row { border-top: 1px solid var(--border); align-items: center; text-decoration: none; }
 .dash-table-row > div:not(:first-child) { text-align: right; font-family: var(--font-mono); }
 .dash-table-symbol { display: flex; align-items: center; gap: 10px; }
 .dash-side-chip { font-size: 10px; font-family: var(--font-mono); border-radius: 4px; padding: 3px 7px; }
@@ -1382,6 +1395,18 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 
 .dash-fees-list { display: grid; }
 .dash-fees-row { display: flex; justify-content: space-between; font-size: var(--fs-small); padding: 10px 20px; border-top: 1px solid var(--border); }
+
+/* 「成交記錄・授權歷程」tab（M3 round2 Task 7）：兩張表的欄數與 dash-table 通用
+   的 6 欄格線不同，各自覆寫 grid-template-columns，不動共用規則（避免牽動
+   跟單持倉／費用明細表）。 */
+.dash-history-panel { display: grid; gap: 24px; }
+.dash-history-section h3 { font-size: var(--fs-small); color: var(--text-dim); margin: 0 0 10px; font-weight: 600; }
+.dash-history-section .dash-table-head,
+.dash-history-section .dash-table-row { grid-template-columns: 1.3fr 0.7fr 0.6fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr; min-width: 720px; }
+.dash-history-section:nth-of-type(2) .dash-table-head,
+.dash-history-section:nth-of-type(2) .dash-table-row { grid-template-columns: 1.3fr 1fr 2fr 0.6fr; min-width: 560px; }
+.dash-history-section .dash-table-row a { color: var(--primary); text-decoration: none; }
+.dash-history-section .dash-table-row a:hover { text-decoration: underline; }
 .dash-fees-row:first-child { border-top: none; }
 
 /* ==================== Task 18：響應式 1024 / 390 全站 pass（設計稿 §07 L933-934） ==================== */

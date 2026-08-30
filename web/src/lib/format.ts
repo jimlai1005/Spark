@@ -23,12 +23,37 @@ export function fmtAmount(v: string | null | undefined, dp?: number): string {
   return n.toLocaleString("en-US", { minimumFractionDigits: places, maximumFractionDigits: places });
 }
 
+/**
+ * bp（basis point）字串 → 顯示字串，2 位小數＋`bp` 後綴。
+ * 後端可能給全精度字串（如 `36.25872425025574226880295914`）——不截斷會撐爆卡片。
+ * null／非有限值 → NO_VALUE（不臆造）。
+ */
+export function fmtBp(v: string | null | undefined): string {
+  if (v == null || v === "") return NO_VALUE;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return NO_VALUE;
+  return `${n.toFixed(2)}bp`;
+}
+
 /** 比例（0.25）→ 百分比顯示（25.0%）。null／非數字 → NO_VALUE。 */
 export function fmtRatioPct(v: string | null | undefined, dp = 1): string {
   if (v == null || v === "") return NO_VALUE;
   const n = Number(v);
   if (!Number.isFinite(n)) return NO_VALUE;
   return `${(n * 100).toFixed(dp)}%`;
+}
+
+/**
+ * epoch 秒 → `YYYY-MM-DD HH:mm UTC`（策略／交易員詳情頁「資料截至」列，
+ * M3 round2 Task 6 從 `strategies/[slug]/page.tsx` 抽出，供 `/traders/[address]`
+ * 共用同一份格式，避免兩處各自維護一份時間字串格式）。
+ * `0`／`NaN` → NO_VALUE（沒有時間戳，不臆造）。
+ */
+export function fmtUpdatedAtUtc(epochSeconds: number): string {
+  if (!epochSeconds) return NO_VALUE;
+  const d = new Date(epochSeconds * 1000);
+  if (Number.isNaN(d.getTime())) return NO_VALUE;
+  return `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 }
 
 /**

@@ -99,6 +99,12 @@ class FakeHL:
         # 需要真的依 [start, end] 過濾——設 True 打開，否則「窗口取錯」在 fake 上
         # 看不出來（正是 opus 對抗審查 Critical 能潛伏的原因）。
         self.window_aware = False
+        # 自助查帳 tab（M3 round2 Task 7）用：per-address 裁切成交明細 ＋ explorer
+        # userDetails 原始 payload，各自可注入失敗（HL/explorer 各自獨立的上游）。
+        self.fills_detail: dict[str, list] = {}
+        self.fills_detail_error: dict[str, Exception] = {}
+        self.user_details_payload: dict[str, dict] = {}
+        self.user_details_error: dict[str, Exception] = {}
 
     def get_account_value(self, address: str) -> Decimal:
         err = self.account_value_error.get(address.lower())
@@ -149,6 +155,18 @@ class FakeHL:
 
     def agent_addresses(self, user: str) -> list[str]:
         return [a.lower() for a in self.agents.get(user.lower(), [])]
+
+    def get_fills_detail(self, address: str, start, end) -> list[dict]:
+        err = self.fills_detail_error.get(address.lower())
+        if err is not None:
+            raise err
+        return list(self.fills_detail.get(address.lower(), []))
+
+    def user_details(self, address: str) -> dict:
+        err = self.user_details_error.get(address.lower())
+        if err is not None:
+            raise err
+        return self.user_details_payload.get(address.lower(), {"txs": []})
 
 
 def make_app(tmp_path, cfg=None, billing=None, now_fn=None, notifier=None):

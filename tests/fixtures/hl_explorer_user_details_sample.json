@@ -1,0 +1,46 @@
+{
+  "type": "userDetails",
+  "txs": [
+    {
+      "time": 1787752386163,
+      "user": "0x85ecf584f25db6f146718b86d493e33c5af72052",
+      "action": {
+        "type": "approveAgent",
+        "signatureChainId": "0x1",
+        "hyperliquidChain": "Mainnet",
+        "agentAddress": "0xaf2292a19d2b144f17115be0775851cd878ef72c",
+        "agentName": "trade85 valid_until 1803304377001",
+        "nonce": 1787752363107
+      },
+      "block": 1124422373,
+      "hash": "0x78421cd43cf39c2079bb04430552e5020c4600b9d7f6baf21c0ac826fbf7760b",
+      "error": null
+    },
+    {
+      "time": 1787375746030,
+      "user": "0x12f7aea21eed5461d30212ea771c4441656b8750",
+      "action": {
+        "type": "approveBuilderFee",
+        "signatureChainId": "0x1",
+        "hyperliquidChain": "Mainnet",
+        "maxFeeRate": "0.095%",
+        "builder": "0x5af1b5f44207784dcb850bbb4143c5dcd1885f71",
+        "nonce": 1787375745222
+      },
+      "block": 1119110718,
+      "hash": "0xadde8c810af9aa5aaf580442b4463e0207a90066a5fcc92c51a737d3c9fd8445",
+      "error": null
+    },
+    {
+      "time": 1774926504932,
+      "user": "0x85ecf584f25db6f146718b86d493e33c5af72052",
+      "action": {
+        "type": "order",
+        "orders": []
+      },
+      "block": 1100000000,
+      "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "error": null
+    }
+  ]
+}

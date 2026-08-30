@@ -26,7 +26,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
 import { EquityCurve } from "@/components/EquityCurve";
-import { fmtAmount, NO_VALUE, shortAddr } from "@/lib/format";
+import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 import {
@@ -35,6 +35,7 @@ import {
   type PublicStrategyMethodology,
 } from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
+import { computeCagrPct, computeStartEndEquity, metricText } from "@/lib/strategyMetrics";
 import type { COPY_ZH, DeepString } from "@/lib/copy";
 
 type CagrCopy = DeepString<typeof COPY_ZH.strategyDetail.cagr>;
@@ -48,62 +49,6 @@ const SCALE_DEFAULT = 25;
 const DD_MIN = 5;
 const DD_MAX = 50;
 const DD_DEFAULT = 20;
-
-/** insufficient → 佔位符；否則附尾綴（例如 %）。與 StrategyCard 的 metricText 同形狀。 */
-function metricText(value: string | null, insufficient: boolean, suffix = ""): string {
-  if (insufficient || value == null) return NO_VALUE;
-  return `${value}${suffix}`;
-}
-
-/**
- * CAGR（年化外推）：由 `total_return_pct`＋`live_days`，用 365 日/年慣例
- * （與 methodology.annualization_days 對齊）算 `(1+r)^(365/live_days) - 1`。
- * 回傳 `null`＝樣本不足或數學上無定義（帳戶歸零，`1+r<=0`），呼叫端一律顯示
- * 「樣本不足」，不強行印出一個沒有意義的數字。
- */
-function computeCagrPct(
-  totalReturnPct: string | null,
-  insufficient: boolean,
-  liveDays: number,
-): string | null {
-  if (insufficient || totalReturnPct == null || liveDays <= 0) return null;
-  const r = Number(totalReturnPct) / 100;
-  if (!Number.isFinite(r)) return null;
-  const base = 1 + r;
-  if (base <= 0) return null;
-  const cagr = base ** (365 / liveDays) - 1;
-  if (!Number.isFinite(cagr)) return null;
-  return (cagr * 100).toFixed(2);
-}
-
-/**
- * 起訖淨值（USD）：`methodology.initial_deposit_usd`（真實入金起點）×
- * `equity_index` 首尾比值 → 起點／終點淨值。任一輸入缺席或首點為 0（無法取
- * 比值）→ `null`（樣本不足）。
- */
-function computeStartEndEquity(
-  methodology: PublicStrategyMethodology,
-  equityIndex: string[],
-): { start: string; end: string } | null {
-  const depositNum = methodology.initial_deposit_usd == null
-    ? null : Number(methodology.initial_deposit_usd);
-  if (depositNum == null || !Number.isFinite(depositNum) || depositNum <= 0
-    || equityIndex.length === 0) return null;
-  const first = Number(equityIndex[0]);
-  const last = Number(equityIndex[equityIndex.length - 1]);
-  if (!Number.isFinite(first) || !Number.isFinite(last) || first === 0) return null;
-  return {
-    start: fmtAmount(String(depositNum), 0),
-    end: fmtAmount(String(depositNum * (last / first)), 0),
-  };
-}
-
-function formatUpdatedAt(epochSeconds: number): string {
-  if (!epochSeconds) return NO_VALUE;
-  const d = new Date(epochSeconds * 1000);
-  if (Number.isNaN(d.getTime())) return NO_VALUE;
-  return `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
-}
 
 export default function StrategyDetailPage() {
   const params = useParams<{ slug: string }>();
@@ -169,10 +114,10 @@ export default function StrategyDetailPage() {
 
   const m = strategy.metrics;
   const explorerHref = `https://app.hyperliquid.xyz/explorer/address/${strategy.leader_address}`;
-  const asOf = formatUpdatedAt(strategy.methodology.updated_at);
+  const asOf = fmtUpdatedAtUtc(strategy.methodology.updated_at);
 
   const cagr = computeCagrPct(m.total_return_pct, m.total_return_pct_insufficient, strategy.live_days);
-  const startEnd = computeStartEndEquity(strategy.methodology, strategy.equity_index);
+  const startEnd = computeStartEndEquity(strategy.methodology, strategy.equity_index, fmtAmount);
 
   function buildQuery(): string {
     const p = new URLSearchParams();

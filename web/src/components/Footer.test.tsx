@@ -65,13 +65,18 @@ describe("Footer", () => {
     expect(await screen.findByText(COPY_ZH.footer.statusUnknown)).toBeInTheDocument();
   });
 
-  it("Task 12：文件／系統狀態／績效方法論已接上真實連結", () => {
+  it("Task 12：系統狀態／績效方法論已接上真實連結", () => {
     stubStatus("unknown");
     renderFooter();
-    expect(screen.getByRole("link", { name: COPY_ZH.footer.productDocs })).toHaveAttribute("href", "/docs");
     expect(screen.getByRole("link", { name: COPY_ZH.footer.verifiableMethodology }))
       .toHaveAttribute("href", "/docs#methodology");
     expect(screen.getByRole("link", { name: COPY_ZH.footer.verifiableStatus })).toHaveAttribute("href", "/status");
+  });
+
+  it("Task 19 round2：「文件」連結已隱藏（產品欄不再有連向 /docs 的入口）", () => {
+    stubStatus("unknown");
+    renderFooter();
+    expect(screen.queryByRole("link", { name: COPY_ZH.footer.productDocs })).not.toBeInTheDocument();
   });
 
   it("載入完成後 data-status 反映後端回應（供樣式掛鉤）", async () => {

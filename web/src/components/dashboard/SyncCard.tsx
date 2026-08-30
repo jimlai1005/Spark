@@ -1,6 +1,6 @@
 "use client";
 import type { DashboardSync } from "@/lib/api";
-import { NO_VALUE } from "@/lib/format";
+import { fmtBp, NO_VALUE } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
 
 function formatTs(epochSeconds: number | null): string {
@@ -32,9 +32,7 @@ export function SyncCard({ sync }: { sync: DashboardSync | null }) {
         </div>
         <div className="dash-sync-metric">
           <div className="dash-sync-metric-label">{c.priceDiff}</div>
-          <div className="mono dash-sync-metric-value">
-            {sync?.price_diff_bp != null ? `${sync.price_diff_bp}bp` : NO_VALUE}
-          </div>
+          <div className="mono dash-sync-metric-value">{fmtBp(sync?.price_diff_bp)}</div>
           <div className="dash-sync-metric-note">{c.priceDiffNote}</div>
         </div>
         <div className="dash-sync-metric">

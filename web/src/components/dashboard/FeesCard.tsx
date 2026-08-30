@@ -29,12 +29,6 @@ export function FeesCard({ feesMonth }: { feesMonth: DashboardFeesMonth | null }
             {feesMonth ? `$${fmtAmount(feesMonth.routed_volume, 0)}` : NO_VALUE}
           </div>
         </div>
-        <div>
-          <div className="dash-fee-metric-label">{c.builderFees}</div>
-          <div className="mono dash-fee-metric-value" style={{ color: "var(--primary)" }}>
-            {feesMonth ? `$${fmtAmount(feesMonth.builder_fees)}` : NO_VALUE}
-          </div>
-        </div>
       </div>
 
       {bars.length > 0 && (

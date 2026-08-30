@@ -1,8 +1,17 @@
 "use client";
-import { useState } from "react";
-import type { DashboardFeesMonth, DashboardPosition } from "@/lib/api";
-import { fmtAmount, NO_VALUE } from "@/lib/format";
+import { useEffect, useState } from "react";
+import {
+  getMyAuthorizations,
+  getMyFills,
+  type DashboardFeesMonth,
+  type DashboardPosition,
+  type MyAuthorizationRow,
+  type MyFillRow,
+} from "@/lib/api";
+import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
+
+const HL_EXPLORER_TX_BASE = "https://app.hyperliquid.xyz/explorer/tx/";
 
 type Tab = "positions" | "fees" | "history";
 
@@ -50,13 +59,19 @@ export function PositionsTable({
         >
           {c.tabs.fees}
         </button>
-        <button type="button" className="dash-tab" disabled title={c.tabs.comingSoon}>
+        <button
+          type="button"
+          className="dash-tab"
+          data-active={tab === "history"}
+          onClick={() => setTab("history")}
+        >
           {c.tabs.history}
         </button>
       </div>
 
       {tab === "positions" && <PositionsGrid positions={positions} />}
       {tab === "fees" && <FeesGrid feesMonth={feesMonth} />}
+      {tab === "history" && <HistoryPanel />}
     </div>
   );
 }
@@ -129,6 +144,186 @@ function FeesGrid({ feesMonth }: { feesMonth: DashboardFeesMonth | null }) {
         <div className="dash-fees-row" key={date}>
           <span>{date}</span>
           <span className="mono">${fmtAmount(fee)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TxLink({ hash, label }: { hash: string; label: string }) {
+  if (!hash) return <span>{NO_VALUE}</span>;
+  return (
+    <a href={`${HL_EXPLORER_TX_BASE}${hash}`} target="_blank" rel="noopener noreferrer">
+      {label}
+    </a>
+  );
+}
+
+/**
+ * 「成交記錄・授權歷程」tab 內容（M3 round2 Task 7）——資料**直取 Hyperliquid**
+ * （`GET /api/me/fills`／`GET /api/me/authorizations`），結構上不讀自家 DB。
+ * lazy fetch：本元件只在 `tab === "history"` 時被掛載才會打 API（見上方
+ * `PositionsTable` 的條件渲染）；兩個上游各自獨立成功/失敗，互不拖累
+ * （工程原則 3 的展示資料版本——一邊讀不到不該讓另一邊也顯示不出來）。
+ */
+function HistoryPanel() {
+  const COPY = useCopy();
+  const c = COPY.dashboard.history;
+  const [loading, setLoading] = useState(true);
+  const [fills, setFills] = useState<MyFillRow[] | null>(null);
+  const [fillsFailed, setFillsFailed] = useState(false);
+  const [authorizations, setAuthorizations] = useState<MyAuthorizationRow[] | null>(null);
+  const [authorizationsFailed, setAuthorizationsFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setFillsFailed(false);
+    setAuthorizationsFailed(false);
+    Promise.allSettled([getMyFills(), getMyAuthorizations()]).then(([f, a]) => {
+      if (cancelled) return;
+      if (f.status === "fulfilled") setFills(f.value.fills);
+      else setFillsFailed(true);
+      if (a.status === "fulfilled") setAuthorizations(a.value.authorizations);
+      else setAuthorizationsFailed(true);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // ApiError 未被讀取，只用 allSettled 的 status 分流——上游 kind 一律視為
+    // 「暫時讀不到」（不 fallback 自家 DB，見 plan 檔尾裁決）。
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="dash-table">
+        <p className="dash-table-empty">{c.loading}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="dash-history-panel">
+      <div className="dash-history-section">
+        <h3>{c.fillsTitle}</h3>
+        <FillsTable rows={fills} failed={fillsFailed} />
+      </div>
+      <div className="dash-history-section">
+        <h3>{c.authorizationsTitle}</h3>
+        <AuthorizationsList rows={authorizations} failed={authorizationsFailed} />
+      </div>
+    </div>
+  );
+}
+
+function FillsTable({ rows, failed }: { rows: MyFillRow[] | null; failed: boolean }) {
+  const COPY = useCopy();
+  const c = COPY.dashboard.history;
+
+  if (failed) {
+    return (
+      <div className="dash-table">
+        <p className="dash-table-empty">{c.loadError}</p>
+      </div>
+    );
+  }
+  if (!rows || rows.length === 0) {
+    return (
+      <div className="dash-table">
+        <p className="dash-table-empty">{c.fillsEmpty}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="dash-table">
+      <div className="dash-table-head">
+        <div>{c.time}</div>
+        <div>{c.coin}</div>
+        <div>{c.side}</div>
+        <div>{c.px}</div>
+        <div>{c.sz}</div>
+        <div>{c.fee}</div>
+        <div>{c.closedPnl}</div>
+        <div>{c.tx}</div>
+      </div>
+      {rows.map((r) => (
+        <div className="dash-table-row" key={r.hash || `${r.time}-${r.coin}`}>
+          <div>{fmtUpdatedAtUtc(r.time / 1000)}</div>
+          <div>{r.coin}</div>
+          <div>{r.side === "B" ? c.buy : c.sell}</div>
+          <div>{fmtAmount(r.px)}</div>
+          <div>{fmtAmount(r.sz)}</div>
+          <div>{fmtAmount(r.fee)}</div>
+          <div>{fmtAmount(r.closed_pnl)}</div>
+          <div>
+            <TxLink hash={r.hash} label={c.viewTx} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+type HistoryCopy = ReturnType<typeof useCopy>["dashboard"]["history"];
+
+/**
+ * 授權動作 → 人類可讀摘要（[W2] 2026-08-29 opus 審查修正：後端只給結構化欄位
+ * `agent_address`／`builder`／`max_fee_rate`，組字＋雙語一律在這裡做，禁止
+ * 內嵌中文——標籤全部來自 `copy.ts`，這裡只負責組句順序）。
+ */
+function authorizationSummary(c: HistoryCopy, r: MyAuthorizationRow): string {
+  if (r.action_type === "approveAgent" && r.agent_address) {
+    return `${c.actionApproveAgent} ${r.agent_address}`;
+  }
+  if (r.action_type === "approveBuilderFee" && r.builder) {
+    const rate = r.max_fee_rate ?? "?";
+    return `${c.actionApproveBuilderFeeLabel} ${rate} ${c.actionApproveBuilderFeeTo} ${r.builder}`;
+  }
+  return c.actionUnknown;
+}
+
+function AuthorizationsList({
+  rows, failed,
+}: {
+  rows: MyAuthorizationRow[] | null;
+  failed: boolean;
+}) {
+  const COPY = useCopy();
+  const c = COPY.dashboard.history;
+
+  if (failed) {
+    return (
+      <div className="dash-table">
+        <p className="dash-table-empty">{c.loadError}</p>
+      </div>
+    );
+  }
+  if (!rows || rows.length === 0) {
+    return (
+      <div className="dash-table">
+        <p className="dash-table-empty">{c.authorizationsEmpty}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="dash-table">
+      <div className="dash-table-head">
+        <div>{c.time}</div>
+        <div>{c.action}</div>
+        <div>{c.summary}</div>
+        <div>{c.tx}</div>
+      </div>
+      {rows.map((r) => (
+        <div className="dash-table-row" key={r.hash || `${r.time}-${r.action_type}`}>
+          <div>{fmtUpdatedAtUtc(r.time / 1000)}</div>
+          <div>{r.action_type}</div>
+          <div>{authorizationSummary(c, r)}</div>
+          <div>
+            <TxLink hash={r.hash} label={c.viewTx} />
+          </div>
         </div>
       ))}
     </div>

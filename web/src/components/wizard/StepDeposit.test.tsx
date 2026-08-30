@@ -18,6 +18,7 @@ function status(over: Partial<OnboardStatus> = {}): OnboardStatus {
     agent_approved: true, funded: false, state: "IN_PROGRESS",
     perp_account_value: "12.5", min_deposit: "100",
     deposit_shortfall: "87.5",
+    spot_stranded: over.spot_stranded ?? null,
     ...over,
   };
 }

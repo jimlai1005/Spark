@@ -274,12 +274,17 @@ const Q_ROW: Extract<OpsTradeQualityRow, { quality_available: true }> = {
 function qualityWith(
   rows: OpsTradeQualityRow[],
   summary: Partial<Extract<OpsTradeQualityResp, { basis_unknown: false }>["summary"]> = {},
-): OpsTradeQualityResp {
+): Extract<OpsTradeQualityResp, { basis_unknown: false }> {
+  const tq = TQ_EMPTY as Extract<OpsTradeQualityResp, { basis_unknown: false }>;
   return {
-    ...TQ_EMPTY,
+    window: "accrued" as const,
+    basis_unknown: false as const,
+    window_start: tq.window_start,
+    window_end: tq.window_end,
     skipped_days: ["2026-07-18", "2026-07-19"],
     followers: rows,
-    summary: { ...TQ_EMPTY.summary, followers: rows.length, ...summary },
+    summary: { ...tq.summary, followers: rows.length, ...summary },
+    manifest_errors: [],
   };
 }
 

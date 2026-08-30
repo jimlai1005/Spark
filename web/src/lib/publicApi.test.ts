@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { getPublicStats, getPublicStatus, getPublicStrategies, getPublicStrategy } from "./publicApi";
+import {
+  getPublicLeaderboard,
+  getPublicStats,
+  getPublicStatus,
+  getPublicStrategies,
+  getPublicStrategy,
+  getPublicTraderDetail,
+} from "./publicApi";
 
 function mockFetchOnce(impl: () => Response | Promise<Response>) {
   vi.stubGlobal("fetch", vi.fn(impl));
@@ -147,6 +154,137 @@ describe("getPublicStrategy", () => {
     expect(r?.metrics.sharpe_insufficient).toBe(true);
     expect(r?.methodology.initial_deposit_usd).toBeNull();
     expect(r?.equity_index).toEqual([]);
+  });
+});
+
+describe("getPublicLeaderboard", () => {
+  const ROW = {
+    address: "0xfeed000000000000000000000000000000f00d",
+    display_name: "Alice", account_value: "58675737.76",
+    pnl: "1234.56", roi: "0.0842", vlm: "999000.0",
+  };
+
+  it("原樣回傳 rows（不吞錯，與其他 getPublic* helper 刻意不同）", async () => {
+    mockFetchOnce(() => jsonResponse({ window: "month", updated_at: 42, rows: [ROW] }));
+    const r = await getPublicLeaderboard("month");
+    expect(r).toEqual({ window: "month", updated_at: 42, rows: [ROW] });
+  });
+
+  it("非 200 → 拋出（呼叫端據此區分 error 態與 empty 態）", async () => {
+    mockFetchOnce(() => jsonResponse({ detail: "壞 window" }, false));
+    await expect(getPublicLeaderboard("month")).rejects.toThrow();
+  });
+
+  it("網路例外 → 拋出", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("network down"); }));
+    await expect(getPublicLeaderboard("day")).rejects.toThrow();
+  });
+
+  it("rows 不是陣列 → 拋出（不得偽裝成空清單，那會被 UI 顯示成 empty 而非 error）", async () => {
+    mockFetchOnce(() => jsonResponse({ window: "month", updated_at: 1, rows: "nope" }));
+    await expect(getPublicLeaderboard("month")).rejects.toThrow();
+  });
+
+  it("成功時空 rows → 空陣列（合法的 empty 態，不是錯誤）", async () => {
+    mockFetchOnce(() => jsonResponse({ window: "week", updated_at: 1, rows: [] }));
+    const r = await getPublicLeaderboard("week");
+    expect(r.rows).toEqual([]);
+  });
+
+  it("列缺 address → 過濾掉，不讓一筆壞資料整批拋錯", async () => {
+    mockFetchOnce(() =>
+      jsonResponse({ window: "month", updated_at: 1, rows: [{ ...ROW, address: undefined }, ROW] }));
+    const r = await getPublicLeaderboard("month");
+    expect(r.rows).toEqual([ROW]);
+  });
+
+  it("window 帶入請求 query", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse({ window: "allTime", updated_at: 1, rows: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    await getPublicLeaderboard("allTime");
+    expect(fetchMock).toHaveBeenCalledWith("/api/public/leaderboard?window=allTime");
+  });
+});
+
+describe("getPublicTraderDetail", () => {
+  const DETAIL = {
+    address: "0xfeed000000000000000000000000000000f00d",
+    account_value: "5000.00",
+    follow_blocked: false,
+    metrics: {
+      total_return_pct: "20.00", total_return_pct_insufficient: false,
+      max_drawdown_pct: "-0.80", max_drawdown_pct_insufficient: false,
+      sharpe: "5.55", sharpe_insufficient: false,
+      sharpe_se: "3.36", sharpe_se_insufficient: false,
+      win_rate_pct: "64.86", win_rate_pct_insufficient: false,
+      annualized_vol_pct: "18.05", annualized_vol_pct_insufficient: false,
+      sortino: "43.42", sortino_insufficient: false,
+      best_day_pct: "3.01", best_day_pct_insufficient: false,
+      worst_day_pct: "-0.80", worst_day_pct_insufficient: false,
+      sample_count: 38,
+    },
+    equity_index: ["1", "1.2"],
+    methodology: {
+      start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
+      sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
+      updated_at: 999,
+    },
+  };
+
+  it("原樣回傳交易員詳情", async () => {
+    mockFetchOnce(() => jsonResponse(DETAIL));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r).toEqual(DETAIL);
+  });
+
+  it("422/503 → null（呼叫端渲染空態，不偽造交易員物件）", async () => {
+    mockFetchOnce(() => jsonResponse({ detail: "位址格式不合法" }, false));
+    const r = await getPublicTraderDetail("not-an-address");
+    expect(r).toBeNull();
+  });
+
+  it("網路例外 → null", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("network down"); }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r).toBeNull();
+  });
+
+  it("回應缺 address → null", async () => {
+    mockFetchOnce(() => jsonResponse({ account_value: "1" }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r).toBeNull();
+  });
+
+  it("account_value 為 null（clearinghouseState 查詢失敗降級）時原樣保留", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, account_value: null }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.account_value).toBeNull();
+  });
+
+  it("metrics／methodology 缺席 → 降級為空殼而非拋錯", async () => {
+    mockFetchOnce(() => jsonResponse({ address: DETAIL.address }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.metrics.sharpe_insufficient).toBe(true);
+    expect(r?.methodology.initial_deposit_usd).toBeNull();
+    expect(r?.equity_index).toEqual([]);
+  });
+
+  it("[W4] follow_blocked: true 原樣保留", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, follow_blocked: true }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.follow_blocked).toBe(true);
+  });
+
+  it("[8b-7] follow_blocked 缺席 → fail-closed 視為 true（與後端方向一致）", async () => {
+    mockFetchOnce(() => jsonResponse({ address: DETAIL.address }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.follow_blocked).toBe(true);
+  });
+
+  it("[8b-7] follow_blocked: false → 明確保留為 false（唯一放行的值）", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, follow_blocked: false }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.follow_blocked).toBe(false);
   });
 });
 

@@ -45,7 +45,10 @@ def test_generate_agent_twice_409(tmp_path):
     assert client.post("/api/onboard/agent").status_code == 200
     r = client.post("/api/onboard/agent")
     assert r.status_code == 409
-    assert "不重生" in r.json()["detail"]
+    # 成功義的 409（前端視為成功）帶機器可判別 code——與自癒失敗的 409 區分
+    # （2026-08-29 M3 round2 Task 3：兩種 409 先前無法區分，是隱藏 bug）。
+    assert r.json()["detail"]["code"] == "agent_exists"
+    assert "不重生" in r.json()["detail"]["message"]
 
 
 def test_keysvc_down_502(tmp_path):
@@ -120,7 +123,10 @@ def test_desync_and_address_also_fails_409(tmp_path):
     keysvc.address_fail = ConnectionRefusedError("keysvc down")
     r = client.post("/api/onboard/agent")
     assert r.status_code == 409
-    assert "無法自動復原" in r.json()["detail"]
+    # 失敗義的 409：code 與「已有 agent」的成功義 409 不同，前端才分得出兩者
+    # （2026-08-29 M3 round2 Task 3）。
+    assert r.json()["detail"]["code"] == "agent_conflict"
+    assert "無法自動復原" in r.json()["detail"]["message"]
     assert store.get_agent_address(account_id) is None  # 未寫入半套狀態
 
 

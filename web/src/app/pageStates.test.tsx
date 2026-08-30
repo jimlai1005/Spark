@@ -108,6 +108,7 @@ const NOT_ACTIVATED: OnboardStatus = {
   perp_account_value: "0",
   min_deposit: "100",
   deposit_shortfall: "100",
+  spot_stranded: null,
   state: "IN_PROGRESS",
 };
 
@@ -309,7 +310,10 @@ describe("導覽涵蓋率（與 Header 對齊）", () => {
     expect(hrefs.length).toBeGreaterThan(0);
     const tested = new Set(ROUTES.map((r) => r.path));
     for (const h of hrefs) {
-      expect(tested, `導覽列有 ${h} 但本檔未測`).toContain(h);
+      // round2 Task 1：「策略」導覽改跳首頁錨點（/#strategies），不是新路由——
+      // 錨點前的路徑段（"/"）本就在 ROUTES 受測，比對前先去掉 hash fragment。
+      const routePath = h?.split("#")[0] || h;
+      expect(tested, `導覽列有 ${h} 但本檔未測`).toContain(routePath);
     }
   });
 });

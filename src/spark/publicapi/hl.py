@@ -14,6 +14,7 @@ from spark.resilience import run
 
 _TIMEOUT_S = 10.0
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+EXPLORER_URL = "https://rpc.hyperliquid.xyz/explorer"
 
 
 def _to_ms_utc(dt: datetime) -> int:
@@ -159,3 +160,45 @@ class HLGateway:
         """使用者已授權的 agent 地址清單（extraAgents）；小寫正規化供同基準比對。"""
         agents = self._info({"type": "extraAgents", "user": user}, "HL extraAgents 查詢")
         return [a["address"].lower() for a in agents if a.get("address")]
+
+    def get_fills_detail(self, address: str, start: datetime, end: datetime) -> list[dict]:
+        """時間窗成交明細，供客戶自助查帳頁用（`/api/me/fills`，M3 round2 Task 7）。
+
+        ⚠️ 刻意**不**復用 `get_user_fills`／共用 `UserFill`：那個型別是給
+        `collect_follower_summary` 等損益管線吃的（只需要 `.sz/.px/.crossed/
+        .builder_fee`），塞進 `hash`/`closedPnl` 這種純展示欄位會讓一個核心財務
+        型別多出跟風控無關的欄位面。這裡回傳的是**裁切後的原始字典**，欄位名
+        直接對齊真實 `userFillsByTime` 回應（實測樣本：`coin/px/sz/side/time/
+        closedPnl/fee/hash` 均存在，2026-08-29 curl 驗證，見 plan 檔頭與
+        `tests/fixtures/hl_user_fills_sample.json`）：金額保留字串（前端格式化，
+        不在這裡轉 float）。"""
+        raw = self._info({"type": "userFillsByTime", "user": address,
+                          "startTime": _to_ms_utc(start), "endTime": _to_ms_utc(end)},
+                         "HL userFillsByTime 查詢")
+        return [{
+            "time": int(f["time"]),
+            "coin": f["coin"],
+            "side": f["side"],
+            "px": str(f["px"]),
+            "sz": str(f["sz"]),
+            "fee": str(f.get("fee", "0") or "0"),
+            "closed_pnl": str(f.get("closedPnl", "0") or "0"),
+            "hash": f.get("hash", ""),
+        } for f in raw]
+
+    def user_details(self, address: str) -> dict:
+        """explorer 的帳戶交易明細（唯讀、冪等 → transient 重試）；`/api/me/
+        authorizations`（M3 round2 Task 7）用來過濾出 approveAgent／
+        approveBuilderFee 兩類授權動作。
+
+        ⚠️ domain 與 `/info` 不同（`rpc.hyperliquid.xyz` vs `api.hyperliquid.xyz`），
+        不走 `_info` 的 `{base}/info` 組裝，直接打 `EXPLORER_URL`（絕對 URL，
+        與 `self._base` 無關）。回應形狀 `{"txs": [{"time": ms, "user": "0x…",
+        "action": {"type": "approveAgent"/"approveBuilderFee"/…, …}, "block": n,
+        "hash": "0x…", "error": null}]}`（2026-08-29 curl 實測 `approveAgent`／
+        `approveBuilderFee` 兩種 action 的確切欄位，見
+        `tests/fixtures/hl_explorer_user_details_sample.json`）。查無資料的地址
+        → `{"txs": []}`（真實行為，非錯誤）。"""
+        return run(lambda: self._post(EXPLORER_URL,
+                                      {"type": "userDetails", "user": address}),
+                   what="HL explorer 帳戶明細查詢", idempotent=True, sleep_fn=self._sleep)

@@ -55,7 +55,6 @@ export function Footer() {
             <span>{c.productStrategies}</span>
             <span>{c.productHow}</span>
             <span>{c.productFees}</span>
-            <Link href="/docs">{c.productDocs}</Link>
           </div>
         </div>
         <div>

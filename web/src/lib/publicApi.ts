@@ -258,6 +258,112 @@ export async function getPublicStrategy(slug: string): Promise<PublicStrategyDet
 }
 
 /**
+ * `/api/public/leaderboard`（M3 round2 Task 5）。Hyperliquid 主網公開排行榜的
+ * 展示資料——與本站策略／客戶資料無關，欄位全是字串（保留原精度，顯示層才
+ * 格式化，見 `hl_leaderboard.top_rows` 檔頭）。
+ */
+export type LeaderboardWindow = "day" | "week" | "month" | "allTime";
+
+export const LEADERBOARD_WINDOWS: LeaderboardWindow[] = ["day", "week", "month", "allTime"];
+
+export interface PublicLeaderboardRow {
+  address: string;
+  display_name: string | null;
+  account_value: string | null;
+  pnl: string | null;
+  roi: string | null;
+  vlm: string | null;
+}
+
+export interface PublicLeaderboardResp {
+  window: LeaderboardWindow;
+  updated_at: number;
+  rows: PublicLeaderboardRow[];
+}
+
+/**
+ * 讀取 `/api/public/leaderboard?window=…`。與其他 `getPublic*` helper 刻意不同：
+ * 這裡**不吞錯**（連線失敗、非 200、格式異常一律 throw）——呼叫端（leaderboard 頁）
+ * 需要區分「讀取失敗」與「讀取成功但剛好零筆」兩種不同的空畫面（load/error/empty
+ * 三態，plan Task 5 明訂），吞成統一的空清單會讓這兩種情況在 UI 上無法分辨。
+ */
+export async function getPublicLeaderboard(
+  window: LeaderboardWindow,
+): Promise<PublicLeaderboardResp> {
+  const res = await fetch(`/api/public/leaderboard?window=${encodeURIComponent(window)}`);
+  if (!res.ok) throw new Error(`leaderboard fetch failed: ${res.status}`);
+  const body = (await res.json()) as { window?: unknown; updated_at?: unknown; rows?: unknown } | null;
+  if (body == null || !Array.isArray(body.rows)) {
+    throw new Error("leaderboard: unexpected response shape");
+  }
+  const rows: PublicLeaderboardRow[] = (body.rows as unknown[])
+    .filter((r): r is Record<string, unknown> => r != null && typeof r === "object")
+    .filter((r) => typeof r.address === "string" && r.address !== "")
+    .map((r) => ({
+      address: r.address as string,
+      display_name: (r.display_name as string | null | undefined) ?? null,
+      account_value: (r.account_value as string | null | undefined) ?? null,
+      pnl: (r.pnl as string | null | undefined) ?? null,
+      roi: (r.roi as string | null | undefined) ?? null,
+      vlm: (r.vlm as string | null | undefined) ?? null,
+    }));
+  return {
+    window: LEADERBOARD_WINDOWS.includes(body.window as LeaderboardWindow)
+      ? (body.window as LeaderboardWindow)
+      : window,
+    updated_at: typeof body.updated_at === "number" ? body.updated_at : 0,
+    rows,
+  };
+}
+
+/**
+ * `/api/public/traders/{address}`（M3 round2 Task 6：交易員詳情頁）。任意 HL
+ * 地址的鏈上績效——**不受精選白名單管轄**，`metrics`／`equity_index`／
+ * `methodology` 與 `/api/public/strategies/{slug}` 同一份形狀（後端共用同一批
+ * 純函式），故前端可重用同一個 `EquityCurve` 元件與指標卡渲染邏輯。
+ * `account_value` 來自另一個端點（`clearinghouseState`，工程原則 1：與
+ * `equity_index` 不同源，不得放進同一個對比），可能單獨為 `null`。
+ */
+export interface PublicTraderDetail {
+  address: string;
+  account_value: string | null;
+  // ⭐ [W4] 2026-08-29 opus 審查修正：地址若被平台安全撤銷（精選白名單
+  // enabled=false），後端回 true——前端隱藏跟單 CTA，不讓新客戶點進去。
+  follow_blocked: boolean;
+  metrics: PublicStrategyMetrics;
+  equity_index: string[];
+  methodology: PublicStrategyMethodology;
+}
+
+/**
+ * 讀取 `/api/public/traders/{address}`。回傳 `null` 代表「這頁沒有東西可畫」
+ * ——404（壞位址格式）、503（上游暫時不可用）、連線失敗、格式異常一律折疊成
+ * 同一種呼叫端渲染（沿 `getPublicStrategy` 的既有慣例，不區分「明確不存在」
+ * 與「讀不到」：對使用者都是「這個地址目前看不到」）。
+ */
+export async function getPublicTraderDetail(address: string): Promise<PublicTraderDetail | null> {
+  try {
+    const res = await fetch(`/api/public/traders/${encodeURIComponent(address)}`);
+    if (!res.ok) return null;
+    const body = (await res.json()) as Partial<PublicTraderDetail> | null;
+    if (body == null || typeof body.address !== "string") return null;
+    return {
+      address: body.address,
+      account_value: body.account_value ?? null,
+      // ⭐ [8b-7] 2026-08-29 二輪複審 Suggestion：fail-closed，與後端
+      // `_trader_follow_blocked` 同方向——欄位缺漏或格式異常一律視為「已封鎖」
+      // （隱藏 CTA），不得因為解析失敗就預設放行去跟一個可能已被撤銷的地址。
+      follow_blocked: body.follow_blocked !== false,
+      metrics: normalizeMetrics(body.metrics),
+      equity_index: Array.isArray(body.equity_index) ? body.equity_index.map(String) : [],
+      methodology: normalizeMethodology(body.methodology),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 讀取 `/api/public/stats`（首頁證據列）。後端承諾任一子項取不到就回 `null`、
  * 端點恆 200；這裡再加一層防禦——連線失敗或非 200 一律降級為全 `null`
  * （`UNKNOWN_STATS`），呼叫端一律走「null → 顯示 `—`」的既有路徑，不特殊處理。

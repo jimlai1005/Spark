@@ -144,8 +144,8 @@ describe("DashboardPage — 六塊渲染假資料", () => {
     expect(screen.getByText("+$39.57")).toBeInTheDocument();
     // ⑤ 同步
     expect(screen.getByText("512ms")).toBeInTheDocument();
-    // ⑥ 費用
-    expect(screen.getByText("$25.66")).toBeInTheDocument();
+    // ⑥ 費用（builder_fees 累計列已依 M3 round2 Task 4 隱藏，改斷言仍保留的路由交易量）
+    expect(screen.getByText("$128,300")).toBeInTheDocument();
     // 持倉表
     expect(screen.getByText("ETH")).toBeInTheDocument();
   });

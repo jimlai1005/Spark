@@ -52,7 +52,11 @@ export const COPY_ZH = {
     settings: "設定",
     ops: "營運",
     admin: "待核准",
-    cta: "查看策略與風險",
+    // Task 2（2026-08-29）：CTA 從「查看策略與風險」改為登入入口——按錢包連接／簽署
+    // 進度顯示簡短狀態字；成功後依 dashboard 狀態導向 dashboard 或 strategies。
+    cta: "登入",
+    ctaConnecting: "連接中…",
+    ctaSigning: "簽署中…",
     langToggleLabel: "語言切換",
     /**
      * 跟單狀態 pill（三態）。⭐ 2026-08-28：資料源尚未接上（Task 13 的
@@ -243,7 +247,14 @@ export const COPY_ZH = {
     errors: {
       walletRejected: "簽署被拒絕——請在錢包中重試。Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
       signerMismatch: "簽名帳號與登入帳號不符——請在錢包中切回登入時使用的帳號後重試。這筆簽名不會被送出。",
-      agentUnavailable: "金鑰服務暫時不可用，請稍後重試。",
+      // 2026-08-29 M3 round2 Task 3：舊文案只說「暫時不可用」，看不出既有授權
+      // 沒事——場景是錢包先前已完成鏈上授權，keysvc 掛掉時整卡只剩這句話，
+      // 客戶會誤以為要重新授權。改講清楚「按重試」而非「自動重試」
+      // （進場 effect 只跑一次，是否自動重試要與實作一致，不能空講）。
+      agentUnavailable: "金鑰服務暫時不可用，請點「重試」再試一次；你已完成的簽署與授權仍然有效，不需要重做。",
+      // agent_conflict：keystore 與 DB 狀態不一致、自癒失敗——與上面的
+      // agent_exists（後端視為成功）不同義，需要人工介入，不會靠重試自己好。
+      agentConflict: "你的 agent 金鑰狀態不一致，請聯絡我們處理；已完成的鏈上授權不受影響。",
       payloadFailed: "取得待簽內容失敗，請稍後重試。",
       hlTransient: "送出授權時網路不穩——可以放心重試，重複送出同一筆簽名不會造成重複授權。",
       hlSemantic: "Hyperliquid 拒絕了這筆授權。請點「重試」重新取得待簽內容再簽一次。",
@@ -1147,7 +1158,6 @@ export const COPY_ZH = {
       positions: "跟單持倉",
       fees: "費用明細",
       history: "成交記錄・授權歷程",
-      comingSoon: "即將推出",
     },
     positionsTable: {
       symbol: "標的",
@@ -1166,6 +1176,39 @@ export const COPY_ZH = {
       date: "日期",
       fee: "Builder fee",
       empty: "本月尚無成交紀錄。",
+    },
+    /**
+     * 「成交記錄・授權歷程」tab（M3 round2 Task 7）——資料**直取 Hyperliquid**
+     * （userFillsByTime／explorer userDetails），結構上不讀自家 DB。lazy fetch，
+     * load/error/empty 三態各自獨立（成交與授權是兩個獨立上游查詢）。
+     */
+    history: {
+      fillsTitle: "成交記錄",
+      authorizationsTitle: "授權歷程",
+      loading: "讀取中…",
+      loadError: "資料暫時讀不到（直接查詢 Hyperliquid 失敗），請稍後重試。",
+      fillsEmpty: "近期沒有成交紀錄。",
+      authorizationsEmpty: "沒有查到授權紀錄。",
+      time: "時間",
+      coin: "幣別",
+      side: "方向",
+      buy: "買",
+      sell: "賣",
+      px: "價格",
+      sz: "數量",
+      fee: "手續費",
+      closedPnl: "已實現盈虧",
+      action: "動作",
+      summary: "說明",
+      // ⭐ [W2] 2026-08-29 opus 審查修正：後端 `/api/me/authorizations` 改回
+      // 結構化欄位（agent_address／builder／max_fee_rate），中文組字移到這裡
+      // （`PositionsTable.tsx` 依 `action_type` 挑對應標籤＋結構化欄位組句）。
+      actionApproveAgent: "授權 API wallet",
+      actionApproveBuilderFeeLabel: "授權 builder fee",
+      actionApproveBuilderFeeTo: "給",
+      actionUnknown: "授權動作",
+      tx: "交易",
+      viewTx: "查看",
     },
   },
   /**
@@ -1339,6 +1382,56 @@ export const COPY_ZH = {
     empty: "目前沒有可顯示的元件狀態。",
     loadFailedNote: "狀態讀取失敗或逾時，以下顯示為保守值（未知），不代表系統健康。",
   },
+  /**
+   * `/leaderboard` 頁（M3 round2 Task 5）：Hyperliquid 主網公開排行榜的展示頁，
+   * 資料來自 `/api/public/leaderboard`（無需登入）。與本站策略／客戶績效無關，
+   * 純供研究參考，故文案刻意強調資料來源與「非本站背書」。
+   */
+  leaderboard: {
+    heading: "交易排行榜",
+    sub: "資料來自 Hyperliquid 官方公開排行榜，依所選視窗的損益排序，僅供研究參考，不代表本站背書或跟單建議。",
+    windows: { day: "日", week: "週", month: "月", allTime: "全期" },
+    table: {
+      rank: "排名",
+      trader: "交易員",
+      accountValue: "帳戶價值",
+      pnl: "損益",
+      roi: "報酬率",
+      volume: "成交量",
+    },
+    loading: "讀取排行榜中…",
+    error: "排行榜讀取失敗，請稍後重試。",
+    empty: "目前沒有可顯示的排行榜資料。",
+  },
+  /**
+   * `/traders/[address]`（M3 round2 Task 6）：leaderboard 任意地址的詳情頁。
+   * 指標卡／CAGR／方法論文案沿用 `strategyDetail.metrics`／`.cagr`／`.methodology`
+   * （通用績效用語，非策略專屬），本區塊只放這頁自己的殼與「非精選、不背書」的
+   * 揭露（沿 `advanced` 頁「進階模式（無背書）」的既有揭露精神，見
+   * `wizard.step1AdvancedLabel`／`step1AdvancedBody`）。
+   */
+  traders: {
+    breadcrumb: "交易員",
+    loadingNote: "讀取交易員資料中…",
+    notFoundTitle: "找不到這個交易員",
+    notFoundBody: "這個地址查無鏈上績效資料，或位址格式不正確。請回到排行榜重新選擇。",
+    backToList: "回排行榜 →",
+    asOfPrefix: "資料截至 ",
+    sourceSuffix: " · 來源：Hyperliquid API",
+    accountValueLabel: "目前帳戶價值",
+    disclaimerNote: "此地址來自 Hyperliquid 公開排行榜，非本平台精選策略，本平台不對其表現背書或負責。",
+    panel: {
+      heading: "跟隨這個地址",
+      cta: "連接錢包並繼續",
+      ctaConnecting: "連接中…",
+      ctaSigning: "請在錢包中簽署登入訊息…",
+      footnote: "下一步僅為免費簽名（不上鏈、不花 gas），你會在授權前看到完整權限說明與費用確認。",
+      // ⭐ [W4] 2026-08-29 opus 審查修正：已被平台安全撤銷（enabled=false）的
+      // leader 不該再讓新客戶點進來就能跟——後端回傳 `follow_blocked` 時前端
+      // 隱藏 CTA、改顯示這句提示。
+      followBlocked: "此地址目前不可跟單。",
+    },
+  },
 } as const;
 
 /**
@@ -1383,7 +1476,9 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     settings: "Settings",
     ops: "Ops",
     admin: "Pending",
-    cta: "View strategies & risks",
+    cta: "Log in",
+    ctaConnecting: "Connecting…",
+    ctaSigning: "Signing…",
     langToggleLabel: "Language",
     pillFollowing: "Copying",
     pillPaused: "Paused",
@@ -1530,7 +1625,11 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         + "seed phrase; signing only happens in your own wallet.",
       signerMismatch: "The signing account doesn't match your login account — please switch your wallet back to the "
         + "account you logged in with and try again. This signature was not submitted.",
-      agentUnavailable: "The key service is temporarily unavailable, please try again later.",
+      agentUnavailable: "The key service is temporarily unavailable — click \"Retry\" to try "
+        + "again; any signature or authorization you've already completed remains valid and "
+        + "doesn't need to be redone.",
+      agentConflict: "Your agent key state is inconsistent — please contact us for help; any "
+        + "on-chain authorization you've already completed is not affected.",
       payloadFailed: "Failed to fetch the content to sign, please try again later.",
       hlTransient: "The network was unstable while submitting the authorization — it's safe to retry; resubmitting the "
         + "same signature won't create a duplicate authorization.",
@@ -2328,7 +2427,6 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       positions: "Followed positions",
       fees: "Fee detail",
       history: "Fill history & authorization log",
-      comingSoon: "Coming soon",
     },
     positionsTable: {
       symbol: "Symbol",
@@ -2347,6 +2445,31 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       date: "Date",
       fee: "Builder fee",
       empty: "No fills this month yet.",
+    },
+    history: {
+      fillsTitle: "Fill history",
+      authorizationsTitle: "Authorization log",
+      loading: "Loading…",
+      loadError: "Data temporarily unavailable (direct query to Hyperliquid failed); please try again later.",
+      fillsEmpty: "No recent fills.",
+      authorizationsEmpty: "No authorization records found.",
+      time: "Time",
+      coin: "Coin",
+      side: "Side",
+      buy: "Buy",
+      sell: "Sell",
+      px: "Price",
+      sz: "Size",
+      fee: "Fee",
+      closedPnl: "Realized PnL",
+      action: "Action",
+      summary: "Summary",
+      actionApproveAgent: "Authorized API wallet",
+      actionApproveBuilderFeeLabel: "Authorized builder fee",
+      actionApproveBuilderFeeTo: "to",
+      actionUnknown: "Authorization action",
+      tx: "Tx",
+      viewTx: "View",
     },
   },
   settings: {
@@ -2504,5 +2627,45 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     componentsHeading: "Components",
     empty: "No component status to display right now.",
     loadFailedNote: "Status could not be loaded or timed out; the values below are conservative (unknown) and do not imply system health.",
+  },
+  leaderboard: {
+    heading: "Trader leaderboard",
+    sub: "Sourced from Hyperliquid's official public leaderboard, ranked by PnL for the selected window. For research only — not an endorsement or copy-trading recommendation from this site.",
+    windows: { day: "Day", week: "Week", month: "Month", allTime: "All time" },
+    table: {
+      rank: "Rank",
+      trader: "Trader",
+      accountValue: "Account value",
+      pnl: "PnL",
+      roi: "ROI",
+      volume: "Volume",
+    },
+    loading: "Loading leaderboard…",
+    error: "Failed to load the leaderboard. Please try again later.",
+    empty: "No leaderboard data to display right now.",
+  },
+  traders: {
+    breadcrumb: "Trader",
+    loadingNote: "Loading trader data…",
+    notFoundTitle: "Trader not found",
+    notFoundBody: "No on-chain performance data for this address, or the address "
+      + "format is invalid. Please go back to the leaderboard and pick another one.",
+    backToList: "Back to leaderboard →",
+    asOfPrefix: "Data as of ",
+    sourceSuffix: " · Source: Hyperliquid API",
+    accountValueLabel: "Current account value",
+    disclaimerNote: "This address is sourced from Hyperliquid's public leaderboard, "
+      + "not a curated Filet strategy — this platform does not endorse or take "
+      + "responsibility for its performance.",
+    panel: {
+      heading: "Copy this address",
+      cta: "Connect wallet and continue",
+      ctaConnecting: "Connecting…",
+      ctaSigning: "Please sign the login message in your wallet…",
+      footnote: "The next step is a free signature only (no on-chain transaction, "
+        + "no gas) — you'll see the full permissions and fee summary before "
+        + "authorizing anything.",
+      followBlocked: "This address is not available for copy-trading right now.",
+    },
   },
 };
