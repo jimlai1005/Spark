@@ -20,11 +20,28 @@
    前端只送布林 chip 開關，不自己算。
 4. **`ExploreIndex`**：仿 `hl_leaderboard.LeaderboardCache` 的 TTL＋
    single-flight 模式，多一層 per-address enrich 結果快取（TTL 30 分鐘、
-   LRU 上限 256）。建置在背景 thread 跑（`build_sync` 是實際工作，序列執行、
-   批間 sleep，保護與實盤引擎共用的 HL 額度）；**從未成功建置過**時
-   `query()` 立即回 `building: True` ＋空 rows，不阻塞呼叫端。已有舊版時，
-   即使背景正在重建或本輪上游故障，一律**回舊版**（fail-open，同
-   `LeaderboardCache` 檔頭精神）。
+   LRU 上限 256）。建置在背景 thread 跑（`build_sync` 是實際工作，序列執行）；
+   **從未成功建置過**時 `query()` 立即回 `building: True` ＋空 rows，不阻塞
+   呼叫端。已有舊版時，即使背景正在重建或本輪上游故障，一律**回舊版**
+   （fail-open，同 `LeaderboardCache` 檔頭精神）。
+
+⚠️ 2026-08-30 mainnet 整合實跑事故（本機起 API 對真實 HL）：節流原本只設在
+「地址與地址之間」（`batch_sleep_s`），同一地址內連續 3 個 HL 請求
+（portfolio/fills/clearinghouse）**之間完全沒有間隔**，實測 burst 到約
+60 req/s，觸發大量 429，enrich 把 429 當成「該地址失敗→跳過」燒完整個
+候選池，index 以近乎 0 列完成建置＝空榜上線。修法（`_call_hl`）：
+1. 節流改成「每個 HL 請求之間」（`ExploreConfig.enrich_call_interval_s`，
+   預設 0.7s），不是地址之間——`batch_sleep_s` 已移除，不再併存兩套節流。
+2. 429 視為 transient（讀操作冪等，工程原則 2）：指數退避重試
+   `RATE_LIMIT_RETRY_DELAYS_S`（2s/8s/30s）。刻意**不**改
+   `spark/resilience.py` 的 `_TRANSIENT_MARKERS` 去收 429——那是與實盤引擎
+   共用的邊界，改寬鬆會連坐交易路徑；本模組自己在 `hl.py` 之上再包一層
+   429 專屬重試（見 `_is_rate_limited`／`_call_hl`）。
+3. 重試耗盡仍 429 → 判定「額度已被打穿，繼續燒剩餘候選只會全部繼續 429」，
+   **中止整輪建置**（`_RateLimitedAbort`，非單一地址跳過）、保留舊 snapshot
+   （fail-open，同上游故障的既有語意）、log 一行 `build aborted: rate
+   limited`。單一地址的**非** 429 錯誤（真的讀不到、格式錯誤…）維持原本
+   「跳過該列」語意，不觸發中止。
 
 工程原則 1（同源同基準）的落地：`ret_30d_pct`／`max_dd_30d_pct`／`spark` 三者
 出自**同一次** `portfolio()` 回應的**同一個** perpMonth `accountValueHistory`
@@ -67,6 +84,29 @@ SPARK_POINTS = 30
 # 風險調整排序鍵的回撤下限（D2）：回撤為 0 時代入，避免除零把新帳戶推上榜首。
 _DD_FLOOR_PCT = Decimal("0.5")
 
+# 每個 HL 請求之間的節流間隔（2026-08-30 mainnet burst 429 事故修法，見模組檔頭）。
+# 100 址 × 3 call ≈ 300 次請求 × 0.7s ≈ 3.5 分鐘一輪，相對 10 分鐘 index TTL 可接受。
+DEFAULT_ENRICH_CALL_INTERVAL_S = 0.7
+# 429（rate limited）指數退避重試序列（三次：2s/8s/30s）；耗盡仍 429 → 中止整輪建置。
+RATE_LIMIT_RETRY_DELAYS_S = (2.0, 8.0, 30.0)
+
+
+class _RateLimitedAbort(Exception):
+    """單一 HL 呼叫退避重試耗盡後仍 429——內部控制流訊號，不對外匯出。
+    `_enrich_one` 讓它原樣往上傳，`build_sync` 是唯一的攔截點（中止整輪建置，
+    保留舊 snapshot），不得被 `_enrich_one`／`_call_hl` 自己的 `except Exception`
+    吞掉，否則會退化成「跳過這一個地址」，失去「額度已被打穿，停止繼續燒」
+    的語意（見模組檔頭事故記錄）。"""
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """429 偵測：不 import httpx（本模組的唯讀 HL 邊界在 `hl.py`，這裡只認
+    錯誤訊息字串）——`httpx.HTTPStatusError` 的訊息固定含
+    `"429 Too Many Requests"`（2026-08-30 對 mainnet 整合實跑的實測 log，見
+    模組檔頭）。用字串比對而非 `isinstance`：測試與未來若換掉底層 HTTP client
+    都不必依賴 httpx 這個實作細節。"""
+    return "429" in str(exc)
+
 
 # ---------------------------------------------------------------------------
 # 設定
@@ -79,6 +119,8 @@ class ExploreConfig:
     max_drawdown_pct: Decimal = DEFAULT_MAX_DRAWDOWN_PCT
     max_concentration_pct: Decimal = DEFAULT_MAX_CONCENTRATION_PCT
     page_size: int = DEFAULT_PAGE_SIZE
+    # 每個 HL 請求之間的節流間隔（秒）。D3／2026-08-30 429 事故修法，見模組檔頭。
+    enrich_call_interval_s: float = DEFAULT_ENRICH_CALL_INTERVAL_S
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ExploreConfig":
@@ -95,6 +137,10 @@ class ExploreConfig:
             v = env.get(key)
             return Decimal(v) if v else default
 
+        def _float(key: str, default: float) -> float:
+            v = env.get(key)
+            return float(v) if v else default
+
         return cls(
             candidate_pool=_int("EXPLORE_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL),
             min_trading_days=_int("EXPLORE_MIN_TRADING_DAYS", DEFAULT_MIN_TRADING_DAYS),
@@ -103,6 +149,8 @@ class ExploreConfig:
             max_concentration_pct=_dec("EXPLORE_MAX_COIN_CONCENTRATION_PCT",
                                        DEFAULT_MAX_CONCENTRATION_PCT),
             page_size=_int("EXPLORE_PAGE_SIZE", DEFAULT_PAGE_SIZE),
+            enrich_call_interval_s=_float("EXPLORE_ENRICH_CALL_INTERVAL_S",
+                                          DEFAULT_ENRICH_CALL_INTERVAL_S),
         )
 
 
@@ -512,7 +560,6 @@ class ExploreIndex:
                 index_ttl_s: float = INDEX_TTL_S,
                 enrich_ttl_s: float = ENRICH_CACHE_TTL_S,
                 enrich_cache_max: int = ENRICH_CACHE_MAX,
-                batch_sleep_s: float = 0.05,
                 fills_window_days: int = FILLS_WINDOW_DAYS):
         self._leaderboard_source_fn = leaderboard_source_fn
         self._hl = hl
@@ -523,7 +570,6 @@ class ExploreIndex:
         self._ttl_s = index_ttl_s
         self._enrich_ttl_s = enrich_ttl_s
         self._enrich_cache_max = enrich_cache_max
-        self._batch_sleep_s = batch_sleep_s
         self._fills_window_days = fills_window_days
 
         self._lock = threading.Lock()
@@ -533,11 +579,45 @@ class ExploreIndex:
         self._building = False                         # single-flight：背景建置中
         self._enrich_cache: dict[str, tuple[float, ExploreRow | None]] = {}
 
+    def _call_hl(self, fn: Callable[[], object], *, what: str) -> object:
+        """單一 HL 呼叫的節流＋429 退避重試邊界（見類別所在模組檔頭 2026-08-30
+        事故記錄）。每個請求之間（不是每個地址之間）睡 `cfg.enrich_call_interval_s`，
+        保護與實盤引擎共用的 HL 額度。
+
+        429（rate limited；讀操作冪等 → 視為 transient，工程原則 2）→ 指數退避
+        `RATE_LIMIT_RETRY_DELAYS_S`（2s/8s/30s）；退避耗盡仍 429 → `_RateLimitedAbort`
+        （額度已被打穿，往上傳給 `build_sync` 中止整輪建置，不是跳過這一個地址）。
+        非 429 的其他錯誤 → 不重試，直接上拋（呼叫端 `_enrich_one` 既有的
+        「跳過該列」語意，不變）。
+        """
+        delays = RATE_LIMIT_RETRY_DELAYS_S
+        for attempt in range(len(delays) + 1):
+            try:
+                result = fn()
+            except Exception as e:
+                if not _is_rate_limited(e):
+                    raise
+                if attempt == len(delays):
+                    logger.error(
+                        "build aborted: rate limited（%s，退避 %d 次仍 429）", what, len(delays))
+                    raise _RateLimitedAbort(what) from e
+                delay = delays[attempt]
+                logger.warning(
+                    "explore %s：429 rate limited（第 %d/%d 次退避），%.0fs 後重試",
+                    what, attempt + 1, len(delays), delay)
+                self._sleep_fn(delay)
+                continue
+            self._sleep_fn(self._cfg.enrich_call_interval_s)
+            return result
+        raise RuntimeError("unreachable")  # pragma: no cover
+
     def _enrich_one(self, address: str, display_name: str | None) -> ExploreRow | None:
         """per-address enrich，帶 30 分鐘 TTL、LRU 256 上限快取（近似 LRU：
         淘汰最舊寫入時間，同 `app.py._cached_trader_data` 既有寫法）。任何一步
-        （portfolio/fills/clearinghouse）失敗 → 整列跳過（`None`），記入快取，
-        60 天內同一輪重建不會重複打壞地址的上游（enrich TTL 本身就是負面快取）。
+        （portfolio/fills/clearinghouse）非 429 失敗 → 整列跳過（`None`），記入
+        快取，60 天內同一輪重建不會重複打壞地址的上游（enrich TTL 本身就是
+        負面快取）。429 退避耗盡 → `_RateLimitedAbort` 原樣往上傳（不快取、
+        不當成「這個地址壞掉」，見 `_call_hl` 與 `build_sync`）。
         """
         now = self._now_fn()
         with self._lock:
@@ -546,12 +626,17 @@ class ExploreIndex:
             return cached[1]
         row: ExploreRow | None = None
         try:
-            portfolio_raw = self._hl.portfolio(address)
+            portfolio_raw = self._call_hl(lambda: self._hl.portfolio(address),
+                                          what=f"portfolio address={address}")
             end = datetime.fromtimestamp(now, tz=timezone.utc)
             start = end - timedelta(days=self._fills_window_days)
-            fills = self._hl.get_fills_detail(address, start, end)
-            ch_state = self._hl.clearinghouse_state(address)
+            fills = self._call_hl(lambda: self._hl.get_fills_detail(address, start, end),
+                                  what=f"fills address={address}")
+            ch_state = self._call_hl(lambda: self._hl.clearinghouse_state(address),
+                                     what=f"clearinghouse address={address}")
             row = enrich_candidate(address, display_name, portfolio_raw, fills, ch_state)
+        except _RateLimitedAbort:
+            raise  # 中止整輪建置的訊號，不得被下面這個 except 吞成「跳過該列」
         except Exception as e:  # noqa: BLE001 — 展示端點：單一地址失敗不得中斷整批建置
             logger.error("explore enrich 失敗 address=%s: %r", address, e)
             row = None
@@ -572,6 +657,11 @@ class ExploreIndex:
         `building: True`，見類別檔頭）。排除清單載入失敗 → 視為空清單
         （寧可這一輪意外把 Filet 自營地址也掃進候選池——下一輪排除清單恢復
         就會自然排除——也不要整個建置流程被一個旁支查詢拖垮）。
+
+        任一地址的 HL 呼叫 429 退避耗盡（`_RateLimitedAbort`）→ **中止整輪建置**
+        （不繼續掃剩餘候選——額度已被打穿，繼續燒只會全部繼續 429）、**不動**
+        `self._rows`（fail-open 到舊版，同上游故障的既有語意），見模組檔頭
+        2026-08-30 事故記錄。
         """
         try:
             payload = self._leaderboard_source_fn()
@@ -589,11 +679,15 @@ class ExploreIndex:
 
         candidates = candidate_addresses(payload, self._cfg.candidate_pool, excluded)
         rows: list[ExploreRow] = []
-        for address, display_name in candidates:
-            row = self._enrich_one(address, display_name)
-            if row is not None:
-                rows.append(row)
-            self._sleep_fn(self._batch_sleep_s)
+        try:
+            for address, display_name in candidates:
+                row = self._enrich_one(address, display_name)
+                if row is not None:
+                    rows.append(row)
+        except _RateLimitedAbort as e:
+            logger.error(
+                "build aborted: rate limited（%s）——中止本輪建置，保留舊 snapshot", e)
+            return
         rows = _apply_tags(rows, self._cfg)
 
         with self._lock:

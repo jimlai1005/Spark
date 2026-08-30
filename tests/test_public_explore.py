@@ -341,6 +341,142 @@ def _seed_hl(hl: FakeHL, address: str, *, roi_ret_pct=("1000", "1100"),
     hl.clearinghouse[address.lower()] = _ch_state()
 
 
+# ============================================================
+# ExploreIndex._call_hl：節流間隔 ＋ 429 退避重試 ＋ 中止整輪建置（2026-08-30
+# mainnet 整合實跑 burst 429 事故修法）
+# ============================================================
+
+_429_MESSAGE = ("Client error '429 Too Many Requests' for url "
+               "'https://api.hyperliquid.xyz/info'")
+
+
+def test_call_hl_sleeps_configured_interval_between_every_single_hl_call():
+    """節流間隔套用在**每個 HL 請求之間**（不是地址之間）：一個地址 3 個
+    HL 呼叫，呼叫與呼叫之間都要有一次設定值的 sleep。"""
+    hl = FakeHL()
+    _seed_hl(hl, _A, alltime_days=60)
+    calls: list[str] = []
+    orig_portfolio, orig_fills, orig_ch = (hl.portfolio, hl.get_fills_detail,
+                                           hl.clearinghouse_state)
+
+    def portfolio(address):
+        calls.append("call:portfolio")
+        return orig_portfolio(address)
+
+    def fills(address, start, end):
+        calls.append("call:fills")
+        return orig_fills(address, start, end)
+
+    def clearinghouse(address):
+        calls.append("call:clearinghouse")
+        return orig_ch(address)
+
+    hl.portfolio, hl.get_fills_detail, hl.clearinghouse_state = (portfolio, fills, clearinghouse)
+
+    def sleep_fn(seconds):
+        calls.append(f"sleep:{seconds}")
+
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.7)
+    index = ExploreIndex(leaderboard_source_fn=lambda: _leaderboard_payload(_lb_row(_A, roi="0.5")),
+                         hl=hl, excluded_fn=lambda: set(), cfg=cfg,
+                         now_fn=lambda: 1000.0, sleep_fn=sleep_fn)
+    index.build_sync()
+
+    assert calls == ["call:portfolio", "sleep:0.7", "call:fills", "sleep:0.7",
+                     "call:clearinghouse", "sleep:0.7"]
+
+
+def test_call_hl_retries_429_with_exponential_backoff_then_succeeds():
+    """429 視為 transient（讀操作冪等，工程原則 2）：前兩次 429，第三次成功
+    → 該地址仍正常進榜；退避延遲依序為 `RATE_LIMIT_RETRY_DELAYS_S` 的前兩個
+    （2s/8s）。"""
+    hl = FakeHL()
+    _seed_hl(hl, _A, alltime_days=60)
+    real_portfolio = hl.portfolio
+    state = {"n": 0}
+
+    def flaky_portfolio(address):
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise RuntimeError(_429_MESSAGE)
+        return real_portfolio(address)
+
+    hl.portfolio = flaky_portfolio
+    sleeps: list[float] = []
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.1)
+    index = ExploreIndex(leaderboard_source_fn=lambda: _leaderboard_payload(_lb_row(_A, roi="0.5")),
+                         hl=hl, excluded_fn=lambda: set(), cfg=cfg,
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
+    index.build_sync()
+
+    result = index.query(require_sample=False)
+    assert len(result["rows"]) == 1  # 429 兩次後第三次成功，該地址仍進榜
+    assert sleeps[:2] == [2.0, 8.0]  # 429 退避延遲（RATE_LIMIT_RETRY_DELAYS_S 前兩個）
+
+
+def test_build_aborts_on_persistent_rate_limit_and_keeps_old_snapshot(caplog):
+    """退避重試耗盡仍 429 → 中止整輪建置（不繼續燒剩餘候選）、保留舊
+    snapshot（fail-open）、`building: False`（有舊值可回）、且大聲留痕
+    `build aborted: rate limited`。"""
+    hl = FakeHL()
+    _seed_hl(hl, _A, alltime_days=60)
+    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.0)
+    # ⭐ enrich_ttl_s=0：固定的 now_fn（1000.0）會讓第二輪 build_sync 命中
+    # per-address enrich 快取、完全不再打 `hl.portfolio`——這裡要測的正是
+    # 「第二輪重新打上游、遇到持續 429」，把快取關掉才會真的走到重試路徑。
+    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
+                         excluded_fn=lambda: set(), cfg=cfg,
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                         enrich_ttl_s=0.0)
+    index.build_sync()  # 第一輪成功，建立舊 snapshot
+    first = index.query(require_sample=False)
+    assert len(first["rows"]) == 1
+
+    def always_429(address):
+        raise RuntimeError(_429_MESSAGE)
+
+    hl.portfolio = always_429
+
+    with caplog.at_level("ERROR"):
+        index.build_sync()  # 第二輪：持續 429，三次退避耗盡
+
+    assert "build aborted: rate limited" in caplog.text
+    second = index.query(require_sample=False)
+    assert second["rows"] == first["rows"]   # 舊 snapshot 保留，不是空清單
+    assert second["building"] is False        # 有舊值 → 不是 building 態
+
+
+def test_call_hl_non_429_error_still_skips_only_that_address_not_whole_build():
+    """非 429 的錯誤維持既有「跳過該地址」語意，不觸發整輪中止——與 429
+    中止路徑明確分流。"""
+    hl = FakeHL()
+    _seed_hl(hl, _A, alltime_days=60)
+    _seed_hl(hl, _B, alltime_days=60)
+    real_portfolio = hl.portfolio
+
+    def bad_for_a(address):
+        if address.lower() == _A.lower():
+            # ⚠️ 訊息刻意不含 "429" 三個字元——`_is_rate_limited` 是字串子字串
+            # 比對，混進這串數字會被誤判成 rate limit，這裡要測的正是「非
+            # rate limit 錯誤」的分流。
+            raise ValueError("資料格式不符（欄位缺失）")
+        return real_portfolio(address)
+
+    hl.portfolio = bad_for_a
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.0)
+    payload = _leaderboard_payload(_lb_row(_A, roi="0.9"), _lb_row(_B, roi="0.5"))
+    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
+                         excluded_fn=lambda: set(), cfg=cfg,
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
+    index.build_sync()
+    result = index.query(require_sample=False)
+    addrs = [r["address"] for r in result["rows"]]
+    assert _A not in addrs
+    assert _B in addrs
+    assert result["building"] is False
+
+
 def test_index_query_never_built_returns_building_true_and_empty_rows_without_blocking():
     """建置中或**從未成功過** → `building: True` ＋空 rows，且讀路徑不阻塞
     （呼叫立即返回，不等背景 thread 跑完）。"""
@@ -489,9 +625,15 @@ def test_endpoint_no_auth_required_and_no_cookie_side_effect(tmp_path):
     assert r.cookies.get("filet_session") is None
 
 
-def test_endpoint_full_flow_after_build_completes(tmp_path):
+def test_endpoint_full_flow_after_build_completes(tmp_path, monkeypatch):
     """走完整條管線：上游 leaderboard → enrich → 過濾 → 排序 → 分頁，一路到
-    HTTP 回應；並驗證 Filet 自營地址在端點層也被排除（讀精選白名單）。"""
+    HTTP 回應；並驗證 Filet 自營地址在端點層也被排除（讀精選白名單）。
+
+    `app.py` 接線的 `ExploreIndex` 不注入假 `sleep_fn`（正式行為就是真睡，
+    見 `_call_hl` 節流）——這裡把節流間隔歸零，測試才不會真的睡
+    `EXPLORE_ENRICH_CALL_INTERVAL_S` 秒（`ExploreConfig.from_env` 讀這個環境
+    變數，見 hl_explore.py）。"""
+    monkeypatch.setenv("EXPLORE_ENRICH_CALL_INTERVAL_S", "0")
     payload = _leaderboard_payload(_lb_row(_A, display_name="Alice", roi="0.5"),
                                    _lb_row(_FILET_OWN, roi="0.99"))
     hl = FakeHL()
