@@ -20,7 +20,7 @@ body {
 h1, h2, h3 { margin: 0 0 8px; font-weight: 300; }
 p { margin: 0 0 8px; }
 ol, ul { margin: 0; padding: 0; list-style: none; }
-a { color: inherit; }
+a { color: inherit; text-decoration: none; }  /* 2026-08-30 使用者裁決：全站超連結一律無底線 */
 button { font: inherit; color: inherit; }
 table { border-collapse: collapse; width: 100%; }
 
@@ -456,7 +456,6 @@ main.page {
 .btn-ghost {
   border-color: transparent;
   background: transparent;
-  text-decoration: underline;
   padding: 6px 4px;
   color: var(--text-dim);
 }
@@ -1401,7 +1400,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-card-collapsed { padding-bottom: 22px; }
 .dash-collapsed-line { margin: 0; font-size: var(--fs-small); color: var(--text-dim); }
 .dash-collapsed-error { color: var(--neg); }
-.dash-retry-btn { background: none; border: none; padding: 0; color: var(--primary); font: inherit; text-decoration: underline; cursor: pointer; }
+.dash-retry-btn { background: none; border: none; padding: 0; color: var(--primary); font: inherit; cursor: pointer; }
 
 .dash-fee-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
 .dash-fee-metric-label { font-size: var(--fs-small); color: var(--text-dim); margin-bottom: 6px; }
@@ -1438,7 +1437,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-history-section:nth-of-type(2) .dash-table-head,
 .dash-history-section:nth-of-type(2) .dash-table-row { grid-template-columns: 1.3fr 1fr 2fr 0.6fr; min-width: 560px; }
 .dash-history-section .dash-table-row a { color: var(--primary); text-decoration: none; }
-.dash-history-section .dash-table-row a:hover { text-decoration: underline; }
+.dash-history-section .dash-table-row a:hover { color: var(--primary-bright, var(--primary)); }
 .dash-fees-row:first-child { border-top: none; }
 
 /* ==================== /explore（M3 round3 Task 4，設計審查 R2·A） ==================== */
