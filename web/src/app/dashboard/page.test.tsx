@@ -86,7 +86,10 @@ const FULL: DashboardResp = {
   fees_month: {
     routed_volume: "128300.00", builder_fees: "25.66", fill_count: 96,
     avg_fee: "0.27", effective_rate_bps: "2.00",
-    daily_bars: [["2026-08-01", "1.20"], ["2026-08-02", "2.50"]],
+    daily_bars: [
+      { date: "2026-08-01", fill_count: 3, routed_volume: "6000", builder_fee: "1.20", effective_rate_bps: "2.00" },
+      { date: "2026-08-02", fill_count: 5, routed_volume: "12500", builder_fee: "2.50", effective_rate_bps: "2.00" },
+    ],
   },
   positions: [
     {

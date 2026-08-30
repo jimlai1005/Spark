@@ -1452,14 +1452,19 @@ export interface DashboardSync {
    * 檔頭），前端不得依賴此欄位取得精確時刻，只用 `data_state==="warming"` 判斷。 */
   since_ts: number | null;
 }
-/** `daily_bars`：`[YYYY-MM-DD, builder_fee_str][]`。 */
+/** `daily_bars`：逐日聚合物件列（M3 round3 Task 2 起與 `/api/me/fees` 的
+ * `MyFeesDailyRow` 同形狀；2026-08-30 事故：本型別曾滯留舊 tuple 形狀導致
+ * FeesCard 對物件做陣列解構而 runtime 崩潰——契約改動時，**所有**消費端
+ * 與此型別必須同一個 commit 內更新）。 */
 export interface DashboardFeesMonth {
   routed_volume: string;
   builder_fees: string;
   fill_count: number;
   avg_fee: string | null;
   effective_rate_bps: string | null;
-  daily_bars: [string, string][];
+  daily_bars: MyFeesDailyRow[];
+  /** R-A：期間 fills 分頁達上限仍滿頁時為 true（合計為下限值）。 */
+  truncated?: boolean;
 }
 export interface DashboardPosition {
   symbol: string;

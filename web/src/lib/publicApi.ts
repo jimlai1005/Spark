@@ -353,6 +353,8 @@ export interface ExploreRow {
   /** 實盤天數＝perpAllTime 首末快照的日曆跨距（後端欄位 `live_days`）。 */
   live_days: number;
   fill_count_30d: number;
+  /** R-A/W2：30D fills 讀到分頁上限仍滿頁 → true（fill_count 為下限值）。 */
+  fills_truncated?: boolean;
   close_win_rate_pct: number | null;
   concentration_pct: number | null;
   exposure: { dir: string | null; pct: number | null };

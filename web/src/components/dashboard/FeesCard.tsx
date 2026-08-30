@@ -15,8 +15,12 @@ export function FeesCard({ feesMonth }: { feesMonth: DashboardFeesMonth | null }
   const COPY = useCopy();
   const c = COPY.dashboard.fees;
 
+  // ⭐ daily_bars 自 M3 round3 起是物件列（{date, builder_fee, …}），不是
+  // [date, fee] tuple——2026-08-30 曾因本元件滯留 tuple 解構而 runtime 崩潰。
   const bars = feesMonth?.daily_bars ?? [];
-  const values = bars.map(([, v]) => Number(v)).filter((v) => Number.isFinite(v));
+  const values = bars
+    .map((bar) => Number(bar.builder_fee))
+    .filter((v) => Number.isFinite(v));
   const maxVal = values.length > 0 ? Math.max(...values, 0) : 0;
 
   return (
@@ -33,10 +37,10 @@ export function FeesCard({ feesMonth }: { feesMonth: DashboardFeesMonth | null }
 
       {bars.length > 0 && (
         <div className="dash-fee-bars" aria-hidden="true">
-          {bars.map(([date, v], i) => {
-            const n = Number(v);
+          {bars.map((bar, i) => {
+            const n = Number(bar.builder_fee);
             const h = maxVal > 0 && Number.isFinite(n) ? Math.max(2, (n / maxVal) * 100) : 2;
-            return <div key={date || i} className="dash-fee-bar" style={{ height: `${h}%` }} />;
+            return <div key={bar.date || i} className="dash-fee-bar" style={{ height: `${h}%` }} />;
           })}
         </div>
       )}

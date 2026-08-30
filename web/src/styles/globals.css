@@ -1603,3 +1603,10 @@ html, body { overflow-x: hidden; }
   .dash-table-row > .dash-table-symbol { grid-column: 1 / -1; }
 }
 
+
+/* ═══ 全站錯誤頁（app/error.tsx；2026-08-30 使用者裁決：不曝露 stack/代碼） ═══ */
+.error-page { min-height: 60vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.error-page-card { max-width: 440px; text-align: center; padding: 36px 32px; }
+.error-page-title { font-size: 22px; margin: 0 0 12px; }
+.error-page-desc { color: var(--text-dim); line-height: 1.7; margin: 0 0 24px; }
+.error-page-actions { display: flex; gap: 12px; justify-content: center; }

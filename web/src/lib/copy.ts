@@ -24,6 +24,14 @@ export const LANG_LABELS: Record<"zh" | "en", string> = { zh: "繁中", en: "EN"
 export const FOLLOWER_COUNT_DISPLAY_MIN = 10;
 
 export const COPY_ZH = {
+  /** 全站 runtime 錯誤頁（app/error.tsx 與 global-error.tsx）。⭐ 使用者裁決
+   * （2026-08-30）：任何錯誤都不得曝露 stack、錯誤訊息或程式碼，只顯示本文案。 */
+  errorPage: {
+    title: "頁面暫時無法顯示",
+    desc: "發生了非預期的問題，你的資金與授權不受影響。請重試一次；若持續發生，請稍後再回來或聯絡我們。",
+    retry: "重試",
+    home: "回首頁",
+  },
   common: {
     appName: "FILET",
     next: "下一步",
@@ -1613,6 +1621,12 @@ export type DeepString<T> = T extends string
  * 保留英文；語氣對齊 zh 版的直接與精確，不用行銷腔。
  */
 export const COPY_EN: DeepString<typeof COPY_ZH> = {
+  errorPage: {
+    title: "This page is temporarily unavailable",
+    desc: "Something unexpected happened. Your funds and authorizations are not affected. Please retry; if it persists, come back later or contact us.",
+    retry: "Retry",
+    home: "Back to home",
+  },
   common: {
     appName: "FILET",
     next: "Next",
