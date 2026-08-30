@@ -51,7 +51,8 @@ function GuardRow({ label, guard }: { label: string; guard: DashboardGuard }) {
 }
 
 export function StatusCard({
-  status, me, positions, closeAllPending, closeAllFailed, onActionSettled, onCloseAllSubmitted,
+  status, me, positions, closeAllPending, closeAllFailed, riskControlsEnabled,
+  onActionSettled, onCloseAllSubmitted,
 }: {
   status: DashboardStatus | null;
   /** 登入身分——kill switch 動作皆需要（暫停/恢復不簽章，平倉並撤銷需要它比對
@@ -64,6 +65,12 @@ export function StatusCard({
   /** 輪詢逾時或後端判定請求過期（opus 審查 Critical 2c）——停止暗示「即將完成」，
    * 改顯示明確失敗卡＋官方介面自助指引。 */
   closeAllFailed: boolean;
+  /** ⭐ M3 round3 Task 6（R2·C 態一）：dashboard 回應頂層的 `risk_controls_enabled`
+   * ——恆為明確布林（見 api.ts::DashboardResp 檔頭），取代舊有的
+   * `guards.drawdown.enabled === true` 判斷（後者在心跳過期時可能是 `null`，
+   * 不如這個欄位確定）。`false` 時回撤護欄列渲染「未啟用 · 前往設定 →」引導，
+   * 不是灰色「—」。 */
+  riskControlsEnabled: boolean;
   /** 暫停/恢復送出成功後呼叫——讓呼叫端立即重新整理 dashboard 資料，不必等下一次
    * 自然輪詢週期。 */
   onActionSettled: () => void;
@@ -121,7 +128,12 @@ export function StatusCard({
           <div className="dash-card-label">{c.label}</div>
           <div className="dash-status-title">
             <span className="dash-status-dot" data-state={state} aria-hidden="true" />
-            <span>{status?.strategy_name ?? c.strategyFallback} · {stateLabel}</span>
+            {/* ⭐ R2 P1：策略名 nowrap＋badge 獨立元素，不與標題同一文流——舊版把
+               名稱與「跟單中」用 " · " 接成同一個文字節點，390px 寬時會斷在
+               文字中間（讀起來像 bug）。現在兩者是獨立的 flex item，badge 整體
+               換行也不會被切成兩半。 */}
+            <span className="dash-status-name">{status?.strategy_name ?? c.strategyFallback}</span>
+            <span className="pill dash-status-badge" data-state={state}>{stateLabel}</span>
           </div>
           <div className="dash-status-sub">{subtitleParts.join(" · ")}</div>
         </div>
@@ -171,7 +183,7 @@ export function StatusCard({
       <div className="dash-guards">
         <GuardRow label={c.guardScale} guard={guards.scale} />
         <GuardRow label={c.guardLeverage} guard={guards.leverage} />
-        {guards.drawdown.enabled === true ? (
+        {riskControlsEnabled ? (
           <GuardRow label={c.guardDrawdown} guard={guards.drawdown} />
         ) : (
           <div>

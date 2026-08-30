@@ -69,6 +69,13 @@ export const COPY_ZH = {
     pillFollowing: "跟單中",
     pillPaused: "已暫停",
     pillNotFollowing: "未跟單",
+    /**
+     * 保證金告警 pill（Task 6，R2 P2「Dashboard 保證金」）：登入態且可用保證金
+     * 低於 `EquityCard.LOW_MARGIN_THRESHOLD`（5%）時，header 同步顯示這顆 pill，
+     * 點擊導向 /dashboard——與 EquityCard 卡片內的告警文案同一資料源
+     * （`/api/me/dashboard` 的 `equity.available_pct`），不是另外算一份。
+     */
+    marginAlertPill: "保證金偏低",
   },
   /**
    * Footer 文案（Task 7）。四欄＋系統狀態燈——資料來自 `/api/public/status`
@@ -1054,7 +1061,7 @@ export const COPY_ZH = {
     liveBadge: "即時",
     loadingNote: "讀取 Dashboard 資料中…",
     status: {
-      label: "① 策略狀態",
+      label: "策略狀態",
       strategyFallback: "此帳號",
       stateFollowing: "跟單中",
       statePaused: "已暫停",
@@ -1103,19 +1110,23 @@ export const COPY_ZH = {
       guardScale: "投入比例",
       guardLeverage: "槓桿",
       guardDrawdown: "回撤（自高點）",
-      drawdownDisabled: "未啟用 · 前往設定",
+      drawdownDisabled: "未啟用 · 前往設定 →",
     },
     equity: {
-      label: "② 帳戶淨值與可用保證金",
+      label: "帳戶淨值與可用保證金",
       custodyNote: "錢包資產由你自己保管；Filet 無提領權限",
       retSuffix: " 30D",
       usedMargin: "已用保證金",
       availableMargin: "可用保證金",
       lowMarginWarning:
         "可用保證金偏低。若策略需加倉可能被跳過，建議入金或調低投入比例。",
+      // ⭐ Task 6（R2 保證金分級）：<2% 的紅框文案——比 lowMarginWarning 更急迫，
+      // 明講「極可能被跳過」而非「可能」，並把「儘速」放在句首引導動作。
+      criticalMarginWarning:
+        "可用保證金嚴重不足，策略加倉極可能被跳過。請儘速入金或調低投入比例。",
     },
     exposure: {
-      label: "③ 目前曝險",
+      label: "目前曝險",
       notionalSuffix: " 名目",
       long: "多方",
       short: "空方",
@@ -1127,17 +1138,20 @@ export const COPY_ZH = {
       maxPosition: "最大單一部位",
     },
     pnl: {
-      label: "④ 淨 PnL（已扣 builder fee）",
+      label: "淨 PnL（已扣 builder fee）",
       realizedPrefix: "已實現 ",
       unrealizedPrefix: " · 未實現 ",
       chartEmpty: "尚無足夠資料繪製走勢圖。",
       winRate: "勝率",
       closedPositions: "已結束倉位",
-      maxDrawdown: "期間最大回撤",
+      // ⭐ D5（2026-08-30 主線程裁決）：策略頁「策略期間回撤」與 Dashboard 這裡的
+      // 「你的跟單回撤」是兩個不同標的（策略自身 vs 你實際跟單的帳戶），不可同名——
+      // 同名曾造成首頁/詳情頁/Dashboard 三處數字互相矛盾卻被誤讀成同一件事。
+      maxDrawdown: "你的跟單回撤",
       feeShare: "費用佔 PnL",
     },
     sync: {
-      label: "⑤ master / follower 同步誤差",
+      label: "master / follower 同步誤差",
       latencyMedian: "訊號延遲 中位",
       latencyP95Prefix: "p95 ",
       priceDiff: "成交價差",
@@ -1146,9 +1160,14 @@ export const COPY_ZH = {
       scaleDeviation: "部位比例偏差（vs master）",
       missedSignals: "近 24h 遺漏訊號",
       lastRecon: "上次完整對帳",
+      // ⭐ R2·C 空值三態（2026-08-30）：`data_state` 三態的收斂文案。「ok」沿用
+      // 上面既有的逐欄渲染（個別欄位仍可能為 null →「—」，但絕不顯示 0ms）；
+      // 「warming」與「error」時整卡摺為一行，不留一整塊空白卡片。
+      warmingLine: "同步誤差：跟單啟動後 24h 內開始累積",
+      errorLine: "引擎狀態讀取失敗",
     },
     fees: {
-      label: "⑥ 本月交易量與 builder fee",
+      label: "本月交易量與 builder fee",
       routedVolume: "路由交易量",
       builderFees: "Builder fee 累計",
       fillCount: "成交筆數",
@@ -1561,6 +1580,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     pillFollowing: "Copying",
     pillPaused: "Paused",
     pillNotFollowing: "Not copying",
+    marginAlertPill: "Margin low",
   },
   footer: {
     brandTagline: "Non-custodial strategy execution on Hyperliquid. Your funds stay in your wallet; authorization can be revoked anytime.",
@@ -2392,7 +2412,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     liveBadge: "Live",
     loadingNote: "Loading dashboard data…",
     status: {
-      label: "1 Strategy status",
+      label: "Strategy status",
       strategyFallback: "This account",
       stateFollowing: "Following",
       statePaused: "Paused",
@@ -2448,10 +2468,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       guardScale: "Allocation",
       guardLeverage: "Leverage",
       guardDrawdown: "Drawdown (from peak)",
-      drawdownDisabled: "Not enabled · Go to settings",
+      drawdownDisabled: "Not enabled · Go to settings →",
     },
     equity: {
-      label: "2 Account equity & available margin",
+      label: "Account equity & available margin",
       custodyNote: "Assets stay in your own wallet; Filet has no withdrawal permission",
       retSuffix: " 30D",
       usedMargin: "Margin used",
@@ -2459,9 +2479,12 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       lowMarginWarning:
         "Available margin is low. New entries may be skipped — consider depositing more or lowering your "
         + "allocation.",
+      criticalMarginWarning:
+        "Available margin is critically low — new entries will very likely be skipped. Please deposit more "
+        + "or lower your allocation as soon as possible.",
     },
     exposure: {
-      label: "3 Current exposure",
+      label: "Current exposure",
       notionalSuffix: " notional",
       long: "Long",
       short: "Short",
@@ -2473,17 +2496,17 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       maxPosition: "Largest single position",
     },
     pnl: {
-      label: "4 Net PnL (after builder fee)",
+      label: "Net PnL (after builder fee)",
       realizedPrefix: "Realized ",
       unrealizedPrefix: " · Unrealized ",
       chartEmpty: "Not enough data to draw the chart yet.",
       winRate: "Win rate",
       closedPositions: "Closed positions",
-      maxDrawdown: "Max drawdown (period)",
+      maxDrawdown: "Your following drawdown",
       feeShare: "Fees / PnL",
     },
     sync: {
-      label: "5 Master / follower sync deviation",
+      label: "Master / follower sync deviation",
       latencyMedian: "Signal latency (median)",
       latencyP95Prefix: "p95 ",
       priceDiff: "Fill price diff",
@@ -2492,9 +2515,11 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       scaleDeviation: "Position ratio deviation (vs master)",
       missedSignals: "Missed signals (24h)",
       lastRecon: "Last full reconciliation",
+      warmingLine: "Sync deviation: starts accumulating within 24h of activation",
+      errorLine: "Engine status unavailable",
     },
     fees: {
-      label: "6 This month's volume & builder fee",
+      label: "This month's volume & builder fee",
       routedVolume: "Routed volume",
       builderFees: "Builder fee accrued",
       fillCount: "Fill count",

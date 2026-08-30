@@ -81,6 +81,7 @@ const FULL: DashboardResp = {
     latency_median_ms: 512, latency_p95_ms: 900, price_diff_bp: "2.3",
     unsynced_positions: 0, scale_deviation_pct: "0.8", missed_signals_24h: 1,
     missed_reason: "insufficient_margin", last_recon_ts: 1724805060,
+    data_state: "ok", since_ts: null,
   },
   fees_month: {
     routed_volume: "128300.00", builder_fees: "25.66", fill_count: 96,
@@ -94,6 +95,7 @@ const FULL: DashboardResp = {
       deviation_pct: "0.4",
     },
   ],
+  risk_controls_enabled: true,
   updated_at: 1724805063,
 };
 
@@ -106,7 +108,7 @@ const ALL_NULL: DashboardResp = {
     },
   },
   equity: null, exposure: null, pnl: null, sync: null, fees_month: null,
-  positions: null, updated_at: 1724805063,
+  positions: null, risk_controls_enabled: false, updated_at: 1724805063,
 };
 
 beforeEach(() => {
@@ -132,19 +134,19 @@ describe("DashboardPage — 六塊渲染假資料", () => {
     getDashboard.mockResolvedValue(FULL);
     render(wrap(<DashboardPage />));
 
-    // ① 狀態
+    // 狀態
     expect(await screen.findByText(/Filet Core/)).toBeInTheDocument();
     expect(screen.getByText(COPY.dashboard.status.stateFollowing, { exact: false })).toBeInTheDocument();
-    // ② 淨值
+    // 淨值
     expect(screen.getByText("$1,206.67")).toBeInTheDocument();
-    // ③ 曝險
+    // 曝險
     expect(screen.getByText("$521.20")).toBeInTheDocument();
     expect(screen.getByText("29.1% (INTC)")).toBeInTheDocument();
-    // ④ PnL
+    // PnL
     expect(screen.getByText("+$39.57")).toBeInTheDocument();
-    // ⑤ 同步
+    // 同步
     expect(screen.getByText("512ms")).toBeInTheDocument();
-    // ⑥ 費用（builder_fees 累計列已依 M3 round2 Task 4 隱藏，改斷言仍保留的路由交易量）
+    // 費用（builder_fees 累計列已依 M3 round2 Task 4 隱藏，改斷言仍保留的路由交易量）
     expect(screen.getByText("$128,300")).toBeInTheDocument();
     // 持倉表
     expect(screen.getByText("ETH")).toBeInTheDocument();

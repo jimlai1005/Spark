@@ -5,6 +5,12 @@ import { useCopy } from "@/lib/lang";
 
 /** NOTE 14：可用保證金低於此比例即出現黃色告警卡（設計稿錨例：0.64% → 觸發）。 */
 export const LOW_MARGIN_THRESHOLD = 0.05;
+/**
+ * ⭐ M3 round3 Task 6（R2 P2「Dashboard 保證金」）：<2% 進一步升級為紅框＋紅字。
+ * 門檻常數集中在這一處 export——Header.tsx 的保證金提示 pill 沿用
+ * `LOW_MARGIN_THRESHOLD`（同一個 5% 判準，不另拼一份數字）。
+ */
+export const CRITICAL_MARGIN_THRESHOLD = 0.02;
 
 function signedPct(v: string | null): string {
   if (v == null) return NO_VALUE;
@@ -30,9 +36,15 @@ export function EquityCard({ equity }: { equity: DashboardEquity | null }) {
   const availablePctNum = equity?.available_pct != null ? Number(equity.available_pct) : null;
   const lowMargin = availablePctNum != null
     && Number.isFinite(availablePctNum) && availablePctNum < LOW_MARGIN_THRESHOLD;
+  const criticalMargin = availablePctNum != null
+    && Number.isFinite(availablePctNum) && availablePctNum < CRITICAL_MARGIN_THRESHOLD;
+  // ⭐ R2 保證金分級：≥5% 無框；<5% 黃框；<2% 紅框（criticalMargin 蘊含 lowMargin，
+  // 兩門檻同源同一個 available_pct，不另拼第二個判斷基準）。
+  const marginLevel: "warning" | "critical" | null =
+    criticalMargin ? "critical" : lowMargin ? "warning" : null;
 
   return (
-    <div className="card dash-card dash-card-equity">
+    <div className="card dash-card dash-card-equity" data-margin={marginLevel ?? undefined}>
       <div className="dash-card-label">{c.label}</div>
       <div className="dash-equity-head">
         <span className="mono dash-equity-value">{accountValue}</span>
@@ -57,14 +69,21 @@ export function EquityCard({ equity }: { equity: DashboardEquity | null }) {
         </div>
         <div className="dash-margin-row" style={{ marginBottom: 0 }}>
           <span style={{ color: "var(--text-dim)" }}>{c.availableMargin}</span>
-          <span className="mono" style={{ color: lowMargin ? "var(--warn)" : undefined }}>
+          <span
+            className="mono"
+            style={{ color: criticalMargin ? "var(--neg)" : lowMargin ? "var(--warn)" : undefined }}
+          >
             {equity ? `$${fmtAmount(equity.withdrawable)}` : NO_VALUE}{" "}
             <span style={{ color: "var(--text-dim)" }}>
               ({equity ? fmtRatioPct(equity.available_pct, 2) : NO_VALUE})
             </span>
           </span>
         </div>
-        {lowMargin && <div className="dash-low-margin-card">{c.lowMarginWarning}</div>}
+        {lowMargin && (
+          <div className="dash-low-margin-card" data-level={marginLevel ?? undefined}>
+            {criticalMargin ? c.criticalMarginWarning : c.lowMarginWarning}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -1444,6 +1444,13 @@ export interface DashboardSync {
   missed_signals_24h: number | null;
   missed_reason: string | null;
   last_recon_ts: number | null;
+  /** ⭐ M3 round3 Task 3（R2·C 空值三態）：`"warming"`＝從未收到心跳（結構上還在
+   * 暖機，不是壞掉）；`"error"`＝這個帳號自己的成交查詢失敗；`"ok"`＝其餘情況
+   * （即使個別欄位仍是 null）。前端據此決定整卡摺疊或逐欄渲染。 */
+  data_state: "ok" | "warming" | "error";
+  /** 跟單啟動時間——repo 目前無此資料源，恆為 `null`（見 app.py::_dashboard_sync
+   * 檔頭），前端不得依賴此欄位取得精確時刻，只用 `data_state==="warming"` 判斷。 */
+  since_ts: number | null;
 }
 /** `daily_bars`：`[YYYY-MM-DD, builder_fee_str][]`。 */
 export interface DashboardFeesMonth {
@@ -1473,6 +1480,13 @@ export interface DashboardResp {
   sync: DashboardSync | null;
   fees_month: DashboardFeesMonth | null;
   positions: DashboardPosition[] | null;
+  /** ⭐ M3 round3 Task 3（D5 風險護欄）：執行期恆由後端帶上、恆為明確布林
+   * （`_dashboard_risk_controls_enabled` 的契約，不會是 `null`）——前端才能用它
+   * 渲染「未啟用 · 前往設定 →」的確定態一，而不是把「不知道」誤顯示成灰色「—」。
+   * 選填（非 optional 會讓既有 mock fixture 缺這個鍵時編不過，沿 `close_request`
+   * 既有慣例）：缺席只在測試假資料裡發生，呼叫端一律用 `?? false` 兜底
+   * （產品預設不啟用風控，見專案 CLAUDE.md 紅線 5）。 */
+  risk_controls_enabled?: boolean;
   updated_at: number;
 }
 

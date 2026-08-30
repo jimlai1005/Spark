@@ -190,6 +190,18 @@ input:focus-visible,
 }
 .follow-pill[data-state="not_following"] .follow-pill-dot { background: var(--text-dim); }
 
+/* Header 保證金告警 pill（Task 6，R2 P2）——沿用 .pill 基底，功能色借 --warn
+   （與 EquityCard 的黃框告警同語意，不新造顏色）。 */
+.header-margin-alert {
+  padding: 5px 11px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-decoration: none;
+  border: 1px solid rgba(var(--warn-rgb), .35);
+  background: rgba(var(--warn-rgb), .1);
+  color: var(--warn);
+}
+
 /* ---------- Footer ---------- */
 .app-footer {
   margin-top: 66px;
@@ -1297,12 +1309,19 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-card-label { font-family: var(--font-mono); font-size: var(--fs-micro); letter-spacing: 0.14em; color: var(--text-dim); margin-bottom: 14px; }
 
 .dash-status-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
-.dash-status-title { display: flex; align-items: center; gap: 11px; margin-bottom: 7px; font-size: var(--fs-h3); font-weight: 700; }
+/* flex-wrap：策略名與「跟單中」badge 是兩個獨立 flex item，窄版時 badge 整體
+   換到下一行，不會被切成兩半（R2 P1 修正——見 StatusCard.tsx 註解）。 */
+.dash-status-title { display: flex; flex-wrap: wrap; align-items: center; gap: 11px; margin-bottom: 7px; font-size: var(--fs-h3); font-weight: 700; }
 .dash-status-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
 .dash-status-dot[data-state="following"] { background: var(--pos); }
 .dash-status-dot[data-state="paused"] { background: var(--warn); }
 .dash-status-dot[data-state="halted"] { background: var(--neg); }
 .dash-status-dot[data-state="inactive"] { background: var(--text-dim); }
+.dash-status-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.dash-status-badge { padding: 3px 10px; font-size: var(--fs-micro); font-weight: 500; white-space: nowrap; border: 1px solid var(--border); background: var(--inset); color: var(--text-dim); }
+.dash-status-badge[data-state="following"] { color: var(--pos); border-color: rgba(var(--pos-rgb), .28); background: rgba(var(--pos-rgb), .1); }
+.dash-status-badge[data-state="paused"] { color: var(--warn); border-color: rgba(var(--warn-rgb), .28); background: rgba(var(--warn-rgb), .1); }
+.dash-status-badge[data-state="halted"] { color: var(--neg); border-color: rgba(var(--neg-rgb), .28); background: rgba(var(--neg-rgb), .1); }
 .dash-status-sub { font-size: var(--fs-small); color: var(--text-dim); }
 .dash-status-actions { display: flex; gap: 9px; }
 .dash-btn-pause { border: 1px solid var(--border-strong); color: var(--text); background: transparent; font-size: var(--fs-small); font-weight: 500; border-radius: var(--radius-btn); padding: 10px 16px; cursor: pointer; white-space: nowrap; }
@@ -1340,6 +1359,10 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-margin-bar { height: 5px; background: var(--inset); border-radius: 3px; position: relative; }
 .dash-margin-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--secondary); }
 .dash-low-margin-card { background: rgba(var(--warn-rgb), 0.08); border: 1px solid rgba(var(--warn-rgb), 0.24); border-radius: 9px; padding: 11px 13px; font-size: var(--fs-micro); line-height: 1.6; color: var(--warn); }
+.dash-low-margin-card[data-level="critical"] { background: rgba(var(--neg-rgb), 0.08); border-color: rgba(var(--neg-rgb), 0.3); color: var(--neg); }
+/* R2 保證金分級（Task 6）：≥5% 無框（沿用 .card 預設 border）；<5% 黃框；<2% 紅框。 */
+.dash-card-equity[data-margin="warning"] { border-color: rgba(var(--warn-rgb), .4); }
+.dash-card-equity[data-margin="critical"] { border-color: rgba(var(--neg-rgb), .5); }
 
 .dash-exposure-value { font-family: var(--font-mono); font-size: var(--fs-h2); font-weight: 700; letter-spacing: -0.02em; }
 .dash-exposure-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 18px; }
@@ -1370,6 +1393,12 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-sync-metric-label { font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 6px; white-space: nowrap; }
 .dash-sync-metric-value { font-family: var(--font-mono); font-size: var(--fs-body-lg); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dash-sync-metric-note { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
+
+/* R2·C 空值三態（Task 6）：warming／error 態整卡摺為一行，不留一整塊「—」空白。 */
+.dash-card-collapsed { padding-bottom: 22px; }
+.dash-collapsed-line { margin: 0; font-size: var(--fs-small); color: var(--text-dim); }
+.dash-collapsed-error { color: var(--neg); }
+.dash-retry-btn { background: none; border: none; padding: 0; color: var(--primary); font: inherit; text-decoration: underline; cursor: pointer; }
 
 .dash-fee-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
 .dash-fee-metric-label { font-size: var(--fs-small); color: var(--text-dim); margin-bottom: 6px; }

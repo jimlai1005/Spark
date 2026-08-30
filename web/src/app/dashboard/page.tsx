@@ -148,6 +148,7 @@ export default function DashboardPage() {
           positions={data?.positions ?? null}
           closeAllPending={awaitingHalt}
           closeAllFailed={closeAllFailed}
+          riskControlsEnabled={data?.risk_controls_enabled ?? false}
           onActionSettled={() => void dash.refetch()}
           onCloseAllSubmitted={() => {
             setAwaitingHalt(true);
@@ -165,7 +166,11 @@ export default function DashboardPage() {
       </div>
 
       <div className="dash-row3">
-        <SyncCard sync={data?.sync ?? null} />
+        <SyncCard
+          sync={data?.sync ?? null}
+          updatedAt={data?.updated_at ?? null}
+          onRetry={() => void dash.refetch()}
+        />
         <FeesCard feesMonth={data?.fees_month ?? null} />
       </div>
 

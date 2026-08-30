@@ -6,6 +6,7 @@ import { useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
 import { getDashboard, logout, type DashboardResp } from "@/lib/api";
 import { LANG_LABELS } from "@/lib/copy";
+import { LOW_MARGIN_THRESHOLD } from "@/components/dashboard/EquityCard";
 import { shortAddr } from "@/lib/format";
 import { useIsAdmin, useMe } from "@/lib/hooks";
 import { useCopy, useLang } from "@/lib/lang";
@@ -152,6 +153,17 @@ export function Header() {
     not_following: COPY.nav.pillNotFollowing,
   }[followStatus];
 
+  /**
+   * ⭐ M3 round3 Task 6（R2 P2「Dashboard 保證金」）：低保證金 header 同步提示。
+   * 沿用同一個 `dash` query（已在跟單狀態 pill 使用），不為這顆 pill 另外打
+   * `/api/me/dashboard`——同一份回應的 `equity.available_pct` 是唯一來源，
+   * 與 EquityCard 卡片內的告警判準同源同基準（工程原則 1）。
+   */
+  const availablePctNum = dash.data?.equity?.available_pct != null
+    ? Number(dash.data.equity.available_pct) : null;
+  const showMarginAlert = availablePctNum != null
+    && Number.isFinite(availablePctNum) && availablePctNum < LOW_MARGIN_THRESHOLD;
+
   return (
     <header className="app-header">
       <Link href="/" className="wordmark-mini">
@@ -207,6 +219,11 @@ export function Header() {
         )}
         {loggedIn && me.data && (
           <>
+            {showMarginAlert && (
+              <Link href="/dashboard" className="pill header-margin-alert">
+                {COPY.nav.marginAlertPill}
+              </Link>
+            )}
             <Link href="/dashboard" className="pill follow-pill" data-state={followStatus}>
               <span className="follow-pill-dot" aria-hidden="true" />
               {followLabel}

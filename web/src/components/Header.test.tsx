@@ -64,7 +64,18 @@ function dashboardWithState(state: DashboardStatus["state"]): DashboardResp {
       },
     },
     equity: null, exposure: null, pnl: null, sync: null, fees_month: null,
-    positions: null, updated_at: 1724800000,
+    positions: null, risk_controls_enabled: false, updated_at: 1724800000,
+  };
+}
+
+/** 供保證金告警 pill 測試使用——固定其餘欄位、只變動 `equity.available_pct`。 */
+function dashboardWithMargin(availablePct: string): DashboardResp {
+  return {
+    ...dashboardWithState("following"),
+    equity: {
+      account_value: "1000.00", margin_used: "100.00", withdrawable: "900.00",
+      available_pct: availablePct, ret_30d_pct: "1.0",
+    },
   };
 }
 
@@ -207,6 +218,28 @@ describe("Header — 跟單狀態 pill 接上 /api/me/dashboard（Task 14）", (
       expect(screen.queryByText(COPY_ZH.nav.pillPaused)).not.toBeInTheDocument();
     },
   );
+});
+
+describe("Header — 保證金告警 pill（M3 round3 Task 6，R2 P2）", () => {
+  it("available_pct < 5% → 顯示保證金告警 pill，連向 /dashboard", async () => {
+    getDashboard.mockResolvedValue(dashboardWithMargin("0.03"));
+    render(wrap(<Header />, qcWithMe({ address: "0xabc", account_id: "fabc" })));
+    const pill = await screen.findByText(COPY_ZH.nav.marginAlertPill);
+    expect(pill.closest("a")).toHaveAttribute("href", "/dashboard");
+  });
+
+  it("available_pct ≥ 5% → 不顯示保證金告警 pill", async () => {
+    getDashboard.mockResolvedValue(dashboardWithMargin("0.10"));
+    render(wrap(<Header />, qcWithMe({ address: "0xabc", account_id: "fabc" })));
+    await screen.findByText(COPY_ZH.nav.pillFollowing);
+    expect(screen.queryByText(COPY_ZH.nav.marginAlertPill)).not.toBeInTheDocument();
+  });
+
+  it("未登入 → 不顯示保證金告警 pill（不打 dashboard）", () => {
+    render(wrap(<Header />, qcWithMe(null)));
+    expect(screen.queryByText(COPY_ZH.nav.marginAlertPill)).not.toBeInTheDocument();
+    expect(getDashboard).not.toHaveBeenCalled();
+  });
 });
 
 describe("Header — CTA「登入」走 wagmi injected＋SIWE，依 dashboard 狀態導向（Task 2）", () => {
