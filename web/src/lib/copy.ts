@@ -1173,10 +1173,33 @@ export const COPY_ZH = {
       marginModeIsolated: "逐倉",
       empty: "目前沒有跟單持倉。",
     },
+    /**
+     * 費用明細 tab（R2·B 重構，2026-08-30）：頂部合計四格＋期間切換（本月/上月/全部）＋
+     * 匯出 CSV＋前端補日曆列（無成交日渲染整列「—」，與 $0.00 有成交但費用為零區分）。
+     * `summaryPnlShare` 語意＝佔**已實現**淨 PnL（Task 2b 裁決 D12），不是總 PnL——
+     * 文案必須如實寫「已實現」，不可省略（`pnl_share_pct` 為 null 時前端顯示「—」）。
+     */
     feesTable: {
-      date: "日期",
-      fee: "Builder fee",
-      empty: "本月尚無成交紀錄。",
+      periodThisMonth: "本月",
+      periodLastMonth: "上月",
+      periodAll: "全部",
+      summaryBuilderFee: "Builder Fee 合計",
+      summaryRoutedVolume: "路由交易量",
+      summaryFillCount: "成交筆數",
+      summaryPnlShare: "佔已實現淨 PnL",
+      exportCsv: "匯出 CSV",
+      colDate: "日期 ↓",
+      colFillCount: "成交筆數",
+      colRoutedVolume: "路由交易量",
+      colBuilderFee: "Builder fee",
+      colEffectiveRate: "實際費率",
+      loadMore: "載入更早的 20 天",
+      footerNote:
+        "日期為 UTC 日界；「—」表示當日無成交，與費用為 0 的情況區分。"
+        + "實際費率＝當日 fee ÷ 路由交易量，用來核對 0.02% 上限沒有被超收。",
+      loading: "讀取中…",
+      loadError: "費用明細暫時讀不到，請稍後重試。",
+      empty: "此期間尚無成交紀錄。",
     },
     /**
      * 「成交記錄・授權歷程」tab（M3 round2 Task 7）——資料**直取 Hyperliquid**
@@ -2497,9 +2520,27 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       empty: "No followed positions right now.",
     },
     feesTable: {
-      date: "Date",
-      fee: "Builder fee",
-      empty: "No fills this month yet.",
+      periodThisMonth: "This month",
+      periodLastMonth: "Last month",
+      periodAll: "All time",
+      summaryBuilderFee: "Builder fee total",
+      summaryRoutedVolume: "Routed volume",
+      summaryFillCount: "Fill count",
+      summaryPnlShare: "Share of realized PnL",
+      exportCsv: "Export CSV",
+      colDate: "Date ↓",
+      colFillCount: "Fills",
+      colRoutedVolume: "Routed volume",
+      colBuilderFee: "Builder fee",
+      colEffectiveRate: "Effective rate",
+      loadMore: "Load 20 more days",
+      footerNote:
+        "Dates use UTC day boundaries. “—” means no fills that day, "
+        + "distinct from a $0.00 fee. Effective rate = that day's fee ÷ routed volume, "
+        + "so you can verify the 0.02% cap was never exceeded.",
+      loading: "Loading…",
+      loadError: "Fee detail temporarily unavailable, please try again later.",
+      empty: "No fills in this period yet.",
     },
     history: {
       fillsTitle: "Fill history",

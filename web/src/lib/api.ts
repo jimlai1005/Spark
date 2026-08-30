@@ -1481,6 +1481,51 @@ export function getDashboard(): Promise<DashboardResp> {
   return request<DashboardResp>("/api/me/dashboard");
 }
 
+// ---------- 費用明細 tab（R2·B 重構；對照 publicapi/app.py GET /api/me/fees） ----------
+
+export type MyFeesPeriod = "this_month" | "last_month" | "all";
+
+/**
+ * 逐日聚合列（`_fee_daily_bars` 擴充形狀）。⭐ 無成交日**不產生列**（「—」列由
+ * 前端補日曆，見 `PositionsTable.tsx` 的 `buildFeesCalendarRows`）；`builder_fee`
+ * 恆為字串（Decimal 無損序列化），`fill_count > 0` 但 `builder_fee === "0"` 是
+ * 合法值（$0.00 有成交，非「當日無成交」，R2·B）。
+ */
+export interface MyFeesDailyRow {
+  date: string;
+  fill_count: number;
+  routed_volume: string;
+  builder_fee: string;
+  effective_rate_bps: string | null;
+}
+
+/**
+ * 期間合計。⭐ `pnl_share_pct`＝builder_fees ÷ 期間**已實現**淨 PnL（同一批 fills
+ * 同源同基準，Task 2b 主線程裁決 D12）——不是佔總 PnL，前端文案須如實寫「已實現」。
+ * 分母 ≤0 或無 closedPnl 資料 → null（顯示「—」，不得顯示 0%）。
+ */
+export interface MyFeesSummary {
+  builder_fees: string;
+  routed_volume: string;
+  fill_count: number;
+  pnl_share_pct: string | null;
+}
+
+export interface MyFeesResp {
+  summary: MyFeesSummary;
+  daily: MyFeesDailyRow[];
+}
+
+/**
+ * 費用明細（需 session）。`period` 決定 `[start, end)`：`this_month`／`last_month`
+ * 為日曆月（UTC），`all` 為帳戶實際交易起點至今。同一個 `collect_follower_summary`
+ * 資料源（不另拼第二來源，工程原則 1）。上游失敗 → 503（kind=upstream）。冪等讀取。
+ */
+export function getMyFees(period: MyFeesPeriod = "this_month"): Promise<MyFeesResp> {
+  const q = new URLSearchParams({ period });
+  return request<MyFeesResp>(`/api/me/fees?${q.toString()}`);
+}
+
 // ---------- 成交記錄・授權歷程（M3 round2 Task 7；對照 publicapi/app.py
 // GET /api/me/fills、GET /api/me/authorizations）----------
 // ⭐ 兩者資料**直取 Hyperliquid**（userFillsByTime／explorer userDetails），

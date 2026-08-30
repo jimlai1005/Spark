@@ -347,7 +347,9 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     //   （24 → 26）。
     // 2026-08-29（M3 round2 Task 7）：+2 匯出（getMyFills、getMyAuthorizations，
     //   「成交記錄・授權歷程」tab，不帶簽名、不進 EXCLUDED）⇒ 反射清單淨增 2（26 → 28）。
-    const HAND_WRITTEN_LIST_LENGTH = 28;
+    // 2026-08-30（M3 round3 Task 5）：+1 匯出（getMyFees，費用明細 tab 期間切換，
+    //   不帶簽名、不進 EXCLUDED）⇒ 反射清單淨增 1（28 → 29）。
+    const HAND_WRITTEN_LIST_LENGTH = 29;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

@@ -2,10 +2,14 @@
 import { useEffect, useState } from "react";
 import {
   getMyAuthorizations,
+  getMyFees,
   getMyFills,
   type DashboardFeesMonth,
   type DashboardPosition,
   type MyAuthorizationRow,
+  type MyFeesDailyRow,
+  type MyFeesPeriod,
+  type MyFeesResp,
   type MyFillRow,
 } from "@/lib/api";
 import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE } from "@/lib/format";
@@ -25,13 +29,19 @@ function signedAmount(v: string): string {
 }
 
 /**
- * 次要區塊：跟單持倉表＋tab 列（Task 14）。「費用明細」v1 無獨立客戶自助帳單端點
- * （`lib/api.ts` 只有 admin only 的 `/api/ops/*`），以 `fees_month.daily_bars` 簡表
- * 呈現（plan 0.2「查有無現成，沒有就以 fees_month 資料簡表呈現」）。「成交記錄・
- * 授權歷程」列 backlog，tab 本身 disabled（0.2）。
+ * 次要區塊：跟單持倉表＋tab 列（Task 14）。「費用明細」自 M3 round3 Task 5（R2·B
+ * 重構）起改用獨立客戶端點 `GET /api/me/fees?period=`（見 `FeesGrid`），支援
+ * 本月/上月/全部三種期間切換＋前端補日曆列＋CSV 匯出，不再吃 dashboard 快照裡
+ * 的 `fees_month.daily_bars`。「成交記錄・授權歷程」自 M3 round2 Task 7 起已實作
+ * （見下方 `HistoryPanel`），非 backlog。
  */
 export function PositionsTable({
-  positions, feesMonth,
+  positions,
+  // ⭐ M3 round3 Task 5：費用明細 tab 改為自帶期間切換的獨立 lazy fetch
+  // （`FeesGrid` 內部直接呼叫 `getMyFees`），不再吃 `fees_month` 快照。`feesMonth`
+  // prop 留著只是為了不動既有呼叫端／既有測試的簽名（`PositionsTable.test.tsx`／
+  // `PositionsTable.history.test.tsx` 仍傳 `feesMonth={null}`），本元件內不使用它。
+  feesMonth: _feesMonth,
 }: {
   positions: DashboardPosition[] | null;
   feesMonth: DashboardFeesMonth | null;
@@ -70,7 +80,7 @@ export function PositionsTable({
       </div>
 
       {tab === "positions" && <PositionsGrid positions={positions} />}
-      {tab === "fees" && <FeesGrid feesMonth={feesMonth} />}
+      {tab === "fees" && <FeesGrid />}
       {tab === "history" && <HistoryPanel />}
     </div>
   );
@@ -125,27 +135,312 @@ function PositionsGrid({ positions }: { positions: DashboardPosition[] | null })
   );
 }
 
-function FeesGrid({ feesMonth }: { feesMonth: DashboardFeesMonth | null }) {
-  const COPY = useCopy();
-  const c = COPY.dashboard.feesTable;
-  const bars = feesMonth?.daily_bars ?? [];
+// ── 費用明細 tab（R2·B 重構，M3 round3 Task 5）──────────────────────────────
+//
+// `/api/me/fees?period=` 只回「有成交的日子」（`daily`，見 api.ts `MyFeesDailyRow`
+// 註解）；「無成交」的日曆列由前端補（`buildFeesCalendarRows`），與 `builder_fee
+// === "0"`（有成交、費用恰為零）在畫面上明確分開——這是 R2·B 要修的核心問題
+// （現況 $0.00 與「當日無成交」完全無法區分）。
+//
+// ⚠️ 這裡刻意不掛 globals.css 的既有 `.dash-table-head`/`.dash-table-row`
+// class（那組 grid-template-columns 是為 6 欄的持倉表寫的，本表是 5 欄），
+// 改用 inline grid style——globals.css 不在本 task 的改動範圍（見派工 prompt
+// 「只動 PositionsTable.tsx / api.ts / copy.ts」），避免動到共用樣式表影響其他表格。
 
-  if (bars.length === 0) {
-    return (
-      <div className="dash-table">
-        <p className="dash-table-empty">{c.empty}</p>
-      </div>
-    );
+const FEES_PERIODS: MyFeesPeriod[] = ["this_month", "last_month", "all"];
+const FEES_DEFAULT_VISIBLE = 10;
+const FEES_LOAD_MORE_STEP = 20;
+const FEES_ROW_GRID_COLUMNS = "140px 1fr 1fr 1fr 110px";
+
+interface FeesCalendarRow {
+  date: string;
+  hasFill: boolean;
+  fill_count: number | null;
+  routed_volume: string | null;
+  builder_fee: string | null;
+  effective_rate_bps: string | null;
+}
+
+type FeesTableCopy = ReturnType<typeof useCopy>["dashboard"]["feesTable"];
+
+function utcDateStr(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/** `dateStr`（`YYYY-MM-DD`，代表 UTC 日曆日）± `days` 天，回傳同格式字串。 */
+function addDaysUtc(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return utcDateStr(new Date(Date.UTC(y, m - 1, d + days)));
+}
+
+/** `monthsBack` 個月前那個月的 1 號（UTC）。`Date.UTC` 對負月份會自動跨年，
+ * 不需要手動處理 12 月→1 月的進位。 */
+function startOfMonthUtc(now: Date, monthsBack: 0 | 1): string {
+  return utcDateStr(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthsBack, 1)));
+}
+
+/**
+ * 把後端「只有成交日」的 `daily` 補成連續日曆列（新→舊）。
+ * - `this_month`／`last_month`：補整個 UTC 日曆月（`this_month` 只補到今天，
+ *   月份尚未走完的日子本來就不該出現）。
+ * - `all`：**只從 `daily` 裡最早的一天補起**，不補到帳戶誕生前——避免把
+ *   帳戶開通前、根本不存在的日子畫成一整排「—」（plan Task 5 明文要求）。
+ *   `daily` 為空（這個帳戶從未有過成交）時直接回傳空陣列，交由呼叫端顯示 empty 態。
+ */
+export function buildFeesCalendarRows(
+  period: MyFeesPeriod,
+  daily: MyFeesDailyRow[],
+  now: Date,
+): FeesCalendarRow[] {
+  const byDate = new Map(daily.map((row) => [row.date, row]));
+  let startStr: string;
+  let endStr: string;
+  if (period === "this_month") {
+    startStr = startOfMonthUtc(now, 0);
+    endStr = utcDateStr(now);
+  } else if (period === "last_month") {
+    startStr = startOfMonthUtc(now, 1);
+    endStr = addDaysUtc(startOfMonthUtc(now, 0), -1);
+  } else {
+    if (daily.length === 0) return [];
+    startStr = daily.reduce((min, row) => (row.date < min ? row.date : min), daily[0].date);
+    endStr = utcDateStr(now);
   }
 
+  const rows: FeesCalendarRow[] = [];
+  for (let cur = startStr; cur <= endStr; cur = addDaysUtc(cur, 1)) {
+    const existing = byDate.get(cur);
+    rows.push(
+      existing
+        ? {
+            date: cur, hasFill: true, fill_count: existing.fill_count,
+            routed_volume: existing.routed_volume, builder_fee: existing.builder_fee,
+            effective_rate_bps: existing.effective_rate_bps,
+          }
+        : {
+            date: cur, hasFill: false, fill_count: null,
+            routed_volume: null, builder_fee: null, effective_rate_bps: null,
+          },
+    );
+  }
+  return rows.reverse();
+}
+
+/** RFC4180 最小轉義：欄位含逗號／引號／換行才加引號，內部引號雙寫。 */
+function csvEscapeField(field: string): string {
+  if (/[",\n]/.test(field)) return `"${field.replace(/"/g, '""')}"`;
+  return field;
+}
+
+/**
+ * CSV 內容（不含 BOM／下載副作用，純函式方便單測）。欄位與畫面表格一致。
+ * `c` 只取用 5 個 `col*` 欄位——用 `Pick` 而非整個 `FeesTableCopy`，讓呼叫端
+ * （含測試）不需要餵一份完整的費用明細文案物件就能單測本函式。
+ */
+export function buildFeesCsv(
+  rows: FeesCalendarRow[],
+  c: Pick<FeesTableCopy, "colDate" | "colFillCount" | "colRoutedVolume" | "colBuilderFee" | "colEffectiveRate">,
+): string {
+  const header = [c.colDate, c.colFillCount, c.colRoutedVolume, c.colBuilderFee, c.colEffectiveRate];
+  const lines = [
+    header,
+    ...rows.map((r) => [
+      r.date,
+      r.hasFill ? String(r.fill_count) : NO_VALUE,
+      r.hasFill ? `$${fmtAmount(r.routed_volume)}` : NO_VALUE,
+      r.hasFill ? `$${fmtAmount(r.builder_fee)}` : NO_VALUE,
+      r.hasFill && r.effective_rate_bps != null
+        ? `${fmtAmount(r.effective_rate_bps, 2)} bps`
+        : NO_VALUE,
+    ]),
+  ];
+  return lines.map((line) => line.map(csvEscapeField).join(",")).join("\n");
+}
+
+function downloadCsv(filename: string, csv: string): void {
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function FeesGrid() {
+  const COPY = useCopy();
+  const c = COPY.dashboard.feesTable;
+  const [period, setPeriod] = useState<MyFeesPeriod>("this_month");
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<MyFeesResp | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(FEES_DEFAULT_VISIBLE);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setFailed(false);
+    setVisibleCount(FEES_DEFAULT_VISIBLE);
+    getMyFees(period).then(
+      (resp) => {
+        if (cancelled) return;
+        setData(resp);
+        setLoading(false);
+      },
+      () => {
+        if (cancelled) return;
+        setFailed(true);
+        setLoading(false);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [period]);
+
+  const periodLabel: Record<MyFeesPeriod, string> = {
+    this_month: c.periodThisMonth, last_month: c.periodLastMonth, all: c.periodAll,
+  };
+
+  const calendarRows = data ? buildFeesCalendarRows(period, data.daily, new Date()) : [];
+  const visibleRows = calendarRows.slice(0, visibleCount);
+  const hasMore = calendarRows.length > visibleCount;
+
   return (
-    <div className="dash-table dash-fees-list">
-      {bars.map(([date, fee]) => (
-        <div className="dash-fees-row" key={date}>
-          <span>{date}</span>
-          <span className="mono">${fmtAmount(fee)}</span>
+    <div className="dash-table">
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        flexWrap: "wrap", gap: 12, padding: "16px 20px 0",
+      }}
+      >
+        <div style={{ display: "flex", gap: 4 }}>
+          {FEES_PERIODS.map((p) => (
+            <button
+              key={p}
+              type="button"
+              onClick={() => setPeriod(p)}
+              disabled={period === p}
+              style={{
+                fontSize: 13, padding: "6px 13px", borderRadius: 6,
+                border: "1px solid var(--border)", cursor: period === p ? "default" : "pointer",
+                background: period === p ? "var(--inset)" : "transparent",
+                color: period === p ? "var(--text)" : "var(--text-dim)",
+                fontWeight: period === p ? 600 : 400,
+              }}
+            >
+              {periodLabel[p]}
+            </button>
+          ))}
         </div>
-      ))}
+        <button
+          type="button"
+          disabled={!data || calendarRows.length === 0}
+          onClick={() => data && downloadCsv(`filet-fees-${period}.csv`, buildFeesCsv(calendarRows, c))}
+          style={{
+            fontSize: 12.5, color: "var(--text-dim)", border: "1px solid var(--border)",
+            borderRadius: 7, padding: "8px 13px", background: "none",
+            cursor: !data || calendarRows.length === 0 ? "not-allowed" : "pointer",
+          }}
+        >
+          {c.exportCsv}
+        </button>
+      </div>
+
+      {loading && <p className="dash-table-empty">{c.loading}</p>}
+      {!loading && failed && <p className="dash-table-empty">{c.loadError}</p>}
+      {!loading && !failed && data && (
+        <>
+          <div style={{
+            display: "flex", gap: 34, flexWrap: "wrap", padding: "16px 20px",
+          }}
+          >
+            {([
+              [c.summaryBuilderFee, `$${fmtAmount(data.summary.builder_fees)}`],
+              [c.summaryRoutedVolume, `$${fmtAmount(data.summary.routed_volume)}`],
+              [c.summaryFillCount, data.summary.fill_count.toLocaleString("en-US")],
+              [
+                c.summaryPnlShare,
+                data.summary.pnl_share_pct != null
+                  ? `${fmtAmount(data.summary.pnl_share_pct, 2)}%`
+                  : NO_VALUE,
+              ],
+            ] as const).map(([label, value]) => (
+              <div key={label}>
+                <div style={{
+                  fontFamily: "var(--font-mono)", fontSize: 10.5, letterSpacing: "0.14em",
+                  color: "var(--text-dim)", marginBottom: 6, textTransform: "uppercase",
+                }}
+                >
+                  {label}
+                </div>
+                <div className="mono" style={{ fontSize: 17, fontWeight: 700 }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          {calendarRows.length === 0 ? (
+            <p className="dash-table-empty">{c.empty}</p>
+          ) : (
+            <>
+              <div style={{
+                display: "grid", gridTemplateColumns: FEES_ROW_GRID_COLUMNS, gap: 16,
+                padding: "0 20px 10px", fontFamily: "var(--font-mono)", fontSize: 11,
+                letterSpacing: "0.1em", color: "var(--text-dim)",
+              }}
+              >
+                <div>{c.colDate}</div>
+                <div style={{ textAlign: "right" }}>{c.colFillCount}</div>
+                <div style={{ textAlign: "right" }}>{c.colRoutedVolume}</div>
+                <div style={{ textAlign: "right" }}>{c.colBuilderFee}</div>
+                <div style={{ textAlign: "right" }}>{c.colEffectiveRate}</div>
+              </div>
+              {visibleRows.map((r) => (
+                <div
+                  key={r.date}
+                  className="mono"
+                  style={{
+                    display: "grid", gridTemplateColumns: FEES_ROW_GRID_COLUMNS, gap: 16,
+                    padding: "13px 20px", borderTop: "1px solid var(--border)", fontSize: 13.5,
+                  }}
+                >
+                  <div>{r.date}</div>
+                  <div style={{ textAlign: "right" }}>{r.hasFill ? r.fill_count : NO_VALUE}</div>
+                  <div style={{ textAlign: "right" }}>
+                    {r.hasFill ? `$${fmtAmount(r.routed_volume)}` : NO_VALUE}
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    {r.hasFill ? `$${fmtAmount(r.builder_fee)}` : NO_VALUE}
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    {r.hasFill && r.effective_rate_bps != null
+                      ? `${fmtAmount(r.effective_rate_bps, 2)} bps`
+                      : NO_VALUE}
+                  </div>
+                </div>
+              ))}
+              {hasMore && (
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount((v) => v + FEES_LOAD_MORE_STEP)}
+                  style={{
+                    display: "block", width: "100%", padding: 14, fontSize: 13,
+                    color: "var(--text-dim)", background: "none", border: "none",
+                    borderTop: "1px solid var(--border)", cursor: "pointer",
+                  }}
+                >
+                  {c.loadMore}
+                </button>
+              )}
+            </>
+          )}
+
+          <p style={{ margin: "12px 20px 16px", fontSize: 12.5, color: "var(--text-dim)" }}>
+            {c.footerNote}
+          </p>
+        </>
+      )}
     </div>
   );
 }
