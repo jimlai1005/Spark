@@ -622,12 +622,22 @@ class ExploreIndex:
 
         從未成功建置過（`self._rows is None`）→ `building: True`、空 rows、
         計數皆 0、`updated_at: None`（前端 R2·C 態二）。
+
+        ⭐ 讀值**必須**在觸發背景建置**之前**取得快照，不能反過來：`_maybe_trigger_
+        build()` 開的背景 thread 若剛好在本次呼叫的極短時間內就跑完（例如注入的
+        `leaderboard_source_fn`/`hl` 全同步、無阻塞——單元測試最常見的情境），
+        會在本函式讀 `self._rows` 之前就把它從 `None` 換成新版，讓「從未建置過
+        → building: True」這個判斷變成競態、非決定性（2026-08-30 全量跑
+        `test_endpoint_never_built_returns_building_true` flake 的根因：機械可
+        重現，見 commit message）。反過來寫（先讀快照、後觸發背景建置）本次呼叫
+        的回應內容只取決於呼叫**當下**已完成的版本，與背景 thread 之後何時完成
+        無關——讀路徑永不阻塞、且結果決定性，兩者同時成立。
         """
-        self._maybe_trigger_build()
         with self._lock:
             rows = self._rows
             built_at = self._built_at
             total_scanned = self._total_scanned
+        self._maybe_trigger_build()
         if rows is None:
             return {"rows": [], "page": page, "page_size": self._cfg.page_size,
                    "total_qualified": 0, "total_scanned": 0,
