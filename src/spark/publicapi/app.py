@@ -25,7 +25,7 @@ from spark.filet.capital_settings import (CapitalSettingsError,
                                           verify_capital_settings,
                                           write_capital_settings)
 from spark.filet.capital_settings_apply import capital_fingerprint
-from spark.filet.aggregate import collect_follower_summary
+from spark.filet.aggregate import collect_follower_summary, summarize_fills
 from spark.filet.followers import FollowerRef, load_followers_tolerant
 from spark.filet.leader_change import (LeaderChangeError, build_leader_change_message,
                                        build_leader_change_record,
@@ -757,13 +757,25 @@ def _dashboard_risk_controls_enabled(hb: "HeartbeatRead",
     return False
 
 
-# ⭐ Warning 1（opus 審查 2026-08-29）：`daily_bars` 逐日重呼 `collect_follower_summary`
-# ——一次 dashboard 請求觸發約「月內天數＋1」次 `get_user_fills`（月中約 15 次、
-# 月底約 31 次），直接打在 Hyperliquid 上游 API，且 dashboard 是客戶最常開的頁面。
-# per-account **in-process** 快取（TTL 300s）把同一帳號 5 分鐘內的重複請求收斂成
-# 一次計算——費用數字反映的是歷史成交，5 分鐘內「本月至今」窗口右端點的偏移對
-# 顯示用途可忽略。快取鍵是 `ref.account_id`；TTL 判定用呼叫端傳入的 `now_s`
-# （與整個 dashboard 端點共用同一個時鐘，可測試注入，不另外硬綁 `time.time()`）。
+# ⭐⭐ R-A（2026-08-30 opus 審查 C2/C3，取代下方舊 Warning 1 註記的緩解手法）：
+# 舊版即使有 per-account 快取，TTL 過期後單一 request 仍會「逐日」重呼
+# `collect_follower_summary`——`period=all` 對兩年帳戶等於串行打 ~730 次
+# `userFillsByTime`，直接打在與實盤引擎共用額度的 Hyperliquid 上游、且無法偵測
+# 單頁 2000 筆上限截斷（>2000 筆帳戶的合計被靜默低估，逐日加總與期間合計還可能
+# 不等，因為兩者各自獨立查詢各自可能截斷）。修法：整個期間**一次**用
+# `hl.get_user_fills_paged`（`spark.publicapi.hl`）分頁抓好 fills，本地用純
+# Python 依 UTC 日切片——期間合計與逐日 bar 現在是**同一份已抓資料**的不同切片，
+# 結構上不可能兜不起來（同源同基準），且呼叫次數 ∝ 筆數/2000，不再 ∝ 天數。
+# `_fee_daily_bars` 因此从「呼叫 HL 的函式」降級成「純 Python 聚合函式」——
+# 見下方新簽名（吃 fills 清單，不吃 hl gateway）。
+#
+# ⭐ 舊 Warning 1（opus 審查 2026-08-29）背景保留：`daily_bars` 逐日重呼
+# `collect_follower_summary`——一次 dashboard 請求觸發約「月內天數＋1」次
+# `get_user_fills`（月中約 15 次、月底約 31 次）。per-account **in-process**
+# 快取（TTL 300s）仍然保留（見下）：即使單一 request 已收斂成一次分頁抓取，
+# 5 分鐘內的重複 dashboard 請求還是不必重算。快取鍵是 `ref.account_id`；
+# TTL 判定用呼叫端傳入的 `now_s`（與整個 dashboard 端點共用同一個時鐘，可測試
+# 注入，不另外硬綁 `time.time()`）。
 # ⚠️ 多 worker 部署下每個 process 各自一份快取（in-process，非共享）——這裡刻意
 # 不做跨 process 一致性：費用顯示不是安全關鍵路徑，worst case 是不同 worker 在
 # TTL 內回應略舊的數字，不是資料損毀或資金風險。
@@ -774,9 +786,14 @@ _fees_month_cache: dict[str, tuple[float, dict]] = {}
 # 認證與快取慣例，5min TTL」——注意這比 /api/me/fills 自己的 60s TTL 長，是 plan
 # 明文指定的值，不是誤植）。
 _fees_period_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+# ⭐ W4（2026-08-30 opus 審查）：256 上限＋近似 LRU 淘汰——沿
+# `_trader_portfolio_cache`（app.py 上方 `_cached_trader_data`）同一款慣例，
+# 防止這個模組層 dict 隨不同帳號數無界成長（同一份設計理由：展示用快取，
+# 淘汰掉最舊一筆不影響正確性，只影響下一次是否要重新計算）。
+_FEES_PERIOD_CACHE_MAX = 256
 # period=all 逐日迴圈的起點取不到帳戶真實交易起點（perpAllTime 首點）時的安全上界
-# ——避免從 1970 起跑產生數萬次 `collect_follower_summary` 呼叫（工程原則：
-# 外部呼叫需有界）。這只影響「迴圈跑多遠」，不影響任何費用/PnL 欄位的公式或來源。
+# ——避免從 1970 起跑產生過大的查詢視窗（工程原則：外部呼叫需有界）。這只影響
+# 「查詢視窗多寬」，不影響任何費用/PnL 欄位的公式或來源。
 _FEES_ALL_FALLBACK_DAYS = 400
 
 
@@ -787,27 +804,43 @@ def _effective_rate_bps(builder_fee: Decimal, routed_volume: Decimal) -> "Decima
         Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-def _fee_daily_bars(ref: FollowerRef, hl, start: datetime, end: datetime) -> list[dict]:
-    """逐日聚合費用明細——**同一資料源**（`collect_follower_summary`，禁止另拼
-    第二來源，見 plan Task 2）。無成交日（`fill_count == 0`）不產生列（「—」列
-    由前端補日曆）；`builder_fee == 0` 但有成交的日子照實列出——$0.00 與「當日
-    無成交」語意分開（R2·B）。某日查詢失敗只跳過那一根 bar，不連坐其餘天數。
+def _fetch_period_fills(ref: FollowerRef, hl, start: datetime, end: datetime, *,
+                        end_exclusive: bool) -> tuple[list, bool]:
+    """整個期間**一次**分頁抓 fills（R-A C2/C3 修法，取代逐日重複呼叫
+    `collect_follower_summary`）。回 `(fills, truncated)`：`end_exclusive=True`
+    時在抓到的資料上本地過濾 `f.time < end`（與 `collect_follower_summary` 的
+    `end_exclusive` 同一個半開區間慣例，Task 2b）。`truncated=True` 時，回傳的
+    `fills` 是這個期間視窗內成交的**下限值**（見 `HLGateway.get_user_fills_paged`
+    docstring）——呼叫端（期間合計與逐日 bar）都吃同一份 `fills`，所以無論是否
+    截斷，兩者永遠互相加總一致（同源同基準）。"""
+    fills, truncated = hl.get_user_fills_paged(ref.user_address, start, end)
+    if end_exclusive:
+        fills = [f for f in fills if f.time < end]
+    return fills, truncated
+
+
+def _fee_daily_bars(ref: FollowerRef, fills: list, start: datetime, end: datetime) -> list[dict]:
+    """本地依 UTC 日切片、聚合**已經抓好**的 fills（R-A C2/C3 修法：本函式不再
+    自己打 HL，呼叫端負責用 `_fetch_period_fills` 一次抓好整個期間，見上方模組
+    註解）。無成交日（`fill_count == 0`）不產生列（「—」列由前端補日曆）；
+    `builder_fee == 0` 但有成交的日子照實列出——$0.00 與「當日無成交」語意分開
+    （R2·B）。
 
     `[start, end)`：`start` 對齊到當日 00:00 UTC；`end` 可以是任意時刻（本日尚未
     走完的部分日照算），迴圈用 `day < end`（而非 `day.date() <= end.date()`）
     確保 `end` 剛好落在某天 00:00（例如「上個月」的排他上界＝本月 1 號 00:00）
     時不會多算出下個月第一天。
 
-    ⭐ M3 round3 Task 2b：每個 `[day, day_end)` 都用 `end_exclusive=True`——
-    恰好落在 `day_end`（例如 UTC 午夜整）的成交只歸下一天，不會同時被本日與
-    次日兩個查詢窗各記一次（既有舊病：`get_user_fills`／`userFillsByTime` 的
-    `start`/`end` 兩端皆含，逐日切窗若不排他上界會在午夜邊界重複計費）。"""
+    ⭐ M3 round3 Task 2b：每個 `[day, day_end)` 都用半開區間過濾（`day <= f.time
+    < day_end`）——恰好落在 `day_end`（例如 UTC 午夜整）的成交只歸下一天，不會
+    同時被本日與次日兩個切片各記一次。"""
     bars: list[dict] = []
     day = start.replace(hour=0, minute=0, second=0, microsecond=0)
     while day < end:
         day_end = min(day + timedelta(days=1), end)
-        day_summary = collect_follower_summary(ref, hl, day, day_end, end_exclusive=True)
-        if day_summary.error is None and day_summary.fills > 0:
+        day_fills = [f for f in fills if day <= f.time < day_end]
+        day_summary = summarize_fills(ref, day_fills)
+        if day_summary.fills > 0:
             bars.append({
                 "date": day.date().isoformat(),
                 "fill_count": day_summary.fills,
@@ -822,11 +855,12 @@ def _fee_daily_bars(ref: FollowerRef, hl, start: datetime, end: datetime) -> lis
 
 def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float, *,
                           cache: dict[str, tuple[float, dict]] | None = None) -> dict:
-    """本月路由量與費用：與 `/api/ops/revenue`／`customer_pnl` 同一個函式
-    （`collect_follower_summary`），只過濾到這個帳號自己（同源同函式，不各自
-    複製公式）。`daily_bars`：逐日聚合（`_fee_daily_bars`，見其 docstring）——
-    某日失敗只跳過那一根 bar，不連坐整月彙總（本函式的失敗——`summary.error`
-    ——才連坐整塊，由呼叫端的 `_safe_block` 統一處理）。
+    """本月路由量與費用：與 `_dashboard_fees_period` 共用 `_fetch_period_fills`／
+    `summarize_fills`（同源同函式，不各自複製公式；`/api/ops/revenue`／
+    `customer_pnl` 走各自的 `collect_follower_summary` 呼叫，本函式不影響
+    那條既有路徑）。`daily_bars`：逐日聚合（`_fee_daily_bars`，見其 docstring）
+    ——本函式與 `daily_bars` 現在吃**同一次抓到的 fills**（R-A C2/C3 修法），
+    結構上不會兜不起來。
 
     `cache` 不給 → 用模組層共用字典（正式路徑）；測試可傳一份乾淨字典避免
     跨測試汙染（見上方模組註解的快取語意）。**只快取成功結果**——失敗（拋例外）
@@ -840,20 +874,23 @@ def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float, *,
     month_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
     # end_exclusive=True：與 `_fee_daily_bars` 同一個半開區間慣例，月總量才會
     # 恰好等於逐日 bar 加總，不因午夜邊界重複計費而兜不起來（Task 2b）。
-    summary = collect_follower_summary(ref, hl, month_start, now_dt, end_exclusive=True)
-    if summary.error is not None:
-        raise RuntimeError(summary.error)
+    fills, truncated = _fetch_period_fills(ref, hl, month_start, now_dt,
+                                           end_exclusive=True)
+    summary = summarize_fills(ref, fills)
     fill_count, routed_volume, builder_fees = (
         summary.fills, summary.notional, summary.builder_fee)
     avg_fee = ((builder_fees / fill_count).quantize(Decimal("0.01"),
                                                      rounding=ROUND_HALF_UP)
               if fill_count > 0 else None)
     effective_rate_bps = _effective_rate_bps(builder_fees, routed_volume)
-    daily_bars = _fee_daily_bars(ref, hl, month_start, now_dt)
+    daily_bars = _fee_daily_bars(ref, fills, month_start, now_dt)
     result = {
         "routed_volume": routed_volume, "builder_fees": builder_fees,
         "fill_count": fill_count, "avg_fee": avg_fee,
         "effective_rate_bps": effective_rate_bps, "daily_bars": daily_bars,
+        # R-A C2/C3：達分頁上限仍滿頁 → True，本結果所有欄位皆是已抓到部分的
+        # 下限值（前端本輪先回欄位，note 顯示留待前端 task）。
+        "truncated": truncated,
     }
     cache[ref.account_id] = (now_s, result)
     return result
@@ -900,13 +937,22 @@ _FEES_PERIODS = ("this_month", "last_month", "all")
 def _pnl_share_pct(builder_fees: Decimal, realized_pnl: "Decimal | None",
                    total_fee: Decimal) -> "Decimal | None":
     """佔已實現淨 PnL 的百分比（M3 round3 Task 2b，主線程裁決 D12）。分母＝
-    期間已實現淨 PnL＝Σ closedPnl − Σ fee（同一批 fills、同一個
-    `collect_follower_summary` 呼叫算出來的兩個欄位，同窗同源；未實現 PnL
-    明確不進分母）。`realized_pnl is None`（fills 完全沒有 closedPnl 資料）或
-    分母 ≤0 → `None`（前端顯示「—」）。
+    期間已實現淨 PnL＝Σ closedPnl − Σ fee（同一批 fills、同一次
+    `summarize_fills` 呼叫算出來的兩個欄位，同窗同源；未實現 PnL明確不進分母）。
+    `realized_pnl is None`（這批 fills 裡有任一筆缺 closedPnl 資料——W5
+    all-or-nothing，見 `summarize_fills` docstring）或分母 ≤0 → `None`（前端
+    顯示「—」）。
 
     數值錨例（plan Task 2b）：builder_fees=2.00、closedPnl 合計=10.00、
-    fee 合計=3.50 → 淨 6.50 → 2.00/6.50*100 ≈ 30.77%。"""
+    fee 合計=3.50 → 淨 6.50 → 2.00/6.50*100 ≈ 30.77%。
+
+    ⚠️ TODO（W5，2026-08-30 opus 審查，上線後補做一次）：`closedPnl 不含手續費、
+    fee 含 builder fee` 是**未經真實 payload 對帳驗證**的假設——現有 fixture
+    （`tests/fixtures/hl_user_fills_sample.json`）只證明兩個欄位個別存在，
+    沒有證明 `closedPnl` 的計算基礎排除了 `fee`（HL 官方文件對此未逐欄位交代）。
+    若上線後對帳發現 `closedPnl` 其實已經淨過手續費，本函式的 `net = realized_pnl
+    - total_fee` 會把手續費算兩次（分母虛低 ⇒ `pnl_share_pct` 虛高），須回來修
+    這一行，不是重新設計整條管線。"""
     if realized_pnl is None:
         return None
     net = realized_pnl - total_fee
@@ -920,10 +966,11 @@ def _dashboard_fees_period(ref: FollowerRef, hl, now_s: float, period: str, *,
                            ) -> dict:
     """`/api/me/fees?period=` 的計算層。`period` 決定 `[start, end)`：
     `this_month`／`last_month` 為日曆月（`_month_bounds`）；`all` 為帳戶實際
-    交易起點至今（`_fees_all_time_start`）。彙總與逐日明細**同一個資料源**
-    （`collect_follower_summary`／`_fee_daily_bars`），不另拼第二來源；
-    `end_exclusive=True`（Task 2b）與 `_fee_daily_bars` 同一個半開區間慣例，
-    期間總量才會恰好等於逐日 bar 加總。
+    交易起點至今（`_fees_all_time_start`）。彙總與逐日明細**同一份已抓資料**
+    （`_fetch_period_fills` 一次抓、`summarize_fills`／`_fee_daily_bars` 各自
+    切片計算，不另拼第二來源，R-A C2/C3 修法）；`end_exclusive=True`
+    （Task 2b）與 `_fee_daily_bars` 同一個半開區間慣例，期間總量才會恰好等於
+    逐日 bar 加總（截斷時兩者也仍然相等，因為都是同一份已截斷資料的切片）。
 
     `pnl_share_pct`：見 `_pnl_share_pct`（Task 2b 主線程裁決 D12，已改用同一條
     fills 流的已實現淨 PnL 當分母，不再永遠 `None`）。"""
@@ -942,20 +989,28 @@ def _dashboard_fees_period(ref: FollowerRef, hl, now_s: float, period: str, *,
     else:
         raise ValueError(f"period 僅支援 {_FEES_PERIODS}: {period!r}")
 
-    summary = collect_follower_summary(ref, hl, start, end, end_exclusive=True)
-    if summary.error is not None:
-        raise RuntimeError(summary.error)
+    fills, truncated = _fetch_period_fills(ref, hl, start, end, end_exclusive=True)
+    summary = summarize_fills(ref, fills)
     fill_count, routed_volume, builder_fees = (
         summary.fills, summary.notional, summary.builder_fee)
     pnl_share_pct = _pnl_share_pct(builder_fees, summary.realized_pnl, summary.total_fee)
-    daily = _fee_daily_bars(ref, hl, start, end)
+    daily = _fee_daily_bars(ref, fills, start, end)
     result = {
         "summary": {
             "builder_fees": builder_fees, "routed_volume": routed_volume,
             "fill_count": fill_count, "pnl_share_pct": pnl_share_pct,
+            # R-A C2/C3：達分頁上限仍滿頁 → True，本結果所有欄位皆是已抓到
+            # 部分的下限值（前端顯示「僅涵蓋最近 N 筆」note 留待前端 task）。
+            "truncated": truncated,
         },
         "daily": daily,
     }
+    # ⭐ W4：256 上限＋近似 LRU 淘汰（沿 `_cached_trader_data` 同款慣例，見上方
+    # `_FEES_PERIOD_CACHE_MAX` 註解）——只在真的要新增一筆、且已達上限時淘汰，
+    # 命中既有 key（同帳號同 period 的更新）不觸發淘汰。
+    if key not in cache and len(cache) >= _FEES_PERIOD_CACHE_MAX:
+        oldest = min(cache, key=lambda k: cache[k][0])
+        del cache[oldest]
     cache[key] = (now_s, result)
     return result
 
@@ -3365,8 +3420,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     def me_fees(period: str = "this_month", address: str = Depends(_require_session)):
         """費用明細 tab（R2·B 重構）的期間切換資料源：`this_month`／`last_month`／
         `all`，逐日聚合與 `/api/me/dashboard` 的 `fees_month` 同一支計算層
-        （`_dashboard_fees_period`／`_fee_daily_bars`，同一個 `collect_follower_summary`
-        資料源，不另拼第二來源）。沿 `/api/me/fills` 的認證與快取慣例：per-
+        （`_dashboard_fees_period`／`_fee_daily_bars`，同一個 `_fetch_period_fills`
+        資料源，不另拼第二來源；R-A C2/C3 修法後改一次分頁抓取，call 數 ∝
+        筆數/2000，不再 ∝ 天數）。沿 `/api/me/fills` 的認證與快取慣例：per-
         (account_id, period) 快取、上游失敗一律 503、不回退自家 DB。"""
         if period not in _FEES_PERIODS:
             raise HTTPException(status_code=422,

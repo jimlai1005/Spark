@@ -78,6 +78,14 @@ class _WindowAwareHL:
         self.calls += 1
         return [f for f in self._fills if start <= f.time <= end]
 
+    def get_user_fills_paged(self, address, start, end, *, max_pages=None):
+        """R-A（2026-08-30，C2/C3 修法）：`_dashboard_fees_month`／
+        `_dashboard_fees_period` 現在走這個分頁介面（一次抓好整個期間，
+        不再逐日呼叫）。這個 fixture 不需要模擬真的分頁/截斷（那條路徑在
+        `tests/test_publicapi_hl.py` 對 `HLGateway` 直測），委派給既有
+        `get_user_fills` 即可，回傳 `truncated=False`。"""
+        return self.get_user_fills(address, start, end), False
+
     def portfolio(self, address: str) -> list:
         return self._portfolio_rows
 
@@ -98,11 +106,13 @@ def test_daily_bars_expanded_fields_and_skips_no_fill_days():
         _fill(datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc),
              sz="1", px="50", builder_fee="0"),  # 有成交但 fee=0
     ]
-    hl = _WindowAwareHL(fills)
     start = datetime(2026, 8, 1, tzinfo=timezone.utc)
     end = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 
-    bars = _fee_daily_bars(ref, hl, start, end)
+    # R-A（2026-08-30 C2/C3 修法）：`_fee_daily_bars` 改吃已抓好的 fills 清單，
+    # 不再自己打 HL——呼叫端（`_dashboard_fees_month`/`_dashboard_fees_period`）
+    # 負責一次抓好整期間；本測試直接餵同一份 fills，驗證聚合邏輯本身。
+    bars = _fee_daily_bars(ref, fills, start, end)
 
     assert [b["date"] for b in bars] == ["2026-08-01", "2026-08-03"]  # Aug 2 不出現
 
@@ -122,10 +132,9 @@ def test_daily_bars_expanded_fields_and_skips_no_fill_days():
 
 def test_daily_bars_empty_when_no_fills_in_range():
     ref = _ref()
-    hl = _WindowAwareHL([])
     start = datetime(2026, 8, 1, tzinfo=timezone.utc)
     end = datetime(2026, 8, 3, tzinfo=timezone.utc)
-    assert _fee_daily_bars(ref, hl, start, end) == []
+    assert _fee_daily_bars(ref, [], start, end) == []
 
 
 # ── /api/me/dashboard 的 fees_month.daily_bars 沿用同一個聚合層 ─────────
@@ -295,6 +304,53 @@ def test_pnl_share_pct_end_to_end_this_month():
     assert result["summary"]["pnl_share_pct"] == Decimal("30.77")
 
 
+# ── R-A（2026-08-30 opus 審查 C2/C3）：分頁截斷旗標＋合計恆等於逐日加總 ────
+
+class _RawPagePost:
+    """`HLGateway` 的假 `post_fn`：依序吐出整頁原始 fills（未經 UserFill 轉換），
+    用來驅動真實的 `get_user_fills_paged` 分頁邏輯（不是 `_WindowAwareHL` 那種
+    已經算好結果的替身）。"""
+
+    def __init__(self, pages: list[list[dict]]):
+        self._pages = list(pages)
+        self.calls: list[dict] = []
+
+    def __call__(self, url, body):
+        self.calls.append(body)
+        return self._pages.pop(0)
+
+
+def test_dashboard_fees_period_truncated_flag_and_daily_sum_matches_summary(monkeypatch):
+    """驗收條件 3：頁上限觸頂 → `truncated=True`，且合計（`summary.fill_count`）
+    仍恰好等於逐日 bar 加總——兩者是同一份已截斷資料的不同切片（同源同基準），
+    截斷不會讓它們兜不起來。驗收條件 4：`FILET_FILLS_MAX_PAGES=1`＋單頁 2000 筆
+    整批落在同一天，只打**一次**上游（call 數不是被天數放大）。"""
+    from spark.publicapi.hl import HLGateway, _to_ms_utc
+
+    monkeypatch.setenv("FILET_FILLS_MAX_PAGES", "1")
+    ref = _ref()
+    base_ms = _to_ms_utc(datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc))
+    raw_page = [{"time": base_ms + i, "coin": "ETH", "px": "100", "sz": "1",
+                "side": "B", "crossed": True, "oid": i, "fee": "0.01",
+                "builderFee": "0.02", "tid": i} for i in range(2000)]
+    post = _RawPagePost([raw_page])
+    hl = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+
+    result = _dashboard_fees_period(ref, hl, _NOW, "this_month", cache={})
+
+    assert result["summary"]["truncated"] is True
+    assert result["summary"]["fill_count"] == 2000
+    assert sum(b["fill_count"] for b in result["daily"]) == result["summary"]["fill_count"]
+    assert len(post.calls) == 1   # 不是 ∝ 天數；2000 筆在單頁上限內只打一次
+
+
+def test_dashboard_fees_period_not_truncated_reports_false():
+    ref = _ref()
+    hl = _WindowAwareHL([_fill(datetime(2026, 8, 5, 9, 0, tzinfo=timezone.utc))])
+    result = _dashboard_fees_period(ref, hl, _NOW, "this_month", cache={})
+    assert result["summary"]["truncated"] is False
+
+
 # ── 午夜邊界（Task 2b／D13）：半開區間 [day, day+1) ───────────────────────
 
 def test_fee_daily_bars_midnight_fill_counted_once_in_next_day():
@@ -303,11 +359,10 @@ def test_fee_daily_bars_midnight_fill_counted_once_in_next_day():
     ref = _ref()
     midnight_fill = _fill(datetime(2026, 8, 6, 0, 0, tzinfo=timezone.utc),
                           builder_fee="1.0")
-    hl = _WindowAwareHL([midnight_fill])
     start = datetime(2026, 8, 5, tzinfo=timezone.utc)
     end = datetime(2026, 8, 7, tzinfo=timezone.utc)
 
-    bars = _fee_daily_bars(ref, hl, start, end)
+    bars = _fee_daily_bars(ref, [midnight_fill], start, end)
 
     assert [b["date"] for b in bars] == ["2026-08-06"]
     assert bars[0]["fill_count"] == 1
@@ -382,8 +437,11 @@ def test_happy_path_this_month(tmp_path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert set(body.keys()) == {"summary", "daily"}
+    # R-A（2026-08-30 C2/C3 修法）：新增 `truncated` 欄位——分頁抓取達上限仍
+    # 滿頁時標示 True，本次固定資料量遠低於上限，預期 False。
     assert set(body["summary"].keys()) == {
-        "builder_fees", "routed_volume", "fill_count", "pnl_share_pct"}
+        "builder_fees", "routed_volume", "fill_count", "pnl_share_pct", "truncated"}
+    assert body["summary"]["truncated"] is False
     assert body["summary"]["pnl_share_pct"] is None
     for row in body["daily"]:
         assert set(row.keys()) == {

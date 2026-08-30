@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import scripts.filet_daily_report as fdr
+from spark.exchange.base import UserFill
 from spark.filet.followers import FollowerRef
 from spark.filet.aggregate import (
     FollowerSummary,
@@ -15,6 +16,7 @@ from spark.filet.aggregate import (
     render_aggregate,
     builder_fee_delta,
     collect_follower_summary,
+    summarize_fills,
 )
 
 
@@ -70,6 +72,11 @@ class _FakeFill:
         self.px = Decimal(px)
         self.crossed = crossed
         self.builder_fee = Decimal(builder_fee)
+        # ⭐ 刻意不設 .fee/.closed_pnl：這兩個是 Task 2b 加法擴充，本替身用來驗證
+        # `summarize_fills`／`collect_follower_summary` 的 `getattr(f, ..., 預設)`
+        # 防禦路徑（缺欄視為「沒有這筆資料」，不是假造出 0，見 aggregate.py 檔頭
+        # 的 getattr 防禦註解）。需要真的帶 fee/closed_pnl 的測試改用
+        # `spark.exchange.base.UserFill`（見下方 W5 all-or-nothing 測試）。
 
 
 class _FakeAdapter:
@@ -131,6 +138,45 @@ def test_collect_follower_summary_sums_notional_and_builder_fee():
     assert s.error is None
     assert s.notional == Decimal("280")
     assert s.builder_fee == Decimal("0.03")
+
+
+# --- summarize_fills：W5（2026-08-30 opus 審查）realized_pnl all-or-nothing ---
+
+def _user_fill(closed_pnl, *, sz="1", px="100", fee="0.01"):
+    return UserFill(time=datetime(2026, 8, 1, tzinfo=timezone.utc), coin="ETH",
+                    px=Decimal(px), sz=Decimal(sz), side="B", crossed=True, oid=1,
+                    fee=Decimal(fee), builder_fee=Decimal("0"),
+                    closed_pnl=Decimal(closed_pnl) if closed_pnl is not None else None)
+
+
+def test_summarize_fills_realized_pnl_none_when_any_fill_missing_closed_pnl():
+    """all-or-nothing：兩筆都帶 closedPnl 才加總；只要有一筆缺，整批回 None
+    ——不是舊版 `any()` 語意（缺席的那幾筆被 `or Decimal("0")` 靜默補零）。"""
+    fills = [_user_fill("10.5"), _user_fill(None)]   # 第二筆缺 closedPnl
+    s = summarize_fills(_ref("alice"), fills)
+    assert s.realized_pnl is None
+
+
+def test_summarize_fills_realized_pnl_sums_when_all_fills_have_closed_pnl():
+    fills = [_user_fill("10.5"), _user_fill("-2.5")]
+    s = summarize_fills(_ref("alice"), fills)
+    assert s.realized_pnl == Decimal("8.0")
+
+
+def test_summarize_fills_realized_pnl_none_when_no_fills():
+    """空 fills 清單＝「沒有可用的 closedPnl 資料」，不是「當期已實現 0」。"""
+    s = summarize_fills(_ref("alice"), [])
+    assert s.realized_pnl is None
+    assert s.fills == 0
+
+
+def test_summarize_fills_total_fee_sums_regardless_of_closed_pnl_presence():
+    """total_fee（分母的另一半）與 realized_pnl 是獨立算的——即使 realized_pnl
+    因缺 closedPnl 而是 None，total_fee 仍照樣加總（沒有連坐）。"""
+    fills = [_user_fill("10.5", fee="1.0"), _user_fill(None, fee="0.5")]
+    s = summarize_fills(_ref("alice"), fills)
+    assert s.realized_pnl is None
+    assert s.total_fee == Decimal("1.5")
 
 
 def test_collect_follower_summary_error_branch_has_zero_notional_and_fee():

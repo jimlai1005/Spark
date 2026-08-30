@@ -252,7 +252,12 @@ class HyperliquidAdapter(ExchangeAdapter):
                 oid=f["oid"],
                 fee=Decimal(str(f.get("fee", "0"))),
                 builder_fee=Decimal(str(f.get("builderFee", "0") or "0")),
-                closed_pnl=(Decimal(str(f["closedPnl"]))
+                # R-A（2026-08-30 opus 審查 C5）：`or "0"` 護欄擋空字串——
+                # `f.get("closedPnl") is not None` 只擋 None，擋不住上游回
+                # `""` 的情形（`Decimal("")` → InvalidOperation，直接炸掉
+                # costbreaker 取數路徑）。空字串視為「0」而非「沒資料」，
+                # 與 `builder_fee` 同一個護欄基準（工程原則 1）。
+                closed_pnl=(Decimal(str(f["closedPnl"]) or "0")
                            if f.get("closedPnl") is not None else None),
             ))
         return fills

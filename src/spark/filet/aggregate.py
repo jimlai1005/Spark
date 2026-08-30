@@ -33,13 +33,49 @@ class FollowerSummary:
                                             # ——沒資料就是沒資料，不可替換成 0（工程原則 1）。
 
 
+def summarize_fills(ref: FollowerRef, fills: list) -> FollowerSummary:
+    """純函式：由**已經抓好**的 fills 清單算 summary，不觸網、不吞例外
+    （呼叫端已經拿到資料，這裡只是算術）。`collect_follower_summary` 現在是
+    「抓 fills ＋呼叫本函式」的薄殼——拆出來是 R-A（2026-08-30 opus 審查
+    C2/C3）修法：批次抓一次 fills 後，可對同一份資料重複套用本函式於不同
+    子區間（例如逐日聚合），不必為每個子區間各自重新打一次 HL（工程原則 1：
+    合計與逐日子區間同源同基準——都是這同一份 fills 的子集）。
+
+    taker_share = crossed 成交名目 / 總成交名目（總量 0 → 0），沿 report.py 語意。
+
+    ⭐ W5（2026-08-30 opus 審查）：`realized_pnl` 是 **all-or-nothing**——只有
+    這批 fills 裡**每一筆**都帶 `closed_pnl`（非 None）才加總；任一筆缺，整批
+    回 `None`。舊版曾用 `any()`（任一筆有資料就當「這批有資料」），代價是
+    缺 `closed_pnl` 的那幾筆被 `or Decimal("0")` 靜默補零——把「不知道這筆
+    賺賠多少」算成「這筆已實現 0」，會讓 `pnl_share_pct` 的分母系統性偏高
+    （沒被算進去的虧損不會拉低淨值），方向對客戶顯示的「佔淨 PnL」有利、
+    誤導的方向正是最危險的那個。空 fills 清單（`not fills`）視為「沒有可用
+    的 closedPnl 資料」→ `None`，不是「當期已實現 0」（沒交易不等於已實現
+    損益剛好是 0，是「沒資料可用」——與非空但缺欄位是同一個道理）。"""
+    ntl = sum((f.sz * f.px for f in fills), Decimal("0"))
+    taker_ntl = sum((f.sz * f.px for f in fills if f.crossed), Decimal("0"))
+    share = (taker_ntl / ntl) if ntl > 0 else Decimal("0")
+    fee_sum = sum((f.builder_fee for f in fills), Decimal("0"))
+    # `getattr` 防禦：既有測試替身（例如 test_filet_aggregate.py 的 `_FakeFill`）
+    # 只鴨模擬 sz/px/crossed/builder_fee，沒有 fee/closed_pnl——這兩個是 Task 2b
+    # 加法擴充，缺席一律視為「沒有這筆資料」，不是本函式假造出 0（total_fee 在
+    # `realized_pnl is None` 的路徑上本就不會被用到，見 `_pnl_share_pct`）。
+    total_fee = sum((getattr(f, "fee", Decimal("0")) for f in fills), Decimal("0"))
+    has_realized = bool(fills) and all(
+        getattr(f, "closed_pnl", None) is not None for f in fills)
+    realized_pnl = (sum((getattr(f, "closed_pnl", None) for f in fills), Decimal("0"))
+                    if has_realized else None)
+    return FollowerSummary(ref, len(fills), share, ntl, fee_sum, None,
+                           total_fee=total_fee, realized_pnl=realized_pnl)
+
+
 def collect_follower_summary(ref: FollowerRef, adapter, start: datetime,
                               end: datetime, *, end_exclusive: bool = False
                               ) -> FollowerSummary:
     """對單一 follower 取 fills 算 summary（不查 accrued——避免重複計）。
     任何取數例外捕成 FollowerSummary(error=...)，不外拋（跨 follower 隔離：
     一個 follower 的 API 錯誤不得中止其他 follower 的匯總，工程原則 4）。
-    taker_share = crossed 成交名目 / 總成交名目（總量 0 → 0），沿 report.py 語意。
+    實際算術見 `summarize_fills`（本函式只負責抓資料＋隔離例外）。
 
     `end_exclusive`（M3 round3 Task 2b，**預設 False，行為與擴充前相同**）：
     `adapter.get_user_fills` 對應真實 `userFillsByTime`，`start`/`end` 兩端皆含
@@ -53,21 +89,7 @@ def collect_follower_summary(ref: FollowerRef, adapter, start: datetime,
         fills = adapter.get_user_fills(ref.user_address, start, end)
         if end_exclusive:
             fills = [f for f in fills if f.time < end]
-        ntl = sum((f.sz * f.px for f in fills), Decimal("0"))
-        taker_ntl = sum((f.sz * f.px for f in fills if f.crossed), Decimal("0"))
-        share = (taker_ntl / ntl) if ntl > 0 else Decimal("0")
-        fee_sum = sum((f.builder_fee for f in fills), Decimal("0"))
-        # `getattr` 防禦：既有測試替身（例如 test_filet_aggregate.py 的 `_FakeFill`）
-        # 只鴨模擬 sz/px/crossed/builder_fee，沒有 fee/closed_pnl——這兩個是 Task 2b
-        # 加法擴充，缺席一律視為「沒有這筆資料」，不是本函式假造出 0（total_fee 在
-        # `realized_pnl is None` 的路徑上本就不會被用到，見 `_pnl_share_pct`）。
-        total_fee = sum((getattr(f, "fee", Decimal("0")) for f in fills), Decimal("0"))
-        has_realized = any(getattr(f, "closed_pnl", None) is not None for f in fills)
-        realized_pnl = (sum((getattr(f, "closed_pnl", None) or Decimal("0")
-                             for f in fills), Decimal("0"))
-                        if has_realized else None)
-        return FollowerSummary(ref, len(fills), share, ntl, fee_sum, None,
-                               total_fee=total_fee, realized_pnl=realized_pnl)
+        return summarize_fills(ref, fills)
     except Exception as e:  # noqa: BLE001 — 跨 follower 隔離，錯誤入 summary 不外拋
         return FollowerSummary(ref, 0, Decimal("0"), Decimal("0"), Decimal("0"), error=str(e))
 

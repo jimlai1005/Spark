@@ -139,6 +139,114 @@ def test_get_user_fills_parses_and_only_posts_info():
     assert body["endTime"] == 1_700_002_800_000
 
 
+# ── get_user_fills_paged（R-A 2026-08-30 opus 審查 C2/C3 修法）─────────────
+
+def _raw_fill(t_ms: int, tid: int, **over) -> dict:
+    d = {"time": t_ms, "coin": "ETH", "px": "100", "sz": "1", "side": "B",
+        "crossed": True, "oid": tid, "fee": "0.01", "builderFee": "0.02",
+        "tid": tid}
+    d.update(over)
+    return d
+
+
+def test_get_user_fills_paged_single_page_under_limit_not_truncated():
+    from datetime import datetime, timezone
+    post = _FakePost([[_raw_fill(1_700_000_000_000, tid=1)]])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_user_fills_paged(
+        "0x" + "ab" * 20,
+        datetime(2023, 11, 14, tzinfo=timezone.utc),
+        datetime(2023, 11, 15, tzinfo=timezone.utc))
+    assert truncated is False
+    assert len(fills) == 1
+    assert len(post.calls) == 1
+
+
+def test_get_user_fills_paged_advances_cursor_and_dedupes_boundary_fill():
+    """滿頁（2000 筆）→ 游標前進到最後一筆的時間 → 下一頁重疊那一毫秒的同一筆
+    （同 `tid`，模擬 `userFillsByTime` 兩端點皆含）不重複計，新筆正常併入。"""
+    from datetime import datetime, timezone
+    from spark.exchange.base import USER_FILLS_PAGE_LIMIT
+    from spark.publicapi.hl import _to_ms_utc
+    base_ms = _to_ms_utc(datetime(2026, 8, 1, tzinfo=timezone.utc))
+    page1 = [_raw_fill(base_ms + i, tid=i) for i in range(USER_FILLS_PAGE_LIMIT)]
+    page2 = [
+        _raw_fill(base_ms + USER_FILLS_PAGE_LIMIT - 1, tid=USER_FILLS_PAGE_LIMIT - 1),
+        _raw_fill(base_ms + USER_FILLS_PAGE_LIMIT, tid=USER_FILLS_PAGE_LIMIT),
+        _raw_fill(base_ms + USER_FILLS_PAGE_LIMIT + 1, tid=USER_FILLS_PAGE_LIMIT + 1),
+    ]
+    post = _FakePost([page1, page2])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_user_fills_paged(
+        "0x" + "ab" * 20,
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 2, tzinfo=timezone.utc))
+    assert truncated is False
+    assert len(fills) == USER_FILLS_PAGE_LIMIT + 2   # 2000 + 2 新筆，重疊那筆不重複計
+    assert len(post.calls) == 2
+    # 第二頁的 startTime＝第一頁最後一筆的時間（游標前進，兩端點皆含）
+    assert post.calls[1][1]["startTime"] == base_ms + USER_FILLS_PAGE_LIMIT - 1
+    assert [f.time for f in fills] == sorted(f.time for f in fills)  # 依時間升冪
+
+
+def test_get_user_fills_paged_truncates_at_max_pages():
+    from datetime import datetime, timezone
+    from spark.exchange.base import USER_FILLS_PAGE_LIMIT
+    from spark.publicapi.hl import _to_ms_utc
+    base_ms = _to_ms_utc(datetime(2026, 8, 1, tzinfo=timezone.utc))
+    page1 = [_raw_fill(base_ms + i, tid=i) for i in range(USER_FILLS_PAGE_LIMIT)]
+    post = _FakePost([page1])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_user_fills_paged(
+        "0x" + "ab" * 20,
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 1, tzinfo=timezone.utc),
+        max_pages=1)
+    assert truncated is True
+    assert len(fills) == USER_FILLS_PAGE_LIMIT   # 已抓到的部分（下限值），照樣回傳
+    assert len(post.calls) == 1
+
+
+def test_get_user_fills_paged_call_count_bounded_by_fill_count_not_days():
+    """驗收條件 4：`period=all` 場景下，呼叫次數 ≤ ceil(N/2000)+1，不再 ∝ 天數。
+    N=4500 筆分三頁（滿、滿、未滿）；查詢視窗跨兩年多，呼叫數仍只有 3 次。"""
+    import math
+    from datetime import datetime, timezone
+    from spark.exchange.base import USER_FILLS_PAGE_LIMIT
+    from spark.publicapi.hl import _to_ms_utc
+    base_ms = _to_ms_utc(datetime(2024, 1, 1, tzinfo=timezone.utc))
+    page1 = [_raw_fill(base_ms + i, tid=i) for i in range(2000)]
+    page2 = [_raw_fill(base_ms + 2000 + i, tid=2000 + i) for i in range(2000)]
+    page3 = [_raw_fill(base_ms + 4000 + i, tid=4000 + i) for i in range(500)]
+    post = _FakePost([page1, page2, page3])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_user_fills_paged(
+        "0x" + "ab" * 20,
+        datetime(2024, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 30, tzinfo=timezone.utc))  # 兩年多的窗口
+    n = len(fills)
+    assert n == 4500 and truncated is False
+    assert len(post.calls) == 3
+    assert len(post.calls) <= math.ceil(n / USER_FILLS_PAGE_LIMIT) + 1
+
+
+def test_get_user_fills_paged_respects_env_max_pages(monkeypatch):
+    from datetime import datetime, timezone
+    from spark.exchange.base import USER_FILLS_PAGE_LIMIT
+    from spark.publicapi.hl import _to_ms_utc
+    monkeypatch.setenv("FILET_FILLS_MAX_PAGES", "1")
+    base_ms = _to_ms_utc(datetime(2026, 8, 1, tzinfo=timezone.utc))
+    page1 = [_raw_fill(base_ms + i, tid=i) for i in range(USER_FILLS_PAGE_LIMIT)]
+    post = _FakePost([page1])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_user_fills_paged(
+        "0x" + "ab" * 20,
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 1, tzinfo=timezone.utc))   # 未顯式傳 max_pages → 讀 env
+    assert truncated is True
+    assert len(post.calls) == 1
+
+
 def test_to_ms_utc_treats_naive_as_utc():
     from datetime import datetime, timedelta, timezone
 

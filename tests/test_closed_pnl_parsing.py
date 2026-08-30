@@ -68,6 +68,20 @@ def test_hyperliquid_adapter_null_closed_pnl_is_none():
     assert f.closed_pnl is None
 
 
+def test_hyperliquid_adapter_empty_string_closed_pnl_is_zero_not_error():
+    """R-A（2026-08-30 opus 審查 C5）：空字串是「四態」之一（值／缺欄／null／
+    空字串）——`f.get("closedPnl") is not None` 只擋 None，擋不住 `""`。
+    修法前 `Decimal("")` 會拋 `InvalidOperation`，直接炸掉呼叫端（含
+    costbreaker 取數路徑）。"""
+    raw = [{"coin": "ETH", "px": "4000.25", "sz": "0.1", "side": "B",
+           "time": 1750000000000, "crossed": True, "oid": 111, "fee": "0.008",
+           "closedPnl": ""}]
+    ad = HyperliquidAdapter(network="testnet", info=_FakeInfo(raw))
+    f = ad.get_user_fills("0xuser", _START, _END)[0]
+    assert f.closed_pnl == Decimal("0")
+    assert f.closed_pnl is not None
+
+
 def test_hyperliquid_adapter_zero_closed_pnl_is_decimal_zero_not_none():
     """`closedPnl` 明確給 "0"（例如開倉成交）→ `Decimal("0")`，與「缺資料」
     （None）不同一個值。"""
@@ -108,3 +122,16 @@ def test_hl_gateway_null_closed_pnl_is_none():
     gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
     f = gw.get_user_fills("0x" + "ab" * 20, _START, _END)[0]
     assert f.closed_pnl is None
+
+
+def test_hl_gateway_empty_string_closed_pnl_is_zero_not_error():
+    """R-A（2026-08-30 opus 審查 C5）：`get_user_fills`（`collect_follower_summary`
+    的資料源）對空字串 `closedPnl` 補 `or "0"` 護欄——同一份 `_parse_fill` 也
+    餵 `get_user_fills_paged`（見 tests/test_publicapi_hl.py），兩者同一基準。"""
+    raw = [{"time": 1_700_000_000_000, "coin": "ETH", "px": "2500.5", "sz": "0.4",
+           "side": "B", "crossed": True, "oid": 1, "closedPnl": ""}]
+    post = _FakePost([raw])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    f = gw.get_user_fills("0x" + "ab" * 20, _START, _END)[0]
+    assert f.closed_pnl == Decimal("0")
+    assert f.closed_pnl is not None

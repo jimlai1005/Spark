@@ -121,6 +121,14 @@ class FakeHL:
             fills = [f for f in fills if start <= f.time <= end]
         return fills
 
+    def get_user_fills_paged(self, address: str, start, end, *, max_pages=None):
+        """R-A（2026-08-30，C2/C3 修法）：`app.py` 的費用明細改吃這個分頁介面。
+        `FakeHL` 的測試 fixture 從不模擬超過 2000 筆的真實分頁/截斷情境（那條
+        路徑由 `tests/test_publicapi_hl.py` 直接對 `HLGateway` 單測）——這裡單純
+        委派給既有 `get_user_fills`（同一份 window_aware／fills_error 語意），
+        回傳 `truncated=False`，讓所有既有呼叫端與測試行為不變。"""
+        return self.get_user_fills(address, start, end), False
+
     def spot_usdc_balance(self, address: str) -> Decimal:
         err = self.spot_error.get(address.lower())
         if err is not None:

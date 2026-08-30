@@ -3,18 +3,31 @@ Public API 對 HL 的唯一出口（單一 resilience boundary，工程原則 5�
 分類在呼叫點強制宣告（沿 spark.resilience.run）：讀取（/info）＝冪等 → transient 重試。
 本模組刻意沒有任何 /exchange 提交路徑：已簽授權由前端直送 HL（設計定案 1），
 後端結構上無法經手簽名（紅線 5，Task 13 有結構性測試）。"""
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
 
-from spark.exchange.base import UserFill
+from spark.exchange.base import USER_FILLS_PAGE_LIMIT, UserFill
 from spark.resilience import run
 
 _TIMEOUT_S = 10.0
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 EXPLORER_URL = "https://rpc.hyperliquid.xyz/explorer"
+
+# R-A（2026-08-30 opus 審查 C2/C3 修法）：`get_user_fills_paged` 的分頁頁數上限，
+# 保護「查一次極活躍帳戶的全史」不會無界地打上游。環境變數可覆寫（沿
+# `ExploreConfig.from_env` 的慣例：可選、缺就用模組預設，展示/計費用途不該因為
+# 漏設一個門檻常數就拒絕啟動）。刻意在**呼叫時**才讀 env（不是模組載入時的頂層
+# 常數），測試才能用 monkeypatch 覆寫而不必重新 import 本模組。
+DEFAULT_FILLS_MAX_PAGES = 10
+
+
+def _fills_max_pages_from_env() -> int:
+    v = os.environ.get("FILET_FILLS_MAX_PAGES")
+    return int(v) if v else DEFAULT_FILLS_MAX_PAGES
 
 
 def _to_ms_utc(dt: datetime) -> int:
@@ -25,6 +38,33 @@ def _to_ms_utc(dt: datetime) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return (dt - _EPOCH) // timedelta(milliseconds=1)
+
+
+def _parse_fill(f: dict) -> UserFill:
+    """單筆 `userFillsByTime` 原始字典 → `UserFill`（`get_user_fills`／
+    `get_user_fills_paged` 共用，避免同一段解析邏輯散落兩處各自漂移）。
+
+    ⭐ R-A（2026-08-30 opus 審查 C5）：`closedPnl` 補 `or "0"` 空字串護欄——
+    `f.get("closedPnl") is not None` 只擋掉 `None`，擋不住上游回空字串 `""`
+    的情形（`Decimal("")` → `InvalidOperation`，會直接炸掉呼叫端，包括
+    costbreaker 取數路徑）；`builder_fee`／`fee` 兩欄已有同款護欄，這裡補齊
+    成同一基準（工程原則 1）。空字串／None 語意不同：`None`＝這筆沒有
+    closedPnl 資料（讀者不可當 0）；空字串視為上游的「0」表達方式，不是
+    「沒資料」，故轉成 `Decimal("0")` 而非放行成 `None`（否則單一筆空字串
+    會讓整批 `has_realized` 誤判成「這批沒有 closedPnl 資料」）。"""
+    raw_pnl = f.get("closedPnl")
+    return UserFill(
+        time=_EPOCH + timedelta(milliseconds=int(f["time"])),
+        coin=f["coin"],
+        px=Decimal(str(f["px"])),
+        sz=Decimal(str(f["sz"])),
+        side=f["side"],
+        crossed=bool(f["crossed"]),
+        oid=f["oid"],
+        fee=Decimal(str(f.get("fee", "0") or "0")),
+        builder_fee=Decimal(str(f.get("builderFee", "0") or "0")),
+        closed_pnl=(Decimal(str(raw_pnl) or "0") if raw_pnl is not None else None),
+    )
 
 
 def _default_post(url: str, body: dict):
@@ -139,24 +179,71 @@ class HLGateway:
         `collect_follower_summary` 只吃 `.sz/.px/.crossed/.builder_fee`，故這裡回
         與 HyperliquidAdapter.get_user_fills 同型的 UserFill（同一份解析慣例：
         Decimal(str(...)) 進位、builderFee 缺欄或 null 視為 0），跨兩個 adapter
-        的欄位語意才是同基準（工程原則 1）。
+        的欄位語意才是同基準（工程原則 1）。單頁：若視窗內成交筆數達
+        `USER_FILLS_PAGE_LIMIT`（2000）則靜默低估——需要涵蓋 >2000 筆的呼叫端
+        改用 `get_user_fills_paged`（R-A C3 修法）。
         ⚠️ 唯讀：只 POST /info，本 gateway 結構上無任何 /exchange 提交面（紅線 5）。"""
         raw = self._info({"type": "userFillsByTime", "user": address,
                           "startTime": _to_ms_utc(start), "endTime": _to_ms_utc(end)},
                          "HL userFillsByTime 查詢")
-        return [UserFill(
-            time=_EPOCH + timedelta(milliseconds=int(f["time"])),
-            coin=f["coin"],
-            px=Decimal(str(f["px"])),
-            sz=Decimal(str(f["sz"])),
-            side=f["side"],
-            crossed=bool(f["crossed"]),
-            oid=f["oid"],
-            fee=Decimal(str(f.get("fee", "0") or "0")),
-            builder_fee=Decimal(str(f.get("builderFee", "0") or "0")),
-            closed_pnl=(Decimal(str(f["closedPnl"]))
-                       if f.get("closedPnl") is not None else None),
-        ) for f in raw]
+        return [_parse_fill(f) for f in raw]
+
+    def get_user_fills_paged(self, address: str, start: datetime, end: datetime, *,
+                             max_pages: int | None = None
+                             ) -> tuple[list[UserFill], bool]:
+        """分頁抓時間窗成交（唯讀展示／計費用途，R-A 2026-08-30 opus 審查 C2/C3
+        修法）——**不是**即時風控路徑：`HyperliquidAdapter.get_user_fills`
+        （引擎 cost breaker 用）刻意不分頁，見該檔 docstring 的風險量級論證
+        （分頁假設錯的方向是換手率分子灌大 ⇒ 誤觸熔斷 ⇒ 強制平倉）。本方法用於
+        `/api/me/fees`／dashboard 費用明細等**顯示**數字，誤判方向只讓一個展示
+        數字偏低（`truncated=True` 時已明確標示），不進任何下單/熔斷判斷。
+
+        ⚠️ 假設（僅單頁 fixture 驗證過，未對真實 API 逐頁分頁驗證）：
+        `userFillsByTime` 依時間**升冪**排列。頁界去重用原始回應的 `tid`
+        （成交唯一識別碼；`UserFill` 型別本身不帶這個欄位，僅用於本方法內部
+        分頁去重，不外流）——同一毫秒可能有多筆不同 `tid` 的成交，光用時間
+        當去重鍵會錯殺；`tid` 缺席（理論上不會，防禦用）才退回
+        `(oid, time, coin, px, sz, side)` 這個較弱的複合鍵。
+
+        滿頁（`USER_FILLS_PAGE_LIMIT`＝2000）時以最後一筆的時間為下一頁
+        `startTime` 續抓（`userFillsByTime` 的 `start`/`end` 兩端皆含，重疊的
+        那一毫秒靠上述去重鍵過濾，不會被算兩次）；連續 `max_pages`
+        （未指定則讀 `FILET_FILLS_MAX_PAGES` env，預設
+        `DEFAULT_FILLS_MAX_PAGES`＝10）頁都滿頁 → 回傳 `truncated=True`，
+        已抓到的部分照樣回傳（呼叫端合計基於這份資料是**下限值**，需標示
+        「未涵蓋全期間」，不得當成完整合計）。"""
+        max_pages = (max_pages if max_pages is not None
+                    else _fills_max_pages_from_env())
+        all_fills: list[UserFill] = []
+        seen: set = set()
+        cur_start_ms = _to_ms_utc(start)
+        end_ms = _to_ms_utc(end)
+        truncated = False
+        for page_idx in range(max_pages):
+            raw = self._info({"type": "userFillsByTime", "user": address,
+                              "startTime": cur_start_ms, "endTime": end_ms},
+                             "HL userFillsByTime 查詢（分頁）")
+            for f in raw:
+                key = f.get("tid")
+                if key is None:
+                    key = (f.get("oid"), f.get("time"), f.get("coin"),
+                          str(f.get("px")), str(f.get("sz")), f.get("side"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_fills.append(_parse_fill(f))
+            if len(raw) < USER_FILLS_PAGE_LIMIT:
+                break
+            last_ms = int(raw[-1]["time"])
+            if last_ms <= cur_start_ms:
+                # 整頁都卡在同一毫秒或時間沒有前進——不無限迴圈，視為已截斷。
+                truncated = True
+                break
+            cur_start_ms = last_ms
+            if page_idx == max_pages - 1:
+                truncated = True
+        all_fills.sort(key=lambda f: f.time)
+        return all_fills, truncated
 
     def agent_addresses(self, user: str) -> list[str]:
         """使用者已授權的 agent 地址清單（extraAgents）；小寫正規化供同基準比對。"""
