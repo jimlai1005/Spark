@@ -288,6 +288,18 @@ def test_no_perf_at_all_gives_zero_live_days_but_still_listable():
     assert view["listable"] is True
 
 
+def test_view_tagline_en_defaults_to_none_when_absent():
+    """entry 未設 tagline_en → view 帶出 None（前端據此 fallback 用 tagline）。"""
+    view = build_strategy_view(_entry(), _ok_perf())
+    assert view["tagline_en"] is None
+
+
+def test_view_tagline_en_passthrough_when_present():
+    view = build_strategy_view(_entry(tagline_en="Multi-asset momentum · Perpetuals"),
+                               _ok_perf())
+    assert view["tagline_en"] == "Multi-asset momentum · Perpetuals"
+
+
 def test_view_never_includes_follower_count_key():
     """純函式結構性保證：follower_count 需要跨客戶 IO，不歸這裡管
     （由呼叫端在拿到這個 dict 之後才併入）。"""
@@ -304,6 +316,7 @@ def test_list_no_auth_required_and_shape(tmp_path):
         tmp_path,
         leaders_path=write_leaders(tmp_path, [
             {"address": _A, "name": "Alpha", "slug": "alpha", "tagline": "動能策略",
+             "tagline_en": "Momentum strategy",
              "featured": True, "min_notional_usd": "500", "max_leverage": "3"}]),
         followers_path=str(tmp_path / "nope.json"))
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
@@ -316,6 +329,7 @@ def test_list_no_auth_required_and_shape(tmp_path):
     assert row["slug"] == "alpha"
     assert row["name"] == "Alpha"
     assert row["tagline"] == "動能策略"
+    assert row["tagline_en"] == "Momentum strategy"
     assert row["featured"] is True
     assert row["leader_address"] == _A
     assert row["status"] == "running"

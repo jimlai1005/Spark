@@ -117,6 +117,7 @@ def build_strategy_view(entry: LeaderRef, perf: dict[str, Any] | None) -> dict[s
         "slug": slug,
         "name": entry.name,
         "tagline": entry.tagline,
+        "tagline_en": entry.tagline_en,
         "featured": entry.featured,
         "leader_address": entry.address,
         "status": status,

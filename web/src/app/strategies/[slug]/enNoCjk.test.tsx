@@ -54,7 +54,8 @@ function wrapEn(children: ReactNode) {
 }
 
 const DETAIL = {
-  slug: "core", name: "Filet Core", tagline: "Multi-asset momentum · perpetuals", featured: true,
+  slug: "core", name: "Filet Core", tagline: "多資產動能 · 永續合約",
+  tagline_en: "Multi-asset momentum · perpetuals", featured: true,
   leader_address: "0xfeed000000000000000000000000000000f00d",
   status: "running", listable: true, live_days: 72, follower_count: 3,
   min_notional_usd: "500", max_leverage: "3",

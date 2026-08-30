@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { COPY_ZH as COPY } from "@/lib/copy";
+import { LangProvider } from "@/lib/lang";
 import type { PublicStrategy } from "@/lib/publicApi";
 import { StrategyCard } from "./StrategyCard";
 
@@ -8,6 +9,7 @@ const BASE: PublicStrategy = {
   slug: "core",
   name: "Filet Core",
   tagline: "多資產動能 · 永續合約",
+  tagline_en: "Multi-asset momentum · Perpetuals",
   featured: false,
   leader_address: "0xfeed000000000000000000000000000000f00d",
   status: "running",
@@ -89,5 +91,40 @@ describe("StrategyCard", () => {
     render(<StrategyCard strategy={pending} summary />);
     expect(screen.queryByText(COPY.home.strategies.pendingNote)).not.toBeInTheDocument();
     expect(screen.queryByTestId("strategy-card-disabled")).not.toBeInTheDocument();
+  });
+});
+
+// ── tagline 語言選用（2026-08-30，EN 模式殘留繁中修法）──────────────────
+describe("StrategyCard — tagline 依語言選用", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("EN 模式且有 tagline_en → 顯示英文版，不顯示 zh tagline", async () => {
+    localStorage.setItem("filet_lang", "en");
+    render(
+      <LangProvider>
+        <StrategyCard strategy={BASE} />
+      </LangProvider>,
+    );
+    expect(await screen.findByText("Multi-asset momentum · Perpetuals")).toBeInTheDocument();
+    expect(screen.queryByText("多資產動能 · 永續合約")).not.toBeInTheDocument();
+  });
+
+  it("EN 模式但 tagline_en 缺席 → fallback 顯示 zh tagline（誠實降級，不留白）", async () => {
+    localStorage.setItem("filet_lang", "en");
+    const noEnTagline: PublicStrategy = { ...BASE, tagline_en: null };
+    render(
+      <LangProvider>
+        <StrategyCard strategy={noEnTagline} />
+      </LangProvider>,
+    );
+    expect(await screen.findByText("多資產動能 · 永續合約")).toBeInTheDocument();
+  });
+
+  it("zh 模式 → 一律顯示 zh tagline，即使 tagline_en 存在", () => {
+    render(<StrategyCard strategy={BASE} />);
+    expect(screen.getByText("多資產動能 · 永續合約")).toBeInTheDocument();
+    expect(screen.queryByText("Multi-asset momentum · Perpetuals")).not.toBeInTheDocument();
   });
 });

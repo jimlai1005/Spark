@@ -37,6 +37,10 @@ export interface PublicStrategy {
   slug: string;
   name: string;
   tagline: string | null;
+  /** 英文版一行文案（2026-08-30 新增）。缺席（`null`）＝白名單未填英文版——
+   * 呼叫端一律用 `lib/format.ts` 的 `resolveTagline()` 決定顯示哪一個，
+   * 不得自己重寫 fallback 邏輯（EN 模式殘留繁中修法，見該函式檔頭）。 */
+  tagline_en: string | null;
   featured: boolean;
   leader_address: string;
   status: "running" | "paused";
@@ -263,6 +267,7 @@ export async function getPublicStrategy(slug: string): Promise<PublicStrategyDet
       slug: body.slug,
       name: typeof body.name === "string" ? body.name : "",
       tagline: body.tagline ?? null,
+      tagline_en: body.tagline_en ?? null,
       featured: !!body.featured,
       leader_address: typeof body.leader_address === "string" ? body.leader_address : "",
       status: body.status === "paused" ? "paused" : "running",

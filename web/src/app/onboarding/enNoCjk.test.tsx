@@ -78,7 +78,8 @@ const READY_STATUS: OnboardStatus = {
 };
 
 const STRATEGY_DETAIL = {
-  slug: "core", name: "Filet Core", tagline: "Multi-asset momentum", featured: true,
+  slug: "core", name: "Filet Core", tagline: "多資產動能",
+  tagline_en: "Multi-asset momentum", featured: true,
   leader_address: "0xfeed000000000000000000000000000000f00d",
   status: "running", listable: true, live_days: 72, follower_count: 3,
   min_notional_usd: "500", max_leverage: "3",

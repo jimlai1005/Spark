@@ -30,9 +30,9 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
 import { EquityCurve } from "@/components/EquityCurve";
-import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, shortAddr } from "@/lib/format";
+import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, resolveTagline, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
-import { useCopy } from "@/lib/lang";
+import { useCopy, useLang } from "@/lib/lang";
 import {
   getPublicStrategy,
   type PublicStrategyDetail,
@@ -59,6 +59,7 @@ export default function StrategyDetailPage() {
   const slug = params?.slug ?? "";
   const router = useRouter();
   const COPY = useCopy();
+  const { lang } = useLang();
   const c = COPY.strategyDetail;
 
   // undefined＝載入中；null＝404／讀不到（兩者對使用者都是「這裡沒有可看的東西」）。
@@ -248,6 +249,7 @@ export default function StrategyDetailPage() {
   const metricCards = sampleInsufficient ? headlineCards : [...headlineCards, ...collapsibleCards];
 
   const listable = strategy.listable;
+  const tagline = resolveTagline(strategy, lang);
 
   return (
     <main className="page strategy-detail-page">
@@ -265,7 +267,7 @@ export default function StrategyDetailPage() {
             </span>
           </div>
           <div className="strategy-detail-sub">
-            {strategy.tagline ? `${strategy.tagline} · ` : ""}
+            {tagline ? `${tagline} · ` : ""}
             {c.leaderPrefix}
             <a className="mono" href={explorerHref} target="_blank" rel="noreferrer">
               {shortAddr(strategy.leader_address)}

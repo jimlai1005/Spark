@@ -361,6 +361,31 @@ def test_kind_non_string_raises(tmp_path):
         ]}))
 
 
+# ── tagline_en（2026-08-30，EN 模式殘留繁中修法）─────────────────────────
+
+def test_tagline_en_defaults_to_none(tmp_path):
+    """tagline_en 缺席 → None（區別於 tagline 的預設空字串——None 讓前端能
+    明確判斷「沒有英文版」而 fallback 用 tagline，空字串會被誤判成「英文版是空的」）。"""
+    leaders = load_leaders(_w(tmp_path, {"leaders": [
+        {"address": _A, "name": "Alpha"}  # 無 tagline_en 欄位
+    ]}))
+    assert leaders[0].tagline_en is None
+
+
+def test_tagline_en_parses(tmp_path):
+    leaders = load_leaders(_w(tmp_path, {"leaders": [
+        {"address": _A, "name": "Alpha", "tagline_en": "Multi-asset momentum · Perpetuals"}
+    ]}))
+    assert leaders[0].tagline_en == "Multi-asset momentum · Perpetuals"
+
+
+def test_tagline_en_non_string_raises(tmp_path):
+    with pytest.raises(ValueError, match="tagline_en"):
+        load_leaders(_w(tmp_path, {"leaders": [
+            {"address": _A, "name": "Alpha", "tagline_en": 123}
+        ]}))
+
+
 def test_find_leader_returns_ref_if_found(tmp_path):
     """find_leader(address, leaders) 命中時回傳 LeaderRef。"""
     leaders = load_leaders(_w(tmp_path, {"leaders": [

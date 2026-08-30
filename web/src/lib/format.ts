@@ -8,6 +8,21 @@ export function shortAddr(addr: string): string {
 export const NO_VALUE = "—";
 
 /**
+ * 策略 tagline 依語言選用（2026-08-30，EN 模式殘留繁中修法）。
+ * EN 模式且白名單填了 `tagline_en` → 用它；否則（含 zh 模式、或 EN 模式但
+ * `tagline_en` 缺席/空字串）一律 fallback 用 `tagline`——誠實降級，不翻譯不留白，
+ * 不偽造一句看起來像英文其實是機器翻譯的文案。所有渲染 tagline 的地方
+ * （StrategyCard／策略詳情頁／首頁 hero 卡）都要走這個函式，不得各自重寫判斷。
+ */
+export function resolveTagline(
+  strategy: { tagline: string | null; tagline_en?: string | null },
+  lang: "zh" | "en",
+): string {
+  if (lang === "en" && strategy.tagline_en) return strategy.tagline_en;
+  return strategy.tagline ?? "";
+}
+
+/**
  * 金額字串（後端 Decimal 序列化結果）→ 顯示字串。
  * null／空／非數字 → NO_VALUE（不當 0）。小額（|v| < 1）保留 4 位小數，
  * 因為 builder fee 常落在小數點後三、四位，2 位會把它顯示成 0.00。

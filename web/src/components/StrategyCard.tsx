@@ -1,7 +1,7 @@
 "use client";
 import Link from "next/link";
-import { fmtAmount } from "@/lib/format";
-import { useCopy } from "@/lib/lang";
+import { fmtAmount, resolveTagline } from "@/lib/format";
+import { useCopy, useLang } from "@/lib/lang";
 import type { PublicStrategy } from "@/lib/publicApi";
 
 interface CardMetric {
@@ -29,8 +29,10 @@ interface CardMetric {
  */
 export function StrategyCard({ strategy, summary }: { strategy: PublicStrategy; summary?: boolean }) {
   const COPY = useCopy();
+  const { lang } = useLang();
   const c = COPY.home.strategies;
   const m = strategy.metrics;
+  const tagline = resolveTagline(strategy, lang);
 
   const metrics: CardMetric[] = [
     {
@@ -68,7 +70,7 @@ export function StrategyCard({ strategy, summary }: { strategy: PublicStrategy; 
       <div className="strategy-card-head">
         <div>
           <div className="strategy-card-name">{strategy.name}</div>
-          {strategy.tagline && <div className="strategy-card-tagline">{strategy.tagline}</div>}
+          {tagline && <div className="strategy-card-tagline">{tagline}</div>}
         </div>
         {strategy.featured ? (
           <span className="pill chip-featured">{c.featuredBadge}</span>

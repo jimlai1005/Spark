@@ -42,7 +42,9 @@ tests/test_filet_user_leaders.py::test_deleting_the_curated_entry_falls_back_to_
 ⭐ 展示欄位＝白名單內可選欄位，清單外仍拒載（2026-08-28，Task 5 策略平台改版）
 ----------------------------------------------------------------------
 新增 `slug`／`tagline`／`featured`／`min_notional_usd`／`max_leverage` 五個**可選**
-欄位供 `/api/public/strategies*` 投影用（見 `filet/strategies.py`）。這是本檔第一次
+欄位供 `/api/public/strategies*` 投影用（見 `filet/strategies.py`）。`tagline_en`
+（2026-08-30，EN 模式殘留繁中修法）是第六個：可選英文版 tagline，缺席時前端
+fallback 用 `tagline`（誠實降級，不翻譯不留白）。這是本檔第一次
 需要「允許新欄位、但不能放鬆 fail-fast」：新增可選欄位的同時，本模組**新增**了
 「entry 的鍵集合必須是已知欄位的子集」這條檢查（先前沒有——任何未列舉的鍵會被
 `.get()` 靜默略過）。理由：這份檔案是資安邊界，展示欄位的拼字錯誤
@@ -72,6 +74,7 @@ class LeaderRef:
     # ── 策略平台展示欄位（全部可選，2026-08-28 Task 5）──────────────────────
     slug: str | None = None          # URL id；缺席時 filet.strategies 回退用 address
     tagline: str = ""                # 一行文案（如「多資產動能 · 永續合約」）
+    tagline_en: str | None = None    # 英文版一行文案；缺席時前端 EN 模式回退用 tagline
     featured: bool = False           # 首頁主推 badge
     min_notional_usd: str | None = None  # 展示用門檻（字串，內部一律 Decimal 的邊界）
     max_leverage: str | None = None      # 展示用槓桿上限（字串，同上）
@@ -86,8 +89,8 @@ class LeaderRef:
 # 一律拒載（`_validate_registry_fields` 是載入之後才跑的第二輪檢查，救不了
 # 已經在這裡被拒絕的請求）。
 _ENTRY_ALLOWED_KEYS = {"address", "name", "description", "enabled", "accepting_new",
-                      "kind", "slug", "tagline", "featured", "min_notional_usd",
-                      "max_leverage", "source", "added_by"}
+                      "kind", "slug", "tagline", "tagline_en", "featured",
+                      "min_notional_usd", "max_leverage", "source", "added_by"}
 
 
 def load_leaders(path: str | Path) -> list[LeaderRef]:
@@ -173,6 +176,10 @@ def load_leaders(path: str | Path) -> list[LeaderRef]:
         tagline = entry.get("tagline", "")
         if not isinstance(tagline, str):
             raise ValueError(f"leaders[{i}].tagline 須為字串: {tagline!r}")
+        tagline_en = entry.get("tagline_en")
+        if tagline_en is not None and not isinstance(tagline_en, str):
+            raise ValueError(
+                f"leaders[{i}].tagline_en 須為字串或省略: {tagline_en!r}")
         featured = entry.get("featured", False)
         if not isinstance(featured, bool):
             raise ValueError(f"leaders[{i}].featured 須為布林: {featured!r}")
@@ -186,7 +193,8 @@ def load_leaders(path: str | Path) -> list[LeaderRef]:
                 f"leaders[{i}].max_leverage 須為字串或省略: {max_leverage!r}")
         seen.add(addr)
         leaders.append(LeaderRef(addr, name, description, enabled, accepting_new, kind,
-                                 slug, tagline, featured, min_notional_usd, max_leverage))
+                                 slug, tagline, tagline_en, featured, min_notional_usd,
+                                 max_leverage))
     return leaders
 
 

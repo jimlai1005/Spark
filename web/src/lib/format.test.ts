@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  fmtAmount, fmtBp, fmtRatioPct, fmtUpdatedAtUtc, fmtUsdCompact, NO_VALUE, shortAddr,
+  fmtAmount, fmtBp, fmtRatioPct, fmtUpdatedAtUtc, fmtUsdCompact, NO_VALUE, resolveTagline,
+  shortAddr,
 } from "./format";
 
 describe("shortAddr", () => {
@@ -73,6 +74,26 @@ describe("fmtBp", () => {
     expect(fmtBp(undefined)).toBe(NO_VALUE);
     expect(fmtBp("")).toBe(NO_VALUE);
     expect(fmtBp("not-a-number")).toBe(NO_VALUE);
+  });
+});
+
+describe("resolveTagline", () => {
+  it("EN 模式且有 tagline_en → 用英文版", () => {
+    expect(resolveTagline({ tagline: "多資產動能", tagline_en: "Multi-asset momentum" }, "en"))
+      .toBe("Multi-asset momentum");
+  });
+  it("EN 模式但 tagline_en 缺席（null）→ fallback 用 zh tagline", () => {
+    expect(resolveTagline({ tagline: "多資產動能", tagline_en: null }, "en")).toBe("多資產動能");
+  });
+  it("EN 模式但 tagline_en 是空字串 → 視同缺席，fallback 用 zh tagline", () => {
+    expect(resolveTagline({ tagline: "多資產動能", tagline_en: "" }, "en")).toBe("多資產動能");
+  });
+  it("zh 模式 → 一律用 zh tagline，即使 tagline_en 存在", () => {
+    expect(resolveTagline({ tagline: "多資產動能", tagline_en: "Multi-asset momentum" }, "zh"))
+      .toBe("多資產動能");
+  });
+  it("tagline 本身為 null → 回傳空字串（不臆造）", () => {
+    expect(resolveTagline({ tagline: null, tagline_en: null }, "zh")).toBe("");
   });
 });
 

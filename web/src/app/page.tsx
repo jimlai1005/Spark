@@ -18,8 +18,8 @@ import { CapabilityMatrix } from "@/components/CapabilityMatrix";
 import { FeeCalculator } from "@/components/FeeCalculator";
 import { StrategyCard } from "@/components/StrategyCard";
 import { FOLLOWER_COUNT_DISPLAY_MIN } from "@/lib/copy";
-import { fmtUsdCompact, NO_VALUE, shortAddr } from "@/lib/format";
-import { useCopy } from "@/lib/lang";
+import { fmtUsdCompact, NO_VALUE, resolveTagline, shortAddr } from "@/lib/format";
+import { useCopy, useLang } from "@/lib/lang";
 import {
   getPublicStats,
   getPublicStrategies,
@@ -47,6 +47,7 @@ function metricText(value: string | null, insufficient: boolean, suffix = ""): s
 
 export default function HomePage() {
   const COPY = useCopy();
+  const { lang } = useLang();
   const home = COPY.home;
 
   const [stats, setStats] = useState<PublicStats>(EMPTY_STATS);
@@ -73,6 +74,7 @@ export default function HomePage() {
   }, []);
 
   const featured = pickFeatured(strategies);
+  const featuredTagline = featured ? resolveTagline(featured, lang) : "";
   const explorerBase = "https://app.hyperliquid.xyz/explorer/address";
   const leaderExplorerHref = featured ? `${explorerBase}/${featured.leader_address}` : "https://app.hyperliquid.xyz";
 
@@ -139,7 +141,7 @@ export default function HomePage() {
                 <div>
                   <div className="home-hero-featured-name">
                     {featured.name}
-                    {featured.tagline ? ` · ${featured.tagline}` : ""}
+                    {featuredTagline ? ` · ${featuredTagline}` : ""}
                   </div>
                   <div className="mono home-hero-featured-addr">
                     {home.hero.featuredCard.leaderPrefix}

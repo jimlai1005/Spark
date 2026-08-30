@@ -100,7 +100,8 @@ describe("getPublicStrategies", () => {
 
 describe("getPublicStrategy", () => {
   const DETAIL = {
-    slug: "core", name: "Filet Core", tagline: "多資產動能 · 永續合約", featured: true,
+    slug: "core", name: "Filet Core", tagline: "多資產動能 · 永續合約",
+    tagline_en: "Multi-asset momentum · Perpetuals", featured: true,
     leader_address: "0xfeed000000000000000000000000000000f00d",
     status: "running", listable: true, live_days: 72, follower_count: 3,
     min_notional_usd: "500", max_leverage: "3",
@@ -133,6 +134,13 @@ describe("getPublicStrategy", () => {
     mockFetchOnce(() => jsonResponse(DETAIL));
     const r = await getPublicStrategy("core");
     expect(r).toEqual(DETAIL);
+  });
+
+  it("tagline_en 鍵不存在 → 降級為 null（白名單未填英文版）", async () => {
+    const { tagline_en: _drop, ...withoutTaglineEn } = DETAIL;
+    mockFetchOnce(() => jsonResponse(withoutTaglineEn));
+    const r = await getPublicStrategy("core");
+    expect(r?.tagline_en).toBeNull();
   });
 
   it("cagr_pct 鍵不存在（樣本不足）→ 降級為 null，不臆造", async () => {
