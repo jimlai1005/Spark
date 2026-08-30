@@ -116,8 +116,11 @@ export default function ExplorePage() {
   const [window_, setWindow] = useState<ExploreWindow>(DEFAULT_WINDOW);
   const [liveDaysChip, setLiveDaysChip] = useState(true);
   const [fillsChip, setFillsChip] = useState(true);
-  const [maxDdChip, setMaxDdChip] = useState(true);
-  const [concentratedChip, setConcentratedChip] = useState(true);
+  // ⭐ 回撤/集中度 chip 預設關閉（2026-08-31 主線程裁決）：候選池本就是 top-ROI
+  // 帳戶，30D 回撤 ≤30% 的閘門會把預設榜刷成空的（實測 month 窗 24→0）——落地頁
+  // 空榜比寬鬆預設更糟。品質基線（實盤天數/成交筆數）維持預設開。
+  const [maxDdChip, setMaxDdChip] = useState(false);
+  const [concentratedChip, setConcentratedChip] = useState(false);
   const [page, setPage] = useState(1);
   const [reloadKey, setReloadKey] = useState(0);
 

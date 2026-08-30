@@ -318,24 +318,28 @@ describe("ExplorePage — R4-10 qualified chip 拆分", () => {
     });
   });
 
-  it("既有「最大回撤」「集中度」chip 映射不變：off → max_dd_pct=100 / max_concentration_pct=100", async () => {
+  it("回撤/集中度 chip 預設關閉（2026-08-31 裁決：避免空榜），首次請求送 100/100；點開才收緊為 30/90", async () => {
     const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
+    // 預設 off → 首次請求即為不過濾邊界值
+    const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
+    expect(firstUrl).toContain("max_dd_pct=100");
+    expect(firstUrl).toContain("max_concentration_pct=100");
 
     fetchMock.mockClear();
     await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.maxDd }));
     await waitFor(() => {
       const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
-      expect(lastUrl).toContain("max_dd_pct=100");
+      expect(lastUrl).toContain("max_dd_pct=30");
     });
 
     fetchMock.mockClear();
     await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.concentrated }));
     await waitFor(() => {
       const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
-      expect(lastUrl).toContain("max_concentration_pct=100");
+      expect(lastUrl).toContain("max_concentration_pct=90");
     });
   });
 });
