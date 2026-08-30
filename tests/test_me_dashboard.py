@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from eth_account import Account
+from eth_account.messages import encode_defunct
 from fastapi.testclient import TestClient
 
 from spark.exchange.base import UserFill
@@ -344,3 +345,90 @@ def test_missing_heartbeat_signal_source_not_ok_but_state_still_following(tmp_pa
     body = client.get("/api/me/dashboard").json()
     assert body["status"]["state"] == "following"
     assert body["status"]["signal_source_ok"] is False
+
+
+# ── sync 三態／null 不冒充 0（M3 round3 Task 3，D7） ────────────────────
+
+def test_sync_ok_state_and_no_zero_fabrication_when_no_pairs(tmp_path):
+    """心跳新鮮，但這一輪沒有可配對的樣本 → `data_state="ok"`（不是還在暖機，
+    是這個來源本來就沒有這個量），延遲／滑價／規模偏移寧可是 `null` 也不冒充
+    `0`（R2·C：0ms 是假數據，比空白更傷信任）。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    write_hb(cfg, acct(wallet))
+
+    body = client.get("/api/me/dashboard").json()
+    sync = body["sync"]
+    assert sync["data_state"] == "ok"
+    assert sync["since_ts"] is None
+    assert sync["latency_median_ms"] is None
+    assert sync["latency_p95_ms"] is None
+    assert sync["price_diff_bp"] is None
+    assert sync["scale_deviation_pct"] is None
+
+
+def test_sync_warming_state_when_engine_never_published_heartbeat(tmp_path):
+    """引擎從未寫過心跳（`HeartbeatRead.status == "missing"`，即「剛 activate」）
+    → `data_state="warming"`，不是 `error` 或 `ok`。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    # 刻意不呼叫 write_hb：心跳檔案從未產生。
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["sync"]["data_state"] == "warming"
+
+
+def test_sync_error_state_when_own_fills_query_fails(tmp_path):
+    """自己的成交查詢失敗（`follower_trade_quality` 內部已把例外吞成
+    `quality_available=False`，不是拋出來）→ `data_state="error"`，不是靜默
+    地看起來像「這一輪沒有樣本」的 `ok`。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    addr = wallet.address.lower()
+    write_hb(cfg, acct(wallet))
+    hl.fills_error[addr] = ConnectionError("boom")
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["sync"]["data_state"] == "error"
+
+
+# ── risk_controls_enabled（M3 round3 Task 3，D5 風險護欄） ─────────────
+
+def test_risk_controls_enabled_true_from_fresh_heartbeat(tmp_path):
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    write_hb(cfg, acct(wallet), risk_enabled=True, risk_source="customer_signed")
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["risk_controls_enabled"] is True
+
+
+def test_risk_controls_enabled_false_from_fresh_heartbeat(tmp_path):
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    write_hb(cfg, acct(wallet), risk_enabled=False, risk_source="customer_signed")
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["risk_controls_enabled"] is False
+
+
+def test_risk_controls_enabled_defaults_false_without_heartbeat_or_signed_record(tmp_path):
+    """從未簽過風控偏好、也沒有心跳 → 產品預設 `False`（不是 `null`——新錢包
+    預設不啟用任何風控，CLAUDE.md 紅線 5；前端據此渲染 R2·C 態一「未啟用」）。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["risk_controls_enabled"] is False
+
+
+def test_risk_controls_enabled_falls_back_to_signed_record_when_no_heartbeat(tmp_path):
+    """心跳缺席，但客戶已簽過一份「啟用風控」的設定 → 用那份已簽章的值，不是
+    直接兜底成 `False`（那會讓一個剛啟用保護的客戶看到「未啟用」）。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    r = client.post("/api/me/risk/message", json={"prefs": {"enabled": True}})
+    assert r.status_code == 200, r.text
+    m = r.json()
+    sig = wallet.sign_message(encode_defunct(text=m["message"])).signature.hex()
+    submit_body = {"account_id": m["account_id"], "prefs": m["prefs"],
+                  "nonce": m["nonce"], "issued_at": m["issued_at"],
+                  "signature": sig, "message": m["message"]}
+    r = client.post("/api/me/risk", json=submit_body)
+    assert r.status_code == 200, r.text
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["risk_controls_enabled"] is True

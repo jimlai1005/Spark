@@ -126,6 +126,36 @@ def build_strategy_view(entry: LeaderRef, perf: dict[str, Any] | None) -> dict[s
     }
 
 
+# ⭐ M3 round3 Task 3（D5 數字一致性）：CAGR 是策略詳情頁專屬的樣本閘（60 天），
+# **與 leader_perf 自己的 `annualized_return_insufficient_data`（90 天，
+# `MIN_DAYS_FOR_ANNUALIZATION`）刻意不同一個門檻**——後者是「年化外推可信度」的
+# 通用揭露分級，這裡是策略卡「要不要秀這張大字卡」的產品決策，兩者服務不同用途，
+# 混用會讓 60–89 天之間的策略卡看到「有 annualized_return 但被前者的旗標關掉」
+# 這種前端要另外判斷的岔路。呼叫端（`publicapi/app.py`）以 `live_days`（＝
+# `int(covered_days)`，與 `build_strategy_view` 算 `live_days` 同一個值、同源）
+# 對照本常數做結構性 gating：`sample_days < CAGR_SAMPLE_THRESHOLD_DAYS` 時
+# 呼叫端整個不放 `cagr_pct` 鍵進回應（不是放 null），前端因此不必自己判斷門檻。
+CAGR_SAMPLE_THRESHOLD_DAYS = 60
+
+
+def build_cagr_pct(perf: dict[str, Any] | None) -> str | None:
+    """CAGR（年化報酬）＝直接取 `leader_perf.compute_window_performance` 算好的
+    `annualized_return`，**不重算**（同一支計算，見 D5 主線程裁決：前端刪除
+    `strategyMetrics.ts` 的自算函式，一律由後端供給）。
+
+    `perf` 缺席／`status != "ok"`／`annualized_return` 數學上無定義（帳戶歸零，
+    `1+twr<=0`，leader_perf 對此整組 `annualized_return*` 鍵一起缺席）→ `None`。
+    是否要把這個值**放進**回應（樣本天數門檻）由呼叫端決定，本函式只管「算不算
+    得出來」。
+    """
+    if not (isinstance(perf, dict) and perf.get("status") == "ok"):
+        return None
+    v = perf.get("annualized_return")
+    if v is None:
+        return None
+    return _quantize_pct_or_ratio(v * Decimal("100"))
+
+
 def build_equity_index(perf: dict[str, Any] | None) -> list[str]:
     """perf 的 `equity_index`（Decimal 序列，出入金中性化）→ jsonable 字串陣列。
 

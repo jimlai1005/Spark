@@ -448,6 +448,119 @@ def test_upstream_portfolio_called_once_within_60s_cache_window(tmp_path):
     assert hl.portfolio_calls == 2          # 重新查詢
 
 
+def test_list_and_detail_share_same_metrics_and_as_of(tmp_path):
+    """D5 數字一致性：同一個 60s 快取窗內，列表卡與詳情頁的 `metrics`／`as_of`
+    必須逐欄相等——兩端點共用同一支 `_strategy_perf_with_as_of` 餵的同一份
+    perf 快照，不是各自重算或各自重新觸網。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    store = ApiStore(cfg.db_path)
+    keysvc = FakeKeysvc()
+    hl = FakeHL()
+    hl.portfolios[_A] = sixty_day_rows()
+    clock = {"t": 1_000_000.0}
+    app = create_app(cfg, store, keysvc, hl, now_fn=lambda: clock["t"])
+    c = _client(app)
+
+    row = c.get("/api/public/strategies").json()["strategies"][0]
+    detail = c.get("/api/public/strategies/alpha").json()
+
+    assert row["as_of"] is not None
+    assert row["as_of"] == detail["as_of"] == int(clock["t"])
+    assert row["metrics"] == detail["metrics"]
+
+
+def test_list_as_of_null_when_upstream_fetch_fails(tmp_path):
+    """上游 portfolio 查詢直接失敗（連 rows 都拿不到）→ 沒有任何快照可言，
+    `as_of` 誠實回 null——與「查到了、但資料不足以算出 window」（as_of 仍有效，
+    我們確實在那個時間點查過）是不同的處境，不可疊成同一個 null。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    hl.portfolio_error[_A] = ConnectionError("hl 5xx")
+    body = _client(app).get("/api/public/strategies").json()
+    assert body["strategies"][0]["as_of"] is None
+
+
+def test_list_as_of_present_even_when_upstream_returns_empty(tmp_path):
+    """上游查詢**成功**但回空清單（真實情境：位址存在、尚無 perp 活動）→
+    perf 仍為 insufficient，但 `as_of` 照樣回真正的查詢時間戳——我們確實在
+    那個時間點查過，只是沒查到足以算出 window 的資料。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, *_ = make_app(tmp_path, cfg=cfg)
+    body = _client(app).get("/api/public/strategies").json()
+    assert body["strategies"][0]["as_of"] is not None
+
+
+# ============================================================
+# 詳情頁：sample_days／sample_threshold／cagr_pct 結構性 gating（Task 3）
+# ============================================================
+
+def test_detail_sample_days_and_cagr_present_at_threshold(tmp_path):
+    """恰好 60 天（`CAGR_SAMPLE_THRESHOLD_DAYS`）：`sample_days`／
+    `sample_threshold` 恆回傳，`cagr_pct` 因為門檻已達而出現。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    hl.portfolios[_A] = sixty_day_rows()
+    body = _client(app).get("/api/public/strategies/alpha").json()
+    assert body["sample_days"] == 60
+    assert body["sample_threshold"] == 60
+    assert "cagr_pct" in body
+    assert Decimal(body["cagr_pct"]) > 0
+
+
+def test_detail_cagr_key_absent_below_threshold(tmp_path):
+    """10 天樣本（< 60）：`cagr_pct` 鍵**整個不存在**（結構性防呆，不是
+    存在但值為 null）——前端因此不必自己判斷門檻。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    t = 10 * _DAY_MS
+    hl.portfolios[_A] = _portfolio_rows([[0, "1000"], [t, "1050"]],
+                                        [[0, "0"], [t, "50"]])
+    body = _client(app).get("/api/public/strategies/alpha").json()
+    assert body["sample_days"] == 10
+    assert body["sample_threshold"] == 60
+    assert "cagr_pct" not in body
+
+
+def test_detail_cagr_key_absent_when_no_perf(tmp_path):
+    """沒有 perf（上游無資料）：`sample_days` 隨 `live_days` 降級為 0，
+    `cagr_pct` 一樣不存在。"""
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, *_ = make_app(tmp_path, cfg=cfg)
+    body = _client(app).get("/api/public/strategies/alpha").json()
+    assert body["sample_days"] == 0
+    assert body["sample_threshold"] == 60
+    assert "cagr_pct" not in body
+
+
+# ============================================================
+# 純函式：build_cagr_pct（filet.strategies，Task 3）
+# ============================================================
+
+def test_build_cagr_pct_uses_annualized_return_directly():
+    """CAGR 直接取 leader_perf 算好的 annualized_return，不重算（同一支計算）。"""
+    from spark.filet.strategies import build_cagr_pct
+    m = build_cagr_pct(_ok_perf(annualized_return=Decimal("0.4523")))
+    assert m == "45.23"
+
+
+def test_build_cagr_pct_none_when_annualized_return_absent():
+    """`annualized_return` 鍵不存在（帳戶歸零，數學上無定義）→ None。"""
+    from spark.filet.strategies import build_cagr_pct
+    assert build_cagr_pct(_ok_perf()) is None
+
+
+def test_build_cagr_pct_none_when_perf_not_ok():
+    from spark.filet.strategies import build_cagr_pct
+    assert build_cagr_pct({"status": "insufficient"}) is None
+    assert build_cagr_pct(None) is None
+
+
 def test_upstream_failure_degrades_that_leader_not_whole_list(tmp_path):
     """上游查詢失敗（transient）→ 該策略的指標全 insufficient，其他策略／整個
     端點不受影響（不得 500/502——公開清單本身要比被監控的上游更可靠）。

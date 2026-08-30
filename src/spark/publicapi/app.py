@@ -36,7 +36,8 @@ from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
                                      compute_window_performance, extract_window)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, find_leader, is_selectable, load_leaders
-from spark.filet.strategies import (build_equity_index, build_metrics,
+from spark.filet.strategies import (CAGR_SAMPLE_THRESHOLD_DAYS, build_cagr_pct,
+                                    build_equity_index, build_metrics,
                                     build_methodology, build_strategy_view)
 from spark.publicapi import hl_explore, hl_leaderboard, public_stats
 from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
@@ -662,14 +663,33 @@ def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
     }
 
 
-def _dashboard_sync(ref: FollowerRef, hl, mine, now_s: float) -> dict:
+def _dashboard_sync(ref: FollowerRef, hl, mine, hb: "HeartbeatRead",
+                    now_s: float) -> dict:
     """同步誤差塊：過濾自 `follower_trade_quality`——與 `/api/ops/trade-quality`
     完全**同一個純函式**，只餵這個帳號自己（不變量 4 的同型：不得跨客戶）。
     窗口固定近 24 小時，對應 `missed_signals_24h` 命名的語意窗。
 
     latency_p95_ms／unsynced_positions／scale_deviation_pct／missed_signals_24h／
     missed_reason／last_recon_ts：`compute_trade_quality`／`TradeQuality` 未產出
-    這些量（全 repo 搜尋確認），沒有既有來源 → 維持 `None`，不新造公式。
+    這些量（全 repo 搜尋確認），沒有既有來源 → 維持 `None`，不新造公式
+    （R2·C／M3 round3 Task 3：無樣本一律 `None`，絕不送 `0` 冒充「零誤差」）。
+
+    ⭐ M3 round3 Task 3：`data_state` 三態——
+    - `"error"`：這個帳號**自己**的成交查詢失敗（`follower_trade_quality` 內部
+      已把 `adapter.get_user_fills` 的例外吞成 `quality_available=False`，不是
+      拋出來——這裡把它投影成一個前端看得懂的狀態，而不是假裝「這一輪沒有樣本」）。
+    - `"warming"`：這個帳號的引擎**從未**發布過心跳（`hb.status == "missing"`，
+      見 `engine_health.HeartbeatRead` 檔頭「剛 activate」）——結構上就是「還沒
+      有時間累積」，不是資料源壞了。
+    - `"ok"`：其餘情況，即使個別欄位仍是 `None`（例如 manifest 未記
+      `leader_address`、或 leader 24h 內沒有成交）——那是「這個來源本來就沒有
+      這個量」，與「還在暖機」是不同的處境，不可疊成同一個狀態（工程原則 1）。
+
+    `since_ts`（跟單啟動時間）：全 repo 沒有既有來源（manifest／心跳都不記
+    follower 首次被引擎追蹤的時刻——`_dashboard_status` 的 `following_days`
+    留 `None` 是同一個既有缺口）。沿用本函式檔頭「沒有既有來源不新造公式」的
+    既有慣例，本輪維持 `None`；`data_state="warming"` 已足以讓前端畫出
+    「跟單啟動後 24h 內開始累積」這句固定文案，不需要精確的起算時刻。
     """
     end = datetime.fromtimestamp(now_s, timezone.utc)
     start = end - timedelta(hours=24)
@@ -687,12 +707,54 @@ def _dashboard_sync(ref: FollowerRef, hl, mine, now_s: float) -> dict:
     delay_s = row.get("median_delay_s")
     if delay_s is not None:
         latency_median_ms = int((delay_s * 1000).to_integral_value())
+    if not row.get("quality_available", True):
+        data_state = "error"
+    elif hb.status == "missing":
+        data_state = "warming"
+    else:
+        data_state = "ok"
     return {
         "latency_median_ms": latency_median_ms, "latency_p95_ms": None,
         "price_diff_bp": row.get("taker_slippage_bp_median"),
         "unsynced_positions": None, "scale_deviation_pct": None,
         "missed_signals_24h": None, "missed_reason": None, "last_recon_ts": None,
+        "data_state": data_state, "since_ts": None,
     }
+
+
+def _dashboard_risk_controls_enabled(hb: "HeartbeatRead",
+                                     signed_prefs: dict | None) -> bool:
+    """風控總開關的最佳已知值——**恆回布林，不留 null**（M3 round3 Task 3 D5/R2·C：
+    前端要用它決定「未啟用 · 前往設定 →」這個確定的態一，不能是「不知道」）。
+
+    `signed_prefs`＝呼叫端已解出的「這個帳號目前已簽章的偏好」原始 dict
+    （`_my_signed_risk_record(account_id)` 的 `["prefs"]`，找不到記錄時傳
+    `None`）——本函式不做 IO，維持與其餘 `_dashboard_*` helper 同一種模組層級
+    純函式形狀（`_my_signed_risk_record` 因需要 `cfg.risk_settings_path` 而留在
+    `create_app` 閉包內，見該函式檔頭的兩層窄化論證）。
+
+    優先權（由新到舊、由確定到不確定）：
+    1. 心跳新鮮且來源可信（`customer_signed`／`env_default`）＝引擎**目前實際
+       套用**的值——與 `_dashboard_guards` 的 `guards.drawdown.enabled` 同一
+       讀法、同源（工程原則 1）。
+    2. 心跳讀不到可信值時，退到帳號**已簽章但引擎可能還沒套用**的偏好——仍是
+       客戶自己的選擇，只是新鮮度差一截（沿 `/api/me/risk` 的 `prefs` 語意）。
+    3. 兩者都沒有（從未簽過、也沒有心跳）→ 產品預設 `False`（新錢包預設不啟用
+       任何風控，見 `filet.risk_prefs.default_prefs`／專案 CLAUDE.md 紅線 5）
+       ——這不是「不知道」，是這個帳號目前的真實狀態：沒有任何風控在執法。
+    """
+    if hb.fresh:
+        risk = (hb.data or {}).get("risk") or {}
+        if risk.get("source") in ("customer_signed", "env_default"):
+            enabled = risk.get("controls_enabled")
+            if isinstance(enabled, bool):
+                return enabled
+    if signed_prefs is not None:
+        try:
+            return canonical_prefs(signed_prefs)["enabled"]
+        except RiskPrefsError:
+            pass
+    return False
 
 
 # ⭐ Warning 1（opus 審查 2026-08-29）：`daily_bars` 逐日重呼 `collect_follower_summary`
@@ -1527,17 +1589,25 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     _strategy_portfolio_lock = threading.Lock()
     STRATEGY_PORTFOLIO_CACHE_TTL_S = 60.0
 
-    def _cached_strategy_portfolio(address: str) -> list | None:
-        """`hl.portfolio()` 的 60s 快取。上游任何失敗（transient 或 schema 漂移）
-        → `None`，**不快取失敗**（下次請求照樣重試，不必等 TTL 過期）——呼叫端
-        把它降級成該策略的 perf 缺席，不得讓一個 leader 的上游故障拖垮整份清單
-        （沿 /api/leaders 目錄「個別 leader 統計為 null」的既有降級精神）。
+    def _cached_strategy_portfolio_with_ts(address: str) -> tuple[list, float] | None:
+        """`hl.portfolio()` 的 60s 快取，回傳 `(rows, fetched_at)`。上游任何失敗
+        （transient 或 schema 漂移）→ `None`，**不快取失敗**（下次請求照樣重試，
+        不必等 TTL 過期）——呼叫端把它降級成該策略的 perf 缺席，不得讓一個 leader
+        的上游故障拖垮整份清單（沿 /api/leaders 目錄「個別 leader 統計為 null」
+        的既有降級精神）。
+
+        ⭐ M3 round3 Task 3（D5 數字一致性）：`fetched_at`＝這批 `rows`（進而算出
+        的 perf）實際落地這份快取的時間戳，是列表卡與詳情頁回應裡 `as_of` 的
+        **唯一來源**——兩個端點在同一個 60s 快取窗內命中同一格快取時，回傳的
+        `fetched_at` 是同一個數字，值也因此保證同源同基準（工程原則 1）；快取過
+        期後兩者各自重新觸網才會各自前進，`as_of` 會誠實反映這一點，不假裝兩次
+        不同時間點的抓取是「同一份快照」。
         """
         now = now_fn()
         with _strategy_portfolio_lock:
             cached = _strategy_portfolio_cache.get(address)
         if cached is not None and now - cached[0] < STRATEGY_PORTFOLIO_CACHE_TTL_S:
-            return cached[1]
+            return cached[1], cached[0]
         try:
             rows = hl.portfolio(address)
         except Exception as e:  # noqa: BLE001 — 公開端點：上游任何失敗都不得 500
@@ -1545,21 +1615,36 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             return None
         with _strategy_portfolio_lock:
             _strategy_portfolio_cache[address] = (now, rows)
-        return rows
+        return rows, now
 
-    def _strategy_perf_for(address: str) -> dict | None:
-        """位址 → `perpAllTime` 窗的績效（策略卡固定只用這一窗：首頁/詳情頁要的
-        是「這個策略整體值不值得跟」，不是逐窗比較）。上游或計算失敗 → None，
-        `strategies.build_strategy_view` 對 None 的處理＝該策略全部指標 insufficient。
+    def _cached_strategy_portfolio(address: str) -> list | None:
+        """`_cached_strategy_portfolio_with_ts` 的薄包裝，只要 rows 不要時間戳
+        （既有呼叫點——`initial_deposit_usd` 推導——不需要 as_of）。"""
+        result = _cached_strategy_portfolio_with_ts(address)
+        return result[0] if result is not None else None
+
+    def _strategy_perf_with_as_of(address: str) -> tuple[dict | None, int | None]:
+        """位址 → `(perf, as_of)`。`perf`＝`perpAllTime` 窗的績效（策略卡固定只用
+        這一窗：首頁/詳情頁要的是「這個策略整體值不值得跟」，不是逐窗比較）；
+        `as_of`＝算出這份 perf 所用 `rows` 的快取時間戳（epoch 秒）。上游或計算
+        失敗 → `(None, None)`，`strategies.build_strategy_view` 對 None 的處理＝
+        該策略全部指標 insufficient。
         """
-        rows = _cached_strategy_portfolio(address)
-        if rows is None:
-            return None
+        result = _cached_strategy_portfolio_with_ts(address)
+        if result is None:
+            return None, None
+        rows, fetched_at = result
         try:
-            return compute_window_performance(rows, "perpAllTime")
+            perf = compute_window_performance(rows, "perpAllTime")
         except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整份清單
             logger.error("策略績效計算失敗 leader=%s: %s", address, e)
-            return None
+            return None, None
+        return perf, int(fetched_at)
+
+    def _strategy_perf_for(address: str) -> dict | None:
+        """`_strategy_perf_with_as_of` 的薄包裝，只要 perf 不要 as_of（既有呼叫點
+        `/api/public/stats` 的 `perf_for=_strategy_perf_for` 不需要時間戳）。"""
+        return _strategy_perf_with_as_of(address)[0]
 
     def _strategy_follower_counts() -> dict[str, int] | None:
         """位址（小寫）→ 目前 active 跟隨的 follower 數。
@@ -1602,7 +1687,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         counts = _strategy_follower_counts()
         strategies = []
         for entry in _public_strategy_entries():
-            perf = _strategy_perf_for(entry.address)
+            # ⭐ M3 round3 Task 3（D5 數字一致性）：列表卡與 `/{slug}` 詳情頁**同一支
+            # `build_strategy_view`／`build_metrics`計算**餵同一次 perf 快照——
+            # 兩端點唯一的差異是「這次請求命中快取的哪一格」，不是計算路徑本身。
+            # `as_of` 把這份 perf 快照的實際時間戳（快取寫入時刻）誠實回吐，
+            # 兩端點在同一個 60s 快取窗內同時打進來時 `as_of` 會相等（見
+            # `_cached_strategy_portfolio_with_ts` 檔頭）。
+            perf, as_of = _strategy_perf_with_as_of(entry.address)
             view = build_strategy_view(entry, perf)
             # ⭐ 缺鍵＝「這個 leader 目前沒有任何 active follower」，不是「不知道」
             # ——聚合成功時一律回真正的整數（`.get(addr, 0)`），只有 counts 整體
@@ -1610,6 +1701,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             # 兩種完全不同的處境（0 個／不知道）疊成同一個 None（工程原則 1）。
             view["follower_count"] = (counts.get(entry.address, 0)
                                       if counts is not None else None)
+            view["as_of"] = as_of
             strategies.append(view)
         return {"strategies": strategies, "updated_at": int(now_fn())}
 
@@ -1625,11 +1717,26 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                      if (r.slug or r.address) == slug), None)
         if entry is None:
             raise HTTPException(status_code=404, detail="策略不存在")
-        perf = _strategy_perf_for(entry.address)
+        # ⭐ M3 round3 Task 3（D5 數字一致性）：與列表端點同一支
+        # `_strategy_perf_with_as_of`——同一個 perf 快照、同一個 as_of 來源。
+        perf, as_of = _strategy_perf_with_as_of(entry.address)
         view = build_strategy_view(entry, perf)
         counts = _strategy_follower_counts()
         view["follower_count"] = (counts.get(entry.address, 0)
                                   if counts is not None else None)
+        view["as_of"] = as_of
+        # ⭐ M3 round3 Task 3：`sample_days`／`sample_threshold`／`cagr_pct`——
+        # `sample_days` 直接沿用 `view["live_days"]`（`build_strategy_view` 已用
+        # `int(covered_days)` 算過一次，同一個值、同一個來源，不重算第二次以免
+        # 兩處日後各自漂移，工程原則 1）。`sample_days < sample_threshold`（60 天，
+        # `strategies.CAGR_SAMPLE_THRESHOLD_DAYS`）時**整個不放 `cagr_pct` 鍵**
+        # ——結構性防呆：前端不需要另外判斷門檻，鍵不存在就是不存在。
+        view["sample_days"] = view["live_days"]
+        view["sample_threshold"] = CAGR_SAMPLE_THRESHOLD_DAYS
+        if view["live_days"] >= CAGR_SAMPLE_THRESHOLD_DAYS:
+            cagr_pct = build_cagr_pct(perf)
+            if cagr_pct is not None:
+                view["cagr_pct"] = cagr_pct
         view["equity_index"] = build_equity_index(perf)
         initial_deposit_usd = None
         rows = _cached_strategy_portfolio(entry.address)
@@ -3234,14 +3341,23 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
         status_block = _safe_block("status", _dashboard_status, mine, hb, acct,
                                    cfg.leaders_path, cfg.exchange_dir)
-        sync_block = _safe_block("sync", _dashboard_sync, ref, hl, mine, now_s)
+        sync_block = _safe_block("sync", _dashboard_sync, ref, hl, mine, hb, now_s)
         fees_month_block = _safe_block("fees_month", _dashboard_fees_month,
                                        ref, hl, now_s)
+        # ⭐ M3 round3 Task 3（D5 風險護欄）：`risk_controls_enabled` 恆為布林
+        # （`_dashboard_risk_controls_enabled` 的契約），不經 `_safe_block`——
+        # 一個「不確定」的風控開關狀態不該被吞成 null，寧可用產品預設 False
+        # 兜底（該函式內部已處理）。`signed_prefs` 讀取失敗（`_my_signed_risk_record`
+        # 本身已內部 try/except 降級為 None）不會讓這裡炸開。
+        signed_risk_rec = _my_signed_risk_record(account_id)
+        risk_controls_enabled = _dashboard_risk_controls_enabled(
+            hb, signed_risk_rec["prefs"] if signed_risk_rec else None)
 
         return jsonable({
             "status": status_block, "equity": equity_block,
             "exposure": exposure_block, "pnl": pnl_block, "sync": sync_block,
             "fees_month": fees_month_block, "positions": positions_block,
+            "risk_controls_enabled": risk_controls_enabled,
             "updated_at": int(now_s),
         })
 
