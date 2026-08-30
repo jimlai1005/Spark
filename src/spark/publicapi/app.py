@@ -734,12 +734,17 @@ def _fee_daily_bars(ref: FollowerRef, hl, start: datetime, end: datetime) -> lis
     `[start, end)`：`start` 對齊到當日 00:00 UTC；`end` 可以是任意時刻（本日尚未
     走完的部分日照算），迴圈用 `day < end`（而非 `day.date() <= end.date()`）
     確保 `end` 剛好落在某天 00:00（例如「上個月」的排他上界＝本月 1 號 00:00）
-    時不會多算出下個月第一天。"""
+    時不會多算出下個月第一天。
+
+    ⭐ M3 round3 Task 2b：每個 `[day, day_end)` 都用 `end_exclusive=True`——
+    恰好落在 `day_end`（例如 UTC 午夜整）的成交只歸下一天，不會同時被本日與
+    次日兩個查詢窗各記一次（既有舊病：`get_user_fills`／`userFillsByTime` 的
+    `start`/`end` 兩端皆含，逐日切窗若不排他上界會在午夜邊界重複計費）。"""
     bars: list[dict] = []
     day = start.replace(hour=0, minute=0, second=0, microsecond=0)
     while day < end:
         day_end = min(day + timedelta(days=1), end)
-        day_summary = collect_follower_summary(ref, hl, day, day_end)
+        day_summary = collect_follower_summary(ref, hl, day, day_end, end_exclusive=True)
         if day_summary.error is None and day_summary.fills > 0:
             bars.append({
                 "date": day.date().isoformat(),
@@ -771,7 +776,9 @@ def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float, *,
         return cached[1]
     now_dt = datetime.fromtimestamp(now_s, timezone.utc)
     month_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
-    summary = collect_follower_summary(ref, hl, month_start, now_dt)
+    # end_exclusive=True：與 `_fee_daily_bars` 同一個半開區間慣例，月總量才會
+    # 恰好等於逐日 bar 加總，不因午夜邊界重複計費而兜不起來（Task 2b）。
+    summary = collect_follower_summary(ref, hl, month_start, now_dt, end_exclusive=True)
     if summary.error is not None:
         raise RuntimeError(summary.error)
     fill_count, routed_volume, builder_fees = (
@@ -828,21 +835,36 @@ def _fees_all_time_start(ref: FollowerRef, hl, now_dt: datetime) -> datetime:
 _FEES_PERIODS = ("this_month", "last_month", "all")
 
 
+def _pnl_share_pct(builder_fees: Decimal, realized_pnl: "Decimal | None",
+                   total_fee: Decimal) -> "Decimal | None":
+    """佔已實現淨 PnL 的百分比（M3 round3 Task 2b，主線程裁決 D12）。分母＝
+    期間已實現淨 PnL＝Σ closedPnl − Σ fee（同一批 fills、同一個
+    `collect_follower_summary` 呼叫算出來的兩個欄位，同窗同源；未實現 PnL
+    明確不進分母）。`realized_pnl is None`（fills 完全沒有 closedPnl 資料）或
+    分母 ≤0 → `None`（前端顯示「—」）。
+
+    數值錨例（plan Task 2b）：builder_fees=2.00、closedPnl 合計=10.00、
+    fee 合計=3.50 → 淨 6.50 → 2.00/6.50*100 ≈ 30.77%。"""
+    if realized_pnl is None:
+        return None
+    net = realized_pnl - total_fee
+    if net <= 0:
+        return None
+    return ((builder_fees / net) * 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 def _dashboard_fees_period(ref: FollowerRef, hl, now_s: float, period: str, *,
                            cache: dict[tuple[str, str], tuple[float, dict]] | None = None
                            ) -> dict:
     """`/api/me/fees?period=` 的計算層。`period` 決定 `[start, end)`：
     `this_month`／`last_month` 為日曆月（`_month_bounds`）；`all` 為帳戶實際
     交易起點至今（`_fees_all_time_start`）。彙總與逐日明細**同一個資料源**
-    （`collect_follower_summary`／`_fee_daily_bars`），不另拼第二來源。
+    （`collect_follower_summary`／`_fee_daily_bars`），不另拼第二來源；
+    `end_exclusive=True`（Task 2b）與 `_fee_daily_bars` 同一個半開區間慣例，
+    期間總量才會恰好等於逐日 bar 加總。
 
-    `pnl_share_pct` 恆為 `None`：HL 只提供 day/week/month/allTime 這幾個**滾動**
-    窗（`portfolio()`），沒有任一個窗口的起訖點會對齊日曆月／`all` 起點；勉強拿
-    `perpMonth`（近 30 天滾動）的 PnL 去除本端點日曆對齊的費用分子，會混用兩個
-    不同基準的窗口（違反工程原則 1：比較雙方須同源同基準）。`UserFill` 也沒有
-    `closedPnl` 欄位可逐筆重建同窗 PnL。沒有同基準來源就是沒有——回 `None`，
-    前端顯示「—」，這正是 plan 本身允許的「PnL≤0 或無值→null」的「無值」分支，
-    不是抄捷徑。"""
+    `pnl_share_pct`：見 `_pnl_share_pct`（Task 2b 主線程裁決 D12，已改用同一條
+    fills 流的已實現淨 PnL 當分母，不再永遠 `None`）。"""
     cache = _fees_period_cache if cache is None else cache
     key = (ref.account_id, period)
     cached = cache.get(key)
@@ -858,16 +880,17 @@ def _dashboard_fees_period(ref: FollowerRef, hl, now_s: float, period: str, *,
     else:
         raise ValueError(f"period 僅支援 {_FEES_PERIODS}: {period!r}")
 
-    summary = collect_follower_summary(ref, hl, start, end)
+    summary = collect_follower_summary(ref, hl, start, end, end_exclusive=True)
     if summary.error is not None:
         raise RuntimeError(summary.error)
     fill_count, routed_volume, builder_fees = (
         summary.fills, summary.notional, summary.builder_fee)
+    pnl_share_pct = _pnl_share_pct(builder_fees, summary.realized_pnl, summary.total_fee)
     daily = _fee_daily_bars(ref, hl, start, end)
     result = {
         "summary": {
             "builder_fees": builder_fees, "routed_volume": routed_volume,
-            "fill_count": fill_count, "pnl_share_pct": None,
+            "fill_count": fill_count, "pnl_share_pct": pnl_share_pct,
         },
         "daily": daily,
     }

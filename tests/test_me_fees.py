@@ -1,12 +1,18 @@
-"""tests/test_me_fees.py — M3 round3 Task 2：費用明細逐日聚合＋期間切換。
+"""tests/test_me_fees.py — M3 round3 Task 2＋2b：費用明細逐日聚合＋期間切換＋
+佔已實現淨 PnL 百分比＋午夜邊界修正。
 
-盯住 plan Task 2 的三件事：
+盯住 plan Task 2／2b 的四件事：
 (1) `daily_bars`／`daily` 每列擴充為 `{date, fill_count, routed_volume, builder_fee,
     effective_rate_bps}`；無成交日不產生列，`builder_fee=0` 但有成交的日子照實列出
     （$0.00 與「無成交」語意分開，R2·B）。
 (2) `GET /api/me/fees?period=this_month|last_month|all`：同一個 `collect_follower_summary`
-    資料源（不另拼第二來源），`pnl_share_pct` 在無同基準 PnL 來源時為 `None`。
-(3) `/api/me/dashboard` 既有欄位（`fees_month.fill_count` 等）不被破壞。
+    資料源（不另拼第二來源）。
+(3) `pnl_share_pct`＝builder_fees ÷（Σ closedPnl − Σ fee），同一批 fills 同源同基準
+    （Task 2b／D12）；沒有 closedPnl 資料或分母 ≤0 → `None`。數值錨例：
+    fee(builder)=2.00、closedPnl 合計=10.00、fee 合計=3.50 → 淨 6.50 → 30.77%。
+(4) 逐日聚合用半開區間 `[day, day+1)`：成交恰在 UTC 午夜整只入當日、不重複計入前一天
+    （Task 2b／D13，`collect_follower_summary(..., end_exclusive=True)`）。
+(5) `/api/me/dashboard` 既有欄位（`fees_month.fill_count` 等）不被破壞。
 
 全離線（tests/conftest.py 的 autouse socket-ban；計算層測試直接呼叫純 Python 函式，
 端點層測試用 TestClient + 真實 SIWE 登入，不經真實網路——見 `_allow_local_sockets`
@@ -21,6 +27,7 @@ from eth_account import Account
 from fastapi.testclient import TestClient
 
 from spark.exchange.base import UserFill
+from spark.filet.aggregate import collect_follower_summary
 from spark.filet.followers import FollowerRef
 from spark.publicapi.app import (
     _dashboard_fees_month,
@@ -28,6 +35,7 @@ from spark.publicapi.app import (
     _fee_daily_bars,
     _fees_all_time_start,
     _month_bounds,
+    _pnl_share_pct,
 )
 from tests.publicapi_helpers import BUILDER, login, make_app, make_cfg
 
@@ -48,10 +56,12 @@ def _ref(account_id="fabc", address=None) -> FollowerRef:
                        builder_address=BUILDER, network="testnet")
 
 
-def _fill(day: datetime, *, sz="1", px="100", builder_fee="0.5") -> UserFill:
+def _fill(day: datetime, *, sz="1", px="100", builder_fee="0.5", fee="0.01",
+         closed_pnl=None) -> UserFill:
     return UserFill(time=day, coin="ETH", px=Decimal(px), sz=Decimal(sz),
-                    side="B", crossed=True, oid=1, fee=Decimal("0.01"),
-                    builder_fee=Decimal(builder_fee))
+                    side="B", crossed=True, oid=1, fee=Decimal(fee),
+                    builder_fee=Decimal(builder_fee),
+                    closed_pnl=Decimal(closed_pnl) if closed_pnl is not None else None)
 
 
 class _WindowAwareHL:
@@ -237,16 +247,89 @@ def test_fees_all_time_start_falls_back_on_portfolio_error():
     assert start == now_dt - timedelta(days=400)
 
 
-# ── pnl_share_pct：無同基準來源 → None ───────────────────────────────────
+# ── pnl_share_pct：Task 2b 同源已實現淨 PnL 分母 ─────────────────────────
+
+def test_pnl_share_pct_numeric_anchor():
+    """plan Task 2b 錨例：fee(builder)=2.00、closedPnl 合計=10.00、
+    fee 合計=3.50 → 淨 6.50 → 2.00/6.50*100 ≈ 30.77%（quantize 0.01 HALF_UP）。"""
+    got = _pnl_share_pct(Decimal("2.00"), Decimal("10.00"), Decimal("3.50"))
+    assert got == Decimal("30.77")
+
+
+def test_pnl_share_pct_null_when_no_closed_pnl_data():
+    assert _pnl_share_pct(Decimal("1.0"), None, Decimal("0")) is None
+
+
+@pytest.mark.parametrize("realized_pnl,total_fee", [
+    (Decimal("0"), Decimal("0")),      # 淨 = 0
+    (Decimal("1.0"), Decimal("2.0")),  # 淨 = -1.0
+])
+def test_pnl_share_pct_null_when_net_realized_not_positive(realized_pnl, total_fee):
+    assert _pnl_share_pct(Decimal("1.0"), realized_pnl, total_fee) is None
+
 
 @pytest.mark.parametrize("period", ["this_month", "last_month", "all"])
-def test_pnl_share_pct_is_null_for_every_period(period):
+def test_pnl_share_pct_null_end_to_end_when_fills_carry_no_closed_pnl(period):
+    """`_fill` 預設不帶 closed_pnl（None）——同一批 fills 完全沒有 closedPnl
+    資料時，`pnl_share_pct` 仍是 `None`（不是永遠 null，是這批資料真的沒有）。"""
     ref = _ref()
     hl = _WindowAwareHL([
-        _fill(datetime(2026, 8, 5, tzinfo=timezone.utc), builder_fee="1.0"),
+        _fill(datetime(2026, 8, 5, 9, 0, tzinfo=timezone.utc), builder_fee="1.0"),
     ])
     result = _dashboard_fees_period(ref, hl, _NOW, period, cache={})
     assert result["summary"]["pnl_share_pct"] is None
+
+
+def test_pnl_share_pct_end_to_end_this_month():
+    """端到端：兩筆本月成交合計 builder_fee=2.00／fee=3.50／closedPnl=10.00，
+    與純函式錨例同一組數字，經 `_dashboard_fees_period` 算出同一個 30.77%。"""
+    ref = _ref()
+    hl = _WindowAwareHL([
+        _fill(datetime(2026, 8, 5, 9, 0, tzinfo=timezone.utc),
+             builder_fee="1.00", fee="2.00", closed_pnl="6.00"),
+        _fill(datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc),
+             builder_fee="1.00", fee="1.50", closed_pnl="4.00"),
+    ])
+    result = _dashboard_fees_period(ref, hl, _NOW, "this_month", cache={})
+    assert result["summary"]["builder_fees"] == Decimal("2.00")
+    assert result["summary"]["pnl_share_pct"] == Decimal("30.77")
+
+
+# ── 午夜邊界（Task 2b／D13）：半開區間 [day, day+1) ───────────────────────
+
+def test_fee_daily_bars_midnight_fill_counted_once_in_next_day():
+    """成交恰好落在 2026-08-06 00:00:00 UTC（前一天 8/5 的收盤邊界＝次日
+    8/6 的起點）：半開區間下只入 8/6，不會同時也被 8/5 那根 bar 算一次。"""
+    ref = _ref()
+    midnight_fill = _fill(datetime(2026, 8, 6, 0, 0, tzinfo=timezone.utc),
+                          builder_fee="1.0")
+    hl = _WindowAwareHL([midnight_fill])
+    start = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+    bars = _fee_daily_bars(ref, hl, start, end)
+
+    assert [b["date"] for b in bars] == ["2026-08-06"]
+    assert bars[0]["fill_count"] == 1
+    total_fill_count = sum(b["fill_count"] for b in bars)
+    assert total_fill_count == 1  # 不是 2（沒有被前一天重複記一次）
+
+
+def test_collect_follower_summary_end_exclusive_drops_boundary_fill():
+    """`end_exclusive=True`：恰好等於 `end` 的成交被過濾掉（半開區間上界）；
+    預設（`end_exclusive=False`，既有呼叫端如 `/api/ops/revenue` 的行為）
+    仍然兩端皆含，不受影響——驗證新參數不動舊路徑。"""
+    ref = _ref()
+    boundary = datetime(2026, 8, 6, 0, 0, tzinfo=timezone.utc)
+    hl = _WindowAwareHL([_fill(boundary, builder_fee="1.0")])
+
+    inclusive = collect_follower_summary(ref, hl, datetime(2026, 8, 5, tzinfo=timezone.utc),
+                                         boundary)
+    assert inclusive.fills == 1  # 舊行為：兩端皆含
+
+    exclusive = collect_follower_summary(ref, hl, datetime(2026, 8, 5, tzinfo=timezone.utc),
+                                         boundary, end_exclusive=True)
+    assert exclusive.fills == 0  # 新行為：上界排他
 
 
 # ── 端點層：認證、422、happy path（TestClient） ──────────────────────────

@@ -138,6 +138,10 @@ class UserFill:
     oid: int
     fee: Decimal
     builder_fee: Decimal = Decimal("0")   # 該筆成交歸屬我方 builder 的費用（HL fills 的 builderFee；無此欄位視為 0）
+    # M3 round3 Task 2b：加法擴充（optional，預設 None），不改變任何既有讀者的行為
+    # ——舊 code 完全不讀這個欄位。HL fills 的 closedPnl；缺欄／解析不到 → None
+    # （不是 0——沒資料就是沒資料，讀者不可把 None 當「當筆已實現 0」處理）。
+    closed_pnl: Decimal | None = None
 
 
 @dataclass(frozen=True)

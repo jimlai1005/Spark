@@ -154,6 +154,8 @@ class HLGateway:
             oid=f["oid"],
             fee=Decimal(str(f.get("fee", "0") or "0")),
             builder_fee=Decimal(str(f.get("builderFee", "0") or "0")),
+            closed_pnl=(Decimal(str(f["closedPnl"]))
+                       if f.get("closedPnl") is not None else None),
         ) for f in raw]
 
     def agent_addresses(self, user: str) -> list[str]:
