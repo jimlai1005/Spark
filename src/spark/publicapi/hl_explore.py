@@ -60,7 +60,7 @@ W1（trading_days → live_days）：`trading_days` 原本量 perpAllTime 降採
 的舊點也可能拿到偏高的值。改為**首末點的日曆跨距天數**（只依賴序列的頭尾
 兩個時間戳，對中間取樣密度不敏感），欄位改名 `live_days`，語意＝「這顆帳戶
 從第一筆到最後一筆觀測，已經實盤了多少天」；`EXPLORE_MIN_TRADING_DAYS` 門檻
-語意同步改成「實盤 ≥ 60 天」（env var 名稱本身保留，見 `ExploreConfig`）。
+語意同步改成「實盤 ≥ N 天」（N 由 EXPLORE_MIN_TRADING_DAYS 決定；2026-08-30 D15 預設 60→30）（env var 名稱本身保留，見 `ExploreConfig`）。
 
 W2（`_fills_stats` 分頁上限最小版）：本函式建立在 `hl.get_fills_detail()`
 單次呼叫（HL `userFillsByTime` 單頁上限 2000 筆）上，卻標「近 30D」。R-A

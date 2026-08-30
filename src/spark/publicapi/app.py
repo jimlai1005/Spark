@@ -1783,7 +1783,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # ⭐ M3 round3 Task 3：`sample_days`／`sample_threshold`／`cagr_pct`——
         # `sample_days` 直接沿用 `view["live_days"]`（`build_strategy_view` 已用
         # `int(covered_days)` 算過一次，同一個值、同一個來源，不重算第二次以免
-        # 兩處日後各自漂移，工程原則 1）。`sample_days < sample_threshold`（60 天，
+        # 兩處日後各自漂移，工程原則 1）。`sample_days < sample_threshold`（30 天〔2026-08-30 D15 由 60 調降〕，
         # `strategies.CAGR_SAMPLE_THRESHOLD_DAYS`）時**整個不放 `cagr_pct` 鍵**
         # ——結構性防呆：前端不需要另外判斷門檻，鍵不存在就是不存在。
         view["sample_days"] = view["live_days"]
