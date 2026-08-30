@@ -17,8 +17,7 @@ from fastapi.testclient import TestClient
 from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
 from spark.publicapi.hl_explore import (ExploreConfig, ExploreIndex, ExploreRow,
-                                        WindowStats, candidate_addresses,
-                                        clamp_explore_params, enrich_candidate,
+                                        candidate_addresses, enrich_candidate,
                                         paginate, qualify, sort_key)
 from spark.publicapi.store import ApiStore
 from tests.publicapi_helpers import FakeHL, FakeKeysvc, make_cfg
@@ -99,19 +98,10 @@ def _sample_fills():
 
 def _row(**over):
     """`qualify`/`sort_key` 測試用的最小 `ExploreRow`（預設全部剛好卡在門檻上，
-    呼叫端逐一覆寫想測的欄位）。R4-3：`windows` 改 dict 形狀——`ret_pct`/
-    `dd_pct` 是便利參數，套到 `"month"`／`"allTime"` 兩窗（`enrich_candidate`
-    保證這兩鍵恆非 None，這裡的假資料維持同一個不變量）；要測特定窗（day/week）
-    或某窗缺席（None）時直接傳 `windows=` 整包覆寫。"""
-    ret_pct = over.pop("ret_pct", 10.0)
-    dd_pct = over.pop("dd_pct", -5.0)
-    windows = over.pop("windows", None)
-    if windows is None:
-        stats = WindowStats(ret_pct=ret_pct, max_dd_pct=dd_pct, spark=())
-        windows = {"day": None, "week": None, "month": stats, "allTime": stats}
+    呼叫端逐一覆寫想測的欄位）。"""
     base = dict(address=_A, display_name=None, label="0xaaaa…aaaa", coins=(),
-               account_bucket="<$10K", windows=windows,
-               live_days=60, fill_count_30d=200,
+               account_bucket="<$10K", spark=(), ret_30d_pct=10.0,
+               max_dd_30d_pct=-5.0, live_days=60, fill_count_30d=200,
                close_win_rate_pct=50.0, concentration_pct=10.0,
                exposure_dir=None, exposure_pct=None, tags=(), fills_truncated=False)
     base.update(over)
@@ -227,18 +217,15 @@ def test_enrich_candidate_computes_return_drawdown_live_days_and_win_rate():
     assert row.address == _A
     assert row.display_name == "Alice"
     assert row.label == "Alice"
-    assert row.windows["month"].ret_pct == 10.0         # (1100/1000 - 1) * 100
-    assert row.windows["month"].max_dd_pct == -10.0     # 900/1000 - 1
+    assert row.ret_30d_pct == 10.0                     # (1100/1000 - 1) * 100
+    assert row.max_dd_30d_pct == -10.0                  # 900/1000 - 1
     assert row.live_days == 64                          # W1：首末點日曆跨距（65 點、
                                                           # 逐日一點 → 首末相差 64 天）
     assert row.fill_count_30d == 2
     assert row.close_win_rate_pct == 100.0
     assert row.account_bucket == "$10K–$100K"
     assert row.exposure_dir == "long"
-    assert len(row.windows["month"].spark) == 3
-    assert row.windows["allTime"] is not None            # R4-3：allTime 窗也一併算好
-    assert row.windows["day"] is None                    # R4-3：_portfolio_raw 只填 month/allTime
-    assert row.windows["week"] is None
+    assert len(row.spark) == 3
     assert row.fills_truncated is False
 
 
@@ -285,57 +272,6 @@ def test_enrich_candidate_short_exposure_when_short_dominant():
 
 
 # ============================================================
-# 純函式：enrich_candidate — R4-3 四窗（day/week/month/allTime 單次 portfolio()
-# 回應一次抽出，不多打上游）
-# ============================================================
-
-def test_enrich_candidate_computes_all_four_windows_from_single_portfolio_response():
-    """R4-3：`portfolio()` 單次回應本就含四窗——`enrich_candidate` 一次讀出
-    day/week/month/allTime 各自獨立的 ret/dd（同源同基準，各窗各自的序列）。"""
-    portfolio_raw = [
-        ["perpDay", {"accountValueHistory": _av_series(0, [1000, 1010], step_ms=3_600_000),
-                     "pnlHistory": [], "vlm": "0"}],
-        ["perpWeek", {"accountValueHistory": _av_series(0, [1000, 950, 1050]),
-                     "pnlHistory": [], "vlm": "0"}],
-        ["perpMonth", {"accountValueHistory": _av_series(0, [1000, 900, 1100]),
-                      "pnlHistory": [], "vlm": "0"}],
-        ["perpAllTime", {"accountValueHistory": _av_series(0, [1000] * 65),
-                         "pnlHistory": [], "vlm": "0"}],
-    ]
-    row = enrich_candidate(_A, None, portfolio_raw, [], _ch_state())
-    assert row is not None
-    assert set(row.windows.keys()) == {"day", "week", "month", "allTime"}
-    assert row.windows["day"].ret_pct == 1.0             # (1010/1000 - 1) * 100
-    assert row.windows["week"].ret_pct == 5.0            # (1050/1000 - 1) * 100
-    assert row.windows["week"].max_dd_pct == -5.0        # 950/1000 - 1
-    assert row.windows["month"].ret_pct == 10.0          # (1100/1000 - 1) * 100
-    assert row.windows["allTime"].ret_pct == 0.0         # 全序列恆為 1000
-
-
-def test_enrich_candidate_day_week_missing_stores_none_not_fabricated():
-    """R4-3：day／week 是 best-effort——`_portfolio_raw` 只填 month／allTime，
-    缺席的兩窗各自存 `None`，不得借別的窗數字冒充（不編數字）。"""
-    portfolio_raw = _portfolio_raw([1000, 1100], [1000] * 60)
-    row = enrich_candidate(_A, None, portfolio_raw, [], _ch_state())
-    assert row is not None
-    assert row.windows["day"] is None
-    assert row.windows["week"] is None
-    assert row.windows["month"] is not None
-    assert row.windows["allTime"] is not None
-
-
-def test_enrich_candidate_day_week_invalid_series_stores_none_not_skip_whole_row():
-    """R4-3：day／week 序列本身無效（首點非正）只讓那一鍵是 `None`——不像
-    month／allTime 那樣連坐整列（gating 只在 month／allTime，見模組檔頭）。"""
-    portfolio_raw = _portfolio_raw([1000, 1100], [1000] * 60)
-    portfolio_raw = [["perpDay", {"accountValueHistory": _av_series(0, [0, 1000]),
-                                  "pnlHistory": [], "vlm": "0"}], *portfolio_raw]
-    row = enrich_candidate(_A, None, portfolio_raw, [], _ch_state())
-    assert row is not None
-    assert row.windows["day"] is None
-
-
-# ============================================================
 # 純函式：qualify — 資格過濾邊界（等號行為釘死）
 # ============================================================
 
@@ -361,12 +297,12 @@ def test_qualify_fill_count_one_below_threshold_fails():
 
 def test_qualify_drawdown_exactly_at_cap_passes():
     cfg = ExploreConfig(max_drawdown_pct=Decimal("30"))
-    assert qualify(_row(dd_pct=-30.0), cfg) is True
+    assert qualify(_row(max_dd_30d_pct=-30.0), cfg) is True
 
 
 def test_qualify_drawdown_just_over_cap_fails():
     cfg = ExploreConfig(max_drawdown_pct=Decimal("30"))
-    assert qualify(_row(dd_pct=-30.01), cfg) is False
+    assert qualify(_row(max_dd_30d_pct=-30.01), cfg) is False
 
 
 def test_qualify_concentration_exactly_at_cap_passes():
@@ -387,7 +323,7 @@ def test_qualify_concentration_none_passes_no_evidence_no_penalty():
 def test_qualify_chips_can_be_toggled_off_independently():
     cfg = ExploreConfig(min_trading_days=60, min_fills=200,
                         max_drawdown_pct=Decimal("30"), max_concentration_pct=Decimal("90"))
-    bad_row = _row(live_days=1, fill_count_30d=1, dd_pct=-99.0,
+    bad_row = _row(live_days=1, fill_count_30d=1, max_dd_30d_pct=-99.0,
                    concentration_pct=99.0)
     assert qualify(bad_row, cfg, require_sample=False, max_dd_filter=False,
                   exclude_concentrated=False) is True
@@ -395,58 +331,18 @@ def test_qualify_chips_can_be_toggled_off_independently():
 
 
 # ============================================================
-# 純函式：qualify — R4-3 window 參數（回撤過濾看所選窗，不是永遠 month）
-# ============================================================
-
-def test_qualify_max_dd_uses_selected_window_not_always_month():
-    windows = {
-        "day": WindowStats(ret_pct=1.0, max_dd_pct=-50.0, spark=()),
-        "week": None,
-        "month": WindowStats(ret_pct=10.0, max_dd_pct=-5.0, spark=()),
-        "allTime": WindowStats(ret_pct=20.0, max_dd_pct=-5.0, spark=()),
-    }
-    row = _row(windows=windows)
-    cfg = ExploreConfig(max_drawdown_pct=Decimal("30"))
-    assert qualify(row, cfg, window="month") is True    # month dd=-5 <= 30
-    assert qualify(row, cfg, window="day") is False      # day dd=-50 > 30
-
-
-def test_qualify_missing_window_stats_passes_max_dd_no_evidence_no_penalty():
-    windows = {"day": None, "week": None,
-              "month": WindowStats(10.0, -5.0, ()), "allTime": WindowStats(10.0, -5.0, ())}
-    row = _row(windows=windows)
-    cfg = ExploreConfig(max_drawdown_pct=Decimal("30"))
-    assert qualify(row, cfg, window="week") is True
-
-
-# ============================================================
 # 純函式：sort_key（風險調整排序鍵，D2）
 # ============================================================
 
 def test_sort_key_ranks_higher_return_lower_drawdown_first():
-    high = _row(ret_pct=20.0, dd_pct=-5.0)
-    low = _row(ret_pct=20.0, dd_pct=-15.0)
+    high = _row(ret_30d_pct=20.0, max_dd_30d_pct=-5.0)
+    low = _row(ret_30d_pct=20.0, max_dd_30d_pct=-15.0)
     assert sort_key(high) > sort_key(low)
 
 
 def test_sort_key_zero_drawdown_uses_floor_not_division_by_zero():
-    row = _row(ret_pct=1.0, dd_pct=0.0)
+    row = _row(ret_30d_pct=1.0, max_dd_30d_pct=0.0)
     assert sort_key(row) == Decimal("1.0") / Decimal("0.5")
-
-
-def test_sort_key_uses_selected_window():
-    windows = {"day": WindowStats(50.0, -1.0, ()), "week": None,
-              "month": WindowStats(10.0, -5.0, ()), "allTime": WindowStats(10.0, -5.0, ())}
-    row = _row(windows=windows)
-    assert sort_key(row, window="day") == Decimal("50.0") / Decimal("1.0")
-    assert sort_key(row, window="month") == Decimal("10.0") / Decimal("5.0")
-
-
-def test_sort_key_falls_back_to_month_when_selected_window_missing():
-    windows = {"day": None, "week": None,
-              "month": WindowStats(10.0, -5.0, ()), "allTime": WindowStats(10.0, -5.0, ())}
-    row = _row(windows=windows)
-    assert sort_key(row, window="week") == sort_key(row, window="month")
 
 
 # ============================================================
@@ -495,38 +391,6 @@ def test_candidate_addresses_excludes_filet_own_leaders():
     payload = _leaderboard_payload(_lb_row(_A, roi="0.90"), _lb_row(_FILET_OWN, roi="0.99"))
     out = candidate_addresses(payload, pool_size=10, excluded={_FILET_OWN.lower()})
     assert [a for a, _ in out] == [_A]
-
-
-# ============================================================
-# 純函式：clamp_explore_params（R4-3：伺服器夾取範圍，防濫用不是驗證錯誤）
-# ============================================================
-
-def test_clamp_explore_params_within_range_is_unchanged():
-    assert clamp_explore_params(min_live_days=30, min_fills=200,
-                                max_dd_pct=30.0, max_concentration_pct=90.0) \
-        == (30, 200, 30.0, 90.0)
-
-
-def test_clamp_explore_params_clamps_values_below_lower_bound():
-    assert clamp_explore_params(min_live_days=-5, min_fills=-1,
-                                max_dd_pct=0.0, max_concentration_pct=0.0) \
-        == (0, 0, 1.0, 1.0)
-
-
-def test_clamp_explore_params_clamps_values_above_upper_bound():
-    assert clamp_explore_params(min_live_days=9999, min_fills=999_999,
-                                max_dd_pct=500.0, max_concentration_pct=500.0) \
-        == (365, 100_000, 100.0, 100.0)
-
-
-def test_clamp_explore_params_boundary_values_pass_through_unchanged():
-    """邊界值本身合法（含），不被夾成別的數字。"""
-    assert clamp_explore_params(min_live_days=0, min_fills=0,
-                                max_dd_pct=1.0, max_concentration_pct=1.0) \
-        == (0, 0, 1.0, 1.0)
-    assert clamp_explore_params(min_live_days=365, min_fills=100_000,
-                                max_dd_pct=100.0, max_concentration_pct=100.0) \
-        == (365, 100_000, 100.0, 100.0)
 
 
 # ============================================================
@@ -810,77 +674,6 @@ def test_index_pagination_across_pages():
     assert len(all_addrs) == 60  # 三頁不重疊、無遺漏
 
 
-def test_index_query_window_selects_ranking_and_response_row_content():
-    """R4-3 端到端：`window` 參數改變回傳列的排序（`sort_key` 依所選窗）。
-    地址 A 是 day 窗強、month 窗弱；地址 B 相反——window 切換應讓排名對調。"""
-    hl = FakeHL()
-    hl.portfolios[_A.lower()] = [
-        ["perpDay", {"accountValueHistory": _av_series(0, [1000, 1100], step_ms=3_600_000),
-                     "pnlHistory": [], "vlm": "0"}],
-        ["perpWeek", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
-        ["perpMonth", {"accountValueHistory": _av_series(0, [1000, 1010]), "pnlHistory": [], "vlm": "0"}],
-        ["perpAllTime", {"accountValueHistory": _av_series(0, [1000] * 60), "pnlHistory": [], "vlm": "0"}],
-    ]
-    hl.fills_detail[_A.lower()] = []
-    hl.clearinghouse[_A.lower()] = _ch_state()
-    hl.portfolios[_B.lower()] = [
-        ["perpDay", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
-        ["perpWeek", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
-        ["perpMonth", {"accountValueHistory": _av_series(0, [1000, 1200]), "pnlHistory": [], "vlm": "0"}],
-        ["perpAllTime", {"accountValueHistory": _av_series(0, [1000] * 60), "pnlHistory": [], "vlm": "0"}],
-    ]
-    hl.fills_detail[_B.lower()] = []
-    hl.clearinghouse[_B.lower()] = _ch_state()
-    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"), _lb_row(_B, roi="0.4"))
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
-
-    by_day = index.query(window="day")
-    assert [r["address"] for r in by_day["rows"]] == [_A, _B]   # A 的 day 報酬較高
-
-    by_month = index.query(window="month")
-    assert [r["address"] for r in by_month["rows"]] == [_B, _A]  # B 的 month 報酬較高
-
-
-# ============================================================
-# ExploreIndex：R4-3 index 結構版本——不相容快照視同未建置，強制重建
-# ============================================================
-
-def test_index_version_mismatch_forces_rebuild_even_within_ttl():
-    """把記憶體內快照的版本標記竄改成舊版後，即使 TTL 未過期，`query()` 也
-    必須回 `building: True`（不得把不相容形狀的舊列序列化給前端），並忽略
-    TTL 觸發背景重建。"""
-    hl = FakeHL()
-    _seed_hl(hl, _A)
-    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(),
-                         cfg=ExploreConfig(min_trading_days=0, min_fills=0),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
-    first = index.query()
-    assert first["building"] is False
-    assert len(first["rows"]) == 1
-
-    # 模擬「上一版程式碼建置出的舊形狀快照」殘留在記憶體（結構性測試：直接
-    # 竄改內部版本標記，不必真的構造一份舊 dataclass shape）。
-    index._rows_version = hl_explore.EXPLORE_INDEX_VERSION - 1
-
-    stale = index.query()
-    assert stale["building"] is True
-    assert stale["rows"] == []
-
-
-def test_index_starts_with_no_rows_version_before_first_build():
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    assert index._rows_version is None
-
-
 # ============================================================
 # 端點：GET /api/public/explore
 # ============================================================
@@ -923,26 +716,11 @@ def test_endpoint_rejects_non_positive_page(tmp_path):
     assert r.status_code == 422
 
 
-@pytest.mark.parametrize("param", ["min_live_days", "min_fills", "max_dd_pct",
-                                   "max_concentration_pct"])
-def test_endpoint_rejects_non_numeric_threshold_params(tmp_path, param):
-    """R4-3：三個布林 chip（qualified/max_dd/exclude_concentrated）已從端點移除，
-    改成四個自由數值——非數值輸入（型別驗證失敗）仍是 422；超出合法範圍的
-    數值不是型別錯誤，是被 `clamp_explore_params` 夾取，見下面 clamp 測試。"""
+@pytest.mark.parametrize("param", ["qualified", "max_dd", "exclude_concentrated"])
+def test_endpoint_rejects_non_boolean_toggle_params(tmp_path, param):
     app = _app(tmp_path, leaderboard_get_fn=lambda url: _leaderboard_payload())
-    r = _client(app).get("/api/public/explore", params={param: "not-a-number"})
+    r = _client(app).get("/api/public/explore", params={param: 2})
     assert r.status_code == 422
-
-
-def test_endpoint_out_of_range_thresholds_are_clamped_not_rejected(tmp_path):
-    """R4-3：超出範圍的數值門檻不是驗證錯誤——伺服器直接夾回邊界內，回應仍
-    200（`clamp_explore_params` 的邊界見模組常數）。"""
-    app = _app(tmp_path, leaderboard_get_fn=lambda url: _leaderboard_payload())
-    r = _client(app).get("/api/public/explore", params={
-        "min_live_days": -5, "min_fills": 999_999,
-        "max_dd_pct": 0, "max_concentration_pct": 500,
-    })
-    assert r.status_code == 200, r.text
 
 
 def test_endpoint_no_auth_required_and_no_cookie_side_effect(tmp_path):
@@ -973,10 +751,7 @@ def test_endpoint_full_flow_after_build_completes(tmp_path, monkeypatch):
     index = app.state.explore_index
     index.build_sync()  # 測試直接同步建置一次，不等背景 thread（見 hl_explore 檔頭）
 
-    # R4-3：`qualified=0` chip 已移除——改送 min_live_days=0/min_fills=0
-    # 停用樣本門檻（`_seed_hl` 的假地址 fills_detail 是空清單，預設
-    # min_fills=200 門檻進不了榜）。
-    r = client.get("/api/public/explore", params={"min_live_days": 0, "min_fills": 0})
+    r = client.get("/api/public/explore", params={"qualified": 0})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["building"] is False
@@ -986,4 +761,4 @@ def test_endpoint_full_flow_after_build_completes(tmp_path, monkeypatch):
     row = next(row for row in body["rows"] if row["address"] == _A)
     assert row["display_name"] == "Alice"
     assert row["label"] == "Alice"
-    assert row["windows"]["month"]["ret_pct"] == 10.0
+    assert row["ret_30d_pct"] == 10.0
