@@ -1470,8 +1470,8 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 
 .explore-table { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; }
 .explore-table-head, .explore-table-row {
-  display: grid; grid-template-columns: 40px 200px 104px 100px 90px 72px 92px 1fr 168px;
-  gap: 14px; align-items: center; padding: 14px 18px; min-width: 1080px;
+  display: grid; grid-template-columns: 36px 180px 96px 88px 80px 64px 72px 1fr 148px;
+  gap: 12px; align-items: center; padding: 14px 18px; min-width: 960px;
 }
 .explore-table-head { font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim); letter-spacing: .08em; }
 .explore-table-row { border-top: 1px solid var(--border); }
