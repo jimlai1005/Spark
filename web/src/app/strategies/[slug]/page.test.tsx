@@ -217,27 +217,27 @@ describe("StrategyDetailPage", () => {
 
   // ⭐ M3 round3 Task 7（R2-P0 指標收斂＋CAGR gating＋回撤改名）
   describe("Task 7：指標收斂與 CAGR 結構性 gating", () => {
-    it("sample_days < sample_threshold → 摺成一行小字，大字只剩 4 張（含最佳/最差日）", async () => {
+    it("sample_days < sample_threshold → 摺成一行小字，大字只剩 3 張", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse({ ...DETAIL, sample_days: 10, sample_threshold: 60 }));
       render(wrap(<StrategyDetailPage />));
       await screen.findByRole("heading", { level: 1, name: "Filet Core" });
 
-      // 摺疊行：Sharpe／Sortino／年化波動／起訖淨值：樣本不足（10/60 天），達門檻後顯示
+      // 摺疊行：Sharpe／Sortino／年化波動／起訖淨值／最佳最差日：樣本不足（10/60 天），達門檻後顯示
       const c = COPY.strategyDetail.metrics;
       const expectedNote = `${c.insufficientGroupLabel}${c.insufficientGroupPrefix}10`
         + `${c.insufficientGroupMid}60${c.insufficientGroupSuffix}`;
       expect(screen.getByText((_, node) => node?.textContent === expectedNote)).toBeInTheDocument();
 
-      // 個別小卡只剩 4 張：總報酬／策略期間回撤／日勝率／最佳最差日。
+      // 個別小卡只剩 3 張：總報酬／策略期間回撤／日勝率（plan Task 7 第 1 條）。
       expect(screen.queryByText(c.sharpeLabel)).not.toBeInTheDocument();
       expect(screen.queryByText(c.sortinoLabel)).not.toBeInTheDocument();
       expect(screen.queryByText(c.annualizedVolLabel)).not.toBeInTheDocument();
       expect(screen.queryByText(c.startEndEquityLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.bestWorstLabel)).not.toBeInTheDocument();
       expect(screen.getByText(c.totalReturnLabel)).toBeInTheDocument();
       expect(screen.getByText(c.maxDrawdownLabel)).toBeInTheDocument();
       expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
-      expect(screen.getByText(c.bestWorstLabel)).toBeInTheDocument();
     });
 
     it("sample_days ≥ sample_threshold → 恢復完整格，不出現摺疊行", async () => {
@@ -250,6 +250,7 @@ describe("StrategyDetailPage", () => {
       expect(screen.getByText(c.sortinoLabel)).toBeInTheDocument();
       expect(screen.getByText(c.annualizedVolLabel)).toBeInTheDocument();
       expect(screen.getByText(c.startEndEquityLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.bestWorstLabel)).toBeInTheDocument();
       expect(screen.queryByText((_, node) => (node?.textContent ?? "").includes(c.insufficientGroupSuffix)))
         .not.toBeInTheDocument();
     });

@@ -998,12 +998,14 @@ export const COPY_ZH = {
       startEndEquityLabel: "起訖淨值",
       startEndEquityNote: "真實入金 → 目前淨值",
       insufficientLabel: "樣本不足",
-      /** ⭐ Task 7：Sharpe／Sortino／年化波動／起訖淨值在 `sample_days` 未達
-       * `sample_threshold` 時摺成一行小字，取代個別「樣本不足」卡片（8 格中
-       * 5 格是樣本不足、佔兩屏高度的 R2-P0 問題）。四段拼接：
+      /** ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／日勝率三張
+       * （plan Task 7 第 1 條＋設計稿 R2 P0 原文）。Sharpe／Sortino／年化波動／
+       * 起訖淨值／最佳最差日在 `sample_days` 未達 `sample_threshold` 時摺成
+       * 一行小字，取代個別「樣本不足」卡片（8 格中 5 格是樣本不足、佔兩屏
+       * 高度的 R2-P0 問題）。五段拼接：
        * `{insufficientGroupLabel}{insufficientGroupPrefix}{sample_days}
        * {insufficientGroupMid}{sample_threshold}{insufficientGroupSuffix}`。 */
-      insufficientGroupLabel: "Sharpe／Sortino／年化波動／起訖淨值",
+      insufficientGroupLabel: "Sharpe／Sortino／年化波動／起訖淨值／最佳最差日",
       insufficientGroupPrefix: "：樣本不足（",
       insufficientGroupMid: "/",
       insufficientGroupSuffix: " 天），達門檻後顯示",
@@ -2367,7 +2369,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       startEndEquityLabel: "Start → end equity",
       startEndEquityNote: "Real deposit → current equity",
       insufficientLabel: "Insufficient sample",
-      insufficientGroupLabel: "Sharpe／Sortino／Annualized vol／Start–end equity",
+      insufficientGroupLabel: "Sharpe／Sortino／Annualized vol／Start–end equity／Best-worst day",
       insufficientGroupPrefix: ": insufficient sample (",
       insufficientGroupMid: "/",
       insufficientGroupSuffix: " days), shown once the threshold is met",

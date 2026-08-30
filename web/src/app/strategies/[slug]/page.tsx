@@ -173,11 +173,11 @@ export default function StrategyDetailPage() {
     }
   }
 
-  // ⭐ Task 7：headline（總報酬／策略期間回撤／日勝率／最佳最差日）恆為個別小卡
-  // ——最佳最差日不受 `sample_days` 門檻影響（有自己的 per-field insufficient
-  // 旗標，任何樣本數都可能有值）。Sharpe／Sortino／年化波動／起訖淨值只在
-  // `sampleInsufficient` 為 false 時才併入同一個 metric-grid；為 true 時整組
-  // 摺成下方一行文字（不逐格判斷，見檔頭）。
+  // ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／日勝率三張
+  // （plan Task 7 第 1 條＋設計稿 R2 P0 原文「大字只留總報酬、最大回撤、日勝率」）。
+  // Sharpe／Sortino／年化波動／起訖淨值／最佳最差日只在 `sampleInsufficient`
+  // 為 false 時才併入同一個 metric-grid；為 true 時整組摺成下方一行文字
+  // （不逐格判斷，見檔頭）。
   const headlineCards = [
     {
       key: "total_return",
@@ -199,14 +199,6 @@ export default function StrategyDetailPage() {
       value: metricText(m.win_rate_pct, m.win_rate_pct_insufficient, "%"),
       insufficient: m.win_rate_pct_insufficient,
       note: `${c.metrics.winRateNotePrefix}${m.sample_count}${c.metrics.winRateNoteSuffix}`,
-    },
-    {
-      key: "best_worst",
-      label: c.metrics.bestWorstLabel,
-      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
-        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
-      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
-      note: c.metrics.bestWorstNote,
     },
   ];
 
@@ -232,6 +224,14 @@ export default function StrategyDetailPage() {
       value: metricText(m.sortino, m.sortino_insufficient),
       insufficient: m.sortino_insufficient,
       note: c.metrics.sortinoNote,
+    },
+    {
+      key: "best_worst",
+      label: c.metrics.bestWorstLabel,
+      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
+        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
+      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
+      note: c.metrics.bestWorstNote,
     },
     {
       key: "start_end_equity",

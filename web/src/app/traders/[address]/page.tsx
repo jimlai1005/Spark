@@ -160,8 +160,9 @@ export default function TraderDetailPage() {
     }
   }
 
-  // ⭐ Task 7：比照 `/strategies/[slug]` 的指標收斂（headline 恆為個別小卡；
-  // Sharpe／Sortino／年化波動／起訖淨值視樣本門檻整組摺成一行）。本頁沒有
+  // ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／日勝率三張
+  // （比照 `/strategies/[slug]`，plan Task 7 第 1 條）。Sharpe／Sortino／
+  // 年化波動／起訖淨值／最佳最差日視樣本門檻整組摺成一行。本頁沒有
   // `sample_days`／`sample_threshold` 欄位，改用 `metrics.sample_count`
   // ＋本地鏡射常數 `TRADER_SAMPLE_THRESHOLD_DAYS`（見檔頭）。
   const sampleInsufficient = m.sample_count < TRADER_SAMPLE_THRESHOLD_DAYS;
@@ -188,14 +189,6 @@ export default function TraderDetailPage() {
       insufficient: m.win_rate_pct_insufficient,
       note: `${sc.metrics.winRateNotePrefix}${m.sample_count}${sc.metrics.winRateNoteSuffix}`,
     },
-    {
-      key: "best_worst",
-      label: sc.metrics.bestWorstLabel,
-      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
-        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
-      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
-      note: sc.metrics.bestWorstNote,
-    },
   ];
 
   const collapsibleCards = [
@@ -220,6 +213,14 @@ export default function TraderDetailPage() {
       value: metricText(m.sortino, m.sortino_insufficient),
       insufficient: m.sortino_insufficient,
       note: sc.metrics.sortinoNote,
+    },
+    {
+      key: "best_worst",
+      label: sc.metrics.bestWorstLabel,
+      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
+        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
+      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
+      note: sc.metrics.bestWorstNote,
     },
     {
       key: "start_end_equity",

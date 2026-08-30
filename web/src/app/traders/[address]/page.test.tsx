@@ -209,7 +209,7 @@ describe("TraderDetailPage", () => {
   // ⭐ M3 round3 Task 7：比照 `/strategies/[slug]` 的指標收斂，本頁用
   // `metrics.sample_count` ＋本地鏡射常數 60 當門檻（無 sample_days 欄位）。
   describe("Task 7：指標收斂（比照策略詳情頁）", () => {
-    it("sample_count < 60（DETAIL 預設 38）→ 摺成一行小字，個別小卡只剩 4 張", async () => {
+    it("sample_count < 60（DETAIL 預設 38）→ 摺成一行小字，個別小卡只剩 3 張", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL));
       render(wrap(<TraderDetailPage />));
@@ -222,10 +222,10 @@ describe("TraderDetailPage", () => {
       expect(screen.queryByText(c.sortinoLabel)).not.toBeInTheDocument();
       expect(screen.queryByText(c.annualizedVolLabel)).not.toBeInTheDocument();
       expect(screen.queryByText(c.startEndEquityLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.bestWorstLabel)).not.toBeInTheDocument();
       expect(screen.getByText(c.totalReturnLabel)).toBeInTheDocument();
       expect(screen.getByText(c.maxDrawdownLabel)).toBeInTheDocument();
       expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
-      expect(screen.getByText(c.bestWorstLabel)).toBeInTheDocument();
     });
 
     it("sample_count ≥ 60 → 恢復完整格，不出現摺疊行", async () => {
@@ -238,6 +238,7 @@ describe("TraderDetailPage", () => {
       expect(screen.getByText(c.sortinoLabel)).toBeInTheDocument();
       expect(screen.getByText(c.annualizedVolLabel)).toBeInTheDocument();
       expect(screen.getByText(c.startEndEquityLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.bestWorstLabel)).toBeInTheDocument();
       expect(screen.queryByText((_, node) => (node?.textContent ?? "").includes(c.insufficientGroupSuffix)))
         .not.toBeInTheDocument();
     });
