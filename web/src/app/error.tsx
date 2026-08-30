@@ -6,6 +6,7 @@
  * 涵蓋的是 production 下 segment render 拋錯的情況。）
  * 錯誤本體只進 console（供營運在瀏覽器 devtools 取證），不進 DOM。
  */
+import Link from "next/link";
 import { useEffect } from "react";
 import { useCopy } from "@/lib/lang";
 
@@ -30,9 +31,9 @@ export default function ErrorPage({
           <button type="button" className="btn btn-primary" onClick={() => reset()}>
             {c.retry}
           </button>
-          <a className="btn" href="/">
+          <Link className="btn" href="/">
             {c.home}
-          </a>
+          </Link>
         </div>
       </div>
     </main>
