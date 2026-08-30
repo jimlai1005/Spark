@@ -124,7 +124,8 @@ export interface PublicStrategyDetail extends PublicStrategy {
   /** M3 round3 Task 3：`live_days` 的同一個值（結構性防呆用途，前端據此門檻
    * 決定是否摺疊次要指標——不得另外重算，見 `strategies.py` 檔頭）。 */
   sample_days: number;
-  /** 目前恆為 60（`filet.strategies.CAGR_SAMPLE_THRESHOLD_DAYS`）。 */
+  /** 目前恆為 30（`filet.strategies.CAGR_SAMPLE_THRESHOLD_DAYS`，
+   * 2026-08-30 D15 裁決原 60 降為 30）。 */
   sample_threshold: number;
   /** `sample_days < sample_threshold` 時後端**整個不回傳這個鍵**——結構性防呆：
    * `null` 代表「鍵不存在或值非字串」，呼叫端一律用它判斷是否渲染 CagrCard，
@@ -281,7 +282,11 @@ export async function getPublicStrategy(slug: string): Promise<PublicStrategyDet
       methodology: normalizeMethodology(body.methodology),
       as_of: typeof body.as_of === "number" ? body.as_of : null,
       sample_days: typeof body.sample_days === "number" ? body.sample_days : 0,
-      sample_threshold: typeof body.sample_threshold === "number" ? body.sample_threshold : 60,
+      // ⭐ R4-11：修正陳舊的 fallback 值——後端 `CAGR_SAMPLE_THRESHOLD_DAYS`
+      // 2026-08-30 D15 裁決已由 60 降為 30（見 c948d6c），這個防禦性 fallback
+      // （只在後端回應缺鍵時才會用到）先前漏改，與新增 `PublicTraderDetail`
+      // 同款欄位時一併發現、一併修正（同一函式內的同型欄位，不留兩種預設值）。
+      sample_threshold: typeof body.sample_threshold === "number" ? body.sample_threshold : 30,
       // ⭐ Task 7（CAGR 結構性 gating 的前端鏡射）：缺鍵／null／非字串一律視為
       // 「不顯示」，防後端序列化差異（見 delegation prompt）。
       cagr_pct: typeof body.cagr_pct === "string" ? body.cagr_pct : null,
@@ -520,6 +525,14 @@ export interface PublicTraderDetail {
   metrics: PublicStrategyMetrics;
   equity_index: string[];
   methodology: PublicStrategyMethodology;
+  /** M3 round4 Task R4-11：與 `PublicStrategyDetail` 同一套組裝規則
+   * （後端 `build_cagr_fields`，見 `filet/strategies.py` 檔頭），供交易員詳情頁
+   * 補齊 CAGR 收合卡。 */
+  sample_days: number;
+  sample_threshold: number;
+  /** `sample_days < sample_threshold` 時後端整個不回傳這個鍵——同
+   * `PublicStrategyDetail.cagr_pct` 的結構性防呆。 */
+  cagr_pct: string | null;
 }
 
 /**
@@ -544,6 +557,9 @@ export async function getPublicTraderDetail(address: string): Promise<PublicTrad
       metrics: normalizeMetrics(body.metrics),
       equity_index: Array.isArray(body.equity_index) ? body.equity_index.map(String) : [],
       methodology: normalizeMethodology(body.methodology),
+      sample_days: typeof body.sample_days === "number" ? body.sample_days : 0,
+      sample_threshold: typeof body.sample_threshold === "number" ? body.sample_threshold : 30,
+      cagr_pct: typeof body.cagr_pct === "string" ? body.cagr_pct : null,
     };
   } catch {
     return null;

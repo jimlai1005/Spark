@@ -302,6 +302,31 @@ describe("StrategyDetailPage", () => {
     });
   });
 
+  // ⭐ M3 round4 Task R4-11 項目 3：雙值卡（最佳/最差日、起訖淨值）改渲染成
+  // 兩個獨立 span（`.metric-card-value-a`/`-b`）而非單一字串，讓 CSS 能在
+  // 窄寬把 A／B 拆成刻意的兩行對齊，不靠瀏覽器隨機折行。
+  describe("R4-11 項目 3：雙值卡結構", () => {
+    it("最佳/最差日、起訖淨值兩張卡帶 metric-card-pair class，值拆成 a/b 兩個 span", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      const { container } = render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+
+      const pairCards = container.querySelectorAll(".metric-card-pair");
+      expect(pairCards.length).toBe(2); // 最佳/最差日、起訖淨值
+
+      const bestWorstCard = screen.getByText(COPY.strategyDetail.metrics.bestWorstLabel).closest(".metric-card");
+      expect(bestWorstCard).toHaveClass("metric-card-pair");
+      expect(bestWorstCard?.querySelector(".metric-card-value-a")?.textContent).toBe("3.01");
+      expect(bestWorstCard?.querySelector(".metric-card-value-b")?.textContent).toBe("/ -0.80");
+
+      const startEndCard = screen.getByText(COPY.strategyDetail.metrics.startEndEquityLabel).closest(".metric-card");
+      expect(startEndCard).toHaveClass("metric-card-pair");
+      expect(startEndCard?.querySelector(".metric-card-value-a")).toBeInTheDocument();
+      expect(startEndCard?.querySelector(".metric-card-value-b")?.textContent).toMatch(/^→/);
+    });
+  });
+
   // ⭐ M3 round4 Task R4-2：起訖淨值方法論句型——有真實入金優先顯示入金句；
   // 查無入金（`initial_deposit_usd: null`，鏈上查無 deposit 紀錄）時改顯示
   // 起始權益句（`start_equity_usd`），不再整段落空或誤印 $0。

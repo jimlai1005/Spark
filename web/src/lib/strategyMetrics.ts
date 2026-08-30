@@ -31,6 +31,25 @@ export function metricText(value: string | null, insufficient: boolean, suffix =
 }
 
 /**
+ * ⭐ M3 round4 Task R4-11 項目 3：指標卡的共用形狀——`strategies/[slug]` 與
+ * `traders/[address]` 兩頁的 `metricCards` 陣列字面量結構完全相同（沿既有
+ * 重複慣例，見兩檔各自的 `headlineCards`/`collapsibleCards`），這裡只抽出
+ * 型別，不抽出陣列本身（陣列內容依賴各頁各自的 `strategy`/`trader` state）。
+ *
+ * 雙值卡（最佳/最差日「A / B」、起訖淨值「A → B」）用 `pair` 而非單一
+ * `value` 字串——讓 CSS 能在窄寬把 A／B 拆成刻意的兩行對齊，不靠瀏覽器隨機
+ * 折行（見 `globals.css` `.metric-card-pair`）。單值卡維持 `value` 字串。
+ */
+export interface MetricCardDef {
+  key: string;
+  label: string;
+  insufficient: boolean;
+  note: string;
+  value?: string;
+  pair?: { a: string; sep: string; b: string };
+}
+
+/**
  * 起訖淨值（USD，TWR 等效淨值）：`start = deposit`、
  * `end = deposit × (equity_index 末值 / 首值)`——與 `EquityCurve` 的美元換算
  * 同一條公式（`depositNum * (v / values[0])`，見該元件檔頭）。

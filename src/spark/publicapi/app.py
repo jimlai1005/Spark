@@ -36,10 +36,10 @@ from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
                                      compute_window_performance, extract_window)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, find_leader, is_selectable, load_leaders
-from spark.filet.strategies import (CAGR_SAMPLE_THRESHOLD_DAYS, build_cagr_pct,
-                                    build_equity_index, build_equity_range,
-                                    build_metrics, build_methodology,
-                                    build_strategy_view, sum_ledger_deposits)
+from spark.filet.strategies import (build_cagr_fields, build_equity_index,
+                                    build_equity_range, build_metrics,
+                                    build_methodology, build_strategy_view,
+                                    sample_days_from_perf, sum_ledger_deposits)
 from spark.publicapi import hl_explore, hl_leaderboard, public_stats
 from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
@@ -1958,18 +1958,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         view["follower_count"] = (counts.get(entry.address, 0)
                                   if counts is not None else None)
         view["as_of"] = as_of
-        # ⭐ M3 round3 Task 3：`sample_days`／`sample_threshold`／`cagr_pct`——
-        # `sample_days` 直接沿用 `view["live_days"]`（`build_strategy_view` 已用
-        # `int(covered_days)` 算過一次，同一個值、同一個來源，不重算第二次以免
-        # 兩處日後各自漂移，工程原則 1）。`sample_days < sample_threshold`（30 天〔2026-08-30 D15 由 60 調降〕，
-        # `strategies.CAGR_SAMPLE_THRESHOLD_DAYS`）時**整個不放 `cagr_pct` 鍵**
-        # ——結構性防呆：前端不需要另外判斷門檻，鍵不存在就是不存在。
-        view["sample_days"] = view["live_days"]
-        view["sample_threshold"] = CAGR_SAMPLE_THRESHOLD_DAYS
-        if view["live_days"] >= CAGR_SAMPLE_THRESHOLD_DAYS:
-            cagr_pct = build_cagr_pct(perf)
-            if cagr_pct is not None:
-                view["cagr_pct"] = cagr_pct
+        # ⭐ M3 round3 Task 3（R4-11 改用共用組裝函式）：`sample_days`／
+        # `sample_threshold`／`cagr_pct`——`sample_days` 直接沿用 `view["live_days"]`
+        # （`build_strategy_view` 已用 `int(covered_days)` 算過一次，同一個值、同一
+        # 個來源，不重算第二次以免兩處日後各自漂移，工程原則 1）。組裝規則本身與
+        # `/api/public/traders/{address}` 共用同一支 `build_cagr_fields`
+        # （`sample_days < sample_threshold`〔30 天，2026-08-30 D15 由 60 調降〕時
+        # **整個不放 `cagr_pct` 鍵**——結構性防呆：前端不需要另外判斷門檻）。
+        view.update(build_cagr_fields(perf, sample_days=view["live_days"]))
         view["equity_index"] = build_equity_index(perf)
         # ⭐ M3 round4 Task R4-2：起訖淨值改用同一份 `accountValueHistory` 的首個
         # 非零值／末值（`build_equity_range`），不再是「首點原樣值」——首點常態
@@ -2291,7 +2287,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             av, _pnl = window
             start_equity_usd, end_equity_usd = build_equity_range(av)
 
-        return {
+        # ⭐ M3 round4 Task R4-11（trader/strategy 詳情頁欄位對齊）：`sample_days`／
+        # `sample_threshold`／(可能的) `cagr_pct` 與 `/api/public/strategies/
+        # {slug}` 共用同一支 `build_cagr_fields`（見該函式檔頭），不重複「門檻時
+        # 整個不放 cagr_pct 鍵」的判斷。`sample_days` 用 `sample_days_from_perf`
+        # （與 `build_strategy_view` 算 `live_days` 同一套算法，抽出共用）。
+        view = {
             "address": addr,
             "account_value": account_value,
             "follow_blocked": _trader_follow_blocked(addr),
@@ -2302,6 +2303,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 start_equity_usd=start_equity_usd, end_equity_usd=end_equity_usd,
                 updated_at=int(now_fn())),
         }
+        view.update(build_cagr_fields(perf, sample_days=sample_days_from_perf(perf)))
+        return view
 
     # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce
     # 空間，見 leaders_select 的 _consume）——刻意不另開一套機具：兩套一次性表格

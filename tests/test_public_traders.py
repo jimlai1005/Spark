@@ -129,6 +129,53 @@ def test_no_perf_still_200_with_empty_equity_index(tmp_path):
     assert body["metrics"]["total_return_pct_insufficient"] is True
 
 
+# ============================================================
+# R4-11：sample_days／sample_threshold／cagr_pct（與策略詳情頁共用
+# `strategies.build_cagr_fields`，見 tests/test_public_strategies.py 同款）
+# ============================================================
+
+def test_sample_days_and_cagr_present_when_sample_days_at_threshold(tmp_path):
+    """`sixty_day_rows()` → covered_days=60 ≥ 30 門檻：`sample_days`／
+    `sample_threshold` 恆回傳，`cagr_pct` 鍵存在。"""
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    hl.portfolios[_A] = sixty_day_rows()
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_days"] == 60
+    assert body["sample_threshold"] == 30
+    assert "cagr_pct" in body
+    assert Decimal(body["cagr_pct"]) > 0
+
+
+def test_cagr_pct_absent_when_sample_days_below_threshold(tmp_path):
+    """涵蓋天數不足 30 天：`sample_days`／`sample_threshold` 照常回傳，
+    `cagr_pct` 鍵整個不存在（結構性防呆，與策略詳情頁同一份組裝規則）。"""
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    ten_day_rows = _portfolio_rows(
+        [[0, "1000"], [10 * _DAY_MS, "1050"]],
+        [[0, "0"], [10 * _DAY_MS, "50"]])
+    hl.portfolios[_A] = ten_day_rows
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_days"] == 10
+    assert body["sample_threshold"] == 30
+    assert "cagr_pct" not in body
+
+
+def test_sample_days_zero_and_cagr_absent_when_no_perf(tmp_path):
+    """查無 portfolio 資料（FakeHL 預設回空清單）：`sample_days` 降級為 0，
+    `cagr_pct` 一樣不存在。"""
+    app, *_ = make_app(tmp_path)
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_days"] == 0
+    assert body["sample_threshold"] == 30
+    assert "cagr_pct" not in body
+
+
 def test_case_insensitive_address_normalized_to_lowercase(tmp_path):
     app, *_ = make_app(tmp_path)
     mixed_case = "0x" + "A1" * 20

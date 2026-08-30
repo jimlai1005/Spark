@@ -1,9 +1,12 @@
 /**
- * `/traders/[address]` — 交易員詳情頁測試（M3 round2 Task 6）。
+ * `/traders/[address]` — 交易員詳情頁測試（M3 round2 Task 6 首建；M3 round4
+ * Task R4-11 版型對齊 `/strategies/[slug]`，測試同步改寫）。
  *
  * 涵蓋：404/讀不到空態、insufficient 指標「樣本不足」、displayName 查詢參數、
- * CTA 依登入狀態分流（未登入→connect+SIWE→帶 advanced: 前綴導向；已登入→直接
- * 導向）、account_value 為 null 時降級顯示、不含策略頁專屬的槓桿/回撤滑桿。
+ * CTA 依登入狀態分流（未登入→connect+SIWE→帶 advanced: 前綴＋scale/dd 導向；
+ * 已登入→直接導向）、account_value 為 null 時降級顯示、投入比例／回撤 slider
+ * 與策略頁同款可互動、槓桿唯讀列顯示「—」（無平台層帽）、面板頂部無背書說明、
+ * CAGR／方法論卡渲染（R4-11 起兩頁版型對齊，後端同一套 `build_cagr_fields`）。
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -74,15 +77,17 @@ const DETAIL = {
     sample_count: 29, annualization_days: 365, risk_free_rate: "0", basis: "perp",
     updated_at: 1756000000,
   },
+  // ⭐ M3 round4 Task R4-11：與 `/api/public/strategies/{slug}` 共用同一套
+  // `build_cagr_fields`（後端）。DETAIL 的 `sample_days:29`（差門檻一天）刻意
+  // 用來驗證「摺疊」是預設路徑；`DETAIL_FULL_SAMPLE` 覆寫成 30 驗證「完整格」。
+  sample_days: 29,
+  sample_threshold: 30,
 };
 
-// ⭐ Task 7：`metrics.sample_count` 用來當本頁的門檻判斷依據（`/api/public/traders`
-// 沒有 `sample_days`／`sample_threshold`，見 page.tsx 檔頭）。⚠️ 2026-08-30 D15
-// 裁決門檻原 60 降為 30。DETAIL 的 `sample_count:29`（差門檻一天）刻意用來驗證
-// 「摺疊」是預設路徑；`DETAIL_FULL_SAMPLE` 覆寫成 30（恰在門檻）驗證「完整格」路徑。
 const DETAIL_FULL_SAMPLE = {
   ...DETAIL,
-  metrics: { ...DETAIL.metrics, sample_count: 30 },
+  sample_days: 30,
+  cagr_pct: "45.23",
 };
 
 beforeEach(() => {
@@ -142,39 +147,82 @@ describe("TraderDetailPage", () => {
     expect(screen.getByText(COPY.traders.accountValueLabel).nextSibling?.textContent).toBe("—");
   });
 
-  it("不含策略頁專屬的投入比例／回撤滑桿", async () => {
+  // ⭐ R4-11：版型對齊策略頁——投入比例／回撤 slider 與策略頁同款可互動。
+  it("R4-11：投入比例／回撤 slider 與策略頁同款，未連錢包仍可互動", async () => {
     getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
     stubFetch(() => jsonResponse(DETAIL));
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
-    expect(screen.queryByLabelText(COPY.strategyDetail.panel.scaleLabel)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(COPY.strategyDetail.panel.ddEnableLabel)).not.toBeInTheDocument();
+    const scaleSlider = screen.getByLabelText(COPY.strategyDetail.panel.scaleLabel) as HTMLInputElement;
+    fireEvent.change(scaleSlider, { target: { value: "60" } });
+    expect(screen.getByText("60%")).toBeInTheDocument();
+    expect(screen.getByLabelText(COPY.strategyDetail.panel.ddEnableLabel)).toBeInTheDocument();
   });
 
-  it("未登入點 CTA → 觸發連接錢包＋SIWE 登入，成功後帶 advanced: 前綴導向 /onboarding", async () => {
+  // ⭐ R4-11：本頁沒有平台審核過的槓桿上限（任意鏈上地址，非策展）——唯讀列
+  // 顯示 `NO_VALUE`（「—」），不臆造數字。
+  it("R4-11：槓桿唯讀列顯示「—」（本頁無平台層帽）", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.getByText(COPY.strategyDetail.panel.leverageLabel)).toBeInTheDocument();
+    const leverageRow = screen.getByText(COPY.strategyDetail.panel.leverageLabel).closest(".risk-slider-row");
+    expect(leverageRow?.textContent).toContain("—");
+  });
+
+  // ⭐ R4-11：面板頂部進階模式無背書說明，沿用 `/advanced` 頁同一句。
+  it("R4-11：面板頂部顯示進階模式無背書說明", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.getByText(COPY.advanced.gate.body)).toBeInTheDocument();
+  });
+
+  it("未登入點 CTA → 觸發連接錢包＋SIWE 登入，成功後帶 advanced: 前綴＋scale 導向 /onboarding", async () => {
     getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
     stubFetch(() => jsonResponse(DETAIL));
     connectAsync.mockResolvedValue({ accounts: ["0xabc"], chainId: 1 });
     loginWithSiwe.mockResolvedValue({ address: "0xabc", account_id: "fabc" });
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
-    fireEvent.click(screen.getByRole("button", { name: COPY.traders.panel.cta }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
     await waitFor(() => expect(loginWithSiwe).toHaveBeenCalled());
     await waitFor(() => expect(push).toHaveBeenCalled());
     const url = push.mock.calls[0][0] as string;
-    expect(url).toBe(`/onboarding?strategy=advanced:${DETAIL.address}`);
+    expect(url).toMatch(/^\/onboarding\?/);
+    const params = new URLSearchParams(url.split("?")[1]);
+    expect(params.get("strategy")).toBe(`advanced:${DETAIL.address}`);
+    expect(params.get("scale")).toBe("25");
+    expect(params.has("dd")).toBe(false);
   });
 
-  it("已登入點 CTA → 不觸發連線/簽署，直接帶 advanced: 前綴導向", async () => {
+  it("已登入點 CTA → 不觸發連線/簽署，直接帶 advanced: 前綴＋scale 導向", async () => {
     getMe.mockResolvedValue({ address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" });
     stubFetch(() => jsonResponse(DETAIL));
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
-    fireEvent.click(screen.getByRole("button", { name: COPY.traders.panel.cta }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
     await waitFor(() => expect(push).toHaveBeenCalled());
     expect(connectAsync).not.toHaveBeenCalled();
     expect(loginWithSiwe).not.toHaveBeenCalled();
-    expect(push).toHaveBeenCalledWith(`/onboarding?strategy=advanced:${DETAIL.address}`);
+    const url = push.mock.calls[0][0] as string;
+    const params = new URLSearchParams(url.split("?")[1]);
+    expect(params.get("strategy")).toBe(`advanced:${DETAIL.address}`);
+    expect(params.get("scale")).toBe("25");
+  });
+
+  it("啟用回撤開關後，CTA 查詢字串帶 dd", async () => {
+    getMe.mockResolvedValue({ address: "0xAbC0000000000000000000000000000000000001", account_id: "fabc" });
+    stubFetch(() => jsonResponse(DETAIL));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    fireEvent.click(screen.getByLabelText(COPY.strategyDetail.panel.ddEnableLabel));
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
+    await waitFor(() => expect(push).toHaveBeenCalled());
+    const url = push.mock.calls[0][0] as string;
+    expect(url).toMatch(/dd=\d+/);
   });
 
   it("錢包拒簽 → 顯示拒簽文案，不導向", async () => {
@@ -183,7 +231,7 @@ describe("TraderDetailPage", () => {
     connectAsync.mockRejectedValue({ name: "UserRejectedRequestError" });
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
-    fireEvent.click(screen.getByRole("button", { name: COPY.traders.panel.cta }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta }));
     expect(await screen.findByText(COPY.login.rejected)).toBeInTheDocument();
     expect(push).not.toHaveBeenCalled();
   });
@@ -194,7 +242,7 @@ describe("TraderDetailPage", () => {
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
     expect(screen.getByText(COPY.traders.panel.followBlocked)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: COPY.traders.panel.cta })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.strategyDetail.panel.cta })).not.toBeInTheDocument();
   });
 
   it("[W4] follow_blocked=false → 正常顯示 CTA", async () => {
@@ -202,15 +250,14 @@ describe("TraderDetailPage", () => {
     stubFetch(() => jsonResponse(DETAIL));
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
-    expect(screen.getByRole("button", { name: COPY.traders.panel.cta })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: COPY.strategyDetail.panel.cta })).toBeInTheDocument();
     expect(screen.queryByText(COPY.traders.panel.followBlocked)).not.toBeInTheDocument();
   });
 
-  // ⭐ M3 round3 Task 7：比照 `/strategies/[slug]` 的指標收斂，本頁用
-  // `metrics.sample_count` ＋本地鏡射常數 30 當門檻（無 sample_days 欄位）。
-  // ⚠️ 2026-08-30 D15 裁決原 60 降為 30。
+  // ⭐ M3 round3 Task 7；R4-11 起改用後端直接供給的 sample_days／
+  // sample_threshold（與策略詳情頁同一套 build_cagr_fields），不再鏡射常數。
   describe("Task 7：指標收斂（比照策略詳情頁）", () => {
-    it("sample_count < 30（DETAIL 預設 29，差門檻一天）→ 摺成一行小字，個別小卡只剩 3 張", async () => {
+    it("sample_days < sample_threshold（DETAIL 預設 29，差門檻一天）→ 摺成一行小字，個別小卡只剩 3 張", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL));
       render(wrap(<TraderDetailPage />));
@@ -229,7 +276,7 @@ describe("TraderDetailPage", () => {
       expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
     });
 
-    it("sample_count ≥ 30（恰在門檻 30）→ 恢復完整格，不出現摺疊行", async () => {
+    it("sample_days ≥ sample_threshold（恰在門檻 30）→ 恢復完整格，不出現摺疊行", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL_FULL_SAMPLE));
       render(wrap(<TraderDetailPage />));
@@ -251,13 +298,33 @@ describe("TraderDetailPage", () => {
       await screen.findByRole("heading", { level: 1 });
       expect(screen.getByText("策略期間回撤")).toBeInTheDocument();
     });
+  });
 
-    it("本頁不含 CAGR／方法論卡（沿既有裁決，任意 leaderboard 地址無策展）", async () => {
+  // ⭐ R4-11：CAGR／方法論卡——兩頁版型對齊，後端同一套 `build_cagr_fields`。
+  describe("R4-11：CAGR／方法論卡（版型對齊策略詳情頁）", () => {
+    it("無 cagr_pct 鍵（sample_days 未達門檻）→ 不渲染 CagrCard", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.queryByText(COPY.strategyDetail.cagr.heading)).not.toBeInTheDocument();
+    });
+
+    it("有 cagr_pct → 渲染 CagrCard", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL_FULL_SAMPLE));
       render(wrap(<TraderDetailPage />));
       await screen.findByRole("heading", { level: 1 });
-      expect(screen.queryByText(COPY.strategyDetail.cagr.heading)).not.toBeInTheDocument();
+      expect(screen.getByText(COPY.strategyDetail.cagr.heading)).toBeInTheDocument();
+      expect(screen.getByText("45.23%")).toBeInTheDocument();
+    });
+
+    it("方法論卡渲染（真實入金句）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.getByText(COPY.strategyDetail.methodology.heading)).toBeInTheDocument();
     });
   });
 });

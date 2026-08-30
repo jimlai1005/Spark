@@ -89,6 +89,19 @@ def build_metrics(perf: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def sample_days_from_perf(perf: dict[str, Any] | None) -> int:
+    """perf 的 `covered_days`（涵蓋天數）→ 整數天數。`perf` 不可用或
+    `status != "ok"` → 0（沿 `build_strategy_view` 既有算法抽出，供
+    `build_strategy_view` 與 `/api/public/traders/{address}` 共用同一個算法，
+    不重新發明，工程原則 1）。"""
+    covered_days = Decimal("0")
+    if isinstance(perf, dict) and perf.get("status") == "ok":
+        cd = perf.get("covered_days")
+        if isinstance(cd, Decimal):
+            covered_days = cd
+    return int(covered_days)
+
+
 def build_strategy_view(entry: LeaderRef, perf: dict[str, Any] | None) -> dict[str, Any]:
     """`LeaderRef` ＋ 單一 perf window → 策略卡 dict（**不含** `follower_count`）。
 
@@ -104,12 +117,7 @@ def build_strategy_view(entry: LeaderRef, perf: dict[str, Any] | None) -> dict[s
     `status`：`accepting_new` → `"running"`；否則（例行下架、仍在跟的不受影響）→
     `"paused"`（沿 `leaders.py` 檔頭的旗標語意，這裡只是把它投影成展示用字串）。
     """
-    covered_days = Decimal("0")
-    if isinstance(perf, dict) and perf.get("status") == "ok":
-        cd = perf.get("covered_days")
-        if isinstance(cd, Decimal):
-            covered_days = cd
-    live_days = int(covered_days)
+    live_days = sample_days_from_perf(perf)
     listable = bool(entry.enabled and entry.accepting_new)
     status = "running" if entry.accepting_new else "paused"
     slug = entry.slug or entry.address
@@ -160,6 +168,30 @@ def build_cagr_pct(perf: dict[str, Any] | None) -> str | None:
     if v is None:
         return None
     return _quantize_pct_or_ratio(v * Decimal("100"))
+
+
+# ⭐ M3 round4 Task R4-11（trader/strategy 詳情頁欄位對齊）：`sample_days`／
+# `sample_threshold`／(可能的) `cagr_pct` 一次組裝，供 `/api/public/strategies/
+# {slug}` 與 `/api/public/traders/{address}` 共用同一套組裝規則，不各自重複
+# 「sample_days<CAGR_SAMPLE_THRESHOLD_DAYS 時整個不放 cagr_pct 鍵」這條判斷
+# （工程原則 1：同一個值只能有一個計算來源）。
+def build_cagr_fields(perf: dict[str, Any] | None, *, sample_days: int) -> dict[str, Any]:
+    """回傳 `{"sample_days", "sample_threshold", 可能的 "cagr_pct"}`，呼叫端
+    `dict.update()` 併入自己的回應。`sample_days` 由呼叫端傳入（strategies 端點
+    傳 `view["live_days"]`；traders 端點傳 `sample_days_from_perf(perf)`）——
+    兩端點的「涵蓋天數」計算方式本就不同源（前者來自 `LeaderRef` 白名單條目的
+    perf，後者是任意鏈上地址），但門檻判斷與 `cagr_pct` 是否放進回應的規則
+    完全相同，故只抽出這條共用規則，不強迫兩端點共用 `sample_days` 的計算。
+    """
+    out: dict[str, Any] = {
+        "sample_days": sample_days,
+        "sample_threshold": CAGR_SAMPLE_THRESHOLD_DAYS,
+    }
+    if sample_days >= CAGR_SAMPLE_THRESHOLD_DAYS:
+        cagr_pct = build_cagr_pct(perf)
+        if cagr_pct is not None:
+            out["cagr_pct"] = cagr_pct
+    return out
 
 
 def build_equity_index(perf: dict[str, Any] | None) -> list[str]:

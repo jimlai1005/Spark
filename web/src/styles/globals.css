@@ -1216,6 +1216,11 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .strategy-detail-sub a { color: var(--primary); text-decoration: none; }
 .strategy-detail-asof { color: var(--text-dim); font-size: var(--fs-micro); text-align: right; line-height: 1.7; }
 
+/* R4-11：交易員頁專屬的帳戶價值行（見 page.tsx 註解）——label／value 兩個
+   span 保持相鄰但視覺上留白。 */
+.trader-account-value { display: flex; gap: 8px; margin-top: 8px; }
+.trader-account-value span:last-child { color: var(--text); }
+
 .strategy-detail-grid { display: grid; grid-template-columns: 1fr 360px; gap: 24px; align-items: start; }
 .strategy-detail-left { display: flex; flex-direction: column; gap: 14px; }
 
@@ -1260,6 +1265,19 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .metric-card-value { font-size: var(--fs-h3); font-weight: 700; letter-spacing: -0.01em; }
 .metric-card-note { font-size: var(--fs-micro); color: var(--text-dim); margin-top: 6px; min-height: 14px; }
 
+/* R4-11 項目 3：雙值卡（最佳/最差日「A / B」、起訖淨值「A → B」）——值字級降
+   一階（22px → 17px）＋預設單行不換行；欄位夠寬時兩段仍在同一行讀成
+   「A / B」。窄寬（390 斷點）改為刻意的上下兩行：A 一行、分隔符＋B 一行
+   （見下方 480 媒體查詢），不允許瀏覽器隨機在數字中間折行。 */
+.metric-card-pair .metric-card-value {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--fs-body-lg);
+  white-space: nowrap;
+}
+.metric-card-value-a, .metric-card-value-b { white-space: nowrap; }
+
 .cagr-card { display: flex; align-items: center; gap: 14px; padding: 16px 18px; }
 .cagr-card-value-col { flex: 1; }
 .cagr-card-value { font-size: var(--fs-h3); font-weight: 700; color: var(--text-dim); }
@@ -1279,11 +1297,17 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 
 .strategy-follow-panel { padding: 22px 24px; border-color: rgba(70, 214, 179, 0.24); }
 .strategy-follow-panel-heading { font-size: var(--fs-body-lg); font-weight: 700; margin-bottom: 18px; }
+/* R4-11 項目 1：交易員頁（進階模式 CTA）面板頂部無背書說明——緊接在標題下方、
+   sliders 之前，沿用 `.hint` 但需要跟標題與下方 sliders 都拉出間距。 */
+.follow-panel-advanced-note { margin-top: -10px; margin-bottom: 18px; line-height: 1.6; }
 .strategy-follow-sliders { display: grid; gap: 16px; margin-bottom: 20px; }
 .strategy-follow-estimate { padding: 14px 16px; margin-bottom: 18px; display: grid; gap: 9px; font-size: var(--fs-body); }
 .strategy-follow-estimate-row { display: flex; justify-content: space-between; color: var(--text-dim); }
 .strategy-follow-estimate-row span:last-child { color: var(--text); }
-.strategy-follow-footnote { line-height: 1.65; }
+/* R4-11 項目 2：CTA 按鈕與下方小字原本 0 上邊距（全站 `p { margin: 0 0 8px }`
+   重置對 `<button>` 無作用，兩者緊貼）——補一段明確間距，共用元件裡改一次
+   兩頁生效。 */
+.strategy-follow-footnote { line-height: 1.65; margin-top: 14px; }
 
 @media (max-width: 1024px) {
   .strategy-detail-grid { grid-template-columns: 1fr; }
@@ -1549,6 +1573,14 @@ html, body { overflow-x: hidden; }
   table { display: block; overflow-x: auto; max-width: 100%; }
 
   /* -- 策略詳情頁指標卡：4→2 col 已由 1024 斷點處理，390 維持 2 col 即可讀 -- */
+
+  /* R4-11 項目 3：雙值卡在 390 窄寬即使字級已降一階仍可能溢出兩欄卡片——
+     改為刻意的上下兩行（A 一行、分隔符＋B 一行），不讓瀏覽器隨機折行。 */
+  .metric-card-pair .metric-card-value {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
 
   /* -- Dashboard：六塊改單欄＋指定順序，持倉表改卡片式，kill switch 常駐底部 -- */
   main.dash-page {

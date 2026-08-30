@@ -28,30 +28,22 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
+import { CagrCard } from "@/components/CagrCard";
 import { EquityCurve } from "@/components/EquityCurve";
+import {
+  DD_DEFAULT, FollowPanel, SCALE_DEFAULT,
+} from "@/components/FollowPanel";
+import { MethodologyCard } from "@/components/MethodologyCard";
 import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, resolveTagline, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { useCopy, useLang } from "@/lib/lang";
-import {
-  getPublicStrategy,
-  type PublicStrategyDetail,
-  type PublicStrategyMethodology,
-} from "@/lib/publicApi";
+import { getPublicStrategy, type PublicStrategyDetail } from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
-import { formatDepositEquivalentEquity, metricText } from "@/lib/strategyMetrics";
-import type { COPY_ZH, DeepString } from "@/lib/copy";
-
-type CagrCopy = DeepString<typeof COPY_ZH.strategyDetail.cagr>;
-type MethodologyCopy = DeepString<typeof COPY_ZH.strategyDetail.methodology>;
+import {
+  formatDepositEquivalentEquity, metricText, type MetricCardDef,
+} from "@/lib/strategyMetrics";
 
 type ConnectPhase = "idle" | "connecting" | "signing";
-
-const SCALE_MIN = 5;
-const SCALE_MAX = 100;
-const SCALE_DEFAULT = 25;
-const DD_MIN = 5;
-const DD_MAX = 50;
-const DD_DEFAULT = 20;
 
 export default function StrategyDetailPage() {
   const params = useParams<{ slug: string }>();
@@ -183,7 +175,7 @@ export default function StrategyDetailPage() {
   // Sharpe／Sortino／年化波動／起訖淨值／最佳最差日只在 `sampleInsufficient`
   // 為 false 時才併入同一個 metric-grid；為 true 時整組摺成下方一行文字
   // （不逐格判斷，見檔頭）。
-  const headlineCards = [
+  const headlineCards: MetricCardDef[] = [
     {
       key: "total_return",
       label: c.metrics.totalReturnLabel,
@@ -207,7 +199,7 @@ export default function StrategyDetailPage() {
     },
   ];
 
-  const collapsibleCards = [
+  const collapsibleCards: MetricCardDef[] = [
     {
       key: "sharpe",
       label: c.metrics.sharpeLabel,
@@ -233,17 +225,23 @@ export default function StrategyDetailPage() {
     {
       key: "best_worst",
       label: c.metrics.bestWorstLabel,
-      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
-        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
       insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
       note: c.metrics.bestWorstNote,
+      // ⭐ R4-11 項目 3：雙值卡改渲染成 { a, sep, b } 三段而非單一字串——
+      // 讓 CSS 能在窄寬把 A／B 拆成兩行對齊，不靠瀏覽器隨機折行（見 globals.css
+      // `.metric-card-pair`）。
+      pair: {
+        a: metricText(m.best_day_pct, m.best_day_pct_insufficient),
+        sep: "/",
+        b: metricText(m.worst_day_pct, m.worst_day_pct_insufficient),
+      },
     },
     {
       key: "start_end_equity",
       label: c.metrics.startEndEquityLabel,
-      value: startEnd ? `${startEnd.start} → ${startEnd.end}` : NO_VALUE,
       insufficient: startEnd === null,
       note: c.metrics.startEndEquityNote,
+      pair: startEnd ? { a: startEnd.start, sep: "→", b: startEnd.end } : { a: NO_VALUE, sep: "", b: "" },
     },
   ];
 
@@ -294,10 +292,17 @@ export default function StrategyDetailPage() {
 
           <div className="metric-grid">
             {metricCards.map((card) => (
-              <div className="card metric-card" key={card.key}>
+              <div className={`card metric-card${card.pair ? " metric-card-pair" : ""}`} key={card.key}>
                 <div className="metric-card-label">{card.label}</div>
                 <div className="mono metric-card-value">
-                  {card.insufficient ? c.metrics.insufficientLabel : card.value}
+                  {card.insufficient ? (
+                    c.metrics.insufficientLabel
+                  ) : card.pair ? (
+                    <>
+                      <span className="metric-card-value-a">{card.pair.a}</span>
+                      <span className="metric-card-value-b">{card.pair.sep} {card.pair.b}</span>
+                    </>
+                  ) : card.value}
                 </div>
                 <div className="metric-card-note">{card.insufficient ? "" : card.note}</div>
               </div>
@@ -325,230 +330,25 @@ export default function StrategyDetailPage() {
           <MethodologyCard methodology={strategy.methodology} metrics={m} copy={c.methodology} />
         </div>
 
-        <div className="card strategy-follow-panel">
-          <div className="strategy-follow-panel-heading">{c.panel.heading}</div>
-
-          <div className="strategy-follow-sliders">
-            <div className="risk-field">
-              <div className="risk-slider-row">
-                <label htmlFor="scale-slider">{c.panel.scaleLabel}</label>
-                <span className="mono risk-value">{scalePct}%</span>
-              </div>
-              <input
-                id="scale-slider"
-                type="range"
-                className="risk-slider"
-                min={SCALE_MIN}
-                max={SCALE_MAX}
-                step={1}
-                value={scalePct}
-                onChange={(e) => setScalePct(Number(e.target.value))}
-              />
-            </div>
-
-            {/*
-              ⭐ Task 10b（主線程裁決 2026-08-28）：槓桿上限改唯讀資訊列——沒有
-              per-user 可簽的槓桿上限通道（`COPY_MAX_TARGET_LEVERAGE` 是引擎 env
-              靜態值），slider 會讓客戶誤以為自己設定了什麼，故移除；`lev` 查詢
-              參數同步移除（見 buildQuery）。
-            */}
-            <div className="risk-field">
-              <div className="risk-slider-row">
-                <span>{c.panel.leverageLabel}</span>
-                <span className="mono risk-value">
-                  {strategy.max_leverage ? `${strategy.max_leverage}x` : NO_VALUE}
-                </span>
-              </div>
-              <p className="hint">
-                {COPY.wizard.leverageInfoPrefix}
-                {strategy.max_leverage ? `${strategy.max_leverage}x` : NO_VALUE}
-                {COPY.wizard.leverageInfoSuffix}
-              </p>
-            </div>
-
-            <div className="risk-field">
-              <label className="risk-toggle">
-                <input
-                  type="checkbox"
-                  checked={ddEnabled}
-                  onChange={(e) => setDdEnabled(e.target.checked)}
-                />
-                <span>{c.panel.ddEnableLabel}</span>
-              </label>
-              <div className="risk-slider-row">
-                <span>{c.panel.ddLabel}</span>
-                <span className="mono risk-value">{ddEnabled ? `-${ddPct}%` : NO_VALUE}</span>
-              </div>
-              <input
-                type="range"
-                className="risk-slider"
-                min={DD_MIN}
-                max={DD_MAX}
-                step={1}
-                value={ddPct}
-                disabled={!ddEnabled}
-                onChange={(e) => setDdPct(Number(e.target.value))}
-                aria-label={c.panel.ddLabel}
-              />
-              <p className="hint risk-toggle-help">{c.panel.ddDisabledNote}</p>
-            </div>
-          </div>
-
-          <div className="inset strategy-follow-estimate">
-            <div className="strategy-follow-estimate-row">
-              <span>{c.panel.estDepositLabel}</span>
-              <span className="mono">{c.panel.estDepositValue}</span>
-            </div>
-            <div className="strategy-follow-estimate-row">
-              <span>{c.panel.builderFeeLabel}</span>
-              <span className="mono">{c.panel.builderFeeValue}</span>
-            </div>
-            <div className="strategy-follow-estimate-row">
-              <span>{c.panel.estMonthlyLabel}</span>
-              <span className="mono">{c.panel.estMonthlyValue}</span>
-            </div>
-          </div>
-
-          {listable ? (
-            <>
-              <button
-                type="button"
-                className="btn btn-primary btn-block"
-                disabled={phase !== "idle"}
-                onClick={handleCta}
-              >
-                {phase === "connecting"
-                  ? c.panel.ctaConnecting
-                  : phase === "signing"
-                    ? c.panel.ctaSigning
-                    : c.panel.cta}
-              </button>
-              {error && (
-                <div className="sign-error">
-                  <p>{error}</p>
-                </div>
-              )}
-              <p className="hint strategy-follow-footnote">{c.panel.footnote}</p>
-            </>
-          ) : (
-            <>
-              <button type="button" className="btn btn-block" disabled data-testid="follow-panel-disabled">
-                {c.panel.pendingCta}
-              </button>
-              <p className="hint strategy-follow-footnote">{c.panel.pendingNote}</p>
-            </>
-          )}
-        </div>
+        <FollowPanel
+          heading={c.panel.heading}
+          copy={c.panel}
+          leverageDisplay={strategy.max_leverage ? `${strategy.max_leverage}x` : NO_VALUE}
+          leverageInfoPrefix={COPY.wizard.leverageInfoPrefix}
+          leverageInfoSuffix={COPY.wizard.leverageInfoSuffix}
+          scalePct={scalePct}
+          onScalePctChange={setScalePct}
+          ddEnabled={ddEnabled}
+          onDdEnabledChange={setDdEnabled}
+          ddPct={ddPct}
+          onDdPctChange={setDdPct}
+          phase={phase}
+          error={error}
+          onCta={handleCta}
+          disabledState={listable ? undefined : { kind: "pending", cta: c.panel.pendingCta, note: c.panel.pendingNote }}
+        />
       </div>
     </main>
   );
 }
 
-/**
- * ⭐ Task 7：呼叫端已用 `strategy.cagr_pct != null` 守門——本元件只在後端明確
- * 給出 CAGR 值時才被渲染（`sample_days<sample_threshold`〔30，2026-08-30 D15
- * 裁決原 60 降為 30〕時整個 `<CagrCard>` 不出現在 DOM，
- * 不再有「樣本不足」灰字佔位）。`cagr` 因此恆為非 null 字串。
- */
-function CagrCard({ cagr, sampleDays, copy }: {
-  cagr: string;
-  sampleDays: number;
-  copy: CagrCopy;
-}) {
-  const [open, setOpen] = useState(true);
-  return (
-    <div className="card cagr-card">
-      <div className="cagr-card-value-col">
-        <div className="metric-card-label">{copy.heading}</div>
-        <div className="mono cagr-card-value">{cagr}%</div>
-      </div>
-      <div className="cagr-card-note-col">
-        <button type="button" className="cagr-toggle" onClick={() => setOpen(!open)}>
-          {open ? copy.toggleHide : copy.toggleShow}
-        </button>
-        {open && (
-          <p className="cagr-note">
-            {copy.notePrefix}
-            {sampleDays}
-            {copy.noteSuffix}
-          </p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function MethodologyCard({ methodology, metrics, copy }: {
-  methodology: PublicStrategyMethodology;
-  metrics: PublicStrategyDetail["metrics"];
-  copy: MethodologyCopy;
-}) {
-  // ⭐ M3 round4 Task R4-2：查無鏈上真實入金（`initial_deposit_usd` 現在來自
-  // `userNonFundingLedgerUpdates`，查無 deposit 紀錄 → null）時，改以起始權益
-  // （`start_equity_usd`，同一份 accountValueHistory 首個非零快照）起算；兩者
-  // 皆無才整句省略、改由 rangePrefix 開頭（2026-08-29 真資料驗證發現、裁決 5）。
-  const depositNum = Number(methodology.initial_deposit_usd);
-  const hasDeposit = methodology.initial_deposit_usd != null
-    && Number.isFinite(depositNum) && depositNum > 0;
-  const startEquityNum = Number(methodology.start_equity_usd);
-  const hasStartEquity = !hasDeposit && methodology.start_equity_usd != null
-    && Number.isFinite(startEquityNum);
-  const hasRange = methodology.start_date != null && methodology.end_date != null
-    && methodology.sample_count != null;
-  const hasSharpe = !metrics.sharpe_insufficient && metrics.sharpe != null
-    && !metrics.sharpe_se_insufficient && metrics.sharpe_se != null;
-  const hasData = hasDeposit || hasStartEquity || hasRange || hasSharpe;
-
-  return (
-    <div className="inset methodology-card">
-      <div className="methodology-heading">{copy.heading}</div>
-      {hasData ? (
-        <p className="methodology-body">
-          {hasDeposit && (
-            <>
-              {copy.depositPrefix}
-              {fmtAmount(methodology.initial_deposit_usd, 0)}
-              {copy.depositSuffix}
-            </>
-          )}
-          {hasStartEquity && (
-            <>
-              {copy.startEquityPrefix}
-              {fmtAmount(methodology.start_equity_usd, 0)}
-              {copy.startEquitySuffix}
-            </>
-          )}
-          {hasRange && (
-            <>
-              {!hasDeposit && !hasStartEquity && copy.rangePrefix}
-              {methodology.sample_count}
-              {copy.daysSuffix}
-              {methodology.start_date} → {methodology.end_date}
-              {copy.rangeSuffix}
-              {" "}
-            </>
-          )}
-          {hasSharpe && (
-            <>
-              {copy.sharpePrefix}
-              {metrics.sharpe}
-              {copy.sharpeSeInfix}
-              {metrics.sharpe_se}
-              {copy.sharpeSeSuffix}
-              {metrics.sample_count}
-              {copy.sampleSuffix}
-              {" "}
-            </>
-          )}
-          {copy.conventionPrefix}
-          {methodology.annualization_days}
-          {copy.conventionMid}
-          {methodology.risk_free_rate}
-          {copy.conventionSuffix}
-        </p>
-      ) : (
-        <p className="methodology-body">{copy.unavailable}</p>
-      )}
-    </div>
-  );
-}

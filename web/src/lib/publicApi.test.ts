@@ -182,7 +182,9 @@ describe("getPublicStrategy", () => {
     expect(r?.equity_index).toEqual([]);
     expect(r?.as_of).toBeNull();
     expect(r?.sample_days).toBe(0);
-    expect(r?.sample_threshold).toBe(60);
+    // ⚠️ 2026-08-30 D15 裁決原 60 降為 30——fallback 值須與後端
+    // `CAGR_SAMPLE_THRESHOLD_DAYS` 同步，見 publicApi.ts 該行註解。
+    expect(r?.sample_threshold).toBe(30);
     expect(r?.cagr_pct).toBeNull();
   });
 });
@@ -260,6 +262,11 @@ describe("getPublicTraderDetail", () => {
       sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
       updated_at: 999,
     },
+    // ⭐ M3 round4 Task R4-11：與 `PublicStrategyDetail` 同一套組裝規則
+    // （後端 `build_cagr_fields`）。
+    sample_days: 72,
+    sample_threshold: 30,
+    cagr_pct: "45.23",
   };
 
   it("原樣回傳交易員詳情", async () => {
