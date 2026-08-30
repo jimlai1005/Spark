@@ -855,7 +855,9 @@ export const COPY_ZH = {
         leaderLinkSuffix: " · 鏈上可驗",
         returnLabelPrefix: "樣本 ",
         returnLabelSuffix: " 天全期報酬",
-        drawdownLabel: "期間最大回撤",
+        // ⭐ M3 round3 Task 7（D5）：回撤 label 不再自己定義一份，改在
+        // page.tsx 直接引用 `strategyDetail.metrics.maxDrawdownLabel`
+        // （「策略期間回撤」），與策略詳情頁／traders 頁同一個 key。
         liveDaysLabel: "實盤天數",
         followerCountLabel: "目前跟單人數",
         sampleNotePrefix: "樣本 ",
@@ -977,7 +979,10 @@ export const COPY_ZH = {
     metrics: {
       totalReturnLabel: "總報酬",
       totalReturnNote: "真實入金起算",
-      maxDrawdownLabel: "最大回撤",
+      // ⭐ M3 round3 Task 7（D5 裁決）：策略頁「策略期間回撤」與 Dashboard
+      // 「你的跟單回撤」（dashboard.pnl.maxDrawdown）是兩個不同標的，不可同名
+      // ——本 key 同時被 home.tsx 與 traders/[address]/page.tsx 引用，三處一致。
+      maxDrawdownLabel: "策略期間回撤",
       maxDrawdownNote: "期間內單次最深",
       sharpeLabel: "Sharpe（年化）",
       sharpeNoteSuffix: " (1 s.e.)",
@@ -993,6 +998,15 @@ export const COPY_ZH = {
       startEndEquityLabel: "起訖淨值",
       startEndEquityNote: "真實入金 → 目前淨值",
       insufficientLabel: "樣本不足",
+      /** ⭐ Task 7：Sharpe／Sortino／年化波動／起訖淨值在 `sample_days` 未達
+       * `sample_threshold` 時摺成一行小字，取代個別「樣本不足」卡片（8 格中
+       * 5 格是樣本不足、佔兩屏高度的 R2-P0 問題）。四段拼接：
+       * `{insufficientGroupLabel}{insufficientGroupPrefix}{sample_days}
+       * {insufficientGroupMid}{sample_threshold}{insufficientGroupSuffix}`。 */
+      insufficientGroupLabel: "Sharpe／Sortino／年化波動／起訖淨值",
+      insufficientGroupPrefix: "：樣本不足（",
+      insufficientGroupMid: "/",
+      insufficientGroupSuffix: " 天），達門檻後顯示",
     },
     cagr: {
       heading: "CAGR（年化）",
@@ -1000,7 +1014,6 @@ export const COPY_ZH = {
       toggleHide: "收合",
       notePrefix: "樣本僅 ",
       noteSuffix: " 天，年化外推無統計意義，因此刻意灰階、不出現在首頁與策略卡。",
-      insufficientNote: "樣本不足，無法計算年化外推。",
     },
     methodology: {
       heading: "方法論與樣本揭露",
@@ -2225,7 +2238,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         leaderLinkSuffix: " · verifiable on-chain",
         returnLabelPrefix: "Sample ",
         returnLabelSuffix: "-day full-period return",
-        drawdownLabel: "Max drawdown (period)",
+        // Task 7 (D5): drawdown label now reuses `strategyDetail.metrics.maxDrawdownLabel`
+        // ("Strategy drawdown") directly in page.tsx — same key across detail/home/traders.
         liveDaysLabel: "Days live",
         followerCountLabel: "Current followers",
         sampleNotePrefix: "Sample ",
@@ -2337,7 +2351,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     metrics: {
       totalReturnLabel: "Total return",
       totalReturnNote: "From real deposit",
-      maxDrawdownLabel: "Max drawdown",
+      maxDrawdownLabel: "Strategy drawdown",
       maxDrawdownNote: "Deepest single instance in period",
       sharpeLabel: "Sharpe (annualized)",
       sharpeNoteSuffix: " (1 s.e.)",
@@ -2353,6 +2367,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       startEndEquityLabel: "Start → end equity",
       startEndEquityNote: "Real deposit → current equity",
       insufficientLabel: "Insufficient sample",
+      insufficientGroupLabel: "Sharpe／Sortino／Annualized vol／Start–end equity",
+      insufficientGroupPrefix: ": insufficient sample (",
+      insufficientGroupMid: "/",
+      insufficientGroupSuffix: " days), shown once the threshold is met",
     },
     cagr: {
       heading: "CAGR (annualized)",
@@ -2361,7 +2379,6 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       notePrefix: "Only ",
       noteSuffix: " days of sample — annualized extrapolation has no statistical meaning, so it's deliberately "
         + "grayed out and never shown on the homepage or strategy cards.",
-      insufficientNote: "Insufficient sample to compute an annualized extrapolation.",
     },
     methodology: {
       heading: "Methodology & sample disclosure",

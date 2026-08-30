@@ -165,7 +165,9 @@ export default function HomePage() {
                   </div>
                 </div>
                 <div>
-                  <div className="strategy-metric-label">{home.hero.featuredCard.drawdownLabel}</div>
+                  {/* ⭐ D5：與策略詳情頁／traders 頁同一個 copy key（「策略期間回撤」），
+                      不再自己定義一份「期間最大回撤」——見 copy.ts strategyDetail.metrics。 */}
+                  <div className="strategy-metric-label">{COPY.strategyDetail.metrics.maxDrawdownLabel}</div>
                   <div className="mono home-hero-featured-value neg">
                     {metricText(featured.metrics.max_drawdown_pct, featured.metrics.max_drawdown_pct_insufficient, "%")}
                   </div>

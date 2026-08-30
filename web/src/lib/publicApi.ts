@@ -46,6 +46,11 @@ export interface PublicStrategy {
   min_notional_usd: string | null;
   max_leverage: string | null;
   metrics: PublicStrategyMetrics;
+  /** M3 round3 Task 3（D5 數字一致性）：perf 快照的快取時間戳，列表與詳情共用同一份
+   * `_strategy_perf_with_as_of`，同一 60s 快取窗內兩端點的值相等。可能為 `null`
+   * （上游查詢失敗）。標成 optional——`PublicStrategy` 也是列表項的型別，既有測試
+   * fixture（`StrategyCard.test.tsx` 等，非本 task 範圍）未必帶這個欄位。 */
+  as_of?: number | null;
 }
 
 export interface PublicStrategiesResp {
@@ -105,6 +110,15 @@ const EMPTY_METHODOLOGY: PublicStrategyMethodology = {
 export interface PublicStrategyDetail extends PublicStrategy {
   equity_index: string[];
   methodology: PublicStrategyMethodology;
+  /** M3 round3 Task 3：`live_days` 的同一個值（結構性防呆用途，前端據此門檻
+   * 決定是否摺疊次要指標——不得另外重算，見 `strategies.py` 檔頭）。 */
+  sample_days: number;
+  /** 目前恆為 60（`filet.strategies.CAGR_SAMPLE_THRESHOLD_DAYS`）。 */
+  sample_threshold: number;
+  /** `sample_days < sample_threshold` 時後端**整個不回傳這個鍵**——結構性防呆：
+   * `null` 代表「鍵不存在或值非字串」，呼叫端一律用它判斷是否渲染 CagrCard，
+   * 不得自己另外算門檻。 */
+  cagr_pct: string | null;
 }
 
 function normalizeMetrics(v: unknown): PublicStrategyMetrics {
@@ -251,6 +265,12 @@ export async function getPublicStrategy(slug: string): Promise<PublicStrategyDet
       metrics: normalizeMetrics(body.metrics),
       equity_index: Array.isArray(body.equity_index) ? body.equity_index.map(String) : [],
       methodology: normalizeMethodology(body.methodology),
+      as_of: typeof body.as_of === "number" ? body.as_of : null,
+      sample_days: typeof body.sample_days === "number" ? body.sample_days : 0,
+      sample_threshold: typeof body.sample_threshold === "number" ? body.sample_threshold : 60,
+      // ⭐ Task 7（CAGR 結構性 gating 的前端鏡射）：缺鍵／null／非字串一律視為
+      // 「不顯示」，防後端序列化差異（見 delegation prompt）。
+      cagr_pct: typeof body.cagr_pct === "string" ? body.cagr_pct : null,
     };
   } catch {
     return null;

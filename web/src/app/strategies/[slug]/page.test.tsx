@@ -10,6 +10,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COPY_ZH as COPY } from "@/lib/copy";
+import { fmtUpdatedAtUtc } from "@/lib/format";
 
 const push = vi.fn();
 let paramsSlug = "core";
@@ -75,6 +76,10 @@ const DETAIL = {
     sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
     updated_at: 1756000000,
   },
+  as_of: 1756000500,
+  sample_days: 72,
+  sample_threshold: 60,
+  cagr_pct: "45.23",
 };
 
 beforeEach(() => {
@@ -208,5 +213,91 @@ describe("StrategyDetailPage", () => {
     const disabledBtn = screen.getByTestId("follow-panel-disabled");
     expect(disabledBtn).toBeDisabled();
     expect(screen.getByText(COPY.strategyDetail.panel.pendingNote)).toBeInTheDocument();
+  });
+
+  // ⭐ M3 round3 Task 7（R2-P0 指標收斂＋CAGR gating＋回撤改名）
+  describe("Task 7：指標收斂與 CAGR 結構性 gating", () => {
+    it("sample_days < sample_threshold → 摺成一行小字，大字只剩 4 張（含最佳/最差日）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({ ...DETAIL, sample_days: 10, sample_threshold: 60 }));
+      render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+
+      // 摺疊行：Sharpe／Sortino／年化波動／起訖淨值：樣本不足（10/60 天），達門檻後顯示
+      const c = COPY.strategyDetail.metrics;
+      const expectedNote = `${c.insufficientGroupLabel}${c.insufficientGroupPrefix}10`
+        + `${c.insufficientGroupMid}60${c.insufficientGroupSuffix}`;
+      expect(screen.getByText((_, node) => node?.textContent === expectedNote)).toBeInTheDocument();
+
+      // 個別小卡只剩 4 張：總報酬／策略期間回撤／日勝率／最佳最差日。
+      expect(screen.queryByText(c.sharpeLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.sortinoLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.annualizedVolLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.startEndEquityLabel)).not.toBeInTheDocument();
+      expect(screen.getByText(c.totalReturnLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.maxDrawdownLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.bestWorstLabel)).toBeInTheDocument();
+    });
+
+    it("sample_days ≥ sample_threshold → 恢復完整格，不出現摺疊行", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL)); // sample_days:72 >= sample_threshold:60
+      render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      const c = COPY.strategyDetail.metrics;
+      expect(screen.getByText(c.sharpeLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.sortinoLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.annualizedVolLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.startEndEquityLabel)).toBeInTheDocument();
+      expect(screen.queryByText((_, node) => (node?.textContent ?? "").includes(c.insufficientGroupSuffix)))
+        .not.toBeInTheDocument();
+    });
+
+    it("回應無 cagr_pct 鍵 → 不渲染 CagrCard", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      const { cagr_pct: _drop, ...withoutCagr } = DETAIL;
+      stubFetch(() => jsonResponse(withoutCagr));
+      render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      expect(screen.queryByText(COPY.strategyDetail.cagr.heading)).not.toBeInTheDocument();
+    });
+
+    it("cagr_pct 為 null（防後端序列化差異）→ 不渲染 CagrCard", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({ ...DETAIL, cagr_pct: null }));
+      render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      expect(screen.queryByText(COPY.strategyDetail.cagr.heading)).not.toBeInTheDocument();
+    });
+
+    it("有 cagr_pct → 渲染 CagrCard，灰階＋樣本標注", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      expect(screen.getByText(COPY.strategyDetail.cagr.heading)).toBeInTheDocument();
+      expect(screen.getByText("45.23%")).toBeInTheDocument();
+      const cc = COPY.strategyDetail.cagr;
+      const expectedNote = `${cc.notePrefix}${DETAIL.sample_days}${cc.noteSuffix}`;
+      expect(screen.getByText((_, node) => node?.textContent === expectedNote)).toBeInTheDocument();
+    });
+
+    it("as_of 顯示為 UTC 時間戳（取代 methodology.updated_at）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      expect(screen.getByText(fmtUpdatedAtUtc(DETAIL.as_of), { exact: false })).toBeInTheDocument();
+    });
+
+    it("回撤 label 為「策略期間回撤」（策略頁／首頁／traders 頁三處同一 key）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<StrategyDetailPage />));
+      await screen.findByRole("heading", { level: 1, name: "Filet Core" });
+      expect(COPY.strategyDetail.metrics.maxDrawdownLabel).toBe("策略期間回撤");
+      expect(screen.getByText("策略期間回撤")).toBeInTheDocument();
+    });
   });
 });

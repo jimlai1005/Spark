@@ -29,6 +29,15 @@
  * 顯示名稱直接渲染）。displayName 現在只在 `/leaderboard` 表格內顯示。
  * ⭐ [W4] 已被平台安全撤銷（`enabled=false`）的 leader：`follow_blocked=true`
  * 時隱藏 CTA、改顯示提示文案，不讓新客戶點進一個已撤銷的地址。
+ *
+ * ⭐ M3 round3 Task 7（R2-P0 指標收斂，比照 `/strategies/[slug]`）：本頁沿用
+ * 同一組 headline／collapse 分組，但 `/api/public/traders/{address}` 沒有
+ * `sample_days`／`sample_threshold`（Task 3 只加到 `/api/public/strategies*`，
+ * 本 task 檔案範圍不含後端，不新增端點欄位）——改用同一份 `metrics.
+ * sample_count`（已有欄位，`build_metrics` 對兩個端點同源同義：N 個日報酬
+ * 樣本，見 copy.ts `winRateNotePrefix`「N=」的既有用法）當門檻判斷依據，
+ * 門檻值沿用與後端 `CAGR_SAMPLE_THRESHOLD_DAYS` 相同的 60（沒有可讀的後端
+ * 欄位可用，故在此鏡射一份常數，而非重新發明門檻）。
  */
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
@@ -43,6 +52,8 @@ import { loginWithSiwe } from "@/lib/siwe";
 import { computeStartEndEquity, metricText } from "@/lib/strategyMetrics";
 
 type ConnectPhase = "idle" | "connecting" | "signing";
+
+const TRADER_SAMPLE_THRESHOLD_DAYS = 60;
 
 export default function TraderDetailPage() {
   const params = useParams<{ address: string }>();
@@ -149,7 +160,13 @@ export default function TraderDetailPage() {
     }
   }
 
-  const metricCards = [
+  // ⭐ Task 7：比照 `/strategies/[slug]` 的指標收斂（headline 恆為個別小卡；
+  // Sharpe／Sortino／年化波動／起訖淨值視樣本門檻整組摺成一行）。本頁沒有
+  // `sample_days`／`sample_threshold` 欄位，改用 `metrics.sample_count`
+  // ＋本地鏡射常數 `TRADER_SAMPLE_THRESHOLD_DAYS`（見檔頭）。
+  const sampleInsufficient = m.sample_count < TRADER_SAMPLE_THRESHOLD_DAYS;
+
+  const headlineCards = [
     {
       key: "total_return",
       label: sc.metrics.totalReturnLabel,
@@ -165,19 +182,30 @@ export default function TraderDetailPage() {
       note: sc.metrics.maxDrawdownNote,
     },
     {
+      key: "win_rate",
+      label: sc.metrics.winRateLabel,
+      value: metricText(m.win_rate_pct, m.win_rate_pct_insufficient, "%"),
+      insufficient: m.win_rate_pct_insufficient,
+      note: `${sc.metrics.winRateNotePrefix}${m.sample_count}${sc.metrics.winRateNoteSuffix}`,
+    },
+    {
+      key: "best_worst",
+      label: sc.metrics.bestWorstLabel,
+      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
+        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
+      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
+      note: sc.metrics.bestWorstNote,
+    },
+  ];
+
+  const collapsibleCards = [
+    {
       key: "sharpe",
       label: sc.metrics.sharpeLabel,
       value: metricText(m.sharpe, m.sharpe_insufficient),
       insufficient: m.sharpe_insufficient,
       note: m.sharpe_se_insufficient || m.sharpe_se == null
         ? "" : `±${m.sharpe_se}${sc.metrics.sharpeNoteSuffix}`,
-    },
-    {
-      key: "win_rate",
-      label: sc.metrics.winRateLabel,
-      value: metricText(m.win_rate_pct, m.win_rate_pct_insufficient, "%"),
-      insufficient: m.win_rate_pct_insufficient,
-      note: `${sc.metrics.winRateNotePrefix}${m.sample_count}${sc.metrics.winRateNoteSuffix}`,
     },
     {
       key: "annualized_vol",
@@ -194,14 +222,6 @@ export default function TraderDetailPage() {
       note: sc.metrics.sortinoNote,
     },
     {
-      key: "best_worst",
-      label: sc.metrics.bestWorstLabel,
-      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
-        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
-      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
-      note: sc.metrics.bestWorstNote,
-    },
-    {
       key: "start_end_equity",
       label: sc.metrics.startEndEquityLabel,
       value: startEnd ? `${startEnd.start} → ${startEnd.end}` : sc.metrics.insufficientLabel,
@@ -209,6 +229,8 @@ export default function TraderDetailPage() {
       note: sc.metrics.startEndEquityNote,
     },
   ];
+
+  const metricCards = sampleInsufficient ? headlineCards : [...headlineCards, ...collapsibleCards];
 
   return (
     <main className="page strategy-detail-page">
@@ -256,6 +278,17 @@ export default function TraderDetailPage() {
               </div>
             ))}
           </div>
+
+          {sampleInsufficient && (
+            <p className="hint metric-collapsed-note">
+              {sc.metrics.insufficientGroupLabel}
+              {sc.metrics.insufficientGroupPrefix}
+              {m.sample_count}
+              {sc.metrics.insufficientGroupMid}
+              {TRADER_SAMPLE_THRESHOLD_DAYS}
+              {sc.metrics.insufficientGroupSuffix}
+            </p>
+          )}
         </div>
 
         <div className="card strategy-follow-panel">

@@ -122,12 +122,29 @@ describe("getPublicStrategy", () => {
       sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
       updated_at: 999,
     },
+    as_of: 995,
+    sample_days: 72,
+    sample_threshold: 60,
+    cagr_pct: "45.23",
   };
 
   it("原樣回傳策略詳情", async () => {
     mockFetchOnce(() => jsonResponse(DETAIL));
     const r = await getPublicStrategy("core");
     expect(r).toEqual(DETAIL);
+  });
+
+  it("cagr_pct 鍵不存在（樣本不足）→ 降級為 null，不臆造", async () => {
+    const { cagr_pct: _drop, ...withoutCagr } = DETAIL;
+    mockFetchOnce(() => jsonResponse(withoutCagr));
+    const r = await getPublicStrategy("core");
+    expect(r?.cagr_pct).toBeNull();
+  });
+
+  it("as_of 為 null（上游查詢失敗）→ 原樣透傳 null", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, as_of: null }));
+    const r = await getPublicStrategy("core");
+    expect(r?.as_of).toBeNull();
   });
 
   it("404 → null（呼叫端渲染空態，不偽造策略物件）", async () => {
@@ -154,6 +171,10 @@ describe("getPublicStrategy", () => {
     expect(r?.metrics.sharpe_insufficient).toBe(true);
     expect(r?.methodology.initial_deposit_usd).toBeNull();
     expect(r?.equity_index).toEqual([]);
+    expect(r?.as_of).toBeNull();
+    expect(r?.sample_days).toBe(0);
+    expect(r?.sample_threshold).toBe(60);
+    expect(r?.cagr_pct).toBeNull();
   });
 });
 

@@ -9,17 +9,18 @@
  * 產品順序（先設定完、再簽名，降低跳出）。已登入者點同一顆按鈕直接帶參數
  * 跳轉，不重複走一次連線/簽名。
  *
- * CAGR 與「起訖淨值」不是後端 `/api/public/strategies*` 直接給的欄位（後端
- * `build_metrics` 只公開 7 個比率型指標＋sample_count，`annualized_return`
- * 停在 leader_perf 內部、未經過策略卡的 insufficient 收斂契約）。本頁在既有
- * API 欄位上做兩個**純算術**的客戶端推導（過程見下方函式），而不是新增後端
- * 欄位——Task 9 檔案範圍只有前端三檔＋copy.ts，加後端欄位超出本 task 範圍：
- *   - CAGR：由 `total_return_pct` 與 `live_days`，用 methodology 揭露的 365 日
- *     慣例外推（`(1+r)^(365/live_days) - 1`）。與後端 `annualized_return` 概念
- *     一致，但係數/樣本閘門是本頁自己算的，不宣稱與後端內部欄位逐位元相同。
- *   - 起訖淨值：由 `methodology.initial_deposit_usd`（真實入金，來自鏈上
- *     `accountValueHistory` 首點）與 `equity_index` 首尾比值換算。
- * 任一輸入缺席／在數學上無定義（帳戶歸零）→ 該卡回「樣本不足」，不硬算。
+ * ⭐ M3 round3 Task 7（D5 數字一致性）：CAGR 不再是前端自算——後端
+ * `/api/public/strategies/{slug}` 直接供給 `cagr_pct`（`sample_days<60` 時該鍵
+ * 整個不回傳，結構性防呆），本頁只依「鍵是否存在」決定是否渲染 `CagrCard`，
+ * 不再重算年化外推（見 `lib/strategyMetrics.ts` 檔頭，工程原則 1：同一個值
+ * 只能有一個計算來源）。「起訖淨值」仍是前端用 `methodology.
+ * initial_deposit_usd`（真實入金）與 `equity_index` 首尾比值換算（不是統計
+ * 外推，是後端已供給兩個真實原始值的另一種呈現，詳見 `strategyMetrics.ts`）。
+ *
+ * ⭐ Task 7（R2-P0）指標收斂：8 張指標卡中只有總報酬／策略期間回撤／日勝率／
+ * 最佳最差日維持個別小卡；Sharpe／Sortino／年化波動／起訖淨值在
+ * `sample_days < sample_threshold` 時摺成一行文字，不逐格判斷（版面以整體
+ * 門檻為準）——避免「8 格中 5 格是樣本不足、佔兩屏高度」（design R2 issue）。
  */
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
@@ -35,7 +36,7 @@ import {
   type PublicStrategyMethodology,
 } from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
-import { computeCagrPct, computeStartEndEquity, metricText } from "@/lib/strategyMetrics";
+import { computeStartEndEquity, metricText } from "@/lib/strategyMetrics";
 import type { COPY_ZH, DeepString } from "@/lib/copy";
 
 type CagrCopy = DeepString<typeof COPY_ZH.strategyDetail.cagr>;
@@ -114,10 +115,12 @@ export default function StrategyDetailPage() {
 
   const m = strategy.metrics;
   const explorerHref = `https://app.hyperliquid.xyz/explorer/address/${strategy.leader_address}`;
-  const asOf = fmtUpdatedAtUtc(strategy.methodology.updated_at);
-
-  const cagr = computeCagrPct(m.total_return_pct, m.total_return_pct_insufficient, strategy.live_days);
+  // ⭐ D5：`as_of`（perf 快照時間戳，列表／詳情同一份）取代 `methodology.updated_at`
+  // （那是每次請求各自的 `now_fn()`，即使算同一份快照也會逐請求前進——正是
+  // 「數字不一致」的根因之一）。
+  const asOf = fmtUpdatedAtUtc(strategy.as_of ?? 0);
   const startEnd = computeStartEndEquity(strategy.methodology, strategy.equity_index, fmtAmount);
+  const sampleInsufficient = strategy.sample_days < strategy.sample_threshold;
 
   function buildQuery(): string {
     const p = new URLSearchParams();
@@ -170,7 +173,12 @@ export default function StrategyDetailPage() {
     }
   }
 
-  const metricCards = [
+  // ⭐ Task 7：headline（總報酬／策略期間回撤／日勝率／最佳最差日）恆為個別小卡
+  // ——最佳最差日不受 `sample_days` 門檻影響（有自己的 per-field insufficient
+  // 旗標，任何樣本數都可能有值）。Sharpe／Sortino／年化波動／起訖淨值只在
+  // `sampleInsufficient` 為 false 時才併入同一個 metric-grid；為 true 時整組
+  // 摺成下方一行文字（不逐格判斷，見檔頭）。
+  const headlineCards = [
     {
       key: "total_return",
       label: c.metrics.totalReturnLabel,
@@ -186,19 +194,30 @@ export default function StrategyDetailPage() {
       note: c.metrics.maxDrawdownNote,
     },
     {
+      key: "win_rate",
+      label: c.metrics.winRateLabel,
+      value: metricText(m.win_rate_pct, m.win_rate_pct_insufficient, "%"),
+      insufficient: m.win_rate_pct_insufficient,
+      note: `${c.metrics.winRateNotePrefix}${m.sample_count}${c.metrics.winRateNoteSuffix}`,
+    },
+    {
+      key: "best_worst",
+      label: c.metrics.bestWorstLabel,
+      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
+        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
+      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
+      note: c.metrics.bestWorstNote,
+    },
+  ];
+
+  const collapsibleCards = [
+    {
       key: "sharpe",
       label: c.metrics.sharpeLabel,
       value: metricText(m.sharpe, m.sharpe_insufficient),
       insufficient: m.sharpe_insufficient,
       note: m.sharpe_se_insufficient || m.sharpe_se == null
         ? "" : `±${m.sharpe_se}${c.metrics.sharpeNoteSuffix}`,
-    },
-    {
-      key: "win_rate",
-      label: c.metrics.winRateLabel,
-      value: metricText(m.win_rate_pct, m.win_rate_pct_insufficient, "%"),
-      insufficient: m.win_rate_pct_insufficient,
-      note: `${c.metrics.winRateNotePrefix}${m.sample_count}${c.metrics.winRateNoteSuffix}`,
     },
     {
       key: "annualized_vol",
@@ -215,14 +234,6 @@ export default function StrategyDetailPage() {
       note: c.metrics.sortinoNote,
     },
     {
-      key: "best_worst",
-      label: c.metrics.bestWorstLabel,
-      value: `${metricText(m.best_day_pct, m.best_day_pct_insufficient)} / `
-        + `${metricText(m.worst_day_pct, m.worst_day_pct_insufficient)}`,
-      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
-      note: c.metrics.bestWorstNote,
-    },
-    {
       key: "start_end_equity",
       label: c.metrics.startEndEquityLabel,
       value: startEnd ? `${startEnd.start} → ${startEnd.end}` : NO_VALUE,
@@ -230,6 +241,8 @@ export default function StrategyDetailPage() {
       note: c.metrics.startEndEquityNote,
     },
   ];
+
+  const metricCards = sampleInsufficient ? headlineCards : [...headlineCards, ...collapsibleCards];
 
   const listable = strategy.listable;
 
@@ -285,7 +298,22 @@ export default function StrategyDetailPage() {
             ))}
           </div>
 
-          <CagrCard cagr={cagr} liveDays={strategy.live_days} copy={c.cagr} />
+          {sampleInsufficient && (
+            <p className="hint metric-collapsed-note">
+              {c.metrics.insufficientGroupLabel}
+              {c.metrics.insufficientGroupPrefix}
+              {strategy.sample_days}
+              {c.metrics.insufficientGroupMid}
+              {strategy.sample_threshold}
+              {c.metrics.insufficientGroupSuffix}
+            </p>
+          )}
+
+          {/* ⭐ D5：後端 `sample_days<60` 時 `cagr_pct` 鍵整個不存在——結構性
+              防呆，前端只需判斷「有沒有這個值」，不必自己重算門檻。 */}
+          {strategy.cagr_pct != null && (
+            <CagrCard cagr={strategy.cagr_pct} sampleDays={strategy.sample_days} copy={c.cagr} />
+          )}
 
           <MethodologyCard methodology={strategy.methodology} metrics={m} copy={c.methodology} />
         </div>
@@ -409,9 +437,14 @@ export default function StrategyDetailPage() {
   );
 }
 
-function CagrCard({ cagr, liveDays, copy }: {
-  cagr: string | null;
-  liveDays: number;
+/**
+ * ⭐ Task 7：呼叫端已用 `strategy.cagr_pct != null` 守門——本元件只在後端明確
+ * 給出 CAGR 值時才被渲染（`sample_days<60` 時整個 `<CagrCard>` 不出現在 DOM，
+ * 不再有「樣本不足」灰字佔位）。`cagr` 因此恆為非 null 字串。
+ */
+function CagrCard({ cagr, sampleDays, copy }: {
+  cagr: string;
+  sampleDays: number;
   copy: CagrCopy;
 }) {
   const [open, setOpen] = useState(true);
@@ -419,9 +452,7 @@ function CagrCard({ cagr, liveDays, copy }: {
     <div className="card cagr-card">
       <div className="cagr-card-value-col">
         <div className="metric-card-label">{copy.heading}</div>
-        <div className="mono cagr-card-value">
-          {cagr == null ? copy.insufficientNote : `${cagr}%`}
-        </div>
+        <div className="mono cagr-card-value">{cagr}%</div>
       </div>
       <div className="cagr-card-note-col">
         <button type="button" className="cagr-toggle" onClick={() => setOpen(!open)}>
@@ -430,7 +461,7 @@ function CagrCard({ cagr, liveDays, copy }: {
         {open && (
           <p className="cagr-note">
             {copy.notePrefix}
-            {liveDays}
+            {sampleDays}
             {copy.noteSuffix}
           </p>
         )}

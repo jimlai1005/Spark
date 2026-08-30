@@ -124,4 +124,18 @@ describe("HomePage", () => {
     const { container } = render(<HomePage />);
     await waitFor(() => expect(container.textContent).not.toMatch(/20\.35|10\.24/));
   });
+
+  // ⭐ M3 round3 Task 7（D5）：主推策略卡的回撤 label 改用
+  // `strategyDetail.metrics.maxDrawdownLabel`（「策略期間回撤」），與策略詳情頁／
+  // traders 頁同一個 key，不再自己定義一份「期間最大回撤」。
+  it("主推策略卡回撤 label 為「策略期間回撤」（與策略詳情頁同一 copy key）", async () => {
+    stubFetch((url) => {
+      if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [STRATEGY], updated_at: 1 });
+      return jsonResponse({ routed_volume_usd_total: "4280000", builder_fee_bps: 2, live_days: 91, updated_at: 1 });
+    });
+    render(<HomePage />);
+    await screen.findByText("Filet Core");
+    expect(COPY.strategyDetail.metrics.maxDrawdownLabel).toBe("策略期間回撤");
+    expect(screen.getByText("策略期間回撤")).toBeInTheDocument();
+  });
 });

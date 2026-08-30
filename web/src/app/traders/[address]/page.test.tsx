@@ -76,6 +76,15 @@ const DETAIL = {
   },
 };
 
+// ⭐ Task 7：`metrics.sample_count` 用來當本頁的門檻判斷依據（`/api/public/traders`
+// 沒有 `sample_days`／`sample_threshold`，見 page.tsx 檔頭）。DETAIL 的
+// `sample_count:38` < 60（門檻），刻意用來驗證「摺疊」是預設路徑；
+// `DETAIL_FULL_SAMPLE` 覆寫成 ≥60 驗證「完整格」路徑。
+const DETAIL_FULL_SAMPLE = {
+  ...DETAIL,
+  metrics: { ...DETAIL.metrics, sample_count: 72 },
+};
+
 beforeEach(() => {
   paramsAddress = DETAIL.address;
   push.mockReset();
@@ -114,8 +123,11 @@ describe("TraderDetailPage", () => {
   it("insufficient 指標 → 渲染「樣本不足」而非數字", async () => {
     getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
     stubFetch(() => jsonResponse({
-      ...DETAIL,
-      metrics: { ...DETAIL.metrics, sharpe: null, sharpe_insufficient: true, sharpe_se: null, sharpe_se_insufficient: true },
+      ...DETAIL_FULL_SAMPLE,
+      metrics: {
+        ...DETAIL_FULL_SAMPLE.metrics,
+        sharpe: null, sharpe_insufficient: true, sharpe_se: null, sharpe_se_insufficient: true,
+      },
     }));
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
@@ -192,5 +204,58 @@ describe("TraderDetailPage", () => {
     await screen.findByRole("heading", { level: 1 });
     expect(screen.getByRole("button", { name: COPY.traders.panel.cta })).toBeInTheDocument();
     expect(screen.queryByText(COPY.traders.panel.followBlocked)).not.toBeInTheDocument();
+  });
+
+  // ⭐ M3 round3 Task 7：比照 `/strategies/[slug]` 的指標收斂，本頁用
+  // `metrics.sample_count` ＋本地鏡射常數 60 當門檻（無 sample_days 欄位）。
+  describe("Task 7：指標收斂（比照策略詳情頁）", () => {
+    it("sample_count < 60（DETAIL 預設 38）→ 摺成一行小字，個別小卡只剩 4 張", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const c = COPY.strategyDetail.metrics;
+      const expectedNote = `${c.insufficientGroupLabel}${c.insufficientGroupPrefix}38`
+        + `${c.insufficientGroupMid}60${c.insufficientGroupSuffix}`;
+      expect(screen.getByText((_, node) => node?.textContent === expectedNote)).toBeInTheDocument();
+      expect(screen.queryByText(c.sharpeLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.sortinoLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.annualizedVolLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(c.startEndEquityLabel)).not.toBeInTheDocument();
+      expect(screen.getByText(c.totalReturnLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.maxDrawdownLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.bestWorstLabel)).toBeInTheDocument();
+    });
+
+    it("sample_count ≥ 60 → 恢復完整格，不出現摺疊行", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL_FULL_SAMPLE));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const c = COPY.strategyDetail.metrics;
+      expect(screen.getByText(c.sharpeLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.sortinoLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.annualizedVolLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.startEndEquityLabel)).toBeInTheDocument();
+      expect(screen.queryByText((_, node) => (node?.textContent ?? "").includes(c.insufficientGroupSuffix)))
+        .not.toBeInTheDocument();
+    });
+
+    it("回撤 label 為「策略期間回撤」（與策略詳情頁／首頁同一 key）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.getByText("策略期間回撤")).toBeInTheDocument();
+    });
+
+    it("本頁不含 CAGR／方法論卡（沿既有裁決，任意 leaderboard 地址無策展）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL_FULL_SAMPLE));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.queryByText(COPY.strategyDetail.cagr.heading)).not.toBeInTheDocument();
+    });
   });
 });
