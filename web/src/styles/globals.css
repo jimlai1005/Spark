@@ -1452,7 +1452,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-copy-btn:hover { color: var(--text); }
 .explore-sub { font-size: 11.5px; color: var(--text-dim); }
 .explore-tag { font-size: 10.5px; padding: 2px 7px; border-radius: 5px; border: 1px solid; white-space: nowrap; }
-.explore-tag[data-tag="low-dd"] { color: var(--primary); border-color: rgba(var(--primary-rgb), .3); background: rgba(var(--primary-rgb), .1); }
+.explore-tag[data-tag="low_drawdown"] { color: var(--primary); border-color: rgba(var(--primary-rgb), .3); background: rgba(var(--primary-rgb), .1); }
 .explore-tag[data-tag="concentrated"] { color: var(--warn); border-color: rgba(var(--warn-rgb), .3); background: rgba(var(--warn-rgb), .1); }
 
 .explore-spark { display: flex; }

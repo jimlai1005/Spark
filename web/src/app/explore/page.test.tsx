@@ -31,8 +31,8 @@ const ROW_A: ExploreRow = {
   fill_count_30d: 250,
   close_win_rate_pct: 61.2,
   concentration_pct: 40.0,
-  exposure: { dir: "多", pct: 72.0 },
-  tags: ["低回撤"],
+  exposure: { dir: "long", pct: 72.0 },
+  tags: ["low_drawdown"],
 };
 
 const ROW_B: ExploreRow = {
@@ -49,7 +49,7 @@ const ROW_B: ExploreRow = {
   close_win_rate_pct: null,
   concentration_pct: 95.0,
   exposure: { dir: null, pct: null },
-  tags: ["集中度高"],
+  tags: ["concentrated"],
 };
 
 function buildResp(over: Partial<ExploreResp> = {}): ExploreResp {
@@ -130,6 +130,27 @@ describe("ExplorePage — 表格渲染", () => {
 
     const viewLinks = screen.getAllByRole("link", { name: COPY.explore.view });
     expect(viewLinks[0]).toHaveAttribute("href", `/traders/${ROW_A.address}`);
+  });
+
+  it("D14：tag／曝險方向代碼對映成 copy.ts 顯示文案；未知代碼防禦性顯示原字串", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [
+        { ...ROW_A, tags: ["low_drawdown", "some_future_tag"] },
+        { ...ROW_B, exposure: { dir: "short", pct: 66.0 }, tags: ["concentrated"] },
+      ],
+    })));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    // 已知代碼 → COPY.explore.tags.* 文案（非後端原始代碼字串）。
+    expect(screen.getByText(COPY.explore.tags.lowDrawdown)).toBeInTheDocument();
+    expect(screen.getByText(COPY.explore.tags.concentrated)).toBeInTheDocument();
+    // 未知代碼 → 防禦性顯示原字串，不吞掉、不當機。
+    expect(screen.getByText("some_future_tag")).toBeInTheDocument();
+
+    // 曝險方向：long/short 代碼對映成中文「多」/「空」，不是英文代碼本身。
+    expect(screen.getByText(`${COPY.explore.exposureDir.long} 72.0%`)).toBeInTheDocument();
+    expect(screen.getByText(`${COPY.explore.exposureDir.short} 66.0%`)).toBeInTheDocument();
   });
 });
 

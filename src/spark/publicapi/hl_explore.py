@@ -123,9 +123,11 @@ class ExploreRow:
     fill_count_30d: int
     close_win_rate_pct: float | None   # None＝資料錯誤或無足夠樣本（R2-02）
     concentration_pct: float | None
-    exposure_dir: str | None       # "多" / "空" / None（無倉位或無法解析）
+    exposure_dir: str | None       # "long" / "short" / None（無倉位或無法解析；
+                                    # D14：locale 中性代碼，前端自行對映顯示文案）
     exposure_pct: float | None
-    tags: tuple[str, ...] = ()     # 子集 {"低回撤", "集中度高"}
+    tags: tuple[str, ...] = ()     # 子集 {"low_drawdown", "concentrated"}（D14：
+                                    # locale 中性代碼，前端自行對映顯示文案）
 
     def to_dict(self) -> dict:
         return {
@@ -313,9 +315,9 @@ def _exposure(positions: list[dict] | None) -> tuple[str | None, float | None]:
     short_value = total - long_value
     if long_value >= short_value:
         pct = (long_value / total * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
-        return "多", float(pct)
+        return "long", float(pct)
     pct = (short_value / total * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
-    return "空", float(pct)
+    return "short", float(pct)
 
 
 def _abbreviate_address(address: str) -> str:
@@ -340,6 +342,10 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     資訊（門檻常數／同批分位數），由 `ExploreIndex.build_sync` 建完整批後
     再用 `_apply_tags` 統一補上，不在單一地址的純函式裡決定。
     """
+    # D14（2026-08-30 主線程裁決）：`tags`／`exposure_dir` 一律用 locale 中性代碼
+    # （"low_drawdown"/"concentrated"、"long"/"short"），不回傳中文顯示字串——
+    # 顯示文案改由前端 `explore/page.tsx` 對映 `copy.ts`（見 `_exposure`／
+    # `_apply_tags` 的實際賦值）。
     month = extract_window(portfolio_raw, "perpMonth")
     if month is None:
         return None
@@ -382,10 +388,11 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
 
 
 def _apply_tags(rows: list[ExploreRow], cfg: ExploreConfig) -> list[ExploreRow]:
-    """整批 enrich 完成後才能算的兩個 tag：
-    - 「集中度高」：`concentration_pct > cfg.max_concentration_pct`（逐列獨立）。
-    - 「低回撤」：本批 `|max_dd_30d_pct|` 最小的下四分位（含邊界）——需要同批
-      其他列的分佈才能定義，故不在 `enrich_candidate` 裡做（見該函式檔頭）。
+    """整批 enrich 完成後才能算的兩個 tag（D14：locale 中性代碼，前端對映
+    `copy.ts` 顯示文案）：
+    - `"concentrated"`：`concentration_pct > cfg.max_concentration_pct`（逐列獨立）。
+    - `"low_drawdown"`：本批 `|max_dd_30d_pct|` 最小的下四分位（含邊界）——需要
+      同批其他列的分佈才能定義，故不在 `enrich_candidate` 裡做（見該函式檔頭）。
     """
     if not rows:
         return rows
@@ -395,10 +402,10 @@ def _apply_tags(rows: list[ExploreRow], cfg: ExploreConfig) -> list[ExploreRow]:
     for r in rows:
         tags = []
         if abs(Decimal(str(r.max_dd_30d_pct))) <= threshold:
-            tags.append("低回撤")
+            tags.append("low_drawdown")
         if (r.concentration_pct is not None
                 and Decimal(str(r.concentration_pct)) > cfg.max_concentration_pct):
-            tags.append("集中度高")
+            tags.append("concentrated")
         out.append(dataclasses.replace(r, tags=tuple(tags)))
     return out
 

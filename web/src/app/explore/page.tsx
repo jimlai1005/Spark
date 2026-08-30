@@ -31,14 +31,27 @@ const SPARK_W = 96;
 const SPARK_H = 28;
 
 // 後端 `hl_explore._apply_tags`／`_exposure`（`src/spark/publicapi/hl_explore.py`）
-// 回傳的這幾個字面值是**資料協議的列舉值，不是使用者可見文案**——比對用的常數，
-// 不受 copy.ts 的「元件不得內嵌中文」紅線管轄（那條紅線管的是顯示語言的單一
-// 來源；這裡是跨服務的資料契約，本頁顯示層一律換成 `COPY.explore.tags.*`，
-// exposure 方向本身目前無法在前端在地化——已知限制，後端若要支援雙語需另開票）。
-const TAG_LOW_DRAWDOWN = "低回撤";
-const TAG_CONCENTRATED = "集中度高";
-const EXPOSURE_LONG = "多";
-const EXPOSURE_SHORT = "空";
+// 回傳的是 locale 中性代碼（D14，2026-08-30 主線程裁決）：`tags` ⊂
+// {"low_drawdown","concentrated"}、`exposure.dir` ∈ {"long","short",null}。
+// 顯示文案一律用下面兩個對映表換成 `COPY.explore.tags.*`／`COPY.explore.
+// exposureDir.*`；未知代碼（後端日後新增、前端尚未跟上）防禦性地顯示原始
+// 代碼字串，不吞掉、不當機。
+
+/** tag 代碼 → `[顯示文案, CSS `data-tag` 值]`；未知代碼原樣顯示，且不掛
+ * 顏色樣式（樸素灰底 chip，見 `globals.css` `.explore-tag` 預設樣式）。 */
+function tagLabel(code: string, c: ReturnType<typeof useCopy>["explore"]): string {
+  if (code === "low_drawdown") return c.tags.lowDrawdown;
+  if (code === "concentrated") return c.tags.concentrated;
+  return code;
+}
+
+/** exposure 方向代碼 → 顯示文案；未知代碼／`null` 原樣顯示（`null` 不會走到
+ * 這裡——呼叫端已先判斷 `dir != null` 才呼叫）。 */
+function exposureDirLabel(dir: string, c: ReturnType<typeof useCopy>["explore"]): string {
+  if (dir === "long") return c.exposureDir.long;
+  if (dir === "short") return c.exposureDir.short;
+  return dir;
+}
 
 /** values → SVG polyline 的 `points` 字串（等距 x，y 依 min/max 正規化，同
  * `EquityCurve.toPoints` 的簡化版：sparkline 只需要形狀，不需要 y 軸刻度）。 */
@@ -287,11 +300,11 @@ function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
     ? `${row.coins.join(" ")}${c.subSep}${row.account_bucket}`
     : row.account_bucket;
   const exposureLabel = row.exposure.dir != null && row.exposure.pct != null
-    ? `${row.exposure.dir} ${row.exposure.pct.toFixed(1)}%`
+    ? `${exposureDirLabel(row.exposure.dir, c)} ${row.exposure.pct.toFixed(1)}%`
     : NO_VALUE;
-  const longPct = row.exposure.dir === EXPOSURE_LONG
+  const longPct = row.exposure.dir === "long"
     ? (row.exposure.pct ?? 0)
-    : row.exposure.dir === EXPOSURE_SHORT
+    : row.exposure.dir === "short"
       ? 100 - (row.exposure.pct ?? 0)
       : 0;
 
@@ -310,12 +323,9 @@ function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
           >
             {copied ? c.copied : "⧉"}
           </button>
-          {row.tags.includes(TAG_LOW_DRAWDOWN) && (
-            <span className="explore-tag" data-tag="low-dd">{c.tags.lowDrawdown}</span>
-          )}
-          {row.tags.includes(TAG_CONCENTRATED) && (
-            <span className="explore-tag" data-tag="concentrated">{c.tags.concentrated}</span>
-          )}
+          {row.tags.map((tag) => (
+            <span key={tag} className="explore-tag" data-tag={tag}>{tagLabel(tag, c)}</span>
+          ))}
         </div>
         <div className="explore-sub">{sub}</div>
       </div>

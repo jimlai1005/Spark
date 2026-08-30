@@ -1436,6 +1436,9 @@ export const COPY_ZH = {
       actions: "",
     },
     tags: { lowDrawdown: "低回撤", concentrated: "集中度高" },
+    // D14（2026-08-30 主線程裁決）：後端 `exposure.dir` 改回傳 locale 中性代碼
+    // `"long"`/`"short"`（見 `hl_explore.py`），顯示文案改由這裡對映。
+    exposureDir: { long: "多", short: "空" },
     subSep: " · 帳戶 ",
     copyAddress: "複製地址",
     copied: "已複製",
@@ -2722,6 +2725,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       actions: "",
     },
     tags: { lowDrawdown: "Low drawdown", concentrated: "High concentration" },
+    exposureDir: { long: "Long", short: "Short" },
     subSep: " · Account ",
     copyAddress: "Copy address",
     copied: "Copied",

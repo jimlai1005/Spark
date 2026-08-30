@@ -161,7 +161,7 @@ def test_enrich_candidate_computes_return_drawdown_trading_days_and_win_rate():
     assert row.fill_count_30d == 2
     assert row.close_win_rate_pct == 100.0
     assert row.account_bucket == "$10K–$100K"
-    assert row.exposure_dir == "多"
+    assert row.exposure_dir == "long"
     assert len(row.spark) == 3
 
 
@@ -203,7 +203,7 @@ def test_enrich_candidate_short_exposure_when_short_dominant():
     ch_state = _ch_state(positions=[_position("BTC", "-2.0", leverage="5", margin_used="4000")])
     row = enrich_candidate(_A, None, portfolio_raw, [], ch_state)
     assert row is not None
-    assert row.exposure_dir == "空"
+    assert row.exposure_dir == "short"
     assert row.exposure_pct == 100.0
 
 
