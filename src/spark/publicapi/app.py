@@ -707,15 +707,59 @@ def _dashboard_sync(ref: FollowerRef, hl, mine, now_s: float) -> dict:
 # TTL 內回應略舊的數字，不是資料損毀或資金風險。
 _FEES_MONTH_CACHE_TTL_S = 300.0
 _fees_month_cache: dict[str, tuple[float, dict]] = {}
+# M3 round3 Task 2：`/api/me/fees?period=` 的 per-(account_id, period) 快取，
+# 同一個 5min TTL（沿 `_FEES_MONTH_CACHE_TTL_S`，見 plan「沿用 /api/me/fills 的
+# 認證與快取慣例，5min TTL」——注意這比 /api/me/fills 自己的 60s TTL 長，是 plan
+# 明文指定的值，不是誤植）。
+_fees_period_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+# period=all 逐日迴圈的起點取不到帳戶真實交易起點（perpAllTime 首點）時的安全上界
+# ——避免從 1970 起跑產生數萬次 `collect_follower_summary` 呼叫（工程原則：
+# 外部呼叫需有界）。這只影響「迴圈跑多遠」，不影響任何費用/PnL 欄位的公式或來源。
+_FEES_ALL_FALLBACK_DAYS = 400
+
+
+def _effective_rate_bps(builder_fee: Decimal, routed_volume: Decimal) -> "Decimal | None":
+    if routed_volume <= 0:
+        return None
+    return ((builder_fee / routed_volume) * 10000).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _fee_daily_bars(ref: FollowerRef, hl, start: datetime, end: datetime) -> list[dict]:
+    """逐日聚合費用明細——**同一資料源**（`collect_follower_summary`，禁止另拼
+    第二來源，見 plan Task 2）。無成交日（`fill_count == 0`）不產生列（「—」列
+    由前端補日曆）；`builder_fee == 0` 但有成交的日子照實列出——$0.00 與「當日
+    無成交」語意分開（R2·B）。某日查詢失敗只跳過那一根 bar，不連坐其餘天數。
+
+    `[start, end)`：`start` 對齊到當日 00:00 UTC；`end` 可以是任意時刻（本日尚未
+    走完的部分日照算），迴圈用 `day < end`（而非 `day.date() <= end.date()`）
+    確保 `end` 剛好落在某天 00:00（例如「上個月」的排他上界＝本月 1 號 00:00）
+    時不會多算出下個月第一天。"""
+    bars: list[dict] = []
+    day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    while day < end:
+        day_end = min(day + timedelta(days=1), end)
+        day_summary = collect_follower_summary(ref, hl, day, day_end)
+        if day_summary.error is None and day_summary.fills > 0:
+            bars.append({
+                "date": day.date().isoformat(),
+                "fill_count": day_summary.fills,
+                "routed_volume": day_summary.notional,
+                "builder_fee": day_summary.builder_fee,
+                "effective_rate_bps": _effective_rate_bps(
+                    day_summary.builder_fee, day_summary.notional),
+            })
+        day += timedelta(days=1)
+    return bars
 
 
 def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float, *,
                           cache: dict[str, tuple[float, dict]] | None = None) -> dict:
     """本月路由量與費用：與 `/api/ops/revenue`／`customer_pnl` 同一個函式
     （`collect_follower_summary`），只過濾到這個帳號自己（同源同函式，不各自
-    複製公式）。`daily_bars`：逐日重呼同一函式取當日 builder_fee，某日失敗
-    只跳過那一根 bar，不連坐整月彙總（本函式的失敗——`summary.error`——才連坐
-    整塊，由呼叫端的 `_safe_block` 統一處理）。
+    複製公式）。`daily_bars`：逐日聚合（`_fee_daily_bars`，見其 docstring）——
+    某日失敗只跳過那一根 bar，不連坐整月彙總（本函式的失敗——`summary.error`
+    ——才連坐整塊，由呼叫端的 `_safe_block` 統一處理）。
 
     `cache` 不給 → 用模組層共用字典（正式路徑）；測試可傳一份乾淨字典避免
     跨測試汙染（見上方模組註解的快取語意）。**只快取成功結果**——失敗（拋例外）
@@ -735,22 +779,99 @@ def _dashboard_fees_month(ref: FollowerRef, hl, now_s: float, *,
     avg_fee = ((builder_fees / fill_count).quantize(Decimal("0.01"),
                                                      rounding=ROUND_HALF_UP)
               if fill_count > 0 else None)
-    effective_rate_bps = (((builder_fees / routed_volume) * 10000).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP) if routed_volume > 0 else None)
-    daily_bars = []
-    day = month_start
-    while day.date() <= now_dt.date():
-        day_end = min(day + timedelta(days=1), now_dt)
-        day_summary = collect_follower_summary(ref, hl, day, day_end)
-        if day_summary.error is None:
-            daily_bars.append([day.date().isoformat(), day_summary.builder_fee])
-        day += timedelta(days=1)
+    effective_rate_bps = _effective_rate_bps(builder_fees, routed_volume)
+    daily_bars = _fee_daily_bars(ref, hl, month_start, now_dt)
     result = {
         "routed_volume": routed_volume, "builder_fees": builder_fees,
         "fill_count": fill_count, "avg_fee": avg_fee,
         "effective_rate_bps": effective_rate_bps, "daily_bars": daily_bars,
     }
     cache[ref.account_id] = (now_s, result)
+    return result
+
+
+def _month_bounds(now_dt: datetime, *, months_back: int) -> tuple[datetime, datetime]:
+    """回傳 `[start, end)`：`months_back=0` 是本月（`start`＝本月 1 號 00:00，
+    `end`＝`now_dt`）；`months_back=1` 是上個月整月（`start`＝上月 1 號 00:00，
+    `end`＝本月 1 號 00:00，排他上界）。本函式只支援 0／1（本模組唯二用法），
+    不做通用 N 個月前的迴圈——留白比一段沒測過的通用迴圈誠實。"""
+    this_month_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
+    if months_back == 0:
+        return this_month_start, now_dt
+    if months_back == 1:
+        year, month = this_month_start.year, this_month_start.month - 1
+        if month == 0:
+            month, year = 12, year - 1
+        return this_month_start.replace(year=year, month=month), this_month_start
+    raise ValueError(f"_month_bounds 只支援 months_back 0 或 1: {months_back!r}")
+
+
+def _fees_all_time_start(ref: FollowerRef, hl, now_dt: datetime) -> datetime:
+    """`period=all` 的起點：`perpAllTime` accountValueHistory 首點時間戳（帳戶
+    實際交易起點，同源自 `hl.portfolio()`——與 explore/策略頁沿用同一個 perp
+    all-time 窗，不另拼新視窗定義）。取不到（`portfolio()` 失敗、或無
+    `perpAllTime` 視窗資料）→ 退回 `_FEES_ALL_FALLBACK_DAYS` 安全上界，只是
+    「迴圈跑多遠」的保護，不影響任何費用公式。"""
+    try:
+        rows = hl.portfolio(ref.user_address)
+    except Exception:  # noqa: BLE001 — 純粹用來界定迴圈起點，查不到就退回安全上界
+        rows = None
+    if rows is not None:
+        window = extract_window(rows, "perpAllTime")
+        if window is not None:
+            av, _pnl = window
+            if av:
+                return datetime.fromtimestamp(av[0][0] / 1000, timezone.utc)
+    return now_dt - timedelta(days=_FEES_ALL_FALLBACK_DAYS)
+
+
+_FEES_PERIODS = ("this_month", "last_month", "all")
+
+
+def _dashboard_fees_period(ref: FollowerRef, hl, now_s: float, period: str, *,
+                           cache: dict[tuple[str, str], tuple[float, dict]] | None = None
+                           ) -> dict:
+    """`/api/me/fees?period=` 的計算層。`period` 決定 `[start, end)`：
+    `this_month`／`last_month` 為日曆月（`_month_bounds`）；`all` 為帳戶實際
+    交易起點至今（`_fees_all_time_start`）。彙總與逐日明細**同一個資料源**
+    （`collect_follower_summary`／`_fee_daily_bars`），不另拼第二來源。
+
+    `pnl_share_pct` 恆為 `None`：HL 只提供 day/week/month/allTime 這幾個**滾動**
+    窗（`portfolio()`），沒有任一個窗口的起訖點會對齊日曆月／`all` 起點；勉強拿
+    `perpMonth`（近 30 天滾動）的 PnL 去除本端點日曆對齊的費用分子，會混用兩個
+    不同基準的窗口（違反工程原則 1：比較雙方須同源同基準）。`UserFill` 也沒有
+    `closedPnl` 欄位可逐筆重建同窗 PnL。沒有同基準來源就是沒有——回 `None`，
+    前端顯示「—」，這正是 plan 本身允許的「PnL≤0 或無值→null」的「無值」分支，
+    不是抄捷徑。"""
+    cache = _fees_period_cache if cache is None else cache
+    key = (ref.account_id, period)
+    cached = cache.get(key)
+    if cached is not None and (now_s - cached[0]) < _FEES_MONTH_CACHE_TTL_S:
+        return cached[1]
+    now_dt = datetime.fromtimestamp(now_s, timezone.utc)
+    if period == "this_month":
+        start, end = _month_bounds(now_dt, months_back=0)
+    elif period == "last_month":
+        start, end = _month_bounds(now_dt, months_back=1)
+    elif period == "all":
+        start, end = _fees_all_time_start(ref, hl, now_dt), now_dt
+    else:
+        raise ValueError(f"period 僅支援 {_FEES_PERIODS}: {period!r}")
+
+    summary = collect_follower_summary(ref, hl, start, end)
+    if summary.error is not None:
+        raise RuntimeError(summary.error)
+    fill_count, routed_volume, builder_fees = (
+        summary.fills, summary.notional, summary.builder_fee)
+    daily = _fee_daily_bars(ref, hl, start, end)
+    result = {
+        "summary": {
+            "builder_fees": builder_fees, "routed_volume": routed_volume,
+            "fill_count": fill_count, "pnl_share_pct": None,
+        },
+        "daily": daily,
+    }
+    cache[key] = (now_s, result)
     return result
 
 
@@ -3100,6 +3221,29 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "fees_month": fees_month_block, "positions": positions_block,
             "updated_at": int(now_s),
         })
+
+    @app.get("/api/me/fees")
+    def me_fees(period: str = "this_month", address: str = Depends(_require_session)):
+        """費用明細 tab（R2·B 重構）的期間切換資料源：`this_month`／`last_month`／
+        `all`，逐日聚合與 `/api/me/dashboard` 的 `fees_month` 同一支計算層
+        （`_dashboard_fees_period`／`_fee_daily_bars`，同一個 `collect_follower_summary`
+        資料源，不另拼第二來源）。沿 `/api/me/fills` 的認證與快取慣例：per-
+        (account_id, period) 快取、上游失敗一律 503、不回退自家 DB。"""
+        if period not in _FEES_PERIODS:
+            raise HTTPException(status_code=422,
+                                detail=f"period 僅支援 {'/'.join(_FEES_PERIODS)}")
+        account_id = derive_account_id(address)
+        ref = FollowerRef(account_id=account_id, user_address=address,
+                          builder_address=cfg.builder_address, network=cfg.network)
+        now_s = now_fn()
+        try:
+            result = _dashboard_fees_period(ref, hl, now_s, period)
+        except Exception as e:  # noqa: BLE001 — 上游任何失敗一律轉譯 503，不讓例外細節外洩
+            logger.error("費用明細查詢失敗 address=%s period=%s: %s",
+                        address.lower(), period, e)
+            raise HTTPException(status_code=503,
+                                detail="費用明細查詢暫時不可用，請稍後重試") from e
+        return jsonable(result)
 
     # ---------- /api/me/fills、/api/me/authorizations（M3 round2 Task 7） ----------
     # 「成交記錄・授權歷程」tab 的唯一資料源：兩者都**直取 Hyperliquid**（userFillsByTime
