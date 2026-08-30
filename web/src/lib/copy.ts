@@ -1019,7 +1019,7 @@ export const COPY_ZH = {
       bestWorstLabel: "最佳 / 最差日",
       bestWorstNote: "單日 %",
       startEndEquityLabel: "起訖淨值",
-      startEndEquityNote: "真實入金 → 目前淨值",
+      startEndEquityNote: "真實入金 → 等效淨值（不含出入金）",
       insufficientLabel: "樣本不足",
       /** ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／日勝率三張
        * （plan Task 7 第 1 條＋設計稿 R2 P0 原文）。Sharpe／Sortino／年化波動／
@@ -1279,7 +1279,7 @@ export const COPY_ZH = {
       colEffectiveRate: "實際費率",
       loadMore: "載入更早的 20 天",
       footerNote:
-        "日期為 UTC 日界；「—」表示當日無成交，與費用為 0 的情況區分。"
+        "日期為 UTC 日界；只列出有成交的日子（無成交的日子不顯示）。"
         + "實際費率＝當日 fee ÷ 路由交易量，用來核對 0.02% 上限沒有被超收。",
       loading: "讀取中…",
       loadError: "費用明細暫時讀不到，請稍後重試。",
@@ -2545,7 +2545,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       bestWorstLabel: "Best / worst day",
       bestWorstNote: "Single-day %",
       startEndEquityLabel: "Start → end equity",
-      startEndEquityNote: "Real deposit → current equity",
+      startEndEquityNote: "Real deposit → equivalent equity (flows excluded)",
       insufficientLabel: "Insufficient sample",
       insufficientGroupLabel: "Sharpe／Sortino／Annualized vol／Start–end equity／Best-worst day",
       insufficientGroupPrefix: ": insufficient sample (",
@@ -2778,8 +2778,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       colEffectiveRate: "Effective rate",
       loadMore: "Load 20 more days",
       footerNote:
-        "Dates use UTC day boundaries. “—” means no fills that day, "
-        + "distinct from a $0.00 fee. Effective rate = that day's fee ÷ routed volume, "
+        "Dates use UTC day boundaries; only days with fills are listed "
+        + "(days without fills are omitted). Effective rate = that day's fee ÷ routed volume, "
         + "so you can verify the 0.02% cap was never exceeded.",
       loading: "Loading…",
       loadError: "Fee detail temporarily unavailable, please try again later.",

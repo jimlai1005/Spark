@@ -1348,9 +1348,13 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-guide-card a { color: var(--primary); }
 
 .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
-.modal-card { max-width: 480px; width: 100%; max-height: 85vh; overflow-y: auto; }
+/* R4-7：卡片內容原本貼邊（.card 本身不帶 padding）——modal-card 補 24px padding，
+   direct children 一律 flex column + gap 18px 取代各自的 margin，避免雙重間距。 */
+.modal-card { max-width: 480px; width: 100%; max-height: 85vh; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 18px; }
+.modal-card > * { margin: 0; }
 .modal-card h3 { margin-top: 0; }
 .modal-card ul { margin: 8px 0; padding-left: 18px; font-size: var(--fs-small); }
+.modal-card .step-actions { margin-top: 0; }
 
 .dash-equity-value { font-family: var(--font-mono); font-size: var(--fs-h1); font-weight: 700; letter-spacing: -0.02em; }
 .dash-equity-ret { font-family: var(--font-mono); font-size: var(--fs-small); }

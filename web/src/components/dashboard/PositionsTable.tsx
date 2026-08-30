@@ -135,95 +135,35 @@ function PositionsGrid({ positions }: { positions: DashboardPosition[] | null })
   );
 }
 
-// ── 費用明細 tab（R2·B 重構，M3 round3 Task 5）──────────────────────────────
+// ── 費用明細 tab（R2·B 重構，M3 round3 Task 5；M3 round4 Task R4-9 移除補日曆）──
 //
 // `/api/me/fees?period=` 只回「有成交的日子」（`daily`，見 api.ts `MyFeesDailyRow`
-// 註解）；「無成交」的日曆列由前端補（`buildFeesCalendarRows`），與 `builder_fee
-// === "0"`（有成交、費用恰為零）在畫面上明確分開——這是 R2·B 要修的核心問題
-// （現況 $0.00 與「當日無成交」完全無法區分）。
+// 註解，後端 `_fee_daily_bars` 從一開始就只吐 `fill_count > 0` 的日子）；
+// `builder_fee === "0"`（有成交、費用恰為零）與「當日無成交」在後端回應裡
+// 本來就明確分開（前者有列、後者無列）。
+//
+// ⭐ R4-9（2026-08-31 使用者裁決）：R2·B 當時額外加了 `buildFeesCalendarRows`
+// 把後端已過濾掉的空日**重新補**成整月連續日曆（顯示一整排「—」），本意是
+// 「讓月份看起來完整」，但使用者截圖回饋這排「—」反而是雜訊——真正的空日
+// 源頭不是後端（後端從未回傳過），是這段前端補日曆邏輯，故整段移除，改為
+// 直接渲染後端回應（新→舊排序），CSV 匯出同規則。
 //
 // ⚠️ 這裡刻意不掛 globals.css 的既有 `.dash-table-head`/`.dash-table-row`
 // class（那組 grid-template-columns 是為 6 欄的持倉表寫的，本表是 5 欄），
-// 改用 inline grid style——globals.css 不在本 task 的改動範圍（見派工 prompt
-// 「只動 PositionsTable.tsx / api.ts / copy.ts」），避免動到共用樣式表影響其他表格。
+// 改用 inline grid style——globals.css 不在本 task 的改動範圍，避免動到共用
+// 樣式表影響其他表格。
 
 const FEES_PERIODS: MyFeesPeriod[] = ["this_month", "last_month", "all"];
 const FEES_DEFAULT_VISIBLE = 10;
 const FEES_LOAD_MORE_STEP = 20;
 const FEES_ROW_GRID_COLUMNS = "140px 1fr 1fr 1fr 110px";
 
-interface FeesCalendarRow {
-  date: string;
-  hasFill: boolean;
-  fill_count: number | null;
-  routed_volume: string | null;
-  builder_fee: string | null;
-  effective_rate_bps: string | null;
-}
-
 type FeesTableCopy = ReturnType<typeof useCopy>["dashboard"]["feesTable"];
 
-function utcDateStr(d: Date): string {
-  return d.toISOString().slice(0, 10);
-}
-
-/** `dateStr`（`YYYY-MM-DD`，代表 UTC 日曆日）± `days` 天，回傳同格式字串。 */
-function addDaysUtc(dateStr: string, days: number): string {
-  const [y, m, d] = dateStr.split("-").map(Number);
-  return utcDateStr(new Date(Date.UTC(y, m - 1, d + days)));
-}
-
-/** `monthsBack` 個月前那個月的 1 號（UTC）。`Date.UTC` 對負月份會自動跨年，
- * 不需要手動處理 12 月→1 月的進位。 */
-function startOfMonthUtc(now: Date, monthsBack: 0 | 1): string {
-  return utcDateStr(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthsBack, 1)));
-}
-
-/**
- * 把後端「只有成交日」的 `daily` 補成連續日曆列（新→舊）。
- * - `this_month`／`last_month`：補整個 UTC 日曆月（`this_month` 只補到今天，
- *   月份尚未走完的日子本來就不該出現）。
- * - `all`：**只從 `daily` 裡最早的一天補起**，不補到帳戶誕生前——避免把
- *   帳戶開通前、根本不存在的日子畫成一整排「—」（plan Task 5 明文要求）。
- *   `daily` 為空（這個帳戶從未有過成交）時直接回傳空陣列，交由呼叫端顯示 empty 態。
- */
-export function buildFeesCalendarRows(
-  period: MyFeesPeriod,
-  daily: MyFeesDailyRow[],
-  now: Date,
-): FeesCalendarRow[] {
-  const byDate = new Map(daily.map((row) => [row.date, row]));
-  let startStr: string;
-  let endStr: string;
-  if (period === "this_month") {
-    startStr = startOfMonthUtc(now, 0);
-    endStr = utcDateStr(now);
-  } else if (period === "last_month") {
-    startStr = startOfMonthUtc(now, 1);
-    endStr = addDaysUtc(startOfMonthUtc(now, 0), -1);
-  } else {
-    if (daily.length === 0) return [];
-    startStr = daily.reduce((min, row) => (row.date < min ? row.date : min), daily[0].date);
-    endStr = utcDateStr(now);
-  }
-
-  const rows: FeesCalendarRow[] = [];
-  for (let cur = startStr; cur <= endStr; cur = addDaysUtc(cur, 1)) {
-    const existing = byDate.get(cur);
-    rows.push(
-      existing
-        ? {
-            date: cur, hasFill: true, fill_count: existing.fill_count,
-            routed_volume: existing.routed_volume, builder_fee: existing.builder_fee,
-            effective_rate_bps: existing.effective_rate_bps,
-          }
-        : {
-            date: cur, hasFill: false, fill_count: null,
-            routed_volume: null, builder_fee: null, effective_rate_bps: null,
-          },
-    );
-  }
-  return rows.reverse();
+/** 後端 `daily`（升冪，`_fee_daily_bars` 依日期由舊到新 append）→ 新→舊排序，
+ * 純格式化、不補日期空隙（見上方檔頭 R4-9）。 */
+export function sortFeesRowsDesc(daily: MyFeesDailyRow[]): MyFeesDailyRow[] {
+  return [...daily].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 }
 
 /** RFC4180 最小轉義：欄位含逗號／引號／換行才加引號，內部引號雙寫。 */
@@ -233,12 +173,13 @@ function csvEscapeField(field: string): string {
 }
 
 /**
- * CSV 內容（不含 BOM／下載副作用，純函式方便單測）。欄位與畫面表格一致。
- * `c` 只取用 5 個 `col*` 欄位——用 `Pick` 而非整個 `FeesTableCopy`，讓呼叫端
- * （含測試）不需要餵一份完整的費用明細文案物件就能單測本函式。
+ * CSV 內容（不含 BOM／下載副作用，純函式方便單測）。欄位與畫面表格一致，
+ * 一律「有成交」（後端已過濾空日，見上方檔頭）。`c` 只取用 5 個 `col*`
+ * 欄位——用 `Pick` 而非整個 `FeesTableCopy`，讓呼叫端（含測試）不需要餵一份
+ * 完整的費用明細文案物件就能單測本函式。
  */
 export function buildFeesCsv(
-  rows: FeesCalendarRow[],
+  rows: MyFeesDailyRow[],
   c: Pick<FeesTableCopy, "colDate" | "colFillCount" | "colRoutedVolume" | "colBuilderFee" | "colEffectiveRate">,
 ): string {
   const header = [c.colDate, c.colFillCount, c.colRoutedVolume, c.colBuilderFee, c.colEffectiveRate];
@@ -246,12 +187,10 @@ export function buildFeesCsv(
     header,
     ...rows.map((r) => [
       r.date,
-      r.hasFill ? String(r.fill_count) : NO_VALUE,
-      r.hasFill ? `$${fmtAmount(r.routed_volume)}` : NO_VALUE,
-      r.hasFill ? `$${fmtAmount(r.builder_fee)}` : NO_VALUE,
-      r.hasFill && r.effective_rate_bps != null
-        ? `${fmtAmount(r.effective_rate_bps, 2)} bps`
-        : NO_VALUE,
+      String(r.fill_count),
+      `$${fmtAmount(r.routed_volume)}`,
+      `$${fmtAmount(r.builder_fee)}`,
+      r.effective_rate_bps != null ? `${fmtAmount(r.effective_rate_bps, 2)} bps` : NO_VALUE,
     ]),
   ];
   return lines.map((line) => line.map(csvEscapeField).join(",")).join("\n");
@@ -304,9 +243,9 @@ function FeesGrid() {
     this_month: c.periodThisMonth, last_month: c.periodLastMonth, all: c.periodAll,
   };
 
-  const calendarRows = data ? buildFeesCalendarRows(period, data.daily, new Date()) : [];
-  const visibleRows = calendarRows.slice(0, visibleCount);
-  const hasMore = calendarRows.length > visibleCount;
+  const rows = data ? sortFeesRowsDesc(data.daily) : [];
+  const visibleRows = rows.slice(0, visibleCount);
+  const hasMore = rows.length > visibleCount;
 
   return (
     <div className="dash-table">
@@ -336,12 +275,12 @@ function FeesGrid() {
         </div>
         <button
           type="button"
-          disabled={!data || calendarRows.length === 0}
-          onClick={() => data && downloadCsv(`filet-fees-${period}.csv`, buildFeesCsv(calendarRows, c))}
+          disabled={!data || rows.length === 0}
+          onClick={() => data && downloadCsv(`filet-fees-${period}.csv`, buildFeesCsv(rows, c))}
           style={{
             fontSize: 12.5, color: "var(--text-dim)", border: "1px solid var(--border)",
             borderRadius: 7, padding: "8px 13px", background: "none",
-            cursor: !data || calendarRows.length === 0 ? "not-allowed" : "pointer",
+            cursor: !data || rows.length === 0 ? "not-allowed" : "pointer",
           }}
         >
           {c.exportCsv}
@@ -380,7 +319,7 @@ function FeesGrid() {
             ))}
           </div>
 
-          {calendarRows.length === 0 ? (
+          {rows.length === 0 ? (
             <p className="dash-table-empty">{c.empty}</p>
           ) : (
             <>
@@ -406,15 +345,11 @@ function FeesGrid() {
                   }}
                 >
                   <div>{r.date}</div>
-                  <div style={{ textAlign: "right" }}>{r.hasFill ? r.fill_count : NO_VALUE}</div>
+                  <div style={{ textAlign: "right" }}>{r.fill_count}</div>
+                  <div style={{ textAlign: "right" }}>{`$${fmtAmount(r.routed_volume)}`}</div>
+                  <div style={{ textAlign: "right" }}>{`$${fmtAmount(r.builder_fee)}`}</div>
                   <div style={{ textAlign: "right" }}>
-                    {r.hasFill ? `$${fmtAmount(r.routed_volume)}` : NO_VALUE}
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    {r.hasFill ? `$${fmtAmount(r.builder_fee)}` : NO_VALUE}
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    {r.hasFill && r.effective_rate_bps != null
+                    {r.effective_rate_bps != null
                       ? `${fmtAmount(r.effective_rate_bps, 2)} bps`
                       : NO_VALUE}
                   </div>

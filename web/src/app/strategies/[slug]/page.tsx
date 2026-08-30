@@ -14,11 +14,10 @@
  * 2026-08-30 D15 裁決原 60 降為 30——時該鍵整個不回傳，結構性防呆），
  * 本頁只依「鍵是否存在」決定是否渲染 `CagrCard`，
  * 不再重算年化外推（見 `lib/strategyMetrics.ts` 檔頭，工程原則 1：同一個值
- * 只能有一個計算來源）。⭐ M3 round4 Task R4-2：「起訖淨值」改為直接格式化
- * 後端供給的 `methodology.start_equity_usd`／`end_equity_usd`（同一份鏈上
- * `accountValueHistory` 的首個非零值與末值），不再用 `initial_deposit_usd` ×
- * `equity_index` 比值推算——真實帳戶的首點常態性是 0，比值法會誤判成樣本
- * 不足（詳見 `strategyMetrics.ts` 檔頭）。
+ * 只能有一個計算來源）。⭐ M3 round4 Task R4-8（2026-08-31 使用者裁決）：
+ * 「起訖淨值」改與淨值曲線同一基準——`initial_deposit_usd` × `equity_index`
+ * 首尾比值（TWR 等效淨值，見 `strategyMetrics.ts` 檔頭：`equity_index` 首點
+ * 恆為 1，與曾造成樣本不足誤判的 `accountValueHistory` 不同源）。
  *
  * ⭐ Task 7（R2-P0）指標收斂：8 張指標卡中只有總報酬／策略期間回撤／日勝率／
  * 最佳最差日維持個別小卡；Sharpe／Sortino／年化波動／起訖淨值在
@@ -39,7 +38,7 @@ import {
   type PublicStrategyMethodology,
 } from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
-import { formatStartEndEquity, metricText } from "@/lib/strategyMetrics";
+import { formatDepositEquivalentEquity, metricText } from "@/lib/strategyMetrics";
 import type { COPY_ZH, DeepString } from "@/lib/copy";
 
 type CagrCopy = DeepString<typeof COPY_ZH.strategyDetail.cagr>;
@@ -123,7 +122,9 @@ export default function StrategyDetailPage() {
   // （那是每次請求各自的 `now_fn()`，即使算同一份快照也會逐請求前進——正是
   // 「數字不一致」的根因之一）。
   const asOf = fmtUpdatedAtUtc(strategy.as_of ?? 0);
-  const startEnd = formatStartEndEquity(strategy.methodology, fmtAmount);
+  const startEnd = formatDepositEquivalentEquity(
+    strategy.methodology.initial_deposit_usd, strategy.equity_index, fmtAmount,
+  );
   const sampleInsufficient = strategy.sample_days < strategy.sample_threshold;
 
   function buildQuery(): string {

@@ -1515,10 +1515,13 @@ export function getDashboard(): Promise<DashboardResp> {
 export type MyFeesPeriod = "this_month" | "last_month" | "all";
 
 /**
- * 逐日聚合列（`_fee_daily_bars` 擴充形狀）。⭐ 無成交日**不產生列**（「—」列由
- * 前端補日曆，見 `PositionsTable.tsx` 的 `buildFeesCalendarRows`）；`builder_fee`
+ * 逐日聚合列（`_fee_daily_bars` 擴充形狀）。無成交日**不產生列**（後端
+ * `fill_count > 0` 才 append，見 `app.py` `_fee_daily_bars`）；`builder_fee`
  * 恆為字串（Decimal 無損序列化），`fill_count > 0` 但 `builder_fee === "0"` 是
- * 合法值（$0.00 有成交，非「當日無成交」，R2·B）。
+ * 合法值（$0.00 有成交，非「當日無成交」，R2·B）。⭐ M3 round4 Task R4-9
+ * （2026-08-31 使用者裁決）：R2·B 當時前端 `buildFeesCalendarRows` 會把後端
+ * 已過濾掉的空日重新補成整月日曆「—」列——已移除，`PositionsTable.tsx` 現在
+ * 直接渲染這裡回傳的列（一律 `fill_count > 0`），不再補日曆。
  */
 export interface MyFeesDailyRow {
   date: string;
