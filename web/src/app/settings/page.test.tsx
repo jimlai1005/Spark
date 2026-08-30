@@ -34,6 +34,7 @@ const getStatus = vi.fn();
 const getDashboard = vi.fn();
 const getMyLeader = vi.fn();
 const postPause = vi.fn<(a0: string) => Promise<PauseResp>>();
+const getRiskSettingsMessage = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   getMyRisk: (...a: unknown[]) => getMyRisk(...a),
@@ -42,10 +43,15 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getDashboard: (...a: unknown[]) => getDashboard(...a),
   getMyLeader: (...a: unknown[]) => getMyLeader(...a),
   postPause: (...a: [string]) => postPause(...a),
+  getRiskSettingsMessage: (...a: unknown[]) => getRiskSettingsMessage(...a),
 }));
 
+// ⭐ Toast 整合測試（M3 round3 Task 8）需要能讓簽署「被拒絕」，所以
+// `signMessageAsync` 改成模組層可控制的 mock（沿 `advanced/page.test.tsx` 的
+// `signMessageAsync` 慣例），而不是固定回傳 pending 的內聯 `vi.fn()`。
+const signMessageAsync = vi.fn();
 vi.mock("wagmi", () => ({
-  useSignMessage: () => ({ signMessageAsync: vi.fn() }),
+  useSignMessage: () => ({ signMessageAsync: (...a: unknown[]) => signMessageAsync(...a) }),
 }));
 
 vi.mock("@/lib/sign", () => ({
@@ -159,6 +165,8 @@ beforeEach(() => {
   getDashboard.mockReset();
   getMyLeader.mockReset();
   postPause.mockReset();
+  getRiskSettingsMessage.mockReset();
+  signMessageAsync.mockReset();
   mockMe = { data: ME, isLoading: false };
 
   getMyRisk.mockResolvedValue(riskResp());
@@ -259,5 +267,113 @@ describe("SettingsPage — 平倉並撤銷入口複用 CloseAllModal", () => {
     expect(dialog).toBeInTheDocument();
     expect(screen.getByText(COPY.dashboard.status.closeAllModal.title)).toBeInTheDocument();
     expect(screen.getByText(/ETH/)).toBeInTheDocument();
+  });
+});
+
+// ==================== Task 8（M3 round3，R2·P1）：每個參數「目前生效 / 你的設定」====================
+
+describe("SettingsPage — 風控參數「目前生效 / 你的設定」（Task 8 R2·P1）", () => {
+  it("已提交值與引擎生效值不同 → 兩值皆顯示＋待套用黃點提示", async () => {
+    const submittedPrefs = {
+      enabled: true, size_tolerance: "0.1", max_drawdown_pct: "0.15",
+      max_total_drawdown_pct: "0.3", flatten_on_breach: true, cooldown_hours: "12",
+    };
+    getMyRisk.mockResolvedValue(riskResp({
+      prefs: submittedPrefs,
+      submitted: { issued_at: "2026-08-29T00:00:00Z" },
+      applied: {
+        controls_enabled: false, source: "customer_signed", changed_at: "2026-08-20T00:00:00Z",
+        prefs: { ...submittedPrefs, max_drawdown_pct: "0.2" }, // 引擎還在用舊門檻 20%
+      },
+    }));
+    render(wrap(<SettingsPage />));
+
+    await screen.findByText(SPECS[1].label); // "最大回撤"
+    expect(await screen.findByText(/目前生效: 20%/)).toBeInTheDocument();
+    expect(screen.getByText(/你的設定: 15%/)).toBeInTheDocument();
+    expect(screen.getByText(COPY.settings.risk.applied.pendingBadge)).toBeInTheDocument();
+  });
+
+  it("已提交值與引擎生效值相同 → 不顯示待套用黃點", async () => {
+    const prefs = { ...riskResp().prefs, enabled: true };
+    getMyRisk.mockResolvedValue(riskResp({
+      prefs,
+      submitted: { issued_at: "2026-08-29T00:00:00Z" },
+      applied: { controls_enabled: true, source: "customer_signed", changed_at: "2026-08-20T00:00:00Z", prefs },
+    }));
+    render(wrap(<SettingsPage />));
+
+    await screen.findByText(SPECS[1].label);
+    expect(await screen.findByText(/目前生效: 20%/)).toBeInTheDocument();
+    expect(screen.getByText(/你的設定: 20%/)).toBeInTheDocument();
+    expect(screen.queryByText(COPY.settings.risk.applied.pendingBadge)).not.toBeInTheDocument();
+  });
+
+  it("引擎心跳讀不到（applied=null）→ 目前生效顯示「無法確認」，不顯示黃點", async () => {
+    getMyRisk.mockResolvedValue(riskResp({
+      prefs: { ...riskResp().prefs, enabled: true },
+      applied: null,
+    }));
+    render(wrap(<SettingsPage />));
+
+    await screen.findByText(SPECS[1].label);
+    const unknownCells = await screen.findAllByText(
+      new RegExp(`目前生效: ${COPY.settings.risk.applied.unknownShort}`),
+    );
+    expect(unknownCells.length).toBeGreaterThan(0);
+    expect(screen.queryByText(COPY.settings.risk.applied.pendingBadge)).not.toBeInTheDocument();
+  });
+});
+
+// ==================== Task 8（R2·P0）：簽署失敗改 toast，不再永久紅框 ====================
+
+/**
+ * 伺服器產生的 canonical 原文（照抄後端 `build_risk_settings_message` 版型，
+ * 沿 `lib/riskSettingsFlow.test.ts` 的 `messageFor` 同一份形狀——這裡只服務
+ * 「簽署被拒絕」這條路徑的內容預驗，讓 `runRiskSettingsFlow` 真的走到
+ * `signMessage` 才失敗，而不是提早在 content-mismatch 擋下）。
+ */
+function riskMessageFor(p: MyRiskResp["prefs"], account: string): string {
+  return (
+    "Filet: update copy-trading risk settings\n\n"
+    + "Signing this authorises Filet to change the risk controls on your\n"
+    + "copy-trading account.\n\n"
+    + `Account: ${account}\n`
+    + `Risk Controls: ${p.enabled ? "enabled" : "disabled"}\n`
+    + `size_tolerance: ${p.size_tolerance}\n`
+    + `max_drawdown_pct: ${p.max_drawdown_pct}\n`
+    + `max_total_drawdown_pct: ${p.max_total_drawdown_pct}\n`
+    + `flatten_on_breach: ${p.flatten_on_breach}\n`
+    + `cooldown_hours: ${p.cooldown_hours} hours\n`
+    + "Nonce: n-1\nIssued At: 2026-07-30T00:00:00Z"
+  );
+}
+
+describe("SettingsPage — 風控簽署失敗改 toast（Task 8 R2·P0）", () => {
+  it("錢包拒絕簽署 → 顯示可關閉的 toast（非永久紅框）＋按鈕改標籤「重新簽署」＋可手動關閉", async () => {
+    const prefs = riskResp().prefs;
+    getRiskSettingsMessage.mockResolvedValue({
+      message: riskMessageFor(prefs, ME.account_id), nonce: "n-1",
+      issued_at: "2026-07-30T00:00:00Z", account_id: ME.account_id, prefs,
+    });
+    signMessageAsync.mockRejectedValue(new Error("user rejected the request"));
+
+    render(wrap(<SettingsPage />));
+    const saveBtn = await screen.findByRole("button", { name: COPY.settings.risk.saveButton });
+    fireEvent.click(saveBtn);
+
+    // toast 顯示錯誤文案（沿用既有 riskErrorCopy 的 wallet-rejected 文案）。
+    const toastText = await screen.findByText(COPY.settings.risk.errors.walletRejected);
+    expect(toastText.closest('[role="alert"]')).toBeInTheDocument();
+
+    // 區塊內只留「重新簽署」——原本的儲存按鈕改標籤，不再是常駐紅框。
+    expect(await screen.findByRole("button", { name: COPY.settings.toast.retrySignButton }))
+      .toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.settings.risk.saveButton })).not.toBeInTheDocument();
+
+    // 手動關閉 → toast 立即消失。
+    fireEvent.click(screen.getByRole("button", { name: COPY.settings.toast.dismiss }));
+    await waitFor(() =>
+      expect(screen.queryByText(COPY.settings.risk.errors.walletRejected)).not.toBeInTheDocument());
   });
 });

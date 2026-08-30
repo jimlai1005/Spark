@@ -836,10 +836,13 @@ main.page {
 .ops-alert-warn .ops-alert-title { color: var(--warn); }
 .ops-error-list { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--text); }
 
+/* M3 round3 Task 8（R2·P1）：資訊框藍色與全站主色系（綠）衝突，改中性灰底 +
+   主色標題——藍（--info）不進調色盤，紅／黃／綠保留給風險語意。 */
 .ops-notice {
-  border-color: rgba(var(--info-rgb), .45);
+  background: var(--inset);
+  border-color: var(--border-strong);
 }
-.ops-notice-title { color: var(--info); font-size: 14px; margin: 0 0 6px; }
+.ops-notice-title { color: var(--primary); font-size: 14px; margin: 0 0 6px; }
 
 .ops-query-error { color: var(--neg); font-size: 13px; }
 

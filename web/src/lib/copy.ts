@@ -725,13 +725,19 @@ export const COPY_ZH = {
         + "你貼上的位址未經平台額外審核，是否值得跟隨由你自行判斷。",
       checkboxLabel: "我理解 Filet 不對此地址的策略品質、風控或存續做任何背書。",
     },
-    /** 未登入：顯示說明＋登入 CTA，不 redirect（進階用戶的直達入口）。 */
+    /**
+     * 未登入：顯示說明＋登入 CTA，不 redirect（進階用戶的直達入口）。
+     * ⭐ M3 round3 Task 8（R2·P1）：舊版兩個藍框堆疊、下半頁全空——合併為單一卡
+     * （風險確認 + disabled 地址輸入框 + 登入按鈕），`exploreExit` 是旁置的
+     * 「或先看精選策略 →」出口（連 `/strategies`），讓用戶不是只有登入一條路。
+     */
     notLoggedIn: {
       title: "請先登入以繼續",
       body: "進階模式需要先連接錢包並登入，才能查詢位址與繼續開通流程。",
       cta: "連接錢包並登入",
       connecting: "連接中…",
       signing: "請在錢包中簽署登入訊息…",
+      exploreExit: "或先看精選策略 →",
     },
     // ⭐ 誠信要求：必須貼著送出按鈕出現。
     upperBound:
@@ -1267,6 +1273,19 @@ export const COPY_ZH = {
       actionUnknown: "授權動作",
       tx: "交易",
       viewTx: "查看",
+      // ⭐ M3 round3 Task 8（R2·P1）：分頁 50/頁＋期間／幣種篩選＋UTC/本地切換。
+      periods: { "7d": "7 天", "30d": "30 天", all: "全部" },
+      coinFilterLabel: "篩選幣種",
+      coinFilterAll: "全部幣種",
+      tzLocal: "本地時間",
+      tzUtc: "UTC",
+      pagination: {
+        showing: "顯示 ",
+        rangeSep: "–",
+        ofTotal: " / ",
+        prev: "上一頁",
+        next: "下一頁",
+      },
     },
   },
   /**
@@ -1282,6 +1301,15 @@ export const COPY_ZH = {
     title: "帳戶設定",
     subtitle: "調整風控門檻、資金配置與授權；查看目前跟隨的策略。",
     loadingNote: "讀取設定中…",
+    /**
+     * ⭐ M3 round3 Task 8（R2·P0）：簽署失敗原本是永久停留在頁上的紅框——改成
+     * 右下角 toast（可手動關閉、8 秒自動消失），區塊內只留一顆重新簽署的按鈕。
+     * 風控／資金配置／熔斷解除三處簽署動作共用同一份文案。
+     */
+    toast: {
+      dismiss: "關閉",
+      retrySignButton: "重新簽署",
+    },
     /** ⭐ 風控 opt-in（裁決 1）：預設不啟用，數字全來自後端 specs，不寫死任何門檻。 */
     risk: {
       title: "風控設定",
@@ -1329,6 +1357,13 @@ export const COPY_ZH = {
         notSubmitted: "你尚未提交過風控設定；畫面上顯示的是系統預設值。",
         sourceLabel: "來源",
         changedAtLabel: "生效時間",
+        // ⭐ M3 round3 Task 8（R2·P1）：建議值／目前生效值／待簽署值三種數字混在
+        // 同一區，用戶分不出哪個在作用——改成每個參數固定顯示「目前生效 / 你的
+        // 設定」兩值；尚未套用時加黃點與這句提示。
+        effectiveLabel: "目前生效",
+        yourSettingLabel: "你的設定",
+        unknownShort: "無法確認",
+        pendingBadge: "待下輪套用（約 1 分鐘）",
       },
       halted: {
         title: "你的跟單已被風控停止",
@@ -1364,7 +1399,10 @@ export const COPY_ZH = {
       subtitle: "投入比例直接乘進你的跟單部位大小，調整前請先確認你理解影響。",
       scaleLabel: "投入比例（佔帳戶淨值）",
       effectiveLabel: "目前生效",
-      pendingLabel: "已提交，待引擎套用",
+      // ⭐ M3 round3 Task 8（R2·P1）：與風控設定同一套「目前生效 / 你的設定」
+      // 兩值＋待套用黃點慣例。
+      yourSettingLabel: "你的設定",
+      pendingLabel: "已提交，待下輪套用（約 1 分鐘）",
       saveButton: "簽署並儲存資金配置",
       saving: "等待錢包簽署…",
       saved: "資金配置已送出。",
@@ -2164,6 +2202,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       cta: "Connect wallet and log in",
       connecting: "Connecting…",
       signing: "Please sign the login message in your wallet…",
+      exploreExit: "Or browse curated strategies first →",
     },
     upperBound: "A follower's actual results will fall below the leader's numbers: entry/exit delay, slippage, and "
       + "differences in capital size will continuously erode copy-trade results. The leader's numbers are an upper "
@@ -2610,6 +2649,18 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       actionUnknown: "Authorization action",
       tx: "Tx",
       viewTx: "View",
+      periods: { "7d": "7d", "30d": "30d", all: "All" },
+      coinFilterLabel: "Filter by coin",
+      coinFilterAll: "All coins",
+      tzLocal: "Local time",
+      tzUtc: "UTC",
+      pagination: {
+        showing: "Showing ",
+        rangeSep: "–",
+        ofTotal: " / ",
+        prev: "Previous",
+        next: "Next",
+      },
     },
   },
   settings: {
@@ -2617,6 +2668,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     title: "Account settings",
     subtitle: "Adjust risk limits, capital allocation and authorization; check which strategy you're following.",
     loadingNote: "Loading settings…",
+    toast: {
+      dismiss: "Dismiss",
+      retrySignButton: "Sign again",
+    },
     risk: {
       title: "Risk controls",
       subtitle:
@@ -2665,6 +2720,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         notSubmitted: "You haven't submitted risk controls yet; the values shown are system defaults.",
         sourceLabel: "Source",
         changedAtLabel: "Effective since",
+        effectiveLabel: "Currently in effect",
+        yourSettingLabel: "Your setting",
+        unknownShort: "Unavailable",
+        pendingBadge: "Pending next cycle (about a minute)",
       },
       halted: {
         title: "Your following has been stopped by risk controls",
@@ -2700,7 +2759,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       subtitle: "Your allocation ratio multiplies directly into your position sizes — please confirm you understand the impact before changing it.",
       scaleLabel: "Allocation ratio (of account equity)",
       effectiveLabel: "Currently in effect",
-      pendingLabel: "Submitted, pending engine application",
+      yourSettingLabel: "Your setting",
+      pendingLabel: "Submitted, pending next cycle (about a minute)",
       saveButton: "Sign & save capital allocation",
       saving: "Waiting for wallet signature…",
       saved: "Capital allocation submitted.",

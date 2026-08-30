@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import {
   getMyAuthorizations,
   getMyFees,
@@ -475,7 +475,10 @@ function HistoryPanel() {
     setLoading(true);
     setFillsFailed(false);
     setAuthorizationsFailed(false);
-    Promise.allSettled([getMyFills(), getMyAuthorizations()]).then(([f, a]) => {
+    // ⭐ M3 round3 Task 8：抓滿後端上限（90 天），讓前端「7D/30D/全部」期間 chip
+    // 有真實資料可切換——「全部」語意是「已抓到的視窗內全部」，不是無上限歷史
+    // （後端 `/api/me/fills` 的 `days` 硬性上限 90，見 api.ts 註解）。
+    Promise.allSettled([getMyFills(90), getMyAuthorizations()]).then(([f, a]) => {
       if (cancelled) return;
       if (f.status === "fulfilled") setFills(f.value.fills);
       else setFillsFailed(true);
@@ -512,9 +515,54 @@ function HistoryPanel() {
   );
 }
 
+// ── 成交記錄表（R2·P1 重構，M3 round3 Task 8）──────────────────────────────
+// 現況問題：全量渲染上千列、無分頁、字級約 10px、時間全為 UTC。修法：
+// client-side 分頁 50/頁＋期間（7D/30D/全部）與幣種篩選＋字級 ≥13px＋UTC/本地
+// 切換。同 FeesGrid 慣例：inline style（globals.css 不在本 task 改動範圍，
+// 只處理「資訊框」藍色樣式），沿用既有 `.dash-table`/`.dash-table-head`/
+// `.dash-table-row` class 只借版面，字級用 inline style 覆蓋。
+
+const FILLS_PAGE_SIZE = 50;
+type FillsPeriodFilter = "7d" | "30d" | "all";
+const FILLS_PERIODS: FillsPeriodFilter[] = ["7d", "30d", "all"];
+const FILLS_PERIOD_DAYS: Record<FillsPeriodFilter, number | null> = { "7d": 7, "30d": 30, all: null };
+const FILLS_ALL_COIN = "__all__";
+const FILLS_ROW_FONT_SIZE = 13.5;
+
+/**
+ * epoch ms → `YYYY-MM-DD HH:mm UTC±N`（瀏覽器本地時區，標注偏移量）。
+ * 與 `fmtUpdatedAtUtc` 的差別只在時區來源：這裡用 `Date` 的本地 getter
+ * （由執行環境的時區決定），UTC 模式繼續沿用既有 `fmtUpdatedAtUtc`。
+ */
+function fmtFillTimeLocal(epochMs: number): string {
+  if (!epochMs) return NO_VALUE;
+  const d = new Date(epochMs);
+  if (Number.isNaN(d.getTime())) return NO_VALUE;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const offsetMin = -d.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const oh = pad(Math.floor(Math.abs(offsetMin) / 60));
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+    + `${pad(d.getHours())}:${pad(d.getMinutes())} UTC${sign}${oh}`;
+}
+
+function fillsFilterBtnStyle(active: boolean): CSSProperties {
+  return {
+    fontSize: 12.5, padding: "6px 12px", borderRadius: 6,
+    border: "1px solid var(--border)", cursor: active ? "default" : "pointer",
+    background: active ? "var(--inset)" : "transparent",
+    color: active ? "var(--text)" : "var(--text-dim)",
+    fontWeight: active ? 600 : 400,
+  };
+}
+
 function FillsTable({ rows, failed }: { rows: MyFillRow[] | null; failed: boolean }) {
   const COPY = useCopy();
   const c = COPY.dashboard.history;
+  const [period, setPeriod] = useState<FillsPeriodFilter>("30d");
+  const [coin, setCoin] = useState<string>(FILLS_ALL_COIN);
+  const [page, setPage] = useState(1);
+  const [tz, setTz] = useState<"local" | "utc">("local");
 
   if (failed) {
     return (
@@ -531,32 +579,153 @@ function FillsTable({ rows, failed }: { rows: MyFillRow[] | null; failed: boolea
     );
   }
 
+  function changePeriod(p: FillsPeriodFilter) {
+    setPeriod(p);
+    setPage(1);
+  }
+  function changeCoin(v: string) {
+    setCoin(v);
+    setPage(1);
+  }
+
+  const coins = Array.from(new Set(rows.map((r) => r.coin))).sort();
+  const periodDays = FILLS_PERIOD_DAYS[period];
+  const cutoff = periodDays != null ? Date.now() - periodDays * 86_400_000 : null;
+  const filtered = rows.filter((r) => {
+    if (cutoff != null && r.time < cutoff) return false;
+    if (coin !== FILLS_ALL_COIN && r.coin !== coin) return false;
+    return true;
+  });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / FILLS_PAGE_SIZE));
+  const clampedPage = Math.min(page, totalPages);
+  const start = (clampedPage - 1) * FILLS_PAGE_SIZE;
+  const pageRows = filtered.slice(start, start + FILLS_PAGE_SIZE);
+
   return (
     <div className="dash-table">
-      <div className="dash-table-head">
-        <div>{c.time}</div>
-        <div>{c.coin}</div>
-        <div>{c.side}</div>
-        <div>{c.px}</div>
-        <div>{c.sz}</div>
-        <div>{c.fee}</div>
-        <div>{c.closedPnl}</div>
-        <div>{c.tx}</div>
-      </div>
-      {rows.map((r) => (
-        <div className="dash-table-row" key={r.hash || `${r.time}-${r.coin}`}>
-          <div>{fmtUpdatedAtUtc(r.time / 1000)}</div>
-          <div>{r.coin}</div>
-          <div>{r.side === "B" ? c.buy : c.sell}</div>
-          <div>{fmtAmount(r.px)}</div>
-          <div>{fmtAmount(r.sz)}</div>
-          <div>{fmtAmount(r.fee)}</div>
-          <div>{fmtAmount(r.closed_pnl)}</div>
-          <div>
-            <TxLink hash={r.hash} label={c.viewTx} />
+      <div style={{
+        display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center",
+        justifyContent: "space-between", padding: "16px 20px",
+      }}
+      >
+        <div style={{ display: "flex", gap: 4 }}>
+          {FILLS_PERIODS.map((p) => (
+            <button
+              key={p}
+              type="button"
+              disabled={period === p}
+              onClick={() => changePeriod(p)}
+              style={fillsFilterBtnStyle(period === p)}
+            >
+              {c.periods[p]}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <select
+            aria-label={c.coinFilterLabel}
+            value={coin}
+            onChange={(e) => changeCoin(e.target.value)}
+            style={{
+              fontSize: 12.5, padding: "6px 10px", borderRadius: 6,
+              border: "1px solid var(--border)", background: "var(--card)", color: "var(--text)",
+            }}
+          >
+            <option value={FILLS_ALL_COIN}>{c.coinFilterAll}</option>
+            {coins.map((coinName) => (
+              <option key={coinName} value={coinName}>{coinName}</option>
+            ))}
+          </select>
+          <div style={{ display: "flex", gap: 4 }}>
+            <button type="button" disabled={tz === "local"} onClick={() => setTz("local")}
+              style={fillsFilterBtnStyle(tz === "local")}
+            >
+              {c.tzLocal}
+            </button>
+            <button type="button" disabled={tz === "utc"} onClick={() => setTz("utc")}
+              style={fillsFilterBtnStyle(tz === "utc")}
+            >
+              {c.tzUtc}
+            </button>
           </div>
         </div>
-      ))}
+      </div>
+
+      {filtered.length === 0 ? (
+        <p className="dash-table-empty">{c.fillsEmpty}</p>
+      ) : (
+        <>
+          <div className="dash-table-head" style={{ fontSize: FILLS_ROW_FONT_SIZE }}>
+            <div>{c.time}</div>
+            <div>{c.coin}</div>
+            <div>{c.side}</div>
+            <div>{c.px}</div>
+            <div>{c.sz}</div>
+            <div>{c.fee}</div>
+            <div>{c.closedPnl}</div>
+            <div>{c.tx}</div>
+          </div>
+          {pageRows.map((r) => (
+            <div className="dash-table-row" key={r.hash || `${r.time}-${r.coin}`}
+              style={{ fontSize: FILLS_ROW_FONT_SIZE }}
+            >
+              <div>{tz === "local" ? fmtFillTimeLocal(r.time) : fmtUpdatedAtUtc(r.time / 1000)}</div>
+              <div>{r.coin}</div>
+              <div>{r.side === "B" ? c.buy : c.sell}</div>
+              <div>{fmtAmount(r.px)}</div>
+              <div>{fmtAmount(r.sz)}</div>
+              <div>{fmtAmount(r.fee)}</div>
+              <div>{fmtAmount(r.closed_pnl)}</div>
+              <div>
+                <TxLink hash={r.hash} label={c.viewTx} />
+              </div>
+            </div>
+          ))}
+          <div style={{
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            flexWrap: "wrap", gap: 10, padding: "14px 20px", borderTop: "1px solid var(--border)",
+            fontSize: 12.5, color: "var(--text-dim)",
+          }}
+          >
+            <span>
+              {c.pagination.showing}
+              {start + 1}
+              {c.pagination.rangeSep}
+              {Math.min(start + FILLS_PAGE_SIZE, filtered.length)}
+              {c.pagination.ofTotal}
+              {filtered.length}
+            </span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                type="button"
+                disabled={clampedPage <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                style={{
+                  fontSize: 12.5, padding: "6px 12px", borderRadius: 6,
+                  border: "1px solid var(--border)", background: "none", color: "var(--text-dim)",
+                  cursor: clampedPage <= 1 ? "not-allowed" : "pointer",
+                }}
+              >
+                {c.pagination.prev}
+              </button>
+              <span className="mono">{clampedPage} / {totalPages}</span>
+              <button
+                type="button"
+                disabled={clampedPage >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                style={{
+                  fontSize: 12.5, padding: "6px 12px", borderRadius: 6,
+                  border: "1px solid var(--border)", background: "none", color: "var(--text-dim)",
+                  cursor: clampedPage >= totalPages ? "not-allowed" : "pointer",
+                }}
+              >
+                {c.pagination.next}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

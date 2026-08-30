@@ -50,6 +50,7 @@ import {
   type RiskPrefs,
 } from "@/lib/api";
 import { CloseAllModal } from "@/components/dashboard/CloseAllModal";
+import { Toast } from "@/components/Toast";
 import { runCapitalSettingsFlow, type CapitalFlowFailure } from "@/lib/capitalSettingsFlow";
 import { fmtRatioPct, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
@@ -103,13 +104,88 @@ function withPref(prefs: RiskPrefs, name: RiskParamName, v: string | boolean): R
   return { ...prefs, [name]: v } as RiskPrefs;
 }
 
-function RiskParamField({ spec, prefs, onChange, c }: {
+// ⭐ M3 round3 Task 8（R2·P1）：建議值／目前生效值／待簽署值三種數字混在同一區，
+// 用戶分不出哪個在作用——每個參數固定顯示「目前生效 / 你的設定」兩值，僅顯示層
+// 重排，不動簽章流程與 API 呼叫。`sameRawValue`／`fmtParamValue` 只服務顯示，
+// 精度容忍度沿用 `riskSettingsFlow.ts` 的 `samePref` 同一種數值同值即相同原則
+// （各自持有一份，理由同檔頭「共用比例 ↔ 百分比換算」段：這裡是純顯示判斷，
+// 不需要跟簽章預驗那份耦合）。
+function sameRawValue(a: string | boolean, b: string | boolean): boolean {
+  if (typeof a === "boolean" || typeof b === "boolean") return a === b;
+  const na = Number(a);
+  const nb = Number(b);
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na === nb;
+  return a === b;
+}
+
+function fmtParamValue(
+  v: string | boolean,
+  type: "decimal" | "bool",
+  unit: RiskParamSpec["unit"] | undefined,
+  c: Copy["settings"]["risk"],
+): string {
+  if (type === "bool") return v === true ? c.boolOn : c.boolOff;
+  const suffix = unit === "hours" ? c.hoursSuffix : c.percentSuffix;
+  const toDisplay = unit === "hours" ? (x: string) => x : ratioToPct;
+  return `${toDisplay(String(v))}${suffix}`;
+}
+
+/**
+ * 每個參數固定顯示的「目前生效 / 你的設定」兩值。`submitted` 是已簽章提交的值
+ * （`data.prefs`，不是還在編輯、尚未送出的 `draft`——待套用與否比的是「已提交
+ * vs 引擎已採用」，草稿還沒簽就談不上套用進度）；`applied`/`appliedUnknown`
+ * 由呼叫端從 `data.applied` 拆出（引擎心跳缺席或版本較舊讀不到逐項門檻時
+ * `appliedUnknown=true`，不得只比對總開關就宣稱逐項都已生效，見 api.ts
+ * `RiskAppliedInfo.prefs` 註解）。
+ */
+function ParamStatus({ submitted, applied, appliedUnknown, type, unit, c }: {
+  submitted: string | boolean;
+  applied: string | boolean | null;
+  appliedUnknown: boolean;
+  type: "decimal" | "bool";
+  unit?: RiskParamSpec["unit"];
+  c: Copy["settings"]["risk"];
+}) {
+  const pending = !appliedUnknown && applied !== null && !sameRawValue(applied, submitted);
+  return (
+    <p className="hint mono risk-param-status"
+      style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}
+    >
+      <span>
+        {c.applied.effectiveLabel}:{" "}
+        {appliedUnknown || applied === null ? c.applied.unknownShort : fmtParamValue(applied, type, unit, c)}
+      </span>
+      <span>{c.applied.yourSettingLabel}: {fmtParamValue(submitted, type, unit, c)}</span>
+      {pending && (
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "var(--warn)" }}>
+          <span aria-hidden="true"
+            style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--warn)", display: "inline-block" }}
+          />
+          {c.applied.pendingBadge}
+        </span>
+      )}
+    </p>
+  );
+}
+
+function RiskParamField({ spec, prefs, onChange, c, data }: {
   spec: RiskParamSpec;
   prefs: RiskPrefs;
   onChange: (next: RiskPrefs) => void;
   c: Copy["settings"]["risk"];
+  data: MyRiskResp;
 }) {
   const v = prefValue(prefs, spec.name);
+  const appliedUnknown = data.applied === null || data.applied.prefs === null;
+  const appliedValue = appliedUnknown ? null : prefValue(data.applied!.prefs as RiskPrefs, spec.name);
+  const statusProps = {
+    submitted: prefValue(data.prefs, spec.name),
+    applied: appliedValue,
+    appliedUnknown,
+    type: spec.type,
+    unit: spec.unit,
+    c,
+  } as const;
   if (spec.type === "bool") {
     return (
       <div className="risk-field">
@@ -121,6 +197,7 @@ function RiskParamField({ spec, prefs, onChange, c }: {
         <p className="hint risk-recommended">
           {c.recommendedLabel}：{spec.recommended === true ? c.boolOn : c.boolOff}
         </p>
+        <ParamStatus {...statusProps} />
         <p className="hint">{spec.help}</p>
       </div>
     );
@@ -146,6 +223,7 @@ function RiskParamField({ spec, prefs, onChange, c }: {
       <p className="hint risk-recommended">
         {c.recommendedLabel}：{s.toDisplay(String(spec.recommended))}{s.suffix}
       </p>
+      <ParamStatus {...statusProps} />
       <p className="hint">{spec.help}</p>
     </div>
   );
@@ -164,14 +242,16 @@ function appliedNoteOf(d: MyRiskResp, c: Copy["settings"]["risk"]): string {
   return same ? c.applied.inSync : c.applied.pending;
 }
 
-function HaltedNotice({ halted, busy, note, error, onResume, c }: {
+function HaltedNotice({ halted, busy, note, error, onResume, onDismissError, c }: {
   halted: MyRiskResp["halted"];
   busy: boolean;
   note: string | null;
   error: string | null;
   onResume: () => void;
+  onDismissError: () => void;
   c: Copy["settings"]["risk"];
 }) {
+  const COPY = useCopy();
   const h = c.halted;
   if (halted === null) {
     return <p className="hint risk-halt-unknown" role="status">{h.unknown}</p>;
@@ -195,14 +275,14 @@ function HaltedNotice({ halted, busy, note, error, onResume, c }: {
         <>
           <p className="hint">{h.resumeNote}</p>
           <button type="button" className="btn btn-secondary" disabled={busy} onClick={onResume}>
-            {busy ? h.resuming : h.resumeButton}
+            {busy ? h.resuming : error ? COPY.settings.toast.retrySignButton : h.resumeButton}
           </button>
         </>
       ) : (
         <p className="hint risk-halt-governance">{h.leaderRevokedNote}</p>
       )}
       {note && <p className="hint risk-resumed" role="status">{note}</p>}
-      {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
+      {error && <Toast message={error} onDismiss={onDismissError} dismissLabel={COPY.settings.toast.dismiss} />}
     </div>
   );
 }
@@ -306,14 +386,15 @@ function RiskSection({ me }: { me: Me }) {
       <p className="hint">{c.applyNote}</p>
 
       <HaltedNotice halted={data.halted} busy={unlocking} note={unlockNote}
-        error={unlockError} onResume={() => void resume()} c={c} />
+        error={unlockError} onResume={() => void resume()}
+        onDismissError={() => setUnlockError(null)} c={c} />
 
       {tracking.length > 0 && (
         <div className="risk-tracking">
           <p className="eyebrow">{c.trackingTitle}</p>
           <p className="hint">{c.trackingSubtitle}</p>
           {tracking.map((spec) => (
-            <RiskParamField key={spec.name} spec={spec} prefs={draft} onChange={edit} c={c} />
+            <RiskParamField key={spec.name} spec={spec} prefs={draft} onChange={edit} c={c} data={data} />
           ))}
         </div>
       )}
@@ -324,12 +405,19 @@ function RiskSection({ me }: { me: Me }) {
         <span>{c.enableLabel}</span>
       </label>
       <p className="hint risk-toggle-help">{c.enableHelp}</p>
+      <ParamStatus
+        submitted={data.prefs.enabled}
+        applied={data.applied?.prefs != null ? data.applied.prefs.enabled : null}
+        appliedUnknown={data.applied === null || data.applied.prefs == null}
+        type="bool"
+        c={c}
+      />
 
       {draft.enabled && (
         <div className="risk-details">
           <p className="eyebrow">{c.detailsTitle}</p>
           {riskParams.map((spec) => (
-            <RiskParamField key={spec.name} spec={spec} prefs={draft} onChange={edit} c={c} />
+            <RiskParamField key={spec.name} spec={spec} prefs={draft} onChange={edit} c={c} data={data} />
           ))}
         </div>
       )}
@@ -344,12 +432,12 @@ function RiskSection({ me }: { me: Me }) {
 
       <div className="step-actions">
         <button type="button" className="btn btn-secondary" disabled={saving} onClick={() => void save()}>
-          {saving ? c.saving : c.saveButton}
+          {saving ? c.saving : error ? COPY.settings.toast.retrySignButton : c.saveButton}
         </button>
       </div>
       <p className="hint">{c.signNote}</p>
       {savedNote && <p className="hint risk-saved" role="status">{c.saved} {savedNote}</p>}
-      {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
+      {error && <Toast message={error} onDismiss={() => setError(null)} dismissLabel={COPY.settings.toast.dismiss} />}
     </section>
   );
 }
@@ -445,22 +533,42 @@ function CapitalSection({ me }: { me: Me }) {
           min={CAPITAL_SCALE_MIN} max={CAPITAL_SCALE_MAX} step={1} value={scale}
           onChange={(e) => { setSavedNote(null); setError(null); setScale(Number(e.target.value)); }} />
         <div className="inset">
-          {data.effective?.capital_utilization != null && (
-            <p className="hint mono">{c.effectiveLabel}：{fmtRatioPct(data.effective.capital_utilization)}</p>
-          )}
-          {data.pending && <p className="hint" role="status">{c.pendingLabel}</p>}
+          {/* ⭐ M3 round3 Task 8（R2·P1）：同風控設定「目前生效 / 你的設定」兩值
+              慣例——「你的設定」有已提交未生效的值（`pending`）就顯示那個，沒有
+              就等於目前生效值（沒有分岔）；黃點只在真的有 `pending` 時出現。 */}
+          <p className="hint mono">
+            {c.effectiveLabel}：{fmtRatioPct(data.effective?.capital_utilization ?? null)}
+          </p>
+          <p className="hint mono" style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+            <span>
+              {c.yourSettingLabel}：
+              {fmtRatioPct(data.pending?.capital_utilization ?? data.effective?.capital_utilization ?? null)}
+            </span>
+            {data.pending && (
+              <span
+                role="status"
+                style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "var(--warn)" }}
+              >
+                <span aria-hidden="true" style={{
+                  width: 6, height: 6, borderRadius: "50%", background: "var(--warn)", display: "inline-block",
+                }}
+                />
+                {c.pendingLabel}
+              </span>
+            )}
+          </p>
           <p className="hint">{data.note}</p>
         </div>
       </div>
 
       <div className="step-actions">
         <button type="button" className="btn btn-secondary" disabled={saving} onClick={() => void save()}>
-          {saving ? c.saving : c.saveButton}
+          {saving ? c.saving : error ? COPY.settings.toast.retrySignButton : c.saveButton}
         </button>
       </div>
       <p className="hint">{c.signNote}</p>
       {savedNote && <p className="hint risk-saved" role="status">{c.saved} {savedNote}</p>}
-      {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
+      {error && <Toast message={error} onDismiss={() => setError(null)} dismissLabel={COPY.settings.toast.dismiss} />}
     </section>
   );
 }

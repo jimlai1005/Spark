@@ -29,6 +29,7 @@
  * `input` state。
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useRef, useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
@@ -133,24 +134,32 @@ export default function AdvancedPage() {
       <h1>{c.title}</h1>
       <p className="hint lead">{c.subtitle}</p>
 
-      <div className="panel ops-notice advanced-gate" role="note">
-        <p className="ops-notice-title">{c.gate.title}</p>
-        <p className="hint">{c.gate.body}</p>
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={gateAgreed}
-            onChange={(e) => setGateAgreed(e.target.checked)}
-          />
-          <span>{c.gate.checkboxLabel}</span>
-        </label>
-      </div>
-
       {!loggedIn ? (
-        <NotLoggedInPanel phase={loginPhase} error={loginError}
-          onLogin={() => void handleLogin()} />
+        // ⭐ M3 round3 Task 8（R2·P1）：未登入原本是「風險確認」與「登入」兩個
+        // 藍框堆疊、下半頁全空——合併為單一卡：風險確認 + 可見但 disabled 的
+        // 地址輸入框（讓用戶看得到接下來要填什麼）+ 登入按鈕 + 「或先看精選
+        // 策略 →」出口。
+        <NotLoggedInGateCard
+          gateAgreed={gateAgreed}
+          onGateChange={setGateAgreed}
+          phase={loginPhase}
+          error={loginError}
+          onLogin={() => void handleLogin()}
+        />
       ) : (
         <>
+          <div className="panel ops-notice advanced-gate" role="note">
+            <p className="ops-notice-title">{c.gate.title}</p>
+            <p className="hint">{c.gate.body}</p>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={gateAgreed}
+                onChange={(e) => setGateAgreed(e.target.checked)}
+              />
+              <span>{c.gate.checkboxLabel}</span>
+            </label>
+          </div>
           <CustomLeaderSection
             gateAgreed={gateAgreed}
             listedLeaders={leaders.data?.leaders}
@@ -168,22 +177,64 @@ export default function AdvancedPage() {
   );
 }
 
-function NotLoggedInPanel({ phase, error, onLogin }: {
+/**
+ * 未登入時的合併卡（Task 8，取代舊版兩個堆疊的藍框：`advanced-gate` 通知框 +
+ * `advanced-login` 登入框）。地址輸入框在此**永遠 disabled**（未登入無論如何
+ * 都無法送出）——只是「可見」，讓用戶知道登入後接下來要填什麼；真正可輸入的
+ * 那個輸入框在登入後由 `CustomLeaderSection` 接手（不同 DOM 元素，id 不同）。
+ */
+function NotLoggedInGateCard({ gateAgreed, onGateChange, phase, error, onLogin }: {
+  gateAgreed: boolean;
+  onGateChange: (v: boolean) => void;
   phase: LoginPhase;
   error: string | null;
   onLogin: () => void;
 }) {
   const COPY = useCopy();
-  const c = COPY.advanced.notLoggedIn;
+  const c = COPY.advanced;
+  const nc = c.notLoggedIn;
   return (
-    <div className="panel advanced-login">
-      <p className="ops-notice-title">{c.title}</p>
-      <p className="hint">{c.body}</p>
+    <div className="panel ops-notice advanced-gate" role="note">
+      <p className="ops-notice-title">{c.gate.title}</p>
+      <p className="hint">{c.gate.body}</p>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={gateAgreed}
+          onChange={(e) => onGateChange(e.target.checked)}
+        />
+        <span>{c.gate.checkboxLabel}</span>
+      </label>
+
+      <div className="dash-divider" />
+
+      <label className="addr-field" htmlFor="advanced-preview-address">
+        <span className="addr-field-label">{c.custom.inputLabel}</span>
+        <input
+          id="advanced-preview-address"
+          className="addr-input mono"
+          type="text"
+          value=""
+          disabled
+          readOnly
+          placeholder={c.custom.inputPlaceholder}
+        />
+      </label>
+      <p className="hint addr-field-hint">{c.custom.inputHint}</p>
+
+      <div className="dash-divider" />
+
+      <p className="panel-title">{nc.title}</p>
+      <p className="hint">{nc.body}</p>
       <button type="button" className="btn btn-primary" disabled={phase !== "idle"}
         onClick={onLogin}>
-        {phase === "connecting" ? c.connecting : phase === "signing" ? c.signing : c.cta}
+        {phase === "connecting" ? nc.connecting : phase === "signing" ? nc.signing : nc.cta}
       </button>
       {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
+
+      <p className="hint">
+        <Link href="/strategies">{nc.exploreExit}</Link>
+      </p>
     </div>
   );
 }

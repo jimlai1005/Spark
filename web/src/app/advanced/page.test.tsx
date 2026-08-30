@@ -203,8 +203,20 @@ describe("AdvancedPage — 未登入", () => {
     // 無背書聲明本身在未登入時也顯示（頁首宣示，不等登入才出現）。
     expect(screen.getByText(/Filet 不對此位址的策略品質、風控或存續做任何背書/))
       .toBeInTheDocument();
-    // 未登入沒有輸入框可顯示。
-    expect(screen.queryByLabelText(/leader 錢包位址/)).not.toBeInTheDocument();
+  });
+
+  it("⭐ M3 round3 Task 8（R2·P1）：未登入合併為單一卡——地址輸入框可見但 disabled，"
+    + "並提供「或先看精選策略 →」出口", async () => {
+    render(wrap(<AdvancedPage />, null));
+    await screen.findByText(/請先登入以繼續/);
+
+    // 輸入框不再整個藏起來：可見，但 disabled（不可送出）。
+    const input = screen.getByLabelText(/leader 錢包位址/);
+    expect(input).toBeDisabled();
+
+    // 精選策略出口。
+    const exit = screen.getByRole("link", { name: /精選策略/ });
+    expect(exit).toHaveAttribute("href", "/strategies");
   });
 
   it("登入 CTA → connect+SIWE 成功後留在本頁（不 push），改顯示位址輸入區", async () => {
