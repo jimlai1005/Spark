@@ -17,6 +17,7 @@ import { useEffect, useState } from "react";
 import { CapabilityMatrix } from "@/components/CapabilityMatrix";
 import { FeeCalculator } from "@/components/FeeCalculator";
 import { StrategyCard } from "@/components/StrategyCard";
+import { FOLLOWER_COUNT_DISPLAY_MIN } from "@/lib/copy";
 import { fmtUsdCompact, NO_VALUE, shortAddr } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
 import {
@@ -176,12 +177,19 @@ export default function HomePage() {
                   <div className="strategy-metric-label">{home.hero.featuredCard.liveDaysLabel}</div>
                   <div className="mono home-hero-featured-value">{featured.live_days}</div>
                 </div>
-                <div>
-                  <div className="strategy-metric-label">{home.hero.featuredCard.followerCountLabel}</div>
-                  <div className="mono home-hero-featured-value">
-                    {featured.follower_count == null ? NO_VALUE : featured.follower_count}
+                {featured.follower_count != null && featured.follower_count >= FOLLOWER_COUNT_DISPLAY_MIN ? (
+                  <div>
+                    <div className="strategy-metric-label">{home.hero.featuredCard.followerCountLabel}</div>
+                    <div className="mono home-hero-featured-value">{featured.follower_count}</div>
                   </div>
-                </div>
+                ) : (
+                  <div>
+                    <div className="strategy-metric-label">
+                      {home.hero.featuredCard.followerCountFallbackLabel}
+                    </div>
+                    <div className="mono home-hero-featured-value">{featured.live_days}</div>
+                  </div>
+                )}
               </div>
               <div className="home-hero-featured-footnote">
                 {home.hero.featuredCard.sampleNotePrefix}

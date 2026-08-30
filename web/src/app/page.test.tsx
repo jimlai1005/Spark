@@ -5,7 +5,7 @@
  */
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { COPY_ZH as COPY } from "@/lib/copy";
+import { COPY_ZH as COPY, FOLLOWER_COUNT_DISPLAY_MIN } from "@/lib/copy";
 import HomePage from "./page";
 
 function jsonResponse(body: unknown, ok = true): Response {
@@ -137,5 +137,50 @@ describe("HomePage", () => {
     await screen.findByText("Filet Core");
     expect(COPY.strategyDetail.metrics.maxDrawdownLabel).toBe("策略期間回撤");
     expect(screen.getByText("策略期間回撤")).toBeInTheDocument();
+  });
+
+  // ⭐ M3 round3 Task 9（R2 P2）：跟單人數 < 10 把冷啟動寫在第一屏，改顯示連續實盤天數。
+  describe("跟單人數門檻（FOLLOWER_COUNT_DISPLAY_MIN）", () => {
+    it(`門檻常數為 ${FOLLOWER_COUNT_DISPLAY_MIN}`, () => {
+      expect(FOLLOWER_COUNT_DISPLAY_MIN).toBe(10);
+    });
+
+    it("follower_count=9（<10）：不顯示跟單人數欄，改顯示連續實盤天數", async () => {
+      const strategy = { ...STRATEGY, follower_count: 9, live_days: 91 };
+      stubFetch((url) => {
+        if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [strategy], updated_at: 1 });
+        return jsonResponse({ routed_volume_usd_total: "1", builder_fee_bps: 2, live_days: 91, updated_at: 1 });
+      });
+      render(<HomePage />);
+      await screen.findByText("Filet Core");
+      expect(screen.queryByText(COPY.home.hero.featuredCard.followerCountLabel)).not.toBeInTheDocument();
+      expect(screen.getByText(COPY.home.hero.featuredCard.followerCountFallbackLabel)).toBeInTheDocument();
+      expect(screen.getAllByText("91").length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("follower_count=10（=10）：顯示跟單人數欄", async () => {
+      const strategy = { ...STRATEGY, follower_count: 10 };
+      stubFetch((url) => {
+        if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [strategy], updated_at: 1 });
+        return jsonResponse({ routed_volume_usd_total: "1", builder_fee_bps: 2, live_days: 91, updated_at: 1 });
+      });
+      render(<HomePage />);
+      await screen.findByText("Filet Core");
+      expect(screen.getByText(COPY.home.hero.featuredCard.followerCountLabel)).toBeInTheDocument();
+      expect(screen.getByText("10")).toBeInTheDocument();
+      expect(screen.queryByText(COPY.home.hero.featuredCard.followerCountFallbackLabel)).not.toBeInTheDocument();
+    });
+
+    it("follower_count=null：不顯示跟單人數欄，改顯示連續實盤天數", async () => {
+      const strategy = { ...STRATEGY, follower_count: null, live_days: 91 };
+      stubFetch((url) => {
+        if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [strategy], updated_at: 1 });
+        return jsonResponse({ routed_volume_usd_total: "1", builder_fee_bps: 2, live_days: 91, updated_at: 1 });
+      });
+      render(<HomePage />);
+      await screen.findByText("Filet Core");
+      expect(screen.queryByText(COPY.home.hero.featuredCard.followerCountLabel)).not.toBeInTheDocument();
+      expect(screen.getByText(COPY.home.hero.featuredCard.followerCountFallbackLabel)).toBeInTheDocument();
+    });
   });
 });

@@ -8,9 +8,11 @@ import { getPublicStatus, type PublicComponentStatus } from "@/lib/publicApi";
  * Footer — 四欄（品牌+免責 / 產品 / 可驗證 / 法務與聯絡）＋系統狀態燈（Task 7）。
  *
  * 狀態燈讀 `/api/public/status`（無需登入，見 lib/publicApi.ts）：**載入一次，
- * 不輪詢**（規格明講不需要 polling）。三態：ok→綠「系統運作正常」、
- * degraded→黃、unknown→灰「狀態未知」——載入中與任何讀取失敗都落在 unknown
- * （讀不到 ≠ 系統健康，工程原則 3 的前端鏡射）。
+ * 不輪詢**（規格明講不需要 polling）。⭐ M3 round3 Task 9（R2 P2）：ok→綠「系統運作
+ * 正常」、degraded→黃；`unknown`／讀取失敗／載入中三種情況**整顆燈連文字都不渲染**
+ * （DOM 不存在，不是 visibility hidden）——舊版「狀態未知」灰字長期常駐等於向使用者
+ * 宣告一個沒有資訊量的狀態，不如不顯示（讀不到 ≠ 系統健康，工程原則 3 的前端鏡射：
+ * 讀不到就不宣告，不偽裝成「已知的未知」）。
  *
  * 法務欄連向 /terms /privacy /risk（Task 12 建立的實體頁）與
  * mailto:contact@filet.trade；產品／可驗證兩欄大多仍是純文字（對應頁面/錨點多數
@@ -23,7 +25,10 @@ import { getPublicStatus, type PublicComponentStatus } from "@/lib/publicApi";
 export function Footer() {
   const COPY = useCopy();
   const c = COPY.footer;
-  const [status, setStatus] = useState<PublicComponentStatus>("unknown");
+  // `null` = 尚未載入完成（初始態）。`getPublicStatus` 本身已把讀取失敗／格式異常
+  // 折疊成 `"unknown"`（見 lib/publicApi.ts），這裡再把 `"unknown"` 與 `null` 一起
+  // 折成「不渲染」——三種情況（載入中／unknown／讀取失敗）在畫面上完全等價。
+  const [status, setStatus] = useState<PublicComponentStatus | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -35,8 +40,7 @@ export function Footer() {
     };
   }, []);
 
-  const statusLabel =
-    status === "ok" ? c.statusOk : status === "degraded" ? c.statusDegraded : c.statusUnknown;
+  const statusLabel = status === "ok" ? c.statusOk : status === "degraded" ? c.statusDegraded : null;
 
   return (
     <footer className="app-footer">
@@ -44,10 +48,12 @@ export function Footer() {
         <div className="footer-brand">
           <div className="wordmark-mini">{COPY.common.appName}</div>
           <p>{c.brandTagline}</p>
-          <div className="footer-status" data-status={status}>
-            <span className="status-dot" aria-hidden="true" />
-            <span>{statusLabel}</span>
-          </div>
+          {statusLabel != null && (
+            <div className="footer-status" data-status={status}>
+              <span className="status-dot" aria-hidden="true" />
+              <span>{statusLabel}</span>
+            </div>
+          )}
         </div>
         <div>
           <div className="footer-col-title">{c.productTitle}</div>

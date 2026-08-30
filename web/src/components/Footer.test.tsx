@@ -59,10 +59,31 @@ describe("Footer", () => {
     expect(await screen.findByText(COPY_ZH.footer.statusDegraded)).toBeInTheDocument();
   });
 
-  it("狀態燈三態：unknown（含讀取失敗降級）→ 灰字「狀態未知」", async () => {
-    vi.stubGlobal("fetch", vi.fn(() => { throw new Error("network down"); }));
+  // ⭐ M3 round3 Task 9（R2 P2）：unknown／讀取失敗／載入中三態一律不渲染狀態燈
+  // （DOM 不存在，不是 visibility hidden）——不再有「狀態未知」灰字常駐。
+  it("狀態燈：unknown（後端明確回傳 unknown）→ 整顆燈不渲染（DOM 不存在）", async () => {
+    stubStatus("unknown");
     renderFooter();
-    expect(await screen.findByText(COPY_ZH.footer.statusUnknown)).toBeInTheDocument();
+    await screen.findByText(COPY_ZH.footer.productTitle); // 等 effect 跑完
+    expect(screen.queryByText(COPY_ZH.footer.statusUnknown)).not.toBeInTheDocument();
+    expect(document.querySelector(".footer-status")).not.toBeInTheDocument();
+  });
+
+  it("狀態燈：fetch 失敗（reject）→ 整顆燈不渲染（DOM 不存在）", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("network down"))));
+    renderFooter();
+    await screen.findByText(COPY_ZH.footer.productTitle); // 等 effect 跑完
+    expect(screen.queryByText(COPY_ZH.footer.statusUnknown)).not.toBeInTheDocument();
+    expect(document.querySelector(".footer-status")).not.toBeInTheDocument();
+  });
+
+  it("狀態燈：載入中（fetch 尚未 resolve）→ 整顆燈不渲染（DOM 不存在）", () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {}))); // 永不 resolve，模擬載入中
+    renderFooter();
+    expect(screen.queryByText(COPY_ZH.footer.statusOk)).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY_ZH.footer.statusDegraded)).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY_ZH.footer.statusUnknown)).not.toBeInTheDocument();
+    expect(document.querySelector(".footer-status")).not.toBeInTheDocument();
   });
 
   it("Task 12：系統狀態／績效方法論已接上真實連結", () => {
