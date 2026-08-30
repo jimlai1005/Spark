@@ -1,0 +1,645 @@
+"""src/spark/publicapi/hl_explore.py
+`GET /api/public/explore`（M3 round3 Task 1）——可跟單對象探索榜。
+
+背景與設計（主線程裁決 D1/D2/D3/D8/D10，plan
+`docs/superpowers/plans/2026-08-30-m3-ui-round3.md`）
+--------------------------------------------------------------------------
+`/api/public/leaderboard`（`hl_leaderboard.py`）只裁切 stats-data 的 pnl/roi/vlm，
+沒有回撤／勝率／交易日這類需要逐地址查詢才能算出的指標。本模組是「候選池選取 →
+逐地址 enrich → 資格過濾／排序 → 分頁」整條管線的唯一出口：
+
+1. **候選池**：stats-data month 窗（沿用 `hl_leaderboard` 既有的 36MB 快取，
+   不重複下載——見 `app.py` 接線）依 **roi 降冪**取前 N 名（`ExploreConfig.
+   candidate_pool`），排除 Filet 自營 leader（D8）。
+2. **逐地址 enrich**（`enrich_candidate`，純函式）：`portfolio()` 的
+   perpMonth/perpAllTime 視窗 ＋ `get_fills_detail()` 近 30 天成交 ＋
+   `clearinghouse_state()` 目前持倉，算出 30D 報酬／回撤／交易日／勝率／
+   集中度／曝險（公式定義見各函式 docstring，對齊 D2）。任一地址讀不到
+   → 該列整筆跳過（`None`），不進榜、不編數字（工程原則 3 的展示版）。
+3. **資格過濾與風險調整排序**（`qualify`／`sort_key`）**全在後端**（R2-01），
+   前端只送布林 chip 開關，不自己算。
+4. **`ExploreIndex`**：仿 `hl_leaderboard.LeaderboardCache` 的 TTL＋
+   single-flight 模式，多一層 per-address enrich 結果快取（TTL 30 分鐘、
+   LRU 上限 256）。建置在背景 thread 跑（`build_sync` 是實際工作，序列執行、
+   批間 sleep，保護與實盤引擎共用的 HL 額度）；**從未成功建置過**時
+   `query()` 立即回 `building: True` ＋空 rows，不阻塞呼叫端。已有舊版時，
+   即使背景正在重建或本輪上游故障，一律**回舊版**（fail-open，同
+   `LeaderboardCache` 檔頭精神）。
+
+工程原則 1（同源同基準）的落地：`ret_30d_pct`／`max_dd_30d_pct`／`spark` 三者
+出自**同一次** `portfolio()` 回應的**同一個** perpMonth `accountValueHistory`
+序列；`trading_days` 出自同一次回應的 perpAllTime 序列；三者不混用不同窗口
+或不同端點的資料。曝險（`exposure`）與帳戶規模 bucket 出自**同一次**
+`clearinghouse_state()` 回應。
+"""
+from __future__ import annotations
+
+import dataclasses
+import logging
+import os
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Callable
+
+from spark.filet.leader_perf import extract_window
+from spark.publicapi import hl_leaderboard
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 門檻常數（D3）：預設值＋環境變數可覆寫，見 `ExploreConfig.from_env`。
+# ---------------------------------------------------------------------------
+DEFAULT_CANDIDATE_POOL = 100
+DEFAULT_MIN_TRADING_DAYS = 60
+DEFAULT_MIN_FILLS = 200
+DEFAULT_MAX_DRAWDOWN_PCT = Decimal("30")
+DEFAULT_MAX_CONCENTRATION_PCT = Decimal("90")
+DEFAULT_PAGE_SIZE = 25
+
+INDEX_TTL_S = 600.0          # 10 分鐘（D1）
+ENRICH_CACHE_TTL_S = 1800.0  # 30 分鐘 per-address enrich 快取（D1）
+ENRICH_CACHE_MAX = 256       # LRU 上限（D1）
+FILLS_WINDOW_DAYS = 30
+SPARK_POINTS = 30
+# 風險調整排序鍵的回撤下限（D2）：回撤為 0 時代入，避免除零把新帳戶推上榜首。
+_DD_FLOOR_PCT = Decimal("0.5")
+
+
+# ---------------------------------------------------------------------------
+# 設定
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ExploreConfig:
+    candidate_pool: int = DEFAULT_CANDIDATE_POOL
+    min_trading_days: int = DEFAULT_MIN_TRADING_DAYS
+    min_fills: int = DEFAULT_MIN_FILLS
+    max_drawdown_pct: Decimal = DEFAULT_MAX_DRAWDOWN_PCT
+    max_concentration_pct: Decimal = DEFAULT_MAX_CONCENTRATION_PCT
+    page_size: int = DEFAULT_PAGE_SIZE
+
+    @classmethod
+    def from_env(cls, env: dict | None = None) -> "ExploreConfig":
+        """環境變數可覆寫、不寫死（D3）。全部 optional——缺一律落回模組預設值，
+        與 `ApiConfig.from_env` 的必填清單不同（探索榜是展示功能，不該因為漏設
+        一個門檻常數就讓整個 API 拒絕啟動）。"""
+        env = os.environ if env is None else env
+
+        def _int(key: str, default: int) -> int:
+            v = env.get(key)
+            return int(v) if v else default
+
+        def _dec(key: str, default: Decimal) -> Decimal:
+            v = env.get(key)
+            return Decimal(v) if v else default
+
+        return cls(
+            candidate_pool=_int("EXPLORE_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL),
+            min_trading_days=_int("EXPLORE_MIN_TRADING_DAYS", DEFAULT_MIN_TRADING_DAYS),
+            min_fills=_int("EXPLORE_MIN_FILLS", DEFAULT_MIN_FILLS),
+            max_drawdown_pct=_dec("EXPLORE_MAX_DRAWDOWN_PCT", DEFAULT_MAX_DRAWDOWN_PCT),
+            max_concentration_pct=_dec("EXPLORE_MAX_COIN_CONCENTRATION_PCT",
+                                       DEFAULT_MAX_CONCENTRATION_PCT),
+            page_size=_int("EXPLORE_PAGE_SIZE", DEFAULT_PAGE_SIZE),
+        )
+
+
+# ---------------------------------------------------------------------------
+# ExploreRow
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ExploreRow:
+    address: str
+    display_name: str | None
+    label: str                     # display_name 有值就用它，否則縮寫地址（D10）
+    coins: tuple[str, ...]         # 近 30D 成交額最大的前 2-3 個幣種
+    account_bucket: str
+    spark: tuple[float, ...]       # perpMonth accountValueHistory downsample（≤30 點）
+    ret_30d_pct: float
+    max_dd_30d_pct: float          # 負值或 0；絕對值愈大回撤愈深
+    trading_days: int
+    fill_count_30d: int
+    close_win_rate_pct: float | None   # None＝資料錯誤或無足夠樣本（R2-02）
+    concentration_pct: float | None
+    exposure_dir: str | None       # "多" / "空" / None（無倉位或無法解析）
+    exposure_pct: float | None
+    tags: tuple[str, ...] = ()     # 子集 {"低回撤", "集中度高"}
+
+    def to_dict(self) -> dict:
+        return {
+            "address": self.address,
+            "display_name": self.display_name,
+            "label": self.label,
+            "coins": list(self.coins),
+            "account_bucket": self.account_bucket,
+            "spark": list(self.spark),
+            "ret_30d_pct": self.ret_30d_pct,
+            "max_dd_30d_pct": self.max_dd_30d_pct,
+            "trading_days": self.trading_days,
+            "fill_count_30d": self.fill_count_30d,
+            "close_win_rate_pct": self.close_win_rate_pct,
+            "concentration_pct": self.concentration_pct,
+            "exposure": {"dir": self.exposure_dir, "pct": self.exposure_pct},
+            "tags": list(self.tags),
+        }
+
+
+# ---------------------------------------------------------------------------
+# 純函式：欄位計算（各自獨立、可單測，零網路）
+# ---------------------------------------------------------------------------
+def _return_and_drawdown(av_points: list[tuple[int, Decimal]]
+                         ) -> tuple[Decimal, Decimal] | None:
+    """D2：30D 報酬率＝首末點變化率；最大回撤＝running-peak 最深跌幅
+    `min_t(V_t/max_{s<=t}V_s - 1)`。首點 <=0 或序列途中出現 <=0（歸零／
+    轉負，帳戶被清算或資料錯誤）→ 整段剔除（`None`），不得用負值分母算出
+    爆炸性的假報酬（沿 `leader_perf.py` DENOMINATOR_FLOOR 同一條理由的極端版：
+    這裡分母直接非正，沒有下限可代入，只能剔除）。"""
+    if not av_points:
+        return None
+    values = [v for _, v in av_points]
+    if any(v <= 0 for v in values):
+        return None
+    v0, vn = values[0], values[-1]
+    ret_pct = (vn / v0 - 1) * 100
+    peak = values[0]
+    min_dd = Decimal("0")
+    for v in values:
+        if v > peak:
+            peak = v
+        dd = v / peak - 1
+        if dd < min_dd:
+            min_dd = dd
+    return ret_pct, min_dd * 100
+
+
+def _distinct_utc_days(av_points: list[tuple[int, Decimal]]) -> int:
+    """D2：交易日＝perpAllTime accountValueHistory 的 distinct UTC 日數。"""
+    days = {datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date()
+            for ts, _ in av_points}
+    return len(days)
+
+
+def _downsample_floats(values: list[Decimal], n: int = SPARK_POINTS) -> list[float]:
+    """等距抽樣至最多 `n` 點（sparkline 用）。點數本就 <= n → 全部回傳，不補點
+    （補點等於編造沒有發生過的淨值，違反「不編數字」）。"""
+    if not values:
+        return []
+    if len(values) <= n:
+        return [float(v) for v in values]
+    step = len(values) / n
+    idxs = [min(len(values) - 1, int(i * step)) for i in range(n)]
+    return [float(values[i]) for i in idxs]
+
+
+def _win_rate_pct(wins: int, closed: int) -> float | None:
+    """結倉勝率＝wins/closed*100。`closed<=0`（無結倉樣本）→ `None`。算出來的
+    值落在 [0,100] 之外（R2-02：資料錯誤，例如上游計數矛盾）一律視為資料錯誤，
+    顯示「—」而不是硬塞一個不可信的數字——閘門獨立於「怎麼數出 wins/closed」，
+    這樣即使未來計數邏輯換了寫法，值域校驗仍然擋得住。"""
+    if closed <= 0:
+        return None
+    pct = Decimal(wins) / Decimal(closed) * 100
+    if pct < 0 or pct > 100:
+        logger.error("close_win_rate_pct 值域外（資料錯誤）wins=%s closed=%s pct=%s",
+                     wins, closed, pct)
+        return None
+    return float(pct.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def _fills_stats(fills: list[dict]) -> tuple[int, float | None, float | None,
+                                              tuple[str, ...]]:
+    """近 30D fills（`hl.get_fills_detail()` 的輸出形狀：coin/px/sz/closed_pnl
+    等鍵，見 `hl.py`）→ `(fill_count, close_win_rate_pct, concentration_pct, coins)`。
+
+    - fill_count：窗內全部成交筆數（含開倉與結倉），對齊 D3 `EXPLORE_MIN_FILLS`
+      門檻的樣本量語意。
+    - 結倉勝率：`closedPnl != 0` 的結倉 fill 中 `closedPnl > 0` 的占比（D2）。
+    - 集中度：成交額（`abs(px*sz)`）最大幣種占全部成交額之比（D2）。
+    - coins：成交額前 2-3 名幣種（降冪），不足則全部列出。
+    """
+    if not fills:
+        return 0, None, None, ()
+    wins = closed = 0
+    notional_by_coin: dict[str, Decimal] = {}
+    total_notional = Decimal("0")
+    for f in fills:
+        try:
+            coin = f["coin"]
+            px = Decimal(str(f["px"]))
+            sz = Decimal(str(f["sz"]))
+        except (KeyError, ValueError, TypeError, InvalidOperation):
+            continue
+        notional = abs(px * sz)
+        notional_by_coin[coin] = notional_by_coin.get(coin, Decimal("0")) + notional
+        total_notional += notional
+        closed_pnl_raw = f.get("closed_pnl")
+        if closed_pnl_raw is None:
+            continue
+        try:
+            cp = Decimal(str(closed_pnl_raw))
+        except (ValueError, TypeError, InvalidOperation):
+            continue
+        if cp != 0:
+            closed += 1
+            if cp > 0:
+                wins += 1
+    win_rate = _win_rate_pct(wins, closed)
+    concentration = None
+    if total_notional > 0:
+        top_notional = max(notional_by_coin.values())
+        concentration = float((top_notional / total_notional * 100)
+                              .quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+    coins = tuple(c for c, _ in sorted(notional_by_coin.items(),
+                                       key=lambda kv: kv[1], reverse=True)[:3])
+    return len(fills), win_rate, concentration, coins
+
+
+def _account_value(ch_state: dict) -> Decimal | None:
+    try:
+        return Decimal(str(ch_state["marginSummary"]["accountValue"]))
+    except (KeyError, ValueError, TypeError, InvalidOperation):
+        return None
+
+
+def _account_bucket(account_value: Decimal | None) -> str:
+    if account_value is None:
+        return "—"
+    if account_value < Decimal("10000"):
+        return "<$10K"
+    if account_value < Decimal("100000"):
+        return "$10K–$100K"
+    if account_value < Decimal("1000000"):
+        return "$100K–$1M"
+    return "$1M+"
+
+
+def _parse_positions(ch_state: dict) -> list[dict] | None:
+    """`assetPositions` → `[{"side": "long"/"short", "value": Decimal}, ...]`。
+    `value = marginUsed × leverage`（同 `app.py._dashboard_positions_raw` 的
+    既有欄位推導，欄位名已在該處驗證過，不是憑印象——刻意不 import 那支函式：
+    `app.py` 會 import 本模組，import 回去會成環）。形狀不符 → `None`
+    （呼叫端把曝險欄位個別降級成 `None`，不因持倉解析失敗連坐整列）。"""
+    if not isinstance(ch_state, dict):
+        return None
+    raw = ch_state.get("assetPositions")
+    if not isinstance(raw, list):
+        return None
+    out: list[dict] = []
+    try:
+        for item in raw:
+            pos = item["position"]
+            szi = Decimal(str(pos["szi"]))
+            if szi == 0:
+                continue
+            leverage = pos["leverage"]
+            lev_val = Decimal(str(leverage["value"]))
+            margin_used = Decimal(str(pos["marginUsed"]))
+            out.append({"side": "long" if szi > 0 else "short",
+                       "value": margin_used * lev_val})
+    except (KeyError, ValueError, ArithmeticError, TypeError):
+        return None
+    return out
+
+
+def _exposure(positions: list[dict] | None) -> tuple[str | None, float | None]:
+    if not positions:
+        return None, None
+    total = sum((p["value"] for p in positions), Decimal("0"))
+    if total <= 0:
+        return None, None
+    long_value = sum((p["value"] for p in positions if p["side"] == "long"), Decimal("0"))
+    short_value = total - long_value
+    if long_value >= short_value:
+        pct = (long_value / total * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        return "多", float(pct)
+    pct = (short_value / total * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return "空", float(pct)
+
+
+def _abbreviate_address(address: str) -> str:
+    if not (isinstance(address, str) and address.startswith("0x") and len(address) >= 10):
+        return address
+    return f"{address[:6]}…{address[-4:]}"
+
+
+def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
+                     fills: list[dict], ch_state: dict) -> ExploreRow | None:
+    """純函式：候選地址的三份原始 HL 回應 → `ExploreRow`，或 `None`（該列整筆
+    跳過，見模組檔頭第 2 點）。
+
+    `portfolio_raw`：`hl.portfolio(address)` 的原始回應。
+    `fills`：`hl.get_fills_detail(address, start, end)` 的輸出（近 30D 窗，
+    窗口切法屬呼叫端 `ExploreIndex` 職責，本函式不管時間窗正確性）。
+    `ch_state`：`hl.clearinghouse_state(address)` 的原始回應。
+
+    跳過整列的情況（讀不到就跳過，不編數字）：perpMonth 或 perpAllTime 視窗
+    缺失／形狀不符；或 perpMonth 淨值序列首點 <=0／途中歸零或轉負。
+    `tags` 留空（`()`）——集中度與低回撤兩個 tag 需要「這一批候選池」的相對
+    資訊（門檻常數／同批分位數），由 `ExploreIndex.build_sync` 建完整批後
+    再用 `_apply_tags` 統一補上，不在單一地址的純函式裡決定。
+    """
+    month = extract_window(portfolio_raw, "perpMonth")
+    if month is None:
+        return None
+    av_month, _ = month
+    rd = _return_and_drawdown(av_month)
+    if rd is None:
+        return None
+    ret_pct, dd_pct = rd
+
+    all_time = extract_window(portfolio_raw, "perpAllTime")
+    if all_time is None:
+        return None
+    av_all, _ = all_time
+    trading_days = _distinct_utc_days(av_all)
+
+    spark = _downsample_floats([v for _, v in av_month])
+    fill_count, win_rate, concentration, coins = _fills_stats(fills or [])
+    account_value = _account_value(ch_state)
+    bucket = _account_bucket(account_value)
+    positions = _parse_positions(ch_state)
+    exp_dir, exp_pct = _exposure(positions)
+
+    return ExploreRow(
+        address=address,
+        display_name=display_name,
+        label=display_name if display_name else _abbreviate_address(address),
+        coins=coins,
+        account_bucket=bucket,
+        spark=tuple(spark),
+        ret_30d_pct=float(ret_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        max_dd_30d_pct=float(dd_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        trading_days=trading_days,
+        fill_count_30d=fill_count,
+        close_win_rate_pct=win_rate,
+        concentration_pct=concentration,
+        exposure_dir=exp_dir,
+        exposure_pct=exp_pct,
+        tags=(),
+    )
+
+
+def _apply_tags(rows: list[ExploreRow], cfg: ExploreConfig) -> list[ExploreRow]:
+    """整批 enrich 完成後才能算的兩個 tag：
+    - 「集中度高」：`concentration_pct > cfg.max_concentration_pct`（逐列獨立）。
+    - 「低回撤」：本批 `|max_dd_30d_pct|` 最小的下四分位（含邊界）——需要同批
+      其他列的分佈才能定義，故不在 `enrich_candidate` 裡做（見該函式檔頭）。
+    """
+    if not rows:
+        return rows
+    dds = sorted(abs(Decimal(str(r.max_dd_30d_pct))) for r in rows)
+    threshold = dds[max(0, -(-len(dds) // 4) - 1)]  # 下四分位邊界（含）
+    out = []
+    for r in rows:
+        tags = []
+        if abs(Decimal(str(r.max_dd_30d_pct))) <= threshold:
+            tags.append("低回撤")
+        if (r.concentration_pct is not None
+                and Decimal(str(r.concentration_pct)) > cfg.max_concentration_pct):
+            tags.append("集中度高")
+        out.append(dataclasses.replace(r, tags=tuple(tags)))
+    return out
+
+
+def qualify(row: ExploreRow, cfg: ExploreConfig, *, require_sample: bool = True,
+           max_dd_filter: bool = True, exclude_concentrated: bool = True) -> bool:
+    """資格過濾（R2-01，全在後端）。三個布林對應前端三個獨立 chip（D1 端點的
+    `qualified`/`max_dd`/`exclude_concentrated` 參數），可各自關閉查看未過濾列表。
+
+    邊界（equal 一律算通過——常數描述的是「上限」/「下限」，卡在門檻上不該被
+    無聲刷掉；本模組唯一的權威定義，測試逐條釘死）：
+    - 樣本門檻：`trading_days >= min_trading_days` 且 `fill_count_30d >= min_fills`
+      （下限，"至少"語意，等於門檻通過）。
+    - 回撤上限：`abs(max_dd_30d_pct) <= max_drawdown_pct`（等於門檻通過）。
+    - 集中度上限：`concentration_pct <= max_concentration_pct`（等於門檻通過；
+      `None`＝無成交量資料可算集中度，視為通過——沒有證據代表集中，不得因為
+      缺資料就先假設它超標）。
+    """
+    if require_sample:
+        if row.trading_days < cfg.min_trading_days:
+            return False
+        if row.fill_count_30d < cfg.min_fills:
+            return False
+    if max_dd_filter:
+        if abs(Decimal(str(row.max_dd_30d_pct))) > cfg.max_drawdown_pct:
+            return False
+    if exclude_concentrated:
+        if (row.concentration_pct is not None
+                and Decimal(str(row.concentration_pct)) > cfg.max_concentration_pct):
+            return False
+    return True
+
+
+def sort_key(row: ExploreRow) -> Decimal:
+    """風險調整排序鍵（D2）＝ 30D 報酬率 ÷ |30D 最大回撤|；回撤絕對值低於
+    `_DD_FLOOR_PCT`（0.5%）時代入下限，避免近乎零回撤的帳戶靠除零式放大霸榜。"""
+    ret = Decimal(str(row.ret_30d_pct))
+    dd = abs(Decimal(str(row.max_dd_30d_pct)))
+    if dd < _DD_FLOOR_PCT:
+        dd = _DD_FLOOR_PCT
+    return ret / dd
+
+
+def paginate(rows: list[ExploreRow], page: int, page_size: int) -> list[ExploreRow]:
+    """1-indexed 分頁；`page`/`page_size` 非正 → 空清單（呼叫端的端點層另外
+    對這兩個參數做 422 驗證，這裡只負責純粹的切片語意）。"""
+    if page < 1 or page_size < 1:
+        return []
+    start = (page - 1) * page_size
+    return rows[start:start + page_size]
+
+
+def _roi_sort_key(row: dict) -> Decimal:
+    """候選池排序鍵：stats-data month 窗的 roi（降冪）。刻意重用
+    `hl_leaderboard._window_perf`（同套件內部函式，解析的是同一份
+    `windowPerformances` 配對清單——見該函式檔頭已驗證過的形狀假設，不重新
+    發明一份可能漂移的複本）。缺窗／解析失敗／NaN 一律排到最後（鏡像
+    `hl_leaderboard._pnl_sort_key` 的既有慣例）。"""
+    perf = hl_leaderboard._window_perf(row, "month")
+    try:
+        value = Decimal(str(perf.get("roi", "")))
+    except (InvalidOperation, TypeError):
+        return Decimal("-Infinity")
+    if value.is_nan():
+        return Decimal("-Infinity")
+    return value
+
+
+def candidate_addresses(payload: dict, pool_size: int,
+                        excluded: set[str]) -> list[tuple[str, str | None]]:
+    """D1 候選池：stats-data month 窗依 roi 降冪取前 `pool_size` 名，排除
+    `excluded`（Filet 自營 leader 地址，D8；比對前正規化小寫）。回傳
+    `[(address, display_name), ...]`，address 原樣（不轉小寫——與
+    `hl_leaderboard.top_rows` 對外欄位一致，前端顯示用；enrich 查詢用
+    `HLGateway` 對大小寫不敏感）。"""
+    rows = (payload or {}).get("leaderboardRows") or []
+    sortable = [r for r in rows
+               if isinstance(r, dict) and r.get("ethAddress")
+               and r["ethAddress"].lower() not in excluded]
+    sortable.sort(key=_roi_sort_key, reverse=True)
+    return [(r["ethAddress"], r.get("displayName")) for r in sortable[:pool_size]]
+
+
+# ---------------------------------------------------------------------------
+# ExploreIndex：背景建置、原子換版（D1）
+# ---------------------------------------------------------------------------
+class ExploreIndex:
+    """`GET /api/public/explore` 的資料索引。仿 `hl_leaderboard.LeaderboardCache`
+    的 TTL 精神，但建置成本遠高於一次 GET（要序列 enrich 上百個地址），所以
+    改用「背景 thread 建置、讀路徑永不阻塞」而非該類別的『等進行中那條 thread』
+    模式——見 `query()`。
+
+    `leaderboard_source_fn`：回傳 stats-data month 窗原始 payload 或 `None`
+    （沿用既有 `LeaderboardCache` 實例，不重複下載 36MB，見 `app.py` 接線）。
+    `hl`：需提供 `.portfolio()` / `.get_fills_detail()` / `.clearinghouse_state()`
+    （唯讀，見 `hl.py`）。
+    `excluded_fn`：回傳 Filet 自營 leader 地址集合（D8，見 `app.py` 接線，讀精選
+    白名單）。
+    """
+
+    def __init__(self, *, leaderboard_source_fn: Callable[[], dict | None],
+                hl, excluded_fn: Callable[[], set[str]], cfg: ExploreConfig,
+                now_fn: Callable[[], float], sleep_fn=time.sleep,
+                index_ttl_s: float = INDEX_TTL_S,
+                enrich_ttl_s: float = ENRICH_CACHE_TTL_S,
+                enrich_cache_max: int = ENRICH_CACHE_MAX,
+                batch_sleep_s: float = 0.05,
+                fills_window_days: int = FILLS_WINDOW_DAYS):
+        self._leaderboard_source_fn = leaderboard_source_fn
+        self._hl = hl
+        self._excluded_fn = excluded_fn
+        self._cfg = cfg
+        self._now_fn = now_fn
+        self._sleep_fn = sleep_fn
+        self._ttl_s = index_ttl_s
+        self._enrich_ttl_s = enrich_ttl_s
+        self._enrich_cache_max = enrich_cache_max
+        self._batch_sleep_s = batch_sleep_s
+        self._fills_window_days = fills_window_days
+
+        self._lock = threading.Lock()
+        self._rows: list[ExploreRow] | None = None   # 目前對外服務的一版
+        self._built_at: float | None = None
+        self._total_scanned = 0
+        self._building = False                         # single-flight：背景建置中
+        self._enrich_cache: dict[str, tuple[float, ExploreRow | None]] = {}
+
+    def _enrich_one(self, address: str, display_name: str | None) -> ExploreRow | None:
+        """per-address enrich，帶 30 分鐘 TTL、LRU 256 上限快取（近似 LRU：
+        淘汰最舊寫入時間，同 `app.py._cached_trader_data` 既有寫法）。任何一步
+        （portfolio/fills/clearinghouse）失敗 → 整列跳過（`None`），記入快取，
+        60 天內同一輪重建不會重複打壞地址的上游（enrich TTL 本身就是負面快取）。
+        """
+        now = self._now_fn()
+        with self._lock:
+            cached = self._enrich_cache.get(address)
+        if cached is not None and now - cached[0] < self._enrich_ttl_s:
+            return cached[1]
+        row: ExploreRow | None = None
+        try:
+            portfolio_raw = self._hl.portfolio(address)
+            end = datetime.fromtimestamp(now, tz=timezone.utc)
+            start = end - timedelta(days=self._fills_window_days)
+            fills = self._hl.get_fills_detail(address, start, end)
+            ch_state = self._hl.clearinghouse_state(address)
+            row = enrich_candidate(address, display_name, portfolio_raw, fills, ch_state)
+        except Exception as e:  # noqa: BLE001 — 展示端點：單一地址失敗不得中斷整批建置
+            logger.error("explore enrich 失敗 address=%s: %r", address, e)
+            row = None
+        with self._lock:
+            if (address not in self._enrich_cache
+                    and len(self._enrich_cache) >= self._enrich_cache_max):
+                oldest = min(self._enrich_cache, key=lambda k: self._enrich_cache[k][0])
+                del self._enrich_cache[oldest]
+            self._enrich_cache[address] = (now, row)
+        return row
+
+    def build_sync(self) -> None:
+        """實際建置工作（背景 thread 的 target；亦可在測試中直接同步呼叫取得
+        決定性行為，不必跑真線程）。
+
+        上游候選池來源失敗／無資料 → 直接返回、**不動** `self._rows`
+        （fail-open 到舊版；若本來就沒有舊版，`query()` 會繼續回
+        `building: True`，見類別檔頭）。排除清單載入失敗 → 視為空清單
+        （寧可這一輪意外把 Filet 自營地址也掃進候選池——下一輪排除清單恢復
+        就會自然排除——也不要整個建置流程被一個旁支查詢拖垮）。
+        """
+        try:
+            payload = self._leaderboard_source_fn()
+        except Exception as e:  # noqa: BLE001 — fail-open，見上
+            logger.error("explore index：候選池來源查詢失敗: %r", e)
+            payload = None
+        if payload is None:
+            logger.error("explore index：leaderboard 來源無資料，本輪建置跳過（沿用舊版）")
+            return
+        try:
+            excluded = {a.lower() for a in (self._excluded_fn() or set())}
+        except Exception as e:  # noqa: BLE001
+            logger.error("explore index：Filet 自營地址排除清單載入失敗，本輪視為空清單: %r", e)
+            excluded = set()
+
+        candidates = candidate_addresses(payload, self._cfg.candidate_pool, excluded)
+        rows: list[ExploreRow] = []
+        for address, display_name in candidates:
+            row = self._enrich_one(address, display_name)
+            if row is not None:
+                rows.append(row)
+            self._sleep_fn(self._batch_sleep_s)
+        rows = _apply_tags(rows, self._cfg)
+
+        with self._lock:
+            self._rows = rows
+            self._built_at = self._now_fn()
+            self._total_scanned = len(candidates)
+
+    def _maybe_trigger_build(self) -> None:
+        """TTL 過期（或從未建置過）且目前沒有背景建置在跑 → 開一條 daemon
+        thread 執行 `build_sync`；呼叫本身立即返回，不等 thread 結束
+        （見類別檔頭：讀路徑永不阻塞）。"""
+        now = self._now_fn()
+        with self._lock:
+            fresh = self._built_at is not None and now - self._built_at < self._ttl_s
+            if fresh or self._building:
+                return
+            self._building = True
+
+        def worker():
+            try:
+                self.build_sync()
+            finally:
+                with self._lock:
+                    self._building = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def query(self, *, page: int = 1, require_sample: bool = True,
+             max_dd_filter: bool = True, exclude_concentrated: bool = True) -> dict:
+        """讀路徑：永不阻塞（觸發背景建置後立即用目前狀態回應）。回傳形狀見
+        `app.py` 端點層文件字串：`{rows, page, page_size, total_qualified,
+        total_scanned, updated_at, building}`。
+
+        從未成功建置過（`self._rows is None`）→ `building: True`、空 rows、
+        計數皆 0、`updated_at: None`（前端 R2·C 態二）。
+        """
+        self._maybe_trigger_build()
+        with self._lock:
+            rows = self._rows
+            built_at = self._built_at
+            total_scanned = self._total_scanned
+        if rows is None:
+            return {"rows": [], "page": page, "page_size": self._cfg.page_size,
+                   "total_qualified": 0, "total_scanned": 0,
+                   "updated_at": None, "building": True}
+        qualified_rows = [r for r in rows
+                          if qualify(r, self._cfg, require_sample=require_sample,
+                                    max_dd_filter=max_dd_filter,
+                                    exclude_concentrated=exclude_concentrated)]
+        qualified_rows.sort(key=sort_key, reverse=True)
+        page_rows = paginate(qualified_rows, page, self._cfg.page_size)
+        return {"rows": [r.to_dict() for r in page_rows], "page": page,
+               "page_size": self._cfg.page_size,
+               "total_qualified": len(qualified_rows), "total_scanned": total_scanned,
+               "updated_at": int(built_at) if built_at is not None else None,
+               "building": False}

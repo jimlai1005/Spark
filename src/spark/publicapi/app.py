@@ -35,11 +35,11 @@ from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
                                      MDD_SAMPLING_NOTE, UPPER_BOUND_NOTE,
                                      compute_window_performance, extract_window)
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
-from spark.filet.leaders import LeaderRef, is_selectable, load_leaders
-from spark.filet.strategies import (build_equity_index, build_methodology,
-                                    build_strategy_view)
-from spark.publicapi import public_stats
-from spark.filet.user_leaders import load_user_leaders, record_user_leader
+from spark.filet.leaders import LeaderRef, find_leader, is_selectable, load_leaders
+from spark.filet.strategies import (build_equity_index, build_metrics,
+                                    build_methodology, build_strategy_view)
+from spark.publicapi import hl_explore, hl_leaderboard, public_stats
+from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
 from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
@@ -814,8 +814,56 @@ def _dashboard_pnl_and_return(ref: FollowerRef, hl, positions: list[dict] | None
     return pnl_block, ret_30d
 
 
+# ---------- /api/me/authorizations（M3 round2 Task 7）純函式層 ----------
+# ⭐ action.type 的確切字串是 2026-08-29 curl 實測（見 hl.py user_details 檔頭
+# 與 tests/fixtures/hl_explorer_user_details_sample.json），不是憑印象/文件猜的
+# camelCase（工程原則：欄位名是假設不是事實）。
+
+_AUTHORIZATION_ACTION_TYPES = frozenset({"approveAgent", "approveBuilderFee"})
+
+
+def _authorization_detail(action: dict) -> dict:
+    """單一動作 → 結構化欄位（[W2] 2026-08-29 opus 審查修正：後端曾直接組出
+    中文摘要字串——語系一律出自 `web/src/lib/copy.ts`，後端寫死中文等於繞過
+    那條紅線且無法雙語化。改回只給機器可讀的原始欄位，組字留給前端。未知
+    欄位缺漏一律降級為 `None`，不猜造內容。"""
+    action_type = action.get("type")
+    if action_type == "approveAgent":
+        return {"agent_address": action.get("agentAddress"), "builder": None,
+                "max_fee_rate": None}
+    if action_type == "approveBuilderFee":
+        return {"agent_address": None, "builder": action.get("builder"),
+                "max_fee_rate": action.get("maxFeeRate")}
+    return {"agent_address": None, "builder": None, "max_fee_rate": None}
+
+
+def filter_authorizations(txs: list, limit: int) -> list[dict]:
+    """explorer `userDetails` 原始 txs → 只留 approveAgent／approveBuilderFee，
+    按時間降冪排序後裁切前 `limit` 筆。形狀不符的條目直接跳過（不得讓一筆壞
+    資料炸掉整份清單）。"""
+    out = []
+    for tx in txs or []:
+        if not isinstance(tx, dict):
+            continue
+        action = tx.get("action")
+        if not isinstance(action, dict) or action.get("type") not in _AUTHORIZATION_ACTION_TYPES:
+            continue
+        try:
+            time_ms = int(tx["time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append({
+            "time": time_ms,
+            "action_type": action["type"],
+            **_authorization_detail(action),
+            "hash": tx.get("hash", ""),
+        })
+    out.sort(key=lambda r: r["time"], reverse=True)
+    return out[:limit]
+
+
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
-               billing=None, notifier=None) -> FastAPI:
+               billing=None, notifier=None, leaderboard_get_fn=None) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -1497,6 +1545,240 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                    {"name": "engine", "status": "unknown"}],
                     "updated_at": int(now_fn())}
 
+    # ---------- /api/public/leaderboard（M3 round2 Task 5）----------
+    # ⭐ 上游 stats-data 全量 leaderboard 是 36MB JSON——絕不可讓瀏覽器直連。
+    # 本端點是唯一出口：10 分鐘 in-process 快取（`hl_leaderboard.LeaderboardCache`，
+    # fail-open 到舊值），依 window 排序後只回傳裁切列。無需登入，無 cookie 副作用
+    # （與 /api/public/strategies* 同一類公開展示端點）。
+    _leaderboard_cache = hl_leaderboard.LeaderboardCache(
+        now_fn=now_fn, get_fn=leaderboard_get_fn)
+
+    @app.get("/api/public/leaderboard")
+    def public_leaderboard(window: str = "month", limit: int = 100):
+        """Hyperliquid 主網公開交易排行榜（展示用，非本站策略/客戶資料）。
+        壞 `window`／`limit` → 422；快取從未成功抓過任何資料（首次抓取即失敗，
+        無舊值可回退）→ 503；其餘情況一律回 200（沿用 fail-open 到 stale 資料
+        的既有精神——見 `hl_leaderboard` 檔頭）。"""
+        if window not in hl_leaderboard.WINDOWS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"window 須為 {'/'.join(hl_leaderboard.WINDOWS)} 之一")
+        if not (1 <= limit <= 100):
+            raise HTTPException(status_code=422, detail="limit 須介於 1 到 100")
+        # ⭐ [C2] 走快取物件自己的 `top_rows`（記憶化排序，見 hl_leaderboard 檔頭），
+        # 不再自己 `.get()` 完 payload 後每個請求重排一次全量列表。
+        rows = _leaderboard_cache.top_rows(window, limit)
+        if rows is None:
+            raise HTTPException(status_code=503, detail="排行榜資料暫時不可用，請稍後重試")
+        # ⭐ [8b-4] `updated_at` 是資料實際抓取完成的時間戳（`LeaderboardCache.
+        # cached_at`），不是請求當下的 `now_fn()`——後者會讓客戶端誤以為資料
+        # 剛更新，即便實際上是 fail-open 續用的十分鐘前舊值。走到這裡代表
+        # `top_rows` 已成功取得 payload，`cached_at` 理論上不會是 None；
+        # `or now_fn()` 只是防禦性兜底，不是預期路徑。
+        updated_at = _leaderboard_cache.cached_at
+        return {"window": window, "updated_at": int(updated_at or now_fn()), "rows": rows}
+
+    # ---------- /api/public/explore（M3 round3 Task 1）----------
+    # ⭐ 可跟單對象探索榜（R2·A）。候選池來源沿用**同一個** `_leaderboard_cache`
+    # 實例（D1：不重複下載 36MB stats-data payload）；排除清單＝精選白名單
+    # （D8，Filet 自營 leader）。詳見 `hl_explore.py` 檔頭。
+    def _explore_excluded_addresses() -> set[str]:
+        """Filet 自營 leader 地址集合（D8）。白名單載入失敗 → 空集合＋記錄
+        （fail-open：這是「要不要把自己的策略也列進探索榜」的展示層判斷，不是
+        資金安全判斷，不比照 `_load_leaders_or_503` 503 掉整個公開端點）。"""
+        try:
+            return {r.address for r in load_leaders(cfg.leaders_path)}
+        except (OSError, ValueError) as e:
+            logger.error("explore 排除清單（精選白名單）載入失敗，本輪視為空清單: %s", e)
+            return set()
+
+    _explore_index = hl_explore.ExploreIndex(
+        leaderboard_source_fn=_leaderboard_cache.get,
+        hl=hl,
+        excluded_fn=_explore_excluded_addresses,
+        cfg=hl_explore.ExploreConfig.from_env(),
+        now_fn=now_fn,
+    )
+    app.state.explore_index = _explore_index  # 唯讀 introspection seam（沿既有慣例）
+
+    @app.get("/api/public/explore")
+    def public_explore(window: str = "30d", page: int = 1, qualified: int = 1,
+                       max_dd: int = 1, exclude_concentrated: int = 1):
+        """探索跟單對象榜（無需登入）。本輪只實作 `window=30d`（D1：7D/90D/全部
+        的 enrich 成本是 ×4，前端 chip 先 disabled）；壞 `window`／`page` 非正
+        整數／布林參數不是 0 或 1 → 422。資格過濾與風險調整排序全在後端
+        （R2-01）；建置中或上游從未成功過 → `building: true` ＋空 rows
+        （200，不是 503——這是漸進式建置中的正常狀態，不是故障，見
+        `hl_explore.ExploreIndex.query`）。"""
+        if window != "30d":
+            raise HTTPException(status_code=422, detail="window 本輪僅支援 30d")
+        if page < 1:
+            raise HTTPException(status_code=422, detail="page 須為正整數")
+        for name, v in (("qualified", qualified), ("max_dd", max_dd),
+                        ("exclude_concentrated", exclude_concentrated)):
+            if v not in (0, 1):
+                raise HTTPException(status_code=422, detail=f"{name} 須為 0 或 1")
+        return _explore_index.query(page=page, require_sample=bool(qualified),
+                                    max_dd_filter=bool(max_dd),
+                                    exclude_concentrated=bool(exclude_concentrated))
+
+    # ---------- /api/public/traders/{address}（M3 round2 Task 6）----------
+    # ⭐ leaderboard 任意地址的詳情頁——不受精選白名單管轄（`leaders.py` 唯讀，
+    # 本區塊完全不 import 它）。計算重用 `filet.strategies` 的純函式
+    # （`build_metrics`／`build_equity_index`／`build_methodology`），與
+    # `/api/public/strategies/{slug}` 共用同一份公式——不重算。回應形狀刻意
+    # 只對齊 `metrics`／`equity_index`／`methodology`（plan Task 6 明訂範圍），
+    # 不硬套 `build_strategy_view`：那個函式吃 `LeaderRef`（name/slug/tagline/
+    # featured/listable…），這些欄位對一個任意鏈上地址沒有意義，硬塞一個假
+    # LeaderRef 只會產生看起來像策展資訊、實際是編造的欄位。
+    # ⭐ [8b-1] 2026-08-29 二輪複審 Critical：`clearinghouse_state` 原本每個請求
+    # 無條件打一次上游（複審實測 50 個匿名請求 → 50 次上游，完全不受任何快取或
+    # 限流保護——它跟 `portfolio` 是「兩個不同端點」沒錯，但兩者的**快取時機**
+    # 不該分開：同一次 cache miss 應該一起抓、一起算一次配額，而不是 portfolio
+    # 有快取、account_value 卻是無底洞的放大面）。修法：併入同一個快取條目，
+    # tuple 多存一個 account_value 欄位；`_enforce_probe_ratelimit` 只在這次
+    # 合併 miss 呼叫一次。
+    _trader_portfolio_cache: dict[str, tuple[float, list, str | None]] = {}
+    _trader_portfolio_lock = threading.Lock()
+    TRADER_PORTFOLIO_CACHE_TTL_S = 300.0  # 5 分鐘（plan 明訂）
+    TRADER_PORTFOLIO_CACHE_MAX = 256      # 上限地址數（防濫用，plan 明訂）
+    # 唯讀 introspection seam（沿 `probe_ratelimit_hits` 的既有模式，[8b-3]）：
+    # 讓測試能直接斷言快取 dict 大小／內容是否真的守住 256 上限，不必靠時鐘
+    # 推進去間接推論（那條路徑會被 TTL 過期悄悄混淆，見 [8b-3] 的複審 mutation
+    # 實證：把上限改成 999999，靠時鐘推進的舊測試照樣通過）。
+    app.state.trader_portfolio_cache = _trader_portfolio_cache
+    # ⭐ [C1] 2026-08-29 opus 審查：portfolio 抓取失敗的短 TTL 負面快取——防同一個
+    # 壞地址（不存在／上游持續 5xx）被重複打上游。與成功快取分開一個 dict，理由是
+    # 兩者的淘汰與 TTL 語意不同（成功快取有 256 上限＋LRU 淘汰，失敗快取沒有值可存，
+    # 只記「何時失敗過」，靠 TTL 自然過期，不需要另外設上限）。
+    _trader_portfolio_negative_cache: dict[str, float] = {}
+    TRADER_PORTFOLIO_NEGATIVE_TTL_S = 60.0
+
+    def _cached_trader_data(address: str, ratelimit_key: str) -> tuple[list | None, str | None]:
+        """`hl.portfolio()` ＋ `hl.clearinghouse_state()` 的 5 分鐘 per-address
+        **合併**快取，上限 256 個地址。同一次 cache miss 把兩個上游一起抓、
+        `_enforce_probe_ratelimit` 只計費一次（見 [8b-1]）——`account_value`
+        （clearinghouseState）失敗只讓它降級為 `None`，不影響 `rows`（portfolio，
+        equity 曲線與 metrics 的唯一資料源）是否成功快取；`rows` 失敗才走負面
+        快取短路整個條目（工程原則 1：兩個來源分別展示各自的數字，不混進同一個
+        對比，但**快取時機**合併不影響這條原則——兩個欄位在回應裡仍各自標明
+        來源、各自可能為 `None`）。
+
+        超過上限時淘汰最舊一筆（近似 LRU）；`rows` 失敗改記負面快取（見上）而非
+        完全不快取——同一壞地址在 60s 內重打會直接短路，不再二次打上游。
+
+        `ratelimit_key`：呼叫端派生的 per-client 識別（本端點無 session，見
+        `public_trader_detail`），不是位址——按位址計費擋不住「同一個 client
+        輪流枚舉不同位址」這個真正的上游放大面（見 [C1]）。"""
+        now = now_fn()
+        with _trader_portfolio_lock:
+            cached = _trader_portfolio_cache.get(address)
+            failed_at = _trader_portfolio_negative_cache.get(address)
+        if cached is not None and now - cached[0] < TRADER_PORTFOLIO_CACHE_TTL_S:
+            return cached[1], cached[2]
+        if failed_at is not None and now - failed_at < TRADER_PORTFOLIO_NEGATIVE_TTL_S:
+            return None, None
+        # ⭐ [C1] per-client rate limit：只在真的要打上游（快取未命中、負面快取也
+        # 已過期）這一刻才計費——cache/negative-cache 命中不消耗額度，因為那兩條
+        # 路徑本來就不會產生上游流量，計費在那兩條路徑上只會誤傷正常瀏覽。
+        _enforce_probe_ratelimit(ratelimit_key)
+        try:
+            rows = hl.portfolio(address)
+        except Exception as e:  # noqa: BLE001 — 公開端點：上游任何失敗都不得 500
+            logger.error("交易員績效上游查詢失敗 address=%s: %s", address, e)
+            with _trader_portfolio_lock:
+                _trader_portfolio_negative_cache[address] = now
+            return None, None
+        account_value = None
+        try:
+            cs = hl.clearinghouse_state(address)
+            account_value = cs.get("marginSummary", {}).get("accountValue")
+        except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
+            logger.error("交易員 account_value 查詢失敗 address=%s: %s", address, e)
+        with _trader_portfolio_lock:
+            _trader_portfolio_negative_cache.pop(address, None)
+            if (address not in _trader_portfolio_cache
+                    and len(_trader_portfolio_cache) >= TRADER_PORTFOLIO_CACHE_MAX):
+                oldest = min(_trader_portfolio_cache,
+                            key=lambda k: _trader_portfolio_cache[k][0])
+                del _trader_portfolio_cache[oldest]
+            _trader_portfolio_cache[address] = (now, rows, account_value)
+        return rows, account_value
+
+    def _trader_follow_blocked(addr: str) -> bool:
+        """[W4] 已被安全撤銷（`enabled=false`）的 leader 不該在交易員詳情頁看到
+        跟單 CTA。合併視圖與 `leaders_preview`/`leaders_select` 同一份（精選優先、
+        缺則由 user registry 遞補，見 `merge_leaders` 檔頭）；白名單檔案唯讀，
+        本函式只讀不寫。
+
+        載入失敗 → fail-closed（回 True，隱藏 CTA）：這是安全相關判斷（會不會把
+        新客戶導去跟一個已撤銷的 leader），寧可誤傷「暫時看不到 CTA」也不要誤放
+        行——不像 `account_value` 那種純展示欄位可以安靜降級成 `null`。"""
+        try:
+            merged = merge_leaders(load_leaders(cfg.leaders_path),
+                                   load_user_leaders(cfg.user_leaders_path))
+        except (OSError, ValueError) as e:
+            logger.error("交易員 follow_blocked 白名單查詢失敗 address=%s: %s", addr, e)
+            return True
+        ref = find_leader(addr, merged)
+        return bool(ref is not None and not ref.enabled)
+
+    _TRADER_PROBE_KEY_PREFIX = "public_trader_probe:"
+
+    @app.get("/api/public/traders/{address}")
+    def public_trader_detail(address: str, request: Request):
+        """任意 HL 地址的鏈上績效詳情（無需登入）。`address` 需為 `0x` + 40 hex，
+        壞格式 → 422。
+
+        `hl.portfolio()`（equity 曲線與 metrics 的唯一資料源）查詢失敗 → 503——
+        沒有它整頁沒有東西可畫，與 `/api/public/leaderboard` 首次抓取失敗同一
+        個判準。`account_value`（來自 `clearinghouseState`，**與 portfolio 是
+        兩個不同端點**，工程原則 1：不得把兩者混進同一個對比裡，這裡只是分別
+        展示各自的數字）查詢失敗只降級該欄位為 `null`，不拖累整頁——它是
+        plan 明訂的「額外」欄位，不是頁面的主要內容。兩者現在**併入同一個
+        5 分鐘快取條目**一起抓（見 [8b-1]、`_cached_trader_data`），不是各自
+        獨立打上游。
+
+        ⭐ [C1] 本端點無需登入、任意人可枚舉任意位址各打一次上游查詢
+        （上游放大面）——套用與 `/api/leaders/preview` 同款的 sliding-window
+        rate limit（見 `_enforce_probe_ratelimit`），但因為本端點沒有 session，
+        key 改用 client IP（`request.client.host`）：按位址計費擋不住「同一個
+        client 輪流枚舉不同位址」這個真正的放大面，按 client 計費才對。只在真的
+        打上游那一刻消耗額度（見 `_cached_trader_data`）。
+        """
+        try:
+            addr = normalize_address(address)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="位址格式不合法（需 0x 開頭 + 40 hex）")
+
+        client_host = request.client.host if request.client else "unknown"
+        rows, account_value = _cached_trader_data(addr, _TRADER_PROBE_KEY_PREFIX + client_host)
+        if rows is None:
+            raise HTTPException(status_code=503, detail="鏈上績效查詢暫時不可用，請稍後重試")
+
+        try:
+            perf = compute_window_performance(rows, "perpAllTime")
+        except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整頁
+            logger.error("交易員績效計算失敗 address=%s: %s", addr, e)
+            perf = None
+
+        initial_deposit_usd = None
+        window = extract_window(rows, "perpAllTime")
+        if window is not None:
+            av, _pnl = window
+            if av:
+                initial_deposit_usd = av[0][1]
+
+        return {
+            "address": addr,
+            "account_value": account_value,
+            "follow_blocked": _trader_follow_blocked(addr),
+            "metrics": build_metrics(perf),
+            "equity_index": build_equity_index(perf),
+            "methodology": build_methodology(
+                perf, initial_deposit_usd=initial_deposit_usd, updated_at=int(now_fn())),
+        }
+
     # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce
     # 空間，見 leaders_select 的 _consume）——刻意不另開一套機具：兩套一次性表格
     # 意味著兩套過期、兩套消耗語意，而其中一套遲早會漏掉原子性。
@@ -2074,7 +2356,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         if store.get_agent_address(account_id):
             raise HTTPException(
                 status_code=409,
-                detail="已有 agent，不重生（避免 rotate 作廢既有鏈上授權）")
+                detail={"code": "agent_exists",
+                        "message": "已有 agent，不重生（避免 rotate 作廢既有鏈上授權）"})
         try:
             agent_address = normalize_address(keysvc.generate(account_id))
         except KeysvcError as e:  # 結構化 code 分支——不比對訊息字串（opus 審 M3）
@@ -2089,8 +2372,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                         account_id, e2)
                     raise HTTPException(
                         status_code=409,
-                        detail="keystore 與 DB 狀態不一致且無法自動復原，"
-                               "請聯絡管理員") from e2
+                        detail={"code": "agent_conflict",
+                                "message": "keystore 與 DB 狀態不一致且無法自動復原，"
+                                           "請聯絡管理員"}) from e2
                 store.set_agent_address(account_id, agent_address)
                 logger.warning("agent 地址自癒回填 account=%s", account_id)
                 return {"agent_address": agent_address, "recovered": True}
@@ -2816,6 +3100,70 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "fees_month": fees_month_block, "positions": positions_block,
             "updated_at": int(now_s),
         })
+
+    # ---------- /api/me/fills、/api/me/authorizations（M3 round2 Task 7） ----------
+    # 「成交記錄・授權歷程」tab 的唯一資料源：兩者都**直取 Hyperliquid**（userFillsByTime
+    # ／explorer userDetails），結構上不讀自家 DB（per 使用者要求，見 plan 檔尾裁決）。
+    # per-address 60s TTL 快取（防連點打爆 HL）；上游失敗一律 503，不 fallback。
+    _ME_HL_CACHE_TTL_S = 60.0
+    # ⭐ [W1] 2026-08-29 opus 審查：key 必須是 `(addr, days)`，不能只有 `addr`——
+    # 同一個登入地址切換 `days`（例如 7 → 30）會撞到同一格快取，回傳錯誤天數
+    # 範圍的成交明細卻不會出現任何錯誤（正確性缺陷，不是效能問題）。
+    _fills_cache: dict[tuple[str, int], tuple[float, list]] = {}
+    _fills_cache_lock = threading.Lock()
+    _authorizations_cache: dict[str, tuple[float, list]] = {}
+    _authorizations_cache_lock = threading.Lock()
+
+    @app.get("/api/me/fills")
+    def me_fills(days: int = 30, address: str = Depends(_require_session)):
+        """登入地址近 `days` 天的成交明細（`userFillsByTime`，唯讀直取 HL）。
+        `days` 須介於 1~90（沿 `/api/public/leaderboard` 的 422 慣例）；上游查詢
+        失敗 → 503，不回退自家 DB。per-(address, days) 60s TTL 快取（見 [W1]：
+        key 缺 `days` 會讓不同天數撞同一格快取）。"""
+        if not (1 <= days <= 90):
+            raise HTTPException(status_code=422, detail="days 須介於 1 到 90")
+        now = now_fn()
+        addr = address.lower()
+        key = (addr, days)
+        with _fills_cache_lock:
+            cached = _fills_cache.get(key)
+        if cached is not None and now - cached[0] < _ME_HL_CACHE_TTL_S:
+            return {"fills": cached[1]}
+        end = datetime.fromtimestamp(now, timezone.utc)
+        start = end - timedelta(days=days)
+        try:
+            fills = hl.get_fills_detail(address, start, end)
+        except Exception as e:  # noqa: BLE001 — 上游任何失敗一律轉譯 503，不讓例外細節外洩
+            logger.error("成交記錄查詢失敗 address=%s: %s", addr, e)
+            raise HTTPException(status_code=503,
+                                detail="成交記錄查詢暫時不可用，請稍後重試") from e
+        with _fills_cache_lock:
+            _fills_cache[key] = (now, fills)
+        return {"fills": fills}
+
+    @app.get("/api/me/authorizations")
+    def me_authorizations(address: str = Depends(_require_session)):
+        """登入地址的授權歷程（explorer `userDetails`，只留 approveAgent／
+        approveBuilderFee，唯讀直取 HL）。上游查詢失敗 → 503，不回退自家 DB。
+        per-address 60s TTL 快取；explorer 回應可能數千筆 txs，過濾＋裁切至前
+        100 筆後才回前端。"""
+        now = now_fn()
+        addr = address.lower()
+        with _authorizations_cache_lock:
+            cached = _authorizations_cache.get(addr)
+        if cached is not None and now - cached[0] < _ME_HL_CACHE_TTL_S:
+            return {"authorizations": cached[1]}
+        try:
+            detail = hl.user_details(address)
+        except Exception as e:  # noqa: BLE001 — 上游任何失敗一律轉譯 503，不讓例外細節外洩
+            logger.error("授權歷程查詢失敗 address=%s: %s", addr, e)
+            raise HTTPException(status_code=503,
+                                detail="授權歷程查詢暫時不可用，請稍後重試") from e
+        txs = detail.get("txs") if isinstance(detail, dict) else None
+        authorizations = filter_authorizations(txs, limit=100)
+        with _authorizations_cache_lock:
+            _authorizations_cache[addr] = (now, authorizations)
+        return {"authorizations": authorizations}
 
     @app.get("/api/admin/pending")
     def admin_pending(admin: str = Depends(_require_admin)):
