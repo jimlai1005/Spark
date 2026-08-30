@@ -5,6 +5,7 @@ import type { DashboardGuard, DashboardPosition, DashboardStatus } from "@/lib/a
 import { postPause } from "@/lib/api";
 import { NO_VALUE } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CloseAllModal } from "./CloseAllModal";
 
 /**
@@ -83,6 +84,9 @@ export function StatusCard({
   const [pauseBusy, setPauseBusy] = useState(false);
   const [pauseError, setPauseError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  // ⭐ M3 round4 Task R4-4（使用者裁決 4）：暫停/恢復前先確認，防誤觸——
+  // 取消只關彈窗，不呼叫 postPause。
+  const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
 
   const state = status?.state ?? "inactive";
   const stateLabel = {
@@ -105,6 +109,7 @@ export function StatusCard({
   };
 
   async function togglePause() {
+    setPauseConfirmOpen(false);
     setPauseError(null);
     setPauseBusy(true);
     try {
@@ -139,7 +144,7 @@ export function StatusCard({
         </div>
         {showActions && (
           <div className="dash-status-actions">
-            <button type="button" className="dash-btn-pause" onClick={() => void togglePause()}
+            <button type="button" className="dash-btn-pause" onClick={() => setPauseConfirmOpen(true)}
               disabled={pauseBusy}>
               {state === "paused" ? c.resumeBtn : c.pauseBtn}
             </button>
@@ -150,6 +155,17 @@ export function StatusCard({
           </div>
         )}
       </div>
+      {pauseConfirmOpen && (
+        <ConfirmDialog
+          title={state === "paused" ? c.resumeConfirm.title : c.pauseConfirm.title}
+          body={state === "paused" ? c.resumeConfirm.body : c.pauseConfirm.body}
+          confirmLabel={state === "paused" ? c.resumeConfirm.confirmBtn : c.pauseConfirm.confirmBtn}
+          cancelLabel={state === "paused" ? c.resumeConfirm.cancelBtn : c.pauseConfirm.cancelBtn}
+          busy={pauseBusy}
+          onConfirm={() => void togglePause()}
+          onCancel={() => setPauseConfirmOpen(false)}
+        />
+      )}
       {pauseError && <p className="dash-status-error">{pauseError}</p>}
       {closeAllFailed && state !== "halted" && (
         <div className="dash-guide-card">

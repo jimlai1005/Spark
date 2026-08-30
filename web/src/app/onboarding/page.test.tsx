@@ -85,6 +85,7 @@ function buildCapMessage(
   ].join("\n");
 }
 
+import { COPY_ZH as COPY } from "@/lib/copy";
 import OnboardingPage from "./page";
 
 const ADDR = "0xabc0000000000000000000000000000000000001";
@@ -407,14 +408,14 @@ describe("OnboardingPage — 已跟單同策略短路（裁決 6）", () => {
     expect(screen.queryByRole("navigation", { name: "開通步驟" })).not.toBeInTheDocument();
   });
 
-  it("短路面板「前往 Dashboard」→ router.push('/dashboard')", async () => {
+  it("短路面板「前往儀表板」CTA（引用 copy key，非硬寫字面）→ router.push('/dashboard')", async () => {
     getMyLeader.mockResolvedValue({
       account_id: "fabc", status: "following",
       leader_address: STRATEGY_DETAIL.leader_address,
       leader_name: "Filet Core", pending_change: null, note: "跟單中。",
     });
     render(wrap(<OnboardingPage />));
-    const btn = await screen.findByRole("button", { name: "前往 Dashboard" });
+    const btn = await screen.findByRole("button", { name: COPY.wizard.alreadyFollowingDashboardCta });
     await userEvent.click(btn);
     expect(push).toHaveBeenCalledWith("/dashboard");
   });

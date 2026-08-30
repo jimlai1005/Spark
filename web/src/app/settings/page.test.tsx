@@ -4,7 +4,7 @@
  * 「暫停跟單」按鈕呼叫 `postPause`；平倉並撤銷入口重用 `CloseAllModal`。
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -189,7 +189,9 @@ describe("SettingsPage — 四段渲染", () => {
     render(wrap(<SettingsPage />));
 
     expect(await screen.findByRole("heading", { name: COPY.settings.risk.title })).toBeInTheDocument();
-    expect(screen.getByText(SPECS[0].label)).toBeInTheDocument(); // tracking 組，不受風控開關影響
+    // ⭐ M3 round4 Task R4-4 裁決：spec.label 已被 copy.ts 的 `paramLabels` 對照表
+    // 取代（查無 name 才 fallback 後端原文）——錨點改引用 copy key，不寫死字面。
+    expect(screen.getByText(COPY.settings.risk.paramLabels.size_tolerance.label)).toBeInTheDocument(); // tracking 組，不受風控開關影響
 
     expect(await screen.findByRole("heading", { name: COPY.settings.capital.title })).toBeInTheDocument();
     expect(screen.getByText("25%")).toBeInTheDocument();
@@ -220,28 +222,42 @@ describe("SettingsPage — 風控開關狀態對應 API mock", () => {
     render(wrap(<SettingsPage />));
     const checkbox = await screen.findByRole("checkbox", { name: COPY.settings.risk.enableLabel });
     expect(checkbox).toBeChecked();
-    expect(screen.getByText(SPECS[2].label)).toBeInTheDocument(); // max_total_drawdown_pct 只在展開時顯示
+    expect(screen.getByText(COPY.settings.risk.paramLabels.max_total_drawdown_pct.label))
+      .toBeInTheDocument(); // max_total_drawdown_pct 只在展開時顯示
   });
 });
 
 describe("SettingsPage — 暫停跟單（Task 15 postPause）", () => {
-  it("點擊「暫停跟單」→ 呼叫 postPause('pause')", async () => {
+  // ⭐ M3 round4 Task R4-4 裁決：暫停/恢復前補了確認彈窗（防誤觸）——點擊按鈕
+  // 只會開啟彈窗，`postPause` 要等使用者在彈窗內再點一次確認才會被呼叫。
+  // 取消不呼叫 postPause 的路徑已由新檔 `StatusCard.pauseConfirm.test.tsx`
+  // （同一顆 `ConfirmDialog` 元件、同一組 `postPause` 呼叫邏輯）與
+  // `ConfirmDialog.test.tsx`（元件層級的取消/確認行為）覆蓋。
+  it("點擊「暫停跟單」→ 開啟確認彈窗；點擊彈窗內「確認暫停」→ 呼叫 postPause('pause')", async () => {
     postPause.mockResolvedValue({ ok: true, paused: true, effective: "next_engine_cycle", effective_note: "" });
     render(wrap(<SettingsPage />));
 
     const btn = await screen.findByRole("button", { name: COPY.settings.auth.pauseBtn });
     fireEvent.click(btn);
 
+    const dialog = await screen.findByRole("dialog", { name: COPY.settings.auth.pauseConfirm.title });
+    expect(postPause).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: COPY.settings.auth.pauseConfirm.confirmBtn }));
+
     await waitFor(() => expect(postPause).toHaveBeenCalledWith("pause"));
   });
 
-  it("state=paused → 顯示「恢復跟單」，點擊呼叫 postPause('resume')", async () => {
+  it("state=paused → 顯示「恢復跟單」；開啟確認彈窗後點擊「確認恢復」→ 呼叫 postPause('resume')", async () => {
     getDashboard.mockResolvedValue(dashboardResp("paused"));
     postPause.mockResolvedValue({ ok: true, paused: false, effective: "next_engine_cycle", effective_note: "" });
     render(wrap(<SettingsPage />));
 
     const btn = await screen.findByRole("button", { name: COPY.settings.auth.resumeBtn });
     fireEvent.click(btn);
+
+    const dialog = await screen.findByRole("dialog", { name: COPY.settings.auth.resumeConfirm.title });
+    expect(postPause).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: COPY.settings.auth.resumeConfirm.confirmBtn }));
 
     await waitFor(() => expect(postPause).toHaveBeenCalledWith("resume"));
   });
@@ -288,7 +304,7 @@ describe("SettingsPage — 風控參數「目前生效 / 你的設定」（Task 
     }));
     render(wrap(<SettingsPage />));
 
-    await screen.findByText(SPECS[1].label); // "最大回撤"
+    await screen.findByText(COPY.settings.risk.paramLabels.max_drawdown_pct.label);
     expect(await screen.findByText(/目前生效: 20%/)).toBeInTheDocument();
     expect(screen.getByText(/你的設定: 15%/)).toBeInTheDocument();
     expect(screen.getByText(COPY.settings.risk.applied.pendingBadge)).toBeInTheDocument();
@@ -303,7 +319,7 @@ describe("SettingsPage — 風控參數「目前生效 / 你的設定」（Task 
     }));
     render(wrap(<SettingsPage />));
 
-    await screen.findByText(SPECS[1].label);
+    await screen.findByText(COPY.settings.risk.paramLabels.max_drawdown_pct.label);
     expect(await screen.findByText(/目前生效: 20%/)).toBeInTheDocument();
     expect(screen.getByText(/你的設定: 20%/)).toBeInTheDocument();
     expect(screen.queryByText(COPY.settings.risk.applied.pendingBadge)).not.toBeInTheDocument();
@@ -316,7 +332,7 @@ describe("SettingsPage — 風控參數「目前生效 / 你的設定」（Task 
     }));
     render(wrap(<SettingsPage />));
 
-    await screen.findByText(SPECS[1].label);
+    await screen.findByText(COPY.settings.risk.paramLabels.max_drawdown_pct.label);
     const unknownCells = await screen.findAllByText(
       new RegExp(`目前生效: ${COPY.settings.risk.applied.unknownShort}`),
     );

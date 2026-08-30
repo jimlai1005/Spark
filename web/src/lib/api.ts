@@ -217,7 +217,9 @@ export interface MyLeaderPendingChange {
   issued_at: string | null;
   /** 機器可讀語意，目前恆為 `next_engine_cycle`。 */
   effective: string;
-  /** 後端寫給人看的原文；顯示層原樣呈現，不在前端另寫一份。 */
+  /** 後端寫給人看的原文——⚠️ M3 round4 Task R4-4 起顯示層改用固定的雙語
+   * `copy.ts` 文案（`settings.leader.pendingChangeNote`），本欄位只保留當
+   * debug/tooltip 用途，不再直接渲染。 */
   note: string;
 }
 
@@ -239,7 +241,9 @@ export interface MyLeaderResp {
   leader_address: string | null;
   leader_name: string | null;
   pending_change: MyLeaderPendingChange | null;
-  /** 每一種狀態各有一句後端原文；顯示層原樣呈現（單一來源）。 */
+  /** 每一種狀態各有一句後端原文——⚠️ M3 round4 Task R4-4 起顯示層改依 `status`
+   * 從 `copy.ts`（`settings.leader.notesByStatus`）取雙語文案，本欄位只在
+   * 查無對應 status 時 fallback 使用。 */
   note: string;
 }
 
@@ -302,6 +306,9 @@ export interface RiskParamSpec {
   recommended: string | boolean;
   min: string | null;
   max: string | null;
+  /** 後端原文（zh）——⚠️ M3 round4 Task R4-4 起顯示層優先查 `copy.ts` 的
+   * `settings.risk.paramLabels[name]`（五個 name 封閉列舉，雙語），查無此
+   * name（未來新參數）才 fallback 這欄。 */
   label: string;
   help: string;
 }
@@ -582,6 +589,9 @@ export interface MyCapitalResp {
   effective: CapitalEffective | null;
   pending: CapitalPending | null;
   heartbeat: { status: string; at: string; age_s: number; stale_after_s: number } | null;
+  /** 每一種 `status` 各有一句後端原文——⚠️ M3 round4 Task R4-4 起顯示層改依
+   * `status` 從 `copy.ts`（`settings.capital.notesByStatus`）取雙語文案，
+   * 本欄位只在查無對應 status 時 fallback 使用。 */
   note: string;
 }
 

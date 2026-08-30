@@ -268,7 +268,11 @@ describe("DashboardPage — kill switch 按鈕渲染條件（Task 15）", () => 
 });
 
 describe("DashboardPage — 暫停/恢復（無需簽章，Task 15）", () => {
-  it("點擊「暫停跟單」→ 呼叫 postPause('pause')，成功後重新整理 dashboard", async () => {
+  // ⭐ M3 round4 Task R4-4 裁決：暫停/恢復前補了確認彈窗（防誤觸）——點擊按鈕
+  // 只會開啟彈窗，`postPause` 要等使用者在彈窗內再點一次確認才會被呼叫。
+  // 取消不呼叫 postPause 的路徑已由新檔 `StatusCard.pauseConfirm.test.tsx`
+  // （同一顆 `StatusCard`／`ConfirmDialog`）與 `ConfirmDialog.test.tsx` 覆蓋。
+  it("點擊「暫停跟單」→ 開啟確認彈窗；點擊「確認暫停」→ 呼叫 postPause('pause')，成功後重新整理 dashboard", async () => {
     getDashboard.mockResolvedValue({
       ...FULL, status: { ...FULL.status!, state: "following" },
     });
@@ -281,12 +285,16 @@ describe("DashboardPage — 暫停/恢復（無需簽章，Task 15）", () => {
 
     fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.pauseBtn }));
 
+    const dialog = await screen.findByRole("dialog", { name: COPY.dashboard.status.pauseConfirm.title });
+    expect(postPause).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: COPY.dashboard.status.pauseConfirm.confirmBtn }));
+
     await waitFor(() => expect(postPause).toHaveBeenCalledWith("pause"));
     await waitFor(() =>
       expect(getDashboard.mock.calls.length).toBeGreaterThan(callsBefore));
   });
 
-  it("點擊「恢復跟單」→ 呼叫 postPause('resume')", async () => {
+  it("點擊「恢復跟單」→ 開啟確認彈窗；點擊「確認恢復」→ 呼叫 postPause('resume')", async () => {
     getDashboard.mockResolvedValue({
       ...FULL, status: { ...FULL.status!, state: "paused" },
     });
@@ -298,10 +306,14 @@ describe("DashboardPage — 暫停/恢復（無需簽章，Task 15）", () => {
 
     fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.resumeBtn }));
 
+    const dialog = await screen.findByRole("dialog", { name: COPY.dashboard.status.resumeConfirm.title });
+    expect(postPause).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: COPY.dashboard.status.resumeConfirm.confirmBtn }));
+
     await waitFor(() => expect(postPause).toHaveBeenCalledWith("resume"));
   });
 
-  it("postPause 失敗 → 顯示錯誤文案，不悄悄吞掉", async () => {
+  it("postPause 失敗 → 確認彈窗內點擊確認後顯示錯誤文案，不悄悄吞掉", async () => {
     getDashboard.mockResolvedValue({
       ...FULL, status: { ...FULL.status!, state: "following" },
     });
@@ -310,6 +322,8 @@ describe("DashboardPage — 暫停/恢復（無需簽章，Task 15）", () => {
     await screen.findByText(/Filet Core/);
 
     fireEvent.click(screen.getByRole("button", { name: COPY.dashboard.status.pauseBtn }));
+    const dialog = await screen.findByRole("dialog", { name: COPY.dashboard.status.pauseConfirm.title });
+    fireEvent.click(within(dialog).getByRole("button", { name: COPY.dashboard.status.pauseConfirm.confirmBtn }));
 
     expect(await screen.findByText(COPY.dashboard.status.pauseErrorNote)).toBeInTheDocument();
   });

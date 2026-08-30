@@ -66,7 +66,7 @@ export const COPY_ZH = {
     how: "運作方式",
     security: "安全性",
     docs: "文件",
-    dashboard: "Dashboard",
+    dashboard: "儀表板",
     settings: "設定",
     ops: "營運",
     admin: "待核准",
@@ -297,7 +297,7 @@ export const COPY_ZH = {
     alreadyFollowingTitle: "已在跟單此策略",
     alreadyFollowingBodyPrefix: "你目前已在跟單「",
     alreadyFollowingBodySuffix: "」，不需要重新開通。",
-    alreadyFollowingDashboardCta: "前往 Dashboard",
+    alreadyFollowingDashboardCta: "前往儀表板",
     alreadyFollowingOtherCta: "查看其他策略",
   },
   admin: {
@@ -931,7 +931,7 @@ export const COPY_ZH = {
         { n: "01", t: "選擇策略", d: "看完績效、回撤與方法論揭露後再決定。" },
         { n: "02", t: "連接錢包並授權", d: "兩筆免費簽名：agent 下單權與 builder fee 費率上限，均不上鏈。" },
         { n: "03", t: "設定風險限制", d: "投入比例、槓桿上限、最大回撤自動停止。" },
-        { n: "04", t: "進入 Dashboard", d: "同步狀態、曝險、PnL、費用一頁看完，隨時可暫停。" },
+        { n: "04", t: "進入儀表板", d: "同步狀態、曝險、PnL、費用一頁看完，隨時可暫停。" },
       ],
     },
   },
@@ -959,7 +959,7 @@ export const COPY_ZH = {
       "超出你簽署的投入比例；超出策略標示的槓桿上限；觸發你啟用的最大回撤而不停止",
     ],
     revocable:
-      "授權為你單方可撤銷：Dashboard 一鍵暫停跟單（停止新開倉），或撤銷 agent（Filet 立即失去下單能力）。"
+      "授權為你單方可撤銷：儀表板一鍵暫停跟單（停止新開倉），或撤銷 agent（Filet 立即失去下單能力）。"
       + "撤銷不需要 Filet 同意，也不需要我們在線。",
   },
   /** 費用試算區（NOTE 06）。slider 邏輯在 `FeeCalculator.tsx`，本區只放靜態文案。 */
@@ -1096,12 +1096,12 @@ export const COPY_ZH = {
    * 接口，實際生效在 Task 15（`DASHBOARD_KILL_SWITCH_ENABLED` 常數關閉時不渲染）。
    */
   dashboard: {
-    heading: "Dashboard",
+    heading: "儀表板",
     lastSyncPrefix: "最後同步 ",
     lastSyncSuffix: " 前",
     lastSyncJustNow: "剛剛",
     liveBadge: "即時",
-    loadingNote: "讀取 Dashboard 資料中…",
+    loadingNote: "讀取儀表板資料中…",
     status: {
       label: "策略狀態",
       strategyFallback: "此帳號",
@@ -1117,6 +1117,24 @@ export const COPY_ZH = {
       resumeBtn: "恢復跟單",
       closeAllBtn: "平倉並撤銷授權",
       pauseErrorNote: "操作失敗，請稍後重試。",
+      /**
+       * ⭐ M3 round4 Task R4-4（使用者裁決 4）：暫停／恢復跟單前補一次輕量
+       * 確認彈窗（`ConfirmDialog`，防誤觸）——平倉走既有的 `CloseAllModal`
+       * 二次確認不動。取消不呼叫 `postPause`。
+       */
+      pauseConfirm: {
+        title: "確認暫停跟單",
+        body: "暫停後：系統不再為你開新倉，但既有部位的減倉／平倉仍會照常執行"
+              + "（不是把部位凍結不動）。你可以隨時按「恢復跟單」回到正常跟單。",
+        cancelBtn: "取消",
+        confirmBtn: "確認暫停",
+      },
+      resumeConfirm: {
+        title: "確認恢復跟單",
+        body: "恢復後：系統會回到正常跟單，依 leader 的動作為你開新倉。",
+        cancelBtn: "取消",
+        confirmBtn: "確認恢復",
+      },
       closeAllModal: {
         title: "確認：平倉並撤銷授權",
         warning: "此操作將以市價平倉你目前所有跟單部位並停止跟單，且不可逆。",
@@ -1201,11 +1219,16 @@ export const COPY_ZH = {
       unsyncedPositions: "未同步倉位",
       scaleDeviation: "部位比例偏差（vs master）",
       missedSignals: "近 24h 遺漏訊號",
-      lastRecon: "上次完整對帳",
+      // ⭐ M3 round4 Task R4-4：對齊 R4-1 的欄位改語意——不再是「引擎本機對帳
+      // 時戳」，而是「本次請求時直接向鏈上計算」的時刻。
+      lastRecon: "本次鏈上比對",
       // ⭐ R2·C 空值三態（2026-08-30）：`data_state` 三態的收斂文案。「ok」沿用
       // 上面既有的逐欄渲染（個別欄位仍可能為 null →「—」，但絕不顯示 0ms）；
       // 「warming」與「error」時整卡摺為一行，不留一整塊空白卡片。
-      warmingLine: "同步誤差：跟單啟動後 24h 內開始累積",
+      // ⭐ M3 round4 Task R4-4：warming＝這個帳號的引擎從未發布過心跳
+      // （結構上「還沒開始跑」，不是「資料還在本機累積」——R4-1 起同步誤差已
+      // 改為請求時即時向鏈上計算，不落盤、不累積）。
+      warmingLine: "同步誤差為即時由鏈上近 24h 成交計算；此帳號的引擎尚未發布過心跳，暫時無法比對。",
       errorLine: "引擎狀態讀取失敗",
     },
     fees: {
@@ -1386,6 +1409,40 @@ export const COPY_ZH = {
         unknownShort: "無法確認",
         pendingBadge: "待下輪套用（約 1 分鐘）",
       },
+      /**
+       * ⭐ M3 round4 Task R4-4：`RiskParamSpec.name → {label,help}` 雙語對照表
+       * （封閉列舉，五個 name，改一邊要改兩邊，同源在 `src/spark/filet/risk_prefs.py`）。
+       * 渲染處查無此 name 才 fallback 後端原文（新參數不炸、只是暫時單語，見
+       * `RiskParamField` 呼叫端）。zh 沿用後端原文字面，不重寫。
+       */
+      paramLabels: {
+        size_tolerance: {
+          label: "與 leader 的部位差異容忍度",
+          help: "你的部位與 leader（按比例換算後）差異超過此值才會校正。"
+                + "調小＝跟得更緊，但校正次數變多、手續費與滑價成本上升；"
+                + "調大＝成本低，但你的部位會與 leader 有較大偏離。建議 8%。",
+        },
+        max_drawdown_pct: {
+          label: "7 天滾動回撤上限",
+          help: "以最近 7 天內的權益高水位為基準；跌幅超過此值即熔斷。",
+        },
+        max_total_drawdown_pct: {
+          label: "累計回撤上限",
+          help: "以開始跟單以來的高水位為基準的絕對底線（0 ＝ 停用這一道）。"
+                + "慢跌可能每個 7 天窗都不超標卻累積成大額虧損，這一道是為此存在。",
+        },
+        flatten_on_breach: {
+          label: "熔斷時自動平倉",
+          help: "開：熔斷即撤單並全平。關：熔斷只停止交易動作並告警，"
+                + "既有部位留在市場上（軟暫停）。",
+        },
+        cooldown_hours: {
+          label: "熔斷後的冷靜期（小時）",
+          help: "熔斷後經過這段時間就自動恢復跟單，權益基準已在熔斷當下重置。"
+                + "建議 12 小時：短到不會把你鎖在門外，長到足以讓觸發熔斷的那段行情過去。"
+                + "設 0 ＝ 不自動恢復（只有你按「立即恢復跟單」才解鎖）。",
+        },
+      },
       halted: {
         title: "你的跟單已被風控停止",
         body:
@@ -1443,6 +1500,24 @@ export const COPY_ZH = {
         submitFailed:
           "送出失敗，資金配置沒有被變更。上一筆簽署已作廢，請重新操作一次。",
       },
+      /**
+       * ⭐ M3 round4 Task R4-4：`/api/me/capital` 頂層 `note` 改依 `status`（封閉
+       * 四態，同源 `MyCapitalStatus`）從這裡取雙語文案，不再直接渲染伺服器散文。
+       * zh 沿用後端原文字面（`app.py::my_capital`）。
+       */
+      notesByStatus: {
+        effective: "這是引擎目前實際採用的本金與使用比例。",
+        unknown:
+          "目前無法確認生效中的資金設定（引擎的健康心跳缺席或已過期）。"
+          + "**請不要**把下方「已提交」的數值當成生效值——它可能還沒被套用。"
+          + "若這個狀態持續，請聯絡管理員。",
+        not_activated:
+          "你的帳號尚未啟用跟單，因此還沒有生效中的資金設定。"
+          + "啟用後，這裡會顯示引擎實際採用的本金與使用比例。",
+        indeterminate:
+          "目前無法確認你的資金設定（帳號清單有無法解析的條目）；"
+          + "請聯絡管理員，不要當作「未設定」處理。",
+      },
     },
     /** agent 位址／builder fee／暫停跟單／平倉並撤銷（複用 Task 15 kill switch）。 */
     auth: {
@@ -1461,7 +1536,22 @@ export const COPY_ZH = {
       closeAllBtn: "平倉並撤銷授權",
       pauseErrorNote: "操作失敗，請稍後重試。",
       noEngineNote: "此帳號目前沒有在運作的引擎，沒有可操作的動作。",
-      closeAllPendingNote: "已送出，引擎正在收尾，請至 Dashboard 查看進度。",
+      closeAllPendingNote: "已送出，引擎正在收尾，請至儀表板查看進度。",
+      /** ⭐ M3 round4 Task R4-4（使用者裁決 4）：與 `dashboard.status` 同一套
+       * 暫停/恢復確認彈窗文案（各頁各自持有一份，理由同檔內既有慣例）。 */
+      pauseConfirm: {
+        title: "確認暫停跟單",
+        body: "暫停後：系統不再為你開新倉，但既有部位的減倉／平倉仍會照常執行"
+              + "（不是把部位凍結不動）。你可以隨時按「恢復跟單」回到正常跟單。",
+        cancelBtn: "取消",
+        confirmBtn: "確認暫停",
+      },
+      resumeConfirm: {
+        title: "確認恢復跟單",
+        body: "恢復後：系統會回到正常跟單，依 leader 的動作為你開新倉。",
+        cancelBtn: "取消",
+        confirmBtn: "確認恢復",
+      },
     },
     /** ⭐ 「目前跟隨的 leader」——沿舊版 `leaders.current` 的既定誠實揭露原則。 */
     leader: {
@@ -1482,6 +1572,27 @@ export const COPY_ZH = {
       pendingTitle: "有一筆已簽署、尚未生效的換 leader",
       pendingLabel: "將換到",
       pendingIssuedAtLabel: "簽署時間",
+      /**
+       * ⭐ M3 round4 Task R4-4：`/api/me/leader` 頂層 `note`（封閉四態，同源
+       * `MyLeaderStatus`）與 `pending_change.note`（恆單一文案）改依結構化欄位
+       * 從這裡取雙語文案，不再直接渲染伺服器散文。zh 沿用後端原文字面
+       * （`app.py::me_leader`／`_pending_leader_change`）。
+       */
+      notesByStatus: {
+        following: "這是引擎目前為你跟隨的 leader。",
+        engine_default:
+          "你已啟用跟單，但尚未指定 leader，引擎沿用部署的預設設定。"
+          + "你可以到 leader 目錄選擇一位——在那之前，跟單仍在進行中。",
+        not_activated:
+          "你的帳號尚未啟用跟單（啟用是人工作業）；完成入金與授權後，"
+          + "管理員會為你啟用，屆時這裡會顯示你跟隨的 leader。",
+        indeterminate:
+          "目前無法確認你的跟隨狀態（帳號清單有無法解析的條目）；"
+          + "請聯絡管理員，不要當作「未在跟單」處理。",
+      },
+      pendingChangeNote:
+        "你已簽署換 leader，尚未生效：引擎會在下一個 cycle 重新驗證你的"
+        + "簽章與白名單後套用。",
       changeStrategyBtn: "更換策略",
       advancedModeBtn: "進階模式",
     },
@@ -2521,6 +2632,21 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       resumeBtn: "Resume following",
       closeAllBtn: "Close all & revoke authorization",
       pauseErrorNote: "Action failed, please try again later.",
+      pauseConfirm: {
+        title: "Confirm pause following",
+        body: "While paused: the system stops opening new positions for you, but reducing/closing "
+              + "existing positions still happens as normal (positions are not frozen). You can resume "
+              + "following at any time.",
+        cancelBtn: "Cancel",
+        confirmBtn: "Confirm pause",
+      },
+      resumeConfirm: {
+        title: "Confirm resume following",
+        body: "Once resumed: the system goes back to normal following and opens new positions for you "
+              + "based on the leader's actions.",
+        cancelBtn: "Cancel",
+        confirmBtn: "Confirm resume",
+      },
       closeAllModal: {
         title: "Confirm: close all & revoke authorization",
         warning: "This will close all of your current copy-trading positions at market "
@@ -2609,8 +2735,9 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       unsyncedPositions: "Unsynced positions",
       scaleDeviation: "Position ratio deviation (vs master)",
       missedSignals: "Missed signals (24h)",
-      lastRecon: "Last full reconciliation",
-      warmingLine: "Sync deviation: starts accumulating within 24h of activation",
+      lastRecon: "This comparison (on-chain)",
+      warmingLine: "Sync deviation is computed live from on-chain fills in the last 24h; this account's "
+                  + "engine hasn't published a heartbeat yet, so comparison isn't available.",
       errorLine: "Engine status unavailable",
     },
     fees: {
@@ -2762,6 +2889,36 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         unknownShort: "Unavailable",
         pendingBadge: "Pending next cycle (about a minute)",
       },
+      paramLabels: {
+        size_tolerance: {
+          label: "Position deviation tolerance from leader",
+          help: "Your position is only corrected once it deviates from the leader (scaled) by more than this. "
+                + "Smaller = tighter tracking but more corrections, higher fees and slippage; larger = lower "
+                + "cost but more deviation from the leader. Recommended 8%.",
+        },
+        max_drawdown_pct: {
+          label: "7-day rolling drawdown limit",
+          help: "Based on the equity high-water mark over the last 7 days; a drop past this value trips the breaker.",
+        },
+        max_total_drawdown_pct: {
+          label: "Cumulative drawdown limit",
+          help: "An absolute floor based on the high-water mark since you started following (0 = disable this "
+                + "one). A slow bleed might never exceed any single 7-day window yet still add up to a large "
+                + "loss — this exists for that case.",
+        },
+        flatten_on_breach: {
+          label: "Auto-close positions when tripped",
+          help: "On: tripping cancels open orders and closes everything. Off: tripping only stops new trading "
+                + "and alerts; existing positions stay in the market (soft pause).",
+        },
+        cooldown_hours: {
+          label: "Cooldown after a trip (hours)",
+          help: "Following resumes automatically once this much time has passed after a trip; the equity "
+                + "baseline is reset at the moment it trips. Recommended 12 hours — short enough not to lock "
+                + "you out, long enough for the move that triggered it to pass. Set to 0 = no automatic resume "
+                + "(only \"Resume following now\" unlocks it).",
+        },
+      },
       halted: {
         title: "Your following has been stopped by risk controls",
         body:
@@ -2816,6 +2973,19 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         messageFailed: "Couldn't fetch the content to sign — capital allocation was not changed. Please try again shortly.",
         submitFailed: "Submission failed — capital allocation was not changed. The previous signature is now void; please try again.",
       },
+      notesByStatus: {
+        effective: "This is the principal and utilization ratio the engine is actually using right now.",
+        unknown:
+          "The currently effective capital settings can't be confirmed right now (the engine's health "
+          + "heartbeat is missing or stale). **Please don't** treat the \"submitted\" value below as the "
+          + "effective one — it may not have been applied yet. If this persists, please contact an admin.",
+        not_activated:
+          "Your account hasn't been activated for following yet, so there's no effective capital setting. "
+          + "Once activated, this will show the principal and utilization ratio the engine actually uses.",
+        indeterminate:
+          "Your capital settings can't be confirmed right now (the account list has an entry that failed to "
+          + "parse). Please contact an admin — don't treat this as \"not configured\".",
+      },
     },
     auth: {
       title: "Authorization",
@@ -2834,6 +3004,21 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       pauseErrorNote: "Action failed, please try again later.",
       noEngineNote: "There is no engine currently running for this account, so there's nothing to act on.",
       closeAllPendingNote: "Submitted — the engine is winding down; check the Dashboard for progress.",
+      pauseConfirm: {
+        title: "Confirm pause following",
+        body: "While paused: the system stops opening new positions for you, but reducing/closing "
+              + "existing positions still happens as normal (positions are not frozen). You can resume "
+              + "following at any time.",
+        cancelBtn: "Cancel",
+        confirmBtn: "Confirm pause",
+      },
+      resumeConfirm: {
+        title: "Confirm resume following",
+        body: "Once resumed: the system goes back to normal following and opens new positions for you "
+              + "based on the leader's actions.",
+        cancelBtn: "Cancel",
+        confirmBtn: "Confirm resume",
+      },
     },
     leader: {
       title: "Strategy you're currently following",
@@ -2854,6 +3039,23 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       pendingTitle: "There's a signed, not-yet-effective leader change",
       pendingLabel: "Switching to",
       pendingIssuedAtLabel: "Signed at",
+      notesByStatus: {
+        following: "This is the leader the engine is currently following on your behalf.",
+        engine_default:
+          "You've enabled following, but haven't chosen a leader yet — the engine is using the "
+          + "deployment's default. You can pick one from the leader directory; following continues "
+          + "in the meantime.",
+        not_activated:
+          "Your account hasn't been activated for following yet (activation is a manual step). Once "
+          + "you've completed funding and authorization, an admin will activate it, and the leader "
+          + "you're following will show up here.",
+        indeterminate:
+          "Your following status can't be confirmed right now (the account list has an entry that "
+          + "failed to parse). Please contact an admin — don't treat this as \"not following\".",
+      },
+      pendingChangeNote:
+        "You've signed a leader change that hasn't taken effect yet — the engine will re-verify your "
+        + "signature and the whitelist before applying it on its next cycle.",
       changeStrategyBtn: "Change strategy",
       advancedModeBtn: "Advanced mode",
     },

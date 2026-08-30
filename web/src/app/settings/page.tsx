@@ -49,6 +49,7 @@ import {
   type RiskParamSpec,
   type RiskPrefs,
 } from "@/lib/api";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CloseAllModal } from "@/components/dashboard/CloseAllModal";
 import { Toast } from "@/components/Toast";
 import { runCapitalSettingsFlow, type CapitalFlowFailure } from "@/lib/capitalSettingsFlow";
@@ -56,6 +57,7 @@ import { fmtRatioPct, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 import { runRiskSettingsFlow, runRiskUnlockFlow, type RiskFlowFailure } from "@/lib/riskSettingsFlow";
+import { capitalNoteOf, leaderNoteOf, paramCopyOf } from "@/lib/settingsCopy";
 import { recoverPersonalSigner } from "@/lib/sign";
 
 type Copy = ReturnType<typeof useCopy>;
@@ -186,19 +188,20 @@ function RiskParamField({ spec, prefs, onChange, c, data }: {
     unit: spec.unit,
     c,
   } as const;
+  const paramCopy = paramCopyOf(spec, c);
   if (spec.type === "bool") {
     return (
       <div className="risk-field">
         <label className="risk-toggle">
           <input type="checkbox" checked={v === true}
             onChange={(e) => onChange(withPref(prefs, spec.name, e.target.checked))} />
-          <span>{spec.label}</span>
+          <span>{paramCopy.label}</span>
         </label>
         <p className="hint risk-recommended">
           {c.recommendedLabel}：{spec.recommended === true ? c.boolOn : c.boolOff}
         </p>
         <ParamStatus {...statusProps} />
-        <p className="hint">{spec.help}</p>
+        <p className="hint">{paramCopy.help}</p>
       </div>
     );
   }
@@ -206,7 +209,7 @@ function RiskParamField({ spec, prefs, onChange, c, data }: {
   const shown = s.toDisplay(String(v));
   return (
     <div className="risk-field">
-      <label htmlFor={`settings-risk-${spec.name}`}>{spec.label}</label>
+      <label htmlFor={`settings-risk-${spec.name}`}>{paramCopy.label}</label>
       <div className="risk-slider-row">
         <input
           id={`settings-risk-${spec.name}`}
@@ -224,7 +227,7 @@ function RiskParamField({ spec, prefs, onChange, c, data }: {
         {c.recommendedLabel}：{s.toDisplay(String(spec.recommended))}{s.suffix}
       </p>
       <ParamStatus {...statusProps} />
-      <p className="hint">{spec.help}</p>
+      <p className="hint">{paramCopy.help}</p>
     </div>
   );
 }
@@ -557,7 +560,7 @@ function CapitalSection({ me }: { me: Me }) {
               </span>
             )}
           </p>
-          <p className="hint">{data.note}</p>
+          <p className="hint">{capitalNoteOf(data, c)}</p>
         </div>
       </div>
 
@@ -584,11 +587,15 @@ function AuthorizationSection({ me }: { me: Me }) {
   const [pauseError, setPauseError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [closeAllSubmitted, setCloseAllSubmitted] = useState(false);
+  // ⭐ M3 round4 Task R4-4（使用者裁決 4）：同 dashboard StatusCard，暫停/恢復
+  // 前先確認——取消只關彈窗，不呼叫 postPause。
+  const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
 
   const state = dash.data?.status?.state ?? "inactive";
   const showActions = state === "following" || state === "paused";
 
   async function togglePause() {
+    setPauseConfirmOpen(false);
     setPauseError(null);
     setPauseBusy(true);
     try {
@@ -627,13 +634,24 @@ function AuthorizationSection({ me }: { me: Me }) {
       {!showActions && <p className="hint">{c.noEngineNote}</p>}
       {showActions && (
         <div className="dash-status-actions">
-          <button type="button" className="dash-btn-pause" onClick={() => void togglePause()} disabled={pauseBusy}>
+          <button type="button" className="dash-btn-pause" onClick={() => setPauseConfirmOpen(true)} disabled={pauseBusy}>
             {state === "paused" ? c.resumeBtn : c.pauseBtn}
           </button>
           <button type="button" className="dash-btn-close" onClick={() => setModalOpen(true)} disabled={pauseBusy}>
             {c.closeAllBtn}
           </button>
         </div>
+      )}
+      {pauseConfirmOpen && (
+        <ConfirmDialog
+          title={state === "paused" ? c.resumeConfirm.title : c.pauseConfirm.title}
+          body={state === "paused" ? c.resumeConfirm.body : c.pauseConfirm.body}
+          confirmLabel={state === "paused" ? c.resumeConfirm.confirmBtn : c.pauseConfirm.confirmBtn}
+          cancelLabel={state === "paused" ? c.resumeConfirm.cancelBtn : c.pauseConfirm.cancelBtn}
+          busy={pauseBusy}
+          onConfirm={() => void togglePause()}
+          onCancel={() => setPauseConfirmOpen(false)}
+        />
       )}
       {pauseError && <p className="dash-status-error">{pauseError}</p>}
       {closeAllSubmitted && <p className="hint" role="status">{c.closeAllPendingNote}</p>}
@@ -675,7 +693,9 @@ function PendingLeaderChange({ change, c }: {
       {change.issued_at !== null && (
         <p className="hint mono">{c.pendingIssuedAtLabel}: {change.issued_at}</p>
       )}
-      <p className="hint">{change.note}</p>
+      {/* ⭐ 後端這則 note 恆為單一文案（無狀態分岔），直接用 copy.ts 固定字串，
+          不再判斷伺服器散文；`change.note` 保留當 debug 欄位不顯示。 */}
+      <p className="hint">{c.pendingChangeNote}</p>
     </div>
   );
 }
@@ -722,7 +742,7 @@ function LeaderBody({ data: d, c }: { data: MyLeaderResp; c: Copy["settings"]["l
       {none?.unknown === true && (
         <p className="hint mono">{c.statusLabel}: {d.status}</p>
       )}
-      <p className="hint">{d.note}</p>
+      <p className="hint">{leaderNoteOf(d, c)}</p>
       {d.pending_change !== null && <PendingLeaderChange change={d.pending_change} c={c} />}
     </>
   );

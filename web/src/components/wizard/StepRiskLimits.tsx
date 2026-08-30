@@ -12,6 +12,7 @@ import { fmtRatioPct, NO_VALUE } from "@/lib/format";
 import { recoverPersonalSigner } from "@/lib/sign";
 import { runCapitalSettingsFlow, type CapitalFlowFailure } from "@/lib/capitalSettingsFlow";
 import { runRiskSettingsFlow, type RiskFlowFailure } from "@/lib/riskSettingsFlow";
+import { capitalNoteOf } from "@/lib/settingsCopy";
 
 const SCALE_MIN = 5;
 const SCALE_MAX = 100;
@@ -192,7 +193,11 @@ export function StepRiskLimits({ me, maxLeverage, initial, onBack, onNext }: {
             {capital.data.pending && (
               <p className="hint" role="status">{c.capitalPendingLabel}</p>
             )}
-            <p className="hint">{capital.data.note}</p>
+            {/* ⭐ M3 round4 Task R4-4：`note` 改依 `status` 從 copy.ts 取雙語
+                文案（`lib/settingsCopy.ts::capitalNoteOf`，同一份對照表供
+                onboarding／settings 共用，避免各存一份走樣）；查無此 status
+                才 fallback 伺服器原文。 */}
+            <p className="hint">{capitalNoteOf(capital.data, COPY.settings.capital)}</p>
           </div>
         )}
       </div>
