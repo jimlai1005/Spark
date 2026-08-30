@@ -361,9 +361,7 @@ function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
         {fmtSignedPct(row.ret_30d_pct)}
       </div>
       <div className="mono neg explore-dd">{row.max_dd_30d_pct.toFixed(1)}%</div>
-      {/* R-B 後端擬將 `trading_days` 改名 `live_days`（同一個值）；改名落地前兩個
-          欄位名都相容，見 `lib/publicApi.ts` 的 `ExploreRow.live_days`。 */}
-      <div className="mono explore-days">{row.live_days ?? row.trading_days}</div>
+      <div className="mono explore-days">{row.live_days}</div>
       <div className="mono explore-wr">{fmtPct1(row.close_win_rate_pct)}</div>
       <div className="explore-exposure">
         <div className="explore-exposure-bar">

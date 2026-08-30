@@ -28,7 +28,7 @@ const ROW_A: ExploreRow = {
   spark: [1, 1.1, 1.05, 1.2],
   ret_30d_pct: 38.4,
   max_dd_30d_pct: -11.2,
-  trading_days: 118,
+  live_days: 118,
   fill_count_30d: 250,
   close_win_rate_pct: 61.2,
   concentration_pct: 40.0,
@@ -45,7 +45,7 @@ const ROW_B: ExploreRow = {
   spark: [],
   ret_30d_pct: -5.0,
   max_dd_30d_pct: -20.0,
-  trading_days: 90,
+  live_days: 90,
   fill_count_30d: 210,
   close_win_rate_pct: null,
   concentration_pct: 95.0,
@@ -117,6 +117,10 @@ describe("ExplorePage — 表格渲染", () => {
     expect(wrCells[0].textContent).toBe("61.2%");
     expect(wrCells[1].textContent).toBe("—");
 
+    const dayCells = container.querySelectorAll(".explore-days");
+    expect(dayCells[0].textContent).toBe("118");
+    expect(dayCells[1].textContent).toBe("90");
+
     expect(screen.getByText((_, el) => (el?.textContent ?? "") === "100 個帳戶 → 符合 2")).toBeInTheDocument();
   });
 
@@ -178,29 +182,6 @@ describe("ExplorePage — updated_at（R-C/W3）", () => {
   });
 });
 
-// R-C／W3：後端 `hl_explore.py` 仍回 `trading_days`（欄位改名 `live_days` 由另一
-// 位 builder 進行中，見 plan R-B）；前端相容兩個欄位名，`live_days` 存在時優先採用。
-describe("ExplorePage — live_days／trading_days 欄位相容（R-C/W3）", () => {
-  it("row 帶 live_days 時優先顯示 live_days（不是 trading_days）", async () => {
-    stubFetch(() => jsonResponse(buildResp({
-      rows: [{ ...ROW_A, trading_days: 118, live_days: 130 }],
-      total_qualified: 1,
-    })));
-    const { container } = render(<ExplorePage />);
-    await screen.findByText("Alice");
-    expect(container.querySelector(".explore-days")?.textContent).toBe("130");
-  });
-
-  it("row 沒有 live_days（後端尚未改名）→ 沿用 trading_days", async () => {
-    stubFetch(() => jsonResponse(buildResp({
-      rows: [ROW_A],
-      total_qualified: 1,
-    })));
-    const { container } = render(<ExplorePage />);
-    await screen.findByText("Alice");
-    expect(container.querySelector(".explore-days")?.textContent).toBe(String(ROW_A.trading_days));
-  });
-});
 
 describe("ExplorePage — 分頁", () => {
   it("點「下一頁」→ 打 API 帶新的 page 參數並渲染新一頁資料", async () => {

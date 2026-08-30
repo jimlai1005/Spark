@@ -350,11 +350,8 @@ export interface ExploreRow {
   spark: number[];
   ret_30d_pct: number;
   max_dd_30d_pct: number;
-  trading_days: number;
-  /** R-B 後端擬將 `trading_days` 改名 `live_days`（同一個值，日曆跨距天數）；
-   * 本輪後端尚未落地改名前，前端兩個欄位名都相容（`live_days ?? trading_days`，
-   * 見 `explore/page.tsx`）。後端改名後這裡不必再動——本欄位保持 optional。 */
-  live_days?: number;
+  /** 實盤天數＝perpAllTime 首末快照的日曆跨距（後端欄位 `live_days`）。 */
+  live_days: number;
   fill_count_30d: number;
   close_win_rate_pct: number | null;
   concentration_pct: number | null;
@@ -400,8 +397,7 @@ function normalizeExploreRow(v: unknown): ExploreRow | null {
       : [],
     ret_30d_pct: toNumberOrNull(r.ret_30d_pct) ?? 0,
     max_dd_30d_pct: toNumberOrNull(r.max_dd_30d_pct) ?? 0,
-    trading_days: typeof r.trading_days === "number" ? r.trading_days : 0,
-    live_days: typeof r.live_days === "number" ? r.live_days : undefined,
+    live_days: typeof r.live_days === "number" ? r.live_days : 0,
     fill_count_30d: typeof r.fill_count_30d === "number" ? r.fill_count_30d : 0,
     close_win_rate_pct: toNumberOrNull(r.close_win_rate_pct),
     concentration_pct: toNumberOrNull(r.concentration_pct),
