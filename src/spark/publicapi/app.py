@@ -2096,25 +2096,36 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     app.state.explore_index = _explore_index  # 唯讀 introspection seam（沿既有慣例）
 
     @app.get("/api/public/explore")
-    def public_explore(window: str = "30d", page: int = 1, qualified: int = 1,
-                       max_dd: int = 1, exclude_concentrated: int = 1):
-        """探索跟單對象榜（無需登入）。本輪只實作 `window=30d`（D1：7D/90D/全部
-        的 enrich 成本是 ×4，前端 chip 先 disabled）；壞 `window`／`page` 非正
-        整數／布林參數不是 0 或 1 → 422。資格過濾與風險調整排序全在後端
-        （R2-01）；建置中或上游從未成功過 → `building: true` ＋空 rows
-        （200，不是 503——這是漸進式建置中的正常狀態，不是故障，見
-        `hl_explore.ExploreIndex.query`）。"""
-        if window != "30d":
-            raise HTTPException(status_code=422, detail="window 本輪僅支援 30d")
+    def public_explore(window: str = hl_explore.DEFAULT_WINDOW, page: int = 1,
+                       min_live_days: int = hl_explore.DEFAULT_MIN_TRADING_DAYS,
+                       min_fills: int = hl_explore.DEFAULT_MIN_FILLS,
+                       max_dd_pct: float = float(hl_explore.DEFAULT_MAX_DRAWDOWN_PCT),
+                       max_concentration_pct: float = float(hl_explore.DEFAULT_MAX_CONCENTRATION_PCT)):
+        """探索跟單對象榜（無需登入）。R4-3（2026-08-30 使用者裁決 6）：四窗全開
+        （`window` ∈ `hl_explore.WINDOW_KEYS`＝day/week/month/allTime，UI 標籤
+        對映見 `hl_explore.py` 檔頭——HL `portfolio()` 沒有「90 天」窗，不是
+        使用者原始回饋字面的 7D/30D/90D）；三個布林 chip（`qualified`/`max_dd`/
+        `exclude_concentrated`）從公開端點移除，改成四個自由數值門檻
+        （`min_live_days`/`min_fills`/`max_dd_pct`/`max_concentration_pct`，
+        預設分別 30/200/30/90）。`window` 是封閉列舉，非法值 → 422；
+        `page` 非正整數 → 422；四個數值門檻**只夾取範圍不 422**（防濫用，不是
+        驗證錯誤，見 `hl_explore.clamp_explore_params`）——前端「清空欄位」送
+        邊界值（0/0/100/100）天然等於「不過濾」。資格過濾與風險調整排序全在
+        後端（R2-01）；建置中、上游從未成功過、或現有快照結構版本不相容
+        → `building: true` ＋空 rows（200，不是 503——這是漸進式建置中的正常
+        狀態，不是故障，見 `hl_explore.ExploreIndex.query`）。"""
+        if window not in hl_explore.WINDOW_KEYS:
+            raise HTTPException(status_code=422,
+                                detail=f"window 須為 {hl_explore.WINDOW_KEYS} 其一")
         if page < 1:
             raise HTTPException(status_code=422, detail="page 須為正整數")
-        for name, v in (("qualified", qualified), ("max_dd", max_dd),
-                        ("exclude_concentrated", exclude_concentrated)):
-            if v not in (0, 1):
-                raise HTTPException(status_code=422, detail=f"{name} 須為 0 或 1")
-        return _explore_index.query(page=page, require_sample=bool(qualified),
-                                    max_dd_filter=bool(max_dd),
-                                    exclude_concentrated=bool(exclude_concentrated))
+        min_live_days, min_fills, max_dd_pct, max_concentration_pct = (
+            hl_explore.clamp_explore_params(
+                min_live_days=min_live_days, min_fills=min_fills,
+                max_dd_pct=max_dd_pct, max_concentration_pct=max_concentration_pct))
+        return _explore_index.query(page=page, window=window, min_live_days=min_live_days,
+                                    min_fills=min_fills, max_dd_pct=max_dd_pct,
+                                    max_concentration_pct=max_concentration_pct)
 
     # ---------- /api/public/traders/{address}（M3 round2 Task 6）----------
     # ⭐ leaderboard 任意地址的詳情頁——不受精選白名單管轄（`leaders.py` 唯讀，

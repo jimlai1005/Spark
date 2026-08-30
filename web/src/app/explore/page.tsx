@@ -1,13 +1,14 @@
 "use client";
 /**
- * `/explore` — 可跟單對象探索榜（M3 round3 Task 4，設計審查 R2·A）。
+ * `/explore` — 可跟單對象探索榜（M3 round3 Task 4，設計審查 R2·A；R4-3
+ * 2026-08-30 改版：合併 chip 拆成四個自由數值門檻＋四期間窗全開）。
  *
  * 從舊版「鯨魚 PnL 榜」（`/leaderboard`，見 `hl_leaderboard.py`）重構而來：解決
  * 冷啟動——讓用戶找到「值得貼進進階模式的地址」。唯一資料源是
  * `GET /api/public/explore`（無需登入，`hl_explore.py`），排序（風險調整後報酬＝
- * 30D 報酬率 ÷ 最大回撤）與資格過濾（樣本門檻／回撤上限／集中度上限）**全在
- * 後端完成**（R2-01）——本頁三顆 chip 只送布林開關，絕不自己排序或過濾一次
- * 已經拿到的 rows（否則分頁的 `total_qualified` 會跟畫面對不上）。
+ * 所選窗報酬率 ÷ 最大回撤）與資格過濾（樣本門檻／回撤上限／集中度上限）**全在
+ * 後端完成**（R2-01）——本頁只送四個自由數值門檻＋所選期間窗，絕不自己排序或
+ * 過濾一次已經拿到的 rows（否則分頁的 `total_qualified` 會跟畫面對不上）。
  *
  * 三態明確區分（同 `/leaderboard` 舊頁與 `PositionsTable.history` 的既有慣例）：
  * - `state==="error"`：fetch 本身失敗（連線／非 200／格式異常，見
@@ -16,19 +17,41 @@
  *   故障，見 `ExploreIndex.query` 檔頭）→ R2·C 態二，「建置中」文案。
  * - `state==="ready" && !resp.building && rows.length===0`：成功但零筆合格 → 空態。
  *
- * `window` 本輪固定 `30d`（7D/90D/全部 三個 chip disabled＋「即將推出」，D1：
- * enrich 成本是 ×4，本輪不做）。
+ * R4-3：四個門檻輸入框各自 debounce 500ms 再打 API（避免每個按鍵都發請求）；
+ * 清空欄位＝不套用該條件——前端送邊界值（min 系欄位送 0、max 系欄位送 100，
+ * 見 `hl_explore.clamp_explore_params` 檔頭「伺服器夾取」設計，這兩個邊界值
+ * 本身天然等於「這個維度永遠通過」，不需要額外的 sentinel/None 概念）。四期間
+ * 窗（`EXPLORE_WINDOWS`：day/week/month/allTime）全部可點，切換立即生效（不
+ * debounce——這是離散選擇不是連續輸入）；候選池仍固定用 30D 表現選出，切窗
+ * 只改變顯示與排序（`c.poolNote` 誠實揭露，見 `hl_explore.py` 檔頭「R4-3」節）。
  */
 import Link from "next/link";
-import { type Dispatch, type SetStateAction, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { NO_VALUE, fmtUpdatedAtUtc } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
-import { getPublicExplore, type ExploreResp, type ExploreRow } from "@/lib/publicApi";
+import {
+  EXPLORE_WINDOWS, getPublicExplore, type ExploreFilters, type ExploreResp,
+  type ExploreRow, type ExploreWindow,
+} from "@/lib/publicApi";
 
 type LoadState = "loading" | "error" | "ready";
 
 const SPARK_W = 96;
 const SPARK_H = 28;
+const FILTER_DEBOUNCE_MS = 500;
+
+const DEFAULT_MIN_LIVE_DAYS = 30;
+const DEFAULT_MIN_FILLS = 200;
+const DEFAULT_MAX_DD_PCT = 30;
+const DEFAULT_MAX_CONCENTRATION_PCT = 90;
+
+const DEFAULT_FILTERS: ExploreFilters = {
+  window: "month",
+  minLiveDays: DEFAULT_MIN_LIVE_DAYS,
+  minFills: DEFAULT_MIN_FILLS,
+  maxDdPct: DEFAULT_MAX_DD_PCT,
+  maxConcentrationPct: DEFAULT_MAX_CONCENTRATION_PCT,
+};
 
 // 後端 `hl_explore._apply_tags`／`_exposure`（`src/spark/publicapi/hl_explore.py`）
 // 回傳的是 locale 中性代碼（D14，2026-08-30 主線程裁決）：`tags` ⊂
@@ -87,13 +110,29 @@ function pageWindow(current: number, total: number, span = 2): number[] {
   return Array.from({ length: Math.max(0, end - start + 1) }, (_, i) => start + i);
 }
 
+/** 門檻輸入框文字 → 送給後端的數值：清空＝送邊界值（"不過濾"，見檔頭說明）；
+ * 非數字（理論上 `type="number"` 擋得住，防禦性保留）→ 落回預設值，不送
+ * `NaN`。 */
+function parseThresholdInput(text: string, emptyValue: number, fallback: number): number {
+  const trimmed = text.trim();
+  if (trimmed === "") return emptyValue;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 export default function ExplorePage() {
   const COPY = useCopy();
   const c = COPY.explore;
 
-  const [qualified, setQualified] = useState(true);
-  const [maxDd, setMaxDd] = useState(true);
-  const [excludeConcentrated, setExcludeConcentrated] = useState(true);
+  // 四個門檻輸入框各自獨立的「使用者正在打字」文字狀態（允許暫時清空／打到一半
+  // 的非終態），debounce 後才轉成數值寫進 `filters`（實際打 API 的來源）。
+  const [minLiveDaysText, setMinLiveDaysText] = useState(String(DEFAULT_MIN_LIVE_DAYS));
+  const [minFillsText, setMinFillsText] = useState(String(DEFAULT_MIN_FILLS));
+  const [maxDdPctText, setMaxDdPctText] = useState(String(DEFAULT_MAX_DD_PCT));
+  const [maxConcentrationPctText, setMaxConcentrationPctText] =
+    useState(String(DEFAULT_MAX_CONCENTRATION_PCT));
+
+  const [filters, setFilters] = useState<ExploreFilters>(DEFAULT_FILTERS);
   const [page, setPage] = useState(1);
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -101,10 +140,28 @@ export default function ExplorePage() {
   const [resp, setResp] = useState<ExploreResp | null>(null);
   const [errorAt, setErrorAt] = useState<number | null>(null);
 
+  // R4-3：四個門檻文字框 debounce 500ms 後才提交成數值門檻並回第一頁——切換
+  // 期間窗（見 `handleWindowChange`）不經過這條路徑，是離散選擇立即生效。
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setFilters((prev) => ({
+        ...prev,
+        minLiveDays: parseThresholdInput(minLiveDaysText, 0, DEFAULT_MIN_LIVE_DAYS),
+        minFills: parseThresholdInput(minFillsText, 0, DEFAULT_MIN_FILLS),
+        maxDdPct: parseThresholdInput(maxDdPctText, 100, DEFAULT_MAX_DD_PCT),
+        maxConcentrationPct: parseThresholdInput(
+          maxConcentrationPctText, 100, DEFAULT_MAX_CONCENTRATION_PCT,
+        ),
+      }));
+      setPage(1);
+    }, FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [minLiveDaysText, minFillsText, maxDdPctText, maxConcentrationPctText]);
+
   useEffect(() => {
     let cancelled = false;
     setState("loading");
-    getPublicExplore(page, { qualified, maxDd, excludeConcentrated })
+    getPublicExplore(page, filters)
       .then((r) => {
         if (cancelled) return;
         setResp(r);
@@ -120,10 +177,10 @@ export default function ExplorePage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, qualified, maxDd, excludeConcentrated, reloadKey]);
+  }, [page, filters, reloadKey]);
 
-  function toggleFilter(setter: Dispatch<SetStateAction<boolean>>) {
-    setter((v) => !v);
+  function handleWindowChange(window: ExploreWindow) {
+    setFilters((prev) => ({ ...prev, window }));
     setPage(1);
   }
 
@@ -158,45 +215,20 @@ export default function ExplorePage() {
       </header>
 
       <div className="explore-chips">
-        <div className="explore-window-group" role="group" aria-label={c.windows.d30}>
-          <span className="explore-window-btn" data-active="true">{c.windows.d30}</span>
-          <button type="button" className="explore-window-btn" disabled title={c.windowComingSoon}>
-            {c.windows.d7}
-          </button>
-          <button type="button" className="explore-window-btn" disabled title={c.windowComingSoon}>
-            {c.windows.d90}
-          </button>
-          <button type="button" className="explore-window-btn" disabled title={c.windowComingSoon}>
-            {c.windows.all}
-          </button>
+        <div className="explore-window-group" role="group" aria-label={c.windows.month}>
+          {EXPLORE_WINDOWS.map((w) => (
+            <button
+              key={w}
+              type="button"
+              className="explore-window-btn"
+              data-active={filters.window === w}
+              aria-pressed={filters.window === w}
+              onClick={() => handleWindowChange(w)}
+            >
+              {c.windows[w]}
+            </button>
+          ))}
         </div>
-        <button
-          type="button"
-          className="explore-chip"
-          data-active={qualified}
-          aria-pressed={qualified}
-          onClick={() => toggleFilter(setQualified)}
-        >
-          {c.filters.sample}
-        </button>
-        <button
-          type="button"
-          className="explore-chip"
-          data-active={maxDd}
-          aria-pressed={maxDd}
-          onClick={() => toggleFilter(setMaxDd)}
-        >
-          {c.filters.maxDd}
-        </button>
-        <button
-          type="button"
-          className="explore-chip"
-          data-active={excludeConcentrated}
-          aria-pressed={excludeConcentrated}
-          onClick={() => toggleFilter(setExcludeConcentrated)}
-        >
-          {c.filters.concentrated}
-        </button>
         <span className="explore-count mono">
           {c.countPrefix}
           {(resp?.total_scanned ?? 0).toLocaleString()}
@@ -205,6 +237,62 @@ export default function ExplorePage() {
           {c.countSuffix}
         </span>
       </div>
+
+      <div className="explore-filters">
+        <label className="explore-filter-item">
+          <span className="explore-filter-label">{c.filters.minLiveDaysLabel}</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            max={365}
+            className="explore-filter-input"
+            value={minLiveDaysText}
+            onChange={(e) => setMinLiveDaysText(e.target.value)}
+            title={c.filters.clearToDisable}
+          />
+        </label>
+        <label className="explore-filter-item">
+          <span className="explore-filter-label">{c.filters.minFillsLabel}</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            max={100000}
+            className="explore-filter-input"
+            value={minFillsText}
+            onChange={(e) => setMinFillsText(e.target.value)}
+            title={c.filters.clearToDisable}
+          />
+        </label>
+        <label className="explore-filter-item">
+          <span className="explore-filter-label">{c.filters.maxDdPctLabel}</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={100}
+            className="explore-filter-input"
+            value={maxDdPctText}
+            onChange={(e) => setMaxDdPctText(e.target.value)}
+            title={c.filters.clearToDisable}
+          />
+        </label>
+        <label className="explore-filter-item">
+          <span className="explore-filter-label">{c.filters.maxConcentrationPctLabel}</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={100}
+            className="explore-filter-input"
+            value={maxConcentrationPctText}
+            onChange={(e) => setMaxConcentrationPctText(e.target.value)}
+            title={c.filters.clearToDisable}
+          />
+        </label>
+      </div>
+      <p className="hint explore-pool-note">{c.poolNote}</p>
 
       {state === "loading" && <p className="hint">{COPY.common.loading}</p>}
 
@@ -238,7 +326,12 @@ export default function ExplorePage() {
               <div>{c.table.actions}</div>
             </div>
             {resp.rows.map((row, i) => (
-              <ExploreRowView key={row.address} row={row} rank={(resp.page - 1) * resp.page_size + i + 1} />
+              <ExploreRowView
+                key={row.address}
+                row={row}
+                rank={(resp.page - 1) * resp.page_size + i + 1}
+                window={filters.window}
+              />
             ))}
           </div>
 
@@ -290,7 +383,9 @@ export default function ExplorePage() {
   );
 }
 
-function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
+function ExploreRowView(
+  { row, rank, window }: { row: ExploreRow; rank: number; window: ExploreWindow },
+) {
   const COPY = useCopy();
   const c = COPY.explore;
   const [copied, setCopied] = useState(false);
@@ -319,6 +414,10 @@ function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
     : row.exposure.dir === "short"
       ? 100 - (row.exposure.pct ?? 0)
       : 0;
+  // R4-3：`windows[window]` 對這一列可能是 `null`（day/week best-effort 缺席，
+  // 見 `hl_explore.py` 檔頭「R4-3」節）——誠實顯示「—」，不回退借用其他窗的
+  // 數字冒充。
+  const winStats = row.windows[window];
 
   return (
     <div className="explore-table-row">
@@ -350,17 +449,19 @@ function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
           aria-label={c.table.sparkline}
         >
           <polyline
-            points={sparkPoints(row.spark)}
+            points={sparkPoints(winStats?.spark ?? [])}
             fill="none"
-            stroke={row.ret_30d_pct >= 0 ? "var(--pos)" : "var(--neg)"}
+            stroke={winStats != null && winStats.ret_pct >= 0 ? "var(--pos)" : "var(--neg)"}
             strokeWidth="1.4"
           />
         </svg>
       </div>
-      <div className={`mono explore-ret ${row.ret_30d_pct >= 0 ? "pos" : "neg"}`}>
-        {fmtSignedPct(row.ret_30d_pct)}
+      <div className={`mono explore-ret ${winStats != null && winStats.ret_pct >= 0 ? "pos" : "neg"}`}>
+        {winStats != null ? fmtSignedPct(winStats.ret_pct) : NO_VALUE}
       </div>
-      <div className="mono neg explore-dd">{row.max_dd_30d_pct.toFixed(1)}%</div>
+      <div className="mono neg explore-dd">
+        {winStats != null ? `${winStats.max_dd_pct.toFixed(1)}%` : NO_VALUE}
+      </div>
       <div className="mono explore-days">{row.live_days}</div>
       <div className="mono explore-wr">{fmtPct1(row.close_win_rate_pct)}</div>
       <div className="explore-exposure">
