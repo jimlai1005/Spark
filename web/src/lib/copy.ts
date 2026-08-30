@@ -875,9 +875,6 @@ export const COPY_ZH = {
         // （「策略期間回撤」），與策略詳情頁／traders 頁同一個 key。
         liveDaysLabel: "實盤天數",
         followerCountLabel: "目前跟單人數",
-        // ⭐ M3 round3 Task 9（R2 P2）：跟單人數 < FOLLOWER_COUNT_DISPLAY_MIN（10）
-        // 時的替代欄——不顯示「還很少人跟」的冷啟動訊號，改顯示連續實盤天數。
-        followerCountFallbackLabel: "連續實盤天數",
         sampleNotePrefix: "樣本 ",
         sampleNoteSuffix: " 交易日，樣本數偏小、指標帶寬較寬。",
         methodologyLink: "完整方法論揭露 →",
@@ -2295,8 +2292,6 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         // ("Strategy drawdown") directly in page.tsx — same key across detail/home/traders.
         liveDaysLabel: "Days live",
         followerCountLabel: "Current followers",
-        // Task 9 (R2 P2): fallback shown when follower count < FOLLOWER_COUNT_DISPLAY_MIN (10).
-        followerCountFallbackLabel: "Consecutive days live",
         sampleNotePrefix: "Sample ",
         sampleNoteSuffix: " trading days; small sample, wider metric bands.",
         methodologyLink: "Full methodology disclosure →",

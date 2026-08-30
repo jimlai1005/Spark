@@ -177,17 +177,14 @@ export default function HomePage() {
                   <div className="strategy-metric-label">{home.hero.featuredCard.liveDaysLabel}</div>
                   <div className="mono home-hero-featured-value">{featured.live_days}</div>
                 </div>
-                {featured.follower_count != null && featured.follower_count >= FOLLOWER_COUNT_DISPLAY_MIN ? (
+                {/* ⭐ M3 round3 Task 9 修正（主線程實機走查退回，2026-08-30）：<10 或 null
+                    時原本改渲染「連續實盤天數」，但值與第三格「實盤天數」完全相同
+                    （同一個 live_days），並排顯示同一個數字兩次看起來像 bug——裁決改為
+                    直接不渲染替代欄，面板收斂為三格。 */}
+                {featured.follower_count != null && featured.follower_count >= FOLLOWER_COUNT_DISPLAY_MIN && (
                   <div>
                     <div className="strategy-metric-label">{home.hero.featuredCard.followerCountLabel}</div>
                     <div className="mono home-hero-featured-value">{featured.follower_count}</div>
-                  </div>
-                ) : (
-                  <div>
-                    <div className="strategy-metric-label">
-                      {home.hero.featuredCard.followerCountFallbackLabel}
-                    </div>
-                    <div className="mono home-hero-featured-value">{featured.live_days}</div>
                   </div>
                 )}
               </div>

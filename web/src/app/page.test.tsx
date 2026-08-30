@@ -139,13 +139,15 @@ describe("HomePage", () => {
     expect(screen.getByText("策略期間回撤")).toBeInTheDocument();
   });
 
-  // ⭐ M3 round3 Task 9（R2 P2）：跟單人數 < 10 把冷啟動寫在第一屏，改顯示連續實盤天數。
+  // ⭐ M3 round3 Task 9（R2 P2，2026-08-30 主線程實機走查退回修正）：跟單人數 < 10
+  // 把冷啟動寫在第一屏 → 不渲染該欄（不是改顯示替代欄——替代欄的 live_days 與既有
+  // 第三格「實盤天數」重複，並排顯示同一個數字兩次看起來像 bug）。面板收斂為三格。
   describe("跟單人數門檻（FOLLOWER_COUNT_DISPLAY_MIN）", () => {
     it(`門檻常數為 ${FOLLOWER_COUNT_DISPLAY_MIN}`, () => {
       expect(FOLLOWER_COUNT_DISPLAY_MIN).toBe(10);
     });
 
-    it("follower_count=9（<10）：不顯示跟單人數欄，改顯示連續實盤天數", async () => {
+    it("follower_count=9（<10）：不顯示跟單人數欄，面板收斂為三格（無重複的實盤天數）", async () => {
       const strategy = { ...STRATEGY, follower_count: 9, live_days: 91 };
       stubFetch((url) => {
         if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [strategy], updated_at: 1 });
@@ -154,11 +156,12 @@ describe("HomePage", () => {
       render(<HomePage />);
       await screen.findByText("Filet Core");
       expect(screen.queryByText(COPY.home.hero.featuredCard.followerCountLabel)).not.toBeInTheDocument();
-      expect(screen.getByText(COPY.home.hero.featuredCard.followerCountFallbackLabel)).toBeInTheDocument();
-      expect(screen.getAllByText("91").length).toBeGreaterThanOrEqual(1);
+      const panel = document.querySelector(".home-hero-featured-metrics") as HTMLElement;
+      expect(panel.children.length).toBe(3);
+      expect(screen.getAllByText("91").length).toBe(1); // 只有第三格「實盤天數」，不重複
     });
 
-    it("follower_count=10（=10）：顯示跟單人數欄", async () => {
+    it("follower_count=10（=10）：顯示跟單人數欄，面板為四格", async () => {
       const strategy = { ...STRATEGY, follower_count: 10 };
       stubFetch((url) => {
         if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [strategy], updated_at: 1 });
@@ -168,10 +171,11 @@ describe("HomePage", () => {
       await screen.findByText("Filet Core");
       expect(screen.getByText(COPY.home.hero.featuredCard.followerCountLabel)).toBeInTheDocument();
       expect(screen.getByText("10")).toBeInTheDocument();
-      expect(screen.queryByText(COPY.home.hero.featuredCard.followerCountFallbackLabel)).not.toBeInTheDocument();
+      const panel = document.querySelector(".home-hero-featured-metrics") as HTMLElement;
+      expect(panel.children.length).toBe(4);
     });
 
-    it("follower_count=null：不顯示跟單人數欄，改顯示連續實盤天數", async () => {
+    it("follower_count=null：不顯示跟單人數欄，面板收斂為三格", async () => {
       const strategy = { ...STRATEGY, follower_count: null, live_days: 91 };
       stubFetch((url) => {
         if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [strategy], updated_at: 1 });
@@ -180,7 +184,8 @@ describe("HomePage", () => {
       render(<HomePage />);
       await screen.findByText("Filet Core");
       expect(screen.queryByText(COPY.home.hero.featuredCard.followerCountLabel)).not.toBeInTheDocument();
-      expect(screen.getByText(COPY.home.hero.featuredCard.followerCountFallbackLabel)).toBeInTheDocument();
+      const panel = document.querySelector(".home-hero-featured-metrics") as HTMLElement;
+      expect(panel.children.length).toBe(3);
     });
   });
 });
