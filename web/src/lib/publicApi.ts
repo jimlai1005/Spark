@@ -352,18 +352,31 @@ export async function getPublicLeaderboard(
 
 /**
  * `/api/public/explore`（M3 round3 Task 1／4：可跟單對象探索榜，`hl_explore.py`
- * `ExploreRow.to_dict()`）。排序與資格過濾全在後端（R2-01）；本頁只送三個布林
- * chip 開關（window 本輪固定 `30d`，其餘視窗前端 disabled，見 explore/page.tsx）。
+ * `ExploreRow.to_dict()`）。排序與資格過濾全在後端（R2-01）。R4-10（2026-08-31
+ * 使用者裁決）：期間 chip 改四窗全開（`ExploreWindow`）；原「樣本門檻」合併
+ * chip 拆成兩顆獨立布林 chip（實盤天數／成交筆數），仍是布林開關送給後端固定
+ * 數值門檻——不是 R4-3 revert 掉的自由數值輸入框（見 `explore/page.tsx`）。
  */
+export type ExploreWindow = "day" | "week" | "month" | "allTime";
+
+export const EXPLORE_WINDOWS: readonly ExploreWindow[] = ["day", "week", "month", "allTime"];
+
+/** 單一窗的報酬／回撤／sparkline；`null`＝該窗對這一列缺席（day/week
+ * best-effort，見 `hl_explore.py` 檔頭「R4-3」節）——前端誠實顯示「—」，
+ * 不得回退借用其他窗的數字冒充。 */
+export interface ExploreWindowStats {
+  ret_pct: number;
+  max_dd_pct: number;
+  spark: number[];
+}
+
 export interface ExploreRow {
   address: string;
   display_name: string | null;
   label: string;
   coins: string[];
   account_bucket: string;
-  spark: number[];
-  ret_30d_pct: number;
-  max_dd_30d_pct: number;
+  windows: Record<ExploreWindow, ExploreWindowStats | null>;
   /** 實盤天數＝perpAllTime 首末快照的日曆跨距（後端欄位 `live_days`）。 */
   live_days: number;
   fill_count_30d: number;
@@ -385,14 +398,37 @@ export interface ExploreResp {
   building: boolean;
 }
 
+/**
+ * R4-10：呼叫端（`explore/page.tsx`）把兩顆布林 chip（實盤天數／成交筆數）與
+ * 既有兩顆布林 chip（最大回撤／集中度）各自映射成後端的固定數值門檻
+ * （on→門檻值／off→邊界值＝不過濾，映射常數集中在 page.tsx），本介面只描述
+ * 「已決定要送出的數值」，不管 chip 開關本身。
+ */
 export interface ExploreFilters {
-  qualified: boolean;
-  maxDd: boolean;
-  excludeConcentrated: boolean;
+  window: ExploreWindow;
+  minLiveDays: number;
+  minFills: number;
+  maxDdPct: number;
+  maxConcentrationPct: number;
 }
 
 function toNumberOrNull(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function normalizeWindowStats(v: unknown): ExploreWindowStats | null {
+  if (v == null || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  const retPct = toNumberOrNull(r.ret_pct);
+  const maxDdPct = toNumberOrNull(r.max_dd_pct);
+  if (retPct == null || maxDdPct == null) return null;
+  return {
+    ret_pct: retPct,
+    max_dd_pct: maxDdPct,
+    spark: Array.isArray(r.spark)
+      ? r.spark.filter((n): n is number => typeof n === "number" && Number.isFinite(n))
+      : [],
+  };
 }
 
 function normalizeExploreRow(v: unknown): ExploreRow | null {
@@ -402,17 +438,19 @@ function normalizeExploreRow(v: unknown): ExploreRow | null {
   const exposure = (r.exposure && typeof r.exposure === "object")
     ? r.exposure as Record<string, unknown>
     : {};
+  const rawWindows = (r.windows && typeof r.windows === "object")
+    ? r.windows as Record<string, unknown>
+    : {};
+  const windows = Object.fromEntries(
+    EXPLORE_WINDOWS.map((w) => [w, normalizeWindowStats(rawWindows[w])]),
+  ) as Record<ExploreWindow, ExploreWindowStats | null>;
   return {
     address: r.address,
     display_name: typeof r.display_name === "string" ? r.display_name : null,
     label: typeof r.label === "string" ? r.label : r.address,
     coins: Array.isArray(r.coins) ? r.coins.filter((c): c is string => typeof c === "string") : [],
     account_bucket: typeof r.account_bucket === "string" ? r.account_bucket : NO_VALUE_PLACEHOLDER,
-    spark: Array.isArray(r.spark)
-      ? r.spark.filter((n): n is number => typeof n === "number" && Number.isFinite(n))
-      : [],
-    ret_30d_pct: toNumberOrNull(r.ret_30d_pct) ?? 0,
-    max_dd_30d_pct: toNumberOrNull(r.max_dd_30d_pct) ?? 0,
+    windows,
     live_days: typeof r.live_days === "number" ? r.live_days : 0,
     fill_count_30d: typeof r.fill_count_30d === "number" ? r.fill_count_30d : 0,
     close_win_rate_pct: toNumberOrNull(r.close_win_rate_pct),
@@ -440,11 +478,12 @@ export async function getPublicExplore(
   page: number, filters: ExploreFilters,
 ): Promise<ExploreResp> {
   const params = new URLSearchParams({
-    window: "30d",
+    window: filters.window,
     page: String(page),
-    qualified: filters.qualified ? "1" : "0",
-    max_dd: filters.maxDd ? "1" : "0",
-    exclude_concentrated: filters.excludeConcentrated ? "1" : "0",
+    min_live_days: String(filters.minLiveDays),
+    min_fills: String(filters.minFills),
+    max_dd_pct: String(filters.maxDdPct),
+    max_concentration_pct: String(filters.maxConcentrationPct),
   });
   const res = await fetch(`/api/public/explore?${params.toString()}`);
   if (!res.ok) throw new Error(`explore fetch failed: ${res.status}`);

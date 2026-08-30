@@ -1,13 +1,19 @@
 "use client";
 /**
- * `/explore` — 可跟單對象探索榜（M3 round3 Task 4，設計審查 R2·A）。
+ * `/explore` — 可跟單對象探索榜（M3 round3 Task 4，設計審查 R2·A；R4-10
+ * 2026-08-31 使用者裁決：保留 chip UI，(a) 期間 chip 從固定 30D 改四窗全開
+ * （1D/7D/30D/全部），(b) 原「樣本門檻」合併 chip 拆成兩顆獨立布林 chip
+ * （實盤天數／成交筆數）。R4-3 那版自由填數字輸入框已被 revert（commit
+ * 061433a，使用者不喜歡輸入框）——本輪**不**重加輸入框，四個門檻維持布林
+ * chip 開關 + 後端固定數值（見下方 `*_THRESHOLD` 常數），只是從三顆 chip
+ * 拆成四顆。
  *
  * 從舊版「鯨魚 PnL 榜」（`/leaderboard`，見 `hl_leaderboard.py`）重構而來：解決
  * 冷啟動——讓用戶找到「值得貼進進階模式的地址」。唯一資料源是
  * `GET /api/public/explore`（無需登入，`hl_explore.py`），排序（風險調整後報酬＝
- * 30D 報酬率 ÷ 最大回撤）與資格過濾（樣本門檻／回撤上限／集中度上限）**全在
- * 後端完成**（R2-01）——本頁三顆 chip 只送布林開關，絕不自己排序或過濾一次
- * 已經拿到的 rows（否則分頁的 `total_qualified` 會跟畫面對不上）。
+ * 所選窗報酬率 ÷ 最大回撤）與資格過濾（樣本門檻／回撤上限／集中度上限）**全在
+ * 後端完成**（R2-01）——本頁四顆 chip 只送布林開關對映的固定數值，絕不自己
+ * 排序或過濾一次已經拿到的 rows（否則分頁的 `total_qualified` 會跟畫面對不上）。
  *
  * 三態明確區分（同 `/leaderboard` 舊頁與 `PositionsTable.history` 的既有慣例）：
  * - `state==="error"`：fetch 本身失敗（連線／非 200／格式異常，見
@@ -16,19 +22,35 @@
  *   故障，見 `ExploreIndex.query` 檔頭）→ R2·C 態二，「建置中」文案。
  * - `state==="ready" && !resp.building && rows.length===0`：成功但零筆合格 → 空態。
  *
- * `window` 本輪固定 `30d`（7D/90D/全部 三個 chip disabled＋「即將推出」，D1：
- * enrich 成本是 ×4，本輪不做）。
+ * 四窗（day/week/month/allTime，UI 標籤 1D/7D/30D/全部）全部可點、切換立即
+ * 生效（不 debounce——離散選擇，不是連續輸入）；候選池仍固定用後端 stats-data
+ * month 窗 roi 選出，切窗只改變顯示與排序（見 `hl_explore.py` 檔頭「R4-3」節）。
+ * 表格數字讀 `row.windows[所選窗]`——該窗對這一列缺席（day/week best-effort）
+ * → 誠實顯示「—」，不得回退借用其他窗的數字冒充（工程原則：不編數字）。
  */
 import Link from "next/link";
 import { type Dispatch, type SetStateAction, useEffect, useState } from "react";
 import { NO_VALUE, fmtUpdatedAtUtc } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
-import { getPublicExplore, type ExploreResp, type ExploreRow } from "@/lib/publicApi";
+import {
+  EXPLORE_WINDOWS, getPublicExplore, type ExploreFilters, type ExploreResp,
+  type ExploreRow, type ExploreWindow,
+} from "@/lib/publicApi";
 
 type LoadState = "loading" | "error" | "ready";
 
 const SPARK_W = 96;
 const SPARK_H = 28;
+
+// R4-10：四顆布林 chip → 後端固定數值門檻的映射常數（集中於此一處）。
+// on → 套用門檻；off → 送邊界值（不過濾，見 `hl_explore.clamp_explore_params`
+// 檔頭「伺服器夾取」設計：min 系送 0、max 系送 100 天然等於「這個維度永遠
+// 通過」）。門檻數字固定，不提供自由填寫（使用者裁決：不喜歡輸入框）。
+const LIVE_DAYS_THRESHOLD = 30;
+const FILLS_THRESHOLD = 200;
+const MAX_DD_PCT_THRESHOLD = 30;
+const MAX_CONCENTRATION_PCT_THRESHOLD = 90;
+const DEFAULT_WINDOW: ExploreWindow = "month";
 
 // 後端 `hl_explore._apply_tags`／`_exposure`（`src/spark/publicapi/hl_explore.py`）
 // 回傳的是 locale 中性代碼（D14，2026-08-30 主線程裁決）：`tags` ⊂
@@ -91,9 +113,11 @@ export default function ExplorePage() {
   const COPY = useCopy();
   const c = COPY.explore;
 
-  const [qualified, setQualified] = useState(true);
-  const [maxDd, setMaxDd] = useState(true);
-  const [excludeConcentrated, setExcludeConcentrated] = useState(true);
+  const [window_, setWindow] = useState<ExploreWindow>(DEFAULT_WINDOW);
+  const [liveDaysChip, setLiveDaysChip] = useState(true);
+  const [fillsChip, setFillsChip] = useState(true);
+  const [maxDdChip, setMaxDdChip] = useState(true);
+  const [concentratedChip, setConcentratedChip] = useState(true);
   const [page, setPage] = useState(1);
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -101,10 +125,18 @@ export default function ExplorePage() {
   const [resp, setResp] = useState<ExploreResp | null>(null);
   const [errorAt, setErrorAt] = useState<number | null>(null);
 
+  const filters: ExploreFilters = {
+    window: window_,
+    minLiveDays: liveDaysChip ? LIVE_DAYS_THRESHOLD : 0,
+    minFills: fillsChip ? FILLS_THRESHOLD : 0,
+    maxDdPct: maxDdChip ? MAX_DD_PCT_THRESHOLD : 100,
+    maxConcentrationPct: concentratedChip ? MAX_CONCENTRATION_PCT_THRESHOLD : 100,
+  };
+
   useEffect(() => {
     let cancelled = false;
     setState("loading");
-    getPublicExplore(page, { qualified, maxDd, excludeConcentrated })
+    getPublicExplore(page, filters)
       .then((r) => {
         if (cancelled) return;
         setResp(r);
@@ -120,10 +152,15 @@ export default function ExplorePage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, qualified, maxDd, excludeConcentrated, reloadKey]);
+  }, [page, window_, liveDaysChip, fillsChip, maxDdChip, concentratedChip, reloadKey]);
 
-  function toggleFilter(setter: Dispatch<SetStateAction<boolean>>) {
+  function toggleChip(setter: Dispatch<SetStateAction<boolean>>) {
     setter((v) => !v);
+    setPage(1);
+  }
+
+  function handleWindowChange(w: ExploreWindow) {
+    setWindow(w);
     setPage(1);
   }
 
@@ -158,42 +195,53 @@ export default function ExplorePage() {
       </header>
 
       <div className="explore-chips">
-        <div className="explore-window-group" role="group" aria-label={c.windows.d30}>
-          <span className="explore-window-btn" data-active="true">{c.windows.d30}</span>
-          <button type="button" className="explore-window-btn" disabled title={c.windowComingSoon}>
-            {c.windows.d7}
-          </button>
-          <button type="button" className="explore-window-btn" disabled title={c.windowComingSoon}>
-            {c.windows.d90}
-          </button>
-          <button type="button" className="explore-window-btn" disabled title={c.windowComingSoon}>
-            {c.windows.all}
-          </button>
+        <div className="explore-window-group" role="group" aria-label={c.windows.month}>
+          {EXPLORE_WINDOWS.map((w) => (
+            <button
+              key={w}
+              type="button"
+              className="explore-window-btn"
+              data-active={window_ === w}
+              aria-pressed={window_ === w}
+              onClick={() => handleWindowChange(w)}
+            >
+              {c.windows[w]}
+            </button>
+          ))}
         </div>
         <button
           type="button"
           className="explore-chip"
-          data-active={qualified}
-          aria-pressed={qualified}
-          onClick={() => toggleFilter(setQualified)}
+          data-active={liveDaysChip}
+          aria-pressed={liveDaysChip}
+          onClick={() => toggleChip(setLiveDaysChip)}
         >
-          {c.filters.sample}
+          {c.filters.liveDays}
         </button>
         <button
           type="button"
           className="explore-chip"
-          data-active={maxDd}
-          aria-pressed={maxDd}
-          onClick={() => toggleFilter(setMaxDd)}
+          data-active={fillsChip}
+          aria-pressed={fillsChip}
+          onClick={() => toggleChip(setFillsChip)}
+        >
+          {c.filters.fills}
+        </button>
+        <button
+          type="button"
+          className="explore-chip"
+          data-active={maxDdChip}
+          aria-pressed={maxDdChip}
+          onClick={() => toggleChip(setMaxDdChip)}
         >
           {c.filters.maxDd}
         </button>
         <button
           type="button"
           className="explore-chip"
-          data-active={excludeConcentrated}
-          aria-pressed={excludeConcentrated}
-          onClick={() => toggleFilter(setExcludeConcentrated)}
+          data-active={concentratedChip}
+          aria-pressed={concentratedChip}
+          onClick={() => toggleChip(setConcentratedChip)}
         >
           {c.filters.concentrated}
         </button>
@@ -238,7 +286,12 @@ export default function ExplorePage() {
               <div>{c.table.actions}</div>
             </div>
             {resp.rows.map((row, i) => (
-              <ExploreRowView key={row.address} row={row} rank={(resp.page - 1) * resp.page_size + i + 1} />
+              <ExploreRowView
+                key={row.address}
+                row={row}
+                window={window_}
+                rank={(resp.page - 1) * resp.page_size + i + 1}
+              />
             ))}
           </div>
 
@@ -290,10 +343,16 @@ export default function ExplorePage() {
   );
 }
 
-function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
+function ExploreRowView(
+  { row, window: windowKey, rank }: { row: ExploreRow; window: ExploreWindow; rank: number },
+) {
   const COPY = useCopy();
   const c = COPY.explore;
   const [copied, setCopied] = useState(false);
+  // R4-10：所選窗對這一列缺席（day/week best-effort，見 hl_explore.py 檔頭
+  // 「R4-3」節）→ `stats` 為 `null`，下方各儲存格誠實顯示「—」，不回退借用
+  // 其他窗的數字冒充。
+  const stats = row.windows[windowKey];
 
   useEffect(() => {
     if (!copied) return;
@@ -350,17 +409,19 @@ function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
           aria-label={c.table.sparkline}
         >
           <polyline
-            points={sparkPoints(row.spark)}
+            points={sparkPoints(stats?.spark ?? [])}
             fill="none"
-            stroke={row.ret_30d_pct >= 0 ? "var(--pos)" : "var(--neg)"}
+            stroke={(stats?.ret_pct ?? 0) >= 0 ? "var(--pos)" : "var(--neg)"}
             strokeWidth="1.4"
           />
         </svg>
       </div>
-      <div className={`mono explore-ret ${row.ret_30d_pct >= 0 ? "pos" : "neg"}`}>
-        {fmtSignedPct(row.ret_30d_pct)}
+      <div className={`mono explore-ret ${stats == null ? "" : stats.ret_pct >= 0 ? "pos" : "neg"}`}>
+        {stats == null ? NO_VALUE : fmtSignedPct(stats.ret_pct)}
       </div>
-      <div className="mono neg explore-dd">{row.max_dd_30d_pct.toFixed(1)}%</div>
+      <div className="mono neg explore-dd">
+        {stats == null ? NO_VALUE : `${stats.max_dd_pct.toFixed(1)}%`}
+      </div>
       <div className="mono explore-days">{row.live_days}</div>
       <div className="mono explore-wr">{fmtPct1(row.close_win_rate_pct)}</div>
       <div className="explore-exposure">

@@ -1,7 +1,10 @@
 /**
- * `/explore` — 探索榜頁測試（M3 round3 Task 4）。只驗證頁面職責：抓資料、三態
- * 區分（building／fetch 失敗／正常）、表格渲染（含勝率 null→「—」）、
- * 「跟單 →」連結帶 `?leader=`、分頁換頁打 API 帶 `page` 參數。
+ * `/explore` — 探索榜頁測試（M3 round3 Task 4；R4-10 2026-08-31 使用者裁決：
+ * chip UI 保留，期間 chip 從固定 30D 改四窗全開，原「樣本門檻」合併 chip 拆成
+ * 兩顆獨立布林 chip）。驗證頁面職責：抓資料、三態區分（building／fetch 失敗／
+ * 正常）、表格渲染（含勝率 null→「—」、所選窗缺席→「—」）、「跟單 →」連結帶
+ * `?leader=`、分頁換頁打 API 帶 `page` 參數、四顆 chip 各自獨立映射固定門檻、
+ * 四窗切換立即打新 window 參數。
  */
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -25,9 +28,12 @@ const ROW_A: ExploreRow = {
   label: "Alice",
   coins: ["BTC", "ETH"],
   account_bucket: "$10K–$100K",
-  spark: [1, 1.1, 1.05, 1.2],
-  ret_30d_pct: 38.4,
-  max_dd_30d_pct: -11.2,
+  windows: {
+    day: { ret_pct: 2.1, max_dd_pct: -1.0, spark: [1, 1.02] },
+    week: { ret_pct: 12.0, max_dd_pct: -4.0, spark: [1, 1.05, 1.12] },
+    month: { ret_pct: 38.4, max_dd_pct: -11.2, spark: [1, 1.1, 1.05, 1.2] },
+    allTime: { ret_pct: 90.0, max_dd_pct: -20.0, spark: [1, 1.9] },
+  },
   live_days: 118,
   fill_count_30d: 250,
   close_win_rate_pct: 61.2,
@@ -42,9 +48,12 @@ const ROW_B: ExploreRow = {
   label: "0xbbbb…bbbb",
   coins: [],
   account_bucket: "$100K–$1M",
-  spark: [],
-  ret_30d_pct: -5.0,
-  max_dd_30d_pct: -20.0,
+  windows: {
+    day: null,
+    week: null,
+    month: { ret_pct: -5.0, max_dd_pct: -20.0, spark: [] },
+    allTime: { ret_pct: -5.0, max_dd_pct: -20.0, spark: [] },
+  },
   live_days: 90,
   fill_count_30d: 210,
   close_win_rate_pct: null,
@@ -106,11 +115,15 @@ describe("ExplorePage — 三態", () => {
 });
 
 describe("ExplorePage — 表格渲染", () => {
-  it("渲染帳戶列，勝率 null → 「—」，count 摘要顯示 total_scanned → total_qualified", async () => {
+  it("渲染帳戶列（預設 30D／month 窗），勝率 null → 「—」，count 摘要顯示 total_scanned → total_qualified", async () => {
     stubFetch(() => jsonResponse(buildResp()));
     const { container } = render(<ExplorePage />);
     await screen.findByText("Alice");
     expect(screen.getByText(ROW_B.label)).toBeInTheDocument();
+
+    const retCells = container.querySelectorAll(".explore-ret");
+    expect(retCells[0].textContent).toBe("+38.4%"); // ROW_A month
+    expect(retCells[1].textContent).toBe("-5.0%");  // ROW_B month
 
     const wrCells = container.querySelectorAll(".explore-wr");
     expect(wrCells).toHaveLength(2);
@@ -122,6 +135,22 @@ describe("ExplorePage — 表格渲染", () => {
     expect(dayCells[1].textContent).toBe("90");
 
     expect(screen.getByText((_, el) => (el?.textContent ?? "") === "100 個帳戶 → 符合 2")).toBeInTheDocument();
+  });
+
+  it("所選窗對某列缺席（day/week best-effort）→ 該列該窗誠實顯示「—」，不回退借用其他窗", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.windows.day }));
+
+    await waitFor(() => {
+      const retCells = container.querySelectorAll(".explore-ret");
+      expect(retCells[0].textContent).toBe("+2.1%"); // ROW_A day
+      expect(retCells[1].textContent).toBe("—");     // ROW_B day 缺席
+    });
+    const ddCells = container.querySelectorAll(".explore-dd");
+    expect(ddCells[1].textContent).toBe("—");
   });
 
   it("「跟單 →」連結帶 ?leader=<address>；「查看」連向 /traders/{address}", async () => {
@@ -206,5 +235,107 @@ describe("ExplorePage — 分頁", () => {
     });
     await screen.findByText(ROW_B.label);
     expect(screen.queryByText("Alice")).not.toBeInTheDocument();
+  });
+});
+
+// R4-10（2026-08-31 使用者裁決）：期間 chip 從固定 30D 改四窗全開，切換立即
+// 打新 window 參數，不 debounce（離散選擇）。
+describe("ExplorePage — R4-10 期間窗切換", () => {
+  it("四鈕全部可點（不再 disabled）；切換立即打新 window 參數並回第一頁", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    const dayBtn = screen.getByRole("button", { name: COPY.explore.windows.day });
+    expect(dayBtn).not.toBeDisabled();
+
+    fetchMock.mockClear();
+    await userEvent.click(dayBtn);
+
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("window=day");
+      expect(lastUrl).toContain("page=1");
+    });
+  });
+
+  it("預設 window=month（30D）打第一次請求", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
+    expect(firstUrl).toContain("window=month");
+  });
+});
+
+// R4-10：原「僅顯示達樣本門檻（實盤 ≥ 30 天 · ≥ 200 筆成交）」合併 chip 拆成
+// 兩顆獨立布林 chip（實盤天數／成交筆數），各自獨立映射固定門檻值（不是自由
+// 填寫輸入框——R4-3 那版已被 revert，見 page.tsx 檔頭）。
+describe("ExplorePage — R4-10 qualified chip 拆分", () => {
+  it("預設兩顆 chip 皆開 → 打 API 帶 min_live_days=30 & min_fills=200", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
+    expect(firstUrl).toContain("min_live_days=30");
+    expect(firstUrl).toContain("min_fills=200");
+  });
+
+  it("關閉「實盤 ≥ 30 天」chip → 只送 min_live_days=0，min_fills 不受影響", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.liveDays }));
+
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("min_live_days=0");
+      expect(lastUrl).toContain("min_fills=200");
+    });
+  });
+
+  it("關閉「成交 ≥ 200 筆」chip → 只送 min_fills=0，min_live_days 不受影響", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.fills }));
+
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("min_fills=0");
+      expect(lastUrl).toContain("min_live_days=30");
+    });
+  });
+
+  it("既有「最大回撤」「集中度」chip 映射不變：off → max_dd_pct=100 / max_concentration_pct=100", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.maxDd }));
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("max_dd_pct=100");
+    });
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.concentrated }));
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("max_concentration_pct=100");
+    });
   });
 });

@@ -71,11 +71,64 @@ W2（`_fills_stats` 分頁上限最小版）：本函式建立在 `hl.get_fills_
 **TODO**：R-A 分頁 helper（`FILET_FILLS_MAX_PAGES`）落地後，本模組應改用它
 翻到頁數上限，而不是自己在這裡重複實作分頁。
 
-工程原則 1（同源同基準）的落地：`ret_30d_pct`／`max_dd_30d_pct`／`spark` 三者
-出自**同一次** `portfolio()` 回應的**同一個** perpMonth `accountValueHistory`
-序列；`live_days` 出自同一次回應的 perpAllTime 序列首末點；三者不混用不同窗口
-或不同端點的資料。曝險（`exposure`）與帳戶規模 bucket 出自**同一次**
-`clearinghouse_state()` 回應。
+工程原則 1（同源同基準）的落地：每個窗（`WindowStats.ret_pct`／`.max_dd_pct`／
+`.spark`）三者出自**同一次** `portfolio()` 回應的**同一個**該窗
+`accountValueHistory` 序列，不混用不同窗口的資料算同一個 WindowStats；
+`live_days` 出自同一次回應的 perpAllTime 序列首末點。曝險（`exposure`）與
+帳戶規模 bucket 出自**同一次** `clearinghouse_state()` 回應。
+
+R4-3（2026-08-30，plan `2026-08-30-m3-ui-round4.md` Task R4-3，使用者裁決 6）：
+四窗自由切換＋門檻自由填寫。
+----------------------------------------------------------------------------
+- **四窗**：`portfolio()` 單次回應本就含 perpDay/perpWeek/perpMonth/
+  perpAllTime——`enrich_candidate` 不多打上游，一次抽出四窗各自的
+  `WindowStats`（ret/dd/spark，同源同基準原則見上）存進 `ExploreRow.windows`
+  （鍵＝`WINDOW_KEYS`：`"day"/"week"/"month"/"allTime"`，映射見
+  `WINDOW_TO_PERIOD`）。**gating 不變**：`month`／`allTime` 兩窗缺席或資料無效
+  （首點非正／中途歸零）→ 整列跳過（沿舊版 `perpMonth`／`perpAllTime` 必要性）；
+  `day`／`week` 是 best-effort 附加——缺席或無效只讓該鍵存 `None`，不連坐整列
+  （新帳戶可能還沒有足夠的日/週窗資料）。前端據此鍵誠實顯示「—」，不得回退
+  借用其他窗的數字冒充（工程原則：不編數字）。
+  UI 標籤映射（相對 HL 實際窗口，不是使用者原始回饋字面的「7D/30D/90D」——
+  HL `portfolio()` 沒有 90 天窗，見 plan 派工說明）：day→「1D」、week→「7D」、
+  month→「30D」、allTime→「全部」。
+- **`qualify`／`sort_key` 改吃 `window` 參數**：`max_dd_filter` 用**所選窗**的
+  `max_dd_pct`（不是永遠用 month）；該窗對這一列剛好是 `None`（day/week 缺席）
+  → 視為「無證據」，比照既有 `concentration_pct is None` 的既有慣例通過、不
+  處罰（見 `qualify` docstring）。`sort_key` 缺該窗時退回 `month`（排序需要一個
+  確定性的鍵，不能對缺資料的列直接報錯或任意排最後——退回月窗是最小驚訝的
+  選擇，前端顯示仍誠實地對該列該窗顯示「—」，兩者不衝突：一個是「排序用什麼
+  數字」、一個是「畫面上顯示什麼數字」）。`live_days`／`fill_count_30d`／
+  `concentration_pct` 三個樣本/集中度門檻維持與 window 無關（近 30D fills、
+  perpAllTime 日曆跨距，本就不隨顯示窗切換）。
+  `_apply_tags`（`low_drawdown`／`concentrated` 批次分位數）固定用 `month`
+  窗計算——這是批次建置時算好、寫死進 `ExploreRow.tags` 的離線標籤，不隨
+  查詢時的 `window` 參數重算（同一列的 tag 不該因為使用者切换顯示窗就改變）。
+- **端點參數化**：`min_live_days`／`min_fills`／`max_dd_pct`／
+  `max_concentration_pct` 從三個布林 chip 改成四個自由數值（預設分別
+  30/200/30/90，即 `DEFAULT_MIN_TRADING_DAYS`／`DEFAULT_MIN_FILLS`／
+  `DEFAULT_MAX_DRAWDOWN_PCT`／`DEFAULT_MAX_CONCENTRATION_PCT`）。伺服器只**夾取**
+  範圍（`clamp_explore_params`，防濫用，不是驗證錯誤）不 422：`min_live_days`
+  ∈[0,365]、`min_fills`∈[0,100000]、`max_dd_pct`／`max_concentration_pct`∈
+  [1,100]。前端「清空欄位＝不過濾」不需要額外的 sentinel/None 概念——清空時
+  送邊界值（`min_live_days=0`／`min_fills=0`／`max_dd_pct=100`／
+  `max_concentration_pct=100`）天然等於「這個維度永遠通過」。舊的三個布林
+  chip 參數（`qualified`/`max_dd`/`exclude_concentrated`）**從公開端點移除**
+  （不再是 HTTP 契約的一部分）；`qualify()`／`ExploreIndex.query()`
+  的同名布林 kwargs 保留成內部/測試用逃生門（各自獨立開關整個過濾維度，
+  預設 `True`），純粹為了不必為每個既有的純函式測試重寫成大量門檻組合。
+- **index 結構版本**：`ExploreRow` 形狀變了（`ret_30d_pct`/`max_dd_30d_pct`/
+  `spark` 三個頂層欄位→`windows` dict）。本模組沒有把 index 落盤（純記憶體，
+  `ExploreIndex._rows` 只在 process 存活期間由 `build_sync()` 寫入，程式重啟
+  必定從 `None` 重新建置一次——結構上不可能出現「半舊半新形狀」混雜的快照）。
+  仍加 `EXPLORE_INDEX_VERSION` 版本標記＋`ExploreIndex._rows_version`，讓
+  「偵測不相容→視為未建置、強制重建」這條語意變成可測試、可驗證的行為
+  （`query()`／`_maybe_trigger_build()` 一旦看到 `_rows_version !=
+  EXPLORE_INDEX_VERSION` 就當作沒有可用快照，忽略 TTL 立即回
+  `building: True` 並觸發重建），也替未來若真的加上跨行程快取/落盤留一個
+  現成的相容性檢查點。**與既有「中止保舊」語義正交、不衝突**：429 中止整輪
+  建置那條路徑完全不動 `self._rows`/`self._rows_version`，版本仍相容的舊
+  snapshot 照常繼續服務（fail-open，見上面 2026-08-30 事故記錄）。
 """
 from __future__ import annotations
 
@@ -120,6 +173,49 @@ _DD_FLOOR_PCT = Decimal("0.5")
 DEFAULT_ENRICH_CALL_INTERVAL_S = 0.7
 # 429（rate limited）指數退避重試序列（三次：2s/8s/30s）；耗盡仍 429 → 中止整輪建置。
 RATE_LIMIT_RETRY_DELAYS_S = (2.0, 8.0, 30.0)
+
+# ---------------------------------------------------------------------------
+# R4-3：四窗（見模組檔頭「R4-3」節）。
+# ---------------------------------------------------------------------------
+WINDOW_KEYS = ("day", "week", "month", "allTime")
+WINDOW_TO_PERIOD = {"day": "perpDay", "week": "perpWeek",
+                    "month": "perpMonth", "allTime": "perpAllTime"}
+DEFAULT_WINDOW = "month"
+
+# 伺服器夾取範圍（R4-3：防濫用，不是驗證錯誤，見 `clamp_explore_params`）。
+MIN_LIVE_DAYS_RANGE = (0, 365)
+MIN_FILLS_RANGE = (0, 100_000)
+MAX_DD_PCT_RANGE = (1, 100)
+MAX_CONCENTRATION_PCT_RANGE = (1, 100)
+
+# index 結構版本（R4-3：`ExploreRow` 形狀變更——`ret_30d_pct`/`max_dd_30d_pct`/
+# `spark` 三個頂層欄位改成 `windows` dict）。見模組檔頭「index 結構版本」節。
+EXPLORE_INDEX_VERSION = 2
+
+
+def _clamp_int(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, value))
+
+
+def _clamp_float(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def clamp_explore_params(*, min_live_days: int, min_fills: int,
+                         max_dd_pct: float, max_concentration_pct: float
+                         ) -> tuple[int, int, float, float]:
+    """伺服器夾取（R4-3，防濫用，不是驗證錯誤——超界值不 422，直接夾回邊界內）：
+    `min_live_days`∈[0,365]、`min_fills`∈[0,100000]、`max_dd_pct`／
+    `max_concentration_pct`∈[1,100]（見模組常數 `*_RANGE`）。前端「清空欄位」
+    送邊界值（0/0/100/100）天然等於「不過濾」，不需要額外的 sentinel/None
+    概念（見模組檔頭「端點參數化」節）。回傳夾取後的
+    `(min_live_days, min_fills, max_dd_pct, max_concentration_pct)`。"""
+    return (
+        _clamp_int(min_live_days, *MIN_LIVE_DAYS_RANGE),
+        _clamp_int(min_fills, *MIN_FILLS_RANGE),
+        _clamp_float(max_dd_pct, *MAX_DD_PCT_RANGE),
+        _clamp_float(max_concentration_pct, *MAX_CONCENTRATION_PCT_RANGE),
+    )
 
 
 class _RateLimitedAbort(Exception):
@@ -193,6 +289,21 @@ class ExploreConfig:
 
 
 # ---------------------------------------------------------------------------
+# WindowStats（R4-3）：單一窗（day/week/month/allTime 之一）的報酬／回撤／
+# sparkline，三者出自同一次 portfolio() 回應的同一個窗序列（工程原則 1）。
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class WindowStats:
+    ret_pct: float
+    max_dd_pct: float              # 負值或 0；絕對值愈大回撤愈深
+    spark: tuple[float, ...]       # 該窗 accountValueHistory downsample（≤30 點）
+
+    def to_dict(self) -> dict:
+        return {"ret_pct": self.ret_pct, "max_dd_pct": self.max_dd_pct,
+                "spark": list(self.spark)}
+
+
+# ---------------------------------------------------------------------------
 # ExploreRow
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -202,9 +313,12 @@ class ExploreRow:
     label: str                     # display_name 有值就用它，否則縮寫地址（D10）
     coins: tuple[str, ...]         # 近 30D 成交額最大的前 2-3 個幣種
     account_bucket: str
-    spark: tuple[float, ...]       # perpMonth accountValueHistory downsample（≤30 點）
-    ret_30d_pct: float
-    max_dd_30d_pct: float          # 負值或 0；絕對值愈大回撤愈深
+    # R4-3：四窗（`WINDOW_KEYS`）各自的 `WindowStats`；`"month"`／`"allTime"`
+    # 是 enrich 的 gating 條件（缺席或無效 → 整列跳過整個 ExploreRow 都不會被
+    # 建構），保證這兩鍵在成功建構的列上恆非 None；`"day"`／`"week"`是
+    # best-effort，缺席／無效 → 該鍵存 None（不得用其他窗的數字冒充，見模組
+    # 檔頭「R4-3」節）。
+    windows: dict[str, "WindowStats | None"]
     live_days: int                 # W1：perpAllTime 首末點日曆跨距天數（非 distinct 日數）
     fill_count_30d: int
     close_win_rate_pct: float | None   # None＝資料錯誤或無足夠樣本（R2-02）
@@ -224,9 +338,8 @@ class ExploreRow:
             "label": self.label,
             "coins": list(self.coins),
             "account_bucket": self.account_bucket,
-            "spark": list(self.spark),
-            "ret_30d_pct": self.ret_30d_pct,
-            "max_dd_30d_pct": self.max_dd_30d_pct,
+            "windows": {k: (v.to_dict() if v is not None else None)
+                       for k, v in self.windows.items()},
             "live_days": self.live_days,
             "fill_count_30d": self.fill_count_30d,
             "close_win_rate_pct": self.close_win_rate_pct,
@@ -291,6 +404,32 @@ def _downsample_floats(values: list[Decimal], n: int = SPARK_POINTS) -> list[flo
     step = len(values) / n
     idxs = [min(len(values) - 1, int(i * step)) for i in range(n)]
     return [float(values[i]) for i in idxs]
+
+
+def _window_stats(av_points: list[tuple[int, Decimal]]) -> WindowStats | None:
+    """R4-3：單一窗（已從 `extract_window` 取出的 `accountValueHistory` 序列）
+    → `WindowStats`，或 `None`（序列無效——首點非正或中途歸零/轉負，見
+    `_return_and_drawdown`）。ret/dd/spark 三者出自同一個傳入序列（工程原則 1）。"""
+    rd = _return_and_drawdown(av_points)
+    if rd is None:
+        return None
+    ret_pct, dd_pct = rd
+    spark = _downsample_floats([v for _, v in av_points])
+    return WindowStats(
+        ret_pct=float(ret_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        max_dd_pct=float(dd_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        spark=tuple(spark),
+    )
+
+
+def _optional_window_stats(portfolio_raw, period: str) -> WindowStats | None:
+    """R4-3：best-effort 窗（day/week）——`extract_window` 查無該期別／形狀不符
+    → `None`，不拋例外、不連坐呼叫端（見 `enrich_candidate`）。"""
+    extracted = extract_window(portfolio_raw, period)
+    if extracted is None:
+        return None
+    av, _ = extracted
+    return _window_stats(av)
 
 
 def _win_rate_pct(wins: int, closed: int) -> float | None:
@@ -443,7 +582,9 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     `ch_state`：`hl.clearinghouse_state(address)` 的原始回應。
 
     跳過整列的情況（讀不到就跳過，不編數字）：perpMonth 或 perpAllTime 視窗
-    缺失／形狀不符；或 perpMonth 淨值序列首點 <=0／途中歸零或轉負。
+    缺失／形狀不符；或該窗淨值序列首點 <=0／途中歸零或轉負（gating 只看
+    month／allTime；day／week 是 best-effort，缺席只讓 `windows["day"/"week"]`
+    為 `None`，不連坐整列，見模組檔頭「R4-3」節）。
     `tags` 留空（`()`）——集中度與低回撤兩個 tag 需要「這一批候選池」的相對
     資訊（門檻常數／同批分位數），由 `ExploreIndex.build_sync` 建完整批後
     再用 `_apply_tags` 統一補上，不在單一地址的純函式裡決定。
@@ -452,22 +593,28 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     # （"low_drawdown"/"concentrated"、"long"/"short"），不回傳中文顯示字串——
     # 顯示文案改由前端 `explore/page.tsx` 對映 `copy.ts`（見 `_exposure`／
     # `_apply_tags` 的實際賦值）。
-    month = extract_window(portfolio_raw, "perpMonth")
+    month = extract_window(portfolio_raw, WINDOW_TO_PERIOD["month"])
     if month is None:
         return None
     av_month, _ = month
-    rd = _return_and_drawdown(av_month)
-    if rd is None:
+    month_stats = _window_stats(av_month)
+    if month_stats is None:
         return None
-    ret_pct, dd_pct = rd
 
-    all_time = extract_window(portfolio_raw, "perpAllTime")
+    all_time = extract_window(portfolio_raw, WINDOW_TO_PERIOD["allTime"])
     if all_time is None:
         return None
     av_all, _ = all_time
     live_days = _calendar_span_days(av_all)
+    all_time_stats = _window_stats(av_all)
 
-    spark = _downsample_floats([v for _, v in av_month])
+    windows: dict[str, WindowStats | None] = {
+        "day": _optional_window_stats(portfolio_raw, WINDOW_TO_PERIOD["day"]),
+        "week": _optional_window_stats(portfolio_raw, WINDOW_TO_PERIOD["week"]),
+        "month": month_stats,
+        "allTime": all_time_stats,
+    }
+
     fill_count, win_rate, concentration, coins, fills_truncated = _fills_stats(fills or [])
     account_value = _account_value(ch_state)
     bucket = _account_bucket(account_value)
@@ -480,9 +627,7 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
         label=display_name if display_name else _abbreviate_address(address),
         coins=coins,
         account_bucket=bucket,
-        spark=tuple(spark),
-        ret_30d_pct=float(ret_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-        max_dd_30d_pct=float(dd_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        windows=windows,
         live_days=live_days,
         fill_count_30d=fill_count,
         close_win_rate_pct=win_rate,
@@ -498,17 +643,21 @@ def _apply_tags(rows: list[ExploreRow], cfg: ExploreConfig) -> list[ExploreRow]:
     """整批 enrich 完成後才能算的兩個 tag（D14：locale 中性代碼，前端對映
     `copy.ts` 顯示文案）：
     - `"concentrated"`：`concentration_pct > cfg.max_concentration_pct`（逐列獨立）。
-    - `"low_drawdown"`：本批 `|max_dd_30d_pct|` 最小的下四分位（含邊界）——需要
-      同批其他列的分佈才能定義，故不在 `enrich_candidate` 裡做（見該函式檔頭）。
+    - `"low_drawdown"`：本批 `"month"` 窗 `|max_dd_pct|` 最小的下四分位（含邊界）
+      ——需要同批其他列的分佈才能定義，故不在 `enrich_candidate` 裡做（見該
+      函式檔頭）。R4-3：固定用 `"month"` 窗計算（`enrich_candidate` 保證
+      該鍵恆非 `None`），是批次建置時算好、寫死進 `tags` 的離線標籤，不隨
+      查詢時的 `window` 參數變動（同一列的 tag 不因使用者切換顯示窗而改變，
+      見模組檔頭「R4-3」節）。
     """
     if not rows:
         return rows
-    dds = sorted(abs(Decimal(str(r.max_dd_30d_pct))) for r in rows)
+    dds = sorted(abs(Decimal(str(r.windows["month"].max_dd_pct))) for r in rows)
     threshold = dds[max(0, -(-len(dds) // 4) - 1)]  # 下四分位邊界（含）
     out = []
     for r in rows:
         tags = []
-        if abs(Decimal(str(r.max_dd_30d_pct))) <= threshold:
+        if abs(Decimal(str(r.windows["month"].max_dd_pct))) <= threshold:
             tags.append("low_drawdown")
         if (r.concentration_pct is not None
                 and Decimal(str(r.concentration_pct)) > cfg.max_concentration_pct):
@@ -517,19 +666,25 @@ def _apply_tags(rows: list[ExploreRow], cfg: ExploreConfig) -> list[ExploreRow]:
     return out
 
 
-def qualify(row: ExploreRow, cfg: ExploreConfig, *, require_sample: bool = True,
-           max_dd_filter: bool = True, exclude_concentrated: bool = True) -> bool:
-    """資格過濾（R2-01，全在後端）。三個布林對應前端三個獨立 chip（D1 端點的
-    `qualified`/`max_dd`/`exclude_concentrated` 參數），可各自關閉查看未過濾列表。
+def qualify(row: ExploreRow, cfg: ExploreConfig, *, window: str = DEFAULT_WINDOW,
+           require_sample: bool = True, max_dd_filter: bool = True,
+           exclude_concentrated: bool = True) -> bool:
+    """資格過濾（R2-01，全在後端）。三個布林是內部/測試逃生門（R4-3：公開端點
+    已改成四個自由數值門檻，不再對外送布林 chip，見模組檔頭「R4-3」節）；
+    `window` 決定回撤門檻要看**哪一窗**的 `max_dd_pct`（R4-3：不再永遠用
+    month——使用者切換顯示窗，回撤過濾也跟著切換，"誠實揭露"見同節）。
 
     邊界（equal 一律算通過——常數描述的是「上限」/「下限」，卡在門檻上不該被
     無聲刷掉；本模組唯一的權威定義，測試逐條釘死）：
     - 樣本門檻：`live_days >= min_trading_days`（W1：live_days＝perpAllTime
-      首末點日曆跨距天數，門檻語意＝「實盤 ≥ min_trading_days 天」）且
-      `fill_count_30d >= min_fills`（下限，"至少"語意，等於門檻通過；W2：
-      `fills_truncated=True` 時 `fill_count_30d` 本身是下限值，真實筆數只會
-      更多，這條比較方向不受影響）。
-    - 回撤上限：`abs(max_dd_30d_pct) <= max_drawdown_pct`（等於門檻通過）。
+      首末點日曆跨距天數，門檻語意＝「實盤 ≥ min_trading_days 天」，與
+      `window` 無關）且 `fill_count_30d >= min_fills`（下限，"至少"語意，
+      等於門檻通過；W2：`fills_truncated=True` 時 `fill_count_30d` 本身是
+      下限值，真實筆數只會更多，這條比較方向不受影響）。
+    - 回撤上限：`abs(windows[window].max_dd_pct) <= max_drawdown_pct`（等於
+      門檻通過）；該窗對這一列是 `None`（day/week best-effort 缺席）→ 視為
+      通過——沒有證據代表回撤超標，比照下面集中度 `None` 的既有慣例，不得
+      因為缺資料就先假設它超標。
     - 集中度上限：`concentration_pct <= max_concentration_pct`（等於門檻通過；
       `None`＝無成交量資料可算集中度，視為通過——沒有證據代表集中，不得因為
       缺資料就先假設它超標）。
@@ -540,7 +695,8 @@ def qualify(row: ExploreRow, cfg: ExploreConfig, *, require_sample: bool = True,
         if row.fill_count_30d < cfg.min_fills:
             return False
     if max_dd_filter:
-        if abs(Decimal(str(row.max_dd_30d_pct))) > cfg.max_drawdown_pct:
+        stats = row.windows.get(window)
+        if stats is not None and abs(Decimal(str(stats.max_dd_pct))) > cfg.max_drawdown_pct:
             return False
     if exclude_concentrated:
         if (row.concentration_pct is not None
@@ -549,11 +705,15 @@ def qualify(row: ExploreRow, cfg: ExploreConfig, *, require_sample: bool = True,
     return True
 
 
-def sort_key(row: ExploreRow) -> Decimal:
-    """風險調整排序鍵（D2）＝ 30D 報酬率 ÷ |30D 最大回撤|；回撤絕對值低於
-    `_DD_FLOOR_PCT`（0.5%）時代入下限，避免近乎零回撤的帳戶靠除零式放大霸榜。"""
-    ret = Decimal(str(row.ret_30d_pct))
-    dd = abs(Decimal(str(row.max_dd_30d_pct)))
+def sort_key(row: ExploreRow, *, window: str = DEFAULT_WINDOW) -> Decimal:
+    """風險調整排序鍵（D2）＝所選窗報酬率 ÷ |所選窗最大回撤|；回撤絕對值低於
+    `_DD_FLOOR_PCT`（0.5%）時代入下限，避免近乎零回撤的帳戶靠除零式放大霸榜。
+    R4-3：`window` 對這一列是 `None`（day/week best-effort 缺席）→ 退回
+    `"month"`（`enrich_candidate` 保證恆非 `None`）——排序需要一個確定性的鍵，
+    前端該窗儲存格仍誠實顯示「—」，兩者不衝突（見模組檔頭「R4-3」節）。"""
+    stats = row.windows.get(window) or row.windows["month"]
+    ret = Decimal(str(stats.ret_pct))
+    dd = abs(Decimal(str(stats.max_dd_pct)))
     if dd < _DD_FLOOR_PCT:
         dd = _DD_FLOOR_PCT
     return ret / dd
@@ -636,6 +796,10 @@ class ExploreIndex:
 
         self._lock = threading.Lock()
         self._rows: list[ExploreRow] | None = None   # 目前對外服務的一版
+        # R4-3：`self._rows` 是用哪個 `EXPLORE_INDEX_VERSION` 建的（見模組檔頭
+        # 「index 結構版本」節）；`None` 表示尚未建置過，與版本不相容視為同一種
+        # 「沒有可用快照」——`query()`／`_maybe_trigger_build()` 兩處都檢查。
+        self._rows_version: int | None = None
         self._built_at: float | None = None
         self._total_scanned = 0
         self._building = False                         # single-flight：背景建置中
@@ -766,16 +930,20 @@ class ExploreIndex:
 
         with self._lock:
             self._rows = rows
+            self._rows_version = EXPLORE_INDEX_VERSION
             self._built_at = self._now_fn()
             self._total_scanned = len(candidates)
 
     def _maybe_trigger_build(self) -> None:
-        """TTL 過期（或從未建置過）且目前沒有背景建置在跑 → 開一條 daemon
+        """TTL 過期（或從未建置過，或現有快照的結構版本已不相容——R4-3，見
+        `EXPLORE_INDEX_VERSION`）且目前沒有背景建置在跑 → 開一條 daemon
         thread 執行 `build_sync`；呼叫本身立即返回，不等 thread 結束
         （見類別檔頭：讀路徑永不阻塞）。"""
         now = self._now_fn()
         with self._lock:
-            fresh = self._built_at is not None and now - self._built_at < self._ttl_s
+            fresh = (self._built_at is not None
+                     and now - self._built_at < self._ttl_s
+                     and self._rows_version == EXPLORE_INDEX_VERSION)
             if fresh or self._building:
                 return
             self._building = True
@@ -789,14 +957,30 @@ class ExploreIndex:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def query(self, *, page: int = 1, require_sample: bool = True,
-             max_dd_filter: bool = True, exclude_concentrated: bool = True) -> dict:
+    def query(self, *, page: int = 1, window: str = DEFAULT_WINDOW,
+             min_live_days: int | None = None, min_fills: int | None = None,
+             max_dd_pct: float | None = None, max_concentration_pct: float | None = None,
+             require_sample: bool = True, max_dd_filter: bool = True,
+             exclude_concentrated: bool = True) -> dict:
         """讀路徑：永不阻塞（觸發背景建置後立即用目前狀態回應）。回傳形狀見
         `app.py` 端點層文件字串：`{rows, page, page_size, total_qualified,
         total_scanned, updated_at, building}`。
 
-        從未成功建置過（`self._rows is None`）→ `building: True`、空 rows、
-        計數皆 0、`updated_at: None`（前端 R2·C 態二）。
+        從未成功建置過，或現有快照的結構版本已不相容（`self._rows is None`
+        或 `self._rows_version != EXPLORE_INDEX_VERSION`，R4-3，見模組檔頭
+        「index 結構版本」節）→ `building: True`、空 rows、計數皆 0、
+        `updated_at: None`（前端 R2·C 態二）——版本不相容的快照結構上不能
+        安全地拿去 `qualify`/`sort_key`/`to_dict`（欄位形狀已經換過），視同
+        「沒有可用快照」，觸發重建。
+
+        `window`：所選期間（`WINDOW_KEYS` 之一），決定 `qualify` 的回撤過濾
+        看哪一窗、`sort_key` 用哪一窗排序（R4-3；不影響候選池——候選池仍是
+        `build_sync` 固定用 stats-data month 窗 roi 選出，見模組檔頭「R4-3」節
+        「誠實揭露」段）。
+        `min_live_days`／`min_fills`／`max_dd_pct`／`max_concentration_pct`：
+        R4-3 自由門檻（`None`＝沿用 `self._cfg` 的預設值，供內部/測試呼叫端在
+        不關心門檻時省略；`app.py` 端點層一律夾取後傳入明確數值，見
+        `clamp_explore_params`）。
 
         ⭐ 讀值**必須**在觸發背景建置**之前**取得快照，不能反過來：`_maybe_trigger_
         build()` 開的背景 thread 若剛好在本次呼叫的極短時間內就跑完（例如注入的
@@ -810,18 +994,30 @@ class ExploreIndex:
         """
         with self._lock:
             rows = self._rows
+            rows_version = self._rows_version
             built_at = self._built_at
             total_scanned = self._total_scanned
         self._maybe_trigger_build()
-        if rows is None:
+        if rows is None or rows_version != EXPLORE_INDEX_VERSION:
             return {"rows": [], "page": page, "page_size": self._cfg.page_size,
                    "total_qualified": 0, "total_scanned": 0,
                    "updated_at": None, "building": True}
+        cfg = self._cfg
+        if (min_live_days, min_fills, max_dd_pct, max_concentration_pct) != (None, None, None, None):
+            cfg = dataclasses.replace(
+                cfg,
+                min_trading_days=cfg.min_trading_days if min_live_days is None else min_live_days,
+                min_fills=cfg.min_fills if min_fills is None else min_fills,
+                max_drawdown_pct=(cfg.max_drawdown_pct if max_dd_pct is None
+                                  else Decimal(str(max_dd_pct))),
+                max_concentration_pct=(cfg.max_concentration_pct if max_concentration_pct is None
+                                       else Decimal(str(max_concentration_pct))),
+            )
         qualified_rows = [r for r in rows
-                          if qualify(r, self._cfg, require_sample=require_sample,
+                          if qualify(r, cfg, window=window, require_sample=require_sample,
                                     max_dd_filter=max_dd_filter,
                                     exclude_concentrated=exclude_concentrated)]
-        qualified_rows.sort(key=sort_key, reverse=True)
+        qualified_rows.sort(key=lambda r: sort_key(r, window=window), reverse=True)
         page_rows = paginate(qualified_rows, page, self._cfg.page_size)
         return {"rows": [r.to_dict() for r in page_rows], "page": page,
                "page_size": self._cfg.page_size,

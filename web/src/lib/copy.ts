@@ -1642,10 +1642,15 @@ export const COPY_ZH = {
     disclaimerBadge: "Filet 不對清單上任何地址背書",
     sub: "資料全部來自 Hyperliquid 公開鏈上紀錄，每 10 分鐘更新。排序預設為風險調整後報酬（報酬率 ÷ 最大回撤），而非絕對獲利金額——大額帳戶的 PnL 無法被小額帳戶複製。",
     updatedAtPrefix: "資料更新於 ",
-    windows: { d7: "7D", d30: "30D", d90: "90D", all: "全部" },
-    windowComingSoon: "即將推出",
+    // R4-10（2026-08-31 使用者裁決）：期間鍵對映 HL 實際回傳的窗
+    // （day/week/month/allTime），四個都可點——不是 90 天，Hyperliquid
+    // portfolio() 沒有 90 天窗。
+    windows: { day: "1D", week: "7D", month: "30D", allTime: "全部" },
     filters: {
-      sample: "僅顯示達樣本門檻（實盤 ≥ 30 天 · ≥ 200 筆成交）",
+      // R4-10：原「僅顯示達樣本門檻（實盤 ≥ 30 天 · ≥ 200 筆成交）」合併 chip
+      // 拆成兩顆獨立布林 chip（門檻固定 30 天 / 200 筆，不做自由填寫）。
+      liveDays: "實盤 ≥ 30 天",
+      fills: "成交 ≥ 200 筆",
       maxDd: "最大回撤 < 30%",
       concentrated: "排除單一幣種 > 90%",
     },
@@ -1655,8 +1660,8 @@ export const COPY_ZH = {
     table: {
       rank: "#",
       account: "帳戶",
-      sparkline: "30D 淨值",
-      ret: "30D 報酬率",
+      sparkline: "淨值走勢",
+      ret: "報酬率",
       dd: "最大回撤",
       days: "實盤天數",
       winRate: "結倉勝率",
@@ -3084,10 +3089,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     disclaimerBadge: "Filet does not endorse any address on this list",
     sub: "Data is sourced entirely from Hyperliquid's public on-chain records, updated every 10 minutes. Default sort is risk-adjusted return (return ÷ max drawdown), not absolute PnL — a large account's PnL can't be replicated by a small account.",
     updatedAtPrefix: "Data updated at ",
-    windows: { d7: "7D", d30: "30D", d90: "90D", all: "All" },
-    windowComingSoon: "Coming soon",
+    windows: { day: "1D", week: "7D", month: "30D", allTime: "All" },
     filters: {
-      sample: "Only show accounts meeting the sample threshold (live ≥ 30 days · ≥ 200 fills)",
+      liveDays: "Live ≥ 30 days",
+      fills: "Fills ≥ 200",
       maxDd: "Max drawdown < 30%",
       concentrated: "Exclude single-coin concentration > 90%",
     },
@@ -3097,8 +3102,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     table: {
       rank: "#",
       account: "Account",
-      sparkline: "30D equity",
-      ret: "30D return",
+      sparkline: "Equity",
+      ret: "Return",
       dd: "Max drawdown",
       days: "Live days",
       winRate: "Close win rate",
