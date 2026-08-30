@@ -534,6 +534,12 @@ const FILLS_ROW_FONT_SIZE = 13.5;
  * 與 `fmtUpdatedAtUtc` 的差別只在時區來源：這裡用 `Date` 的本地 getter
  * （由執行環境的時區決定），UTC 模式繼續沿用既有 `fmtUpdatedAtUtc`。
  */
+/**
+ * ⭐ R-C／S5（2026-08-30 審查修正）：時區偏移舊實作只取整小時（`Math.floor(.../60)`），
+ * 半小時／45 分偏移（如 UTC+5:30、UTC+5:45）被無聲截斷成 `UTC+5`——時間戳因此
+ * 錯了半小時以上。改法：分鐘為 0 時維持既有兩位數整點形式（`UTC+08`，不動既有
+ * 顯示與既有測試），否則補上 `:分鐘`（`UTC+05:30`）。
+ */
 function fmtFillTimeLocal(epochMs: number): string {
   if (!epochMs) return NO_VALUE;
   const d = new Date(epochMs);
@@ -541,9 +547,12 @@ function fmtFillTimeLocal(epochMs: number): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   const offsetMin = -d.getTimezoneOffset();
   const sign = offsetMin >= 0 ? "+" : "-";
-  const oh = pad(Math.floor(Math.abs(offsetMin) / 60));
+  const absMin = Math.abs(offsetMin);
+  const oh = Math.floor(absMin / 60);
+  const om = absMin % 60;
+  const offsetLabel = om === 0 ? pad(oh) : `${pad(oh)}:${pad(om)}`;
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
-    + `${pad(d.getHours())}:${pad(d.getMinutes())} UTC${sign}${oh}`;
+    + `${pad(d.getHours())}:${pad(d.getMinutes())} UTC${sign}${offsetLabel}`;
 }
 
 function fillsFilterBtnStyle(active: boolean): CSSProperties {

@@ -254,3 +254,51 @@ describe("PositionsTable — 成交記錄表：UTC/本地時間切換（Task 8�
     await waitFor(() => expect(screen.getByText(utcStr)).toBeInTheDocument());
   });
 });
+
+// R-C／S5（2026-08-30 審查修正）：舊實作 `Math.floor(offsetMin / 60)` 只取整小時，
+// 半小時／45 分偏移（UTC+5:30、UTC+5:45 等，印度、尼泊爾等地實際使用的時區）
+// 會被無聲截斷成 `UTC+5`，時間戳因此錯了半小時以上。這裡直接 mock
+// `Date.prototype.getTimezoneOffset` 到 UTC+5:30，不依賴測試機本身的時區。
+describe("PositionsTable — 本地時間偏移含分鐘（R-C/S5）", () => {
+  it("UTC+5:30（半小時偏移）→ 顯示 UTC+05:30，不再被無聲截斷成 UTC+05", async () => {
+    const offsetSpy = vi.spyOn(Date.prototype, "getTimezoneOffset").mockReturnValue(-330);
+    try {
+      const t = Date.now() - 60_000; // 1 分鐘前，落在預設 30D 篩選內
+      const fills = [fill({ time: t, coin: "ETH", hash: "0xtz530" })];
+      getMyFills.mockResolvedValue({ fills });
+      getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+      renderTable();
+      fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+      await waitFor(() => expect(screen.getByText("ETH", IN_ROW)).toBeInTheDocument());
+
+      const d = new Date(t);
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const localStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+        + `${pad(d.getHours())}:${pad(d.getMinutes())} UTC+05:30`;
+      expect(screen.getByText(localStr)).toBeInTheDocument();
+    } finally {
+      offsetSpy.mockRestore();
+    }
+  });
+
+  it("整小時偏移（UTC+8）仍維持既有兩位數整點形式，不因分鐘邏輯而變動", async () => {
+    const offsetSpy = vi.spyOn(Date.prototype, "getTimezoneOffset").mockReturnValue(-480);
+    try {
+      const t = Date.now() - 60_000;
+      const fills = [fill({ time: t, coin: "ETH", hash: "0xtz800" })];
+      getMyFills.mockResolvedValue({ fills });
+      getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+      renderTable();
+      fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+      await waitFor(() => expect(screen.getByText("ETH", IN_ROW)).toBeInTheDocument());
+
+      const d = new Date(t);
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const localStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+        + `${pad(d.getHours())}:${pad(d.getMinutes())} UTC+08`;
+      expect(screen.getByText(localStr)).toBeInTheDocument();
+    } finally {
+      offsetSpy.mockRestore();
+    }
+  });
+});

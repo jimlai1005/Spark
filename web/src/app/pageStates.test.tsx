@@ -20,8 +20,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LeadersResp, OnboardStatus } from "@/lib/api";
 
 const routerPush = vi.fn();
+const routerReplace = vi.fn();
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: routerPush }),
+  // ⭐ R-C／S1（2026-08-30 審查修正）：`/leaders`／`/leaderboard` 轉發頁改用
+  // `router.replace`（不留在瀏覽紀錄）；其餘頁面仍走 `push`——兩支各自的 mock
+  // fn 讓底下斷言可以分別驗證用了哪一支。
+  useRouter: () => ({ push: routerPush, replace: routerReplace }),
   usePathname: () => "/",
   // ⭐ Task 10：OnboardingPage 改讀 `?strategy=`；本檔的通用 ROUTES 迴圈不帶任何
   // 查詢參數，這對 /onboarding 剛好是它自己的「無 strategy 參數」guard 路徑
@@ -195,6 +199,7 @@ const ROUTES: { path: string; name: string; el: () => ReactNode }[] = [
 beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset();
   routerPush.mockReset();
+  routerReplace.mockReset();
 });
 
 /** 未登入：所有需要 session 的端點一律 401。 */
@@ -241,10 +246,11 @@ describe("逐頁狀態｜未登入", () => {
     await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/strategies"));
   });
 
-  it("⭐ Task 11：/leaders 舊路由未登入照樣 redirect /advanced（功能已遷移，見該頁專屬測試）",
+  it("⭐ Task 11：/leaders 舊路由未登入照樣 replace /advanced（功能已遷移，見該頁專屬測試；"
+    + "R-C/S1：轉發頁改 replace 不留瀏覽紀錄）",
     async () => {
       render(wrap(<LeadersPage />, null));
-      await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/advanced"));
+      await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/advanced"));
     });
 
   it("⭐ Task 11：/advanced 未登入 → 顯示說明＋登入 CTA，不 redirect（進階用戶的直達入口）",
@@ -282,9 +288,9 @@ describe("逐頁狀態｜已登入但未活化（沒有 follower）", () => {
     });
   }
 
-  it("⭐ Task 11：/leaders 舊路由已登入未活化照樣 redirect /advanced", async () => {
+  it("⭐ Task 11：/leaders 舊路由已登入未活化照樣 replace /advanced（R-C/S1）", async () => {
     render(wrap(<LeadersPage />, ME));
-    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/advanced"));
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/advanced"));
   });
 
   it("⭐ Task 11：/advanced 已登入未活化 → 地址輸入入口照樣呈現，不是白畫面", async () => {

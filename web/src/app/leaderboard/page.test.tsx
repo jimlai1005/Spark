@@ -6,21 +6,23 @@
 import { render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const routerPush = vi.fn();
+const routerReplace = vi.fn();
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: routerPush }),
+  useRouter: () => ({ replace: routerReplace }),
 }));
 
 import LeaderboardPage from "./page";
 
 beforeEach(() => {
-  routerPush.mockReset();
+  routerReplace.mockReset();
 });
 
-describe("LeaderboardPage — 舊路由 redirect（M3 round3 Task 4）", () => {
-  it("進頁即 redirect /explore（不留白畫面）", async () => {
+// R-C／S1（2026-08-30 審查修正）：純轉發頁改 `router.replace`（非 `push`），
+// 避免使用者在 `/explore` 按上一頁回到這裡又立刻被轉走的死循環。
+describe("LeaderboardPage — 舊路由 redirect（M3 round3 Task 4，R-C/S1）", () => {
+  it("進頁即 replace /explore（不留白畫面、不留在瀏覽紀錄）", async () => {
     const { container } = render(<LeaderboardPage />);
-    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/explore"));
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/explore"));
     expect((container.textContent ?? "").trim().length).toBeGreaterThan(0);
   });
 });

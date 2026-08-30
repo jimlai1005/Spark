@@ -130,6 +130,8 @@ export default function ExplorePage() {
   const showBuilding = state === "ready" && !!resp?.building;
   const showEmpty = state === "ready" && resp != null && !resp.building && resp.rows.length === 0;
   const showTable = state === "ready" && resp != null && !resp.building && resp.rows.length > 0;
+  // W3：index 成功建置過（非 building）就有意義的 `updated_at`，不論這頁是否為空。
+  const showUpdatedAt = (showTable || showEmpty) && resp?.updated_at != null;
 
   const totalPages = resp ? Math.max(1, Math.ceil(resp.total_qualified / Math.max(1, resp.page_size))) : 1;
   const rangeStart = resp && resp.rows.length > 0 ? (resp.page - 1) * resp.page_size + 1 : 0;
@@ -141,6 +143,16 @@ export default function ExplorePage() {
         <div>
           <h1>{c.heading}</h1>
           <p className="section-sub">{c.sub}</p>
+          {/* W3（R-C，2026-08-30 審查修正）：後端 index 有 TTL（10min），文案已同步
+              改「每 10 分鐘更新」——渲染 `updated_at` 讓用戶自己核對這份榜單多新，
+              不只是相信文案描述的頻率。只在成功且非 building 態顯示（loading/error/
+              building 都還沒有一個有意義的 `updated_at`）。 */}
+          {showUpdatedAt && resp?.updated_at != null && (
+            <p className="hint explore-updated-at">
+              {c.updatedAtPrefix}
+              {fmtUpdatedAtUtc(resp.updated_at)}
+            </p>
+          )}
         </div>
         <div className="explore-disclaimer-badge">{c.disclaimerBadge}</div>
       </header>
@@ -349,7 +361,9 @@ function ExploreRowView({ row, rank }: { row: ExploreRow; rank: number }) {
         {fmtSignedPct(row.ret_30d_pct)}
       </div>
       <div className="mono neg explore-dd">{row.max_dd_30d_pct.toFixed(1)}%</div>
-      <div className="mono explore-days">{row.trading_days}</div>
+      {/* R-B 後端擬將 `trading_days` 改名 `live_days`（同一個值）；改名落地前兩個
+          欄位名都相容，見 `lib/publicApi.ts` 的 `ExploreRow.live_days`。 */}
+      <div className="mono explore-days">{row.live_days ?? row.trading_days}</div>
       <div className="mono explore-wr">{fmtPct1(row.close_win_rate_pct)}</div>
       <div className="explore-exposure">
         <div className="explore-exposure-bar">

@@ -7,6 +7,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { COPY_ZH as COPY } from "@/lib/copy";
+import { fmtUpdatedAtUtc } from "@/lib/format";
 import type { ExploreResp, ExploreRow } from "@/lib/publicApi";
 import ExplorePage from "./page";
 
@@ -151,6 +152,53 @@ describe("ExplorePage — 表格渲染", () => {
     // 曝險方向：long/short 代碼對映成中文「多」/「空」，不是英文代碼本身。
     expect(screen.getByText(`${COPY.explore.exposureDir.long} 72.0%`)).toBeInTheDocument();
     expect(screen.getByText(`${COPY.explore.exposureDir.short} 66.0%`)).toBeInTheDocument();
+  });
+});
+
+// R-C／W3（2026-08-30 審查修正）：後端 index TTL 是 10min，文案已同步改
+// 「每 10 分鐘更新」；頁面另外渲染 `updated_at` 讓用戶自己核對這份榜單多新，
+// 不只是相信文案描述的更新頻率。
+describe("ExplorePage — updated_at（R-C/W3）", () => {
+  it("成功且非 building → 渲染「資料更新於 …」＋ fmtUpdatedAtUtc 格式化的時間戳", async () => {
+    stubFetch(() => jsonResponse(buildResp({ updated_at: 1_700_000_000 })));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.getByText((_, el) => el?.tagName === "P"
+      && (el?.textContent ?? "") === `${COPY.explore.updatedAtPrefix}${fmtUpdatedAtUtc(1_700_000_000)}`,
+    )).toBeInTheDocument();
+  });
+
+  it("building:true（`updated_at: null`）→ 不渲染「資料更新於」列", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [], building: true, total_qualified: 0, total_scanned: 0, updated_at: null,
+    })));
+    render(<ExplorePage />);
+    await screen.findByText(COPY.explore.building);
+    expect(screen.queryByText(new RegExp(COPY.explore.updatedAtPrefix))).not.toBeInTheDocument();
+  });
+});
+
+// R-C／W3：後端 `hl_explore.py` 仍回 `trading_days`（欄位改名 `live_days` 由另一
+// 位 builder 進行中，見 plan R-B）；前端相容兩個欄位名，`live_days` 存在時優先採用。
+describe("ExplorePage — live_days／trading_days 欄位相容（R-C/W3）", () => {
+  it("row 帶 live_days 時優先顯示 live_days（不是 trading_days）", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{ ...ROW_A, trading_days: 118, live_days: 130 }],
+      total_qualified: 1,
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(container.querySelector(".explore-days")?.textContent).toBe("130");
+  });
+
+  it("row 沒有 live_days（後端尚未改名）→ 沿用 trading_days", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [ROW_A],
+      total_qualified: 1,
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(container.querySelector(".explore-days")?.textContent).toBe(String(ROW_A.trading_days));
   });
 });
 

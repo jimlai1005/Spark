@@ -5,6 +5,10 @@
  * 2026-08-30-m3-ui-round3.md` D4）；本頁只負責 redirect，保留路由不 404
  * （外部書籤／既有連結仍可能指向這裡），沿用 `/leaders` → `/advanced` 的既有
  * redirect 慣例（見 `app/leaders/page.tsx`）。
+ *
+ * `router.replace`（非 `push`，R-C／S1 審查修正）：這是純轉發頁，不該把自己
+ * 留在瀏覽紀錄裡——用 `push` 的話使用者在 `/explore` 按上一頁會回到這裡又立刻
+ * 被轉走，形成死循環式的返回體驗。
  */
 import { useRouter } from "next/navigation";
 import { useEffect } from "react";
@@ -15,7 +19,7 @@ export default function LeaderboardPage() {
   const COPY = useCopy();
 
   useEffect(() => {
-    router.push("/explore");
+    router.replace("/explore");
   }, [router]);
 
   return <main className="page"><p className="hint">{COPY.common.loading}</p></main>;

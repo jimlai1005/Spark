@@ -1517,7 +1517,8 @@ export const COPY_ZH = {
   explore: {
     heading: "探索跟單對象",
     disclaimerBadge: "Filet 不對清單上任何地址背書",
-    sub: "資料全部來自 Hyperliquid 公開鏈上紀錄，每 5 分鐘更新。排序預設為風險調整後報酬（報酬率 ÷ 最大回撤），而非絕對獲利金額——大額帳戶的 PnL 無法被小額帳戶複製。",
+    sub: "資料全部來自 Hyperliquid 公開鏈上紀錄，每 10 分鐘更新。排序預設為風險調整後報酬（報酬率 ÷ 最大回撤），而非絕對獲利金額——大額帳戶的 PnL 無法被小額帳戶複製。",
+    updatedAtPrefix: "資料更新於 ",
     windows: { d7: "7D", d30: "30D", d90: "90D", all: "全部" },
     windowComingSoon: "即將推出",
     filters: {
@@ -1534,7 +1535,7 @@ export const COPY_ZH = {
       sparkline: "30D 淨值",
       ret: "30D 報酬率",
       dd: "最大回撤",
-      days: "交易日",
+      days: "實盤天數",
       winRate: "結倉勝率",
       exposure: "目前曝險",
       actions: "",
@@ -2856,7 +2857,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
   explore: {
     heading: "Explore traders to copy",
     disclaimerBadge: "Filet does not endorse any address on this list",
-    sub: "Data is sourced entirely from Hyperliquid's public on-chain records, updated every 5 minutes. Default sort is risk-adjusted return (return ÷ max drawdown), not absolute PnL — a large account's PnL can't be replicated by a small account.",
+    sub: "Data is sourced entirely from Hyperliquid's public on-chain records, updated every 10 minutes. Default sort is risk-adjusted return (return ÷ max drawdown), not absolute PnL — a large account's PnL can't be replicated by a small account.",
+    updatedAtPrefix: "Data updated at ",
     windows: { d7: "7D", d30: "30D", d90: "90D", all: "All" },
     windowComingSoon: "Coming soon",
     filters: {
@@ -2873,7 +2875,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       sparkline: "30D equity",
       ret: "30D return",
       dd: "Max drawdown",
-      days: "Trading days",
+      days: "Live days",
       winRate: "Close win rate",
       exposure: "Current exposure",
       actions: "",

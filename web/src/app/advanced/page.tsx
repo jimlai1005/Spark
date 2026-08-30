@@ -31,7 +31,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useRef, useState } from "react";
+import { Suspense, useRef, useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
 import {
   ApiError,
@@ -49,7 +49,19 @@ import { loginWithSiwe } from "@/lib/siwe";
 
 type LoginPhase = "idle" | "connecting" | "signing";
 
+/** `useSearchParams()` 在 build 期 prerender 需要 Suspense 邊界（Next.js
+ * missing-suspense-with-csr-bailout，見 `onboarding/page.tsx` 同寫法，
+ * R-C／C1：`npm run build` 沒包這層會直接失敗）。頁面本體在 AdvancedInner。
+ * fallback 留空：本頁全 client 資料，無首繪內容可給。 */
 export default function AdvancedPage() {
+  return (
+    <Suspense fallback={null}>
+      <AdvancedInner />
+    </Suspense>
+  );
+}
+
+function AdvancedInner() {
   const COPY = useCopy();
   const c = COPY.advanced;
   const me = useMe();
