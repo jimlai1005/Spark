@@ -98,7 +98,7 @@ logger = logging.getLogger(__name__)
 # 門檻常數（D3）：預設值＋環境變數可覆寫，見 `ExploreConfig.from_env`。
 # ---------------------------------------------------------------------------
 DEFAULT_CANDIDATE_POOL = 100
-DEFAULT_MIN_TRADING_DAYS = 60
+DEFAULT_MIN_TRADING_DAYS = 30  # 2026-08-30 使用者裁決：60 → 30（實測 60 天閘下 300 候選僅 2 合格）
 DEFAULT_MIN_FILLS = 200
 DEFAULT_MAX_DRAWDOWN_PCT = Decimal("30")
 DEFAULT_MAX_CONCENTRATION_PCT = Decimal("90")
