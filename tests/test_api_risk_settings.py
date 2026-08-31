@@ -557,9 +557,33 @@ def test_applied_and_halted_come_from_a_fresh_heartbeat(client_wallet):
     assert body["applied"]["controls_enabled"] is True
     assert body["applied"]["source"] == "customer_signed"
     assert body["applied"]["as_of"] is not None
+    # I-25：新版心跳帶逐項門檻 → 投影必須帶出（前端「已提交 vs 已生效」逐項比對
+    # 的唯一資料源）；本 fixture 未給 risk_prefs → None（舊心跳語義），下方
+    # 專屬測試驗有值的情形。
+    assert "prefs" in body["applied"]
     assert body["halted"]["tripped"] is True
     assert body["halted"]["resumable"] is True
     assert "立即恢復" in body["halted"]["note"]
+
+
+def test_applied_prefs_forwarded_from_new_heartbeat(client_wallet):
+    """I-25（2026-09-01 生產發現）：引擎新版心跳帶 `risk.prefs`（實際執法門檻），
+    投影層過去從未帶出——前端型別自始宣告此欄位，逐項生效比對因此恆「無法確認」。
+    舊心跳（無此格）→ None，前端顯示無法確認（I-21 已防 undefined）。"""
+    client, cfg, wallet = client_wallet
+    account_id = derive_account_id(wallet.address)
+    prefs = {"enabled": False, "size_tolerance": "0.08", "max_drawdown_pct": "0.2",
+             "max_total_drawdown_pct": "0.4", "flatten_on_breach": True,
+             "cooldown_hours": "12"}
+    write_hb(cfg, account_id, enabled=False, source="env_default",
+             changed_at=None, risk_prefs=prefs)
+    body = client.get("/api/me/risk").json()
+    assert body["applied"]["prefs"] == prefs
+
+    write_hb(cfg, account_id, enabled=False, source="env_default",
+             changed_at=None, risk_prefs=None)
+    body = client.get("/api/me/risk").json()
+    assert body["applied"]["prefs"] is None
 
 
 def test_leader_revoked_halt_is_not_self_resumable(client_wallet):

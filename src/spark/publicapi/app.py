@@ -3228,6 +3228,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 # 「我看到的是部署預設」。
                 "source": risk.get("source"),
                 "changed_at": risk.get("changed_at"),
+                # ⭐ I-25（2026-09-01）：引擎實際執法的逐項門檻（新版心跳才有；
+                # 舊版心跳缺此格 → None）。前端型別自始宣告此欄位，但投影從未
+                # 帶出——「已提交 vs 已生效」的逐項比對因此永遠顯示無法確認。
+                "prefs": risk.get("prefs"),
                 # 這組值是引擎在哪一刻回報的——沒有這個時間戳，一份接近過期的心跳
                 # 會被當成即時查詢讀（工程原則 1 的變形：連時點都不同源）。
                 "as_of": hb.at,
