@@ -79,3 +79,12 @@ pause/close-all 於 prod 無實效）。後續：日報每日附加 accrued（�
 | I-21 | 設定頁壞掉（錯誤頁） | 舊版引擎心跳的 `applied` 塊**沒有 `prefs` 鍵**（undefined），settings 的 `=== null` 守門放行 → `undefined.size_tolerance` 崩潰。本機從未測過「心跳存在但形狀舊」象限；以正式機 3662 真 payload 重現後定位 | `== null` 補防＋以真 payload 形狀加回歸測試；prod 端到端驗證通過（除錯 session 用畢即刪） | `6d228e7` | ✅（prod 已驗） |
 | I-22 | 登出按鈕按了沒反應（換頁才發現已登出） | I-20 修法用的 `queryClient.clear()` 只清資料**不通知活著的 observer**——useMe 收不到變更，畫面停在登入態；伺服器端 cookie 其實已清（所以換頁就對了） | 五個身份切換站點全改 `resetQueries()`（清資料＋通知＋活躍查詢重抓）；prod E2E 實測：點登出原地即翻未登入態（dashboard guard 並自動導回 /strategies） | `c181b87` | ✅（prod 已驗） |
 | I-23 | 登出後要回首頁，不留在原頁 | 原行為：留在原頁、由各頁 guard 各自導向（不一致） | handleLogout 統一 `router.push("/")`；prod E2E 實測登出落在首頁 hero | `c2e200a` | ✅（prod 已驗） |
+
+## 第八批（2026-09-01，上線後放行與網域）
+
+| # | 項目 | 內容 | Commit | 狀態 |
+|---|---|---|---|---|
+| I-24 | 日報每日附加 accrued（路由量數據源） | filet_daily_report 北極星查詢後落 accrued_history.jsonl（全部 builder 成功才落檔，防低估混源；同日冪等覆蓋）；prod 實跑通過（$30.66） | `dc8133e` | ✅ |
+| I-25 | 設定頁「目前生效」永遠無法確認 | 後端 /api/me/risk 投影從未帶出心跳的 `risk.prefs`（前端型別自始宣告、跨層縫隙兩邊各自測都綠）；補投影＋測試；prod 驗證逐項生效值已回傳 | `d77318c` | ✅ |
+| — | 引擎重啟放行 | filet-follower 重啟乾淨、心跳新格式（含 risk.prefs/halt）；暫停/恢復 round-trip prod 實測通過（paused↔following） | — | ✅ |
+| — | 網域切換 trade.filet.app | LE 憑證（89 天自動續簽）、nginx 分流（sslip 301→新域）、SIWE domain/URI 換新域（拋棄式錢包實測簽章綁定 OK）、前端以新 origin 重建（canonical ✓）；IPv6 `2406:da14:196:cc00:f633:bdf3:dbce:33d7` 供 AAAA | — | ✅ |
