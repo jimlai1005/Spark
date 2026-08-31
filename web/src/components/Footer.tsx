@@ -78,7 +78,7 @@ export function Footer() {
             <Link href="/terms">{c.legalTerms}</Link>
             <Link href="/privacy">{c.legalPrivacy}</Link>
             <Link href="/risk">{c.legalRisk}</Link>
-            <a href="mailto:contact@filet.trade">{c.legalContact}</a>
+            <a href="https://filet.app/#/contact" target="_blank" rel="noopener noreferrer">{c.legalContact}</a>
           </div>
         </div>
       </div>

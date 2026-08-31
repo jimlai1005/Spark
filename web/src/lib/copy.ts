@@ -97,7 +97,7 @@ export const COPY_ZH = {
   /**
    * Footer 文案（Task 7）。四欄＋系統狀態燈——資料來自 `/api/public/status`
    * （見 lib/publicApi.ts），只讀一次不輪詢。法務欄連向 /terms /privacy /risk
-   * 三頁（Task 12 建立）與 contact@filet.trade；免責文字對照設計稿 §03 L412。
+   * 三頁（Task 12 建立）與聯絡表單（filet.app/#/contact，2026-09-01 起）；免責文字對照設計稿 §03 L412。
    */
   footer: {
     brandTagline: "Hyperliquid 上的非保管策略執行。資金留在你的錢包，授權可隨時撤銷。",
@@ -118,7 +118,7 @@ export const COPY_ZH = {
     legalTerms: "服務條款",
     legalPrivacy: "隱私政策",
     legalRisk: "風險揭露",
-    legalContact: "contact@filet.trade",
+    legalContact: "聯絡我們",
     disclaimer:
       "跟單交易具有虧損風險，過往績效不代表未來結果，你可能損失全部投入資金。"
       + "Filet 不提供投資建議，不保管用戶資產。所有簽署僅在你自己的錢包中完成；"
@@ -1818,7 +1818,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     legalTerms: "Terms of service",
     legalPrivacy: "Privacy policy",
     legalRisk: "Risk disclosure",
-    legalContact: "contact@filet.trade",
+    legalContact: "Contact us",
     disclaimer:
       "Copy trading carries risk of loss; past performance does not guarantee future results and you may lose your "
       + "entire investment. Filet does not provide investment advice and does not custody user assets. All signing "

@@ -24,7 +24,7 @@ const FEE_RATE = 0.0002;
  * 首頁既有呼叫點行為不變。夾在 [MIN_NOTIONAL, MAX_NOTIONAL] 之間，避免呼叫端傳入
  * 超出 slider 範圍的值。
  */
-export function FeeCalculator({ initialNotional }: { initialNotional?: number } = {}) {
+export function FeeCalculator({ initialNotional, id }: { initialNotional?: number; id?: string } = {}) {
   const COPY = useCopy();
   const c = COPY.fee;
   const clampedInitial = initialNotional == null
@@ -35,7 +35,7 @@ export function FeeCalculator({ initialNotional }: { initialNotional?: number } 
   const total = side * 2;
 
   return (
-    <section className="fee-section">
+    <section className="fee-section" id={id}>
       <div className="fee-copy">
         <h2>{c.heading}</h2>
         <p>{c.body}</p>

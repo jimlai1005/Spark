@@ -111,7 +111,7 @@ export const LEGAL_ZH = {
       },
       {
         heading: "9. 聯絡方式",
-        paragraphs: ["contact@filet.trade"],
+        paragraphs: ["https://filet.app/#/contact"],
       },
     ],
   },
@@ -165,7 +165,7 @@ export const LEGAL_ZH = {
       },
       {
         heading: "6. 聯絡方式",
-        paragraphs: ["contact@filet.trade"],
+        paragraphs: ["https://filet.app/#/contact"],
       },
     ],
   },
@@ -348,7 +348,7 @@ export const LEGAL_EN: DeepString<typeof LEGAL_ZH> = {
       },
       {
         heading: "9. Contact",
-        paragraphs: ["contact@filet.trade"],
+        paragraphs: ["https://filet.app/#/contact"],
       },
     ],
   },
@@ -414,7 +414,7 @@ export const LEGAL_EN: DeepString<typeof LEGAL_ZH> = {
       },
       {
         heading: "6. Contact",
-        paragraphs: ["contact@filet.trade"],
+        paragraphs: ["https://filet.app/#/contact"],
       },
     ],
   },

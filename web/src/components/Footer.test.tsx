@@ -37,14 +37,14 @@ describe("Footer", () => {
     expect(screen.getByText(COPY_ZH.footer.disclaimer)).toBeInTheDocument();
   });
 
-  it("法務欄連向 /terms /privacy /risk 與 mailto:contact@filet.trade", () => {
+  it("法務欄連向 /terms /privacy /risk 與聯絡表單（filet.app，新開視窗）", () => {
     stubStatus("unknown");
     renderFooter();
     expect(screen.getByRole("link", { name: COPY_ZH.footer.legalTerms })).toHaveAttribute("href", "/terms");
     expect(screen.getByRole("link", { name: COPY_ZH.footer.legalPrivacy })).toHaveAttribute("href", "/privacy");
     expect(screen.getByRole("link", { name: COPY_ZH.footer.legalRisk })).toHaveAttribute("href", "/risk");
     expect(screen.getByRole("link", { name: COPY_ZH.footer.legalContact }))
-      .toHaveAttribute("href", "mailto:contact@filet.trade");
+      .toHaveAttribute("href", "https://filet.app/#/contact");
   });
 
   it("狀態燈三態：ok → 綠字「系統運作正常」", async () => {

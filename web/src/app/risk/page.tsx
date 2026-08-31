@@ -22,7 +22,11 @@ export default function RiskPage() {
         <section key={section.heading} className="card legal-section">
           <h2>{section.heading}</h2>
           {section.paragraphs.map((p, i) => (
-            <p key={`${section.heading}-${i}`}>{p}</p>
+            <p key={`${section.heading}-${i}`}>
+              {p.startsWith("http")
+                ? <a href={p} target="_blank" rel="noopener noreferrer">{p}</a>
+                : p}
+            </p>
           ))}
         </section>
       ))}

@@ -101,14 +101,14 @@ export default function HomePage() {
       value: builderFeeDisplay,
       label: home.evidence.builderFeeLabel,
       link: home.evidence.builderFeeLink,
-      href: "/docs#fees",
+      href: "/#fee",
     },
     {
       key: "custody",
       value: home.evidence.custodyValue,
       label: home.evidence.custodyLabel,
       link: home.evidence.custodyLink,
-      href: "/docs#custody",
+      href: "/#security",
     },
   ];
 
@@ -209,7 +209,13 @@ export default function HomePage() {
           <div key={item.key} className="evidence-item">
             <div className="mono evidence-value">{item.value}</div>
             <div className="evidence-label">{item.label}</div>
-            <a href={item.href} className="mono evidence-link">
+            <a
+              href={item.href}
+              className="mono evidence-link"
+              // 外部連結（Hyperliquid）新開視窗；站內錨點原視窗（2026-09-01 使用者裁決）
+              target={item.href.startsWith("http") ? "_blank" : undefined}
+              rel={item.href.startsWith("http") ? "noopener noreferrer" : undefined}
+            >
               {item.link}
             </a>
           </div>
@@ -246,7 +252,7 @@ export default function HomePage() {
       <CapabilityMatrix id="security" />
 
       {/* ---------- 費用試算 ---------- */}
-      <FeeCalculator />
+      <FeeCalculator id="fee" />
 
       {/* ---------- 開始跟單的四個步驟 ---------- */}
       <section id="how" className="home-steps">

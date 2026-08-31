@@ -79,7 +79,7 @@ Filet（下稱「本服務」）是一套非保管（non-custodial）的策略�
 
 ### 9. 聯絡方式
 
-contact@filet.trade
+https://filet.app/#/contact（聯絡表單）
 
 ---
 
@@ -123,7 +123,7 @@ localStorage）、來信查詢或要求刪除我們持有的你的資料。
 
 ### 6. 聯絡方式
 
-contact@filet.trade
+https://filet.app/#/contact（聯絡表單）
 
 ---
 
