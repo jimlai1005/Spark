@@ -1,5 +1,8 @@
 /**
- * PositionsTable —「成交記錄・授權歷程」tab（M3 round2 Task 7）。
+ * PositionsTable —「成交記錄・授權歷程」tab（M3 round2 Task 7；I-18 2026-08-31
+ * 使用者裁決：後端固定近 30 天窗＋游標分頁抓滿，前端移除 7天/30天/全部期間
+ * chip、排序改新→舊、空態帶最近一筆成交時間、加「在 Hyperliquid 查看完整
+ * 歷史」外連結）。
  * 資料**直取 Hyperliquid**（`getMyFills`／`getMyAuthorizations`），不讀自家 DB
  * ——本檔只驗證前端組裝層：tab 不再 disabled、lazy fetch（切到 tab 才打 API）、
  * load/error/empty 三態各自獨立。
@@ -7,9 +10,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LangProvider } from "@/lib/lang";
-import type { DashboardPosition, MyAuthorizationRow, MyFillRow } from "@/lib/api";
+import type { DashboardPosition, MyAuthorizationRow, MyFillRow, MyFillsResp } from "@/lib/api";
 
-const getMyFills = vi.fn<() => Promise<{ fills: MyFillRow[] }>>();
+const getMyFills = vi.fn<() => Promise<MyFillsResp>>();
 const getMyAuthorizations = vi.fn<() => Promise<{ authorizations: MyAuthorizationRow[] }>>();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -45,10 +48,17 @@ const AUTH_BUILDER_FEE: MyAuthorizationRow = {
   hash: "0xadde8c810af9aa5aaf580442b4463e0207a90066a5fcc92c51a737d3c9fd8445",
 };
 
-function renderTable() {
+/** I-18：`/api/me/fills` 回應完整形狀——`truncated`／`last_fill_time` 是新增
+ * 欄位，測試預設值分別是 `false`／`null`（絕大多數測試不關心這兩個欄位），
+ * 個別測試需要非預設值時用 `over` 覆寫。 */
+function fillsResp(fills: MyFillRow[], over: Partial<MyFillsResp> = {}): MyFillsResp {
+  return { fills, truncated: false, last_fill_time: null, ...over };
+}
+
+function renderTable(address?: string) {
   return render(
     <LangProvider>
-      <PositionsTable positions={[POSITION]} feesMonth={null} />
+      <PositionsTable positions={[POSITION]} feesMonth={null} address={address} />
     </LangProvider>,
   );
 }
@@ -59,7 +69,7 @@ afterEach(() => {
 
 describe("PositionsTable — history tab", () => {
   it("history tab 不再 disabled，可以點擊切換", () => {
-    getMyFills.mockResolvedValue({ fills: [] });
+    getMyFills.mockResolvedValue(fillsResp([]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     const tab = screen.getByText("成交記錄・授權歷程");
@@ -67,7 +77,7 @@ describe("PositionsTable — history tab", () => {
   });
 
   it("lazy fetch：未切到 history tab 前不打 API", () => {
-    getMyFills.mockResolvedValue({ fills: [] });
+    getMyFills.mockResolvedValue(fillsResp([]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     expect(getMyFills).not.toHaveBeenCalled();
@@ -75,7 +85,7 @@ describe("PositionsTable — history tab", () => {
   });
 
   it("切到 history tab 才打兩支 API（各一次）", async () => {
-    getMyFills.mockResolvedValue({ fills: [] });
+    getMyFills.mockResolvedValue(fillsResp([]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -91,8 +101,8 @@ describe("PositionsTable — history tab", () => {
     expect(screen.getByText("讀取中…")).toBeInTheDocument();
   });
 
-  it("兩者皆空 → 各自顯示 empty 文案", async () => {
-    getMyFills.mockResolvedValue({ fills: [] });
+  it("兩者皆空、帳戶完全沒有成交紀錄（last_fill_time=null）→ 各自顯示 empty 文案", async () => {
+    getMyFills.mockResolvedValue(fillsResp([]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -112,7 +122,7 @@ describe("PositionsTable — history tab", () => {
   });
 
   it("兩者皆有資料 → 渲染成交列與授權列", async () => {
-    getMyFills.mockResolvedValue({ fills: [FILL] });
+    getMyFills.mockResolvedValue(fillsResp([FILL]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [AUTH] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -127,7 +137,7 @@ describe("PositionsTable — history tab", () => {
   });
 
   it("[W2] approveAgent → 前端用結構化欄位組出中文摘要（不吃後端 summary 字串）", async () => {
-    getMyFills.mockResolvedValue({ fills: [] });
+    getMyFills.mockResolvedValue(fillsResp([]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [AUTH] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -136,7 +146,7 @@ describe("PositionsTable — history tab", () => {
   });
 
   it("[W2] approveBuilderFee → 前端組出「授權 builder fee 費率 給 位址」", async () => {
-    getMyFills.mockResolvedValue({ fills: [] });
+    getMyFills.mockResolvedValue(fillsResp([]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [AUTH_BUILDER_FEE] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -148,7 +158,8 @@ describe("PositionsTable — history tab", () => {
 
 // ==================== 成交記錄表重構（M3 round3 Task 8，R2·P1）====================
 // 現況問題：全量渲染上千列、無分頁、字級約 10px、時間全為 UTC——本節驗證分頁
-// 50/頁、期間（7D/30D/全部）與幣種篩選、UTC/本地時間切換。
+// 50/頁、幣種篩選、UTC/本地時間切換。I-18（2026-08-31）：期間 chip（7天/30天/
+// 全部）已移除（後端固定回應近 30 天窗），排序改新→舊。
 
 function fill(over: Partial<MyFillRow> & { time: number; coin: string; hash: string }): MyFillRow {
   return { side: "B", px: "1", sz: "1", fee: "0", closed_pnl: "0", ...over };
@@ -165,7 +176,7 @@ describe("PositionsTable — 成交記錄表：分頁 50/頁（Task 8）", () =>
     const now = Date.now();
     const fills = Array.from({ length: 55 }, (_, i) =>
       fill({ time: now - i * 1000, coin: `C${i}`, hash: `0xfill${i}` }));
-    getMyFills.mockResolvedValue({ fills });
+    getMyFills.mockResolvedValue(fillsResp(fills));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -182,31 +193,92 @@ describe("PositionsTable — 成交記錄表：分頁 50/頁（Task 8）", () =>
   });
 });
 
-describe("PositionsTable — 成交記錄表：期間篩選（Task 8）", () => {
-  it("預設 30 天排除 45 天前的成交；切 7 天／全部即時變化", async () => {
-    const now = Date.now();
-    const fills = [
-      fill({ time: now - 1000, coin: "ETH", hash: "0xnow" }),
-      fill({ time: now - 10 * 86_400_000, coin: "BTC", hash: "0x10d" }),
-      fill({ time: now - 45 * 86_400_000, coin: "SOL", hash: "0x45d" }),
-    ];
-    getMyFills.mockResolvedValue({ fills });
+describe("PositionsTable — 成交記錄表：無期間 chip（I-18，固定近 30 天窗）", () => {
+  it("不再渲染 7天/30天/全部 期間按鈕", async () => {
+    getMyFills.mockResolvedValue(fillsResp([FILL]));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
     await waitFor(() => expect(screen.getByText("ETH", IN_ROW)).toBeInTheDocument());
 
-    // 預設 30 天：ETH、BTC 在，SOL（45 天前）不在。
-    expect(screen.getByText("BTC", IN_ROW)).toBeInTheDocument();
-    expect(screen.queryByText("SOL", IN_ROW)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "7 天" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "30 天" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "全部" })).not.toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: "7 天" }));
-    await waitFor(() => expect(screen.queryByText("BTC", IN_ROW)).not.toBeInTheDocument());
-    expect(screen.getByText("ETH", IN_ROW)).toBeInTheDocument();
+  it("標題標注「近 30 天」", async () => {
+    getMyFills.mockResolvedValue(fillsResp([FILL]));
+    getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+    renderTable();
+    fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+    await waitFor(() => expect(screen.getByText("成交記錄（近 30 天）")).toBeInTheDocument());
+  });
+});
 
-    fireEvent.click(screen.getByRole("button", { name: "全部" }));
-    await waitFor(() => expect(screen.getByText("SOL", IN_ROW)).toBeInTheDocument());
-    expect(screen.getByText("BTC", IN_ROW)).toBeInTheDocument();
+describe("PositionsTable — 成交記錄表：新→舊排序（I-18）", () => {
+  it("後端依時間升冪回傳，前端渲染改為新→舊（最新一筆在最上面）", async () => {
+    const now = Date.now();
+    // 刻意用升冪（後端既有回應順序）餵給元件，驗證元件自己做了反轉，不是
+    // 剛好利用測試 fixture 已經降冪排列這件事矇混過去。
+    const fills = [
+      fill({ time: now - 3000, coin: "OLDEST", hash: "0x1" }),
+      fill({ time: now - 2000, coin: "MID", hash: "0x2" }),
+      fill({ time: now - 1000, coin: "NEWEST", hash: "0x3" }),
+    ];
+    getMyFills.mockResolvedValue(fillsResp(fills));
+    getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+    const { container } = renderTable();
+    fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+    await waitFor(() => expect(screen.getByText("NEWEST", IN_ROW)).toBeInTheDocument());
+
+    const coinCells = Array.from(container.querySelectorAll(".dash-table-row"))
+      .map((row) => row.querySelector("div")?.nextElementSibling?.textContent);
+    expect(coinCells).toEqual(["NEWEST", "MID", "OLDEST"]);
+  });
+});
+
+describe("PositionsTable — 成交記錄表：空態帶最近一筆成交時間（I-18）", () => {
+  it("30 天窗零筆但帳戶有歷史成交（last_fill_time 非 null）→ 空態文案帶時間戳", async () => {
+    getMyFills.mockResolvedValue(fillsResp([], { last_fill_time: 1_700_000_000_000 }));
+    getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+    renderTable();
+    fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+    await waitFor(() => expect(screen.getByText(/近 30 天沒有成交（最近一筆：/)).toBeInTheDocument());
+    expect(screen.queryByText("近期沒有成交紀錄。")).not.toBeInTheDocument();
+  });
+
+  it("完全沒有成交紀錄（last_fill_time 為 null）→ 沿用既有純空態句", async () => {
+    getMyFills.mockResolvedValue(fillsResp([], { last_fill_time: null }));
+    getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+    renderTable();
+    fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+    await waitFor(() => expect(screen.getByText("近期沒有成交紀錄。")).toBeInTheDocument());
+  });
+});
+
+describe("PositionsTable — 成交記錄表：外連 Hyperliquid 完整歷史（I-18）", () => {
+  const ADDRESS = "0x" + "ab".repeat(20);
+
+  it("有登入地址 → 渲染外連結，href 指向 explorer/address/{address}", async () => {
+    getMyFills.mockResolvedValue(fillsResp([FILL]));
+    getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+    renderTable(ADDRESS);
+    fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+    await waitFor(() => expect(screen.getByText("ETH", IN_ROW)).toBeInTheDocument());
+
+    const link = screen.getByRole("link", { name: "在 Hyperliquid 查看完整歷史 ↗" });
+    expect(link).toHaveAttribute("href", `https://app.hyperliquid.xyz/explorer/address/${ADDRESS}`);
+    expect(link).toHaveAttribute("target", "_blank");
+  });
+
+  it("沒有地址（prop 未傳）→ 不渲染外連結，不當機", async () => {
+    getMyFills.mockResolvedValue(fillsResp([FILL]));
+    getMyAuthorizations.mockResolvedValue({ authorizations: [] });
+    renderTable();
+    fireEvent.click(screen.getByText("成交記錄・授權歷程"));
+    await waitFor(() => expect(screen.getByText("ETH", IN_ROW)).toBeInTheDocument());
+
+    expect(screen.queryByRole("link", { name: "在 Hyperliquid 查看完整歷史 ↗" })).not.toBeInTheDocument();
   });
 });
 
@@ -217,7 +289,7 @@ describe("PositionsTable — 成交記錄表：幣種篩選（Task 8）", () => 
       fill({ time: now, coin: "ETH", hash: "0xe" }),
       fill({ time: now, coin: "BTC", hash: "0xb" }),
     ];
-    getMyFills.mockResolvedValue({ fills });
+    getMyFills.mockResolvedValue(fillsResp(fills));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -231,9 +303,9 @@ describe("PositionsTable — 成交記錄表：幣種篩選（Task 8）", () => 
 
 describe("PositionsTable — 成交記錄表：UTC/本地時間切換（Task 8）", () => {
   it("預設本地時間；切 UTC 後改顯示 UTC 字串", async () => {
-    const t = Date.now() - 60_000; // 1 分鐘前，落在預設 30D 篩選內
+    const t = Date.now() - 60_000; // 1 分鐘前
     const fills = [fill({ time: t, coin: "ETH", hash: "0xtz" })];
-    getMyFills.mockResolvedValue({ fills });
+    getMyFills.mockResolvedValue(fillsResp(fills));
     getMyAuthorizations.mockResolvedValue({ authorizations: [] });
     renderTable();
     fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -263,9 +335,9 @@ describe("PositionsTable — 本地時間偏移含分鐘（R-C/S5）", () => {
   it("UTC+5:30（半小時偏移）→ 顯示 UTC+05:30，不再被無聲截斷成 UTC+05", async () => {
     const offsetSpy = vi.spyOn(Date.prototype, "getTimezoneOffset").mockReturnValue(-330);
     try {
-      const t = Date.now() - 60_000; // 1 分鐘前，落在預設 30D 篩選內
+      const t = Date.now() - 60_000;
       const fills = [fill({ time: t, coin: "ETH", hash: "0xtz530" })];
-      getMyFills.mockResolvedValue({ fills });
+      getMyFills.mockResolvedValue(fillsResp(fills));
       getMyAuthorizations.mockResolvedValue({ authorizations: [] });
       renderTable();
       fireEvent.click(screen.getByText("成交記錄・授權歷程"));
@@ -286,7 +358,7 @@ describe("PositionsTable — 本地時間偏移含分鐘（R-C/S5）", () => {
     try {
       const t = Date.now() - 60_000;
       const fills = [fill({ time: t, coin: "ETH", hash: "0xtz800" })];
-      getMyFills.mockResolvedValue({ fills });
+      getMyFills.mockResolvedValue(fillsResp(fills));
       getMyAuthorizations.mockResolvedValue({ authorizations: [] });
       renderTable();
       fireEvent.click(screen.getByText("成交記錄・授權歷程"));

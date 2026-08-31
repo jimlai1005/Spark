@@ -247,6 +247,54 @@ def test_get_user_fills_paged_respects_env_max_pages(monkeypatch):
     assert len(post.calls) == 1
 
 
+# ── get_fills_detail_paged（I-18：/api/me/fills 固定 30 天窗＋游標分頁）────
+
+def test_get_fills_detail_paged_advances_cursor_across_2000_boundary():
+    """I-18：與 `get_user_fills_paged` 共用同一份游標迴圈（`_paged_fills_raw`），
+    這裡驗證 dict 展示形狀（含 `hash`，`UserFill` 沒有這個欄位）在跨 2000 筆
+    邊界時同樣正確分頁抓滿、重疊筆不重複計、依時間升冪排列。"""
+    from datetime import datetime, timezone
+    from spark.exchange.base import USER_FILLS_PAGE_LIMIT
+    from spark.publicapi.hl import _to_ms_utc
+    base_ms = _to_ms_utc(datetime(2026, 8, 1, tzinfo=timezone.utc))
+    page1 = [_raw_fill(base_ms + i, tid=i, hash=f"0x{i:x}")
+            for i in range(USER_FILLS_PAGE_LIMIT)]
+    page2 = [
+        _raw_fill(base_ms + USER_FILLS_PAGE_LIMIT - 1, tid=USER_FILLS_PAGE_LIMIT - 1,
+                 hash=f"0x{USER_FILLS_PAGE_LIMIT - 1:x}"),
+        _raw_fill(base_ms + USER_FILLS_PAGE_LIMIT, tid=USER_FILLS_PAGE_LIMIT,
+                 hash=f"0x{USER_FILLS_PAGE_LIMIT:x}"),
+    ]
+    post = _FakePost([page1, page2])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_fills_detail_paged(
+        "0x" + "ab" * 20,
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 2, tzinfo=timezone.utc))
+    assert truncated is False
+    assert len(fills) == USER_FILLS_PAGE_LIMIT + 1   # 重疊那筆（同 tid）不重複計
+    assert len(post.calls) == 2
+    assert fills[0]["hash"] == "0x0"                 # 展示形狀保留 hash
+    assert [f["time"] for f in fills] == sorted(f["time"] for f in fills)  # 依時間升冪
+
+
+def test_get_fills_detail_paged_truncates_at_max_pages():
+    from datetime import datetime, timezone
+    from spark.exchange.base import USER_FILLS_PAGE_LIMIT
+    from spark.publicapi.hl import _to_ms_utc
+    base_ms = _to_ms_utc(datetime(2026, 8, 1, tzinfo=timezone.utc))
+    page1 = [_raw_fill(base_ms + i, tid=i) for i in range(USER_FILLS_PAGE_LIMIT)]
+    post = _FakePost([page1])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_fills_detail_paged(
+        "0x" + "ab" * 20,
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 1, tzinfo=timezone.utc),
+        max_pages=1)
+    assert truncated is True
+    assert len(fills) == USER_FILLS_PAGE_LIMIT
+
+
 def test_to_ms_utc_treats_naive_as_utc():
     from datetime import datetime, timedelta, timezone
 

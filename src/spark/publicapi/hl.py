@@ -67,6 +67,23 @@ def _parse_fill(f: dict) -> UserFill:
     )
 
 
+def _fill_detail_dict(f: dict) -> dict:
+    """單筆 `userFillsByTime` 原始字典 → `get_fills_detail`／`get_fills_detail_paged`
+    共用的展示形狀（I-18：抽出成獨立函式，兩個方法都吃同一份欄位映射，不重複
+    寫兩份會各自漂移的裁切邏輯）。欄位名直接對齊真實 `userFillsByTime` 回應
+    （見 `HLGateway.get_fills_detail` docstring 的實測依據）；金額保留字串。"""
+    return {
+        "time": int(f["time"]),
+        "coin": f["coin"],
+        "side": f["side"],
+        "px": str(f["px"]),
+        "sz": str(f["sz"]),
+        "fee": str(f.get("fee", "0") or "0"),
+        "closed_pnl": str(f.get("closedPnl", "0") or "0"),
+        "hash": f.get("hash", ""),
+    }
+
+
 def _default_post(url: str, body: dict):
     """httpx 的 ConnectError/ReadTimeout 等**不繼承**內建 ConnectionError/TimeoutError，
     訊息還可能是空字串——resilience 邊界的錯誤分類器認不得，真實連線失敗會被
@@ -212,9 +229,21 @@ class HLGateway:
         `DEFAULT_FILLS_MAX_PAGES`＝10）頁都滿頁 → 回傳 `truncated=True`，
         已抓到的部分照樣回傳（呼叫端合計基於這份資料是**下限值**，需標示
         「未涵蓋全期間」，不得當成完整合計）。"""
+        raw_fills, truncated = self._paged_fills_raw(address, start, end, max_pages=max_pages)
+        all_fills = sorted((_parse_fill(f) for f in raw_fills), key=lambda f: f.time)
+        return all_fills, truncated
+
+    def _paged_fills_raw(self, address: str, start: datetime, end: datetime, *,
+                         max_pages: int | None = None) -> tuple[list[dict], bool]:
+        """共用的時間游標分頁核心（I-18：`get_user_fills_paged`／
+        `get_fills_detail_paged` 皆基於本方法，只是最後一步的欄位裁切／型別
+        轉換不同——滿頁偵測、`tid` 去重、時間不前進防呆這幾條邏輯只寫一份，
+        不讓兩個呼叫端各自維護一份可能漂移的複本，見類別所在模組檔頭
+        `get_user_fills_paged` 的既有 docstring；本方法的行為與其完全相同，
+        只是回傳**原始** fill dict（未轉 `UserFill`），供呼叫端自行裁切。"""
         max_pages = (max_pages if max_pages is not None
                     else _fills_max_pages_from_env())
-        all_fills: list[UserFill] = []
+        all_raw: list[dict] = []
         seen: set = set()
         cur_start_ms = _to_ms_utc(start)
         end_ms = _to_ms_utc(end)
@@ -231,7 +260,7 @@ class HLGateway:
                 if key in seen:
                     continue
                 seen.add(key)
-                all_fills.append(_parse_fill(f))
+                all_raw.append(f)
             if len(raw) < USER_FILLS_PAGE_LIMIT:
                 break
             last_ms = int(raw[-1]["time"])
@@ -242,8 +271,22 @@ class HLGateway:
             cur_start_ms = last_ms
             if page_idx == max_pages - 1:
                 truncated = True
-        all_fills.sort(key=lambda f: f.time)
-        return all_fills, truncated
+        all_raw.sort(key=lambda f: int(f["time"]))
+        return all_raw, truncated
+
+    def get_fills_detail_paged(self, address: str, start: datetime, end: datetime, *,
+                               max_pages: int | None = None) -> tuple[list[dict], bool]:
+        """`get_fills_detail` 的分頁版（I-18：`/api/me/fills` 改固定 30 天窗＋
+        游標分頁抓滿，取代舊版單頁 `get_fills_detail` 呼叫——實測使用者錢包
+        90 天窗 2820 筆成交被單頁 2000 上限截掉最新 8 天，見 issue log I-18）。
+        游標迴圈與 `get_user_fills_paged` 共用同一份實作（`_paged_fills_raw`，
+        不重造），只是最後一步用 `_fill_detail_dict` 裁切成展示形狀（含
+        `hash`，`UserFill` 沒有這個欄位，故不能直接復用 `get_user_fills_paged`
+        的輸出）。回傳升冪排列的 dict 清單 ＋ `truncated`（見
+        `_paged_fills_raw` docstring：連續 `max_pages` 頁滿頁才會是 True，
+        已抓到的部分是下限值）。"""
+        raw_fills, truncated = self._paged_fills_raw(address, start, end, max_pages=max_pages)
+        return [_fill_detail_dict(f) for f in raw_fills], truncated
 
     def agent_addresses(self, user: str) -> list[str]:
         """使用者已授權的 agent 地址清單（extraAgents）；小寫正規化供同基準比對。"""
@@ -264,16 +307,7 @@ class HLGateway:
         raw = self._info({"type": "userFillsByTime", "user": address,
                           "startTime": _to_ms_utc(start), "endTime": _to_ms_utc(end)},
                          "HL userFillsByTime 查詢")
-        return [{
-            "time": int(f["time"]),
-            "coin": f["coin"],
-            "side": f["side"],
-            "px": str(f["px"]),
-            "sz": str(f["sz"]),
-            "fee": str(f.get("fee", "0") or "0"),
-            "closed_pnl": str(f.get("closedPnl", "0") or "0"),
-            "hash": f.get("hash", ""),
-        } for f in raw]
+        return [_fill_detail_dict(f) for f in raw]
 
     def user_details(self, address: str) -> dict:
         """explorer 的帳戶交易明細（唯讀、冪等 → transient 重試）；`/api/me/

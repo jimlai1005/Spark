@@ -183,6 +183,14 @@ class FakeHL:
             raise err
         return list(self.fills_detail.get(address.lower(), []))
 
+    def get_fills_detail_paged(self, address: str, start, end, *, max_pages=None):
+        """I-18：`/api/me/fills` 改吃這個分頁介面。`FakeHL` 同 `get_user_fills_paged`
+        的既有簡化慣例——單頁測試委派給 `get_fills_detail`（同一份
+        `fills_detail`／`fills_detail_error` 語意），回傳 `truncated=False`；
+        真正跨 2000 筆邊界的分頁行為由 `tests/test_publicapi_hl.py` 對
+        `HLGateway` 直接單測。"""
+        return self.get_fills_detail(address, start, end), False
+
     def user_details(self, address: str) -> dict:
         err = self.user_details_error.get(address.lower())
         if err is not None:

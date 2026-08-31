@@ -1581,12 +1581,27 @@ export interface MyFillRow {
 }
 
 /**
- * 近 N 天成交（需 session）。`days` 須介於 1~90，超界 → 400（kind=client）；
- * 上游查詢失敗 → 503（kind=upstream，不 fallback 自家 DB）。冪等讀取。
+ * `/api/me/fills` 回應（I-18 2026-08-31 使用者裁決：固定近 30 天窗＋游標分頁
+ * 抓滿，取代舊版可切換 `days`）。
  */
-export function getMyFills(days: number = 30): Promise<{ fills: MyFillRow[] }> {
-  const q = new URLSearchParams({ days: String(days) });
-  return request<{ fills: MyFillRow[] }>(`/api/me/fills?${q.toString()}`);
+export interface MyFillsResp {
+  fills: MyFillRow[];
+  /** 游標分頁迴圈防炸上限仍在時的下限值旗標（見後端 `hl.get_user_fills_paged`
+   * docstring）——目前前端不另外渲染警示文案，只如實透傳。 */
+  truncated: boolean;
+  /** I-18：30 天窗零筆時，後端額外查一次有界回溯窗取得的最近一筆成交時間
+   * （epoch ms）；查無或帳戶從未有過成交 → `null`。空態文案用它分辨「近 30
+   * 天沒有成交」與「完全沒有成交紀錄」兩種情況（見 `PositionsTable.tsx`
+   * `FillsTable`）。 */
+  last_fill_time: number | null;
+}
+
+/**
+ * 近 30 天成交（需 session，固定窗——I-18）。上游查詢失敗 → 503
+ * （kind=upstream，不 fallback 自家 DB）。冪等讀取。
+ */
+export function getMyFills(): Promise<MyFillsResp> {
+  return request<MyFillsResp>("/api/me/fills");
 }
 
 /**

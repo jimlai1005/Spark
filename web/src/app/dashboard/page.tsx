@@ -174,7 +174,11 @@ export default function DashboardPage() {
         <FeesCard feesMonth={data?.fees_month ?? null} />
       </div>
 
-      <PositionsTable positions={data?.positions ?? null} feesMonth={data?.fees_month ?? null} />
+      <PositionsTable
+        positions={data?.positions ?? null}
+        feesMonth={data?.fees_month ?? null}
+        address={me.data.address}
+      />
     </main>
   );
 }

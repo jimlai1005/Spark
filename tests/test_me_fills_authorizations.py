@@ -59,15 +59,32 @@ def test_fills_returns_hl_detail_fields(tmp_path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["fills"] == hl.fills_detail[addr]
+    assert body["truncated"] is False
+    # I-18：fills 非空 → 不觸發空態的「最近一筆」回溯查詢，維持 None。
+    assert body["last_fill_time"] is None
 
 
-def test_fills_days_out_of_range_422(tmp_path):
-    app, *_ = make_app(tmp_path)
+def test_fills_ignores_days_param_uses_fixed_30d_window(tmp_path):
+    """I-18 使用者裁決：`/api/me/fills` 改固定 30 天窗，`days` 參數保留但被
+    忽略——任何 `days` 值（含超出舊版 1~90 合法範圍的值）都不再 422，且上游
+    查詢視窗恆為 30 天。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
     c = _client(app)
-    login(c)
-    assert c.get("/api/me/fills", params={"days": 0}).status_code == 422
-    assert c.get("/api/me/fills", params={"days": 91}).status_code == 422
-    assert c.get("/api/me/fills", params={"days": 90}).status_code == 200
+    wallet = login(c)
+    addr = wallet.address.lower()
+
+    windows = []
+    orig = hl.get_fills_detail_paged
+
+    def counting(address, start, end, **kw):
+        windows.append((end - start).days)
+        return orig(address, start, end, **kw)
+    hl.get_fills_detail_paged = counting
+    hl.fills_detail[addr] = FILLS_SAMPLE
+
+    assert c.get("/api/me/fills", params={"days": 0}).status_code == 200
+    assert c.get("/api/me/fills", params={"days": 91}).status_code == 200
+    assert windows == [30]  # 第二次命中同一格 60s TTL 快取（key 已收斂回純 addr），未重打上游
 
 
 def test_fills_upstream_failure_is_503_not_db_fallback(tmp_path):
@@ -79,33 +96,29 @@ def test_fills_upstream_failure_is_503_not_db_fallback(tmp_path):
     assert r.status_code == 503
 
 
-def test_fills_cache_key_includes_days(tmp_path):
-    """[W1] 2026-08-29 opus 審查：快取 key 若漏 `days`，切換天數會撞到同一格
-    快取、回傳錯誤天數範圍的成交明細卻不報錯。同一地址切換 days 必須各自
-    觸發一次上游查詢，回到同一個 days 才吃 TTL 內的快取。"""
+def test_fills_cache_key_is_address_only_now_days_is_ignored(tmp_path):
+    """I-18：視窗固定後快取鍵收斂回純 `addr`——同一地址不論 `days` 傳什麼值，
+    TTL 內都命中同一格快取，只打一次上游（取代舊版 `(addr, days)` 快取鍵測試，
+    見 issue log I-18「`days` 參數收斂或忽略」裁決）。"""
     clock = {"t": 1_000_000.0}
     app, cfg, store, keysvc, hl = make_app(tmp_path, now_fn=lambda: clock["t"])
     c = _client(app)
     wallet = login(c)
     addr = wallet.address.lower()
 
-    calls = {"n": 0, "days": []}
-    orig = hl.get_fills_detail
+    calls = {"n": 0}
+    orig = hl.get_fills_detail_paged
 
-    def counting(address, start, end):
+    def counting(*a, **kw):
         calls["n"] += 1
-        calls["days"].append((end - start).days)
-        return orig(address, start, end)
-    hl.get_fills_detail = counting
+        return orig(*a, **kw)
+    hl.get_fills_detail_paged = counting
     hl.fills_detail[addr] = FILLS_SAMPLE
 
     assert c.get("/api/me/fills", params={"days": 7}).status_code == 200
     assert calls["n"] == 1
     assert c.get("/api/me/fills", params={"days": 30}).status_code == 200
-    assert calls["n"] == 2  # 不同 days，不得撞到同一格快取
-    assert c.get("/api/me/fills", params={"days": 7}).status_code == 200
-    assert calls["n"] == 2  # 回到 days=7，仍在 60s TTL 內，命中快取
-    assert calls["days"] == [7, 30]
+    assert calls["n"] == 1  # 不同 days 值，仍撞同一格快取（days 已被忽略）
 
 
 def test_fills_cached_within_60s_ttl(tmp_path):
@@ -116,12 +129,12 @@ def test_fills_cached_within_60s_ttl(tmp_path):
     addr = wallet.address.lower()
 
     calls = {"n": 0}
-    orig = hl.get_fills_detail
+    orig = hl.get_fills_detail_paged
 
     def counting(*a, **kw):
         calls["n"] += 1
         return orig(*a, **kw)
-    hl.get_fills_detail = counting
+    hl.get_fills_detail_paged = counting
     hl.fills_detail[addr] = FILLS_SAMPLE
 
     assert c.get("/api/me/fills").status_code == 200
@@ -132,6 +145,52 @@ def test_fills_cached_within_60s_ttl(tmp_path):
     clock["t"] += 31.0
     assert c.get("/api/me/fills").status_code == 200
     assert calls["n"] == 2  # 超過 TTL，重打
+
+
+def test_fills_truncated_flag_propagates_from_gateway(tmp_path):
+    """I-18：`hl.get_fills_detail_paged` 回報 `truncated=True`（迴圈防炸上限
+    仍在時）要如實透到 API 回應，不得被端點層吞掉或改寫。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    c = _client(app)
+    wallet = login(c)
+    addr = wallet.address.lower()
+    hl.fills_detail[addr] = FILLS_SAMPLE
+    hl.get_fills_detail_paged = lambda address, start, end, **kw: (FILLS_SAMPLE, True)
+    r = c.get("/api/me/fills")
+    assert r.status_code == 200, r.text
+    assert r.json()["truncated"] is True
+
+
+def test_fills_empty_window_looks_back_for_last_fill_time(tmp_path):
+    """I-18：30 天窗零筆時，額外查一次有界回溯窗取最近一筆成交時間
+    （`last_fill_time`），供前端空態文案分辨「近 30 天沒有」與「完全沒有」。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    c = _client(app)
+    login(c)
+    # 主查詢（近 30 天）維持空清單（hl.fills_detail 預設 []）；回溯窗查詢注入一筆。
+
+    def fallback(address, start, end):
+        if (end - start).days <= 30:
+            return []
+        return [{"time": 1_700_000_000_000, "coin": "ETH", "side": "B", "px": "1",
+                 "sz": "1", "fee": "0", "closed_pnl": "0", "hash": "0xabc"}]
+    hl.get_fills_detail = fallback
+    r = c.get("/api/me/fills")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fills"] == []
+    assert body["last_fill_time"] == 1_700_000_000_000
+
+
+def test_fills_empty_window_no_history_at_all_last_fill_time_is_none(tmp_path):
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    c = _client(app)
+    login(c)
+    r = c.get("/api/me/fills")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fills"] == []
+    assert body["last_fill_time"] is None
 
 
 # ---------- /api/me/authorizations ----------

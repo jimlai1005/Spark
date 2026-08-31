@@ -16,6 +16,10 @@ import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
 
 const HL_EXPLORER_TX_BASE = "https://app.hyperliquid.xyz/explorer/tx/";
+// I-18：完整成交歷史（超過 30 天）導去 Hyperliquid 官方 explorer——沿 repo 既有
+// `explorer/address/{address}` 連結慣例（`traders/[address]/page.tsx`／
+// `strategies/[slug]/page.tsx` 已用同一個 base）。
+const HL_EXPLORER_ADDRESS_BASE = "https://app.hyperliquid.xyz/explorer/address/";
 
 type Tab = "positions" | "fees" | "history";
 
@@ -42,9 +46,15 @@ export function PositionsTable({
   // prop 留著只是為了不動既有呼叫端／既有測試的簽名（`PositionsTable.test.tsx`／
   // `PositionsTable.history.test.tsx` 仍傳 `feesMonth={null}`），本元件內不使用它。
   feesMonth: _feesMonth,
+  // I-18：登入地址——「在 Hyperliquid 查看完整歷史」外連結用（成交記錄 tab
+  // 只涵蓋近 30 天，超過 30 天導去官方 explorer）。可選＋預設 undefined：
+  // 既有測試（`PositionsTable.test.tsx`）沒有傳這個 prop 也不該壞——沒有地址
+  // 就不渲染外連結，不是硬錯誤。
+  address,
 }: {
   positions: DashboardPosition[] | null;
   feesMonth: DashboardFeesMonth | null;
+  address?: string;
 }) {
   const COPY = useCopy();
   const c = COPY.dashboard;
@@ -81,7 +91,7 @@ export function PositionsTable({
 
       {tab === "positions" && <PositionsGrid positions={positions} />}
       {tab === "fees" && <FeesGrid />}
-      {tab === "history" && <HistoryPanel />}
+      {tab === "history" && <HistoryPanel address={address} />}
     </div>
   );
 }
@@ -396,12 +406,15 @@ function TxLink({ hash, label }: { hash: string; label: string }) {
  * `PositionsTable` 的條件渲染）；兩個上游各自獨立成功/失敗，互不拖累
  * （工程原則 3 的展示資料版本——一邊讀不到不該讓另一邊也顯示不出來）。
  */
-function HistoryPanel() {
+function HistoryPanel({ address }: { address?: string }) {
   const COPY = useCopy();
   const c = COPY.dashboard.history;
   const [loading, setLoading] = useState(true);
   const [fills, setFills] = useState<MyFillRow[] | null>(null);
   const [fillsFailed, setFillsFailed] = useState(false);
+  // I-18：後端固定近 30 天窗零筆時的最近一筆成交時間（epoch ms），供空態文案
+  // 分辨「近期沒有」與「完全沒有」（見 `FillsTable` 空態渲染）。
+  const [lastFillTime, setLastFillTime] = useState<number | null>(null);
   const [authorizations, setAuthorizations] = useState<MyAuthorizationRow[] | null>(null);
   const [authorizationsFailed, setAuthorizationsFailed] = useState(false);
 
@@ -410,13 +423,16 @@ function HistoryPanel() {
     setLoading(true);
     setFillsFailed(false);
     setAuthorizationsFailed(false);
-    // ⭐ M3 round3 Task 8：抓滿後端上限（90 天），讓前端「7D/30D/全部」期間 chip
-    // 有真實資料可切換——「全部」語意是「已抓到的視窗內全部」，不是無上限歷史
-    // （後端 `/api/me/fills` 的 `days` 硬性上限 90，見 api.ts 註解）。
-    Promise.allSettled([getMyFills(90), getMyAuthorizations()]).then(([f, a]) => {
+    // I-18：`/api/me/fills` 改固定近 30 天窗＋游標分頁抓滿（取代舊版可切換
+    // days 的「7D/30D/全部」期間 chip，見 `FillsTable` 檔頭）。
+    Promise.allSettled([getMyFills(), getMyAuthorizations()]).then(([f, a]) => {
       if (cancelled) return;
-      if (f.status === "fulfilled") setFills(f.value.fills);
-      else setFillsFailed(true);
+      if (f.status === "fulfilled") {
+        setFills(f.value.fills);
+        setLastFillTime(f.value.last_fill_time);
+      } else {
+        setFillsFailed(true);
+      }
       if (a.status === "fulfilled") setAuthorizations(a.value.authorizations);
       else setAuthorizationsFailed(true);
       setLoading(false);
@@ -440,7 +456,7 @@ function HistoryPanel() {
     <div className="dash-history-panel">
       <div className="dash-history-section">
         <h3>{c.fillsTitle}</h3>
-        <FillsTable rows={fills} failed={fillsFailed} />
+        <FillsTable rows={fills} failed={fillsFailed} lastFillTime={lastFillTime} address={address} />
       </div>
       <div className="dash-history-section">
         <h3>{c.authorizationsTitle}</h3>
@@ -450,19 +466,28 @@ function HistoryPanel() {
   );
 }
 
-// ── 成交記錄表（R2·P1 重構，M3 round3 Task 8）──────────────────────────────
+// ── 成交記錄表（R2·P1 重構，M3 round3 Task 8；I-18 2026-08-31 使用者裁決：
+// 固定近 30 天窗，移除 7D/30D/全部期間 chip）──────────────────────────────
 // 現況問題：全量渲染上千列、無分頁、字級約 10px、時間全為 UTC。修法：
-// client-side 分頁 50/頁＋期間（7D/30D/全部）與幣種篩選＋字級 ≥13px＋UTC/本地
-// 切換。同 FeesGrid 慣例：inline style（globals.css 不在本 task 改動範圍，
-// 只處理「資訊框」藍色樣式），沿用既有 `.dash-table`/`.dash-table-head`/
-// `.dash-table-row` class 只借版面，字級用 inline style 覆蓋。
+// client-side 分頁 50/頁＋幣種篩選＋字級 ≥13px＋UTC/本地切換。同 FeesGrid
+// 慣例：inline style（globals.css 不在本 task 改動範圍，只處理「資訊框」藍色
+// 樣式），沿用既有 `.dash-table`/`.dash-table-head`/`.dash-table-row` class
+// 只借版面，字級用 inline style 覆蓋。
+//
+// I-18：期間 chip 移除——後端 `/api/me/fills` 已固定回應近 30 天窗（游標分頁
+// 抓滿，不再受單頁 2000 筆上限截斷，見 `api.ts` `getMyFills` 註解），前端不
+// 需要也不該再自己切期間（沒有 30 天外的資料可切）。排序改新→舊（後端回傳
+// 依時間升冪，這裡本地反轉一次，見 `sortFillsDesc`）。
 
 const FILLS_PAGE_SIZE = 50;
-type FillsPeriodFilter = "7d" | "30d" | "all";
-const FILLS_PERIODS: FillsPeriodFilter[] = ["7d", "30d", "all"];
-const FILLS_PERIOD_DAYS: Record<FillsPeriodFilter, number | null> = { "7d": 7, "30d": 30, all: null };
 const FILLS_ALL_COIN = "__all__";
 const FILLS_ROW_FONT_SIZE = 13.5;
+
+/** 後端依時間升冪回傳 → 新→舊排序（I-18：使用者裁決，成交記錄要「最新的在
+ * 最上面」）。純函式，不動輸入陣列（`[...rows].sort` 複本再排）。 */
+export function sortFillsDesc(rows: MyFillRow[]): MyFillRow[] {
+  return [...rows].sort((a, b) => b.time - a.time);
+}
 
 /**
  * epoch ms → `YYYY-MM-DD HH:mm UTC±N`（瀏覽器本地時區，標注偏移量）。
@@ -500,10 +525,20 @@ function fillsFilterBtnStyle(active: boolean): CSSProperties {
   };
 }
 
-function FillsTable({ rows, failed }: { rows: MyFillRow[] | null; failed: boolean }) {
+function FillsTable({
+  rows, failed, lastFillTime, address,
+}: {
+  rows: MyFillRow[] | null;
+  failed: boolean;
+  /** I-18：後端固定 30 天窗零筆時的最近一筆成交時間（epoch ms）——用於空態
+   * 文案分辨「近期沒有」與「完全沒有」，見下方渲染。 */
+  lastFillTime?: number | null;
+  /** I-18：登入地址，組「在 Hyperliquid 查看完整歷史」外連結；缺省（例如舊
+   * 測試未傳）就不渲染外連結，不當硬錯誤。 */
+  address?: string;
+}) {
   const COPY = useCopy();
   const c = COPY.dashboard.history;
-  const [period, setPeriod] = useState<FillsPeriodFilter>("30d");
   const [coin, setCoin] = useState<string>(FILLS_ALL_COIN);
   const [page, setPage] = useState(1);
   const [tz, setTz] = useState<"local" | "utc">("local");
@@ -516,30 +551,28 @@ function FillsTable({ rows, failed }: { rows: MyFillRow[] | null; failed: boolea
     );
   }
   if (!rows || rows.length === 0) {
+    // I-18：帳戶有歷史成交、只是不在近 30 天窗內（`lastFillTime` 非 null）→
+    // 空態帶最近一筆成交時間；完全沒有成交紀錄（`lastFillTime` 為 null）→
+    // 沿用既有純空態句，不編造一個不存在的時間戳。
     return (
       <div className="dash-table">
-        <p className="dash-table-empty">{c.fillsEmpty}</p>
+        <p className="dash-table-empty">
+          {lastFillTime != null
+            ? `${c.fillsEmptyWithLastPrefix}${fmtUpdatedAtUtc(lastFillTime / 1000)}${c.fillsEmptyWithLastSuffix}`
+            : c.fillsEmpty}
+        </p>
       </div>
     );
   }
 
-  function changePeriod(p: FillsPeriodFilter) {
-    setPeriod(p);
-    setPage(1);
-  }
   function changeCoin(v: string) {
     setCoin(v);
     setPage(1);
   }
 
-  const coins = Array.from(new Set(rows.map((r) => r.coin))).sort();
-  const periodDays = FILLS_PERIOD_DAYS[period];
-  const cutoff = periodDays != null ? Date.now() - periodDays * 86_400_000 : null;
-  const filtered = rows.filter((r) => {
-    if (cutoff != null && r.time < cutoff) return false;
-    if (coin !== FILLS_ALL_COIN && r.coin !== coin) return false;
-    return true;
-  });
+  const sorted = sortFillsDesc(rows);   // I-18：新→舊
+  const coins = Array.from(new Set(sorted.map((r) => r.coin))).sort();
+  const filtered = coin === FILLS_ALL_COIN ? sorted : sorted.filter((r) => r.coin === coin);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / FILLS_PAGE_SIZE));
   const clampedPage = Math.min(page, totalPages);
@@ -553,19 +586,6 @@ function FillsTable({ rows, failed }: { rows: MyFillRow[] | null; failed: boolea
         justifyContent: "space-between", padding: "16px 20px",
       }}
       >
-        <div style={{ display: "flex", gap: 4 }}>
-          {FILLS_PERIODS.map((p) => (
-            <button
-              key={p}
-              type="button"
-              disabled={period === p}
-              onClick={() => changePeriod(p)}
-              style={fillsFilterBtnStyle(period === p)}
-            >
-              {c.periods[p]}
-            </button>
-          ))}
-        </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <select
             aria-label={c.coinFilterLabel}
@@ -594,6 +614,16 @@ function FillsTable({ rows, failed }: { rows: MyFillRow[] | null; failed: boolea
             </button>
           </div>
         </div>
+        {address && (
+          <a
+            href={`${HL_EXPLORER_ADDRESS_BASE}${address}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ fontSize: 12.5, color: "var(--text-dim)" }}
+          >
+            {c.viewFullHistory}
+          </a>
+        )}
       </div>
 
       {filtered.length === 0 ? (

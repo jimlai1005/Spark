@@ -1295,11 +1295,18 @@ export const COPY_ZH = {
      * load/error/empty 三態各自獨立（成交與授權是兩個獨立上游查詢）。
      */
     history: {
-      fillsTitle: "成交記錄",
+      // I-18（2026-08-31 使用者裁決）：固定近 30 天窗（移除 7天/30天/全部期間
+      // chip），標題標注視窗範圍。
+      fillsTitle: "成交記錄（近 30 天）",
       authorizationsTitle: "授權歷程",
       loading: "讀取中…",
       loadError: "資料暫時讀不到（直接查詢 Hyperliquid 失敗），請稍後重試。",
       fillsEmpty: "近期沒有成交紀錄。",
+      // I-18：帳戶有歷史成交、但不在近 30 天窗內——空態帶最近一筆成交時間，
+      // 分辨「近期沒有」與「完全沒有」兩種情況（`last_fill_time` 後端算好，
+      // 前端只負責格式化＋組句，見 `PositionsTable.tsx` `FillsTable`）。
+      fillsEmptyWithLastPrefix: "近 30 天沒有成交（最近一筆：",
+      fillsEmptyWithLastSuffix: "）",
       authorizationsEmpty: "沒有查到授權紀錄。",
       time: "時間",
       coin: "幣別",
@@ -1321,12 +1328,15 @@ export const COPY_ZH = {
       actionUnknown: "授權動作",
       tx: "交易",
       viewTx: "查看",
-      // ⭐ M3 round3 Task 8（R2·P1）：分頁 50/頁＋期間／幣種篩選＋UTC/本地切換。
-      periods: { "7d": "7 天", "30d": "30 天", all: "全部" },
+      // ⭐ M3 round3 Task 8（R2·P1）：分頁 50/頁＋幣種篩選＋UTC/本地切換。
+      // I-18：期間 chip（7天/30天/全部）已移除，固定近 30 天窗（見 fillsTitle）。
       coinFilterLabel: "篩選幣種",
       coinFilterAll: "全部幣種",
       tzLocal: "本地時間",
       tzUtc: "UTC",
+      // I-18：後端資料僅涵蓋近 30 天，超過 30 天的完整歷史導去 Hyperliquid 官方
+      // explorer（沿 repo 既有 `explorer/address/{address}` 連結慣例）。
+      viewFullHistory: "在 Hyperliquid 查看完整歷史 ↗",
       pagination: {
         showing: "顯示 ",
         rangeSep: "–",
@@ -2805,11 +2815,13 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       empty: "No fills in this period yet.",
     },
     history: {
-      fillsTitle: "Fill history",
+      fillsTitle: "Fill history (last 30 days)",
       authorizationsTitle: "Authorization log",
       loading: "Loading…",
       loadError: "Data temporarily unavailable (direct query to Hyperliquid failed); please try again later.",
       fillsEmpty: "No recent fills.",
+      fillsEmptyWithLastPrefix: "No fills in the last 30 days (most recent: ",
+      fillsEmptyWithLastSuffix: ")",
       authorizationsEmpty: "No authorization records found.",
       time: "Time",
       coin: "Coin",
@@ -2828,11 +2840,11 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       actionUnknown: "Authorization action",
       tx: "Tx",
       viewTx: "View",
-      periods: { "7d": "7d", "30d": "30d", all: "All" },
       coinFilterLabel: "Filter by coin",
       coinFilterAll: "All coins",
       tzLocal: "Local time",
       tzUtc: "UTC",
+      viewFullHistory: "View full history on Hyperliquid ↗",
       pagination: {
         showing: "Showing ",
         rangeSep: "–",

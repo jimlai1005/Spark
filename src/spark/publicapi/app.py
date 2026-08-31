@@ -3673,45 +3673,79 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                 detail="費用明細查詢暫時不可用，請稍後重試") from e
         return jsonable(result)
 
-    # ---------- /api/me/fills、/api/me/authorizations（M3 round2 Task 7） ----------
+    # ---------- /api/me/fills、/api/me/authorizations（M3 round2 Task 7；
+    # I-18 2026-08-31 使用者裁決：固定 30 天窗＋游標分頁抓滿） ----------
     # 「成交記錄・授權歷程」tab 的唯一資料源：兩者都**直取 Hyperliquid**（userFillsByTime
     # ／explorer userDetails），結構上不讀自家 DB（per 使用者要求，見 plan 檔尾裁決）。
     # per-address 60s TTL 快取（防連點打爆 HL）；上游失敗一律 503，不 fallback。
     _ME_HL_CACHE_TTL_S = 60.0
-    # ⭐ [W1] 2026-08-29 opus 審查：key 必須是 `(addr, days)`，不能只有 `addr`——
-    # 同一個登入地址切換 `days`（例如 7 → 30）會撞到同一格快取，回傳錯誤天數
-    # 範圍的成交明細卻不會出現任何錯誤（正確性缺陷，不是效能問題）。
-    _fills_cache: dict[tuple[str, int], tuple[float, list]] = {}
+    # ⭐ I-18：視窗固定 30 天（不再由客戶端 `days` 決定），快取鍵因此收斂回單純
+    # `addr`（舊版 `(addr, days)` 的理由——不同 days 撞同一格快取——不再適用，
+    # 見下方 `me_fills` docstring）。
+    _fills_cache: dict[str, tuple[float, dict]] = {}
     _fills_cache_lock = threading.Lock()
     _authorizations_cache: dict[str, tuple[float, list]] = {}
     _authorizations_cache_lock = threading.Lock()
+    _ME_FILLS_WINDOW_DAYS = 30
+    # I-18：30 天窗零筆時，額外查一次有界回溯窗（單頁、不分頁）取「最近一筆
+    # 成交時間」供前端空態文案使用（`last_fill_time`）——沿 `_FEES_ALL_FALLBACK_
+    # DAYS`（400 天）同一款「不知道確切起點就給一個有界回溯窗」慣例，這裡只
+    # 需要「有沒有、什麼時候」，不需要真的分頁抓全部，故沿用單頁 `get_fills_
+    # detail`（見下方 docstring）。
+    _ME_FILLS_LAST_SEEN_LOOKBACK_DAYS = 365
 
     @app.get("/api/me/fills")
     def me_fills(days: int = 30, address: str = Depends(_require_session)):
-        """登入地址近 `days` 天的成交明細（`userFillsByTime`，唯讀直取 HL）。
-        `days` 須介於 1~90（沿 `/api/public/leaderboard` 的 422 慣例）；上游查詢
-        失敗 → 503，不回退自家 DB。per-(address, days) 60s TTL 快取（見 [W1]：
-        key 缺 `days` 會讓不同天數撞同一格快取）。"""
-        if not (1 <= days <= 90):
-            raise HTTPException(status_code=422, detail="days 須介於 1 到 90")
+        """登入地址近 30 天成交明細（I-18：固定視窗，取代舊版可切換 `days`）。
+        `days` 查詢參數**保留但被忽略**（向下相容既有呼叫端不必同時改動，見
+        issue log I-18「`days` 參數收斂或忽略」裁決）——視窗永遠是
+        `[now-30d, now)`。
+
+        `userFillsByTime` 單頁 2000 筆上限——實測使用者錢包 90 天窗 2820 筆
+        成交被單頁截斷、漏掉最新 8 天（I-18 根因）。改用時間游標分頁抓滿整個
+        30 天窗（`hl.get_fills_detail_paged`，與 `/api/me/fees` 的
+        `_fetch_period_fills`／`hl.get_user_fills_paged` 共用同一套游標迴圈
+        實作 `HLGateway._paged_fills_raw`，不重造）；回應加 `truncated`
+        （迴圈防炸上限——連續 `FILET_FILLS_MAX_PAGES` 頁仍滿頁——仍在時如實
+        回報，見 `hl.get_user_fills_paged` docstring）。
+
+        30 天窗零筆時，額外查一次 `_ME_FILLS_LAST_SEEN_LOOKBACK_DAYS` 天的
+        回溯窗（單頁、不分頁）取最近一筆成交時間，存入 `last_fill_time`
+        （epoch ms，查無或這次額外查詢本身失敗 → `None`）——前端空態文案用
+        它分辨「近 30 天沒有成交（但帳戶有歷史成交）」與「完全沒有成交紀錄」
+        兩種空態（見 `PositionsTable.tsx` `FillsTable` 空態渲染）。這是非必要
+        的展示欄位，失敗只降級成 `None`，不影響 `fills`／`truncated` 或讓整個
+        端點 503。
+
+        上游主查詢失敗 → 503，不回退自家 DB。per-address 60s TTL 快取（I-18：
+        視窗固定後快取鍵收斂回單純 `addr`，見上方模組層註解）。"""
         now = now_fn()
         addr = address.lower()
-        key = (addr, days)
         with _fills_cache_lock:
-            cached = _fills_cache.get(key)
+            cached = _fills_cache.get(addr)
         if cached is not None and now - cached[0] < _ME_HL_CACHE_TTL_S:
-            return {"fills": cached[1]}
+            return cached[1]
         end = datetime.fromtimestamp(now, timezone.utc)
-        start = end - timedelta(days=days)
+        start = end - timedelta(days=_ME_FILLS_WINDOW_DAYS)
         try:
-            fills = hl.get_fills_detail(address, start, end)
+            fills, truncated = hl.get_fills_detail_paged(address, start, end)
         except Exception as e:  # noqa: BLE001 — 上游任何失敗一律轉譯 503，不讓例外細節外洩
             logger.error("成交記錄查詢失敗 address=%s: %s", addr, e)
             raise HTTPException(status_code=503,
                                 detail="成交記錄查詢暫時不可用，請稍後重試") from e
+        last_fill_time = None
+        if not fills:
+            try:
+                lookback_start = start - timedelta(days=_ME_FILLS_LAST_SEEN_LOOKBACK_DAYS)
+                older = hl.get_fills_detail(address, lookback_start, start)
+                if older:
+                    last_fill_time = older[-1]["time"]
+            except Exception as e:  # noqa: BLE001 — 非必要欄位，失敗只降級成 None
+                logger.error("成交記錄空態最近一筆查詢失敗 address=%s: %s", addr, e)
+        result = {"fills": fills, "truncated": truncated, "last_fill_time": last_fill_time}
         with _fills_cache_lock:
-            _fills_cache[key] = (now, fills)
-        return {"fills": fills}
+            _fills_cache[addr] = (now, result)
+        return result
 
     @app.get("/api/me/authorizations")
     def me_authorizations(address: str = Depends(_require_session)):
