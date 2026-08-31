@@ -70,3 +70,10 @@ accrued 播種一筆真值。外部驗證：/ /strategies /explore /terms 皆 20
 alpha 合併基準 +20.58%、起訖 $1,002→$1,208、engine 心跳 ok。
 **未重啟**：filet-follower@*、filet-keysvc（實盤紅線待使用者放行；引擎重啟前
 pause/close-all 於 prod 無實效）。後續：日報每日附加 accrued（追蹤中）。
+
+## 第七批（2026-09-01，生產環境登入後）
+
+| # | 問題 | 根因 | 修法 | Commit | 狀態 |
+|---|---|---|---|---|---|
+| I-20 | 登入後出現營運/待核准 tabs，點入卻「此頁僅限管理員」 | 換錢包登入時 React Query 快取未清——前一個 admin 錢包的探測結果殘留，非 admin 錢包（builder 0x81E9…）看到 tabs、點入吃真 403。日誌實證：16:11 builder 錢包 403 全正確、16:13 換 9760 全 200 | 登入/登出全部改 `queryClient.clear()`（Header 兩處＋advanced/traders/strategies 登入流），Header 測試改斷言整包清 | `6d228e7` | ✅（prod 已驗） |
+| I-21 | 設定頁壞掉（錯誤頁） | 舊版引擎心跳的 `applied` 塊**沒有 `prefs` 鍵**（undefined），settings 的 `=== null` 守門放行 → `undefined.size_tolerance` 崩潰。本機從未測過「心跳存在但形狀舊」象限；以正式機 3662 真 payload 重現後定位 | `== null` 補防＋以真 payload 形狀加回歸測試；prod 端到端驗證通過（除錯 session 用畢即刪） | `6d228e7` | ✅（prod 已驗） |
