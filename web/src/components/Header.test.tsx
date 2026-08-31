@@ -166,16 +166,20 @@ describe("Header — 已登入導覽", () => {
     expect(screen.queryByRole("button", { name: COPY_ZH.nav.cta })).not.toBeInTheDocument();
   });
 
-  it("已登入 → 顯示登出鈕；點擊呼叫 logout 並清空 [\"me\"] 快取", async () => {
+  // 2026-09-01 生產事故：登出只 invalidate ["me"] 會讓 admin 探測等其他快取
+  // 跨錢包殘留（A 錢包 tabs 亮著、B 錢包點進去 403）→ 改整包 clear。
+  it("已登入 → 顯示登出鈕；點擊呼叫 logout 並清空整個 query 快取", async () => {
     logout.mockResolvedValue({ ok: true });
     const qc = qcWithMe({ address: "0xabc", account_id: "fabc" });
+    qc.setQueryData(["admin-pending"], { pending: [] }); // 模擬前一個身分的殘留
     render(wrap(<Header />, qc));
 
     const btn = screen.getByRole("button", { name: COPY_ZH.common.logout });
     await userEvent.click(btn);
 
     expect(logout).toHaveBeenCalledTimes(1);
-    expect(qc.getQueryState(["me"])?.isInvalidated).toBe(true);
+    expect(qc.getQueryData(["me"])).toBeUndefined();
+    expect(qc.getQueryData(["admin-pending"])).toBeUndefined();
   });
 
   it("後端放行 admin 探測 → ops／admin 連結出現在已登入導覽裡", async () => {

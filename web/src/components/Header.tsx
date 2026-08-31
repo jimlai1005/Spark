@@ -53,8 +53,10 @@ export function Header() {
 
   async function handleLogout() {
     await logout();
-    // 成功後讓 ["me"] 快取失效——useMe 重抓回未登入態，各頁 guard 自然導回登入視圖。
-    queryClient.invalidateQueries({ queryKey: ["me"] });
+    // ⭐ clear 而非只 invalidate ["me"]：換錢包時上一個 session 的快取（admin
+    // 探測、儀表板、風控/資金）會殘留——「A 錢包的 admin tabs 亮著、B 錢包點進
+    // 去吃 403」（2026-09-01 生產事故）。整包清，useMe 重抓自然回未登入態。
+    queryClient.clear();
   }
 
   /**
@@ -89,7 +91,8 @@ export function Header() {
         chainId: cid,
         signMessage: (message) => signMessageAsync({ message }),
       });
-      queryClient.invalidateQueries({ queryKey: ["me"] });
+      queryClient.clear(); // 登入＝身份切換，同 handleLogout 的理由整包清
+
       let dest = "/strategies";
       try {
         const dashboard = await getDashboard();

@@ -178,7 +178,10 @@ function RiskParamField({ spec, prefs, onChange, c, data }: {
   data: MyRiskResp;
 }) {
   const v = prefValue(prefs, spec.name);
-  const appliedUnknown = data.applied === null || data.applied.prefs === null;
+  // ⚠️ `== null` 同時擋 null 與 undefined：舊版引擎心跳的 `applied` 塊**沒有**
+  // `prefs` 鍵（undefined），`=== null` 放行後下一行就炸——2026-09-01 生產事故，
+  // 引擎未升級期間所有已跟單用戶的設定頁白屏。
+  const appliedUnknown = data.applied === null || data.applied.prefs == null;
   const appliedValue = appliedUnknown ? null : prefValue(data.applied!.prefs as RiskPrefs, spec.name);
   const statusProps = {
     submitted: prefValue(data.prefs, spec.name),

@@ -55,6 +55,7 @@ import {
 } from "@/components/FollowPanel";
 import { MethodologyCard } from "@/components/MethodologyCard";
 import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, shortAddr } from "@/lib/format";
+import { useQueryClient } from "@tanstack/react-query";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 import { getPublicTraderDetail, type PublicTraderDetail } from "@/lib/publicApi";
@@ -87,6 +88,7 @@ export default function TraderDetailPage() {
     if (trader) document.title = `${shortAddr(trader.address)}｜Filet`;
   }, [trader]);
 
+  const queryClient = useQueryClient();
   const me = useMe();
   const loggedIn = !!me.data;
   const { address: walletAddress, chainId, isConnected } = useAccount();
@@ -166,6 +168,7 @@ export default function TraderDetailPage() {
         chainId: cid,
         signMessage: (message) => signMessageAsync({ message }),
       });
+      queryClient.clear(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
       router.push(`/onboarding?${buildQuery()}`);
     } catch (err) {
       const e = err as { name?: string; code?: number; message?: string } | undefined;

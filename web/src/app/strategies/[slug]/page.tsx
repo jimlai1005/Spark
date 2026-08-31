@@ -35,6 +35,7 @@ import {
 } from "@/components/FollowPanel";
 import { MethodologyCard } from "@/components/MethodologyCard";
 import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, resolveTagline, shortAddr } from "@/lib/format";
+import { useQueryClient } from "@tanstack/react-query";
 import { useMe } from "@/lib/hooks";
 import { useCopy, useLang } from "@/lib/lang";
 import { getPublicStrategy, type PublicStrategyDetail } from "@/lib/publicApi";
@@ -73,6 +74,7 @@ export default function StrategyDetailPage() {
     if (strategy) document.title = `${strategy.name}｜Filet`;
   }, [strategy]);
 
+  const queryClient = useQueryClient();
   const me = useMe();
   const loggedIn = !!me.data;
   const { address, chainId, isConnected } = useAccount();
@@ -157,6 +159,7 @@ export default function StrategyDetailPage() {
         chainId: cid,
         signMessage: (message) => signMessageAsync({ message }),
       });
+      queryClient.clear(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
       router.push(`/onboarding?${buildQuery()}`);
     } catch (err) {
       const e = err as { name?: string; code?: number; message?: string } | undefined;

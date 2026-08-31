@@ -339,6 +339,25 @@ describe("SettingsPage — 風控參數「目前生效 / 你的設定」（Task 
     expect(unknownCells.length).toBeGreaterThan(0);
     expect(screen.queryByText(COPY.settings.risk.applied.pendingBadge)).not.toBeInTheDocument();
   });
+
+  // ⚠️ 2026-09-01 生產事故回歸：舊版引擎心跳的 applied 塊**沒有 prefs 鍵**
+  // （undefined，非 null）——`=== null` 守門放行後整頁白屏。payload 形狀取自
+  // 正式機 3662 的真實回應。
+  it("applied.prefs 鍵缺席（舊引擎心跳）→ 頁面照常渲染、生效值顯示「無法確認」", async () => {
+    getMyRisk.mockResolvedValue(riskResp({
+      prefs: { ...riskResp().prefs, enabled: true },
+      applied: {
+        controls_enabled: false, source: "env_default", changed_at: null,
+      } as unknown as MyRiskResp["applied"],
+    }));
+    render(wrap(<SettingsPage />));
+
+    await screen.findByText(COPY.settings.risk.paramLabels.max_drawdown_pct.label);
+    const unknownCells = await screen.findAllByText(
+      new RegExp(`目前生效: ${COPY.settings.risk.applied.unknownShort}`),
+    );
+    expect(unknownCells.length).toBeGreaterThan(0);
+  });
 });
 
 // ==================== Task 8（R2·P0）：簽署失敗改 toast，不再永久紅框 ====================
