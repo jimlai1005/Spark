@@ -58,7 +58,9 @@ def follower(account_id, leader_address):
            "leader_address": leader_address}
 
 
-def _portfolio_rows(av, pnl, period="perpAllTime"):
+def _portfolio_rows(av, pnl, period="allTime"):
+    # ⚠️ 2026-08-31 issue log I-15 使用者裁決：策略卡改吃 `allTime`（spot+perp
+    # 合併窗，原 `perpAllTime`）——見 app.py `_strategy_perf_with_as_of`。
     return [[period, {"accountValueHistory": av, "pnlHistory": pnl, "vlm": "0"}]]
 
 
@@ -434,7 +436,7 @@ def test_detail_shape_includes_equity_index_and_methodology(tmp_path):
                          "basis", "updated_at"}
     assert meth["annualization_days"] == 365
     assert meth["risk_free_rate"] == "0"
-    assert meth["basis"] == "perp"
+    assert meth["basis"] == "combined"   # I-15：改用 spot+perp 合併窗，見模組檔頭
     assert meth["initial_deposit_usd"] == "1000.0"   # 真實 ledger deposit 加總
     assert meth["start_equity_usd"] == "1000"        # av[0]（同一次 portfolio 回應）
     assert meth["end_equity_usd"] == "1200"          # av[-1]

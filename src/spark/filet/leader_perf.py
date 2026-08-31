@@ -15,6 +15,24 @@ Leader 績效指標（**perp 基準**）——純函式，零網路。
    HYPE 都會顯示成「交易績效」）。本模組的 `extract_window` 直接拒絕非 perp 期別，
    呼叫端無法「不小心」傳進預設窗。
 
+   ⭐ 2026-08-31 追加（issue log I-15 使用者裁決，**不取代**上一段，只加開一條窄門）：
+   「只吃 perp 窗」的前提是「perp 是唯一 copytrade 能複製的範圍」——這對資金全倉在
+   perp 的帳戶成立，但對資金停泊在 spot、經常 spot↔perp 內部轉帳進出的帳戶會反過來
+   出錯：`perpAllTime`/`perpMonth` 把每一筆內部轉帳都算成損益，產生幻影回撤／幻影
+   波動（實證：`0xfB9C…9760`，perp-only 讀出回撤 −19%／波動 134%／勝率 18%，與
+   參考工具逐位吻合的 combined 序列 1002.24→1197.9 真值天差地遠——工程原則事故 #3
+   同型：equity basis 是錢包形態專屬的，不能通用套用）。`/api/public/strategies*`／
+   `/api/public/traders/{address}`／`/api/public/explore` 三個**展示**端點因此改吃
+   `COMBINED_PERIODS`（`day/week/month/allTime`，HL `portfolio()` 的預設窗，
+   spot+perp 合併＋vault），`extract_window` 的閘門相應加開這四個期別。**不影響**
+   既有呼叫端：`leaderboard.py` 每日快照與 follower dashboard（`/api/me/dashboard`
+   的 `perpMonth`、`/api/me/fees` 的 `perpAllTime`）仍只請求 `PERP_PERIODS`——這些
+   帳戶全倉在 perp、且要與 copytrade 引擎本身同基準，perp-only 對它們仍是正確答案，
+   這扇新窄門對它們不存在。合併窗算出的 `basis`／`basis_note` 欄位相應回
+   `"combined"`／`COMBINED_BASIS_NOTE`（見 `_basis_for`），不得繼續標「perp」誤導
+   下游（那組欄位目前未被 strategies/traders 端點外流，但本模組的輸出契約本身
+   必須誠實）。
+
 2. **MDD 只算在權益指數 `I_t` 上，永不算在 `accountValue` 上**。leader 提領 50%
    會讓 AV 腰斬 → 用 AV 算 MDD 直接產生幻影回撤（本專案事故 #1 同型）；反向也成立：
    leader 一路入金會讓 AV 單調上升，把真實的虧損完全遮住 → AV 基準的 MDD = 0。
@@ -87,6 +105,12 @@ logger = logging.getLogger(__name__)
 # ⭐ 唯一合法的期別集合（見檔頭閘門 1）。預設窗 day/week/month/allTime 刻意不在此列。
 PERP_PERIODS = ("perpDay", "perpWeek", "perpMonth", "perpAllTime")
 
+# 2026-08-31 追加（I-15，見檔頭閘門 1 附加段）：spot+perp 合併窗，僅供「展示」端點
+# （strategies/traders/explore）在錢包資金停泊 spot、經常 spot↔perp 內部轉帳時當
+# 正確 basis 使用。**不是**「perp 閘門放寬」——`PERP_PERIODS` 本身一個字元沒動，
+# 這是另一組獨立列表，`extract_window` 對兩者的聯集開放。
+COMBINED_PERIODS = ("day", "week", "month", "allTime")
+
 _MS_PER_DAY = Decimal("86400000")
 DAYS_PER_YEAR = Decimal("365")
 
@@ -118,6 +142,21 @@ UPPER_BOUND_NOTE = (
 BASIS_NOTE = (
     "基準為 **perp only**（perpDay/perpWeek/perpMonth/perpAllTime 窗），"
     "與 copytrade 實際鏡像的範圍一致；不含 spot 與 vault 餘額。")
+# 2026-08-31 追加（I-15）：COMBINED_PERIODS 窗（day/week/month/allTime）的對應文案。
+COMBINED_BASIS_NOTE = (
+    "基準為 **spot + perp 合併帳戶**（HL portfolio 預設窗 day/week/month/allTime，"
+    "含 vault 餘額）；此帳戶資金停泊 spot 並經內部轉帳進出 perp，perp-only 序列會"
+    "把轉帳誤算成損益，合併基準才是這顆錢包的真實績效。跟單者僅鏡像 perp 部位，"
+    "不保證能複製 spot 部分的損益（見 `UPPER_BOUND_NOTE`）。")
+
+
+def _basis_for(period: str) -> tuple[str, str]:
+    """`period` → `(basis, basis_note)`。`period` 屬 `COMBINED_PERIODS` → 合併家族
+    文案；否則（`PERP_PERIODS`）沿用既有 perp 文案。單一來源，`_insufficient()`
+    與 `compute_window_performance()` 共用，避免兩處各自判斷而漂移。"""
+    if period in COMBINED_PERIODS:
+        return "combined", COMBINED_BASIS_NOTE
+    return "perp", BASIS_NOTE
 
 # 資料充足度分級（純粹是 covered_days 的函式，見檔頭「揭露模型改版」）。
 # ⚠️ 層級**值**刻意不改名（前端已在用；改名是一次無謂的破壞性變更），但語意已從
@@ -150,9 +189,10 @@ def _insufficient(period: str, reason: str, sample_count: int = 0) -> dict[str, 
     一個有意義且**錯誤**的訊息（「這個 leader 這段時間沒賺沒賠」）。NaN 同理，
     只是換一種形式的髒資料。缺鍵才能逼下游顯式處理「沒有資料」這個狀態。
     """
+    basis, basis_note = _basis_for(period)
     return {
         "period": period,
-        "basis": "perp",
+        "basis": basis,
         "status": STATUS_INSUFFICIENT,
         "reason": reason,
         "disclosure_tier": TIER_INSUFFICIENT,
@@ -163,7 +203,7 @@ def _insufficient(period: str, reason: str, sample_count: int = 0) -> dict[str, 
         "skipped_intervals": 0,
         "mdd_note": MDD_SAMPLING_NOTE,
         "upper_bound_note": UPPER_BOUND_NOTE,
-        "basis_note": BASIS_NOTE,
+        "basis_note": basis_note,
     }
 
 
@@ -196,18 +236,23 @@ def _parse_series(raw: Any) -> list[tuple[int, Decimal]] | None:
 
 def extract_window(portfolio_rows: Any, period: str
                    ) -> tuple[list[tuple[int, Decimal]], list[tuple[int, Decimal]]] | None:
-    """從 `portfolio()` 回應取出某個 **perp** 窗的 (accountValueHistory, pnlHistory)。
+    """從 `portfolio()` 回應取出某個窗的 (accountValueHistory, pnlHistory)。
 
-    ⭐ `period` 不在 `PERP_PERIODS` 內 → `ValueError`（檔頭閘門 1）。這是刻意的
-    程式錯誤而非資料錯誤：傳進 `"month"` 代表呼叫端要算的是 spot+perp+vault 的
-    總值績效，那是一個**客戶複製不到**的數字，不該有一條靜默的路徑通往它。
+    ⭐ `period` 不在 `PERP_PERIODS ∪ COMBINED_PERIODS` 內 → `ValueError`（檔頭
+    閘門 1）。這是刻意的程式錯誤而非資料錯誤：任意字串都會靜默通過等於閘門形同
+    虛設。`PERP_PERIODS`（copytrade 鏡像範圍）與 `COMBINED_PERIODS`（2026-08-31
+    I-15 追加，僅供展示端點在錢包資金停泊 spot 時當正確 basis）是**兩個獨立**
+    白名單的聯集，不是把 perp 閘門整個拿掉——呼叫端仍須明確選邊，沒有第三種
+    「隨便一個字串」的靜默路徑。
 
     查無該期別／欄位缺／形狀不符 → None（資料錯誤，由呼叫端轉成「資料不足」）。
     """
-    if period not in PERP_PERIODS:
+    if period not in PERP_PERIODS and period not in COMBINED_PERIODS:
         raise ValueError(
-            f"只接受 perp 窗 {PERP_PERIODS}（預設窗含 spot 與 vault，"
-            f"不是 copytrade 鏡像得到的範圍）: {period!r}")
+            f"只接受 {PERP_PERIODS + COMBINED_PERIODS}"
+            f"（perp 窗＝copytrade 鏡像範圍；day/week/month/allTime＝"
+            f"2026-08-31 I-15 追加，僅供展示端點在合併基準正確的錢包形態使用）: "
+            f"{period!r}")
     if not isinstance(portfolio_rows, list):
         return None
     for row in portfolio_rows:
@@ -349,10 +394,11 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
         equity_index.append(equity_index[-1] * (Decimal("1") + r))
 
     cum_pnl = pnl[-1][1] - pnl[0][1]
+    basis, basis_note = _basis_for(period)
 
     out: dict[str, Any] = {
         "period": period,
-        "basis": "perp",
+        "basis": basis,
         "status": STATUS_OK,
         "reason": None,
         "sample_count": len(pnl),
@@ -363,7 +409,7 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
         "net_external_flow": net_flow,
         "mdd_note": MDD_SAMPLING_NOTE,
         "upper_bound_note": UPPER_BOUND_NOTE,
-        "basis_note": BASIS_NOTE,
+        "basis_note": basis_note,
     }
 
     # --- 資料充足度分級：層級是 covered_days 的純函式，不決定哪些鍵存在 ---

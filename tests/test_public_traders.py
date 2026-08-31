@@ -33,7 +33,9 @@ _A = "0x" + "a1" * 20
 _DAY_MS = 86400000
 
 
-def _portfolio_rows(av, pnl, period="perpAllTime"):
+def _portfolio_rows(av, pnl, period="allTime"):
+    # ⚠️ 2026-08-31 issue log I-15 使用者裁決：交易員詳情頁改吃 `allTime`
+    # （spot+perp 合併窗，原 `perpAllTime`）——見 app.py `public_trader_detail`。
     return [[period, {"accountValueHistory": av, "pnlHistory": pnl, "vlm": "0"}]]
 
 

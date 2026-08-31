@@ -297,9 +297,16 @@ def build_methodology(perf: dict[str, Any] | None, *,
     重新觸網。
 
     `risk_free_rate`／`annualization_days`／`basis` 是 leader_perf 全模組通用的
-    計算慣例（365 日/年、無風險利率 0%、perp only），寫死在這裡是把「這份文案
-    講的假設」與「compute_window_performance 實際用的假設」釘在同一批常數——
-    leader_perf 若哪天改了年化天數，這裡也要跟著改，用寫死的字面值提醒維護者。
+    計算慣例（365 日/年、無風險利率 0%），寫死在這裡是把「這份文案講的假設」與
+    「compute_window_performance 實際用的假設」釘在同一批常數——leader_perf 若
+    哪天改了年化天數，這裡也要跟著改，用寫死的字面值提醒維護者。
+
+    ⚠️ 2026-08-31 issue log I-15 使用者裁決：`basis` 由 `"perp"` 改為
+    `"combined"`——呼叫端（`publicapi/app.py`）已改用 `leader_perf.
+    compute_window_performance(rows, "allTime")`（spot+perp 合併窗，原
+    `"perpAllTime"`），本欄位釘的是「呼叫端實際用的假設」，必須跟著換，
+    否則這份文案會對合併窗的數字謊稱是 perp-only 算出來的。理由見
+    `leader_perf.py` 檔頭「I-15」段。
     """
     ok = isinstance(perf, dict) and perf.get("status") == "ok"
     first_ms = perf.get("first_ts_ms") if ok else None
@@ -317,6 +324,6 @@ def build_methodology(perf: dict[str, Any] | None, *,
         "sample_count": sample_count if isinstance(sample_count, int) else None,
         "annualization_days": 365,
         "risk_free_rate": "0",
-        "basis": "perp",
+        "basis": "combined",
         "updated_at": updated_at,
     }

@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from spark.filet.leader_perf import (INSUFFICIENCY_MARKERS,
+from spark.filet.leader_perf import (COMBINED_PERIODS, INSUFFICIENCY_MARKERS,
                                      MIN_DAYS_FOR_ANNUALIZATION, PERP_PERIODS,
                                      STATUS_INSUFFICIENT, STATUS_OK,
                                      TIER_ANNUALIZABLE, TIER_INSUFFICIENT,
@@ -231,13 +231,45 @@ def test_denominator_floor_blocks_exploding_returns():
     assert r["twr"] == Decimal("-0.9995")
 
 
-def test_extract_window_rejects_non_perp_periods():
-    """⭐ basis 閘門：預設窗含 spot 與 vault，是客戶複製不到的績效 → 結構性拒絕。"""
+def test_extract_window_accepts_combined_periods_rejects_unknown():
+    """⭐ 2026-08-31 issue log I-15 使用者裁決：`COMBINED_PERIODS`（day/week/month/
+    allTime，spot+perp 合併，僅供展示端點在錢包資金停泊 spot 時當正確 basis）現在
+    也是合法期別——`PERP_PERIODS` 本身這條閘門完全不變，仍拒絕任何不在兩個白名單
+    聯集裡的字串（閘門沒有被拿掉，只是多開一扇窄門）。"""
     payload = rows(_FLOWS_60D)
-    for bad in ("day", "week", "month", "allTime"):
-        with pytest.raises(ValueError, match="perp"):
-            extract_window(payload, bad)
+    # "month" 是 `rows()` 固定加的誘餌列，其餘合併窗（day/week/allTime）不在
+    # 這份 payload 裡——重點是「不拋 ValueError」（合法期別），不是「一定找得到列」。
+    for combined in COMBINED_PERIODS:
+        extract_window(payload, combined)   # 不拋例外＝閘門已放行
+    assert extract_window(payload, "month") is not None
     assert extract_window(payload, "perpMonth") is not None
+    with pytest.raises(ValueError, match="perp"):
+        extract_window(payload, "bogus_period")
+
+
+def test_perp_and_combined_windows_coexist_compute_uses_requested_family():
+    """⭐ 2026-08-31 I-15：真實 HL `portfolio()` 回應同時含 perp 與合併兩個家族的
+    視窗（鍵不同、值不同，一如生產環境）——`compute_window_performance` 必須嚴格
+    照 `period` 取值，不得混用／回退到另一家族。這裡刻意讓兩個家族算出**相反號**
+    的 TWR（合併窗獲利、perp-only 窗因為把內部轉帳算成損益而變成虧損），
+    確保拿到的數字真的來自呼叫端指定的那一窗，不是不小心撿到同一份回應裡的另一窗。
+    """
+    payload = [
+        ["perpAllTime", {"accountValueHistory": [[0, "1000"], [DAY_MS * 30, "500"]],
+                         "pnlHistory": [[0, "0"], [DAY_MS * 30, "-500"]], "vlm": "0"}],
+        ["allTime", {"accountValueHistory": [[0, "1000"], [DAY_MS * 30, "1200"]],
+                     "pnlHistory": [[0, "0"], [DAY_MS * 30, "200"]], "vlm": "0"}],
+    ]
+    combined = compute_window_performance(payload, "allTime")
+    assert combined["status"] == STATUS_OK
+    assert combined["twr"] == Decimal("0.2")
+    assert combined["basis"] == "combined"
+    assert combined["basis_note"] != ""
+
+    perp_only = compute_window_performance(payload, "perpAllTime")
+    assert perp_only["status"] == STATUS_OK
+    assert perp_only["twr"] == Decimal("-0.5")
+    assert perp_only["basis"] == "perp"
 
 
 def test_compute_perp_performance_covers_all_four_perp_windows():

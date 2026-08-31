@@ -59,13 +59,13 @@ def _av_series(start_ms, values, step_ms=86_400_000):
 
 
 def _portfolio_raw(month_values, alltime_values, start_ms=1_700_000_000_000):
-    """最小 `portfolio()` 原始回應：只填 perpMonth／perpAllTime（本模組只吃這兩窗）。"""
+    """最小 `portfolio()` 原始回應：只填 month／allTime（本模組只吃這兩窗）。"""
     month_series = _av_series(start_ms, month_values)
     alltime_series = _av_series(start_ms, alltime_values)
     return [
-        ["perpMonth", {"accountValueHistory": month_series,
+        ["month", {"accountValueHistory": month_series,
                        "pnlHistory": [[t, "0"] for t, _ in month_series], "vlm": "0"}],
-        ["perpAllTime", {"accountValueHistory": alltime_series,
+        ["allTime", {"accountValueHistory": alltime_series,
                          "pnlHistory": [[t, "0"] for t, _ in alltime_series], "vlm": "0"}],
     ]
 
@@ -263,14 +263,14 @@ def test_enrich_candidate_skipped_when_zeroed_mid_series():
 
 
 def test_enrich_candidate_skipped_when_perp_month_missing():
-    """讀不到（perpMonth 視窗缺席）→ 跳過該列，不進榜、不編數字。"""
-    portfolio_raw = [["perpAllTime", {"accountValueHistory": _av_series(0, [1000] * 60),
+    """讀不到（month 視窗缺席）→ 跳過該列，不進榜、不編數字。"""
+    portfolio_raw = [["allTime", {"accountValueHistory": _av_series(0, [1000] * 60),
                                      "pnlHistory": []}]]
     assert enrich_candidate(_A, None, portfolio_raw, [], _ch_state()) is None
 
 
 def test_enrich_candidate_skipped_when_perp_all_time_missing():
-    portfolio_raw = [["perpMonth", {"accountValueHistory": _av_series(0, [1000, 1100]),
+    portfolio_raw = [["month", {"accountValueHistory": _av_series(0, [1000, 1100]),
                                     "pnlHistory": []}]]
     assert enrich_candidate(_A, None, portfolio_raw, [], _ch_state()) is None
 
@@ -293,13 +293,13 @@ def test_enrich_candidate_computes_all_four_windows_from_single_portfolio_respon
     """R4-3：`portfolio()` 單次回應本就含四窗——`enrich_candidate` 一次讀出
     day/week/month/allTime 各自獨立的 ret/dd（同源同基準，各窗各自的序列）。"""
     portfolio_raw = [
-        ["perpDay", {"accountValueHistory": _av_series(0, [1000, 1010], step_ms=3_600_000),
+        ["day", {"accountValueHistory": _av_series(0, [1000, 1010], step_ms=3_600_000),
                      "pnlHistory": [], "vlm": "0"}],
-        ["perpWeek", {"accountValueHistory": _av_series(0, [1000, 950, 1050]),
+        ["week", {"accountValueHistory": _av_series(0, [1000, 950, 1050]),
                      "pnlHistory": [], "vlm": "0"}],
-        ["perpMonth", {"accountValueHistory": _av_series(0, [1000, 900, 1100]),
+        ["month", {"accountValueHistory": _av_series(0, [1000, 900, 1100]),
                       "pnlHistory": [], "vlm": "0"}],
-        ["perpAllTime", {"accountValueHistory": _av_series(0, [1000] * 65),
+        ["allTime", {"accountValueHistory": _av_series(0, [1000] * 65),
                          "pnlHistory": [], "vlm": "0"}],
     ]
     row = enrich_candidate(_A, None, portfolio_raw, [], _ch_state())
@@ -328,7 +328,7 @@ def test_enrich_candidate_day_week_invalid_series_stores_none_not_skip_whole_row
     """R4-3：day／week 序列本身無效（首點非正）只讓那一鍵是 `None`——不像
     month／allTime 那樣連坐整列（gating 只在 month／allTime，見模組檔頭）。"""
     portfolio_raw = _portfolio_raw([1000, 1100], [1000] * 60)
-    portfolio_raw = [["perpDay", {"accountValueHistory": _av_series(0, [0, 1000]),
+    portfolio_raw = [["day", {"accountValueHistory": _av_series(0, [0, 1000]),
                                   "pnlHistory": [], "vlm": "0"}], *portfolio_raw]
     row = enrich_candidate(_A, None, portfolio_raw, [], _ch_state())
     assert row is not None
@@ -815,19 +815,19 @@ def test_index_query_window_selects_ranking_and_response_row_content():
     地址 A 是 day 窗強、month 窗弱；地址 B 相反——window 切換應讓排名對調。"""
     hl = FakeHL()
     hl.portfolios[_A.lower()] = [
-        ["perpDay", {"accountValueHistory": _av_series(0, [1000, 1100], step_ms=3_600_000),
+        ["day", {"accountValueHistory": _av_series(0, [1000, 1100], step_ms=3_600_000),
                      "pnlHistory": [], "vlm": "0"}],
-        ["perpWeek", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
-        ["perpMonth", {"accountValueHistory": _av_series(0, [1000, 1010]), "pnlHistory": [], "vlm": "0"}],
-        ["perpAllTime", {"accountValueHistory": _av_series(0, [1000] * 60), "pnlHistory": [], "vlm": "0"}],
+        ["week", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
+        ["month", {"accountValueHistory": _av_series(0, [1000, 1010]), "pnlHistory": [], "vlm": "0"}],
+        ["allTime", {"accountValueHistory": _av_series(0, [1000] * 60), "pnlHistory": [], "vlm": "0"}],
     ]
     hl.fills_detail[_A.lower()] = []
     hl.clearinghouse[_A.lower()] = _ch_state()
     hl.portfolios[_B.lower()] = [
-        ["perpDay", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
-        ["perpWeek", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
-        ["perpMonth", {"accountValueHistory": _av_series(0, [1000, 1200]), "pnlHistory": [], "vlm": "0"}],
-        ["perpAllTime", {"accountValueHistory": _av_series(0, [1000] * 60), "pnlHistory": [], "vlm": "0"}],
+        ["day", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
+        ["week", {"accountValueHistory": _av_series(0, [1000, 1000]), "pnlHistory": [], "vlm": "0"}],
+        ["month", {"accountValueHistory": _av_series(0, [1000, 1200]), "pnlHistory": [], "vlm": "0"}],
+        ["allTime", {"accountValueHistory": _av_series(0, [1000] * 60), "pnlHistory": [], "vlm": "0"}],
     ]
     hl.fills_detail[_B.lower()] = []
     hl.clearinghouse[_B.lower()] = _ch_state()

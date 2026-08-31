@@ -1857,8 +1857,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         return deposit
 
     def _strategy_perf_with_as_of(address: str) -> tuple[dict | None, int | None]:
-        """位址 → `(perf, as_of)`。`perf`＝`perpAllTime` 窗的績效（策略卡固定只用
-        這一窗：首頁/詳情頁要的是「這個策略整體值不值得跟」，不是逐窗比較）；
+        """位址 → `(perf, as_of)`。`perf`＝`allTime`（spot+perp 合併）窗的績效（策略卡
+        固定只用這一窗：首頁/詳情頁要的是「這個策略整體值不值得跟」，不是逐窗比較）。
+        ⚠️ 2026-08-31 issue log I-15 使用者裁決：改用合併窗（原 `perpAllTime`）——
+        資金停泊 spot、經 spot↔perp 內部轉帳進出的錢包，perp-only 序列把轉帳算成
+        損益，產生幻影回撤/波動（實證見 `leader_perf.py` 檔頭「I-15」段）；合併窗
+        才是這類錢包的真實績效，見 `leader_perf.COMBINED_PERIODS`。
         `as_of`＝算出這份 perf 所用 `rows` 的快取時間戳（epoch 秒）。上游或計算
         失敗 → `(None, None)`，`strategies.build_strategy_view` 對 None 的處理＝
         該策略全部指標 insufficient。
@@ -1868,7 +1872,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             return None, None
         rows, fetched_at = result
         try:
-            perf = compute_window_performance(rows, "perpAllTime")
+            perf = compute_window_performance(rows, "allTime")
         except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整份清單
             logger.error("策略績效計算失敗 leader=%s: %s", address, e)
             return None, None
@@ -1978,7 +1982,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         end_equity_usd = None
         rows = _cached_strategy_portfolio(entry.address)
         if rows is not None:
-            window = extract_window(rows, "perpAllTime")
+            window = extract_window(rows, "allTime")
             if window is not None:
                 av, _pnl = window
                 start_equity_usd, end_equity_usd = build_equity_range(av)
@@ -2271,7 +2275,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise HTTPException(status_code=503, detail="鏈上績效查詢暫時不可用，請稍後重試")
 
         try:
-            perf = compute_window_performance(rows, "perpAllTime")
+            # ⚠️ 2026-08-31 I-15 使用者裁決：改用 `allTime`（spot+perp 合併，原
+            # `perpAllTime`）——任意鏈上地址同樣可能資金停泊 spot、經內部轉帳進出
+            # perp，perp-only 序列會把轉帳算成損益，見 `leader_perf.py` 檔頭
+            # 「I-15」段與 `_strategy_perf_with_as_of` 同款註解。
+            perf = compute_window_performance(rows, "allTime")
         except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整頁
             logger.error("交易員績效計算失敗 address=%s: %s", addr, e)
             perf = None
@@ -2282,7 +2290,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # `_cached_trader_data` 併入同一次快取抓好，這裡不重打上游。
         start_equity_usd = None
         end_equity_usd = None
-        window = extract_window(rows, "perpAllTime")
+        window = extract_window(rows, "allTime")
         if window is not None:
             av, _pnl = window
             start_equity_usd, end_equity_usd = build_equity_range(av)

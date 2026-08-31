@@ -12,7 +12,8 @@
    不重複下載——見 `app.py` 接線）依 **roi 降冪**取前 N 名（`ExploreConfig.
    candidate_pool`），排除 Filet 自營 leader（D8）。
 2. **逐地址 enrich**（`enrich_candidate`，純函式）：`portfolio()` 的
-   perpMonth/perpAllTime 視窗 ＋ `get_fills_detail()` 近 30 天成交 ＋
+   month/allTime 視窗（2026-08-31 I-15 起為 spot+perp 合併窗，原 perpMonth/
+   perpAllTime，見下方「I-15」段）＋ `get_fills_detail()` 近 30 天成交 ＋
    `clearinghouse_state()` 目前持倉，算出 30D 報酬／回撤／交易日／勝率／
    集中度／曝險（公式定義見各函式 docstring，對齊 D2）。任一地址讀不到
    → 該列整筆跳過（`None`），不進榜、不編數字（工程原則 3 的展示版）。
@@ -74,7 +75,7 @@ W2（`_fills_stats` 分頁上限最小版）：本函式建立在 `hl.get_fills_
 工程原則 1（同源同基準）的落地：每個窗（`WindowStats.ret_pct`／`.max_dd_pct`／
 `.spark`）三者出自**同一次** `portfolio()` 回應的**同一個**該窗
 `accountValueHistory` 序列，不混用不同窗口的資料算同一個 WindowStats；
-`live_days` 出自同一次回應的 perpAllTime 序列首末點。曝險（`exposure`）與
+`live_days` 出自同一次回應的 allTime 序列首末點。曝險（`exposure`）與
 帳戶規模 bucket 出自**同一次** `clearinghouse_state()` 回應。
 
 R4-3（2026-08-30，plan `2026-08-30-m3-ui-round4.md` Task R4-3，使用者裁決 6）：
@@ -129,6 +130,17 @@ R4-3（2026-08-30，plan `2026-08-30-m3-ui-round4.md` Task R4-3，使用者裁�
   現成的相容性檢查點。**與既有「中止保舊」語義正交、不衝突**：429 中止整輪
   建置那條路徑完全不動 `self._rows`/`self._rows_version`，版本仍相容的舊
   snapshot 照常繼續服務（fail-open，見上面 2026-08-30 事故記錄）。
+
+I-15（2026-08-31，issue log 使用者裁決「改！」；**取代**上面 R4-3 段
+`WINDOW_TO_PERIOD` 的映射值，其餘 R4-3 內容不變）
+----------------------------------------------------------------------------
+`WINDOW_TO_PERIOD` 原映射到 perp-only 窗（`perpDay/perpWeek/perpMonth/
+perpAllTime`）；候選是任意鏈上地址，資金停泊 spot、經 spot↔perp 內部轉帳進出的
+錢包用 perp-only 窗會把轉帳算成損益、產生幻影回撤／幻影波動（實證與理由見
+`leader_perf.py` 檔頭「I-15」段）。改吃 HL `portfolio()` 的合併窗（`day/week/
+month/allTime`，`leader_perf.COMBINED_PERIODS`）——`extract_window` 的閘門已
+為此開放。本節以下（曾提及 perpDay/perpWeek/perpMonth/perpAllTime 的文字）
+一律讀作對應的合併窗；`WINDOW_KEYS`／欄位形狀／gating 規則本身不變。
 """
 from __future__ import annotations
 
@@ -177,9 +189,14 @@ RATE_LIMIT_RETRY_DELAYS_S = (2.0, 8.0, 30.0)
 # ---------------------------------------------------------------------------
 # R4-3：四窗（見模組檔頭「R4-3」節）。
 # ---------------------------------------------------------------------------
+# ⚠️ 2026-08-31 issue log I-15 使用者裁決：改吃 HL portfolio() 的**合併**家族
+# （spot+perp，原本是 perpDay/perpWeek/perpMonth/perpAllTime）——探索榜的候選是
+# 任意鏈上地址，資金停泊 spot、經 spot↔perp 內部轉帳進出的錢包用 perp-only 窗會
+# 把轉帳算成損益、產生幻影回撤（實證與理由見 `leader_perf.py` 檔頭「I-15」段、
+# `COMBINED_PERIODS`）。`extract_window` 的閘門已為此開放這四個期別。
 WINDOW_KEYS = ("day", "week", "month", "allTime")
-WINDOW_TO_PERIOD = {"day": "perpDay", "week": "perpWeek",
-                    "month": "perpMonth", "allTime": "perpAllTime"}
+WINDOW_TO_PERIOD = {"day": "day", "week": "week",
+                    "month": "month", "allTime": "allTime"}
 DEFAULT_WINDOW = "month"
 
 # 伺服器夾取範圍（R4-3：防濫用，不是驗證錯誤，見 `clamp_explore_params`）。

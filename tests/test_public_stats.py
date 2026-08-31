@@ -44,7 +44,9 @@ def write_leaders(tmp_path, entries) -> str:
     return str(p)
 
 
-def _portfolio_rows(av, pnl, period="perpAllTime"):
+def _portfolio_rows(av, pnl, period="allTime"):
+    # ⚠️ 2026-08-31 issue log I-15 使用者裁決：`live_days` 走 `_strategy_perf_for`
+    # →「allTime」（spot+perp 合併窗，原 `perpAllTime`），見 app.py 同函式註解。
     return [[period, {"accountValueHistory": av, "pnlHistory": pnl, "vlm": "0"}]]
 
 

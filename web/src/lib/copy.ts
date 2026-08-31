@@ -1066,7 +1066,11 @@ export const COPY_ZH = {
        * API 欄位本身也從未在任何頁面被渲染過，見 publicApi.ts）。這是本任務唯一
        * 新增的一句話；其餘 /docs 段落全部複用既有 key，不重複定義語義。
        */
-      basisNote: "指標以 perp（永續合約）帳戶淨值為計算基準。",
+      /** ⚠️ 2026-08-31 issue log I-15 使用者裁決：由「perp 基準」改為「合併基準」
+       * ——資金停泊 spot、經 spot↔perp 內部轉帳進出的錢包，perp-only 序列會把
+       * 轉帳算成損益、產生幻影回撤（實證見 spark 後端 `leader_perf.py` 檔頭
+       * 「I-15」段）；合併基準才是這類錢包的真實績效。 */
+      basisNote: "指標以 spot＋perp 合併帳戶淨值為計算基準（此錢包型態下轉帳不污染序列）。",
     },
     panel: {
       heading: "跟隨此策略",
@@ -2586,7 +2590,12 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       conventionPrefix: "Metrics are annualized using the crypto convention of ",
       conventionMid: " days/year, risk-free rate ",
       conventionSuffix: ".",
-      basisNote: "Metrics are computed on a perp (perpetual futures) account equity basis.",
+      /** ⚠️ 2026-08-31 issue log I-15 decision: switched from perp-only to combined
+       * basis — wallets that park funds in spot and move them in/out of perp via
+       * internal transfers would have those transfers miscounted as P&L under a
+       * perp-only series, producing phantom drawdown (see `leader_perf.py`
+       * header "I-15" section on the spark backend). */
+      basisNote: "Metrics are computed on a combined spot + perp account equity basis (internal transfers don't pollute the series for this wallet shape).",
     },
     panel: {
       heading: "Follow this strategy",
