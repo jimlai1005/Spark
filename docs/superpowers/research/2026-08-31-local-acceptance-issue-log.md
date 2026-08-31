@@ -77,3 +77,4 @@ pause/close-all 於 prod 無實效）。後續：日報每日附加 accrued（�
 |---|---|---|---|---|---|
 | I-20 | 登入後出現營運/待核准 tabs，點入卻「此頁僅限管理員」 | 換錢包登入時 React Query 快取未清——前一個 admin 錢包的探測結果殘留，非 admin 錢包（builder 0x81E9…）看到 tabs、點入吃真 403。日誌實證：16:11 builder 錢包 403 全正確、16:13 換 9760 全 200 | 登入/登出全部改 `queryClient.clear()`（Header 兩處＋advanced/traders/strategies 登入流），Header 測試改斷言整包清 | `6d228e7` | ✅（prod 已驗） |
 | I-21 | 設定頁壞掉（錯誤頁） | 舊版引擎心跳的 `applied` 塊**沒有 `prefs` 鍵**（undefined），settings 的 `=== null` 守門放行 → `undefined.size_tolerance` 崩潰。本機從未測過「心跳存在但形狀舊」象限；以正式機 3662 真 payload 重現後定位 | `== null` 補防＋以真 payload 形狀加回歸測試；prod 端到端驗證通過（除錯 session 用畢即刪） | `6d228e7` | ✅（prod 已驗） |
+| I-22 | 登出按鈕按了沒反應（換頁才發現已登出） | I-20 修法用的 `queryClient.clear()` 只清資料**不通知活著的 observer**——useMe 收不到變更，畫面停在登入態；伺服器端 cookie 其實已清（所以換頁就對了） | 五個身份切換站點全改 `resetQueries()`（清資料＋通知＋活躍查詢重抓）；prod E2E 實測：點登出原地即翻未登入態（dashboard guard 並自動導回 /strategies） | `c181b87` | ✅（prod 已驗） |
