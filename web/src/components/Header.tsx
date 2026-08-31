@@ -59,6 +59,9 @@ export function Header() {
     // Header 的 useMe 拿不到變更 → 畫面停在登入態、換頁才更新（同日第二波事故）。
     // resetQueries = 清資料＋通知＋活躍查詢重抓，useMe 立即翻回未登入態。
     await queryClient.resetQueries();
+    // 使用者裁決（2026-09-01）：登出一律回首頁，不留在原頁（也免得各頁 guard
+    // 各自導去不同地方——dashboard 導 /strategies、settings 又是另一套）。
+    router.push("/");
   }
 
   /**

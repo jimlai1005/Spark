@@ -180,6 +180,8 @@ describe("Header — 已登入導覽", () => {
     expect(logout).toHaveBeenCalledTimes(1);
     expect(qc.getQueryData(["me"])).toBeUndefined();
     expect(qc.getQueryData(["admin-pending"])).toBeUndefined();
+    // 使用者裁決（2026-09-01）：登出一律回首頁。
+    expect(push).toHaveBeenCalledWith("/");
   });
 
   it("後端放行 admin 探測 → ops／admin 連結出現在已登入導覽裡", async () => {
