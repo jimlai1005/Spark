@@ -79,6 +79,10 @@ class ApiConfig:
     # builder accrued 歷史序列（北極星實收，由 scripts/copytrade_daily_report.py 每日附加）。
     # API 進程不自己查 accrued——查一次的職責在日報腳本，這裡只讀它落下的檔（紅線：不加總）。
     accrued_history_path: str = "var/copytrade/accrued_history.jsonl"
+    # I-17（2026-08-31 使用者裁決）：探索榜 index 的磁碟快照快取路徑（沿本欄位
+    # 正上方的既有可選 env 模式：有預設值、`from_env` 用 `FILET_EXPLORE_CACHE_
+    # PATH` 覆寫，缺設不拒絕啟動——展示功能，見 `hl_explore.py` 檔頭「I-17」節）。
+    explore_cache_path: str = "var/copytrade/explore_index.json"
     # watchlist 每日快照目錄（scripts/watchlist_snapshot.py 的落檔處，cron 00:10 UTC）。
     # 由 DEFAULT_LEADERS_PATH 的父目錄推導＝<repo>/var/filet/leaderboard/watchlist，
     # 對齊 watchlist_snapshot 的 <FILET_DATA_DIR>/leaderboard/watchlist 版面；
@@ -286,6 +290,8 @@ class ApiConfig:
                    followers_path=followers_path,
                    accrued_history_path=(env.get("FILET_ACCRUED_HISTORY_PATH")
                                          or cls.accrued_history_path),
+                   explore_cache_path=(env.get("FILET_EXPLORE_CACHE_PATH")
+                                      or cls.explore_cache_path),
                    state_base=env["FILET_STATE_BASE"],
                    leaders_path=leaders_path,
                    watchlist_dir=watchlist_dir,

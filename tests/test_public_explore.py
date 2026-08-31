@@ -739,7 +739,7 @@ def test_index_query_never_built_returns_building_true_and_empty_rows_without_bl
 
     assert elapsed < 0.5, f"query() 被背景建置卡住了（耗時 {elapsed}s）"
     assert result == {"rows": [], "page": 1, "page_size": ExploreConfig().page_size,
-                      "total_qualified": 0, "total_scanned": 0,
+                      "total_qualified": 0, "total_scanned": 0, "pool": 0,
                       "updated_at": None, "building": True}
     assert started.wait(timeout=5), "背景建置未啟動"
     release.set()
@@ -882,6 +882,145 @@ def test_index_starts_with_no_rows_version_before_first_build():
 
 
 # ============================================================
+# I-17（2026-08-31 使用者裁決）：候選池 300 ＋ 常駐磁碟快照快取
+# ============================================================
+
+def test_default_candidate_pool_is_300():
+    assert hl_explore.DEFAULT_CANDIDATE_POOL == 300
+
+
+def test_snapshot_dump_and_load_round_trips_rows(tmp_path):
+    """磁碟快照落檔/載入 round-trip：`ExploreRow`（含 `windows` dict、tags、
+    coins 等 tuple 欄位）序列化再反序列化後內容不變。"""
+    path = str(tmp_path / "explore_snapshot.json")
+    row = _row(address=_A, coins=("BTC", "ETH"), tags=("low_drawdown",))
+    hl_explore.dump_snapshot(path, rows=[row], built_at=1234.5, total_scanned=7)
+
+    loaded = hl_explore.load_snapshot(path)
+
+    assert loaded is not None
+    assert loaded["built_at"] == 1234.5
+    assert loaded["total_scanned"] == 7
+    assert len(loaded["rows"]) == 1
+    restored = loaded["rows"][0]
+    assert restored.address == row.address
+    assert restored.coins == row.coins
+    assert restored.tags == row.tags
+    assert restored.windows["month"].ret_pct == row.windows["month"].ret_pct
+    assert restored.windows["month"].max_dd_pct == row.windows["month"].max_dd_pct
+    assert restored.windows["day"] is None   # `_row()` 預設 day/week 缺席
+
+
+def test_snapshot_load_missing_file_returns_none(tmp_path):
+    assert hl_explore.load_snapshot(str(tmp_path / "nope.json")) is None
+
+
+def test_snapshot_load_corrupt_json_returns_none(tmp_path):
+    path = tmp_path / "explore_snapshot.json"
+    path.write_text("{not valid json")
+    assert hl_explore.load_snapshot(str(path)) is None
+
+
+def test_snapshot_load_version_mismatch_returns_none(tmp_path):
+    """版本不符（例如上一版程式碼寫的舊形狀快照）→ 忽略，視同沒有可用快照
+    （呼叫端走既有冷建語意）。"""
+    path = tmp_path / "explore_snapshot.json"
+    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 1,
+                                "built_at": 1.0, "total_scanned": 0, "rows": []}))
+    assert hl_explore.load_snapshot(str(path)) is None
+
+
+def test_index_loads_snapshot_at_construction_and_is_immediately_queryable(tmp_path):
+    """I-17：啟動時載入——版本相符 → 建構子跑完當下就能查，不必等一輪背景
+    建置（數分鐘）才有資料。"""
+    path = str(tmp_path / "explore_snapshot.json")
+    row = _row(address=_A)
+    hl_explore.dump_snapshot(path, rows=[row], built_at=1000.0, total_scanned=1)
+    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
+                         excluded_fn=lambda: set(),
+                         cfg=ExploreConfig(min_trading_days=0, min_fills=0),
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                         snapshot_path=path)
+
+    result = index.query()
+
+    assert result["building"] is False
+    assert len(result["rows"]) == 1
+    assert result["rows"][0]["address"] == _A
+
+
+def test_index_snapshot_version_mismatch_on_disk_ignored_falls_back_to_cold_build(tmp_path):
+    path = tmp_path / "explore_snapshot.json"
+    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 1,
+                                "built_at": 1.0, "total_scanned": 0, "rows": []}))
+    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
+                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                         snapshot_path=str(path))
+    assert index._rows is None
+    assert index._rows_version is None
+
+
+def test_index_ttl_expired_serves_stale_snapshot_rows_not_empty_building_rows(tmp_path):
+    """stale-while-revalidate：TTL 早已過期時查詢立即回舊 rows（非空）、
+    `building: False`——「building:true＋空 rows」只允許出現在「從未建成且
+    無可用快照」的第一次，磁碟快照存在時 TTL 過期不得退化成那個狀態。"""
+    path = str(tmp_path / "explore_snapshot.json")
+    row = _row(address=_A)
+    hl_explore.dump_snapshot(path, rows=[row], built_at=0.0, total_scanned=1)
+    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
+                         excluded_fn=lambda: set(),
+                         cfg=ExploreConfig(min_trading_days=0, min_fills=0),
+                         now_fn=lambda: 100_000.0, sleep_fn=lambda s: None,
+                         index_ttl_s=600.0, snapshot_path=path)
+
+    result = index.query()
+
+    assert result["building"] is False
+    assert len(result["rows"]) == 1
+    assert result["updated_at"] == 0
+
+
+def test_index_build_sync_writes_snapshot_that_next_index_can_load(tmp_path):
+    """端到端：`build_sync` 成功建置後落一份新快照；下一個（模擬程序重啟）
+    `ExploreIndex` 讀到同一個路徑立即可查，不必等自己那輪背景建置。"""
+    path = str(tmp_path / "explore_snapshot.json")
+    hl = FakeHL()
+    _seed_hl(hl, _A, alltime_days=60)
+    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
+    first = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
+                         excluded_fn=lambda: set(), cfg=cfg,
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                         snapshot_path=path)
+    first.build_sync()
+    assert Path(path).exists()
+
+    second = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
+                          excluded_fn=lambda: set(), cfg=cfg,
+                          now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                          snapshot_path=path)
+    result = second.query()
+    assert result["building"] is False
+    assert [r["address"] for r in result["rows"]] == [_A]
+
+
+def test_query_response_includes_pool_field_not_hardcoded():
+    """回應需帶 `pool` 大小欄位（I-17：前端榜首常駐提示句用它，不寫死 300）。"""
+    hl = FakeHL()
+    for i in range(3):
+        _seed_hl(hl, f"0x{i:040x}")
+    payload = _leaderboard_payload(*[_lb_row(f"0x{i:040x}", roi=str(i)) for i in range(3)])
+    cfg = ExploreConfig(page_size=25, min_trading_days=0, min_fills=0)
+    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
+                         excluded_fn=lambda: set(), cfg=cfg,
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
+    index.build_sync()
+    result = index.query()
+    assert result["pool"] == 3 == result["total_scanned"]
+
+
+# ============================================================
 # 端點：GET /api/public/explore
 # ============================================================
 
@@ -987,3 +1126,4 @@ def test_endpoint_full_flow_after_build_completes(tmp_path, monkeypatch):
     assert row["display_name"] == "Alice"
     assert row["label"] == "Alice"
     assert row["windows"]["month"]["ret_pct"] == 10.0
+    assert body["pool"] == body["total_scanned"] == 1  # I-17：pool 欄位來自後端，不寫死

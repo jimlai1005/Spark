@@ -141,10 +141,47 @@ perpAllTime`）；候選是任意鏈上地址，資金停泊 spot、經 spot↔p
 month/allTime`，`leader_perf.COMBINED_PERIODS`）——`extract_window` 的閘門已
 為此開放。本節以下（曾提及 perpDay/perpWeek/perpMonth/perpAllTime 的文字）
 一律讀作對應的合併窗；`WINDOW_KEYS`／欄位形狀／gating 規則本身不變。
+
+I-17（2026-08-31，issue log 使用者裁決）：候選池 100→300 ＋ 常駐磁碟快取。
+----------------------------------------------------------------------------
+`DEFAULT_CANDIDATE_POOL` 100→300（實測 60 天門檻下 300 候選才有夠多合格列，
+見 D15 段）。原版 index 只在記憶體（見「index 結構版本」節「本模組沒有把
+index 落盤」），程序重啟後第一個請求必定 `building: True` ＋空 rows、要等一輪
+背景建置（300 址 enrich，數分鐘）才有資料——本輪加**磁碟快照快取**：
+
+- `dump_snapshot`／`load_snapshot`：`ExploreIndex._rows` 的 JSON 序列化（含
+  `EXPLORE_INDEX_VERSION` 與 `built_at`），原子寫入（`os.replace`，同
+  `leader_change_apply` 等既有落檔慣例——先寫 `.tmp` 再換名，避免半寫壞檔）。
+  序列化用 `ExploreRow.to_dict()` 現成形狀，反序列化 `_row_from_dict` 精確
+  逆操作（含 `windows` dict／`exposure` 拆包／tuple 欄位）。
+- `ExploreIndex.__init__` 新增可選 `snapshot_path`：非 `None` 時嘗試
+  `load_snapshot`——版本相符 → 立即灌進 `self._rows`／`_rows_version`／
+  `_built_at`／`_total_scanned`，程序重啟後第一個請求就有資料可查（不必等
+  一輪背景建置）；版本不符／檔不存在／檔壞 → 忽略，`self._rows` 維持
+  `None`，行為等同沒有快照（冷建，既有語意不變）。
+- `build_sync` 成功建置一輪後（`self._rows` 換版的同一刻）順手落一份新快照
+  （`snapshot_path` 有設才寫；寫入失敗只記錄、不影響本輪建置結果——快取是
+  加速手段，不是資料正確性的一部分）。
+- **與既有 TTL／stale-while-revalidate 語意正交**：`query()` 讀路徑本來就是
+  「先讀目前快照 → 觸發背景重建（若已過期）→ 用讀到的快照回應」（見
+  `query()` docstring「⭐ 讀值必須在觸發背景建置之前取得快照」段）——`
+  building: True` ＋空 rows 只會出現在 `self._rows is None`（從未成功建置過
+  **且**磁碟無可用快照）這唯一情況；TTL 過期時一律服務舊 rows、背景才重建。
+  磁碟快照只是把「有沒有舊版可服務」這件事從「這個 process 有沒有跑過至少
+  一輪」放寬成「這個 process **或前一個 process** 有沒有跑過至少一輪」，不
+  改變上述判斷邏輯本身。
+- ⚠️ 與 issue log 另一條裁決 I-04（「同步誤差不得落盤累積」）無關：I-04 限
+  的是 dashboard 同步誤差這類**對帳指標**（落盤會讓誤差逐輪累積、失真），
+  這裡落的是**榜單快照**（純展示排序結果），過期後照 stale-while-revalidate
+  背景重建、不會累積誤差——兩者是不同資料種類、不同裁決範圍。
+- `query()` 回應新增 `pool`（＝這一輪實際掃描的候選數，鏡射既有
+  `total_scanned`——前端榜首常駐提示句要用這個數字，不寫死 300，見
+  `explore/page.tsx`）。
 """
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 import threading
@@ -152,6 +189,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from pathlib import Path
 from typing import Callable
 
 from spark.filet.leader_perf import extract_window
@@ -162,7 +200,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 門檻常數（D3）：預設值＋環境變數可覆寫，見 `ExploreConfig.from_env`。
 # ---------------------------------------------------------------------------
-DEFAULT_CANDIDATE_POOL = 100
+DEFAULT_CANDIDATE_POOL = 300  # I-17（2026-08-31 使用者裁決）：100 → 300
 DEFAULT_MIN_TRADING_DAYS = 30  # 2026-08-30 使用者裁決：60 → 30（實測 60 天閘下 300 候選僅 2 合格）
 DEFAULT_MIN_FILLS = 200
 DEFAULT_MAX_DRAWDOWN_PCT = Decimal("30")
@@ -365,6 +403,79 @@ class ExploreRow:
             "tags": list(self.tags),
             "fills_truncated": self.fills_truncated,
         }
+
+
+def _window_stats_from_dict(v: dict | None) -> "WindowStats | None":
+    if v is None:
+        return None
+    return WindowStats(ret_pct=v["ret_pct"], max_dd_pct=v["max_dd_pct"],
+                       spark=tuple(v.get("spark") or ()))
+
+
+def _row_from_dict(d: dict) -> ExploreRow:
+    """`ExploreRow.to_dict()` 的精確逆操作（I-17 磁碟快照用）——不透過
+    dataclasses 泛用工具（那些工具不知道 `windows`/`exposure` 這兩層需要
+    拆包／重建成巢狀 `WindowStats`），逐欄位手寫對稱，欄位漂移時兩邊都要
+    改，測試（round-trip）會抓到不對稱。"""
+    windows = {k: _window_stats_from_dict(v) for k, v in (d.get("windows") or {}).items()}
+    exposure = d.get("exposure") or {}
+    return ExploreRow(
+        address=d["address"],
+        display_name=d.get("display_name"),
+        label=d["label"],
+        coins=tuple(d.get("coins") or ()),
+        account_bucket=d["account_bucket"],
+        windows=windows,
+        live_days=d["live_days"],
+        fill_count_30d=d["fill_count_30d"],
+        close_win_rate_pct=d.get("close_win_rate_pct"),
+        concentration_pct=d.get("concentration_pct"),
+        exposure_dir=exposure.get("dir"),
+        exposure_pct=exposure.get("pct"),
+        tags=tuple(d.get("tags") or ()),
+        fills_truncated=bool(d.get("fills_truncated", False)),
+    )
+
+
+def dump_snapshot(path: str, *, rows: list[ExploreRow], built_at: float,
+                  total_scanned: int) -> None:
+    """I-17：原子寫入榜單快照（`.tmp` 寫完再 `os.replace`，避免行程被中斷時
+    留下半寫壞檔——同 repo 既有落檔慣例）。寫入失敗（例如目錄不可寫）由
+    呼叫端（`ExploreIndex.build_sync`）自行 try/except 決定要不要吞掉；本函式
+    本身不吞錯，讓呼叫端能記錄清楚是哪一步壞的。"""
+    payload = {"version": EXPLORE_INDEX_VERSION, "built_at": built_at,
+              "total_scanned": total_scanned, "rows": [r.to_dict() for r in rows]}
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, p)
+
+
+def load_snapshot(path: str) -> dict | None:
+    """I-17：讀快照。不存在／解析失敗／版本不符 → `None`（呼叫端視為「沒有
+    可用快照」，忽略、走既有冷建語意，不拋例外——這是加速路徑，不是資料正確
+    性的一部分，讀不到就當作沒發生過）。成功時回傳
+    `{"rows": [ExploreRow, ...], "built_at": float, "total_scanned": int}`。"""
+    try:
+        raw = Path(path).read_text()
+    except OSError:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.error("explore index 快照解析失敗，忽略（冷建）: %s", path)
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != EXPLORE_INDEX_VERSION:
+        return None
+    try:
+        rows = [_row_from_dict(r) for r in payload["rows"]]
+        built_at = float(payload["built_at"])
+        total_scanned = int(payload["total_scanned"])
+    except (KeyError, TypeError, ValueError) as e:
+        logger.error("explore index 快照形狀不符，忽略（冷建）: %s", e)
+        return None
+    return {"rows": rows, "built_at": built_at, "total_scanned": total_scanned}
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +902,10 @@ class ExploreIndex:
     （唯讀，見 `hl.py`）。
     `excluded_fn`：回傳 Filet 自營 leader 地址集合（D8，見 `app.py` 接線，讀精選
     白名單）。
+    `snapshot_path`：I-17 磁碟快照路徑，`None`＝不落盤（沿用純記憶體既有語意，
+    多數測試直接構造 `ExploreIndex` 時不傳，行為不變）；有設時建構子會嘗試
+    `load_snapshot` 立即灌一份舊資料（見模組檔頭「I-17」節），`build_sync`
+    每次成功建置後會寫回一份新的。
     """
 
     def __init__(self, *, leaderboard_source_fn: Callable[[], dict | None],
@@ -799,7 +914,8 @@ class ExploreIndex:
                 index_ttl_s: float = INDEX_TTL_S,
                 enrich_ttl_s: float = ENRICH_CACHE_TTL_S,
                 enrich_cache_max: int = ENRICH_CACHE_MAX,
-                fills_window_days: int = FILLS_WINDOW_DAYS):
+                fills_window_days: int = FILLS_WINDOW_DAYS,
+                snapshot_path: str | None = None):
         self._leaderboard_source_fn = leaderboard_source_fn
         self._hl = hl
         self._excluded_fn = excluded_fn
@@ -810,6 +926,7 @@ class ExploreIndex:
         self._enrich_ttl_s = enrich_ttl_s
         self._enrich_cache_max = enrich_cache_max
         self._fills_window_days = fills_window_days
+        self._snapshot_path = snapshot_path
 
         self._lock = threading.Lock()
         self._rows: list[ExploreRow] | None = None   # 目前對外服務的一版
@@ -821,6 +938,18 @@ class ExploreIndex:
         self._total_scanned = 0
         self._building = False                         # single-flight：背景建置中
         self._enrich_cache: dict[str, tuple[float, ExploreRow | None]] = {}
+
+        # I-17：啟動時嘗試從磁碟快照灌一份舊資料，讓「程序重啟後第一個請求」
+        # 不必等一輪背景建置（數分鐘）才有資料可查（見模組檔頭「I-17」節）。
+        # 版本不符／檔不存在／檔壞 → `load_snapshot` 回 `None`，維持既有冷建
+        # 語意（`self._rows` 留 `None`），不拋例外、不阻塞建構子。
+        if self._snapshot_path is not None:
+            snap = load_snapshot(self._snapshot_path)
+            if snap is not None:
+                self._rows = snap["rows"]
+                self._rows_version = EXPLORE_INDEX_VERSION
+                self._built_at = snap["built_at"]
+                self._total_scanned = snap["total_scanned"]
 
     def _call_hl(self, fn: Callable[[], object], *, what: str) -> object:
         """單一 HL 呼叫的節流＋429 退避重試邊界（見類別所在模組檔頭 2026-08-30
@@ -944,12 +1073,24 @@ class ExploreIndex:
                 "build aborted: rate limited（%s）——中止本輪建置，保留舊 snapshot", e)
             return
         rows = _apply_tags(rows, self._cfg)
+        built_at = self._now_fn()
+        total_scanned = len(candidates)
 
         with self._lock:
             self._rows = rows
             self._rows_version = EXPLORE_INDEX_VERSION
-            self._built_at = self._now_fn()
-            self._total_scanned = len(candidates)
+            self._built_at = built_at
+            self._total_scanned = total_scanned
+
+        # I-17：成功建置一輪後順手落一份磁碟快照，供下次程序重啟時立即可查
+        # （見模組檔頭「I-17」節）。寫入失敗（例如目錄權限）只記錄、不影響
+        # 本輪建置已經成功換版這件事——快取是加速手段，不是正確性的一部分。
+        if self._snapshot_path is not None:
+            try:
+                dump_snapshot(self._snapshot_path, rows=rows, built_at=built_at,
+                             total_scanned=total_scanned)
+            except OSError as e:
+                logger.error("explore index 快照落檔失敗（不影響本輪建置結果）: %s", e)
 
     def _maybe_trigger_build(self) -> None:
         """TTL 過期（或從未建置過，或現有快照的結構版本已不相容——R4-3，見
@@ -981,7 +1122,10 @@ class ExploreIndex:
              exclude_concentrated: bool = True) -> dict:
         """讀路徑：永不阻塞（觸發背景建置後立即用目前狀態回應）。回傳形狀見
         `app.py` 端點層文件字串：`{rows, page, page_size, total_qualified,
-        total_scanned, updated_at, building}`。
+        total_scanned, pool, updated_at, building}`（`pool`：I-17，鏡射
+        `total_scanned`——這一輪實際掃描的候選數，前端榜首常駐提示句「自
+        {pool} 個候選帳戶中列出…」用這個數字，不寫死候選池上限常數，見
+        `explore/page.tsx`）。
 
         從未成功建置過，或現有快照的結構版本已不相容（`self._rows is None`
         或 `self._rows_version != EXPLORE_INDEX_VERSION`，R4-3，見模組檔頭
@@ -1017,7 +1161,7 @@ class ExploreIndex:
         self._maybe_trigger_build()
         if rows is None or rows_version != EXPLORE_INDEX_VERSION:
             return {"rows": [], "page": page, "page_size": self._cfg.page_size,
-                   "total_qualified": 0, "total_scanned": 0,
+                   "total_qualified": 0, "total_scanned": 0, "pool": 0,
                    "updated_at": None, "building": True}
         cfg = self._cfg
         if (min_live_days, min_fills, max_dd_pct, max_concentration_pct) != (None, None, None, None):
@@ -1039,5 +1183,6 @@ class ExploreIndex:
         return {"rows": [r.to_dict() for r in page_rows], "page": page,
                "page_size": self._cfg.page_size,
                "total_qualified": len(qualified_rows), "total_scanned": total_scanned,
+               "pool": total_scanned,
                "updated_at": int(built_at) if built_at is not None else None,
                "building": False}

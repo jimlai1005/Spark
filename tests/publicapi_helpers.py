@@ -31,6 +31,12 @@ def make_cfg(tmp_path, **over):
                 # DEFAULT_LEADERS_PATH ＝ **repo 工作樹裡的** var/filet/leaders.json，
                 # 只要有人在本機建了那個檔，沒指定白名單的測試就會靜默改讀真實營運資料。
                 leaders_path=str(tmp_path / "leaders.json"),
+                # I-17：探索榜磁碟快照路徑同樣釘進 tmp_path——不釘會落回
+                # dataclass 預設的相對路徑 `var/copytrade/explore_index.json`，
+                # 任何直接呼叫 `ExploreIndex.build_sync()`（見 test_public_explore.py
+                # `_app()` helper）的測試就會真的寫進 repo 工作樹（工程原則：
+                # 測試不得碰真實世界）。
+                explore_cache_path=str(tmp_path / "explore_index.json"),
                 admin_addresses=frozenset())
     base.update(over)
     return ApiConfig(**base)

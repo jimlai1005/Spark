@@ -69,6 +69,7 @@ function buildResp(over: Partial<ExploreResp> = {}): ExploreResp {
     page_size: 25,
     total_qualified: 2,
     total_scanned: 100,
+    pool: 100,
     updated_at: 1_700_000_000,
     building: false,
     ...over,
@@ -135,6 +136,15 @@ describe("ExplorePage — 表格渲染", () => {
     expect(dayCells[1].textContent).toBe("90");
 
     expect(screen.getByText((_, el) => (el?.textContent ?? "") === "100 個帳戶 → 符合 2")).toBeInTheDocument();
+  });
+
+  it("I-17：榜首常駐一行顯示候選池與合格數，數字來自後端回應（不寫死）", async () => {
+    stubFetch(() => jsonResponse(buildResp({ pool: 300, total_qualified: 7 })));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.getByText((_, el) => (el?.textContent ?? "")
+      === `${COPY.explore.poolNotePrefix}300${COPY.explore.poolNoteMid}7${COPY.explore.poolNoteSuffix}`,
+    )).toBeInTheDocument();
   });
 
   it("所選窗對某列缺席（day/week best-effort）→ 該列該窗誠實顯示「—」，不回退借用其他窗", async () => {

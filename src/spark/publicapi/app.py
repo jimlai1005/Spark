@@ -2092,6 +2092,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         excluded_fn=_explore_excluded_addresses,
         cfg=hl_explore.ExploreConfig.from_env(),
         now_fn=now_fn,
+        # I-17（2026-08-31 使用者裁決）：常駐磁碟快照——程序重啟後第一個請求
+        # 不必等一輪背景建置（見 hl_explore.py 檔頭「I-17」節）。
+        snapshot_path=cfg.explore_cache_path,
     )
     app.state.explore_index = _explore_index  # 唯讀 introspection seam（沿既有慣例）
 

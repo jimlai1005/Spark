@@ -399,6 +399,10 @@ export interface ExploreResp {
   page_size: number;
   total_qualified: number;
   total_scanned: number;
+  /** I-17：這一輪實際掃描的候選數（鏡射 `total_scanned`）——榜首常駐提示句
+   * 「自 {pool} 個候選帳戶中列出…」用這個數字，不寫死候選池上限常數
+   * （後端 `ExploreConfig.candidate_pool` 預設 300，見 `hl_explore.py`）。 */
+  pool: number;
   updated_at: number | null;
   building: boolean;
 }
@@ -503,6 +507,7 @@ export async function getPublicExplore(
     page_size: typeof body.page_size === "number" ? body.page_size : rows.length,
     total_qualified: typeof body.total_qualified === "number" ? body.total_qualified : 0,
     total_scanned: typeof body.total_scanned === "number" ? body.total_scanned : 0,
+    pool: typeof body.pool === "number" ? body.pool : 0,
     updated_at: typeof body.updated_at === "number" ? body.updated_at : null,
     building: !!body.building,
   };

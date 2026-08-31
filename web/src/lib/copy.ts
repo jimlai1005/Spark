@@ -1646,6 +1646,11 @@ export const COPY_ZH = {
     disclaimerBadge: "Filet 不對清單上任何地址背書",
     sub: "資料全部來自 Hyperliquid 公開鏈上紀錄，每 10 分鐘更新。排序預設為風險調整後報酬（報酬率 ÷ 最大回撤），而非絕對獲利金額——大額帳戶的 PnL 無法被小額帳戶複製。",
     updatedAtPrefix: "資料更新於 ",
+    // I-17（2026-08-31 使用者裁決）：榜首常駐一行說明「為什麼候選數 → 上榜數
+    // 之間有落差」——數字（`{pool}`／`{qualified}`）來自後端回應，不寫死。
+    poolNotePrefix: "自 ",
+    poolNoteMid: " 個候選帳戶中列出鏈上資料完整者（目前 ",
+    poolNoteSuffix: " 檔）；未列入者為鏈上資料缺席——帳戶太新、抓取失敗或期間資料無效。",
     // R4-10（2026-08-31 使用者裁決）：期間鍵對映 HL 實際回傳的窗
     // （day/week/month/allTime），四個都可點——不是 90 天，Hyperliquid
     // portfolio() 沒有 90 天窗。
@@ -3098,6 +3103,9 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     disclaimerBadge: "Filet does not endorse any address on this list",
     sub: "Data is sourced entirely from Hyperliquid's public on-chain records, updated every 10 minutes. Default sort is risk-adjusted return (return ÷ max drawdown), not absolute PnL — a large account's PnL can't be replicated by a small account.",
     updatedAtPrefix: "Data updated at ",
+    poolNotePrefix: "Listing accounts with complete on-chain data out of ",
+    poolNoteMid: " candidates screened (currently ",
+    poolNoteSuffix: " qualify); accounts not listed are missing on-chain data — too new, a failed fetch, or invalid data for the period.",
     windows: { day: "1D", week: "7D", month: "30D", allTime: "All" },
     filters: {
       liveDays: "Live ≥ 30 days",

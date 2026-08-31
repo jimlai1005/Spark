@@ -101,8 +101,8 @@ function fmtPct1(n: number | null): string {
 }
 
 /** 分頁按鈕：目前頁 ± `span`，並夾在 `[1, total]` 範圍內（不做省略號，`total`
- * 一般不大——`page_size` 預設 25，符合 `ExploreConfig.candidate_pool` 上限 100
- * 時最多 4 頁）。 */
+ * 一般不大——`page_size` 預設 25，`ExploreConfig.candidate_pool` 預設 300
+ * 時最多約 12 頁，實際頁數以合格列數 `total_qualified` 為準）。 */
 function pageWindow(current: number, total: number, span = 2): number[] {
   const start = Math.max(1, current - span);
   const end = Math.min(total, current + span);
@@ -191,6 +191,20 @@ export default function ExplorePage() {
             <p className="hint explore-updated-at">
               {c.updatedAtPrefix}
               {fmtUpdatedAtUtc(resp.updated_at)}
+            </p>
+          )}
+          {/* I-17（2026-08-31 使用者裁決）：榜首常駐一行，說明候選池與上榜數的
+              落差來自鏈上資料缺席（帳戶太新／抓取失敗／期間資料無效），不是
+              篩選條件太嚴——數字（`pool`／`total_qualified`）一律來自後端回應，
+              不寫死候選池上限常數。與「資料更新於」同一個顯示條件（成功且非
+              building 態才有意義的數字）。 */}
+          {showUpdatedAt && resp && (
+            <p className="hint explore-pool-note">
+              {c.poolNotePrefix}
+              {resp.pool}
+              {c.poolNoteMid}
+              {resp.total_qualified}
+              {c.poolNoteSuffix}
             </p>
           )}
         </div>

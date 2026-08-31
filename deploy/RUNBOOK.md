@@ -674,6 +674,18 @@ grep -E '^Environment=FILET_API_NETWORK=' /etc/systemd/system/filet-api.service
 # 預期：testnet（測試機）或 mainnet（正式機）——與這台機器的定位相符才往下走
 ```
 
+#### ⭐ 選配：`/explore` 候選榜磁碟快取（I-17，2026-08-31）
+
+`FILET_EXPLORE_CACHE_PATH`（選配，預設 `var/copytrade/explore_index.json`，相對
+`filet-api` 進程的 CWD）：`/api/public/explore` index 的磁碟快照，讓 `filet-api`
+重啟後第一個請求不必等一輪背景建置（候選池 300 址，數分鐘）就有資料可查。
+可安全刪除——刪了只是這台機器下次啟動走冷建（回到「從未建置過」的既有行為，
+不影響任何資金安全或客戶資料）。
+
+```bash
+rm -f /opt/filet/var/copytrade/explore_index.json   # 依實際部署路徑調整；可安全刪除
+```
+
 ### 5.4 拉起服務（依序，逐一確認再往下）
 
 ```bash
