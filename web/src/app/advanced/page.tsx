@@ -119,7 +119,7 @@ function AdvancedInner() {
       });
       // 留在本頁：只讓 useMe 重抓，不 router.push（不同於 strategy 詳情頁的登入
       // 即帶參數跳轉——這裡登入完就是為了繼續填本頁的位址輸入框）。
-      queryClient.clear(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
+      void queryClient.resetQueries(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
     } catch (err) {
       const e = err as { name?: string; code?: number; message?: string } | undefined;
       const isRejected =

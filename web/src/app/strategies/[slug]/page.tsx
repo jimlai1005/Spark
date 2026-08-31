@@ -159,7 +159,7 @@ export default function StrategyDetailPage() {
         chainId: cid,
         signMessage: (message) => signMessageAsync({ message }),
       });
-      queryClient.clear(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
+      void queryClient.resetQueries(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
       router.push(`/onboarding?${buildQuery()}`);
     } catch (err) {
       const e = err as { name?: string; code?: number; message?: string } | undefined;

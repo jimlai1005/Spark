@@ -53,10 +53,12 @@ export function Header() {
 
   async function handleLogout() {
     await logout();
-    // ⭐ clear 而非只 invalidate ["me"]：換錢包時上一個 session 的快取（admin
-    // 探測、儀表板、風控/資金）會殘留——「A 錢包的 admin tabs 亮著、B 錢包點進
-    // 去吃 403」（2026-09-01 生產事故）。整包清，useMe 重抓自然回未登入態。
-    queryClient.clear();
+    // ⭐ resetQueries 而非只 invalidate ["me"]：換錢包時上一個 session 的快取
+    // （admin 探測、儀表板、風控/資金）會殘留（2026-09-01 生產事故）。
+    // ⚠️ 也不能用 queryClient.clear()：clear 只清資料**不通知活著的 observer**，
+    // Header 的 useMe 拿不到變更 → 畫面停在登入態、換頁才更新（同日第二波事故）。
+    // resetQueries = 清資料＋通知＋活躍查詢重抓，useMe 立即翻回未登入態。
+    await queryClient.resetQueries();
   }
 
   /**
@@ -91,7 +93,7 @@ export function Header() {
         chainId: cid,
         signMessage: (message) => signMessageAsync({ message }),
       });
-      queryClient.clear(); // 登入＝身份切換，同 handleLogout 的理由整包清
+      await queryClient.resetQueries(); // 登入＝身份切換，同 handleLogout 的理由整包清
 
       let dest = "/strategies";
       try {
