@@ -42,6 +42,7 @@ from pathlib import Path
 
 from hyperliquid.info import Info
 
+from scripts.copytrade_daily_report import append_accrued_history
 from spark.config import API_URLS
 from spark.copytrade.notifier import Notifier, NullNotifier, TelegramNotifier
 from spark.exchange.hyperliquid import HyperliquidAdapter
@@ -210,6 +211,19 @@ def generate_report(refs, load_errors, adapter_for, now, notifier: Notifier | No
         prev = prev_snapshot.get(builder, Decimal("0"))
         north_star_delta += builder_fee_delta(accrued_today, prev)
         today_accrued[builder] = accrued_today
+
+    # --- I-24（2026-09-01）：accrued 歷史序列每日落檔 ---
+    # 首頁「累計路由交易量」（public_stats）由 accrued_history.jsonl 末筆反推；
+    # 過去只有 copytrade 版日報會寫這檔，filet 主機從未產生 → 數字停在人工播種值。
+    # 重用 copytrade_daily_report.append_accrued_history（同日冪等覆蓋、captured_at
+    # 與值同源）。⭐ 只在**全部** builder 查詢成功時落檔：部分失敗的加總是低估值，
+    # 寫進去會讓下游路由量無聲下修（工程原則 1 混源）；保留上一筆完好值更誠實。
+    if today_accrued and failed_builders == 0:
+        append_accrued_history(day.isoformat(), sum(today_accrued.values()),
+                               now_fn=lambda: now)
+    elif failed_builders:
+        print("[WARN] accrued 歷史序列本日不落檔（部分 builder 查詢失敗，"
+              "避免低估值進入路由量推導）", file=sys.stderr)
 
     # --- ⭐ builder 資格合規（營收關鍵；見 filet/builder_compliance.py 檔頭）---
     # 這裡查的是「builder fee 到底還會不會產生」，與上面查的「產生了多少」是兩件事：

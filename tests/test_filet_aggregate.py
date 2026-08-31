@@ -8,6 +8,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import scripts.filet_daily_report as fdr
+import scripts.copytrade_daily_report as cdr
+import pytest
 from spark.exchange.base import UserFill
 from spark.filet.followers import FollowerRef
 from spark.filet.aggregate import (
@@ -18,6 +20,13 @@ from spark.filet.aggregate import (
     collect_follower_summary,
     summarize_fills,
 )
+
+@pytest.fixture(autouse=True)
+def _accrued_history_to_tmp(tmp_path, monkeypatch):
+    """I-24：generate_report 現在會落 accrued_history.jsonl——全檔測試一律導向
+    tmp，防止測試寫進 repo 工作樹（紅線 6 精神）。"""
+    monkeypatch.setattr(cdr, "HISTORY_PATH", tmp_path / "accrued_history.jsonl")
+
 
 
 def _ref(aid, net="mainnet"):
@@ -613,3 +622,40 @@ def test_build_notifier_is_telegram_with_env():
     from spark.copytrade.notifier import TelegramNotifier
     n = fdr.build_notifier({"COPY_TG_BOT_TOKEN": "t", "COPY_TG_CHAT_ID": "c"})
     assert isinstance(n, TelegramNotifier)
+
+
+# ==================== I-24（2026-09-01）：accrued 歷史序列每日落檔 ====================
+
+def test_generate_report_appends_accrued_history_on_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(fdr, "SNAPSHOT_PATH", tmp_path / "snap.json")
+    monkeypatch.setattr(fdr, "REPORTS_DIR", tmp_path / "reports")
+    hist = tmp_path / "accrued_history.jsonl"
+    monkeypatch.setattr(cdr, "HISTORY_PATH", hist)
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    refs = [_ref("alice")]
+    fdr.generate_report(refs, [], lambda _n: _CountingAdapter(accrued=Decimal("7.25")),
+                        now)
+    import json as _json
+    lines = [_json.loads(x) for x in hist.read_text().splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["date"] == "2026-07-17" 
+    assert lines[0]["accrued"] == "7.25"
+    assert lines[0]["captured_at"]  # 值與時刻同源落檔
+
+
+def test_generate_report_skips_accrued_history_on_partial_failure(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(fdr, "SNAPSHOT_PATH", tmp_path / "snap.json")
+    monkeypatch.setattr(fdr, "REPORTS_DIR", tmp_path / "reports")
+    hist = tmp_path / "accrued_history.jsonl"
+    monkeypatch.setattr(cdr, "HISTORY_PATH", hist)
+
+    class _FailingAccrued(_CountingAdapter):
+        def __init__(self):
+            super().__init__(accrued=Decimal("0"))
+        def query_builder_accrued(self, builder):
+            raise ConnectionError("boom")
+
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    fdr.generate_report([_ref("alice")], [], lambda _n: _FailingAccrued(), now)
+    assert not hist.exists()  # 低估值不落檔，保留上一筆完好值
+    assert "不落檔" in capsys.readouterr().err
