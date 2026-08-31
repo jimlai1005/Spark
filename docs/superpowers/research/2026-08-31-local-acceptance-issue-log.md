@@ -88,3 +88,5 @@ pause/close-all 於 prod 無實效）。後續：日報每日附加 accrued（�
 | I-25 | 設定頁「目前生效」永遠無法確認 | 後端 /api/me/risk 投影從未帶出心跳的 `risk.prefs`（前端型別自始宣告、跨層縫隙兩邊各自測都綠）；補投影＋測試；prod 驗證逐項生效值已回傳 | `d77318c` | ✅ |
 | — | 引擎重啟放行 | filet-follower 重啟乾淨、心跳新格式（含 risk.prefs/halt）；暫停/恢復 round-trip prod 實測通過（paused↔following） | — | ✅ |
 | — | 網域切換 trade.filet.app | LE 憑證（89 天自動續簽）、nginx 分流（sslip 301→新域）、SIWE domain/URI 換新域（拋棄式錢包實測簽章綁定 OK）、前端以新 origin 重建（canonical ✓）；IPv6 `2406:da14:196:cc00:f633:bdf3:dbce:33d7` 供 AAAA | — | ✅ |
+| I-26 | 證據列四連結整理＋contact 改表單 | 1/2（Hyperliquid explorer）改新開視窗；3/4 原指已停用的 /docs → 改站內錨點 /#fee、/#security；contact@filet.trade 全站（footer＋法務四處＋權威 spec）改連 https://filet.app/#/contact（新開視窗，法務頁 http 段落自動成連結） | `cdf17da` | ✅（prod 已驗） |
+| — | AAAA 記錄 | 使用者已填妥；DNS 解析正確、IPv6 直連實測 200 | — | ✅ |
