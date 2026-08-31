@@ -13,7 +13,9 @@ const VIEW_H = 230;
  * **不含文案**：標籤來自 `COPY.strategyDetail.equity.overlays`（陣列，zh/en
  * 對稱），這裡只給「第 i 個 overlay 用什麼顏色／對應 `/api/public/benchmarks`
  * 回應的哪個鍵」這種與語言無關的結構資料，順序必須與 `overlays` 陣列一致。 */
-const OVERLAY_COLORS = ["#e9853f", "#6b8afd", "#4da3ff", "#e9b872"] as const;
+// 順序＝COPY.strategyDetail.equity.overlays：BTC 橘、ETH 藍、S&P 500 綠
+// （2026-08-31 使用者指定；取比主曲線 #3ecf8e 深一階的綠避免混淆）、黃金 金。
+const OVERLAY_COLORS = ["#e9853f", "#6b8afd", "#1f8a4c", "#e9b872"] as const;
 const OVERLAY_KEYS = ["btc", "eth", "sp500", "gold"] as const;
 
 /** `getPublicBenchmarks` 的抓取窗天數——固定用後端夾取上限（見
