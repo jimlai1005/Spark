@@ -60,3 +60,13 @@
 |---|---|---|---|---|---|
 | I-19 | 淨值曲線「疊加對照」（BTC/ETH/S&P500/黃金）沒有實作 | v1 骨架（checkbox disabled，無資料源） | 新公開端點 `/api/public/benchmarks`（HL candleSnapshot 日線；xyz:SP500/xyz:GOLD 代號與 K 線欄位名經主網 probe 驗證；600s 快取；單標的失敗降級 null）；前端勾選 lazy 載入、同起點 rebase、細線低飽和、y 軸納入 overlay；附帶修 traders 頁「目前帳戶價值」改與曲線同源（原 perp-only 會出現 0.00 vs 曲線 15 萬的同頁矛盾）。上線驗證：四序列各 91 點、勾 BTC＋S&P500 疊加渲染正常 | `a65f387` | ✅ |
 
+
+## 部署記錄（2026-09-01）
+
+main `26d5780`（feat/m3-redesign ff-merge，200 檔）已上版正式機（sslip origin）：
+rsync 照 RUNBOOK §3.2、前端 rebuild、leaders.json 補展示欄位（loader 實機驗證）、
+filet-api 新增 `FILET_EXPLORE_CACHE_PATH`（unit 備份 `.bak-m3-20260901`）、
+accrued 播種一筆真值。外部驗證：/ /strategies /explore /terms 皆 200、
+alpha 合併基準 +20.58%、起訖 $1,002→$1,208、engine 心跳 ok。
+**未重啟**：filet-follower@*、filet-keysvc（實盤紅線待使用者放行；引擎重啟前
+pause/close-all 於 prod 無實效）。後續：日報每日附加 accrued（追蹤中）。
