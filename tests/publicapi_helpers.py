@@ -115,6 +115,12 @@ class FakeHL:
         self.fills_detail_error: dict[str, Exception] = {}
         self.user_details_payload: dict[str, dict] = {}
         self.user_details_error: dict[str, Exception] = {}
+        # I-19（EquityCurve overlay benchmarks）：per-coin K 線 fixture ＋可注入
+        # 失敗，同其餘查詢的既有 `_error` 慣例。鍵是 `coin`（`hl.candle_snapshot`
+        # 的第一個參數，如 `"BTC"`／`"xyz:SP500"`），不做大小寫正規化——真實代號
+        # 本身就有大小寫混合（`xyz:SP500`），normalize 反而會失真。
+        self.candles: dict[str, list] = {}
+        self.candle_error: dict[str, Exception] = {}
 
     def get_account_value(self, address: str) -> Decimal:
         err = self.account_value_error.get(address.lower())
@@ -190,6 +196,12 @@ class FakeHL:
         真正跨 2000 筆邊界的分頁行為由 `tests/test_publicapi_hl.py` 對
         `HLGateway` 直接單測。"""
         return self.get_fills_detail(address, start, end), False
+
+    def candle_snapshot(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list:
+        err = self.candle_error.get(coin)
+        if err is not None:
+            raise err
+        return self.candles.get(coin, [])
 
     def user_details(self, address: str) -> dict:
         err = self.user_details_error.get(address.lower())

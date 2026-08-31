@@ -278,13 +278,20 @@ export default function TraderDetailPage() {
       </div>
 
       <p className="hint">{c.disclaimerNote}</p>
-      {/* ⭐ R4-11：`account_value`（clearinghouseState，與 equity_index 不同源，
-          工程原則 1）原本顯示在右欄面板的估算區——右欄改用共用 `FollowPanel`
-          （與策略頁同一組估算文案）後，這個交易員頁專屬欄位移到頁面層單獨
-          一行，不塞進共用元件（避免共用元件多開一條「traders 專屬 prop」）。 */}
+      {/* ⭐ R4-11：這個交易員頁專屬欄位移到頁面層單獨一行，不塞進共用
+          `FollowPanel`（避免共用元件多開一條「traders 專屬 prop」）。
+          ⭐ issue log I-19 附帶一致性修復：原本讀 `account_value`
+          （clearinghouseState，perp-only）——同一頁上方 `EquityCurve`／指標卡
+          走的是 `equity_index`（`allTime`，spot+perp 合併，見 I-15），兩個來源
+          在資金停泊 spot 或近期有內部轉帳時會顯著不一致（同頁出現「目前帳戶
+          價值 0.00 但曲線顯示 15 萬」的自相矛盾）。改讀
+          `methodology.end_equity_usd`——與 `EquityCurve` 同一份 `allTime`
+          `accountValueHistory` 末值（工程原則 1：比較/展示的數字要同源），
+          label 不變。`account_value` 欄位本身在後端回應裡保留（未刪除），
+          只是本頁不再用它做這個展示。 */}
       <p className="hint trader-account-value">
         <span>{c.accountValueLabel}</span>
-        <span className="mono">{fmtAmount(trader.account_value)}</span>
+        <span className="mono">{fmtAmount(trader.methodology.end_equity_usd)}</span>
       </p>
 
       <div className="strategy-detail-grid">

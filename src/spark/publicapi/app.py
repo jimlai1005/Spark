@@ -40,7 +40,7 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     build_equity_range, build_metrics,
                                     build_methodology, build_strategy_view,
                                     sample_days_from_perf, sum_ledger_deposits)
-from spark.publicapi import hl_explore, hl_leaderboard, public_stats
+from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
 from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
@@ -2037,6 +2037,29 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             return {"status": "unknown",
                     "components": [{"name": "api", "status": "ok"},
                                    {"name": "engine", "status": "unknown"}],
+                    "updated_at": int(now_fn())}
+
+    # ---------- /api/public/benchmarks（issue log I-19：淨值曲線疊加對照）----------
+    # ⭐ EquityCurve 的 overlay checkbox（策略/交易員詳情頁共用同一元件）用的四個
+    # 外部標的日線收盤序列，見 `benchmarks.py` 檔頭的代號與欄位實測依據。600s
+    # in-process 快取依 `days` 分桶。
+    _benchmarks_cache = benchmarks.BenchmarksCache(now_fn=now_fn)
+
+    @app.get("/api/public/benchmarks")
+    def public_benchmarks(days: int = benchmarks.DEFAULT_DAYS):
+        """BTC/ETH/S&P500/黃金日線收盤序列（無需登入）。`days` 只夾取範圍到
+        `[1, 400]` 不 422（防濫用的展示層參數，非驗證錯誤，沿 `hl_explore`
+        數值門檻的既有慣例）。任一標的取不到 → 該鍵 `null`，端點恆 200
+        （公開端點可靠度原則，同 `/api/public/stats`）。"""
+        d = benchmarks.clamp_days(days)
+
+        def _compute():
+            return benchmarks.build_benchmarks_payload(hl, days=d, now_fn=now_fn)
+        try:
+            return _benchmarks_cache.get(d, _compute)
+        except Exception as e:  # noqa: BLE001 — 公開端點：絕不 500
+            logger.error("/api/public/benchmarks 計算失敗（全欄降級為 null）: %r", e)
+            return {"series": {k: None for k in benchmarks.BENCHMARK_COINS},
                     "updated_at": int(now_fn())}
 
     # ---------- /api/public/leaderboard（M3 round2 Task 5）----------

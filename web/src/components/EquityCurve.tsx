@@ -2,17 +2,25 @@
 import { useMemo, useState } from "react";
 import { fmtAmount } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
+import { getPublicBenchmarks, type PublicBenchmarksResp } from "@/lib/publicApi";
 
 type Period = "all" | "30d" | "7d";
 
 const VIEW_W = 900;
 const VIEW_H = 230;
 
-/** overlay 對照資產（NOTE 09）的固定顯示順序＋顏色——**不含文案**：標籤來自
- * `COPY.strategyDetail.equity.overlays`（陣列，zh/en 對稱），這裡只給「第 i 個
- * overlay 用什麼顏色」這種與語言無關的結構資料。v1 無現成資料源，checkbox
- * 一律 disabled——保留 UI 骨架讓後續接上資料源時只需拿掉 `disabled`（plan §0.2）。 */
+/** overlay 對照資產（issue log I-19）的固定顯示順序＋顏色＋後端回應鍵——
+ * **不含文案**：標籤來自 `COPY.strategyDetail.equity.overlays`（陣列，zh/en
+ * 對稱），這裡只給「第 i 個 overlay 用什麼顏色／對應 `/api/public/benchmarks`
+ * 回應的哪個鍵」這種與語言無關的結構資料，順序必須與 `overlays` 陣列一致。 */
 const OVERLAY_COLORS = ["#e9853f", "#6b8afd", "#4da3ff", "#e9b872"] as const;
+const OVERLAY_KEYS = ["btc", "eth", "sp500", "gold"] as const;
+
+/** `getPublicBenchmarks` 的抓取窗天數——固定用後端夾取上限（見
+ * `publicapi/benchmarks.py` 的 `MAX_DAYS`，鏡射常數，兩處必須同值：抓太短會讓
+ * 「全部」期間的疊加線在較舊的日期對不到收盤價）。一次抓齊，不隨 period 切換
+ * 重抓（見下方 `ensureOverlayData`）。 */
+const OVERLAY_FETCH_DAYS = 400;
 
 const Y_TICK_COUNT = 6;
 const X_TICK_TARGET = 7;
@@ -75,12 +83,14 @@ function sliceByPeriod(values: number[], period: Period): number[] {
   return values.slice(Math.max(0, values.length - n));
 }
 
-/** values → SVG polyline 的 `points` 字串（等距 x，y 依 min/max 正規化）。
- * 全平（min===max）時畫一條水平中線，避免除以零。 */
-function toPoints(values: number[]): string {
+/** values → SVG polyline 的 `points` 字串（等距 x，y 依 `range`——缺省時退回
+ * 依自身 min/max 正規化，沿舊行為）。全平（min===max）時畫一條水平中線，
+ * 避免除以零。`range` 讓主線與 overlay 疊加線共用同一個 y 軸座標系
+ * （見 `EquityCurve` 內 `yRange` 的計算，兩者才畫得出可比較的相對位置）。 */
+function toPoints(values: number[], range?: { min: number; max: number }): string {
   if (values.length === 0) return "";
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  const min = range ? range.min : Math.min(...values);
+  const max = range ? range.max : Math.max(...values);
   const span = max - min;
   const n = values.length;
   return values
@@ -90,6 +100,71 @@ function toPoints(values: number[]): string {
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
     .join(" ");
+}
+
+/** overlay（可能含 `null` 缺格）→ SVG polyline 的 `points` 字串。`n`＝主曲線
+ * 目前裁切後的點數（不是 overlay 自己非 null 值的個數）——x 位置依「這一天在
+ * 主曲線裁切窗內的第幾個」計算，才能與主線對齊；`null` 缺格直接跳過、不插值
+ * 補一個數字（issue log I-19 明訂：日期缺格跳過該點，不編數字），polyline
+ * 會因此在缺格處以直線連接前後兩個有值的點。 */
+function toOverlayPoints(values: (number | null)[], n: number, range: { min: number; max: number }): string {
+  const span = range.max - range.min;
+  const pts: string[] = [];
+  values.forEach((v, i) => {
+    if (v == null || !Number.isFinite(v)) return;
+    const x = n === 1 ? 0 : (i / (n - 1)) * VIEW_W;
+    const y = span === 0 ? VIEW_H / 2 : VIEW_H - ((v - range.min) / span) * VIEW_H;
+    pts.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+  });
+  return pts.join(" ");
+}
+
+/** `sliced`（裁切後主曲線）每個位置對應的 `YYYY-MM-DD` 日期——與 `xLabels`
+ * 同一套「從 `endDate` 往回推、一點 ≈ 一天」假設（見該函式），供 overlay 對齊
+ * 收盤價用。`endDate` 缺席或格式不符 → 全部回 `null`（無法對齊，overlay 該日
+ * 期沒有東西可畫）。 */
+function datesForSlice(sliced: number[], endDate: string | null | undefined): (string | null)[] {
+  if (!endDate) return sliced.map(() => null);
+  const end = new Date(`${endDate}T00:00:00Z`);
+  if (Number.isNaN(end.getTime())) return sliced.map(() => null);
+  return sliced.map((_, idx) => {
+    const daysFromEnd = sliced.length - 1 - idx;
+    const d = new Date(end.getTime() - daysFromEnd * 86400000);
+    return d.toISOString().slice(0, 10);
+  });
+}
+
+/** `/api/public/benchmarks` 的單一標的原始序列 `[[epoch_ms, "close"], ...]` →
+ * `YYYY-MM-DD`（UTC）→ 收盤價（number）的查表。`null`（該標的上游查詢失敗）
+ * 原樣傳遞——呼叫端據此判斷 checkbox 是否該顯示「資料暫不可用」。 */
+function closeByDate(series: [number, string][] | null): Record<string, number> | null {
+  if (series == null) return null;
+  const map: Record<string, number> = {};
+  for (const [ms, close] of series) {
+    const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) continue;
+    const n = Number(close);
+    if (!Number.isFinite(n)) continue;
+    map[d.toISOString().slice(0, 10)] = n;
+  }
+  return map;
+}
+
+/**
+ * rebase：`overlay[i] = mainFirst × (closes[i] / closes[0])`——`closes[0]`
+ * 是裁切窗內首日的收盤價（錨點），與主曲線同基準才能直接比形狀（issue log
+ * I-19）。錨點缺席／非有限數／為零 → 整條 overlay 回全 `null`（沒有錨點就無法
+ * rebase 任何一天，不是「這一天沒資料」那種可以單點跳過的情形）。其餘位置
+ * 缺席／非有限數 → 該點 `null`（跳過，不插值）。
+ *
+ * 匯出供單元測試直接驗證公式本身（不必經過完整元件與日期對齊管線）。
+ */
+export function rebaseCloses(mainFirst: number, closes: (number | null)[]): (number | null)[] {
+  const anchor = closes.length > 0 ? closes[0] : null;
+  if (anchor == null || !Number.isFinite(anchor) || anchor === 0) {
+    return closes.map(() => null);
+  }
+  return closes.map((c) => (c == null || !Number.isFinite(c) ? null : mainFirst * (c / anchor)));
 }
 
 /**
@@ -114,12 +189,34 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
   const c = COPY.strategyDetail.equity;
   const [period, setPeriod] = useState<Period>("all");
 
+  // ⭐ issue log I-19：overlay 對照資料。`overlayData === null` 代表「還沒抓過」
+  // （首次勾任一項 checkbox 才 lazy fetch，見 `ensureOverlayData`）；抓過一次後
+  // 就地記在 state 裡不再重抓（同一元件實例內，切換 period／勾選其他 overlay
+  // 都不會觸發第二次請求）。`getPublicBenchmarks` 本身不拋（fail-safe 全降級為
+  // null，見 `lib/publicApi.ts`），這裡不需要 `.catch`。
+  const [overlayData, setOverlayData] = useState<PublicBenchmarksResp | null>(null);
+  const [overlayLoading, setOverlayLoading] = useState(false);
+  const [overlayChecked, setOverlayChecked] = useState<boolean[]>(() => OVERLAY_KEYS.map(() => false));
+
+  function ensureOverlayData() {
+    if (overlayData != null || overlayLoading) return;
+    setOverlayLoading(true);
+    void getPublicBenchmarks(OVERLAY_FETCH_DAYS).then((resp) => {
+      setOverlayData(resp);
+      setOverlayLoading(false);
+    });
+  }
+
+  function toggleOverlay(i: number) {
+    ensureOverlayData();
+    setOverlayChecked((prev) => prev.map((v, idx) => (idx === i ? !v : v)));
+  }
+
   const values = useMemo(
     () => equityIndex.map((v) => Number(v)).filter((v) => Number.isFinite(v)),
     [equityIndex],
   );
   const sliced = useMemo(() => sliceByPeriod(values, period), [values, period]);
-  const points = useMemo(() => toPoints(sliced), [sliced]);
 
   const depositNum = initialDepositUsd == null ? null : Number(initialDepositUsd);
   // depositNum > 0：首快照為 0 的帳戶換算出全 $0 的 y 軸（2026-08-29 真資料驗證），
@@ -130,7 +227,42 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
     if (!hasDeposit) return sliced;
     return sliced.map((v) => (depositNum as number) * (v / values[0]));
   }, [sliced, hasDeposit, depositNum, values]);
-  const yTickValues = useMemo(() => yTicks(dollarSliced, Y_TICK_COUNT), [dollarSliced]);
+
+  // overlay 對齊窗（issue log I-19）：`sliced` 每個位置對應的日期，供從
+  // `/api/public/benchmarks` 查表取收盤價；rebase 錨點＝裁切窗內首日。
+  const slicedDates = useMemo(() => datesForSlice(sliced, endDate), [sliced, endDate]);
+  const overlayValuesByKey = useMemo(() => {
+    const out: Record<(typeof OVERLAY_KEYS)[number], (number | null)[] | null> = {
+      btc: null, eth: null, sp500: null, gold: null,
+    };
+    if (overlayData == null || dollarSliced.length === 0) return out;
+    for (const key of OVERLAY_KEYS) {
+      const table = closeByDate(overlayData.series[key]);
+      if (table == null) continue;   // 該標的上游查詢失敗（null）→ 維持 null
+      const closes = slicedDates.map((d) => (d != null && table[d] != null ? table[d] : null));
+      out[key] = rebaseCloses(dollarSliced[0], closes);
+    }
+    return out;
+  }, [overlayData, slicedDates, dollarSliced]);
+
+  const yInputValues = useMemo(() => {
+    const vals = [...dollarSliced];
+    OVERLAY_KEYS.forEach((key, i) => {
+      if (!overlayChecked[i]) return;
+      const ov = overlayValuesByKey[key];
+      if (ov == null) return;
+      for (const v of ov) if (v != null) vals.push(v);
+    });
+    return vals;
+  }, [dollarSliced, overlayChecked, overlayValuesByKey]);
+
+  const yRange = useMemo(() => {
+    if (yInputValues.length === 0) return { min: 0, max: 0 };
+    return { min: Math.min(...yInputValues), max: Math.max(...yInputValues) };
+  }, [yInputValues]);
+
+  const yTickValues = useMemo(() => yTicks(yInputValues, Y_TICK_COUNT), [yInputValues]);
+  const points = useMemo(() => toPoints(dollarSliced, yRange), [dollarSliced, yRange]);
   const xTickLabels = useMemo(
     () => xLabels(sliced, values.length, startDate, endDate),
     [sliced, values.length, startDate, endDate],
@@ -162,19 +294,37 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
         </div>
       </div>
 
-      <div className="equity-curve-overlay-row">
+      <div className="equity-curve-overlay-row" aria-busy={overlayLoading}>
         <span className="equity-overlay-label">{c.overlayLabel}</span>
-        {c.overlays.map((label, i) => (
-          <label key={label} className="equity-overlay-item" title={c.overlayNote}>
-            <input type="checkbox" disabled aria-label={label} />
-            <span
-              className="equity-overlay-swatch"
-              style={{ background: OVERLAY_COLORS[i % OVERLAY_COLORS.length] }}
-              aria-hidden="true"
-            />
-            {label}
-          </label>
-        ))}
+        {c.overlays.map((label, i) => {
+          const key = OVERLAY_KEYS[i];
+          // 未抓過資料前（`overlayData === null`）不代表「不可用」——只有抓過
+          // 之後該標的仍是 `null` 才是真的不可用（見 `lib/publicApi.ts` 的
+          // null/[] 語意區分）。
+          const unavailable = overlayData != null && overlayData.series[key] == null;
+          const disabled = overlayLoading || unavailable;
+          return (
+            <label
+              key={label}
+              className="equity-overlay-item"
+              title={unavailable ? c.overlayUnavailable : overlayLoading ? c.overlayLoading : undefined}
+            >
+              <input
+                type="checkbox"
+                aria-label={label}
+                disabled={disabled}
+                checked={overlayChecked[i] && !unavailable}
+                onChange={() => toggleOverlay(i)}
+              />
+              <span
+                className="equity-overlay-swatch"
+                style={{ background: OVERLAY_COLORS[i % OVERLAY_COLORS.length] }}
+                aria-hidden="true"
+              />
+              {label}
+            </label>
+          );
+        })}
       </div>
 
       {sliced.length < 2 ? (
@@ -205,6 +355,22 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
                 );
               })}
               <polyline points={points} fill="none" stroke="var(--pos)" strokeWidth="2" />
+              {OVERLAY_KEYS.map((key, i) => {
+                if (!overlayChecked[i]) return null;
+                const ov = overlayValuesByKey[key];
+                if (ov == null) return null;
+                // 細線、低飽和，不搶主線（issue log I-19 沿設計稿 NOTE 09 精神）。
+                return (
+                  <polyline
+                    key={key}
+                    points={toOverlayPoints(ov, dollarSliced.length, yRange)}
+                    fill="none"
+                    stroke={OVERLAY_COLORS[i % OVERLAY_COLORS.length]}
+                    strokeWidth="1"
+                    opacity="0.7"
+                  />
+                );
+              })}
             </svg>
             <div className="equity-curve-xaxis mono">
               {xTickLabels.map(({ idx, label }) => (

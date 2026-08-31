@@ -572,6 +572,73 @@ export async function getPublicTraderDetail(address: string): Promise<PublicTrad
 }
 
 /**
+ * `/api/public/benchmarks`（issue log I-19：`EquityCurve` 疊加對照）。四個外部
+ * 標的（BTC/ETH/S&P500/黃金）的日線收盤序列——後兩者是 Hyperliquid xyz
+ * builder-dex 合成市場，非本站資料，見 `publicapi/benchmarks.py` 檔頭。每個鍵
+ * 獨立可能為 `null`（該標的上游查詢失敗），呼叫端據此把對應 checkbox 顯示成
+ * 「資料暫不可用」，不得對 `null` 做任何算術或當空陣列處理（兩者語意不同：
+ * `null`＝讀不到，`[]`＝讀到但這個窗口沒有任何 K 棒）。
+ */
+export type BenchmarkPoint = [number, string];
+
+export interface PublicBenchmarksSeries {
+  btc: BenchmarkPoint[] | null;
+  eth: BenchmarkPoint[] | null;
+  sp500: BenchmarkPoint[] | null;
+  gold: BenchmarkPoint[] | null;
+}
+
+export interface PublicBenchmarksResp {
+  series: PublicBenchmarksSeries;
+  updated_at: number;
+}
+
+const UNKNOWN_BENCHMARKS: PublicBenchmarksResp = {
+  series: { btc: null, eth: null, sp500: null, gold: null },
+  updated_at: 0,
+};
+
+function normalizeBenchmarkSeries(v: unknown): BenchmarkPoint[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: BenchmarkPoint[] = [];
+  for (const row of v) {
+    if (!Array.isArray(row) || row.length !== 2) continue;
+    const [t, c] = row as [unknown, unknown];
+    if (typeof t !== "number" || typeof c !== "string") continue;
+    out.push([t, c]);
+  }
+  return out;
+}
+
+/**
+ * 讀取 `/api/public/benchmarks?days=…`。連線失敗、非 200、或回應形狀異常 →
+ * 全欄降級為 `null`（`UNKNOWN_BENCHMARKS`）——沿 `getPublicStats` 的既有 fail-safe
+ * 精神：讀不到就說讀不到，不偽裝成「這個標的沒有資料」（`[]`）。
+ */
+export async function getPublicBenchmarks(days: number): Promise<PublicBenchmarksResp> {
+  try {
+    const res = await fetch(`/api/public/benchmarks?days=${encodeURIComponent(String(days))}`);
+    if (!res.ok) return UNKNOWN_BENCHMARKS;
+    const body = (await res.json()) as { series?: unknown; updated_at?: unknown } | null;
+    if (body == null || body.series == null || typeof body.series !== "object") {
+      return UNKNOWN_BENCHMARKS;
+    }
+    const s = body.series as Record<string, unknown>;
+    return {
+      series: {
+        btc: normalizeBenchmarkSeries(s.btc),
+        eth: normalizeBenchmarkSeries(s.eth),
+        sp500: normalizeBenchmarkSeries(s.sp500),
+        gold: normalizeBenchmarkSeries(s.gold),
+      },
+      updated_at: typeof body.updated_at === "number" ? body.updated_at : 0,
+    };
+  } catch {
+    return UNKNOWN_BENCHMARKS;
+  }
+}
+
+/**
  * 讀取 `/api/public/stats`（首頁證據列）。後端承諾任一子項取不到就回 `null`、
  * 端點恆 200；這裡再加一層防禦——連線失敗或非 200 一律降級為全 `null`
  * （`UNKNOWN_STATS`），呼叫端一律走「null → 顯示 `—`」的既有路徑，不特殊處理。

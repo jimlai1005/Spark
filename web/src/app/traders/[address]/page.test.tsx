@@ -74,6 +74,10 @@ const DETAIL = {
   equity_index: Array.from({ length: 29 }, (_, i) => String(1 + i * 0.005)),
   methodology: {
     start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
+    // ⭐ issue log I-19 附帶一致性修復：頁面「目前帳戶價值」改讀
+    // `methodology.end_equity_usd`（與 equity_index 同源），不再讀
+    // `account_value`（clearinghouseState，見 page.tsx 同款註解）。
+    end_equity_usd: "5000.00",
     sample_count: 29, annualization_days: 365, risk_free_rate: "0", basis: "perp",
     updated_at: 1756000000,
   },
@@ -139,9 +143,14 @@ describe("TraderDetailPage", () => {
     expect(screen.getAllByText(COPY.strategyDetail.metrics.insufficientLabel).length).toBeGreaterThan(0);
   });
 
-  it("account_value 為 null（clearinghouseState 查詢失敗降級）→ 顯示 —，equity 仍照常渲染", async () => {
+  it("methodology.end_equity_usd 為 null（allTime 查無資料降級）→ 顯示 —，equity 仍照常渲染", async () => {
+    // ⭐ issue log I-19：本頁「目前帳戶價值」與 equity_index 同源
+    // （methodology.end_equity_usd），不再讀 account_value（見 page.tsx 註解）。
     getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
-    stubFetch(() => jsonResponse({ ...DETAIL, account_value: null }));
+    stubFetch(() => jsonResponse({
+      ...DETAIL,
+      methodology: { ...DETAIL.methodology, end_equity_usd: null },
+    }));
     render(wrap(<TraderDetailPage />));
     await screen.findByRole("heading", { level: 1 });
     expect(screen.getByText(COPY.traders.accountValueLabel).nextSibling?.textContent).toBe("—");

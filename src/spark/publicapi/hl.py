@@ -136,6 +136,23 @@ class HLGateway:
         """
         return self._info({"type": "portfolio", "user": address}, "HL portfolio 查詢")
 
+    def candle_snapshot(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list:
+        """K 線快照（唯讀、冪等 → transient 重試）。`coin` 可以是一般幣種
+        （`"BTC"`）或 xyz builder-dex 的合成市場（`"xyz:SP500"`／`"xyz:GOLD"`，
+        代號本身即含 dex 前綴，請求體不需另帶 `dex` 欄位——2026-08-31 curl 實測，
+        見 `publicapi/benchmarks.py` 檔頭）。
+
+        回應形狀 `[{t, T, s, i, o, c, h, l, v, n}, ...]`（升冪排列）：`t`/`T` 為
+        該根 K 棒的開/收盤時間 epoch 毫秒，`c` 為收盤價字串——本方法回原始清單，
+        欄位挑選與型別轉換交給呼叫端（`benchmarks.py`），gateway 只負責 IO 與
+        重試（沿 `portfolio`/`non_funding_ledger_updates` 不挑窗欄位的既有慣例）。
+        請求體照 SDK 原始碼核對（`hyperliquid/info.py` 的 `candles_snapshot`：
+        `{"coin": ..., "interval": ..., "startTime": ..., "endTime": ...}`）。"""
+        return self._info({"type": "candleSnapshot",
+                           "req": {"coin": coin, "interval": interval,
+                                   "startTime": start_ms, "endTime": end_ms}},
+                          "HL candleSnapshot 查詢")
+
     def spot_usdc_balance(self, address: str) -> Decimal:
         """spot 錢包的 USDC 餘額（唯讀、冪等 → transient 重試）。
 
