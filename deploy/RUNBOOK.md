@@ -676,14 +676,19 @@ grep -E '^Environment=FILET_API_NETWORK=' /etc/systemd/system/filet-api.service
 
 #### ⭐ 選配：`/explore` 候選榜磁碟快取（I-17，2026-08-31）
 
-`FILET_EXPLORE_CACHE_PATH`（選配，預設 `var/copytrade/explore_index.json`，相對
-`filet-api` 進程的 CWD）：`/api/public/explore` index 的磁碟快照，讓 `filet-api`
-重啟後第一個請求不必等一輪背景建置（候選池 300 址，數分鐘）就有資料可查。
-可安全刪除——刪了只是這台機器下次啟動走冷建（回到「從未建置過」的既有行為，
-不影響任何資金安全或客戶資料）。
+`FILET_EXPLORE_CACHE_PATH`：`/api/public/explore` index 的磁碟快照，讓 `filet-api`
+重啟後第一個請求不必等一輪背景建置（候選池 300 址，約 12 分鐘）就有資料可查。
+**2026-09-02 起視為必填**：正式機在 unit 主檔與 drop-in 都沒宣告過它，預設相對路徑
+`var/copytrade/explore_index.json` 在 `ProtectSystem=strict` 下落檔失敗（journal 只有
+一行「快照落檔失敗（不影響本輪建置結果）」），結果是每次重啟都冷建空榜。正確值是
+`/var/lib/filet-api/explore_index.json`（唯一同時滿足「filet-api 可寫」與「在
+ReadWritePaths 內」的位置；`/opt/filet/spark/var/filet-api-cache` **不在** ReadWritePaths，
+不要用）。正式機以 drop-in 宣告：`/etc/systemd/system/filet-api.service.d/explore-cache.conf`。
+快照檔可安全刪除——刪了只是下次啟動走冷建，不影響資金安全或客戶資料。
+`scripts/filet_regression_check.py --ssh` 會檢查這個變數是否宣告且落在 ReadWritePaths 內。
 
 ```bash
-rm -f /opt/filet/var/copytrade/explore_index.json   # 依實際部署路徑調整；可安全刪除
+sudo rm -f /var/lib/filet-api/explore_index.json   # 可安全刪除（下次啟動冷建 ~12 分鐘）
 ```
 
 ### 5.4 拉起服務（依序，逐一確認再往下）
@@ -1908,6 +1913,65 @@ systemctl list-units 'filet-daily-report*' --state=failed --no-pager
 sudo journalctl -u filet-daily-report --since '3 days ago' --no-pager | tail -30
 ```
 
+### 5.8a ⭐⭐⭐ 部署 I-27 修復：accrued 歷史序列改走 `FILET_ACCRUED_HISTORY_PATH`（2026-09-02）
+
+<!-- 2026-09-02: I-27 事故修復——舊版硬編相對路徑 var/copytrade/accrued_history.jsonl，
+不在 filet-daily-report.service 任何 ReadWritePaths 底下，ProtectSystem=strict 下
+每日 `OSError: Read-only file system`，北極星／builder 合規／換 leader 對帳／營收告警
+兩天沒跑。修法：路徑改由 env `FILET_ACCRUED_HISTORY_PATH` 決定（daily-report 與 api
+兩個 unit 逐字元同值），落在既有 `ReadWritePaths=/opt/filet/spark/var/filet/reports`
+底下，不必新增放行。-->
+
+`scripts/copytrade_daily_report.append_accrued_history` 與
+`src/spark/publicapi/config.py` 的 `Config.accrued_history_path` 現在讀**同一個**
+env 名。部署本次修復（含 rsync 新版 `deploy/*.service`）之後，需要**一次性**把播種檔
+從舊路徑搬到新路徑，再重啟兩個 unit：
+
+```bash
+# 0) ⭐ reports 目錄的 owner/group/mode 必須是 filet-engine:filet-api 2750（setgid）：
+#    日報（filet-engine）寫、API（filet-api）讀。2026-07-28～09-02 日報連續 36 天失敗，
+#    三種錯誤（builder_accrued_snapshot.json 權限 → reports/ 是 root:root 700 →
+#    history 路徑不在 ReadWritePaths）全是這個目錄樹的 owner 沒照 unit 的 User= 設。
+#    setgid 讓日報用 os.replace 產生的新檔自動繼承 filet-api 群組（644 可讀）；
+#    少了 setgid，日報下次寫出的檔會變 filet-engine:filet-engine，API 讀不到 →
+#    /api/public/stats 的 routed_volume 靜默變 null（2026-09-02 實際發生）。
+sudo chown -R filet-engine:filet-api /opt/filet/spark/var/filet/reports
+sudo chmod 2750 /opt/filet/spark/var/filet/reports
+sudo chmod 644 /opt/filet/spark/var/filet/reports/*.md 2>/dev/null || true
+
+# 1) 播種檔搬家（若舊檔存在；沒有就跳過，新路徑首跑會自己生成空歷史）
+if [ -f /opt/filet/spark/var/copytrade/accrued_history.jsonl ]; then
+  sudo install -o filet-engine -g filet-api -m 644 \
+       /opt/filet/spark/var/copytrade/accrued_history.jsonl \
+       /opt/filet/spark/var/filet/reports/accrued_history.jsonl
+fi
+
+# 2) unit：daily-report 直接用 rsync 帶來的新版；filet-api 正式機的主檔含機密 Environment
+#    行（§5.1a），**不要整檔覆蓋**，改 drop-in（與既有 leaders-path.conf 同法）：
+sudo mkdir -p /etc/systemd/system/filet-api.service.d
+printf '[Service]\nEnvironment=FILET_ACCRUED_HISTORY_PATH=/opt/filet/spark/var/filet/reports/accrued_history.jsonl\n' \
+  | sudo tee /etc/systemd/system/filet-api.service.d/accrued-history.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl restart filet-api.service
+sudo systemctl start filet-daily-report.service
+
+# 3) 驗收：journalctl 無 Traceback，且新路徑檔案確實被寫入
+sudo journalctl -u filet-daily-report --since '5 min ago' --no-pager | tail -30
+sudo ls -l /opt/filet/spark/var/filet/reports/accrued_history.jsonl
+# 預期：mtime 是剛才這次執行；systemctl status filet-daily-report --no-pager -l 顯示
+# SUCCESS（不是上次跑留下的 failed）。
+
+# 4) 驗收：兩個 unit 的**有效**值逐字元相同（本地離線斷言見 tests/test_deploy_artifacts.py）。
+#    ⚠️ 用 systemctl show 看有效環境，不要 grep 主檔——正式機的 FILET_LEADERS_PATH 與
+#    FILET_ACCRUED_HISTORY_PATH 都在 drop-in，grep 主檔會誤判「缺少」。
+for u in filet-daily-report filet-api; do
+  systemctl show $u -p Environment | tr ' ' '\n' | grep FILET_ACCRUED_HISTORY_PATH
+done
+# 5) 驗收：API 身分讀得到（讀不到＝首頁路由量靜默 null）
+sudo -u filet-api test -r /opt/filet/spark/var/filet/reports/accrued_history.jsonl && echo READABLE
+curl -s https://trade.filet.app/api/public/stats   # routed_volume_usd_total 不得為 null
+```
+
 ---
 
 ## 6. nginx + certbot
@@ -2058,6 +2122,38 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://FILET_DOMAIN_PLACEHOLDER/
 curl -sk -o /dev/null -w '%{http_code}\n' https://FILET_DOMAIN_PLACEHOLDER/api/auth/nonce?address=0x0000000000000000000000000000000000000000
 # 預期：印出 HTTP 狀態碼（連得上、有回應）
 ```
+
+### 驗收 4：上線前／每次部署後的四層回歸（2026-09-02 建立，plan `docs/superpowers/plans/2026-09-02-golive-regression.md`）
+
+<!-- 2026-09-02: 對外上線前最後回歸建立的固定流程。當天用它抓到：日報自 7/28 起連續 36 天失敗、
+explore 磁碟快取從未生效、ledger 漏收 internalTransfer（幻影回撤面）、精靈重整後跳過 verify
+（客戶永不啟用）。四層缺一層就會漏掉其中至少一項。 -->
+
+| 層 | 指令 | 抓什麼 | 需要 |
+|---|---|---|---|
+| 1 離線 | `uv run pytest -q && uv run ruff check src tests scripts && (cd web && npm test)` | 邏輯回歸 | 無 |
+| 2 真鏈契約＋E2E | `uv run pytest -m integration tests/integration -q -p no:cacheprovider`（順序：`test_hl_contract.py` → `test_e2e_noncustodial.py` → `test_adapter_testnet.py`，後兩者要一起跑且 E2E 在前） | HL 欄位漂移（testnet＋mainnet 唯讀）、非託管全流程（SIWE→keysvc→鏈上授權→簽章→watcher→引擎鏡像→pause→close-all）、builder fee 實收 | Keychain `spark/filet-testnet-faucet:main`（水龍頭 `0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`，每輪消耗約 $3–5 testnet USDC 手續費；`faucet-status` 查餘額，低於 ~280 時從 9760 testnet UI 補） |
+| 3 瀏覽器 | 起本機 stack（見下）→ `cd web && npm run test:e2e`（含 `wallet-onboarding.spec.ts`，需 `E2E_WALLET_PK_FILE`） | 公開頁零 console error／EN 無中文殘留、注入錢包走完精靈（approveAgent／approveBuilderFee 真上 testnet、pending 落地） | 同上＋Node |
+| 4 正式機 | `uv run python -m scripts.filet_regression_check --http --ssh` | 66 條唯讀檢查：路由、公開 API 契約、未授權 401、TLS、`systemctl --failed`、四個 timer 新鮮度、drop-in 有效環境（`FILET_LEADERS_PATH`／`FILET_ACCRUED_HISTORY_PATH`／`FILET_EXPLORE_CACHE_PATH`）、reports 目錄 setgid、交換目錄方向性、機密檔 | SSH 金鑰 |
+
+本機 stack（第 3 層）：
+```bash
+SCR=<短路徑，例如 /tmp/spark-e2e>; mkdir -p $SCR/keys $SCR/exchange $SCR/state
+cp deploy/leaders.json.example $SCR/leaders.json; printf '{"followers": []}\n' > $SCR/followers.json
+# ⚠️ keysvc socket 路徑必須短（macOS AF_UNIX 上限 104 字元，太長會 "path too long" → /api/onboard/agent 502）
+uv run python -m tests.integration.harness keysvc-serve --sock $SCR/keysvc.sock --keys-dir $SCR/keys &
+FILET_API_NETWORK=testnet FILET_BUILDER_ADDR=0xbAC652a5fb611c1bdc3b9d244cc7e0cc03123662 \
+FILET_SIWE_DOMAIN=localhost FILET_SIWE_URI=http://localhost:3100 \   # ⚠️ 必須 localhost：session cookie 是 secure=True，Chromium 對 127.0.0.1 不存 Secure cookie
+FILET_API_DB=$SCR/api.db FILET_KEYSVC_SOCK=$SCR/keysvc.sock FILET_PENDING_PATH=$SCR/pending.json \
+FILET_EXCHANGE_DIR=$SCR/exchange FILET_STATE_BASE=$SCR/state FILET_LEADERS_PATH=$SCR/leaders.json \
+FILET_FOLLOWERS=$SCR/followers.json uv run python -m scripts.run_api &
+(cd web && NEXT_PUBLIC_SITE_ORIGIN=http://localhost:3100 npm run build && npx next start -p 3100 &)
+uv run python -m tests.integration.harness mint-wallet --usdc 150 --pk-file $SCR/wallet.pk   # pk 檔限 scratchpad/短路徑、600
+(cd web && E2E_BASE_URL=http://localhost:3100 E2E_WALLET_PK_FILE=$SCR/wallet.pk FILET_PENDING_PATH=$SCR/pending.json npm run test:e2e)
+uv run python -m tests.integration.harness sweep-wallet --pk-file $SCR/wallet.pk   # 掃回水龍頭並刪 pk 檔
+```
+
+判定：四層全綠才算通過；第 2、3 層 skip 不等於通過（缺水龍頭就是沒驗）。
 
 ---
 
