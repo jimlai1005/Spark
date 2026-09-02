@@ -90,3 +90,20 @@ pause/close-all 於 prod 無實效）。後續：日報每日附加 accrued（�
 | — | 網域切換 trade.filet.app | LE 憑證（89 天自動續簽）、nginx 分流（sslip 301→新域）、SIWE domain/URI 換新域（拋棄式錢包實測簽章綁定 OK）、前端以新 origin 重建（canonical ✓）；IPv6 `2406:da14:196:cc00:f633:bdf3:dbce:33d7` 供 AAAA | — | ✅ |
 | I-26 | 證據列四連結整理＋contact 改表單 | 1/2（Hyperliquid explorer）改新開視窗；3/4 原指已停用的 /docs → 改站內錨點 /#fee、/#security；contact@filet.trade 全站（footer＋法務四處＋權威 spec）改連 https://filet.app/#/contact（新開視窗，法務頁 http 段落自動成連結） | `cdf17da` | ✅（prod 已驗） |
 | — | AAAA 記錄 | 使用者已填妥；DNS 解析正確、IPv6 直連實測 200 | — | ✅ |
+
+## 第九批（2026-09-02，對外上線前最終回歸——plan `2026-09-02-golive-regression.md`、報告 `2026-09-02-golive-regression-report.md`）
+
+四層回歸（離線／真鏈契約＋E2E／瀏覽器／正式機唯讀）主線程親跑終態：pytest 2741、vitest 664、
+HL 契約 24、非託管 E2E 17（真 testnet 拋棄式錢包）、Playwright 20/20 ×2、prod regression_check 66/66。
+
+| # | 問題 | 修法／證據 | commit | 狀態 |
+|---|---|---|---|---|
+| I-27 | **日報自 7/28 起連續 36 天失敗**（三種權限錯誤輪流：snapshot 檔→reports/ 目錄→history 路徑不在 ReadWritePaths），北極星／合規／換 leader 對帳／營收告警全停；沒人監控 `systemctl --failed` | 路徑改 `FILET_ACCRUED_HISTORY_PATH`（日報與 API 同名 env）、原子寫入；prod drop-in `accrued-history.conf`；`reports/` 改 `filet-engine:filet-api 2750` setgid；補跑 Finished、路由量 153,315→157,455；deploy 測試＋regression_check 四條釘住 | `db0bd7b` | ✅（prod 已部署 03:01 UTC） |
+| I-28 | explore 磁碟快取從未在 prod 生效（env 未宣告→相對路徑 Read-only FS 靜默失敗）→ 每次 API 重啟空榜 12 分鐘 | drop-in `explore-cache.conf` → `/var/lib/filet-api/explore_index.json`；快照 441 KB 落地；RUNBOOK §5.3 改必填；deploy 測試＋regression_check 兩條 | `db0bd7b` | ✅（prod 已部署） |
+| I-29 | **ledger 白名單漏收 `internalTransfer`**（HL「Send」）：客戶 Send 轉出被引擎當虧損→幻影回撤熔斷；轉入不抬基準→fail-open | `signed_flow(delta, *, address)` 依查詢位址判方向；自轉自守衛；髒金額 anomaly 不拋；接線變異測試；實測 spot 轉帳型別是 `send` 不受影響。opus 兩輪審查 | `a0662f2` | ✅（引擎重啟見部署記錄） |
+| I-30 | **精靈重新整理後跳過 verify** → 客戶走完精靈卻永不啟用、無錯誤畫面（瀏覽器 E2E 第二次跑同錢包重現） | 前端 READY 但無 `step2Verified` → 自動補打 verify；後端 `POST /api/leaders/select` 補寫 pending（冪等、manifest 壞條目不猜、失敗 → 200＋`pending_written=false`＋notifier.critical）；瀏覽器兩條路徑實測落地 | `e515746` | ✅（API＋前端見部署記錄） |
+| I-31 | `/api/me/authorizations` explorer URL 硬編主網 | 依 network 切換（`EXPLORER_URLS`）；E2E S13 在 testnet 查到記錄 | `a0662f2` | ✅ |
+| — | `filet_regression_check.py` 漂移（sslip、舊九條路由、預期 testnet、無 --failed） | 重寫 66 條；`/leaderboard` client-side redirect 接受（裁決 B 待使用者） | `2a60c5b` | ✅ |
+| — | 測試基建 | testnet 水龍頭 `0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`（Keychain `spark/filet-testnet-faucet:main`，每輪 E2E 約耗 $3–5 手續費；`faucet-status` 查、低於 ~280 從 9760 補）；harness CLI `keysvc-serve`/`mint-wallet`/`sweep-wallet`；RUNBOOK §8 驗收 4 固定流程 | `bf340da` | ✅ |
+| 待裁決 A | 策略頁「真實入金」是否計入 Send 轉入（目前只算 `deposit`） | 若計入需同時倒扣轉出，否則 leader 自轉可灌大公開數字 | — | 🔶 |
+| 待裁決 B | `/leaderboard` 維持 client-side redirect 或改伺服器 30x | 該路由已無導覽入口；只影響不執行 JS 的爬蟲／舊書籤 | — | 🔶 |

@@ -6,7 +6,7 @@ builder／reviewer 的回報只作參考，不作證據。
 
 ## 1. 判定
 
-**GO（有條件）**：程式碼層面可以對外上線；條件是 §5 的三個部署動作與兩個使用者裁決先完成。
+**GO**：程式碼層面可以對外上線；三個部署動作已於 2026-09-02 05:09 UTC 完成並驗證（§5），只剩兩個產品語意裁決（A／B）不阻擋上線。
 信心標註：對「已測到的面」信心高（真鏈、真瀏覽器、正式機唯讀都跑過）；對 §6 列的未覆蓋面
 是誠實的未知，不是「應該沒問題」。
 
@@ -54,7 +54,7 @@ builder accrued 增加（0.62 → 0.65）。
   ReadWritePaths 內且 filet-api 可寫的位置）；03:27 UTC 快照落地 441 KB、25 rows。
   釘住：`test_deploy_artifacts.py` 一條、regression_check 兩條、RUNBOOK §5.3 改為必填。
 
-### F3 ledger 白名單漏收 `internalTransfer`（實盤引擎，已修，待部署）
+### F3 ledger 白名單漏收 `internalTransfer`（實盤引擎，已修並部署）
 - 事實（真 payload）：HL「Send」／`usdSend` 在雙方 ledger 都是
   `{"type":"internalTransfer","usdc","user","destination","fee"}`；收方實收 `usdc−fee`
   （新地址首轉 fee=1.0），送方 perp 減 `usdc`。白名單沒有這個型別 → 只進 unknown_types。
@@ -67,7 +67,7 @@ builder accrued 增加（0.62 → 0.65）。
 - 未併入：策略頁「真實入金」是否納入 Send（inbound 計入會讓 leader 自己兩個錢包來回 Send 灌大
   公開數字）→ 還原為只算 `deposit`，列 §5 裁決。
 
-### F4 onboarding 精靈重新整理後跳過 verify → 客戶永遠不被啟用（前端＋API，已修，待部署）
+### F4 onboarding 精靈重新整理後跳過 verify → 客戶永遠不被啟用（前端＋API，已修並部署）
 - 事實：`deriveStep` 只看 status 是否 READY；`postVerify` 唯一呼叫點是 step 2 的按鈕；pending.json
   只在 `POST /api/onboard/verify` 寫。客戶簽完授權、入金後重新整理／換頁／隔天回來 → 從 step 3
   開始 → 走完精靈、簽了 leader → dashboard 顯示等待啟用 → watcher 永遠撿不到，**無任何錯誤畫面**。
@@ -102,17 +102,15 @@ builder accrued 增加（0.62 → 0.65）。
 
 ## 5. 待使用者裁決／部署（T8）
 
-1. **部署 F3（引擎）**：rsync `src/spark/exchange/ledger_flows.py`、`hyperliquid.py`、
-   `scripts/vault_preflight.py` 後重啟 `filet-follower@fbac652…`（紅線 5：引擎重啟需使用者放行）。
-2. **部署 F4＋F5（API＋前端）**：rsync `src/spark/publicapi/*`、`src/spark/config.py`、`web/`
-   重 build（`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app`）→ restart `filet-api`、
-   `filet-dashboard`。restart API 會讓 `/explore` 走磁碟快取（F2 已生效，不再空榜）。
-3. **commit**：工作樹 31 檔改動＋新檔（tests/integration、web/e2e、fixtures）未 commit；
-   建議一次 commit 並 push。
+1. ✅ **部署 F3（引擎）**：使用者 2026-09-02 放行；`reload_follower.sh` 重啟 `filet-follower@fbac652…`，
+   active、`systemctl --failed` 空（部署記錄見 RUNBOOK 附錄 B）。
+2. ✅ **部署 F4＋F5（API＋前端）**：rsync＋`npm ci`＋build（origin `https://trade.filet.app`）→ restart
+   `filet-api`、`filet-dashboard`；regression_check 66/66、API 零 Traceback、`/explore` 重啟後直接 25 rows。
+3. ✅ **commit＋push**：六個 commit（`db0bd7b`…`82bc8bb`）已在 `origin/main`；`DEPLOYED_VERSION=82bc8bb`。
 4. **裁決 A**：策略頁／trader 頁的「真實入金」要不要把 inbound `internalTransfer` 計入
    （若計入需同時倒扣 outbound，否則可被灌水）；目前維持只算 `deposit`。
 5. **裁決 B**：`/leaderboard` 維持 client-side redirect（現狀）或改成伺服器層 30x。
-6. 水龍頭錢包 `0x4229…9CE2` 目前約 260 USDC testnet，留給日後回歸；低於 ~280 前補一次。
+6. 水龍頭錢包 `0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`（Keychain `spark/filet-testnet-faucet:main`）約 268 USDC testnet（perp 266.8＋spot 1.9），留給日後回歸；每輪約耗 $3–5，低於 ~280 前從 9760 補 300。
 
 ## 6. 未覆蓋（誠實標註）
 

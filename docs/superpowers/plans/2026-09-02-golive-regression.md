@@ -19,7 +19,7 @@
 | T10 精靈跳過 verify 修復 | ✅ 主線程瀏覽器複核：全新錢包與「已核准後重載」兩條路徑皆由 auto-verify 落地 pending（`途徑=auto-verify`），全套 20/20；離線 2738 / vitest 664 | opus 第二輪 4 個 Warning（補寫失敗無告警、`_progress` 順序、`manifest_degraded` 被丟、只捕 OSError）→ T10b |
 | T10b T10 審查修正 | ✅ 主線程親讀 diff＋親跑 | notifier.critical 兩處、先查 manifest 再打 HL、`manifest_degraded` 不寫、捕 `ValueError`、useRef 守衛；離線 2741 / vitest 664 |
 | T7 全量執行＋報告＋opus 審查＋verdict | ✅ 2026-09-02 04:5x UTC 主線程親跑終態 | 離線 2741 passed、ruff clean、vitest 664、tsc 零新增（17 既有）；契約 24 passed；真鏈 E2E 17 passed（第三次）；瀏覽器 20/20 ×2（post-T10b build，兩條路徑皆 auto-verify）；prod regression_check **66/66 PASS**。報告 `docs/superpowers/research/2026-09-02-golive-regression-report.md`；RUNBOOK §8 驗收 4 |
-| T8 檢查點（需使用者裁決） | 待使用者 | 見報告 §5：部署 F3（引擎重啟）、部署 F4/F5（API＋前端）、commit、裁決「真實入金是否計入 Send」與 `/leaderboard` redirect 形態 |
+| T8 檢查點 | ✅ 部署／commit 完成（2026-09-02 05:09 UTC，使用者放行）；裁決 A／B 待使用者 | 六個 commit 推上 origin/main（`82bc8bb`）；prod rsync＋build＋restart api/dashboard/follower；regression_check 66/66、failed 0、`/explore` 25 rows、`DEPLOYED_VERSION=82bc8bb`。剩：裁決 A（真實入金是否計入 Send）、裁決 B（`/leaderboard` redirect 形態） |
 
 ## 0. 盤點結論（2026-09-02 10:40，主線程親跑）
 

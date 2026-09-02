@@ -2369,3 +2369,17 @@ Node.js                   20（LTS，見 §4.1）
 nginx                     1.18（Ubuntu 22.04 內建，非 1.25+——見 deploy/nginx-filet.conf 的
                           http2 語法註解，這是 Bug 2 的根因）
 ```
+
+**2026-09-02 上線前最終回歸部署記錄（commit `82bc8bb`，05:09 UTC）：**
+
+- 部署內容：I-27～I-31 修復（見 issue log 第九批）＋四層回歸測試基建。流程照 §3.2 rsync 兩段
+  → `uv sync`（依賴無變動）→ chown root → §4.2 `npm ci`＋`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app`
+  build → §9.2 restart `filet-api`、`filet-dashboard`、`reload_follower.sh`（keysvc 程式未變更，未重啟）
+  → `DEPLOYED_VERSION`。unit 檔未覆蓋（api 用 drop-in：`leaders-path.conf`／`accrued-history.conf`／
+  `explore-cache.conf`；daily-report 主檔與 repo 相同）。
+- 驗證：`filet_regression_check --http --ssh` 66/66 PASS；`systemctl --failed` 空；API journal
+  零 Traceback；`/explore` 重啟後直接 25 rows（磁碟快取生效，不再冷建空榜）；sitemap host
+  `trade.filet.app`；路由量 157,455。
+- testnet 回歸水龍頭：`0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`（Keychain `spark/filet-testnet-faucet:main`），
+  部署當下餘額約 268 USDC（perp 266.8＋spot 1.9）；每輪第 2＋3 層回歸約耗 $3–5，低於 ~280 前
+  從 9760 的 testnet UI 補 300。
