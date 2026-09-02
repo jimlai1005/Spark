@@ -1389,7 +1389,7 @@ opus 審查 1C/5W：C（TG parse_mode=HTML 未 escape、回 False 靜默）→ `
 W1 email 大小寫繞過日限 → `validate_contact` 小寫正規化；W2 textarea 180px 被 44px 規則蓋掉 → 選擇器同級；
 W4 TG 呼叫佔 in-flight 名額 → 移到 `finally` 釋放之後；S1 殘留 JSDoc 刪除；S3 R3 原文檔重抽（8 條）。
 未採納：W5 日限檢查與 INSERT 非同一交易（最多多 1 筆）；S2 複製失敗無提示；S4 `settings-help` 無 CSS；S5 sending 態測試。
-**待使用者裁決 W3**：隱私政策未提及聯絡表單會記錄 IP／UA／頁面網址（`web/src/content/legal.ts:125-135`），屬法務文字，主線程不擅改。
+W3（隱私政策未提及聯絡表單記錄 IP／UA／頁面網址，`web/src/content/legal.ts:125-135`）：**使用者裁決不額外增加文字**（2026-09-02）。
 
 ## 狀態
 
