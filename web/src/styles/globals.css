@@ -1015,6 +1015,15 @@ main.page {
 .addr-input-error {
   margin: 10px 0 0; font-size: 13px; color: var(--neg); line-height: 1.6;
 }
+
+/* ---------- /contact ---------- */
+.contact-page { max-width: 760px; }
+.contact-head { margin-bottom: 20px; }
+.contact-card { padding: 24px; display: grid; gap: 16px; }
+.contact-textarea { resize: vertical; min-height: 160px; font-family: inherit; }
+textarea.addr-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.contact-actions { display: flex; justify-content: flex-end; }
+.contact-success h2 { margin: 0 0 8px; }
 .leader-custom-preview {
   border-top: 1px solid var(--border);
   margin-top: 16px; padding-top: 14px;

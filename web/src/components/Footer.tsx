@@ -14,8 +14,8 @@ import { getPublicStatus, type PublicComponentStatus } from "@/lib/publicApi";
  * 宣告一個沒有資訊量的狀態，不如不顯示（讀不到 ≠ 系統健康，工程原則 3 的前端鏡射：
  * 讀不到就不宣告，不偽裝成「已知的未知」）。
  *
- * 法務欄連向 /terms /privacy /risk（Task 12 建立的實體頁）與
- * mailto:contact@filet.trade；產品／可驗證兩欄大多仍是純文字（對應頁面/錨點多數
+ * 法務欄連向 /terms /privacy /risk（Task 12 建立的實體頁）與 /contact（2026-09-02
+ * 起改為站內聯絡表單頁，取代先前的 filet.app 外部連結）；產品／可驗證兩欄大多仍是純文字（對應頁面/錨點多數
  * 尚未存在，見設計稿 §03 L399-405 的靜態 mock，本任務不擅自發明路由）——
  * ⭐ Task 12 順帶把**已經有真實去處**的三項接上連結：文件 → `/docs`、
  * 系統狀態 → `/status`、績效方法論 → `/docs#methodology`（三者都是本 task
@@ -78,7 +78,7 @@ export function Footer() {
             <Link href="/terms">{c.legalTerms}</Link>
             <Link href="/privacy">{c.legalPrivacy}</Link>
             <Link href="/risk">{c.legalRisk}</Link>
-            <a href="https://filet.app/#/contact" target="_blank" rel="noopener noreferrer">{c.legalContact}</a>
+            <Link href="/contact">{c.legalContact}</Link>
           </div>
         </div>
       </div>

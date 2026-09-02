@@ -65,7 +65,7 @@ EXPECT_NETWORK = os.environ.get("FILET_RC_EXPECT_NETWORK", "mainnet")
 # `docs/superpowers/plans/2026-09-02-golive-regression.md` T4）。`/leaderboard`
 # （redirect）與 `/strategies/<slug>`（動態）另外檢查，不在這裡列。
 FRONTEND_ROUTES = ["/", "/strategies", "/explore", "/advanced", "/docs", "/terms",
-                   "/privacy", "/risk", "/status", "/onboarding", "/dashboard",
+                   "/privacy", "/risk", "/status", "/contact", "/onboarding", "/dashboard",
                    "/settings"]
 
 # 需要 session 的 GET 端點：**必須 401**。500 代表沒認證就先炸（可能已碰到資料層），

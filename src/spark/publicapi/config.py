@@ -112,6 +112,11 @@ class ApiConfig:
     # 它只是顯示用字串，缺了不影響任何金流路徑（plan_catalog 回 price_display=None，
     # 前端顯示「價格待定」）。價格數字使用者尚未拍板 → 走設定不寫死在程式碼。
     stripe_price_display: str | None = None
+    # ⭐ /contact 聯絡表單 SMTP（2026-09-02）。user/pass 成對（同 stripe trio 慣例）；
+    # 都不設 → 端點回 503（表單頁仍可開）。pass 是 secret → repr=False（紅線 2）。
+    contact_smtp_user: str | None = None
+    contact_smtp_pass: str | None = field(default=None, repr=False)
+    contact_to: str | None = None          # 未設 → 預設等於 contact_smtp_user
     # --- 營運告警（自訂 vault 准入 advisory FAIL → TG critical；2026-07-31 Wave 2）---
     # 兩鍵齊 → create_app 建 TelegramNotifier；任一缺 → NullNotifier（log-only）。
     # 刻意**不必填**：告警是加值不是啟動前置條件，缺鍵不得擋 API 啟動。
@@ -131,6 +136,10 @@ class ApiConfig:
         if any(v is not None for v in trio) and not all(v is not None for v in trio):
             raise ValueError("Stripe 設定不完整（secret key / webhook secret / price id "
                              "三個一起設或都不設）")
+        if (self.contact_smtp_user is None) != (self.contact_smtp_pass is None):
+            raise ValueError("FILET_CONTACT_SMTP_USER 與 FILET_CONTACT_SMTP_PASS 必須成對設定")
+        if self.contact_smtp_user is not None and self.contact_to is None:
+            object.__setattr__(self, "contact_to", self.contact_smtp_user)
 
     @property
     def leader_changes_path(self) -> str:
@@ -218,6 +227,10 @@ class ApiConfig:
         return self.stripe_secret_key is not None
 
     @property
+    def contact_enabled(self) -> bool:
+        return self.contact_smtp_user is not None
+
+    @property
     def is_mainnet(self) -> bool:
         return self.network == "mainnet"
 
@@ -302,5 +315,8 @@ class ApiConfig:
                    # 獨立讀取（不進 stripe_env）：納入 stripe_env 會被上面的
                    # 「三個一起設」檢查算成第四個成員，讓純顯示字串能擋下啟動
                    stripe_price_display=env.get("FILET_STRIPE_PRICE_DISPLAY") or None,
+                   contact_smtp_user=env.get("FILET_CONTACT_SMTP_USER") or None,
+                   contact_smtp_pass=env.get("FILET_CONTACT_SMTP_PASS") or None,
+                   contact_to=env.get("FILET_CONTACT_TO") or None,
                    tg_bot_token=env.get("FILET_API_TG_BOT_TOKEN", ""),
                    tg_chat_id=env.get("FILET_API_TG_CHAT_ID", ""))

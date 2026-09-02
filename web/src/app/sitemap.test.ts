@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import sitemap, { SITEMAP_ROUTES } from "./sitemap";
 
 describe("sitemap.ts（Task 17）", () => {
-  it("固定路由清單＝9 條，不含動態 slug", () => {
+  it("固定路由清單＝10 條，不含動態 slug", () => {
     expect(SITEMAP_ROUTES).toEqual([
       "/",
       "/strategies",
@@ -13,6 +13,7 @@ describe("sitemap.ts（Task 17）", () => {
       "/privacy",
       "/risk",
       "/status",
+      "/contact",
     ]);
   });
 

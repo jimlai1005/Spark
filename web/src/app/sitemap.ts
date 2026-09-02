@@ -16,6 +16,7 @@ export const SITEMAP_ROUTES: readonly string[] = [
   "/privacy",
   "/risk",
   "/status",
+  "/contact",
 ];
 
 export default function sitemap(): MetadataRoute.Sitemap {

@@ -41,6 +41,8 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     build_methodology, build_strategy_view,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
+from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
+                                     build_contact_email, validate_contact)
 from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
@@ -104,6 +106,16 @@ SESSION_COOKIE = "filet_session"
 # /api/leaders 目錄不套（走離線快照、不打 HL）。
 PROBE_RATELIMIT_WINDOW_S = 60.0
 PROBE_RATELIMIT_MAX = 10
+
+# ⭐ /api/public/contact 的 per-client-IP sliding window（2026-09-02）：無需登入、
+# 每次成功呼叫都寄一封信到站主信箱（外送放大面）。獨立於 probe 限流。
+CONTACT_RATELIMIT_WINDOW_S = 600.0
+CONTACT_RATELIMIT_MAX = 3
+
+# ⭐ 同時在寄信中的請求上限（2026-09-02，reviewer Warning）：smtplib 阻塞在 starlette
+# threadpool（40 執行緒，全 API 共用），Gmail 變慢時不得讓 /contact 佔滿執行緒拖垮
+# dashboard／explore。超限回 503。
+CONTACT_MAX_INFLIGHT = 2
 
 # 換 leader 驗簽失敗 → 回給客戶的**分類化**訊息。key 是 LeaderChangeError.reason
 # （伺服器產生的機器可讀碼），value 是可以安全外顯的固定字串。
@@ -1271,7 +1283,8 @@ def filter_authorizations(txs: list, limit: int) -> list[dict]:
 
 
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
-               billing=None, notifier=None, leaderboard_get_fn=None) -> FastAPI:
+               billing=None, notifier=None, leaderboard_get_fn=None,
+               mailer=None) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -1282,6 +1295,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         notifier = (TelegramNotifier(token=cfg.tg_bot_token, chat_id=cfg.tg_chat_id)
                     if cfg.tg_bot_token and cfg.tg_chat_id else NullNotifier())
     app.state.notifier = notifier   # 唯讀 introspection seam（沿 probe_ratelimit_hits）
+
+    # /contact 寄信通道：未注入 → cfg 有 SMTP 設定則建 SmtpMailer，否則 None（端點 503）。
+    if mailer is None and cfg.contact_enabled:
+        mailer = SmtpMailer(cfg.contact_smtp_user, cfg.contact_smtp_pass)
 
     # 單一邊界（工程原則 5）：HL resilience 重試耗盡後上拋的 transient 例外，
     # 統一轉譯成 502（而非通用 500），供前端判斷「稍後重試」。逐端點不再各自 try/except。
@@ -1352,6 +1369,33 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                     detail="查詢過於頻繁，請稍後再試")
             hits.append(now)
             _probe_hits[address] = hits
+
+    # ⭐ /api/public/contact 的 per-client-IP sliding window（獨立 dict/lock，同款
+    #   reap 邏輯，不與 probe 限流共用——見 CONTACT_RATELIMIT_WINDOW_S 註解）。
+    _contact_hits: dict[str, list[float]] = {}
+    _contact_lock = threading.Lock()
+    # ⭐ in-flight 上限（見 CONTACT_MAX_INFLIGHT 註解）。
+    _contact_inflight = threading.BoundedSemaphore(CONTACT_MAX_INFLIGHT)
+    # ⭐ 寄信失敗告警冷卻（2026-09-02，reviewer Suggestion 採納）：1 小時內只推第一則，
+    # 避免 SMTP 全斷時每次送出都推一則洗版。list 包一個 float 是可變容器慣例
+    # （閉包內對外層變數只能讀，改值要靠可變容器）。
+    _contact_alert_last = [0.0]
+
+    def _enforce_contact_ratelimit(client_ip: str) -> None:
+        now = now_fn()
+        cutoff = now - CONTACT_RATELIMIT_WINDOW_S
+        with _contact_lock:
+            for k in list(_contact_hits.keys()):
+                kept = [t for t in _contact_hits[k] if t > cutoff]
+                if kept:
+                    _contact_hits[k] = kept
+                else:
+                    del _contact_hits[k]
+            hits = _contact_hits.get(client_ip, [])
+            if len(hits) >= CONTACT_RATELIMIT_MAX:
+                raise HTTPException(status_code=429, detail="送出過於頻繁，請稍後再試")
+            hits.append(now)
+            _contact_hits[client_ip] = hits
 
     # ---------- auth ----------
     @app.get("/api/auth/nonce")
@@ -2038,6 +2082,62 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     "components": [{"name": "api", "status": "ok"},
                                    {"name": "engine", "status": "unknown"}],
                     "updated_at": int(now_fn())}
+
+    class ContactBody(BaseModel):
+        name: str
+        email: str
+        message: str
+        website: str = ""    # honeypot：真人看不到、機器人會填
+
+    @app.post("/api/public/contact")
+    def public_contact_endpoint(body: ContactBody, request: Request):
+        """/contact 表單：驗證 → honeypot → in-flight 上限 → IP 限流 → 寄信。無需登入。
+        寄信非冪等：失敗只 log + 502，不重試（工程原則 2）。寄信例外另外告警站主
+        （1 小時冷卻，見 _contact_alert_last）。"""
+        if body.website.strip():
+            logger.info("/api/public/contact honeypot 命中，靜默接受")
+            return {"ok": True}
+        try:
+            ci = validate_contact(name=body.name, email=body.email, message=body.message)
+        except ContactValidationError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        if mailer is None or not cfg.contact_enabled:
+            # 沿 `_require_billing` 的既有雙重檢查慣例：cfg 才是「已設定」的單一
+            # 事實來源，注入的 mailer 物件本身不足以代表已設定（測試會在
+            # cfg 未設定時仍注入 FakeMailer 以斷言 mailer.sent == []）。
+            raise HTTPException(status_code=503,
+                                detail="聯絡表單暫時無法使用，請直接來信")
+        client_ip = request.client.host if request.client else "unknown"
+        # in-flight 上限：smtplib 阻塞在 starlette threadpool（見 CONTACT_MAX_INFLIGHT
+        # 註解），非阻塞 acquire，滿了直接 503，不排隊等（排隊一樣會拖垮 threadpool）。
+        if not _contact_inflight.acquire(blocking=False):
+            raise HTTPException(status_code=503, detail="系統忙碌中，請稍後再試")
+        try:
+            _enforce_contact_ratelimit(client_ip)
+            now_iso = datetime.fromtimestamp(now_fn(), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            msg = build_contact_email(ci, sender=cfg.contact_smtp_user, to=cfg.contact_to,
+                                      client_ip=client_ip, now_iso=now_iso)
+            try:
+                mailer.send(msg)
+            except Exception as e:  # noqa: BLE001 — 失敗必須外顯（原則 3），但不得洩露信件內容
+                logger.error("/api/public/contact 寄信失敗 (%s): %s", type(e).__name__, e)
+                now = now_fn()
+                if now - _contact_alert_last[0] >= 3600:
+                    _contact_alert_last[0] = now
+                    try:
+                        notifier.critical(
+                            "contact_mail_failure",
+                            f"/contact 寄信失敗：{type(e).__name__}",
+                            dedup_key="contact_mail_failure")
+                    except Exception as ne:  # noqa: BLE001 — 告警失敗不得蓋掉原錯誤
+                        logger.error("/contact 失敗告警送出失敗: %r", ne)
+                raise HTTPException(status_code=502,
+                                    detail="寄送失敗，請稍後再試或直接來信") from e
+            logger.info("/api/public/contact 已寄出（reply-to 網域 %s）",
+                        ci.email.rsplit("@", 1)[-1])
+            return {"ok": True}
+        finally:
+            _contact_inflight.release()
 
     # ---------- /api/public/benchmarks（issue log I-19：淨值曲線疊加對照）----------
     # ⭐ EquityCurve 的 overlay checkbox（策略/交易員詳情頁共用同一元件）用的四個

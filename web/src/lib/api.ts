@@ -173,6 +173,12 @@ function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+// ---------- /contact（無需登入）----------
+export interface ContactBody { name: string; email: string; message: string; website?: string }
+export function postContact(body: ContactBody): Promise<{ ok: boolean }> {
+  return post("/api/public/contact", body);
+}
+
 // ---------- auth ----------
 export function getNonce(address: string, chainId: number): Promise<NonceResp> {
   const q = new URLSearchParams({ address, chain_id: String(chainId) });

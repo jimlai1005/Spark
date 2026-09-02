@@ -57,6 +57,12 @@ Environment=FILET_API_PORT=8700
 #Environment=FILET_STRIPE_SECRET_KEY=sk_test_REPLACE
 #Environment=FILET_STRIPE_WEBHOOK_SECRET=whsec_REPLACE
 #Environment=FILET_STRIPE_PRICE_ID=price_REPLACE
+# /contact 聯絡表單（2026-09-02，選配；2026-09-02 reviewer Critical 修正）：Gmail SMTP
+# 應用程式密碼（需帳號 2FA）。USER/PASS 成對，只設一個會拒絕啟動；都不設 → 表單頁仍可
+# 開、送出回 503。⚠️ 密碼**不得**走本檔或 `systemctl edit` 的行內 `Environment=`（那條路
+# 落地會是 0644、`systemctl cat` 對所有帳號可讀）——改走下方 EnvironmentFile 指到的
+# `/etc/filet/contact.env`（0640 root:filet-api，絕不進 repo）。申請與落地見 RUNBOOK §5.8b。
+EnvironmentFile=-/etc/filet/contact.env
 StateDirectory=filet-api
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_api
 Restart=on-failure

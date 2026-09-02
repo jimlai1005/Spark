@@ -239,6 +239,24 @@ describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
   });
 });
 
+/**
+ * postContact（/contact 聯絡頁 Task 3）：POST /api/public/contact，無需登入、不帶簽名。
+ */
+describe("postContact（/contact 聯絡表單）", () => {
+  it("POST /api/public/contact，body 原樣帶出 name/email/message/website", async () => {
+    mockFetchJson(200, { ok: true });
+    const r = await api.postContact({
+      name: "Jim", email: "jim@example.com", message: "Hello, a question about fees.", website: "",
+    });
+    expect(captured[0].url).toBe("/api/public/contact");
+    expect(captured[0].init.method).toBe("POST");
+    expect(JSON.parse(captured[0].init.body as string)).toEqual({
+      name: "Jim", email: "jim@example.com", message: "Hello, a question about fees.", website: "",
+    });
+    expect(r).toEqual({ ok: true });
+  });
+});
+
 describe("⭐ 結構性紅線：EIP-712 授權簽名絕不進後端（紅線 3）", () => {
   // 已知合法例外（二支，皆為 EIP-191 personal_sign、原文皆由伺服器產生）：
   //   authVerify（SIWE 登入）、postLeaderSelect（換 leader 授權）。
@@ -349,7 +367,9 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     //   「成交記錄・授權歷程」tab，不帶簽名、不進 EXCLUDED）⇒ 反射清單淨增 2（26 → 28）。
     // 2026-08-30（M3 round3 Task 5）：+1 匯出（getMyFees，費用明細 tab 期間切換，
     //   不帶簽名、不進 EXCLUDED）⇒ 反射清單淨增 1（28 → 29）。
-    const HAND_WRITTEN_LIST_LENGTH = 29;
+    // 2026-09-02（/contact 聯絡頁 Task 3）：+1 匯出（postContact，無需登入、
+    //   不帶簽名、不進 EXCLUDED）⇒ 反射清單淨增 1（29 → 30）。
+    const HAND_WRITTEN_LIST_LENGTH = 30;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

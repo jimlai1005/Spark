@@ -210,10 +210,12 @@ class FakeHL:
         return self.user_details_payload.get(address.lower(), {"txs": []})
 
 
-def make_app(tmp_path, cfg=None, billing=None, now_fn=None, notifier=None):
+def make_app(tmp_path, cfg=None, billing=None, now_fn=None, notifier=None, mailer=None):
     """now_fn 可注入假時鐘（TTL 類測試用）——不給就走 create_app 的預設 time.time。
     notifier 可注入 RecordingNotifier（vault advisory 告警測試用）——不給就走
-    create_app 的預設（TG 鍵缺席 → NullNotifier，log-only）。"""
+    create_app 的預設（TG 鍵缺席 → NullNotifier，log-only）。
+    mailer 可注入 FakeMailer（/contact 測試用）——不給就走 create_app 的預設
+    （cfg 有 SMTP 設定才建 SmtpMailer，否則 None）。"""
     cfg = cfg or make_cfg(tmp_path)
     store = ApiStore(cfg.db_path)
     keysvc, hl = FakeKeysvc(), FakeHL()
@@ -221,6 +223,8 @@ def make_app(tmp_path, cfg=None, billing=None, now_fn=None, notifier=None):
                                                       "now_fn": now_fn}
     if notifier is not None:
         kw["notifier"] = notifier
+    if mailer is not None:
+        kw["mailer"] = mailer
     return create_app(cfg, store, keysvc, hl, **kw), cfg, store, keysvc, hl
 
 

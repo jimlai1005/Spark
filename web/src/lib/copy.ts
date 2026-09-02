@@ -97,7 +97,7 @@ export const COPY_ZH = {
   /**
    * Footer 文案（Task 7）。四欄＋系統狀態燈——資料來自 `/api/public/status`
    * （見 lib/publicApi.ts），只讀一次不輪詢。法務欄連向 /terms /privacy /risk
-   * 三頁（Task 12 建立）與聯絡表單（filet.app/#/contact，2026-09-01 起）；免責文字對照設計稿 §03 L412。
+   * 三頁（Task 12 建立）與聯絡表單（/contact，2026-09-02 起改為站內頁）；免責文字對照設計稿 §03 L412。
    */
   footer: {
     brandTagline: "Hyperliquid 上的非保管策略執行。資金留在你的錢包，授權可隨時撤銷。",
@@ -1626,6 +1626,32 @@ export const COPY_ZH = {
     loadFailedNote: "狀態讀取失敗或逾時，以下顯示為保守值（未知），不代表系統健康。",
   },
   /**
+   * `/contact` 聯絡頁（2026-09-02）：表單送到 POST /api/public/contact，由站主人工回覆。
+   * fallbackEmail 是「表單壞了也找得到人」的保底路徑，錯誤訊息一律附上。
+   */
+  contact: {
+    heading: "聯絡我們",
+    sub: "感謝你的關注。任何問題或合作洽詢都歡迎透過下方表單送出，我們會盡快回覆到你留下的 Email。",
+    fallbackPrefix: "也可以直接來信：",
+    fallbackEmail: "goldwisetw@gmail.com",
+    nameLabel: "姓名",
+    namePlaceholder: "你的姓名",
+    emailLabel: "Email",
+    emailPlaceholder: "你的 Email",
+    messageLabel: "訊息",
+    messagePlaceholder: "想說的話寫在這裡",
+    send: "送出",
+    sending: "送出中…",
+    successTitle: "已送出",
+    successBody: "我們已收到你的訊息，會盡快回覆到你留下的 Email。",
+    sendAnother: "再送一則",
+    errNameRequired: "請填寫姓名（最多 80 字）",
+    errEmailInvalid: "請填寫正確的 Email",
+    errMessageLength: "訊息長度需介於 10 到 2000 字",
+    errNetwork: "無法連線到伺服器，請稍後再試。",
+    errGeneric: "送出失敗，請稍後再試。",
+  },
+  /**
    * `/leaderboard` 頁（M3 round2 Task 5）：Hyperliquid 主網公開排行榜的展示頁，
    * 資料來自 `/api/public/leaderboard`（無需登入）。與本站策略／客戶績效無關，
    * 純供研究參考，故文案刻意強調資料來源與「非本站背書」。
@@ -3095,6 +3121,28 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     componentsHeading: "Components",
     empty: "No component status to display right now.",
     loadFailedNote: "Status could not be loaded or timed out; the values below are conservative (unknown) and do not imply system health.",
+  },
+  contact: {
+    heading: "Contact us",
+    sub: "Thank you for your interest. Send any questions or inquiries through the form below and we will reply to the email you leave as promptly as possible.",
+    fallbackPrefix: "You can also email us directly: ",
+    fallbackEmail: "goldwisetw@gmail.com",
+    nameLabel: "Name",
+    namePlaceholder: "Your name",
+    emailLabel: "Email",
+    emailPlaceholder: "Your email",
+    messageLabel: "Message",
+    messagePlaceholder: "Your message goes here",
+    send: "Send",
+    sending: "Sending…",
+    successTitle: "Message sent",
+    successBody: "We have received your message and will reply to the email you provided.",
+    sendAnother: "Send another",
+    errNameRequired: "Please enter your name (up to 80 characters)",
+    errEmailInvalid: "Please enter a valid email address",
+    errMessageLength: "Message must be between 10 and 2000 characters",
+    errNetwork: "Could not reach the server. Please try again later.",
+    errGeneric: "Sending failed. Please try again later.",
   },
   leaderboard: {
     heading: "Trader leaderboard",
