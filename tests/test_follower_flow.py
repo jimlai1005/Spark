@@ -321,6 +321,31 @@ def test_account_class_transfer_out_shifts_baseline(tmp_path):
     assert _peak(tmp_path) == Decimal("1100")
 
 
+def test_internal_transfer_send_out_shifts_baseline_no_phantom_drawdown(tmp_path):
+    """T9 錨例：客戶用 HL「Send」把 150 USDC 轉給另一個地址（送方視角，
+    ledger `internalTransfer` usdc=150.0）——`signed_flow(delta,
+    address=ADDR)` 算出 −150（送方不扣 fee，見 ledger_flows 測試），
+    比照 accountClassTransfer 錨例：樣本 [1000,1200]、peak 1200 → 平移
+    −150 → [850,1050]、peak 1050。修復前這筆流量落在 unknown_types
+    （方向不明，未傳 address），完全不校正——出金會被誤判成虧損
+    （工程原則 1 事故 #4 同型：幻影回撤）。"""
+    _seed_baseline(tmp_path)
+    d = {"type": "internalTransfer", "usdc": "150.0",
+         "user": ADDR, "destination": "0x" + "ee" * 20, "fee": "1.0"}
+    usdc = signed_flow(d, address=ADDR)
+    assert usdc == Decimal("-150.0")
+    fa = _flows_adapter(LedgerFlow(time_ms=FLOW_MS, usdc=usdc))
+    _apply(tmp_path, fa)
+
+    assert _sample_values(tmp_path) == [Decimal("850"), Decimal("1050")]
+    assert _peak(tmp_path) == Decimal("1050")
+    # current=1050、peak=1050 → dd=0（未校正前會是 (1200-1050)/1200=12.5%）
+    st = check_drawdown(EquityView(current=Decimal("1050"), recent_peak=Decimal("1050")),
+                        Decimal("0.10"))
+    assert st.drawdown_pct == Decimal("0")
+    assert st.breached is False
+
+
 def test_samples_write_failure_warns_and_skips_batch_without_raising(tmp_path,
                                                                      monkeypatch):
     """觀察 (b)：樣本檔寫失敗（OSError）→ warn＋本批跳過（標記已推進＝漏校正，

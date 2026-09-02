@@ -10,12 +10,24 @@ from decimal import Decimal
 
 import httpx
 
+from spark.config import API_URLS, EXPLORER_URLS
 from spark.exchange.base import USER_FILLS_PAGE_LIMIT, UserFill
 from spark.resilience import run
 
 _TIMEOUT_S = 10.0
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-EXPLORER_URL = "https://rpc.hyperliquid.xyz/explorer"
+# 保留舊名／預設值：`user_details` 曾不分網路一律打這個（主網）URL（T9 修復
+# 前的行為）；未知 base_url（例如測試用的假網域）時的 fallback 仍是它，維持
+# 舊行為不變——只有 base_url 精確等於 API_URLS 裡的登記值才會反查到對應網路。
+EXPLORER_URL = EXPLORER_URLS["mainnet"]
+
+
+def _explorer_url_for(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    for network, url in API_URLS.items():
+        if url.rstrip("/") == base:
+            return EXPLORER_URLS[network]
+    return EXPLORER_URL
 
 # R-A（2026-08-30 opus 審查 C2/C3 修法）：`get_user_fills_paged` 的分頁頁數上限，
 # 保護「查一次極活躍帳戶的全史」不會無界地打上游。環境變數可覆寫（沿
@@ -105,6 +117,10 @@ class HLGateway:
 
     def __init__(self, base_url: str, post_fn=None, sleep_fn=time.sleep):
         self._base = base_url.rstrip("/")
+        # T9：explorer domain 與 /info domain 分開反查一次，供 user_details 用
+        # （base_url == API_URLS[network] 才反查得到；未知 base_url 落回主網
+        # 預設，見 _explorer_url_for 檔頭）。
+        self._explorer_url = _explorer_url_for(self._base)
         self._post = post_fn or _default_post
         self._sleep = sleep_fn
 
@@ -331,14 +347,16 @@ class HLGateway:
         authorizations`（M3 round2 Task 7）用來過濾出 approveAgent／
         approveBuilderFee 兩類授權動作。
 
-        ⚠️ domain 與 `/info` 不同（`rpc.hyperliquid.xyz` vs `api.hyperliquid.xyz`），
-        不走 `_info` 的 `{base}/info` 組裝，直接打 `EXPLORER_URL`（絕對 URL，
-        與 `self._base` 無關）。回應形狀 `{"txs": [{"time": ms, "user": "0x…",
+        ⚠️ domain 與 `/info` 不同（`rpc.hyperliquid*.xyz` vs `api.hyperliquid*.xyz`），
+        不走 `_info` 的 `{base}/info` 組裝，直接打 `self._explorer_url`（絕對 URL，
+        建構時依 base_url 反查網路決定，見 `_explorer_url_for`——T9 修復前
+        不分網路一律打主網 explorer，testnet 部署下查自己的授權永遠是空清單）。
+        回應形狀 `{"txs": [{"time": ms, "user": "0x…",
         "action": {"type": "approveAgent"/"approveBuilderFee"/…, …}, "block": n,
         "hash": "0x…", "error": null}]}`（2026-08-29 curl 實測 `approveAgent`／
         `approveBuilderFee` 兩種 action 的確切欄位，見
         `tests/fixtures/hl_explorer_user_details_sample.json`）。查無資料的地址
         → `{"txs": []}`（真實行為，非錯誤）。"""
-        return run(lambda: self._post(EXPLORER_URL,
+        return run(lambda: self._post(self._explorer_url,
                                       {"type": "userDetails", "user": address}),
                    what="HL explorer 帳戶明細查詢", idempotent=True, sleep_fn=self._sleep)

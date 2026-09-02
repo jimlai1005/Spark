@@ -5,6 +5,7 @@ import pytest
 
 from scripts.vault_preflight import (
     PreflightData,
+    fetch_preflight_data,
     main,
     run_checks,
 )
@@ -233,6 +234,37 @@ def test_allowed_ledger_types_frozen():
     assert set(FLOW_FIELDS) | {ACCOUNT_CLASS_TRANSFER} == {
         "deposit", "vaultDeposit", "withdraw", "vaultWithdraw",
         "accountClassTransfer"}
+
+
+# ── T9：internalTransfer（address 決定方向）─────────────────────────────
+
+
+def test_check6_passes_on_internal_transfer_when_address_matches_destination():
+    """T9：PreflightData.address == vault 位址時，vault 收到的 Send 轉帳
+    （destination==VAULT）計入白名單，不再落入 unknown_types。"""
+    extra = [{"time": TS0 + 6_000, "hash": "0x6",
+              "delta": {"type": "internalTransfer", "usdc": "0.5",
+                        "user": "0x" + "cd" * 20, "destination": VAULT, "fee": "0.0"}}]
+    # +0.5 遠小於容差（~$90），恆等式不受牽連
+    by = _by_name(run_checks(_data(ledger_updates=_ledger(extra), address=VAULT)))
+    assert by["ledger-type-whitelist"].passed
+    assert by["flow-neutral-pnl"].passed
+
+
+def test_check6_fails_on_internal_transfer_without_address():
+    """T9 修復前的行為（address 未提供）：方向不明，白名單檢查必須 FAIL。"""
+    extra = [{"time": TS0 + 6_000, "hash": "0x6",
+              "delta": {"type": "internalTransfer", "usdc": "100.0",
+                        "user": "0x" + "cd" * 20, "destination": VAULT, "fee": "1.0"}}]
+    by = _by_name(run_checks(_data(ledger_updates=_ledger(extra))))
+    assert not by["ledger-type-whitelist"].passed
+    assert "internal-transfer-direction-unknown" in by["ledger-type-whitelist"].detail
+
+
+def test_fetch_preflight_data_threads_address_into_preflight_data():
+    gw = _FakeGateway(_data())
+    data = fetch_preflight_data(gw, VAULT)
+    assert data.address == VAULT
 
 
 # ── main：exit code 與 ledger 查詢窗 ─────────────────────────────────────

@@ -46,11 +46,17 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class PreflightData:
-    """四份 /info 原始回應（gateway 原樣回傳；語意判讀集中在 run_checks）。"""
+    """四份 /info 原始回應（gateway 原樣回傳；語意判讀集中在 run_checks）。
+
+    `address` 預設 None（向後相容既有測試呼叫點，不必逐一補參數）；
+    `fetch_preflight_data` 一律帶入真實查詢位址。只有 internalTransfer
+    型別（T9，錢包對錢包 Send）的方向判定需要它——其餘型別的白名單判定與
+    位址無關，None 時行為與修復前完全一致。"""
     clearinghouse_state: dict
     vault_details: dict
     portfolio: list
     ledger_updates: list
+    address: str | None = None
 
 
 def _window(portfolio: list, period: str) -> dict | None:
@@ -94,8 +100,9 @@ def run_checks(data: PreflightData) -> list[CheckResult]:
         f"withdrawable={withdrawable} maxDistributable={max_distributable} |diff|={tvl_diff}"))
 
     # 帳本流量（檢查 3/5/6 共用；白名單外型別不入淨流量，由檢查 6 專責 FAIL）。
+    # address 只有 internalTransfer 分支會用到（見 ledger_flows 註解）。
     flows = [f for e in data.ledger_updates
-             if (f := _signed_flow(e.get("delta") or {})) is not None]
+             if (f := _signed_flow(e.get("delta") or {}, address=data.address)) is not None]
     net_flow = sum(flows, Decimal("0"))
 
     # 3. flow-neutral pnl 恆等式：|ΔaccountValue − Δpnl − 淨流量| ≤ max($1, 0.01%×AV)。
@@ -154,7 +161,8 @@ def run_checks(data: PreflightData) -> list[CheckResult]:
     #    缺欄位的白名單型別會被 signed_flow 靜默漏計（回 None）——兩者同罪。
     #    異常分類取道 ledger_flows.flow_anomaly（唯一定義點）。
     anomalies = sorted({a for e in data.ledger_updates
-                        if (a := flow_anomaly(e.get("delta") or {})) is not None})
+                        if (a := flow_anomaly(e.get("delta") or {},
+                                              address=data.address)) is not None})
     out.append(CheckResult(
         "ledger-type-whitelist", not anomalies,
         "全部型別在白名單內且欄位齊全" if not anomalies
@@ -186,7 +194,7 @@ def fetch_preflight_data(gateway, address: str, *, window_days: int = 30,
     else:
         start_ms = int(time.time() * 1000) - window_days * 86_400_000
     ledger = gateway.non_funding_ledger_updates(address, start_ms)
-    return PreflightData(chs, vd, pf, ledger)
+    return PreflightData(chs, vd, pf, ledger, address)
 
 
 def main(argv=None, gateway=None) -> None:

@@ -577,6 +577,32 @@ def test_get_ledger_flows_whitelisted_type_missing_amount_is_flagged_and_skipped
     assert "vaultWithdraw:missing-amount" in unknown
 
 
+def test_get_ledger_flows_wires_query_address_into_internal_transfer_direction():
+    """T9b W1（接線回歸保護）：get_ledger_flows 必須把查詢位址傳給
+    flow_anomaly/signed_flow，否則 internalTransfer 永遠落回「方向不明」。
+    這個案例故意只驗證接線本身（不重測 ledger_flows 的方向公式，那是
+    test_ledger_flows.py 的職責）——拿掉 hyperliquid.py 的 `address=address`
+    必須讓它 FAIL（見 T9b 驗收的變異驗證）。"""
+    other = "0xother0000000000000000000000000000000000"
+    outbound = {"time": 1000, "delta": {"type": "internalTransfer", "usdc": "150.0",
+                                         "user": "0xuser", "destination": other,
+                                         "fee": "1.0"}}
+    ad = _adapter(ledger_updates=[outbound])
+    flows, unknown = ad.get_ledger_flows("0xuser", 0)
+    assert unknown == []
+    assert len(flows) == 1
+    assert flows[0].usdc == Decimal("-150.0")  # outbound：查詢位址是 user
+
+    inbound = {"time": 2000, "delta": {"type": "internalTransfer", "usdc": "150.0",
+                                        "user": other, "destination": "0xuser",
+                                        "fee": "1.0"}}
+    ad2 = _adapter(ledger_updates=[inbound])
+    flows2, unknown2 = ad2.get_ledger_flows("0xuser", 0)
+    assert unknown2 == []
+    assert len(flows2) == 1
+    assert flows2[0].usdc == Decimal("149.0")  # inbound：查詢位址是 destination
+
+
 # --- 9. get_active_asset_leverage ---
 
 def test_get_active_asset_leverage_cross_position():

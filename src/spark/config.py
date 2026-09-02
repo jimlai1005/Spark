@@ -10,6 +10,14 @@ CSV_BASE_URLS = {
     "testnet": "https://stats-data.hyperliquid.xyz/Testnet/builder_fills",
     "mainnet": "https://stats-data.hyperliquid.xyz/Mainnet/builder_fills",
 }
+# HL explorer（不同 domain：rpc.* 而非 api.*）——T9：`HLGateway.user_details`
+# 曾不分網路一律打主網 explorer，在 testnet 部署下對自己的授權永遠查無資料
+# （2026-09-02 testnet E2E 發現）。單點定義，供 publicapi/hl.py 依 base_url
+# 反查所屬網路後取用。
+EXPLORER_URLS = {
+    "testnet": "https://rpc.hyperliquid-testnet.xyz/explorer",
+    "mainnet": "https://rpc.hyperliquid.xyz/explorer",
+}
 MIN_BUILDER_BALANCE = Decimal("100")  # builder 啟用門檻 USDC
 
 

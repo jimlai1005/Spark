@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from spark.exchange.ledger_flows import signed_flow, flow_anomaly
+from spark.exchange.ledger_flows import INTERNAL_TRANSFER, flow_anomaly, signed_flow
 
 
 class TestSignedFlow:
@@ -181,3 +181,112 @@ class TestRegressionCasesFromExistingTests:
         # signed_flow 應一律回 None（不進 flows）
         assert signed_flow(vault_deposit_no_usdc) is None
         assert signed_flow(vault_withdraw_no_netwithdrawusd) is None
+
+
+class TestInternalTransfer:
+    """T9：錢包對錢包轉帳（HL UI「Send」／SDK usdSend）。真實 payload 取自
+    2026-09-02 testnet 實測（見 plan docs/superpowers/plans/
+    2026-09-02-golive-regression.md T9 節）：兩邊 ledger 收到同一筆
+    `{"type": "internalTransfer", "usdc": ..., "user": <sender>,
+    "destination": <receiver>, "fee": ...}`；`address` 決定呼叫端在問哪一邊。
+    """
+
+    RECEIVER = "0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2"
+    SENDER = "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
+
+    def _new_address_payload(self):
+        """收方視角，新地址首次轉入：fee="1.0"（實測）。"""
+        return {"type": "internalTransfer", "usdc": "150.0",
+                "user": self.SENDER, "destination": self.RECEIVER, "fee": "1.0"}
+
+    def _existing_address_payload(self):
+        """既有地址：fee="0.0"（實測）。"""
+        return {"type": "internalTransfer", "usdc": "150.0",
+                "user": self.SENDER, "destination": self.RECEIVER, "fee": "0.0"}
+
+    def test_receiver_gets_usdc_minus_fee_new_address(self):
+        d = self._new_address_payload()
+        assert signed_flow(d, address=self.RECEIVER) == Decimal("149.0")
+        assert flow_anomaly(d, address=self.RECEIVER) is None
+
+    def test_receiver_gets_full_usdc_when_fee_zero_existing_address(self):
+        d = self._existing_address_payload()
+        assert signed_flow(d, address=self.RECEIVER) == Decimal("150.0")
+        assert flow_anomaly(d, address=self.RECEIVER) is None
+
+    def test_receiver_address_case_insensitive(self):
+        d = self._new_address_payload()
+        assert signed_flow(d, address=self.RECEIVER.lower()) == Decimal("149.0")
+        assert signed_flow(d, address=self.RECEIVER.upper()) == Decimal("149.0")
+
+    def test_sender_loses_full_usdc_no_fee_deduction(self):
+        """送方視角（同一筆）：perp −150.0，fee 不影響送方（fee 是收方少收，
+        不是送方多付）。"""
+        d = self._new_address_payload()
+        assert signed_flow(d, address=self.SENDER) == Decimal("-150.0")
+        assert flow_anomaly(d, address=self.SENDER) is None
+
+    def test_address_none_returns_none_and_direction_unknown_anomaly(self):
+        """T2 發現的核心缺口：不傳 address（修復前的呼叫形狀）→ 方向不明，
+        不得猜號。"""
+        d = self._new_address_payload()
+        assert signed_flow(d) is None
+        assert flow_anomaly(d) == "internal-transfer-direction-unknown"
+
+    def test_neither_side_matches_address_returns_none_and_anomaly(self):
+        other = "0x" + "ee" * 20
+        d = self._new_address_payload()
+        assert signed_flow(d, address=other) is None
+        assert flow_anomaly(d, address=other) == "internal-transfer-direction-unknown"
+
+    def test_missing_usdc_is_missing_amount_anomaly(self):
+        d = {"type": "internalTransfer", "user": self.SENDER,
+             "destination": self.RECEIVER, "fee": "1.0"}
+        assert signed_flow(d, address=self.RECEIVER) is None
+        assert flow_anomaly(d, address=self.RECEIVER) == "internalTransfer:missing-amount"
+
+    def test_missing_fee_key_defaults_to_zero_not_anomaly(self):
+        """明確決定（見 ledger_flows._internal_transfer_flow docstring）：缺
+        fee 鍵視為 0，不是 anomaly——收方拿到全額 usdc，不因為缺一個次要欄位
+        就把整筆真實入金打回「型別不明」。"""
+        d = {"type": "internalTransfer", "usdc": "150.0",
+             "user": self.SENDER, "destination": self.RECEIVER}
+        assert signed_flow(d, address=self.RECEIVER) == Decimal("150.0")
+        assert flow_anomaly(d, address=self.RECEIVER) is None
+
+    def test_internal_transfer_not_added_to_flow_fields_whitelist_dict(self):
+        """internalTransfer 是特例分支（同 accountClassTransfer 模式），不進
+        FLOW_FIELDS 的 (欄位, 固定號) 結構——號不是固定的，取決於 address。"""
+        from spark.exchange.ledger_flows import FLOW_FIELDS
+        assert INTERNAL_TRANSFER not in FLOW_FIELDS
+
+    # ── T9b W2：自轉自（user == destination == address）────────────────
+
+    def test_self_transfer_nets_to_negative_fee(self):
+        """自轉自（同一顆錢包既是 user 又是 destination）：perp 沒有淨流入
+        流出，只有 fee 這筆真實成本流出。修復前這個情境先撞進「destination
+        匹配」分支回 +(usdc−fee)（實測 +149.0）——方向錯在幻影回撤側：把
+        自轉自誤記成一筆入金，這裡必須先判自轉自。"""
+        d = {"type": "internalTransfer", "usdc": "150.0",
+             "user": self.RECEIVER, "destination": self.RECEIVER, "fee": "1.0"}
+        assert signed_flow(d, address=self.RECEIVER) == Decimal("-1.0")
+        assert flow_anomaly(d, address=self.RECEIVER) is None
+
+    def test_self_transfer_zero_fee_nets_to_zero(self):
+        d = {"type": "internalTransfer", "usdc": "150.0",
+             "user": self.RECEIVER, "destination": self.RECEIVER, "fee": "0.0"}
+        assert signed_flow(d, address=self.RECEIVER) == Decimal("0")
+
+    # ── T9b 建議 4：髒 fee／usdc（非數字）不得拋，回新分類 ──────────────
+
+    def test_non_numeric_usdc_is_bad_amount_anomaly_not_exception(self):
+        d = {"type": "internalTransfer", "usdc": "not-a-number",
+             "user": self.SENDER, "destination": self.RECEIVER, "fee": "1.0"}
+        assert signed_flow(d, address=self.RECEIVER) is None
+        assert flow_anomaly(d, address=self.RECEIVER) == "internal-transfer-bad-amount"
+
+    def test_non_numeric_fee_is_bad_amount_anomaly_not_exception(self):
+        d = {"type": "internalTransfer", "usdc": "150.0",
+             "user": self.SENDER, "destination": self.RECEIVER, "fee": "not-a-number"}
+        assert signed_flow(d, address=self.RECEIVER) is None
+        assert flow_anomaly(d, address=self.RECEIVER) == "internal-transfer-bad-amount"

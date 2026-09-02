@@ -324,14 +324,15 @@ class HyperliquidAdapter(ExchangeAdapter):
             delta = item.get("delta", {})
             time_ms = int(item.get("time", 0))
 
-            # 檢查異常（白名單外、或白名單內但缺欄位）
-            anomaly = flow_anomaly(delta)
+            # 檢查異常（白名單外、或白名單內但缺欄位）——address 只有
+            # internalTransfer 分支會用到（方向判定，見 ledger_flows 註解）。
+            anomaly = flow_anomaly(delta, address=address)
             if anomaly is not None:
                 unknown_types.add(anomaly)
                 continue
 
             # 白名單內且欄位齊全 → 取有號流量
-            usdc = signed_flow(delta)
+            usdc = signed_flow(delta, address=address)
             if usdc is not None:
                 flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
 

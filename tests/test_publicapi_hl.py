@@ -447,6 +447,33 @@ def test_user_details_posts_to_explorer_domain_not_info():
     assert body == {"type": "userDetails", "user": "0x85ec"}
 
 
+def test_user_details_posts_to_testnet_explorer_when_base_url_is_testnet():
+    """T9：base_url 反查到 testnet 時，explorer 打 `hyperliquid-testnet` 網域，
+    不再一律硬編主網 explorer（修復前的行為，見 test_e2e_noncustodial.py S13
+    對此已知限制的說明）。"""
+    from spark.config import API_URLS, EXPLORER_URLS
+    payload = {"type": "userDetails", "txs": []}
+    post = _FakePost([payload])
+    gw = HLGateway(API_URLS["testnet"], post_fn=post, sleep_fn=lambda s: None)
+    gw.user_details("0x85ec")
+    url, body = post.calls[0]
+    assert url == EXPLORER_URLS["testnet"]
+    assert "hyperliquid-testnet" in url
+    assert body == {"type": "userDetails", "user": "0x85ec"}
+
+
+def test_user_details_unknown_base_url_falls_back_to_mainnet_explorer():
+    """未知 base_url（例如測試假網域）→ 落回舊有預設（主網 explorer），
+    不因為反查不到網路就整段炸掉或猜一個 testnet。"""
+    from spark.publicapi.hl import EXPLORER_URL
+    payload = {"type": "userDetails", "txs": []}
+    post = _FakePost([payload])
+    gw = HLGateway("https://not-a-real-hl-host.example", post_fn=post, sleep_fn=lambda s: None)
+    gw.user_details("0x85ec")
+    url, _ = post.calls[0]
+    assert url == EXPLORER_URL
+
+
 def test_user_details_retries_transient():
     payload = {"type": "userDetails", "txs": []}
     post = _FakePost([RuntimeError("Server error '503 Service Unavailable' for url"),
