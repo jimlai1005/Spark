@@ -173,9 +173,18 @@ function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
-// ---------- /contact（無需登入）----------
-export interface ContactBody { name: string; email: string; message: string; website?: string }
-export function postContact(body: ContactBody): Promise<{ ok: boolean }> {
+// ---------- /contact（無需登入；2026-09-02 Task 6 雙欄設計稿：無姓名欄、
+// 改 topic 單選＋選填錢包地址，成功回應帶工單編號）----------
+export type ContactTopic = "copytrade" | "billing" | "security" | "partnership" | "other";
+export interface ContactBody {
+  topic: ContactTopic;
+  email: string;
+  wallet: string;
+  message: string;
+  website?: string;
+}
+export interface ContactResp { ok: boolean; ticket: string }
+export function postContact(body: ContactBody): Promise<ContactResp> {
   return post("/api/public/contact", body);
 }
 

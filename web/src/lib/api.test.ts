@@ -240,20 +240,24 @@ describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
 });
 
 /**
- * postContact（/contact 聯絡頁 Task 3）：POST /api/public/contact，無需登入、不帶簽名。
+ * postContact（/contact 聯絡頁 Task 6，雙欄設計稿改版）：POST /api/public/contact，
+ * 無需登入、不帶簽名。body 改為 topic/email/wallet/message/website（無 name）；
+ * 成功回應帶工單編號 `ticket`。
  */
 describe("postContact（/contact 聯絡表單）", () => {
-  it("POST /api/public/contact，body 原樣帶出 name/email/message/website", async () => {
-    mockFetchJson(200, { ok: true });
+  it("POST /api/public/contact，body 原樣帶出 topic/email/wallet/message/website", async () => {
+    mockFetchJson(200, { ok: true, ticket: "FLT-AB12-CD34" });
     const r = await api.postContact({
-      name: "Jim", email: "jim@example.com", message: "Hello, a question about fees.", website: "",
+      topic: "copytrade", email: "jim@example.com", wallet: "",
+      message: "Hello, a question about fees.", website: "",
     });
     expect(captured[0].url).toBe("/api/public/contact");
     expect(captured[0].init.method).toBe("POST");
     expect(JSON.parse(captured[0].init.body as string)).toEqual({
-      name: "Jim", email: "jim@example.com", message: "Hello, a question about fees.", website: "",
+      topic: "copytrade", email: "jim@example.com", wallet: "",
+      message: "Hello, a question about fees.", website: "",
     });
-    expect(r).toEqual({ ok: true });
+    expect(r).toEqual({ ok: true, ticket: "FLT-AB12-CD34" });
   });
 });
 

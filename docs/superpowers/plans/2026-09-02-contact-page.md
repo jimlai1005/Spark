@@ -1029,6 +1029,325 @@ RUNBOOK.md:2163 §8 驗收 4 的「66 條」改「67 條」（2406 行是歷史�
 `grep -n "systemctl edit" deploy/RUNBOOK.md` 在 §5.8b 範圍內只出現在「不要」句；
 `grep -n "67 條" deploy/RUNBOOK.md` 命中 §8。
 
+---
+
+## Task 6：照 Claude Design 設計稿重做（2026-09-02 使用者退版）
+
+> 第一版照錯了參考圖（淺色「CONTACT US」三欄位表單）。真正的設計稿是**雙欄深色**版，且**沒有姓名欄**。
+> 寄信通道（SmtpMailer／限流／in-flight／告警／部署憑證）全部保留；改的是**欄位**與**頁面**。
+
+### 設計稿規格（截圖逐項對照，實作以此為準）
+
+**版面**：`main.page` 內雙欄 grid（左 1fr、右 1.4fr，gap 40px；<900px 折成單欄）。
+
+**左欄**：
+1. 眉標 `CONTACT`（`.eyebrow`，主色綠）。
+2. `h1` 聯絡我們（大、粗）。
+3. 說明段：「跟單問題、費用疑義、安全回報或合作提案都從這裡送出。我們會以你留下的 Email 回覆，通常在 1 個工作日內。」
+4. 卡片「送出前請確認」（小標，dim），三列：
+   - `01` 跟單或帳務問題請附上錢包地址，我們才能對到鏈上紀錄。
+   - `02` 回信主旨會帶工單編號 FLT-XXXX-XXXX，請以此辨識是否為我們的回覆。
+   - `!`（`--neg` 紅）Filet 團隊**永遠不會**向你索取私鑰、助記詞或要求轉帳。收到此類訊息一律視為詐騙。（「永遠不會」粗體）
+   - 編號用 mono 主色綠；`!` 用 mono 紅。
+5. 卡片下方一行、前面琥珀色圓點：「安全漏洞請選擇「安全回報」，將進入優先處理佇列。」
+
+**右欄**（一張 `.card`，padding 32px，欄位垂直 gap 24px）：
+1. **主題**（label）＋五顆單選 chip：跟單問題／費用與帳務／安全回報／合作提案／其他。選中＝主色綠邊框＋綠字＋淡綠底；未選＝一般邊框。預設選「跟單問題」。用 `<button type="button" role="radio" aria-checked>` 包在 `role="radiogroup"`。
+2. **Email** `*`（必填星號紅）；label 列右側 dim 小字「回覆會寄到這裡」；placeholder `you@example.com`。
+3. **錢包地址**；label 列右側 dim 小字「選填 · 已登入時自動帶入」。
+   - 已登入（`useMe().data?.address` 有值）且使用者未手動改過：input **readOnly**、mono、顯示 `shortAddr(address)`，右側綠色小字徽章「已連結錢包」；旁邊一個小文字按鈕「改填其他地址」按下後變成空白可編輯 input（badge 消失）。送出時送**完整**地址。
+   - 未登入：空白可編輯 input，mono，placeholder `0x…`。
+4. **訊息** `*`；label 列右側 mono dim 計數 `N / 2000` 即時更新；textarea rows=7，placeholder：「請描述發生什麼事、大約時間（UTC）、以及你預期的結果。若是跟單問題，附上策略名稱或跟隨的地址會更快。」
+5. 底列：左側 dim 兩行同意文字「送出即表示你同意我們使用此 Email 回覆你的問題，不會用於其他用途。」；右側主色按鈕「送出訊息」（送出中「送出中…」＋ disabled）。
+6. 錯誤：在底列上方紅字 `role=alert`（後端 detail 原樣；network → errNetwork；502/503 → detail ＋「或直接來信 goldwisetw@gmail.com」）。
+7. **成功態**（取代右卡內容）：標題「已送出」、mono 大字工單編號 `FLT-XXXX-XXXX`、說明「我們會回覆到 {email}，回信主旨會帶上這個編號。」、按鈕「再送一則」。
+
+**沒有的東西**：姓名欄、頁面上的 mailto 保底句（只在錯誤訊息裡出現）。
+
+### 主線程裁決（Task 6）
+
+| 項目 | 裁決 |
+|---|---|
+| 主題 enum | 後端 `topic` ∈ `copytrade / billing / security / partnership / other`；後端保存中文標籤對照表 `CONTACT_TOPIC_LABELS`（信件主旨用）。 |
+| 工單編號 | 後端產生 `FLT-XXXX-XXXX`，字元集 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`（去 0/O/1/I），`secrets.choice`。回應 `{"ok": true, "ticket": "FLT-…"}`。 |
+| 信件主旨 | `[FLT-XXXX-XXXX] Filet 聯絡表單：<主題中文>`；security 主題前面再加 `【安全回報】`。站主回信時 Gmail 會保留主旨 → 用戶看到編號。 |
+| 安全回報優先 | topic=security 成功寄出後**另外**呼叫 `notifier.critical("contact_security_report", f"/contact 安全回報 {ticket}", dedup_key=ticket)`——這就是「優先處理佇列」的實作（TG 是站主唯一即時通道）。告警失敗只 log。 |
+| 錢包地址 | 選填；非空時必須符合 `^0x[0-9a-fA-F]{40}$`（strip 後），否則 422「錢包地址格式不正確」。信件 body 印原值；空則印「（未提供）」。 |
+| 欄位驗證 | email 與 message 規則不變（ASCII email、10–2000 字、分隔字元擋掉）。`name` 欄位**移除**（`ContactInput` 改為 `topic / email / wallet / message`）。 |
+| honeypot／限流／in-flight／不重試／失敗告警 | 全部不變。 |
+| 前端 API | `postContact({topic, email, wallet, message, website})` → `{ok, ticket}`。 |
+
+### Task 6A `@inline`：後端欄位改版
+
+**Files:** `src/spark/publicapi/contact.py`、`src/spark/publicapi/app.py`（`ContactBody`＋路由）、`tests/test_contact_module.py`、`tests/test_api_contact.py`
+
+`contact.py` 新增／修改：
+
+```python
+import secrets
+
+CONTACT_TOPICS = ("copytrade", "billing", "security", "partnership", "other")
+CONTACT_TOPIC_LABELS = {
+    "copytrade": "跟單問題", "billing": "費用與帳務", "security": "安全回報",
+    "partnership": "合作提案", "other": "其他",
+}
+WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_TICKET_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def new_ticket_id() -> str:
+    part = lambda: "".join(secrets.choice(_TICKET_ALPHABET) for _ in range(4))  # noqa: E731
+    return f"FLT-{part()}-{part()}"
+
+
+@dataclass(frozen=True)
+class ContactInput:
+    topic: str
+    email: str
+    wallet: str          # "" ＝ 未提供
+    message: str
+
+
+def validate_contact(*, topic: str, email: str, wallet: str, message: str) -> ContactInput:
+    topic = (topic or "").strip()
+    email = (email or "").strip()
+    wallet = (wallet or "").strip()
+    message = (message or "").strip()
+    if topic not in CONTACT_TOPICS:
+        raise ContactValidationError("請選擇主題")
+    if (not email or len(email) > EMAIL_MAX or _has_linebreak(email)
+            or not _EMAIL_RE.match(email)):
+        raise ContactValidationError("Email 格式不正確")
+    if wallet and not WALLET_RE.match(wallet):
+        raise ContactValidationError("錢包地址格式不正確")
+    if len(message) < MESSAGE_MIN or len(message) > MESSAGE_MAX:
+        raise ContactValidationError("訊息長度需介於 10 到 2000 字")
+    return ContactInput(topic=topic, email=email, wallet=wallet, message=message)
+
+
+def build_contact_email(ci: ContactInput, *, ticket: str, sender: str, to: str,
+                        client_ip: str, now_iso: str) -> EmailMessage:
+    label = CONTACT_TOPIC_LABELS[ci.topic]
+    prefix = "【安全回報】" if ci.topic == "security" else ""
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = to
+    msg["Reply-To"] = ci.email
+    msg["Subject"] = f"[{ticket}] {prefix}Filet 聯絡表單：{label}"
+    msg.set_content(
+        f"工單：{ticket}\n主題：{label}\nEmail：{ci.email}\n"
+        f"錢包地址：{ci.wallet or '（未提供）'}\n來源 IP：{client_ip}\n時間：{now_iso}\n\n"
+        f"訊息：\n{ci.message}\n"
+    )
+    return msg
+```
+
+`NAME_MAX` 與 name 相關程式碼刪除。`app.py`：`ContactBody` 改為 `topic: str; email: str; wallet: str = ""; message: str; website: str = ""`；路由呼叫 `validate_contact(topic=..., email=..., wallet=..., message=...)`；寄信前 `ticket = new_ticket_id()`，`build_contact_email(ci, ticket=ticket, ...)`；成功後若 `ci.topic == "security"` 走裁決表的 `notifier.critical`（try/except 只 log）；回傳 `{"ok": True, "ticket": ticket}`；成功 log 加上 ticket（不含 email）。
+
+測試改寫要點（`tests/test_contact_module.py`）：
+- 驗證通過案例改用 `topic="copytrade"`, `wallet=""`；wallet 合法 `"0x" + "ab"*20` 通過、`"0x123"` 拒絕、`"0x"+"zz"*20` 拒絕；topic 不在清單拒絕；email／message 既有拒絕案例保留（去掉 name 相關）。
+- `test_build_email_headers_and_body`：Subject == `"[FLT-AAAA-BBBB] Filet 聯絡表單：跟單問題"`（ticket 由參數傳入）；security 主題 Subject 含 `【安全回報】`；body 含工單、錢包（空 → 「（未提供）」）。
+- `new_ticket_id()`：符合 `^FLT-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$`，連取 50 次無重複。
+
+`tests/test_api_contact.py`：`GOOD = {"topic": "copytrade", "email": "jim@example.com", "message": "..."}`；happy path 斷言 `r.json()["ok"] is True` 且 `ticket` 符合正則、`mailer.sent[0]["Subject"].startswith(f"[{ticket}]")`；422 案例改為壞 topic／壞 wallet／缺 email；新增 `test_security_topic_alerts_notifier`（RecordingNotifier 收到 1 則、dedup_key == ticket）與 `test_non_security_topic_no_alert`；其餘（honeypot、限流、in-flight、502、503、失敗告警冷卻）改 payload 後保留。
+
+驗收：`uv run pytest tests/test_contact_module.py tests/test_api_contact.py -q` 全綠；`uv run pytest -q` 全綠；`uv run ruff check src tests`；`grep -n "name" src/spark/publicapi/contact.py` 只剩與欄位無關的命中（例如 `__name__`）。
+
+### Task 6B `@inline`：前端照設計稿重做
+
+**Files:** `web/src/app/contact/page.tsx`（重寫）、`web/src/app/contact/page.test.tsx`（重寫）、`web/src/lib/copy.ts`（`contact` 區整段換掉，zh 1632 / en 3125 附近）、`web/src/lib/api.ts`（`ContactBody`／`postContact` 回傳型別）、`web/src/lib/api.test.ts`（契約測試同步）、`web/src/styles/globals.css`（`.contact-*` 整段換掉）
+
+既有可沿用：`useMe()`（`web/src/lib/hooks.ts:17`，react-query 結果，`me.data?.address`）、`shortAddr`（`web/src/lib/format.ts:2`）、`.eyebrow`（globals.css:342）、`.card`、`.addr-input`／`.addr-field`／`.addr-field-label`／`.addr-input-error`、`.btn.btn-primary`／`.btn-secondary`、`.mono`、`.neg`、`.hint`、`--primary`／`--primary-rgb`／`--neg`／`--text-dim`／`--border` tokens；雙欄範例 `.strategy-detail-grid`（globals.css:1233）。
+
+**copy.ts `contact` 區（zh；en 鏡射、無 CJK）：**
+
+```ts
+  contact: {
+    eyebrow: "CONTACT",
+    heading: "聯絡我們",
+    sub: "跟單問題、費用疑義、安全回報或合作提案都從這裡送出。我們會以你留下的 Email 回覆，通常在 1 個工作日內。",
+    checklistTitle: "送出前請確認",
+    check1: "跟單或帳務問題請附上錢包地址，我們才能對到鏈上紀錄。",
+    check2: "回信主旨會帶工單編號 FLT-XXXX-XXXX，請以此辨識是否為我們的回覆。",
+    checkWarnPrefix: "Filet 團隊",
+    checkWarnStrong: "永遠不會",
+    checkWarnSuffix: "向你索取私鑰、助記詞或要求轉帳。收到此類訊息一律視為詐騙。",
+    securityNote: "安全漏洞請選擇「安全回報」，將進入優先處理佇列。",
+    topicLabel: "主題",
+    topics: { copytrade: "跟單問題", billing: "費用與帳務", security: "安全回報", partnership: "合作提案", other: "其他" },
+    emailLabel: "Email",
+    emailHint: "回覆會寄到這裡",
+    emailPlaceholder: "you@example.com",
+    walletLabel: "錢包地址",
+    walletHint: "選填 · 已登入時自動帶入",
+    walletPlaceholder: "0x…",
+    walletConnected: "已連結錢包",
+    walletUseOther: "改填其他地址",
+    messageLabel: "訊息",
+    messagePlaceholder: "請描述發生什麼事、大約時間（UTC）、以及你預期的結果。若是跟單問題，附上策略名稱或跟隨的地址會更快。",
+    consent: "送出即表示你同意我們使用此 Email 回覆你的問題，不會用於其他用途。",
+    send: "送出訊息",
+    sending: "送出中…",
+    successTitle: "已送出",
+    successBody: "我們會回覆到 {email}，回信主旨會帶上這個編號。",
+    sendAnother: "再送一則",
+    fallbackEmail: "goldwisetw@gmail.com",
+    fallbackPrefix: "或直接來信 ",
+    errEmailInvalid: "請填寫正確的 Email",
+    errWalletInvalid: "錢包地址格式不正確（0x 開頭 + 40 位十六進位）",
+    errMessageLength: "訊息長度需介於 10 到 2000 字",
+    errNetwork: "無法連線到伺服器，請稍後再試。",
+    errGeneric: "送出失敗，請稍後再試。",
+  },
+```
+
+（`{email}` 用 `.replace("{email}", email)` 代入；`topics` 是巢狀物件，copy.test 的深層對稱檢查會涵蓋。）
+
+**api.ts：**
+
+```ts
+export type ContactTopic = "copytrade" | "billing" | "security" | "partnership" | "other";
+export interface ContactBody { topic: ContactTopic; email: string; wallet: string; message: string; website?: string }
+export interface ContactResp { ok: boolean; ticket: string }
+export function postContact(body: ContactBody): Promise<ContactResp> {
+  return post("/api/public/contact", body);
+}
+```
+
+**page.tsx 結構：**
+
+```tsx
+<main className="page contact-page">
+  <div className="contact-grid">
+    <section className="contact-intro">
+      <p className="eyebrow">{c.eyebrow}</p>
+      <h1 className="contact-title">{c.heading}</h1>
+      <p className="contact-sub">{c.sub}</p>
+      <div className="card contact-checklist">
+        <p className="contact-checklist-title">{c.checklistTitle}</p>
+        <ol className="contact-checklist-list">
+          <li><span className="contact-check-num mono">01</span><span>{c.check1}</span></li>
+          <li><span className="contact-check-num mono">02</span><span>{c.check2}</span></li>
+          <li><span className="contact-check-num mono neg">!</span>
+              <span>{c.checkWarnPrefix}<strong>{c.checkWarnStrong}</strong>{c.checkWarnSuffix}</span></li>
+        </ol>
+      </div>
+      <p className="contact-security-note"><span className="contact-dot" aria-hidden />{c.securityNote}</p>
+    </section>
+
+    <section className="card contact-card">
+      {phase === "sent" ? <成功態/> : (
+        <form onSubmit={onSubmit} noValidate className="contact-form">
+          <div className="contact-field">
+            <div className="contact-label-row"><span className="contact-label">{c.topicLabel}</span></div>
+            <div className="contact-chips" role="radiogroup" aria-label={c.topicLabel}>
+              {TOPICS.map(t => <button key={t} type="button" role="radio" aria-checked={topic===t}
+                 className={"contact-chip" + (topic===t ? " is-active" : "")} onClick={() => setTopic(t)}>{c.topics[t]}</button>)}
+            </div>
+          </div>
+          <div className="contact-field">
+            <div className="contact-label-row">
+              <label className="contact-label" htmlFor="contact-email">{c.emailLabel} <span className="neg">*</span></label>
+              <span className="contact-hint">{c.emailHint}</span>
+            </div>
+            <input id="contact-email" className="addr-input" type="email" ... />
+          </div>
+          <div className="contact-field">
+            <div className="contact-label-row">
+              <label className="contact-label" htmlFor="contact-wallet">{c.walletLabel}</label>
+              <span className="contact-hint">{c.walletHint}</span>
+            </div>
+            <div className="contact-wallet-wrap">
+              <input id="contact-wallet" className="addr-input mono" readOnly={autofilled}
+                     value={autofilled ? shortAddr(meAddress) : wallet} ... />
+              {autofilled && <span className="contact-wallet-badge">{c.walletConnected}</span>}
+            </div>
+            {autofilled && <button type="button" className="contact-link-btn" onClick={useOther}>{c.walletUseOther}</button>}
+          </div>
+          <div className="contact-field">
+            <div className="contact-label-row">
+              <label className="contact-label" htmlFor="contact-message">{c.messageLabel} <span className="neg">*</span></label>
+              <span className="contact-hint mono">{message.length} / 2000</span>
+            </div>
+            <textarea id="contact-message" className="addr-input contact-textarea" rows={7} maxLength={2000} ... />
+          </div>
+          <input className="visually-hidden" tabIndex={-1} autoComplete="off" aria-hidden="true" name="website" ... />
+          {error && <p className="addr-input-error" role="alert">{error}</p>}
+          <div className="contact-footer-row">
+            <p className="contact-consent">{c.consent}</p>
+            <button type="submit" className="btn btn-primary" disabled={phase==="sending"}>{phase==="sending" ? c.sending : c.send}</button>
+          </div>
+        </form>
+      )}
+    </section>
+  </div>
+</main>
+```
+
+狀態：`topic`（預設 `"copytrade"`）、`email`、`wallet`（使用者手填）、`walletOverride: boolean`（按了「改填其他地址」）、`message`、`website`、`phase`、`error`、`ticket`。
+`meAddress = useMe().data?.address ?? ""`；`autofilled = !!meAddress && !walletOverride`；送出的 wallet ＝ `autofilled ? meAddress : wallet.trim()`。
+客端驗證：email 正則；wallet 非空時 `/^0x[0-9a-fA-F]{40}$/`；message 10–2000。
+錯誤映射：`ApiError.kind === "network"` → errNetwork；`kind === "upstream"`（502/503）→ `(detail ?? errGeneric) + fallbackPrefix + fallbackEmail`（mailto 連結）；其他 → `detail ?? errGeneric`。
+
+**globals.css `.contact-*`（換掉第一版那段）：**
+
+```css
+/* ---------- /contact（雙欄，照 Claude Design 設計稿）---------- */
+.contact-grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 40px; align-items: start; }
+@media (max-width: 900px) { .contact-grid { grid-template-columns: 1fr; } }
+.contact-title { font-size: 40px; font-weight: 800; margin: 8px 0 12px; letter-spacing: -.01em; }
+.contact-sub { color: var(--text-dim); font-size: 16px; line-height: 1.8; margin: 0 0 28px; }
+.contact-checklist { padding: 22px 24px; }
+.contact-checklist-title { color: var(--text-dim); font-size: 12px; letter-spacing: .08em; margin: 0 0 14px; }
+.contact-checklist-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.contact-checklist-list li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; line-height: 1.7; }
+.contact-check-num { color: var(--primary); font-size: 14px; }
+.contact-check-num.neg { color: var(--neg); }
+.contact-security-note { display: flex; align-items: center; gap: 10px; color: var(--text-dim); margin: 22px 0 0; font-size: 14px; }
+.contact-dot { width: 8px; height: 8px; border-radius: 50%; background: #e0b35a; flex: 0 0 auto; }
+.contact-card { padding: 32px; }
+.contact-form { display: grid; gap: 24px; }
+.contact-field { display: grid; gap: 10px; }
+.contact-label-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.contact-label { font-size: 15px; font-weight: 500; }
+.contact-hint { color: var(--text-dim); font-size: 13px; }
+.contact-chips { display: flex; flex-wrap: wrap; gap: 10px; }
+.contact-chip { padding: 10px 16px; border-radius: 12px; border: 1px solid var(--border); background: transparent;
+  color: var(--text); font-size: 15px; cursor: pointer; }
+.contact-chip:hover { border-color: rgba(var(--text-rgb), .3); }
+.contact-chip.is-active { border-color: var(--primary); color: var(--primary); background: rgba(var(--primary-rgb), .08); }
+.contact-wallet-wrap { position: relative; }
+.contact-wallet-wrap .addr-input { padding-right: 120px; }
+.contact-wallet-badge { position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+  color: var(--primary); font-size: 13px; }
+.contact-link-btn { background: none; border: 0; padding: 0; color: var(--text-dim); font-size: 12px;
+  cursor: pointer; text-decoration: underline; justify-self: start; }
+.contact-textarea { resize: vertical; min-height: 180px; font-family: inherit; line-height: 1.7; }
+textarea.addr-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.contact-footer-row { display: flex; justify-content: space-between; align-items: center; gap: 24px; }
+.contact-consent { color: var(--text-dim); font-size: 13px; line-height: 1.7; margin: 0; max-width: 60%; }
+.contact-success { display: grid; gap: 12px; }
+.contact-ticket { font-size: 28px; letter-spacing: .04em; color: var(--primary); }
+@media (max-width: 600px) { .contact-footer-row { flex-direction: column; align-items: stretch; } .contact-consent { max-width: none; } }
+```
+
+（`--text-rgb`／`--primary-rgb` 若 tokens.css 沒有就改用既有等價變數。）
+
+**page.test.tsx 必測**（mock `@/lib/api` 的 `postContact`，並 mock `@/lib/hooks` 的 `useMe`）：
+1. 渲染：眉標、h1、五顆 chip（`role=radio`，預設「跟單問題」`aria-checked=true`）、Email／錢包／訊息欄位、送出訊息鈕、三列確認清單、安全提示。
+2. 未登入：錢包欄可編輯、無「已連結錢包」徽章。
+3. 已登入（`useMe` 回 `{data:{address:"0x"+"ab"*20}}`）：錢包欄 readOnly、值為 `shortAddr`、徽章顯示；送出時 `postContact` 收到**完整**地址；按「改填其他地址」後欄位可編輯且徽章消失。
+4. 客端驗證：壞 email／壞錢包／短訊息各自顯示對應錯誤且不打 API。
+5. 字數計數：輸入 12 字後顯示 `12 / 2000`。
+6. 成功：`postContact` 回 `{ok:true, ticket:"FLT-AB12-CD34"}` → 顯示「已送出」與工單編號、表單消失；「再送一則」回到表單且主題重置。
+7. 錯誤：`ApiError("client", "...", 429, "...")` detail 原樣顯示；`ApiError("upstream", "...", 503, "...")` 顯示 detail 並含 mailto 連結；network 顯示 errNetwork。
+
+驗收：`cd web && npm test` 全綠；`npx tsc --noEmit` 對本次檔案零錯；`npm run lint` 乾淨；`grep -c "nameLabel" web/src/lib/copy.ts` 為 0。
+
+### Task 6C：部署（主線程）
+
+同 §3.2／§4.2／§9.2：rsync → uv sync → chown → build → restart api＋dashboard → DEPLOYED_VERSION → 真實送出一封（topic=other）驗證回傳 ticket 且信件主旨帶 ticket。
+
 ## 執行順序與狀態
 
 - Task 1 → Task 2（後端，同一 builder 連做）與 Task 3（前端）互不相依，可平行派工；Task 4 最後。
@@ -1042,6 +1361,10 @@ RUNBOOK.md:2163 §8 驗收 4 的「66 條」改「67 條」（2406 行是歷史�
 | 3 | 完成（builder；主線程另改 `legal.ts` 四處舊 URL → `https://trade.filet.app/contact`） |
 | 4 | 完成（builder；主線程修 RUNBOOK 驗收 curl 主機名） |
 | 5 | 完成（opus 審查 1C/4W 全修；主線程親驗 32 passed、全量 2773 passed、探針三種輸入皆 422） |
+| 6A/6B | 完成（使用者退版後照設計稿重做；opus 審查 PASS 0C/3W，W1 載入競態、W2 honeypot 缺 ticket、W3 裸 U+2028 皆已修；主線程親驗後端 40 passed、全量 2781、前端 674、本機截圖三態對照設計稿） |
+| 6C | 見 RUNBOOK 附錄 B 部署記錄 |
+
+未採納（Task 6 審查建議）：chip 方向鍵 roving tabindex（Tab＋Enter 可操作）；字數計數 UTF-16 vs code point 差異（只影響 emoji 的下限判定，上限方向安全）；security 告警佔 in-flight 名額（與既有失敗告警同形狀）。
 
 未採納的審查建議：`legal.ts` 改相對路徑（法務頁只把 `http` 開頭段落渲染成連結，改相對路徑要動三個頁面渲染器，超出範圍）。
 待使用者：Google 應用程式密碼申請＋落地 `/etc/filet/contact.env`（RUNBOOK §5.8b）；未落地前端點回 503、頁面顯示 mailto 保底。

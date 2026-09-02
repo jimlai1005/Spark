@@ -42,7 +42,7 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
 from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
-                                     build_contact_email, validate_contact)
+                                     build_contact_email, new_ticket_id, validate_contact)
 from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
@@ -2084,8 +2084,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     "updated_at": int(now_fn())}
 
     class ContactBody(BaseModel):
-        name: str
+        topic: str
         email: str
+        wallet: str = ""      # 選填；已登入時前端自動帶入
         message: str
         website: str = ""    # honeypot：真人看不到、機器人會填
 
@@ -2093,12 +2094,15 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     def public_contact_endpoint(body: ContactBody, request: Request):
         """/contact 表單：驗證 → honeypot → in-flight 上限 → IP 限流 → 寄信。無需登入。
         寄信非冪等：失敗只 log + 502，不重試（工程原則 2）。寄信例外另外告警站主
-        （1 小時冷卻，見 _contact_alert_last）。"""
+        （1 小時冷卻，見 _contact_alert_last）。topic=security 額外走優先處理佇列告警。"""
         if body.website.strip():
             logger.info("/api/public/contact honeypot 命中，靜默接受")
-            return {"ok": True}
+            # 也回一個 ticket：回應形狀與正常路徑一致（前端成功卡不會出現空白工單），
+            # 機器人也分不出自己被丟棄（reviewer W2）。
+            return {"ok": True, "ticket": new_ticket_id()}
         try:
-            ci = validate_contact(name=body.name, email=body.email, message=body.message)
+            ci = validate_contact(topic=body.topic, email=body.email,
+                                  wallet=body.wallet, message=body.message)
         except ContactValidationError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         if mailer is None or not cfg.contact_enabled:
@@ -2115,8 +2119,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         try:
             _enforce_contact_ratelimit(client_ip)
             now_iso = datetime.fromtimestamp(now_fn(), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            msg = build_contact_email(ci, sender=cfg.contact_smtp_user, to=cfg.contact_to,
-                                      client_ip=client_ip, now_iso=now_iso)
+            ticket = new_ticket_id()
+            msg = build_contact_email(ci, ticket=ticket, sender=cfg.contact_smtp_user,
+                                      to=cfg.contact_to, client_ip=client_ip, now_iso=now_iso)
             try:
                 mailer.send(msg)
             except Exception as e:  # noqa: BLE001 — 失敗必須外顯（原則 3），但不得洩露信件內容
@@ -2133,9 +2138,18 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                         logger.error("/contact 失敗告警送出失敗: %r", ne)
                 raise HTTPException(status_code=502,
                                     detail="寄送失敗，請稍後再試或直接來信") from e
-            logger.info("/api/public/contact 已寄出（reply-to 網域 %s）",
-                        ci.email.rsplit("@", 1)[-1])
-            return {"ok": True}
+            if ci.topic == "security":
+                # 優先處理佇列的實作：TG 是站主唯一即時通道；dedup_key 用 ticket，
+                # 每張工單最多告警一次（不受寄信失敗冷卻影響）。告警失敗只 log。
+                try:
+                    notifier.critical(
+                        "contact_security_report",
+                        f"/contact 安全回報 {ticket}",
+                        dedup_key=ticket)
+                except Exception as ne:  # noqa: BLE001 — 告警失敗不得蓋掉成功回應
+                    logger.error("/contact 安全回報告警送出失敗: %r", ne)
+            logger.info("/api/public/contact 已寄出（工單 %s）", ticket)
+            return {"ok": True, "ticket": ticket}
         finally:
             _contact_inflight.release()
 

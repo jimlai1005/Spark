@@ -1,5 +1,9 @@
 """tests/test_api_contact.py — POST /api/public/contact：無需登入；驗證→honeypot→IP 限流
-→寄信；寄信失敗 502、未設定 503。全離線（FakeMailer；loopback 放行供 TestClient）。"""
+→寄信；寄信失敗 502、未設定 503。全離線（FakeMailer；loopback 放行供 TestClient）。
+
+Task 6（2026-09-02，設計稿改版）：payload 改為 topic/email/wallet/message（移除 name）；
+成功回應多帶 ticket；topic=security 額外告警。"""
+import re
 import socket
 import threading
 import time
@@ -15,6 +19,7 @@ from spark.publicapi.app import (
 from tests.publicapi_helpers import make_app, make_cfg
 
 _REAL_SOCKET = socket.socket
+_TICKET_RE = re.compile(r"^FLT-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +46,8 @@ class FakeMailer:
         self.sent.append(msg)
 
 
-GOOD = {"name": "Jim", "email": "jim@example.com", "message": "Hello, I have a question about fees."}
+GOOD = {"topic": "copytrade", "email": "jim@example.com",
+        "message": "Hello, I have a question about fees."}
 
 
 def _make(tmp_path, *, configured=True, fail=False):
@@ -57,26 +63,40 @@ def _make(tmp_path, *, configured=True, fail=False):
 def test_happy_path_sends_mail(tmp_path):
     client, _, mailer = _make(tmp_path)
     r = client.post("/api/public/contact", json=GOOD)
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert _TICKET_RE.match(body["ticket"])
     assert len(mailer.sent) == 1
     m = mailer.sent[0]
     assert m["To"] == "owner@gmail.com" and m["From"] == "site@gmail.com"
     assert m["Reply-To"] == "jim@example.com"
-    assert m["Subject"] == "[Filet 聯絡表單] Jim"
+    assert m["Subject"] == f"[{body['ticket']}] Filet 聯絡表單：跟單問題"
     assert "question about fees" in m.get_content()
+
+
+def test_wallet_included_when_provided(tmp_path):
+    client, _, mailer = _make(tmp_path)
+    wallet = "0x" + "ab" * 20
+    r = client.post("/api/public/contact", json={**GOOD, "wallet": wallet})
+    assert r.status_code == 200
+    assert wallet in mailer.sent[0].get_content()
 
 
 def test_honeypot_silently_accepts_without_sending(tmp_path):
     client, _, mailer = _make(tmp_path)
     r = client.post("/api/public/contact", json={**GOOD, "website": "http://spam"})
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert r.json()["ticket"].startswith("FLT-")   # 回應形狀與正常路徑一致
     assert mailer.sent == []
 
 
 @pytest.mark.parametrize("bad", [
-    {**GOOD, "name": ""}, {**GOOD, "email": "nope"}, {**GOOD, "message": "short"},
-    {**GOOD, "name": "a\r\nBcc: x@y.z"},
-    {**GOOD, "name": "a Bcc: x@y.z"},
+    {**GOOD, "topic": "nope"},
+    {**GOOD, "email": "nope"},
+    {**GOOD, "message": "short"},
+    {**GOOD, "wallet": "0x123"},
+    {**GOOD, "email": "a@b.co\nBcc: x@y.z"},
 ])
 def test_validation_422_does_not_echo_input(tmp_path, bad):
     client, _, mailer = _make(tmp_path)
@@ -89,7 +109,7 @@ def test_validation_422_does_not_echo_input(tmp_path, bad):
 
 def test_missing_fields_422(tmp_path):
     client, _, mailer = _make(tmp_path)
-    assert client.post("/api/public/contact", json={"name": "Jim"}).status_code == 422
+    assert client.post("/api/public/contact", json={"topic": "copytrade"}).status_code == 422
     assert mailer.sent == []
 
 
@@ -184,3 +204,31 @@ def test_mailer_failure_alerts_notifier_with_cooldown(tmp_path):
     assert client.post("/api/public/contact", json=GOOD).status_code == 502
     critical = [r for r in notifier.records if r[0] == "critical"]
     assert len(critical) == 2
+
+
+def test_security_topic_alerts_notifier(tmp_path):
+    cfg = make_cfg(tmp_path, contact_smtp_user="site@gmail.com", contact_smtp_pass="pw")
+    mailer = FakeMailer()
+    notifier = RecordingNotifier()
+    app, *_ = make_app(tmp_path, cfg=cfg, mailer=mailer, notifier=notifier)
+    client = TestClient(app, base_url="https://testserver")
+
+    r = client.post("/api/public/contact", json={**GOOD, "topic": "security"})
+    assert r.status_code == 200
+    ticket = r.json()["ticket"]
+    critical = [rec for rec in notifier.records if rec[0] == "critical"]
+    assert len(critical) == 1
+    assert critical[0][1] == "contact_security_report"
+    assert critical[0][3] == ticket
+
+
+def test_non_security_topic_no_alert(tmp_path):
+    cfg = make_cfg(tmp_path, contact_smtp_user="site@gmail.com", contact_smtp_pass="pw")
+    mailer = FakeMailer()
+    notifier = RecordingNotifier()
+    app, *_ = make_app(tmp_path, cfg=cfg, mailer=mailer, notifier=notifier)
+    client = TestClient(app, base_url="https://testserver")
+
+    r = client.post("/api/public/contact", json=GOOD)
+    assert r.status_code == 200
+    assert notifier.records == []

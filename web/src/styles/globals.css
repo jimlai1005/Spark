@@ -1016,14 +1016,43 @@ main.page {
   margin: 10px 0 0; font-size: 13px; color: var(--neg); line-height: 1.6;
 }
 
-/* ---------- /contact ---------- */
-.contact-page { max-width: 760px; }
-.contact-head { margin-bottom: 20px; }
-.contact-card { padding: 24px; display: grid; gap: 16px; }
-.contact-textarea { resize: vertical; min-height: 160px; font-family: inherit; }
+/* ---------- /contact（雙欄，照 Claude Design 設計稿）---------- */
+.contact-grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 40px; align-items: start; }
+@media (max-width: 900px) { .contact-grid { grid-template-columns: 1fr; } }
+.contact-title { font-size: 40px; font-weight: 800; margin: 8px 0 12px; letter-spacing: -.01em; }
+.contact-sub { color: var(--text-dim); font-size: 16px; line-height: 1.8; margin: 0 0 28px; }
+.contact-checklist { padding: 22px 24px; }
+.contact-checklist-title { color: var(--text-dim); font-size: 12px; letter-spacing: .08em; margin: 0 0 14px; }
+.contact-checklist-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.contact-checklist-list li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; line-height: 1.7; }
+.contact-check-num { color: var(--primary); font-size: 14px; }
+.contact-check-num.neg { color: var(--neg); }
+.contact-security-note { display: flex; align-items: center; gap: 10px; color: var(--text-dim); margin: 22px 0 0; font-size: 14px; }
+.contact-dot { width: 8px; height: 8px; border-radius: 50%; background: #e0b35a; flex: 0 0 auto; }
+.contact-card { padding: 32px; }
+.contact-form { display: grid; gap: 24px; }
+.contact-field { display: grid; gap: 10px; }
+.contact-label-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.contact-label { font-size: 15px; font-weight: 500; }
+.contact-hint { color: var(--text-dim); font-size: 13px; }
+.contact-chips { display: flex; flex-wrap: wrap; gap: 10px; }
+.contact-chip { padding: 10px 16px; border-radius: 12px; border: 1px solid var(--border); background: transparent;
+  color: var(--text); font-size: 15px; cursor: pointer; }
+.contact-chip:hover { border-color: rgba(var(--text-rgb), .3); }
+.contact-chip.is-active { border-color: var(--primary); color: var(--primary); background: rgba(var(--primary-rgb), .08); }
+.contact-wallet-wrap { position: relative; }
+.contact-wallet-wrap .addr-input { padding-right: 120px; }
+.contact-wallet-badge { position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+  color: var(--primary); font-size: 13px; }
+.contact-link-btn { background: none; border: 0; padding: 0; color: var(--text-dim); font-size: 12px;
+  cursor: pointer; text-decoration: underline; justify-self: start; }
+.contact-textarea { resize: vertical; min-height: 180px; font-family: inherit; line-height: 1.7; }
 textarea.addr-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-.contact-actions { display: flex; justify-content: flex-end; }
-.contact-success h2 { margin: 0 0 8px; }
+.contact-footer-row { display: flex; justify-content: space-between; align-items: center; gap: 24px; }
+.contact-consent { color: var(--text-dim); font-size: 13px; line-height: 1.7; margin: 0; max-width: 60%; }
+.contact-success { display: grid; gap: 12px; }
+.contact-ticket { font-size: 28px; letter-spacing: .04em; color: var(--primary); }
+@media (max-width: 600px) { .contact-footer-row { flex-direction: column; align-items: stretch; } .contact-consent { max-width: none; } }
 .leader-custom-preview {
   border-top: 1px solid var(--border);
   margin-top: 16px; padding-top: 14px;
