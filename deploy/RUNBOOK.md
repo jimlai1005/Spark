@@ -1989,6 +1989,11 @@ docs/superpowers/plans/2026-09-02-contact-page.md Task 4。
    端點回 503，見下方驗收 5）。**不要**用 `sudo systemctl edit filet-api` 的行內
    `Environment=` 放密碼——那條 drop-in 檔落地權限是 0644，`systemctl cat filet-api` 對
    所有登入本機的帳號可讀，等於把 Gmail 應用程式密碼公開給整台機器的使用者。
+   ⭐ 正式機實況（2026-09-02 13:50 UTC 落地）：`EnvironmentFile=` 那一行**不是**靠重裝 unit 主檔，
+   而是 drop-in `/etc/systemd/system/filet-api.service.d/contact-env.conf`（內容只有 `[Service]` ＋
+   `EnvironmentFile=-/etc/filet/contact.env`，不含任何密碼）——與 leaders-path／accrued-history／
+   explore-cache 三個既有 drop-in 同款，避免覆蓋主檔上手動加的 TG 兩行（§5.1a）。
+   查有效值：`systemctl show filet-api -p EnvironmentFiles`。
 
 ```bash
 # 內容格式（密碼為佔位，換成 Google 應用程式密碼；不要把真值寫進任何 repo 檔案或 commit）：
@@ -2432,3 +2437,11 @@ nginx                     1.18（Ubuntu 22.04 內建，非 1.25+——見 deploy
 程式未變更，未重啟）。驗證：`curl -I https://trade.filet.app/leaderboard` → 308 Location `/explore`；
 regression_check `--http` 43/43；`systemctl --failed` 空。裁決 A（真實入金不計入 Send）不改程式，
 理由見 `docs/superpowers/research/2026-09-02-golive-regression-report.md` §5.4。
+
+**2026-09-02 追加部署（commit `2344157`，13:53 UTC，`/contact` 聯絡頁）：** 流程照 §3.2 rsync 兩段
+→ `uv sync`（依賴無變動，uv.lock mtime 仍為 07-17）→ chown root → §4.2 `npm ci`＋
+`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app` build → restart `filet-api`、`filet-dashboard`
+（keysvc／follower 程式未變更，未重啟）。憑證：`/etc/filet/contact.env` 0640 root:filet-api ＋
+drop-in `contact-env.conf`（§5.8b）。驗證：`curl https://trade.filet.app/contact` 200；sitemap 含
+`/contact`；`POST /api/public/contact` 空 body 422、真實送出 `{"ok":true}`（測試信主旨
+「[Filet 聯絡表單] Filet 部署驗證」）；`systemctl --failed` 空。
