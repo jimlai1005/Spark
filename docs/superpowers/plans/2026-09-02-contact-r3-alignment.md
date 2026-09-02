@@ -1395,6 +1395,7 @@ W4 TG 呼叫佔 in-flight 名額 → 移到 `finally` 釋放之後；S1 殘留 J
 
 | Task | 狀態 |
 |---|---|
-| 7A-1 / 7A-2 / 7A-3 | 待使用者確認 plan |
-| 7B-1～7B-6 | 待使用者確認 plan |
-| 7C | 待 7A/7B |
+| 7A-1 / 7A-2 / 7A-3 | 完成（haiku impl-worker；主線程親驗 47 passed、全量 2788） |
+| 7B-1～7B-6 | 完成（haiku impl-worker；主線程親驗 675 passed；截圖四態對照設計稿，補 `grid-template-rows: auto 1fr`） |
+| 7D | 完成（opus 審查 1C/5W，C＋W1/W2/W4 已修；W3 隱私政策待使用者裁決） |
+| 7C | 完成（commit f5b254e 上正式機 15:48 UTC；真實送出 FLT-2609-0001，DB mailed=1；見 RUNBOOK 附錄 B） |

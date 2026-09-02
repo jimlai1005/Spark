@@ -2452,3 +2452,14 @@ drop-in `contact-env.conf`（§5.8b）。驗證：`curl https://trade.filet.app/
 security 主題另送 TG critical。流程同上一筆（rsync → uv sync → chown → build → restart api＋dashboard）。
 驗證：頁面 200 且含新版文案；舊欄位契約 `{"topic":"nope",…}` → 422「請選擇主題」；真實送出
 （topic=other＋錢包）→ `{"ok":true,"ticket":"FLT-UL6X-KAU7"}`；`systemctl --failed` 空。
+
+**2026-09-02 追加部署（commit `f5b254e`，15:48 UTC，`/contact` 對齊設計稿 R3-01～R3-08）：** 這次先用
+DesignSync 讀到設計稿本體（`docs/superpowers/research/2026-09-02-contact-design-r3*.{html,txt}`）、plan 經使用者
+確認後才派 haiku。內容：工單改 `FLT-YYMM-NNNN` 月份流水並落 sqlite 新表 `contact_tickets`（`/var/lib/filet-api/api.db`，
+`CREATE TABLE IF NOT EXISTS` 於 API 啟動自建，無需人工 migration）；每筆推 TG（📩 編號｜主題＋前 200 字，
+security 走 critical 🚨 URGENT）；限流改 IP 5/小時＋email 10/日；**DB＋TG 即送出成功**，Email 失敗只告警
+（`mailed=0`）；honeypot 命中仍寄但標 🤖 疑似機器人（`bot=1`）；設定頁底部「需要協助？」入口；全站移除信箱字串。
+流程同上（rsync → uv sync → chown → build → restart api＋dashboard）。驗證：`.tables` 含 `contact_tickets`；
+舊契約探針 422「請選擇主題」；真實送出 → `{"ok":true,"ticket":"FLT-2609-0001"}`，DB 列 `mailed=1, bot=0`，
+`client_ip` 為真實 IPv6（proxy header 生效）；journal 無「TG 通知未送達」警告；`systemctl --failed` 空。
+工單查詢：`sudo /opt/filet/spark/.venv/bin/python -c "import sqlite3;print(sqlite3.connect('/var/lib/filet-api/api.db').execute('select ticket,topic,email,mailed,bot,created_at from contact_tickets order by created_at desc limit 20').fetchall())"`。
