@@ -105,5 +105,5 @@ HL 契約 24、非託管 E2E 17（真 testnet 拋棄式錢包）、Playwright 20
 | I-31 | `/api/me/authorizations` explorer URL 硬編主網 | 依 network 切換（`EXPLORER_URLS`）；E2E S13 在 testnet 查到記錄 | `a0662f2` | ✅ |
 | — | `filet_regression_check.py` 漂移（sslip、舊九條路由、預期 testnet、無 --failed） | 重寫 66 條；`/leaderboard` client-side redirect 接受（裁決 B 待使用者） | `2a60c5b` | ✅ |
 | — | 測試基建 | testnet 水龍頭 `0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`（Keychain `spark/filet-testnet-faucet:main`，每輪 E2E 約耗 $3–5 手續費；`faucet-status` 查、低於 ~280 從 9760 補）；harness CLI `keysvc-serve`/`mint-wallet`/`sweep-wallet`；RUNBOOK §8 驗收 4 固定流程 | `bf340da` | ✅ |
-| 待裁決 A | 策略頁「真實入金」是否計入 Send 轉入（目前只算 `deposit`） | 若計入需同時倒扣轉出，否則 leader 自轉可灌大公開數字 | — | 🔶 |
-| 待裁決 B | `/leaderboard` 維持 client-side redirect 或改伺服器 30x | 該路由已無導覽入口；只影響不執行 JS 的爬蟲／舊書籤 | — | 🔶 |
+| 裁決 A | 策略頁「真實入金」是否計入 Send 轉入 | **使用者裁決：不調整**，維持只算橋接入金 `deposit`。理由：只加轉入不扣轉出＝leader 自轉可灌大公開數字；改淨額則語意整個變動、既有 leader 數字立刻改變。現況偏差方向只會低估本金（報酬率高估），不會被灌水。完整說明見報告 §5.4 | — | ✅（不改，已記錄） |
+| 裁決 B | `/leaderboard` 轉址形態 | **使用者裁決：改伺服器層永久轉址**。`next.config.ts` redirects() → 308 `/explore`；移除 client-side 轉發頁；首頁「全部策略 →」直連 `/explore`；Playwright 新增 308＋Location 斷言 | 見下方部署記錄 | ✅ |

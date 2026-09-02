@@ -112,11 +112,11 @@ describe("HomePage", () => {
     });
   });
 
-  it("「全部策略 →」連向 /leaderboard（round2：leaderboard 頁尚未建，僅先接連結）", async () => {
+  it("「全部策略 →」直連 /explore（2026-09-02 裁決 B：/leaderboard 改伺服器層 308，首頁不再多一跳）", async () => {
     stubFetch(() => jsonResponse({ strategies: [], updated_at: 1 }));
     render(<HomePage />);
     const link = await screen.findByRole("link", { name: COPY.home.strategies.viewAll });
-    expect(link).toHaveAttribute("href", "/leaderboard");
+    expect(link).toHaveAttribute("href", "/explore");
   });
 
   it("不寫死設計稿佔位數字（20.35 / 4.28M / 10.24 一律來自 API 狀態）", async () => {

@@ -107,9 +107,23 @@ builder accrued 增加（0.62 → 0.65）。
 2. ✅ **部署 F4＋F5（API＋前端）**：rsync＋`npm ci`＋build（origin `https://trade.filet.app`）→ restart
    `filet-api`、`filet-dashboard`；regression_check 66/66、API 零 Traceback、`/explore` 重啟後直接 25 rows。
 3. ✅ **commit＋push**：六個 commit（`db0bd7b`…`82bc8bb`）已在 `origin/main`；`DEPLOYED_VERSION=82bc8bb`。
-4. **裁決 A**：策略頁／trader 頁的「真實入金」要不要把 inbound `internalTransfer` 計入
-   （若計入需同時倒扣 outbound，否則可被灌水）；目前維持只算 `deposit`。
-5. **裁決 B**：`/leaderboard` 維持 client-side redirect（現狀）或改成伺服器層 30x。
+4. ✅ **裁決 A（使用者 2026-09-02）：不調整**，維持「真實入金」只算橋接入金 `deposit`。
+   問題與理由記錄如下，供日後重審：
+   - 問題：策略頁／交易員頁的「真實入金」是報酬率分母與起訖淨值的基礎，只加總 HL 官方橋接
+     入金（ledger 型別 `deposit`）。HL 錢包對錢包的「Send」是另一個型別 `internalTransfer`，
+     用 Send 把本金轉進來的 leader，這個數字會**低估**本金，報酬率看起來偏高。
+   - 為什麼不直接加進去：只加轉入、不扣轉出會開一個灌水口——leader 用自己另一個錢包把同一筆
+     1,000 USDC 來回 Send 十次，「真實入金」就顯示 10,000。要堵這個口就得改成淨額（轉入加、
+     轉出減），而現行函式對橋接提領本來就不扣，語意會整個從「毛額」變「淨額」，所有已上架
+     leader 的公開數字會立刻變動。這是產品定義的選擇，不是對錯。
+   - 現況的偏差方向：只會低估本金（報酬率高估），不會被灌水；`sum_ledger_deposits` 維持
+     T9 之前的實作（`src/spark/filet/strategies.py`），引擎的回撤校正**已**正確處理 Send
+     （兩者刻意脫鉤）。
+   - 若日後要改：三個選項——維持現狀；改淨額含 Send（需同時定義提領的處理並重新解釋既有
+     數字）；顯示時標註「僅計橋接入金」。
+5. ✅ **裁決 B（使用者 2026-09-02）：改伺服器層永久轉址**。`web/next.config.ts` `redirects()`
+   `/leaderboard → /explore`（permanent，Next 回 308）；移除 client-side 轉發頁與其測試；首頁
+   「全部策略 →」直連 `/explore`（不再多一跳）；Playwright 新增不跟隨轉址的 308＋Location 斷言。
 6. 水龍頭錢包 `0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`（Keychain `spark/filet-testnet-faucet:main`）約 268 USDC testnet（perp 266.8＋spot 1.9），留給日後回歸；每輪約耗 $3–5，低於 ~280 前從 9760 補 300。
 
 ## 6. 未覆蓋（誠實標註）

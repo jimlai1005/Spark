@@ -381,6 +381,10 @@ HL「Send」（錢包對錢包 USDC 轉帳，`usdSend`）在**雙方**的 ledger
   非託管產品矛盾（2026-07-19 findings F2 早已指出）；其有效情境（builder 歸屬、modify）併入 T2 A 組。
 - D3 leader 用拋棄式錢包＋tmp 白名單，而不是 prod 白名單裡的真 leader：可控、可反手、可平倉，
   且不會因為真 leader 靜止而測不到鏡像。
+- D5（使用者，2026-09-02）裁決 A：「真實入金」不計入 Send 轉入，維持只算 `deposit`；問題與理由
+  記在報告 §5.4（只加轉入會被灌水；改淨額則語意全變；現況只會低估本金）。
+- D6（使用者，2026-09-02）裁決 B：`/leaderboard` 改伺服器層永久轉址（`next.config.ts` redirects，
+  308）；移除 client-side 轉發頁；首頁「全部策略 →」直連 `/explore`。
 - D4 T2 不做「真的觸發回撤熔斷」：需要真實虧損到門檻，testnet 上不可控；kill switch 全鏈路
   有 2026-07-19 人工驗證＋離線測試，本輪只驗「簽章→env→引擎讀到參數」這段接線（S7/S8）。
   報告的未覆蓋清單要寫明。

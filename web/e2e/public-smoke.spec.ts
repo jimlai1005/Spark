@@ -246,6 +246,16 @@ for (const [route, target] of REDIRECT_ROUTES) {
   });
 }
 
+// ---------- 舊路由 server-side redirect（next.config.ts redirects()） ----------
+// 2026-09-02 裁決 B：/leaderboard 由 client-side router.replace 改為伺服器層永久轉址。
+// 這裡不跟隨轉址，直接斷言狀態碼與 Location——這才是「不執行 JS 的訪客」看到的東西。
+
+test("/leaderboard — 伺服器層永久轉址到 /explore（不執行 JS 也成立）", async ({ request }) => {
+  const res = await request.get("/leaderboard", { maxRedirects: 0 });
+  expect([301, 308], `預期永久轉址，實際 ${res.status()}`).toContain(res.status());
+  expect(res.headers()["location"] ?? "").toMatch(/\/explore$/);
+});
+
 // ---------- 登入閘門頁：未登入應導向 /strategies ----------
 
 for (const route of LOGIN_REDIRECT_GATED) {

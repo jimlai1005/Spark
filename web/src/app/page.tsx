@@ -229,7 +229,7 @@ export default function HomePage() {
             <h2>{home.strategies.heading}</h2>
             <p className="section-sub">{home.strategies.sub}</p>
           </div>
-          <Link href="/leaderboard" className="home-strategies-viewall">
+          <Link href="/explore" className="home-strategies-viewall">
             {home.strategies.viewAll}
           </Link>
         </div>
