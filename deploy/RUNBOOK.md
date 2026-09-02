@@ -2383,3 +2383,9 @@ nginx                     1.18（Ubuntu 22.04 內建，非 1.25+——見 deploy
 - testnet 回歸水龍頭：`0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`（Keychain `spark/filet-testnet-faucet:main`），
   部署當下餘額約 268 USDC（perp 266.8＋spot 1.9）；每輪第 2＋3 層回歸約耗 $3–5，低於 ~280 前
   從 9760 的 testnet UI 補 300。
+
+**2026-09-02 追加部署（commit `e6cc2c9`，05:2x UTC，裁決 B）：** `/leaderboard` 改 `next.config.ts`
+`redirects()` 伺服器層 308 → `/explore`；只 rsync＋web rebuild＋restart `filet-dashboard`（API／引擎
+程式未變更，未重啟）。驗證：`curl -I https://trade.filet.app/leaderboard` → 308 Location `/explore`；
+regression_check `--http` 43/43；`systemctl --failed` 空。裁決 A（真實入金不計入 Send）不改程式，
+理由見 `docs/superpowers/research/2026-09-02-golive-regression-report.md` §5.4。
