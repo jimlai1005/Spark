@@ -2445,3 +2445,10 @@ regression_check `--http` 43/43；`systemctl --failed` 空。裁決 A（真實�
 drop-in `contact-env.conf`（§5.8b）。驗證：`curl https://trade.filet.app/contact` 200；sitemap 含
 `/contact`；`POST /api/public/contact` 空 body 422、真實送出 `{"ok":true}`（測試信主旨
 「[Filet 聯絡表單] Filet 部署驗證」）；`systemctl --failed` 空。
+
+**2026-09-02 追加部署（commit `4281d06`，14:36 UTC，`/contact` 照設計稿重做）：** 使用者退版——第一版
+照錯參考圖。改為雙欄版（主題 chip／Email／錢包自動帶入／訊息計數），API 欄位改 `topic/email/wallet/message`
+（**無 name**），回應 `{"ok":true,"ticket":"FLT-XXXX-XXXX"}`，主旨 `[FLT-…] Filet 聯絡表單：<主題>`，
+security 主題另送 TG critical。流程同上一筆（rsync → uv sync → chown → build → restart api＋dashboard）。
+驗證：頁面 200 且含新版文案；舊欄位契約 `{"topic":"nope",…}` → 422「請選擇主題」；真實送出
+（topic=other＋錢包）→ `{"ok":true,"ticket":"FLT-UL6X-KAU7"}`；`systemctl --failed` 空。
