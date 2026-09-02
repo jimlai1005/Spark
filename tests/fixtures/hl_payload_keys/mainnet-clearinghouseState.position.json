@@ -1,0 +1,15 @@
+{
+  "keys": [
+    "coin",
+    "cumFunding",
+    "entryPx",
+    "leverage",
+    "liquidationPx",
+    "marginUsed",
+    "maxLeverage",
+    "positionValue",
+    "returnOnEquity",
+    "szi",
+    "unrealizedPnl"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "keys": [
+    "children",
+    "cloid",
+    "coin",
+    "isPositionTpsl",
+    "isTrigger",
+    "limitPx",
+    "oid",
+    "orderType",
+    "origSz",
+    "reduceOnly",
+    "side",
+    "sz",
+    "tif",
+    "timestamp",
+    "triggerCondition",
+    "triggerPx"
+  ]
+}

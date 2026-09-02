@@ -1,0 +1,12 @@
+{
+  "keys": [
+    "builderRewards",
+    "claimedRewards",
+    "cumVlm",
+    "referredBy",
+    "referrerState",
+    "rewardHistory",
+    "tokenToState",
+    "unclaimedRewards"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "keys": [
+    "marginTableId",
+    "maxLeverage",
+    "name",
+    "szDecimals"
+  ]
+}

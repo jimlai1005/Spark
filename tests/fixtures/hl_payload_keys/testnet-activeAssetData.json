@@ -1,0 +1,10 @@
+{
+  "keys": [
+    "availableToTrade",
+    "coin",
+    "leverage",
+    "markPx",
+    "maxTradeSzs",
+    "user"
+  ]
+}

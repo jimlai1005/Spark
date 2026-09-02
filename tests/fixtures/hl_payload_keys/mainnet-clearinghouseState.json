@@ -1,0 +1,10 @@
+{
+  "keys": [
+    "assetPositions",
+    "crossMaintenanceMarginUsed",
+    "crossMarginSummary",
+    "marginSummary",
+    "time",
+    "withdrawable"
+  ]
+}

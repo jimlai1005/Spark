@@ -1,0 +1,12 @@
+{
+  "periods": [
+    "allTime",
+    "day",
+    "month",
+    "perpAllTime",
+    "perpDay",
+    "perpMonth",
+    "perpWeek",
+    "week"
+  ]
+}
