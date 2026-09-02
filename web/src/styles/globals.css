@@ -1016,42 +1016,65 @@ main.page {
   margin: 10px 0 0; font-size: 13px; color: var(--neg); line-height: 1.6;
 }
 
-/* ---------- /contact（雙欄，照 Claude Design 設計稿）---------- */
-.contact-grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 40px; align-items: start; }
-@media (max-width: 900px) { .contact-grid { grid-template-columns: 1fr; } }
-.contact-title { font-size: 40px; font-weight: 800; margin: 8px 0 12px; letter-spacing: -.01em; }
-.contact-sub { color: var(--text-dim); font-size: 16px; line-height: 1.8; margin: 0 0 28px; }
+/* ---------- /contact（設計稿 R3-01～R3-08）---------- */
+/* R3-08：<900px 上下堆疊，且「送出前請確認」(aside) 移到表單下方 → grid-template-areas 決定順序 */
+.contact-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 40px; align-items: start;
+  grid-template-areas: "head form" "aside form";
+  /* 表單跨兩列時，多出的高度全給第二列（否則 head 與 aside 之間會出現大片空白）。 */
+  grid-template-rows: auto 1fr;
+}
+.contact-head { grid-area: head; }
+.contact-aside { grid-area: aside; }
+.contact-card { grid-area: form; padding: 32px; }
+@media (max-width: 900px) {
+  .contact-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "form" "aside"; gap: 24px; }
+}
+.contact-title { font-size: 36px; font-weight: 800; margin: 8px 0 12px; letter-spacing: -.01em; }
+.contact-sub { color: var(--text-dim); font-size: 15px; line-height: 1.8; margin: 0; }
 .contact-checklist { padding: 22px 24px; }
 .contact-checklist-title { color: var(--text-dim); font-size: 12px; letter-spacing: .08em; margin: 0 0 14px; }
 .contact-checklist-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
-.contact-checklist-list li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; line-height: 1.7; }
+.contact-checklist-list li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; line-height: 1.7; font-size: 14px; }
 .contact-check-num { color: var(--primary); font-size: 14px; }
 .contact-check-num.neg { color: var(--neg); }
 .contact-security-note { display: flex; align-items: center; gap: 10px; color: var(--text-dim); margin: 22px 0 0; font-size: 14px; }
-.contact-dot { width: 8px; height: 8px; border-radius: 50%; background: #e0b35a; flex: 0 0 auto; }
-.contact-card { padding: 32px; }
+.contact-dot { width: 8px; height: 8px; border-radius: 50%; background: #e9b872; flex: 0 0 auto; }
 .contact-form { display: grid; gap: 24px; }
 .contact-field { display: grid; gap: 10px; }
 .contact-label-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .contact-label { font-size: 15px; font-weight: 500; }
 .contact-hint { color: var(--text-dim); font-size: 13px; }
 .contact-chips { display: flex; flex-wrap: wrap; gap: 10px; }
-.contact-chip { padding: 10px 16px; border-radius: 12px; border: 1px solid var(--border); background: transparent;
+.contact-chip { min-height: 44px; padding: 8px 14px; border-radius: 12px; border: 1px solid var(--border); background: transparent;
   color: var(--text); font-size: 15px; cursor: pointer; }
-.contact-chip:hover { border-color: rgba(var(--text-rgb), .3); }
+.contact-chip:hover { border-color: rgba(var(--text-dim-rgb), .5); }
 .contact-chip.is-active { border-color: var(--primary); color: var(--primary); background: rgba(var(--primary-rgb), .08); }
+/* R3-08：輸入框高度 ≥ 44px */
+.contact-form .addr-input { min-height: 44px; padding: 12px 14px; }
 .contact-wallet-wrap { position: relative; }
-.contact-wallet-wrap .addr-input { padding-right: 120px; }
-.contact-wallet-badge { position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
-  color: var(--primary); font-size: 13px; }
-.contact-link-btn { background: none; border: 0; padding: 0; color: var(--text-dim); font-size: 12px;
-  cursor: pointer; text-decoration: underline; justify-self: start; }
-.contact-textarea { resize: vertical; min-height: 180px; font-family: inherit; line-height: 1.7; }
+.contact-wallet-wrap .addr-input { padding-right: 160px; }
+.contact-wallet-tools { position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; gap: 12px; }
+.contact-wallet-badge { color: var(--primary); font-size: 13px; }
+.contact-link-btn { background: none; border: 0; padding: 0; color: var(--text-dim); font-size: 13px;
+  cursor: pointer; text-decoration: underline; }
+/* 選擇器加 .contact-form 讓優先權與上面 44px 規則同級、後者勝：訊息框維持 180px 下限（reviewer W2） */
+.contact-form .contact-textarea { resize: vertical; min-height: 180px; font-family: inherit; line-height: 1.7; }
 textarea.addr-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .contact-footer-row { display: flex; justify-content: space-between; align-items: center; gap: 24px; }
 .contact-consent { color: var(--text-dim); font-size: 13px; line-height: 1.7; margin: 0; max-width: 60%; }
-.contact-success { display: grid; gap: 12px; }
-.contact-ticket { font-size: 28px; letter-spacing: .04em; color: var(--primary); }
+/* 成功卡（同位置取代表單，R3-07） */
+.contact-success { display: grid; gap: 14px; justify-items: start; }
+.contact-success-check { width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center;
+  background: rgba(var(--primary-rgb), .12); color: var(--primary); font-size: 22px; font-weight: 700; }
+.contact-success-title { margin: 0; font-size: 20px; }
+.contact-success-body { margin: 0; color: var(--text-dim); line-height: 1.8; }
+.contact-ticket-box { display: flex; align-items: center; gap: 16px; padding: 14px 18px; width: 100%; box-sizing: border-box; flex-wrap: wrap; }
+.contact-ticket-label { color: var(--text-dim); font-size: 12px; letter-spacing: .08em; }
+.contact-ticket { font-size: 24px; letter-spacing: .04em; color: var(--primary); flex: 1; }
+.contact-copy-btn { padding: 8px 14px; }
+.contact-back-link { color: var(--text-dim); font-size: 14px; }
 @media (max-width: 600px) { .contact-footer-row { flex-direction: column; align-items: stretch; } .contact-consent { max-width: none; } }
 .leader-custom-preview {
   border-top: 1px solid var(--border);

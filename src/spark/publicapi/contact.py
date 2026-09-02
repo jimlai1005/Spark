@@ -9,11 +9,13 @@ Task 6（2026-09-02，設計稿改版）：欄位改為 主題／Email／錢包�
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
 import secrets
 import smtplib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Protocol
 
@@ -38,13 +40,24 @@ CONTACT_TOPIC_LABELS = {
     "partnership": "合作提案", "other": "其他",
 }
 WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-# 去 0/O/1/I，避免工單編號人眼辨識歧義。
-_TICKET_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+PAGE_URL_MAX = 512
+USER_AGENT_MAX = 512
+NOTIFY_PREVIEW_CHARS = 200
 
 
-def new_ticket_id() -> str:
-    part = lambda: "".join(secrets.choice(_TICKET_ALPHABET) for _ in range(4))  # noqa: E731
-    return f"FLT-{part()}-{part()}"
+def clip(s: str, n: int) -> str:
+    return (s or "").strip()[:n]
+
+
+def ticket_month(now_s: float) -> str:
+    """FLT-YYMM-NNNN 的 YYMM 段（UTC）。"""
+    return datetime.fromtimestamp(now_s, tz=timezone.utc).strftime("%y%m")
+
+
+def decoy_ticket(now_s: float) -> str:
+    """honeypot 命中時回給機器人的假工單：格式同真工單、不落 DB（R3-03「靜默丟棄但仍回成功」）。"""
+    return f"FLT-{ticket_month(now_s)}-{secrets.randbelow(9000) + 1000:04d}"
 
 
 def _has_linebreak(s: str) -> bool:
@@ -65,7 +78,8 @@ class ContactInput:
 
 def validate_contact(*, topic: str, email: str, wallet: str, message: str) -> ContactInput:
     topic = (topic or "").strip()
-    email = (email or "").strip()
+    # 小寫正規化：email 日限（R3-03）用 DB 等值比對，不正規化就能用大小寫變體繞過（reviewer W1）。
+    email = (email or "").strip().lower()
     wallet = (wallet or "").strip()
     message = (message or "").strip()
     if topic not in CONTACT_TOPICS:
@@ -80,21 +94,39 @@ def validate_contact(*, topic: str, email: str, wallet: str, message: str) -> Co
     return ContactInput(topic=topic, email=email, wallet=wallet, message=message)
 
 
+BOT_TAG = "🤖 疑似機器人"
+
+
 def build_contact_email(ci: ContactInput, *, ticket: str, sender: str, to: str,
-                        client_ip: str, now_iso: str) -> EmailMessage:
+                        client_ip: str, now_iso: str, page_url: str = "",
+                        user_agent: str = "", bot: bool = False) -> EmailMessage:
+    """bot=True（honeypot 命中）：主旨與 body 首行標明疑似機器人（使用者裁決：照樣寄）。"""
     label = CONTACT_TOPIC_LABELS[ci.topic]
-    prefix = "【安全回報】" if ci.topic == "security" else ""
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = to
     msg["Reply-To"] = ci.email
-    msg["Subject"] = f"[{ticket}] {prefix}Filet 聯絡表單：{label}"
+    msg["Subject"] = f"[Filet {ticket}] {BOT_TAG}｜{label}" if bot else f"[Filet {ticket}] {label}"
+    bot_line = f"⚠️ {BOT_TAG}：honeypot 欄位有值，此訊息由自動程式送出的機率很高。\n\n" if bot else ""
     msg.set_content(
-        f"工單：{ticket}\n主題：{label}\nEmail：{ci.email}\n"
-        f"錢包地址：{ci.wallet or '（未提供）'}\n來源 IP：{client_ip}\n時間：{now_iso}\n\n"
+        f"{bot_line}工單：{ticket}\n主題：{label}\nEmail：{ci.email}\n"
+        f"錢包地址：{ci.wallet or '（未提供）'}\n來源 IP：{client_ip}\n時間：{now_iso}\n"
+        f"頁面：{page_url or '（未提供）'}\nUA：{user_agent or '（未提供）'}\n\n"
         f"訊息：\n{ci.message}\n"
     )
     return msg
+
+
+def notify_text(ci: ContactInput, ticket: str, *, bot: bool = False) -> str:
+    """TG 內部通知（R3-04）：編號、主題、前 200 字。security 加 🚨 URGENT（使用者裁決 3）；
+    bot 加 🤖 疑似機器人 前綴（使用者裁決）。"""
+    label = CONTACT_TOPIC_LABELS[ci.topic]
+    head = f"🚨 URGENT {ticket}｜{label}" if ci.topic == "security" else f"📩 {ticket}｜{label}"
+    if bot:
+        head = f"{BOT_TAG}（honeypot）{head}"
+    # ⭐ TelegramNotifier 固定 parse_mode=HTML：用戶文字必須 escape，否則一個 `<` 就讓
+    #   Telegram 回 400、通知靜默消失（reviewer Critical）。
+    return f"{head}\n{html.escape(ci.message[:NOTIFY_PREVIEW_CHARS], quote=False)}"
 
 
 class Mailer(Protocol):

@@ -245,17 +245,19 @@ describe("getLeaderPreview（自訂 leader 准入預覽）", () => {
  * 成功回應帶工單編號 `ticket`。
  */
 describe("postContact（/contact 聯絡表單）", () => {
-  it("POST /api/public/contact，body 原樣帶出 topic/email/wallet/message/website", async () => {
+  it("POST /api/public/contact，body 原樣帶出 topic/email/wallet/message/page_url/user_agent/website", async () => {
     mockFetchJson(200, { ok: true, ticket: "FLT-AB12-CD34" });
     const r = await api.postContact({
       topic: "copytrade", email: "jim@example.com", wallet: "",
-      message: "Hello, a question about fees.", website: "",
+      message: "Hello, a question about fees.", page_url: "https://x/contact", user_agent: "UA",
+      website: "",
     });
     expect(captured[0].url).toBe("/api/public/contact");
     expect(captured[0].init.method).toBe("POST");
     expect(JSON.parse(captured[0].init.body as string)).toEqual({
       topic: "copytrade", email: "jim@example.com", wallet: "",
-      message: "Hello, a question about fees.", website: "",
+      message: "Hello, a question about fees.", page_url: "https://x/contact", user_agent: "UA",
+      website: "",
     });
     expect(r).toEqual({ ok: true, ticket: "FLT-AB12-CD34" });
   });

@@ -42,7 +42,8 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
 from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
-                                     build_contact_email, new_ticket_id, validate_contact)
+                                     build_contact_email, clip, decoy_ticket, notify_text,
+                                     PAGE_URL_MAX, USER_AGENT_MAX, validate_contact)
 from spark.filet.user_leaders import load_user_leaders, merge_leaders, record_user_leader
 from spark.keysvc.client import KeysvcError
 from spark.publicapi.approvals import build_approve_agent, build_approve_builder_fee
@@ -107,10 +108,13 @@ SESSION_COOKIE = "filet_session"
 PROBE_RATELIMIT_WINDOW_S = 60.0
 PROBE_RATELIMIT_MAX = 10
 
-# ⭐ /api/public/contact 的 per-client-IP sliding window（2026-09-02）：無需登入、
-# 每次成功呼叫都寄一封信到站主信箱（外送放大面）。獨立於 probe 限流。
-CONTACT_RATELIMIT_WINDOW_S = 600.0
-CONTACT_RATELIMIT_MAX = 3
+# ⭐ /api/public/contact 防濫用（設計稿 R3-03）：同 IP 每小時 5 次（sliding window，記憶體）、
+# 同 email 每日 10 次（查 contact_tickets 表，重啟不歸零）。超限 429。不上 CAPTCHA。
+CONTACT_RATELIMIT_WINDOW_S = 3600.0
+CONTACT_RATELIMIT_MAX = 5
+CONTACT_EMAIL_DAILY_MAX = 10
+CONTACT_EMAIL_WINDOW_S = 86400.0
+CONTACT_RATELIMIT_DETAIL = "送出太頻繁，請稍後再試"
 
 # ⭐ 同時在寄信中的請求上限（2026-09-02，reviewer Warning）：smtplib 阻塞在 starlette
 # threadpool（40 執行緒，全 API 共用），Gmail 變慢時不得讓 /contact 佔滿執行緒拖垮
@@ -1393,7 +1397,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     del _contact_hits[k]
             hits = _contact_hits.get(client_ip, [])
             if len(hits) >= CONTACT_RATELIMIT_MAX:
-                raise HTTPException(status_code=429, detail="送出過於頻繁，請稍後再試")
+                raise HTTPException(status_code=429, detail=CONTACT_RATELIMIT_DETAIL)
             hits.append(now)
             _contact_hits[client_ip] = hits
 
@@ -2086,72 +2090,87 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     class ContactBody(BaseModel):
         topic: str
         email: str
-        wallet: str = ""      # 選填；已登入時前端自動帶入
+        wallet: str = ""       # 選填；已登入時前端自動帶入（R3-06）
         message: str
-        website: str = ""    # honeypot：真人看不到、機器人會填
+        page_url: str = ""     # R3-02
+        user_agent: str = ""   # R3-02（空則取 header）
+        website: str = ""      # honeypot：真人看不到、機器人會填（R3-03）
 
     @app.post("/api/public/contact")
     def public_contact_endpoint(body: ContactBody, request: Request):
-        """/contact 表單：驗證 → honeypot → in-flight 上限 → IP 限流 → 寄信。無需登入。
-        寄信非冪等：失敗只 log + 502，不重試（工程原則 2）。寄信例外另外告警站主
-        （1 小時冷卻，見 _contact_alert_last）。topic=security 額外走優先處理佇列告警。"""
-        if body.website.strip():
-            logger.info("/api/public/contact honeypot 命中，靜默接受")
-            # 也回一個 ticket：回應形狀與正常路徑一致（前端成功卡不會出現空白工單），
-            # 機器人也分不出自己被丟棄（reviewer W2）。
-            return {"ok": True, "ticket": new_ticket_id()}
+        """/contact 表單（設計稿 R3-02～R3-05＋使用者裁決 2026-09-02）：
+        驗證 → in-flight 上限 → IP 限流 → email 日限 → **工單落 DB（FLT-YYMM-NNNN）＝送出成功**
+        → TG 通知（一律推）→ 寄信（失敗只告警、mailed=0，仍回 200）。無需登入。
+        「送出成功」的定義是 DB＋TG 這條內部佇列收到，Email 只是站主回信的載體，SMTP 壞掉不叫
+        用戶重送。honeypot 命中（website 有值）：欄位合法就照常走完整流程但標 bot=1、主旨與 TG
+        加「🤖 疑似機器人」；欄位不合法（無法安全組信）才回假工單靜默丟棄。
+        寄信非冪等：不重試（工程原則 2）。"""
+        now = now_fn()
+        is_bot = bool(body.website.strip())
         try:
             ci = validate_contact(topic=body.topic, email=body.email,
                                   wallet=body.wallet, message=body.message)
         except ContactValidationError as e:
+            if is_bot:
+                logger.info("/api/public/contact honeypot 命中且欄位不合法，回假工單靜默丟棄")
+                return {"ok": True, "ticket": decoy_ticket(now)}
             raise HTTPException(status_code=422, detail=str(e)) from e
-        if mailer is None or not cfg.contact_enabled:
-            # 沿 `_require_billing` 的既有雙重檢查慣例：cfg 才是「已設定」的單一
-            # 事實來源，注入的 mailer 物件本身不足以代表已設定（測試會在
-            # cfg 未設定時仍注入 FakeMailer 以斷言 mailer.sent == []）。
-            raise HTTPException(status_code=503,
-                                detail="聯絡表單暫時無法使用，請直接來信")
         client_ip = request.client.host if request.client else "unknown"
-        # in-flight 上限：smtplib 阻塞在 starlette threadpool（見 CONTACT_MAX_INFLIGHT
-        # 註解），非阻塞 acquire，滿了直接 503，不排隊等（排隊一樣會拖垮 threadpool）。
+        page_url = clip(body.page_url, PAGE_URL_MAX)
+        user_agent = clip(body.user_agent or request.headers.get("user-agent", ""), USER_AGENT_MAX)
         if not _contact_inflight.acquire(blocking=False):
             raise HTTPException(status_code=503, detail="系統忙碌中，請稍後再試")
         try:
             _enforce_contact_ratelimit(client_ip)
-            now_iso = datetime.fromtimestamp(now_fn(), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            ticket = new_ticket_id()
-            msg = build_contact_email(ci, ticket=ticket, sender=cfg.contact_smtp_user,
-                                      to=cfg.contact_to, client_ip=client_ip, now_iso=now_iso)
-            try:
-                mailer.send(msg)
-            except Exception as e:  # noqa: BLE001 — 失敗必須外顯（原則 3），但不得洩露信件內容
-                logger.error("/api/public/contact 寄信失敗 (%s): %s", type(e).__name__, e)
-                now = now_fn()
-                if now - _contact_alert_last[0] >= 3600:
-                    _contact_alert_last[0] = now
-                    try:
-                        notifier.critical(
-                            "contact_mail_failure",
-                            f"/contact 寄信失敗：{type(e).__name__}",
-                            dedup_key="contact_mail_failure")
-                    except Exception as ne:  # noqa: BLE001 — 告警失敗不得蓋掉原錯誤
-                        logger.error("/contact 失敗告警送出失敗: %r", ne)
-                raise HTTPException(status_code=502,
-                                    detail="寄送失敗，請稍後再試或直接來信") from e
-            if ci.topic == "security":
-                # 優先處理佇列的實作：TG 是站主唯一即時通道；dedup_key 用 ticket，
-                # 每張工單最多告警一次（不受寄信失敗冷卻影響）。告警失敗只 log。
+            if store.count_contact_by_email_since(
+                    ci.email, now - CONTACT_EMAIL_WINDOW_S) >= CONTACT_EMAIL_DAILY_MAX:
+                raise HTTPException(status_code=429, detail=CONTACT_RATELIMIT_DETAIL)
+            ticket = store.create_contact_ticket(
+                topic=ci.topic, email=ci.email, wallet=ci.wallet, message=ci.message,
+                page_url=page_url, user_agent=user_agent, client_ip=client_ip, now_s=now,
+                bot=is_bot)
+            # Email：站主回信載體。未設定 SMTP 或寄失敗 → mailed 留 0、告警（1 小時冷卻），仍回 200。
+            if mailer is None or not cfg.contact_enabled:
+                logger.warning("/api/public/contact SMTP 未設定，工單 %s 只落 DB＋TG（mailed=0）", ticket)
+            else:
+                now_iso = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                msg = build_contact_email(ci, ticket=ticket, sender=cfg.contact_smtp_user,
+                                          to=cfg.contact_to, client_ip=client_ip, now_iso=now_iso,
+                                          page_url=page_url, user_agent=user_agent, bot=is_bot)
                 try:
-                    notifier.critical(
-                        "contact_security_report",
-                        f"/contact 安全回報 {ticket}",
-                        dedup_key=ticket)
-                except Exception as ne:  # noqa: BLE001 — 告警失敗不得蓋掉成功回應
-                    logger.error("/contact 安全回報告警送出失敗: %r", ne)
-            logger.info("/api/public/contact 已寄出（工單 %s）", ticket)
-            return {"ok": True, "ticket": ticket}
+                    mailer.send(msg)
+                    store.mark_contact_mailed(ticket)
+                except Exception as e:  # noqa: BLE001 — 失敗必須外顯（原則 3），但不得洩露信件內容
+                    logger.error("/api/public/contact 寄信失敗 工單 %s (%s): %s",
+                                 ticket, type(e).__name__, e)
+                    if now - _contact_alert_last[0] >= 3600:
+                        _contact_alert_last[0] = now
+                        try:
+                            notifier.critical(
+                                "contact_mail_failure",
+                                f"/contact 寄信失敗：{type(e).__name__}（工單 {ticket} 已落 DB，mailed=0）",
+                                dedup_key="contact_mail_failure")
+                        except Exception as ne:  # noqa: BLE001 — 告警失敗不得蓋掉原錯誤
+                            logger.error("/contact 失敗告警送出失敗: %r", ne)
         finally:
             _contact_inflight.release()
+        # R3-04 內部通知：每筆都推、與寄信成敗無關；security 走 critical＋🚨 URGENT（裁決 3）。
+        # ⭐ 放在 in-flight 名額**釋放之後**：TG timeout 8s 不該佔用 SMTP 的併發名額（reviewer W4）。
+        # ⭐ notifier 回 False（未設定 token／muted／Telegram 4xx）不拋例外——必須自己記 warning，
+        #   否則「DB＋TG＝送出成功」的 TG 那一半可以靜默失效（reviewer Critical）。
+        try:
+            text = notify_text(ci, ticket, bot=is_bot)
+            if ci.topic == "security":
+                delivered = notifier.critical("contact_security_report", text, dedup_key=ticket)
+            else:
+                delivered = notifier.info("contact_ticket", text, dedup_key=ticket)
+            if not delivered:
+                logger.warning("/contact TG 通知未送達 工單 %s（notifier 回 False：未設定／muted／API 拒絕）；"
+                               "工單已落 DB，mailed=%s", ticket, int(store.get_contact_ticket(ticket)["mailed"]))
+        except Exception as ne:  # noqa: BLE001 — 通知失敗不得蓋掉成功回應
+            logger.error("/contact TG 通知送出失敗 工單 %s: %r", ticket, ne)
+        logger.info("/api/public/contact 已受理（工單 %s，bot=%s）", ticket, is_bot)
+        return {"ok": True, "ticket": ticket}
 
     # ---------- /api/public/benchmarks（issue log I-19：淨值曲線疊加對照）----------
     # ⭐ EquityCurve 的 overlay checkbox（策略/交易員詳情頁共用同一元件）用的四個

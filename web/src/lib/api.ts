@@ -177,11 +177,8 @@ function post<T>(path: string, body?: unknown): Promise<T> {
 // 改 topic 單選＋選填錢包地址，成功回應帶工單編號）----------
 export type ContactTopic = "copytrade" | "billing" | "security" | "partnership" | "other";
 export interface ContactBody {
-  topic: ContactTopic;
-  email: string;
-  wallet: string;
-  message: string;
-  website?: string;
+  topic: ContactTopic; email: string; wallet: string; message: string;
+  page_url: string; user_agent: string; website?: string;
 }
 export interface ContactResp { ok: boolean; ticket: string }
 export function postContact(body: ContactBody): Promise<ContactResp> {

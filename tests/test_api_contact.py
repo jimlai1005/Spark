@@ -1,12 +1,10 @@
-"""tests/test_api_contact.py — POST /api/public/contact：無需登入；驗證→honeypot→IP 限流
-→寄信；寄信失敗 502、未設定 503。全離線（FakeMailer；loopback 放行供 TestClient）。
-
-Task 6（2026-09-02，設計稿改版）：payload 改為 topic/email/wallet/message（移除 name）；
-成功回應多帶 ticket；topic=security 額外告警。"""
+"""tests/test_api_contact.py — POST /api/public/contact 對齊設計稿 R3-02～R3-05：
+honeypot decoy、422、503、in-flight、IP 5/小時、email 10/日、工單 FLT-YYMM-NNNN 落 DB、
+寄信主旨、TG 通知（每筆 info；security critical 🚨）、寄信失敗 502＋mailed=0。全離線。"""
 import re
 import socket
 import threading
-import time
+from datetime import datetime, timezone
 from email.message import EmailMessage
 
 import pytest
@@ -14,12 +12,14 @@ from fastapi.testclient import TestClient
 
 from spark.copytrade.notifier import RecordingNotifier
 from spark.publicapi.app import (
-    CONTACT_MAX_INFLIGHT, CONTACT_RATELIMIT_MAX, CONTACT_RATELIMIT_WINDOW_S,
+    CONTACT_EMAIL_DAILY_MAX, CONTACT_MAX_INFLIGHT, CONTACT_RATELIMIT_DETAIL,
+    CONTACT_RATELIMIT_MAX, CONTACT_RATELIMIT_WINDOW_S,
 )
+from spark.publicapi.contact import BOT_TAG
 from tests.publicapi_helpers import make_app, make_cfg
 
 _REAL_SOCKET = socket.socket
-_TICKET_RE = re.compile(r"^FLT-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
+TICKET_RE = re.compile(r"^FLT-\d{4}-\d{4}$")
 
 
 @pytest.fixture(autouse=True)
@@ -29,7 +29,7 @@ def _allow_local_sockets(monkeypatch):
 
 class Clock:
     def __init__(self):
-        self.t = time.time()
+        self.t = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
 
     def __call__(self):
         return self.t
@@ -46,110 +46,7 @@ class FakeMailer:
         self.sent.append(msg)
 
 
-GOOD = {"topic": "copytrade", "email": "jim@example.com",
-        "message": "Hello, I have a question about fees."}
-
-
-def _make(tmp_path, *, configured=True, fail=False):
-    over = {"contact_smtp_user": "site@gmail.com", "contact_smtp_pass": "pw",
-            "contact_to": "owner@gmail.com"} if configured else {}
-    cfg = make_cfg(tmp_path, **over)
-    clock = Clock()
-    mailer = FakeMailer(fail=fail)
-    app, *_ = make_app(tmp_path, cfg=cfg, now_fn=clock, mailer=mailer)
-    return TestClient(app, base_url="https://testserver"), clock, mailer
-
-
-def test_happy_path_sends_mail(tmp_path):
-    client, _, mailer = _make(tmp_path)
-    r = client.post("/api/public/contact", json=GOOD)
-    assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] is True
-    assert _TICKET_RE.match(body["ticket"])
-    assert len(mailer.sent) == 1
-    m = mailer.sent[0]
-    assert m["To"] == "owner@gmail.com" and m["From"] == "site@gmail.com"
-    assert m["Reply-To"] == "jim@example.com"
-    assert m["Subject"] == f"[{body['ticket']}] Filet 聯絡表單：跟單問題"
-    assert "question about fees" in m.get_content()
-
-
-def test_wallet_included_when_provided(tmp_path):
-    client, _, mailer = _make(tmp_path)
-    wallet = "0x" + "ab" * 20
-    r = client.post("/api/public/contact", json={**GOOD, "wallet": wallet})
-    assert r.status_code == 200
-    assert wallet in mailer.sent[0].get_content()
-
-
-def test_honeypot_silently_accepts_without_sending(tmp_path):
-    client, _, mailer = _make(tmp_path)
-    r = client.post("/api/public/contact", json={**GOOD, "website": "http://spam"})
-    assert r.status_code == 200 and r.json()["ok"] is True
-    assert r.json()["ticket"].startswith("FLT-")   # 回應形狀與正常路徑一致
-    assert mailer.sent == []
-
-
-@pytest.mark.parametrize("bad", [
-    {**GOOD, "topic": "nope"},
-    {**GOOD, "email": "nope"},
-    {**GOOD, "message": "short"},
-    {**GOOD, "wallet": "0x123"},
-    {**GOOD, "email": "a@b.co\nBcc: x@y.z"},
-])
-def test_validation_422_does_not_echo_input(tmp_path, bad):
-    client, _, mailer = _make(tmp_path)
-    r = client.post("/api/public/contact", json=bad)
-    assert r.status_code == 422
-    assert isinstance(r.json()["detail"], str)
-    assert "Bcc" not in r.json()["detail"] and "nope" not in r.json()["detail"]
-    assert mailer.sent == []
-
-
-def test_missing_fields_422(tmp_path):
-    client, _, mailer = _make(tmp_path)
-    assert client.post("/api/public/contact", json={"topic": "copytrade"}).status_code == 422
-    assert mailer.sent == []
-
-
-def test_ip_ratelimit_429_then_recovers(tmp_path):
-    client, clock, mailer = _make(tmp_path)
-    for _ in range(CONTACT_RATELIMIT_MAX):
-        assert client.post("/api/public/contact", json=GOOD).status_code == 200
-    r = client.post("/api/public/contact", json=GOOD)
-    assert r.status_code == 429
-    assert len(mailer.sent) == CONTACT_RATELIMIT_MAX
-    clock.t += CONTACT_RATELIMIT_WINDOW_S + 1
-    assert client.post("/api/public/contact", json=GOOD).status_code == 200
-
-
-def test_ratelimit_counts_only_sendable_requests(tmp_path):
-    """422 不消耗額度（限流在驗證之後、寄信之前）。"""
-    client, _, _ = _make(tmp_path)
-    for _ in range(CONTACT_RATELIMIT_MAX + 2):
-        assert client.post("/api/public/contact", json={**GOOD, "email": "nope"}).status_code == 422
-    assert client.post("/api/public/contact", json=GOOD).status_code == 200
-
-
-def test_mailer_failure_502_no_retry(tmp_path):
-    client, _, mailer = _make(tmp_path, fail=True)
-    r = client.post("/api/public/contact", json=GOOD)
-    assert r.status_code == 502
-    assert "來信" in r.json()["detail"]
-    assert mailer.sent == []
-
-
-def test_unconfigured_503(tmp_path):
-    client, _, mailer = _make(tmp_path, configured=False)
-    r = client.post("/api/public/contact", json=GOOD)
-    assert r.status_code == 503
-    assert mailer.sent == []
-
-
 class BlockingMailer:
-    """send 卡在 Event 上，讓測試把 in-flight 佔滿。"""
-
     def __init__(self):
         self.release = threading.Event()
         self.entered = threading.Semaphore(0)
@@ -161,11 +58,155 @@ class BlockingMailer:
         self.sent += 1
 
 
+GOOD = {"topic": "copytrade", "email": "jim@example.com",
+        "message": "Hello, I have a question about fees.",
+        "page_url": "https://trade.filet.app/contact", "user_agent": "UA/1.0"}
+
+
+def _make(tmp_path, *, configured=True, fail=False, mailer=None):
+    over = {"contact_smtp_user": "site@gmail.com", "contact_smtp_pass": "pw",
+            "contact_to": "owner@gmail.com"} if configured else {}
+    cfg = make_cfg(tmp_path, **over)
+    clock = Clock()
+    mailer = mailer or FakeMailer(fail=fail)
+    notifier = RecordingNotifier()
+    app, _cfg, store, *_ = make_app(tmp_path, cfg=cfg, now_fn=clock, mailer=mailer, notifier=notifier)
+    return TestClient(app, base_url="https://testserver"), clock, mailer, notifier, store
+
+
+def test_happy_path_ticket_db_mail_notify(tmp_path):
+    client, _, mailer, notifier, store = _make(tmp_path)
+    r = client.post("/api/public/contact", json=GOOD)
+    assert r.status_code == 200
+    ticket = r.json()["ticket"]
+    assert r.json()["ok"] is True and ticket == "FLT-2609-0001"
+    m = mailer.sent[0]
+    assert m["Subject"] == "[Filet FLT-2609-0001] 跟單問題"
+    assert m["Reply-To"] == "jim@example.com" and m["To"] == "owner@gmail.com"
+    assert "UA/1.0" in m.get_content() and "trade.filet.app/contact" in m.get_content()
+    row = store.get_contact_ticket(ticket)
+    assert row["email"] == "jim@example.com" and row["mailed"] == 1
+    assert row["message"] == GOOD["message"] and row["client_ip"] == "testclient"
+    assert notifier.records == [("info", "contact_ticket",
+                                 "📩 FLT-2609-0001｜跟單問題\n" + GOOD["message"], ticket)]
+    assert client.post("/api/public/contact", json=GOOD).json()["ticket"] == "FLT-2609-0002"
+
+
+def test_user_agent_falls_back_to_header(tmp_path):
+    client, _, mailer, _, store = _make(tmp_path)
+    body = {**GOOD, "user_agent": ""}
+    r = client.post("/api/public/contact", json=body, headers={"User-Agent": "HeaderUA/2"})
+    assert store.get_contact_ticket(r.json()["ticket"])["user_agent"] == "HeaderUA/2"
+
+
+def test_security_topic_critical_urgent(tmp_path):
+    client, _, _, notifier, _ = _make(tmp_path)
+    r = client.post("/api/public/contact", json={**GOOD, "topic": "security"})
+    t = r.json()["ticket"]
+    assert notifier.records[0][0] == "critical"
+    assert notifier.records[0][1] == "contact_security_report"
+    assert notifier.records[0][2].startswith(f"🚨 URGENT {t}｜安全回報\n")
+    assert notifier.records[0][3] == t
+
+
+def test_honeypot_valid_fields_flagged_bot_but_still_delivered(tmp_path):
+    """使用者裁決：honeypot 命中仍寄信＋推 TG＋落 DB，但主旨／通知／DB 都標疑似機器人。"""
+    client, _, mailer, notifier, store = _make(tmp_path)
+    r = client.post("/api/public/contact", json={**GOOD, "website": "http://spam"})
+    assert r.status_code == 200 and r.json()["ticket"] == "FLT-2609-0001"
+    assert store.get_contact_ticket("FLT-2609-0001")["bot"] == 1
+    assert mailer.sent[0]["Subject"] == f"[Filet FLT-2609-0001] {BOT_TAG}｜跟單問題"
+    assert notifier.records[0][2].startswith(f"{BOT_TAG}（honeypot）📩 FLT-2609-0001｜跟單問題\n")
+
+
+def test_honeypot_invalid_fields_returns_decoy_without_db_or_mail(tmp_path):
+    client, _, mailer, notifier, store = _make(tmp_path)
+    r = client.post("/api/public/contact", json={**GOOD, "email": "nope", "website": "http://spam"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert TICKET_RE.match(r.json()["ticket"])
+    assert mailer.sent == [] and notifier.records == []
+    assert store.get_contact_ticket(r.json()["ticket"]) is None
+
+
+@pytest.mark.parametrize("bad", [
+    {**GOOD, "topic": "nope"}, {**GOOD, "email": "nope"}, {**GOOD, "message": "short"},
+    {**GOOD, "wallet": "0x123"}, {**GOOD, "email": "a@b.co\nBcc: x@y.z"},
+    {**GOOD, "email": "a@b.co X"},
+])
+def test_validation_422_does_not_echo_input(tmp_path, bad):
+    client, _, mailer, _, _ = _make(tmp_path)
+    r = client.post("/api/public/contact", json=bad)
+    assert r.status_code == 422 and isinstance(r.json()["detail"], str)
+    assert "Bcc" not in r.json()["detail"] and "nope" not in r.json()["detail"]
+    assert mailer.sent == []
+
+
+def test_missing_fields_422(tmp_path):
+    client, _, mailer, _, _ = _make(tmp_path)
+    assert client.post("/api/public/contact", json={"topic": "other"}).status_code == 422
+    assert mailer.sent == []
+
+
+def test_ip_ratelimit_5_per_hour_then_recovers(tmp_path):
+    client, clock, mailer, _, _ = _make(tmp_path)
+    assert CONTACT_RATELIMIT_MAX == 5 and CONTACT_RATELIMIT_WINDOW_S == 3600.0
+    for _ in range(CONTACT_RATELIMIT_MAX):
+        assert client.post("/api/public/contact", json=GOOD).status_code == 200
+    r = client.post("/api/public/contact", json=GOOD)
+    assert r.status_code == 429 and r.json()["detail"] == CONTACT_RATELIMIT_DETAIL
+    assert len(mailer.sent) == CONTACT_RATELIMIT_MAX
+    clock.t += CONTACT_RATELIMIT_WINDOW_S + 1
+    assert client.post("/api/public/contact", json=GOOD).status_code == 200
+
+
+def test_email_daily_limit_10(tmp_path):
+    client, clock, _, _, store = _make(tmp_path)
+    assert CONTACT_EMAIL_DAILY_MAX == 10
+    for i in range(CONTACT_EMAIL_DAILY_MAX):
+        clock.t += 1000     # 每筆間隔，避免撞 IP 每小時 5 次
+        if i % 4 == 3:
+            clock.t += 3600
+        assert client.post("/api/public/contact", json=GOOD).status_code == 200, i
+    clock.t += 3600
+    r = client.post("/api/public/contact", json=GOOD)
+    assert r.status_code == 429 and r.json()["detail"] == CONTACT_RATELIMIT_DETAIL
+    # 換一個 email 不受影響
+    assert client.post("/api/public/contact", json={**GOOD, "email": "z@example.com"}).status_code == 200
+    clock.t += 86400
+    assert client.post("/api/public/contact", json=GOOD).status_code == 200
+
+
+def test_mailer_failure_still_200_ticket_unmailed_alert_cooldown(tmp_path):
+    """使用者裁決 2：DB＋TG 收到＝送出成功；Email 失敗只告警（1 小時冷卻）、mailed=0。"""
+    client, clock, mailer, notifier, store = _make(tmp_path, fail=True)
+    r = client.post("/api/public/contact", json=GOOD)
+    assert r.status_code == 200 and r.json()["ticket"] == "FLT-2609-0001"
+    assert store.get_contact_ticket("FLT-2609-0001")["mailed"] == 0
+    # 順序：寄信（失敗告警）在 in-flight 名額內，📩 通知在名額釋放後
+    assert [x[1] for x in notifier.records] == ["contact_mail_failure", "contact_ticket"]
+    assert "FLT-2609-0001" in notifier.records[0][2]
+    clock.t += 1000
+    client.post("/api/public/contact", json=GOOD)          # 冷卻內：📩 照推，失敗告警不再推
+    assert [x[1] for x in notifier.records] == ["contact_mail_failure", "contact_ticket", "contact_ticket"]
+    clock.t += 3600
+    client.post("/api/public/contact", json=GOOD)
+    assert [x[1] for x in notifier.records].count("contact_mail_failure") == 2
+
+
+def test_unconfigured_smtp_still_accepts_via_db_and_tg(tmp_path):
+    client, _, mailer, notifier, store = _make(tmp_path, configured=False)
+    r = client.post("/api/public/contact", json=GOOD)
+    assert r.status_code == 200 and r.json()["ticket"] == "FLT-2609-0001"
+    assert mailer.sent == []
+    assert store.get_contact_ticket("FLT-2609-0001")["mailed"] == 0
+    assert [x[1] for x in notifier.records] == ["contact_ticket"]
+
+
 def test_inflight_cap_503_and_recovers(tmp_path):
-    cfg = make_cfg(tmp_path, contact_smtp_user="site@gmail.com", contact_smtp_pass="pw")
     mailer = BlockingMailer()
+    cfg = make_cfg(tmp_path, contact_smtp_user="site@gmail.com", contact_smtp_pass="pw")
     app, *_ = make_app(tmp_path, cfg=cfg, mailer=mailer)
-    results = []
+    results: list[int] = []
 
     def worker():
         c = TestClient(app, base_url="https://testserver")
@@ -175,60 +216,12 @@ def test_inflight_cap_503_and_recovers(tmp_path):
     for t in threads:
         t.start()
     for _ in range(CONTACT_MAX_INFLIGHT):
-        assert mailer.entered.acquire(timeout=10)   # 全部卡在 send 內
+        assert mailer.entered.acquire(timeout=10)
     c = TestClient(app, base_url="https://testserver")
     assert c.post("/api/public/contact", json=GOOD).status_code == 503
     mailer.release.set()
     for t in threads:
         t.join(timeout=10)
     assert sorted(results) == [200] * CONTACT_MAX_INFLIGHT
-    # 釋放後恢復（同 IP 額度 3 次：前面 2 次成功 +1 次 503 不計額度 → 這次仍在額度內）
     assert c.post("/api/public/contact", json=GOOD).status_code == 200
     assert mailer.sent == CONTACT_MAX_INFLIGHT + 1
-
-
-def test_mailer_failure_alerts_notifier_with_cooldown(tmp_path):
-    cfg = make_cfg(tmp_path, contact_smtp_user="site@gmail.com", contact_smtp_pass="pw")
-    clock = Clock()
-    mailer = FakeMailer(fail=True)
-    notifier = RecordingNotifier()
-    app, *_ = make_app(tmp_path, cfg=cfg, now_fn=clock, mailer=mailer, notifier=notifier)
-    client = TestClient(app, base_url="https://testserver")
-
-    assert client.post("/api/public/contact", json=GOOD).status_code == 502
-    assert client.post("/api/public/contact", json=GOOD).status_code == 502
-    critical = [r for r in notifier.records if r[0] == "critical"]
-    assert len(critical) == 1
-
-    clock.t += 3600
-    assert client.post("/api/public/contact", json=GOOD).status_code == 502
-    critical = [r for r in notifier.records if r[0] == "critical"]
-    assert len(critical) == 2
-
-
-def test_security_topic_alerts_notifier(tmp_path):
-    cfg = make_cfg(tmp_path, contact_smtp_user="site@gmail.com", contact_smtp_pass="pw")
-    mailer = FakeMailer()
-    notifier = RecordingNotifier()
-    app, *_ = make_app(tmp_path, cfg=cfg, mailer=mailer, notifier=notifier)
-    client = TestClient(app, base_url="https://testserver")
-
-    r = client.post("/api/public/contact", json={**GOOD, "topic": "security"})
-    assert r.status_code == 200
-    ticket = r.json()["ticket"]
-    critical = [rec for rec in notifier.records if rec[0] == "critical"]
-    assert len(critical) == 1
-    assert critical[0][1] == "contact_security_report"
-    assert critical[0][3] == ticket
-
-
-def test_non_security_topic_no_alert(tmp_path):
-    cfg = make_cfg(tmp_path, contact_smtp_user="site@gmail.com", contact_smtp_pass="pw")
-    mailer = FakeMailer()
-    notifier = RecordingNotifier()
-    app, *_ = make_app(tmp_path, cfg=cfg, mailer=mailer, notifier=notifier)
-    client = TestClient(app, base_url="https://testserver")
-
-    r = client.post("/api/public/contact", json=GOOD)
-    assert r.status_code == 200
-    assert notifier.records == []

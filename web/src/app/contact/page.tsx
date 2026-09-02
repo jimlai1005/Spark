@@ -1,18 +1,21 @@
 "use client";
 /**
- * `/contact` — 聯絡表單（2026-09-02 Task 6，照 Claude Design 雙欄深色設計稿重做）。
- * POST /api/public/contact（無需登入），後端寄信到站主信箱、人工回覆。未登入可直接
- * 開啟，不掛登入 guard（同 /terms /privacy /risk）。**沒有姓名欄**——`topic` 單選 chip
- * 取代之。已登入時錢包地址自動帶入（唯讀＋徽章），可按「改填其他地址」切換成手填。
+ * `/contact` — 聯絡表單（設計稿 R3-01～R3-08，2026-09-02 Task 7）。
+ * POST /api/public/contact（無需登入）；後端落工單 FLT-YYMM-NNNN、寄信到站主、推 TG。
+ * 頁面上**沒有任何信箱字串**（R3-01）。錢包地址登入時自動帶入、可「清除」（R3-06）。
+ * 狀態（R3-07）：送出中 disabled；5xx／網路 → 紅字「送出失敗，請稍後再試」保留內容；
+ * 4xx → 後端 detail 原樣；成功 → 同位置卡片取代表單，不跳頁。
  * honeypot 欄位 `website`：視覺隱藏＋tabIndex=-1，真人不會填；後端見非空即靜默接受。
+ * 窄版（R3-08）：grid-template-areas 讓「送出前請確認」移到表單下方（見 globals.css）。
  */
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 import { useCopy } from "@/lib/lang";
 import { ApiError, postContact, type ContactTopic } from "@/lib/api";
 import { useMe } from "@/lib/hooks";
 import { shortAddr } from "@/lib/format";
 
-const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const WALLET_RE = /^0x[0-9a-fA-F]{40}$/;
 const TOPICS: ContactTopic[] = ["copytrade", "billing", "security", "partnership", "other"];
 type Phase = "idle" | "sending" | "sent";
@@ -25,20 +28,20 @@ export default function ContactPage() {
   const [topic, setTopic] = useState<ContactTopic>("copytrade");
   const [email, setEmail] = useState("");
   const [wallet, setWallet] = useState("");
-  const [walletOverride, setWalletOverride] = useState(false);
+  const [walletCleared, setWalletCleared] = useState(false);
   const [message, setMessage] = useState("");
   const [website, setWebsite] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
-  const [errorFallback, setErrorFallback] = useState(false);
   const [ticket, setTicket] = useState("");
+  const [sentEmail, setSentEmail] = useState("");
+  const [copied, setCopied] = useState(false);
 
-  // ⭐ `wallet === ""` 是載入競態的守門：/api/me 回來之前使用者若已手動輸入地址，
-  //   不得被自動帶入蓋掉（reviewer W1）。
-  const autofilled = !!meAddress && !walletOverride && wallet === "";
+  // `wallet === ""` 是載入競態的守門：/api/me 回來之前使用者若已手動輸入地址，不得被自動帶入蓋掉。
+  const autofilled = !!meAddress && !walletCleared && wallet === "";
 
-  function useOtherWallet() {
-    setWalletOverride(true);
+  function clearWallet() {
+    setWalletCleared(true);
     setWallet("");
   }
 
@@ -55,9 +58,8 @@ export default function ContactPage() {
   async function onSubmit(ev: FormEvent) {
     ev.preventDefault();
     const v = validate();
-    if (v) { setError(v); setErrorFallback(false); return; }
+    if (v) { setError(v); return; }
     setError(null);
-    setErrorFallback(false);
     setPhase("sending");
     try {
       const resp = await postContact({
@@ -65,50 +67,42 @@ export default function ContactPage() {
         email: email.trim(),
         wallet: autofilled ? meAddress : wallet.trim(),
         message: message.trim(),
+        page_url: typeof window === "undefined" ? "" : window.location.href,
+        user_agent: typeof navigator === "undefined" ? "" : navigator.userAgent,
         website,
       });
       setTicket(resp.ticket);
+      setSentEmail(email.trim());
       setPhase("sent");
     } catch (e) {
       setPhase("idle");
-      if (e instanceof ApiError) {
-        if (e.kind === "network") {
-          setError(c.errNetwork);
-          setErrorFallback(false);
-        } else if (e.kind === "upstream") {
-          setError(e.detail ?? c.errGeneric);
-          setErrorFallback(true);
-        } else {
-          setError(e.detail ?? c.errGeneric);
-          setErrorFallback(false);
-        }
+      if (e instanceof ApiError && (e.kind === "client" || e.kind === "auth") && e.detail) {
+        setError(e.detail);                 // 4xx：後端固定字串（422／429）
       } else {
-        setError(c.errGeneric);
-        setErrorFallback(false);
+        setError(c.errSendFailed);          // 5xx／網路（R3-07）
       }
     }
   }
 
-  function reset() {
-    setTopic("copytrade");
-    setEmail("");
-    setWallet("");
-    setWalletOverride(false);
-    setMessage("");
-    setWebsite("");
-    setError(null);
-    setErrorFallback(false);
-    setPhase("idle");
-    setTicket("");
+  async function copyTicket() {
+    try {
+      await navigator.clipboard.writeText(ticket);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
   }
 
   return (
     <main className="page contact-page">
       <div className="contact-grid">
-        <section className="contact-intro">
+        <header className="contact-head">
           <p className="eyebrow">{c.eyebrow}</p>
           <h1 className="contact-title">{c.heading}</h1>
           <p className="contact-sub">{c.sub}</p>
+        </header>
+
+        <aside className="contact-aside">
           <div className="card contact-checklist">
             <p className="contact-checklist-title">{c.checklistTitle}</p>
             <ol className="contact-checklist-list">
@@ -134,17 +128,22 @@ export default function ContactPage() {
             <span className="contact-dot" aria-hidden />
             {c.securityNote}
           </p>
-        </section>
+        </aside>
 
         <section className="card contact-card">
           {phase === "sent" ? (
             <div className="contact-success" role="status">
-              <h2>{c.successTitle}</h2>
-              <p className="contact-ticket mono">{ticket}</p>
-              <p>{c.successBody.replace("{email}", email.trim())}</p>
-              <button type="button" className="btn btn-secondary" onClick={reset}>
-                {c.sendAnother}
-              </button>
+              <div className="contact-success-check" aria-hidden>✓</div>
+              <h2 className="contact-success-title">{c.successTitle}</h2>
+              <p className="contact-success-body">{c.successBody.replace("{email}", sentEmail)}</p>
+              <div className="inset contact-ticket-box">
+                <span className="contact-ticket-label">{c.ticketLabel}</span>
+                <span className="contact-ticket mono">{ticket}</span>
+                <button type="button" className="btn btn-secondary contact-copy-btn" onClick={copyTicket}>
+                  {copied ? c.copied : c.copy}
+                </button>
+              </div>
+              <Link href="/" className="contact-back-link">{c.backHome}</Link>
             </div>
           ) : (
             <form onSubmit={onSubmit} noValidate className="contact-form">
@@ -205,13 +204,15 @@ export default function ContactPage() {
                       if (!autofilled) setWallet(e.target.value);
                     }}
                   />
-                  {autofilled && <span className="contact-wallet-badge">{c.walletConnected}</span>}
+                  {autofilled && (
+                    <span className="contact-wallet-tools">
+                      <span className="contact-wallet-badge">{c.walletConnected}</span>
+                      <button type="button" className="contact-link-btn" onClick={clearWallet}>
+                        {c.walletClear}
+                      </button>
+                    </span>
+                  )}
                 </div>
-                {autofilled && (
-                  <button type="button" className="contact-link-btn" onClick={useOtherWallet}>
-                    {c.walletUseOther}
-                  </button>
-                )}
               </div>
 
               <div className="contact-field">
@@ -242,18 +243,7 @@ export default function ContactPage() {
                 onChange={(e) => setWebsite(e.target.value)}
               />
 
-              {error && (
-                <p className="addr-input-error" role="alert">
-                  {error}
-                  {errorFallback && (
-                    <>
-                      {" "}
-                      {c.fallbackPrefix}
-                      <a href={`mailto:${c.fallbackEmail}`}>{c.fallbackEmail}</a>
-                    </>
-                  )}
-                </p>
-              )}
+              {error && <p className="addr-input-error" role="alert">{error}</p>}
 
               <div className="contact-footer-row">
                 <p className="contact-consent">{c.consent}</p>

@@ -6,6 +6,7 @@ import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from spark.filet.followers import validate_account_id
@@ -42,6 +43,22 @@ CREATE TABLE IF NOT EXISTS billing (
     last_event_created INTEGER NOT NULL DEFAULT 0,
     last_event_id TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS contact_tickets (
+    ticket TEXT PRIMARY KEY,
+    month TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    topic TEXT NOT NULL,
+    email TEXT NOT NULL,
+    wallet TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL,
+    page_url TEXT NOT NULL DEFAULT '',
+    user_agent TEXT NOT NULL DEFAULT '',
+    client_ip TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    mailed INTEGER NOT NULL DEFAULT 0,
+    bot INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS contact_tickets_email_created ON contact_tickets (email, created_at);
 """
 
 
@@ -114,6 +131,50 @@ class ApiStore:
                 "SELECT address, chain_id, issued_at FROM nonces WHERE nonce = ?",
                 (nonce,)).fetchone()
         return NonceRecord(address=row[0], chain_id=row[1], issued_at=row[2])
+
+    # --- /contact 工單（設計稿 R3-04：FLT-YYMM-NNNN 月份流水，落 DB）---
+    def create_contact_ticket(self, *, topic: str, email: str, wallet: str, message: str,
+                              page_url: str, user_agent: str, client_ip: str,
+                              now_s: float, bot: bool = False) -> str:
+        """同一把鎖內取 MAX(seq)+1 並 INSERT：流水號不會因並發重複。bot=True ＝ honeypot 命中
+        （使用者裁決：照樣落 DB／寄信／推 TG，但標明疑似機器人）。"""
+        month = datetime.fromtimestamp(now_s, tz=timezone.utc).strftime("%y%m")
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM contact_tickets WHERE month = ?",
+                (month,)).fetchone()
+            seq = int(row[0]) + 1
+            ticket = f"FLT-{month}-{seq:04d}"
+            self._db.execute(
+                "INSERT INTO contact_tickets (ticket, month, seq, topic, email, wallet, message, "
+                "page_url, user_agent, client_ip, created_at, bot) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ticket, month, seq, topic, email, wallet, message, page_url, user_agent,
+                 client_ip, now_s, 1 if bot else 0))
+        return ticket
+
+    def mark_contact_mailed(self, ticket: str) -> None:
+        with self._lock, self._db:
+            self._db.execute("UPDATE contact_tickets SET mailed = 1 WHERE ticket = ?", (ticket,))
+
+    def count_contact_by_email_since(self, email: str, since_s: float) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM contact_tickets WHERE email = ? AND created_at >= ?",
+                (email, since_s)).fetchone()
+        return int(row[0])
+
+    def get_contact_ticket(self, ticket: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT ticket, month, seq, topic, email, wallet, message, page_url, user_agent, "
+                "client_ip, created_at, mailed, bot FROM contact_tickets WHERE ticket = ?",
+                (ticket,)).fetchone()
+        if row is None:
+            return None
+        keys = ("ticket", "month", "seq", "topic", "email", "wallet", "message", "page_url",
+                "user_agent", "client_ip", "created_at", "mailed", "bot")
+        return dict(zip(keys, row))
 
     # --- session ---
     def create_session(self, address: str, *, now_s: float, ttl_s: int) -> str:

@@ -725,6 +725,9 @@ function LeaderSection() {
         <Link href="/strategies" className="btn btn-secondary">{c.changeStrategyBtn}</Link>
         <Link href="/advanced" className="btn btn-secondary">{c.advancedModeBtn}</Link>
       </div>
+      <p className="hint settings-help">
+        {c.helpPrompt} <Link href="/contact">{c.helpLink}</Link>
+      </p>
     </section>
   );
 }
