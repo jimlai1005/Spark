@@ -22,7 +22,7 @@ function progress(over: Partial<WizardProgress> = {}): WizardProgress {
   return {
     address: "0xabc0000000000000000000000000000000000001",
     strategy: "core", scale: 25, ddEnabled: false, ddPct: 20,
-    step3Confirmed: false,
+    step3Confirmed: false, step2Verified: false,
     ...over,
   };
 }
@@ -81,6 +81,30 @@ describe("wizard 進度 localStorage（NOTE 11：只存 UI 進度，不存簽章
   it("clearWizardProgress 後讀回 null", () => {
     saveWizardProgress(progress());
     clearWizardProgress();
+    expect(loadWizardProgress(
+      "0xabc0000000000000000000000000000000000001", "core",
+    )).toBeNull();
+  });
+
+  // ⭐ T10（2026-09-02）：step2Verified 是後補的欄位，舊格式（T10 之前存的
+  // localStorage）缺這個鍵，缺鍵視為 false，不得整個判成壞格式而從頭來。
+  it("舊格式缺 step2Verified → 視為 false，仍可續作（向後相容）", () => {
+    const legacy = {
+      address: "0xabc0000000000000000000000000000000000001",
+      strategy: "core", scale: 25, ddEnabled: false, ddPct: 20,
+      step3Confirmed: true,
+      // 刻意不含 step2Verified 鍵
+    };
+    localStorage.setItem("filet_onboarding", JSON.stringify(legacy));
+    const back = loadWizardProgress("0xabc0000000000000000000000000000000000001", "core");
+    expect(back).not.toBeNull();
+    expect(back?.step2Verified).toBe(false);
+    expect(back?.step3Confirmed).toBe(true);
+  });
+
+  it("step2Verified 存在但型別錯誤（非 boolean）→ 回傳 null", () => {
+    const bad = { ...progress(), step2Verified: "yes" };
+    localStorage.setItem("filet_onboarding", JSON.stringify(bad));
     expect(loadWizardProgress(
       "0xabc0000000000000000000000000000000000001", "core",
     )).toBeNull();

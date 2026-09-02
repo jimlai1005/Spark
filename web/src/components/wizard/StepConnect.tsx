@@ -16,10 +16,13 @@ import { StepSign } from "./StepSign";
  * 完成條件（父層 `deriveStep` 判定）＝ `status.state === "READY"`
  * （agent_approved && builder_fee_approved && funded 的伺服器端投影）。
  */
-export function StepConnect({ status, loginAddress, refetchStatus }: {
+export function StepConnect({ status, loginAddress, refetchStatus, autoVerify, onVerified }: {
   status: OnboardStatus;
   loginAddress: string;
   refetchStatus: () => void;
+  /** T10：轉交給 `StepDeposit`——見該元件對這個 prop 的說明。 */
+  autoVerify?: boolean;
+  onVerified?: () => void;
 }) {
   const COPY = useCopy();
   const c = COPY.wizard;
@@ -33,7 +36,8 @@ export function StepConnect({ status, loginAddress, refetchStatus }: {
       {/* ⭐ StepSign／StepDeposit 各自保留自己的 `.step-card` 外框（既有樣式），
           本層刻意不再包一層 `.step-card`，避免視覺上雙層邊框巢狀。 */}
       <StepSign status={status} loginAddress={loginAddress} refetchStatus={refetchStatus} />
-      <StepDeposit status={status} refetchStatus={refetchStatus} />
+      <StepDeposit status={status} refetchStatus={refetchStatus}
+        autoVerify={autoVerify} onVerified={onVerified} />
     </div>
   );
 }

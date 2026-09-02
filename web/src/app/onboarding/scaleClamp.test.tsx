@@ -38,11 +38,19 @@ vi.mock("@/lib/hooks", () => ({
 const createAgent = vi.fn();
 const getMyRisk = vi.fn();
 const getMyCapital = vi.fn();
+// ⭐ T10（2026-09-02）：page.tsx 現在會在 READY 且本地無 `step2Verified` 旗標時
+// 自動補打一次 `postVerify()`（見該檔頭 `needsAutoVerify`）。這裡的兩段式 render
+// 第二階段直接把 `state` 切到 READY（見 `renderReachingStep3`），若不 mock，
+// `postVerify` 會落到真實實作打出一個 jsdom 沒有的網路請求並失敗，導致精靈卡在
+// step 2、永遠到不了本檔要驗的 step 3——mock 只是補一個成功的 stub，不是本檔
+// 要驗的行為。
+const postVerify = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   createAgent: (...a: unknown[]) => createAgent(...a),
   getMyRisk: (...a: unknown[]) => getMyRisk(...a),
   getMyCapital: (...a: unknown[]) => getMyCapital(...a),
+  postVerify: (...a: unknown[]) => postVerify(...a),
 }));
 
 const getPublicStrategy = vi.fn();
@@ -120,6 +128,7 @@ beforeEach(() => {
   mockMe = { data: { address: ADDR, account_id: "fabc" }, isLoading: false };
   mockStatus = { data: status(), refetch: () => undefined };
   createAgent.mockResolvedValue({ agent_address: "0xa" });
+  postVerify.mockResolvedValue(status());
   getPublicStrategy.mockResolvedValue(STRATEGY_DETAIL);
   getMyRisk.mockResolvedValue(RISK);
   getMyCapital.mockResolvedValue({

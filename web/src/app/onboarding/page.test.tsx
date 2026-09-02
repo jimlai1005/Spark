@@ -9,7 +9,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { MyRiskResp, OnboardStatus } from "@/lib/api";
+import { ApiError, type MyRiskResp, type OnboardStatus } from "@/lib/api";
 
 const push = vi.fn();
 let currentSearch = new URLSearchParams({ strategy: "core" });
@@ -163,6 +163,11 @@ beforeEach(() => {
   mockMe = { data: { address: ADDR, account_id: "fabc" }, isLoading: false };
   mockStatus = { data: status(), refetch: () => undefined };
   createAgent.mockResolvedValue({ agent_address: "0xa" });
+  // ⭐ T10：預設 postVerify 成功回 READY——多數既有測試在意的是 step 3/4 的行為，
+  // 不是本次新增的「載入即補打 verify」機制本身；沒有這個預設，每個把
+  // `mockStatus` 設成 READY_STATUS 卻沒先在 localStorage 標記 `step2Verified`
+  // 的既有測試都會卡在 step 2（見下面專門測這個機制的 describe 區塊）。
+  postVerify.mockResolvedValue(READY_STATUS);
   getPublicStrategy.mockResolvedValue(STRATEGY_DETAIL);
   getMyRisk.mockResolvedValue(RISK);
   recoverPersonalSigner.mockResolvedValue(ADDR.toLowerCase());
@@ -294,6 +299,51 @@ describe("OnboardingPage — localStorage 續作（NOTE 11）", () => {
     }));
     const raw = localStorage.getItem("filet_onboarding")!;
     expect(raw).not.toMatch(/signature|message/i);
+  });
+});
+
+describe("OnboardingPage — 補打 verify（T10：重新整理跳過 step 2 的靜默失敗修法）", () => {
+  it("載入即 READY 且本地無 step2Verified 紀錄 → 自動呼叫 postVerify 一次，成功後放行到 step 3並落地旗標", async () => {
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+
+    expect(await screen.findByRole("heading", { name: "設定你的風險限制" })).toBeInTheDocument();
+    expect(postVerify).toHaveBeenCalledTimes(1);
+    const saved = JSON.parse(localStorage.getItem("filet_onboarding")!);
+    expect(saved.step2Verified).toBe(true);
+  });
+
+  it("postVerify 失敗 → 停在 step 2，顯示既有錯誤 UI，不靜默放行", async () => {
+    postVerify.mockRejectedValue(
+      new ApiError("upstream", "上游服務暫時不可用", 502, "上游服務暫時不可用"),
+    );
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+
+    await waitFor(() => expect(postVerify).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("上游服務暫時不可用")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "設定你的風險限制" })).not.toBeInTheDocument();
+    const saved = localStorage.getItem("filet_onboarding");
+    expect(saved == null || !JSON.parse(saved).step2Verified).toBe(true);
+  });
+
+  it("本地已有 step2Verified=true → 不重複呼叫 postVerify，直接放行", async () => {
+    localStorage.setItem("filet_onboarding", JSON.stringify({
+      address: ADDR, strategy: "core", scale: 25,
+      ddEnabled: false, ddPct: 20, step3Confirmed: false, step2Verified: true,
+    }));
+    mockStatus = { data: READY_STATUS, refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+
+    expect(await screen.findByRole("heading", { name: "設定你的風險限制" })).toBeInTheDocument();
+    expect(postVerify).not.toHaveBeenCalled();
+  });
+
+  it("state 未 READY → 不觸發自動 verify（正常走手動 step 2 流程）", async () => {
+    mockStatus = { data: status({ state: "IN_PROGRESS" }), refetch: () => undefined };
+    render(wrap(<OnboardingPage />));
+    await screen.findByRole("navigation", { name: "開通步驟" });
+    expect(postVerify).not.toHaveBeenCalled();
   });
 });
 

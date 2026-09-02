@@ -4,23 +4,28 @@
 (1) 客戶只能改**自己**的帳號（403）；
 (2) leader 必須是**目錄可選**的——`enabled` 與 `accepting_new` 兩個旗標各自要擋；
 (3) 驗簽失敗 → 4xx 且**記錄不落地**（被拒絕的請求不得偽裝成待套用的意圖）；
-(4) 回應必須明講後果（有實際交易成本）與生效時機（下一個 cycle），不讓前端猜。
+(4) 回應必須明講後果（有實際交易成本）與生效時機（下一個 cycle），不讓前端猜；
+(5)（2026-09-02，T10）簽章記錄落地後補寫 pending：READY 且未啟用才寫、已在
+    manifest 或非 READY 都不寫、manifest 檔不存在視為未啟用而不是 503。
 
 簽名用真密碼學（eth_account 本地運算，不觸網，沿 publicapi_helpers.login）。
 """
 import json
 import socket
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from fastapi.testclient import TestClient
 
+from spark.copytrade.notifier import RecordingNotifier
 from spark.filet.leader_change import (LEADER_CHANGE_MAX_AGE_S,
                                        build_leader_change_message,
                                        load_leader_changes)
-from tests.publicapi_helpers import make_app, make_cfg
+from spark.publicapi.pending import load_pending
+from tests.publicapi_helpers import BUILDER, make_app, make_cfg
 
 _REAL_SOCKET = socket.socket  # import 期捕捉，早於 autouse 斷網（沿 test_api_leaders）
 
@@ -129,7 +134,7 @@ def test_response_states_consequences_and_effective_timing(tmp_path):
     # 客戶必須被告知這會產生實際成交與成本，不是改一個設定值
     assert "平掉" in body["consequences"] and "成本" in body["consequences"]
     assert set(body) == {"ok", "account_id", "leader_address", "effective",
-                         "effective_note", "consequences"}
+                         "effective_note", "consequences", "pending_written"}
 
 
 def test_record_is_engine_verifiable_after_landing(tmp_path):
@@ -395,6 +400,244 @@ def test_endpoint_never_touches_the_followers_manifest(tmp_path):
     r, _ = _select(c2, store2, cfg2, Account.create())
     assert r.status_code == 200, r.text
     assert manifest.read_text() == before
+
+
+# ---------- 補寫 pending（T10，2026-09-02）----------
+# 客戶簽完 agent／builder fee、入金到位後若重新整理／換頁，onboarding 精靈會直接
+# 跳過唯一會寫 pending.json 的 `POST /api/onboard/verify`（只掛在 step 2 按鈕上）。
+# 本端點是精靈必經的最後一步（選 leader），簽章記錄落地後補上同一道寫入，
+# 客戶才不會走完精靈卻永遠不被 watcher 啟用。
+
+def _app_with_hl(tmp_path, *, entries=None, followers_path=None, notifier=None):
+    """同 `_make`，但額外把 `hl`（FakeHL）與 `keysvc` 交回，供本節設定鏈上狀態。
+    `notifier` 可注入 `RecordingNotifier`，供斷言 W1 的 critical 告警。"""
+    p = tmp_path / "leaders.json"
+    p.write_text(json.dumps({"leaders": entries if entries is not None else _LEADERS}))
+    over = {"leaders_path": str(p)}
+    if followers_path is not None:
+        over["followers_path"] = followers_path
+    cfg = make_cfg(tmp_path, **over)
+    app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg, notifier=notifier)
+    return TestClient(app, base_url="https://testserver"), cfg, store, keysvc, hl
+
+
+def _make_ready(hl, wallet_addr: str, agent: str):
+    """把 `wallet_addr` 佈成 `_progress` 眼中的 READY（沿 test_api_onboard.py
+    同名 helper 的既有數值：150 USDC 超過門檻、100 為非零 builder fee）。"""
+    hl.max_fees[(wallet_addr.lower(), BUILDER.lower())] = 100
+    hl.agents[wallet_addr.lower()] = [agent]
+    hl.account_values[wallet_addr.lower()] = Decimal("150")
+
+
+def test_ready_and_not_activated_writes_pending(tmp_path):
+    """⭐ 核心修法：READY 且尚未在 followers manifest（首次啟用，manifest 檔
+    甚至不存在）→ 簽章記錄落地後補寫 pending.json，且回應誠實回報
+    `pending_written: true`。"""
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text   # manifest 檔不存在 → 不得變成 503
+    assert r.json()["pending_written"] is True
+    assert "pending_error" not in r.json()
+    entries = load_pending(cfg.pending_path)
+    assert len(entries) == 1
+    assert entries[0]["account_id"] == acct
+    assert entries[0]["user_address"] == w.address.lower()
+    assert entries[0]["agent_address"] == agent.lower()
+    assert entries[0]["builder_address"] == cfg.builder_address
+    assert entries[0]["network"] == cfg.network
+
+
+def test_ready_but_already_in_manifest_does_not_write_pending(tmp_path):
+    """⭐ 已在 followers manifest（已啟用過、這次只是換 leader）→ 絕不補寫
+    pending：寫了會讓 watcher 把老客戶當新客戶再走一次啟用路徑。"""
+    manifest = tmp_path / "followers.json"
+    manifest.write_text(json.dumps({"followers": [
+        {"account_id": "placeholder", "user_address": "0x" + "11" * 20,
+         "builder_address": BUILDER, "network": "testnet"},
+    ]}))
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path, followers_path=str(manifest))
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    # 帳號真正的 account_id 才是 manifest 要匹配的那筆——把佔位條目換成本人。
+    manifest.write_text(json.dumps({"followers": [
+        {"account_id": acct, "user_address": w.address.lower(),
+         "builder_address": BUILDER, "network": "testnet"},
+    ]}))
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is False
+    assert load_pending(cfg.pending_path) == []
+    # 換 leader 記錄仍然落地——本測試盯的只是 pending，不是主要動作。
+    assert len(load_leader_changes(cfg.leader_changes_path)) == 1
+
+
+def test_not_ready_does_not_write_pending(tmp_path):
+    """⭐ 非 READY（例如還沒入金）→ 不寫 pending、不報錯——客戶可能只是先選好
+    leader，稍後才入金；`POST /api/onboard/verify` 之後仍會補上。"""
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    c.post("/api/onboard/agent")
+    # 刻意不呼叫 _make_ready：builder fee／agent 授權／入金皆未完成 → IN_PROGRESS
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is False
+    assert load_pending(cfg.pending_path) == []
+
+
+def test_pending_write_idempotent_across_repeated_leader_changes(tmp_path):
+    """⭐ 冪等：同一帳號第二次換 leader（仍未被人工啟用）不得在 pending.json
+    產生第二筆條目（`write_pending_entry` 本身冪等，這裡驗證呼叫端沒有繞過它）。"""
+    c, cfg, store, keysvc, hl = _app_with_hl(
+        tmp_path, entries=_LEADERS + [{"address": _D, "name": "Delta"}])
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    for leader in (_A, _D):
+        nonce = _fresh_nonce(c, w, leader=leader)
+        body = _payload(account_id=acct, leader=leader, nonce=nonce, wallet=w)
+        r = c.post("/api/leaders/select", json=body)
+        assert r.status_code == 200, r.text
+        assert r.json()["pending_written"] is True
+
+    assert len(load_pending(cfg.pending_path)) == 1
+
+
+def test_hl_read_failure_does_not_fail_the_already_landed_signature(tmp_path):
+    """⭐ 補寫 pending 時 HL 讀取失敗（`_progress` 的三次查詢之一）不得讓整個
+    端點回 500——簽章記錄已經驗證通過並落地，不能因為這個錦上添花的副作用
+    把成功的回應變成失敗（工程原則 2/3：safety-critical 的主動作已成功，
+    附加動作的 transient 失敗只需大聲留痕，不得拖垮主動作）。
+
+    （2026-09-02，opus 審查 W1）大聲留痕不只是 `logger.error`——必須發告警，
+    否則「客戶永遠卡在等待啟用」這件事沒有人看得見。"""
+    notifier = RecordingNotifier()
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path, notifier=notifier)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    c.post("/api/onboard/agent")
+
+    def _boom(*a, **kw):
+        raise ConnectionError("HL unreachable")
+    hl.get_account_value = _boom
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is False
+    assert "pending_error" in r.json()
+    assert len(load_leader_changes(cfg.leader_changes_path)) == 1  # 主動作不受影響
+    assert load_pending(cfg.pending_path) == []
+    critical = [rec for rec in notifier.records if rec[0] == "critical"]
+    assert len(critical) == 1
+    assert acct in critical[0][2]
+
+
+def test_disk_write_failure_does_not_fail_the_already_landed_signature_and_alerts(
+        tmp_path, monkeypatch):
+    """⭐（2026-09-02，opus 審查 W1／W4）磁碟寫入失敗（`write_pending_entry` 拋
+    `OSError`）→ 端點仍 200、`pending_written=false`、`pending_error` 存在，
+    且 notifier 收到 critical 告警——不是只留一條 log。"""
+    notifier = RecordingNotifier()
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path, notifier=notifier)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    def _boom(*a, **kw):
+        raise OSError("disk full")
+    monkeypatch.setattr("spark.publicapi.app.write_pending_entry", _boom)
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is False
+    assert "pending_error" in r.json()
+    assert len(load_leader_changes(cfg.leader_changes_path)) == 1  # 主動作不受影響
+    critical = [rec for rec in notifier.records if rec[0] == "critical"]
+    assert len(critical) == 1
+    assert acct in critical[0][2]
+
+
+def test_corrupt_pending_json_does_not_fail_the_already_landed_signature_and_alerts(
+        tmp_path):
+    """⭐（2026-09-02，opus 審查 W4）pending.json 本身壞掉（非合法 JSON）→
+    `write_pending_entry` 內部 `load_pending` 會拋 `json.JSONDecodeError`
+    （`ValueError` 子類），原本只接 `OSError` 會讓它以 500 洩漏出端點——簽章
+    記錄與 nonce 都已消耗，500 會讓客戶卡死。端點仍須 200 並發告警。"""
+    notifier = RecordingNotifier()
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path, notifier=notifier)
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    from pathlib import Path
+    Path(cfg.pending_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.pending_path).write_text("{not valid json")
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is False
+    assert "pending_error" in r.json()
+    assert len(load_leader_changes(cfg.leader_changes_path)) == 1  # 主動作不受影響
+    critical = [rec for rec in notifier.records if rec[0] == "critical"]
+    assert len(critical) == 1
+    assert acct in critical[0][2]
+
+
+def test_manifest_with_broken_entry_skips_pending_as_indeterminate(tmp_path):
+    """⭐（2026-09-02，opus 審查 W3）manifest 有無法解析的條目（非「查無此帳號」）
+    → 不確定 ≠ 不在，寧可不寫也不猜；`pending_written=false`、
+    `pending_error="manifest_degraded"`。"""
+    manifest = tmp_path / "followers.json"
+    manifest.write_text(json.dumps({"followers": [
+        {"account_id": "broken", "user_address": "0x" + "11" * 20,
+         "builder_address": BUILDER, "network": "not-a-real-network"},
+    ]}))
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path, followers_path=str(manifest))
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is False
+    assert r.json()["pending_error"] == "manifest_degraded"
+    assert load_pending(cfg.pending_path) == []
+    assert len(load_leader_changes(cfg.leader_changes_path)) == 1  # 主動作不受影響
 
 
 def test_leader_changes_path_lives_in_the_dedicated_exchange_dir(tmp_path):

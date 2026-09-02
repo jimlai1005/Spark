@@ -45,6 +45,14 @@ export interface WizardProgress {
   ddEnabled: boolean;
   ddPct: number;
   step3Confirmed: boolean;
+  /**
+   * step 2（連接與授權）是否已經成功呼叫過 `POST /api/onboard/verify` 一次
+   * ——T10（2026-09-02）：精靈只靠 `status.state === "READY"` 判斷可以跳過
+   * step 2，但客戶可能是「重新整理／換頁」跳過了唯一會寫 pending.json 的
+   * verify 呼叫。`onboarding/page.tsx` 用這個旗標決定：載入時已 READY 但這裡
+   * 仍是 false → 先自動補打一次 verify，成功才放行到 step 3。
+   */
+  step2Verified: boolean;
 }
 
 const STORAGE_KEY = "filet_onboarding";
@@ -77,10 +85,15 @@ export function loadWizardProgress(address: string, strategy: string): WizardPro
     || typeof p.scale !== "number"
     || typeof p.ddEnabled !== "boolean" || typeof p.ddPct !== "number"
     || typeof p.step3Confirmed !== "boolean"
+    // ⭐ step2Verified 缺鍵（舊格式，T10 之前存的進度）視為合法、預設 false
+    // ——不讓一個新加的欄位把舊 localStorage 判成壞格式而整個從頭來；型別錯
+    // （存在但不是 boolean）仍視為壞格式，同其餘欄位。
+    || (p.step2Verified !== undefined && typeof p.step2Verified !== "boolean")
   ) return null;
   return {
     address: p.address.toLowerCase(), strategy: p.strategy, scale: p.scale,
     ddEnabled: p.ddEnabled, ddPct: p.ddPct, step3Confirmed: p.step3Confirmed,
+    step2Verified: p.step2Verified === true,
   };
 }
 

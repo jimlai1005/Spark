@@ -134,6 +134,16 @@ function OnboardingInner() {
   const [ddEnabled, setDdEnabled] = useState(false);
   const [ddPct, setDdPct] = useState(DD_DEFAULT);
   const [step3Confirmed, setStep3Confirmed] = useState(false);
+  // T10（2026-09-02）：本地「step 2 已經成功呼叫過 verify 一次」旗標——見
+  // lib/wizard.ts 的 WizardProgress.step2Verified 檔頭說明。
+  const [step2Verified, setStep2Verified] = useState(false);
+  // ⭐ T10：`needsAutoVerify`（下方）在讀到真正的 `step2Verified` 之前**不得**
+  // 判斷為 true——localStorage 讀取是這個 effect 的**非同步**第一輪（`step2Verified`
+  // 初始值恆為 `false`），若不用這個旗標擋住，即使本地其實已經記錄過
+  // `step2Verified: true`，首次 render 仍會以初始值 `false` 誤判為「需要補打」，
+  // 白白多打一次 `postVerify()`（該呼叫本身冪等、後端不會出錯，但這是不必要的
+  // 額外請求，且會讓「不重複呼叫」這個承諾在時序上失真）。
+  const [progressLoaded, setProgressLoaded] = useState(false);
 
   // 斷點續作：me/strategy 就緒後讀一次 localStorage；找不到相符進度就沿用查詢
   // 參數／預設值（URL 帶來的 scale/dd 只在「第一次進來、還沒有本地進度」時採用；
@@ -146,18 +156,20 @@ function OnboardingInner() {
       setDdEnabled(saved.ddEnabled);
       setDdPct(saved.ddPct);
       setStep3Confirmed(saved.step3Confirmed);
-      return;
-    }
-    const qScale = Number(searchParams.get("scale"));
-    const qDd = searchParams.get("dd");
-    if (Number.isFinite(qScale) && qScale > 0) setScale(clampScale(qScale));
-    if (qDd != null) {
-      const n = Number(qDd);
-      if (Number.isFinite(n) && n > 0) {
-        setDdEnabled(true);
-        setDdPct(n);
+      setStep2Verified(saved.step2Verified);
+    } else {
+      const qScale = Number(searchParams.get("scale"));
+      const qDd = searchParams.get("dd");
+      if (Number.isFinite(qScale) && qScale > 0) setScale(clampScale(qScale));
+      if (qDd != null) {
+        const n = Number(qDd);
+        if (Number.isFinite(n) && n > 0) {
+          setDdEnabled(true);
+          setDdPct(n);
+        }
       }
     }
+    setProgressLoaded(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me.data?.address, strategyParam]);
 
@@ -191,12 +203,22 @@ function OnboardingInner() {
 
   const address = me.data.address;
   const s = status.data ?? null;
-  const step = deriveStep({ status: s, step3Confirmed });
+  const rawStep = deriveStep({ status: s, step3Confirmed });
+  // ⭐ T10（2026-09-02）：`deriveStep` 只看鏈上事實（`status.state`），判斷不到
+  // 「客戶到底有沒有真的按過 step 2 的完成按鈕」——重新整理／換頁會直接跳過
+  // 唯一會寫 pending.json 的 `POST /api/onboard/verify`。載入時已 READY（會被
+  // `deriveStep` 判定跳過 step 2）但本地沒有 `step2Verified` 旗標 → 攔在 step 2，
+  // 由 `StepConnect`／`StepDeposit` 自動補打一次 verify（冪等），成功才放行。
+  const needsAutoVerify =
+    progressLoaded && rawStep !== 2 && s != null && s.state === "READY" && !step2Verified;
+  const step = needsAutoVerify ? 2 : rawStep;
   const walletReady = isConnected && !!walletAddress;
 
-  function persist(next: Partial<StepRiskLimitsValues & { step3Confirmed: boolean }>) {
+  function persist(
+    next: Partial<StepRiskLimitsValues & { step3Confirmed: boolean; step2Verified: boolean }>,
+  ) {
     saveWizardProgress({
-      address, strategy: strategyParam, scale, ddEnabled, ddPct, step3Confirmed,
+      address, strategy: strategyParam, scale, ddEnabled, ddPct, step3Confirmed, step2Verified,
       ...next,
     });
   }
@@ -207,6 +229,12 @@ function OnboardingInner() {
     setDdPct(values.ddPct);
     setStep3Confirmed(true);
     persist({ ...values, step3Confirmed: true });
+  }
+
+  // verify 成功（自動補打或手動點擊皆同一路徑）→ 記下旗標，之後不再需要補打。
+  function handleStep2Verified() {
+    setStep2Verified(true);
+    persist({ step2Verified: true });
   }
 
   function handleDone() {
@@ -249,7 +277,8 @@ function OnboardingInner() {
       <div className="wizard-panel">
         {step === 2 && !walletReady && <ReconnectGate />}
         {step === 2 && walletReady && s && (
-          <StepConnect status={s} loginAddress={address} refetchStatus={refetchStatus} />
+          <StepConnect status={s} loginAddress={address} refetchStatus={refetchStatus}
+            autoVerify={needsAutoVerify} onVerified={handleStep2Verified} />
         )}
         {step === 2 && walletReady && !s && <p className="hint">{COPY.common.loading}</p>}
 

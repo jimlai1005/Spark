@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError, postVerify, type OnboardStatus } from "@/lib/api";
 import { useCopy } from "@/lib/lang";
 import { fmtAmount } from "@/lib/format";
@@ -21,9 +21,18 @@ function deriveUnmetReasons(
   return reasons;
 }
 
-export function StepDeposit({ status, refetchStatus }: {
+export function StepDeposit({ status, refetchStatus, autoVerify = false, onVerified }: {
   status: OnboardStatus;
   refetchStatus: () => void;
+  /**
+   * ⭐ T10（2026-09-02）：父層判定客戶載入時已 READY、但本地進度沒有
+   * 「step2 已 verify」旗標（多半是重新整理／換頁跳過了這顆按鈕）→ 傳
+   * `autoVerify=true`，本元件掛載即自動補打一次 `postVerify()`（冪等），
+   * 失敗與成功都沿用下面既有的 submit 錯誤 UI，不另建一套。
+   */
+  autoVerify?: boolean;
+  /** verify 成功（`state === "READY"`）時呼叫——不論是自動或手動點擊觸發。 */
+  onVerified?: () => void;
 }) {
   const COPY = useCopy();
   const c = COPY.wizard;
@@ -31,6 +40,12 @@ export function StepDeposit({ status, refetchStatus }: {
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorList, setErrorList] = useState<string[] | null>(null);
+  // ⭐（2026-09-02，opus 審查 S2）guard 只讓 `autoVerify` 觸發一次：StrictMode
+  // 的 dev 期雙呼叫（mount→cleanup→remount，同一個 fiber，ref 跨兩次都存活）
+  // 或父層意外重掛載，都不該把 `POST /api/onboard/verify` 多打一次——雖然後端
+  // 冪等，多打一次仍是白白浪費一次 HL 讀取。ref 而非 state：這是「做過了嗎」
+  // 的旁路旗標，改它不該觸發重繪。
+  const autoVerifyFired = useRef(false);
 
   async function handleSubmit() {
     setSubmitting(true);
@@ -40,6 +55,7 @@ export function StepDeposit({ status, refetchStatus }: {
       const r = await postVerify();
       if (r.state === "READY") {
         setSubmitted(true);
+        onVerified?.();
       } else {
         const reasons = deriveUnmetReasons(r, c);
         if (reasons.length > 0) setErrorList(reasons);
@@ -59,6 +75,18 @@ export function StepDeposit({ status, refetchStatus }: {
       setSubmitting(false);
     }
   }
+
+  // ⭐ T10：`autoVerify` 只在掛載當下判斷一次是否需要補打——不重複輪詢、不在
+  // 失敗後自動重試（失敗留給客戶用下面既有的按鈕手動重試，同一顆按鈕、同一套
+  // 錯誤 UI）。effect 依賴刻意只有 `autoVerify`：這是「掛載時要不要做一次」的
+  // 判斷，不是要跟著 `status` 每次輪詢重跑。
+  useEffect(() => {
+    if (autoVerify && !autoVerifyFired.current) {
+      autoVerifyFired.current = true;
+      void handleSubmit();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoVerify]);
 
   return (
     <div className="step-card">

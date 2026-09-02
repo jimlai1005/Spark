@@ -37,12 +37,17 @@ const createAgent = vi.fn();
 const getMyRisk = vi.fn();
 const getMyCapital = vi.fn();
 const getMyLeader = vi.fn();
+// ⭐ T10（2026-09-02）：`mockStatus` 一開始就是 READY_STATUS，page.tsx 會在載入時
+// 自動補打一次 `postVerify()`（本地無 `step2Verified` 旗標）——不 mock 會打到
+// 真實實作、在 jsdom 觸發失敗的網路請求，讓頁面卡在 step 2 而非本檔要驗的 step3。
+const postVerify = vi.fn();
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   createAgent: (...a: unknown[]) => createAgent(...a),
   getMyRisk: (...a: unknown[]) => getMyRisk(...a),
   getMyCapital: (...a: unknown[]) => getMyCapital(...a),
   getMyLeader: (...a: unknown[]) => getMyLeader(...a),
+  postVerify: (...a: unknown[]) => postVerify(...a),
 }));
 
 const getPublicStrategy = vi.fn();
@@ -128,6 +133,7 @@ beforeEach(() => {
   mockMe = { data: { address: ADDR, account_id: "fabc" }, isLoading: false };
   mockStatus = { data: READY_STATUS, refetch: () => undefined };
   createAgent.mockResolvedValue({ agent_address: "0xa" });
+  postVerify.mockResolvedValue(READY_STATUS);
   getPublicStrategy.mockResolvedValue(STRATEGY_DETAIL);
   getMyRisk.mockResolvedValue(RISK);
   // ⭐ status="effective"——命中 `notesByStatus` 查表路徑（同 settings 頁）。

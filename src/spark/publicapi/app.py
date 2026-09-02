@@ -2429,6 +2429,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         前端據此把使用者踢回登入頁（web 的 session-expiry redirect）。簽章壞掉時
         session 好端端的，回 401 會讓客戶莫名其妙被登出，而真正的問題（他簽錯了／
         簽章過期）反而不會被顯示出來。
+
+        ⭐⭐（2026-09-02，T10）簽章記錄落地後**額外**補寫 pending：本端點是精靈流程
+        中必經的最後一步，若客戶在完成 step 2（`POST /api/onboard/verify`）之前
+        重新整理／換頁跳過了它，這裡是唯一還會補上 pending.json 的地方——否則客戶
+        會走完整趟精靈卻永遠不被 watcher 啟用，且沒有任何錯誤畫面。回應多帶
+        `pending_written`（是否補寫成功）；已在 followers manifest 的帳號（換 leader
+        而非首次啟用）與非 READY 一律不寫。這一步失敗（HL 讀取或磁碟）不影響本端點
+        的 200：簽章記錄已經生效，見下方實作註解。
         """
         # 1) 客戶只能改自己的：body 的 account_id 必須等於 session 衍生值。
         #    account_id 是待簽訊息的一部分（見 LeaderSelectBody），所以必須顯式收下
@@ -2558,10 +2566,92 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         logger.info("換 leader 記錄已落地 account=%s leader=%s",
                     account_id, verified.leader_address)
 
+        # 5) ⭐ 補寫 pending（2026-09-02，T10）：客戶簽完 agent／builder fee、入金到位
+        #    後若重新整理／換頁，精靈會直接從已完成的 step 判定跳到後面幾步——
+        #    唯一會寫 pending.json 的動作是 `POST /api/onboard/verify`，而它只掛在
+        #    「step 2 完成」按鈕上。客戶因此可能整趟精靈走完、看到「等待啟用」，
+        #    但 pending.json 永遠沒有他，watcher 永遠不啟用（無任何錯誤畫面）。
+        #    本端點是精靈**必經**的最後一步（選 leader），在這裡補一道結構性保證
+        #    （工程原則 5 的 meta-rule：不能只靠前端記得呼叫 verify）。
+        #
+        #    ⭐ 放在簽章記錄成功落地**之後**：這是額外的錦上添花動作，不該讓它的
+        #    失敗（尤其是下面的 HL 讀取）反過來讓已經驗證通過、已經落地的換 leader
+        #    請求整個回 500——客戶的簽章意圖已經生效，不能因為這一步的副作用把
+        #    成功的回應變成失敗。
+        #
+        #    ⭐ 順序刻意是「先查 manifest、再打 HL」（opus 審查 W2）：manifest 讀取
+        #    是本地檔案，`_progress` 是 3 次 HL `/info` 查詢——已經在 manifest 裡的
+        #    客戶（換 leader，非首次啟用）本來就不該寫 pending，沒必要為了這個
+        #    early-out 先付 HL 的成本。manifest 不存在視為「不在 manifest」
+        #    （`_load_own_follower` 對「查無」的既有 503 語意是給跨客戶營運頁用的
+        #    fail-loud，這裡的落地動作已經成功，不該因為 manifest 檔案暫時不存在
+        #    就整個 500）。
+        pending_written = False
+        pending_error: str | None = None
+        try:
+            mine, manifest_degraded = _load_own_follower(account_id)
+        except HTTPException:
+            mine, manifest_degraded = None, False
+
+        if mine is not None:
+            pass  # 已在 manifest（已啟用過、這次只是換 leader）→ 絕不寫 pending，
+            # 否則 watcher 會把他當成新客戶再走一次啟用路徑。
+        elif manifest_degraded:
+            # ⭐ opus 審查 W3：manifest 有無法解析的條目時，「查無此帳號」與「這帳號
+            # 就是壞掉的那筆」無法區分——不確定 ≠ 不在（工程原則 3 的危險方向）。
+            # 誤判「不在」而寫入，會讓一個其實已啟用的客戶被 watcher 當新客戶重跑
+            # 一次啟用流程；因此寧可這次不寫，也不猜。客戶下次操作（或人工排查
+            # manifest 後）仍會再補一次。
+            logger.warning(
+                "leaders_select 補寫 pending 略過：manifest 有無法解析的條目，"
+                "無法確認 account=%s 是否已啟用", account_id)
+            # ⭐ 機器可讀的分類碼（非人話訊息，plan §T10 W3 明訂字面值）：
+            # 前端／測試可以按值分派，不必解析中文字串猜語意。
+            pending_error = "manifest_degraded"
+        else:
+            try:
+                progress = _progress(address)
+            except Exception as e:  # noqa: BLE001 — HL 讀取失敗不得拖垮已落地的簽章記錄
+                logger.error(
+                    "leaders_select 補寫 pending 時 HL 讀取失敗（換 leader 記錄已落地，"
+                    "不受影響）account=%s: %s", account_id, e)
+                # ⭐ opus 審查 W1：log 不夠——這是「客戶會永遠卡在等待啟用」的前兆，
+                # 必須大聲到有人看得見（工程原則 3），不能只靜靜躺在 log 裡。
+                notifier.critical(
+                    "pending_backfill",
+                    f"leaders_select 補寫 pending 失敗（HL 讀取）account={account_id}: {e}",
+                    dedup_key=f"pending_backfill_hl:{account_id}")
+                pending_error = "無法確認入金／授權狀態，請稍後重新整理查看是否已啟用"
+            else:
+                if progress["state"] == "READY":
+                    try:
+                        write_pending_entry(
+                            cfg.pending_path, account_id=progress["account_id"],
+                            user_address=address, builder_address=cfg.builder_address,
+                            network=cfg.network, agent_address=progress["agent_address"])
+                        pending_written = True
+                    except (OSError, ValueError) as e:
+                        # transient／格式性失敗；換 leader 記錄已落地不受影響。
+                        # ⭐ opus 審查 W4：`write_pending_entry` 內部會 `load_pending`
+                        # 既有 pending.json——該檔壞掉會拋 `json.JSONDecodeError`
+                        # （`ValueError` 子類），先前只接 `OSError` 會讓它以 500 洩漏出
+                        # 端點（簽章記錄與 nonce 都已消耗，500 會讓客戶卡死，見
+                        # docstring）。與 W1 同樣大聲留痕（工程原則 3）——寫入本身
+                        # 冪等，客戶下次操作會再補一次。
+                        logger.error(
+                            "leaders_select 補寫 pending 失敗 account=%s path=%s: %s",
+                            account_id, cfg.pending_path, e)
+                        notifier.critical(
+                            "pending_backfill",
+                            f"leaders_select 補寫 pending 失敗（寫入）account={account_id}"
+                            f" path={cfg.pending_path}: {e}",
+                            dedup_key=f"pending_backfill_write:{account_id}")
+                        pending_error = "啟用佇列寫入失敗，請稍後重新整理查看是否已啟用"
+
         # ⭐ 回應必須明講後果與生效時機，不讓前端自己猜（`effective` 是機器可讀的
         #    語意欄位，後面兩個字串是給人看的）。換 leader 不是換一個設定值：引擎會
         #    收斂到新 leader 的部位，平掉舊部位、開新部位，有實際的 taker 成本。
-        return {
+        response = {
             "ok": True,
             "account_id": account_id,
             "leader_address": verified.leader_address,
@@ -2572,7 +2662,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "consequences": "生效時引擎會把你的部位收斂到新 leader："
                             "平掉目前的部位、依新 leader 開新部位。"
                             "這是真實成交，會產生實際的交易成本（taker 費用與滑價）。",
+            "pending_written": pending_written,
         }
+        if pending_error is not None:
+            response["pending_error"] = pending_error
+        return response
 
     # ---------- 資金設定（per-follower 本金與使用比例） ----------
     # ⭐ nonce 與換 leader、SIWE 登入**共用同一張表與同一個 chain_id 域（0）**。
