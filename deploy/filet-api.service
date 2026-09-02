@@ -40,6 +40,16 @@ Environment=FILET_STATE_BASE=/opt/filet/state
 # fail-open——引擎那份撤銷了某個 leader，目錄頁仍列著他、客戶仍選得到。預設值已移除，
 # 漏設即拒絕啟動（require_leaders_path）。驗收見 RUNBOOK §5.7 驗收 4。
 Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
+# ⭐ I-27（2026-09-02）：北極星／路由量 basis 讀的歷史序列檔——必須與
+# filet-daily-report.service 的同名變數逐字元相同（日報寫、API 只讀；API 不需要
+# ReadWritePaths，ProtectSystem=strict 下讀取不受限）。值不同會讓 API 讀到日報從未
+# 寫過的檔，首頁路由量卡在播種值卻零錯誤（事故 I-27，見 RUNBOOK §5.8a）。
+Environment=FILET_ACCRUED_HISTORY_PATH=/opt/filet/spark/var/filet/reports/accrued_history.jsonl
+# ⭐ I-17 explore 磁碟快取（2026-09-02 追加為必填）：**必須**落在下方 ReadWritePaths 之一
+# （/var/lib/filet-api）。不宣告＝預設相對路徑 var/copytrade/explore_index.json，在
+# ProtectSystem=strict 下落檔靜默失敗（只有一行 warning），結果是每次 API 重啟
+# /explore 冷建空榜 ~12 分鐘——正式機 2026-08-31～09-02 就是這個狀態。
+Environment=FILET_EXPLORE_CACHE_PATH=/var/lib/filet-api/explore_index.json
 Environment=FILET_ADMIN_ADDRESSES=REPLACE_WITH_ADMIN_ADDRESSES
 Environment=FILET_API_PORT=8700
 # M3 計費（測試模式）：要啟用時取消註解並填 Stripe **測試** key（sk_test_ 前綴強制，

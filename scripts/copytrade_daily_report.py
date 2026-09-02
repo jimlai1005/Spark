@@ -41,7 +41,15 @@ from spark.verification.reconcile import reconcile
 DEFAULT_LEADER = "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
 VAR_DIR = Path("var/copytrade")
 SNAPSHOT_PATH = VAR_DIR / "accrued_snapshot.json"
-HISTORY_PATH = VAR_DIR / "accrued_history.jsonl"
+# ⭐ I-27（2026-09-02，正式機事故修復）：路徑由 env `FILET_ACCRUED_HISTORY_PATH` 決定
+# ——與 `src/spark/publicapi/config.py` 的 `Config.accrued_history_path` 讀的是**同一個**
+# env 名（單一來源）。日報寫、API 讀，兩邊若各自硬編一個相對路徑，CWD 一旦不同
+# （systemd unit 的 WorkingDirectory 與 ProtectSystem=strict 的 ReadWritePaths 就是
+# 這種錯位）就會出現「寫得到但讀錯檔」或「寫不到」兩種靜默/非靜默失效
+# （工程原則 1：兩側必須同源同路徑）。未設 env 時預設維持
+# `var/copytrade/accrued_history.jsonl`（本機開發相對路徑不變）。
+HISTORY_PATH = Path(os.environ.get("FILET_ACCRUED_HISTORY_PATH")
+                    or (VAR_DIR / "accrued_history.jsonl"))
 
 
 def _usage() -> str:
@@ -106,8 +114,12 @@ def append_accrued_history(day_iso: str, accrued: Decimal, *,
                 continue  # 壞行跳過，不讓一行壞資料擋掉今天的落檔
     rows[day_iso] = {"date": day_iso, "captured_at": now_fn().isoformat(),
                      "accrued": str(accrued)}  # 同日重跑覆蓋（值與時刻同源）
-    HISTORY_PATH.write_text(
-        "".join(json.dumps(rows[d]) + "\n" for d in sorted(rows)))
+    content = "".join(json.dumps(rows[d]) + "\n" for d in sorted(rows))
+    # 原子替換：寫暫存檔＋os.replace，同目錄下的 rename 是原子操作——半寫壞的檔案
+    # 不會被下游（ops.load_accrued_series）讀到，crash-mid-write 也不會留下截斷的 jsonl。
+    tmp_path = HISTORY_PATH.with_suffix(HISTORY_PATH.suffix + f".tmp-{os.getpid()}")
+    tmp_path.write_text(content)
+    os.replace(tmp_path, HISTORY_PATH)
 
 
 def load_skipped(day_iso: str) -> list[tuple[str, Decimal]]:

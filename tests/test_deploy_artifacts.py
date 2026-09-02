@@ -412,6 +412,61 @@ def test_nginx_upstream_port_matches_the_api_unit():
     )
 
 
+# ══ I-27（2026-09-02）：daily-report / api 的 accrued 歷史序列路徑必須同值＋落在放行內 ═
+# 事故：daily-report 舊版硬編相對路徑 var/copytrade/accrued_history.jsonl，不在任何
+# ReadWritePaths 底下 → ProtectSystem=strict 下每日 Read-only file system 失敗，
+# 北極星／builder 合規／換 leader 對帳／營收告警全停兩天。
+
+def test_accrued_history_path_matches_between_daily_report_and_api_units():
+    """⭐⭐⭐ 兩個 unit 宣告的 FILET_ACCRUED_HISTORY_PATH 必須逐字元相同。
+
+    日報寫、API 讀：不同源就是「日報寫到 A、API 讀 B」——API 讀到的檔案永遠是
+    人工播種的舊值，零錯誤、零告警（工程原則 1：比較雙方必須同源）。
+    """
+    daily_val = _unit_env("filet-daily-report.service")["FILET_ACCRUED_HISTORY_PATH"]
+    api_val = _unit_env("filet-api.service")["FILET_ACCRUED_HISTORY_PATH"]
+    assert daily_val == api_val, (
+        f"filet-daily-report.service 的 FILET_ACCRUED_HISTORY_PATH={daily_val!r} 與"
+        f" filet-api.service 的 {api_val!r} 不同值。兩者必須逐字元相同，否則 API"
+        " 讀到的歷史序列永遠不是日報實際寫入的那份（首頁路由量卡在舊值，零錯誤訊息）。"
+    )
+
+
+def test_accrued_history_path_is_writable_under_daily_report_read_write_paths():
+    """⭐⭐⭐ 該路徑必須落在 daily-report unit 已放行的某條 ReadWritePaths 底下。
+
+    這正是 I-27 事故的根因：`ProtectSystem=strict` 下，寫入任何**不在**
+    `ReadWritePaths` 底下的路徑都會是 `OSError: Read-only file system`——服務進
+    failed，但直到隔天報表沒生成才會被人發現。
+    """
+    path = _unit_env("filet-daily-report.service")["FILET_ACCRUED_HISTORY_PATH"]
+    rw_paths = _unit_directive("filet-daily-report.service", "ReadWritePaths")
+    assert any(path == rw or path.startswith(rw.rstrip("/") + "/") for rw in rw_paths), (
+        f"filet-daily-report.service 的 FILET_ACCRUED_HISTORY_PATH={path!r} 不在任何"
+        f" 已放行的 ReadWritePaths（{rw_paths}）底下。ProtectSystem=strict 下對它的寫入"
+        " 會是 Read-only file system（I-27 事故：舊路徑 var/copytrade/accrued_history.jsonl"
+        " 就是這樣掛掉兩天，北極星／builder 合規／換 leader 對帳／營收告警全停）。"
+    )
+
+
+def test_explore_cache_path_declared_and_writable_under_api_read_write_paths():
+    """⭐ I-17 explore 磁碟快取路徑必須宣告、且落在 filet-api 的 ReadWritePaths 底下。
+
+    2026-09-02 查明正式機從未宣告 FILET_EXPLORE_CACHE_PATH → 預設相對路徑
+    var/copytrade/explore_index.json 在 ProtectSystem=strict 下落檔靜默失敗（只有一行
+    warning）→ 每次 API 重啟 /explore 冷建空榜 ~12 分鐘，stale-while-revalidate 形同虛設。
+    """
+    path = _unit_env("filet-api.service").get("FILET_EXPLORE_CACHE_PATH")
+    assert path and path.startswith("/"), (
+        "filet-api.service 未宣告 FILET_EXPLORE_CACHE_PATH（或不是絕對路徑）——預設相對路徑"
+        " 在 ProtectSystem=strict 下寫不進去，重啟後 /explore 空榜。")
+    rw_paths = [p for line in _unit_directive("filet-api.service", "ReadWritePaths")
+                for p in line.split()]
+    assert any(path.startswith(rw.rstrip("/") + "/") for rw in rw_paths), (
+        f"FILET_EXPLORE_CACHE_PATH={path!r} 不在 filet-api.service 的 ReadWritePaths"
+        f"（{rw_paths}）底下——落檔會是 Read-only file system。")
+
+
 def test_perf_series_failure_must_surface_as_a_failed_unit():
     """⭐ perf-series 的 ExecStart 不得加 `-` 前綴（與 leaderboard 的 best-effort 相反）。
 

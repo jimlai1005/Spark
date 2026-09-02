@@ -20,6 +20,13 @@ EnvironmentFile=-/etc/filet/telegram.env
 Environment=FILET_FOLLOWERS=/opt/filet/spark/var/filet/followers.json
 Environment=FILET_STATE_BASE=/opt/filet/state
 Environment=FILET_EXCHANGE_DIR=/var/lib/filet-exchange
+# ⭐ I-27（2026-09-02）：accrued 歷史序列（北極星／路由量 basis）的落點——**必須**
+# 落在下面 ReadWritePaths 放行的 var/filet/reports 底下，否則 ProtectSystem=strict
+# 會讓寫入變 Read-only file system（事故實例：舊版硬編相對路徑
+# var/copytrade/accrued_history.jsonl，不在任何 ReadWritePaths 底下）。
+# 必須與 filet-api.service 的同名變數逐字元相同——日報寫、API 讀，兩邊不同源就會讀錯檔
+# （工程原則 1）。
+Environment=FILET_ACCRUED_HISTORY_PATH=/opt/filet/spark/var/filet/reports/accrued_history.jsonl
 # ⚠️ 刻意**沒有** `-` 前綴（與 filet-leaderboard 的 best-effort 相反）：這是營收關鍵
 # 告警的唯一定時來源，失敗必須讓 unit 進 failed 被監控看見，不能靜默吞掉。
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.filet_daily_report
