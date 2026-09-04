@@ -691,6 +691,12 @@ ReadWritePaths 內」的位置；`/opt/filet/spark/var/filet-api-cache` **不在
 sudo rm -f /var/lib/filet-api/explore_index.json   # 可安全刪除（下次啟動冷建 ~12 分鐘）
 ```
 
+**2026-09-05（explore/trader 指標統一 plan）**：`EXPLORE_INDEX_VERSION` 2 → 3
+（結構不相容，見 `src/spark/publicapi/hl_explore.py` 模組檔頭 D7）。部署後
+`/explore` 會回 `building: true` 直到背景重建完成——候選池 300 址 × 每址
+3–5 個 HL 呼叫 × 0.7s，約 12–20 分鐘。磁碟快照檔（本節上方的
+`explore_index.json`）版本不符會被自動忽略、重新冷建，**不必手動刪除**。
+
 ### 5.4 拉起服務（依序，逐一確認再往下）
 
 ```bash

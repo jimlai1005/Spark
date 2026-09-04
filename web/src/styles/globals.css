@@ -1282,6 +1282,10 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .trader-account-value { display: flex; gap: 8px; margin-top: 8px; }
 .trader-account-value span:last-child { color: var(--text); }
 
+/* 2026-09-05（Task 7）：帳戶價值下方的起訖淨值／初始入金列，同款排版。 */
+.trader-account-row { display: flex; gap: 8px; margin-top: 4px; font-size: var(--fs-micro); color: var(--text-dim); }
+.trader-account-row span:last-child { color: var(--text); }
+
 /* 2026-09-05（explore/trader 指標統一 plan Task 6）：四窗切換群組（複用
    `.explore-window-group`/`.explore-window-btn`），與帳戶價值行之間留白。 */
 .trader-window-group { margin: 4px 0 18px; }

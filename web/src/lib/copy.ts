@@ -1797,6 +1797,11 @@ export const COPY_ZH = {
     fillsTruncatedNote: "成交筆數超過抓取上限，以上為下限值",
     pnlCurveLabel: "損益曲線",
     pnlSourceNote: "損益含未實現損益、資金費率與手續費，已排除出入金（HL pnlHistory）",
+    // 2026-09-05（explore/trader 指標統一 plan Task 7）：Task 6 移除了
+    // MethodologyCard，但 methodology.start/end_equity_usd／initial_deposit_usd
+    // 仍回傳——補回帳戶價值下方一行，不建整張卡。
+    startEndEquityLabel: "起訖淨值（allTime）",
+    initialDepositLabel: "初始入金",
     panel: {
       heading: "跟隨這個地址",
       cta: "連接錢包並繼續",
@@ -3301,6 +3306,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     fillsTruncatedNote: "Fill count exceeded the fetch limit; figures above are lower bounds",
     pnlCurveLabel: "PnL curve",
     pnlSourceNote: "PnL includes unrealized PnL, funding, and fees, net of deposits/withdrawals (HL pnlHistory)",
+    startEndEquityLabel: "Start → end equity (allTime)",
+    initialDepositLabel: "Initial deposit",
     panel: {
       heading: "Copy this address",
       cta: "Connect wallet and continue",

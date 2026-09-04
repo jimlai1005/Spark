@@ -1044,11 +1044,30 @@ git commit -m "feat: 交易員詳情頁改四窗切換＋與探索清單同源�
 
 ---
 
-### Task 7: 收尾（文件、部署註記、全量驗收） `@inline`
+### Task 7: 收尾（起訖淨值補回、文件、部署註記、全量驗收） `@inline`
 
 **Files:**
+- Modify: `web/src/app/traders/[address]/page.tsx`＋`page.test.tsx`（Step 0）
 - Modify: `deploy/RUNBOOK.md`（找 explore 索引／快取相關段落）
 - Modify: `CLAUDE.md`（「慣例」節加一行）
+
+- [ ] **Step 0: 補回起訖淨值一行**（2026-09-05 主線程裁決：Task 6 builder 因型別不相容移除了 `MethodologyCard` 與 `start_end_equity` 卡，但後端 `methodology.start_equity_usd`／`end_equity_usd`／`initial_deposit_usd` 仍回傳，且使用者要求「其餘資料全部保留」）。在帳戶價值那一行下方加一行，沿用既有 `strategyDetail` 的起訖淨值文案 key（Task 6 前 `page.tsx` 約 249 行 `key: "start_end_equity"` 用的那組；若 key 不存在就在 `copy.ts` 的 `traders` 加 `startEndEquityLabel: "起訖淨值（allTime）"` 與 `initialDepositLabel: "初始入金"`，zh/en 對稱）：
+
+```tsx
+<div className="trader-account-row">
+  <span>{c.startEndEquityLabel}</span>
+  <span className="mono">
+    {fmtAmount(trader.methodology.start_equity_usd)} → {fmtAmount(trader.methodology.end_equity_usd)}
+  </span>
+</div>
+{trader.methodology.initial_deposit_usd != null && (
+  <div className="trader-account-row">
+    <span>{c.initialDepositLabel}</span>
+    <span className="mono">{fmtAmount(trader.methodology.initial_deposit_usd)}</span>
+  </div>
+)}
+```
+（`fmtAmount` 對 null 的既有處理沿用；不得用 `??`/`||` 把 null 換成 0。）測試加一條：假資料 `start_equity_usd: "28.70"`、`end_equity_usd: "1.40"`、`initial_deposit_usd: null` → 畫面出現 `→` 兩側金額且不出現初始入金列。
 
 - [ ] **Step 1: RUNBOOK** 加一段：`EXPLORE_INDEX_VERSION` 升 3，部署後 `/explore` 會 `building: true` 直到背景重建完成（300 地址 × 每地址 3–5 個 HL 呼叫 × 0.7s ≈ 12–20 分鐘）；舊快照檔 `var/copytrade/explore_index.json` 版本不符會被忽略、不必手動刪。
 

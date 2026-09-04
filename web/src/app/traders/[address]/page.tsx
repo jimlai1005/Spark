@@ -311,6 +311,21 @@ function TraderDetailInner() {
         <span>{c.accountValueLabel}</span>
         <span className="mono">{fmtAmount(trader.methodology.end_equity_usd)}</span>
       </p>
+      {/* 2026-09-05（Task 7 補回）：Task 6 移除了 MethodologyCard，但後端
+          methodology.start/end_equity_usd／initial_deposit_usd 仍回傳，使用者
+          要求「其餘資料全部保留」——沿用起訖淨值文案 key，加一行不建整張卡。 */}
+      <div className="trader-account-row">
+        <span>{c.startEndEquityLabel}</span>
+        <span className="mono">
+          {fmtAmount(trader.methodology.start_equity_usd)} → {fmtAmount(trader.methodology.end_equity_usd)}
+        </span>
+      </div>
+      {trader.methodology.initial_deposit_usd != null && (
+        <div className="trader-account-row">
+          <span>{c.initialDepositLabel}</span>
+          <span className="mono">{fmtAmount(trader.methodology.initial_deposit_usd)}</span>
+        </div>
+      )}
 
       <div className="explore-window-group trader-window-group" role="group" aria-label={c.windowsLabel}>
         {EXPLORE_WINDOWS.map((w) => (

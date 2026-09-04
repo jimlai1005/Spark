@@ -420,4 +420,33 @@ describe("TraderDetailPage", () => {
       expect(screen.getByText(COPY.traders.fillsTruncatedNote)).toBeInTheDocument();
     });
   });
+
+  describe("Task 7：起訖淨值補回（帳戶價值下方一行）", () => {
+    it("start_equity_usd/end_equity_usd 有值、initial_deposit_usd 為 null → 顯示起訖淨值兩側金額，不出現初始入金列", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        methodology: {
+          ...DETAIL.methodology,
+          start_equity_usd: "28.70",
+          end_equity_usd: "1.40",
+          initial_deposit_usd: null,
+        },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const row = screen.getByText(COPY.traders.startEndEquityLabel).closest(".trader-account-row");
+      expect(row?.textContent).toContain("28.70");
+      expect(row?.textContent).toContain("1.40");
+      expect(screen.queryByText(COPY.traders.initialDepositLabel)).not.toBeInTheDocument();
+    });
+
+    it("initial_deposit_usd 有值 → 額外渲染初始入金列", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.getByText(COPY.traders.initialDepositLabel).nextSibling?.textContent).toBe("1,000.00");
+    });
+  });
 });

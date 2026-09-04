@@ -37,3 +37,4 @@ Hyperliquid builder-code 基礎設施 + copytrade orchestrator（Filet M1）。P
 - Commit 格式：feat:/fix:/test:/docs: 一行敘述（見 git log）。
 - 通知一律走 `spark.copytrade.notifier.Notifier` 注入，引擎不 import 具體實作。
 - 前端（2026-08-29 改版後）：文案雙語單一來源 `web/src/lib/copy.ts`（COPY_ZH/COPY_EN 結構對稱、元件經 `useCopy()` 取用，禁內嵌中文；法務長文在 `web/src/content/legal.ts` 同紀律）。公開路由 `/ /strategies /strategies/[slug] /explore /traders/[address] /advanced /docs /terms /privacy /risk /status /contact`（/docs 自 2026-08-29 起不在導覽；/leaderboard 自 2026-08-30 起 redirect → /explore）；登入後 `/onboarding /dashboard /settings`。nav：未登入 策略/探索/運作方式/安全性，登入後 Dashboard/策略/探索/設定。對外主機名走 build 期 `NEXT_PUBLIC_SITE_ORIGIN`（RUNBOOK §4.2）。
+- 探索清單與交易員詳情的績效數字一律出自 `src/spark/filet/trader_stats.py`（pnl 金額＋權益指數回撤＋Hyperbot 定義成交統計）；兩頁不得各自加公式。策略頁仍走 leader_perf TWR。
