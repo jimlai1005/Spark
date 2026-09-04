@@ -1080,3 +1080,16 @@ def test_endpoint_full_flow_after_build_completes(tmp_path, monkeypatch):
     assert row["label"] == "Alice"
     assert row["windows"]["month"]["pnl_usd"] == 100.0   # 1100-1000
     assert body["pool"] == body["total_scanned"] == 1  # I-17：pool 欄位來自後端，不寫死
+
+
+# --- 2026-09-05 複審修正（Task 10 Step 2）：`fills_max_pages_from_env` 原本無條件讀
+# `os.environ`，`ExploreConfig.from_env(env=...)` 傳進來的 `env` 字典被忽略——單元測試
+# 若用假 env dict（不動真正的程序環境）驗這個欄位，會靜默讀到真實環境值。 -----------
+def test_explore_config_from_env_reads_fills_max_pages_from_given_env_not_os_environ(monkeypatch):
+    monkeypatch.delenv("EXPLORE_FILLS_MAX_PAGES", raising=False)
+    cfg = ExploreConfig.from_env(env={"EXPLORE_FILLS_MAX_PAGES": "7"})
+    assert cfg.fills_max_pages == 7
+    # 假 env 沒設這個鍵時，即使程序環境有值也不該滲入——from_env 傳進去的 env 是唯一來源。
+    monkeypatch.setenv("EXPLORE_FILLS_MAX_PAGES", "9")
+    cfg2 = ExploreConfig.from_env(env={})
+    assert cfg2.fills_max_pages == hl_explore.DEFAULT_FILLS_MAX_PAGES

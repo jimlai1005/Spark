@@ -519,3 +519,26 @@ def test_max_pages_single_source_shared_by_explore_and_traders(tmp_path, monkeyp
     r = _client(app).get(f"/api/public/traders/{_TRADER_ADDR}")
     assert r.status_code == 200, r.text
     assert hl.fills_raw_calls[-1] == (_TRADER_ADDR, 5)
+
+
+# ============================================================
+# Task 10: 複審修正輪（2026-09-05）
+# ============================================================
+
+def test_live_days_from_av_exception_degrades_to_zero_not_whole_page(tmp_path, monkeypatch):
+    """Task 10 Step 3（Suggestion）：`live_days_from_av` 與 `windows` 迴圈同款
+    降級——上游 schema 漂移不得炸掉整頁，只讓 `live_days` 降級成 0。"""
+    import spark.publicapi.app as app_module
+
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    hl.portfolios[_A] = _multi_window_rows()
+
+    def _boom(av_points):
+        raise ValueError("schema 漂移模擬")
+
+    monkeypatch.setattr(app_module, "live_days_from_av", _boom)
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["live_days"] == 0
+    assert body["windows"]["month"] is not None   # 其他區塊不受影響

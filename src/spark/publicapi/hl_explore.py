@@ -210,7 +210,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from spark.filet.leader_perf import extract_window
 from spark.filet.trader_stats import SPARK_POINTS  # noqa: F401 — 保留名稱給既有測試
@@ -241,9 +241,14 @@ DEFAULT_FILLS_MAX_PAGES = 3
 FILLS_MAX_PAGES_ENV = "EXPLORE_FILLS_MAX_PAGES"
 
 
-def fills_max_pages_from_env() -> int:
-    """D5：探索清單與交易員詳情**同一個**分頁上限（兩頁逐位一致的前提）。"""
-    v = os.environ.get(FILLS_MAX_PAGES_ENV)
+def fills_max_pages_from_env(env: Mapping[str, str] | None = None) -> int:
+    """D5：探索清單與交易員詳情**同一個**分頁上限（兩頁逐位一致的前提）。
+    2026-09-05 複審修正（Task 10 Step 2）：原本無條件讀 `os.environ`，
+    `ExploreConfig.from_env(env=...)` 傳進來的假 `env` 字典會被忽略——單元測試用
+    假 env 驗這個欄位會靜默滲入真實程序環境。`env=None`（預設，`app.py` 正式呼叫路徑）
+    才讀 `os.environ`；`ExploreConfig.from_env` 把自己收到的 `env` 原樣傳進來。"""
+    src = os.environ if env is None else env
+    v = src.get(FILLS_MAX_PAGES_ENV)
     return int(v) if v else DEFAULT_FILLS_MAX_PAGES
 
 INDEX_TTL_S = 600.0          # 10 分鐘（D1）
@@ -379,7 +384,7 @@ class ExploreConfig:
             page_size=_int("EXPLORE_PAGE_SIZE", DEFAULT_PAGE_SIZE),
             enrich_call_interval_s=_float("EXPLORE_ENRICH_CALL_INTERVAL_S",
                                           DEFAULT_ENRICH_CALL_INTERVAL_S),
-            fills_max_pages=fills_max_pages_from_env(),
+            fills_max_pages=fills_max_pages_from_env(env),
         )
 
 

@@ -544,24 +544,16 @@ export interface TraderFillsStats {
   truncated: boolean;
 }
 
-const EMPTY_TRADER_FILLS: TraderFillsStats = {
-  order_count: 0,
-  closed_positions: 0,
-  wins: 0,
-  win_rate_pct: null,
-  realized_pnl_usd: 0,
-  concentration_pct: null,
-  coins: [],
-  truncated: false,
-};
-
 // 2026-09-05 Task 9 Step 1（reviewer W2）：後端 fills 抓取失敗回 `null`
 // （Task 8 Step 3），前端必須原樣保留 `null`，不得偽造出一份「看起來合法的
-// 零成交」統計（工程原則 1：讀不到的資料不能冒充讀到）。只有非 null 但格式
-// 異常的物件（缺鍵）才退回 `EMPTY_TRADER_FILLS` 空殼補齊。
+// 零成交」統計（工程原則 1：讀不到的資料不能冒充讀到）。
+// 2026-09-05 Task 10 Step 4（複審 Suggestion）：非物件（字串／數字／陣列）
+// 一律回 `null`，不得退回一份全零殼——那會被前端渲染成「這位交易員零成交」，
+// 與「上游根本沒回傳這個形狀」是不同語意，混為一談等於偽造資料（同一條工程
+// 原則）。只有 `null`／非物件才短路；缺鍵的合法物件仍逐欄位補預設值。
 function normalizeTraderFillsStats(v: unknown): TraderFillsStats | null {
   if (v == null) return null;
-  if (typeof v !== "object") return EMPTY_TRADER_FILLS;
+  if (typeof v !== "object" || Array.isArray(v)) return null;
   const m = v as Partial<TraderFillsStats>;
   return {
     order_count: typeof m.order_count === "number" ? m.order_count : 0,

@@ -422,6 +422,14 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
     # 閘門 5：比例只看「首次入金之後」的區間——開頭尚未入金不是入金→提光。
     effective_total = (len(pnl) - 1) - leading_unfunded
     effective_skipped = skipped - leading_unfunded
+    # 2026-09-05 複審修正（Task 10 Step 1）：effective_total <= 0 代表整窗沒有任何一個
+    # 已入金區間（例如整窗 prev_av 恆 < 地板）——`effective_total > 0` 這個前提原本會讓
+    # 整道比例閘門被跳過，falls through 到 status ok、max_drawdown 0，把「一段都算不出來」
+    # 說成「零回撤」，且會通過探索頁「回撤 < 30%」過濾（fail-open）。
+    if effective_total <= 0:
+        out = _insufficient(period, "no_funded_interval", sample_count=len(pnl))
+        out["skipped_intervals"] = skipped
+        return out
     if (effective_total > 0
             and Decimal(effective_skipped) > MAX_SKIPPED_RATIO * Decimal(effective_total)):
         out = _insufficient(period, "too_many_skipped_intervals", sample_count=len(pnl))

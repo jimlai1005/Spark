@@ -335,6 +335,12 @@ describe("getPublicTraderDetail", () => {
     const r = await getPublicTraderDetail(DETAIL.address);
     expect(r?.follow_blocked).toBe(false);
   });
+
+  it("Task 10 Step 4：fills_30d 畸形 payload（字串）→ null，不偽造成四個 0", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, fills_30d: "x" }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_30d).toBeNull();
+  });
 });
 
 describe("getPublicStats", () => {

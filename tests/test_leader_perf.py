@@ -343,3 +343,18 @@ def test_leading_unfunded_run_is_not_counted_toward_skipped_ratio():
     assert perf["status"] == "ok"
     assert perf["skipped_intervals"] == 20           # 總跳過數語意不變
     assert perf["cum_pnl"] == Decimal("40")
+
+
+# --- 2026-09-05 複審修正（Task 10 Step 1）：effective_total == 0（整窗沒有任何已入金
+# 區間）此前會讓比例閘門整段被跳過（`effective_total > 0` 為 False）、falls through 回
+# status ok、max_drawdown 0——把「算不到」說成「零回撤」，且會通過探索頁的回撤過濾
+# （fail-open）。修法：effective_total <= 0 直接判 insufficient，reason
+# "no_funded_interval"。 ---------------------------------------------------------
+def test_no_funded_interval_is_insufficient_not_zero_drawdown():
+    # 整窗 prev_av 都 < 地板：沒有任何一段算得出 r_t，不得宣告零回撤
+    av = [50] * 10
+    pnl = [0, 5, -30, -20, 10, 20, -5, 0, 3, 7]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == STATUS_INSUFFICIENT
+    assert perf["reason"] == "no_funded_interval"
+    assert perf["skipped_intervals"] == 9

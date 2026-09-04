@@ -2496,7 +2496,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 ws = None
             windows[k] = ws.to_dict() if ws is not None else None
         all_time = extract_window(rows, hl_explore.WINDOW_TO_PERIOD["allTime"])
-        live_days = live_days_from_av(all_time[0]) if all_time is not None else 0
+        # 2026-09-05 複審修正（Task 10 Step 3）：與上方 windows 迴圈同款降級——
+        # 上游 schema 漂移不得炸掉整頁，只讓 live_days 降級成 0。
+        live_days = 0
+        if all_time is not None:
+            try:
+                live_days = live_days_from_av(all_time[0])
+            except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
+                logger.error("交易員 live_days 計算失敗 address=%s: %s", addr, e)
         start_equity_usd, end_equity_usd = (
             build_equity_range(all_time[0]) if all_time is not None else (None, None))
         # 2026-09-05 Task 8 Step 3（reviewer Warning 2）：`fills is None` ＝上游
