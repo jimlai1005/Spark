@@ -453,7 +453,8 @@ function ExploreRowView(
         <span className="mono explore-exposure-label">{exposureLabel}</span>
       </div>
       <div className="explore-actions">
-        <Link href={`/traders/${row.address}`} className="btn btn-ghost explore-view-btn">
+        {/* 2026-09-05（Task 6）：帶所選窗過去，詳情頁預設就是同一窗（D10）。 */}
+        <Link href={`/traders/${row.address}?window=${windowKey}`} className="btn btn-ghost explore-view-btn">
           {c.view}
         </Link>
         <Link

@@ -1,76 +1,87 @@
 "use client";
 /**
  * `/traders/[address]` — 交易員詳情頁（M3 round2 Task 6 首建；M3 round4
- * Task R4-11 版型對齊 `/strategies/[slug]`，使用者三項回饋之一）。
+ * Task R4-11 版型對齊 `/strategies/[slug]`；2026-09-05 explore/trader 指標統一
+ * plan Task 6 改四窗切換＋與探索清單同源欄位）。
  *
  * leaderboard（`/leaderboard`）任意地址的鏈上績效展示頁，**不受精選白名單管轄**
- * ——資料源是公開端點 `GET /api/public/traders/{address}`，計算與
- * `/strategies/[slug]` 共用同一份後端純函式（`filet.strategies.build_metrics`／
- * `build_equity_index`／`build_methodology`／`build_cagr_fields`），前端亦共用
- * 同一批純算術（`lib/strategyMetrics.ts`）與元件（`EquityCurve`／`CagrCard`／
- * `MethodologyCard`／`FollowPanel`），兩頁的公式與圖表渲染只有一份。
+ * ——資料源是公開端點 `GET /api/public/traders/{address}`。`windows`／`live_days`／
+ * `fills_30d`／`exposure` 與 `/api/public/explore`（`ExploreRow`）共用同一組後端
+ * 純函式（`spark.filet.trader_stats`，工程原則 1：兩頁的每一個數字只能從同一處
+ * 出來）——四窗切換（day/week/month/allTime，預設 `month`，D10）不重打 API，
+ * 四窗資料已一次回來，只切換本地顯示。
  *
- * ⭐ M3 round4 Task R4-11（版型對齊）：本頁版型自此與 `/strategies/[slug]`
- * 完整對齊——淨值曲線、指標卡組（含最佳/最差日、起訖淨值）、CAGR 收合卡、
- * 方法論與樣本揭露、右欄跟單面板（含投入比例／回撤 slider）全部齊備，
- * 不再是「plan 明訂範圍」的精簡版（沿舊版註解，已過時移除）。唯三差異全部
- * 收在 `FollowPanel` 的 props，不寫死在頁面裡：
- * 1. 面板頂部多一行進階模式無背書說明（`COPY.advanced.gate.body`，與 `/advanced`
- *    頁同一句無背書語義，不另開一組重複 key）。
- * 2. 槓桿唯讀列：本頁沒有平台審核過的槓桿上限（任意鏈上地址，非策展），顯示
- *    `NO_VALUE`（「—」），不臆造數字（工程原則 1）。
- * 3. CTA 導向 `strategy=advanced:{address}`（沿 `/advanced` 頁同一個入口語義），
- *    不是 `strategy={slug}`；查詢字串同樣可帶 `scale`／`dd`。
+ * ⭐ D6（2026-09-04 使用者否決移除版，改為保留）：`metrics`（Sharpe/Sortino/
+ * 年化波動/日勝率/最佳最差日）改逐窗，網格只渲染**比率型指標**，**不重複渲染**
+ * `total_return_pct`／`max_drawdown_pct`——損益與回撤由窗卡（`windows[w]`）顯示，
+ * 避免同頁兩個回撤數字。CAGR 只算 allTime（`sample_days`／`sample_threshold`
+ * 為頁面層欄位，與所選窗無關）。`equity_index` 已移除，由損益曲線
+ * （`PnlCurve`，讀 `windows[w].spark`）取代——`EquityCurve` 與
+ * `MethodologyCard`（其 prop 型別 `PublicStrategyMethodology` 含
+ * `start_date`/`end_date`/`annualization_days`/`risk_free_rate`，與新版精簡的
+ * `PublicTraderMethodology` 不相容，見 `lib/publicApi.ts` 該型別檔頭「不共用
+ * 同一個介面」）本頁均不再使用。
+ *
+ * ⭐ M3 round4 Task R4-11（版型對齊）：右欄跟單面板（含投入比例／回撤 slider）
+ * 本次改版**完全不動**——差異全部收在 `FollowPanel` 的 props：
+ * 1. 面板頂部多一行進階模式無背書說明（`COPY.advanced.gate.body`）。
+ * 2. 槓桿唯讀列：本頁沒有平台審核過的槓桿上限，顯示 `NO_VALUE`（「—」）。
+ * 3. CTA 導向 `strategy=advanced:{address}`，查詢字串可帶 `scale`／`dd`。
  *
  * ⭐⭐ CTA「連接錢包並繼續」**原封不動**沿用 `/strategies/[slug]` 的
- * connect→SIWE→跳轉流程：`strategy=advanced:{address}`——與 `/advanced` 頁
- * （Task 11）產生的格式完全相同，onboarding（`page.tsx` `ADVANCED_PREFIX`）與
- * `StepConfirm` 的 `postLeaderSelect` 已經吃這個格式：非精選位址在**送出簽章
- * 那一刻**由後端 `_admit_custom_leader` 重新准入並寫入 `user_leaders`
- * registry（見 `publicapi/app.py` `leaders_select` 端點 4a 段），本頁不需要、
- * 也不重新實作那段准入或 registry 邏輯。
+ * connect→SIWE→跳轉流程：`strategy=advanced:{address}`——後端
+ * `_admit_custom_leader` 在送出簽章那一刻重新准入，本頁不重新實作。
  *
- * ⭐ [W3] 2026-08-29 opus 審查修正：標題**一律**用 `shortAddr(trader.address)`
- * ——不再信任 `?name=` 查詢參數（那是 client 端可任意竄改的值，曾經被拿來當
- * 顯示名稱直接渲染）。displayName 現在只在 `/leaderboard` 表格內顯示。
- * ⭐ [W4] 已被平台安全撤銷（`enabled=false`）的 leader：`follow_blocked=true`
- * 時隱藏 CTA、改顯示提示文案，不讓新客戶點進一個已撤銷的地址
- * （`FollowPanel` 的 `disabledState={{kind:"blocked",...}}`，與策略頁
- * `{kind:"pending",...}` 是刻意不同形狀，見該元件檔頭）。
- *
- * ⭐ M3 round3 Task 7（R2-P0 指標收斂，比照 `/strategies/[slug]`）：本頁沿用
- * 同一組 headline／collapse 分組。⭐ R4-11 起改用後端直接供給的
- * `sample_days`／`sample_threshold`（`build_cagr_fields`，與策略頁同一套組裝
- * 規則）取代先前的 `metrics.sample_count` ＋前端鏡射常數 30——不再需要自己
- * 鏡射門檻值。
+ * ⭐ [W3] 標題**一律**用 `shortAddr(trader.address)`，不信任 `?name=`。
+ * ⭐ [W4] `follow_blocked=true`：隱藏 CTA、改顯示提示文案。
  */
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 import { useAccount, useConnect, useSignMessage } from "wagmi";
 import { CagrCard } from "@/components/CagrCard";
-import { EquityCurve } from "@/components/EquityCurve";
 import {
   DD_DEFAULT, FollowPanel, SCALE_DEFAULT,
 } from "@/components/FollowPanel";
-import { MethodologyCard } from "@/components/MethodologyCard";
-import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, shortAddr } from "@/lib/format";
+import { PnlCurve } from "@/components/PnlCurve";
+import { fmtAmount, fmtSignedUsd, fmtUpdatedAtUtc, NO_VALUE, shortAddr } from "@/lib/format";
 import { useQueryClient } from "@tanstack/react-query";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
-import { getPublicTraderDetail, type PublicTraderDetail } from "@/lib/publicApi";
+import {
+  EXPLORE_WINDOWS, getPublicTraderDetail, type ExploreWindow, type PublicTraderDetail,
+} from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
-import { formatDepositEquivalentEquity, metricText, type MetricCardDef } from "@/lib/strategyMetrics";
+import { metricText, type MetricCardDef } from "@/lib/strategyMetrics";
 
 type ConnectPhase = "idle" | "connecting" | "signing";
 
+const DEFAULT_WINDOW: ExploreWindow = "month"; // D10（2026-09-05）：與探索清單預設一致，最穩的窗。
+
+function isExploreWindow(v: string | null): v is ExploreWindow {
+  return v != null && (EXPLORE_WINDOWS as readonly string[]).includes(v);
+}
+
+/** `useSearchParams()` 在 build 期 prerender 需要 Suspense 邊界（Next.js
+ * missing-suspense-with-csr-bailout，見 `advanced/page.tsx`／`onboarding/page.tsx`
+ * 同寫法）。頁面本體在 `TraderDetailInner`。fallback 留空：本頁全 client 資料，
+ * 無首繪內容可給。 */
 export default function TraderDetailPage() {
+  return (
+    <Suspense fallback={null}>
+      <TraderDetailInner />
+    </Suspense>
+  );
+}
+
+function TraderDetailInner() {
   const params = useParams<{ address: string }>();
   const routeAddress = params?.address ?? "";
   const router = useRouter();
+  const searchParams = useSearchParams();
   const COPY = useCopy();
   const c = COPY.traders;
-  const sc = COPY.strategyDetail; // 指標卡／CAGR／方法論／面板 slider 文案沿用（通用績效用語）
+  const sc = COPY.strategyDetail; // 指標卡／CAGR 文案沿用（通用績效用語）
 
   const [trader, setTrader] = useState<PublicTraderDetail | null | undefined>(undefined);
   useEffect(() => {
@@ -87,6 +98,24 @@ export default function TraderDetailPage() {
   useEffect(() => {
     if (trader) document.title = `${shortAddr(trader.address)}｜Filet`;
   }, [trader]);
+
+  // 2026-09-05 Task 6：四窗切換只改本地 state＋URL query，四窗資料已一次回來，
+  // 不重打 API。初始值讀 `?window=`（explore 頁「查看」連結帶所選窗過來，D10：
+  // 非法／缺席一律退回預設 `month`）。用 `window.history.replaceState` 而非
+  // Next router 更新網址——這是純顯示狀態同步，不是導航，不需要進歷史堆疊。
+  const [windowSel, setWindowSel] = useState<ExploreWindow>(() => {
+    const w = searchParams.get("window");
+    return isExploreWindow(w) ? w : DEFAULT_WINDOW;
+  });
+
+  function handleWindowChange(w: ExploreWindow) {
+    setWindowSel(w);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("window", w);
+      window.history.replaceState(null, "", url.toString());
+    }
+  }
 
   const queryClient = useQueryClient();
   const me = useMe();
@@ -123,12 +152,10 @@ export default function TraderDetailPage() {
     );
   }
 
-  const m = trader.metrics;
+  const stats = trader.windows[windowSel];
+  const wm = trader.metrics[windowSel];
   const explorerHref = `https://app.hyperliquid.xyz/explorer/address/${trader.address}`;
   const asOf = fmtUpdatedAtUtc(trader.methodology.updated_at);
-  const startEnd = formatDepositEquivalentEquity(
-    trader.methodology.initial_deposit_usd, trader.equity_index, fmtAmount,
-  );
 
   function buildQuery(): string {
     const p = new URLSearchParams();
@@ -183,31 +210,24 @@ export default function TraderDetailPage() {
   }
 
   // ⭐ R4-11：改用後端直接供給的 sample_days／sample_threshold（與策略頁同一套
-  // `build_cagr_fields` 組裝規則），取代先前 `metrics.sample_count` ＋前端鏡射
-  // 常數 30 的 workaround（見檔頭）。
+  // `build_cagr_fields` 組裝規則）。這是 allTime 專屬的整體樣本量門檻，與
+  // `windowSel`（哪一窗）是兩個不同維度——與 D6 的指標網格摺疊機制共用同一個
+  // 布林旗標，但門檻本身不隨選窗變動。
   const sampleInsufficient = trader.sample_days < trader.sample_threshold;
 
+  // D6：指標網格只渲染比率型指標（sharpe／sharpe_se／annualized_vol_pct／
+  // sortino／win_rate_pct／best_day_pct／worst_day_pct），不再渲染
+  // total_return_pct／max_drawdown_pct（窗卡已顯示 pnl_usd／max_dd_pct，同頁不要
+  // 兩個回撤數字）。win_rate_pct 不受 RATIO_MIN_DAYS 門檻限制（N>=1 即存在，
+  // 見 plan Task 4 測試註解），維持為 headline，其餘四項隨 `sampleInsufficient`
+  // 摺疊。
   const headlineCards: MetricCardDef[] = [
-    {
-      key: "total_return",
-      label: sc.metrics.totalReturnLabel,
-      value: metricText(m.total_return_pct, m.total_return_pct_insufficient, "%"),
-      insufficient: m.total_return_pct_insufficient,
-      note: sc.metrics.totalReturnNote,
-    },
-    {
-      key: "max_drawdown",
-      label: sc.metrics.maxDrawdownLabel,
-      value: metricText(m.max_drawdown_pct, m.max_drawdown_pct_insufficient, "%"),
-      insufficient: m.max_drawdown_pct_insufficient,
-      note: sc.metrics.maxDrawdownNote,
-    },
     {
       key: "win_rate",
       label: sc.metrics.winRateLabel,
-      value: metricText(m.win_rate_pct, m.win_rate_pct_insufficient, "%"),
-      insufficient: m.win_rate_pct_insufficient,
-      note: `${sc.metrics.winRateNotePrefix}${m.sample_count}${sc.metrics.winRateNoteSuffix}`,
+      value: metricText(wm.win_rate_pct, wm.win_rate_pct_insufficient, "%"),
+      insufficient: wm.win_rate_pct_insufficient,
+      note: `${sc.metrics.winRateNotePrefix}${wm.sample_count}${sc.metrics.winRateNoteSuffix}`,
     },
   ];
 
@@ -215,46 +235,47 @@ export default function TraderDetailPage() {
     {
       key: "sharpe",
       label: sc.metrics.sharpeLabel,
-      value: metricText(m.sharpe, m.sharpe_insufficient),
-      insufficient: m.sharpe_insufficient,
-      note: m.sharpe_se_insufficient || m.sharpe_se == null
-        ? "" : `±${m.sharpe_se}${sc.metrics.sharpeNoteSuffix}`,
+      value: metricText(wm.sharpe, wm.sharpe_insufficient),
+      insufficient: wm.sharpe_insufficient,
+      note: wm.sharpe_se_insufficient || wm.sharpe_se == null
+        ? "" : `±${wm.sharpe_se}${sc.metrics.sharpeNoteSuffix}`,
     },
     {
       key: "annualized_vol",
       label: sc.metrics.annualizedVolLabel,
-      value: metricText(m.annualized_vol_pct, m.annualized_vol_pct_insufficient, "%"),
-      insufficient: m.annualized_vol_pct_insufficient,
+      value: metricText(wm.annualized_vol_pct, wm.annualized_vol_pct_insufficient, "%"),
+      insufficient: wm.annualized_vol_pct_insufficient,
       note: sc.metrics.annualizedVolNote,
     },
     {
       key: "sortino",
       label: sc.metrics.sortinoLabel,
-      value: metricText(m.sortino, m.sortino_insufficient),
-      insufficient: m.sortino_insufficient,
+      value: metricText(wm.sortino, wm.sortino_insufficient),
+      insufficient: wm.sortino_insufficient,
       note: sc.metrics.sortinoNote,
     },
     {
       key: "best_worst",
       label: sc.metrics.bestWorstLabel,
-      insufficient: m.best_day_pct_insufficient || m.worst_day_pct_insufficient,
+      insufficient: wm.best_day_pct_insufficient || wm.worst_day_pct_insufficient,
       note: sc.metrics.bestWorstNote,
       pair: {
-        a: metricText(m.best_day_pct, m.best_day_pct_insufficient),
+        a: metricText(wm.best_day_pct, wm.best_day_pct_insufficient),
         sep: "/",
-        b: metricText(m.worst_day_pct, m.worst_day_pct_insufficient),
+        b: metricText(wm.worst_day_pct, wm.worst_day_pct_insufficient),
       },
-    },
-    {
-      key: "start_end_equity",
-      label: sc.metrics.startEndEquityLabel,
-      insufficient: startEnd === null,
-      note: sc.metrics.startEndEquityNote,
-      pair: startEnd ? { a: startEnd.start, sep: "→", b: startEnd.end } : { a: NO_VALUE, sep: "", b: "" },
     },
   ];
 
   const metricCards = sampleInsufficient ? headlineCards : [...headlineCards, ...collapsibleCards];
+
+  const ddText = stats == null || stats.max_dd_pct == null ? null : `${stats.max_dd_pct.toFixed(1)}%`;
+  const exposureText = trader.exposure == null
+    ? NO_VALUE
+    : trader.exposure.pct != null
+      ? `${COPY.explore.exposureDir[trader.exposure.dir]} ${trader.exposure.pct.toFixed(1)}%`
+      : COPY.explore.exposureDir[trader.exposure.dir];
+  const fills = trader.fills_30d;
 
   return (
     <main className="page strategy-detail-page">
@@ -282,29 +303,60 @@ export default function TraderDetailPage() {
 
       <p className="hint">{c.disclaimerNote}</p>
       {/* ⭐ R4-11：這個交易員頁專屬欄位移到頁面層單獨一行，不塞進共用
-          `FollowPanel`（避免共用元件多開一條「traders 專屬 prop」）。
-          ⭐ issue log I-19 附帶一致性修復：原本讀 `account_value`
-          （clearinghouseState，perp-only）——同一頁上方 `EquityCurve`／指標卡
-          走的是 `equity_index`（`allTime`，spot+perp 合併，見 I-15），兩個來源
-          在資金停泊 spot 或近期有內部轉帳時會顯著不一致（同頁出現「目前帳戶
-          價值 0.00 但曲線顯示 15 萬」的自相矛盾）。改讀
-          `methodology.end_equity_usd`——與 `EquityCurve` 同一份 `allTime`
-          `accountValueHistory` 末值（工程原則 1：比較/展示的數字要同源），
-          label 不變。`account_value` 欄位本身在後端回應裡保留（未刪除），
-          只是本頁不再用它做這個展示。 */}
+          `FollowPanel`。帳戶價值讀 `methodology.end_equity_usd`（allTime
+          `accountValueHistory` 末值），與損益曲線（`windows[w].spark`）不同源
+          （工程原則 1：`account_value` 來自另一個端點 clearinghouseState），
+          label 不變、來源不變（沿舊版 issue log I-19 修法）。 */}
       <p className="hint trader-account-value">
         <span>{c.accountValueLabel}</span>
         <span className="mono">{fmtAmount(trader.methodology.end_equity_usd)}</span>
       </p>
 
+      <div className="explore-window-group trader-window-group" role="group" aria-label={c.windowsLabel}>
+        {EXPLORE_WINDOWS.map((w) => (
+          <button
+            key={w}
+            type="button"
+            className="explore-window-btn"
+            data-active={windowSel === w}
+            aria-pressed={windowSel === w}
+            onClick={() => handleWindowChange(w)}
+          >
+            {COPY.explore.windows[w]}
+          </button>
+        ))}
+      </div>
+
       <div className="strategy-detail-grid">
         <div className="strategy-detail-left">
-          <EquityCurve
-            equityIndex={trader.equity_index}
-            initialDepositUsd={trader.methodology.initial_deposit_usd}
-            startDate={trader.methodology.start_date}
-            endDate={trader.methodology.end_date}
-          />
+          <div className="metric-grid">
+            <div className="card metric-card">
+              <div className="metric-card-label">{c.pnlLabel}</div>
+              <div className={`mono metric-card-value${stats == null ? "" : stats.pnl_usd >= 0 ? " pos" : " neg"}`}>
+                {stats == null ? NO_VALUE : fmtSignedUsd(stats.pnl_usd)}
+              </div>
+            </div>
+            <div className="card metric-card">
+              <div className="metric-card-label">{c.ddLabel}</div>
+              <div className="mono metric-card-value neg">
+                {ddText == null
+                  ? <span title={c.ddUnavailableTitle}>{c.ddUnavailable}</span>
+                  : ddText}
+              </div>
+            </div>
+            <div className="card metric-card">
+              <div className="metric-card-label">{c.liveDaysLabel}</div>
+              <div className="mono metric-card-value">{trader.live_days}</div>
+            </div>
+            <div className="card metric-card">
+              <div className="metric-card-label">{c.exposureLabel}</div>
+              <div className="mono metric-card-value">{exposureText}</div>
+            </div>
+          </div>
+
+          <PnlCurve values={stats?.spark ?? []} ariaLabel={c.pnlCurveLabel} />
+          <p className="hint">{c.pnlSourceNote}</p>
+          <p className="hint">{c.ddDefinition}</p>
 
           <div className="metric-grid">
             {metricCards.map((card) => (
@@ -342,7 +394,32 @@ export default function TraderDetailPage() {
             <CagrCard cagr={trader.cagr_pct} sampleDays={trader.sample_days} copy={sc.cagr} />
           )}
 
-          <MethodologyCard methodology={trader.methodology} metrics={m} copy={sc.methodology} />
+          <div className="trader-fills-card card">
+            <div className="methodology-heading">{c.fillsHeading}</div>
+            <div className="metric-grid">
+              <div className="card metric-card">
+                <div className="metric-card-label">{c.orders}</div>
+                <div className="mono metric-card-value">{fills.order_count}</div>
+              </div>
+              <div className="card metric-card">
+                <div className="metric-card-label">{c.closedPositions}</div>
+                <div className="mono metric-card-value">{fills.closed_positions}</div>
+              </div>
+              <div className="card metric-card">
+                <div className="metric-card-label">{c.winRate}</div>
+                <div className="mono metric-card-value">
+                  {fills.win_rate_pct == null ? NO_VALUE : `${fills.win_rate_pct}%`}
+                </div>
+              </div>
+              <div className="card metric-card">
+                <div className="metric-card-label">{c.realizedPnl}</div>
+                <div className={`mono metric-card-value${fills.realized_pnl_usd >= 0 ? " pos" : " neg"}`}>
+                  {fmtSignedUsd(fills.realized_pnl_usd)}
+                </div>
+              </div>
+            </div>
+            {fills.truncated && <p className="hint">{c.fillsTruncatedNote}</p>}
+          </div>
         </div>
 
         <FollowPanel

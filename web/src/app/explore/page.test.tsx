@@ -161,6 +161,25 @@ describe("ExplorePage — 表格渲染", () => {
     expect(retCells[1].textContent).toBe("−$2,182");
   });
 
+  // 2026-09-05（Task 6 grid 欄寬修正）：損益欄改 `minmax(7.5rem, auto)`，長數字
+  // （七位數）不再被固定 88px 截斷——這是 smoke 測試（jsdom 不算版面，只驗證
+  // 長金額仍完整渲染成一段文字，不被 `fmtSignedUsd` 以外的邏輯截斷）。
+  it("損益欄寬修正 smoke：七位數金額完整渲染 +$1,234,568", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{
+        ...ROW_A,
+        windows: {
+          ...ROW_A.windows,
+          month: { pnl_usd: 1234567.89, max_dd_pct: -5.0, max_dd_reason: null, spark: [1, 1.1] },
+        },
+      }],
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const retCells = container.querySelectorAll(".explore-ret");
+    expect(retCells[0].textContent).toBe("+$1,234,568");
+  });
+
   it("max_dd_pct 為 null → 顯示「—」且帶 title 說明", async () => {
     stubFetch(() => jsonResponse(buildResp()));
     const { container } = render(<ExplorePage />);
@@ -210,7 +229,8 @@ describe("ExplorePage — 表格渲染", () => {
     expect(followLinks[1]).toHaveAttribute("href", `/advanced?leader=${ROW_B.address}`);
 
     const viewLinks = screen.getAllByRole("link", { name: COPY.explore.view });
-    expect(viewLinks[0]).toHaveAttribute("href", `/traders/${ROW_A.address}`);
+    // 2026-09-05（Task 6）：「查看」帶所選窗過去，詳情頁預設就落在同一窗（D10）。
+    expect(viewLinks[0]).toHaveAttribute("href", `/traders/${ROW_A.address}?window=month`);
   });
 
   it("D14：tag／曝險方向代碼對映成 copy.ts 顯示文案；未知代碼防禦性顯示原字串", async () => {
