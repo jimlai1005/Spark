@@ -2311,12 +2311,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     # 有快取、account_value 卻是無底洞的放大面）。修法：併入同一個快取條目，
     # tuple 多存一個 account_value 欄位；`_enforce_probe_ratelimit` 只在這次
     # 合併 miss 呼叫一次。
-    # D5（2026-09-05）：`hl.get_fills_raw_paged` 分頁上限，與 `ExploreConfig.
-    # fills_max_pages` 預設同值（各自宣告、註解互指——探索榜與詳情頁是兩個獨立
-    # 的呼叫路徑，不共用同一個 dataclass 實例，但語意必須一致，見 D5）。
-    TRADER_FILLS_MAX_PAGES = 3
+    # D5（2026-09-05）／Task 8 Step 4（reviewer Warning 3）：`hl.get_fills_raw_paged`
+    # 分頁上限不再各自宣告一份本地常數——探索榜與詳情頁改共用
+    # `hl_explore.fills_max_pages_from_env()` 單一來源，兩頁的語意不可能分歧
+    # （原本本檔與 `ExploreConfig.fills_max_pages` 各自宣告一份預設值、各自讀
+    # env，改一邊忘了改另一邊就會讓兩頁的分頁上限悄悄不同）。
     _trader_portfolio_cache: dict[
-        str, tuple[float, list, str | None, Decimal | None, dict | None, list, bool]
+        str, tuple[float, list, str | None, Decimal | None, dict | None, list | None, bool]
     ] = {}
     _trader_portfolio_lock = threading.Lock()
     TRADER_PORTFOLIO_CACHE_TTL_S = 300.0  # 5 分鐘（plan 明訂）
@@ -2335,7 +2336,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
     def _cached_trader_data(
         address: str, ratelimit_key: str
-    ) -> tuple[list | None, str | None, Decimal | None, dict | None, list, bool]:
+    ) -> tuple[list | None, str | None, Decimal | None, dict | None, list | None, bool]:
         """`hl.portfolio()` ＋ `hl.clearinghouse_state()` ＋
         `hl.non_funding_ledger_updates()` ＋ `hl.get_fills_raw_paged()`（D5，
         2026-09-05 新增，供 `trader_stats.fills_stats` 使用）的 5 分鐘
@@ -2346,9 +2347,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         呼叫，就是重新製造一次 [8b-1] 那種放大面）——`account_value`
         （clearinghouseState，本次起**整份 ch_state 也一併快取**供 `exposure`
         欄位使用）、真實入金（ledger）、fills 三者失敗都只讓各自欄位降級
-        （`account_value=None`／`ch_state=None`／`fills=[]`,
-        `fills_truncated=False`），不影響 `rows`（portfolio，windows／metrics
-        的唯一資料源）是否成功快取；`rows` 失敗才走負面快取短路整個條目
+        （`account_value=None`／`ch_state=None`／`fills=None`——2026-09-05
+        Task 8 Step 3（reviewer Warning 2）：失敗與「查到、但這 30 天沒有
+        任何成交」是兩件不同的事，前者不得偽造成後者的 `[]`，否則前端會把
+        「查不到」顯示成「零成交」；`fills_truncated=False`），不影響
+        `rows`（portfolio，windows／metrics 的唯一資料源）是否成功快取；
+        `rows` 失敗才走負面快取短路整個條目
         （工程原則 1：四個來源分別展示各自的數字，不混進同一個對比，但**快取
         時機**合併不影響這條原則——每個欄位在回應裡仍各自標明來源、各自可能
         為 `None`／空值）。
@@ -2369,7 +2373,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         if cached is not None and now - cached[0] < TRADER_PORTFOLIO_CACHE_TTL_S:
             return cached[1], cached[2], cached[3], cached[4], cached[5], cached[6]
         if failed_at is not None and now - failed_at < TRADER_PORTFOLIO_NEGATIVE_TTL_S:
-            return None, None, None, None, [], False
+            return None, None, None, None, None, False
         # ⭐ [C1] per-client rate limit：只在真的要打上游（快取未命中、負面快取也
         # 已過期）這一刻才計費——cache/negative-cache 命中不消耗額度，因為那兩條
         # 路徑本來就不會產生上游流量，計費在那兩條路徑上只會誤傷正常瀏覽。
@@ -2380,7 +2384,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             logger.error("交易員績效上游查詢失敗 address=%s: %s", address, e)
             with _trader_portfolio_lock:
                 _trader_portfolio_negative_cache[address] = now
-            return None, None, None, None, [], False
+            return None, None, None, None, None, False
         account_value = None
         ch_state = None
         try:
@@ -2394,13 +2398,16 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             deposit = sum_ledger_deposits(ledger_raw)
         except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
             logger.error("交易員真實入金查詢失敗 address=%s: %s", address, e)
-        fills: list = []
+        # 2026-09-05 Task 8 Step 3（reviewer Warning 2）：失敗降級為 `None`，不是
+        # `[]`——`[]` 是「查到了、剛好零成交」的合法值，`None` 才是「沒查到」，
+        # 兩者混用會讓前端把「上游查詢失敗」誤顯示成「這位交易員零成交」。
+        fills: list | None = None
         fills_truncated = False
         try:
             end_dt = datetime.fromtimestamp(now, tz=timezone.utc)
             start_dt = end_dt - timedelta(days=hl_explore.FILLS_WINDOW_DAYS)
             fills, fills_truncated = hl.get_fills_raw_paged(
-                address, start_dt, end_dt, max_pages=TRADER_FILLS_MAX_PAGES)
+                address, start_dt, end_dt, max_pages=hl_explore.fills_max_pages_from_env())
         except Exception as e:  # noqa: BLE001 — 額外欄位（成交統計），失敗只降級該欄位
             logger.error("交易員近 30 天成交查詢失敗 address=%s: %s", address, e)
         with _trader_portfolio_lock:
@@ -2477,13 +2484,25 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         if rows is None:
             raise HTTPException(status_code=503, detail="鏈上績效查詢暫時不可用，請稍後重試")
 
-        windows = {k: (ws.to_dict() if (ws := window_stats(rows, p)) is not None else None)
-                  for k, p in hl_explore.WINDOW_TO_PERIOD.items()}
+        # 2026-09-05 Task 8 Step 2（reviewer Warning 1）：與下方 perfs 迴圈同款
+        # 降級——`window_stats` 對某一窗拋例外（上游 schema 漂移）不得炸掉整頁，
+        # 只讓那一窗降級成 None，其餘窗照常計算。
+        windows: dict[str, dict | None] = {}
+        for k, p in hl_explore.WINDOW_TO_PERIOD.items():
+            try:
+                ws = window_stats(rows, p)
+            except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整頁（與 perfs 迴圈同款）
+                logger.error("交易員窗指標計算失敗 address=%s window=%s: %s", addr, k, e)
+                ws = None
+            windows[k] = ws.to_dict() if ws is not None else None
         all_time = extract_window(rows, hl_explore.WINDOW_TO_PERIOD["allTime"])
         live_days = live_days_from_av(all_time[0]) if all_time is not None else 0
         start_equity_usd, end_equity_usd = (
             build_equity_range(all_time[0]) if all_time is not None else (None, None))
-        fs = fills_stats(fills, truncated=fills_truncated)
+        # 2026-09-05 Task 8 Step 3（reviewer Warning 2）：`fills is None` ＝上游
+        # 查詢失敗（見 `_cached_trader_data`），`fills_30d` 必須是 `null`，不得
+        # 用 `fills_stats([], ...)` 偽造出一份看起來合法的「零成交」統計。
+        fs = fills_stats(fills, truncated=fills_truncated) if fills is not None else None
         exp_dir, exp_pct = (hl_explore.exposure_from_clearinghouse(ch_state)
                            if ch_state else (None, None))
 
@@ -2511,7 +2530,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "exposure": None if exp_dir is None else {"dir": exp_dir, "pct": exp_pct},
             "windows": windows,
             "metrics": metrics,
-            "fills_30d": fs.to_dict(),
+            "fills_30d": fs.to_dict() if fs is not None else None,
             "methodology": {
                 "basis": "combined",
                 "updated_at": int(now_fn()),

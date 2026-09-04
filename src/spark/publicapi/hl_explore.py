@@ -233,6 +233,18 @@ DEFAULT_PAGE_SIZE = 25
 # ≤ 6000 筆——`_call_hl` 的節流包住整個分頁呼叫，頁與頁之間沒有額外間隔，這是
 # 已知的 burst 面，上限 3 就是為了壓它（見 Task 3a）。
 DEFAULT_FILLS_MAX_PAGES = 3
+# Task 8 Step 4（2026-09-05，reviewer Warning 3）：探索清單與交易員詳情頁原本
+# 各自讀一份 `EXPLORE_FILLS_MAX_PAGES`（`ExploreConfig.fills_max_pages` 與
+# app.py 的 `TRADER_FILLS_MAX_PAGES`）——同名 env var、兩處硬編預設值，改一邊
+# 忘了改另一邊，兩頁的分頁上限就會悄悄分歧（D5「兩頁逐位一致」的前提被打破）。
+# 改為單一來源函式，兩處呼叫端都指到這裡。
+FILLS_MAX_PAGES_ENV = "EXPLORE_FILLS_MAX_PAGES"
+
+
+def fills_max_pages_from_env() -> int:
+    """D5：探索清單與交易員詳情**同一個**分頁上限（兩頁逐位一致的前提）。"""
+    v = os.environ.get(FILLS_MAX_PAGES_ENV)
+    return int(v) if v else DEFAULT_FILLS_MAX_PAGES
 
 INDEX_TTL_S = 600.0          # 10 分鐘（D1）
 ENRICH_CACHE_TTL_S = 1800.0  # 30 分鐘 per-address enrich 快取（D1）
@@ -367,7 +379,7 @@ class ExploreConfig:
             page_size=_int("EXPLORE_PAGE_SIZE", DEFAULT_PAGE_SIZE),
             enrich_call_interval_s=_float("EXPLORE_ENRICH_CALL_INTERVAL_S",
                                           DEFAULT_ENRICH_CALL_INTERVAL_S),
-            fills_max_pages=_int("EXPLORE_FILLS_MAX_PAGES", DEFAULT_FILLS_MAX_PAGES),
+            fills_max_pages=fills_max_pages_from_env(),
         )
 
 

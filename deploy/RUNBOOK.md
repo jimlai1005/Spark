@@ -697,6 +697,11 @@ sudo rm -f /var/lib/filet-api/explore_index.json   # 可安全刪除（下次啟
 3–5 個 HL 呼叫 × 0.7s，約 12–20 分鐘。磁碟快照檔（本節上方的
 `explore_index.json`）版本不符會被自動忽略、重新冷建，**不必手動刪除**。
 
+**2026-09-05（Task 8，reviewer 修正輪）**：`EXPLORE_FILLS_MAX_PAGES`（預設 3，
+每頁 2000 筆；探索清單與交易員詳情頁**共用同一個**分頁上限，見
+`hl_explore.fills_max_pages_from_env()`）——大戶 30 天成交常超過 6000 筆，
+實測 0xbf73 為 5887+ 筆，調高前先確認 429 情況。
+
 ### 5.4 拉起服務（依序，逐一確認再往下）
 
 ```bash

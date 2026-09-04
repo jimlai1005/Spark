@@ -309,9 +309,9 @@ def test_flow_dominated_interval_marks_window_insufficient():
 
 
 def test_too_many_skipped_intervals_marks_window_insufficient():
-    # 10 點 → 9 區間；av[0..4] = 10 → 區間 i=1..5 的前值 < 100（跳過 5 段）→ 5/9 = 0.556 > 0.30
-    av = [10, 10, 10, 10, 10, 1000, 1010, 1020, 1030, 1040]
-    pnl = [0, 0, 0, 0, 0, 0, 10, 20, 30, 40]
+    # 10 點 → 9 區間；入金後又提光 5 段（i=3..7 前值 10 < 100）→ 5/9 = 0.556 > 0.30
+    av = [1000, 1010, 10, 10, 10, 10, 10, 1000, 1010, 1020]
+    pnl = [0, 10, 10, 10, 10, 10, 10, 10, 20, 30]
     perf = compute_window_performance(_portfolio("month", av, pnl), "month")
     assert perf["status"] == STATUS_INSUFFICIENT
     assert perf["reason"] == "too_many_skipped_intervals"
@@ -326,10 +326,20 @@ def test_exact_total_loss_is_not_flow_dominated():
 
 
 def test_skipped_ratio_exactly_at_threshold_passes():
-    # 11 點 → 10 區間；3 個跳過 = 0.30，不大於門檻 → ok
-    av = [10, 10, 10, 1000, 1010, 1020, 1030, 1040, 1050, 1060, 1070]
-    pnl = [0, 0, 0, 0, 10, 20, 30, 40, 50, 60, 70]
+    # 11 點 → 10 區間；入金後提光 3 段（i=2..4 前值 5）= 0.30，不大於門檻 → ok
+    av = [1000, 5, 5, 5, 1000, 1010, 1020, 1030, 1040, 1050, 1060]
+    pnl = [0, -995, -995, -995, -995, -985, -975, -965, -955, -945, -935]
     perf = compute_window_performance(_portfolio("month", av, pnl), "month")
     assert perf["status"] == "ok"
     assert perf["skipped_intervals"] == 3
     assert MAX_SKIPPED_RATIO == Decimal("0.30")
+
+
+def test_leading_unfunded_run_is_not_counted_toward_skipped_ratio():
+    # 新 follower：前 20 點 AV=0（尚未入金），入金後 8 個區間全部正常 → ok，cum_pnl 照算
+    av = [0] * 20 + [500, 505, 510, 515, 520, 525, 530, 535, 540]
+    pnl = [0] * 20 + [0, 5, 10, 15, 20, 25, 30, 35, 40]
+    perf = compute_window_performance(_portfolio("perpMonth", av, pnl), "perpMonth")
+    assert perf["status"] == "ok"
+    assert perf["skipped_intervals"] == 20           # 總跳過數語意不變
+    assert perf["cum_pnl"] == Decimal("40")

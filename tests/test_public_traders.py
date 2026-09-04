@@ -451,3 +451,71 @@ def test_trader_detail_and_explore_row_agree_on_same_address(tmp_path):
     assert detail["fills_30d"]["closed_positions"] == row["closed_positions_30d"]
     assert detail["fills_30d"]["win_rate_pct"] == row["close_win_rate_pct"]
     assert detail["fills_30d"]["realized_pnl_usd"] == row["realized_pnl_30d_usd"]
+
+
+# ============================================================
+# Task 8: reviewer 修正輪（後端）——2026-09-05
+# ============================================================
+
+def _multi_window_rows():
+    """day/week/month/allTime 四窗都給真實資料（2 點、有損益）——用來驗證
+    `windows` 迴圈裡單一窗拋例外時，其餘窗不受拖累（Step 2）。"""
+    t = 60 * _DAY_MS
+    rows = []
+    for period in ("day", "week", "month", "allTime"):
+        rows.append([period, {"accountValueHistory": [[0, "1000"], [t, "1200"]],
+                              "pnlHistory": [[0, "0"], [t, "200"]]}])
+    return rows
+
+
+def test_window_stats_exception_degrades_only_that_window_not_whole_page(tmp_path, monkeypatch):
+    """Task 8 Step 2（reviewer Warning 1）：`window_stats` 對某一窗拋例外
+    （上游 schema 漂移）不得炸掉整頁——只讓那一窗降級成 None，其餘窗照常算。"""
+    import spark.publicapi.app as app_module
+
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    hl.portfolios[_A] = _multi_window_rows()
+
+    real_window_stats = app_module.window_stats
+
+    def _boom(rows, period):
+        if period == "month":
+            raise ValueError("schema 漂移模擬")
+        return real_window_stats(rows, period)
+
+    monkeypatch.setattr(app_module, "window_stats", _boom)
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["windows"]["month"] is None
+    assert body["windows"]["day"] is not None
+    assert body["windows"]["allTime"] is not None
+
+
+def test_trader_detail_fills_failure_yields_null_not_zeros(tmp_path):
+    """Task 8 Step 3（reviewer Warning 2）：fills 抓取失敗必須是 `fills_30d: null`，
+    不得偽造成 `fills_stats([], ...)` 那種看起來合法的「零成交」統計。"""
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    _seed_0x6648(hl)
+    hl.fills_raw_error[_TRADER_ADDR] = RuntimeError("HL 500")
+    r = _client(app).get(f"/api/public/traders/{_TRADER_ADDR}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fills_30d"] is None
+    assert body["windows"]["month"]["pnl_usd"] == 33055.26     # 其他區塊不受影響
+
+
+def test_max_pages_single_source_shared_by_explore_and_traders(tmp_path, monkeypatch):
+    """Task 8 Step 4（reviewer Warning 3）：探索清單與交易員詳情頁的
+    `get_fills_raw_paged` 呼叫都讀同一個 `EXPLORE_FILLS_MAX_PAGES`——改一邊
+    env 兩條路徑都要跟著變，不是各自硬編一份預設值。"""
+    monkeypatch.setenv("EXPLORE_FILLS_MAX_PAGES", "5")
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    _seed_0x6648(hl)
+
+    assert hl_explore.fills_max_pages_from_env() == 5
+    assert hl_explore.ExploreConfig.from_env().fills_max_pages == 5
+
+    r = _client(app).get(f"/api/public/traders/{_TRADER_ADDR}")
+    assert r.status_code == 200, r.text
+    assert hl.fills_raw_calls[-1] == (_TRADER_ADDR, 5)

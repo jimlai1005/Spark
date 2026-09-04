@@ -132,3 +132,17 @@ def test_fills_stats_empty():
     fs = fills_stats([], truncated=False)
     assert fs.order_count == 0 and fs.realized_pnl_usd == 0.0 and fs.coins == () \
         and fs.concentration_pct is None
+
+
+def test_fills_stats_order_count_excludes_unparseable_and_missing_oid():
+    """Task 8 Step 5（reviewer Suggestion 3）：px 解析失敗的 fill 已被整筆跳過
+    （不計入任何統計）；`oid` 缺席的 fill 不是一張可辨識的訂單，也不該計進
+    `order_count`——只有一筆真正合法的 fill 應該被算進去。"""
+    f = [{"coin": "BTC", "oid": 1, "dir": "Open Long", "startPosition": "0", "sz": "1", "px": "x",
+          "closedPnl": "0", "time": 1},                                       # px 解析失敗
+         {"coin": "BTC", "dir": "Open Long", "startPosition": "0", "sz": "1", "px": "100",
+          "closedPnl": "0", "time": 2},                                       # 無 oid
+         {"coin": "BTC", "oid": 3, "dir": "Open Long", "startPosition": "0", "sz": "1", "px": "100",
+          "closedPnl": "0", "time": 3}]
+    fs = fills_stats(f, truncated=False)
+    assert fs.order_count == 1

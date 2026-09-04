@@ -381,6 +381,13 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
     # --- 分段報酬與權益指數（出入金中性化的唯一正確基準） ---
     equity_index: list[Decimal] = [Decimal("1")]
     skipped = 0
+    # 2026-09-05 Task 8 Step 1（reviewer Critical）：窗口開頭連續「尚未入金」
+    # （prev_av < 地板）的區間數，不計入跳過比例的分子分母——新 follower 在窗中途
+    # 才入金，窗前段全是「還沒開始交易」，不是「入金→提光」型的無效資料。主線程
+    # 實跑重現：av=[0]*20+[500..540] 舊邏輯判 too_many_skipped_intervals，導致
+    # 剛入金的 follower 在 dashboard 上損益／回撤全部顯示 None。
+    leading_unfunded = 0
+    funded_seen = False
     net_flow = Decimal("0")
     for i in range(1, len(pnl)):
         d_pnl = pnl[i][1] - pnl[i - 1][1]
@@ -391,8 +398,11 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
             # 分母地板：不計入複利（r_t 視為 0），但**記數**——被跳過的區間數是
             # 「這個數字有多少沒算進去」的誠實揭露，不可靜默吞掉（工程原則 3）。
             skipped += 1
+            if not funded_seen:
+                leading_unfunded += 1
             equity_index.append(equity_index[-1])
             continue
+        funded_seen = True
         try:
             r = d_pnl / prev_av
         except (DivisionByZero, InvalidOperation):  # 地板已擋住，這裡是縱深防禦
@@ -409,7 +419,11 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
             return _insufficient(period, "flow_dominated_interval", sample_count=len(pnl))
         equity_index.append(equity_index[-1] * (Decimal("1") + r))
 
-    if Decimal(skipped) > MAX_SKIPPED_RATIO * Decimal(len(pnl) - 1):
+    # 閘門 5：比例只看「首次入金之後」的區間——開頭尚未入金不是入金→提光。
+    effective_total = (len(pnl) - 1) - leading_unfunded
+    effective_skipped = skipped - leading_unfunded
+    if (effective_total > 0
+            and Decimal(effective_skipped) > MAX_SKIPPED_RATIO * Decimal(effective_total)):
         out = _insufficient(period, "too_many_skipped_intervals", sample_count=len(pnl))
         out["skipped_intervals"] = skipped
         return out

@@ -142,13 +142,19 @@ def fills_stats(fills: list[dict], *, truncated: bool) -> FillsStats:
     acc: dict[str, Decimal] = {}
     notional: dict[str, Decimal] = {}
     for f in perp:
-        oids.add(f.get("oid"))
         coin = str(f.get("coin", ""))
         try:
             pnl = Decimal(str(f.get("closedPnl", "0") or "0"))
             n = abs(Decimal(str(f.get("px", "0"))) * Decimal(str(f.get("sz", "0"))))
         except (ArithmeticError, TypeError, ValueError):
             continue
+        # 2026-09-05 Task 8 Step 5（reviewer Suggestion 3）：只算解析成功且
+        # `oid` 非 None 的 fill——解析失敗的 fill 已被上面 `continue` 跳過不計
+        # 入任何統計，`order_count` 不該是例外；`oid` 缺席就不是一張可辨識的
+        # 訂單，計進去會虛增訂單數。
+        oid = f.get("oid")
+        if oid is not None:
+            oids.add(oid)
         realized += pnl
         acc[coin] = acc.get(coin, Decimal("0")) + pnl
         notional[coin] = notional.get(coin, Decimal("0")) + n

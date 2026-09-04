@@ -119,6 +119,10 @@ class FakeHL:
         # 慣例——鏡射真實 `HLGateway.get_fills_raw_paged`（見 hl.py Task 3a）。
         self.fills_raw: dict[str, list] = {}
         self.fills_raw_error: dict[str, Exception] = {}
+        # Task 8 Step 4（2026-09-05，reviewer Warning 3：max_pages 單一來源）：
+        # 記錄每次呼叫實際收到的 `(address, max_pages)`，讓測試能斷言探索與
+        # 詳情兩條路徑真的讀到同一個 env 值，不必間接推論。
+        self.fills_raw_calls: list[tuple[str, int | None]] = []
         self.user_details_payload: dict[str, dict] = {}
         self.user_details_error: dict[str, Exception] = {}
         # I-19（EquityCurve overlay benchmarks）：per-coin K 線 fixture ＋可注入
@@ -207,7 +211,8 @@ class FakeHL:
         """`HLGateway.get_fills_raw_paged`（Task 3a）的假版：同 `get_fills_detail_paged`
         的既有簡化慣例——單頁測試委派給 `fills_raw`（未裁切原始形狀）字典，
         回傳 `truncated=False`；真正跨頁截斷行為由 `tests/test_publicapi_hl.py`
-        對 `HLGateway` 直接單測。"""
+        對 `HLGateway` 直接單測。每次呼叫記進 `fills_raw_calls`（Task 8 Step 4）。"""
+        self.fills_raw_calls.append((address.lower(), max_pages))
         err = self.fills_raw_error.get(address.lower())
         if err is not None:
             raise err
