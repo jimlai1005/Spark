@@ -113,6 +113,12 @@ class FakeHL:
         # userDetails 原始 payload，各自可注入失敗（HL/explorer 各自獨立的上游）。
         self.fills_detail: dict[str, list] = {}
         self.fills_detail_error: dict[str, Exception] = {}
+        # 探索清單／交易員詳情（hl_explore Task 3，2026-09-05）用：per-address
+        # **原始** HL fills dict（含 dir/oid/startPosition/closedPnl，未經
+        # `_fill_detail_dict` 裁切）＋可注入失敗，同其餘查詢的既有 `_error`
+        # 慣例——鏡射真實 `HLGateway.get_fills_raw_paged`（見 hl.py Task 3a）。
+        self.fills_raw: dict[str, list] = {}
+        self.fills_raw_error: dict[str, Exception] = {}
         self.user_details_payload: dict[str, dict] = {}
         self.user_details_error: dict[str, Exception] = {}
         # I-19（EquityCurve overlay benchmarks）：per-coin K 線 fixture ＋可注入
@@ -196,6 +202,16 @@ class FakeHL:
         真正跨 2000 筆邊界的分頁行為由 `tests/test_publicapi_hl.py` 對
         `HLGateway` 直接單測。"""
         return self.get_fills_detail(address, start, end), False
+
+    def get_fills_raw_paged(self, address: str, start, end, *, max_pages=None):
+        """`HLGateway.get_fills_raw_paged`（Task 3a）的假版：同 `get_fills_detail_paged`
+        的既有簡化慣例——單頁測試委派給 `fills_raw`（未裁切原始形狀）字典，
+        回傳 `truncated=False`；真正跨頁截斷行為由 `tests/test_publicapi_hl.py`
+        對 `HLGateway` 直接單測。"""
+        err = self.fills_raw_error.get(address.lower())
+        if err is not None:
+            raise err
+        return list(self.fills_raw.get(address.lower(), [])), False
 
     def candle_snapshot(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list:
         err = self.candle_error.get(coin)
