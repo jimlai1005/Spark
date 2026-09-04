@@ -271,6 +271,11 @@ export default function ExplorePage() {
         </span>
       </div>
 
+      {/* ⭐ Task 9 Step 5（reviewer W5）：後端回撤過濾對「算不出回撤」的帳戶
+          不過濾（`hl_explore.qualify`「沒有證據代表回撤超標」慣例），chip 開啟
+          時提示這件事，否則使用者以為榜單裡不會再出現回撤欄「—」的列。 */}
+      {maxDdChip && <p className="hint explore-dd-filter-note">{c.ddFilterNoEvidenceNote}</p>}
+
       {state === "loading" && <p className="hint">{COPY.common.loading}</p>}
 
       {state === "error" && (

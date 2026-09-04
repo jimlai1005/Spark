@@ -385,6 +385,20 @@ describe("ExplorePage — R4-10 qualified chip 拆分", () => {
     });
   });
 
+  // ⭐ Task 9 Step 5（reviewer W5）：後端回撤過濾對「算不出回撤」的帳戶不過濾
+  // （`hl_explore.qualify`「沒有證據代表回撤超標」慣例，見 `hl_explore.py:721-725`），
+  // chip 開啟時 UI 要提示這件事，否則使用者誤以為榜單裡不會再出現回撤「—」的列。
+  it("W5：「最大回撤 <」chip 關閉時不顯示提示；開啟後顯示回撤過濾無證據不過濾的提示", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.queryByText(COPY.explore.ddFilterNoEvidenceNote)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.maxDd }));
+    expect(screen.getByText(COPY.explore.ddFilterNoEvidenceNote)).toBeInTheDocument();
+  });
+
   it("回撤/集中度 chip 預設關閉（2026-08-31 裁決：避免空榜），首次請求送 100/100；點開才收緊為 30/90", async () => {
     const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);

@@ -15,7 +15,15 @@
  * 年化波動/日勝率/最佳最差日）改逐窗，網格只渲染**比率型指標**，**不重複渲染**
  * `total_return_pct`／`max_drawdown_pct`——損益與回撤由窗卡（`windows[w]`）顯示，
  * 避免同頁兩個回撤數字。CAGR 只算 allTime（`sample_days`／`sample_threshold`
- * 為頁面層欄位，與所選窗無關）。`equity_index` 已移除，由損益曲線
+ * 為頁面層欄位，與所選窗無關）。
+ * ⭐⭐ 2026-09-05 Task 9 Step 2（reviewer W4）：`sample_days<sample_threshold`
+ * （`sampleInsufficient`）**只**守 `CagrCard`（`cagr_pct` 鍵是否存在，後端
+ * `build_cagr_fields` 結構性防呆）——不再拿它去摺疊比率型指標網格。網格一律
+ * 渲染該窗全部比率型指標卡，每張各自依 `metrics[window_].<key>_insufficient`
+ * 顯示「樣本不足」。原因：`sampleInsufficient` 只看 allTime 樣本量，但網格顯示
+ * 的是**所選窗**（`windowSel`）的指標——一個 allTime 樣本不足的帳戶切到 30D
+ * 窗，30D 底下的 Sharpe 等指標可能是充足的，被 allTime 門檻牽連隱藏就違反
+ * D6「指標逐窗、跟著選窗切換」的精神。`equity_index` 已移除，由損益曲線
  * （`PnlCurve`，讀 `windows[w].spark`）取代——`EquityCurve` 與
  * `MethodologyCard`（其 prop 型別 `PublicStrategyMethodology` 含
  * `start_date`/`end_date`/`annualization_days`/`risk_free_rate`，與新版精簡的
@@ -210,17 +218,15 @@ function TraderDetailInner() {
   }
 
   // ⭐ R4-11：改用後端直接供給的 sample_days／sample_threshold（與策略頁同一套
-  // `build_cagr_fields` 組裝規則）。這是 allTime 專屬的整體樣本量門檻，與
-  // `windowSel`（哪一窗）是兩個不同維度——與 D6 的指標網格摺疊機制共用同一個
-  // 布林旗標，但門檻本身不隨選窗變動。
-  const sampleInsufficient = trader.sample_days < trader.sample_threshold;
+  // `build_cagr_fields` 組裝規則）——allTime 專屬的整體樣本量門檻，只守
+  // `CagrCard`（`trader.cagr_pct != null` 已是結構性防呆，見 `CagrCard.tsx`
+  // 檔頭），2026-09-05 Task 9 Step 2 起不再用來摺疊下方指標網格（見檔頭 D6 說明）。
 
   // D6：指標網格只渲染比率型指標（sharpe／sharpe_se／annualized_vol_pct／
   // sortino／win_rate_pct／best_day_pct／worst_day_pct），不再渲染
   // total_return_pct／max_drawdown_pct（窗卡已顯示 pnl_usd／max_dd_pct，同頁不要
-  // 兩個回撤數字）。win_rate_pct 不受 RATIO_MIN_DAYS 門檻限制（N>=1 即存在，
-  // 見 plan Task 4 測試註解），維持為 headline，其餘四項隨 `sampleInsufficient`
-  // 摺疊。
+  // 兩個回撤數字）。Task 9 Step 2 起網格全卡一律渲染，每張各自依對應
+  // `*_insufficient` 顯示「樣本不足」，不再整組隨 allTime 樣本量摺疊。
   const headlineCards: MetricCardDef[] = [
     {
       key: "win_rate",
@@ -267,14 +273,21 @@ function TraderDetailInner() {
     },
   ];
 
-  const metricCards = sampleInsufficient ? headlineCards : [...headlineCards, ...collapsibleCards];
+  const metricCards = [...headlineCards, ...collapsibleCards];
 
   const ddText = stats == null || stats.max_dd_pct == null ? null : `${stats.max_dd_pct.toFixed(1)}%`;
+  // ⭐ Task 9 Step 3（reviewer S4）：`neg`（紅字）class 只在確定是負值時加；
+  // `stats` 缺席或 `max_dd_pct` 算不出（null，顯示「—」）用中性樣式，不得讓
+  // 一個算不出的回撤看起來像已知的負數。
+  const ddNeg = stats != null && stats.max_dd_pct != null && stats.max_dd_pct < 0;
   const exposureText = trader.exposure == null
     ? NO_VALUE
     : trader.exposure.pct != null
       ? `${COPY.explore.exposureDir[trader.exposure.dir]} ${trader.exposure.pct.toFixed(1)}%`
       : COPY.explore.exposureDir[trader.exposure.dir];
+  // ⭐ Task 9 Step 1（reviewer W2）：`fills_30d` 可能為 `null`（上游成交抓取
+  // 失敗，見 `publicApi.ts` 型別檔頭）——顯示 `c.fillsUnavailable`，不得渲染
+  // 四個偽造的 0。
   const fills = trader.fills_30d;
 
   return (
@@ -353,7 +366,7 @@ function TraderDetailInner() {
             </div>
             <div className="card metric-card">
               <div className="metric-card-label">{c.ddLabel}</div>
-              <div className="mono metric-card-value neg">
+              <div className={`mono metric-card-value${ddNeg ? " neg" : ""}`}>
                 {ddText == null
                   ? <span title={c.ddUnavailableTitle}>{c.ddUnavailable}</span>
                   : ddText}
@@ -392,17 +405,6 @@ function TraderDetailInner() {
             ))}
           </div>
 
-          {sampleInsufficient && (
-            <p className="hint metric-collapsed-note">
-              {sc.metrics.insufficientGroupLabel}
-              {sc.metrics.insufficientGroupPrefix}
-              {trader.sample_days}
-              {sc.metrics.insufficientGroupMid}
-              {trader.sample_threshold}
-              {sc.metrics.insufficientGroupSuffix}
-            </p>
-          )}
-
           {/* ⭐ R4-11：與策略頁同一套結構性防呆——`sample_days<sample_threshold`
               時 `cagr_pct` 鍵整個不存在，本頁只依「鍵是否存在」決定是否渲染。 */}
           {trader.cagr_pct != null && (
@@ -411,29 +413,35 @@ function TraderDetailInner() {
 
           <div className="trader-fills-card card">
             <div className="methodology-heading">{c.fillsHeading}</div>
-            <div className="metric-grid">
-              <div className="card metric-card">
-                <div className="metric-card-label">{c.orders}</div>
-                <div className="mono metric-card-value">{fills.order_count}</div>
-              </div>
-              <div className="card metric-card">
-                <div className="metric-card-label">{c.closedPositions}</div>
-                <div className="mono metric-card-value">{fills.closed_positions}</div>
-              </div>
-              <div className="card metric-card">
-                <div className="metric-card-label">{c.winRate}</div>
-                <div className="mono metric-card-value">
-                  {fills.win_rate_pct == null ? NO_VALUE : `${fills.win_rate_pct}%`}
+            {fills == null ? (
+              <p className="hint">{c.fillsUnavailable}</p>
+            ) : (
+              <>
+                <div className="metric-grid">
+                  <div className="card metric-card">
+                    <div className="metric-card-label">{c.orders}</div>
+                    <div className="mono metric-card-value">{fills.order_count}</div>
+                  </div>
+                  <div className="card metric-card">
+                    <div className="metric-card-label">{c.closedPositions}</div>
+                    <div className="mono metric-card-value">{fills.closed_positions}</div>
+                  </div>
+                  <div className="card metric-card">
+                    <div className="metric-card-label">{c.winRate}</div>
+                    <div className="mono metric-card-value">
+                      {fills.win_rate_pct == null ? NO_VALUE : `${fills.win_rate_pct}%`}
+                    </div>
+                  </div>
+                  <div className="card metric-card">
+                    <div className="metric-card-label">{c.realizedPnl}</div>
+                    <div className={`mono metric-card-value${fills.realized_pnl_usd >= 0 ? " pos" : " neg"}`}>
+                      {fmtSignedUsd(fills.realized_pnl_usd)}
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div className="card metric-card">
-                <div className="metric-card-label">{c.realizedPnl}</div>
-                <div className={`mono metric-card-value${fills.realized_pnl_usd >= 0 ? " pos" : " neg"}`}>
-                  {fmtSignedUsd(fills.realized_pnl_usd)}
-                </div>
-              </div>
-            </div>
-            {fills.truncated && <p className="hint">{c.fillsTruncatedNote}</p>}
+                {fills.truncated && <p className="hint">{c.fillsTruncatedNote}</p>}
+              </>
+            )}
           </div>
         </div>
 

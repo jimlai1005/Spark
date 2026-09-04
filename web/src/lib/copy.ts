@@ -1718,6 +1718,10 @@ export const COPY_ZH = {
       maxDd: "最大回撤 < 30%",
       concentrated: "排除單一幣種 > 90%",
     },
+    // 2026-09-05（Task 9 Step 5，reviewer W5）：回撤過濾在後端對「算不出回撤」
+    // 的帳戶不過濾（見 `hl_explore.clamp_explore_params`），chip 開啟時要提示
+    // 這件事，否則使用者以為「回撤 <30%」的榜單裡不會出現回撤欄是「—」的列。
+    ddFilterNoEvidenceNote: "回撤算不出的帳戶不在此過濾範圍，其回撤欄顯示 —",
     countPrefix: "",
     countMid: " 個帳戶 → 符合 ",
     countSuffix: "",
@@ -1795,6 +1799,9 @@ export const COPY_ZH = {
     winRate: "結倉勝率",
     realizedPnl: "已實現損益（USD）",
     fillsTruncatedNote: "成交筆數超過抓取上限，以上為下限值",
+    // 2026-09-05（Task 9 Step 1，reviewer W2）：`fills_30d` 為 `null`（上游抓取
+    // 失敗）時顯示這一行，不得渲染四個偽造的 0。
+    fillsUnavailable: "成交統計暫時無法取得",
     pnlCurveLabel: "損益曲線",
     pnlSourceNote: "損益含未實現損益、資金費率與手續費，已排除出入金（HL pnlHistory）",
     // 2026-09-05（explore/trader 指標統一 plan Task 7）：Task 6 移除了
@@ -3240,6 +3247,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       maxDd: "Max drawdown < 30%",
       concentrated: "Exclude single-coin concentration > 90%",
     },
+    ddFilterNoEvidenceNote: "Accounts whose drawdown can't be computed are not filtered by this — their drawdown column shows —",
     countPrefix: "",
     countMid: " accounts → ",
     countSuffix: " qualify",
@@ -3304,6 +3312,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     winRate: "Close win rate",
     realizedPnl: "Realized PnL (USD)",
     fillsTruncatedNote: "Fill count exceeded the fetch limit; figures above are lower bounds",
+    fillsUnavailable: "Fill stats are temporarily unavailable",
     pnlCurveLabel: "PnL curve",
     pnlSourceNote: "PnL includes unrealized PnL, funding, and fees, net of deposits/withdrawals (HL pnlHistory)",
     startEndEquityLabel: "Start → end equity (allTime)",

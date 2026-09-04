@@ -555,8 +555,13 @@ const EMPTY_TRADER_FILLS: TraderFillsStats = {
   truncated: false,
 };
 
-function normalizeTraderFillsStats(v: unknown): TraderFillsStats {
-  if (v == null || typeof v !== "object") return EMPTY_TRADER_FILLS;
+// 2026-09-05 Task 9 Step 1（reviewer W2）：後端 fills 抓取失敗回 `null`
+// （Task 8 Step 3），前端必須原樣保留 `null`，不得偽造出一份「看起來合法的
+// 零成交」統計（工程原則 1：讀不到的資料不能冒充讀到）。只有非 null 但格式
+// 異常的物件（缺鍵）才退回 `EMPTY_TRADER_FILLS` 空殼補齊。
+function normalizeTraderFillsStats(v: unknown): TraderFillsStats | null {
+  if (v == null) return null;
+  if (typeof v !== "object") return EMPTY_TRADER_FILLS;
   const m = v as Partial<TraderFillsStats>;
   return {
     order_count: typeof m.order_count === "number" ? m.order_count : 0,
@@ -628,7 +633,9 @@ export interface PublicTraderDetail {
   exposure: { dir: "long" | "short"; pct: number | null } | null;
   windows: Record<ExploreWindow, ExploreWindowStats | null>;
   metrics: Record<ExploreWindow, PublicStrategyMetrics>;
-  fills_30d: TraderFillsStats;
+  /** `null` ＝ 上游成交抓取失敗（Task 8 Step 3），呼叫端須顯示「暫時無法取得」
+   * 而非渲染四個偽造的 0（Task 9 Step 1，reviewer W2）。 */
+  fills_30d: TraderFillsStats | null;
   methodology: PublicTraderMethodology;
   /** M3 round4 Task R4-11：與 `PublicStrategyDetail` 同一套組裝規則
    * （後端 `build_cagr_fields`，見 `filet/strategies.py` 檔頭），供交易員詳情頁

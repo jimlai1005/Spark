@@ -6,8 +6,10 @@
  * 涵蓋：404/讀不到空態、insufficient 指標「樣本不足」、CTA 依登入狀態分流、
  * account_value 為 null 時降級顯示、投入比例／回撤 slider、槓桿唯讀列「—」、
  * 面板頂部無背書說明、CAGR 卡渲染（sample_days/sample_threshold）、
- * 四窗切換（預設 month／`?window=` 帶入）、損益／回撤／實盤天數／成交統計
- * 與探索清單同源欄位、指標網格不重複渲染 total_return_pct／max_drawdown_pct。
+ * 四窗切換（預設 month／`?window=` 帶入／點按鈕切換）、損益／回撤／實盤天數／
+ * 成交統計與探索清單同源欄位、指標網格不重複渲染 total_return_pct／
+ * max_drawdown_pct、fills_30d 為 null 的降級顯示、指標網格不再被 allTime
+ * 樣本門檻牽連摺疊（Task 9 reviewer 修正輪）。
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -304,24 +306,48 @@ describe("TraderDetailPage", () => {
 
   // ⭐ M3 round3 Task 7；R4-11 起改用後端直接供給的 sample_days／
   // sample_threshold（與策略詳情頁同一套 build_cagr_fields），不再鏡射常數。
-  describe("Task 7：指標收斂（比照策略詳情頁）", () => {
-    it("sample_days < sample_threshold（DETAIL 預設 29，差門檻一天）→ 摺成一行小字，個別小卡只剩 1 張（win_rate）", async () => {
+  describe("Task 7/9：指標收斂（比照策略詳情頁；Task 9 起 sampleInsufficient 只守 CagrCard）", () => {
+    // ⭐ Task 9 Step 2（reviewer W4）：allTime 的 sample_days<sample_threshold
+    // 不再摺疊指標網格——網格一律渲染該窗全部比率型指標卡，各自依
+    // `metrics[window_].<key>_insufficient` 顯示「樣本不足」。DETAIL 預設 month
+    // 窗全部指標不足（METRICS_ALL_INSUFFICIENT），驗證卡的**標籤**仍然渲染、
+    // 值改顯示「樣本不足」，而非整張卡被隱藏。
+    it("sample_days < sample_threshold（DETAIL 預設 29，差門檻一天）→ 指標網格仍渲染全部比率型指標卡（不足的顯示「樣本不足」），不再摺成一行小字", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL));
       render(wrap(<TraderDetailPage />));
       await screen.findByRole("heading", { level: 1 });
       const c = COPY.strategyDetail.metrics;
+      // 摺疊行整個不再渲染（Task 9 起 sampleInsufficient 不再控制網格）。
       const expectedNote = `${c.insufficientGroupLabel}${c.insufficientGroupPrefix}29`
         + `${c.insufficientGroupMid}30${c.insufficientGroupSuffix}`;
-      expect(screen.getByText((_, node) => node?.textContent === expectedNote)).toBeInTheDocument();
-      expect(screen.queryByText(c.sharpeLabel)).not.toBeInTheDocument();
-      expect(screen.queryByText(c.sortinoLabel)).not.toBeInTheDocument();
-      expect(screen.queryByText(c.annualizedVolLabel)).not.toBeInTheDocument();
-      expect(screen.queryByText(c.bestWorstLabel)).not.toBeInTheDocument();
-      // D6：total_return/max_drawdown 卡已移除（由窗卡取代），指標網格只剩 win_rate。
+      expect(screen.queryByText((_, node) => node?.textContent === expectedNote)).not.toBeInTheDocument();
+      // 全部卡的標籤都在，值都顯示「樣本不足」（DETAIL 預設 month 窗全不足）。
+      expect(screen.getByText(c.sharpeLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.sortinoLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.annualizedVolLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.bestWorstLabel)).toBeInTheDocument();
+      expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
+      // D6：total_return/max_drawdown 卡已移除（由窗卡取代）。
       expect(screen.queryByText(c.totalReturnLabel)).not.toBeInTheDocument();
       expect(screen.queryByText(c.maxDrawdownLabel)).not.toBeInTheDocument();
-      expect(screen.getByText(c.winRateLabel)).toBeInTheDocument();
+      expect(screen.getAllByText(c.insufficientLabel).length).toBeGreaterThanOrEqual(5);
+    });
+
+    // ⭐ Task 9 Step 2（reviewer W4 核心場景）：allTime 樣本仍不足
+    // （`sample_days:29<30`），但**所選窗**（month）本身的比率型指標充足
+    // ——舊版會被 `sampleInsufficient` 牽連整組摺疊成「樣本不足」，新版必須照樣
+    // 顯示 month 窗真實數字，證明網格已跟著選窗獨立切換，不再受 allTime 門檻連坐。
+    it("allTime 樣本不足（sample_days 29）但選窗（month）指標本身充足 → 網格顯示真實數字，不被 allTime 門檻牽連隱藏", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        metrics: { ...DETAIL.metrics, month: METRICS_MONTH_FULL },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.getByText("5.55")).toBeInTheDocument(); // sharpe 真實值，非「樣本不足」
+      expect(screen.getByText("43.42")).toBeInTheDocument(); // sortino 真實值
     });
 
     it("sample_days ≥ sample_threshold（恰在門檻 30）→ 恢復完整格，不出現摺疊行", async () => {
@@ -397,6 +423,26 @@ describe("TraderDetailPage", () => {
       expect(screen.getByText("64.86%")).toBeInTheDocument();
     });
 
+    // ⭐ Task 9 Step 4（reviewer S2）：四窗按鈕本身沒有測試覆蓋切換行為
+    // （既有測試只測 `?window=` 帶入的初始值）——點按鈕本身要驗證損益數字與
+    // 指標網格切到該窗。
+    it("點「1D」按鈕（非 URL query）→ 損益數字與指標網格切到 metrics.day", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse(DETAIL));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      // 預設 month 窗：+$33,055，此時尚未有 64.86% 這個 day 窗才有的 win_rate 值。
+      expect(screen.getByText("+$33,055")).toBeInTheDocument();
+      expect(screen.queryByText("64.86%")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: COPY.explore.windows.day }));
+
+      expect(screen.getByText("−$2,182")).toBeInTheDocument();
+      expect(screen.queryByText("+$33,055")).not.toBeInTheDocument();
+      // metrics.day 的 win_rate_pct 有值（64.86%），證明指標網格切窗了。
+      expect(screen.getByText("64.86%")).toBeInTheDocument();
+    });
+
     it("成交統計卡：221 / 27 / 55.56% / +$40,226", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse(DETAIL));
@@ -407,6 +453,20 @@ describe("TraderDetailPage", () => {
       expect(screen.getByText("27")).toBeInTheDocument();
       expect(screen.getByText("55.56%")).toBeInTheDocument();
       expect(screen.getByText("+$40,226")).toBeInTheDocument();
+    });
+
+    // ⭐ Task 9 Step 1（reviewer W2）：`fills_30d` 為 `null`（上游抓取失敗，
+    // 見 `publicApi.ts` 型別檔頭）→ 顯示 `fillsUnavailable` 提示，不得渲染
+    // 四個偽造的 0（訂單／平倉次數／勝率／已實現損益）。
+    it("fills_30d 為 null（上游抓取失敗）→ 顯示成交統計暫時無法取得，不渲染四個 0", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({ ...DETAIL, fills_30d: null }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.getByText(COPY.traders.fillsUnavailable)).toBeInTheDocument();
+      expect(screen.queryByText(COPY.traders.orders)).not.toBeInTheDocument();
+      expect(screen.queryByText(COPY.traders.closedPositions)).not.toBeInTheDocument();
+      expect(screen.queryByText("221")).not.toBeInTheDocument();
     });
 
     it("fills_30d.truncated → 顯示下限值提示", async () => {
