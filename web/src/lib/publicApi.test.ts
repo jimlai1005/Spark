@@ -239,28 +239,38 @@ describe("getPublicLeaderboard", () => {
 });
 
 describe("getPublicTraderDetail", () => {
+  // 2026-09-05（explore/trader 指標統一 plan Task 4/5）：形狀改為與
+  // `/api/public/explore`（`ExploreRow`）同源的 `windows`／`live_days`／
+  // `fills_30d`／`exposure`；`metrics` 保留但改逐窗；`equity_index` 移除。
+  const METRICS_OK = {
+    total_return_pct: "20.00", total_return_pct_insufficient: false,
+    max_drawdown_pct: "-0.80", max_drawdown_pct_insufficient: false,
+    sharpe: "5.55", sharpe_insufficient: false,
+    sharpe_se: "3.36", sharpe_se_insufficient: false,
+    win_rate_pct: "64.86", win_rate_pct_insufficient: false,
+    annualized_vol_pct: "18.05", annualized_vol_pct_insufficient: false,
+    sortino: "43.42", sortino_insufficient: false,
+    best_day_pct: "3.01", best_day_pct_insufficient: false,
+    worst_day_pct: "-0.80", worst_day_pct_insufficient: false,
+    sample_count: 38,
+  };
+  const WINDOW_OK = { pnl_usd: 1200.5, max_dd_pct: -8.0, max_dd_reason: null, spark: [0, 600, 1200.5] };
   const DETAIL = {
     address: "0xfeed000000000000000000000000000000f00d",
     account_value: "5000.00",
     follow_blocked: false,
-    metrics: {
-      total_return_pct: "20.00", total_return_pct_insufficient: false,
-      max_drawdown_pct: "-0.80", max_drawdown_pct_insufficient: false,
-      sharpe: "5.55", sharpe_insufficient: false,
-      sharpe_se: "3.36", sharpe_se_insufficient: false,
-      win_rate_pct: "64.86", win_rate_pct_insufficient: false,
-      annualized_vol_pct: "18.05", annualized_vol_pct_insufficient: false,
-      sortino: "43.42", sortino_insufficient: false,
-      best_day_pct: "3.01", best_day_pct_insufficient: false,
-      worst_day_pct: "-0.80", worst_day_pct_insufficient: false,
-      sample_count: 38,
+    live_days: 120,
+    exposure: { dir: "long", pct: 60.0 },
+    windows: { day: WINDOW_OK, week: WINDOW_OK, month: WINDOW_OK, allTime: WINDOW_OK },
+    metrics: { day: METRICS_OK, week: METRICS_OK, month: METRICS_OK, allTime: METRICS_OK },
+    fills_30d: {
+      order_count: 221, closed_positions: 27, wins: 15, win_rate_pct: 55.56,
+      realized_pnl_usd: 40225.79, concentration_pct: 62.5, coins: ["BTC", "ETH"], truncated: false,
     },
-    equity_index: ["1", "1.2"],
     methodology: {
-      start_date: "2026-06-17", end_date: "2026-08-27", initial_deposit_usd: "1000",
+      basis: "combined", updated_at: 999,
       start_equity_usd: "1000", end_equity_usd: "1200",
-      sample_count: 38, annualization_days: 365, risk_free_rate: "0", basis: "perp",
-      updated_at: 999,
+      initial_deposit_usd: "1000", mdd_note: "MDD 採樣說明",
     },
     // ⭐ M3 round4 Task R4-11：與 `PublicStrategyDetail` 同一套組裝規則
     // （後端 `build_cagr_fields`）。
@@ -302,9 +312,10 @@ describe("getPublicTraderDetail", () => {
   it("metrics／methodology 缺席 → 降級為空殼而非拋錯", async () => {
     mockFetchOnce(() => jsonResponse({ address: DETAIL.address }));
     const r = await getPublicTraderDetail(DETAIL.address);
-    expect(r?.metrics.sharpe_insufficient).toBe(true);
+    expect(r?.metrics.month.sharpe_insufficient).toBe(true);
     expect(r?.methodology.initial_deposit_usd).toBeNull();
-    expect(r?.equity_index).toEqual([]);
+    expect(r?.windows.month).toBeNull();
+    expect(r?.exposure).toBeNull();
   });
 
   it("[W4] follow_blocked: true 原樣保留", async () => {

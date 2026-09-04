@@ -30,7 +30,7 @@
  */
 import Link from "next/link";
 import { type Dispatch, type SetStateAction, useEffect, useState } from "react";
-import { NO_VALUE, fmtUpdatedAtUtc } from "@/lib/format";
+import { NO_VALUE, fmtSignedUsd, fmtUpdatedAtUtc } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
 import {
   EXPLORE_WINDOWS, getPublicExplore, type ExploreFilters, type ExploreResp,
@@ -90,10 +90,6 @@ function sparkPoints(values: number[]): string {
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
     .join(" ");
-}
-
-function fmtSignedPct(n: number): string {
-  return `${n > 0 ? "+" : ""}${n.toFixed(1)}%`;
 }
 
 function fmtPct1(n: number | null): string {
@@ -207,6 +203,10 @@ export default function ExplorePage() {
               {c.poolNoteSuffix}
             </p>
           )}
+          {/* 2026-09-05（explore/trader 指標統一 plan Task 5）：回撤定義揭露——
+              權益指數 MDD 與交易所／第三方工具的原始淨值 MDD 不同，靜態文案，
+              不依賴資料載入狀態。 */}
+          <p className="hint explore-dd-definition">{c.ddDefinition}</p>
         </div>
         <div className="explore-disclaimer-badge">{c.disclaimerBadge}</div>
       </header>
@@ -295,7 +295,7 @@ export default function ExplorePage() {
               <div>{c.table.rank}</div>
               <div>{c.table.account}</div>
               <div>{c.table.sparkline}</div>
-              <div>{c.table.ret}</div>
+              <div>{c.table.pnl}</div>
               <div>{c.table.dd}</div>
               <div>{c.table.days}</div>
               <div>{c.table.winRate}</div>
@@ -428,16 +428,21 @@ function ExploreRowView(
           <polyline
             points={sparkPoints(stats?.spark ?? [])}
             fill="none"
-            stroke={(stats?.ret_pct ?? 0) >= 0 ? "var(--pos)" : "var(--neg)"}
+            stroke={(stats?.pnl_usd ?? 0) >= 0 ? "var(--pos)" : "var(--neg)"}
             strokeWidth="1.4"
           />
         </svg>
       </div>
-      <div className={`mono explore-ret ${stats == null ? "" : stats.ret_pct >= 0 ? "pos" : "neg"}`}>
-        {stats == null ? NO_VALUE : fmtSignedPct(stats.ret_pct)}
+      <div className={`mono explore-ret ${stats == null ? "" : stats.pnl_usd >= 0 ? "pos" : "neg"}`}>
+        {stats == null ? NO_VALUE : fmtSignedUsd(stats.pnl_usd)}
       </div>
+      {/* max_dd_pct 可能為 null（算不出，見 max_dd_reason）——與「該窗整列缺席」
+          （stats == null）是不同語意，兩者都顯示 c.table.ddUnavailable，但算不出時
+          額外帶 title 說明原因；不得用 ?? / || 把 null 換成 0（那是偽造回撤為零）。 */}
       <div className="mono neg explore-dd">
-        {stats == null ? NO_VALUE : `${stats.max_dd_pct.toFixed(1)}%`}
+        {stats == null || stats.max_dd_pct == null
+          ? <span title={c.table.ddUnavailableTitle}>{c.table.ddUnavailable}</span>
+          : `${stats.max_dd_pct.toFixed(1)}%`}
       </div>
       <div className="mono explore-days">{row.live_days}</div>
       <div className="mono explore-wr">{fmtPct1(row.close_win_rate_pct)}</div>

@@ -10,7 +10,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { COPY_ZH as COPY } from "@/lib/copy";
-import { fmtUpdatedAtUtc } from "@/lib/format";
+import { fmtSignedUsd, fmtUpdatedAtUtc } from "@/lib/format";
 import type { ExploreResp, ExploreRow } from "@/lib/publicApi";
 import ExplorePage from "./page";
 
@@ -29,13 +29,20 @@ const ROW_A: ExploreRow = {
   coins: ["BTC", "ETH"],
   account_bucket: "$10K–$100K",
   windows: {
-    day: { ret_pct: 2.1, max_dd_pct: -1.0, spark: [1, 1.02] },
-    week: { ret_pct: 12.0, max_dd_pct: -4.0, spark: [1, 1.05, 1.12] },
-    month: { ret_pct: 38.4, max_dd_pct: -11.2, spark: [1, 1.1, 1.05, 1.2] },
-    allTime: { ret_pct: 90.0, max_dd_pct: -20.0, spark: [1, 1.9] },
+    day: { pnl_usd: 210, max_dd_pct: -1.0, max_dd_reason: null, spark: [1, 1.02] },
+    week: { pnl_usd: 1200, max_dd_pct: -4.0, max_dd_reason: null, spark: [1, 1.05, 1.12] },
+    // 錨例沿 tests/test_trader_stats.py 的 0x6648 fixture：pnl_usd 33055.26、
+    // max_dd_pct 因 too_many_skipped_intervals 為 null。
+    month: {
+      pnl_usd: 33055.26, max_dd_pct: null, max_dd_reason: "too_many_skipped_intervals",
+      spark: [1, 1.1, 1.05, 1.2],
+    },
+    allTime: { pnl_usd: 90000, max_dd_pct: -20.0, max_dd_reason: null, spark: [1, 1.9] },
   },
   live_days: 118,
-  fill_count_30d: 250,
+  order_count_30d: 250,
+  closed_positions_30d: 20,
+  realized_pnl_30d_usd: 5000.0,
   close_win_rate_pct: 61.2,
   concentration_pct: 40.0,
   exposure: { dir: "long", pct: 72.0 },
@@ -51,11 +58,15 @@ const ROW_B: ExploreRow = {
   windows: {
     day: null,
     week: null,
-    month: { ret_pct: -5.0, max_dd_pct: -20.0, spark: [] },
-    allTime: { ret_pct: -5.0, max_dd_pct: -20.0, spark: [] },
+    // 錨例沿 tests/test_trader_stats.py 的 0x6648 day 窗：pnl_usd -2181.94、
+    // max_dd_pct -74.07（權益指數 MDD，負值慣例）。
+    month: { pnl_usd: -2181.94, max_dd_pct: -74.07, max_dd_reason: null, spark: [] },
+    allTime: { pnl_usd: -2181.94, max_dd_pct: -74.07, max_dd_reason: null, spark: [] },
   },
   live_days: 90,
-  fill_count_30d: 210,
+  order_count_30d: 210,
+  closed_positions_30d: 15,
+  realized_pnl_30d_usd: -2181.94,
   close_win_rate_pct: null,
   concentration_pct: 95.0,
   exposure: { dir: null, pct: null },
@@ -123,8 +134,8 @@ describe("ExplorePage — 表格渲染", () => {
     expect(screen.getByText(ROW_B.label)).toBeInTheDocument();
 
     const retCells = container.querySelectorAll(".explore-ret");
-    expect(retCells[0].textContent).toBe("+38.4%"); // ROW_A month
-    expect(retCells[1].textContent).toBe("-5.0%");  // ROW_B month
+    expect(retCells[0].textContent).toBe("+$33,055"); // ROW_A month
+    expect(retCells[1].textContent).toBe("−$2,182");  // ROW_B month
 
     const wrCells = container.querySelectorAll(".explore-wr");
     expect(wrCells).toHaveLength(2);
@@ -136,6 +147,32 @@ describe("ExplorePage — 表格渲染", () => {
     expect(dayCells[1].textContent).toBe("90");
 
     expect(screen.getByText((_, el) => (el?.textContent ?? "") === "100 個帳戶 → 符合 2")).toBeInTheDocument();
+  });
+
+  it("損益以金額顯示：+$33,055 / −$2,182", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    const retCells = container.querySelectorAll(".explore-ret");
+    expect(retCells[0].textContent).toBe(fmtSignedUsd(33055.26)); // ROW_A month
+    expect(retCells[0].textContent).toBe("+$33,055");
+    expect(retCells[1].textContent).toBe(fmtSignedUsd(-2181.94)); // ROW_B month
+    expect(retCells[1].textContent).toBe("−$2,182");
+  });
+
+  it("max_dd_pct 為 null → 顯示「—」且帶 title 說明", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    // ROW_A 預設 month 窗 max_dd_pct 為 null（too_many_skipped_intervals）。
+    const ddCells = container.querySelectorAll(".explore-dd");
+    expect(ddCells[0].textContent).toBe(COPY.explore.table.ddUnavailable);
+    const titled = ddCells[0].querySelector(`[title="${COPY.explore.table.ddUnavailableTitle}"]`);
+    expect(titled).not.toBeNull();
+    // ROW_B 的 max_dd_pct 有值 → 正常顯示百分比，不帶 title 提示。
+    expect(ddCells[1].textContent).toBe("-74.1%");
   });
 
   it("I-17：榜首常駐一行顯示候選池與合格數，數字來自後端回應（不寫死）", async () => {
@@ -156,7 +193,7 @@ describe("ExplorePage — 表格渲染", () => {
 
     await waitFor(() => {
       const retCells = container.querySelectorAll(".explore-ret");
-      expect(retCells[0].textContent).toBe("+2.1%"); // ROW_A day
+      expect(retCells[0].textContent).toBe("+$210"); // ROW_A day
       expect(retCells[1].textContent).toBe("—");     // ROW_B day 缺席
     });
     const ddCells = container.querySelectorAll(".explore-dd");

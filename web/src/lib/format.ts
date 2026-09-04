@@ -72,6 +72,18 @@ export function fmtUpdatedAtUtc(epochSeconds: number): string {
 }
 
 /**
+ * 損益金額（number，非字串）→ 帶正負號的顯示字串（探索表格／交易員詳情頁
+ * 損益欄，2026-09-05 explore/trader 指標統一 plan Task 5：報酬率改金額）。
+ * 正值前綴 `+`、負值前綴 `−`（U+2212 minus sign，非連字號）、零無前綴；
+ * 千分位、無小數（`+$33,055`／`−$2,182`／`$0`）。⚠️ 只用於顯示，門檻判定在
+ * 後端以 Decimal 完成。
+ */
+export function fmtSignedUsd(n: number): string {
+  const sign = n > 0 ? "+" : n < 0 ? "−" : "";
+  return `${sign}$${Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+}
+
+/**
  * USD 金額 → 縮寫顯示（首頁證據列，設計稿 §03 錨例 $4.28M）。
  * ≥ 1,000,000 → `$X.XXM`；≥ 1,000 → `$X.XXK`；否則 `$X.XX`。
  * null／空／非數字 → NO_VALUE（不得寫死假數字，見不變量 0.3.6）。

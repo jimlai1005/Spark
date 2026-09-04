@@ -1565,6 +1565,9 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-table-row { border-top: 1px solid var(--border); }
 .explore-table-head > div:nth-child(n+4), .explore-table-row > div:nth-child(n+4) { text-align: right; }
 .explore-table-head > div:nth-child(8), .explore-table-row > div:nth-child(8) { text-align: left; }
+/* 2026-09-05（explore/trader 指標統一 plan Task 5）：報酬率欄改損益金額，
+   長數字（例：+$1,234,567）比原本的百分比寬，加寬避免溢欄換行。 */
+.explore-ret { min-width: 7.5rem; text-align: right; white-space: nowrap; }
 
 .explore-account { display: flex; flex-direction: column; gap: 3px; }
 .explore-account-top { display: flex; align-items: center; gap: 7px; }

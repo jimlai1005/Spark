@@ -1711,25 +1711,35 @@ export const COPY_ZH = {
     filters: {
       // R4-10：原「僅顯示達樣本門檻（實盤 ≥ 30 天 · ≥ 200 筆成交）」合併 chip
       // 拆成兩顆獨立布林 chip（門檻固定 30 天 / 200 筆，不做自由填寫）。
+      // 2026-09-05（D3）：後端 30D 成交欄位改回傳 distinct 訂單數
+      // （`order_count_30d`），文案跟著改「訂單」不再說「成交」。
       liveDays: "實盤 ≥ 30 天",
-      fills: "成交 ≥ 200 筆",
+      fills: "訂單 ≥ 200 筆",
       maxDd: "最大回撤 < 30%",
       concentrated: "排除單一幣種 > 90%",
     },
     countPrefix: "",
     countMid: " 個帳戶 → 符合 ",
     countSuffix: "",
+    // 2026-09-05（explore/trader 指標統一 plan Task 5）：報酬率欄改損益金額，
+    // sparkline 改畫損益曲線；`max_dd_pct` 可能為 `null`（算不出，見
+    // `max_dd_reason`）→ 顯示 `ddUnavailable` 並帶 `ddUnavailableTitle` 說明。
     table: {
       rank: "#",
       account: "帳戶",
-      sparkline: "淨值走勢",
-      ret: "報酬率",
+      sparkline: "損益走勢",
+      pnl: "損益（USD）",
       dd: "最大回撤",
+      ddUnavailable: "—",
+      ddUnavailableTitle: "此窗回撤無法可靠計算（出入金主導或淨值長期低於 100 USDC）",
       days: "實盤天數",
       winRate: "結倉勝率",
       exposure: "目前曝險",
       actions: "",
     },
+    // 回撤定義揭露（權益指數 MDD，與交易所／第三方工具的原始淨值 MDD 不同），
+    // 渲染於頁面底部 disclaimer／poolNote 附近。
+    ddDefinition: "回撤以出入金中性化的權益指數計算，與交易所／第三方工具的定義不同",
     tags: { lowDrawdown: "低回撤", concentrated: "集中度高" },
     // D14（2026-08-30 主線程裁決）：後端 `exposure.dir` 改回傳 locale 中性代碼
     // `"long"`/`"short"`（見 `hl_explore.py`），顯示文案改由這裡對映。
@@ -1769,6 +1779,24 @@ export const COPY_ZH = {
     sourceSuffix: " · 來源：Hyperliquid API",
     accountValueLabel: "目前帳戶價值",
     disclaimerNote: "此地址來自 Hyperliquid 公開排行榜，非本平台精選策略，本平台不對其表現背書或負責。",
+    // 2026-09-05（explore/trader 指標統一 plan Task 5/6）：詳情頁改四窗切換＋
+    // 與探索清單同源的損益／回撤／成交統計（Task 6 用，型別與文案先在 Task 5 備好）。
+    windowsLabel: "統計窗",
+    pnlLabel: "損益（USD）",
+    ddLabel: "最大回撤",
+    ddUnavailable: "—",
+    ddUnavailableTitle: "此窗回撤無法可靠計算（出入金主導或淨值長期低於 100 USDC）",
+    ddDefinition: "回撤以出入金中性化的權益指數計算，與交易所／第三方工具的定義不同",
+    liveDaysLabel: "實盤天數",
+    exposureLabel: "目前曝險",
+    fillsHeading: "近 30 天成交統計",
+    orders: "訂單",
+    closedPositions: "平倉次數",
+    winRate: "結倉勝率",
+    realizedPnl: "已實現損益（USD）",
+    fillsTruncatedNote: "成交筆數超過抓取上限，以上為下限值",
+    pnlCurveLabel: "損益曲線",
+    pnlSourceNote: "損益含未實現損益、資金費率與手續費，已排除出入金（HL pnlHistory）",
     panel: {
       heading: "跟隨這個地址",
       cta: "連接錢包並繼續",
@@ -3203,7 +3231,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     windows: { day: "1D", week: "7D", month: "30D", allTime: "All" },
     filters: {
       liveDays: "Live ≥ 30 days",
-      fills: "Fills ≥ 200",
+      fills: "Orders ≥ 200",
       maxDd: "Max drawdown < 30%",
       concentrated: "Exclude single-coin concentration > 90%",
     },
@@ -3213,14 +3241,17 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     table: {
       rank: "#",
       account: "Account",
-      sparkline: "Equity",
-      ret: "Return",
+      sparkline: "PnL trend",
+      pnl: "PnL (USD)",
       dd: "Max drawdown",
+      ddUnavailable: "—",
+      ddUnavailableTitle: "This window's drawdown can't be reliably computed (dominated by flows, or equity stayed below 100 USDC for too long)",
       days: "Live days",
       winRate: "Close win rate",
       exposure: "Current exposure",
       actions: "",
     },
+    ddDefinition: "Drawdown is computed from a flow-neutralized equity index, which differs from exchange or third-party tool definitions",
     tags: { lowDrawdown: "Low drawdown", concentrated: "High concentration" },
     exposureDir: { long: "Long", short: "Short" },
     subSep: " · Account ",
@@ -3254,6 +3285,22 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     disclaimerNote: "This address is sourced from Hyperliquid's public leaderboard, "
       + "not a curated Filet strategy — this platform does not endorse or take "
       + "responsibility for its performance.",
+    windowsLabel: "Window",
+    pnlLabel: "PnL (USD)",
+    ddLabel: "Max drawdown",
+    ddUnavailable: "—",
+    ddUnavailableTitle: "This window's drawdown can't be reliably computed (dominated by flows, or equity stayed below 100 USDC for too long)",
+    ddDefinition: "Drawdown is computed from a flow-neutralized equity index, which differs from exchange or third-party tool definitions",
+    liveDaysLabel: "Live days",
+    exposureLabel: "Current exposure",
+    fillsHeading: "Last 30 days fills",
+    orders: "Orders",
+    closedPositions: "Closed positions",
+    winRate: "Close win rate",
+    realizedPnl: "Realized PnL (USD)",
+    fillsTruncatedNote: "Fill count exceeded the fetch limit; figures above are lower bounds",
+    pnlCurveLabel: "PnL curve",
+    pnlSourceNote: "PnL includes unrealized PnL, funding, and fees, net of deposits/withdrawals (HL pnlHistory)",
     panel: {
       heading: "Copy this address",
       cta: "Connect wallet and continue",

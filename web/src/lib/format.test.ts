@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  fmtAmount, fmtBp, fmtRatioPct, fmtUpdatedAtUtc, fmtUsdCompact, NO_VALUE, resolveTagline,
-  shortAddr,
+  fmtAmount, fmtBp, fmtRatioPct, fmtSignedUsd, fmtUpdatedAtUtc, fmtUsdCompact, NO_VALUE,
+  resolveTagline, shortAddr,
 } from "./format";
 
 describe("shortAddr", () => {
@@ -49,6 +49,18 @@ describe("fmtUsdCompact", () => {
     expect(fmtUsdCompact(null)).toBe(NO_VALUE);
     expect(fmtUsdCompact(undefined)).toBe(NO_VALUE);
     expect(fmtUsdCompact("not-a-number")).toBe(NO_VALUE);
+  });
+});
+
+describe("fmtSignedUsd", () => {
+  it("正值加 + 號、千分位、無小數（探索表格月損益錨例 33055.26 → +$33,055）", () => {
+    expect(fmtSignedUsd(33055.26)).toBe("+$33,055");
+  });
+  it("負值用 − （U+2212 減號）、取絕對值千分位（錨例 -2181.94 → −$2,182）", () => {
+    expect(fmtSignedUsd(-2181.94)).toBe("−$2,182");
+  });
+  it("零無正負號前綴", () => {
+    expect(fmtSignedUsd(0)).toBe("$0");
   });
 });
 

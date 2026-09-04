@@ -366,12 +366,18 @@ export type ExploreWindow = "day" | "week" | "month" | "allTime";
 
 export const EXPLORE_WINDOWS: readonly ExploreWindow[] = ["day", "week", "month", "allTime"];
 
-/** 單一窗的報酬／回撤／sparkline；`null`＝該窗對這一列缺席（day/week
- * best-effort，見 `hl_explore.py` 檔頭「R4-3」節）——前端誠實顯示「—」，
- * 不得回退借用其他窗的數字冒充。 */
+/** 單一窗的損益（USD）／回撤／損益曲線降採樣；`null`＝該窗對這一列缺席
+ * （day/week best-effort，見 `hl_explore.py` 檔頭「R4-3」節）——前端誠實顯示
+ * 「—」，不得回退借用其他窗的數字冒充。
+ * 2026-09-05（explore/trader 指標統一 plan Task 5）：原「報酬率」欄位改為
+ * `pnl_usd`（金額，不是報酬率）；`max_dd_pct` 改為可能 `null`（權益指數 MDD
+ * 算不出時，見 `max_dd_reason`——與「這一列/這一窗整個缺席」是不同語意，
+ * 缺席時整個 `ExploreWindowStats` 為 `null`，算不出時物件仍在但
+ * `max_dd_pct` 為 `null`）。 */
 export interface ExploreWindowStats {
-  ret_pct: number;
-  max_dd_pct: number;
+  pnl_usd: number;
+  max_dd_pct: number | null;
+  max_dd_reason: string | null;
   spark: number[];
 }
 
@@ -384,12 +390,17 @@ export interface ExploreRow {
   windows: Record<ExploreWindow, ExploreWindowStats | null>;
   /** 實盤天數＝perpAllTime 首末快照的日曆跨距（後端欄位 `live_days`）。 */
   live_days: number;
-  fill_count_30d: number;
-  /** R-A/W2：30D fills 讀到分頁上限仍滿頁 → true（fill_count 為下限值）。 */
+  /** D3（2026-09-05）：distinct 訂單數（原欄位名帶「fill」字樣，不是 fills 數）。 */
+  order_count_30d: number;
+  /** D3：部位歸零的生命週期數（Hyperbot 定義，見 `trader_stats.fills_stats`）。 */
+  closed_positions_30d: number;
+  /** D3：Σ closedPnl（未扣手續費／funding）。 */
+  realized_pnl_30d_usd: number;
+  /** R-A/W2：30D fills 讀到分頁上限仍滿頁 → true（三個 *_30d 欄位為下限值）。 */
   fills_truncated?: boolean;
   close_win_rate_pct: number | null;
   concentration_pct: number | null;
-  exposure: { dir: string | null; pct: number | null };
+  exposure: { dir: "long" | "short" | null; pct: number | null };
   tags: string[];
 }
 
@@ -428,12 +439,15 @@ function toNumberOrNull(v: unknown): number | null {
 function normalizeWindowStats(v: unknown): ExploreWindowStats | null {
   if (v == null || typeof v !== "object") return null;
   const r = v as Record<string, unknown>;
-  const retPct = toNumberOrNull(r.ret_pct);
-  const maxDdPct = toNumberOrNull(r.max_dd_pct);
-  if (retPct == null || maxDdPct == null) return null;
+  // `pnl_usd` 缺席／非數字 → 這一窗對這一列整個缺席（true null，不是「算不出」）。
+  // `max_dd_pct` 允許 `null`（算不出，見 `max_dd_reason`）——不得用 `??`/`||`
+  // 把它換成 0，那會偽造出一個「回撤為零」的假數字。
+  const pnlUsd = toNumberOrNull(r.pnl_usd);
+  if (pnlUsd == null) return null;
   return {
-    ret_pct: retPct,
-    max_dd_pct: maxDdPct,
+    pnl_usd: pnlUsd,
+    max_dd_pct: toNumberOrNull(r.max_dd_pct),
+    max_dd_reason: typeof r.max_dd_reason === "string" ? r.max_dd_reason : null,
     spark: Array.isArray(r.spark)
       ? r.spark.filter((n): n is number => typeof n === "number" && Number.isFinite(n))
       : [],
@@ -461,11 +475,13 @@ function normalizeExploreRow(v: unknown): ExploreRow | null {
     account_bucket: typeof r.account_bucket === "string" ? r.account_bucket : NO_VALUE_PLACEHOLDER,
     windows,
     live_days: typeof r.live_days === "number" ? r.live_days : 0,
-    fill_count_30d: typeof r.fill_count_30d === "number" ? r.fill_count_30d : 0,
+    order_count_30d: typeof r.order_count_30d === "number" ? r.order_count_30d : 0,
+    closed_positions_30d: typeof r.closed_positions_30d === "number" ? r.closed_positions_30d : 0,
+    realized_pnl_30d_usd: typeof r.realized_pnl_30d_usd === "number" ? r.realized_pnl_30d_usd : 0,
     close_win_rate_pct: toNumberOrNull(r.close_win_rate_pct),
     concentration_pct: toNumberOrNull(r.concentration_pct),
     exposure: {
-      dir: typeof exposure.dir === "string" ? exposure.dir : null,
+      dir: exposure.dir === "long" || exposure.dir === "short" ? exposure.dir : null,
       pct: toNumberOrNull(exposure.pct),
     },
     tags: Array.isArray(r.tags) ? r.tags.filter((t): t is string => typeof t === "string") : [],
@@ -513,13 +529,94 @@ export async function getPublicExplore(
   };
 }
 
+/** `/api/public/traders/{address}` 的 `fills_30d`（近 30 天成交統計，
+ * `spark.filet.trader_stats.FillsStats.to_dict()`）——Hyperbot 已驗證定義
+ * （distinct 訂單數／部位歸零生命週期／生命週期勝率／Σ closedPnl），見
+ * `docs/superpowers/plans/2026-09-04-explore-trader-pnl-metrics.md`。 */
+export interface TraderFillsStats {
+  order_count: number;
+  closed_positions: number;
+  wins: number;
+  win_rate_pct: number | null;
+  realized_pnl_usd: number;
+  concentration_pct: number | null;
+  coins: string[];
+  truncated: boolean;
+}
+
+const EMPTY_TRADER_FILLS: TraderFillsStats = {
+  order_count: 0,
+  closed_positions: 0,
+  wins: 0,
+  win_rate_pct: null,
+  realized_pnl_usd: 0,
+  concentration_pct: null,
+  coins: [],
+  truncated: false,
+};
+
+function normalizeTraderFillsStats(v: unknown): TraderFillsStats {
+  if (v == null || typeof v !== "object") return EMPTY_TRADER_FILLS;
+  const m = v as Partial<TraderFillsStats>;
+  return {
+    order_count: typeof m.order_count === "number" ? m.order_count : 0,
+    closed_positions: typeof m.closed_positions === "number" ? m.closed_positions : 0,
+    wins: typeof m.wins === "number" ? m.wins : 0,
+    win_rate_pct: toNumberOrNull(m.win_rate_pct),
+    realized_pnl_usd: typeof m.realized_pnl_usd === "number" ? m.realized_pnl_usd : 0,
+    concentration_pct: toNumberOrNull(m.concentration_pct),
+    coins: Array.isArray(m.coins) ? m.coins.filter((x): x is string => typeof x === "string") : [],
+    truncated: !!m.truncated,
+  };
+}
+
+/** `/api/public/traders/{address}` 的 `methodology`（内联組裝，見 `app.py`
+ * `public_trader_detail`）——與 `PublicStrategyMethodology` 是不同形狀
+ * （沒有 `start_date`/`end_date`/`annualization_days` 等 TWR 相關欄位，多了
+ * `mdd_note`），不共用同一個介面。 */
+export interface PublicTraderMethodology {
+  basis: string;
+  updated_at: number;
+  start_equity_usd: string | null;
+  end_equity_usd: string | null;
+  initial_deposit_usd: string | null;
+  mdd_note: string;
+}
+
+const EMPTY_TRADER_METHODOLOGY: PublicTraderMethodology = {
+  basis: "combined",
+  updated_at: 0,
+  start_equity_usd: null,
+  end_equity_usd: null,
+  initial_deposit_usd: null,
+  mdd_note: "",
+};
+
+function normalizeTraderMethodology(v: unknown): PublicTraderMethodology {
+  if (v == null || typeof v !== "object") return EMPTY_TRADER_METHODOLOGY;
+  const m = v as Partial<PublicTraderMethodology>;
+  return {
+    basis: typeof m.basis === "string" ? m.basis : "combined",
+    updated_at: typeof m.updated_at === "number" ? m.updated_at : 0,
+    start_equity_usd: m.start_equity_usd ?? null,
+    end_equity_usd: m.end_equity_usd ?? null,
+    initial_deposit_usd: m.initial_deposit_usd ?? null,
+    mdd_note: typeof m.mdd_note === "string" ? m.mdd_note : "",
+  };
+}
+
 /**
- * `/api/public/traders/{address}`（M3 round2 Task 6：交易員詳情頁）。任意 HL
- * 地址的鏈上績效——**不受精選白名單管轄**，`metrics`／`equity_index`／
- * `methodology` 與 `/api/public/strategies/{slug}` 同一份形狀（後端共用同一批
- * 純函式），故前端可重用同一個 `EquityCurve` 元件與指標卡渲染邏輯。
- * `account_value` 來自另一個端點（`clearinghouseState`，工程原則 1：與
- * `equity_index` 不同源，不得放進同一個對比），可能單獨為 `null`。
+ * `/api/public/traders/{address}`（M3 round2 Task 6：交易員詳情頁；
+ * 2026-09-05 explore/trader 指標統一 plan Task 4/5 改形狀）。任意 HL 地址的
+ * 鏈上績效——**不受精選白名單管轄**。`windows`／`live_days`／`fills_30d`／
+ * `exposure` 與 `/api/public/explore`（`ExploreRow`）共用同一組後端純函式
+ * （`spark.filet.trader_stats`，工程原則 1：兩頁的每一個數字只能從同一處
+ * 出來），故 `windows[w]` 與同地址 `ExploreRow.windows[w]` 逐位相等。
+ * `metrics` 保留（D6 保留版）但改逐窗：`{day,week,month,allTime}` 各自一份
+ * `build_metrics` 形狀（`PublicStrategyMetrics`，沿用既有型別不改）。
+ * `equity_index` 已移除（由 `windows[w].spark` 取代）。`account_value` 來自
+ * 另一個端點（`clearinghouseState`，工程原則 1：與 `windows` 不同源，不得
+ * 放進同一個對比），可能單獨為 `null`。
  */
 export interface PublicTraderDetail {
   address: string;
@@ -527,17 +624,20 @@ export interface PublicTraderDetail {
   // ⭐ [W4] 2026-08-29 opus 審查修正：地址若被平台安全撤銷（精選白名單
   // enabled=false），後端回 true——前端隱藏跟單 CTA，不讓新客戶點進去。
   follow_blocked: boolean;
-  metrics: PublicStrategyMetrics;
-  equity_index: string[];
-  methodology: PublicStrategyMethodology;
+  live_days: number;
+  exposure: { dir: "long" | "short"; pct: number | null } | null;
+  windows: Record<ExploreWindow, ExploreWindowStats | null>;
+  metrics: Record<ExploreWindow, PublicStrategyMetrics>;
+  fills_30d: TraderFillsStats;
+  methodology: PublicTraderMethodology;
   /** M3 round4 Task R4-11：與 `PublicStrategyDetail` 同一套組裝規則
    * （後端 `build_cagr_fields`，見 `filet/strategies.py` 檔頭），供交易員詳情頁
-   * 補齊 CAGR 收合卡。 */
+   * 補齊 CAGR 收合卡。CAGR 只算 allTime（D6）。 */
   sample_days: number;
   sample_threshold: number;
   /** `sample_days < sample_threshold` 時後端整個不回傳這個鍵——同
    * `PublicStrategyDetail.cagr_pct` 的結構性防呆。 */
-  cagr_pct: string | null;
+  cagr_pct?: string | null;
 }
 
 /**
@@ -552,6 +652,30 @@ export async function getPublicTraderDetail(address: string): Promise<PublicTrad
     if (!res.ok) return null;
     const body = (await res.json()) as Partial<PublicTraderDetail> | null;
     if (body == null || typeof body.address !== "string") return null;
+    const rawWindows = (body.windows && typeof body.windows === "object")
+      ? body.windows as Record<string, unknown>
+      : {};
+    const windows = Object.fromEntries(
+      EXPLORE_WINDOWS.map((w) => [w, normalizeWindowStats(rawWindows[w])]),
+    ) as Record<ExploreWindow, ExploreWindowStats | null>;
+    const rawMetrics = (body.metrics && typeof body.metrics === "object")
+      ? body.metrics as Record<string, unknown>
+      : {};
+    const metrics = Object.fromEntries(
+      EXPLORE_WINDOWS.map((w) => [w, normalizeMetrics(rawMetrics[w])]),
+    ) as Record<ExploreWindow, PublicStrategyMetrics>;
+    const rawExposure = (body.exposure && typeof body.exposure === "object")
+      ? body.exposure as Record<string, unknown>
+      : null;
+    // 拆到局部變數才能讓 TS 的 equality narrowing 生效；且必須明寫型別註記
+    // ——不寫的話 `{ dir: exposureDir, ... }` 這個新物件字面值會把已收斂的
+    // `"long"|"short"` 字面型別拓寬回 `string`（object literal 的既有拓寬
+    // 規則，沒有 contextual type 就不會保留字面型別）。
+    const exposureDir = rawExposure?.dir;
+    const exposure: { dir: "long" | "short"; pct: number | null } | null =
+      exposureDir === "long" || exposureDir === "short"
+        ? { dir: exposureDir, pct: toNumberOrNull(rawExposure?.pct) }
+        : null;
     return {
       address: body.address,
       account_value: body.account_value ?? null,
@@ -559,9 +683,12 @@ export async function getPublicTraderDetail(address: string): Promise<PublicTrad
       // `_trader_follow_blocked` 同方向——欄位缺漏或格式異常一律視為「已封鎖」
       // （隱藏 CTA），不得因為解析失敗就預設放行去跟一個可能已被撤銷的地址。
       follow_blocked: body.follow_blocked !== false,
-      metrics: normalizeMetrics(body.metrics),
-      equity_index: Array.isArray(body.equity_index) ? body.equity_index.map(String) : [],
-      methodology: normalizeMethodology(body.methodology),
+      live_days: typeof body.live_days === "number" ? body.live_days : 0,
+      exposure,
+      windows,
+      metrics,
+      fills_30d: normalizeTraderFillsStats(body.fills_30d),
+      methodology: normalizeTraderMethodology(body.methodology),
       sample_days: typeof body.sample_days === "number" ? body.sample_days : 0,
       sample_threshold: typeof body.sample_threshold === "number" ? body.sample_threshold : 30,
       cagr_pct: typeof body.cagr_pct === "string" ? body.cagr_pct : null,
