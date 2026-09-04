@@ -1018,6 +1018,7 @@ export function PnlCurve({ values, ariaLabel }: { values: number[]; ariaLabel: s
 - **指標網格保留但改逐窗**：資料來源改 `trader.metrics[window_]`；網格只渲染 `sharpe`／`sharpe_se`／`annualized_vol_pct`／`sortino`／`win_rate_pct`／`best_day_pct`／`worst_day_pct`（連同各自 `*_insufficient` → 既有「樣本不足」渲染），**不再渲染** `total_return_pct` 與 `max_drawdown_pct`（由窗卡顯示 `pnl_usd`／`max_dd_pct`，見 D6）。`CagrCard` 與 `sampleInsufficient`（`sample_days < sample_threshold`）邏輯**原樣保留**（allTime）。
 - **移除**：`EquityCurve` 及其 import（損益曲線取代）。跟單面板（SIWE／approval／follow CTA）**一行不改**。
 - 探索表格「查看」連結改成 `/traders/${address}?window=${window_}`，讓清單所選窗帶進詳情頁。
+- **探索表格 grid 欄寬**（2026-09-05 Task 5 builder 發現）：`web/src/styles/globals.css` 探索表格的 `grid-template-columns` 中損益欄固定 88px，`.explore-ret` 的 `min-width` 會被 grid 蓋掉，`+$1,234,567` 仍會溢欄。把該欄改成 `minmax(7.5rem, auto)`（找到那條 `grid-template-columns`，只改損益那一欄，其他欄不動），並在探索頁測試補一條快照無關的 smoke（渲染 `pnl_usd: 1234567.89` 的列，斷言文字為 `+$1,234,568`）。
 
 - [ ] **Step 3: 測試**
 
