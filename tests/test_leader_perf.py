@@ -12,8 +12,8 @@ from decimal import Decimal
 import pytest
 
 from spark.filet.leader_perf import (COMBINED_PERIODS, INSUFFICIENCY_MARKERS,
-                                     MIN_DAYS_FOR_ANNUALIZATION, PERP_PERIODS,
-                                     STATUS_INSUFFICIENT, STATUS_OK,
+                                     MAX_SKIPPED_RATIO, MIN_DAYS_FOR_ANNUALIZATION,
+                                     PERP_PERIODS, STATUS_INSUFFICIENT, STATUS_OK,
                                      TIER_ANNUALIZABLE, TIER_INSUFFICIENT,
                                      TIER_PNL_ONLY, TIER_WINDOW_RETURN,
                                      compute_perp_performance,
@@ -222,12 +222,15 @@ def test_misaligned_series_refuses_to_compute():
 
 
 def test_denominator_floor_blocks_exploding_returns():
-    """提領到近乎 0 後的小額交易不得產生爆炸性報酬；跳過的區間要誠實計數。"""
+    """提領到近乎 0 後的小額交易不得產生爆炸性報酬；跳過的區間要誠實計數。
+    2026-09-05：補兩個平盤點（r=0），讓跳過比例 1/4 = 25% 落在 MAX_SKIPPED_RATIO 之內，
+    這條測的是地板，不是比例閘門（比例閘門另有 test_too_many_skipped_intervals_*）。"""
     r = compute_window_performance(
-        rows([(0, "10000", "0"), (20, "5", "-9995"), (40, "15", "-9985")]),
+        rows([(0, "10000", "0"), (20, "5", "-9995"), (40, "105", "-9895"),
+              (60, "105", "-9895"), (80, "105", "-9895")]),
         "perpMonth")
     assert r["skipped_intervals"] == 1          # 第二段分母 5 < 100，不計入
-    # 若不設地板，第二段 r = 10/5 = +200%，TWR 會從 −99.95% 反彈成正的。
+    # 若不設地板，第二段 r = 100/5 = +2000%，TWR 會從 −99.95% 反彈成正的。
     assert r["twr"] == Decimal("-0.9995")
 
 
@@ -286,3 +289,47 @@ def test_jsonable_drops_equity_index_but_keeps_its_length():
     assert j["twr"] == "0.21" and isinstance(j["covered_days"], str)
     j2 = jsonable_performance(r, include_equity_index=True)
     assert j2["equity_index"] == ["1", "1.1", "1.1", "1.21"]
+
+
+# --- 2026-09-04 閘門 4／5（explore/detail 指標統一 plan，D8）：flow_dominated_interval
+# ／too_many_skipped_intervals ---------------------------------------------------
+def _portfolio(period, av, pnl):
+    ts = [1_700_000_000_000 + i * 3_600_000 for i in range(len(av))]
+    return [[period, {"accountValueHistory": [[t, str(a)] for t, a in zip(ts, av)],
+                      "pnlHistory": [[t, str(p)] for t, p in zip(ts, pnl)]}]]
+
+
+def test_flow_dominated_interval_marks_window_insufficient():
+    # 前值 1000，同一區間入金 5000 且虧 1500：r = -1500/1000 = -1.5 <= -1 → 整窗無效
+    rows = _portfolio("month", av=[1000, 4500, 4600], pnl=[0, -1500, -1400])
+    perf = compute_window_performance(rows, "month")
+    assert perf["status"] == STATUS_INSUFFICIENT
+    assert perf["reason"] == "flow_dominated_interval"
+    assert "twr" not in perf and "max_drawdown" not in perf
+
+
+def test_too_many_skipped_intervals_marks_window_insufficient():
+    # 10 點 → 9 區間；av[0..4] = 10 → 區間 i=1..5 的前值 < 100（跳過 5 段）→ 5/9 = 0.556 > 0.30
+    av = [10, 10, 10, 10, 10, 1000, 1010, 1020, 1030, 1040]
+    pnl = [0, 0, 0, 0, 0, 0, 10, 20, 30, 40]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == STATUS_INSUFFICIENT
+    assert perf["reason"] == "too_many_skipped_intervals"
+    assert perf["skipped_intervals"] == 5
+
+
+def test_exact_total_loss_is_not_flow_dominated():
+    # r == -1（上一期淨值全部虧光，無入金）是合法的歸零，不是資金流主導：狀態 ok、TWR = -1
+    rows = _portfolio("month", av=[1000, 0], pnl=[0, -1000])
+    perf = compute_window_performance(rows, "month")
+    assert perf["status"] == "ok" and perf["twr"] == Decimal("-1")
+
+
+def test_skipped_ratio_exactly_at_threshold_passes():
+    # 11 點 → 10 區間；3 個跳過 = 0.30，不大於門檻 → ok
+    av = [10, 10, 10, 1000, 1010, 1020, 1030, 1040, 1050, 1060, 1070]
+    pnl = [0, 0, 0, 0, 10, 20, 30, 40, 50, 60, 70]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == "ok"
+    assert perf["skipped_intervals"] == 3
+    assert MAX_SKIPPED_RATIO == Decimal("0.30")

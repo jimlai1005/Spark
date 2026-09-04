@@ -119,6 +119,14 @@ DAYS_PER_YEAR = Decimal("365")
 # 一律不計入複利，並在 `skipped_intervals` 誠實回報跳過了幾段。
 DENOMINATOR_FLOOR = Decimal("100")
 
+# 2026-09-04 閘門 4／5（explore/detail 指標統一 plan，D8）：
+# - 任一區間 r_t <= -1（虧損 >= 上一期 AV）代表入金與虧損落在同一取樣區間，
+#   權益指數會轉負、之後全是垃圾——整窗判無效（reason="flow_dominated_interval"）。
+#   allTime 窗降採樣 6–9 天一點時常見（實證 0xbf73…5d58 2024-12-25 區間 r=-1.36）。
+# - 被分母地板跳過的區間比例 > MAX_SKIPPED_RATIO 代表這顆帳戶大半時間淨值 < 100
+#   USDC（入金→交易→提光型），剩下的區間不足以代表整窗（reason="too_many_skipped_intervals"）。
+MAX_SKIPPED_RATIO = Decimal("0.30")
+
 # 資料充足度門檻（研究文件 2d；2026-07-19 起語意為「足不足」而非「給不給」）。
 # 門檻寫成常數而不是散在判斷式裡：「多少天的資料算充足」是會被討論、會被外部審查的
 # 判準，必須有單一可引用的位置。
@@ -391,7 +399,20 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
             skipped += 1
             equity_index.append(equity_index[-1])
             continue
+        if r < Decimal("-1"):
+            # 嚴格小於：r == -1 是「這段把上一期淨值全部虧光」，無需入金即可發生
+            # （既有測試 test_annualized_markers_never_appear_without_the_number 就是這個
+            # 案例，TWR = −1 是正確答案）；r < -1 代表虧損 > 上一期淨值，沒有同區間入金
+            # 在數學上不可能，才是「資金流主導」的證據。
+            logger.warning("portfolio %s 窗第 %d 區間 r=%s < -1（prev_av=%s, d_pnl=%s）"
+                           "——入金與虧損同區間，整窗判無效", period, i, r, prev_av, d_pnl)
+            return _insufficient(period, "flow_dominated_interval", sample_count=len(pnl))
         equity_index.append(equity_index[-1] * (Decimal("1") + r))
+
+    if Decimal(skipped) > MAX_SKIPPED_RATIO * Decimal(len(pnl) - 1):
+        out = _insufficient(period, "too_many_skipped_intervals", sample_count=len(pnl))
+        out["skipped_intervals"] = skipped
+        return out
 
     cum_pnl = pnl[-1][1] - pnl[0][1]
     basis, basis_note = _basis_for(period)
