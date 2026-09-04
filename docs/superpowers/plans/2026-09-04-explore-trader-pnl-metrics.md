@@ -50,7 +50,8 @@
 - D2 探索排序鍵改為**所選窗 `pnl_usd` 降冪**（缺該窗退回 `month`）；風險由「最大回撤 <」chip 過濾，不再做 ret/dd 比值。
 - D3 `fill_count_30d` 改名 `order_count_30d`（語意＝distinct 訂單）；HTTP 查詢參數 `min_fills` **名稱不變**（契約），門檻比對對象改成 `order_count_30d`。
 - D4 成交統計只算 **perp fills**（`dir` ∈ `{Open Long, Open Short, Close Long, Close Short, Long > Short, Short > Long}`），spot 成交（`Buy`/`Sell`/`Spot Dust Conversion`）一律排除。
-- D5 fills 改走 `hl.get_fills_detail_paged(..., max_pages=cfg.fills_max_pages)`，`ExploreConfig.fills_max_pages` 預設 **3**（≤ 6000 筆）；詳情端點同值。
+- D5 fills 改走分頁；`ExploreConfig.fills_max_pages` 預設 **3**（≤ 6000 筆）；詳情端點同值。
+  ⚠️ 2026-09-05 修正（Task 3 builder 發現）：`hl.get_fills_detail_paged` 最後一步經 `_fill_detail_dict` 裁切，**丟掉了 `dir`／`oid`／`startPosition`、`closedPnl` 改名 `closed_pnl`**，而 `trader_stats.fills_stats` 需要原始 HL 形狀（fixture 也是原始形狀）。裁決：在 `hl.py` 新增公開方法 `get_fills_raw_paged(address, start, end, *, max_pages=None) -> tuple[list[dict], bool]`，直接回傳 `_paged_fills_raw` 的原始 dict（不裁切），探索與詳情端點一律呼叫它；`get_fills_detail_paged` 與 `/api/me/fills` 不動。見 Task 3a。
 - D6（2026-09-04 使用者否決移除版，改為保留）詳情頁**保留** `metrics`（`build_metrics` 輸出：TWR/MDD/Sharpe/Sortino/年化波動/日勝率/最佳最差日）與 `cagr_pct`/`sample_days`/`sample_threshold`，但 `metrics` 改成**逐窗**：`metrics: {day, week, month, allTime}`，每窗各自 `build_metrics(compute_window_performance(rows, period))`；CAGR 只算 allTime（年化需 ≥ 90 天）。前端指標網格只渲染比率型指標（Sharpe/Sortino/年化波動/日勝率/最佳最差日），**不重複渲染** `total_return_pct`／`max_drawdown_pct`——損益與回撤由窗卡（`windows[w]`）顯示，避免同頁兩個回撤數字（窗卡的 `max_dd_pct` 是該窗事實上的峰谷跌幅，`metrics` 的 `max_drawdown_pct` 在 < 30 天窗會被 `*_insufficient` 標成樣本不足，兩者語意不同）。`equity_index` 移除（由損益曲線 `windows[w].spark` 取代）。策略頁與 `strategies.py` 不動。
 - D9 **不做 7D 退路**：2026-09-04 抽樣探索池前 40 地址，30D 算不出的 13 列在 7D 下**全部**仍算不出（跳過區間比例 90% 以上），24H 只救回 2 列且 24H 對回撤無意義。算不出就顯示「—」＋原因，不用別的窗冒充。
 - D10 詳情頁**預設窗改為 `month`**（原 allTime）：同一抽樣 allTime 有 27/40 列算不出（降採樣 6–9 天一點，入金與損益同區間），其中 15 列在 30D 是好的；30D 是最穩的窗，且與探索清單預設一致。`?window=` 可切四窗。
@@ -438,8 +439,11 @@ def downsample(values: list[float], n: int = SPARK_POINTS) -> list[float]:
         return []
     if len(values) <= n:
         return [float(v) for v in values]
-    step = len(values) / n
-    idxs = [min(len(values) - 1, int(i * step)) for i in range(n)]
+    # 2026-09-05 Task 2 實作修正：分母用 n-1、round() 取樣，讓最後一點精確落在序列末端
+    # （原 len/n + int() 對 100→30 會停在索引 96，丟掉末值）。Task 3 換掉 hl_explore 的
+    # `_downsample_floats` 時，既有測試若斷言舊索引，改成斷言「首末點保留、長度 ≤ n」。
+    step = (len(values) - 1) / (n - 1)
+    idxs = [min(len(values) - 1, round(i * step)) for i in range(n)]
     return [float(values[i]) for i in idxs]
 
 
@@ -550,6 +554,64 @@ git commit -m "feat: trader_stats 共用指標模組（pnl_usd／權益指數回
 
 ---
 
+### Task 3a: `hl.py` 新增原始形狀分頁出口 `get_fills_raw_paged` `@inline`
+
+**Files:**
+- Modify: `src/spark/publicapi/hl.py`（`get_fills_detail_paged` 下方）
+- Test: `tests/test_publicapi_hl.py`（沿既有分頁測試的假 `post_fn` 寫法，約 252／281 行）
+
+- [ ] **Step 1: 寫失敗測試**（沿該檔既有的假 gateway／`post_fn` fixture 慣例；`_gw()` 若不存在就照既有分頁測試的建法）
+
+```python
+def test_get_fills_raw_paged_preserves_raw_hl_fields():
+    """trader_stats.fills_stats 需要 dir／oid／startPosition／closedPnl 原始欄位；
+    本方法不得經 _fill_detail_dict 裁切。"""
+    raw = [{"time": 1, "coin": "BTC", "side": "B", "px": "100", "sz": "1", "fee": "0.1",
+            "closedPnl": "0", "hash": "0xh", "oid": 11, "tid": 1, "dir": "Open Long",
+            "startPosition": "0.0"},
+           {"time": 2, "coin": "BTC", "side": "A", "px": "110", "sz": "1", "fee": "0.1",
+            "closedPnl": "10", "hash": "0xh2", "oid": 12, "tid": 2, "dir": "Close Long",
+            "startPosition": "1.0"}]
+    gw = _gw(post_fn=lambda url, body: raw)          # 單頁 < 2000 → 不續抓
+    fills, truncated = gw.get_fills_raw_paged("0xabc", _dt(0), _dt(10), max_pages=3)
+    assert truncated is False
+    assert [f["dir"] for f in fills] == ["Open Long", "Close Long"]
+    assert fills[0]["oid"] == 11 and fills[1]["startPosition"] == "1.0"
+    assert "closedPnl" in fills[1] and "closed_pnl" not in fills[1]
+```
+
+- [ ] **Step 2: 跑確認失敗**
+
+Run: `uv run pytest tests/test_publicapi_hl.py -k raw_paged -v`
+Expected: FAIL（`AttributeError: get_fills_raw_paged`）
+
+- [ ] **Step 3: 實作**（放在 `get_fills_detail_paged` 之後）
+
+```python
+    def get_fills_raw_paged(self, address: str, start: datetime, end: datetime, *,
+                            max_pages: int | None = None) -> tuple[list[dict], bool]:
+        """`_paged_fills_raw` 的公開出口：回傳**原始** `userFillsByTime` dict（升冪、
+        `tid` 去重），**不**經 `_fill_detail_dict` 裁切。2026-09-05 新增，供
+        `spark.filet.trader_stats.fills_stats`（探索清單與交易員詳情共用）使用——它需要
+        `dir`（開/平倉/翻倉語意）、`oid`（distinct 訂單數）、`startPosition`（部位歸零判斷）、
+        `closedPnl`，這些在 `_fill_detail_dict` 都被丟掉或改名，而 `dir`/`startPosition`
+        無法從裁切後的 `side` 重建。`/api/me/fills` 仍走 `get_fills_detail_paged`，不受影響。
+        `truncated` 語意同 `_paged_fills_raw`。"""
+        return self._paged_fills_raw(address, start, end, max_pages=max_pages)
+```
+
+- [ ] **Step 4: 跑綠 + commit**
+
+Run: `uv run pytest tests/test_publicapi_hl.py -q`
+Expected: 全綠。
+
+```bash
+git add src/spark/publicapi/hl.py tests/test_publicapi_hl.py
+git commit -m "feat: hl.get_fills_raw_paged 原始形狀分頁出口（供 trader_stats.fills_stats）"
+```
+
+---
+
 ### Task 3: `hl_explore` 改吃 `trader_stats` `@inline`
 
 **Files:**
@@ -600,7 +662,7 @@ a. import：`from spark.filet.trader_stats import (WindowStats, FillsStats, wind
 
 b. `EXPLORE_INDEX_VERSION = 3`。
 
-c. `ExploreConfig` 加欄位 `fills_max_pages: int = 3`（docstring：D5，配合 `hl.get_fills_detail_paged`；每頁 2000 筆，3 頁上限；`_call_hl` 的節流包住整個分頁呼叫，頁與頁之間沒有額外間隔，這是已知的 burst 面，上限 3 就是為了壓它）。
+c. `ExploreConfig` 加欄位 `fills_max_pages: int = 3`（docstring：D5，配合 `hl.get_fills_raw_paged`；每頁 2000 筆，3 頁上限；`_call_hl` 的節流包住整個分頁呼叫，頁與頁之間沒有額外間隔，這是已知的 burst 面，上限 3 就是為了壓它）。
 
 d. `ExploreRow`：`fill_count_30d: int` → `order_count_30d: int`；新增 `closed_positions_30d: int`、`realized_pnl_30d_usd: float`；`to_dict` 對應輸出這三個鍵（移除 `fill_count_30d`）；`from_dict`／`_row_from_dict`（snapshot 讀回）對應改；`windows` 讀回改用 `WindowStats.from_dict`。
 
@@ -651,9 +713,9 @@ i. `_enrich_one`：
 
 ```python
         fills, fills_truncated = self._call_hl(
-            lambda: self._hl.get_fills_detail_paged(address, start, end,
-                                                    max_pages=self._cfg.fills_max_pages),
-            address, "fills")
+            lambda: self._hl.get_fills_raw_paged(address, start, end,
+                                                 max_pages=self._cfg.fills_max_pages),
+            address, "fills")   # 原始 HL 形狀（含 dir/oid/startPosition），見 Task 3a
         ...
         return enrich_candidate(address, display_name, portfolio_raw, fills, ch_state,
                                 fills_truncated=fills_truncated)
@@ -747,7 +809,7 @@ Expected: FAIL（形狀不符）。
 
 - [ ] **Step 2: 實作**
 
-a. `_cached_trader_data`：快取條目多抓兩樣：`fills, fills_truncated = hl.get_fills_detail_paged(addr, now-30d, now, max_pages=3)`，以及保留原始 `ch_state`（目前只抽 `account_value`）。回傳 tuple 擴成 `(rows, account_value, initial_deposit_usd, ch_state, fills, fills_truncated)`；fills 抓失敗 → `fills=[]`、`fills_truncated=False` 並 log（降級該區塊，不拖累整頁，沿 `account_value` 既有語意）。`max_pages` 常數 `TRADER_FILLS_MAX_PAGES = 3`（與 `ExploreConfig.fills_max_pages` 預設同值，各自宣告、註解互指）。
+a. `_cached_trader_data`：快取條目多抓兩樣：`fills, fills_truncated = hl.get_fills_raw_paged(addr, now-30d, now, max_pages=3)`（原始形狀，Task 3a），以及保留原始 `ch_state`（目前只抽 `account_value`）。回傳 tuple 擴成 `(rows, account_value, initial_deposit_usd, ch_state, fills, fills_truncated)`；fills 抓失敗 → `fills=[]`、`fills_truncated=False` 並 log（降級該區塊，不拖累整頁，沿 `account_value` 既有語意）。`max_pages` 常數 `TRADER_FILLS_MAX_PAGES = 3`（與 `ExploreConfig.fills_max_pages` 預設同值，各自宣告、註解互指）。
 
 b. `public_trader_detail`：
 
