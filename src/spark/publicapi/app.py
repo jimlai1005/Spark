@@ -40,6 +40,7 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     build_equity_range, build_metrics,
                                     build_methodology, build_strategy_view,
                                     sample_days_from_perf, sum_ledger_deposits)
+from spark.filet.trader_stats import fills_stats, live_days_from_av, window_stats
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
 from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
                                      build_contact_email, clip, decoy_ticket, notify_text,
@@ -2286,12 +2287,20 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                     min_fills=min_fills, max_dd_pct=max_dd_pct,
                                     max_concentration_pct=max_concentration_pct)
 
-    # ---------- /api/public/traders/{address}（M3 round2 Task 6）----------
+    # ---------- /api/public/traders/{address}（M3 round2 Task 6；2026-09-05 改吃
+    # trader_stats，見 docs/superpowers/plans/2026-09-04-explore-trader-pnl-metrics.md
+    # Task 4／D6／D10）----------
     # ⭐ leaderboard 任意地址的詳情頁——不受精選白名單管轄（`leaders.py` 唯讀，
-    # 本區塊完全不 import 它）。計算重用 `filet.strategies` 的純函式
-    # （`build_metrics`／`build_equity_index`／`build_methodology`），與
-    # `/api/public/strategies/{slug}` 共用同一份公式——不重算。回應形狀刻意
-    # 只對齊 `metrics`／`equity_index`／`methodology`（plan Task 6 明訂範圍），
+    # 本區塊完全不 import 它）。損益金額／權益指數回撤／sparkline／成交統計
+    # 全部委派給 `spark.filet.trader_stats`（`window_stats`／`fills_stats`／
+    # `live_days_from_av`），與 `/api/public/explore`（`hl_explore.
+    # enrich_candidate`）共用同一組公式——工程原則 1：兩頁的每一個數字都只能
+    # 從這裡出來，不得各自重算（見本 plan 背景段的 2026-09-04 事故）。
+    # `metrics`（Sharpe/Sortino/年化波動/日勝率/最佳最差日）**保留但逐窗**
+    # （D6 保留版，使用者明確要求）：`{day, week, month, allTime}` 各自一份
+    # `build_metrics(compute_window_performance(rows, period))`；`cagr_pct`
+    # 只算 allTime（`build_cagr_fields`，與 `/api/public/strategies/{slug}`
+    # 共用同一支）。`equity_index` 已移除（由 `windows[w].spark` 取代，D6）。
     # 不硬套 `build_strategy_view`：那個函式吃 `LeaderRef`（name/slug/tagline/
     # featured/listable…），這些欄位對一個任意鏈上地址沒有意義，硬塞一個假
     # LeaderRef 只會產生看起來像策展資訊、實際是編造的欄位。
@@ -2302,7 +2311,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     # 有快取、account_value 卻是無底洞的放大面）。修法：併入同一個快取條目，
     # tuple 多存一個 account_value 欄位；`_enforce_probe_ratelimit` 只在這次
     # 合併 miss 呼叫一次。
-    _trader_portfolio_cache: dict[str, tuple[float, list, str | None, Decimal | None]] = {}
+    # D5（2026-09-05）：`hl.get_fills_raw_paged` 分頁上限，與 `ExploreConfig.
+    # fills_max_pages` 預設同值（各自宣告、註解互指——探索榜與詳情頁是兩個獨立
+    # 的呼叫路徑，不共用同一個 dataclass 實例，但語意必須一致，見 D5）。
+    TRADER_FILLS_MAX_PAGES = 3
+    _trader_portfolio_cache: dict[
+        str, tuple[float, list, str | None, Decimal | None, dict | None, list, bool]
+    ] = {}
     _trader_portfolio_lock = threading.Lock()
     TRADER_PORTFOLIO_CACHE_TTL_S = 300.0  # 5 分鐘（plan 明訂）
     TRADER_PORTFOLIO_CACHE_MAX = 256      # 上限地址數（防濫用，plan 明訂）
@@ -2320,34 +2335,41 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
     def _cached_trader_data(
         address: str, ratelimit_key: str
-    ) -> tuple[list | None, str | None, Decimal | None]:
+    ) -> tuple[list | None, str | None, Decimal | None, dict | None, list, bool]:
         """`hl.portfolio()` ＋ `hl.clearinghouse_state()` ＋
-        `hl.non_funding_ledger_updates()` 的 5 分鐘 per-address **合併**快取，
-        上限 256 個地址。同一次 cache miss 把三個上游一起抓、
-        `_enforce_probe_ratelimit` 只計費一次（見 [8b-1]；M3 round4 Task R4-2
-        沿用同一條理由把真實入金查詢併進來——任意位址皆可查的端點多開一個不受
-        限流保護的上游呼叫，就是重新製造一次 [8b-1] 那種放大面）——
-        `account_value`（clearinghouseState）與真實入金（ledger）失敗都只讓
-        各自欄位降級為 `None`，不影響 `rows`（portfolio，equity 曲線與 metrics
+        `hl.non_funding_ledger_updates()` ＋ `hl.get_fills_raw_paged()`（D5，
+        2026-09-05 新增，供 `trader_stats.fills_stats` 使用）的 5 分鐘
+        per-address **合併**快取，上限 256 個地址。同一次 cache miss 把四個
+        上游一起抓、`_enforce_probe_ratelimit` 只計費一次（見 [8b-1]；M3
+        round4 Task R4-2／2026-09-05 Task 4 沿用同一條理由把真實入金查詢／
+        近 30 天成交併進來——任意位址皆可查的端點多開一個不受限流保護的上游
+        呼叫，就是重新製造一次 [8b-1] 那種放大面）——`account_value`
+        （clearinghouseState，本次起**整份 ch_state 也一併快取**供 `exposure`
+        欄位使用）、真實入金（ledger）、fills 三者失敗都只讓各自欄位降級
+        （`account_value=None`／`ch_state=None`／`fills=[]`,
+        `fills_truncated=False`），不影響 `rows`（portfolio，windows／metrics
         的唯一資料源）是否成功快取；`rows` 失敗才走負面快取短路整個條目
-        （工程原則 1：三個來源分別展示各自的數字，不混進同一個對比，但**快取
-        時機**合併不影響這條原則——三個欄位在回應裡仍各自標明來源、各自可能
-        為 `None`）。
+        （工程原則 1：四個來源分別展示各自的數字，不混進同一個對比，但**快取
+        時機**合併不影響這條原則——每個欄位在回應裡仍各自標明來源、各自可能
+        為 `None`／空值）。
 
         超過上限時淘汰最舊一筆（近似 LRU）；`rows` 失敗改記負面快取（見上）而非
         完全不快取——同一壞地址在 60s 內重打會直接短路，不再二次打上游。
 
         `ratelimit_key`：呼叫端派生的 per-client 識別（本端點無 session，見
         `public_trader_detail`），不是位址——按位址計費擋不住「同一個 client
-        輪流枚舉不同位址」這個真正的上游放大面（見 [C1]）。"""
+        輪流枚舉不同位址」這個真正的上游放大面（見 [C1]）。
+
+        回傳 `(rows, account_value, initial_deposit_usd, ch_state, fills,
+        fills_truncated)`。"""
         now = now_fn()
         with _trader_portfolio_lock:
             cached = _trader_portfolio_cache.get(address)
             failed_at = _trader_portfolio_negative_cache.get(address)
         if cached is not None and now - cached[0] < TRADER_PORTFOLIO_CACHE_TTL_S:
-            return cached[1], cached[2], cached[3]
+            return cached[1], cached[2], cached[3], cached[4], cached[5], cached[6]
         if failed_at is not None and now - failed_at < TRADER_PORTFOLIO_NEGATIVE_TTL_S:
-            return None, None, None
+            return None, None, None, None, [], False
         # ⭐ [C1] per-client rate limit：只在真的要打上游（快取未命中、負面快取也
         # 已過期）這一刻才計費——cache/negative-cache 命中不消耗額度，因為那兩條
         # 路徑本來就不會產生上游流量，計費在那兩條路徑上只會誤傷正常瀏覽。
@@ -2358,11 +2380,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             logger.error("交易員績效上游查詢失敗 address=%s: %s", address, e)
             with _trader_portfolio_lock:
                 _trader_portfolio_negative_cache[address] = now
-            return None, None, None
+            return None, None, None, None, [], False
         account_value = None
+        ch_state = None
         try:
-            cs = hl.clearinghouse_state(address)
-            account_value = cs.get("marginSummary", {}).get("accountValue")
+            ch_state = hl.clearinghouse_state(address)
+            account_value = ch_state.get("marginSummary", {}).get("accountValue")
         except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
             logger.error("交易員 account_value 查詢失敗 address=%s: %s", address, e)
         deposit = None
@@ -2371,6 +2394,15 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             deposit = sum_ledger_deposits(ledger_raw)
         except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
             logger.error("交易員真實入金查詢失敗 address=%s: %s", address, e)
+        fills: list = []
+        fills_truncated = False
+        try:
+            end_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+            start_dt = end_dt - timedelta(days=hl_explore.FILLS_WINDOW_DAYS)
+            fills, fills_truncated = hl.get_fills_raw_paged(
+                address, start_dt, end_dt, max_pages=TRADER_FILLS_MAX_PAGES)
+        except Exception as e:  # noqa: BLE001 — 額外欄位（成交統計），失敗只降級該欄位
+            logger.error("交易員近 30 天成交查詢失敗 address=%s: %s", address, e)
         with _trader_portfolio_lock:
             _trader_portfolio_negative_cache.pop(address, None)
             if (address not in _trader_portfolio_cache
@@ -2378,8 +2410,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 oldest = min(_trader_portfolio_cache,
                             key=lambda k: _trader_portfolio_cache[k][0])
                 del _trader_portfolio_cache[oldest]
-            _trader_portfolio_cache[address] = (now, rows, account_value, deposit)
-        return rows, account_value, deposit
+            _trader_portfolio_cache[address] = (
+                now, rows, account_value, deposit, ch_state, fills, fills_truncated)
+        return rows, account_value, deposit, ch_state, fills, fills_truncated
 
     def _trader_follow_blocked(addr: str) -> bool:
         """[W4] 已被安全撤銷（`enabled=false`）的 leader 不該在交易員詳情頁看到
@@ -2406,14 +2439,25 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         """任意 HL 地址的鏈上績效詳情（無需登入）。`address` 需為 `0x` + 40 hex，
         壞格式 → 422。
 
-        `hl.portfolio()`（equity 曲線與 metrics 的唯一資料源）查詢失敗 → 503——
+        `hl.portfolio()`（`windows`／`metrics` 的唯一資料源）查詢失敗 → 503——
         沒有它整頁沒有東西可畫，與 `/api/public/leaderboard` 首次抓取失敗同一
         個判準。`account_value`（來自 `clearinghouseState`，**與 portfolio 是
         兩個不同端點**，工程原則 1：不得把兩者混進同一個對比裡，這裡只是分別
-        展示各自的數字）查詢失敗只降級該欄位為 `null`，不拖累整頁——它是
-        plan 明訂的「額外」欄位，不是頁面的主要內容。兩者現在**併入同一個
-        5 分鐘快取條目**一起抓（見 [8b-1]、`_cached_trader_data`），不是各自
-        獨立打上游。
+        展示各自的數字）、真實入金（ledger）、近 30 天成交（fills）三者查詢
+        失敗只降級各自欄位，不拖累整頁。四者現在**併入同一個 5 分鐘快取條目**
+        一起抓（見 [8b-1]、`_cached_trader_data`），不是各自獨立打上游。
+
+        ⭐ 2026-09-05（Task 4，見 docs/superpowers/plans/
+        2026-09-04-explore-trader-pnl-metrics.md D6/D10）：`windows`／
+        `live_days`／`fills_30d`／`exposure` 改呼叫
+        `spark.filet.trader_stats`（`window_stats`／`fills_stats`／
+        `live_days_from_av`）＋ `hl_explore.exposure_from_clearinghouse`，與
+        `/api/public/explore`（`hl_explore.enrich_candidate`）共用同一組公式
+        （工程原則 1：兩頁的每一個數字都只能從這裡出來）。`metrics` 保留但
+        改逐窗（D6 保留版）：`{day, week, month, allTime}` 各自一份
+        `build_metrics(compute_window_performance(rows, period))`；`cagr_pct`
+        仍只算 allTime（`build_cagr_fields`）。`equity_index` 已移除（由
+        `windows[w].spark` 取代）。
 
         ⭐ [C1] 本端點無需登入、任意人可枚舉任意位址各打一次上游查詢
         （上游放大面）——套用與 `/api/leaders/preview` 同款的 sliding-window
@@ -2428,49 +2472,60 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise HTTPException(status_code=422, detail="位址格式不合法（需 0x 開頭 + 40 hex）")
 
         client_host = request.client.host if request.client else "unknown"
-        rows, account_value, initial_deposit_usd = _cached_trader_data(
-            addr, _TRADER_PROBE_KEY_PREFIX + client_host)
+        rows, account_value, initial_deposit_usd, ch_state, fills, fills_truncated = (
+            _cached_trader_data(addr, _TRADER_PROBE_KEY_PREFIX + client_host))
         if rows is None:
             raise HTTPException(status_code=503, detail="鏈上績效查詢暫時不可用，請稍後重試")
 
-        try:
-            # ⚠️ 2026-08-31 I-15 使用者裁決：改用 `allTime`（spot+perp 合併，原
-            # `perpAllTime`）——任意鏈上地址同樣可能資金停泊 spot、經內部轉帳進出
-            # perp，perp-only 序列會把轉帳算成損益，見 `leader_perf.py` 檔頭
-            # 「I-15」段與 `_strategy_perf_with_as_of` 同款註解。
-            perf = compute_window_performance(rows, "allTime")
-        except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整頁
-            logger.error("交易員績效計算失敗 address=%s: %s", addr, e)
-            perf = None
+        windows = {k: (ws.to_dict() if (ws := window_stats(rows, p)) is not None else None)
+                  for k, p in hl_explore.WINDOW_TO_PERIOD.items()}
+        all_time = extract_window(rows, hl_explore.WINDOW_TO_PERIOD["allTime"])
+        live_days = live_days_from_av(all_time[0]) if all_time is not None else 0
+        start_equity_usd, end_equity_usd = (
+            build_equity_range(all_time[0]) if all_time is not None else (None, None))
+        fs = fills_stats(fills, truncated=fills_truncated)
+        exp_dir, exp_pct = (hl_explore.exposure_from_clearinghouse(ch_state)
+                           if ch_state else (None, None))
 
-        # ⭐ M3 round4 Task R4-2：起訖淨值改用同一份 `accountValueHistory` 的首個
-        # 非零值／末值（`build_equity_range`）——理由與 `/api/public/strategies/
-        # {slug}` 同一套，見該端點註解。`initial_deposit_usd` 已在
-        # `_cached_trader_data` 併入同一次快取抓好，這裡不重打上游。
-        start_equity_usd = None
-        end_equity_usd = None
-        window = extract_window(rows, "allTime")
-        if window is not None:
-            av, _pnl = window
-            start_equity_usd, end_equity_usd = build_equity_range(av)
+        # ⭐ D6 保留版（使用者明確要求保留 Sharpe 等比率型指標）：`metrics` 逐窗，
+        # 每窗各自呼叫 `compute_window_performance`——與 `windows[w]`（`window_stats`
+        # 內部同樣呼叫它算 `max_dd_pct`）各自獨立計算一次，不共用同一份 `perf` 物件
+        # （`window_stats` 沒有對外暴露 perf，只暴露算好的 `max_dd_pct`），但兩者都是
+        # 對同一次 `rows` 回應、同一個 `period` 呼叫同一支 `compute_window_performance`
+        # ——同源同基準（工程原則 1）沒有被打破，只是計算路徑各自呼叫一次。
+        perfs: dict[str, dict | None] = {}
+        for k, p in hl_explore.WINDOW_TO_PERIOD.items():
+            try:
+                perfs[k] = compute_window_performance(rows, p)
+            except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整頁
+                logger.error("交易員績效計算失敗 address=%s window=%s: %s", addr, k, e)
+                perfs[k] = None
+        metrics = {k: build_metrics(perf) for k, perf in perfs.items()}
+        all_time_perf = perfs.get("allTime")
 
-        # ⭐ M3 round4 Task R4-11（trader/strategy 詳情頁欄位對齊）：`sample_days`／
-        # `sample_threshold`／(可能的) `cagr_pct` 與 `/api/public/strategies/
-        # {slug}` 共用同一支 `build_cagr_fields`（見該函式檔頭），不重複「門檻時
-        # 整個不放 cagr_pct 鍵」的判斷。`sample_days` 用 `sample_days_from_perf`
-        # （與 `build_strategy_view` 算 `live_days` 同一套算法，抽出共用）。
         view = {
             "address": addr,
             "account_value": account_value,
             "follow_blocked": _trader_follow_blocked(addr),
-            "metrics": build_metrics(perf),
-            "equity_index": build_equity_index(perf),
-            "methodology": build_methodology(
-                perf, initial_deposit_usd=initial_deposit_usd,
-                start_equity_usd=start_equity_usd, end_equity_usd=end_equity_usd,
-                updated_at=int(now_fn())),
+            "live_days": live_days,
+            "exposure": None if exp_dir is None else {"dir": exp_dir, "pct": exp_pct},
+            "windows": windows,
+            "metrics": metrics,
+            "fills_30d": fs.to_dict(),
+            "methodology": {
+                "basis": "combined",
+                "updated_at": int(now_fn()),
+                "start_equity_usd": (str(start_equity_usd)
+                                     if start_equity_usd is not None else None),
+                "end_equity_usd": (str(end_equity_usd)
+                                   if end_equity_usd is not None else None),
+                "initial_deposit_usd": (str(initial_deposit_usd)
+                                        if initial_deposit_usd is not None else None),
+                "mdd_note": MDD_SAMPLING_NOTE,
+            },
         }
-        view.update(build_cagr_fields(perf, sample_days=sample_days_from_perf(perf)))
+        view.update(build_cagr_fields(all_time_perf,
+                                      sample_days=sample_days_from_perf(all_time_perf)))
         return view
 
     # 換 leader 的待簽原文所用的 nonce 與 SIWE 登入**共用同一張表**（同一個 nonce

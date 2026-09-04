@@ -569,6 +569,15 @@ def _exposure(positions: list[dict] | None) -> tuple[str | None, float | None]:
     return "short", float(pct)
 
 
+def exposure_from_clearinghouse(ch_state: dict) -> tuple[str | None, float | None]:
+    """公開出口：`clearinghouse_state()` 原始回應 → `(dir, pct)`（`_parse_positions`
+    ＋`_exposure` 的組合）。2026-09-05（Task 4）供 `publicapi/app.py`
+    `public_trader_detail` 呼叫——它與 `enrich_candidate` 必須算出同一個曝險，
+    不得各自重新解析 `assetPositions`（工程原則 1）。`app.py` 只呼叫這個公開名，
+    不碰底線私有的 `_parse_positions`／`_exposure`。"""
+    return _exposure(_parse_positions(ch_state))
+
+
 def _abbreviate_address(address: str) -> str:
     if not (isinstance(address, str) and address.startswith("0x") and len(address) >= 10):
         return address

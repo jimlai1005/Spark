@@ -1,21 +1,30 @@
 """tests/test_public_traders.py — `GET /api/public/traders/{address}`
 （M3 round2 Task 6：交易員詳情頁，不受精選白名單管轄）。
 
-計算重用 `filet.strategies` 的既有純函式（`build_metrics`／`build_equity_index`／
-`build_methodology`）——本檔只驗證端點層的組裝：位址驗證、快取、account_value
-與 portfolio 兩個獨立來源各自的失敗降級、上限 256 個地址的淘汰。全離線
+計算重用 `filet.strategies` 的既有純函式（`build_metrics`／`build_cagr_fields`）
+＋（2026-09-05 起）`spark.filet.trader_stats`（`window_stats`／`fills_stats`／
+`live_days_from_av`，與 `/api/public/explore` 共用，見
+docs/superpowers/plans/2026-09-04-explore-trader-pnl-metrics.md Task 4）——
+本檔驗證端點層的組裝：位址驗證、快取、四個獨立來源（portfolio／
+clearinghouseState／ledger／fills）各自的失敗降級、上限 256 個地址的淘汰，
+以及與 `hl_explore.enrich_candidate` 的同源數字逐位相等。全離線
 （autouse socket-ban，見 conftest.py；FakeHL 全假資料）。
 """
 import json
 import socket
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
 from spark.publicapi.store import ApiStore
 from tests.publicapi_helpers import FakeHL, FakeKeysvc, make_app, make_cfg
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+_TRADER_ADDR = "0x6648f8dd041ed689de7bf501efb3b827cf15b1f3"
 
 _REAL_SOCKET = socket.socket  # import 期捕捉，早於 autouse 斷網 fixture（沿既有慣例）
 
@@ -77,17 +86,18 @@ def test_not_whitelisted_address_still_returns_200(tmp_path):
     body = r.json()
     assert body["address"] == _A
     assert body["account_value"] == "5000.00"
-    assert body["equity_index"] == ["1", "1.2"]
-    assert body["metrics"]["total_return_pct"] == "20.00"
-    assert body["metrics"]["total_return_pct_insufficient"] is False
+    assert "equity_index" not in body
+    assert body["metrics"]["allTime"]["total_return_pct"] == "20.00"
+    assert body["metrics"]["allTime"]["total_return_pct_insufficient"] is False
+    assert set(body["metrics"]) == {"day", "week", "month", "allTime"}
+    assert set(body["windows"]) == {"day", "week", "month", "allTime"}
+    assert body["windows"]["allTime"]["pnl_usd"] == 200.0
     meth = body["methodology"]
     assert meth["initial_deposit_usd"] == "1000.0"   # 真實 ledger deposit 加總
     assert meth["start_equity_usd"] == "1000"        # av[0]（同一次 portfolio 回應）
     assert meth["end_equity_usd"] == "1200"          # av[-1]
-    assert set(meth) == {"start_date", "end_date", "initial_deposit_usd",
-                         "start_equity_usd", "end_equity_usd",
-                         "sample_count", "annualization_days", "risk_free_rate",
-                         "basis", "updated_at"}
+    assert set(meth) == {"initial_deposit_usd", "start_equity_usd", "end_equity_usd",
+                         "basis", "updated_at", "mdd_note"}
 
 
 def test_ledger_deposit_failure_degrades_to_null_not_503(tmp_path):
@@ -102,7 +112,7 @@ def test_ledger_deposit_failure_degrades_to_null_not_503(tmp_path):
     body = r.json()
     assert body["methodology"]["initial_deposit_usd"] is None
     assert body["methodology"]["start_equity_usd"] == "1000"
-    assert body["equity_index"] == ["1", "1.2"]
+    assert body["windows"]["allTime"]["pnl_usd"] == 200.0
 
 
 def test_account_value_failure_degrades_to_null_not_503(tmp_path):
@@ -116,19 +126,22 @@ def test_account_value_failure_degrades_to_null_not_503(tmp_path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["account_value"] is None
-    assert body["equity_index"] == ["1", "1.2"]
+    assert body["windows"]["allTime"]["pnl_usd"] == 200.0
 
 
-def test_no_perf_still_200_with_empty_equity_index(tmp_path):
+def test_no_perf_still_200_with_all_windows_none(tmp_path):
     """FakeHL 預設對未塞資料的地址回空 portfolio 清單（不是失敗）——不 503，
-    equity_index 空陣列、metrics 全 insufficient（沿
-    `/api/public/strategies/{slug}` 的既有降級精神）。"""
+    四窗全 None、metrics 全 insufficient（沿 `/api/public/strategies/{slug}`
+    的既有降級精神）。"""
     app, *_ = make_app(tmp_path)
     r = _client(app).get(f"/api/public/traders/{_A}")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["equity_index"] == []
-    assert body["metrics"]["total_return_pct_insufficient"] is True
+    assert body["windows"] == {"day": None, "week": None, "month": None, "allTime": None}
+    assert body["metrics"]["allTime"]["total_return_pct_insufficient"] is True
+    assert body["live_days"] == 0
+    assert body["exposure"] is None
+    assert body["fills_30d"]["order_count"] == 0
 
 
 # ============================================================
@@ -364,3 +377,77 @@ def test_follow_blocked_false_when_address_not_in_any_whitelist(tmp_path):
     r = c.get(f"/api/public/traders/{_A}")
     assert r.status_code == 200, r.text
     assert r.json()["follow_blocked"] is False
+
+
+# ============================================================
+# 2026-09-05（Task 4，trader_stats 指標統一）：詳情端點與 explore 同源
+# ============================================================
+
+def _load_0x6648_portfolio():
+    return json.loads((_FIXTURES / "trader_stats_0x6648_portfolio.json").read_text())
+
+
+def _load_0x6648_fills():
+    return json.loads((_FIXTURES / "trader_stats_0x6648_fills30d.json").read_text())["fills"]
+
+
+def _seed_0x6648(hl):
+    """假 HL 回真實 0x6648 fixture（portfolio／fills）＋一個 accountValue=0
+    無持倉的 clearinghouseState（plan Task 4 Step 1 明訂的 fixture 建法）。"""
+    hl.portfolios[_TRADER_ADDR] = _load_0x6648_portfolio()
+    hl.fills_raw[_TRADER_ADDR] = _load_0x6648_fills()
+    hl.clearinghouse[_TRADER_ADDR] = {"marginSummary": {"accountValue": "0.0"},
+                                      "assetPositions": []}
+
+
+def test_trader_detail_shape_matches_explore_windows(tmp_path):
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    _seed_0x6648(hl)
+    r = _client(app).get(f"/api/public/traders/{_TRADER_ADDR}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) >= {"address", "account_value", "follow_blocked", "live_days", "exposure",
+                         "windows", "fills_30d", "methodology", "metrics",
+                         "sample_days", "sample_threshold"}
+    assert set(body["windows"]) == {"day", "week", "month", "allTime"}
+    assert set(body["metrics"]) == {"day", "week", "month", "allTime"}
+    # month/allTime 兩窗在 0x6648 上都被閘門判無效 → 該窗 metrics 全部 insufficient
+    assert body["metrics"]["month"]["sharpe_insufficient"] is True
+    assert body["metrics"]["month"]["sharpe"] is None
+    assert body["metrics"]["allTime"]["total_return_pct_insufficient"] is True
+    # day 窗 perf ok，但 covered_days < 30 → 比率型指標仍標不足（RATIO_MIN_DAYS）
+    assert body["metrics"]["day"]["sharpe_insufficient"] is True
+    assert body["metrics"]["day"]["win_rate_pct"] is not None      # N>=1 即存在，不設閘
+    assert body["sample_days"] == 0 and "cagr_pct" not in body      # allTime 無效 → 無 CAGR
+    m = body["windows"]["month"]
+    assert m["pnl_usd"] == 33055.26 and m["max_dd_pct"] is None \
+        and m["max_dd_reason"] == "too_many_skipped_intervals" and len(m["spark"]) == 30
+    assert body["windows"]["day"]["max_dd_pct"] == pytest.approx(-74.07, abs=0.01)
+    assert body["live_days"] == 1003
+    f = body["fills_30d"]
+    assert (f["order_count"], f["closed_positions"], f["wins"], f["win_rate_pct"],
+            f["realized_pnl_usd"], f["truncated"]) == (221, 27, 15, 55.56, 40225.79, False)
+    assert set(body["methodology"]) == {"basis", "updated_at", "start_equity_usd",
+                                        "end_equity_usd", "initial_deposit_usd", "mdd_note"}
+    assert body["methodology"]["basis"] == "combined"
+    assert "equity_index" not in body
+
+
+def test_trader_detail_and_explore_row_agree_on_same_address(tmp_path):
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    _seed_0x6648(hl)
+    detail = _client(app).get(f"/api/public/traders/{_TRADER_ADDR}").json()
+
+    portfolio_raw = _load_0x6648_portfolio()
+    fills = _load_0x6648_fills()
+    ch_state = hl.clearinghouse[_TRADER_ADDR]
+    row = hl_explore.enrich_candidate(_TRADER_ADDR, None, portfolio_raw, fills, ch_state,
+                                      fills_truncated=False).to_dict()
+
+    for w in ("day", "week", "month", "allTime"):
+        assert detail["windows"][w] == row["windows"][w]
+    assert detail["live_days"] == row["live_days"]
+    assert detail["fills_30d"]["order_count"] == row["order_count_30d"]
+    assert detail["fills_30d"]["closed_positions"] == row["closed_positions_30d"]
+    assert detail["fills_30d"]["win_rate_pct"] == row["close_win_rate_pct"]
+    assert detail["fills_30d"]["realized_pnl_usd"] == row["realized_pnl_30d_usd"]
