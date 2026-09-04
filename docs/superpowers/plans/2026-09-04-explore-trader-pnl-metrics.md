@@ -1091,6 +1091,166 @@ git commit -m "docs: explore/trader 指標統一的部署註記與慣例"
 
 ---
 
+### Task 8: reviewer 修正輪（後端） `@inline`
+
+2026-09-05 opus reviewer 對 `62df325^..HEAD` 的審查結果，主線程已親自重現 Critical。全部修在後端；前端對應改動在 Task 9。
+
+**Files:**
+- Modify: `src/spark/filet/leader_perf.py`（跳過比例閘門）＋ `tests/test_leader_perf.py`
+- Modify: `src/spark/filet/trader_stats.py`（訂單計數）＋ `tests/test_trader_stats.py`
+- Modify: `src/spark/publicapi/hl_explore.py`（`fills_max_pages` 單一來源）
+- Modify: `src/spark/publicapi/app.py`（`window_stats` 例外降級、fills 失敗 → `null`、`max_pages` 單一來源）＋ `tests/test_public_traders.py`
+- Modify: `deploy/RUNBOOK.md`（`EXPLORE_FILLS_MAX_PAGES` env 說明）
+
+- [ ] **Step 1（Critical）：跳過比例閘門排除「窗口開頭尚未入金」的連續段**
+
+問題：新 follower 在 30D 窗中途才入金 → 窗前段 AV=0 的區間全被地板跳過 → 比例 > 30% → 整窗 `insufficient` → `/api/me/dashboard` 的 `net`／`fees_paid`／`win_rate`／`max_drawdown_pct` 全 `None`（主線程實跑重現：`av=[0]*20+[500..540]` → `insufficient too_many_skipped_intervals skipped=20`）。「還沒入金」不是「入金→提光」，不該算進比例。修法：比例的分子分母都扣掉開頭連續未入金段；`skipped_intervals` 欄位仍回報總跳過數（既有語意不變）。
+
+先改測試（`tests/test_leader_perf.py`）：
+
+```python
+def test_leading_unfunded_run_is_not_counted_toward_skipped_ratio():
+    # 新 follower：前 20 點 AV=0（尚未入金），入金後 8 個區間全部正常 → ok，cum_pnl 照算
+    av = [0] * 20 + [500, 505, 510, 515, 520, 525, 530, 535, 540]
+    pnl = [0] * 20 + [0, 5, 10, 15, 20, 25, 30, 35, 40]
+    perf = compute_window_performance(_portfolio("perpMonth", av, pnl), "perpMonth")
+    assert perf["status"] == "ok"
+    assert perf["skipped_intervals"] == 20           # 總跳過數語意不變
+    assert perf["cum_pnl"] == Decimal("40")
+```
+
+並把 Task 1 的兩條比例測試改成「未入金段在中間／入金之後」的形狀（開頭段現在會被排除，原資料測不到門檻）：
+
+```python
+def test_too_many_skipped_intervals_marks_window_insufficient():
+    # 10 點 → 9 區間；入金後又提光 5 段（i=3..7 前值 10 < 100）→ 5/9 = 0.556 > 0.30
+    av = [1000, 1010, 10, 10, 10, 10, 10, 1000, 1010, 1020]
+    pnl = [0, 10, 10, 10, 10, 10, 10, 10, 20, 30]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == STATUS_INSUFFICIENT
+    assert perf["reason"] == "too_many_skipped_intervals"
+    assert perf["skipped_intervals"] == 5
+
+
+def test_skipped_ratio_exactly_at_threshold_passes():
+    # 11 點 → 10 區間；入金後提光 3 段（i=2..4 前值 5）= 0.30，不大於門檻 → ok
+    av = [1000, 5, 5, 5, 1000, 1010, 1020, 1030, 1040, 1050, 1060]
+    pnl = [0, -995, -995, -995, -995, -985, -975, -965, -955, -945, -935]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == "ok"
+    assert perf["skipped_intervals"] == 3
+    assert MAX_SKIPPED_RATIO == Decimal("0.30")
+```
+
+實作（`compute_window_performance` 迴圈）：
+
+```python
+    equity_index: list[Decimal] = [Decimal("1")]
+    skipped = 0
+    leading_unfunded = 0     # 窗口開頭連續「尚未入金」（prev_av < 地板）的區間數，不算進比例
+    funded_seen = False
+    net_flow = Decimal("0")
+    for i in range(1, len(pnl)):
+        ...
+        if prev_av < DENOMINATOR_FLOOR:
+            skipped += 1
+            if not funded_seen:
+                leading_unfunded += 1
+            equity_index.append(equity_index[-1])
+            continue
+        funded_seen = True
+        ...（r 的計算與 flow_dominated 閘門不變）
+
+    # 閘門 5：比例只看「首次入金之後」的區間——開頭尚未入金不是入金→提光。
+    effective_total = (len(pnl) - 1) - leading_unfunded
+    effective_skipped = skipped - leading_unfunded
+    if (effective_total > 0
+            and Decimal(effective_skipped) > MAX_SKIPPED_RATIO * Decimal(effective_total)):
+        out = _insufficient(period, "too_many_skipped_intervals", sample_count=len(pnl))
+        out["skipped_intervals"] = skipped
+        return out
+```
+
+驗證 fixture 錨例不變：`uv run pytest tests/test_trader_stats.py -q` 仍全綠（0x6648 month 扣掉開頭段後 20/45 = 0.44、week 46/66 = 0.70，仍被擋；主線程已算過）。
+
+- [ ] **Step 2（Warning 1）：`public_trader_detail` 的 `windows` 推導式加例外降級**
+
+```python
+        windows = {}
+        for k, p in WINDOW_TO_PERIOD.items():
+            try:
+                ws = window_stats(rows, p)
+            except Exception as e:  # noqa: BLE001 — schema 漂移不得炸掉整頁（與 perfs 迴圈同款）
+                logger.error("交易員窗指標計算失敗 address=%s window=%s: %s", addr, k, e)
+                ws = None
+            windows[k] = ws.to_dict() if ws is not None else None
+```
+測試：`FakeHL` 給一份 `portfolio` 回應，其中 `month` 窗的 `pnlHistory` 值是 `"not-a-number"` → 端點 200、`windows.month` 為 `null`、其他窗正常。
+
+- [ ] **Step 3（Warning 2）：fills 抓取失敗 → `fills_30d: null`，不得偽造 0**
+
+`_cached_trader_data`：`fills: list | None = None`，抓成功才賦值；快取 tuple 照存 `None`。`public_trader_detail`：`"fills_30d": fills_stats(fills, truncated=fills_truncated).to_dict() if fills is not None else None`。測試（用 `tests/publicapi_helpers.py:121` 既有的 `fills_raw_error` 鉤子）：
+
+```python
+def test_trader_detail_fills_failure_yields_null_not_zeros(client_with_fake_hl, fake_hl):
+    fake_hl.fills_raw_error["0x6648f8dd041ed689de7bf501efb3b827cf15b1f3"] = RuntimeError("HL 500")
+    body = client_with_fake_hl.get("/api/public/traders/0x6648f8dd041ed689de7bf501efb3b827cf15b1f3").json()
+    assert body["fills_30d"] is None
+    assert body["windows"]["month"]["pnl_usd"] == 33055.26     # 其他區塊不受影響
+```
+
+- [ ] **Step 4（Warning 3）：`max_pages` 單一來源**
+
+`hl_explore.py` 新增公開函式：
+
+```python
+FILLS_MAX_PAGES_ENV = "EXPLORE_FILLS_MAX_PAGES"
+
+def fills_max_pages_from_env() -> int:
+    """D5：探索清單與交易員詳情**同一個**分頁上限（兩頁逐位一致的前提）。"""
+    return _int(FILLS_MAX_PAGES_ENV, DEFAULT_FILLS_MAX_PAGES)
+```
+`ExploreConfig.from_env` 改呼叫它；`app.py` 刪除 `TRADER_FILLS_MAX_PAGES = 3`，改在抓 fills 時呼叫 `hl_explore.fills_max_pages_from_env()`。測試：`monkeypatch.setenv("EXPLORE_FILLS_MAX_PAGES", "5")` → `FakeHL` 記錄的 `max_pages` 為 5（explore 與 traders 兩條路徑各一條斷言，或共用一條）。RUNBOOK 在 Task 7 那段後補一行：`EXPLORE_FILLS_MAX_PAGES`（預設 3，每頁 2000 筆；探索與詳情共用；大戶 30 天成交常超過 6000 筆，實測 0xbf73 為 5887+ 筆，調高前先確認 429 情況）。
+
+- [ ] **Step 5（Suggestion 3）：訂單數只算解析成功且 `oid` 非 None 的 fill**
+
+`trader_stats.fills_stats`：把 `oids.add(f.get("oid"))` 移到 Decimal 解析成功之後，且 `if f.get("oid") is not None`。測試：一筆 `px` 為 `"x"` 的壞 fill 與一筆無 `oid` 的 fill → `order_count` 不計入。
+
+- [ ] **Step 6：驗收與 commit**
+
+```bash
+uv run ruff check src tests scripts && uv run pytest -q
+git add src/spark/filet/leader_perf.py tests/test_leader_perf.py src/spark/filet/trader_stats.py tests/test_trader_stats.py src/spark/publicapi/hl_explore.py src/spark/publicapi/app.py tests/test_public_traders.py tests/test_public_explore.py deploy/RUNBOOK.md
+git commit -m "fix: reviewer 修正輪（後端）：跳過比例排除開頭未入金段、詳情頁例外降級與 fills null、max_pages 單一來源"
+```
+
+---
+
+### Task 9: reviewer 修正輪（前端） `@inline`
+
+**Files:**
+- Modify: `web/src/lib/publicApi.ts`（`fills_30d: TraderFillsStats | null`）
+- Modify: `web/src/lib/copy.ts`（`traders.fillsUnavailable`、`explore.ddFilterNoEvidenceNote`，zh/en 對稱）
+- Modify: `web/src/app/traders/[address]/page.tsx` ＋ `page.test.tsx`
+- Modify: `web/src/app/explore/page.tsx` ＋ `page.test.tsx`
+
+- [ ] **Step 1（Warning 2 前端）**：`fills_30d` 為 `null` → 成交統計卡顯示一行 `c.fillsUnavailable`（zh「成交統計暫時無法取得」），不渲染四個 0。測試一條。
+- [ ] **Step 2（Warning 4）**：`sampleInsufficient`（allTime 的 `sample_days < sample_threshold`）**只**控制 `CagrCard`，不再決定比率型指標網格顯示哪些卡；網格一律渲染該窗的全部比率型指標，各自依 `metrics[window_].<key>_insufficient` 顯示「樣本不足」。把 `page.test.tsx` 裡釘死「只剩 1 張小卡」的斷言改成「7 張卡全在、不足的顯示樣本不足」。
+- [ ] **Step 3（Suggestion 4）**：回撤卡的 `neg` class 只在 `max_dd_pct < 0` 時加；null／0 用中性樣式。
+- [ ] **Step 4（Suggestion 2）**：加一條測試：點四窗按鈕 → 損益數字與指標網格切到該窗（用 `userEvent.click` 或 `fireEvent.click`，沿該檔既有寫法）。
+- [ ] **Step 5（Warning 5）**：探索頁「最大回撤 <」chip 啟用時，chip 下方顯示 `c.ddFilterNoEvidenceNote`（zh「回撤算不出的帳戶不在此過濾範圍，其回撤欄顯示 —」）。測試一條。
+- [ ] **Step 6：驗收與 commit**
+
+```bash
+export PATH="/Users/jim/.nvm/versions/node/v24.18.0/bin:$PATH" && cd web && npm test && npx tsc --noEmit && npm run build
+git add web/src/lib/publicApi.ts web/src/lib/copy.ts "web/src/app/traders/[address]/page.tsx" "web/src/app/traders/[address]/page.test.tsx" web/src/app/explore/page.tsx web/src/app/explore/page.test.tsx
+git commit -m "fix: reviewer 修正輪（前端）：fills null 顯示、指標網格逐窗不受 allTime 門檻牽制、回撤過濾提示"
+```
+
+（`npx tsc --noEmit` 的既有基線錯誤：`explore/page.test.tsx` 的 `.at(-1)?.[0] as string` 與 `EquityCurve.test.tsx:128`，本輪不處理。）
+
+**reviewer 的 Suggestion 1（`min_fills` 預設 200 改以訂單數比對後實質收緊）**：留給使用者裁決，不在本輪改。
+
 ## 驗收條款（主線程 verdict 用，預註冊）
 
 1. `uv run pytest -q` 全綠；`tests/test_trader_stats.py` 內 fixture 錨例（221／27／15／55.56／40225.79／33055.26／-2181.94／-74.07／1003）逐條通過。
