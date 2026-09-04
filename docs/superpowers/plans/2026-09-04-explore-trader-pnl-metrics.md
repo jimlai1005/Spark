@@ -1251,6 +1251,57 @@ git commit -m "fix: reviewer 修正輪（前端）：fills null 顯示、指標�
 
 **reviewer 的 Suggestion 1（`min_fills` 預設 200 改以訂單數比對後實質收緊）**：留給使用者裁決，不在本輪改。
 
+---
+
+### Task 10: 複審修正（小） `@inline`
+
+2026-09-05 複審（對 Task 8／9）結果：上輪 finding 全部已修；新增 1 Warning 必修＋1 Warning 潛伏＋2 Suggestion 順手收。
+
+**Files:**
+- Modify: `src/spark/filet/leader_perf.py` ＋ `tests/test_leader_perf.py`
+- Modify: `src/spark/publicapi/hl_explore.py` ＋ `tests/test_public_explore.py`
+- Modify: `src/spark/publicapi/app.py` ＋ `tests/test_public_traders.py`
+- Modify: `web/src/lib/publicApi.ts` ＋ `web/src/lib/publicApi.test.ts`
+
+- [ ] **Step 1（Warning，必修）：`effective_total == 0` → insufficient，不得回 ok＋回撤 0**
+
+觸發：整窗每個區間 `prev_av < 100`（帳戶整月 AV=50 卻有真實損益；或只在最後一個取樣點入金）。現行：`effective_total == 0` 時整道比例閘門被跳過 → `status ok`、`max_drawdown 0`，與非零 `cum_pnl` 同窗矛盾，且會通過探索頁「回撤 < 30%」過濾（fail-open）。
+
+測試：
+```python
+def test_no_funded_interval_is_insufficient_not_zero_drawdown():
+    # 整窗 prev_av 都 < 地板：沒有任何一段算得出 r_t，不得宣告零回撤
+    av = [50] * 10
+    pnl = [0, 5, -30, -20, 10, 20, -5, 0, 3, 7]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == STATUS_INSUFFICIENT
+    assert perf["reason"] == "no_funded_interval"
+    assert perf["skipped_intervals"] == 9
+```
+實作：比例閘門前加
+```python
+    if effective_total <= 0:
+        out = _insufficient(period, "no_funded_interval", sample_count=len(pnl))
+        out["skipped_intervals"] = skipped
+        return out
+```
+跑 `uv run pytest tests/test_leader_perf.py tests/test_trader_stats.py tests/test_public_strategies.py tests/test_public_traders.py -q`，若有既有測試用「全零／全 dust」序列期待 ok，回報該測試名與其意圖，不得自行放寬。
+
+- [ ] **Step 2（Warning，潛伏）：`fills_max_pages_from_env(env: Mapping[str, str] | None = None)`**，`None` 時讀 `os.environ`；`ExploreConfig.from_env(env=...)` 把自己的 `env` 傳進去；`app.py` 呼叫處不帶參數（讀程序環境）。測試：`ExploreConfig.from_env(env={"EXPLORE_FILLS_MAX_PAGES": "7"})` → `fills_max_pages == 7`，且不受 `monkeypatch.setenv` 影響。
+
+- [ ] **Step 3（Suggestion）：`app.py` 的 `live_days_from_av(...)` 移進與 `windows` 同款的 try/except**（失敗 → `live_days = 0` 並 log），測試：monkeypatch `live_days_from_av` 拋例外 → 端點 200、`live_days == 0`。
+
+- [ ] **Step 4（Suggestion）：前端 `normalizeTraderFillsStats` 對非物件（字串／數字／陣列）一律回 `null`**，不得退回 `EMPTY_TRADER_FILLS`（那會渲染四個 0）；測試一條（`fills_30d: "x"` → `null`）。
+
+- [ ] **Step 5：驗收與 commit**
+
+```bash
+uv run ruff check src tests scripts && uv run pytest -q
+export PATH="/Users/jim/.nvm/versions/node/v24.18.0/bin:$PATH" && cd web && npm test
+git add src/spark/filet/leader_perf.py tests/test_leader_perf.py src/spark/publicapi/hl_explore.py tests/test_public_explore.py src/spark/publicapi/app.py tests/test_public_traders.py web/src/lib/publicApi.ts web/src/lib/publicApi.test.ts
+git commit -m "fix: 複審修正：無已入金區間判 insufficient、fills_max_pages env 注入、live_days 例外降級、fills_30d 畸形 payload 回 null"
+```
+
 ## 驗收條款（主線程 verdict 用，預註冊）
 
 1. `uv run pytest -q` 全綠；`tests/test_trader_stats.py` 內 fixture 錨例（221／27／15／55.56／40225.79／33055.26／-2181.94／-74.07／1003）逐條通過。
