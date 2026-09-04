@@ -126,6 +126,13 @@ def test_too_many_skipped_intervals_marks_window_insufficient():
     assert perf["skipped_intervals"] == 5
 
 
+def test_exact_total_loss_is_not_flow_dominated():
+    # r == -1（上一期淨值全部虧光，無入金）是合法的歸零，不是資金流主導：狀態 ok、TWR = -1
+    rows = _portfolio("month", av=[1000, 0], pnl=[0, -1000])
+    perf = compute_window_performance(rows, "month")
+    assert perf["status"] == "ok" and perf["twr"] == Decimal("-1")
+
+
 def test_skipped_ratio_exactly_at_threshold_passes():
     # 11 點 → 10 區間；3 個跳過 = 0.30，不大於門檻 → ok
     av = [10, 10, 10, 1000, 1010, 1020, 1030, 1040, 1050, 1060, 1070]
@@ -158,8 +165,12 @@ MAX_SKIPPED_RATIO = Decimal("0.30")
 在 `compute_window_performance` 的迴圈裡，`r = d_pnl / prev_av` 成功算出之後、`equity_index.append(...)` 之前加：
 
 ```python
-        if r <= Decimal("-1"):
-            logger.warning("portfolio %s 窗第 %d 區間 r=%s <= -1（prev_av=%s, d_pnl=%s）"
+        if r < Decimal("-1"):
+            # 嚴格小於：r == -1 是「這段把上一期淨值全部虧光」，無需入金即可發生
+            # （既有測試 test_annualized_markers_never_appear_without_the_number 就是這個
+            # 案例，TWR = −1 是正確答案）；r < -1 代表虧損 > 上一期淨值，沒有同區間入金
+            # 在數學上不可能，才是「資金流主導」的證據。
+            logger.warning("portfolio %s 窗第 %d 區間 r=%s < -1（prev_av=%s, d_pnl=%s）"
                            "——入金與虧損同區間，整窗判無效", period, i, r, prev_av, d_pnl)
             return _insufficient(period, "flow_dominated_interval", sample_count=len(pnl))
 ```
@@ -171,6 +182,22 @@ MAX_SKIPPED_RATIO = Decimal("0.30")
         out = _insufficient(period, "too_many_skipped_intervals", sample_count=len(pnl))
         out["skipped_intervals"] = skipped
         return out
+```
+
+- [ ] **Step 3b: 調整既有測試 `test_denominator_floor_blocks_exploding_returns` 的 fixture**（主線程 2026-09-05 裁決：原 3 點序列只有 2 個區間，1 個被地板跳過就是 50% > 30%，會被新的比例閘門判無效；這條測試的目的是驗「地板擋住爆炸報酬」，補兩個平盤區間讓比例降到 25%，斷言值不變）：
+
+```python
+def test_denominator_floor_blocks_exploding_returns():
+    """提領到近乎 0 後的小額交易不得產生爆炸性報酬；跳過的區間要誠實計數。
+    2026-09-05：補兩個平盤點（r=0），讓跳過比例 1/4 = 25% 落在 MAX_SKIPPED_RATIO 之內，
+    這條測的是地板，不是比例閘門（比例閘門另有 test_too_many_skipped_intervals_*）。"""
+    r = compute_window_performance(
+        rows([(0, "10000", "0"), (20, "5", "-9995"), (40, "105", "-9895"),
+              (60, "105", "-9895"), (80, "105", "-9895")]),
+        "perpMonth")
+    assert r["skipped_intervals"] == 1          # 第二段分母 5 < 100，不計入
+    # 若不設地板，第二段 r = 100/5 = +2000%，TWR 會從 −99.95% 反彈成正的。
+    assert r["twr"] == Decimal("-0.9995")
 ```
 
 - [ ] **Step 4: 跑全檔測試**
