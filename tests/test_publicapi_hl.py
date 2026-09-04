@@ -295,6 +295,30 @@ def test_get_fills_detail_paged_truncates_at_max_pages():
     assert len(fills) == USER_FILLS_PAGE_LIMIT
 
 
+def test_get_fills_raw_paged_preserves_raw_hl_fields():
+    """2026-09-05（D5 修正，見 plan trader-pnl-metrics）：`trader_stats.fills_stats`
+    需要 `dir`／`oid`／`startPosition`／`closedPnl` 原始欄位；`get_fills_detail_paged`
+    經 `_fill_detail_dict` 裁切會丟掉這些欄位，`get_fills_raw_paged` 不得裁切。"""
+    from datetime import datetime, timezone
+    raw = [{"time": 1, "coin": "BTC", "side": "B", "px": "100", "sz": "1", "fee": "0.1",
+            "closedPnl": "0", "hash": "0xh", "oid": 11, "tid": 1, "dir": "Open Long",
+            "startPosition": "0.0"},
+           {"time": 2, "coin": "BTC", "side": "A", "px": "110", "sz": "1", "fee": "0.1",
+            "closedPnl": "10", "hash": "0xh2", "oid": 12, "tid": 2, "dir": "Close Long",
+            "startPosition": "1.0"}]
+    post = _FakePost([raw])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    fills, truncated = gw.get_fills_raw_paged(
+        "0x" + "ab" * 20,
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 2, tzinfo=timezone.utc),
+        max_pages=3)
+    assert truncated is False
+    assert [f["dir"] for f in fills] == ["Open Long", "Close Long"]
+    assert fills[0]["oid"] == 11 and fills[1]["startPosition"] == "1.0"
+    assert "closedPnl" in fills[1] and "closed_pnl" not in fills[1]
+
+
 def test_to_ms_utc_treats_naive_as_utc():
     from datetime import datetime, timedelta, timezone
 

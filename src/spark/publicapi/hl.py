@@ -321,6 +321,17 @@ class HLGateway:
         raw_fills, truncated = self._paged_fills_raw(address, start, end, max_pages=max_pages)
         return [_fill_detail_dict(f) for f in raw_fills], truncated
 
+    def get_fills_raw_paged(self, address: str, start: datetime, end: datetime, *,
+                            max_pages: int | None = None) -> tuple[list[dict], bool]:
+        """`_paged_fills_raw` 的公開出口：回傳**原始** `userFillsByTime` dict（升冪、
+        `tid` 去重），**不**經 `_fill_detail_dict` 裁切。2026-09-05 新增，供
+        `spark.filet.trader_stats.fills_stats`（探索清單與交易員詳情共用）使用——它需要
+        `dir`（開/平倉/翻倉語意）、`oid`（distinct 訂單數）、`startPosition`（部位歸零判斷）、
+        `closedPnl`，這些在 `_fill_detail_dict` 都被丟掉或改名，而 `dir`/`startPosition`
+        無法從裁切後的 `side` 重建。`/api/me/fills` 仍走 `get_fills_detail_paged`，不受影響。
+        `truncated` 語意同 `_paged_fills_raw`。"""
+        return self._paged_fills_raw(address, start, end, max_pages=max_pages)
+
     def agent_addresses(self, user: str) -> list[str]:
         """使用者已授權的 agent 地址清單（extraAgents）；小寫正規化供同基準比對。"""
         agents = self._info({"type": "extraAgents", "user": user}, "HL extraAgents 查詢")
