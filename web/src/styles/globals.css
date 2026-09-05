@@ -1602,7 +1602,10 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-ret { min-width: 7.5rem; text-align: right; white-space: nowrap; }
 
 .explore-account { display: flex; flex-direction: column; gap: 3px; }
-.explore-account-top { display: flex; align-items: center; gap: 7px; }
+/* 2026-09-05 本機驗證：帳戶欄收窄後，地址＋tag 擠在一行會把地址折成兩行——改讓 tag
+   換行到地址下方，地址本身不折行。 */
+.explore-account-top { display: flex; align-items: center; flex-wrap: wrap; gap: 3px 7px; }
+.explore-account-top > .mono { white-space: nowrap; }
 /* D14（2026-09-05，Task 12）：地址 label 可點進 /traders/{address}——樸素文字色，
    hover 才顯露是連結（避免整表格看起來到處都是藍色連結）。 */
 .explore-address-link { color: inherit; text-decoration: none; }
