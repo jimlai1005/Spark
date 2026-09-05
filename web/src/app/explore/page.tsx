@@ -29,12 +29,14 @@
  * → 誠實顯示「—」，不得回退借用其他窗的數字冒充（工程原則：不編數字）。
  */
 import Link from "next/link";
-import { type Dispatch, type SetStateAction, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, type Dispatch, type SetStateAction, useEffect, useState } from "react";
 import { NO_VALUE, fmtSignedUsd, fmtUpdatedAtUtc } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
 import {
-  EXPLORE_WINDOWS, getPublicExplore, type ExploreFilters, type ExploreResp,
-  type ExploreRow, type ExploreWindow,
+  EXPLORE_ORDERS, EXPLORE_SORT_FIELDS, EXPLORE_WINDOWS, getPublicExplore,
+  type ExploreFilters, type ExploreOrder, type ExploreResp, type ExploreRow,
+  type ExploreSort, type ExploreWindow,
 } from "@/lib/publicApi";
 
 type LoadState = "loading" | "error" | "ready";
@@ -51,6 +53,41 @@ const FILLS_THRESHOLD = 200;
 const MAX_DD_PCT_THRESHOLD = 30;
 const MAX_CONCENTRATION_PCT_THRESHOLD = 90;
 const DEFAULT_WINDOW: ExploreWindow = "month";
+// Task 12（2026-09-05，D11–D13）：與後端 `hl_explore.DEFAULT_SORT`／`DEFAULT_ORDER`
+// 同值（`src/spark/publicapi/hl_explore.py:285-286`）。
+const DEFAULT_SORT: ExploreSort = "pnl";
+const DEFAULT_ORDER: ExploreOrder = "desc";
+
+/** D11：query string → 各狀態的解析 helper，全部有 fallback（非法／缺席值不炸，
+ * 退回既有預設，讓「使用者手改網址」與「舊書籤缺新鍵」都安全）。 */
+function parseBoolFlag(v: string | null, fallback: boolean): boolean {
+  if (v === "1") return true;
+  if (v === "0") return false;
+  return fallback;
+}
+
+function parsePositiveIntParam(v: string | null, fallback: number): number {
+  const n = v == null ? Number.NaN : Number(v);
+  return Number.isInteger(n) && n >= 1 ? n : fallback;
+}
+
+function parseWindowParam(v: string | null): ExploreWindow {
+  return v != null && (EXPLORE_WINDOWS as readonly string[]).includes(v)
+    ? (v as ExploreWindow)
+    : DEFAULT_WINDOW;
+}
+
+function parseSortParam(v: string | null): ExploreSort {
+  return v != null && (EXPLORE_SORT_FIELDS as readonly string[]).includes(v)
+    ? (v as ExploreSort)
+    : DEFAULT_SORT;
+}
+
+function parseOrderParam(v: string | null): ExploreOrder {
+  return v != null && (EXPLORE_ORDERS as readonly string[]).includes(v)
+    ? (v as ExploreOrder)
+    : DEFAULT_ORDER;
+}
 
 // 後端 `hl_explore._apply_tags`／`_exposure`（`src/spark/publicapi/hl_explore.py`）
 // 回傳的是 locale 中性代碼（D14，2026-08-30 主線程裁決）：`tags` ⊂
@@ -96,6 +133,35 @@ function fmtPct1(n: number | null): string {
   return n == null ? NO_VALUE : `${n.toFixed(1)}%`;
 }
 
+/** D13（2026-09-05，Task 12）：表頭排序按鈕。作用中的欄在文字後加箭頭
+ * （`▼` desc／`▲` asc，`aria-hidden`——不進 accessible name，避免
+ * `getByRole("button", {name})` 因箭頭字元而配不上純文案）。 */
+function SortableTh({
+  field, label, sort, order, hint, onSort,
+}: {
+  field: ExploreSort;
+  label: string;
+  sort: ExploreSort;
+  order: ExploreOrder;
+  hint: string;
+  onSort: (field: ExploreSort) => void;
+}) {
+  const active = sort === field;
+  return (
+    <button
+      type="button"
+      className="explore-sort-btn"
+      data-active={active}
+      aria-sort={active ? (order === "desc" ? "descending" : "ascending") : "none"}
+      title={hint}
+      onClick={() => onSort(field)}
+    >
+      {label}
+      {active && <span aria-hidden="true">{order === "desc" ? "▼" : "▲"}</span>}
+    </button>
+  );
+}
+
 /** 分頁按鈕：目前頁 ± `span`，並夾在 `[1, total]` 範圍內（不做省略號，`total`
  * 一般不大——`page_size` 預設 25，`ExploreConfig.candidate_pool` 預設 300
  * 時最多約 12 頁，實際頁數以合格列數 `total_qualified` 為準）。 */
@@ -105,19 +171,35 @@ function pageWindow(current: number, total: number, span = 2): number[] {
   return Array.from({ length: Math.max(0, end - start + 1) }, (_, i) => start + i);
 }
 
+/** `useSearchParams()` 在 build 期 prerender 需要 Suspense 邊界（沿
+ * `traders/[address]/page.tsx:73-83` 既有寫法）。頁面本體在 `ExploreInner`。 */
 export default function ExplorePage() {
+  return (
+    <Suspense fallback={null}>
+      <ExploreInner />
+    </Suspense>
+  );
+}
+
+function ExploreInner() {
   const COPY = useCopy();
   const c = COPY.explore;
+  const searchParams = useSearchParams();
 
-  const [window_, setWindow] = useState<ExploreWindow>(DEFAULT_WINDOW);
-  const [liveDaysChip, setLiveDaysChip] = useState(true);
-  const [fillsChip, setFillsChip] = useState(true);
+  // D11（2026-09-05，Task 12）：filter／window／page／sort／order 全部放 URL
+  // query，初始值從 `useSearchParams` 讀（返回頁面時 Next 重新掛載，讀到 query
+  // 即還原——不用 sessionStorage，URL 可分享／可書籤）。
+  const [window_, setWindow] = useState<ExploreWindow>(() => parseWindowParam(searchParams.get("window")));
+  const [liveDaysChip, setLiveDaysChip] = useState(() => parseBoolFlag(searchParams.get("ld"), true));
+  const [fillsChip, setFillsChip] = useState(() => parseBoolFlag(searchParams.get("fills"), true));
   // ⭐ 回撤/集中度 chip 預設關閉（2026-08-31 主線程裁決）：候選池本就是 top-ROI
   // 帳戶，30D 回撤 ≤30% 的閘門會把預設榜刷成空的（實測 month 窗 24→0）——落地頁
   // 空榜比寬鬆預設更糟。品質基線（實盤天數/成交筆數）維持預設開。
-  const [maxDdChip, setMaxDdChip] = useState(false);
-  const [concentratedChip, setConcentratedChip] = useState(false);
-  const [page, setPage] = useState(1);
+  const [maxDdChip, setMaxDdChip] = useState(() => parseBoolFlag(searchParams.get("dd"), false));
+  const [concentratedChip, setConcentratedChip] = useState(() => parseBoolFlag(searchParams.get("conc"), false));
+  const [page, setPage] = useState(() => parsePositiveIntParam(searchParams.get("page"), 1));
+  const [sort, setSort] = useState<ExploreSort>(() => parseSortParam(searchParams.get("sort")));
+  const [order, setOrder] = useState<ExploreOrder>(() => parseOrderParam(searchParams.get("order")));
   const [reloadKey, setReloadKey] = useState(0);
 
   const [state, setState] = useState<LoadState>("loading");
@@ -130,6 +212,8 @@ export default function ExplorePage() {
     minFills: fillsChip ? FILLS_THRESHOLD : 0,
     maxDdPct: maxDdChip ? MAX_DD_PCT_THRESHOLD : 100,
     maxConcentrationPct: concentratedChip ? MAX_CONCENTRATION_PCT_THRESHOLD : 100,
+    sort,
+    order,
   };
 
   useEffect(() => {
@@ -147,11 +231,28 @@ export default function ExplorePage() {
         setErrorAt(Math.floor(Date.now() / 1000));
         setState("error");
       });
+
+    // D11：每次任一狀態變動都把全部狀態寫回 URL（含預設值，讓 URL 自描述），
+    // 用 `replaceState` 不進歷史堆疊、不用 Next router（純顯示狀態同步，同
+    // `traders/[address]/page.tsx:110-126` 既有寫法與理由）。
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("window", window_);
+      url.searchParams.set("ld", liveDaysChip ? "1" : "0");
+      url.searchParams.set("fills", fillsChip ? "1" : "0");
+      url.searchParams.set("dd", maxDdChip ? "1" : "0");
+      url.searchParams.set("conc", concentratedChip ? "1" : "0");
+      url.searchParams.set("page", String(page));
+      url.searchParams.set("sort", sort);
+      url.searchParams.set("order", order);
+      window.history.replaceState(null, "", url.toString());
+    }
+
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, window_, liveDaysChip, fillsChip, maxDdChip, concentratedChip, reloadKey]);
+  }, [page, window_, liveDaysChip, fillsChip, maxDdChip, concentratedChip, sort, order, reloadKey]);
 
   function toggleChip(setter: Dispatch<SetStateAction<boolean>>) {
     setter((v) => !v);
@@ -160,6 +261,18 @@ export default function ExplorePage() {
 
   function handleWindowChange(w: ExploreWindow) {
     setWindow(w);
+    setPage(1);
+  }
+
+  // D13：第一次點某欄＝desc；再點同一欄＝翻轉；切換排序回第一頁（分頁在後端切，
+  // 換排序後舊頁碼對不上新順序）。
+  function handleSortClick(field: ExploreSort) {
+    if (sort === field) {
+      setOrder((o) => (o === "desc" ? "asc" : "desc"));
+    } else {
+      setSort(field);
+      setOrder("desc");
+    }
     setPage(1);
   }
 
@@ -300,10 +413,30 @@ export default function ExplorePage() {
               <div>{c.table.rank}</div>
               <div>{c.table.account}</div>
               <div>{c.table.sparkline}</div>
-              <div>{c.table.pnl}</div>
-              <div>{c.table.dd}</div>
-              <div>{c.table.days}</div>
-              <div>{c.table.winRate}</div>
+              <div>
+                <SortableTh
+                  field="pnl" label={c.table.pnl} sort={sort} order={order}
+                  hint={c.table.sortHint} onSort={handleSortClick}
+                />
+              </div>
+              <div>
+                <SortableTh
+                  field="max_dd" label={c.table.dd} sort={sort} order={order}
+                  hint={c.table.sortHint} onSort={handleSortClick}
+                />
+              </div>
+              <div>
+                <SortableTh
+                  field="live_days" label={c.table.days} sort={sort} order={order}
+                  hint={c.table.sortHint} onSort={handleSortClick}
+                />
+              </div>
+              <div>
+                <SortableTh
+                  field="win_rate" label={c.table.winRate} sort={sort} order={order}
+                  hint={c.table.sortHint} onSort={handleSortClick}
+                />
+              </div>
               <div>{c.table.exposure}</div>
               <div>{c.table.actions}</div>
             </div>
@@ -406,7 +539,12 @@ function ExploreRowView(
       <div className="mono explore-rank">{rank}</div>
       <div className="explore-account">
         <div className="explore-account-top">
-          <span className="mono">{row.label}</span>
+          {/* D14（2026-09-05，Task 12）：地址 label 點進詳情頁，與「查看」同目標
+              （帶所選窗過去，詳情頁預設就落在同一窗，D10）；複製按鈕維持獨立
+              元素，不包在 Link 內。 */}
+          <Link href={`/traders/${row.address}?window=${windowKey}`} className="mono explore-address-link">
+            {row.label}
+          </Link>
           <button
             type="button"
             className="explore-copy-btn"

@@ -1740,6 +1740,9 @@ export const COPY_ZH = {
       winRate: "結倉勝率",
       exposure: "目前曝險",
       actions: "",
+      // Task 12（2026-09-05，D13）：損益／最大回撤／實盤天數／結倉勝率四欄表頭
+      // 可點擊排序，此文案為表頭按鈕的 title 提示。
+      sortHint: "點擊排序",
     },
     // 回撤定義揭露（權益指數 MDD，與交易所／第三方工具的原始淨值 MDD 不同），
     // 渲染於頁面底部 disclaimer／poolNote 附近。
@@ -3263,6 +3266,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       winRate: "Close win rate",
       exposure: "Current exposure",
       actions: "",
+      sortHint: "Click to sort",
     },
     ddDefinition: "Drawdown is computed from a flow-neutralized equity index, which differs from exchange or third-party tool definitions",
     tags: { lowDrawdown: "Low drawdown", concentrated: "High concentration" },

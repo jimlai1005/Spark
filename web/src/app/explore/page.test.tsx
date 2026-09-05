@@ -8,11 +8,25 @@
  */
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COPY_ZH as COPY } from "@/lib/copy";
 import { fmtSignedUsd, fmtUpdatedAtUtc } from "@/lib/format";
 import type { ExploreResp, ExploreRow } from "@/lib/publicApi";
+
+// Task 12（2026-09-05，D11）：page.tsx 改用 `useSearchParams()` 初始化 URL 狀態，
+// 需要 Suspense 邊界（見 page.tsx 檔頭）。沿 `traders/[address]/page.test.tsx:22-27`
+// 既有 mock 寫法——`searchParamsValue` 是可變的模組級變數，每個測試視需要覆寫，
+// `beforeEach` 重置回空字串，避免測試互相汙染。
+let searchParamsValue = new URLSearchParams();
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => searchParamsValue,
+}));
+
 import ExplorePage from "./page";
+
+beforeEach(() => {
+  searchParamsValue = new URLSearchParams();
+});
 
 function jsonResponse(body: unknown, ok = true): Response {
   return { ok, json: async () => body } as Response;
@@ -83,6 +97,10 @@ function buildResp(over: Partial<ExploreResp> = {}): ExploreResp {
     pool: 100,
     updated_at: 1_700_000_000,
     building: false,
+    // Task 12（D11–D13）：後端 echo 回目前生效的排序，預設與 `DEFAULT_SORT`／
+    // `DEFAULT_ORDER`（page.tsx）一致。
+    sort: "pnl",
+    order: "desc",
     ...over,
   };
 }
@@ -324,6 +342,9 @@ describe("ExplorePage — R4-10 期間窗切換", () => {
       const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
       expect(lastUrl).toContain("window=day");
       expect(lastUrl).toContain("page=1");
+      // Task 12（D11–D13）：排序參數未變動時維持預設 sort=pnl&order=desc 一起送出。
+      expect(lastUrl).toContain("sort=pnl");
+      expect(lastUrl).toContain("order=desc");
     });
   });
 
@@ -335,6 +356,8 @@ describe("ExplorePage — R4-10 期間窗切換", () => {
 
     const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
     expect(firstUrl).toContain("window=month");
+    expect(firstUrl).toContain("sort=pnl");
+    expect(firstUrl).toContain("order=desc");
   });
 });
 
@@ -421,6 +444,122 @@ describe("ExplorePage — R4-10 qualified chip 拆分", () => {
     await waitFor(() => {
       const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
       expect(lastUrl).toContain("max_concentration_pct=90");
+    });
+  });
+});
+
+// Task 12（2026-09-05，D11）：filter／window／page／sort／order 進 URL；返回頁面
+// 時（Next 重新掛載）讀 `useSearchParams()` 還原，變動時 `replaceState` 寫回。
+describe("ExplorePage — Task 12 URL 狀態（D11）", () => {
+  it("URL 初始化：useSearchParams 的既有值反映在第一次 fetch 的 URL 上", async () => {
+    searchParamsValue = new URLSearchParams(
+      "window=week&ld=0&fills=1&dd=1&conc=0&page=2&sort=live_days&order=asc",
+    );
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp({ page: 2 }))));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
+    expect(firstUrl).toContain("window=week");
+    expect(firstUrl).toContain("page=2");
+    expect(firstUrl).toContain("min_live_days=0");   // ld=0
+    expect(firstUrl).toContain("min_fills=200");      // fills=1
+    expect(firstUrl).toContain("max_dd_pct=30");      // dd=1
+    expect(firstUrl).toContain("max_concentration_pct=100"); // conc=0
+    expect(firstUrl).toContain("sort=live_days");
+    expect(firstUrl).toContain("order=asc");
+  });
+
+  it("replaceState 寫回：切換 dd chip（初始 dd=1）後 window.history.replaceState 帶最新狀態（dd=0）", async () => {
+    searchParamsValue = new URLSearchParams("dd=1");
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    const replaceSpy = vi.spyOn(window.history, "replaceState");
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    replaceSpy.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.filters.maxDd }));
+
+    await waitFor(() => {
+      expect(replaceSpy).toHaveBeenCalled();
+      const lastCall = replaceSpy.mock.calls.at(-1)!;
+      const url = new URL(String(lastCall[2]));
+      expect(url.searchParams.get("dd")).toBe("0");
+      // 全部鍵都寫回（含未變動的預設值），讓 URL 自描述。
+      expect(url.searchParams.get("sort")).toBe("pnl");
+      expect(url.searchParams.get("order")).toBe("desc");
+    });
+    replaceSpy.mockRestore();
+  });
+});
+
+// D14（2026-09-05，Task 12）：地址 label 可點進詳情頁，與「查看」同目標。
+describe("ExplorePage — Task 12 地址連結（D14）", () => {
+  it("地址 label 是連向 /traders/{address}?window=<所選窗> 的連結", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    const links = screen.getAllByRole("link", { name: ROW_A.label });
+    expect(links[0]).toHaveAttribute("href", `/traders/${ROW_A.address}?window=month`);
+  });
+});
+
+// D13（2026-09-05，Task 12）：表頭排序按鈕——第一次點某欄＝desc，再點＝翻轉；
+// 切換排序回第一頁；作用中的欄顯示箭頭（▼desc／▲asc），非作用中的欄不顯示。
+describe("ExplorePage — Task 12 表頭排序（D13）", () => {
+  // ⚠️ 每次排序切換都會經過 loading（`setState("loading")` 同步觸發、fetch resolve
+  // 後才 `setState("ready")`），期間表格整個卸載重掛，舊的表頭按鈕 DOM 節點會
+  // 變成 detached（`isConnected === false`）——點擊 detached 節點不會走到 React
+  // 的合成事件系統，等同無效點擊。每次點擊前都要用 `screen.getByRole` 重新取得
+  // 當時掛載的節點，不能沿用上一輪的參照。
+  it("點「最大回撤」表頭兩次：第一次 sort=max_dd&order=desc&page=1，第二次 order=asc", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.table.dd }));
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("sort=max_dd");
+      expect(lastUrl).toContain("order=desc");
+      expect(lastUrl).toContain("page=1");
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: COPY.explore.table.dd }).textContent).toContain("▼");
+    });
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.table.dd }));
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("sort=max_dd");
+      expect(lastUrl).toContain("order=asc");
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: COPY.explore.table.dd }).textContent).toContain("▲");
+    });
+  });
+
+  it("箭頭只在作用中的欄顯示：預設損益欄顯示 ▼，切到實盤天數欄後損益欄不再顯示箭頭", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    expect(screen.getByRole("button", { name: COPY.explore.table.pnl }).textContent).toContain("▼");
+
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.table.days }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: COPY.explore.table.pnl }).textContent).not.toContain("▼");
+      expect(screen.getByRole("button", { name: COPY.explore.table.pnl }).textContent).not.toContain("▲");
+      expect(screen.getByRole("button", { name: COPY.explore.table.days }).textContent).toContain("▼");
     });
   });
 });

@@ -416,6 +416,10 @@ export interface ExploreResp {
   pool: number;
   updated_at: number | null;
   building: boolean;
+  /** Task 12：後端回顯目前生效的排序（`ExploreIndex.query` 回傳的 `sort`／
+   * `order` 鍵），供 URL 狀態初始化／還原用。 */
+  sort: ExploreSort;
+  order: ExploreOrder;
 }
 
 /**
@@ -430,7 +434,21 @@ export interface ExploreFilters {
   minFills: number;
   maxDdPct: number;
   maxConcentrationPct: number;
+  sort: ExploreSort;
+  order: ExploreOrder;
 }
+
+/**
+ * Task 12（2026-09-05，D11–D13）：排序在後端做（`hl_explore.SORT_FIELDS`／
+ * `SORT_ORDERS`，`src/spark/publicapi/app.py:2258-2299`），前端只送鍵值、
+ * 回顯後端 echo 回來的 `sort`／`order`（供 URL 狀態還原）。非法值一律 422，
+ * 契約以後端 code 為準，不在前端重複驗證邊界——`getPublicExplore` 只在解析
+ * 回應時 fallback 到呼叫端送出的值（防禦性，不假設後端一定 echo 合法值）。
+ */
+export type ExploreSort = "pnl" | "max_dd" | "live_days" | "win_rate";
+export type ExploreOrder = "asc" | "desc";
+export const EXPLORE_SORT_FIELDS: readonly ExploreSort[] = ["pnl", "max_dd", "live_days", "win_rate"];
+export const EXPLORE_ORDERS: readonly ExploreOrder[] = ["asc", "desc"];
 
 function toNumberOrNull(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
@@ -498,6 +516,10 @@ const NO_VALUE_PLACEHOLDER = "—";
  * 連線失敗、非 200、格式異常一律 throw——呼叫端（explore 頁）需要區分
  * 「fetch 失敗」（R2·C 態三：時間戳＋重試）與「成功但 `building:true`」
  * （R2·C 態二：建置中）两種不同的空狀態，吞掉會讓兩者在 UI 上無法分辨。
+ *
+ * Task 12（2026-09-05，D11–D13）：排序在後端做（分頁後端切，前端只排得動當
+ * 頁），本函式把 `filters.sort`／`filters.order` 帶上查詢字串，例如
+ * `/api/public/explore?window=month&page=1&...&sort=pnl&order=desc`。
  */
 export async function getPublicExplore(
   page: number, filters: ExploreFilters,
@@ -509,6 +531,8 @@ export async function getPublicExplore(
     min_fills: String(filters.minFills),
     max_dd_pct: String(filters.maxDdPct),
     max_concentration_pct: String(filters.maxConcentrationPct),
+    sort: filters.sort,
+    order: filters.order,
   });
   const res = await fetch(`/api/public/explore?${params.toString()}`);
   if (!res.ok) throw new Error(`explore fetch failed: ${res.status}`);
@@ -526,6 +550,8 @@ export async function getPublicExplore(
     pool: typeof body.pool === "number" ? body.pool : 0,
     updated_at: typeof body.updated_at === "number" ? body.updated_at : null,
     building: !!body.building,
+    sort: EXPLORE_SORT_FIELDS.includes(body.sort as ExploreSort) ? (body.sort as ExploreSort) : filters.sort,
+    order: EXPLORE_ORDERS.includes(body.order as ExploreOrder) ? (body.order as ExploreOrder) : filters.order,
   };
 }
 
