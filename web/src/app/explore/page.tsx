@@ -542,7 +542,8 @@ function ExploreRowView(
           {/* D14（2026-09-05，Task 12）：地址 label 點進詳情頁，與「查看」同目標
               （帶所選窗過去，詳情頁預設就落在同一窗，D10）；複製按鈕維持獨立
               元素，不包在 Link 內。 */}
-          <Link href={`/traders/${row.address}?window=${windowKey}`} className="mono explore-address-link">
+          <Link href={`/traders/${row.address}?window=${windowKey}`} className="mono explore-address-link"
+                target="_blank" rel="noopener noreferrer">
             {row.label}
           </Link>
           <button
@@ -600,7 +601,9 @@ function ExploreRowView(
       </div>
       <div className="explore-actions">
         {/* 2026-09-05（Task 6）：帶所選窗過去，詳情頁預設就是同一窗（D10）。 */}
-        <Link href={`/traders/${row.address}?window=${windowKey}`} className="btn btn-ghost explore-view-btn">
+        {/* 2026-09-05 使用者要求：詳情頁一律新分頁開啟（清單的 filter／排序狀態留在原分頁） */}
+        <Link href={`/traders/${row.address}?window=${windowKey}`} className="btn btn-ghost explore-view-btn"
+              target="_blank" rel="noopener noreferrer">
           {c.view}
         </Link>
         <Link

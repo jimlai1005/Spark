@@ -249,6 +249,8 @@ describe("ExplorePage — 表格渲染", () => {
     const viewLinks = screen.getAllByRole("link", { name: COPY.explore.view });
     // 2026-09-05（Task 6）：「查看」帶所選窗過去，詳情頁預設就落在同一窗（D10）。
     expect(viewLinks[0]).toHaveAttribute("href", `/traders/${ROW_A.address}?window=month`);
+    expect(viewLinks[0]).toHaveAttribute("target", "_blank");
+    expect(viewLinks[0]).toHaveAttribute("rel", "noopener noreferrer");
   });
 
   it("D14：tag／曝險方向代碼對映成 copy.ts 顯示文案；未知代碼防禦性顯示原字串", async () => {
@@ -505,6 +507,8 @@ describe("ExplorePage — Task 12 地址連結（D14）", () => {
 
     const links = screen.getAllByRole("link", { name: ROW_A.label });
     expect(links[0]).toHaveAttribute("href", `/traders/${ROW_A.address}?window=month`);
+    expect(links[0]).toHaveAttribute("target", "_blank");
+    expect(links[0]).toHaveAttribute("rel", "noopener noreferrer");
   });
 });
 
