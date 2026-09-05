@@ -2474,3 +2474,19 @@ security 走 critical 🚨 URGENT）；限流改 IP 5/小時＋email 10/日；**
 舊契約探針 422「請選擇主題」；真實送出 → `{"ok":true,"ticket":"FLT-2609-0001"}`，DB 列 `mailed=1, bot=0`，
 `client_ip` 為真實 IPv6（proxy header 生效）；journal 無「TG 通知未送達」警告；`systemctl --failed` 空。
 工單查詢：`sudo /opt/filet/spark/.venv/bin/python -c "import sqlite3;print(sqlite3.connect('/var/lib/filet-api/api.db').execute('select ticket,topic,email,mailed,bot,created_at from contact_tickets order by created_at desc limit 20').fetchall())"`。
+
+**2026-09-05 部署（commit `a1b0a88`，02:20 UTC，探索清單／交易員詳情指標統一＋探索頁互動）：** plan
+`docs/superpowers/plans/2026-09-04-explore-trader-pnl-metrics.md`（Task 0–12，兩輪 opus 審查）。內容：兩頁績效數字改由
+`src/spark/filet/trader_stats.py` 單一來源（損益改 **金額**＝HL pnlHistory 末值；回撤改權益指數＋三道閘門
+`flow_dominated_interval`／`too_many_skipped_intervals`／`no_funded_interval`，算不出顯示「—」；成交統計改 Hyperbot 定義：
+distinct 訂單／部位歸零生命週期／生命週期勝率／Σ closedPnl，與 Hyperbot 逐位對帳一致）；詳情頁四窗切換、比率型指標逐窗；
+`/api/public/explore` 加 `sort`／`order`；探索頁 filter／排序狀態進 URL query、地址與「查看」新分頁開詳情；`leader_perf`
+閘門連帶保護 dashboard／策略頁。**`EXPLORE_INDEX_VERSION` 2→3**：為免重啟後 `/explore` 冷建 15 分鐘，先把本機用
+300 池建好的 v3 快照 `install -o filet-api -g filet-api -m 644` 到 `/var/lib/filet-api/explore_index.json`（舊 v2 備份
+`explore_index.json.bak-v2-20260905`），重啟即有 300 筆。流程照 §3.2 rsync 兩段 → `uv sync`（依賴無變動，uv.lock mtime
+仍 07-17）→ chown root（非 root 檔 4＝.venv symlink 例外）→ §4.2 `npm ci`＋`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app`
+build → restart `filet-api`、`filet-dashboard`（keysvc／follower 程式未變未重啟；`leaderboard.py`／`perf_series.py` 有 import
+`leader_perf` 但為 oneshot timer，下次執行自帶新碼）→ `DEPLOYED_VERSION`。驗證：`filet_regression_check --http --ssh` 67/67
+PASS；`systemctl --failed` 空；API journal 零 Traceback；`/explore` 重啟後 `building:false, scanned 300`；`sort=max_dd`
+回撤最小者在前；`sort=foo` 422；`/traders/0x6648…` 30D 損益 33,055.26／訂單 221／平倉 27／勝率 55.56%（與 Hyperbot 一致）。
+新增 env `EXPLORE_FILLS_MAX_PAGES`（預設 3，探索與詳情共用）；待裁決：`min_fills` 200 改以訂單數比對後實質收緊（300 池只 27–88 檔過）。
