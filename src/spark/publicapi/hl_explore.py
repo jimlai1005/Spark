@@ -275,6 +275,16 @@ WINDOW_TO_PERIOD = {"day": "day", "week": "week",
                     "month": "month", "allTime": "allTime"}
 DEFAULT_WINDOW = "month"
 
+# ---------------------------------------------------------------------------
+# Task 11（2026-09-05，D11–D14）：`/api/public/explore` 後端 sort/order。
+# 分頁在後端切，前端只拿得到當頁列——排序必須也在後端做，否則使用者點表頭
+# 排序只能排到「這一頁」，翻頁後排序就散掉。
+# ---------------------------------------------------------------------------
+SORT_FIELDS = ("pnl", "max_dd", "live_days", "win_rate")
+SORT_ORDERS = ("asc", "desc")
+DEFAULT_SORT = "pnl"
+DEFAULT_ORDER = "desc"
+
 # 伺服器夾取範圍（R4-3：防濫用，不是驗證錯誤，見 `clamp_explore_params`）。
 MIN_LIVE_DAYS_RANGE = (0, 365)
 MIN_FILLS_RANGE = (0, 100_000)
@@ -749,12 +759,44 @@ def qualify(row: ExploreRow, cfg: ExploreConfig, *, window: str = DEFAULT_WINDOW
     return True
 
 
+def sort_value(row: ExploreRow, *, window: str = DEFAULT_WINDOW,
+              sort: str = DEFAULT_SORT) -> Decimal | None:
+    """D13（2026-09-05）：排序取值。`pnl`／`max_dd` 是窗類欄位——缺該窗（day/week
+    best-effort 缺席）退回 `"month"`（`enrich_candidate` 保證恆非 `None`）；
+    `live_days`／`win_rate` 與 `window` 無關。值本身為 `None`（`max_dd_pct`
+    算不出、或該帳戶沒有已歸零的成交生命週期）時原樣回傳 `None`——由
+    `sort_rows` 決定「None 一律排最後」，這裡不做排序決策，只負責誠實取值。"""
+    if sort in ("pnl", "max_dd"):
+        stats = row.windows.get(window) or row.windows["month"]
+        v = stats.pnl_usd if sort == "pnl" else stats.max_dd_pct
+    elif sort == "live_days":
+        v = row.live_days
+    elif sort == "win_rate":
+        v = row.close_win_rate_pct
+    else:
+        raise ValueError(f"unknown sort {sort!r}")
+    return None if v is None else Decimal(str(v))
+
+
+def sort_rows(rows: list[ExploreRow], *, window: str = DEFAULT_WINDOW,
+             sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> list[ExploreRow]:
+    """D12（2026-09-05）：`ExploreIndex.query` 的排序責任——分頁在後端切，
+    排序也必須在後端做（前端只拿得到當頁列，排不動全體）。`None` 值（例如
+    `max_dd_pct` 算不出、或沒有已歸零的成交生命週期）不論 `order` 一律排
+    最後：回撤算不出的列不能因為 `asc` 排到最前面冒充「回撤最小」。穩定
+    排序（Python `sort` 本身穩定）：同值列維持輸入順序。"""
+    keyed = [(sort_value(r, window=window, sort=sort), r) for r in rows]
+    present = [(k, r) for k, r in keyed if k is not None]
+    missing = [r for k, r in keyed if k is None]
+    present.sort(key=lambda kr: kr[0], reverse=(order == "desc"))
+    return [r for _, r in present] + missing
+
+
 def sort_key(row: ExploreRow, *, window: str = DEFAULT_WINDOW) -> Decimal:
-    """D2（2026-09-04）：所選窗 `pnl_usd` 降冪（金額，不再做報酬÷回撤比值——
-    分母來自另一個指標且可能為 `None`）。R4-3：`window` 對這一列是 `None`
-    （day/week best-effort 缺席）→ 退回 `"month"`（`enrich_candidate` 保證
-    恆非 `None`）——排序需要一個確定性的鍵，前端該窗儲存格仍誠實顯示「—」，
-    兩者不衝突（見模組檔頭「R4-3」節）。"""
+    """D2（2026-09-04）舊介面，既有測試沿用：所選窗 `pnl_usd` 降冪，值恆非
+    `None`（`enrich_candidate` 保證 month/allTime 兩窗的 `pnl_usd` 存在）。
+    2026-09-05（Task 11）：實際排序責任已移交 `sort_rows`（`sort_value(...,
+    sort="pnl")` 的等價寫法），本函式保留給呼叫端只需要單一鍵值比較的場合。"""
     stats = row.windows.get(window) or row.windows["month"]
     return Decimal(str(stats.pnl_usd))
 
@@ -1038,7 +1080,8 @@ class ExploreIndex:
              min_live_days: int | None = None, min_fills: int | None = None,
              max_dd_pct: float | None = None, max_concentration_pct: float | None = None,
              require_sample: bool = True, max_dd_filter: bool = True,
-             exclude_concentrated: bool = True) -> dict:
+             exclude_concentrated: bool = True,
+             sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> dict:
         """讀路徑：永不阻塞（觸發背景建置後立即用目前狀態回應）。回傳形狀見
         `app.py` 端點層文件字串：`{rows, page, page_size, total_qualified,
         total_scanned, pool, updated_at, building}`（`pool`：I-17，鏡射
@@ -1054,13 +1097,16 @@ class ExploreIndex:
         「沒有可用快照」，觸發重建。
 
         `window`：所選期間（`WINDOW_KEYS` 之一），決定 `qualify` 的回撤過濾
-        看哪一窗、`sort_key` 用哪一窗排序（R4-3；不影響候選池——候選池仍是
+        看哪一窗、`sort_rows` 用哪一窗排序（R4-3；不影響候選池——候選池仍是
         `build_sync` 固定用 stats-data month 窗 roi 選出，見模組檔頭「R4-3」節
         「誠實揭露」段）。
         `min_live_days`／`min_fills`／`max_dd_pct`／`max_concentration_pct`：
         R4-3 自由門檻（`None`＝沿用 `self._cfg` 的預設值，供內部/測試呼叫端在
         不關心門檻時省略；`app.py` 端點層一律夾取後傳入明確數值，見
         `clamp_explore_params`）。
+        `sort`／`order`：Task 11（D12／D13），排序在資格過濾**之後**、分頁
+        **之前**做（對合格全集排序，不是只排當頁）；回傳 dict 原樣 echo 這兩個
+        值（`"sort"`／`"order"` 鍵）供前端表頭箭頭顯示對照，見 `sort_rows`。
 
         ⭐ 讀值**必須**在觸發背景建置**之前**取得快照，不能反過來：`_maybe_trigger_
         build()` 開的背景 thread 若剛好在本次呼叫的極短時間內就跑完（例如注入的
@@ -1097,11 +1143,11 @@ class ExploreIndex:
                           if qualify(r, cfg, window=window, require_sample=require_sample,
                                     max_dd_filter=max_dd_filter,
                                     exclude_concentrated=exclude_concentrated)]
-        qualified_rows.sort(key=lambda r: sort_key(r, window=window), reverse=True)
+        qualified_rows = sort_rows(qualified_rows, window=window, sort=sort, order=order)
         page_rows = paginate(qualified_rows, page, self._cfg.page_size)
         return {"rows": [r.to_dict() for r in page_rows], "page": page,
                "page_size": self._cfg.page_size,
                "total_qualified": len(qualified_rows), "total_scanned": total_scanned,
                "pool": total_scanned,
                "updated_at": int(built_at) if built_at is not None else None,
-               "building": False}
+               "building": False, "sort": sort, "order": order}

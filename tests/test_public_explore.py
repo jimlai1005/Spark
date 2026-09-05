@@ -17,10 +17,10 @@ from fastapi.testclient import TestClient
 from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
 from spark.filet.trader_stats import WindowStats
-from spark.publicapi.hl_explore import (ExploreConfig, ExploreIndex, ExploreRow,
-                                        candidate_addresses,
+from spark.publicapi.hl_explore import (SORT_FIELDS, ExploreConfig, ExploreIndex,
+                                        ExploreRow, candidate_addresses,
                                         clamp_explore_params, enrich_candidate,
-                                        paginate, qualify, sort_key)
+                                        paginate, qualify, sort_key, sort_rows)
 from spark.publicapi.store import ApiStore
 from tests.publicapi_helpers import FakeHL, FakeKeysvc, make_cfg
 
@@ -121,6 +121,10 @@ def _row(**over):
     if windows is None:
         stats = WindowStats(pnl_usd=pnl_usd, max_dd_pct=dd_pct, max_dd_reason=None, spark=())
         windows = {"day": None, "week": None, "month": stats, "allTime": stats}
+    if "win_rate" in over:
+        # Task 11：`sort_rows` 測試用 `win_rate=` 當 `close_win_rate_pct` 的簡寫
+        # （欄位真名較長，且與 `sort` 查詢參數同名容易誤讀）。
+        over["close_win_rate_pct"] = over.pop("win_rate")
     base = dict(address=_A, display_name=None, label="0xaaaa…aaaa", coins=(),
                account_bucket="<$10K", windows=windows,
                live_days=60, order_count_30d=200, closed_positions_30d=10,
@@ -379,6 +383,43 @@ def test_sort_key_falls_back_to_month_when_window_missing():
     row = _row(pnl_usd=123.0)
     row.windows["day"] = None
     assert sort_key(row, window="day") == sort_key(row, window="month")
+
+
+# ============================================================
+# 純函式：sort_rows（Task 11：後端 sort/order，D12／D13）
+# ============================================================
+
+def test_sort_rows_pnl_desc_default_and_asc():
+    a, b, c = _row(pnl_usd=100.0), _row(pnl_usd=300.0), _row(pnl_usd=-50.0)
+    assert [r.windows["month"].pnl_usd for r in sort_rows([a, b, c], window="month")] == [300.0, 100.0, -50.0]
+    assert [r.windows["month"].pnl_usd for r in sort_rows([a, b, c], window="month", order="asc")] == [-50.0, 100.0, 300.0]
+
+
+def test_sort_rows_max_dd_none_always_last_regardless_of_order():
+    ok1, ok2, none = _row(dd_pct=-10.0), _row(dd_pct=-40.0), _row(dd_pct=None)
+    desc = sort_rows([none, ok1, ok2], window="month", sort="max_dd", order="desc")
+    asc = sort_rows([none, ok1, ok2], window="month", sort="max_dd", order="asc")
+    assert [r.windows["month"].max_dd_pct for r in desc] == [-10.0, -40.0, None]   # 回撤小者在前
+    assert [r.windows["month"].max_dd_pct for r in asc] == [-40.0, -10.0, None]
+
+
+def test_sort_rows_live_days_and_win_rate():
+    a, b = _row(live_days=10, win_rate=None), _row(live_days=500, win_rate=55.5)
+    assert sort_rows([a, b], window="month", sort="live_days")[0] is b
+    assert sort_rows([a, b], window="month", sort="win_rate")[0] is b       # None 排最後
+    assert sort_rows([a, b], window="month", sort="win_rate", order="asc")[0] is b
+
+
+def test_sort_rows_missing_window_falls_back_to_month():
+    a = _row(pnl_usd=5.0)
+    a.windows["day"] = None
+    b = _row(pnl_usd=1.0)
+    b.windows["day"] = WindowStats(pnl_usd=999.0, max_dd_pct=None, max_dd_reason="x", spark=())
+    assert sort_rows([a, b], window="day")[0] is b
+
+
+def test_sort_fields_constant():
+    assert SORT_FIELDS == ("pnl", "max_dd", "live_days", "win_rate")
 
 
 # ============================================================
@@ -1080,6 +1121,50 @@ def test_endpoint_full_flow_after_build_completes(tmp_path, monkeypatch):
     assert row["label"] == "Alice"
     assert row["windows"]["month"]["pnl_usd"] == 100.0   # 1100-1000
     assert body["pool"] == body["total_scanned"] == 1  # I-17：pool 欄位來自後端，不寫死
+
+
+# ============================================================
+# 端點：GET /api/public/explore?sort=&order=（Task 11，D12／D13）
+# ============================================================
+
+def _many_perp_fills(n):
+    """`n` 筆 distinct-oid 開倉單（不平倉），只用來墊高 `order_count_30d`
+    好過 `min_fills` 預設門檻——`fills_stats` 的 order_count 只數 distinct
+    `oid`，與是否平倉無關。兩幣輪流下單（非單一幣），讓 `concentration_pct`
+    落在 50%（過 `qualify` 預設 90% 集中度上限；只用一種幣會頂到 100%）。"""
+    coins = ("BTC", "ETH")
+    return [_raw_fill(i, "Open Long", "0", "1", "0", coin=coins[i % 2], time=i)
+           for i in range(n)]
+
+
+@pytest.fixture
+def client_after_build(tmp_path, monkeypatch):
+    """建置完成、含兩筆合格列（不同 `live_days`）的 client，供 sort/order
+    端點測試共用（Task 11）。兩地址都墊 200 筆 fills 過 `min_fills` 預設門檻，
+    `alltime_days` 不同讓 `live_days` 可排序區分。"""
+    monkeypatch.setenv("EXPLORE_ENRICH_CALL_INTERVAL_S", "0")
+    hl = FakeHL()
+    _seed_hl(hl, _A, alltime_days=100)
+    _seed_hl(hl, _B, alltime_days=50)
+    hl.fills_raw[_A.lower()] = _many_perp_fills(200)
+    hl.fills_raw[_B.lower()] = _many_perp_fills(200)
+    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"), _lb_row(_B, roi="0.4"))
+    app = _app(tmp_path, hl=hl, leaderboard_get_fn=lambda url: payload)
+    app.state.explore_index.build_sync()
+    return _client(app)
+
+
+def test_endpoint_rejects_bad_sort_and_order(client_after_build):
+    assert client_after_build.get("/api/public/explore?sort=foo").status_code == 422
+    assert client_after_build.get("/api/public/explore?order=sideways").status_code == 422
+
+
+def test_endpoint_sort_order_passthrough_and_echo(client_after_build):
+    body = client_after_build.get("/api/public/explore?sort=live_days&order=asc").json()
+    assert body["sort"] == "live_days" and body["order"] == "asc"
+    days = [r["live_days"] for r in body["rows"]]
+    assert len(days) == 2               # 兩地址都應通過 min_fills=200/min_live_days=30 預設門檻
+    assert days == sorted(days)
 
 
 # --- 2026-09-05 複審修正（Task 10 Step 2）：`fills_max_pages_from_env` 原本無條件讀
