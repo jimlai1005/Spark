@@ -452,9 +452,12 @@ function ExploreRowView(
       <div className="mono explore-days">{row.live_days}</div>
       <div className="mono explore-wr">{fmtPct1(row.close_win_rate_pct)}</div>
       <div className="explore-exposure">
-        <div className="explore-exposure-bar">
-          <div className="explore-exposure-fill" style={{ width: `${longPct}%` }} />
-        </div>
+        {/* 無持倉（dir null）不畫 bar：bar 底色是空方紅，畫出來會像 100% 空單 */}
+        {row.exposure.dir != null && (
+          <div className="explore-exposure-bar">
+            <div className="explore-exposure-fill" style={{ width: `${longPct}%` }} />
+          </div>
+        )}
         <span className="mono explore-exposure-label">{exposureLabel}</span>
       </div>
       <div className="explore-actions">

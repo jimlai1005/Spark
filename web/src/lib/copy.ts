@@ -1697,7 +1697,7 @@ export const COPY_ZH = {
   explore: {
     heading: "探索跟單對象",
     disclaimerBadge: "Filet 不對清單上任何地址背書",
-    sub: "資料全部來自 Hyperliquid 公開鏈上紀錄，每 10 分鐘更新。排序預設為風險調整後報酬（報酬率 ÷ 最大回撤），而非絕對獲利金額——大額帳戶的 PnL 無法被小額帳戶複製。",
+    sub: "資料全部來自 Hyperliquid 公開鏈上紀錄，每 10 分鐘更新。依所選視窗的損益金額排序，風險請用「最大回撤 <」等條件過濾——大額帳戶的 PnL 無法被小額帳戶複製，請一併看回撤與帳戶規模。",
     updatedAtPrefix: "資料更新於 ",
     // I-17（2026-08-31 使用者裁決）：榜首常駐一行說明「為什麼候選數 → 上榜數
     // 之間有落差」——數字（`{pool}`／`{qualified}`）來自後端回應，不寫死。
@@ -3235,7 +3235,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
   explore: {
     heading: "Explore traders to copy",
     disclaimerBadge: "Filet does not endorse any address on this list",
-    sub: "Data is sourced entirely from Hyperliquid's public on-chain records, updated every 10 minutes. Default sort is risk-adjusted return (return ÷ max drawdown), not absolute PnL — a large account's PnL can't be replicated by a small account.",
+    sub: "Data is sourced entirely from Hyperliquid's public on-chain records, updated every 10 minutes. Rows are sorted by PnL in the selected window; use filters such as \"Max drawdown <\" for risk — a large account's PnL can't be replicated by a small account, so read drawdown and account size alongside it.",
     updatedAtPrefix: "Data updated at ",
     poolNotePrefix: "Listing accounts with complete on-chain data out of ",
     poolNoteMid: " candidates screened (currently ",
