@@ -2033,6 +2033,58 @@ curl -s -X POST https://trade.filet.app/api/public/contact \
 
 ---
 
+### 5.8c ⭐⭐ 重啟前預熱探索索引快照（`EXPLORE_INDEX_VERSION` 升版必做；2026-09-05 使用者裁決：**以後一律照此**）
+
+<!-- 2026-09-05: 探索指標統一部署（a1b0a88）首次採用。版本升級會讓 filet-api 忽略舊快照、
+冷建 300 個地址（每地址 4–5 個 HL 呼叫 × 0.7s 節流 ＋ 429 退避）約 12–20 分鐘，期間
+/explore 顯示「建置中」空榜。本節把冷建搬到本機做，正式機重啟即有完整榜單。 -->
+
+**適用時機**：任何會讓正式機重啟後探索快照失效的部署——`EXPLORE_INDEX_VERSION` 升版、
+`ExploreRow`／`WindowStats` 欄位改動（snapshot 讀回會因版本不符被丟棄）、或快取檔本身遺失。
+一般部署（版本不變）不需要：`filet-api` 啟動會直接讀回舊快照（serve stale while revalidate）。
+
+**原則**：冷建成本放本機承擔，正式機只接收成品。快照是公開鏈上資料的快取、不含任何機密，
+可以直接搬。**順序固定：先裝快照，再重啟**（反過來重啟會先冷建、覆寫掉你剛裝的檔）。
+
+```bash
+# ── 本機（/Users/jim/projects/spark）：用新版程式對主網建一份完整快照 ──
+# 用一組本機專用的絕對路徑（FILET_* 路徑必須絕對），候選池用預設 300，不要縮。
+R=/Users/jim/projects/spark/var/localdemo; mkdir -p $R/state $R/exchange
+rm -f $R/explore_index.json     # 舊版快照會被忽略，但先刪掉避免混淆
+FILET_API_NETWORK=mainnet FILET_BUILDER_ADDR=<builder 位址> \
+FILET_SIWE_DOMAIN=localhost FILET_SIWE_URI=http://localhost:3000 \
+FILET_API_DB=$R/api.db FILET_KEYSVC_SOCK=$R/keysvc.sock FILET_PENDING_PATH=$R/pending.json \
+FILET_EXCHANGE_DIR=$R/exchange FILET_STATE_BASE=$R/state FILET_LEADERS_PATH=$R/leaders.json \
+FILET_FOLLOWERS_PATH=$R/followers.json FILET_ACCRUED_HISTORY_PATH=$R/accrued_history.jsonl \
+FILET_EXPLORE_CACHE_PATH=$R/explore_index.json FILET_API_PORT=8700 \
+uv run python -m scripts.run_api > $R/api.log 2>&1 &
+
+# 等到 building:false（約 12–20 分鐘；HL 對本機 429 時會自動退避，只是變慢）
+until curl -s "http://127.0.0.1:8700/api/public/explore?window=month" | grep -q '"building":false'; do sleep 15; done
+# 驗收：版本＝新版 EXPLORE_INDEX_VERSION、rows 接近候選池數（少數地址讀不到會被跳過）
+python3 -c "import json;d=json.load(open('$R/explore_index.json'));print(d['version'],len(d['rows']),d['total_scanned'])"
+kill $(lsof -ti :8700 -sTCP:LISTEN)   # 建完就關
+
+# ── 推到正式機（在「§3.2 rsync＋§4.2 build 完成、尚未重啟 filet-api」的時間點做）──
+scp -i <金鑰路徑> $R/explore_index.json ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER:/tmp/explore_index_new.json
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+  P=$(systemctl show filet-api -p Environment | tr " " "\n" | grep FILET_EXPLORE_CACHE_PATH | cut -d= -f2)
+  sudo cp -a "$P" "$P.bak-$(date -u +%Y%m%d)"                    # 舊快照留備份（回滾用）
+  sudo install -o filet-api -g filet-api -m 644 /tmp/explore_index_new.json "$P"
+  rm /tmp/explore_index_new.json
+  sudo python3 -c "import json;d=json.load(open(\"$P\"));print(\"installed\",d[\"version\"],len(d[\"rows\"]))"'
+
+# 然後才 §9.2 restart filet-api。驗收（重啟後 10 秒內）：
+curl -s "https://trade.filet.app/api/public/explore?window=month" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['building'],d['total_scanned'])"
+# 預期：False 300（不是 True 0）。之後 TTL 到期背景重建會自然接手，不必人工介入。
+```
+
+**回滾**：`sudo cp -a "$P.bak-<日期>" "$P"` 再 restart；若回滾的程式版本也對不上這份快照的版本號，
+就讓它冷建（回滾情境下可接受）。
+
+**為什麼不在正式機上「先起新版再等它建完」**：正式機只有 2GB、與 follower 引擎共機，冷建期間
+的 HL 呼叫與舊版 API 的流量疊在一起會拉高 429；而且 `filet-api` 是單一 unit，沒有藍綠切換可用。
+
 ## 6. nginx + certbot
 
 ```bash
