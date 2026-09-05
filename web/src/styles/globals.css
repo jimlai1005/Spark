@@ -1583,7 +1583,9 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-table-head, .explore-table-row {
   /* 2026-09-05（Task 6）：損益欄固定 88px 會被長數字（例：+$1,234,567）溢出，
      `.explore-ret` 的 `min-width` 被 grid 固定寬蓋掉——改用 minmax 讓欄寬跟內容走。 */
-  display: grid; grid-template-columns: 36px 180px 96px minmax(7.5rem, auto) 80px 64px 72px 1fr 148px;
+  /* 2026-09-05 本機截圖驗證：加寬損益欄後總寬超過容器，跟單鈕被切——帳戶 180→172、
+     走勢 96→88、曝險 bar 84→64（見 .explore-exposure-bar），總計省 36px 回到容器內。 */
+  display: grid; grid-template-columns: 36px 172px 88px minmax(7.5rem, auto) 80px 64px 72px 1fr 148px;
   gap: 12px; align-items: center; padding: 14px 18px; min-width: 960px;
 }
 .explore-table-head { font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim); letter-spacing: .08em; }
@@ -1605,7 +1607,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 
 .explore-spark { display: flex; }
 .explore-exposure { display: flex; align-items: center; gap: 10px; }
-.explore-exposure-bar { width: 84px; height: 5px; border-radius: 3px; background: var(--neg); overflow: hidden; }
+.explore-exposure-bar { width: 64px; height: 5px; border-radius: 3px; background: var(--neg); overflow: hidden; }
 .explore-exposure-fill { height: 100%; background: var(--pos); }
 .explore-exposure-label { font-size: 12px; color: var(--text-dim); }
 
