@@ -6,6 +6,7 @@
 
 **Architecture:** 新增 `src/spark/filet/trader_stats.py`（零網路純函式）：`window_stats()` 吃 `portfolio()` 原始回應算單窗 `WindowStats(pnl_usd, max_dd_pct|None, max_dd_reason, spark)`；`fills_stats()` 吃 fills 清單算 `FillsStats`；`live_days_from_av()` 算實盤天數。`hl_explore.enrich_candidate` 與 `app.public_trader_detail` 都只呼叫這個模組，各自不再有自己的公式。`leader_perf.compute_window_performance` 加兩道閘門（任一區間 `r_t <= -1` → `flow_dominated_interval`；跳過區間比例 > 30% → `too_many_skipped_intervals`），回傳既有的 `insufficient` 形狀。前端：探索表格「報酬率」欄改「損益（USD）」、sparkline 改畫損益曲線；詳情頁改成與清單相同的四窗切換＋同一組欄位，**保留** TWR 衍生指標（Sharpe／Sortino／年化波動／日勝率／最佳最差日）但改為逐窗計算、跟著所選窗切換，CAGR 維持 allTime；算不出的窗由既有 `*_insufficient` 標記顯示「樣本不足」——策略頁（`/strategies*`）**不動**。
 
+**狀態（2026-09-05 晚）：** 第二輪 Task 11／12（後端 sort/order、探索頁 URL 狀態／地址連結／表頭排序）亦完成並 commit；本機 300 候選池已驗證（88 檔合格）。截圖驗收另修三處版面（說明文案、曝險 bar、欄寬／tag 換行）。
 **狀態（2026-09-05）：** Task 0–10 全部完成並 commit（`62df325`…HEAD，main 分支，**未部署**）。兩輪 opus 審查：第一輪 1 Critical＋5 Warning 全修（Task 8／9），第二輪 1 Warning 修（Task 10），其餘為觀察。主線程親跑：`uv run pytest -q` 2805 passed、`npm test` 691 passed、ruff 乾淨、`npm run build` 成功；真實 HL 端到端（0x6648／0xbf73）數字與 Hyperbot 對帳一致。部署待辦見 RUNBOOK（`EXPLORE_INDEX_VERSION` 3 → 索引重建 12–20 分鐘）。待使用者裁決：`min_fills` 預設 200 改以訂單數比對後實質收緊（reviewer S1）；大戶 30 天成交超過 6000 筆時 `EXPLORE_FILLS_MAX_PAGES` 是否調高。
 
 **Tech Stack:** Python 3.11 + uv + pytest（離線，autouse socket-ban）；Next.js + vitest。測試錨例來自真實地址 `0x6648f8dd041ed689de7bf501efb3b827cf15b1f3` 的 fixture（已與 Hyperbot 逐位對帳：訂單 221／平倉 27／勝 15／已實現 $40,225.792264／month PnL $33,055.25879）。
