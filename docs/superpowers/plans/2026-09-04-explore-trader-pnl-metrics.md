@@ -1304,6 +1304,147 @@ git add src/spark/filet/leader_perf.py tests/test_leader_perf.py src/spark/publi
 git commit -m "fix: 複審修正：無已入金區間判 insufficient、fills_max_pages env 注入、live_days 例外降級、fills_30d 畸形 payload 回 null"
 ```
 
+---
+
+## 第二輪（2026-09-05 使用者本機驗收後需求）：探索頁互動
+
+使用者需求：(1) 點進詳情再返回，filter 不得重置；(2) 清單上的地址可點進詳情；(3) 欄位標題可點擊排序（升／降冪＋箭頭）；(4) 本機候選池回到 300（環境問題，主線程處理）；(5) 改完上本機。
+
+主線程裁決：
+- D11 filter／window／page／sort／order **全部放 URL query**（`?window=month&ld=1&fills=1&dd=0&conc=0&page=2&sort=pnl&order=desc`），初始值從 `useSearchParams` 讀，變更時用 `window.history.replaceState` 寫回（沿 `traders/[address]/page.tsx:110-126` 既有寫法與理由）。返回時 Next 重新掛載、讀到 query 即還原。不用 sessionStorage（不可分享、不可書籤）。
+- D12 排序做在**後端**：分頁是後端切的，前端只能排當頁。`/api/public/explore` 加 `sort`／`order` 參數；`sort_key` 改成依欄位取值；**值為 None 的列不論方向一律排最後**。
+- D13 可排序欄位與鍵值：`pnl`→`windows[w].pnl_usd`、`max_dd`→`windows[w].max_dd_pct`（≤0，desc＝最接近 0＝回撤最小者在前）、`live_days`→`live_days`、`win_rate`→`close_win_rate_pct`。預設 `sort=pnl&order=desc`（與 D2 相同）。第一次點某欄＝desc，再點＝asc；箭頭 `▼` desc／`▲` asc 只在作用中的欄顯示；切換排序回第一頁。
+- D14 地址 label 改 `Link` 到 `/traders/{address}?window={window}`（與「查看」同目標）；複製按鈕維持獨立元素，不包在 Link 內。
+
+### Task 11: 後端 sort/order `@inline`
+
+**Files:**
+- Modify: `src/spark/publicapi/hl_explore.py`（`sort_key`、`ExploreIndex.query`，約 752–759 與 1037–1101）
+- Modify: `src/spark/publicapi/app.py`（`/api/public/explore` handler，約 2258–2288）
+- Test: `tests/test_public_explore.py`
+
+- [ ] **Step 1: 測試**（沿該檔 `_row()` helper；`_row(pnl_usd=..., dd_pct=..., live_days=..., ...)` 既有參數）
+
+```python
+from spark.publicapi.hl_explore import SORT_FIELDS, sort_rows
+
+
+def test_sort_rows_pnl_desc_default_and_asc():
+    a, b, c = _row(pnl_usd=100.0), _row(pnl_usd=300.0), _row(pnl_usd=-50.0)
+    assert [r.windows["month"].pnl_usd for r in sort_rows([a, b, c], window="month")] == [300.0, 100.0, -50.0]
+    assert [r.windows["month"].pnl_usd for r in sort_rows([a, b, c], window="month", order="asc")] == [-50.0, 100.0, 300.0]
+
+
+def test_sort_rows_max_dd_none_always_last_regardless_of_order():
+    ok1, ok2, none = _row(dd_pct=-10.0), _row(dd_pct=-40.0), _row(dd_pct=None)
+    desc = sort_rows([none, ok1, ok2], window="month", sort="max_dd", order="desc")
+    asc = sort_rows([none, ok1, ok2], window="month", sort="max_dd", order="asc")
+    assert [r.windows["month"].max_dd_pct for r in desc] == [-10.0, -40.0, None]   # 回撤小者在前
+    assert [r.windows["month"].max_dd_pct for r in asc] == [-40.0, -10.0, None]
+
+
+def test_sort_rows_live_days_and_win_rate():
+    a, b = _row(live_days=10, win_rate=None), _row(live_days=500, win_rate=55.5)
+    assert sort_rows([a, b], window="month", sort="live_days")[0] is b
+    assert sort_rows([a, b], window="month", sort="win_rate")[0] is b       # None 排最後
+    assert sort_rows([a, b], window="month", sort="win_rate", order="asc")[0] is b
+
+
+def test_sort_rows_missing_window_falls_back_to_month():
+    a = _row(pnl_usd=5.0); a.windows["day"] = None
+    b = _row(pnl_usd=1.0); b.windows["day"] = WindowStats(pnl_usd=999.0, max_dd_pct=None, max_dd_reason="x", spark=())
+    assert sort_rows([a, b], window="day")[0] is b
+
+
+def test_sort_fields_constant():
+    assert SORT_FIELDS == ("pnl", "max_dd", "live_days", "win_rate")
+
+
+def test_endpoint_rejects_bad_sort_and_order(client_after_build):   # 沿既有 endpoint 測試的 fixture 名
+    assert client_after_build.get("/api/public/explore?sort=foo").status_code == 422
+    assert client_after_build.get("/api/public/explore?order=sideways").status_code == 422
+
+
+def test_endpoint_sort_order_passthrough_and_echo(client_after_build):
+    body = client_after_build.get("/api/public/explore?sort=live_days&order=asc").json()
+    assert body["sort"] == "live_days" and body["order"] == "asc"
+    days = [r["live_days"] for r in body["rows"]]
+    assert days == sorted(days)
+```
+（`_row` 若沒有 `win_rate`／`dd_pct=None` 參數就補上；endpoint fixture 名以檔內既有 `test_endpoint_full_flow_after_build_completes` 的建法為準。）
+
+- [ ] **Step 2: 實作**
+
+`hl_explore.py`：
+```python
+SORT_FIELDS = ("pnl", "max_dd", "live_days", "win_rate")
+SORT_ORDERS = ("asc", "desc")
+DEFAULT_SORT = "pnl"
+DEFAULT_ORDER = "desc"
+
+
+def sort_value(row: ExploreRow, *, window: str, sort: str) -> Decimal | None:
+    """D13：排序取值。窗類欄位缺該窗退回 month；值為 None → None（呼叫端排最後）。"""
+    if sort in ("pnl", "max_dd"):
+        stats = row.windows.get(window) or row.windows["month"]
+        v = stats.pnl_usd if sort == "pnl" else stats.max_dd_pct
+    elif sort == "live_days":
+        v = row.live_days
+    elif sort == "win_rate":
+        v = row.close_win_rate_pct
+    else:
+        raise ValueError(f"unknown sort {sort!r}")
+    return None if v is None else Decimal(str(v))
+
+
+def sort_rows(rows: list[ExploreRow], *, window: str = DEFAULT_WINDOW,
+              sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> list[ExploreRow]:
+    """D12：None 一律排最後（不論 asc/desc）；其餘依 order。穩定排序，同值維持輸入順序。"""
+    keyed = [(sort_value(r, window=window, sort=sort), r) for r in rows]
+    present = [(k, r) for k, r in keyed if k is not None]
+    missing = [r for k, r in keyed if k is None]
+    present.sort(key=lambda kr: kr[0], reverse=(order == "desc"))
+    return [r for _, r in present] + missing
+```
+保留 `sort_key(row, *, window)`＝`sort_value(..., sort="pnl")`（既有測試用），docstring 註明「由 `sort_rows` 取代排序責任」。`ExploreIndex.query` 簽名加 `sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER`，1100 行的 `.sort(...)` 改成 `qualified_rows = sort_rows(qualified_rows, window=window, sort=sort, order=order)`；回傳 dict 加 `"sort": sort, "order": order`。
+
+`app.py` handler：加 `sort: str = hl_explore.DEFAULT_SORT, order: str = hl_explore.DEFAULT_ORDER`；不在 `SORT_FIELDS`／`SORT_ORDERS` → 422（與 `window` 同款）；傳給 `query`。
+
+- [ ] **Step 3: 驗收與 commit**
+
+```bash
+uv run ruff check src tests scripts && uv run pytest tests/test_public_explore.py -q && uv run pytest -q
+git add src/spark/publicapi/hl_explore.py src/spark/publicapi/app.py tests/test_public_explore.py
+git commit -m "feat: /api/public/explore 加 sort/order（pnl/max_dd/live_days/win_rate；None 排最後）"
+```
+
+### Task 12: 前端 URL 狀態、地址連結、表頭排序 `@inline`
+
+**Files:**
+- Modify: `web/src/lib/publicApi.ts`（`ExploreFilters` 加 `sort`／`order`；`ExploreResp` 加 `sort`／`order`；query string 帶上）
+- Modify: `web/src/lib/copy.ts`（`explore.table.sortHint: "點擊排序"`；zh/en 對稱）
+- Modify: `web/src/app/explore/page.tsx` ＋ `page.test.tsx`
+- Modify: `web/src/styles/globals.css`（表頭按鈕與箭頭樣式、地址 link 樣式）
+
+- [ ] **Step 1: URL 狀態（D11）**
+  - 型別 `ExploreSort = "pnl" | "max_dd" | "live_days" | "win_rate"`、`ExploreOrder = "asc" | "desc"`，放 `publicApi.ts` 並 export。
+  - `ExplorePage` 改成 `export default function ExplorePage() { return <Suspense fallback={null}><ExploreInner /></Suspense>; }`（沿 `traders/[address]/page.tsx:77-83`）。
+  - `ExploreInner` 用 `useSearchParams()` 初始化：`window`（合法值才收）、`ld`／`fills`／`dd`／`conc`（`"1"`→true、`"0"`→false、缺席→各自既有預設）、`page`（正整數）、`sort`／`order`（合法值才收，缺席→`pnl`／`desc`）。
+  - 每次任一狀態變動（同一個 `useEffect` 的依賴陣列）除了 fetch，也把全部狀態寫回 URL：`const url = new URL(window.location.href); url.searchParams.set(...)`（全部鍵都寫，缺省值也寫，讓 URL 自描述）→ `window.history.replaceState(null, "", url.toString())`。
+  - 測試：mock `next/navigation` 的 `useSearchParams` 回 `new URLSearchParams("window=week&ld=0&fills=1&dd=1&conc=0&page=2&sort=live_days&order=asc")` → 第一次 fetch 的 URL 含 `window=week&page=2&min_live_days=0&min_fills=200&max_dd_pct=30&...&sort=live_days&order=asc`；切換 chip 後 `window.history.replaceState` 被呼叫且 URL 內 `dd=0`（用 `vi.spyOn(window.history, "replaceState")`）。
+
+- [ ] **Step 2: 地址連結（D14）**：`page.tsx:409` 的 `<span className="mono">{row.label}</span>` 改 `<Link href={`/traders/${row.address}?window=${windowKey}`} className="mono explore-address-link">{row.label}</Link>`；複製按鈕不動。測試：`getAllByRole("link", { name: ROW_A.label })[0]` 的 `href` 為 `/traders/<address>?window=month`。
+
+- [ ] **Step 3: 表頭排序（D13）**：表頭四欄（`c.table.pnl`／`dd`／`days`／`winRate`）改成 `<button type="button" className="explore-sort-btn" aria-sort=... onClick>`：點擊時 `sort !== field` → `setSort(field); setOrder("desc")`；`sort === field` → 翻轉 order；兩者都 `setPage(1)`。作用中的欄在文字後加 `<span aria-hidden>{order === "desc" ? "▼" : "▲"}</span>`；`title={c.table.sortHint}`。CSS：`.explore-sort-btn { all: unset; cursor: pointer; }`，作用中加 `data-active` 顏色 `var(--text)`。測試：點「最大回撤」→ fetch URL 含 `sort=max_dd&order=desc&page=1`；再點 → `order=asc`；箭頭文字存在於該欄。
+
+- [ ] **Step 4: 驗收與 commit**
+
+```bash
+export PATH="/Users/jim/.nvm/versions/node/v24.18.0/bin:$PATH" && cd web && npm test && npx tsc --noEmit && npm run build
+git add web/src/lib/publicApi.ts web/src/lib/copy.ts web/src/app/explore/page.tsx web/src/app/explore/page.test.tsx web/src/styles/globals.css
+git commit -m "feat: 探索頁 filter/排序狀態進 URL、地址可點進詳情、表頭可排序"
+```
+
 ## 驗收條款（主線程 verdict 用，預註冊）
 
 1. `uv run pytest -q` 全綠；`tests/test_trader_stats.py` 內 fixture 錨例（221／27／15／55.56／40225.79／33055.26／-2181.94／-74.07／1003）逐條通過。
