@@ -60,8 +60,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from scripts.filet_activate import activate, validate_pending_entry
+from spark.copytrade.killswitch import (ARM_FILE_RELPATH, archive_owner_close,
+                                        is_tripped, owner_close_terminal)
 from spark.copytrade.notifier import Notifier, NullNotifier, TelegramNotifier
 from spark.copytrade.vault_policy import VAULT_MAX_TARGET_LEVERAGE
+from spark.filet.close_all import (clear_close_all_result, close_all_path_for,
+                                   close_all_result_path_for,
+                                   remove_close_all_requests)
 from spark.filet.followers import load_followers_tolerant
 from spark.filet.leaders import LeaderRef, find_leader, load_leaders
 from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_for,
@@ -321,6 +326,24 @@ class WatcherState:
         write_json_atomic(self._path, self._data, mode=0o600)
 
 
+def _chown_tree(root: Path, owner: str, group: str) -> None:
+    """把 `root` 與其下所有檔案／子目錄的擁有者設為 (owner, group)。
+
+    供 owner_close 歸檔目錄使用（Task 6）：`Path.rename` 不改變擁有者，歸檔前後
+    通常已經是 filet-engine，這裡統一做一次以防萬一（例如帳戶曾以不同身分建立
+    過 equity 樣本檔）——歸檔目錄仍須是引擎可讀寫，`announce_owner_close_history`
+    要在引擎啟動時讀它。非 root 執行（測試、dry-run）→ `named_owner_ids` 回
+    None，靜默跳過（同 `safe_fs.named_owner_ids` docstring 的既有慣例）。
+    """
+    owner_ids = named_owner_ids(owner, group)
+    if owner_ids is None:
+        return
+    uid, gid = owner_ids
+    os.chown(root, uid, gid)
+    for p in root.rglob("*"):
+        os.chown(p, uid, gid)
+
+
 def _manifest_ref(manifest_path: str, account_id: str):
     """回傳 (是否在 manifest, 該筆的 leader_address 或 None)。
 
@@ -345,9 +368,10 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                   risk_settings: list[dict],
                   env_dir: Path, env_template: Path,
                   state_base: Path, owner: str, group: str, state: WatcherState,
-                  notifier: Notifier, run_cmd=subprocess.run) -> str:
-    """處理單一 pending 條目。回傳結果碼：activated／healed_*／waiting_leader。
-    失敗以例外冒出，由呼叫端隔離。"""
+                  notifier: Notifier, exchange_dir: str,
+                  run_cmd=subprocess.run) -> str:
+    """處理單一 pending 條目。回傳結果碼：activated／reactivated／healed_*／
+    waiting_leader。失敗以例外冒出，由呼叫端隔離。"""
     account_id = entry["account_id"]
     start_cmd = ["systemctl", "start", f"filet-follower@{account_id}"]
 
@@ -357,6 +381,70 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
 
     in_manifest, manifest_leader = _manifest_ref(manifest_path, account_id)
     if in_manifest:
+        # ⭐ Task 6（owner_close 生命週期收尾，裁決 D2/D3）：帳號已在 manifest
+        # 且 state 目錄留有「owner_close 已收尾完成」的終態 ARM ⇒ 這不是普通的
+        # 重複 pending（下面 F3 的既有情境），而是用戶完成平倉並撤銷後**重新
+        # 跟單**——唯一入口是用戶重新簽章選 leader（D2），本 watcher 是唯一的
+        # （重）啟用者。判定與非終態鎖定必須先於既有的 phase 分支，否則會被誤判
+        # 成「已在 manifest 又出現 pending」而只清佇列、不重啟。
+        state_root = state_base / account_id
+        terminal = owner_close_terminal(state_root)
+        if terminal is not None:
+            leader = _latest_signed_leader(
+                leader_changes, account_id=account_id,
+                user_address=entry["user_address"])
+            if leader is None:
+                # 尚未簽新的 leader 選擇：保留 pending，等他簽（產品語意同一般
+                # 新戶的 waiting_leader）。
+                return "waiting_leader"
+            # D3：歸檔而非刪除——ARM＋全期高水位＋權益樣本一起搬走，新一輪
+            # 跟單用全新基準。歸檔目錄仍須是 filet-engine 可讀寫（引擎啟動時要
+            # 讀它發「先前曾平倉並撤銷」的提示，見
+            # killswitch.announce_owner_close_history）。
+            archive_dir = archive_owner_close(state_root)
+            _chown_tree(archive_dir, owner, group)
+            # 清掉舊的一次性 close_all 請求與 result 標記：不清的話，殘留的
+            # 「已完成」標記會讓 dashboard／API 對這一輪新的跟單誤判為仍是
+            # halted（見 publicapi.app._close_all_completed）。
+            remove_close_all_requests(close_all_path_for(exchange_dir),
+                                      account_id=account_id)
+            clear_close_all_result(
+                close_all_result_path_for(exchange_dir, account_id))
+            state.set_phase(account_id, "starting")
+            run_cmd(start_cmd, check=True)
+            state.set_phase(account_id, "started")
+            # manifest 裡的 leader 若與新簽章不同，由引擎自己的
+            # LeaderChangeApplier 每輪消化 leader_changes.json 套用（既有機制，
+            # 見 spark.filet.leader_change_apply）——watcher 不改 manifest，所以
+            # **只有目標 == manifest 現值時才回收記錄**（remove_satisfied_leader_change
+            # 的狀態述詞語意）。目標不同時記錄必須留著：`systemctl start` 對
+            # Type=simple 幾乎立即返回，引擎第一輪 cycle 還沒讀到它；此時刪掉
+            # 等於讓引擎靜默沿用 manifest 的舊 leader（builder 2026-09-07 發現）。
+            if manifest_leader is not None and leader == manifest_leader:
+                remove_satisfied_leader_change(changes_path, account_id=account_id,
+                                               leader_address=manifest_leader)
+            remove_pending_entry(pending_path, account_id)
+            notifier.warn(
+                "auto-activate",
+                f"account={account_id} 重新跟單：先前於 {terminal['tripped_at']} "
+                f"平倉並撤銷，記錄已歸檔至 {archive_dir}，引擎已重新啟動"
+                f"（leader={leader}）",
+                dedup_key=f"auto-activate:refollow:{account_id}")
+            return "reactivated"
+        if is_tripped(state_root):
+            # owner_close 尚未收尾完成（phase 非 complete，收尾中途崩潰）、或
+            # 其他熔斷原因（drawdown 等）：不自動重啟——只有明確的 owner_close
+            # 終態才代表「用戶已確認退出、可以重新開始」，其餘一律 fail-closed，
+            # 需人工處置（見 deploy/RUNBOOK.md）。
+            remove_pending_entry(pending_path, account_id)
+            notifier.critical(
+                "auto-activate",
+                f"account={account_id} 出現 pending 但 state 有非終態的 kill "
+                f"switch 鎖定（{state_root / ARM_FILE_RELPATH}），需人工處置後"
+                f"再啟用",
+                dedup_key=f"auto-activate:tripped-pending:{account_id}")
+            return "healed_no_start"
+
         phase = state.phase(account_id)
         # 意圖已滿足的記錄一律回收（F7A）：不分分支——記錄留著只會讓引擎每 cycle
         # 發假 expired critical、對帳工具永久列 not_redeemed。
@@ -488,7 +576,7 @@ def run_once(*, pending_path: str, manifest_path: str, builder: str,
                 risk_settings=risk_settings, env_dir=env_dir,
                 env_template=env_template, state_base=state_base,
                 owner=owner, group=group, state=state, notifier=notifier,
-                run_cmd=run_cmd)
+                exchange_dir=exchange_dir, run_cmd=run_cmd)
         except (SystemExit, Exception) as e:  # noqa: BLE001 — 逐條目隔離是本函式的職責
             failures += 1
             # CRIT＋條目保留：下輪自動重試，人工可從 journal／TG 追（工程原則 3）。

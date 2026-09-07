@@ -17,7 +17,11 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 
 from scripts.filet_auto_activate import GENERATED_KEYS, VAULT_ENV_KEYS, run_once
+from spark.copytrade.killswitch import ARM_FILE_RELPATH
 from spark.copytrade.notifier import RecordingNotifier
+from spark.filet.close_all import (close_all_path_for, close_all_result_path_for,
+                                   load_close_all_requests, write_close_all_request,
+                                   write_close_all_result)
 from spark.filet.leader_change import (build_leader_change_message,
                                        build_leader_change_record,
                                        leader_changes_path_for,
@@ -140,6 +144,52 @@ class _Site:
 
     def warns(self):
         return [r for r in self.notifier.records if r[0] == "warn"]
+
+    def last_result(self, account_id=None) -> str | None:
+        """讀 watcher state 檔記錄的本輪結果碼（`process_entry` 的回傳值，
+        由 `WatcherState.note_result` 落檔）。"""
+        if not self.state_file.exists():
+            return None
+        data = json.loads(self.state_file.read_text())
+        return data.get(account_id or self.account_id, {}).get("last_result")
+
+    def put_in_manifest(self, *, leader=_LEADER):
+        """帳號已在 manifest（供 owner_close 重新啟用情境使用，state watcher
+        無此帳號的啟動紀錄，同 `test_manually_activated_account_not_touched`）。"""
+        self.manifest.write_text(json.dumps({"followers": [
+            {"account_id": self.account_id, "user_address": self.user_address,
+             "builder_address": _BUILDER, "network": "testnet",
+             "label": "", "leader_address": leader}]}))
+
+    def write_owner_close_arm(self, *, phase="complete", failures=None,
+                              orders_not_cancelled=False,
+                              tripped_at=None) -> Path:
+        """在 state 目錄寫一份 owner_close ARM 檔（payload 形狀沿
+        `tests/test_copy_killswitch.py` 的 `_owner_close_arm`）。"""
+        tripped_at = tripped_at or _at(-3600)
+        root = self.state_base / self.account_id
+        p = root / ARM_FILE_RELPATH
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "tripped_at": tripped_at, "current": "700", "peak": "1000",
+            "drawdown_pct": "0.3", "breached": True, "reason": "owner_close",
+            "phase": phase, "cancelled": 3,
+            "orders_not_cancelled": orders_not_cancelled,
+            "closed": [], "failures": failures or [],
+        }))
+        return p
+
+    def write_drawdown_arm(self, *, tripped_at=None) -> Path:
+        """非 owner_close 的一般熔斷 ARM（reason=drawdown），供對照組使用。"""
+        tripped_at = tripped_at or _at(-3600)
+        root = self.state_base / self.account_id
+        p = root / ARM_FILE_RELPATH
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "tripped_at": tripped_at, "current": "700", "peak": "1000",
+            "drawdown_pct": "0.3", "breached": True, "reason": "drawdown",
+        }))
+        return p
 
 
 @pytest.fixture
@@ -601,3 +651,96 @@ def test_existing_env_file_not_overwritten(site):
     site.sign_change(leader=_LEADER)
     assert site.run() == 0
     assert (site.env_dir / f"{site.account_id}.env").read_text() == custom
+
+
+# ── owner_close 終態帳號的重新啟用（2026-09-07 Task 6，裁決 D2/D3）─────────
+
+def test_owner_close_terminal_with_signature_reactivates(site):
+    """⭐ (a) 已在 manifest＋state 有 owner_close 終態 ARM＋用戶新簽了 leader
+    選擇 ⇒ 歸檔舊 ARM／peak／samples、清掉舊的一次性 close_all 請求與 result
+    標記、systemctl start、清 pending。不同於全新帳號的 `activated` 路徑：
+    watcher 不改 manifest 的 leader_address（交給引擎自己的 LeaderChangeApplier
+    在下一輪消化新選擇，見 process_entry 檔內註解）。"""
+    site.put_in_manifest()
+    arm_path = site.write_owner_close_arm()
+    req_path = close_all_path_for(site.exchange)
+    write_close_all_request(req_path, {"account_id": site.account_id, "nonce": "n1"})
+    result_path = close_all_result_path_for(site.exchange, site.account_id)
+    write_close_all_result(result_path, status="completed",
+                           request_issued_at=_at(), now_s=_NOW)
+    site.sign_change(leader=_LEADER)
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    assert site.calls == [["systemctl", "start",
+                           f"filet-follower@{site.account_id}"]]
+    assert not arm_path.exists()
+    from spark.copytrade.killswitch import OWNER_CLOSE_ARCHIVE_RELPATH
+    archive_root = site.state_base / site.account_id / OWNER_CLOSE_ARCHIVE_RELPATH
+    assert archive_root.is_dir()
+    archived = list(archive_root.iterdir())
+    assert len(archived) == 1
+    assert (archived[0] / ARM_FILE_RELPATH.name).exists()
+    assert not result_path.exists()
+    assert [r["account_id"] for r in load_close_all_requests(req_path)
+           if r.get("account_id") == site.account_id] == []
+    assert load_pending(site.pending) == []
+
+
+def test_refollow_same_leader_recycles_change_record(site):
+    """⭐ (a2) 新簽章的 leader == manifest 現值 ⇒ 記錄意圖已滿足，回收（否則
+    引擎每輪對一筆 nonce 未兌現的舊記錄發 expired critical）。"""
+    from spark.filet.leader_change import load_leader_changes
+    site.put_in_manifest(leader=_LEADER)
+    site.write_owner_close_arm()
+    site.sign_change(leader=_LEADER)
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    assert load_leader_changes(leader_changes_path_for(site.exchange)) == []
+
+
+def test_refollow_different_leader_keeps_change_record_for_engine(site):
+    """⭐ (a3) 新簽章的 leader != manifest 現值 ⇒ 記錄**必須留著**給引擎的
+    LeaderChangeApplier 消化：`systemctl start` 立即返回、引擎第一輪還沒讀到它，
+    此時刪掉等於讓引擎靜默沿用 manifest 的舊 leader（fail-open）。"""
+    from spark.filet.leader_change import load_leader_changes
+    site.put_in_manifest(leader=_LEADER)
+    site.write_owner_close_arm()
+    site.sign_change(leader=_CUSTOM)
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    assert site.calls == [["systemctl", "start",
+                           f"filet-follower@{site.account_id}"]]
+    remaining = load_leader_changes(leader_changes_path_for(site.exchange))
+    assert [r["leader_address"] for r in remaining] == [_CUSTOM]
+    assert site.manifest_leaders() == {site.account_id: _LEADER}   # watcher 不改 manifest
+
+
+def test_owner_close_terminal_without_signature_waits(site):
+    """⭐ (b) 終態 ARM 但用戶還沒簽新的 leader 選擇 ⇒ `waiting_leader`：
+    pending 保留、不歸檔、不 start（與一般新戶的 waiting_leader 同一語意）。"""
+    site.put_in_manifest()
+    arm_path = site.write_owner_close_arm()
+
+    assert site.run() == 0
+    assert site.last_result() == "waiting_leader"
+    assert site.calls == []
+    assert arm_path.exists()
+    assert len(load_pending(site.pending)) == 1
+
+
+def test_non_terminal_tripped_pending_healed_without_start(site):
+    """⭐ (c) state 有 ARM 但不是 owner_close 終態（reason=drawdown，一般熔斷
+    尚在鎖定中）⇒ `healed_no_start`：不自動重啟、CRIT 一則、清掉這筆多餘的
+    pending（帳號已在 manifest，重跑 onboarding 產生的 pending 沒有意義）。"""
+    site.put_in_manifest()
+    site.write_drawdown_arm()
+
+    assert site.run() == 0
+    assert site.last_result() == "healed_no_start"
+    assert site.calls == []
+    assert len(site.crits()) == 1
+    assert "kill switch 鎖定" in site.crits()[0][2]
+    assert load_pending(site.pending) == []
