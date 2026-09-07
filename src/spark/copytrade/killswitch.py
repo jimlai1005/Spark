@@ -53,7 +53,12 @@ from typing import Iterable
 
 from spark.copytrade.config import CopySettings
 from spark.copytrade.costbreaker import reset_log as reset_cost_log
-from spark.copytrade.equity import reset_lifetime_peak, reset_samples
+from spark.copytrade.equity import (
+    LIFETIME_PEAK_RELPATH,
+    SAMPLES_RELPATH,
+    reset_lifetime_peak,
+    reset_samples,
+)
 from spark.copytrade.executor import ExecutorPort
 from spark.copytrade.notifier import Notifier
 from spark.exchange.base import EquityView, Position
@@ -241,6 +246,117 @@ def halt_status(root: Path) -> dict | None:
     return {"tripped": True, "reason": reason, "tripped_at": tripped_at,
             "residual_exposure": residual,
             "resumable": rearm_allowed_for(reason, manual=True)}
+
+
+OWNER_CLOSE_ARCHIVE_RELPATH = Path("var/copytrade/owner_close_archive")
+
+
+def owner_close_terminal(root: Path) -> dict | None:
+    """ARM 檔為「owner_close 且 phase == complete」→ 回 payload dict（另加鍵
+    `residual: bool`＝有無殘留暴險，與 `_read_arm_payload` 同一個布林算式）；否則 None。
+
+    ⚠️ fail-closed：ARM 不存在、JSON 壞掉、不是 dict、`reason` 不是 `owner_close`、
+    或 `phase` 不是 `"complete"`（例如收尾中途崩潰停在 `flatten_in_progress`）——
+    一律回 None，不宣稱終態。裁決 D1：終態判定只看 `reason`/`phase`，殘留暴險
+    （`failures`／`orders_not_cancelled`）不影響終態本身，只影響 `residual` 這個鍵。
+    """
+    arm_path = root / ARM_FILE_RELPATH
+    if not arm_path.exists():
+        return None
+    try:
+        payload = json.loads(arm_path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("reason") != REASON_OWNER_CLOSE:
+        return None
+    if payload.get("phase") != "complete":
+        return None
+    residual = bool(payload.get("failures")) or bool(payload.get("orders_not_cancelled"))
+    return {**payload, "residual": residual}
+
+
+def archive_owner_close(root: Path, *, now: datetime | None = None) -> Path:
+    """把 ARM、equity_lifetime_peak.json、equity_samples.json 搬進
+    `OWNER_CLOSE_ARCHIVE_RELPATH/<tripped_at 去掉冒號>/` 並回傳該目錄。
+
+    前置：`owner_close_terminal(root)` 非 None，否則 raise ValueError——歸檔動作
+    不對非終態的 ARM 執行（呼叫端在搬走鎖檔之前必須先證明「這是一次完成的
+    owner_close 收尾」，不是意外把仍在鎖著交易的 ARM 檔搬走）。
+
+    目錄名優先用 payload 的 `tripped_at`；那個欄位讀不到（型別壞掉／空字串，
+    理論上不該發生在已通過 `owner_close_terminal` 的 payload 上，但仍 fail-safe）
+    時退回 `now`（未注入則用目前 UTC 時間）——與模組其餘函式的 `now_s`/`sleep_fn`
+    可注入慣例一致，保留可測試性。
+
+    缺 peak/samples 檔時略過不報錯（新帳戶可能還沒累積過樣本）。
+    目錄名衝突（同一秒觸發兩次、或重跑測試）時加 `-2`、`-3` 後綴。
+    """
+    terminal = owner_close_terminal(root)
+    if terminal is None:
+        raise ValueError(
+            "archive_owner_close: ARM 檔非 owner_close 終態（reason/phase 不符），"
+            "拒絕歸檔")
+    tripped_at = terminal.get("tripped_at")
+    name_source = tripped_at if isinstance(tripped_at, str) and tripped_at else (
+        now or datetime.now(timezone.utc)).isoformat()
+    safe_name = name_source.replace(":", "")
+
+    base_dir = root / OWNER_CLOSE_ARCHIVE_RELPATH
+    dest = base_dir / safe_name
+    suffix = 1
+    while dest.exists():
+        suffix += 1
+        dest = base_dir / f"{safe_name}-{suffix}"
+    dest.mkdir(parents=True, exist_ok=False)
+
+    arm_path = root / ARM_FILE_RELPATH
+    arm_path.rename(dest / ARM_FILE_RELPATH.name)
+    for relpath in (LIFETIME_PEAK_RELPATH, SAMPLES_RELPATH):
+        src = root / relpath
+        if src.exists():
+            src.rename(dest / relpath.name)
+    return dest
+
+
+def owner_close_history(root: Path) -> list[dict]:
+    """歸檔目錄底下每個子目錄的 killswitch.tripped payload（依目錄名排序，即依
+    `tripped_at` 字典序，等同時間序——ISO 8601 字串排序與時間序一致）。
+
+    讀不到（JSON 壞掉、非 dict）的子目錄略過，不擋其餘筆數。
+    `OWNER_CLOSE_ARCHIVE_RELPATH` 目錄本身不存在 → `[]`（從未 owner_close 過）。
+    """
+    base_dir = root / OWNER_CLOSE_ARCHIVE_RELPATH
+    if not base_dir.exists():
+        return []
+    history: list[dict] = []
+    for sub in sorted(base_dir.iterdir(), key=lambda p: p.name):
+        if not sub.is_dir():
+            continue
+        arm_path = sub / ARM_FILE_RELPATH.name
+        try:
+            payload = json.loads(arm_path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            history.append(payload)
+    return history
+
+
+def announce_owner_close_history(root: Path, notifier: Notifier) -> None:
+    """引擎啟動時提示：這顆帳戶先前是否曾 owner_close 過（歸檔紀錄非空）。
+    供 `scripts/run_copytrade.py` 在 `main_loop` 之前呼叫（接線見該檔，本函式
+    只負責邏輯，便於離線測試不必起真的 runner）。無歸檔 → 靜默不發。"""
+    hist = owner_close_history(root)
+    if not hist:
+        return
+    last = hist[-1].get("tripped_at")
+    notifier.warn(
+        "killswitch",
+        f"提醒：此帳號先前曾平倉並撤銷 {len(hist)} 次（最近一次 {last}），"
+        f"記錄已歸檔；本次啟動為新一輪跟單，全期高水位重新起算",
+        dedup_key="owner_close_history")
 
 
 def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Notifier,

@@ -19,13 +19,18 @@ from spark.copytrade.config import CopySettings
 from spark.copytrade.killswitch import (
     ALERTS_LOG_RELPATH,
     ARM_FILE_RELPATH,
+    OWNER_CLOSE_ARCHIVE_RELPATH,
     CloseAction,
     DrawdownStatus,
+    announce_owner_close_history,
+    archive_owner_close,
     auto_rearm_if_cooled_down,
     check_drawdown,
     manual_rearm,
     evaluate,
     is_tripped,
+    owner_close_history,
+    owner_close_terminal,
     plan_close_actions,
     trip,
 )
@@ -831,3 +836,148 @@ def test_rolling_drawdown_resume_keeps_the_lifetime_peak(tmp_path):
     assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
                                      RecordingNotifier(), now_s=now) is True
     assert (tmp_path / LIFETIME_PEAK_RELPATH).exists(), "全期高水位必須留著"
+
+
+# ── owner_close 終態判定與歸檔（2026-09-07，裁決 D1/D3）───────────────────
+def _owner_close_arm(root, *, tripped_at: str, phase: str = "complete",
+                     failures=None, orders_not_cancelled: bool = False,
+                     cancelled: int = 3, closed=None) -> Path:
+    p = root / ARM_FILE_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tripped_at": tripped_at,
+        "current": "700",
+        "peak": "1000",
+        "drawdown_pct": "0.3",
+        "breached": True,
+        "reason": "owner_close",
+        "phase": phase,
+        "cancelled": cancelled,
+        "orders_not_cancelled": orders_not_cancelled,
+        "closed": closed or [],
+        "failures": failures or [],
+    }
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def test_owner_close_terminal_no_arm_file_is_none(tmp_path):
+    assert owner_close_terminal(tmp_path) is None
+
+
+def test_owner_close_terminal_wrong_reason_is_none(tmp_path):
+    _arm(tmp_path, tripped_at=_hours_ago(1)[0], reason="drawdown")
+    assert owner_close_terminal(tmp_path) is None
+
+
+def test_owner_close_terminal_phase_not_complete_is_none(tmp_path):
+    _owner_close_arm(tmp_path, tripped_at=_hours_ago(1)[0], phase="flatten_in_progress")
+    assert owner_close_terminal(tmp_path) is None
+
+
+def test_owner_close_terminal_complete_with_failures_marks_residual_true(tmp_path):
+    at, _ = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at, failures=["BTC"])
+    terminal = owner_close_terminal(tmp_path)
+    assert terminal is not None
+    assert terminal["residual"] is True
+    assert terminal["tripped_at"] == at
+
+
+def test_owner_close_terminal_complete_no_residual(tmp_path):
+    at, _ = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    terminal = owner_close_terminal(tmp_path)
+    assert terminal is not None
+    assert terminal["residual"] is False
+
+
+def test_archive_owner_close_moves_three_files_and_clears_original(tmp_path):
+    at, _ = _hours_ago(1)
+    arm = _owner_close_arm(tmp_path, tripped_at=at)
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, SAMPLES_RELPATH
+    peak_path = tmp_path / LIFETIME_PEAK_RELPATH
+    samples_path = tmp_path / SAMPLES_RELPATH
+    peak_path.parent.mkdir(parents=True, exist_ok=True)
+    peak_path.write_text('{"peak": "10000"}')
+    samples_path.write_text('[[1.0, "700"]]')
+
+    dest = archive_owner_close(tmp_path)
+
+    assert not arm.exists()
+    assert not peak_path.exists()
+    assert not samples_path.exists()
+    assert (dest / ARM_FILE_RELPATH.name).exists()
+    assert (dest / LIFETIME_PEAK_RELPATH.name).exists()
+    assert (dest / SAMPLES_RELPATH.name).exists()
+    assert dest == tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH / at.replace(":", "")
+
+
+def test_archive_owner_close_missing_peak_and_samples_is_not_an_error(tmp_path):
+    at, _ = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    dest = archive_owner_close(tmp_path)
+    assert (dest / ARM_FILE_RELPATH.name).exists()
+
+
+def test_archive_owner_close_raises_on_non_terminal(tmp_path):
+    _arm(tmp_path, tripped_at=_hours_ago(1)[0], reason="drawdown")
+    with pytest.raises(ValueError):
+        archive_owner_close(tmp_path)
+
+
+def test_archive_owner_close_no_arm_raises(tmp_path):
+    with pytest.raises(ValueError):
+        archive_owner_close(tmp_path)
+
+
+def test_archive_owner_close_dirname_conflict_gets_suffix(tmp_path):
+    at, _ = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    dest1 = archive_owner_close(tmp_path)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    dest2 = archive_owner_close(tmp_path)
+    assert dest1 != dest2
+    assert dest2.name == dest1.name + "-2"
+
+
+def test_owner_close_history_returns_one_entry_with_tripped_at(tmp_path):
+    at, _ = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    archive_owner_close(tmp_path)
+    hist = owner_close_history(tmp_path)
+    assert len(hist) == 1
+    assert hist[0]["tripped_at"] == at
+
+
+def test_owner_close_history_no_archive_dir_is_empty(tmp_path):
+    assert owner_close_history(tmp_path) == []
+
+
+def test_owner_close_history_skips_unreadable_entries(tmp_path):
+    base = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH / "broken-entry"
+    base.mkdir(parents=True)
+    (base / ARM_FILE_RELPATH.name).write_text("{ 不是合法 JSON")
+    assert owner_close_history(tmp_path) == []
+
+
+# ── announce_owner_close_history（Task 3 helper）─────────────────────────
+def test_announce_owner_close_history_no_archive_is_silent(tmp_path):
+    n = RecordingNotifier()
+    announce_owner_close_history(tmp_path, n)
+    assert n.records == []
+
+
+def test_announce_owner_close_history_with_archive_warns_with_count_and_last_ts(tmp_path):
+    at, _ = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    archive_owner_close(tmp_path)
+    n = RecordingNotifier()
+    announce_owner_close_history(tmp_path, n)
+    assert len(n.records) == 1
+    level, category, text, dedup_key = n.records[0]
+    assert level == "warn"
+    assert category == "killswitch"
+    assert "1 次" in text
+    assert at in text
+    assert dedup_key == "owner_close_history"

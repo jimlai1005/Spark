@@ -12,8 +12,12 @@ import json
 from eth_account import Account
 
 from spark.copytrade.notifier import RecordingNotifier
-from spark.filet.close_all import (close_all_result_path_for,
-                                   read_close_all_result, write_close_all_request,
+from spark.filet.close_all import (clear_close_all_result,
+                                   close_all_result_path_for,
+                                   load_close_all_requests,
+                                   read_close_all_result,
+                                   remove_close_all_requests,
+                                   write_close_all_request,
                                    write_close_all_result)
 from spark.filet.close_all_apply import (CloseAllApplier,
                                          resolve_close_all_result_path)
@@ -149,3 +153,40 @@ def test_successful_trigger_writes_completed_result(tmp_path):
     stored = read_close_all_result(result_path)
     assert stored["status"] == "completed"
     assert stored["request_issued_at"] == issued_at
+
+
+# ── remove_close_all_requests／clear_close_all_result（Task 6 清理原語）───
+
+def test_remove_close_all_requests_only_affects_target_account(tmp_path):
+    req_path = tmp_path / "owner_close.json"
+    write_close_all_request(req_path, {"account_id": "acct1", "nonce": "n1"})
+    write_close_all_request(req_path, {"account_id": "acct2", "nonce": "n2"})
+
+    removed = remove_close_all_requests(req_path, account_id="acct1")
+
+    assert removed == 1
+    remaining = load_close_all_requests(req_path)
+    assert [e["account_id"] for e in remaining] == ["acct2"]
+
+
+def test_remove_close_all_requests_missing_file_returns_zero(tmp_path):
+    req_path = tmp_path / "owner_close.json"
+    assert not req_path.exists()
+
+    removed = remove_close_all_requests(req_path, account_id="acct1")
+
+    assert removed == 0
+    assert not req_path.exists()
+
+
+def test_clear_close_all_result_second_call_is_false(tmp_path):
+    p = close_all_result_path_for(str(tmp_path), "fabc")
+    write_close_all_result(p, status="completed", request_issued_at=_at(),
+                           now_s=_NOW)
+
+    first = clear_close_all_result(p)
+    second = clear_close_all_result(p)
+
+    assert first is True
+    assert second is False
+    assert not p.exists()

@@ -18,6 +18,8 @@ Hyperliquid builder-code 基礎設施 + copytrade orchestrator（Filet M1）。P
    **曾通過入金檢查**（寫入 pending 當下驗過鏈上入金，啟用時不重驗）且已簽章選定 leader
    的用戶，自動建 env（`COPY_LIVE_TRADING=true`）並啟動引擎——僅此一條路徑豁免；
    對外開放前必須重審本例外。
+   2026-09-07：owner_close 後重新選 leader 的**重新啟用**亦走此自動路徑（API 重驗
+   READY、watcher 歸檔舊 ARM 後 start），同受對外開放前重審的約束。
    ⚠️ 2026-07-30 追加：新錢包**預設不啟用任何風控**（回撤 kill switch ＋ 成本熔斷），
    由錢包主人在跟單頁自行勾選啟用。此路徑已於同日**升級為客戶簽章記錄**
    （`POST /api/me/risk/message` 取原文 → `POST /api/me/risk` 落簽章記錄 →

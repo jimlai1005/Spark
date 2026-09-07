@@ -12,6 +12,7 @@
 """
 import json
 import socket
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -21,6 +22,8 @@ from eth_account.messages import encode_defunct
 from fastapi.testclient import TestClient
 
 from spark.copytrade.notifier import RecordingNotifier
+from spark.filet.close_all import (close_all_path_for, close_all_result_path_for,
+                                   write_close_all_request, write_close_all_result)
 from spark.filet.leader_change import (LEADER_CHANGE_MAX_AGE_S,
                                        build_leader_change_message,
                                        load_leader_changes)
@@ -483,6 +486,70 @@ def test_ready_but_already_in_manifest_does_not_write_pending(tmp_path):
     assert load_pending(cfg.pending_path) == []
     # 換 leader 記錄仍然落地——本測試盯的只是 pending，不是主要動作。
     assert len(load_leader_changes(cfg.leader_changes_path)) == 1
+
+
+# ── owner_close 生命週期（2026-09-07，D2）：重新跟單補寫 pending ────────────
+# 在 manifest 但「平倉並撤銷」已由引擎收尾完成（result 標記 completed）→ 視同
+# 重新跟單，不再被舊 manifest 條目擋下——走與新客戶相同的 READY 重驗＋補寫
+# pending（真正的歸檔＋重啟是 watcher 的事，見 Task 6，本端點只負責補寫）。
+
+def test_ready_and_in_manifest_but_close_all_completed_writes_pending(tmp_path):
+    manifest = tmp_path / "followers.json"
+    manifest.write_text(json.dumps({"followers": []}))
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path, followers_path=str(manifest))
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    manifest.write_text(json.dumps({"followers": [
+        {"account_id": acct, "user_address": w.address.lower(),
+         "builder_address": BUILDER, "network": "testnet"},
+    ]}))
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    issued_at = _now_iso(-3600)
+    write_close_all_request(close_all_path_for(cfg.exchange_dir),
+                            {"account_id": acct, "issued_at": issued_at})
+    write_close_all_result(close_all_result_path_for(cfg.exchange_dir, acct),
+                           status="completed", request_issued_at=issued_at,
+                           now_s=time.time())
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is True
+    entries = load_pending(cfg.pending_path)
+    assert len(entries) == 1
+    assert entries[0]["account_id"] == acct
+
+
+def test_ready_and_in_manifest_with_uncompleted_close_all_does_not_write_pending(
+        tmp_path):
+    """對照組：有一筆「平倉並撤銷」請求但尚未收尾完成（無 result 標記）→ 仍是
+    既有行為——已在 manifest 就不寫 pending。"""
+    manifest = tmp_path / "followers.json"
+    manifest.write_text(json.dumps({"followers": []}))
+    c, cfg, store, keysvc, hl = _app_with_hl(tmp_path, followers_path=str(manifest))
+    w = Account.create()
+    acct = _login(c, store, cfg, w)
+    manifest.write_text(json.dumps({"followers": [
+        {"account_id": acct, "user_address": w.address.lower(),
+         "builder_address": BUILDER, "network": "testnet"},
+    ]}))
+    agent = c.post("/api/onboard/agent").json()["agent_address"]
+    _make_ready(hl, w.address, agent)
+
+    write_close_all_request(close_all_path_for(cfg.exchange_dir),
+                            {"account_id": acct, "issued_at": _now_iso(-3600)})
+
+    nonce = _fresh_nonce(c, w, leader=_A)
+    body = _payload(account_id=acct, leader=_A, nonce=nonce, wallet=w)
+    r = c.post("/api/leaders/select", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pending_written"] is False
+    assert load_pending(cfg.pending_path) == []
 
 
 def test_not_ready_does_not_write_pending(tmp_path):

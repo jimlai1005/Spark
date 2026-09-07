@@ -589,6 +589,13 @@ def _dashboard_close_request(exchange_dir: str, account_id: str) -> dict | None:
     return {"state": "pending"}
 
 
+def _close_all_completed(exchange_dir: str, account_id: str) -> bool:
+    """本帳號最近一筆「平倉並撤銷」請求是否已由引擎收尾完成——單一定義，供
+    `leaders_select` 補寫 pending 與 `_dashboard_status` 的 `halted` 判定共用
+    （見 `_dashboard_close_request` 的 state 語意）。"""
+    return (_dashboard_close_request(exchange_dir, account_id) or {}).get("state") == "completed"
+
+
 def _dashboard_guards(hb: "HeartbeatRead", mine, acct: dict | None,
                       leaders_path: str) -> dict:
     """設定 vs 目前三條護欄。**max** 全部取自各自的權威來源（心跳＝引擎實際套用值、
@@ -665,8 +672,13 @@ def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
             logger.error("dashboard: leader 白名單載入失敗（僅影響顯示名稱） %s",
                         leaders_path)
     tripped = (hb.data or {}).get("killswitch_tripped") if hb.fresh else None
+    close_request = _dashboard_close_request(exchange_dir, mine.account_id)
     paused, pause_unknown = _read_pause_flag(exchange_dir, mine.user_address)
-    if tripped is True:
+    # ⭐ D4（2026-09-07 裁決）：`tripped is True` 或 close_request 已 completed
+    # 都要顯示 halted——引擎在 owner_close 終態發最後一則通知後自行結束
+    # （Task 2），此後心跳必然過期（`hb.fresh` 為 False ⇒ `tripped` 讀不到），
+    # 只靠心跳判斷會讓已經停機的帳號顯示成仍在「跟單中」。
+    if tripped is True or (close_request or {}).get("state") == "completed":
         state = "halted"
     elif paused is True:
         state = "paused"
@@ -676,7 +688,7 @@ def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
     return {
         "strategy_name": strategy_name, "state": state, "following_days": None,
         "signal_source_ok": bool(hb.fresh and not pause_unknown and last_cycle_ok),
-        "close_request": _dashboard_close_request(exchange_dir, mine.account_id),
+        "close_request": close_request,
         "guards": _dashboard_guards(hb, mine, acct, leaders_path),
     }
 
@@ -2823,9 +2835,17 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         except HTTPException:
             mine, manifest_degraded = None, False
 
-        if mine is not None:
+        if mine is not None and not _close_all_completed(cfg.exchange_dir, account_id):
             pass  # 已在 manifest（已啟用過、這次只是換 leader）→ 絕不寫 pending，
             # 否則 watcher 會把他當成新客戶再走一次啟用路徑。
+            # ⭐（2026-09-07，owner_close 生命週期 D2）唯一的例外：本帳號最近一筆
+            # 「平倉並撤銷」請求已由引擎收尾完成——manifest 裡那筆是**舊**跟單的
+            # 殘跡（引擎已依 owner_close 終態自行結束，見 loop.py），這次重新選
+            # leader 在語意上是「重新跟單」而非「換 leader」。落入下面 elif/else，
+            # 與新客戶走同一條 READY 重驗＋寫 pending 路徑；watcher 收到 pending
+            # 後會先歸檔舊 ARM／高水位再 systemctl start（Task 6），不會讓一個
+            # 沒有新簽章的帳號恢復交易——這裡只是補寫 pending，套用仍需 watcher
+            # 端看到 owner_close 終態 ARM 才會動作。
         elif manifest_degraded:
             # ⭐ opus 審查 W3：manifest 有無法解析的條目時，「查無此帳號」與「這帳號
             # 就是壞掉的那筆」無法區分——不確定 ≠ 不在（工程原則 3 的危險方向）。

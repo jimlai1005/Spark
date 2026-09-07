@@ -19,6 +19,8 @@ from eth_account.messages import encode_defunct
 from fastapi.testclient import TestClient
 
 from spark.exchange.base import UserFill
+from spark.filet.close_all import (close_all_path_for, close_all_result_path_for,
+                                   write_close_all_request, write_close_all_result)
 from spark.filet.engine_health import build_heartbeat, heartbeat_path_for, write_heartbeat
 from tests.publicapi_helpers import BUILDER, login, make_app, make_cfg
 
@@ -334,6 +336,37 @@ def test_halted_when_killswitch_tripped(tmp_path):
 
     body = client.get("/api/me/dashboard").json()
     assert body["status"]["state"] == "halted"
+
+
+# ── owner_close 生命週期（2026-09-07，D4）：心跳過期時以 close_request 判 halted ──
+# 引擎在 owner_close 終態發最後一則通知後自行結束（Task 2），此後心跳必然過期
+# （`hb.fresh` 為 False ⇒ `tripped` 讀不到），只靠心跳判斷會讓已經停機的帳號
+# 顯示成仍在「跟單中」——`close_request.state == "completed"` 必須單獨也能判 halted。
+
+def test_halted_when_close_request_completed_even_if_heartbeat_stale(tmp_path):
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    write_hb(cfg, acct(wallet), age_s=700)  # > HEARTBEAT_STALE_S（600）→ 過期
+    issued_at = "2026-09-01T00:00:00+00:00"
+    write_close_all_request(close_all_path_for(cfg.exchange_dir),
+                            {"account_id": acct(wallet), "issued_at": issued_at})
+    write_close_all_result(close_all_result_path_for(cfg.exchange_dir, acct(wallet)),
+                           status="completed", request_issued_at=issued_at,
+                           now_s=time.time())
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["status"]["state"] == "halted"
+    assert body["status"]["close_request"] == {"state": "completed"}
+
+
+def test_following_when_heartbeat_fresh_not_tripped_and_no_close_request(tmp_path):
+    """對照組（既有行為）：心跳新鮮、未 tripped、也沒有平倉並撤銷請求 →
+    following。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    write_hb(cfg, acct(wallet))
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["status"]["state"] == "following"
+    assert body["status"]["close_request"] is None
 
 
 def test_missing_heartbeat_signal_source_not_ok_but_state_still_following(tmp_path):

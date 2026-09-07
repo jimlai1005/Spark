@@ -258,6 +258,34 @@ def write_close_all_result(path: str | Path, *, status: str,
     }, mode=0o644)
 
 
+def remove_close_all_requests(path: str | Path, *, account_id: str) -> int:
+    """從 `owner_close.json` 移除該帳號的全部請求，回傳移除筆數；檔不存在或
+    該帳號無請求 → 0（不觸碰檔案）。**供 watcher 重新啟用時清空舊請求使用**
+    （Task 6：owner_close 終態帳號重新跟單時，歸檔舊 ARM 前先清乾淨舊的一次性
+    請求，避免殘留的已消耗請求被誤讀為「還有待處理」）。原子寫回（同
+    `write_close_all_request` 的 tmp+replace 慣例）。
+    """
+    p = Path(path)
+    entries = load_close_all_requests(p)
+    keep = [e for e in entries if e.get("account_id") != account_id]
+    removed = len(entries) - len(keep)
+    if removed == 0:
+        return 0
+    write_json_atomic(p, {"requests": keep}, mode=0o644)
+    return removed
+
+
+def clear_close_all_result(result_path: str | Path) -> bool:
+    """刪除 result 標記檔；不存在 → False（同 `remove_close_all_requests`，
+    供 watcher 重新啟用時清掉舊的 expired/completed 標記，讓新一輪跟單不會
+    被誤讀成「仍有舊結果」）。"""
+    p = Path(result_path)
+    if not p.exists():
+        return False
+    p.unlink()
+    return True
+
+
 def read_close_all_result(path: str | Path) -> dict | None:
     """讀 result 標記；不存在或讀取/格式失敗 → `None`（**顯示層**：API 端呼叫，
     讀不到就是「還沒有結果」，不是錯誤——沿 `_read_pause_flag` 顯示層的既有方向，

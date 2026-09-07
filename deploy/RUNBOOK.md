@@ -1457,45 +1457,49 @@ cat $FILET_EXCHANGE_DIR/<user_address>/pause.json   # 目前的暫停狀態
 **只在有新請求時被覆寫**，不會自己過期，所以「已處理過的殘留」與「客戶從未
 重簽過」在檔案系統上分得清楚——這正是本節第 4 步要清乾淨它的原因。
 
-#### owner 收尾後的人工 re-arm 程序
+#### owner 收尾後：引擎自行結束與自動重新啟用（2026-09-07 改版）
 
-平倉並撤銷完成後，該 follower 的引擎會**永久停在 tripped 狀態**，直到 operator
-人工介入。標準程序（**只有客戶明確要求恢復跟單時才做**，否則保持停機）：
+⭐ 平倉並撤銷完成後，引擎**不再永久停在 tripped 狀態等 operator 手動 re-arm**。
+ARM payload 為 `reason=owner_close, phase=complete`（`killswitch.owner_close_terminal()`
+判定）時，引擎發最後一則 critical（撤單張數、平倉張數；若有殘留暴險——`failures`／
+`orders_not_cancelled` 非空——會在同一則訊息中明列，並註明「剩餘小額部位請用戶
+自行至 Hyperliquid 收尾」，本站不代為處理）後，`main_loop` 正常返回（exit 0）。
+unit 是 `Restart=on-failure`，不會被拉起，systemd 顯示 `inactive`，不再每 15
+分鐘重複告警。
+
+⭐ **重新跟單是全自動路徑，operator 不需要手動刪任何檔**：
+
+1. 客戶在站上重新選定 leader 並簽章（`leaders_select`）。API 端偵測到該帳號的
+   `close_all_result` 標記為 `completed` 即視同新客戶（`_close_all_completed`
+   helper），照 READY 流程重驗授權與入金後補寫 pending。若客戶已在 Hyperliquid
+   移除了 API wallet 導致 READY 不過，畫面會回到 onboarding 重新授權，
+   `onboard_verify` 通過後同樣寫 pending，走同一條 watcher 路徑，不需要另外的
+   人工分支。
+2. auto-activate watcher 看到 pending 帳號已在 manifest、state 目錄有終態 ARM、
+   且客戶已有新簽章 leader，便呼叫 `archive_owner_close()` 把 ARM、全期高水位、
+   權益樣本一起搬進 `<state_root>/var/copytrade/owner_close_archive/<tripped_at>/`
+   （歸檔，不是刪除——新一輪跟單＝新基準），接著呼叫
+   `remove_close_all_requests()` 清掉 `owner_close.json` 裡該帳號的請求條目、
+   `clear_close_all_result()` 清 result 標記檔，最後 `systemctl start` 重啟引擎。
+3. 引擎本次啟動看到歸檔目錄非空，會發一則 warn 提示「先前曾平倉並撤銷 N 次，
+   記錄已歸檔，本次為新一輪跟單」，避免客戶或 operator 誤以為是同一輪跟單延續。
+
+⚠️ **唯一仍需人工介入的情況**：ARM phase 停在 `flatten_in_progress`（收尾中途
+崩潰，不是終態，`owner_close_terminal()` 會回 None）——先人工檢查該帳戶實際
+持倉／掛單狀態，確認安全後再刪 ARM 檔並重啟，同其餘 kill switch 路徑的既有
+re-arm 慣例。
+
+**排障**：
 
 ```bash
-# 1. 確認 ARM payload 確實是 owner_close（不是誤觸別的熔斷路徑）
-cat /opt/filet/state/<account_id>/var/copytrade/killswitch.tripped
-# 應看到 "reason": "owner_close"
-
-# 2. 確認客戶真的要恢復（他已經簽過一次「不可逆」的平倉並撤銷——多數情況下
-#    正確的下一步是引導他重新走一次 onboarding，而不是恢復這顆舊引擎）。
-
-# 3. 若確定要恢復同一顆引擎：刪 ARM 檔（同其餘 kill switch 路徑的既有 re-arm 慣例）
-sudo -u filet-engine rm /opt/filet/state/<account_id>/var/copytrade/killswitch.tripped
-sudo systemctl restart filet-follower@<account_id>   # 非必要，但建議乾淨重啟一次
-
-# 4. 清掉這個帳號在 owner_close.json 的請求條目與 result 標記檔（見上方「result
-#    標記檔」說明）——不清的話，/api/me/dashboard 的 status.close_request 會
-#    永遠停在 completed，客戶若之後又走一次 onboarding、重新開始跟單，畫面上
-#    仍會顯示「已完成平倉並撤銷」的舊痕跡，混淆這是不是同一顆引擎的新狀態。
-sudo -u filet-api /opt/filet/spark/.venv/bin/python - <<'EOF'
-import json
-from pathlib import Path
-from spark.filet.close_all import close_all_path_for, close_all_result_path_for
-
-exchange_dir = "/opt/filet/exchange"  # 換成實際 FILET_EXCHANGE_DIR
-account_id = "<account_id>"           # 換成實際 account_id
-
-p = Path(close_all_path_for(exchange_dir))
-if p.exists():
-    doc = json.loads(p.read_text())
-    doc["requests"] = [r for r in doc.get("requests", [])
-                        if r.get("account_id") != account_id]
-    p.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
-
-Path(close_all_result_path_for(exchange_dir, account_id)).unlink(missing_ok=True)
-EOF
+# 查某帳號的 owner_close 歷史（每個子目錄是一次 killswitch.tripped payload 的歸檔快照）
+ls /opt/filet/state/<account_id>/var/copytrade/owner_close_archive/
 ```
+
+對一個仍有終態 ARM（`reason=owner_close, phase=complete`）的帳號手動
+`systemctl start filet-follower@<account_id>`（例如誤觸或排查用）是安全的：引擎
+只會再跑一輪、再發一次終態通知後退出，不會誤開新倉——這是預期的 fail-closed
+行為，不是 bug。
 
 ⚠️ **前端指引卡不代發鏈上撤銷**（plan 0.2 明文，v1 範圍）：客戶頁面在收尾完成
 （`status.state == "halted"`）後只顯示「請至 Hyperliquid 官方介面移除 API wallet」

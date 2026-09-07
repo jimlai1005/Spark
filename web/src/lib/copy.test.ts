@@ -84,6 +84,15 @@ describe("i18n（Task 2：雙語 copy 基礎）", () => {
     expect(offenders, `含 CJK 字元的 en 文案: ${offenders.join(" | ")}`).toEqual([]);
   });
 
+  it("closeAllDone.steps 提示重新跟單方式（owner_close 生命週期收尾）", () => {
+    expect(COPY_ZH.dashboard.status.closeAllDone.steps).toContain(
+      "想再次跟單：到探索頁選定交易員並簽章即可，系統會自動重新啟用（先前的平倉紀錄會保留歸檔）",
+    );
+    expect(COPY_EN.dashboard.status.closeAllDone.steps).toContain(
+      "To follow again: pick a trader on Explore and sign — the engine restarts automatically (your previous close-out stays on record).",
+    );
+  });
+
   it("useCopy 在 setLang(\"en\") 後回傳英文字典", async () => {
     // 檔案為 .ts（非 .tsx），改用 React.createElement 避免 JSX 需要 .tsx 副檔名。
     function Probe() {
