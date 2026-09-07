@@ -262,14 +262,15 @@ def owner_close_terminal(root: Path) -> dict | None:
     （`failures`／`orders_not_cancelled`）不影響終態本身，只影響 `residual` 這個鍵。
 
     ⭐ `tripped_s`（第二輪審查 C1，2026-09-08）：供 `CloseAllApplier.consume`
-    與 auto-activate watcher 判定「這份請求／簽章是否晚於這次 owner_close」，
-    重用 `_read_arm_payload`（本模組唯一的 ARM 解析點）取得 epoch——**不再造
-    第二個 `fromisoformat` 解析點**。`_read_arm_payload` 本身不拒 naive（無時區）
-    時間戳（它把 naive 當本地時間換算 epoch，這是它既有、別的呼叫端依賴的行為，
-    不得改），所以這裡拿到它的結果後**另外**檢查 `tzinfo is None`：naive 一律
-    視同「讀不出」，`tripped_s=None`——把 naive 字串當 UTC（或任何固定時區）
-    是一個看不見的假設，錯的方向會讓「簽在熔斷前」的重放請求被誤判成「晚於
-    熔斷」（fail-open）。`tripped_at` 缺漏、非字串或解析失敗（`_read_arm_payload`
+    與 auto-activate watcher 判定「這份請求／簽章是否晚於這次 owner_close」。
+    epoch 取自 `_read_arm_payload`（本模組唯一的 ARM 解析點），此處只**另外**
+    檢查 tzinfo（S1，2026-09-08 第三輪審查：措辭修正——`_read_arm_payload`
+    本身不拒 naive（無時區）時間戳，它把 naive 當本地時間換算 epoch，這是
+    它既有、別的呼叫端依賴的行為，不得改；本函式拿到它的結果後才另外判斷
+    `tzinfo is None`，不是「造第二個解析點」）：naive 一律視同「讀不出」，
+    `tripped_s=None`——把 naive 字串當 UTC（或任何固定時區）是一個看不見的
+    假設，錯的方向會讓「簽在熔斷前」的重放請求被誤判成「晚於熔斷」
+    （fail-open）。`tripped_at` 缺漏、非字串或解析失敗（`_read_arm_payload`
     回 None）同樣 → `tripped_s=None`。
     """
     arm_path = root / ARM_FILE_RELPATH
@@ -301,26 +302,31 @@ def last_owner_close_s(root: Path) -> float | None:
     close_all 請求（殘留未清、或被重放）早已被那次收尾消化過，不該再觸發
     一次新的收尾（那會讓一份舊簽章意外平掉新一輪的部位）。
 
-    取 `owner_close_history(root)` 排序後的最後一筆（已依 payload 的 `tripped_at`
-    排序，見該函式 S2）；缺該欄位、非字串、naive（無時區，理由同
-    `owner_close_terminal` 的 `tripped_s`）或解析失敗 → `None`（fail-closed：
+    取 `owner_close_history(root)`**所有可解析（aware）條目**的最大 epoch
+    （W2/W3，2026-09-08 第三輪審查）——不是只看排序後的最後一筆：目錄名／
+    payload 內容都可能被手動操作或衝突後綴打亂，若只挑最後一筆而那一筆恰好
+    `tripped_at` 壞掉（naive、非字串、解析失敗），會整個回 `None`，白白丟掉
+    其他筆仍然合法可用的歷史；改成掃全部、取可解析者的最大值，單一筆壞掉
+    不擋其餘歷史提供的保護。每筆的判定條件不變：缺該欄位、非字串、naive
+    （無時區，理由同 `owner_close_terminal` 的 `tripped_s`）或解析失敗 →
+    該筆略過不計入。一筆都算不出（或無歸檔目錄）→ `None`（fail-closed：
     判不出「上一次收尾在何時」就不擋這筆請求，交給既有的驗章與
     `is_tripped` 短路把關，不會因為這條新檢查而多放行任何東西）。
-    無歸檔目錄（從未 owner_close 過）→ `None`。
     """
     hist = owner_close_history(root)
-    if not hist:
-        return None
-    tripped_at = hist[-1].get("tripped_at")
-    if not isinstance(tripped_at, str) or not tripped_at:
-        return None
-    try:
-        dt = datetime.fromisoformat(tripped_at)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        return None
-    return dt.timestamp()
+    epochs: list[float] = []
+    for entry in hist:
+        tripped_at = entry.get("tripped_at")
+        if not isinstance(tripped_at, str) or not tripped_at:
+            continue
+        try:
+            dt = datetime.fromisoformat(tripped_at)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            continue
+        epochs.append(dt.timestamp())
+    return max(epochs) if epochs else None
 
 
 def archive_owner_close(root: Path, *, now: datetime | None = None) -> Path:
@@ -382,12 +388,24 @@ def owner_close_history(root: Path) -> list[dict]:
 
     讀不到（JSON 壞掉、非 dict）的子目錄略過，不擋其餘筆數。
     `OWNER_CLOSE_ARCHIVE_RELPATH` 目錄本身不存在 → `[]`（從未 owner_close 過）。
+
+    ⚠️ W2/W3（第三輪審查 2026-09-08）：`iterdir()` 與每個子目錄的 `read_text()`
+    各自接 `OSError` 並略過——`base_dir.exists()` 為真之後，目錄仍可能在
+    `iterdir()` 當下變成不可讀（權限變更、掛載脫落等競態），一顆掛掉的
+    `OSError` 不該讓整份歷史清單直接 raise（本函式是 fail-safe 的顯示/判斷
+    輔助，不是安全閘門本身）；`iterdir()` 失敗 → 視同讀不到任何歷史，回
+    `[]`（與目錄不存在同一個結果，呼叫端不需要區分兩者）。單一子目錄的
+    `read_text()` 失敗則維持既有行為：只略過那一筆，不擋其餘。
     """
     base_dir = root / OWNER_CLOSE_ARCHIVE_RELPATH
     if not base_dir.exists():
         return []
+    try:
+        subdirs = sorted(base_dir.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
     history: list[dict] = []
-    for sub in sorted(base_dir.iterdir(), key=lambda p: p.name):
+    for sub in subdirs:
         if not sub.is_dir():
             continue
         arm_path = sub / ARM_FILE_RELPATH.name

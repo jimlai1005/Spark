@@ -1072,6 +1072,64 @@ def test_archive_owner_close_arm_stays_when_samples_rename_fails(tmp_path, monke
     assert owner_close_terminal(tmp_path) is not None
 
 
+# ── Task 12（第三輪審查修正 2026-09-08）──────────────────────────────────
+
+def test_last_owner_close_s_falls_back_to_previous_when_last_entry_is_naive(tmp_path):
+    """⭐ W2/W3：`last_owner_close_s` 改取所有可解析（aware）條目的最大 epoch，
+    不是只看最後一筆——最後一筆 `tripped_at` 是 naive（無時區），前一筆合法，
+    仍要回前一筆的 epoch，不能整個判 None。"""
+    base = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH
+    early, now = _hours_ago(2)
+    (base / "a-valid").mkdir(parents=True)
+    (base / "a-valid" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": early, "reason": "owner_close"}))
+    (base / "b-naive").mkdir(parents=True)
+    (base / "b-naive" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": "2026-09-01T00:00:00", "reason": "owner_close"}))
+
+    assert last_owner_close_s(tmp_path) == pytest.approx(now - 2 * 3600)
+
+
+def test_owner_close_history_unreadable_archive_dir_returns_empty(tmp_path, monkeypatch):
+    """⭐ W2/W3：歸檔子目錄不可讀（`iterdir()` 拋 `OSError`）→ 略過不 raise，
+    回 `[]`（fail-safe：本函式是顯示/判斷輔助，不是安全閘門）。"""
+    base = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH
+    base.mkdir(parents=True)
+    (base / "x").mkdir()
+
+    def _boom_iterdir(self):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "iterdir", _boom_iterdir)
+
+    assert owner_close_history(tmp_path) == []
+
+
+def test_owner_close_history_skips_entry_when_read_text_raises_oserror(tmp_path, monkeypatch):
+    """⭐ W2/W3：單一歸檔子目錄的 `read_text()` 拋 `OSError`（不是 JSON 壞掉）
+    → 只略過那一筆，不擋其餘筆數、不 raise。"""
+    base = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH
+    at, _ = _hours_ago(1)
+    (base / "broken").mkdir(parents=True)
+    broken_arm = base / "broken" / ARM_FILE_RELPATH.name
+    broken_arm.write_text(json.dumps({"tripped_at": at, "reason": "owner_close"}))
+    (base / "ok").mkdir(parents=True)
+    (base / "ok" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": at, "reason": "owner_close"}))
+
+    real_read_text = Path.read_text
+
+    def _maybe_boom(self, *a, **kw):
+        if self == broken_arm:
+            raise OSError("io error")
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", _maybe_boom)
+
+    hist = owner_close_history(tmp_path)
+    assert len(hist) == 1
+
+
 def test_owner_close_history_sort_handles_non_string_tripped_at(tmp_path):
     """W4：`tripped_at` 若被手改成非字串型別（例如數字），排序 key 不得因為
     「跨型別比較」raise TypeError——非字串一律視同缺欄位、排最前；正常的字串

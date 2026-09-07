@@ -258,12 +258,23 @@ def write_close_all_result(path: str | Path, *, status: str,
     }, mode=0o644)
 
 
-def remove_close_all_requests(path: str | Path, *, account_id: str) -> int:
-    """從 `owner_close.json` 移除該帳號的全部請求，回傳移除筆數；檔不存在或
+def remove_close_all_requests(path: str | Path, *, account_id: str,
+                              issued_on_or_before_s: float | None = None) -> int:
+    """從 `owner_close.json` 移除該帳號的請求，回傳移除筆數；檔不存在或
     該帳號無請求 → 0（不觸碰檔案）。**供 watcher 重新啟用時清空舊請求使用**
     （Task 6：owner_close 終態帳號重新跟單時，歸檔舊 ARM 前先清乾淨舊的一次性
     請求，避免殘留的已消耗請求被誤讀為「還有待處理」）。原子寫回（同
     `write_close_all_request` 的 tmp+replace 慣例）。
+
+    `issued_on_or_before_s`（Task 12 C1，2026-09-08 第三輪審查）：非 `None`
+    時**只移除** `issued_at` 早於或等於這個 epoch 秒的請求——`issued_at`
+    缺漏或解析失敗（`parse_issued_at` 拋 `LeaderChangeError`）的條目也一併
+    移除（那種條目永遠驗不過，留著只會讓引擎每輪重複告警，清掉沒有損失）。
+    晚於這個時間的請求**保留原位**：那代表用戶在這次 owner_close **之後**
+    又重新簽了一筆新的「平倉並撤銷」請求，是這一輪重新跟單期間的新意圖，
+    watcher 清理舊記錄時不得把它一併刪掉（否則客戶剛簽的請求會憑空消失，
+    引擎永遠不會處理它）。`None` 時行為不變（沿舊語意：全刪該帳號的請求，
+    供不需要時間判斷的呼叫端使用）。
 
     ⚠️ 2026-09-07 審查 W3a／S3（2026-09-08 第二輪審查補充措辭）：呼叫端是 root
     的 auto-activate watcher，寫回這個目錄時帶 `owner_ids=dir_owner_ids(p.parent)`
@@ -277,7 +288,19 @@ def remove_close_all_requests(path: str | Path, *, account_id: str) -> int:
     """
     p = Path(path)
     entries = load_close_all_requests(p)
-    keep = [e for e in entries if e.get("account_id") != account_id]
+
+    def _should_remove(e: dict) -> bool:
+        if e.get("account_id") != account_id:
+            return False
+        if issued_on_or_before_s is None:
+            return True
+        try:
+            issued_s = parse_issued_at(e.get("issued_at")).timestamp()
+        except LeaderChangeError:
+            return True  # 缺漏／解析失敗：永遠驗不過，清掉沒有損失
+        return issued_s <= issued_on_or_before_s
+
+    keep = [e for e in entries if not _should_remove(e)]
     removed = len(entries) - len(keep)
     if removed == 0:
         return 0

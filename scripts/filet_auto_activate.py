@@ -371,8 +371,11 @@ def _chown_tree(root: Path, owner: str, group: str) -> None:
         os.chown(p, uid, gid, follow_symlinks=False)
 
 
-def _cleanup_close_all(exchange_dir: str, account_id: str, notifier: Notifier) -> None:
-    """清掉該帳號舊的一次性 close_all 請求與 result 標記（第二輪審查 S1/W2）。
+def _cleanup_close_all(exchange_dir: str, account_id: str, notifier: Notifier, *,
+                       issued_on_or_before_s: float | None,
+                       clear_request: bool) -> None:
+    """清掉該帳號舊的一次性 close_all 請求與 result 標記（第二輪審查 S1/W2；
+    Task 12 C1 補上「不得刪用戶的新請求」）。
 
     共用給兩個呼叫端：owner_close 重新啟用分支，以及通用的
     `phase == "starting"` 復原分支（後者涵蓋「歸檔已完成、cleanup 尚未跑完
@@ -380,27 +383,45 @@ def _cleanup_close_all(exchange_dir: str, account_id: str, notifier: Notifier) -
     下一輪會落在通用復原分支而不是重新啟用分支，若那裡不清，殘留的
     `completed` 標記會讓 dashboard／API 一直誤判成 halted）。
 
+    `clear_request`：只有重新啟用分支傳 `True`——那個分支剛用
+    `owner_close_terminal` 證明了「這次收尾已完成」，才有資格清請求檔；
+    通用復原分支沒有「這筆請求已被這次收尾消化」的證據（ARM 可能早已不在，
+    也可能根本沒發生過 owner_close），**不得**碰請求檔，只清 result 標記。
+    `issued_on_or_before_s`：重新啟用分支傳 `terminal["tripped_s"]`——只清掉
+    簽在這次 owner_close **之前**（含缺漏／解析失敗）的舊請求；用戶在這次
+    收尾之後又重新簽的新請求必須保留，交給引擎正常消化（`clear_request=False`
+    時本參數不生效）。
+
     不清的話，殘留標記會讓 `publicapi.app._close_all_completed` 對新一輪
     跟單誤判為仍是 halted。兩步各自 try/except、**各自獨立的 dedup_key**
     （S1：不共用同一把——共用會讓「請求清除失敗」的告警被「標記清除失敗」的
     告警 dedup 掉，反之亦然，兩種失敗會互相消音）。失敗只降級成告警，
     **不得**擋掉呼叫端接下來的 `systemctl start`（W2：啟動是主要動作，殘留
     標記只影響顯示與 dashboard 判讀，不是安全性動作）。
+
+    ⚠️ W1（Task 12 第三輪審查）：兩個 try 各自接
+    `(OSError, ValueError, TypeError, AttributeError)`——單接 `OSError` 太窄，
+    `owner_close.json` 若被手改成非 JSON 內容，`load_close_all_requests` 會
+    拋 `json.JSONDecodeError`（`ValueError` 子類）而不是 `OSError`，原本會
+    直接冒出未捕捉例外讓整個 `process_entry` 失敗、擋掉 `systemctl start`——
+    與本函式「清理失敗只降級告警、絕不擋啟動」的方向相反。
     """
-    try:
-        remove_close_all_requests(close_all_path_for(exchange_dir),
-                                  account_id=account_id)
-    except OSError as e:
-        notifier.critical(
-            "auto-activate",
-            f"account={account_id} 清除舊 close_all 請求失敗：{e}——"
-            f"引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不一致，"
-            f"需人工檢查 {close_all_path_for(exchange_dir)}",
-            dedup_key=f"auto-activate:refollow-cleanup-request:{account_id}")
+    if clear_request:
+        try:
+            remove_close_all_requests(
+                close_all_path_for(exchange_dir), account_id=account_id,
+                issued_on_or_before_s=issued_on_or_before_s)
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            notifier.critical(
+                "auto-activate",
+                f"account={account_id} 清除舊 close_all 請求失敗：{e}——"
+                f"引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不一致，"
+                f"需人工檢查 {close_all_path_for(exchange_dir)}",
+                dedup_key=f"auto-activate:refollow-cleanup-request:{account_id}")
     try:
         clear_close_all_result(
             close_all_result_path_for(exchange_dir, account_id))
-    except OSError as e:
+    except (OSError, ValueError, TypeError, AttributeError) as e:
         notifier.critical(
             "auto-activate",
             f"account={account_id} 清除舊 close_all result 標記失敗："
@@ -497,8 +518,13 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
             # 清掉舊的一次性 close_all 請求與 result 標記（S1/W2，見
             # `_cleanup_close_all`）：不清的話，殘留的「已完成」標記會讓
             # dashboard／API 對這一輪新的跟單誤判為仍是 halted（見
-            # publicapi.app._close_all_completed）。
-            _cleanup_close_all(exchange_dir, account_id, notifier)
+            # publicapi.app._close_all_completed）。clear_request=True＋
+            # issued_on_or_before_s=terminal["tripped_s"]（Task 12 C1）：
+            # 只清簽在這次收尾之前的舊請求，用戶在收尾之後又重新簽的新請求
+            # 保留原位，交給引擎正常消化。
+            _cleanup_close_all(exchange_dir, account_id, notifier,
+                               issued_on_or_before_s=not_before_s,
+                               clear_request=True)
             run_cmd(start_cmd, check=True)
             state.set_phase(account_id, "started")
             # manifest 裡的 leader 若與新簽章不同，由引擎自己的
@@ -545,8 +571,11 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
             # 重新啟用若恰好在 ARM 已歸檔、cleanup 尚未跑完前崩潰，下一輪會
             # 落在這個通用復原分支（此時 ARM 已不在，owner_close_terminal
             # 判 None，不會再走重新啟用分支），不清的話 dashboard／API 會
-            # 一直誤判成 halted。
-            _cleanup_close_all(exchange_dir, account_id, notifier)
+            # 一直誤判成 halted。clear_request=False（Task 12 C1）：這個分支
+            # 沒有「這筆請求已被這次收尾消化」的證據（ARM 可能根本不是因
+            # owner_close 而消失），只清 result 標記、不碰請求檔。
+            _cleanup_close_all(exchange_dir, account_id, notifier,
+                               issued_on_or_before_s=None, clear_request=False)
             run_cmd(start_cmd, check=True)
             state.set_phase(account_id, "started")
             remove_pending_entry(pending_path, account_id)

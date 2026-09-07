@@ -851,7 +851,11 @@ def test_starting_phase_resume_also_clears_leftover_close_all_result(site):
     """⭐ W2/S1（第二輪審查）：owner_close 重新啟用若恰好在 ARM 已歸檔、
     cleanup 尚未跑完前崩潰，下一輪會落在通用的 `phase == "starting"` 復原
     分支（此時 ARM 已不在，`owner_close_terminal` 判 None）——這個分支也要
-    清掉殘留的 close_all result 標記，否則 dashboard 會一直誤判成 halted。"""
+    清掉殘留的 close_all result 標記，否則 dashboard 會一直誤判成 halted。
+
+    ⭐ Task 12 C1 補斷言：這個分支沒有「這筆請求已被這次收尾消化」的證據
+    （`clear_request=False`），請求檔內該帳號的請求必須維持原樣，只清 result
+    標記。"""
     from scripts.filet_auto_activate import WatcherState
 
     site.put_in_manifest()
@@ -860,9 +864,54 @@ def test_starting_phase_resume_also_clears_leftover_close_all_result(site):
     result_path = close_all_result_path_for(site.exchange, site.account_id)
     write_close_all_result(result_path, status="completed",
                            request_issued_at=_at(), now_s=_NOW)
+    req_path = close_all_path_for(site.exchange)
+    write_close_all_request(req_path, {
+        "account_id": site.account_id, "nonce": "leftover",
+        "issued_at": _at()})
 
     assert site.run() == 0
     assert site.last_result() == "healed_started"
     assert site.calls == [["systemctl", "start",
                            f"filet-follower@{site.account_id}"]]
     assert not result_path.exists()
+    remaining = load_close_all_requests(req_path)
+    assert [r["account_id"] for r in remaining] == [site.account_id]
+
+
+def test_reactivation_keeps_close_all_request_signed_after_tripped_at(site):
+    """⭐ Task 12 C1：`owner_close.json` 有一筆簽在 `tripped_at` **之後**的新
+    請求（用戶重新跟單期間又簽了一次「平倉並撤銷」）→ 重新啟用清理舊請求
+    時不得連這筆一起刪掉，重啟後仍在檔內，留給引擎自己消化。"""
+    site.put_in_manifest()
+    site.write_owner_close_arm(tripped_at=_at(-3600))
+    req_path = close_all_path_for(site.exchange)
+    write_close_all_request(req_path, {
+        "account_id": site.account_id, "nonce": "new-one",
+        "issued_at": _at(100)})  # 晚於 tripped_at
+    site.sign_change(leader=_LEADER, issued_at=_at())
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    remaining = load_close_all_requests(req_path)
+    assert [r["account_id"] for r in remaining] == [site.account_id]
+    assert remaining[0]["nonce"] == "new-one"
+
+
+def test_reactivation_continues_start_when_close_all_file_is_malformed_json(site):
+    """⭐ Task 12 W1：`owner_close.json` 被寫入非 JSON 內容 → `load_close_all_requests`
+    冒出 `json.JSONDecodeError`（`ValueError` 子類，不是 `OSError`）——
+    `_cleanup_close_all` 的例外清單原本只接 `OSError` 太窄，這種壞檔會直接冒出
+    未捕捉例外，讓整個 `process_entry` 失敗、擋掉 `systemctl start`。"""
+    site.put_in_manifest()
+    site.write_owner_close_arm()
+    site.sign_change(leader=_LEADER)
+    req_path = close_all_path_for(site.exchange)
+    Path(req_path).write_text("{ 不是合法 JSON")
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    assert site.calls == [["systemctl", "start",
+                           f"filet-follower@{site.account_id}"]]
+    crits = site.crits()
+    assert len(crits) == 1
+    assert "清除舊 close_all 請求失敗" in crits[0][2]

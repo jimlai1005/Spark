@@ -254,5 +254,17 @@ elif is_tripped(state_root):
 - **W4 排序型別安全**：`owner_close_history` 排序 key 改 `(isinstance(t, str), t if isinstance(t, str) else "")`；測試：一筆 `tripped_at` 為數字＋一筆缺欄位＋一筆正常 → 不 raise、正常者排最後。
 - **S3**：`close_all.py` `remove_close_all_requests` 的 owner_ids 註解改為「維持權限拓撲不漂移（tmp+replace 只需目錄寫權，root 擁有的目標檔不會擋 filet-api 覆寫；還原 owner 是為了與 pending.py 慣例一致、避免 ls 看起來像被誰改過）」。
 
+### Task 12 @inline：第三輪審查修正（2026-09-08）
+
+**Files:** `src/spark/filet/close_all.py`、`tests/test_close_all_result_marker.py`、`scripts/filet_auto_activate.py`、`tests/test_filet_auto_activate.py`、`src/spark/copytrade/killswitch.py`、`tests/test_copy_killswitch.py`
+
+- **C1 不得刪用戶的新請求**：
+  - `remove_close_all_requests(path, *, account_id, issued_on_or_before_s: float | None = None) -> int`：`issued_on_or_before_s` 非 None 時**只移除** `parse_issued_at(issued_at).timestamp() <= issued_on_or_before_s` 的請求；`issued_at` 缺漏或解析失敗（`LeaderChangeError`）的也移除（永遠驗不過、留著只會每輪告警）；晚於該時間的**保留**。None 時行為同現在（全刪）。
+  - `_cleanup_close_all(exchange_dir, account_id, notifier, *, issued_on_or_before_s: float | None, clear_request: bool)`：`clear_request=False` 只清 result 標記。重新啟用分支呼叫 `clear_request=True, issued_on_or_before_s=terminal["tripped_s"]`；`phase == "starting"` 復原分支呼叫 `clear_request=False`（沒有「已消化」證據，不碰請求）。
+  - 測試：(a) `remove_close_all_requests` 帶 `issued_on_or_before_s`：一筆早於、一筆晚於 → 只刪早的；(b) 重新啟用分支：`owner_close.json` 有一筆簽在 tripped_at 之後的新請求 → 重啟後仍在檔內；(c) phase=starting 復原分支：請求檔內該帳號的請求仍在、result 標記被清（改既有 `test_starting_phase_resume_also_clears_leftover_close_all_result` 補斷言）。
+- **W1 例外太窄**：`_cleanup_close_all` 兩個 try 改接 `(OSError, ValueError, TypeError, AttributeError)`；測試：`owner_close.json` 寫入非 JSON 內容 → 重新啟用仍 `reactivated`、start 被呼叫、critical 一則。
+- **W2/W3 `owner_close_history`／`last_owner_close_s` 韌性**：`owner_close_history` 對 `iterdir()` 與每個子目錄的 `read_text()` 各自接 `OSError` 並略過（iterdir 失敗 → `[]`）；`last_owner_close_s` 改取**所有可解析（aware）條目的最大 epoch**，沒有可解析的 → None。測試：最後一筆 `tripped_at` 為 naive、前一筆合法 → 回前一筆的 epoch；歸檔子目錄不可讀（monkeypatch `Path.read_text` raise OSError）→ 略過不 raise。
+- **S1 docstring**：`owner_close_terminal` 的說明改為「epoch 取自 `_read_arm_payload`，此處只另外檢查 tzinfo」，不再宣稱「不再造第二個解析點」。
+
 ## 狀態
-- 2026-09-07：plan 完成，使用者確認（D1 改為殘留暴險也結束）。Task 1–8 完成並 commit（4966cfc、fe2b166、22e895b）；reviewer 一輪 → Task 10 修正（2d11ab7）；第二輪 reviewer → Task 11 修正完成（2026-09-08，全套 2860 passed）→ 第三輪複審。
+- 2026-09-07：plan 完成，使用者確認（D1 改為殘留暴險也結束）。Task 1–8 完成並 commit（4966cfc、fe2b166、22e895b）；reviewer 一輪 → Task 10 修正（2d11ab7）；第二輪 reviewer → Task 11 修正完成（2026-09-08，全套 2860 passed）→ 第三輪複審 → Task 12 修正完成（2867 passed）→ 第四輪增量複審。

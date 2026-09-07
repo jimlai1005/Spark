@@ -179,6 +179,44 @@ def test_remove_close_all_requests_missing_file_returns_zero(tmp_path):
     assert not req_path.exists()
 
 
+# ── issued_on_or_before_s（Task 12 C1：不得刪用戶的新請求）───────────────
+
+def test_remove_close_all_requests_only_removes_entries_on_or_before_cutoff(tmp_path):
+    """一筆早於 cutoff（已被上一次收尾消化）、一筆晚於 cutoff（用戶重新跟單後
+    又簽的新請求）→ 只刪早的，晚的留在檔內；另一帳號的請求不受影響。"""
+    req_path = tmp_path / "owner_close.json"
+    req_path.write_text(json.dumps({"requests": [
+        {"account_id": "acct1", "nonce": "old", "issued_at": _at(-100)},
+        {"account_id": "acct1", "nonce": "new", "issued_at": _at(100)},
+        {"account_id": "acct2", "nonce": "other", "issued_at": _at(-100)},
+    ]}))
+    cutoff = _NOW - 50  # 早於 cutoff 的那筆 issued_at = _NOW-100 <= cutoff
+
+    removed = remove_close_all_requests(req_path, account_id="acct1",
+                                        issued_on_or_before_s=cutoff)
+
+    assert removed == 1
+    remaining = load_close_all_requests(req_path)
+    assert [(e["account_id"], e["nonce"]) for e in remaining] == [
+        ("acct1", "new"), ("acct2", "other")]
+
+
+def test_remove_close_all_requests_cutoff_removes_missing_or_unparseable_issued_at(tmp_path):
+    """`issued_at` 缺漏或格式壞掉的條目在有 cutoff 時也一併移除——那種條目
+    永遠驗不過，留著只會讓每輪重複告警。"""
+    req_path = tmp_path / "owner_close.json"
+    req_path.write_text(json.dumps({"requests": [
+        {"account_id": "acct1", "nonce": "no-ts"},
+        {"account_id": "acct1", "nonce": "bad-ts", "issued_at": "not-a-timestamp"},
+    ]}))
+
+    removed = remove_close_all_requests(req_path, account_id="acct1",
+                                        issued_on_or_before_s=_NOW)
+
+    assert removed == 2
+    assert load_close_all_requests(req_path) == []
+
+
 def test_clear_close_all_result_second_call_is_false(tmp_path):
     p = close_all_result_path_for(str(tmp_path), "fabc")
     write_close_all_result(p, status="completed", request_issued_at=_at(),
