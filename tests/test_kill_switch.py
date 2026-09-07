@@ -31,7 +31,8 @@ import spark.copytrade.loop as loop_mod
 import scripts.run_copytrade as rc
 from spark.copytrade.config import CopySettings
 from spark.copytrade.executor import ActionExecutor
-from spark.copytrade.killswitch import ARM_FILE_RELPATH, is_tripped
+from spark.copytrade.killswitch import (ARM_FILE_RELPATH, OWNER_CLOSE_ARCHIVE_RELPATH,
+                                        is_tripped)
 from spark.copytrade.loop import run_cycle
 from spark.copytrade.notifier import RecordingNotifier
 from spark.copytrade.orders import CycleReport, ReconcileResult, ReconcileState
@@ -39,8 +40,9 @@ from spark.exchange.base import AccountSnapshot, BuilderCode, EquityView
 from spark.exchange.fakes import FakeAdapter
 from spark.filet.close_all import (CloseAllError, build_close_all_message,
                                    build_close_all_record, close_all_path_for,
+                                   close_all_result_path_for,
                                    load_close_all_requests, verify_close_all,
-                                   write_close_all_request)
+                                   write_close_all_request, write_close_all_result)
 from spark.filet.close_all_apply import CloseAllApplier
 from spark.filet.pause_flag import (pause_flag_path_for,
                                     read_pause_flag_for_engine, write_pause_flag)
@@ -467,6 +469,58 @@ def test_close_all_applier_no_request_is_a_quiet_noop(tmp_path):
     assert applier.consume(tmp_path, wind_down) is False
     assert calls == []
     assert notifier.records == []
+
+
+# ── C1（第二輪審查 2026-09-08）：舊 close_all 簽章重放 ──────────────────────
+
+def test_close_all_applier_completed_result_already_recorded_is_idempotent(tmp_path):
+    """result 標記已是 completed 且 issued_at 與這筆請求相同（尚未過期）⇒
+    這筆請求已經被消化過，`consume` 直接略過，不重複觸發收尾（也不會誤重放
+    出第二次 wind_down）。"""
+    wallet = Account.create()
+    account_id = _acct(wallet)
+    manifest = _manifest(tmp_path, account_id=account_id, user_address=wallet.address)
+    rec, _ = _sign_close_all(wallet, account_id=account_id)
+    write_close_all_request(tmp_path / "owner_close.json", rec)
+    result_path = close_all_result_path_for(tmp_path, account_id)
+    write_close_all_result(result_path, status="completed",
+                           request_issued_at=rec["issued_at"], now_s=_NOW)
+
+    applier = _applier(tmp_path, account_id=account_id, manifest_path=manifest)
+    wind_down, calls = _wind_down_recorder()
+    triggered = applier.consume(tmp_path, wind_down)
+
+    assert triggered is False
+    assert calls == []
+
+
+def test_close_all_applier_ignores_request_signed_before_last_owner_close(tmp_path):
+    """一份已歸檔的 owner_close 記錄（tripped_at = now-300s）之後，一筆殘留／
+    重放的舊 close_all 請求若簽署在那次收尾**之前**（issued_at = now-400s）
+    ⇒ 視為已被那次收尾消化，不重複觸發；簽署在那次收尾**之後**
+    （issued_at = now-100s，代表用戶重新跟單後再次要求平倉）⇒ 正常觸發。"""
+    wallet = Account.create()
+    account_id = _acct(wallet)
+    manifest = _manifest(tmp_path, account_id=account_id, user_address=wallet.address)
+    tripped_at = _at(-300)
+    archive_dir = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH / tripped_at.replace(":", "")
+    archive_dir.mkdir(parents=True)
+    (archive_dir / ARM_FILE_RELPATH.name).write_text(json.dumps(
+        {"tripped_at": tripped_at, "reason": "owner_close", "phase": "complete"}))
+
+    rec, _ = _sign_close_all(wallet, account_id=account_id, issued_at=_at(-400))
+    write_close_all_request(tmp_path / "owner_close.json", rec)
+    applier = _applier(tmp_path, account_id=account_id, manifest_path=manifest)
+    wind_down, calls = _wind_down_recorder()
+    assert applier.consume(tmp_path, wind_down) is False
+    assert calls == []
+
+    rec2, _ = _sign_close_all(wallet, account_id=account_id, nonce="n2",
+                              issued_at=_at(-100))
+    write_close_all_request(tmp_path / "owner_close.json", rec2)
+    wind_down2, calls2 = _wind_down_recorder()
+    assert applier.consume(tmp_path, wind_down2) is True
+    assert calls2 == [True]
 
 
 # ══════════════════════════════════════════════════════════════════════

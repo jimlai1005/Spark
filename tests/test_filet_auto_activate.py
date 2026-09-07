@@ -799,3 +799,70 @@ def test_reactivation_continues_start_when_close_all_cleanup_raises(site, monkey
     crits = site.crits()
     assert len(crits) == 1
     assert "清除舊 close_all 請求失敗" in crits[0][2]
+
+
+# ── 第二輪審查修正（2026-09-08 Task 11）───────────────────────────────────
+
+def test_reactivation_with_unparseable_tripped_at_waits_and_warns(site):
+    """⭐ W1（第二輪審查）：owner_close 終態的 `tripped_at` 是 naive（無時區）
+    字串 ⇒ `owner_close_terminal` 回 `tripped_s=None`，watcher 無法判定新簽章
+    是否晚於熔斷 ⇒ 保留 pending、發一則 warn，不 start（watcher 不再自己
+    解析出一個可能把 naive 時間戳當成本地時間的答案）。"""
+    site.put_in_manifest()
+    arm_path = site.write_owner_close_arm(tripped_at="2026-09-01T00:00:00")
+    site.sign_change(leader=_LEADER)
+
+    assert site.run() == 0
+    assert site.last_result() == "waiting_leader"
+    assert site.calls == []
+    assert arm_path.exists()
+    warns = site.warns()
+    assert any("tripped_at" in r[2]
+               and r[3] == f"auto-activate:refollow-no-tripped-at:{site.account_id}"
+               for r in warns)
+
+
+def test_reactivation_continues_start_when_clear_result_marker_raises(site, monkeypatch):
+    """⭐ S2（第二輪審查）：清除 result 標記時發生 OSError 同樣不得擋掉
+    systemctl start（與清除請求失敗同一個降級方向，W2），且各自有獨立的
+    dedup_key（S1：不共用同一把，避免其中一種失敗的告警被另一種 dedup 掉）。"""
+    import scripts.filet_auto_activate as mod
+
+    site.put_in_manifest()
+    site.write_owner_close_arm()
+    site.sign_change(leader=_LEADER)
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mod, "clear_close_all_result", _boom)
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    assert site.calls == [["systemctl", "start",
+                           f"filet-follower@{site.account_id}"]]
+    crits = site.crits()
+    assert len(crits) == 1
+    assert "清除舊 close_all result 標記失敗" in crits[0][2]
+    assert crits[0][3] == f"auto-activate:refollow-cleanup-result:{site.account_id}"
+
+
+def test_starting_phase_resume_also_clears_leftover_close_all_result(site):
+    """⭐ W2/S1（第二輪審查）：owner_close 重新啟用若恰好在 ARM 已歸檔、
+    cleanup 尚未跑完前崩潰，下一輪會落在通用的 `phase == "starting"` 復原
+    分支（此時 ARM 已不在，`owner_close_terminal` 判 None）——這個分支也要
+    清掉殘留的 close_all result 標記，否則 dashboard 會一直誤判成 halted。"""
+    from scripts.filet_auto_activate import WatcherState
+
+    site.put_in_manifest()
+    state = WatcherState(site.state_file)
+    state.set_phase(site.account_id, "starting")
+    result_path = close_all_result_path_for(site.exchange, site.account_id)
+    write_close_all_result(result_path, status="completed",
+                           request_issued_at=_at(), now_s=_NOW)
+
+    assert site.run() == 0
+    assert site.last_result() == "healed_started"
+    assert site.calls == [["systemctl", "start",
+                           f"filet-follower@{site.account_id}"]]
+    assert not result_path.exists()

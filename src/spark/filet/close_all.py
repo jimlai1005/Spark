@@ -265,11 +265,15 @@ def remove_close_all_requests(path: str | Path, *, account_id: str) -> int:
     請求，避免殘留的已消耗請求被誤讀為「還有待處理」）。原子寫回（同
     `write_close_all_request` 的 tmp+replace 慣例）。
 
-    ⚠️ 2026-09-07 審查 W3a：呼叫端是 root 的 auto-activate watcher，寫回這個
-    `filet-api` 擁有的目錄時必須把所有權還回去，否則下一次 `filet-api` 自己
-    寫（`write_close_all_request`）會因為檔案被 root 佔走而失敗——與
-    `publicapi.pending._atomic_write` 同一套 `dir_owner_ids(p.parent)` 慣例
-    （非 root 執行時回 `None`，寫入照常、不 chown）。
+    ⚠️ 2026-09-07 審查 W3a／S3（2026-09-08 第二輪審查補充措辭）：呼叫端是 root
+    的 auto-activate watcher，寫回這個目錄時帶 `owner_ids=dir_owner_ids(p.parent)`
+    是為了**維持權限拓撲不漂移**——`write_json_atomic` 的 tmp+replace 只需要
+    目錄本身的寫權限，root 擁有的目標檔並不會擋住 `filet-api` 之後覆寫它
+    （`os.replace` 只看目錄權限，不看被取代檔案的 owner）；把 owner 還原成
+    `filet-api` 純粹是為了與 `publicapi.pending` 的既有慣例一致，避免這份
+    檔案的擁有者在 `ls` 底下看起來像是被誰動過手腳，而不是「不還原就會寫入
+    失敗」。同一套 `dir_owner_ids(p.parent)` 慣例，非 root 執行時回 `None`，
+    寫入照常、不 chown。
     """
     p = Path(path)
     entries = load_close_all_requests(p)

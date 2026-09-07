@@ -29,6 +29,7 @@ from spark.copytrade.killswitch import (
     manual_rearm,
     evaluate,
     is_tripped,
+    last_owner_close_s,
     owner_close_history,
     owner_close_terminal,
     plan_close_actions,
@@ -1003,3 +1004,90 @@ def test_announce_owner_close_history_with_archive_warns_with_count_and_last_ts(
     assert "1 次" in text
     assert at in text
     assert dedup_key == "owner_close_history"
+
+
+# ── Task 11（第二輪審查修正 2026-09-08）──────────────────────────────────
+
+def test_owner_close_terminal_includes_tripped_s(tmp_path):
+    """C1：`tripped_s` 是 `tripped_at`（tz-aware）換算的 epoch 秒。"""
+    at, now = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    terminal = owner_close_terminal(tmp_path)
+    assert terminal is not None
+    assert terminal["tripped_s"] == pytest.approx(now - 3600)
+
+
+def test_owner_close_terminal_naive_tripped_at_yields_none_tripped_s(tmp_path):
+    """C1：naive（無時區）`tripped_at` 不得被憑空當成 UTC 換算——terminal 判定
+    仍成立（reason/phase 符合），但 `tripped_s` 必須是 None，fail-closed 交由
+    呼叫端（CloseAllApplier／watcher）保守處理。"""
+    _owner_close_arm(tmp_path, tripped_at="2026-09-01T00:00:00")
+    terminal = owner_close_terminal(tmp_path)
+    assert terminal is not None
+    assert terminal["tripped_s"] is None
+
+
+def test_last_owner_close_s_returns_epoch_of_last_archived(tmp_path):
+    at, now = _hours_ago(1)
+    _owner_close_arm(tmp_path, tripped_at=at)
+    archive_owner_close(tmp_path)
+    assert last_owner_close_s(tmp_path) == pytest.approx(now - 3600)
+
+
+def test_last_owner_close_s_no_archive_is_none(tmp_path):
+    assert last_owner_close_s(tmp_path) is None
+
+
+def test_last_owner_close_s_rejects_naive_tripped_at(tmp_path):
+    base = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH / "x"
+    base.mkdir(parents=True)
+    (base / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": "2026-09-01T00:00:00", "reason": "owner_close"}))
+    assert last_owner_close_s(tmp_path) is None
+
+
+def test_archive_owner_close_arm_stays_when_samples_rename_fails(tmp_path, monkeypatch):
+    """W3：peak／samples 先搬、ARM 最後搬——中途失敗時 ARM 仍在原位，
+    `owner_close_terminal` 仍判定為終態，下一輪可以安全重試整個歸檔。"""
+    at, _ = _hours_ago(1)
+    arm = _owner_close_arm(tmp_path, tripped_at=at)
+    from spark.copytrade.equity import SAMPLES_RELPATH
+    samples_path = tmp_path / SAMPLES_RELPATH
+    samples_path.parent.mkdir(parents=True, exist_ok=True)
+    samples_path.write_text('[[1.0, "700"]]')
+
+    real_rename = Path.rename
+
+    def _boom_rename(self, target):
+        if self == samples_path:
+            raise OSError("disk full")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _boom_rename)
+
+    with pytest.raises(OSError):
+        archive_owner_close(tmp_path)
+
+    assert arm.exists()
+    assert owner_close_terminal(tmp_path) is not None
+
+
+def test_owner_close_history_sort_handles_non_string_tripped_at(tmp_path):
+    """W4：`tripped_at` 若被手改成非字串型別（例如數字），排序 key 不得因為
+    「跨型別比較」raise TypeError——非字串一律視同缺欄位、排最前；正常的字串
+    `tripped_at` 排在它們之後。"""
+    base = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH
+    (base / "a").mkdir(parents=True)
+    (base / "a" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": 12345, "reason": "owner_close"}))
+    (base / "b").mkdir(parents=True)
+    (base / "b" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"reason": "owner_close"}))
+    at, _ = _hours_ago(1)
+    (base / "c").mkdir(parents=True)
+    (base / "c" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": at, "reason": "owner_close"}))
+
+    hist = owner_close_history(tmp_path)  # 不 raise
+
+    assert hist[-1]["tripped_at"] == at

@@ -237,5 +237,22 @@ elif is_tripped(state_root):
 
 主線程自改：`src/spark/filet/close_all_apply.py` `_record_result` 失敗改發 critical（W1）；`web/src/lib/copy.ts` 第四步文案改為含「若已移除 API wallet 會先帶你重新授權」（W4）。
 
+### Task 11 @inline：第二輪審查修正（2026-09-08）
+
+**Files:** `src/spark/copytrade/killswitch.py`、`tests/test_copy_killswitch.py`、`src/spark/filet/close_all_apply.py`、`tests/test_kill_switch.py`、`scripts/filet_auto_activate.py`、`tests/test_filet_auto_activate.py`、`src/spark/filet/close_all.py`（只改註解）
+
+- **C1 舊 close_all 簽章重放（結構性閘門在引擎端）**：
+  - `killswitch.owner_close_terminal()` 回傳 dict 新增 `tripped_s: float | None`——由 `_read_arm_payload` 同一解析點取得 epoch；`tripped_at` 缺漏、非字串、**naive（無 tzinfo）**或解析失敗 → `None`（不再有第二個 `fromisoformat` 解析點）。
+  - `killswitch.last_owner_close_s(root) -> float | None`：`owner_close_history(root)` 最後一筆的 `tripped_at` 轉 epoch（同樣拒 naive），無歸檔／讀不出 → `None`。
+  - `CloseAllApplier.consume()`：讀到本帳號請求後、驗章之前加兩道跳過（皆 `return False`，不告警、只 `logger.info`）：(1) `_already_recorded("completed", issued_at)` 為真＝這筆已收尾過；(2) `last_owner_close_s(root)` 非 None 且請求 `issued_at`（用 `close_all.py` 既有的 issued_at 解析函式，找 `verify_close_all` 內用的那個）的 epoch `<=` 它＝這筆簽在上一次 owner_close 之前（已被那次收尾消化）。
+  - 測試（`tests/test_kill_switch.py`，沿 `_applier`／`_sign_close_all` 既有 helper）：(a) result 標記 completed＋同 issued_at 的未過期請求 → `consume` 回 False、wind_down 未呼叫；(b) 歸檔目錄有 tripped_at = now-300s 的 payload、請求 issued_at = now-400s → False；issued_at = now-100s → 正常觸發。
+- **watcher**：
+  - 重新啟用分支改用 `terminal["tripped_s"]`；為 `None` → `notifier.warn("auto-activate", "…tripped_at 讀不出，無法判定簽章先後，保留 pending 待人工檢查", dedup_key=f"auto-activate:refollow-no-tripped-at:{account_id}")` 後 `return "waiting_leader"`（W2）。刪除分支內的 `datetime.fromisoformat(...)`（W1）。
+  - 把「清 close_all 請求＋清 result 標記」抽成 `_cleanup_close_all(exchange_dir, account_id, notifier) -> None`（兩步各自 try/except，dedup_key 分別為 `…:refollow-cleanup-request:{id}` 與 `…:refollow-cleanup-result:{id}`，S1），在重新啟用分支與 `phase == "starting"` 復原分支**都**呼叫（C1 情境 b）。
+  - 測試：`clear_close_all_result` raise OSError → 仍 reactivated＋critical（S2）；phase=starting 復原分支會清掉殘留的 result 標記。
+- **W3 歸檔順序**：`archive_owner_close` 先搬 peak／samples，**ARM 最後搬**（ARM 是閘門，搬走前失敗 → 下一輪仍是終態、可重試）。測試：monkeypatch 讓 samples rename 失敗 → ARM 仍在原位。
+- **W4 排序型別安全**：`owner_close_history` 排序 key 改 `(isinstance(t, str), t if isinstance(t, str) else "")`；測試：一筆 `tripped_at` 為數字＋一筆缺欄位＋一筆正常 → 不 raise、正常者排最後。
+- **S3**：`close_all.py` `remove_close_all_requests` 的 owner_ids 註解改為「維持權限拓撲不漂移（tmp+replace 只需目錄寫權，root 擁有的目標檔不會擋 filet-api 覆寫；還原 owner 是為了與 pending.py 慣例一致、避免 ls 看起來像被誰改過）」。
+
 ## 狀態
-- 2026-09-07：plan 完成，使用者確認（D1 改為殘留暴險也結束）。Task 1–8 完成並 commit（4966cfc、fe2b166、22e895b）；reviewer 一輪 → Task 10 修正中。
+- 2026-09-07：plan 完成，使用者確認（D1 改為殘留暴險也結束）。Task 1–8 完成並 commit（4966cfc、fe2b166、22e895b）；reviewer 一輪 → Task 10 修正（2d11ab7）；第二輪 reviewer → Task 11 修正完成（2026-09-08，全套 2860 passed）→ 第三輪複審。

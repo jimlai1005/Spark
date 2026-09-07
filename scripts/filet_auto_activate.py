@@ -57,7 +57,6 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -372,6 +371,44 @@ def _chown_tree(root: Path, owner: str, group: str) -> None:
         os.chown(p, uid, gid, follow_symlinks=False)
 
 
+def _cleanup_close_all(exchange_dir: str, account_id: str, notifier: Notifier) -> None:
+    """清掉該帳號舊的一次性 close_all 請求與 result 標記（第二輪審查 S1/W2）。
+
+    共用給兩個呼叫端：owner_close 重新啟用分支，以及通用的
+    `phase == "starting"` 復原分支（後者涵蓋「歸檔已完成、cleanup 尚未跑完
+    就崩潰」的窗口——那種崩潰後 ARM 已不在，`owner_close_terminal` 判 None，
+    下一輪會落在通用復原分支而不是重新啟用分支，若那裡不清，殘留的
+    `completed` 標記會讓 dashboard／API 一直誤判成 halted）。
+
+    不清的話，殘留標記會讓 `publicapi.app._close_all_completed` 對新一輪
+    跟單誤判為仍是 halted。兩步各自 try/except、**各自獨立的 dedup_key**
+    （S1：不共用同一把——共用會讓「請求清除失敗」的告警被「標記清除失敗」的
+    告警 dedup 掉，反之亦然，兩種失敗會互相消音）。失敗只降級成告警，
+    **不得**擋掉呼叫端接下來的 `systemctl start`（W2：啟動是主要動作，殘留
+    標記只影響顯示與 dashboard 判讀，不是安全性動作）。
+    """
+    try:
+        remove_close_all_requests(close_all_path_for(exchange_dir),
+                                  account_id=account_id)
+    except OSError as e:
+        notifier.critical(
+            "auto-activate",
+            f"account={account_id} 清除舊 close_all 請求失敗：{e}——"
+            f"引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不一致，"
+            f"需人工檢查 {close_all_path_for(exchange_dir)}",
+            dedup_key=f"auto-activate:refollow-cleanup-request:{account_id}")
+    try:
+        clear_close_all_result(
+            close_all_result_path_for(exchange_dir, account_id))
+    except OSError as e:
+        notifier.critical(
+            "auto-activate",
+            f"account={account_id} 清除舊 close_all result 標記失敗："
+            f"{e}——引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不"
+            f"一致，需人工檢查",
+            dedup_key=f"auto-activate:refollow-cleanup-result:{account_id}")
+
+
 def _manifest_ref(manifest_path: str, account_id: str):
     """回傳 (是否在 manifest, 該筆的 leader_address 或 None)。
 
@@ -420,12 +457,23 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
         if terminal is not None:
             # ⭐ C1（審查 2026-09-07）：新簽章必須**晚於**這次 owner_close 的
             # tripped_at，否則一份熔斷前的舊選擇就能自動復活一顆用戶已明確
-            # 撤銷的引擎。`tripped_at` 解析失敗 → fail-closed，不判定為已重新
-            # 跟單（terminal 本身沒壞，只是這個欄位讀不出來，保留 pending 讓
-            # 下一輪重試比貿然放行安全）。
-            try:
-                not_before_s = datetime.fromisoformat(terminal["tripped_at"]).timestamp()
-            except (KeyError, TypeError, ValueError):
+            # 撤銷的引擎。
+            # ⭐ W1（第二輪審查 2026-09-08）：改讀 `terminal["tripped_s"]`——
+            # `killswitch.owner_close_terminal` 是唯一的 ISO 時間戳解析點
+            # （同一份 `tripped_at` 若在這裡自己再解析一次，就是工程原則 1
+            # 說的「同一個值被兩處各自解析出兩個答案」），且它已經拒絕
+            # naive（無時區）時間戳；watcher 自己再解析一次會把 naive 字串
+            # 悄悄當成本地時間，方向是 fail-open。讀不出（缺漏、非字串、
+            # naive 或解析失敗）→ fail-closed，保留 pending 待人工檢查，
+            # 不判定為已重新跟單。
+            not_before_s = terminal.get("tripped_s")
+            if not_before_s is None:
+                notifier.warn(
+                    "auto-activate",
+                    f"account={account_id} owner_close 終態的 tripped_at "
+                    f"讀不出（缺漏、非字串或無時區），無法判定新簽章是否晚於"
+                    f"熔斷——保留 pending 待人工檢查",
+                    dedup_key=f"auto-activate:refollow-no-tripped-at:{account_id}")
                 return "waiting_leader"
             leader = _latest_signed_leader(
                 leader_changes, account_id=account_id,
@@ -446,32 +494,11 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
             # watcher，所以基底目錄與本次子目錄都要覆蓋成引擎帳號，否則引擎
             # 啟動時讀不到自己該讀的歸檔基底。
             _chown_tree(archive_dir.parent, owner, group)
-            # 清掉舊的一次性 close_all 請求與 result 標記：不清的話，殘留的
-            # 「已完成」標記會讓 dashboard／API 對這一輪新的跟單誤判為仍是
-            # halted（見 publicapi.app._close_all_completed）。
-            # ⭐ W2（審查）：這兩步各自 try/except——失敗只降級成告警，**不得**
-            # 擋掉 systemctl start：啟動是主要動作，殘留標記只影響顯示與
-            # dashboard 判讀，不是安全性動作（不清乾淨的代價遠小於不啟動）。
-            try:
-                remove_close_all_requests(close_all_path_for(exchange_dir),
-                                          account_id=account_id)
-            except OSError as e:
-                notifier.critical(
-                    "auto-activate",
-                    f"account={account_id} 清除舊 close_all 請求失敗：{e}——"
-                    f"引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不一致，"
-                    f"需人工檢查 {close_all_path_for(exchange_dir)}",
-                    dedup_key=f"auto-activate:refollow-cleanup:{account_id}")
-            try:
-                clear_close_all_result(
-                    close_all_result_path_for(exchange_dir, account_id))
-            except OSError as e:
-                notifier.critical(
-                    "auto-activate",
-                    f"account={account_id} 清除舊 close_all result 標記失敗："
-                    f"{e}——引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不"
-                    f"一致，需人工檢查",
-                    dedup_key=f"auto-activate:refollow-cleanup:{account_id}")
+            # 清掉舊的一次性 close_all 請求與 result 標記（S1/W2，見
+            # `_cleanup_close_all`）：不清的話，殘留的「已完成」標記會讓
+            # dashboard／API 對這一輪新的跟單誤判為仍是 halted（見
+            # publicapi.app._close_all_completed）。
+            _cleanup_close_all(exchange_dir, account_id, notifier)
             run_cmd(start_cmd, check=True)
             state.set_phase(account_id, "started")
             # manifest 裡的 leader 若與新簽章不同，由引擎自己的
@@ -514,6 +541,12 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                                            leader_address=manifest_leader)
         if phase == "starting":
             # 本 watcher 的 crash 窗口（activate 後、start 確認前）→ 重試 start。
+            # ⭐ 也順手清一次 close_all 殘留標記（第二輪審查）：owner_close
+            # 重新啟用若恰好在 ARM 已歸檔、cleanup 尚未跑完前崩潰，下一輪會
+            # 落在這個通用復原分支（此時 ARM 已不在，owner_close_terminal
+            # 判 None，不會再走重新啟用分支），不清的話 dashboard／API 會
+            # 一直誤判成 halted。
+            _cleanup_close_all(exchange_dir, account_id, notifier)
             run_cmd(start_cmd, check=True)
             state.set_phase(account_id, "started")
             remove_pending_entry(pending_path, account_id)

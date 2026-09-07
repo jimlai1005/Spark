@@ -33,13 +33,14 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from spark.copytrade.killswitch import is_tripped
+from spark.copytrade.killswitch import is_tripped, last_owner_close_s
 from spark.copytrade.notifier import Notifier
 from spark.filet.close_all import (CloseAllError, close_all_path_for,
                                    close_all_result_path_for,
                                    load_close_all_requests, read_close_all_result,
                                    verify_close_all, write_close_all_result)
 from spark.filet.followers import load_followers
+from spark.filet.leader_change import LeaderChangeError, parse_issued_at
 from spark.filet.leader_change_apply import require_exchange_dir
 
 logger = logging.getLogger(__name__)
@@ -159,6 +160,37 @@ class CloseAllApplier:
             rec = self._my_record()
             if rec is None:
                 return False
+            issued_at = rec.get("issued_at") if isinstance(rec, dict) else None
+            if isinstance(issued_at, str):
+                # ⭐⭐ C1（第二輪審查 2026-09-08）：舊 close_all 簽章重放。
+                # 用戶完成一次 owner_close 收尾之後，watcher 會歸檔 ARM 並清掉
+                # 這個帳號的 owner_close.json／result 標記，但那兩個清理動作
+                # 各自可能失敗（W2，見 filet_auto_activate._cleanup_close_all）
+                # 或被重放——這裡在驗章之前、用 `is_tripped` 短路之外再加兩道
+                # 「這筆早就處理過」的判定，兩者都只 `logger.info`（不告警：
+                # 這是正常會發生的重放情境，不是攻擊或壞資料）：
+                # (1) result 標記已記過同一筆 issued_at 的 completed 結果；
+                # (2) 這筆簽署時間不晚於（`<=`）上一次 owner_close 收尾——
+                #     那次收尾早已消化掉這份簽章授權的整段跟單關係，一份
+                #     舊簽章不該在新一輪重新跟單之後又平掉新的部位。
+                if self._already_recorded("completed", issued_at):
+                    logger.info(
+                        "平倉並撤銷請求已完成過（issued_at=%s），視為重放，"
+                        "本輪不重複觸發 account=%s", issued_at, self._account_id)
+                    return False
+                last_close_s = last_owner_close_s(root)
+                if last_close_s is not None:
+                    try:
+                        issued_s = parse_issued_at(issued_at).timestamp()
+                    except LeaderChangeError:
+                        issued_s = None
+                    if issued_s is not None and issued_s <= last_close_s:
+                        logger.info(
+                            "平倉並撤銷請求簽署於上一次 owner_close 收尾"
+                            "（%.0f）之前或同時（issued_at=%s），視為已被"
+                            "那次收尾消化，本輪不處理 account=%s",
+                            last_close_s, issued_at, self._account_id)
+                        return False
             user_address = self._trusted_user_address()
             if user_address is None:
                 return False

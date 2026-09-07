@@ -252,13 +252,25 @@ OWNER_CLOSE_ARCHIVE_RELPATH = Path("var/copytrade/owner_close_archive")
 
 
 def owner_close_terminal(root: Path) -> dict | None:
-    """ARM 檔為「owner_close 且 phase == complete」→ 回 payload dict（另加鍵
-    `residual: bool`＝有無殘留暴險，與 `_read_arm_payload` 同一個布林算式）；否則 None。
+    """ARM 檔為「owner_close 且 phase == complete」→ 回 payload dict（另加兩鍵：
+    `residual: bool`＝有無殘留暴險，與 `_read_arm_payload` 同一個布林算式；
+    `tripped_s: float | None`＝`tripped_at` 換算的 epoch 秒）；否則 None。
 
     ⚠️ fail-closed：ARM 不存在、JSON 壞掉、不是 dict、`reason` 不是 `owner_close`、
     或 `phase` 不是 `"complete"`（例如收尾中途崩潰停在 `flatten_in_progress`）——
     一律回 None，不宣稱終態。裁決 D1：終態判定只看 `reason`/`phase`，殘留暴險
     （`failures`／`orders_not_cancelled`）不影響終態本身，只影響 `residual` 這個鍵。
+
+    ⭐ `tripped_s`（第二輪審查 C1，2026-09-08）：供 `CloseAllApplier.consume`
+    與 auto-activate watcher 判定「這份請求／簽章是否晚於這次 owner_close」，
+    重用 `_read_arm_payload`（本模組唯一的 ARM 解析點）取得 epoch——**不再造
+    第二個 `fromisoformat` 解析點**。`_read_arm_payload` 本身不拒 naive（無時區）
+    時間戳（它把 naive 當本地時間換算 epoch，這是它既有、別的呼叫端依賴的行為，
+    不得改），所以這裡拿到它的結果後**另外**檢查 `tzinfo is None`：naive 一律
+    視同「讀不出」，`tripped_s=None`——把 naive 字串當 UTC（或任何固定時區）
+    是一個看不見的假設，錯的方向會讓「簽在熔斷前」的重放請求被誤判成「晚於
+    熔斷」（fail-open）。`tripped_at` 缺漏、非字串或解析失敗（`_read_arm_payload`
+    回 None）同樣 → `tripped_s=None`。
     """
     arm_path = root / ARM_FILE_RELPATH
     if not arm_path.exists():
@@ -274,7 +286,41 @@ def owner_close_terminal(root: Path) -> dict | None:
     if payload.get("phase") != "complete":
         return None
     residual = bool(payload.get("failures")) or bool(payload.get("orders_not_cancelled"))
-    return {**payload, "residual": residual}
+    tripped_s = None
+    parsed = _read_arm_payload(arm_path)
+    if parsed is not None and datetime.fromisoformat(parsed[0]).tzinfo is not None:
+        tripped_s = parsed[2]
+    return {**payload, "residual": residual, "tripped_s": tripped_s}
+
+
+def last_owner_close_s(root: Path) -> float | None:
+    """最近一次 owner_close 收尾的觸發時間（epoch 秒）；無歸檔或讀不出 → `None`。
+
+    供 `CloseAllApplier.consume`（第二輪審查 C1）判定「這筆平倉並撤銷請求是否
+    簽在上一次收尾之前」——用戶重新跟單之後，一份簽在上一次收尾之前的舊
+    close_all 請求（殘留未清、或被重放）早已被那次收尾消化過，不該再觸發
+    一次新的收尾（那會讓一份舊簽章意外平掉新一輪的部位）。
+
+    取 `owner_close_history(root)` 排序後的最後一筆（已依 payload 的 `tripped_at`
+    排序，見該函式 S2）；缺該欄位、非字串、naive（無時區，理由同
+    `owner_close_terminal` 的 `tripped_s`）或解析失敗 → `None`（fail-closed：
+    判不出「上一次收尾在何時」就不擋這筆請求，交給既有的驗章與
+    `is_tripped` 短路把關，不會因為這條新檢查而多放行任何東西）。
+    無歸檔目錄（從未 owner_close 過）→ `None`。
+    """
+    hist = owner_close_history(root)
+    if not hist:
+        return None
+    tripped_at = hist[-1].get("tripped_at")
+    if not isinstance(tripped_at, str) or not tripped_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(tripped_at)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.timestamp()
 
 
 def archive_owner_close(root: Path, *, now: datetime | None = None) -> Path:
@@ -292,6 +338,14 @@ def archive_owner_close(root: Path, *, now: datetime | None = None) -> Path:
 
     缺 peak/samples 檔時略過不報錯（新帳戶可能還沒累積過樣本）。
     目錄名衝突（同一秒觸發兩次、或重跑測試）時加 `-2`、`-3` 後綴。
+
+    ⚠️ W3（第二輪審查 2026-09-08）：**先搬 peak／samples，ARM 最後搬**——ARM
+    是 `owner_close_terminal` 唯一認的閘門。若先搬 ARM 再搬 peak／samples，
+    中途任一 rename 失敗（OSError）會留下「ARM 已消失但歸檔未完成」的狀態：
+    `owner_close_terminal` 判不出這仍是待歸檔的終態，下一輪 watcher 與人工都
+    無從安全重試。ARM 最後搬的話，任何前段失敗都讓 ARM 留在原位，終態判定
+    不變，下一輪可以直接重跑整個 `archive_owner_close`（冪等：已搬走的
+    peak/samples 這次 `src.exists()` 為 False，略過不報錯）。
     """
     terminal = owner_close_terminal(root)
     if terminal is None:
@@ -311,12 +365,12 @@ def archive_owner_close(root: Path, *, now: datetime | None = None) -> Path:
         dest = base_dir / f"{safe_name}-{suffix}"
     dest.mkdir(parents=True, exist_ok=False)
 
-    arm_path = root / ARM_FILE_RELPATH
-    arm_path.rename(dest / ARM_FILE_RELPATH.name)
     for relpath in (LIFETIME_PEAK_RELPATH, SAMPLES_RELPATH):
         src = root / relpath
         if src.exists():
             src.rename(dest / relpath.name)
+    arm_path = root / ARM_FILE_RELPATH
+    arm_path.rename(dest / ARM_FILE_RELPATH.name)
     return dest
 
 
@@ -343,9 +397,16 @@ def owner_close_history(root: Path) -> list[dict]:
             continue
         if isinstance(payload, dict):
             history.append(payload)
-    history.sort(key=lambda payload: (
-        isinstance(payload.get("tripped_at"), str) and bool(payload.get("tripped_at")),
-        payload.get("tripped_at") or ""))
+
+    def _sort_key(payload: dict) -> tuple[bool, str]:
+        # ⚠️ W4（第二輪審查 2026-09-08）：第二個元素**必須**永遠是同一個型別
+        # （str），否則 `tripped_at` 被手改成數字之類的非字串值時，兩筆
+        # `isinstance` 皆為 False 的條目會拿數字與空字串互相比較——Python 3
+        # 不允許跨型別排序比較，會直接 raise TypeError，讓整份歷史清單掛掉。
+        t = payload.get("tripped_at")
+        return (isinstance(t, str), t if isinstance(t, str) else "")
+
+    history.sort(key=_sort_key)
     return history
 
 
