@@ -72,7 +72,9 @@ export const COPY_ZH = {
     admin: "待核准",
     // Task 2（2026-08-29）：CTA 從「查看策略與風險」改為登入入口——按錢包連接／簽署
     // 進度顯示簡短狀態字；成功後依 dashboard 狀態導向 dashboard 或 strategies。
-    cta: "登入",
+    // 2026-09-07 用戶回饋：寫「登入」時新用戶不知道要走錢包連結，改為「連接錢包」
+    // 直接說明動作（EN 同步 "Connect wallet"）。
+    cta: "連接錢包",
     ctaConnecting: "連接中…",
     ctaSigning: "簽署中…",
     langToggleLabel: "語言切換",
@@ -1875,7 +1877,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     settings: "Settings",
     ops: "Ops",
     admin: "Pending",
-    cta: "Log in",
+    cta: "Connect wallet",
     ctaConnecting: "Connecting…",
     ctaSigning: "Signing…",
     langToggleLabel: "Language",
