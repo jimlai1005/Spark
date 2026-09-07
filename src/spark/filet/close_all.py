@@ -38,7 +38,7 @@ from typing import Callable
 from spark.filet.engine_health import engine_publish_dir_for
 from spark.filet.followers import normalize_hex_address, validate_account_id
 from spark.filet.leader_change import LeaderChangeError, parse_issued_at
-from spark.filet.safe_fs import write_json_atomic
+from spark.filet.safe_fs import dir_owner_ids, write_json_atomic
 from spark.filet.signing import recover_personal_sign_address
 
 ACTION_CLOSE_ALL = "close_all"
@@ -264,6 +264,12 @@ def remove_close_all_requests(path: str | Path, *, account_id: str) -> int:
     （Task 6：owner_close 終態帳號重新跟單時，歸檔舊 ARM 前先清乾淨舊的一次性
     請求，避免殘留的已消耗請求被誤讀為「還有待處理」）。原子寫回（同
     `write_close_all_request` 的 tmp+replace 慣例）。
+
+    ⚠️ 2026-09-07 審查 W3a：呼叫端是 root 的 auto-activate watcher，寫回這個
+    `filet-api` 擁有的目錄時必須把所有權還回去，否則下一次 `filet-api` 自己
+    寫（`write_close_all_request`）會因為檔案被 root 佔走而失敗——與
+    `publicapi.pending._atomic_write` 同一套 `dir_owner_ids(p.parent)` 慣例
+    （非 root 執行時回 `None`，寫入照常、不 chown）。
     """
     p = Path(path)
     entries = load_close_all_requests(p)
@@ -271,7 +277,8 @@ def remove_close_all_requests(path: str | Path, *, account_id: str) -> int:
     removed = len(entries) - len(keep)
     if removed == 0:
         return 0
-    write_json_atomic(p, {"requests": keep}, mode=0o644)
+    write_json_atomic(p, {"requests": keep}, mode=0o644,
+                      owner_ids=dir_owner_ids(p.parent))
     return removed
 
 

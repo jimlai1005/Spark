@@ -223,5 +223,19 @@ elif is_tripped(state_root):
 - [ ] 派 `reviewer` 對照本檔審 `git diff main~N`，重點：(1) fail-open 方向——任何路徑會不會讓已撤銷的用戶在沒有新簽章時恢復交易；(2) 引擎退出與心跳/dashboard 一致性；(3) watcher 檔案權限。
 - [ ] 部署（晨間檢查點，須使用者放行）：rsync 至正式機 → `systemctl restart filet-api`；watcher 每分鐘新進程自動用新碼；無需重啟任何 follower。既有 fbac652 錢包：unit 已 disabled、ARM 終態在檔——用戶重新選 leader 時新路徑會自動處理，無需人工。
 
+### Task 10 @inline：審查修正（reviewer 2026-09-07，Critical 1＋Warning 1-4＋Suggestion 1-2）
+
+**Files:** `scripts/filet_auto_activate.py`、`tests/test_filet_auto_activate.py`、`src/spark/copytrade/killswitch.py`、`tests/test_copy_killswitch.py`、`src/spark/filet/close_all.py`
+
+- **C1 簽章必須晚於 tripped_at**：`_latest_signed_leader(records, *, account_id, user_address, not_before_s: float | None = None)`——`not_before_s` 非 None 時，`parse_issued_at(rec["issued_at"]).timestamp() <= not_before_s` 的記錄一律略過（視同未選；log warning「早於 owner_close，不採計」）。重新啟用分支呼叫時傳 `not_before_s=datetime.fromisoformat(terminal["tripped_at"]).timestamp()`；`tripped_at` 解析失敗 → 回 `waiting_leader`（fail-closed）。既有 `activated` 路徑不傳（行為不變）。檔頭 F7B 殘餘風險段補一句：「owner_close 重新啟用另要求簽章晚於 tripped_at，被打穿的 API 拿舊記錄無法重啟」。
+  測試：終態 ARM（tripped_at = now-3600s）＋記錄 issued_at = now-7200s → `waiting_leader`、未 start、ARM 仍在原位；issued_at = now → `reactivated`。
+- **W2 crash 窗口**：重新啟用分支順序改為 `state.set_phase(account_id, "starting")` → 歸檔 → 清 close_all 請求／標記 → `systemctl start` → `set_phase("started")` → 回收記錄（條件式）→ 清 pending。清理兩步各自 try/except OSError：失敗 `notifier.critical("auto-activate", ..., dedup_key=f"auto-activate:refollow-cleanup:{account_id}")` 後**繼續** start（啟動是主要動作，殘留標記只影響顯示與補寫 pending）。
+  測試：monkeypatch `remove_close_all_requests` raise OSError → 仍 `reactivated`、start 被呼叫、critical 一則。
+- **W3b 歸檔基底目錄 owner**：watcher 改 `_chown_tree(archive_dir.parent, owner, group)`（涵蓋 `owner_close_archive/` 基底＋本次子目錄）；`_chown_tree` 用 `os.chown(..., follow_symlinks=False)`（S1）。
+- **W3a**：`remove_close_all_requests` 寫回時帶 `owner_ids=dir_owner_ids(p.parent)`（`safe_fs.dir_owner_ids`；與 `write_close_all_request` 同一保全慣例——先看該函式怎麼用，沒有就沿 `pending.py` 的用法）。
+- **S2**：`owner_close_history` 依 payload `tripped_at` 排序（缺者排最前），不靠目錄名。
+
+主線程自改：`src/spark/filet/close_all_apply.py` `_record_result` 失敗改發 critical（W1）；`web/src/lib/copy.ts` 第四步文案改為含「若已移除 API wallet 會先帶你重新授權」（W4）。
+
 ## 狀態
-- 2026-09-07：plan 完成，待使用者確認。
+- 2026-09-07：plan 完成，使用者確認（D1 改為殘留暴險也結束）。Task 1–8 完成並 commit（4966cfc、fe2b166、22e895b）；reviewer 一輪 → Task 10 修正中。

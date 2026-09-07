@@ -85,12 +85,10 @@ describe("i18n（Task 2：雙語 copy 基礎）", () => {
   });
 
   it("closeAllDone.steps 提示重新跟單方式（owner_close 生命週期收尾）", () => {
-    expect(COPY_ZH.dashboard.status.closeAllDone.steps).toContain(
-      "想再次跟單：到探索頁選定交易員並簽章即可，系統會自動重新啟用（先前的平倉紀錄會保留歸檔）",
-    );
-    expect(COPY_EN.dashboard.status.closeAllDone.steps).toContain(
-      "To follow again: pick a trader on Explore and sign — the engine restarts automatically (your previous close-out stays on record).",
-    );
+    expect(COPY_ZH.dashboard.status.closeAllDone.steps.at(-1)).toContain("想再次跟單");
+    expect(COPY_ZH.dashboard.status.closeAllDone.steps.at(-1)).toContain("重新完成授權");
+    expect(COPY_EN.dashboard.status.closeAllDone.steps.at(-1)).toContain("To follow again");
+    expect(COPY_EN.dashboard.status.closeAllDone.steps.at(-1)).toContain("re-authorizing");
   });
 
   it("useCopy 在 setLang(\"en\") 後回傳英文字典", async () => {

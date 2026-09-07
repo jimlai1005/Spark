@@ -1165,7 +1165,7 @@ export const COPY_ZH = {
           "登入 app.hyperliquid.xyz",
           "進入「API」設定頁面",
           "找到本站建立的 API wallet 並移除其權限",
-          "想再次跟單：到探索頁選定交易員並簽章即可，系統會自動重新啟用（先前的平倉紀錄會保留歸檔）",
+          "想再次跟單：到探索頁選定交易員並簽章即可，系統會自動重新啟用；若你已移除 API wallet，頁面會先帶你重新完成授權（先前的平倉紀錄會保留歸檔）",
         ],
       },
       closeAllFailed: {
@@ -2790,7 +2790,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
           "Sign in at app.hyperliquid.xyz",
           "Open the \"API\" settings page",
           "Find the API wallet created by this site and remove its permissions",
-          "To follow again: pick a trader on Explore and sign — the engine restarts automatically (your previous close-out stays on record).",
+          "To follow again: pick a trader on Explore and sign — the engine restarts automatically; if you already removed the API wallet, you will be walked through re-authorizing first (your previous close-out stays on record).",
         ],
       },
       closeAllFailed: {

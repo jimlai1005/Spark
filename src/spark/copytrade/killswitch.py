@@ -321,8 +321,10 @@ def archive_owner_close(root: Path, *, now: datetime | None = None) -> Path:
 
 
 def owner_close_history(root: Path) -> list[dict]:
-    """歸檔目錄底下每個子目錄的 killswitch.tripped payload（依目錄名排序，即依
-    `tripped_at` 字典序，等同時間序——ISO 8601 字串排序與時間序一致）。
+    """歸檔目錄底下每個子目錄的 killswitch.tripped payload，依 **payload 的
+    `tripped_at` 欄位**排序（缺該欄位的排最前）——不靠目錄名（2026-09-07 審查
+    S2：目錄名雖然通常源自 `tripped_at`，但衝突後綴（`-2`、`-3`）與手動操作都可能
+    讓目錄名與 payload 內容分岔，排序基準必須直接讀 payload，不能假設兩者同步）。
 
     讀不到（JSON 壞掉、非 dict）的子目錄略過，不擋其餘筆數。
     `OWNER_CLOSE_ARCHIVE_RELPATH` 目錄本身不存在 → `[]`（從未 owner_close 過）。
@@ -341,6 +343,9 @@ def owner_close_history(root: Path) -> list[dict]:
             continue
         if isinstance(payload, dict):
             history.append(payload)
+    history.sort(key=lambda payload: (
+        isinstance(payload.get("tripped_at"), str) and bool(payload.get("tripped_at")),
+        payload.get("tripped_at") or ""))
     return history
 
 

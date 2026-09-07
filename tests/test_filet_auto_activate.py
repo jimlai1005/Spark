@@ -744,3 +744,58 @@ def test_non_terminal_tripped_pending_healed_without_start(site):
     assert len(site.crits()) == 1
     assert "kill switch 鎖定" in site.crits()[0][2]
     assert load_pending(site.pending) == []
+
+
+# ── 審查修正（2026-09-07 Task 10）─────────────────────────────────────────
+
+def test_reactivation_rejects_signature_signed_before_tripped_at(site):
+    """⭐ C1：終態 ARM 的 tripped_at = now-3600s，但用戶簽的 leader 選擇
+    issued_at = now-7200s（早於熔斷）⇒ 視同尚未表達，回 `waiting_leader`、
+    不 start、ARM 仍在原位（未被歸檔）——擋掉「拿一份熔斷前的舊選擇自動復活
+    已撤銷引擎」的路徑。"""
+    site.put_in_manifest()
+    arm_path = site.write_owner_close_arm(tripped_at=_at(-3600))
+    site.sign_change(leader=_LEADER, issued_at=_at(-7200))
+
+    assert site.run() == 0
+    assert site.last_result() == "waiting_leader"
+    assert site.calls == []
+    assert arm_path.exists()
+    assert len(load_pending(site.pending)) == 1
+
+
+def test_reactivation_accepts_signature_signed_after_tripped_at(site):
+    """⭐ C1：終態 ARM 的 tripped_at = now-3600s，用戶簽的 leader 選擇
+    issued_at = now（晚於熔斷）⇒ 正常視為重新跟單，回 `reactivated`、
+    systemctl start 被呼叫。"""
+    site.put_in_manifest()
+    site.write_owner_close_arm(tripped_at=_at(-3600))
+    site.sign_change(leader=_LEADER, issued_at=_at())
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    assert site.calls == [["systemctl", "start",
+                           f"filet-follower@{site.account_id}"]]
+
+
+def test_reactivation_continues_start_when_close_all_cleanup_raises(site, monkeypatch):
+    """⭐ W2：清理舊 close_all 請求／標記時發生 OSError 不得擋掉 systemctl
+    start——啟動才是主要動作，清理失敗只降級成一則 critical。"""
+    import scripts.filet_auto_activate as mod
+
+    site.put_in_manifest()
+    site.write_owner_close_arm()
+    site.sign_change(leader=_LEADER)
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mod, "remove_close_all_requests", _boom)
+
+    assert site.run() == 0
+    assert site.last_result() == "reactivated"
+    assert site.calls == [["systemctl", "start",
+                           f"filet-follower@{site.account_id}"]]
+    crits = site.crits()
+    assert len(crits) == 1
+    assert "清除舊 close_all 請求失敗" in crits[0][2]

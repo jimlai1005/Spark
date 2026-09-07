@@ -673,3 +673,20 @@ def test_forged_close_all_signature_does_not_trip(monkeypatch, tmp_path):
     rc.main(["--once"])
 
     assert not is_tripped(tmp_path / "state")
+
+
+def test_record_result_write_failure_is_loud(tmp_path):
+    """⭐ 2026-09-07 審查 W1：result 標記自 owner_close 生命週期改版起是控制面訊號
+    （dashboard 判 halted、leaders_select 判重新跟單都靠它）——寫失敗不得只留 log，
+    必須 critical（工程原則 3）。"""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
+    notifier = RecordingNotifier()
+    applier = CloseAllApplier(account_id="acct", manifest_path=tmp_path / "m.json",
+                              request_path=tmp_path / "owner_close.json",
+                              result_path=blocker / "acct.json",
+                              notifier=notifier, now_fn=lambda: _NOW)
+    applier._record_result("completed", "2026-09-07T00:00:00Z")
+    crits = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crits) == 1
+    assert "結果標記寫入失敗" in crits[0][2]

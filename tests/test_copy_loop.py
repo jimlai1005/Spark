@@ -106,13 +106,18 @@ def test_tripped_short_circuits_with_zero_calls(tmp_path):
 
 
 # ── 1b. owner_close 終態：發完成通知後 halt_engine=True（裁決 D1/D5）─────
-def _owner_close_arm(root, *, tripped_at="2026-09-07T01:00:00+00:00",
+def _owner_close_arm(root, *, tripped_at=None,
                      phase="complete", failures=None,
                      orders_not_cancelled=False, cancelled=3, closed=None,
                      reason="owner_close") -> None:
     """本檔專用（不依賴 tests/test_copy_killswitch.py）——寫一份能通過
     `owner_close_terminal` 判定的 ARM payload，欄位對齊 killswitch.trip() 寫入形狀。"""
     import json
+    from datetime import datetime, timezone
+    # ⚠️ 不可寫死時間戳：reason=drawdown 的案例會先經過 auto_rearm_if_cooled_down，
+    # 寫死的時間一過 12 小時冷靜期就被自動解鎖（2026-09-08 跨日後真的發生過）。
+    if tripped_at is None:
+        tripped_at = datetime.now(timezone.utc).isoformat()
     p = root / ARM_FILE_RELPATH
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {

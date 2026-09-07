@@ -79,7 +79,14 @@ class CloseAllApplier:
         self._now_fn = now_fn
 
     def _record_result(self, status: str, request_issued_at: str) -> None:
-        """發布處理結果標記（**寫入失敗不得中斷跟單**，同心跳的既有慣例）。"""
+        """發布處理結果標記（**寫入失敗不得中斷跟單**，同心跳的既有慣例）。
+
+        ⚠️ 2026-09-07 起這份標記不只是顯示層：引擎在 owner_close 終態會自行結束、
+        心跳隨之過期，之後 `/api/me/dashboard` 判 halted 與 `leaders_select` 判
+        「重新跟單」都靠它（`publicapi.app._close_all_completed`）。寫失敗＝用戶
+        畫面會顯示成「跟單中」、且永遠無法自動重新啟用——必須大聲（工程原則 3），
+        不能只留一行 log。
+        """
         try:
             write_close_all_result(self._result_path, status=status,
                                    request_issued_at=request_issued_at,
@@ -87,6 +94,11 @@ class CloseAllApplier:
         except OSError as e:
             logger.warning("平倉並撤銷結果標記寫入失敗（%s）: %r",
                           self._result_path, e)
+            self._critical(
+                f"**平倉並撤銷結果標記寫入失敗**（{self._result_path}，status={status}）"
+                f"：{e!r}——dashboard 將無法判定 halted、用戶重新選 leader 也不會"
+                f"自動重新啟用，需人工檢查交換目錄 engine/close_all_result 的權限",
+                dedup_key="close_all_result_write_failed")
 
     def _already_recorded(self, status: str, request_issued_at: str) -> bool:
         """這筆請求（以 `issued_at` 識別，見 `close_all.py` 檔頭）是否已經發過同一種

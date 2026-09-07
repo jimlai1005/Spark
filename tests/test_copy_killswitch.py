@@ -961,6 +961,28 @@ def test_owner_close_history_skips_unreadable_entries(tmp_path):
     assert owner_close_history(tmp_path) == []
 
 
+def test_owner_close_history_sorts_by_payload_tripped_at_not_dirname(tmp_path):
+    """⭐ S2：目錄名與 payload 的 `tripped_at` 刻意錯位（dirname 字母序與時間序
+    相反），驗證排序基準是 payload 內容而非目錄名；缺 `tripped_at` 的條目排最前。
+    """
+    early, _ = _hours_ago(2)
+    late, _ = _hours_ago(1)
+    base = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH
+    (base / "aaa-later").mkdir(parents=True)
+    (base / "aaa-later" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": late, "reason": "owner_close"}))
+    (base / "zzz-earlier").mkdir(parents=True)
+    (base / "zzz-earlier" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"tripped_at": early, "reason": "owner_close"}))
+    (base / "missing-field").mkdir(parents=True)
+    (base / "missing-field" / ARM_FILE_RELPATH.name).write_text(
+        json.dumps({"reason": "owner_close"}))
+
+    hist = owner_close_history(tmp_path)
+
+    assert [h.get("tripped_at") for h in hist] == [None, early, late]
+
+
 # ── announce_owner_close_history（Task 3 helper）─────────────────────────
 def test_announce_owner_close_history_no_archive_is_silent(tmp_path):
     n = RecordingNotifier()

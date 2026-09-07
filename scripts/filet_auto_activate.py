@@ -37,7 +37,8 @@ activation 只問「這位用戶是否真的簽過要跟這個 leader」；引�
 的處理是「leader 相同 → 忽略不告警」（leader_change_apply 檔頭），不會產生假告警。
 殘餘風險（審查 F7B，已接受）：簽章選擇不過期——被打穿的 API 可為「曾簽過選擇但
 從未被本 watcher 啟動」的用戶重造 pending 使其被啟用；started 標記擋掉重啟情境，
-且 leader 仍限於用戶自己簽過的那一個。
+且 leader 仍限於用戶自己簽過的那一個。2026-09-07 補充（審查 C1）：owner_close
+重新啟用另要求簽章晚於 tripped_at，被打穿的 API 拿舊記錄無法重啟。
 
 用法（RUNBOOK §5.6a）：
     FILET_BUILDER_ADDR=0x... FILET_LEADERS_PATH=/abs/leaders.json \\
@@ -56,6 +57,7 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -108,16 +110,36 @@ GENERATED_KEYS = ("SPARK_NETWORK", "SPARK_ACCOUNT_ID",
 
 
 def _latest_signed_leader(records: list[dict], *, account_id: str,
-                          user_address: str) -> str | None:
+                          user_address: str,
+                          not_before_s: float | None = None) -> str | None:
     """回傳該帳號**驗章通過**的 leader 選擇；沒有 → None（尚未選）。
 
     記錄檔的合約是每帳號單筆覆蓋（write_leader_change：「當前意圖」而非流水帳），
     所以正常情況 mine 至多一筆：驗章過就用、被竄改／偽造就視同未選（fail-closed，
     攻擊者塞不進自己的 leader）。仍以反向迴圈寫（防手改檔案出現多筆時取最新）。
     ⚠️ user_address 必須已通過 validate_pending_entry 的 derive 綁定（呼叫端負責）。
+
+    `not_before_s`（2026-09-07 審查 C1）：非 None 時，`issued_at` 未晚於此值的
+    記錄一律略過（視同未選），供 owner_close 重新啟用分支使用——舊的、平倉並
+    撤銷**之前**簽過的 leader 選擇不能拿來當作「用戶已表達要重新跟單」，否則
+    一份熔斷前的舊記錄就足以自動復活一顆用戶已明確撤銷的引擎。`issued_at`
+    解析失敗也視同略過（fail-closed，與驗章失敗同一個方向）。
     """
     mine = [r for r in records if r.get("account_id") == account_id]
     for rec in reversed(mine):
+        if not_before_s is not None:
+            try:
+                issued_s = parse_issued_at(rec.get("issued_at")).timestamp()
+            except LeaderChangeError:
+                logger.warning(
+                    "略過一筆 issued_at 無法解析的 leader 選擇 account=%s",
+                    account_id)
+                continue
+            if issued_s <= not_before_s:
+                logger.warning(
+                    "略過一筆早於 owner_close tripped_at 的 leader 選擇 "
+                    "account=%s（issued_at 未晚於熔斷時刻，不採計）", account_id)
+                continue
         try:
             verified = verify_leader_change(
                 rec, account_id=account_id, user_address=user_address,
@@ -334,14 +356,20 @@ def _chown_tree(root: Path, owner: str, group: str) -> None:
     過 equity 樣本檔）——歸檔目錄仍須是引擎可讀寫，`announce_owner_close_history`
     要在引擎啟動時讀它。非 root 執行（測試、dry-run）→ `named_owner_ids` 回
     None，靜默跳過（同 `safe_fs.named_owner_ids` docstring 的既有慣例）。
+
+    ⚠️ `follow_symlinks=False`（2026-09-07 審查 S1）：`os.chown` 對路徑預設會
+    跟隨 symlink，把所有權設到 symlink **指向**的檔案上，而不是 symlink 本身
+    ——與 `safe_fs.py` 檔頭記載的 symlink 提權事故同一個方向（一顆惡意 symlink
+    可誘使 root chown 到任意檔案）。呼叫端傳進來的通常是 `archive_dir.parent`
+    （`owner_close_archive/` 基底＋本次子目錄，W3b），遞迴時同樣不得跟隨。
     """
     owner_ids = named_owner_ids(owner, group)
     if owner_ids is None:
         return
     uid, gid = owner_ids
-    os.chown(root, uid, gid)
+    os.chown(root, uid, gid, follow_symlinks=False)
     for p in root.rglob("*"):
-        os.chown(p, uid, gid)
+        os.chown(p, uid, gid, follow_symlinks=False)
 
 
 def _manifest_ref(manifest_path: str, account_id: str):
@@ -390,27 +418,60 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
         state_root = state_base / account_id
         terminal = owner_close_terminal(state_root)
         if terminal is not None:
+            # ⭐ C1（審查 2026-09-07）：新簽章必須**晚於**這次 owner_close 的
+            # tripped_at，否則一份熔斷前的舊選擇就能自動復活一顆用戶已明確
+            # 撤銷的引擎。`tripped_at` 解析失敗 → fail-closed，不判定為已重新
+            # 跟單（terminal 本身沒壞，只是這個欄位讀不出來，保留 pending 讓
+            # 下一輪重試比貿然放行安全）。
+            try:
+                not_before_s = datetime.fromisoformat(terminal["tripped_at"]).timestamp()
+            except (KeyError, TypeError, ValueError):
+                return "waiting_leader"
             leader = _latest_signed_leader(
                 leader_changes, account_id=account_id,
-                user_address=entry["user_address"])
+                user_address=entry["user_address"], not_before_s=not_before_s)
             if leader is None:
-                # 尚未簽新的 leader 選擇：保留 pending，等他簽（產品語意同一般
-                # 新戶的 waiting_leader）。
+                # 尚未簽新的（或只有熔斷前的舊）leader 選擇：保留 pending，
+                # 等他簽（產品語意同一般新戶的 waiting_leader）。
                 return "waiting_leader"
+            state.set_phase(account_id, "starting")
             # D3：歸檔而非刪除——ARM＋全期高水位＋權益樣本一起搬走，新一輪
             # 跟單用全新基準。歸檔目錄仍須是 filet-engine 可讀寫（引擎啟動時要
             # 讀它發「先前曾平倉並撤銷」的提示，見
             # killswitch.announce_owner_close_history）。
             archive_dir = archive_owner_close(state_root)
-            _chown_tree(archive_dir, owner, group)
+            # W3b（審查）：連 `owner_close_archive/` 基底目錄本身也要
+            # chown——首次歸檔時它是 `archive_owner_close` 用 `mkdir(parents=True)`
+            # 新建的，owner 是「執行 archive 的那個身分」；正式機以 root 執行
+            # watcher，所以基底目錄與本次子目錄都要覆蓋成引擎帳號，否則引擎
+            # 啟動時讀不到自己該讀的歸檔基底。
+            _chown_tree(archive_dir.parent, owner, group)
             # 清掉舊的一次性 close_all 請求與 result 標記：不清的話，殘留的
             # 「已完成」標記會讓 dashboard／API 對這一輪新的跟單誤判為仍是
             # halted（見 publicapi.app._close_all_completed）。
-            remove_close_all_requests(close_all_path_for(exchange_dir),
-                                      account_id=account_id)
-            clear_close_all_result(
-                close_all_result_path_for(exchange_dir, account_id))
-            state.set_phase(account_id, "starting")
+            # ⭐ W2（審查）：這兩步各自 try/except——失敗只降級成告警，**不得**
+            # 擋掉 systemctl start：啟動是主要動作，殘留標記只影響顯示與
+            # dashboard 判讀，不是安全性動作（不清乾淨的代價遠小於不啟動）。
+            try:
+                remove_close_all_requests(close_all_path_for(exchange_dir),
+                                          account_id=account_id)
+            except OSError as e:
+                notifier.critical(
+                    "auto-activate",
+                    f"account={account_id} 清除舊 close_all 請求失敗：{e}——"
+                    f"引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不一致，"
+                    f"需人工檢查 {close_all_path_for(exchange_dir)}",
+                    dedup_key=f"auto-activate:refollow-cleanup:{account_id}")
+            try:
+                clear_close_all_result(
+                    close_all_result_path_for(exchange_dir, account_id))
+            except OSError as e:
+                notifier.critical(
+                    "auto-activate",
+                    f"account={account_id} 清除舊 close_all result 標記失敗："
+                    f"{e}——引擎仍會啟動，但殘留標記可能讓 dashboard 顯示不"
+                    f"一致，需人工檢查",
+                    dedup_key=f"auto-activate:refollow-cleanup:{account_id}")
             run_cmd(start_cmd, check=True)
             state.set_phase(account_id, "started")
             # manifest 裡的 leader 若與新簽章不同，由引擎自己的
