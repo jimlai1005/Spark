@@ -267,4 +267,4 @@ elif is_tripped(state_root):
 - **S1 docstring**：`owner_close_terminal` 的說明改為「epoch 取自 `_read_arm_payload`，此處只另外檢查 tzinfo」，不再宣稱「不再造第二個解析點」。
 
 ## 狀態
-- 2026-09-07：plan 完成，使用者確認（D1 改為殘留暴險也結束）。Task 1–8 完成並 commit（4966cfc、fe2b166、22e895b）；reviewer 一輪 → Task 10 修正（2d11ab7）；第二輪 reviewer → Task 11 修正完成（2026-09-08，全套 2860 passed）→ 第三輪複審 → Task 12 修正完成（2867 passed）→ 第四輪增量複審：可部署（另補 W1 新鮮請求被閘門跳過改發 critical）。
+- 2026-09-07：plan 完成，使用者確認（D1 改為殘留暴險也結束）。Task 1–8 完成並 commit（4966cfc、fe2b166、22e895b）；reviewer 一輪 → Task 10 修正（2d11ab7）；第二輪 reviewer → Task 11 修正完成（2026-09-08，全套 2860 passed）→ 第三輪複審 → Task 12 修正完成（2867 passed）→ 第四輪增量複審：可部署（另補 W1 新鮮請求被閘門跳過改發 critical）→ **2026-09-07 17:27 UTC 已部署（03a73d7），regression 67/67 PASS**。

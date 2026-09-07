@@ -2546,3 +2546,21 @@ build → restart `filet-api`、`filet-dashboard`（keysvc／follower 程式未�
 PASS；`systemctl --failed` 空；API journal 零 Traceback；`/explore` 重啟後 `building:false, scanned 300`；`sort=max_dd`
 回撤最小者在前；`sort=foo` 422；`/traders/0x6648…` 30D 損益 33,055.26／訂單 221／平倉 27／勝率 55.56%（與 Hyperbot 一致）。
 新增 env `EXPLORE_FILLS_MAX_PAGES`（預設 3，探索與詳情共用）；待裁決：`min_fills` 200 改以訂單數比對後實質收緊（300 池只 27–88 檔過）。
+
+**2026-09-07 部署（commit `03a73d7`，17:27 UTC，owner_close 生命週期收尾＋header CTA「連接錢包」）：** plan
+`docs/superpowers/plans/2026-09-07-owner-close-lifecycle.md`（Task 1–12，四輪 opus 審查）。內容：(1) 用戶「平倉並撤銷」
+收尾完成後引擎發一則 critical 即 exit 0（`CycleReport.halt_engine`；殘留暴險明列於訊息、由用戶自行收尾），不再每 15 分鐘
+重送 tripped 告警；(2) 重新跟單全自動：用戶重新選 leader 簽章 → `leaders_select` 見 result 標記 completed 視同新客戶補寫
+pending → watcher 對「已在 manifest＋終態 ARM＋簽章晚於 tripped_at」的帳號歸檔 ARM/peak/samples 到
+`owner_close_archive/`、清舊請求（只刪簽在 tripped_at 之前的）與 result 標記、`systemctl start`；引擎啟動提示歸檔歷史；
+(3) 引擎端結構性閘門：`CloseAllApplier.consume` 跳過已記 completed 或簽在上次 owner_close 之前的請求（仍在時效內被跳過
+→ critical）；(4) dashboard 心跳過期時以 result 標記判 halted；完成指引卡補重新跟單方式；(5) header CTA
+「登入」→「連接錢包」（b521ea4）＋ 09-05 未提交的統計卡片防折行 CSS（d72929c）。本節「owner 收尾後」已改寫。流程照 §3.2
+rsync 兩段 → `uv sync` 略過（pyproject/uv.lock 無變動）→ chown root → §4.2 `npm ci`＋`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app`
+build → restart `filet-api`、`filet-dashboard`（keysvc／follower 未重啟；watcher 為每分鐘新進程自動用新碼）→ `DEPLOYED_VERSION`。
+⚠️ 本次誤用無差別 `chown -R root:root /opt/filet/spark`（未照 §3.2 的 `find -prune var` 版本）→ `var/filet/reports` 與
+`builder_accrued_snapshot.json` 被收成 root，regression 3 紅（reports owner、API 讀不到 accrued 歷史、stats routed_volume null）；
+照 §5.8a 步驟 0 還原（`chown -R filet-engine:filet-api reports`＋`chmod 2750`＋snapshot `chown filet-engine:filet-engine`）後
+`filet_regression_check --http --ssh` 67/67 PASS；`systemctl --failed` 空；API journal 零 Traceback；首頁 CTA 三處「連接錢包」；
+`/api/public/stats` routed_volume 175,534。既有 fbac652 錢包：09-07 07:31 UTC owner_close 完成後 unit 已人工
+`disable --now`，ARM 終態仍在檔——用戶重新選 leader 時新路徑自動處理，無需人工。
