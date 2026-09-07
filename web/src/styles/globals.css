@@ -1170,7 +1170,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .home-hero-featured-metrics {
   display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; margin-bottom: 14px;
 }
-.home-hero-featured-value { font-size: 20px; font-weight: 700; }
+.home-hero-featured-value { font-size: 20px; font-weight: 700; white-space: nowrap; }
 .home-hero-featured-footnote {
   border-top: 1px solid var(--border); padding-top: 14px; font-size: var(--fs-small);
   color: var(--text-dim); line-height: 1.6;
@@ -1180,7 +1180,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
   display: grid; grid-template-columns: repeat(4, 1fr); gap: 30px;
   margin: 60px 0 0; padding: 24px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
 }
-.evidence-value { font-size: 26px; font-weight: 700; letter-spacing: -.02em; margin-bottom: 6px; }
+.evidence-value { font-size: 26px; font-weight: 700; letter-spacing: -.02em; margin-bottom: 6px; white-space: nowrap; }
 .evidence-label { font-size: var(--fs-small); color: var(--text-dim); margin-bottom: 5px; }
 .evidence-link { font-size: var(--fs-micro); color: var(--primary); text-decoration: none; }
 
@@ -1206,7 +1206,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .strategy-card-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
 .strategy-metric { padding: 11px 12px; }
 .strategy-metric-label { font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 4px; }
-.strategy-metric-value { font-size: var(--fs-body-lg); font-weight: 700; }
+.strategy-metric-value { font-size: var(--fs-body-lg); font-weight: 700; white-space: nowrap; }
 .strategy-metric-se { font-size: var(--fs-micro); color: var(--text-dim); }
 
 .strategy-card-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -1279,12 +1279,13 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 
 /* R4-11：交易員頁專屬的帳戶價值行（見 page.tsx 註解）——label／value 兩個
    span 保持相鄰但視覺上留白。 */
-.trader-account-value { display: flex; gap: 8px; margin-top: 8px; }
-.trader-account-value span:last-child { color: var(--text); }
+/* 2026-09-05 防折行：放不下時整個數值換到下一行，不在數字中間折。 */
+.trader-account-value { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 8px; }
+.trader-account-value span:last-child { color: var(--text); white-space: nowrap; }
 
 /* 2026-09-05（Task 7）：帳戶價值下方的起訖淨值／初始入金列，同款排版。 */
-.trader-account-row { display: flex; gap: 8px; margin-top: 4px; font-size: var(--fs-micro); color: var(--text-dim); }
-.trader-account-row span:last-child { color: var(--text); }
+.trader-account-row { display: flex; flex-wrap: wrap; gap: 2px 8px; margin-top: 4px; font-size: var(--fs-micro); color: var(--text-dim); }
+.trader-account-row span:last-child { color: var(--text); white-space: nowrap; }
 
 /* 2026-09-05（explore/trader 指標統一 plan Task 6）：四窗切換群組（複用
    `.explore-window-group`/`.explore-window-btn`），與帳戶價值行之間留白。 */
@@ -1343,28 +1344,53 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
   margin-top: 8px;
 }
 
-.metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-.metric-card { padding: 16px 18px; }
-.metric-card-label { font-size: var(--fs-small); color: var(--text-dim); margin-bottom: 8px; }
-.metric-card-value { font-size: var(--fs-h3); font-weight: 700; letter-spacing: -0.01em; }
+/* 2026-09-05 統計卡片防折行（使用者回報：交易員頁「−$30,044,122」「多 100.0%」在
+   4 欄版面被瀏覽器隨機折成兩行）。三道結構性防護，全部用 container query 量「卡片
+   實際寬度」，不靠 viewport 斷點猜：
+   1. 標籤與值一律 nowrap——數字絕不允許在中間折行。
+   2. 值字級隨卡片內容寬連續縮放 `min(22px, 13cqw)`：13 個等寬字元（"−$300,044,122"）
+      在任何卡寬都放得下（JetBrains Mono 字寬 0.6em，13×0.6=7.8em ≤ 100cqw/13）；
+      卡片夠寬時維持設計稿 22px。
+   3. 欄數一律 2 欄。根因：`main.page` 版心 1080px 減 360px 面板後左欄只剩 656px，
+      原本的 4 欄卡內容寬只有 ~120px，22px 的 12 字元值（158px）本來就塞不下；
+      4 欄要不折行得把值縮到 16px 以下、比標籤大不了多少，不如 2 欄保住 22px。
+      （原 1024 斷點的「4→2 欄」與 480 斷點的雙值卡上下兩行規則因此一併移除，
+      由這裡的基礎規則與下方 container query 取代。）
+   雙值卡（A / B）改為卡片內容寬 ≤ 170px 就上下兩行，且字級同樣隨卡寬縮放
+   （390 寬時「→ 161,768,586」13 字元在 17px 仍溢出 5px）。 */
+.metric-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.metric-card { padding: 16px 18px; min-width: 0; container-type: inline-size; }
+.metric-card-label { font-size: var(--fs-small); color: var(--text-dim); margin-bottom: 8px; white-space: nowrap; }
+.metric-card-value {
+  font-size: min(var(--fs-h3), 13cqw);
+  font-weight: 700; letter-spacing: -0.01em; white-space: nowrap;
+}
 .metric-card-note { font-size: var(--fs-micro); color: var(--text-dim); margin-top: 6px; min-height: 14px; }
 
 /* R4-11 項目 3：雙值卡（最佳/最差日「A / B」、起訖淨值「A → B」）——值字級降
    一階（22px → 17px）＋預設單行不換行；欄位夠寬時兩段仍在同一行讀成
-   「A / B」。窄寬（390 斷點）改為刻意的上下兩行：A 一行、分隔符＋B 一行
-   （見下方 480 媒體查詢），不允許瀏覽器隨機在數字中間折行。 */
+   「A / B」。卡片內容寬 ≤ 170px 改為刻意的上下兩行：A 一行、分隔符＋B 一行
+   （見下方 container query），不允許瀏覽器隨機在數字中間折行。 */
 .metric-card-pair .metric-card-value {
   display: flex;
   align-items: baseline;
   gap: 6px;
-  font-size: var(--fs-body-lg);
+  font-size: min(var(--fs-body-lg), 11.5cqw);
   white-space: nowrap;
 }
 .metric-card-value-a, .metric-card-value-b { white-space: nowrap; }
 
+@container (max-width: 170px) {
+  .metric-card-pair .metric-card-value { flex-direction: column; align-items: flex-start; gap: 2px; }
+}
+/* 英文標籤（"Realized PnL (USD)" ≈ 129px @13px）在最窄的 4 欄卡放不下 → 降一號。 */
+@container (max-width: 132px) {
+  .metric-card-label { font-size: 12px; }
+}
+
 .cagr-card { display: flex; align-items: center; gap: 14px; padding: 16px 18px; }
 .cagr-card-value-col { flex: 1; }
-.cagr-card-value { font-size: var(--fs-h3); font-weight: 700; color: var(--text-dim); }
+.cagr-card-value { font-size: var(--fs-h3); font-weight: 700; color: var(--text-dim); white-space: nowrap; }
 .cagr-card-note-col {
   flex: 2; font-size: var(--fs-small); line-height: 1.65; color: var(--text-dim);
   border-left: 1px solid var(--border); padding-left: 16px;
@@ -1387,7 +1413,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .strategy-follow-sliders { display: grid; gap: 16px; margin-bottom: 20px; }
 .strategy-follow-estimate { padding: 14px 16px; margin-bottom: 18px; display: grid; gap: 9px; font-size: var(--fs-body); }
 .strategy-follow-estimate-row { display: flex; justify-content: space-between; color: var(--text-dim); }
-.strategy-follow-estimate-row span:last-child { color: var(--text); }
+.strategy-follow-estimate-row span:last-child { color: var(--text); white-space: nowrap; }
 /* R4-11 項目 2：CTA 按鈕與下方小字原本 0 上邊距（全站 `p { margin: 0 0 8px }`
    重置對 `<button>` 無作用，兩者緊貼）——補一段明確間距，共用元件裡改一次
    兩頁生效。 */
@@ -1399,7 +1425,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
     position: sticky; bottom: 0; z-index: 5;
     box-shadow: 0 -8px 24px rgba(var(--bg-rgb), 0.6);
   }
-  .metric-grid { grid-template-columns: repeat(2, 1fr); }
+  /* `.metric-grid` 自 2026-09-05 起基礎規則即為 2 欄，此處不再需要覆寫。 */
 }
 
 /* ── /dashboard（Task 14，設計稿 §06）── 響應式斷點細節由 Task 18 統一收（1024/390）。 */
@@ -1495,9 +1521,15 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-pnl-value[data-sign="pos"] { color: var(--pos); }
 .dash-pnl-sub { font-family: var(--font-mono); font-size: var(--fs-small); color: var(--text-dim); }
 .dash-pnl-svg { width: 100%; height: 130px; display: block; }
+/* 2026-09-05 防折行：標籤／值 nowrap；PnL 卡內容寬 < 480px（1024 雙欄版面）時
+   4 欄收成 2 欄，與 `.metric-grid` 同一套 container query 做法。 */
+.dash-card-pnl { container-type: inline-size; }
 .dash-pnl-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 14px; }
-.dash-pnl-metric-label { font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 5px; }
-.dash-pnl-metric-value { font-family: var(--font-mono); font-size: var(--fs-body-lg); font-weight: 700; }
+.dash-pnl-metric-label { font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 5px; white-space: nowrap; }
+.dash-pnl-metric-value { font-family: var(--font-mono); font-size: var(--fs-body-lg); font-weight: 700; white-space: nowrap; }
+@container (max-width: 480px) {
+  .dash-pnl-metrics { grid-template-columns: repeat(2, 1fr); }
+}
 
 .dash-sync-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 /* auto-fit + min-width：卡片變窄時欄位改為換行（2/1 欄）而非硬擠成 3 欄，
@@ -1675,15 +1707,8 @@ html, body { overflow-x: hidden; }
   /* -- 真實 <table>（/admin、/ops）容器可橫向捲動，不撐開 body -- */
   table { display: block; overflow-x: auto; max-width: 100%; }
 
-  /* -- 策略詳情頁指標卡：4→2 col 已由 1024 斷點處理，390 維持 2 col 即可讀 -- */
-
-  /* R4-11 項目 3：雙值卡在 390 窄寬即使字級已降一階仍可能溢出兩欄卡片——
-     改為刻意的上下兩行（A 一行、分隔符＋B 一行），不讓瀏覽器隨機折行。 */
-  .metric-card-pair .metric-card-value {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
-  }
+  /* -- 策略詳情頁指標卡：一律 2 col；雙值卡在 390 的上下兩行已改由
+        `.metric-card` 的 container query（內容寬 ≤ 170px）處理，見 metric-grid 區塊 -- */
 
   /* -- Dashboard：六塊改單欄＋指定順序，持倉表改卡片式，kill switch 常駐底部 -- */
   main.dash-page {

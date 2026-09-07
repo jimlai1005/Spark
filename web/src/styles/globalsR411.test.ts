@@ -33,24 +33,35 @@ describe("globals.css — 項目 2：CTA 與下方小字間距 (R4-11)", () => {
 });
 
 describe("globals.css — 項目 3：雙值卡排版 (R4-11)", () => {
-  it(".metric-card-pair .metric-card-value 預設單行不換行、字級降一階", () => {
+  it(".metric-card-pair .metric-card-value 預設單行不換行、字級降一階（上限 --fs-body-lg，隨卡寬縮放）", () => {
     const body = ruleBody(".metric-card-pair .metric-card-value {");
     expect(body).toMatch(/white-space:\s*nowrap/);
-    expect(body).toMatch(/font-size:\s*var\(--fs-body-lg\)/);
+    // 2026-09-05 防折行改版：字級改為 `min(var(--fs-body-lg), Ncqw)`——上限仍是
+    // 降一階的 17px，卡片內容寬不夠時隨寬度縮，不允許溢出。
+    expect(body).toMatch(/font-size:\s*min\(var\(--fs-body-lg\),\s*[\d.]+cqw\)/);
   });
 
-  it("390 斷點（max-width: 480px）內有 .metric-card-pair 改上下兩行的規則", () => {
-    // globals.css 有多個 `@media (max-width: 480px)` 區塊——直接找「規則本身在
-    // 某個 480px 區塊內」比切割字串更穩：抓規則本體，確認緊鄰其前的最近一個
-    // `@media (max-width: 480px) {` 早於規則、且規則早於該區塊的收尾 `}`。
+  it("窄卡（@container max-width ≤ 170px）內有 .metric-card-pair 改上下兩行的規則", () => {
+    // 2026-09-05 防折行改版：上下兩行規則從 `@media (max-width: 480px)` 搬到
+    // `.metric-card` 的 container query（量卡片實際寬度，不猜 viewport）。
+    // 抓規則本體，確認緊鄰其前的最近一個 `@container (max-width: …px)` 早於規則、
+    // 且兩者之間沒夾另一個頂層 at-rule。
     const ruleMatch = css.match(/\.metric-card-pair \.metric-card-value\s*\{\s*flex-direction:\s*column[^}]*\}/);
     expect(ruleMatch).not.toBeNull();
     const ruleIndex = ruleMatch?.index ?? -1;
-    const precedingMediaIndex = css.lastIndexOf("@media (max-width: 480px)", ruleIndex);
-    expect(precedingMediaIndex).toBeGreaterThan(-1);
-    // 確認兩者之間沒有夾著另一個頂層 `@media`（代表規則真的在這個 480px 區塊內，
-    // 不是巧合落在更早的區塊之後、更晚的另一個 @media 之前）。
-    const between = css.slice(precedingMediaIndex + 1, ruleIndex);
-    expect(between).not.toMatch(/\n@media/);
+    const precedingContainerIndex = css.lastIndexOf("@container (max-width:", ruleIndex);
+    expect(precedingContainerIndex).toBeGreaterThan(-1);
+    const header = css.slice(precedingContainerIndex, ruleIndex);
+    const px = header.match(/@container \(max-width:\s*(\d+)px\)/);
+    expect(Number(px?.[1])).toBeLessThanOrEqual(170);
+    const between = css.slice(precedingContainerIndex + 1, ruleIndex);
+    expect(between).not.toMatch(/\n@(media|container)/);
+  });
+
+  it(".metric-card 是 inline-size 容器、值 nowrap（2026-09-05 防折行）", () => {
+    expect(ruleBody(".metric-card {")).toMatch(/container-type:\s*inline-size/);
+    const value = ruleBody(".metric-card-value {");
+    expect(value).toMatch(/white-space:\s*nowrap/);
+    expect(value).toMatch(/font-size:\s*min\(var\(--fs-h3\),\s*[\d.]+cqw\)/);
   });
 });
