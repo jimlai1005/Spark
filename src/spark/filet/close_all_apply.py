@@ -35,8 +35,8 @@ from typing import Callable
 
 from spark.copytrade.killswitch import is_tripped, last_owner_close_s
 from spark.copytrade.notifier import Notifier
-from spark.filet.close_all import (CloseAllError, close_all_path_for,
-                                   close_all_result_path_for,
+from spark.filet.close_all import (CLOSE_ALL_MAX_AGE_S, CloseAllError,
+                                   close_all_path_for, close_all_result_path_for,
                                    load_close_all_requests, read_close_all_result,
                                    verify_close_all, write_close_all_result)
 from spark.filet.followers import load_followers
@@ -190,6 +190,18 @@ class CloseAllApplier:
                             "（%.0f）之前或同時（issued_at=%s），視為已被"
                             "那次收尾消化，本輪不處理 account=%s",
                             last_close_s, issued_at, self._account_id)
+                        # ⭐ 第四輪審查 W1：被這道閘門跳過的請求若**仍在時效內**
+                        # （600 秒），代表一份新鮮簽章被判成舊重放——只可能是歸檔
+                        # 時間戳偏晚（主機時鐘偏移、人工搬過歸檔目錄），那是異常，
+                        # 不能靜默（工程原則 3）；超過時效的殘留才是正常重放。
+                        if float(self._now_fn()) - issued_s <= CLOSE_ALL_MAX_AGE_S:
+                            self._critical(
+                                f"**平倉並撤銷請求被判為舊重放但仍在時效內**"
+                                f"（issued_at={issued_at}，上次收尾 epoch="
+                                f"{last_close_s:.0f}）——歸檔的 tripped_at 可能"
+                                f"偏晚（時鐘偏移／人工搬動歸檔）；本輪不處理，"
+                                f"請人工檢查 owner_close_archive/ 後由客戶重簽",
+                                dedup_key="close_all_superseded_fresh")
                         return False
             user_address = self._trusted_user_address()
             if user_address is None:

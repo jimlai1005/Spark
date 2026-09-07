@@ -523,6 +523,44 @@ def test_close_all_applier_ignores_request_signed_before_last_owner_close(tmp_pa
     assert calls2 == [True]
 
 
+def test_close_all_applier_alerts_when_fresh_request_is_superseded_by_archive(tmp_path):
+    """⭐ 第四輪審查 W1：歸檔的 tripped_at 偏晚（now+100s，時鐘偏移／人工搬動）時，
+    一筆**仍在時效內**的新鮮請求（issued_at = now-50s）會被閘門 (2) 跳過——這是
+    異常而非正常重放，必須發 critical（不得靜默）；超過時效的殘留（now-900s）
+    則維持安靜。"""
+    wallet = Account.create()
+    account_id = _acct(wallet)
+    manifest = _manifest(tmp_path, account_id=account_id, user_address=wallet.address)
+    tripped_at = _at(100)
+    archive_dir = tmp_path / OWNER_CLOSE_ARCHIVE_RELPATH / tripped_at.replace(":", "")
+    archive_dir.mkdir(parents=True)
+    (archive_dir / ARM_FILE_RELPATH.name).write_text(json.dumps(
+        {"tripped_at": tripped_at, "reason": "owner_close", "phase": "complete"}))
+
+    rec, _ = _sign_close_all(wallet, account_id=account_id, issued_at=_at(-50))
+    write_close_all_request(tmp_path / "owner_close.json", rec)
+    notifier = RecordingNotifier()
+    applier = CloseAllApplier(account_id=account_id, manifest_path=manifest,
+                              request_path=tmp_path / "owner_close.json",
+                              notifier=notifier, now_fn=lambda: _NOW)
+    wind_down, calls = _wind_down_recorder()
+    assert applier.consume(tmp_path, wind_down) is False
+    assert calls == []
+    crits = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crits) == 1
+    assert crits[0][3] == "close_all_superseded_fresh"
+
+    rec2, _ = _sign_close_all(wallet, account_id=account_id, nonce="n2",
+                              issued_at=_at(-900))
+    write_close_all_request(tmp_path / "owner_close.json", rec2)
+    notifier2 = RecordingNotifier()
+    applier2 = CloseAllApplier(account_id=account_id, manifest_path=manifest,
+                               request_path=tmp_path / "owner_close.json",
+                               notifier=notifier2, now_fn=lambda: _NOW)
+    assert applier2.consume(tmp_path, wind_down) is False
+    assert [r for r in notifier2.records if r[0] == "critical"] == []
+
+
 # ══════════════════════════════════════════════════════════════════════
 # (E) publicapi/app.py：POST /api/me/pause、GET/POST /api/me/close-all
 # ══════════════════════════════════════════════════════════════════════
