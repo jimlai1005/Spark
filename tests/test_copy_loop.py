@@ -105,6 +105,84 @@ def test_tripped_short_circuits_with_zero_calls(tmp_path):
     assert crits[0][3] == "tripped"  # dedup_key（TelegramNotifier TTL 去重靠它）
 
 
+# ── 1b. owner_close 終態：發完成通知後 halt_engine=True（裁決 D1/D5）─────
+def _owner_close_arm(root, *, tripped_at="2026-09-07T01:00:00+00:00",
+                     phase="complete", failures=None,
+                     orders_not_cancelled=False, cancelled=3, closed=None,
+                     reason="owner_close") -> None:
+    """本檔專用（不依賴 tests/test_copy_killswitch.py）——寫一份能通過
+    `owner_close_terminal` 判定的 ARM payload，欄位對齊 killswitch.trip() 寫入形狀。"""
+    import json
+    p = root / ARM_FILE_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tripped_at": tripped_at,
+        "current": "700",
+        "peak": "1000",
+        "drawdown_pct": "0.3",
+        "breached": True,
+        "reason": reason,
+        "phase": phase,
+        "cancelled": cancelled,
+        "orders_not_cancelled": orders_not_cancelled,
+        "closed": closed or [],
+        "failures": failures or [],
+    }
+    p.write_text(json.dumps(payload))
+
+
+def test_owner_close_terminal_halts_engine_with_completion_notice(tmp_path):
+    """(a) 終態、無殘留 → halt_engine=True、恰一則 critical 含完成訊息、零交易。"""
+    _owner_close_arm(tmp_path, tripped_at="2026-09-07T01:00:00+00:00")
+    fa = FakeAdapter()
+    report, notifier, ex = _run(fa, tmp_path=tmp_path)
+
+    assert report.halt_engine is True
+    assert report.tripped is True
+    assert dict(fa.calls) == {}, "owner_close 終態不得有任何 adapter 呼叫（含讀取）"
+    assert ex.records == []
+    crits = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crits) == 1
+    assert crits[0][3] == "owner_close_done"
+    assert "平倉並撤銷已完成" in crits[0][2]
+    assert "2026-09-07T01:00:00+00:00" in crits[0][2]
+    assert "殘留暴險" not in crits[0][2]
+
+
+def test_owner_close_terminal_with_residual_still_halts_and_names_failures(tmp_path):
+    """(b) 終態、有殘留暴險（D1：仍只發一則、仍 halt_engine=True，訊息明列殘留）。"""
+    _owner_close_arm(tmp_path, failures=["BTC"], orders_not_cancelled=True)
+    fa = FakeAdapter()
+    report, notifier, ex = _run(fa, tmp_path=tmp_path)
+
+    assert report.halt_engine is True
+    assert dict(fa.calls) == {}
+    assert ex.records == []
+    crits = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crits) == 1, "D1：有無殘留都只發一則"
+    assert crits[0][3] == "owner_close_done"
+    assert "殘留暴險" in crits[0][2]
+    assert "BTC" in crits[0][2]
+
+
+def test_owner_close_reason_mismatch_keeps_ordinary_tripped_message(tmp_path):
+    """(b2) reason=drawdown（非 owner_close）→ 不算終態：halt_engine=False，
+    訊息仍是既有那則「kill switch 已 tripped」。"""
+    _owner_close_arm(tmp_path, reason="drawdown")
+    fa = FakeAdapter()
+    report, notifier, ex = _run(fa, tmp_path=tmp_path)
+
+    assert report.halt_engine is False
+    assert report.tripped is True
+    assert dict(fa.calls) == {}
+    assert ex.records == []
+    crits = [r for r in notifier.records if r[0] == "critical"]
+    assert len(crits) == 1
+    assert crits[0][3] == "tripped"
+    assert "kill switch 已 tripped" in crits[0][2]
+    assert "平倉並撤銷已完成" not in crits[0][2]
+
+
 # ── 2. breach → flatten_on_breach=True 時呼叫 trip ────────────────────
 def test_breach_with_flatten_calls_trip(tmp_path, monkeypatch):
     calls = []
@@ -919,6 +997,33 @@ def test_main_loop_sleeps_aligned_to_interval():
     assert _seconds_until_next_interval(90.0, 60) == 30.0
     assert _seconds_until_next_interval(120.0, 60) == 60.0
     assert _seconds_until_next_interval(119.5, 60) == 1.0  # 貼近邊界至少睡 1 秒
+
+
+# ── 5b. main_loop：report.halt_engine=True → 提前正常返回（裁決 D1/D5）────
+def test_main_loop_returns_when_report_has_halt_engine():
+    """(c) owner_close 終態的一輪之後，main_loop 不得再排程下一輪
+    （sleep_fn 計數器證明沒有第二輪）；用 info 留痕，且正常返回（不 raise）。"""
+    calls = []
+
+    def mk_cycle():
+        calls.append(1)
+        return CycleReport(
+            reconcile=ReconcileResult(placed=0, cancelled=0, modified=0, matched=0,
+                                      sync_failed=False, skipped_small=()),
+            safety_net={"skipped": True}, scale=Decimal("0"), tripped=True,
+            halt_engine=True,
+        )
+
+    notifier = RecordingNotifier()
+    sleeps = []
+    main_loop(mk_cycle, _settings(), notifier, clock=lambda: 0.0,
+             sleep_fn=lambda s: sleeps.append(s), now_fn=_advancing_now())
+
+    assert len(calls) == 1, "halt_engine=True 之後不得再跑第二輪"
+    assert sleeps == [], "halt_engine 應在排程下一次 sleep 之前就返回"
+    infos = [r for r in notifier.records if r[0] == "info"]
+    assert any("owner_close" in r[2] for r in infos)
+    assert [r for r in notifier.records if r[0] == "critical"] == []
 
 
 # ── 6. main_loop：連續錯誤熔斷與成功歸零 ─────────────────────────────

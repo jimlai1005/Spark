@@ -102,8 +102,8 @@ from spark.copytrade.equity import perp_equity_view, sample_coverage, update_lif
 from spark.copytrade.executor import ActionExecutor, ActionRecord, VirtualBook
 from spark.copytrade.killswitch import (ALERTS_LOG_RELPATH, REASON_LEADER_REVOKED,
                                         REASON_OWNER_CLOSE, DrawdownStatus,
-                                        check_drawdown, count_alerts, halt_status,
-                                        is_tripped, trip)
+                                        announce_owner_close_history, check_drawdown,
+                                        count_alerts, halt_status, is_tripped, trip)
 from spark.copytrade.loop import main_loop, run_cycle, tripped_report
 from spark.copytrade.notifier import NullNotifier, Notifier, TelegramNotifier
 from spark.copytrade.orders import ReconcileState
@@ -616,6 +616,9 @@ def main(argv: list[str] | None = None) -> None:
     notifier = (TelegramNotifier.from_env()
                 if os.environ.get("COPY_TG_BOT_TOKEN") else NullNotifier())
     notifier = wrap_notifier(notifier, account_id)
+    # Task 3（owner_close 生命週期）：notifier／state_root 就緒後立刻提示歸檔歷史，
+    # 涵蓋全部模式（含 --once／shadow／--status）——純讀檔＋無歸檔即靜默，無副作用。
+    announce_owner_close_history(state_root, notifier)
 
     # ⭐ leader 解析＋白名單二次驗證，刻意放在建立 Info／取 key 之前：純檔案 IO，
     # 失敗要在碰網路與 Keychain 之前就拒絕啟動（威脅模型見 leader_resolve.py 檔頭）。

@@ -39,7 +39,7 @@ from spark.copytrade.follower_flow import apply_follower_flows
 from spark.copytrade.killswitch import (REASON_COST_BREACH, REASON_ROLLING_DRAWDOWN,
                                         REASON_TOTAL_DRAWDOWN, DrawdownStatus,
                                         auto_rearm_if_cooled_down, evaluate,
-                                        is_tripped, trip)
+                                        is_tripped, owner_close_terminal, trip)
 from spark.copytrade.leader_flow import adjusted_leader_equity
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
@@ -60,11 +60,14 @@ logger = logging.getLogger(__name__)
 _EMPTY_RECONCILE = ReconcileResult(placed=0, cancelled=0, modified=0, matched=0,
                                    sync_failed=False, skipped_small=())
 
-def tripped_report() -> CycleReport:
+def tripped_report(*, halt_engine: bool = False) -> CycleReport:
     """零交易動作的一輪。公開（非 _ 前綴）是因為 run_copytrade 的 leader 撤銷路徑
-    也要回報「這一輪什麼都沒做」——兩處各造一份會漂移。"""
+    也要回報「這一輪什麼都沒做」——兩處各造一份會漂移。
+
+    `halt_engine=True`（owner_close 終態，裁決 D1/D5）：`main_loop` 見到後正常
+    返回，引擎自行結束——與預設的「tripped 但迴圈續跑、等人工 re-arm」不同。"""
     return CycleReport(reconcile=_EMPTY_RECONCILE, safety_net={"skipped": True},
-                       scale=Decimal("0"), tripped=True)
+                       scale=Decimal("0"), tripped=True, halt_engine=halt_engine)
 
 
 def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
@@ -89,6 +92,30 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
 
     # ── 1. killswitch 短路：tripped 只讀報狀態，零交易動作 ─────────────
     if is_tripped(root):
+        # ⭐ owner_close 終態（裁決 D1/D5）：客戶簽章「平倉並撤銷」已收尾完成，
+        # 不是等人工 re-arm 的一般熔斷——發最後一則完成通知後引擎自行結束
+        # （不論有無殘留暴險都只發這一則；有殘留暴險時在訊息裡明列，交由用戶
+        # 自行至 Hyperliquid 收尾）。判定只看 owner_close_terminal（fail-closed：
+        # ARM 壞掉/欄位不符時它回 None，走下面既有的一般 tripped 路徑）。
+        terminal = owner_close_terminal(root)
+        if terminal is not None:
+            residual_note = ""
+            if terminal["residual"]:
+                residual_note = (
+                    f"⚠️ 有殘留暴險：平倉失敗 {terminal.get('failures')}、"
+                    f"掛單未撤={terminal.get('orders_not_cancelled')}——"
+                    f"剩餘小額部位請用戶自行至 Hyperliquid 收尾。"
+                )
+            notifier.critical(
+                "killswitch",
+                f"平倉並撤銷已完成（{terminal['tripped_at']}，撤單 "
+                f"{terminal.get('cancelled')} 張、平倉 {terminal.get('closed')}）——"
+                f"引擎結束運行，不再重複提醒。{residual_note}"
+                f"重新跟單：用戶在站上重新選定 leader 並簽章後會自動重新啟用"
+                f"（舊記錄自動歸檔）",
+                dedup_key="owner_close_done",
+            )
+            return tripped_report(halt_engine=True)
         notifier.critical(
             "killswitch",
             f"kill switch 已 tripped（{root / 'var/copytrade/killswitch.tripped'}），"
@@ -435,7 +462,9 @@ def main_loop(mk_cycle: Callable[[], CycleReport], settings: CopySettings,
     - 連續錯誤 >= settings.max_consecutive_errors → notifier.critical + SystemExit(1)
       （hl main.py:291-292,351-363）；任一輪成功即歸零。
     - tripped 的輪次不算錯誤也不停迴圈——killswitch 短路由 run_cycle 內部處理，
-      re-arm 後（人工刪 ARM_FILE）迴圈自動恢復交易。
+      re-arm 後（人工刪 ARM_FILE）迴圈自動恢復交易。例外：owner_close 終態
+      （`report.halt_engine=True`，裁決 D1/D5）——引擎發完最後一則通知即正常
+      返回（exit 0），不再繼續排程；unit 為 `Restart=on-failure`，不會被拉起。
     - KeyboardInterrupt → 通知後正常返回。
     """
     consecutive_errors = 0
@@ -447,8 +476,11 @@ def main_loop(mk_cycle: Callable[[], CycleReport], settings: CopySettings,
             if key != last_key:
                 last_key = key
                 try:
-                    mk_cycle()
+                    report = mk_cycle()
                     consecutive_errors = 0
+                    if getattr(report, "halt_engine", False):
+                        notifier.info("loop", "引擎已依 owner_close 終態結束")
+                        return
                 except Exception as e:  # noqa: BLE001 —— 熔斷計數層，KeyboardInterrupt/SystemExit 不攔
                     consecutive_errors += 1
                     logger.error("同步錯誤 (%d/%d): %s", consecutive_errors,

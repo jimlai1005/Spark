@@ -66,7 +66,8 @@ def owner_close_history(root: Path) -> list[dict]:
 ### Task 2 @inline：引擎在 owner_close 終態自行結束
 
 **Files:**
-- Modify: `src/spark/copytrade/loop.py`（`CycleReport`、`tripped_report`、`run_cycle` :90-102、`main_loop` :444-451）
+- Modify: `src/spark/copytrade/orders.py:381-389`（`CycleReport` frozen dataclass 定義在這裡，欄位 `halt_engine: bool = False` 加在 `tripped` 之後；2026-09-07 裁決：允許改此檔）
+- Modify: `src/spark/copytrade/loop.py`（`tripped_report`、`run_cycle` :90-102、`main_loop` :444-451）
 - Test: `tests/test_copy_loop.py`
 
 - `CycleReport` 新增欄位 `halt_engine: bool = False`；`tripped_report(*, halt_engine: bool = False)`。

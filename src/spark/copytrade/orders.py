@@ -381,12 +381,18 @@ class ReconcileResult:
 @dataclass(frozen=True)
 class CycleReport:
     """`sync_open_orders` 單輪報告。對應 hl orders.py:351-361 的回傳 dict。
-    `tripped` 預留給回撤熔斷（Task 13），本層恆為預設 False。"""
+    `tripped` 預留給回撤熔斷（Task 13），本層恆為預設 False。
+
+    `halt_engine`（owner_close 生命週期收尾，2026-09-07 裁決 D1/D5）：ARM 為
+    owner_close 終態（`killswitch.owner_close_terminal`）時 `run_cycle` 回傳
+    此旗標為 True，`main_loop` 見到後正常返回（exit 0，不再每輪重跑）——
+    與一般 `tripped=True`（每輪繼續、等人工 re-arm）語意不同，故獨立成欄位。"""
 
     reconcile: ReconcileResult
     safety_net: dict
     scale: Decimal
     tripped: bool = False
+    halt_engine: bool = False
 
 
 def _set_entry_leverage(
