@@ -139,6 +139,13 @@ def write_referral_optin(path, record) -> None
 - Modify: `src/spark/exchange/hyperliquid.py`（`query_builder_accrued` 附近加讀；`approve_agent` 附近加寫）
 - Modify: `src/spark/exchange/fakes.py`（fake 記錄呼叫、可預設回值／注入錯誤）
 - Modify: `tests/test_hyperliquid_adapter.py`（追加）
+- Modify: `src/spark/resilience.py`（**2026-09-19 主線程裁決**，執行時發現 `tests/test_resilience_boundary.py` 的結構守門：所有 `self._exchange.<name>(` 都必須是 `ResilientExchange` 的顯式包裝方法或在唯讀白名單）：`set_referrer` 是交易所寫入，**不得走透傳白名單**，在 `ResilientExchange` 加顯式包裝，分類為**冪等**（送達但回應遺失時重送只會得到語意錯 `Referrer already set`，不會重複產生任何效果）：
+  ```python
+  def set_referrer(self, *a, **k):
+      return run(lambda: self._ex.set_referrer(*a, **k),
+                 what="設定推薦碼", idempotent=True, sleep_fn=self._sleep_fn)
+  ```
+  並在 `tests/test_resilience.py`（或該檔既有的 ResilientExchange 測試檔）照 `update_leverage` 的既有測試追加：transient 例外會重試、成功回傳原 dict。Task 3 的 applier 對「例外」的處理（下一輪再試）維持不變，作為邊界之外的第二層。
 
 ```python
 # base.py
