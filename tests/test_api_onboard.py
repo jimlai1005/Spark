@@ -2,6 +2,7 @@
 import socket
 from decimal import Decimal
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -82,6 +83,37 @@ def test_status_hl_down_502(tmp_path):
     hl.max_builder_fee = _boom
     r = client.get("/api/onboard/status")
     assert r.status_code == 502
+
+
+def test_status_hl_429_is_502_not_500(tmp_path):
+    """HL 回 429 → httpx.HTTPStatusError；先前沒有任何 handler 接住 → 500 帶 traceback
+    （2026-09-19 事故）。與 ConnectionError/TimeoutError 同一個全域邊界、同轉 502
+    （app.py:1363-1371 起的單一邊界慣例，工程原則 5）。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    login(client)
+
+    def _429(*a, **kw):
+        req = httpx.Request("POST", "https://x/info")
+        raise httpx.HTTPStatusError("429", request=req, response=httpx.Response(429, request=req))
+    hl.max_builder_fee = _429
+    r = client.get("/api/onboard/status")
+    assert r.status_code == 502
+    assert "429" in r.json()["detail"]
+
+
+def test_status_programming_error_is_still_500(tmp_path):
+    """反面：非上游 HTTP 錯誤的例外不得被這個新 handler 吃成 502——它必須原樣炸出來
+    （TestClient 預設 raise_server_exceptions=True，往上拋成 Python 例外而非 500 回應）。"""
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    login(client)
+
+    def _boom(*a, **kw):
+        raise KeyError("x")
+    hl.max_builder_fee = _boom
+    with pytest.raises(KeyError):
+        client.get("/api/onboard/status")
 
 
 def test_payload_builder_fee_hl_timeout_502(tmp_path):

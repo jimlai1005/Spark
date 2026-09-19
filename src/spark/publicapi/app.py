@@ -1370,6 +1370,16 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     async def _hl_timeout(request, exc):
         return JSONResponse(status_code=502, content={"detail": "上游服務逾時，請稍後重試"})
 
+    @app.exception_handler(httpx.HTTPStatusError)
+    async def _hl_http_status(request, exc):
+        # 429／5xx 等上游 HTTP 錯誤：resilience 邊界視 429 為語意錯不重試、直接上拋，
+        # 先前沒有任何 handler 接住 → 500 帶 traceback（2026-09-19 事故）。與上面兩個
+        # handler 同一個邊界、同轉 502（工程原則 5：單一邊界，不逐端點各自 try/except）。
+        code = getattr(getattr(exc, "response", None), "status_code", "?")
+        logger.warning("HL 上游 HTTP %s: %s %s", code, request.method, request.url.path)
+        return JSONResponse(status_code=502,
+                             content={"detail": f"上游服務回應 HTTP {code}，請稍後重試"})
+
     @app.exception_handler(BillingError)
     async def _billing_error(request, exc):
         # semantic 失敗（設定錯/請求被拒）：不重試、大聲留痕（工程原則 3）
