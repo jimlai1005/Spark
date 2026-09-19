@@ -190,30 +190,58 @@ def test_sync_cache_skips_error_results():
 - [ ] **Step 4: 跑 `uv run pytest tests/test_dashboard_sync.py -q` 全綠**
 - [ ] **Step 5: Commit** `fix: dashboard sync 快取不釘住 error 結果`
 
-### Task 0.4 @inline：onboard/status 上游失敗回 503 而非 500
+### Task 0.4 @inline：HL 4xx/5xx（含 429）統一轉 502，不再 500
+
+<!-- 2026-09-20 裁決（builder 回報）：原版在 `_progress` 局部 try/except 轉 503 會撞既有
+全域 handler（app.py:1363-1371 把 ConnectionError/TimeoutError 轉 502）與兩條 pinned 測試
+（test_status_hl_down_502、test_perp_value_read_failure_is_502_not_a_zero_balance）。
+改為沿單一邊界慣例（工程原則 5）：全域 handler 加 httpx.HTTPStatusError → 502，
+覆蓋所有端點；P1 的 BudgetExhausted 也在同處加。 -->
 
 **Files:**
-- Modify: `src/spark/publicapi/app.py:3386-3410`（`_progress`）
-- Test: `tests/test_onboard*.py`（找既有測 `/api/onboard/status` 的檔）
+- Modify: `src/spark/publicapi/app.py:1363-1371`（全域 exception handler 區）
+- Test: `tests/test_api_onboard.py`
 
-- [ ] **Step 1: 失敗測試**：FakeHL 的 `max_builder_fee` 改成拋 `httpx.HTTPStatusError`（用 `httpx.Response(429)` 構造）或字串含 "429" 的 `RuntimeError`；`GET /api/onboard/status` 應回 503，body `{"detail": "upstream_unavailable"}`。
-- [ ] **Step 2: 跑，FAIL（500）**
-- [ ] **Step 3: 改 `_progress`**：把三個 `hl.*` 呼叫包成
+- [ ] **Step 1: 失敗測試**（沿該檔 `test_status_hl_down_502` 第 73-84 行的寫法）
 
 ```python
-        try:
-            builder_fee_approved = hl.max_builder_fee(address, cfg.builder_address) != 0
-            agent_approved = bool(agent_address) and agent_address in hl.agent_addresses(address)
-            perp_account_value = hl.get_account_value(address)
-        except (ConnectionError, TimeoutError, httpx.HTTPStatusError, BudgetExhausted) as e:
-            logger.warning("onboard progress: HL 查詢失敗 account=%s: %r", account_id, e)
-            raise HTTPException(status_code=503, detail="upstream_unavailable") from e
+def test_status_hl_429_is_502_not_500(tmp_path, monkeypatch):
+    """HL 回 429／5xx → httpx.HTTPStatusError；之前沒有任何 handler 接住 → 500 帶
+    traceback（2026-09-19 事故）。與 ConnectionError/TimeoutError 同一個邊界、同 502。"""
+    client, hl = ...  # 同 test_status_hl_down_502 的場景建立
+    def _429(*a, **k):
+        req = httpx.Request("POST", "https://x/info")
+        raise httpx.HTTPStatusError("429", request=req, response=httpx.Response(429, request=req))
+    monkeypatch.setattr(hl, "max_builder_fee", _429)
+    r = client.get("/api/onboard/status")
+    assert r.status_code == 502
+    assert "429" in r.json()["detail"]
+
+def test_status_programming_error_is_still_500(tmp_path, monkeypatch):
+    """反面：非上游例外不得被吃成 502。"""
+    monkeypatch.setattr(hl, "max_builder_fee", lambda *a, **k: (_ for _ in ()).throw(KeyError("x")))
+    with pytest.raises(KeyError):          # TestClient 預設 raise_server_exceptions=True；若 _client 關閉了，改斷言 500
+        client.get("/api/onboard/status")
 ```
 
-（`BudgetExhausted` 在 P1 才存在：P0 先不列，P1 Task 1.2 Step 6 補上。`httpx` 若 `app.py` 未 import，改為 `Exception` 但**只**包這三行，並在註解寫明是上游邊界。）
+- [ ] **Step 2: 跑，第一個 FAIL（500 或直接拋 HTTPStatusError）**
+- [ ] **Step 3: 在 `app.py:1371` 之後加**
 
-- [ ] **Step 4: 跑該測試檔全綠**
-- [ ] **Step 5: Commit** `fix: onboard/status 上游失敗回 503`
+```python
+    @app.exception_handler(httpx.HTTPStatusError)
+    async def _hl_http_status(request, exc):
+        # 429／5xx 等上游 HTTP 錯誤：resilience 邊界視 429 為語意錯不重試、直接上拋，
+        # 之前沒有 handler → 500（2026-09-19 事故）。與上面兩個 handler 同一個邊界、同 502。
+        code = getattr(getattr(exc, "response", None), "status_code", "?")
+        logger.warning("HL 上游 HTTP %s: %s %s", code, request.method, request.url.path)
+        return JSONResponse(status_code=502,
+                            content={"detail": f"上游服務回應 HTTP {code}，請稍後重試"})
+```
+
+`app.py` 若未 `import httpx`，在檔頭 import 區加上。既有測試 `test_status_hl_down_502`／`test_perp_value_read_failure_is_502_not_a_zero_balance` **不動**。
+
+- [ ] **Step 4: `uv run pytest tests/test_api_onboard.py tests/test_api_billing.py -q` 全綠**
+- [ ] **Step 5: Commit** `fix: HL 上游 HTTP 錯誤（含 429）統一轉 502，不再 500`
 
 ### Task 0.5 @sdd：文案「引擎狀態讀取失敗」→「鏈上資料讀取失敗」
 
@@ -914,4 +942,13 @@ class ExplorePublisher:
 
 ## 4. 執行狀態
 
-（主線程逐 task 更新：日期、commit、驗收輸出摘要。）
+分支 `feat/explore-rate-limit`（自 main 54c038b 切出）。主線程逐 task 親跑驗收後記錄。
+
+| Task | 日期 | commit | 主線程驗收 |
+|---|---|---|---|
+| 0.1 | 2026-09-20 | e7ee43d | `pytest tests/test_public_explore.py` 78 passed；ruff 乾淨；`query()` 內無 `_maybe_trigger_build()` 呼叫 |
+| 0.2 | 2026-09-20 | f6c42f9 | `pytest tests/test_me_dashboard.py tests/test_dashboard_sync.py` 31 passed；`_HEALTHY_CYCLE_RESULTS` 於 app.py:690/727 |
+| 0.5 | 2026-09-20 | e466f07 | copy.ts 1257/2917 新值；vitest SyncCard＋enNoCjk 10 passed |
+| 0.3 | 2026-09-20 | 5b348d1 | 同上兩檔 32 passed；`_dashboard_sync` 只在 `data_state != "error"` 寫快取 |
+| 0.4 | 2026-09-20 | 30cdec7 | 裁決改為全域 handler（見 Task 0.4 註）；`pytest tests/test_api_onboard.py tests/test_api_billing.py` 59 passed |
+| **P0 驗收** | 2026-09-20 | — | `uv run pytest -q` 2933 passed；`uv run ruff check src tests scripts` 乾淨；`query()` 內無觸發呼叫。可做第一次部署（D8）待 P1 完成後一起 |
