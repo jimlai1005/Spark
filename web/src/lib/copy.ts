@@ -1254,7 +1254,7 @@ export const COPY_ZH = {
       // （結構上「還沒開始跑」，不是「資料還在本機累積」——R4-1 起同步誤差已
       // 改為請求時即時向鏈上計算，不落盤、不累積）。
       warmingLine: "同步誤差為即時由鏈上近 24h 成交計算；此帳號的引擎尚未發布過心跳，暫時無法比對。",
-      errorLine: "引擎狀態讀取失敗",
+      errorLine: "鏈上資料讀取失敗",
     },
     fees: {
       label: "本月交易量與 builder fee",
@@ -2914,7 +2914,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       lastRecon: "This comparison (on-chain)",
       warmingLine: "Sync deviation is computed live from on-chain fills in the last 24h; this account's "
                   + "engine hasn't published a heartbeat yet, so comparison isn't available.",
-      errorLine: "Engine status unavailable",
+      errorLine: "On-chain data unavailable",
     },
     fees: {
       label: "This month's volume & builder fee",
