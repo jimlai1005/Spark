@@ -947,8 +947,8 @@ class ExplorePublisher:
 | Task | 日期 | commit | 主線程驗收 |
 |---|---|---|---|
 | 0.1 | 2026-09-20 | e7ee43d | `pytest tests/test_public_explore.py` 78 passed；ruff 乾淨；`query()` 內無 `_maybe_trigger_build()` 呼叫 |
-| 0.2 | 2026-09-20 | f6c42f9 | `pytest tests/test_me_dashboard.py tests/test_dashboard_sync.py` 31 passed；`_HEALTHY_CYCLE_RESULTS` 於 app.py:690/727 |
-| 0.5 | 2026-09-20 | e466f07 | copy.ts 1257/2917 新值；vitest SyncCard＋enNoCjk 10 passed |
-| 0.3 | 2026-09-20 | 5b348d1 | 同上兩檔 32 passed；`_dashboard_sync` 只在 `data_state != "error"` 寫快取 |
-| 0.4 | 2026-09-20 | 30cdec7 | 裁決改為全域 handler（見 Task 0.4 註）；`pytest tests/test_api_onboard.py tests/test_api_billing.py` 59 passed |
+| 0.2 | 2026-09-20 | ad6f82b | `pytest tests/test_me_dashboard.py tests/test_dashboard_sync.py` 31 passed；`_HEALTHY_CYCLE_RESULTS` 於 app.py:690/727 |
+| 0.5 | 2026-09-20 | 270230f | copy.ts 1257/2917 新值；vitest SyncCard＋enNoCjk 10 passed |
+| 0.3 | 2026-09-20 | 9b56058 | 同上兩檔 32 passed；`_dashboard_sync` 只在 `data_state != "error"` 寫快取 |
+| 0.4 | 2026-09-20 | e5a6479 | 裁決改為全域 handler（見 Task 0.4 註）；`pytest tests/test_api_onboard.py tests/test_api_billing.py` 59 passed |
 | **P0 驗收** | 2026-09-20 | — | `uv run pytest -q` 2933 passed；`uv run ruff check src tests scripts` 乾淨；`query()` 內無觸發呼叫。可做第一次部署（D8）待 P1 完成後一起 |
