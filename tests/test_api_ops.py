@@ -1748,3 +1748,15 @@ def test_health_hl_budget_snapshot_when_limiter_injected(tmp_path):
     body = client.get("/api/ops/health").json()
     assert body["hl_budget"]["global_cap"] == 900
     assert body["hl_budget"]["scope_caps"]["explore"] == 300
+
+
+# ---------- explore_index（Task 1.5，reviewer W3：凍結快照的年齡要可觀測）----------
+
+def test_health_explore_index_status_shape(tmp_path):
+    """P1-only 部署期間 Explore 仍是舊版 build_sync、榜單凍結在最後一次成功建置
+    ——ops/health 要能看到「服務中的是哪一版、建於何時」（reviewer W3）。"""
+    client, _cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert set(body["explore_index"].keys()) == {"rows", "built_at", "version", "building"}
+    assert body["explore_index"]["rows"] is None      # 從未建置過（本測試不觸發建置）
+    assert body["explore_index"]["building"] is False

@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
+from spark.publicapi.hl_budget import BudgetExhausted
 from spark.publicapi.store import ApiStore
 from tests.publicapi_helpers import FakeHL, FakeKeysvc, make_app, make_cfg
 
@@ -335,6 +336,33 @@ def test_portfolio_failure_negative_cache_short_circuits_repeat_upstream_hits(tm
     del hl.portfolio_error[_A]
     hl.portfolios[_A] = sixty_day_rows()
     assert c.get(f"/api/public/traders/{_A}").status_code == 200
+    assert hl.portfolio_calls == 2
+
+
+def test_portfolio_budget_exhausted_is_502_not_negative_cached(tmp_path):
+    """reviewer C2：額度不足（`BudgetExhausted`／`ScopePaused`）是 transient——
+    這個進程當下的權重帳本滿了，不是這個地址真的查不到——不得被寫進 60 秒
+    負面快取；上拋交給全域 handler 轉 502，額度一恢復下一次請求就要能立刻
+    重打上游，不被錯誤地短路成負面快取命中。"""
+    cfg = make_cfg(tmp_path)
+    store = ApiStore(cfg.db_path)
+    keysvc = FakeKeysvc()
+    hl = _CountingHL()
+    hl.portfolio_error[_A] = BudgetExhausted(
+        "hl budget exhausted for scope=interactive weight=20")
+    clock = {"t": 1_000_000.0}
+    app = create_app(cfg, store, keysvc, hl, now_fn=lambda: clock["t"])
+    c = _client(app)
+
+    r = c.get(f"/api/public/traders/{_A}")
+    assert r.status_code == 502
+    assert hl.portfolio_calls == 1
+
+    clock["t"] += 1.0  # 遠低於 60 秒負面快取 TTL——若被誤快取，這裡仍會短路
+    del hl.portfolio_error[_A]
+    hl.portfolios[_A] = sixty_day_rows()
+    r2 = c.get(f"/api/public/traders/{_A}")
+    assert r2.status_code == 200
     assert hl.portfolio_calls == 2
 
 

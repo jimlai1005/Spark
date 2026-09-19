@@ -43,7 +43,7 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.filet.trader_stats import fills_stats, live_days_from_av, window_stats
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
-from spark.publicapi.hl_budget import BudgetExhausted, WeightLimiter
+from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, WeightLimiter
 from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
                                      build_contact_email, clip, decoy_ticket, notify_text,
                                      PAGE_URL_MAX, USER_AGENT_MAX, validate_contact)
@@ -1395,6 +1395,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         return JSONResponse(status_code=502,
                              content={"detail": "上游額度暫時用盡，請稍後重試"})
 
+    @app.exception_handler(ScopePaused)
+    async def _hl_scope_paused(request, exc):
+        # Task 1.5（reviewer C2）：scope 因 429 暫停中——同 BudgetExhausted 是
+        # transient、不得被吞進任何負面快取，統一經此邊界回 502。
+        logger.warning("HL scope 暫停中: %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=502,
+                             content={"detail": "上游額度暫停中，請稍後重試"})
+
     @app.exception_handler(BillingError)
     async def _billing_error(request, exc):
         # semantic 失敗（設定錯/請求被拒）：不重試、大聲留痕（工程原則 3）
@@ -2478,6 +2486,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         _enforce_probe_ratelimit(ratelimit_key)
         try:
             rows = hl.portfolio(address)
+        # reviewer C2：額度不足／scope 暫停是 transient（上游本身沒問題，只是
+        # 這個進程當下的權重帳本滿了），不得寫進 60 秒負面快取——負面快取是給
+        # 「這個地址真的查不到」用的；上拋交給全域 handler 轉 502，下一次請求
+        # （額度恢復後）要能立刻重打上游，不被錯誤地短路。
+        except (BudgetExhausted, ScopePaused): raise  # noqa: E701 — reviewer C2：單行短路，緊鄰下面的 except Exception 降級分支
         except Exception as e:  # noqa: BLE001 — 公開端點：上游任何失敗都不得 500
             logger.error("交易員績效上游查詢失敗 address=%s: %s", address, e)
             with _trader_portfolio_lock:
@@ -2488,12 +2501,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         try:
             ch_state = hl.clearinghouse_state(address)
             account_value = ch_state.get("marginSummary", {}).get("accountValue")
+        except (BudgetExhausted, ScopePaused): raise  # noqa: E701 — reviewer C2：單行短路，緊鄰下面的 except Exception 降級分支
         except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
             logger.error("交易員 account_value 查詢失敗 address=%s: %s", address, e)
         deposit = None
         try:
             ledger_raw = hl.non_funding_ledger_updates(address, 0)
             deposit = sum_ledger_deposits(ledger_raw)
+        except (BudgetExhausted, ScopePaused): raise  # noqa: E701 — reviewer C2：單行短路，緊鄰下面的 except Exception 降級分支
         except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
             logger.error("交易員真實入金查詢失敗 address=%s: %s", address, e)
         # 2026-09-05 Task 8 Step 3（reviewer Warning 2）：失敗降級為 `None`，不是
@@ -2506,6 +2521,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             start_dt = end_dt - timedelta(days=hl_explore.FILLS_WINDOW_DAYS)
             fills, fills_truncated = hl.get_fills_raw_paged(
                 address, start_dt, end_dt, max_pages=hl_explore.fills_max_pages_from_env())
+        except (BudgetExhausted, ScopePaused): raise  # noqa: E701 — reviewer C2：單行短路，緊鄰下面的 except Exception 降級分支
         except Exception as e:  # noqa: BLE001 — 額外欄位（成交統計），失敗只降級該欄位
             logger.error("交易員近 30 天成交查詢失敗 address=%s: %s", address, e)
         with _trader_portfolio_lock:
@@ -4568,6 +4584,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "summary": health_summary(rows, backlog, lc_errors),
             "manifest_errors": manifest_errors,
             "hl_budget": limiter.snapshot() if limiter is not None else None,
+            # reviewer W3：P1-only 部署期間 Explore 建置仍是舊版 build_sync（背景
+            # scheduler 是 P3 才做的事），榜單暫時凍結在最後一次成功建置——ops
+            # 要看得到「服務中的是哪一版、建於何時」，不是空白猜測。
+            "explore_index": _explore_index.status(),
         })
 
     @app.get("/api/ops/trade-quality")

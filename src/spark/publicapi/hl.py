@@ -14,7 +14,7 @@ import httpx
 from spark.config import API_URLS, EXPLORER_URLS
 from spark.exchange.base import USER_FILLS_PAGE_LIMIT, UserFill
 from spark.publicapi.hl_budget import (INTERACTIVE_SCOPE, INTERACTIVE_WAIT_S,
-                                       WeightLimiter, weight_for)
+                                       WeightLimiter, is_rate_limited, weight_for)
 from spark.resilience import run
 
 _TIMEOUT_S = 10.0
@@ -116,10 +116,10 @@ def _default_post(url: str, body: dict):
 
 
 def _is_429(exc: Exception) -> bool:
-    resp = getattr(exc, "response", None)
-    if resp is not None and getattr(resp, "status_code", None) == 429:
-        return True
-    return "429" in str(exc)          # 與 hl_explore._is_rate_limited 同一判準（fake post 用字串）
+    """委派 `hl_budget.is_rate_limited`（reviewer W2）：本地曾有一份 `"429" in
+    str(exc)` 的鬆散判準，會把 `JSONDecodeError ... column 429` 這種訊息誤判成
+    429——與 `hl_explore._is_rate_limited` 現在共用同一份判準，不再各自維護。"""
+    return is_rate_limited(exc)
 
 
 def _retry_after_s(exc: Exception) -> float | None:
@@ -158,9 +158,11 @@ class HLGateway:
 
     def _info(self, body: dict, what: str):
         def attempt():
+            token = None
             if self._limiter is not None:
                 # 每一次嘗試（含 resilience 的重試）各自預留；預留後立即發送。
-                self._limiter.reserve(weight_for(body["type"]), self._scope, wait_s=self._wait_s)
+                token = self._limiter.reserve(weight_for(body["type"]), self._scope,
+                                              wait_s=self._wait_s)
             try:
                 result = self._post(f"{self._base}/info", body)
             except Exception as e:
@@ -169,6 +171,11 @@ class HLGateway:
                 raise
             if self._limiter is not None:
                 self._limiter.note_ok(self._scope)
+                # reviewer C1：fills 類預留的 120 是「一頁上限」，HL 實際計費是
+                # 20 + ceil(筆數/20)——回應到手、知道實際筆數後立刻結算下修，
+                # 不結算會讓自訂帳本比 HL 真實計費高 3–6 倍（假陽性）。
+                if body["type"] in ("userFillsByTime", "userFills") and isinstance(result, list):
+                    self._limiter.settle(token, 20 + (len(result) + 19) // 20)
             return result
         return run(attempt, what=what, idempotent=True, sleep_fn=self._sleep)
 

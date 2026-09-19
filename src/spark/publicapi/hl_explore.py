@@ -233,6 +233,7 @@ from spark.filet.trader_stats import (FillsStats, WindowStats, fills_stats,
                                       live_days_from_av, window_stats)
 from spark.publicapi import hl_leaderboard
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused
+from spark.publicapi.hl_budget import is_rate_limited as _hl_budget_is_rate_limited
 
 logger = logging.getLogger(__name__)
 
@@ -353,12 +354,11 @@ class _BudgetUnavailable(Exception):
 
 
 def _is_rate_limited(exc: Exception) -> bool:
-    """429 偵測：不 import httpx（本模組的唯讀 HL 邊界在 `hl.py`，這裡只認
-    錯誤訊息字串）——`httpx.HTTPStatusError` 的訊息固定含
-    `"429 Too Many Requests"`（2026-08-30 對 mainnet 整合實跑的實測 log，見
-    模組檔頭）。用字串比對而非 `isinstance`：測試與未來若換掉底層 HTTP client
-    都不必依賴 httpx 這個實作細節。"""
-    return "429" in str(exc)
+    """429 偵測：委派 `hl_budget.is_rate_limited`（reviewer W2，2026-09-20）——
+    與 `hl.py._is_429` 共用同一份判準，不再各自維護一份鬆散的
+「訊息含 429 子字串就判定」這種鬆散判準（會把 `JSONDecodeError ... column 429` 這種訊息誤判成
+    429）。函式名與呼叫端保留：`build_sync`／`_call_hl` 不必跟著改。"""
+    return _hl_budget_is_rate_limited(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +917,17 @@ class ExploreIndex:
                 self._rows_version = EXPLORE_INDEX_VERSION
                 self._built_at = snap["built_at"]
                 self._total_scanned = snap["total_scanned"]
+
+    def status(self) -> dict:
+        """`/api/ops/health` 揭露用（reviewer W3，2026-09-20）：P1-only 部署期間
+        Explore 建置仍是舊版 `build_sync`（背景 scheduler 是 P3 才做的事），
+        意味著榜單暫時凍結在最後一次成功建置／磁碟快照——ops 需要能看到
+        「現在服務的是哪一版、建於何時」，否則一份已經凍結數天的榜單會被誤讀成
+        「持續在更新」。"""
+        with self._lock:
+            return {"rows": None if self._rows is None else len(self._rows),
+                    "built_at": self._built_at, "version": self._rows_version,
+                    "building": self._building}
 
     def _call_hl(self, fn: Callable[[], object], *, what: str) -> object:
         """單一 HL 呼叫。節流與 429 處理已**全部**移到 `HLGateway`＋`WeightLimiter`

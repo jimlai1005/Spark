@@ -84,11 +84,64 @@ def test_429_pauses_explore_scope_with_escalation_and_retry_after():
         lim.try_reserve(2, "explore")
     assert lim.snapshot()["paused_until"]["explore"] == pytest.approx(1060.0)
     c.t = 1100.0
-    lim.note_429("explore", retry_after_s=90)           # 第二次：max(60,90)*2 = 180
-    assert lim.snapshot()["paused_until"]["explore"] == pytest.approx(1280.0)
+    # 第一次暫停（到 1060）已在 t=1100 過期，這是「再犯」→ 升級：n=2，
+    # pause = min(max(retry_after=90, PAUSE_MIN_S*2**(2-1)=120), 900) = 120
+    # （2026-09-20 reviewer 修正：Retry-After 不再乘上指數，見 hl_budget.note_429）
+    lim.note_429("explore", retry_after_s=90)
+    assert lim.snapshot()["paused_until"]["explore"] == pytest.approx(1220.0)
     c.t = 1300.0
     lim.note_ok("explore")
     assert lim.try_reserve(2, "explore")
+
+
+def test_note_429_during_active_pause_does_not_escalate():
+    """暫停仍在生效中收到 429（同一輪違規的延續）不升級 `n`，只延長
+    paused_until；只有「已解除又再犯」才真正升級（reviewer 修正）。"""
+    lim, c = _lim()
+    lim.note_429("explore")                              # n=1，until=1060
+    assert lim.snapshot()["paused_until"]["explore"] == pytest.approx(1060.0)
+    c.t = 1010.0                                          # 仍在暫停中（<1060）
+    lim.note_429("explore")                               # 不升級：until=max(1060,1010+60)=1070
+    s = lim.snapshot()
+    assert s["paused_until"]["explore"] == pytest.approx(1070.0)
+    assert s["consecutive_429"]["explore"] == 1           # 沒有變成 2
+    c.t = 1071.0                                          # 暫停解除後才第二次真違規
+    lim.note_429("explore")
+    s = lim.snapshot()
+    assert s["consecutive_429"]["explore"] == 2
+    assert s["paused_until"]["explore"] == pytest.approx(1071.0 + 120.0)
+
+
+def test_settle_refunds_down_only():
+    lim, c = _lim()
+    token = lim.reserve(120, "interactive")
+    lim.settle(token, 23)
+    assert lim.snapshot()["used"]["interactive"] == 23
+    assert lim.snapshot()["counters"]["refunded_weight"] == 97
+    lim.settle(token, 200)                                # 只降不升，200 > 23 不生效
+    assert lim.snapshot()["used"]["interactive"] == 23
+
+
+def test_scope_paused_message_has_no_digits():
+    """reviewer W1：訊息不含任何數字，避免十進位的 `until` 偶然含 "502"/"503"/
+    "504" 子字串被 `spark.resilience._TRANSIENT_MARKERS` 誤判成 transient。"""
+    from spark.resilience import _is_transient_error
+    exc = ScopePaused("explore", 250238.0)
+    assert not any(ch.isdigit() for ch in str(exc))
+    assert _is_transient_error(exc) is False
+
+
+def test_is_rate_limited_ignores_json_column_429():
+    import json
+    from spark.publicapi.hl_budget import is_rate_limited
+    try:
+        json.loads(" " * 428)
+    except json.JSONDecodeError as e:
+        exc = e
+    else:
+        raise AssertionError("expected JSONDecodeError")
+    assert is_rate_limited(exc) is False
+    assert is_rate_limited(RuntimeError("429 Too Many Requests")) is True
 
 
 def test_interactive_429_also_pauses_explore():

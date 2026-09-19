@@ -117,3 +117,31 @@ def test_no_limiter_keeps_old_behaviour():
     c = Clock()
     gw = HLGateway("https://x", post_fn=lambda u, b: {}, sleep_fn=c.sleep)
     assert gw.portfolio("0xabc") == {}
+
+
+def test_fills_page_settles_to_actual_weight():
+    """reviewer C1：fills 類預留的 120 是「一頁上限」，回應到手後依實際筆數
+    （20 + ceil(筆數/20)）下修，不得讓自訂帳本比 HL 真實計費高 3–6 倍。"""
+    c = Clock()
+
+    def post(url, body):
+        return [{"tid": i} for i in range(50)]
+    gw, lim = _gw(post, c)
+    gw._info({"type": "userFillsByTime", "user": "0xabc",
+              "startTime": 0, "endTime": 1}, "測試")
+    assert lim.snapshot()["used"] == {"interactive": 23}   # 20 + ceil(50/20) = 20+3
+
+
+def test_json_decode_error_is_not_reported_as_429():
+    """reviewer W2：`JSONDecodeError` 訊息可能含 "column 429"，不得被誤判成
+    速率限制而暫停 explore scope。"""
+    import json
+    c = Clock()
+
+    def post(url, body):
+        json.loads(" " * 428)  # 觸發 JSONDecodeError（訊息含 "column 429"）
+    gw, lim = _gw(post, c)
+    with pytest.raises(json.JSONDecodeError):
+        gw.portfolio("0xabc")
+    assert lim.snapshot()["counters"]["rate_limited"] == 0
+    assert lim.snapshot()["paused_until"] == {}

@@ -1146,15 +1146,14 @@ def test_endpoint_no_auth_required_and_no_cookie_side_effect(tmp_path):
     assert r.cookies.get("filet_session") is None
 
 
-def test_endpoint_full_flow_after_build_completes(tmp_path, monkeypatch):
+def test_endpoint_full_flow_after_build_completes(tmp_path):
     """走完整條管線：上游 leaderboard → enrich → 過濾 → 排序 → 分頁，一路到
     HTTP 回應；並驗證 Filet 自營地址在端點層也被排除（讀精選白名單）。
 
-    `app.py` 接線的 `ExploreIndex` 不注入假 `sleep_fn`（正式行為就是真睡，
-    見 `_call_hl` 節流）——這裡把節流間隔歸零，測試才不會真的睡
-    `EXPLORE_ENRICH_CALL_INTERVAL_S` 秒（`ExploreConfig.from_env` 讀這個環境
-    變數，見 hl_explore.py）。"""
-    monkeypatch.setenv("EXPLORE_ENRICH_CALL_INTERVAL_S", "0")
+    2026-09-20（Task 1.3）起節流與 429 重試已全部移到 `HLGateway`／
+    `WeightLimiter`，`hl_explore` 不再自己 sleep，測試不需要（也不再能）靠環境
+    變數歸零節流間隔（reviewer S1：舊的節流間隔環境變數已隨
+    `ExploreConfig.enrich_call_interval_s` 一起移除）。"""
     payload = _leaderboard_payload(_lb_row(_A, display_name="Alice", roi="0.5"),
                                    _lb_row(_FILET_OWN, roi="0.99"))
     hl = FakeHL()
@@ -1199,11 +1198,10 @@ def _many_perp_fills(n):
 
 
 @pytest.fixture
-def client_after_build(tmp_path, monkeypatch):
+def client_after_build(tmp_path):
     """建置完成、含兩筆合格列（不同 `live_days`）的 client，供 sort/order
     端點測試共用（Task 11）。兩地址都墊 200 筆 fills 過 `min_fills` 預設門檻，
     `alltime_days` 不同讓 `live_days` 可排序區分。"""
-    monkeypatch.setenv("EXPLORE_ENRICH_CALL_INTERVAL_S", "0")
     hl = FakeHL()
     _seed_hl(hl, _A, alltime_days=100)
     _seed_hl(hl, _B, alltime_days=50)
