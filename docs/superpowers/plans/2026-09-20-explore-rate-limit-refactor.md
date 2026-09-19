@@ -957,3 +957,8 @@ class ExplorePublisher:
 | 0.3 | 2026-09-20 | 9b56058 | 同上兩檔 32 passed；`_dashboard_sync` 只在 `data_state != "error"` 寫快取 |
 | 0.4 | 2026-09-20 | e5a6479 | 裁決改為全域 handler（見 Task 0.4 註）；`pytest tests/test_api_onboard.py tests/test_api_billing.py` 59 passed |
 | **P0 驗收** | 2026-09-20 | — | `uv run pytest -q` 2933 passed；`uv run ruff check src tests scripts` 乾淨；`query()` 內無觸發呼叫。可做第一次部署（D8）待 P1 完成後一起 |
+| 1.1 | 2026-09-20 | c01b217 | `pytest tests/test_hl_budget.py` 9 passed（含 8 thread 並發）；snapshot counters 修正寫回 plan（a00fac9） |
+| 1.2 | 2026-09-20 | f8cece7 | 113 passed（gateway budget＋explore＋onboard）；`BudgetExhausted` 全域 handler app.py:1384 |
+| 1.4 | 2026-09-20 | c9f4b66 | 133 passed（ops＋config）；run_api 注入 limiter；ExploreIndex 用 `scoped("explore")`；ops/health `hl_budget` |
+| 1.3 | 2026-09-20 | 6cb73a8 | 86 passed；hl_explore 零 `time.sleep`／退避常數；`_BudgetUnavailable` 中止保舊 |
+| **P1 驗收** | 2026-09-20 | — | `uv run pytest -q` 2957 passed；`ruff check src tests scripts` 乾淨；`rg limiter scripts/run_api.py` 3 命中。reviewer 派工中；第一次部署（D8）待使用者確認 |
