@@ -263,3 +263,37 @@ def test_sync_upstream_called_once_within_60s_cache_window(tmp_path, monkeypatch
     assert r3.status_code == 200, r3.text
     assert calls["n"] == 2          # 累計 61s，重新查詢
     assert r3.json()["sync"]["last_recon_ts"] != first_recon
+
+
+def test_sync_error_result_not_cached_so_retry_recomputes(tmp_path, monkeypatch):
+    """error 結果（自己的成交查詢失敗）不應被快取，以便「重試」鍵有效。"""
+    clock = {"t": 1_000_000.0}
+    client, cfg, hl, wallet = _logged_in(tmp_path, now_fn=lambda: clock["t"])
+    addr = wallet.address.lower()
+    write_hb(cfg, acct(wallet), now_s=clock["t"])
+    hl.fills[_LEADER] = [mkfill("ETH", "100", T0)]
+    hl.fills[addr] = [mkfill("ETH", "100.5", T0 + timedelta(seconds=1))]
+
+    # 第一次：follower 自己位址的 fills 查詢拋例外
+    real_get_user_fills = hl.get_user_fills
+
+    def _failing_get_user_fills(address, start, end):
+        if address == addr:
+            raise RuntimeError("boom: fills unavailable")
+        return real_get_user_fills(address, start, end)
+
+    monkeypatch.setattr(hl, "get_user_fills", _failing_get_user_fills)
+
+    r1 = client.get("/api/me/dashboard")
+    assert r1.status_code == 200, r1.text
+    sync1 = r1.json()["sync"]
+    assert sync1["data_state"] == "error"
+
+    # 移除 monkeypatch（恢復原函式），只推進 1 秒（error 結果不該被快取）
+    monkeypatch.setattr(hl, "get_user_fills", real_get_user_fills)
+    clock["t"] += 1.0
+
+    r2 = client.get("/api/me/dashboard")
+    assert r2.status_code == 200, r2.text
+    sync2 = r2.json()["sync"]
+    assert sync2["data_state"] == "ok"  # 重新計算成功

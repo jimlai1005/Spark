@@ -835,16 +835,18 @@ def _dashboard_sync(ref: FollowerRef, hl, mine, hb: "HeartbeatRead",
     """同步誤差塊：`_compute_dashboard_sync` 的 60s 快取層（計算細節見該函式
     docstring）。快取鍵＝`account_id`；`cache` 不給 → 用模組層共用字典（正式
     路徑），測試可傳一份乾淨字典避免跨測試汙染（沿 `_dashboard_fees_month`
-    既有慣例）。**只快取成功結果**：`_compute_dashboard_sync` 內部子查詢的例外
-    已由自己的 try/except 吸收（回傳一份欄位為 null 的字典，而不是拋出），
-    所以快取進去的一律是完整結果，不會有半成品。
+    既有慣例）。**只快取 `data_state != "error"` 的結果**：`error` 表示這個帳號
+    自己的成交查詢失敗，下一次請求（或使用者按「重試」）必須立刻重算，不能被釘住
+    60 秒（2026-09-19 事故）。`None`（未活化）亦不快取。`_compute_dashboard_sync`
+    內部子查詢的例外已由自己的 try/except 吸收，所以進快取的一律是完整結果。
     """
     cache = _dashboard_sync_cache if cache is None else cache
     cached = cache.get(ref.account_id)
     if cached is not None and (now_s - cached[0]) < _SYNC_CACHE_TTL_S:
         return cached[1]
     result = _compute_dashboard_sync(ref, hl, mine, hb, follower_positions, now_s)
-    cache[ref.account_id] = (now_s, result)
+    if result is not None and result.get("data_state") != "error":
+        cache[ref.account_id] = (now_s, result)
     return result
 
 
