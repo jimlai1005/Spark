@@ -380,6 +380,25 @@ def test_missing_heartbeat_signal_source_not_ok_but_state_still_following(tmp_pa
     assert body["status"]["signal_source_ok"] is False
 
 
+def test_signal_source_ok_true_when_last_cycle_no_action(tmp_path):
+    """引擎 `no_action`＝跑完沒事做（絕大多數 cycle，scripts/run_copytrade.py:828），
+    是健康態；只認 "ok" 會讓面板幾乎永遠顯示「訊號來源狀態未知」（2026-09-19 事故）。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    write_hb(cfg, acct(wallet), last_cycle="no_action")
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["status"]["signal_source_ok"] is True
+
+
+def test_signal_source_not_ok_when_last_cycle_tripped(tmp_path):
+    """引擎 `tripped`＝熔斷，不屬於健康態。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    write_hb(cfg, acct(wallet), last_cycle="tripped")
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["status"]["signal_source_ok"] is False
+
+
 # ── sync 三態／null 不冒充 0（M3 round3 Task 3，D7） ────────────────────
 
 def test_sync_ok_state_and_no_zero_fabrication_when_no_pairs(tmp_path):

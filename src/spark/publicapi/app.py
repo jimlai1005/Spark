@@ -684,6 +684,12 @@ def _dashboard_guards(hb: "HeartbeatRead", mine, acct: dict | None,
     }
 
 
+# 心跳 `last_cycle.result` 的健康值：`ok`＝本輪下了單、`no_action`＝跑完沒事做
+# （絕大多數 cycle，scripts/run_copytrade.py:828）。`tripped` 不在內。
+# 2026-09-19 事故：只認 "ok" 讓面板幾乎永遠顯示「訊號來源狀態未知」。
+_HEALTHY_CYCLE_RESULTS = ("ok", "no_action")
+
+
 def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
                       leaders_path: str, exchange_dir: str) -> dict:
     """狀態塊：state 四態＋護欄。`mine is None`（未活化）→ `inactive`，其餘全
@@ -717,7 +723,8 @@ def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
         state = "paused"
     else:
         state = "following"
-    last_cycle_ok = ((hb.data or {}).get("last_cycle") or {}).get("result") == "ok"
+    last_cycle_ok = (((hb.data or {}).get("last_cycle") or {}).get("result")
+                     in _HEALTHY_CYCLE_RESULTS)
     return {
         "strategy_name": strategy_name, "state": state, "following_days": None,
         "signal_source_ok": bool(hb.fresh and not pause_unknown and last_cycle_ok),
