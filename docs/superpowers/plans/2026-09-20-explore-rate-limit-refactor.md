@@ -828,6 +828,26 @@ def test_build_stops_when_explore_budget_exhausted_and_keeps_old_rows(tmp_path):
 - [ ] **F. plan D9** 那列的「onboard/status 回 503」改為 502（本檔）。
 - [ ] **G. Commit** `fix: P1 審查修正（fills 實際結算、額度不足不進負快取、429/暫停判型）`
 
+### Task 1.6 @inline：複審修正（2026-09-20 opus 複審：0 Critical／4 Warning／3 Suggestion）
+
+<!-- 裁決：W1 Retry-After 不得被 PAUSE_MAX_S 夾住；W2 撤回 1.5-A4（任何 scope 成功歸零）——interactive 的
+weight-2 成功不代表 explore 的 120 權重請求也能過，升級階梯要靠 explore 自己的 429 累積；W3 快照加相對秒數；
+W4 詳情頁次要欄位「降級但不快取」而非整頁 502；S1 過期 token 不計退款；S2/S3 補測試。 -->
+
+**Files:** `src/spark/publicapi/hl_budget.py`、`app.py`；`tests/test_hl_budget.py`、`tests/test_public_traders.py`、`tests/test_api_ops.py`。
+
+- [ ] **A. `hl_budget.py`**
+  1. `note_429` 升級公式改 `pause = max(retry_after or 0.0, min(PAUSE_MIN_S * 2**(n-1), PAUSE_MAX_S)) + jitter`（上限只夾指數部分，Retry-After 是下限）；「暫停生效中」分支同樣 `max(既有, now + max(PAUSE_MIN_S, retry_after or 0) + jitter)`（已如此，確認）。
+  2. `note_ok(scope)`：**只有 `scope == DEFERRABLE_SCOPE`** 才歸零 `_consecutive_429`（撤回 1.5-A4；docstring 寫明理由：interactive 的低權重成功不證明 explore 的 120 權重能過，階梯要靠 explore 自己的 429 累積、自己的成功歸零）。
+  3. `settle`：token 已滑出視窗（`token[0] <= now - WINDOW_S`）→ 直接 return，不計 `refunded_weight`。
+  4. `snapshot()` 加 `"paused_remaining_s": {scope: max(0.0, until - now) for scope, until in self._paused_until.items()}`；docstring 註明 `paused_until` 是 `now_fn` 時基（正式路徑 monotonic），ops 看 `paused_remaining_s`。
+- [ ] **B. `app.py` `_cached_trader_data`**：ledger 與 fills 兩個 try 的 `except (BudgetExhausted, ScopePaused): raise` 改為「降級該欄位為 None＋設 `skip_cache = True`」（在函式開頭 `skip_cache = False`）；函式末尾 `if skip_cache: return rows, account_value, deposit, ch_state, fills, fills_truncated`（**不寫** `_trader_portfolio_cache`、但仍 pop 負面快取）。portfolio 與 clearinghouse 兩處維持上拋（主欄位缺就是整頁不可用）。註解：額度不足是 transient，次要欄位降級但這份不完整結果不得進 5 分鐘快取（複審 W4）。
+- [ ] **C. 測試**
+  - `test_hl_budget.py`：`test_retry_after_is_floor_not_clamped`（t=2000、`retry_after_s=1800` → `paused_until == 3800 + jitter(0)`）；`test_escalation_survives_interactive_success`（429 → t+61 `note_ok("interactive")` → 再 429 → `consecutive_429["explore"] == 2`、暫停 120）；`test_explore_success_resets_escalation`；`test_settle_after_prune_does_not_count_refund`；`test_snapshot_has_paused_remaining_s`。
+  - `test_public_traders.py`：`test_fills_budget_exhausted_degrades_without_caching`——`hl.get_fills_raw_paged` 拋 `BudgetExhausted` → 200、`fills_30d is None`（或該檔既有的缺值表示）；隨後恢復 → 下一次 GET 重新打上游（`portfolio_calls == 2`，證明沒進 5 分鐘快取）。
+  - `test_api_ops.py`：`explore_index` 在 `idx.build_sync()` 後 `rows`／`built_at` 非 None；`hl_budget.paused_remaining_s` 鍵存在。
+- [ ] **D. Commit** `fix: P1 複審修正（Retry-After 下限、explore 自身歸零、詳情頁降級不快取、快照剩餘秒數）`
+
 **P1 驗收（主線程親跑）：** 全測試綠；`rg -n "enrich_call_interval_s|RATE_LIMIT_RETRY_DELAYS_S" src` 零命中；`rg -n "limiter" scripts/run_api.py` 命中；`uv run python -c "from spark.publicapi.app import create_app"` 可 import。D8 通過則此時做第一次部署（RUNBOOK §5.8a 流程，env 新增兩個 cap 變數，drop-in `hl-budget.conf`）。
 
 ---
