@@ -1011,4 +1011,6 @@ class ExplorePublisher:
 | 1.2 | 2026-09-20 | f8cece7 | 113 passed（gateway budget＋explore＋onboard）；`BudgetExhausted` 全域 handler app.py:1384 |
 | 1.4 | 2026-09-20 | c9f4b66 | 133 passed（ops＋config）；run_api 注入 limiter；ExploreIndex 用 `scoped("explore")`；ops/health `hl_budget` |
 | 1.3 | 2026-09-20 | 6cb73a8 | 86 passed；hl_explore 零 `time.sleep`／退避常數；`_BudgetUnavailable` 中止保舊 |
-| **P1 驗收** | 2026-09-20 | — | `uv run pytest -q` 2957 passed；`ruff check src tests scripts` 乾淨；`rg limiter scripts/run_api.py` 3 命中。reviewer 派工中；第一次部署（D8）待使用者確認 |
+| **P1 驗收** | 2026-09-20 | — | `uv run pytest -q` 2957 passed；`ruff check src tests scripts` 乾淨；`rg limiter scripts/run_api.py` 3 命中 |
+| P1 審查 | 2026-09-20 | — | opus reviewer：2 Critical／5 Warning／3 Suggestion，主線程逐條實跑確認 → Task 1.5 |
+| 1.5 | 2026-09-20 | a41c189 | 三判準（ScopePaused 非 transient／JSON column 429 不誤判／真 429 命中）主線程實跑 False/False/True；settle 120→23 退 97；2965 passed；ruff 乾淨。複審派工中；第一次部署（D8）待使用者確認 |
