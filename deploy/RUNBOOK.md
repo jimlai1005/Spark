@@ -2637,3 +2637,13 @@ restart `filet-api`、`filet-dashboard`（keysvc／follower 未重啟；既有 f
 → `DEPLOYED_VERSION`。驗證：`/proc/<api pid>/environ` 含 `FILET_REFERRAL_CODE=JIMLAI1005`（⚠️ `systemctl show -p Environment`
 **不會列** EnvironmentFile 載入的值，要看 `-p EnvironmentFiles` 或進程 environ）；`filet_regression_check --http --ssh`
 67/67 PASS；`systemctl --failed` 空；API journal 零 Traceback；`/terms`、`/risk` 已見推薦碼段落；`/api/me/referral` 未登入 401。
+
+**2026-09-19 部署（commit `b9e5649`，14:41 UTC，推薦碼區塊位置＋兩鈕互鎖，純前端）：** plan
+`docs/superpowers/plans/2026-09-19-referral-card-placement.md`（Task 1 opus 審查 PASS、Task 2 使用者追加）。內容：onboarding
+step 4 的「推薦碼（選填）」原為獨立卡片掛在「確認並開始跟單」之後（主按鈕成功即導頁，使用者實際看不到），搬進主卡片、
+勾選框之後、主按鈕之前；推薦碼簽署中與主按鈕簽署中互相停用，避免同時排入兩個錢包簽章。流程照 §3.2 rsync 兩段 →
+`uv sync` 略過（Python 無變動，uv.lock mtime 仍 07-17）→ `find -prune var` chown root（非 root 檔 0）→ §4.2 `npm ci`＋
+`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app` build → **只 restart `filet-dashboard`**（api／keysvc／follower 未動，
+unit 檔未動）→ `DEPLOYED_VERSION`。驗證：本機四項全綠（`npm test` 716、`pytest` 2927、ruff、build）；正式機
+`filet_regression_check --http --ssh` 67/67 PASS；`systemctl --failed` 空；dashboard journal `Ready in 831ms`；
+`.next/static/chunks` 含 `referral-optin`；`/`、`/onboarding` 200。回歸第 2、3 層（testnet E2E／瀏覽器）**未跑**：本次無後端與簽章流程改動，屬刻意略過。

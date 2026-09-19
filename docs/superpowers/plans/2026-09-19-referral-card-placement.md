@@ -1,6 +1,6 @@
 # 推薦碼區塊移進費用確認主卡片（onboarding step 4）
 
-日期：2026-09-19。狀態：**Task 1 完成、reviewer PASS、已 commit，待部署**（純前端，走 RUNBOOK 一般前端部署）。
+日期：2026-09-19。狀態：**Task 1＋2 完成、reviewer PASS、已部署正式機（commit `b9e5649`，14:41 UTC，記錄見 `deploy/RUNBOOK.md` 附錄 B）**。
 驗收證據（主線程親跑）：`npm test` 72 files / 714 tests 全綠；`npm run build` 型別檢查通過；
 `ReferralOptinCard me` 在第 199 行、`btn-primary` 在第 204 行。reviewer 另提一條既有行為觀察：
 推薦碼簽署進行中主按鈕仍可按（非本次引入，未處理，見下方「未處理項」）。
