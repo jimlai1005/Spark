@@ -502,6 +502,11 @@ class WeightLimiter:
             if scope == DEFERRABLE_SCOPE:
                 self._consecutive_429[DEFERRABLE_SCOPE] = 0
 
+    # <!-- 2026-09-20 builder 回報修正：dict(Counter) 對未出現的鍵不回 0，
+    #      快照改為固定鍵集合逐一取值，「未觸發＝0」的語意才成立。 -->
+    _COUNTER_KEYS = ("reservations", "reserved_weight", "denied_global",
+                     "denied_scope", "rate_limited", "exhausted")
+
     def snapshot(self) -> dict:
         with self._lock:
             now = self._now()
@@ -514,7 +519,7 @@ class WeightLimiter:
                 "scope_caps": dict(self._scope_caps), "used": dict(used),
                 "paused_until": dict(self._paused_until),
                 "consecutive_429": dict(self._consecutive_429),
-                "counters": dict(self._counters),
+                "counters": {k: self._counters.get(k, 0) for k in self._COUNTER_KEYS},
             }
 ```
 
