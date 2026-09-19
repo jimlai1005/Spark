@@ -58,7 +58,13 @@ function referralErrorCopy(
  * 真的按下「簽署啟用」那一刻才去要 specs（`getMyRisk`），沒點擊就不會有任何
  * risk API 呼叫。
  */
-function ReferralOptinCard({ me }: { me: { address: string; account_id: string } }) {
+function ReferralOptinCard({ me, disabled = false, onSigningChange }: {
+  me: { address: string; account_id: string };
+  /** 主按鈕簽署中 → 本卡按鈕一併停用（兩鈕互鎖，避免同時排入兩個錢包簽章）。 */
+  disabled?: boolean;
+  /** 本卡進出「等待錢包簽署」時通知父層，讓主按鈕同步停用。 */
+  onSigningChange?: (signing: boolean) => void;
+}) {
   const COPY = useCopy();
   const c = COPY.wizard.referralOptin;
   const ce = COPY.wizard;
@@ -77,37 +83,45 @@ function ReferralOptinCard({ me }: { me: { address: string; account_id: string }
   if (status.data.code === null) return null; // 防禦：enabled 理論上意味 code 非 null
   const code = status.data.code;
 
+  function setSigningBoth(v: boolean) {
+    setSigning(v);
+    onSigningChange?.(v);
+  }
+
   async function sign() {
-    setSigning(true);
+    setSigningBoth(true);
     setError(null);
-    let risk: MyRiskResp;
     try {
-      risk = await getMyRisk();
-    } catch {
-      setSigning(false);
-      setError(ce.errors.payloadFailed);
-      return;
-    }
-    const r = await runReferralOptinFlow(
-      {
-        fetchMessage: getReferralMessage,
-        signMessage: (message) => signMessageAsync({ message }),
-        recover: recoverPersonalSigner,
-        submit: submitReferralOptin,
-      },
-      {
-        expectedSigner: me.address,
-        expectedAccountId: me.account_id,
-        expectedCode: code,
-        riskParamNames: risk.specs.map((s) => s.name),
-      },
-    );
-    setSigning(false);
-    if (r.ok) {
-      setSigned(true);
-      void queryClient.invalidateQueries({ queryKey: ["me-referral"] });
-    } else {
-      setError(referralErrorCopy(r, ce));
+      let risk: MyRiskResp;
+      try {
+        risk = await getMyRisk();
+      } catch {
+        setError(ce.errors.payloadFailed);
+        return;
+      }
+      const r = await runReferralOptinFlow(
+        {
+          fetchMessage: getReferralMessage,
+          signMessage: (message) => signMessageAsync({ message }),
+          recover: recoverPersonalSigner,
+          submit: submitReferralOptin,
+        },
+        {
+          expectedSigner: me.address,
+          expectedAccountId: me.account_id,
+          expectedCode: code,
+          riskParamNames: risk.specs.map((s) => s.name),
+        },
+      );
+      if (r.ok) {
+        setSigned(true);
+        void queryClient.invalidateQueries({ queryKey: ["me-referral"] });
+      } else {
+        setError(referralErrorCopy(r, ce));
+      }
+    } finally {
+      // 不論成功、失敗或 throw，都要把父層的互鎖解開，否則主按鈕會永久停用。
+      setSigningBoth(false);
     }
   }
 
@@ -120,7 +134,7 @@ function ReferralOptinCard({ me }: { me: { address: string; account_id: string }
         <p className="hint" role="status">{c.signedNote}</p>
       ) : (
         <div className="step-actions">
-          <button type="button" className="btn btn-secondary" disabled={signing} onClick={() => void sign()}>
+          <button type="button" className="btn btn-secondary" disabled={signing || disabled} onClick={() => void sign()}>
             {signing ? c.signing : c.signButton}
           </button>
         </div>
@@ -154,6 +168,9 @@ export function StepConfirm({ me, leaderAddress, estimatedNotional, onDone }: {
   const { signMessageAsync } = useSignMessage();
   const [checks, setChecks] = useState([false, false, false]);
   const [submitting, setSubmitting] = useState(false);
+  // 推薦碼卡片正在等錢包簽章 → 主按鈕停用；反向由 `disabled={submitting}` 傳給卡片。
+  // 兩鈕互鎖，避免使用者同時排入兩個簽章請求（部分錢包會直接拒掉第二個）。
+  const [referralSigning, setReferralSigning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const allChecked = checks.every(Boolean);
   const labels = [c.step4CheckLoss, c.step4CheckFee, c.step4CheckRevoke];
@@ -196,13 +213,13 @@ export function StepConfirm({ me, leaderAddress, estimatedNotional, onDone }: {
         </label>
       ))}
 
-      <ReferralOptinCard me={me} />
+      <ReferralOptinCard me={me} disabled={submitting} onSigningChange={setReferralSigning} />
 
       {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
 
       <div className="step-actions">
         <button type="button" className="btn btn-primary"
-          disabled={!allChecked || submitting || !leaderAddress}
+          disabled={!allChecked || submitting || referralSigning || !leaderAddress}
           onClick={() => void handleSubmit()}>
           {submitting ? c.step4Submitting : c.step4SubmitButton}
         </button>

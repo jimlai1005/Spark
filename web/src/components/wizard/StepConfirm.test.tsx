@@ -131,4 +131,36 @@ describe("StepConfirm ⭐ 推薦碼區塊移進主卡片", () => {
     expect(runLeaderSelectFlow).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "確認並開始跟單" })).toBeInTheDocument();
   });
+
+  it("推薦碼簽署進行中 → 主按鈕停用；簽完（含失敗）解鎖", async () => {
+    getMyRisk.mockResolvedValue(myRisk());
+    let resolveFlow!: (r: { ok: boolean; kind?: string }) => void;
+    runReferralOptinFlow.mockImplementation(() => new Promise((r) => { resolveFlow = r; }));
+    renderStepConfirm();
+    await checkAll();
+    const primaryBtn = screen.getByRole("button", { name: "確認並開始跟單" });
+    expect(primaryBtn).toBeEnabled();
+    await userEvent.click(await screen.findByRole("button", { name: "簽署啟用" }));
+    await waitFor(() => expect(primaryBtn).toBeDisabled());
+    resolveFlow({ ok: false, kind: "wallet-rejected" });
+    await waitFor(() => expect(primaryBtn).toBeEnabled());
+    expect(runLeaderSelectFlow).not.toHaveBeenCalled();
+  });
+
+  it("主按鈕簽署進行中 → 「簽署啟用」停用", async () => {
+    let resolveFlow!: (r: { ok: boolean }) => void;
+    runLeaderSelectFlow.mockImplementation(() => new Promise((r) => { resolveFlow = r; }));
+    renderStepConfirm();
+    const signBtn = await screen.findByRole("button", { name: "簽署啟用" });
+    await checkAll();
+    await userEvent.click(screen.getByRole("button", { name: "確認並開始跟單" }));
+    await waitFor(() => expect(signBtn).toBeDisabled());
+    resolveFlow({ ok: true });
+    await waitFor(() => expect(signBtn).toBeEnabled());
+    expect(runReferralOptinFlow).not.toHaveBeenCalled();
+  });
 });
+
+async function checkAll() {
+  for (const box of screen.getAllByRole("checkbox")) await userEvent.click(box);
+}

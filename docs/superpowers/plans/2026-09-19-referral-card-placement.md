@@ -5,8 +5,17 @@
 `ReferralOptinCard me` 在第 199 行、`btn-primary` 在第 204 行。reviewer 另提一條既有行為觀察：
 推薦碼簽署進行中主按鈕仍可按（非本次引入，未處理，見下方「未處理項」）。
 
-## 未處理項（reviewer Suggestion，非本次範圍）
-- `signing=true` 時只 disable 推薦碼自己的按鈕，主按鈕仍可按；兩鈕相鄰後同時排入兩個簽章請求的機率變高。是否要在推薦碼簽署中一併 disable 主按鈕，留使用者裁決。
+### Task 2 `@inline`：兩鈕互鎖（使用者 2026-09-19 裁決追加，主線程自行實作）
+
+reviewer 指出：`signing=true` 時只 disable 推薦碼自己的按鈕，主按鈕仍可按；兩鈕相鄰後同時
+排入兩個錢包簽章請求的機率變高（MetaMask／Rabby 會排隊依序彈窗、部分 WalletConnect 錢包
+直接拒掉第二個；兩者都是離線 personal_sign、原文各自預驗，不會交叉污染，最壞是體驗混亂）。
+
+- `ReferralOptinCard` 新增 `disabled`（主按鈕簽署中→本卡按鈕停用）與 `onSigningChange`
+  （本卡進出簽署→父層 `referralSigning`），`sign()` 改 try/finally 保證解鎖。
+- 主按鈕 `disabled` 加 `referralSigning`；卡片收 `disabled={submitting}`。
+- 測試追加 2 例（推薦碼簽署中主按鈕停用、失敗後解鎖；主按鈕簽署中「簽署啟用」停用）。
+- 狀態：**完成**，`npm test` 716 全綠、`npm run build` 通過。
 
 ## 問題與根因
 
