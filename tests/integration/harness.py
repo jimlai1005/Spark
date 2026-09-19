@@ -296,7 +296,8 @@ class KeysvcThread:
 
 
 def make_real_app(tmp_path: Path, *, builder: str, leaders: list[dict],
-                  keysvc_sock: str) -> tuple[TestClient, object, ApiStore]:
+                  keysvc_sock: str,
+                  referral_code: str | None = None) -> tuple[TestClient, object, ApiStore]:
     """真 KeysvcClient + 真 HLGateway(TESTNET_URL) 組出來的 public API app。
     leaders 是 spark.filet.leaders.load_leaders 接受的 entry dict 清單
     （只含 _ENTRY_ALLOWED_KEYS 內的鍵，否則 loader 會拒載）。
@@ -306,16 +307,23 @@ def make_real_app(tmp_path: Path, *, builder: str, leaders: list[dict],
     端點（`/api/me/leader`／`/api/me/dashboard` 等）在測試進程 CWD＝repo 根時會去讀
     **repo 工作樹裡的真實檔案**，等同對正式資料造成非預期讀取面（若該檔存在甚至可能
     洩漏真實 follower 清單到測試斷言）。與 leaders_path／exchange_dir／state_base
-    同一個「測試必須明講落點」的紀律（make_cfg 既有慣例）。"""
+    同一個「測試必須明講落點」的紀律（make_cfg 既有慣例）。
+
+    `referral_code`（Task 9，推薦碼 opt-in testnet 端到端）：None（預設）＝功能關閉
+    （既有情境不動）；帶值時同時 (a) 傳進 `ApiConfig.referral_code`，(b) 把
+    `HLGateway.referred_by` 接成 `create_app` 的 `referral_lookup`——鏡射
+    `scripts/run_api.py` 的正式接線（Task 4b），讓 `GET /api/me/referral` 的
+    `onchain_code` 在這個 harness 裡也是真查詢而非恆 null。"""
     leaders_path = tmp_path / "leaders.json"
     leaders_path.write_text(json.dumps({"leaders": leaders}))
     cfg = make_cfg(tmp_path, network="testnet", builder_address=builder,
                    keysvc_sock=keysvc_sock, leaders_path=str(leaders_path),
-                   followers_path=str(tmp_path / "followers.json"))
+                   followers_path=str(tmp_path / "followers.json"),
+                   referral_code=referral_code)
     store = ApiStore(cfg.db_path)
     keysvc = KeysvcClient(cfg.keysvc_sock)
     hl = HLGateway(TESTNET_URL)
-    app = create_app(cfg, store, keysvc, hl)
+    app = create_app(cfg, store, keysvc, hl, referral_lookup=hl.referred_by)
     return TestClient(app, base_url="https://testserver"), cfg, store
 
 

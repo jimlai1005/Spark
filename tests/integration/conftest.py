@@ -88,10 +88,15 @@ def keysvc(tmp_path_factory):
 @pytest.fixture(scope="session")
 def app(tmp_path_factory, builder_address: str, keysvc: KeysvcThread, leader: Wallet):
     """真 keysvc + 真 HLGateway 組出來的 public API app；白名單只含拋棄式 leader
-    （D3：可控、可反手、可平倉，見 plan §4）。"""
+    （D3：可控、可反手、可平倉，見 plan §4）。
+
+    `referral_code="HYPERLIQUID"`（Task 9，推薦碼 opt-in testnet 端到端）：這是
+    testnet 上唯一已知已註冊的碼（主網碼 `JIMLAI1005` 在 testnet 會回
+    `Referral code not registered`，見 docs/superpowers/plans/
+    2026-09-19-referral-optin.md §0）。"""
     tmp_path = tmp_path_factory.mktemp("app")
     leaders = [{"address": leader.address, "name": "harness-leader",
                "description": "T2 E2E 用拋棄式 leader", "enabled": True,
                "accepting_new": True}]
     return make_real_app(tmp_path, builder=builder_address, leaders=leaders,
-                         keysvc_sock=keysvc.sock_path)
+                         keysvc_sock=keysvc.sock_path, referral_code="HYPERLIQUID")

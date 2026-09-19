@@ -292,12 +292,51 @@ def test_s7_enable_risk_controls(app, customer):
 
 
 # ---------------------------------------------------------------------------
+# S7b — 推薦碼 opt-in 客戶簽署（可選；testnet 唯一已知已註冊的碼是 HYPERLIQUID）
+# ---------------------------------------------------------------------------
+
+
+def test_s7b_referral_optin(app, customer):
+    """app fixture 的 `cfg.referral_code == "HYPERLIQUID"`（見
+    tests/integration/conftest.py）。這裡只驗證「客戶簽章 opt-in 落地」——引擎
+    真的送出 `setReferrer` 並在鏈上生效的驗證挪到 S9（那裡才有活著的引擎第一輪）。
+    """
+    if not _STATE.account_id:
+        pytest.fail("S1 未完成：缺 account_id")
+    client, cfg, store = app
+
+    r = client.get("/api/me/referral")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["enabled"] is True, body
+    assert body["signed"] is False, body
+
+    r2 = client.post("/api/me/referral/message")
+    assert r2.status_code == 200, r2.text
+    m = r2.json()
+    assert m["code"] == "HYPERLIQUID", m
+    sig = customer.sign_text(m["message"])
+    body_submit = {"account_id": m["account_id"], "code": m["code"],
+                   "nonce": m["nonce"], "issued_at": m["issued_at"],
+                   "signature": sig, "message": m["message"]}
+    r3 = client.post("/api/me/referral", json=body_submit)
+    assert r3.status_code == 200, r3.text
+    print(f"[S7b] referral opt-in submit response={r3.json()}")
+
+    r4 = client.get("/api/me/referral")
+    assert r4.status_code == 200, r4.text
+    body4 = r4.json()
+    assert body4["signed"] is True, body4
+    print(f"[S7b] referral status after sign={body4}")
+
+
+# ---------------------------------------------------------------------------
 # S8 — auto-activate watcher run_once
 # ---------------------------------------------------------------------------
 
 
 def test_s8_watcher_activates_follower(app, keysvc, builder_address, customer, leader,
-                                       tmp_path_factory):
+                                       tmp_path_factory, monkeypatch):
     if not _STATE.account_id:
         pytest.fail("S1 未完成")
     client, cfg, store = app
@@ -314,6 +353,11 @@ def test_s8_watcher_activates_follower(app, keysvc, builder_address, customer, l
     def _recorder(cmd, check):
         assert check is True
         calls.append(list(cmd))
+
+    # Task 9：watcher 讀自己進程的 FILET_REFERRAL_CODE（單一來源
+    # /etc/filet/referral.env，見 scripts/filet_auto_activate.py::run_once）——
+    # 不是 make_real_app 那份 cfg.referral_code（那是 API 端的設定）。
+    monkeypatch.setenv("FILET_REFERRAL_CODE", "HYPERLIQUID")
 
     owner = group = os.environ.get("USER", "nobody")
     rc = auto_activate_run_once(
@@ -334,6 +378,7 @@ def test_s8_watcher_activates_follower(app, keysvc, builder_address, customer, l
     assert env["SPARK_BUILDER_ADDR"].lower() == builder_address.lower()
     assert env["COPY_LIVE_TRADING"] == "true"
     assert env["COPY_RISK_CONTROLS_ENABLED"] == "true"
+    assert env["COPY_REFERRAL_CODE"] == "HYPERLIQUID", env
 
     assert not any(e["account_id"] == _STATE.account_id for e in load_pending(cfg.pending_path))
     data = json.loads(manifest_path.read_text())
@@ -364,6 +409,13 @@ def test_s9_engine_mirrors_leader_open(app, leader, customer, keysvc):
     if _STATE.env_file is None:
         pytest.fail("S8 未完成：缺 env 檔")
     client, cfg, store = app
+
+    # Task 9：確認「這一輪」才是設定推薦碼的那一輪——本引擎第一次呼叫
+    # run_engine_once 就在這個 test 裡（下面），所以在此之前查到的 referredBy
+    # 必須是 None，否則後面的斷言就無法證明是這次引擎 cycle 設的。
+    referral_before = _info.query_referral_state(customer.address).get("referredBy")
+    assert referral_before is None, (
+        f"customer 在引擎第一輪之前不應已有推薦人：{referral_before}")
 
     notional = Decimal("20")
     res = leader_trade(leader, _COIN, True, notional)
@@ -418,6 +470,19 @@ def test_s9_engine_mirrors_leader_open(app, leader, customer, keysvc):
          f"expected_scale={expected_scale} actual_scale={actual_scale} "
          f"builder_accrued={accrued_now}")
     assert accrued_now > 0
+
+    # Task 9：`ReferralOptinApplier.apply_once()` 跑在 `run_cycle` 之前
+    # （scripts/run_copytrade.py::cycle），所以這一輪引擎 subprocess 執行完，
+    # 客戶簽署的推薦碼 opt-in（S7b）應該已經送出 setReferrer 並在鏈上生效。
+    def _referral_set() -> bool:
+        rb = _info.query_referral_state(customer.address).get("referredBy")
+        return isinstance(rb, dict) and rb.get("code") == "HYPERLIQUID"
+
+    assert wait_until(_referral_set, timeout=30), (
+        f"引擎第一輪後推薦碼未設定為 HYPERLIQUID，實得 "
+        f"{_info.query_referral_state(customer.address).get('referredBy')}")
+    referral_after = _info.query_referral_state(customer.address)["referredBy"]
+    print(f"[S9] referredBy after first engine cycle={referral_after}")
 
 
 # ---------------------------------------------------------------------------
