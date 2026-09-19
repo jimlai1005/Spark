@@ -42,7 +42,7 @@
 | D6 | 舊 `build_sync`／0.7s 節流／2/8/30 退避在 P3 完成後刪除，測試改寫 | 採用 | 2026-09-20 使用者同意 |
 | D7 | 遷移：舊 `explore_index.json` 的 rows 匯入為首版 published，`as_of` 全部＝`built_at`，`fills_coverage.state="backfilling"`；不推導 fills 與 endpoint cache | 採用 | 2026-09-20 使用者同意 |
 | D8 | 部署節奏：P0＋P1 完成即先部署一次（開探索頁不再燒 90 分鐘；dashboard 有限流保護），P2–P5 完成再部署第二次。`EXPLORE_UPSTREAM_REFRESH` 預設 off，第二次部署後觀察 `/api/ops/health.hl_budget` 再開 | 採用（spec §0.1 說不必分階段上線，但正式機現在每次開頁就滿載 90 分鐘，先止血代價最低） | 2026-09-20 使用者同意 |
-| D9 | interactive scope 等額度上限 2 秒；等不到 → `BudgetExhausted`（非 transient，不重試）→ dashboard 該塊 null、onboard/status 回 503 | 採用 | 2026-09-20 使用者同意 |
+| D9 | interactive scope 等額度上限 2 秒；等不到 → `BudgetExhausted`（非 transient，不重試）→ dashboard 該塊 null、其他端點經全域 handler 回 502（2026-09-20 與 Task 0.4 統一） | 採用 | 2026-09-20 使用者同意 |
 
 ---
 
@@ -777,6 +777,56 @@ def test_build_stops_when_explore_budget_exhausted_and_keeps_old_rows(tmp_path):
 
 - [ ] **Step 1: 失敗測試** → **Step 2: FAIL** → **Step 3: 實作** → **Step 4: `uv run pytest -q` 全綠、`ruff` 乾淨**
 - [ ] **Step 5: Commit** `feat: filet-api 接上 HL 權重限流；ops/health 揭露預算快照`
+
+### Task 1.5 @inline：P1 reviewer 修正（2026-09-20 opus 審查，2 Critical／5 Warning）
+
+<!-- 裁決記錄：C1 fills 固定預留 120 使自訂帳本比 HL 真實計費高 3–6 倍 → 採「預留後依實際筆數結算退回」
+（spec §5.1「第一版不退款」是簡化而非禁令；同源同基準優先）。C2 額度不足被寫進詳情頁負面快取 → 視為 transient
+上拋 502。W1/W2 兩處字串判型假陽性。W3 快照凍結期間需 ops 可見。D9 統一為 502。 -->
+
+**Files:** `src/spark/publicapi/hl_budget.py`、`hl.py`、`hl_explore.py`、`app.py`；`tests/test_hl_budget.py`、`tests/test_hl_gateway_budget.py`、`tests/test_api_ops.py`、`tests/test_public_explore.py`、traders 詳情測試檔。
+
+- [ ] **A. `hl_budget.py`**
+  1. 帳本項目改為可變 `list[float, int, str]`，`try_reserve`／`reserve` 回傳該項目作為 token（`try_reserve` 失敗回 `None`；`reserve` 成功回 token）。新增：
+     ```python
+     def settle(self, token, actual_weight: int) -> None:
+         """回應到手後依實際計費**下修**預留（只降不升）。fills 類預留 120 是上限，
+         實際 = 20 + ceil(筆數/20)；不結算會讓自訂帳本比 HL 真實計費高 3–6 倍，
+         造成 HL 沒擋、我們自己先擋的假陽性（reviewer C1）。"""
+         with self._lock:
+             if token is None or actual_weight >= token[1]:
+                 return
+             self._counters["refunded_weight"] += token[1] - actual_weight
+             token[1] = actual_weight
+     ```
+     `_COUNTER_KEYS` 加 `"refunded_weight"`。
+  2. `ScopePaused.__init__` 訊息改為 `f"scope {scope} paused: upstream rate limited"`（**不含任何數字**——`resilience._TRANSIENT_MARKERS` 含 "502/503/504"，`until` 的十進位若含這些子串會被誤判 transient 重試 3 次；reviewer W1，主線程實跑確認）。`until` 仍存屬性。
+  3. `note_429`：暫停已在生效中（`now < paused_until[explore]`）就**不升級**，只取 `max(既有, now+base)`；升級公式改為 `pause = min(max(retry_after or 0, PAUSE_MIN_S * 2**(n-1)), PAUSE_MAX_S) + jitter`（Retry-After 是「至少等這麼久」，不再被乘上去；docstring 同步）。
+  4. `note_ok(scope)`：任何 scope 成功都把 `_consecutive_429[explore]` 歸零（上游恢復的證據不分 scope）。
+  5. 新增模組層 `is_rate_limited(exc) -> bool`：`getattr(getattr(exc,"response",None),"status_code",None) == 429`，否則 `re.search(r"^429\b|429 Too Many Requests", str(exc))`（不再用 `"429" in str`；reviewer W2：`JSONDecodeError ... column 429` 會誤判）。
+  6. 模組 docstring「唯一的權重帳本」改為「所有 `/info` 呼叫的權重帳本（`user_details` 走 explorer host，不計）」。
+- [ ] **B. `hl.py`**：`_info` 的 `attempt()` 保存 `token = self._limiter.reserve(...)`；`_post` 成功後若 `body["type"] in ("userFillsByTime", "userFills")` 且 `isinstance(result, list)` → `self._limiter.settle(token, 20 + (len(result) + 19) // 20)`。`_is_429` 改為呼叫 `hl_budget.is_rate_limited`（刪本地版本）。
+- [ ] **C. `hl_explore.py`**：`_is_rate_limited` 改為 `return is_rate_limited(exc)`（import 自 hl_budget；保留函式名與 docstring 改一句）。
+- [ ] **D. `app.py`**
+  1. `_cached_trader_data`（約 2479-2510）四個 `try` 各在既有 `except Exception` **之前**加 `except (BudgetExhausted, ScopePaused): raise`，並在第一個加註解：額度不足是 transient，不得進負面快取或部分結果快取（reviewer C2），由全域 handler 回 502。
+  2. 全域 handler：`BudgetExhausted` 之後再註冊 `ScopePaused` → 502，detail `"上游額度暫停中，請稍後重試"`。
+  3. `/api/ops/health` 加 `"explore_index": explore_index.status()`；在 `hl_explore.ExploreIndex` 新增
+     ```python
+     def status(self) -> dict:
+         with self._lock:
+             return {"rows": None if self._rows is None else len(self._rows),
+                     "built_at": self._built_at, "version": self._rows_version,
+                     "building": self._building}
+     ```
+     （reviewer W3：P1-only 部署期間 Explore 凍結在磁碟快照，ops 需看得到年齡。）
+- [ ] **E. 測試**（先寫、FAIL、改、PASS）
+  - `test_hl_budget.py`：`test_429_pauses_explore_scope_with_escalation_and_retry_after` 第二段改 `retry_after_s=90` → `paused_until == 1100 + max(90, 120) = 1220`；新增 `test_settle_refunds_down_only`（reserve 120 → settle 23 → used 23、`refunded_weight == 97`；settle 200 不變）；`test_note_429_during_active_pause_does_not_escalate`；`test_scope_paused_message_has_no_digits`（`not any(ch.isdigit() for ch in str(ScopePaused("explore", 250238.0)))` 且 `resilience._is_transient_error(...)` 為 False）；`test_is_rate_limited_ignores_json_column_429`。
+  - `test_hl_gateway_budget.py`：`test_fills_page_settles_to_actual_weight`（post 回 50 筆 list → `used["interactive"] == 23`）；`test_json_decode_error_is_not_reported_as_429`（post 拋 `json.JSONDecodeError("Expecting value", " "*428, 428)` → `rate_limited == 0`）。
+  - traders 詳情測試檔（`rg -ln "_trader_portfolio_negative_cache|/api/traders/" tests`）：`hl.portfolio` 拋 `BudgetExhausted` → 502；隨後 `hl.portfolio` 恢復正常 → 下一次 GET 200（未被負面快取釘 60 秒）。
+  - `test_api_ops.py`：health 回應含 `explore_index.rows/built_at/version/building`。
+  - `test_public_explore.py:1152-1157, 1206`：刪 `EXPLORE_ENRICH_CALL_INTERVAL_S` 殘留與「真睡」docstring（reviewer S1）。
+- [ ] **F. plan D9** 那列的「onboard/status 回 503」改為 502（本檔）。
+- [ ] **G. Commit** `fix: P1 審查修正（fills 實際結算、額度不足不進負快取、429/暫停判型）`
 
 **P1 驗收（主線程親跑）：** 全測試綠；`rg -n "enrich_call_interval_s|RATE_LIMIT_RETRY_DELAYS_S" src` 零命中；`rg -n "limiter" scripts/run_api.py` 命中；`uv run python -c "from spark.publicapi.app import create_app"` 可 import。D8 通過則此時做第一次部署（RUNBOOK §5.8a 流程，env 新增兩個 cap 變數，drop-in `hl-budget.conf`）。
 
