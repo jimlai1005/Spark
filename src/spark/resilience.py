@@ -93,7 +93,9 @@ class ResilientExchange:
     """包住 SDK Exchange，所有交易寫入經此分類。Adapter 只持有這個包裝物件。
     冪等 / reduce-only → 直接重試；market_open / 非 reduce-only 掛單 → 驗證後重試
     （由呼叫端以 _verify 提供驗證，目前無呼叫端提供 → 等同單次嘗試不重送）；
-    modify_order → 不重試（已自帶 cancel→重掛 退回）。
+    modify_order → 不重試（已自帶 cancel→重掛 退回）；set_referrer（設定推薦碼）
+    屬冪等寫入——送達但回應遺失時重送，最壞情況只換來語意錯 `Referrer already set`，
+    不會重複產生任何效果，故與 update_leverage 同分類直接重試。
 
     未顯式包裝的屬性（如 approve_builder_fee/approve_agent）一律經 __getattr__
     透傳給內層 exchange——這些是 onboarding 一次性動作，不在本任務的重試範圍內。
@@ -114,6 +116,10 @@ class ResilientExchange:
     def update_leverage(self, *a, **k):
         return run(lambda: self._ex.update_leverage(*a, **k),
                    what="設定槓桿", idempotent=True, sleep_fn=self._sleep_fn)
+
+    def set_referrer(self, *a, **k):
+        return run(lambda: self._ex.set_referrer(*a, **k),
+                   what="設定推薦碼", idempotent=True, sleep_fn=self._sleep_fn)
 
     def cancel(self, *a, **k):
         return run(lambda: self._ex.cancel(*a, **k),

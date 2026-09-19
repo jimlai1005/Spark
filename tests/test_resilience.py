@@ -213,6 +213,8 @@ class FakeSDK:
     def update_leverage(self, *a, **k): return self._do("update_leverage", a, k, "lev")
     def cancel(self, *a, **k):       return self._do("cancel", a, k, "cancelled")
     def modify_order(self, *a, **k): return self._do("modify_order", a, k, "modified")
+    def set_referrer(self, *a, **k):
+        return self._do("set_referrer", a, k, {"status": "ok", "response": {"type": "default"}})
 
     def approve_builder_fee(self, builder, max_fee_rate):
         self.calls.append(("approve_builder_fee", (builder, max_fee_rate), {}))
@@ -248,6 +250,20 @@ def test_wrapper_update_leverage_retries_idempotent():
     rex = _rex(sdk)
     assert rex.update_leverage(5, "BTC", True) == "lev"
     assert sdk.counts["update_leverage"] == 3
+
+
+def test_wrapper_set_referrer_retries_idempotent_and_returns_original_dict():
+    sdk = FakeSDK(fail={"set_referrer": 2})
+    rex = _rex(sdk)
+    assert rex.set_referrer("FILET") == {"status": "ok", "response": {"type": "default"}}
+    assert sdk.counts["set_referrer"] == 3
+
+
+def test_wrapper_set_referrer_success_calls_once():
+    sdk = FakeSDK()
+    rex = _rex(sdk)
+    assert rex.set_referrer("FILET") == {"status": "ok", "response": {"type": "default"}}
+    assert sdk.counts["set_referrer"] == 1
 
 
 def test_wrapper_cancel_retries_idempotent():

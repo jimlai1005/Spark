@@ -30,7 +30,9 @@ class FakeAdapter(ExchangeAdapter):
                  mids=None, sz_decimals=None, daily_abs_pnl=(),
                  cancel_ok=True, modify_ok=True, market_open_ok=True,
                  close_reduce_only_ok=True, update_leverage_ok=True, extra_agents=(),
-                 user_abstraction="disabled", ledger_flows=None, active_asset_leverage=None):
+                 user_abstraction="disabled", ledger_flows=None, active_asset_leverage=None,
+                 referred_by=None, referred_by_raises=None,
+                 set_referrer_result=None, set_referrer_raises=None):
         self._account_value = Decimal(account_value)
         self._account_values = dict(account_values or {})
         self._max_fee = 0
@@ -58,6 +60,13 @@ class FakeAdapter(ExchangeAdapter):
         self._ledger_flows = ledger_flows if ledger_flows is not None else ([], [])
         # 槓桿查詢：dict {coin: (leverage, is_cross)} 或 None（查無 coin → raise）。
         self._active_asset_leverage = dict(active_asset_leverage or {})
+        # referral opt-in（2026-09-19）：鏈上目前推薦碼的注入值；預設 None（尚無推薦人）。
+        self._referred_by = referred_by
+        self._referred_by_raises = referred_by_raises
+        # set_referrer 的注入回應；預設成功（同 testnet 實測的 ok 回應形狀）。
+        self._set_referrer_result = set_referrer_result or {
+            "status": "ok", "response": {"type": "default"}}
+        self._set_referrer_raises = set_referrer_raises
         # writes（M1 補齊）：可注入的成功/失敗結果，預設成功。
         self._cancel_ok = cancel_ok
         self._modify_ok = modify_ok
@@ -181,3 +190,16 @@ class FakeAdapter(ExchangeAdapter):
         if coin not in self._active_asset_leverage:
             raise ValueError(f"activeAssetData 回應形狀不符（coin={coin}）: coin not in registry")
         return self._active_asset_leverage[coin]
+
+    def query_referred_by(self, user: str) -> str | None:
+        self.calls["query_referred_by"].append({"user": user})
+        if self._referred_by_raises is not None:
+            raise self._referred_by_raises
+        return self._referred_by
+
+    def set_referrer(self, code: str) -> TxResult:
+        self.calls["set_referrer"].append({"code": code})
+        if self._set_referrer_raises is not None:
+            raise self._set_referrer_raises
+        res = self._set_referrer_result
+        return TxResult(ok=res.get("status") == "ok", raw=res)

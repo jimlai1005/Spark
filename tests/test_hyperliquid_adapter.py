@@ -5,8 +5,9 @@ from spark.exchange.hyperliquid import HyperliquidAdapter
 
 
 class FakeInfo:
-    def __init__(self):
+    def __init__(self, referral_state=None):
         self.posts = []
+        self._referral_state = referral_state
     def user_state(self, address):
         return {"marginSummary": {"accountValue": "150.5"}}
     def post(self, url_path, payload=None):
@@ -14,6 +15,8 @@ class FakeInfo:
         assert payload["type"] == "maxBuilderFee"
         return 100
     def query_referral_state(self, address):
+        if self._referral_state is not None:
+            return self._referral_state
         return {"builderRewards": "0.008"}
 
 
@@ -30,6 +33,9 @@ class FakeExchange:
         self.calls.append(("order", coin, is_buy, sz, limit_px, order_type, builder))
         return {"status": "ok", "response": {"data": {"statuses": [
             {"filled": {"totalSz": str(sz), "avgPx": str(limit_px)}}]}}}
+    def set_referrer(self, code):
+        self.calls.append(("set_referrer", code))
+        return {"status": "ok", "response": {"type": "default"}}
 
 
 def _adapter():
@@ -137,3 +143,43 @@ def test_fetch_builder_fills_lowercases_address_in_url(monkeypatch):
     ad = _adapter()
     ad.fetch_builder_fills("0xABCdef", date(2026, 6, 18))
     assert "/0xabcdef/" in captured["url"]
+
+
+def test_query_referred_by_returns_none_when_referred_by_null():
+    ad = HyperliquidAdapter(
+        network="testnet",
+        info=FakeInfo(referral_state={"referredBy": None, "builderRewards": "0"}),
+        exchange=FakeExchange(),
+    )
+    assert ad.query_referred_by("0xuser") is None
+
+
+def test_query_referred_by_returns_code_when_present():
+    ad = HyperliquidAdapter(
+        network="testnet",
+        info=FakeInfo(referral_state={
+            "referredBy": {"referrer": "0xreferrer", "code": "FILET"},
+            "builderRewards": "0",
+        }),
+        exchange=FakeExchange(),
+    )
+    assert ad.query_referred_by("0xuser") == "FILET"
+
+
+def test_set_referrer_ok_response():
+    ad = _adapter()
+    res = ad.set_referrer("FILET")
+    assert res.ok is True
+    assert res.raw == {"status": "ok", "response": {"type": "default"}}
+    assert ad._exchange.calls[-1] == ("set_referrer", "FILET")
+
+
+def test_set_referrer_err_response_keeps_raw():
+    class RejectingExchange(FakeExchange):
+        def set_referrer(self, code):
+            self.calls.append(("set_referrer", code))
+            return {"status": "err", "response": "Referrer already set"}
+    ad = HyperliquidAdapter(network="testnet", info=FakeInfo(), exchange=RejectingExchange())
+    res = ad.set_referrer("FILET")
+    assert res.ok is False
+    assert res.raw == {"status": "err", "response": "Referrer already set"}

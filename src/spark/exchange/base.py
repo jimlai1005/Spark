@@ -224,6 +224,13 @@ class ExchangeAdapter(ABC):
         呼叫端負責捕獲後降級與告警。
         """
         ...
+    @abstractmethod
+    def query_referred_by(self, user: str) -> str | None:
+        """該地址鏈上目前的推薦碼（HL `referredBy.code`）——**唯讀**。
+
+        非託管不變量不受影響：這是查詢，不是 withdraw/transfer。null（尚無推薦人）
+        → None；不得猜測或回空字串代替「沒有」。"""
+        ...
 
     # --- writes（approve_* 概念上屬主錢包；Phase 1 testnet 由 test harness 簽）---
     @abstractmethod
@@ -266,3 +273,12 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     def update_leverage(self, agent_signer: Signer, coin: str, leverage: int,
                         is_cross: bool) -> bool: ...
+    @abstractmethod
+    def set_referrer(self, code: str) -> TxResult:
+        """設定本帳戶的推薦碼（HL `setReferrer` L1 action）——agent wallet 可簽，
+        非託管不變量不受影響：這不是 withdraw/transfer，只是設定一個帳戶屬性。
+
+        只能設一次；已設過再設會回 `status: err`（"Referrer already set"）。
+        `ok` 依 SDK 回應的 `status == "ok"` 判定；`raw` 保留原始回應供呼叫端
+        分類失敗原因（重試決策留給引擎端 applier，此層不重試）。"""
+        ...

@@ -54,6 +54,13 @@ class HyperliquidAdapter(ExchangeAdapter):
         state = self._info.query_referral_state(builder)
         return Decimal(str(state["builderRewards"]))
 
+    def query_referred_by(self, user: str) -> str | None:
+        # referral opt-in plan（2026-09-19）：唯讀查鏈上目前的推薦碼。
+        # `referredBy` 為 null（尚無推薦人）或缺鍵一律回 None，不猜測。
+        state = self._info.query_referral_state(user)
+        rb = state.get("referredBy")
+        return str(rb["code"]) if isinstance(rb, dict) and rb.get("code") else None
+
     def query_user_abstraction(self, user: str) -> str:
         """`userAbstraction` 的原始模式字串（唯讀）。語意見 ABC docstring。
 
@@ -372,6 +379,14 @@ class HyperliquidAdapter(ExchangeAdapter):
         # 重複呼叫會 rotate key —— 是否呼叫由 onboarding 依「是否已有 key」決定。
         res, agent_key = self._exchange.approve_agent(agent_name)
         return TxResult(ok=res.get("status") == "ok", raw=res, agent_key=agent_key)
+
+    def set_referrer(self, code: str) -> TxResult:
+        # referral opt-in plan（2026-09-19）：走 sign_l1_action，agent wallet 可簽
+        # （與下單同一種簽法）。經 ResilientExchange 顯式包裝方法（冪等直接重試——
+        # 見 resilience.py：送達但回應遺失時重送，最壞只換來語意錯
+        # "Referrer already set"，不會重複產生效果）。
+        res = self._exchange.set_referrer(code)
+        return TxResult(ok=res.get("status") == "ok", raw=res)
 
     def _parse_order_response(self, res: dict) -> OrderResult:
         """order()/market_open() 共用的回應解析。被拒單（IOC 未成交、保證金不足等）是
