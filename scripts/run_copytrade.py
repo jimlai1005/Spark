@@ -141,6 +141,8 @@ from spark.filet.leader_resolve import (
     require_leaders_path,
     resolve_leader,
 )
+from spark.filet.referral_apply import ReferralOptinApplier
+from spark.filet.referral_optin import referral_optin_path_for
 from spark.filet.risk_settings_apply import (
     RiskSettingsApplier,
     resolve_risk_settings_path,
@@ -283,6 +285,30 @@ def make_risk_settings_applier(*, account_id: str | None, notifier: Notifier,
         settings_path=resolve_risk_settings_path(),
         unlock_path=resolve_risk_unlock_path(),
         state_root=state_root,
+        notifier=notifier)
+
+
+def make_referral_applier(*, account_id: str | None, settings: CopySettings,
+                          adapter, notifier: Notifier, live: bool):
+    """建立每 cycle 冪等套用「客戶簽章推薦碼 opt-in」的 applier；不符任一前提 → None。
+
+    三個前提都必須成立才建（沿其餘 `make_*_applier` factory 的同一個決定）：
+    - `account_id` 有值：沒有帳號就沒有「哪一筆記錄是我的」，也沒有可信的
+      user_address 可比對簽章者。
+    - `live` 為真：`setReferrer` 是一筆需要 agent 私鑰簽的 L1 action，
+      dry-run／shadow 沒有 signer，送了也沒有意義。
+    - `settings.referral_code` 有值：功能未部署（單一來源
+      `/etc/filet/referral.env` 未建）或客戶所在的部署尚未啟用時，env 缺這一鍵，
+      維持**逐位元組不變**的既有行為（不建 applier，`cycle()` 完全不呼叫它）。
+    """
+    if account_id is None or not live or settings.referral_code is None:
+        return None
+    return ReferralOptinApplier(
+        account_id=account_id,
+        manifest_path=os.environ.get("FILET_FOLLOWERS", DEFAULT_MANIFEST_PATH),
+        optin_path=referral_optin_path_for(require_exchange_dir()),
+        expected_code=settings.referral_code,
+        adapter=adapter,
         notifier=notifier)
 
 
@@ -707,6 +733,9 @@ def main(argv: list[str] | None = None) -> None:
         account_id=account_id, notifier=notifier, state_root=state_root)
     risk_applier = make_risk_settings_applier(
         account_id=account_id, notifier=notifier, state_root=state_root)
+    referral_applier = make_referral_applier(
+        account_id=account_id, settings=copy_settings, adapter=adapter,
+        notifier=notifier, live=live)
     # ⭐ Task 15 kill switch 第二級（平倉並撤銷）：重用 make_revocation_wind_down，
     # 只換 reason——同一條收尾路徑，不新造平倉邏輯（見該函式 docstring）。
     close_all_applier = make_close_all_applier(account_id=account_id, notifier=notifier)
@@ -786,6 +815,12 @@ def main(argv: list[str] | None = None) -> None:
                              if capital_applier is not None else None)
             hb["risk"] = (risk_applier.last_applied
                           if risk_applier is not None else None)
+            # ⭐ 客戶簽章的推薦碼 opt-in（2026-09-19）：不疊在 `cs` 上、不影響下單
+            # 邏輯，純粹是「有沒有一筆待送出的 setReferrer」的旁路動作，所以擺在
+            # settings 的產生點之後、`run_cycle` 之前——本輪最終用的 settings 仍只
+            # 有一個產生點。`apply_once` 絕不 raise（見 referral_apply 檔頭）。
+            if referral_applier is not None:
+                referral_applier.apply_once()
             start = len(ex.records)
             report = run_cycle(adapter, ex, cs, notifier, state, state_root)
             if args.shadow:

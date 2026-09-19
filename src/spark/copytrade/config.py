@@ -236,6 +236,16 @@ class CopySettings:
     # 減倉/平倉與既有風控動作（reduce-only 全平、撤單）。
     paused: bool = False
 
+    # ── 推薦碼 opt-in（2026-09-19）───────────────────────────────────────
+    # ⭐ 未設 ⇒ None＝功能關閉：既有 follower 的 env 沒有這一行，`make_referral_applier`
+    # 見到 None 就不建 applier，引擎行為與加入本功能前逐位元組相同（見
+    # docs/superpowers/plans/2026-09-19-referral-optin.md §2）。
+    # 值由 auto-activate watcher 依 `/etc/filet/referral.env` 的單一來源代入
+    # （已在寫入前 `normalize_referral_code`），本欄位刻意**不**在這裡再正規化——
+    # 正規化的唯一定義點在 `referral_optin.normalize_referral_code`，這裡多做一次
+    # 只會製造第二個可能與它漂移的實作。
+    referral_code: str | None = None
+
     @classmethod
     def from_env(
         cls, env: Mapping[str, str] | None = None
@@ -315,6 +325,8 @@ class CopySettings:
             follower_flow_correction_enabled=_env_bool(
                 "COPY_FOLLOWER_FLOW_CORRECTION",
                 str(cls.follower_flow_correction_enabled).lower(), env),
+            # 空字串（未設或行內只有註解）視為 None＝功能關閉（見欄位宣告處）。
+            referral_code=_env_str("COPY_REFERRAL_CODE", "", env) or None,
         )
 
     def __post_init__(self) -> None:
