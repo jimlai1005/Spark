@@ -224,6 +224,22 @@ class HLGateway:
         return int(self._info({"type": "maxBuilderFee", "user": user, "builder": builder},
                               "HL maxBuilderFee 查詢"))
 
+    def referred_by(self, address: str) -> str | None:
+        """使用者目前鏈上的推薦人代碼（唯讀、冪等 → transient 重試）。
+        `GET /api/me/referral`（`filet/referral_optin.py` 姊妹功能的 API 端）
+        用它顯示鏈上狀態——僅供展示，不進任何下單/風控判斷。
+
+        請求體照抄查證過的 SDK 原始碼（`hyperliquid/info.py` 的
+        `query_referral_state` → `{"type": "referral", "user": address}`）；
+        回應形狀 `{"referredBy": {"referrer", "code"} | null, "cumVlm", ...}`。
+        `referredBy` 為 null 或缺 `code` → None（沒有推薦人，不是錯誤；同
+        `max_builder_fee` 對「未核」的 0 這種正常態表示法）。"""
+        raw = self._info({"type": "referral", "user": address}, "HL referral 查詢")
+        rb = raw.get("referredBy") if isinstance(raw, dict) else None
+        if isinstance(rb, dict) and rb.get("code"):
+            return str(rb["code"])
+        return None
+
     def get_user_fills(self, address: str, start: datetime, end: datetime) -> list[UserFill]:
         """時間窗成交明細（唯讀、冪等 → transient 重試）。營運後台每客戶損益用：
         `collect_follower_summary` 只吃 `.sz/.px/.crossed/.builder_fee`，故這裡回

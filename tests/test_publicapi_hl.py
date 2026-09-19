@@ -93,6 +93,21 @@ def test_gateway_read_retries_5xx_marker():
     assert len(post.calls) == 2
 
 
+def test_referred_by_parses_code_from_referral_state():
+    post = _FakePost([{"referredBy": {"referrer": "0x" + "ab" * 20, "code": "FILET"},
+                       "cumVlm": "0"}])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    assert gw.referred_by("0x" + "ab" * 20) == "FILET"
+    assert post.calls == [("https://x/info",
+                           {"type": "referral", "user": "0x" + "ab" * 20})]
+
+
+def test_referred_by_null_returns_none():
+    post = _FakePost([{"referredBy": None, "cumVlm": "0"}])
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=lambda s: None)
+    assert gw.referred_by("0x" + "ab" * 20) is None
+
+
 def test_gateway_has_no_exchange_write_surface():
     """紅線 5 的結構性斷言：gateway 沒有任何提交/寫入方法——前端直送 HL，
     後端連 /exchange 的呼叫路徑都不存在。"""

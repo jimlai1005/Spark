@@ -27,8 +27,9 @@ def main() -> None:
     from spark.publicapi.hl import HLGateway
     from spark.publicapi.store import ApiStore
     billing = (StripeGateway(cfg.stripe_secret_key) if cfg.billing_enabled else None)
+    gateway = HLGateway(cfg.api_url)
     app = create_app(cfg, ApiStore(cfg.db_path), KeysvcClient(cfg.keysvc_sock),
-                     HLGateway(cfg.api_url), billing=billing)
+                     gateway, billing=billing, referral_lookup=gateway.referred_by)
     uvicorn.run(app, host="127.0.0.1",
                 port=int(os.environ.get("FILET_API_PORT", "8700")))
 
