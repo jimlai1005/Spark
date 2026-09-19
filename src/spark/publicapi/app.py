@@ -199,6 +199,12 @@ REFERRAL_OPTIN_DETAIL = {**RISK_SETTINGS_DETAIL,
                         "action_mismatch": "這份簽章不是推薦碼授權，"
                                            "請重新取得待簽原文並重簽"}
 
+# `GET /api/me/referral` 的鏈上查詢負快取 TTL（2026-09-19 審查修正 W3）：非 None
+# 的推薦碼永久快取（鏈上一旦設定即不可改，見 referral_optin.py 檔頭）；None 或
+# 查詢失敗只快取這麼久，避免每次 GET 都對 HL info 端點打一次（這是唯讀展示查詢，
+# 沒有即時性要求）。
+REFERRAL_ONCHAIN_NEG_TTL_S = 60.0
+
 
 class VerifyBody(BaseModel):
     nonce: str
@@ -3888,6 +3894,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         return {"code": rec.get("code"),
                "signed_at": issued_at if isinstance(issued_at, str) else None}
 
+    # {address: (code, expires_at, is_error)}（W3）。`expires_at is None` ＝永久
+    # 快取（只有非 None 的碼才會這樣存——鏈上一旦設定即不可改）；否則到期後下一次
+    # GET 重新查一次。in-process、無鎖：最壞情況是 TTL 邊界附近幾個並發請求各打
+    # 一次 HL，比照 `public_stats.TTLCache` 同一個取捨（見該類別 docstring）。
+    _referral_onchain_cache: dict[str, tuple[str | None, float | None, bool]] = {}
+
     def _referral_onchain_lookup(address: str) -> tuple[str | None, bool]:
         """鏈上 `referredBy.code` 唯讀查詢——`(code, onchain_error)`。
 
@@ -3895,14 +3907,32 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         一律降級成 `onchain_error: True`、`code: None`，**不 5xx**：這只是一句
         提示（前端顯示「無法讀取鏈上狀態」），不是任何判斷的前提（工程原則 3
         的反向——非關鍵的展示查詢，失敗不該拖累整個端點）。
+
+        ⭐ 2026-09-19 審查修正（W3）：加進程內快取，見 `_referral_onchain_cache`
+        與 `REFERRAL_ONCHAIN_NEG_TTL_S`——否則每一次 `GET /api/me/referral` 都會
+        對 HL info 端點打一次，而這個端點沒有即時性要求。
         """
         if referral_lookup is None:
             return None, True
+        now = now_fn()
+        cached = _referral_onchain_cache.get(address)
+        if cached is not None:
+            code, expires_at, is_error = cached
+            if expires_at is None or now < expires_at:
+                return code, is_error
         try:
-            return referral_lookup(address), False
+            code = referral_lookup(address)
         except Exception as e:  # noqa: BLE001 —— 唯讀展示查詢，失敗只降級成提示
             logger.warning("推薦碼鏈上查詢失敗 address=%s: %s", address, e)
+            _referral_onchain_cache[address] = (
+                None, now + REFERRAL_ONCHAIN_NEG_TTL_S, True)
             return None, True
+        if code is not None:
+            _referral_onchain_cache[address] = (code, None, False)  # 永久快取
+        else:
+            _referral_onchain_cache[address] = (
+                None, now + REFERRAL_ONCHAIN_NEG_TTL_S, False)
+        return code, False
 
     @app.get("/api/me/referral")
     def me_referral(address: str = Depends(_require_session)):

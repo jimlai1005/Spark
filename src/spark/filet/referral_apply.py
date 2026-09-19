@@ -33,7 +33,21 @@ Hyperliquid 端**不可撤銷**（同一帳號只能設一次）。所以：
 
 `self._rejected_issued_at` 記住「這一筆記錄已經判定壞掉」（驗章失敗或推薦碼與
 本引擎的 `COPY_REFERRAL_CODE` 不符），避免同一筆記錄每輪重複告警；客戶重新簽一筆
-新的（issued_at 不同）會自然重新嘗試。
+新的（issued_at 不同）會自然重新嘗試。⚠️ 2026-09-19 審查修正（W1）：記錄缺
+`issued_at`（malformed）時不能只比 `issued_at`——兩邊都會是 `None`，guard 會在
+驗章**之前**就靜默 return，永不觸發 critical。改用 `signature` 當 fallback 識別
+（見 `_apply_once` 開頭），並加 `is not None` guard 防止「初始狀態」與「已判定壞掉
+且識別碼恰好是 None」混淆。
+
+⭐⭐ 鏈上寫入結果與查詢結果矛盾時的收斂（W2）
+----------------------------------------------
+`Referrer already set` 後重查回 `None`、或送出成功後重查不是期望碼，理論上都該是
+暫態（info 端點落後鏈上寫入）；但如果**連續多輪**都矛盾，就不該永遠 warn 下去
+（那等於默默重試一個永遠不會成功的動作，還會每輪對主網重送一次 `setReferrer`）。
+`self._contradictions` 計數這兩種矛盾（共用同一個計數器——它們是同一類「鏈上真相
+與觀測不一致」的訊號），達到 `CONTRADICTION_LIMIT` 次才升級成 critical 並停止
+（`_done=True`、`status="rejected"`）；矛盾解除（重查等於期望碼）就正常走向
+`applied`，不需要重置計數器（狀態機已經終結）。
 """
 from __future__ import annotations
 
@@ -47,6 +61,10 @@ from spark.filet.referral_optin import (ReferralOptinError, load_referral_optins
                                         verify_referral_optin)
 
 logger = logging.getLogger(__name__)
+
+# 連續幾輪「setReferrer 回應」與「query_referred_by 重查」矛盾，就不再自動重試
+# 並升級成 critical（見檔頭 W2）。
+CONTRADICTION_LIMIT = 3
 
 
 class ReferralOptinApplier:
@@ -72,8 +90,12 @@ class ReferralOptinApplier:
         self._notifier = notifier
         self._done = False
         self._status = "pending"
-        # 已判定壞掉（驗章失敗／推薦碼不符）的記錄的 issued_at，避免每輪重複告警。
+        # 已判定壞掉（驗章失敗／推薦碼不符）的記錄的識別碼，避免每輪重複告警。
+        # 一般情況是 issued_at；記錄缺 issued_at（malformed）時 fallback 到
+        # signature（見 `_apply_once` 開頭與檔頭 W1）。
         self._rejected_issued_at: str | None = None
+        # 「setReferrer 回應」與「重查」矛盾的連續次數（見檔頭 W2）。
+        self._contradictions = 0
 
     @property
     def status(self) -> str:
@@ -94,11 +116,30 @@ class ReferralOptinApplier:
         except Exception:  # noqa: BLE001
             logger.exception("推薦碼告警發送失敗（跟單不受影響）")
 
-    def _info(self, text: str) -> None:
+    def _info(self, text: str, *, dedup_key: str | None = None) -> None:
         try:
-            self._notifier.info("referral", text)
+            self._notifier.info("referral", text, dedup_key=dedup_key)
         except Exception:  # noqa: BLE001
             logger.exception("推薦碼告警發送失敗（跟單不受影響）")
+
+    def _record_contradiction(self, text: str, *, dedup_key: str) -> None:
+        """記一次「setReferrer 回應」與「重查」矛盾（W2）。
+
+        連續 `CONTRADICTION_LIMIT` 次仍矛盾 → critical 並停止（不再自動重送
+        `setReferrer`，需要人工查）；未達上限只 warn，下一輪再查一次
+        （矛盾多半是 info 端點落後鏈上寫入的暫態）。
+        """
+        self._contradictions += 1
+        if self._contradictions >= CONTRADICTION_LIMIT:
+            self._done = True
+            self._status = "rejected"
+            self._critical(
+                f"**推薦碼鏈上狀態連續 {CONTRADICTION_LIMIT} 輪矛盾**"
+                f"（account={self._account_id}，{text}）——可能是 info 端點落後"
+                f"寫入或子帳本不同，不再自動重試，請人工查",
+                dedup_key="referral_state_contradiction")
+            return
+        self._warn(text, dedup_key=dedup_key)
 
     # ---------- 讀取（沿 RiskSettingsApplier 同一套慣例） ----------
 
@@ -161,7 +202,8 @@ class ReferralOptinApplier:
             self._status = "already_referred"
             which = "Filet" if current == self._expected_code else "其他推薦人"
             self._info(f"account={self._account_id} 鏈上已有推薦碼（{which}），"
-                      f"不再嘗試")
+                      f"不再嘗試",
+                      dedup_key="referral_already_referred")
             return "referred"
         return "not_referred"
 
@@ -180,7 +222,13 @@ class ReferralOptinApplier:
         rec = self._my_record()
         if rec is None:
             return
-        if rec.get("issued_at") == self._rejected_issued_at:
+        # W1：識別碼一般是 issued_at；記錄缺 issued_at（malformed）時 fallback 到
+        # signature，避免兩邊都是 None 而在驗章之前就靜默 return（見檔頭）。
+        rec_issued_at = rec.get("issued_at")
+        rejection_key = (rec_issued_at if isinstance(rec_issued_at, str)
+                         else f"malformed:{rec.get('signature')!r}")
+        if (self._rejected_issued_at is not None
+                and rejection_key == self._rejected_issued_at):
             return
         user_address = self._trusted_user_address()
         if user_address is None:
@@ -198,7 +246,7 @@ class ReferralOptinApplier:
                 f"這是 semantic 失敗，重試同一筆記錄必定再次失敗；若客戶確實要"
                 f"授權，請他重新取得待簽原文並重簽",
                 dedup_key=f"referral_verify_failed:{e.reason}")
-            self._rejected_issued_at = rec.get("issued_at")
+            self._rejected_issued_at = rejection_key
             return
 
         if verified.code != self._expected_code:
@@ -229,8 +277,13 @@ class ReferralOptinApplier:
             response = res.raw.get("response") if isinstance(res.raw, dict) else None
             if isinstance(response, str) and "already set" in response.lower():
                 # 送達但鏈上早已是終態（可能是上一輪送出、回應遺失）：重查一次即可，
-                # 不是失敗（見檔頭）。
-                self._check_onchain(user_address)
+                # 不是失敗（見檔頭）。若重查仍顯示未設定，兩者矛盾——見檔頭 W2。
+                outcome = self._check_onchain(user_address)
+                if outcome == "not_referred":
+                    self._record_contradiction(
+                        f"推薦碼設定回應「Referrer already set」，但鏈上重查顯示"
+                        f"未設定（account={self._account_id}），下一輪重試",
+                        dedup_key="referral_already_set_contradiction")
                 return
             self._done = True
             self._status = "rejected"
@@ -256,7 +309,7 @@ class ReferralOptinApplier:
             self._info(f"account={self._account_id} 推薦碼已設定為 "
                       f"{self._expected_code}")
             return
-        self._warn(
+        self._record_contradiction(
             f"推薦碼設定後重查不符（account={self._account_id}，收到 "
             f"{confirmed!r}），下一輪重試",
             dedup_key="referral_verify_mismatch")

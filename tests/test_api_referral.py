@@ -213,3 +213,49 @@ def test_onchain_lookup_not_injected_sets_onchain_error(client_wallet):
     body = client.get("/api/me/referral").json()
     assert body["onchain_code"] is None
     assert body["onchain_error"] is True
+
+
+# ── W3（2026-09-19 審查修正）：鏈上查詢加進程內快取 ──────────────────
+
+def test_onchain_lookup_cached_for_non_null_code(tmp_path):
+    """非 None 的碼永久快取——兩次 GET 只打 stub 一次。"""
+    calls = []
+
+    def _lookup(addr):
+        calls.append(addr)
+        return "FILET"
+
+    app, _cfg, _store = _make_app(
+        tmp_path, referral_code="FILET", referral_lookup=_lookup)
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+    client.get("/api/me/referral")
+    client.get("/api/me/referral")
+    assert len(calls) == 1
+
+
+def test_onchain_lookup_null_result_cached_then_reexpires(tmp_path):
+    """None 結果只快取 `REFERRAL_ONCHAIN_NEG_TTL_S` 秒：TTL 內不重打，過了重打。"""
+    calls = []
+    now = {"t": 1_000_000.0}
+
+    def _lookup(addr):
+        calls.append(addr)
+        return None
+
+    cfg = make_cfg(tmp_path, referral_code="FILET")
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    app = create_app(cfg, store, keysvc, hl, now_fn=lambda: now["t"],
+                     referral_lookup=_lookup)
+    client = TestClient(app, base_url="https://testserver")
+    login(client)
+
+    client.get("/api/me/referral")
+    assert len(calls) == 1
+    client.get("/api/me/referral")
+    assert len(calls) == 1  # 仍在 60s TTL 內，不重打
+
+    now["t"] += 61
+    client.get("/api/me/referral")
+    assert len(calls) == 2  # TTL 過期，重打

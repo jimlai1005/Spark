@@ -64,7 +64,7 @@ testnet 實測（scratchpad `referral_probe.py` / `referral_probe2.py`，水龍�
 
 - 動作常數 `ACTION_REFERRAL_OPTIN = "referral_optin"`。記錄欄位（順序固定）：
   `REFERRAL_OPTIN_FIELDS = ("action", "account_id", "code", "nonce", "issued_at", "signature", "message")`。**沒有 signer 欄位**（同 risk_settings）。
-- 推薦碼合法格式：`^[A-Z0-9_]{1,32}$`（HL 碼為大寫英數；API 設定值先 `.strip().upper()`；不合法 → API 拒絕啟動時**不**拒絕，只在端點回 503「推薦功能未設定」；引擎端記錄裡的 code 不合法 → `malformed`）。
+- 推薦碼合法格式：`^[A-Z0-9_]{1,32}$`（HL 碼為大寫英數；API 設定值先 `.strip().upper()`；**未設** → 端點回 503「推薦功能未設定」；**設了但不合法** → API 啟動時 `ValueError`（寧可起不來，同 `require_exchange_dir` 慣例；2026-09-19 審查後更正本句）；引擎端記錄裡的 code 不合法 → `malformed`）。
 - 待簽原文（**唯一版型**，寫端與讀端都用 `build_referral_optin_message`）：
 
 ```
@@ -298,6 +298,25 @@ UI 行為：
 輸入：`git diff main...HEAD`、本 plan、`uv run pytest -q` 與 `npm test` 輸出。特別盯：(1) 引擎 applier 的每條失敗路徑是否都有出口且不 raise；(2) 記錄與 log 是否洩漏簽章材料；(3) 域分隔第五個字面量是否與既有四個都不同；(4) `COPY_REFERRAL_CODE` 缺席時引擎行為與改動前逐位元組相同（既有 follower 不動）；(5) 前端預驗是否在進錢包之前。
 
 ---
+
+### Task 8 `@inline`：審查修正（2026-09-19 reviewer PASS 附 3 Warning）
+
+**Files:** `src/spark/filet/referral_apply.py`、`tests/test_referral_apply.py`、`src/spark/publicapi/app.py`、`tests/test_api_referral.py`
+
+- [x] **W1 守門條件吃掉壞記錄**（`referral_apply.py:183`）：`rec.get("issued_at") == self._rejected_issued_at` 在記錄缺 `issued_at` 時兩邊都是 None → 每輪在驗章前靜默 return，永不告警。改為 `self._rejected_issued_at is not None and rec.get("issued_at") == self._rejected_issued_at`；缺欄位的記錄要走到 `verify_referral_optin` 的 `malformed` critical。測試：記錄刪掉 `issued_at` → critical 一次、status 仍 pending、adapter 零呼叫；第二輪不重複 critical（`_rejected_issued_at` 記的是 None 時要另用旗標 `_rejected_malformed = True` 或記錄的 `signature` 值——任選，測試要證明「同一筆壞記錄只告警一次、換一筆新記錄會重新處理」）。
+- [x] **W2 矛盾態迴圈**（`referral_apply.py:228-234` 與 step 11）：`Referrer already set` 後重查回 None、或送出成功後重查不等於期望碼，目前只 warn 一次（dedup）就每輪重送 `setReferrer`，永不收斂也不 critical。加計數器 `self._contradictions`：上述兩種矛盾各 +1；達 `CONTRADICTION_LIMIT = 3` → critical（dedup `referral_state_contradiction`，內容：鏈上寫入與讀取連續三輪不一致，可能是 info 端點落後或子帳本不同，請人工查）＋ `_done = True`、`status = "rejected"`。矛盾解除（重查等於期望碼）→ 正常 applied。測試：用依呼叫序回值的 fake（既有 `_SeqAdapter`）模擬「set ok → 重查 None」三輪 → 第三輪 critical 且第四輪 adapter 零呼叫；模擬「already set → 重查 None」同樣三輪；模擬矛盾兩輪後第三輪重查等於碼 → applied。
+- [x] **W3 GET 每次打 HL**（`app.py:3908-3917`）：`_referral_onchain_lookup` 加進程內快取 dict `{address: (code, expires_at)}`：非 None 的碼**永久快取**（鏈上一旦設定不可改）；None 或查詢失敗快取 `REFERRAL_ONCHAIN_NEG_TTL_S = 60` 秒。用 `now_fn` 取時間（測試可控）。測試：兩次 GET 只打 stub 一次；null 結果 60 秒內不重打、超過重打。
+- [x] **S1**：`already_referred` 的 `_info` 加 `dedup_key="referral_already_referred"`（引擎重啟不洗版）。
+- [x] **S3**（plan 敘述更正，不改 code）：watcher 的 reactivation／heal 路徑也重寫 env，所以 owner_close 後重新選 leader 的舊用戶會拿到 `COPY_REFERRAL_CODE`；沒有簽章記錄時 applier 什麼都不做，行為安全。「既有 follower 不動」指的是不主動改正在跑的引擎 env。
+- [x] 驗收：`uv run pytest tests/test_referral_apply.py tests/test_api_referral.py -q` 全綠且比改前多 ≥ 6 個測試；`uv run pytest -q` 全綠；ruff 乾淨。commit `fix: 推薦碼 opt-in 審查修正（壞記錄不靜默、矛盾態收斂、鏈上查詢快取）`。
+
+**Task 8 實作記錄（2026-09-19）**：W1 用 `_rejected_issued_at`（issued_at 存在時）／
+`f"malformed:{signature!r}"`（issued_at 缺漏時的 fallback 識別碼）＋ `is not None`
+guard；W2 新增共用計數器 `self._contradictions` 與 `_record_contradiction()`（兩個矛盾
+呼叫點共用），達 `CONTRADICTION_LIMIT=3` 才 critical＋停止；W3 快取三元組
+`(code, expires_at, is_error)`，`expires_at is None` 表永久。`uv run pytest
+tests/test_referral_apply.py tests/test_api_referral.py -q` 22→29（+7）；
+`uv run pytest -q` 2927 passed；ruff 乾淨。
 
 ## 3. 上線步驟（實作完成後，人工）
 

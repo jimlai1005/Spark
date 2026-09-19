@@ -233,3 +233,111 @@ def test_confirm_mismatch_after_set_warns_and_retries_next_round(env):
     assert len(env.warns()) == 1
     assert env.warns()[0][3] == "referral_verify_mismatch"
     assert len(adapter.calls["set_referrer"]) == 1
+
+
+# ── 2026-09-19 審查修正（Task 8）──────────────────────────────────────
+
+def test_already_referred_info_has_dedup_key(env):
+    """S1：`already_referred` 的 info 通知要帶 dedup_key（引擎重啟不洗版）。"""
+    env.write_optin(code=_CODE)
+    adapter = FakeAdapter(referred_by=_CODE)
+    applier = env.applier(adapter=adapter, expected_code=_CODE)
+    applier.apply_once()
+    assert applier.status == "already_referred"
+    assert env.infos()[0][3] == "referral_already_referred"
+
+
+def test_record_missing_issued_at_is_critical_once_not_silently_skipped(env):
+    """W1：記錄缺 `issued_at` 時，舊的 guard（比較 issued_at）兩邊都是 None，
+    會在驗章之前就靜默 return、永不告警。修正後要走到 verify 的 malformed
+    critical，且同一筆壞記錄只告警一次；換一筆新的壞記錄要重新處理。"""
+    def _write_malformed(nonce):
+        env.write_optin(nonce=nonce)
+        data = json.loads(env.optin_path.read_text())
+        del data["optins"][-1]["issued_at"]
+        env.optin_path.write_text(json.dumps(data))
+
+    adapter = FakeAdapter()
+    applier = env.applier(adapter=adapter)
+
+    _write_malformed("n1")
+    applier.apply_once()
+    assert applier.status == "pending"
+    assert len(env.crits()) == 1
+    assert env.crits()[0][3].startswith("referral_verify_failed:")
+    assert dict(adapter.calls) == {}
+
+    # 同一筆壞記錄再跑一次 → 不重複告警。
+    applier.apply_once()
+    assert len(env.crits()) == 1
+    assert dict(adapter.calls) == {}
+
+    # 換一筆不同的壞記錄（不同 nonce/signature）→ 重新處理、再告警一次。
+    _write_malformed("n2")
+    applier.apply_once()
+    assert len(env.crits()) == 2
+    assert dict(adapter.calls) == {}
+
+
+def test_already_set_recheck_none_contradiction_reaches_limit_and_stops(env):
+    """W2：`Referrer already set` 後重查回 None，連續三輪 → critical 並停止；
+    第四輪不再打 adapter。"""
+    env.write_optin(code=_CODE)
+    adapter = _SeqAdapter(
+        referred_by_sequence=[None] * 6,
+        set_referrer_result={"status": "err", "response": "Referrer already set"})
+    applier = env.applier(adapter=adapter, expected_code=_CODE)
+
+    applier.apply_once()
+    assert applier.status == "pending"
+    applier.apply_once()
+    assert applier.status == "pending"
+    applier.apply_once()
+    assert applier.status == "rejected"
+
+    assert len(env.warns()) == 2
+    assert len(env.crits()) == 1
+    assert env.crits()[0][3] == "referral_state_contradiction"
+    assert len(adapter.calls["set_referrer"]) == 3
+    assert len(adapter.calls["query_referred_by"]) == 6
+
+    applier.apply_once()
+    assert len(adapter.calls["set_referrer"]) == 3
+    assert len(adapter.calls["query_referred_by"]) == 6
+
+
+def test_set_ok_confirm_none_contradiction_reaches_limit_and_stops(env):
+    """W2：送出成功但重查連續三輪都不是期望碼 → critical 並停止；第四輪
+    不再打 adapter。"""
+    env.write_optin(code=_CODE)
+    adapter = _SeqAdapter(referred_by_sequence=[None] * 6)
+    applier = env.applier(adapter=adapter, expected_code=_CODE)
+
+    for _ in range(3):
+        applier.apply_once()
+    assert applier.status == "rejected"
+
+    assert len(env.warns()) == 2
+    assert len(env.crits()) == 1
+    assert env.crits()[0][3] == "referral_state_contradiction"
+    assert len(adapter.calls["set_referrer"]) == 3
+
+    applier.apply_once()
+    assert len(adapter.calls["set_referrer"]) == 3
+
+
+def test_contradiction_resolves_before_limit_then_applied(env):
+    """W2：矛盾解除（重查等於期望碼）→ 正常走向 applied，不升級成 critical。"""
+    env.write_optin(code=_CODE)
+    adapter = _SeqAdapter(
+        referred_by_sequence=[None, None, None, None, None, _CODE])
+    applier = env.applier(adapter=adapter, expected_code=_CODE)
+
+    applier.apply_once()
+    applier.apply_once()
+    applier.apply_once()
+
+    assert applier.status == "applied"
+    assert len(env.crits()) == 0
+    assert len(env.warns()) == 2
+    assert len(adapter.calls["set_referrer"]) == 3
