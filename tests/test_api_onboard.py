@@ -102,6 +102,23 @@ def test_status_hl_429_is_502_not_500(tmp_path):
     assert "429" in r.json()["detail"]
 
 
+def test_status_budget_exhausted_is_502(tmp_path):
+    """Task 1.2：limiter 等額度逾時拋 BudgetExhausted（非 transient，resilience 不重試）
+    ——同一個全域邊界要把它轉 502，而非讓它原樣炸成 500（新 handler，非既有兩個之一）。"""
+    from spark.publicapi.hl_budget import BudgetExhausted
+
+    app, cfg, store, keysvc, hl = make_app(tmp_path)
+    client = _client(app)
+    login(client)
+
+    def _exhausted(*a, **kw):
+        raise BudgetExhausted("x")
+    hl.max_builder_fee = _exhausted
+    r = client.get("/api/onboard/status")
+    assert r.status_code == 502
+    assert "額度" in r.json()["detail"]
+
+
 def test_status_programming_error_is_still_500(tmp_path):
     """反面：非上游 HTTP 錯誤的例外不得被這個新 handler 吃成 502——它必須原樣炸出來
     （TestClient 預設 raise_server_exceptions=True，往上拋成 Python 例外而非 500 回應）。"""

@@ -43,6 +43,7 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.filet.trader_stats import fills_stats, live_days_from_av, window_stats
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
+from spark.publicapi.hl_budget import BudgetExhausted
 from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
                                      build_contact_email, clip, decoy_ticket, notify_text,
                                      PAGE_URL_MAX, USER_AGENT_MAX, validate_contact)
@@ -1379,6 +1380,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         logger.warning("HL 上游 HTTP %s: %s %s", code, request.method, request.url.path)
         return JSONResponse(status_code=502,
                              content={"detail": f"上游服務回應 HTTP {code}，請稍後重試"})
+
+    @app.exception_handler(BudgetExhausted)
+    async def _hl_budget_exhausted(request, exc):
+        # Task 1.2：limiter 等額度逾時（非 transient，resilience 不重試）——與上面
+        # 三個上游失敗 handler 同一個邊界、同轉 502（工程原則 5：單一邊界）。
+        logger.warning("HL 權重額度暫時用盡: %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=502,
+                             content={"detail": "上游額度暫時用盡，請稍後重試"})
 
     @app.exception_handler(BillingError)
     async def _billing_error(request, exc):

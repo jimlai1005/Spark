@@ -3,6 +3,7 @@ Public API 對 HL 的唯一出口（單一 resilience boundary，工程原則 5�
 分類在呼叫點強制宣告（沿 spark.resilience.run）：讀取（/info）＝冪等 → transient 重試。
 本模組刻意沒有任何 /exchange 提交路徑：已簽授權由前端直送 HL（設計定案 1），
 後端結構上無法經手簽名（紅線 5，Task 13 有結構性測試）。"""
+import copy
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,8 @@ import httpx
 
 from spark.config import API_URLS, EXPLORER_URLS
 from spark.exchange.base import USER_FILLS_PAGE_LIMIT, UserFill
+from spark.publicapi.hl_budget import (INTERACTIVE_SCOPE, INTERACTIVE_WAIT_S,
+                                       WeightLimiter, weight_for)
 from spark.resilience import run
 
 _TIMEOUT_S = 10.0
@@ -112,10 +115,33 @@ def _default_post(url: str, body: dict):
     return resp.json()
 
 
-class HLGateway:
-    """post_fn / sleep_fn 可注入：測試給 fake post 與不真睡的 sleep（沿 resilience 慣例）。"""
+def _is_429(exc: Exception) -> bool:
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) == 429:
+        return True
+    return "429" in str(exc)          # 與 hl_explore._is_rate_limited 同一判準（fake post 用字串）
 
-    def __init__(self, base_url: str, post_fn=None, sleep_fn=time.sleep):
+
+def _retry_after_s(exc: Exception) -> float | None:
+    resp = getattr(exc, "response", None)
+    raw = getattr(getattr(resp, "headers", None), "get", lambda k, d=None: None)("retry-after")
+    try:
+        return float(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+class HLGateway:
+    """post_fn / sleep_fn 可注入：測試給 fake post 與不真睡的 sleep（沿 resilience 慣例）。
+
+    `limiter`（2026-09-20 spec §5）：同 IP 權重限流器；`None` 維持舊行為（測試與
+    timer 腳本）。`scope`／`wait_s`：本 gateway 發出的請求記在哪個 scope、等額度
+    最多幾秒。`scoped()` 產生共用同一個 limiter 與 post_fn 的另一個 scope 視圖。
+    """
+
+    def __init__(self, base_url: str, post_fn=None, sleep_fn=time.sleep, *,
+                 limiter: WeightLimiter | None = None,
+                 scope: str = INTERACTIVE_SCOPE, wait_s: float = INTERACTIVE_WAIT_S):
         self._base = base_url.rstrip("/")
         # T9：explorer domain 與 /info domain 分開反查一次，供 user_details 用
         # （base_url == API_URLS[network] 才反查得到；未知 base_url 落回主網
@@ -123,10 +149,28 @@ class HLGateway:
         self._explorer_url = _explorer_url_for(self._base)
         self._post = post_fn or _default_post
         self._sleep = sleep_fn
+        self._limiter, self._scope, self._wait_s = limiter, scope, wait_s
+
+    def scoped(self, scope: str, *, wait_s: float = 0.0) -> "HLGateway":
+        g = copy.copy(self)
+        g._scope, g._wait_s = scope, wait_s
+        return g
 
     def _info(self, body: dict, what: str):
-        return run(lambda: self._post(f"{self._base}/info", body),
-                   what=what, idempotent=True, sleep_fn=self._sleep)
+        def attempt():
+            if self._limiter is not None:
+                # 每一次嘗試（含 resilience 的重試）各自預留；預留後立即發送。
+                self._limiter.reserve(weight_for(body["type"]), self._scope, wait_s=self._wait_s)
+            try:
+                result = self._post(f"{self._base}/info", body)
+            except Exception as e:
+                if self._limiter is not None and _is_429(e):
+                    self._limiter.note_429(self._scope, _retry_after_s(e))
+                raise
+            if self._limiter is not None:
+                self._limiter.note_ok(self._scope)
+            return result
+        return run(attempt, what=what, idempotent=True, sleep_fn=self._sleep)
 
     def clearinghouse_state(self, address: str) -> dict:
         """完整 clearinghouseState（唯讀、冪等 → transient 重試）。
