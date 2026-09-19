@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -80,6 +81,11 @@ from spark.filet.risk_settings import (RISK_SETTINGS_MAX_AGE_S, RiskSettingsErro
                                        load_risk_settings, verify_risk_settings,
                                        verify_risk_unlock, write_risk_settings,
                                        write_risk_unlock)
+from spark.filet.referral_optin import (REFERRAL_OPTIN_MAX_AGE_S, ReferralOptinError,
+                                        build_referral_optin_message,
+                                        build_referral_optin_record,
+                                        load_referral_optins, normalize_referral_code,
+                                        verify_referral_optin, write_referral_optin)
 from spark.filet.close_all import (CloseAllError, build_close_all_message,
                                    build_close_all_record, close_all_path_for,
                                    close_all_result_path_for,
@@ -186,6 +192,13 @@ CLOSE_ALL_DETAIL = {**RISK_SETTINGS_DETAIL,
                     "action_mismatch": "這份簽章不是平倉並撤銷的授權，"
                                        "請重新取得待簽原文並重簽"}
 
+# 推薦碼 opt-in 驗簽失敗 → 回給客戶的分類化訊息（第五張表：獨立的可行動建議，
+# 同 CLOSE_ALL_DETAIL 不與資金/風控/解鎖/平倉共用一張表的理由）。
+REFERRAL_OPTIN_DETAIL_DEFAULT = "推薦碼授權驗證失敗，請重新取得待簽原文並重簽"
+REFERRAL_OPTIN_DETAIL = {**RISK_SETTINGS_DETAIL,
+                        "action_mismatch": "這份簽章不是推薦碼授權，"
+                                           "請重新取得待簽原文並重簽"}
+
 
 class VerifyBody(BaseModel):
     nonce: str
@@ -282,6 +295,20 @@ class RiskUnlockBody(BaseModel):
     """
 
     account_id: str
+    nonce: str
+    issued_at: str
+    signature: str
+    message: str = ""
+
+
+class ReferralOptinBody(BaseModel):
+    """客戶簽章的推薦碼 opt-in 請求（記錄格式減去 action，同 `RiskSettingsBody`
+    形狀）——`account_id` 顯式收下再與 session 衍生值比對（不符 403），理由與
+    `CapitalSettingsBody` 逐字相同。`code` 完全不可信，驗證與正規化的唯一定義
+    在 `filet/referral_optin.py`（本模型不預先 normalize）。"""
+
+    account_id: str
+    code: str
     nonce: str
     issued_at: str
     signature: str
@@ -1301,7 +1328,8 @@ def filter_authorizations(txs: list, limit: int) -> list[dict]:
 
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                billing=None, notifier=None, leaderboard_get_fn=None,
-               mailer=None) -> FastAPI:
+               mailer=None,
+               referral_lookup: Callable[[str], str | None] | None = None) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -3827,6 +3855,157 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                               "同一段跌幅熔斷一次。"
                               "⚠️ 若熔斷的原因是你的 leader 被撤銷，這份簽章**不會**"
                               "解除它（那需要你先選一個新的 leader）。",
+        }
+
+    # ---------- 推薦碼 opt-in（客戶簽章 → 引擎每輪代設 setReferrer）----------
+
+    def _referral_code() -> str | None:
+        """`cfg.referral_code` 的 canonical 化版本（唯一使用點）。`from_env` 已經
+        normalize 過，這裡再過一次是防禦直接建構 `ApiConfig`（測試／腳本）帶進
+        非 canonical 大小寫——待簽原文與端點回的 `code` 必須是同一個字串，否則
+        客戶簽的字串與伺服器記的字串就不同（工程原則 1）。"""
+        return (normalize_referral_code(cfg.referral_code)
+               if cfg.referral_code is not None else None)
+
+    def _my_referral_optin(account_id: str) -> dict | None:
+        """交換目錄 → 這個帳號的推薦碼 opt-in 記錄，且只投影安全欄位（同
+        `_my_signed_risk_record`：signature／message 原文結構上到不了回應——
+        這是唯讀顯示端點，驗章是引擎與 `POST /api/me/referral` 的事）。
+        記錄壞掉／讀不到一律回 None（＝「尚未簽署」），**不 raise**。"""
+        try:
+            records = load_referral_optins(cfg.referral_optin_path)
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            logger.error("推薦碼 opt-in 記錄讀取失敗 %s: %r", cfg.referral_optin_path, e)
+            return None
+        mine = [r for r in records if isinstance(r, dict)
+               and r.get("account_id") == account_id]
+        if not mine:
+            return None
+        # write_referral_optin 是「同 account 覆蓋」，正常至多一筆；取最後一筆
+        # ＝取最新意圖（沿風控設定同一個選法）。
+        rec = mine[-1]
+        issued_at = rec.get("issued_at")
+        return {"code": rec.get("code"),
+               "signed_at": issued_at if isinstance(issued_at, str) else None}
+
+    def _referral_onchain_lookup(address: str) -> tuple[str | None, bool]:
+        """鏈上 `referredBy.code` 唯讀查詢——`(code, onchain_error)`。
+
+        `referral_lookup` 未注入（例如尚未接上真實查詢的部署）或查詢本身失敗，
+        一律降級成 `onchain_error: True`、`code: None`，**不 5xx**：這只是一句
+        提示（前端顯示「無法讀取鏈上狀態」），不是任何判斷的前提（工程原則 3
+        的反向——非關鍵的展示查詢，失敗不該拖累整個端點）。
+        """
+        if referral_lookup is None:
+            return None, True
+        try:
+            return referral_lookup(address), False
+        except Exception as e:  # noqa: BLE001 —— 唯讀展示查詢，失敗只降級成提示
+            logger.warning("推薦碼鏈上查詢失敗 address=%s: %s", address, e)
+            return None, True
+
+    @app.get("/api/me/referral")
+    def me_referral(address: str = Depends(_require_session)):
+        """推薦碼 opt-in 現況：功能是否啟用、客戶是否已簽署、鏈上是否已有推薦人。
+
+        ⭐ `signed` 只看記錄檔裡有沒有這個帳號的條目——**不驗章**（驗章是引擎與
+        `POST /api/me/referral` 的事；這裡驗了也不會改變任何行為，只會讓一份
+        格式壞掉的舊記錄把這個唯讀端點拖成 500）。
+        """
+        account_id = derive_account_id(address)
+        rec = _my_referral_optin(account_id)
+        onchain_code, onchain_error = _referral_onchain_lookup(address)
+        return {
+            "enabled": cfg.referral_code is not None,
+            "code": _referral_code(),
+            "signed": rec is not None,
+            "signed_at": rec["signed_at"] if rec else None,
+            "onchain_code": onchain_code,
+            "onchain_error": onchain_error,
+        }
+
+    @app.post("/api/me/referral/message")
+    def referral_optin_message(address: str = Depends(_require_session)):
+        """回傳推薦碼 opt-in 的 **canonical 待簽原文** ＋ 配套的一次性 nonce。
+
+        推薦功能未設定（`cfg.referral_code is None`）→ 503：讓客戶簽一份必定
+        被 `POST /api/me/referral` 拒絕（或根本不該存在）的原文，是把閘門變成
+        一個只會浪費他一次錢包簽名的陷阱（同 `risk_settings_message` 的邊界
+        檢查放在發原文之前的理由）。本端點無 body：待簽的推薦碼是伺服器設定，
+        不是客戶輸入。
+        """
+        code = _referral_code()
+        if code is None:
+            raise HTTPException(status_code=503, detail="推薦功能未設定")
+        account_id = derive_account_id(address)
+        issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        nonce = store.issue_nonce(address, _LEADER_CHANGE_CHAIN_ID, issued_at,
+                                  now_s=now_fn(), ttl_s=cfg.nonce_ttl_s)
+        message = build_referral_optin_message(
+            account_id=account_id, code=code, nonce=nonce, issued_at=issued_at)
+        return {"message": message, "nonce": nonce, "issued_at": issued_at,
+                "account_id": account_id, "code": code}
+
+    @app.post("/api/me/referral")
+    def me_referral_submit(body: ReferralOptinBody,
+                           address: str = Depends(_require_session)):
+        """客戶**自己簽章**授權引擎代設推薦碼 → 寫一筆簽章記錄。
+
+        ⭐ 本端點**不改任何引擎設定**，只落一筆記錄。引擎在套用前自己重新驗章、
+        自己重新比對 `COPY_REFERRAL_CODE`——繞過那道驗證等於把整套簽章設計
+        降級成裝飾（同 `me_risk_submit` 的理由）。
+
+        失敗分類（工程原則 2）：驗簽失敗、動作類型不符、帳號不符**全是 semantic**
+        （4xx，不得自動重試）；寫檔失敗才是 transient（5xx）。驗簽失敗一律 400
+        而非 401（session 沒問題，壞的是這一份請求內容）。
+        """
+        account_id = derive_account_id(address)
+        if body.account_id != account_id:
+            raise HTTPException(status_code=403, detail="只能簽署自己帳號的推薦碼授權")
+
+        try:
+            record = build_referral_optin_record(
+                account_id=body.account_id, code=body.code, nonce=body.nonce,
+                issued_at=body.issued_at, signature=body.signature,
+                message=body.message)
+            verified = verify_referral_optin(
+                record, account_id=account_id, user_address=address,
+                now_s=now_fn(), consume_nonce=_consume_risk_nonce(address),
+                # ⭐ API 端**強制時效**（引擎端刻意放行，見 referral_optin.py）：
+                # 這裡驗的是「客戶剛剛按下的那一次」，nonce 也才剛發出去。
+                max_age_s=REFERRAL_OPTIN_MAX_AGE_S)
+        except ReferralOptinError as e:
+            # 稽核痕跡（偽造探測）：記 reason 與帳號，**不記** signature／message
+            # 原文，也不記推薦碼（來路不明的內容不進 log）。
+            logger.warning("推薦碼 opt-in 驗簽失敗 account=%s reason=%s",
+                           account_id, e.reason)
+            raise HTTPException(
+                status_code=400,
+                detail=REFERRAL_OPTIN_DETAIL.get(e.reason, REFERRAL_OPTIN_DETAIL_DEFAULT)
+            ) from None
+
+        # 落檔（唯一的寫入，且在全部驗證通過之後）。落地的每一個欄位都取自
+        # **verified**（通過驗證的那一份），不是 body——否則落地的記錄可以與
+        # 客戶簽的原文不一致。
+        record = build_referral_optin_record(
+            account_id=verified.account_id, code=verified.code,
+            nonce=verified.nonce, issued_at=verified.issued_at,
+            signature=body.signature, message=body.message)
+        try:
+            write_referral_optin(cfg.referral_optin_path, record)
+        except OSError as e:
+            logger.error("推薦碼 opt-in 記錄落檔失敗 account=%s path=%s: %s",
+                         account_id, cfg.referral_optin_path, e)
+            raise HTTPException(status_code=500,
+                                detail="設定記錄寫入失敗，請稍後重試") from e
+        logger.info("推薦碼 opt-in 記錄已落地 account=%s code=%s",
+                    account_id, verified.code)
+
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "code": verified.code,
+            "effective": "next_engine_cycle",
         }
 
     # ---------- owner kill switch（Task 15：暫停／平倉並撤銷）----------

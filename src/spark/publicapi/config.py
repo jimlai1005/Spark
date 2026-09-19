@@ -17,6 +17,7 @@ from spark.filet.leader_change import leader_changes_path_for
 from spark.filet.leader_resolve import DEFAULT_LEADERS_PATH, require_leaders_path
 from spark.filet.risk_settings import risk_settings_path_for, risk_unlock_path_for
 from spark.filet.close_all import close_all_path_for
+from spark.filet.referral_optin import normalize_referral_code, referral_optin_path_for
 from spark.filet.user_leaders import user_leaders_path_for
 
 _HEX = set("0123456789abcdefABCDEF")
@@ -33,6 +34,17 @@ def derive_account_id(user_address: str) -> str:
     acct = "f" + normalize_address(user_address)[2:]
     validate_account_id(acct)  # 縱深防禦（結構上必過；單一真相沿 followers.py）
     return acct
+
+
+def _referral_code_from_env(env) -> str | None:
+    """`FILET_REFERRAL_CODE` 讀取＋正規化（唯一定義點）。空字串 → None（未設）；
+    非空但不合法（`referral_optin.normalize_referral_code` 拒絕）→ `ValueError`
+    直接冒出去，讓 `from_env` 拒絕啟動——設定壞了寧可起不來（同其餘必填欄位的
+    fail-closed 理由）。"""
+    raw = env.get("FILET_REFERRAL_CODE")
+    if not raw:
+        return None
+    return normalize_referral_code(raw)
 
 
 @dataclass(frozen=True)
@@ -123,6 +135,13 @@ class ApiConfig:
     # token 是 secret → repr=False（沿 stripe key 的遮蔽慣例；紅線 2）。
     tg_bot_token: str = field(default="", repr=False)
     tg_chat_id: str = ""
+    # --- 推薦碼 opt-in（客戶簽章後由引擎代設 setReferrer；2026-09-19）---
+    # 單一設定來源 `/etc/filet/referral.env` 的 `FILET_REFERRAL_CODE`（見 plan
+    # docs/superpowers/plans/2026-09-19-referral-optin.md 檔頭）。未設 → None
+    # ＝功能整體關閉（`/api/me/referral/message` 503、GET `enabled:false`）。
+    # 已 normalize（`referral_optin.normalize_referral_code`）——與記錄裡的 code
+    # 用同一個定義；`from_env` 收到不合法值直接拒絕啟動（設定錯了寧可起不來）。
+    referral_code: str | None = None
 
     def __post_init__(self):
         if self.stripe_secret_key is not None and \
@@ -203,6 +222,18 @@ class ApiConfig:
         會讓其中一方的格式問題連坐另一方，而兩者都能造成不可逆的資金操作。
         """
         return close_all_path_for(self.exchange_dir)
+
+    @property
+    def referral_optin_path(self) -> str:
+        """客戶簽章的推薦碼 opt-in 記錄落點（filet/referral_optin.py 的格式）。
+
+        與 `risk_settings_path`／`risk_unlock_path` 同一個交換目錄、同一個權限
+        拓撲（API 寫、引擎讀），**各自一個檔**——同一個理由：共用一個檔會讓
+        其中一方的格式問題連坐另外兩方，而它們各自都能造成資金/授權後果。
+        推導的單一定義在 `referral_optin_path_for`——引擎端（Task 3 的
+        `make_referral_applier`）用同一個函式從同一個 `exchange_dir` 推導。
+        """
+        return referral_optin_path_for(self.exchange_dir)
 
     @property
     def user_leaders_path(self) -> str:
@@ -319,4 +350,5 @@ class ApiConfig:
                    contact_smtp_pass=env.get("FILET_CONTACT_SMTP_PASS") or None,
                    contact_to=env.get("FILET_CONTACT_TO") or None,
                    tg_bot_token=env.get("FILET_API_TG_BOT_TOKEN", ""),
-                   tg_chat_id=env.get("FILET_API_TG_CHAT_ID", ""))
+                   tg_chat_id=env.get("FILET_API_TG_CHAT_ID", ""),
+                   referral_code=_referral_code_from_env(env))
