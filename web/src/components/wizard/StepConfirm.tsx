@@ -112,7 +112,7 @@ function ReferralOptinCard({ me }: { me: { address: string; account_id: string }
   }
 
   return (
-    <div className="step-card referral-optin-card">
+    <div className="referral-optin">
       <p className="eyebrow">{c.title}</p>
       <p className="hint">{c.body}</p>
       {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
@@ -177,38 +177,37 @@ export function StepConfirm({ me, leaderAddress, estimatedNotional, onDone }: {
   }
 
   return (
-    <>
-      <div className="step-card">
-        <p className="eyebrow">04・{c.stepNames[3]}</p>
-        <h2>{c.step4Title}</h2>
-        <p className="hint">{c.step4Body}</p>
+    <div className="step-card">
+      <p className="eyebrow">04・{c.stepNames[3]}</p>
+      <h2>{c.step4Title}</h2>
+      <p className="hint">{c.step4Body}</p>
 
-        <FeeCalculator initialNotional={estimatedNotional} />
+      <FeeCalculator initialNotional={estimatedNotional} />
 
-        {labels.map((text, i) => (
-          <label key={text} className="check-row">
-            <input type="checkbox" checked={checks[i]}
-              onChange={(e) => {
-                const next = [...checks];
-                next[i] = e.target.checked;
-                setChecks(next);
-              }} />
-            <span>{text}</span>
-          </label>
-        ))}
+      {labels.map((text, i) => (
+        <label key={text} className="check-row">
+          <input type="checkbox" checked={checks[i]}
+            onChange={(e) => {
+              const next = [...checks];
+              next[i] = e.target.checked;
+              setChecks(next);
+            }} />
+          <span>{text}</span>
+        </label>
+      ))}
 
-        {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
-
-        <div className="step-actions">
-          <button type="button" className="btn btn-primary"
-            disabled={!allChecked || submitting || !leaderAddress}
-            onClick={() => void handleSubmit()}>
-            {submitting ? c.step4Submitting : c.step4SubmitButton}
-          </button>
-        </div>
-        <p className="hint">{COPY.common.nonCustodial}</p>
-      </div>
       <ReferralOptinCard me={me} />
-    </>
+
+      {error && <div className="sign-error" role="alert"><p>{error}</p></div>}
+
+      <div className="step-actions">
+        <button type="button" className="btn btn-primary"
+          disabled={!allChecked || submitting || !leaderAddress}
+          onClick={() => void handleSubmit()}>
+          {submitting ? c.step4Submitting : c.step4SubmitButton}
+        </button>
+      </div>
+      <p className="hint">{COPY.common.nonCustodial}</p>
+    </div>
   );
 }

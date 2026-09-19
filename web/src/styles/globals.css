@@ -658,6 +658,17 @@ main.page {
 
 .step-actions { margin-top: 24px; }
 
+/* 2026-09-19：推薦碼（選填）是 step 4 主卡片內的子區塊，放在勾選框與主按鈕之間；
+   用 --surface 素色內嵌（與 .sign-card 同語彙），不套 .step-card。 */
+.referral-optin {
+  margin-top: 20px;
+  padding: 16px 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.referral-optin .step-actions { margin-top: 12px; }
+
 /* 簽署卡＝全站最安靜的區塊：用 --surface 素色內嵌，功能色（--pos/--neg）標示簽署狀態 */
 .sign-card {
   border: 1px solid var(--border);
