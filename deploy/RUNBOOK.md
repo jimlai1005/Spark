@@ -2621,3 +2621,19 @@ build → restart `filet-api`、`filet-dashboard`（keysvc／follower 未重啟�
 `filet_regression_check --http --ssh` 67/67 PASS；`systemctl --failed` 空；API journal 零 Traceback；首頁 CTA 三處「連接錢包」；
 `/api/public/stats` routed_volume 175,534。既有 fbac652 錢包：09-07 07:31 UTC owner_close 完成後 unit 已人工
 `disable --now`，ARM 終態仍在檔——用戶重新選 leader 時新路徑自動處理，無需人工。
+
+**2026-09-19 部署（commit `3367519`，11:14 UTC，推薦碼 opt-in）：** plan
+`docs/superpowers/plans/2026-09-19-referral-optin.md`（Task 1–9，opus 審查 PASS＋3 Warning 修正）。內容：用戶可選簽署
+（personal_sign，第五個域分隔字面量 `Filet: set Hyperliquid referral code`）→ API 落 `referral_optin.json` → 引擎每輪
+`run_cycle` 前冪等送 `setReferrer`（L1 action，agent 可簽；testnet 實測已交易錢包仍可設）→ 重查鏈上驗證；watcher 代入
+`COPY_REFERRAL_CODE`（`GENERATED_KEYS`）；前端 onboarding 費用頁＋設定頁卡片、條款／風險頁揭露。上線前 testnet 劇本
+S1–S13＋S7b 14/14 PASS（S9 引擎第一輪後 `referredBy.code == HYPERLIQUID`）。流程照 §3.2 rsync 兩段 → `uv sync` 略過
+（依賴無變動，uv.lock mtime 仍 07-17）→ `find -prune var` chown root（非 root 檔 0）→ §4.2 `npm ci`＋
+`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app` build → §5.8d：`/etc/filet/referral.env`（`FILET_REFERRAL_CODE=JIMLAI1005`，
+主網 `referrerState.stage == ready`）；**filet-api 走 drop-in** `filet-api.service.d/referral-env.conf`（這台機器的
+`EnvironmentFile` 全在 drop-in，主檔沒有可 `sed -a` 的錨行——§5.8d (b) 的主檔加行寫法在此機不適用）；
+`filet-auto-activate.service` 主檔加行（unit 備份 `/etc/filet/unit-backups/2026-09-19-111146/`）→ `daemon-reload` →
+restart `filet-api`、`filet-dashboard`（keysvc／follower 未重啟；既有 fb8c353 引擎 env 無 `COPY_REFERRAL_CODE`，行為不變）
+→ `DEPLOYED_VERSION`。驗證：`/proc/<api pid>/environ` 含 `FILET_REFERRAL_CODE=JIMLAI1005`（⚠️ `systemctl show -p Environment`
+**不會列** EnvironmentFile 載入的值，要看 `-p EnvironmentFiles` 或進程 environ）；`filet_regression_check --http --ssh`
+67/67 PASS；`systemctl --failed` 空；API journal 零 Traceback；`/terms`、`/risk` 已見推薦碼段落；`/api/me/referral` 未登入 401。

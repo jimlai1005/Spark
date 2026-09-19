@@ -345,3 +345,4 @@ tests/test_referral_apply.py tests/test_api_referral.py -q` 22→29（+7）；
 - [ ] commit `test: testnet 端到端加入推薦碼 opt-in（S7b 簽署、S8 env、S9 鏈上驗證）`。
 
 **驗收**：integration 劇本 S1–S13 全 PASS（含新增斷言）；主線程另跑一次同指令複驗。
+- 2026-09-19 11:14 UTC：**已部署正式機**（commit `3367519`）。testnet 劇本 14/14 PASS；正式機 `FILET_REFERRAL_CODE=JIMLAI1005`（filet-api 走 drop-in `referral-env.conf`，watcher 主檔加行）；`filet_regression_check --http --ssh` 67/67 PASS。部署記錄見 `deploy/RUNBOOK.md` 部署日誌 2026-09-19 條。既有 follower 未動。後續觀測：第一位新啟用且簽署的用戶，看 TG info「推薦碼已設定為 JIMLAI1005」與 `/info referral` 的 `referredBy`。
