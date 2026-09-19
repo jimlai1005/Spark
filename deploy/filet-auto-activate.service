@@ -18,6 +18,10 @@ Environment=FILET_LEADERS_PATH=/opt/filet/spark/var/filet/leaders.json
 # 告警通道與 filet-daily-report 同源；檔案允許不存在（`-`）→ notifier 全靜默，
 # 但啟用失敗仍會讓 unit 進 failed（journal 可查）。
 EnvironmentFile=-/etc/filet/telegram.env
+# 推薦碼 opt-in（Task 6）：`FILET_REFERRAL_CODE` 單一來源，本 unit 讀它並在
+# 啟用新用戶時代入該引擎 env 的 `COPY_REFERRAL_CODE`——不是 secret，0644 即
+# 可；`-` 前綴＝檔案不存在不擋啟動（未設＝功能關閉，新啟用的 env 沒有這個鍵）。
+EnvironmentFile=-/etc/filet/referral.env
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.filet_auto_activate \
     --pending /var/lib/filet-api/pending.json \
     --manifest /opt/filet/spark/var/filet/followers.json \

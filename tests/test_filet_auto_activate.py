@@ -16,7 +16,8 @@ import pytest
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from scripts.filet_auto_activate import GENERATED_KEYS, VAULT_ENV_KEYS, run_once
+from scripts.filet_auto_activate import (GENERATED_KEYS, REFERRAL_ENV_KEYS,
+                                         VAULT_ENV_KEYS, run_once)
 from spark.copytrade.killswitch import ARM_FILE_RELPATH
 from spark.copytrade.notifier import RecordingNotifier
 from spark.filet.close_all import (close_all_path_for, close_all_result_path_for,
@@ -237,10 +238,11 @@ def test_generated_env_has_every_engine_required_var(site):
     lines = dict(ln.split("=", 1) for ln in text.splitlines()
                  if "=" in ln and not ln.startswith("#"))
     for key in GENERATED_KEYS:
-        if key in VAULT_ENV_KEYS:
-            # vault 兩鍵是**條件式**代入：standard leader 的 env 不得出現
-            # （出現＝對一般錢包 leader 硬套 vault 保護）；vault 情境的完整性
-            # 由 test_vault_leader_env_gets_protection_keys 釘住。
+        if key in VAULT_ENV_KEYS or key in REFERRAL_ENV_KEYS:
+            # vault 兩鍵與推薦碼鍵都是**條件式**代入：這裡沒有標成 vault leader，
+            # 也沒設 FILET_REFERRAL_CODE，兩者都不該出現。vault 情境的完整性由
+            # test_vault_leader_env_gets_protection_keys 釘住；推薦碼由
+            # test_referral_code_env_var_injected_into_follower_env 釘住。
             assert key not in lines, key
         else:
             assert lines[key] == expected[key], key
@@ -434,6 +436,46 @@ def test_template_containing_vault_key_fails_closed(site):
     """範本自帶 COPY_MAX_TARGET_LEVERAGE ＝ 與 vault 代入區塊重複定義的歧義
     → 整輪拒跑（沿 SPARK_* 重複定義的既有 fail-closed 語意）。"""
     site.template.write_text(_TEMPLATE_OK + "COPY_MAX_TARGET_LEVERAGE=5\n")
+    site.sign_change(leader=_LEADER)
+    with pytest.raises(SystemExit):
+        site.run()
+    assert site.manifest_leaders() == {}
+
+
+# ── 推薦碼 opt-in（Task 6：單一來源 /etc/filet/referral.env → COPY_REFERRAL_CODE）──
+
+def test_referral_code_env_var_injected_into_follower_env(site, monkeypatch):
+    """⭐ `FILET_REFERRAL_CODE` 設了（watcher 進程讀 /etc/filet/referral.env）
+    → 新啟用的 follower env 含 `COPY_REFERRAL_CODE`，正規化為大寫。"""
+    monkeypatch.setenv("FILET_REFERRAL_CODE", "abc")
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert _env_kv(site)["COPY_REFERRAL_CODE"] == "ABC"
+
+
+def test_no_referral_code_env_var_means_key_absent(site, monkeypatch):
+    """未設 `FILET_REFERRAL_CODE`（既有部署、功能關閉）→ env 完全不含這個鍵，
+    行為與改動前逐位元組相同。"""
+    monkeypatch.delenv("FILET_REFERRAL_CODE", raising=False)
+    site.sign_change(leader=_LEADER)
+    assert site.run() == 0
+    assert "COPY_REFERRAL_CODE" not in _env_kv(site)
+
+
+def test_template_containing_referral_key_fails_closed(site):
+    """範本自帶 `COPY_REFERRAL_CODE=` 值行 ＝ 與代入區塊重複定義的歧義
+    → 整輪拒跑（沿 SPARK_*／vault 鍵既有的 fail-closed 語意）。"""
+    site.template.write_text(_TEMPLATE_OK + "COPY_REFERRAL_CODE=XXXX\n")
+    site.sign_change(leader=_LEADER)
+    with pytest.raises(SystemExit):
+        site.run()
+    assert site.manifest_leaders() == {}
+
+
+def test_bad_referral_code_env_var_fails_closed(site, monkeypatch):
+    """`FILET_REFERRAL_CODE` 設了但格式不合法 → 整輪 fail-closed（理由同
+    REPLACE_WITH：設定壞了寧可不啟用任何人），不是只讓這一筆條目失敗。"""
+    monkeypatch.setenv("FILET_REFERRAL_CODE", "bad-code")
     site.sign_change(leader=_LEADER)
     with pytest.raises(SystemExit):
         site.run()

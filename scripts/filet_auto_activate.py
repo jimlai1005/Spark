@@ -77,6 +77,7 @@ from spark.filet.leader_change import (LeaderChangeError, leader_changes_path_fo
 from spark.filet.leader_resolve import require_leaders_path
 from spark.filet.safe_fs import (ensure_dir_secure, named_owner_ids,
                                  write_json_atomic, write_text_atomic)
+from spark.filet.referral_optin import ReferralOptinError, normalize_referral_code
 from spark.filet.risk_prefs import (RISK_ENV_KEYS, RiskPrefsError, risk_env_lines,
                                     safe_fallback_prefs)
 from spark.filet.risk_settings import (RiskSettingsError, load_risk_settings,
@@ -103,9 +104,35 @@ STATE_DIR_MODE = 0o700
 # **條件式**代入：standard leader 的 env 不寫（不對一般錢包 leader 硬套 vault
 # 保護）；仍列入 GENERATED_KEYS——範本自帶即 fail-closed（重複定義歧義，既有語意）。
 VAULT_ENV_KEYS = ("COPY_MAX_TARGET_LEVERAGE", "COPY_LEADER_FLOW_NEUTRALIZATION")
+# ⭐ 推薦碼 opt-in（2026-09-19，Task 6）：單一來源 `/etc/filet/referral.env`
+# 的 `FILET_REFERRAL_CODE`，本 watcher 讀自己的進程 env（EnvironmentFile 載入）
+# 並代入新啟用 follower 的 `COPY_REFERRAL_CODE`——同 VAULT_ENV_KEYS 的**條件式**
+# 代入語意：未設就不寫這個鍵（既有 follower env 沒有它，行為不變）；仍列入
+# GENERATED_KEYS，範本自帶即 fail-closed（重複定義歧義，既有語意）。
+REFERRAL_ENV_KEYS = ("COPY_REFERRAL_CODE",)
 GENERATED_KEYS = ("SPARK_NETWORK", "SPARK_ACCOUNT_ID",
                   "SPARK_USER_ADDR", "SPARK_BUILDER_ADDR") \
-    + RISK_ENV_KEYS + VAULT_ENV_KEYS
+    + RISK_ENV_KEYS + VAULT_ENV_KEYS + REFERRAL_ENV_KEYS
+
+
+def _referral_code_from_env() -> str | None:
+    """讀本 watcher 進程的 `FILET_REFERRAL_CODE`（單一來源
+    `/etc/filet/referral.env`，見 docs/architecture.md §6）。
+
+    空字串／未設 → `None`（功能關閉，既有 follower 與新 follower 的 env 都
+    不含 `COPY_REFERRAL_CODE`，行為不變）。設了但格式不合法 → `SystemExit`
+    （整輪 fail-closed，理由同範本 REPLACE_WITH 檢查：設定壞了寧可不啟用
+    任何人，也不要讓一部分新用戶漏簽推薦碼而不自知）。
+    """
+    raw = os.environ.get("FILET_REFERRAL_CODE", "").strip()
+    if not raw:
+        return None
+    try:
+        return normalize_referral_code(raw)
+    except ReferralOptinError as e:
+        raise SystemExit(
+            f"環境變數 FILET_REFERRAL_CODE 設定不合法（{e}）——"
+            f"拒絕啟用任何 follower。請檢查 /etc/filet/referral.env。") from e
 
 
 def _latest_signed_leader(records: list[dict], *, account_id: str,
@@ -257,7 +284,8 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
                  user_address: str, builder: str,
                  risk_lines: list[str] | None = None,
                  vault_leader: bool = False,
-                 max_leverage: str | None = None) -> str:
+                 max_leverage: str | None = None,
+                 referral_code: str | None = None) -> str:
     """範本＋watcher 代入的 per-follower 區塊。兩類錯誤整輪 fail-closed：
     - 殘留 REPLACE_WITH：部署者還沒完成安裝，用半成品設定開實盤是拿真錢冒險；
     - 範本自帶 SPARK_*：會與代入區塊重複定義，哪個生效取決於 EnvironmentFile
@@ -265,6 +293,10 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
 
     `max_leverage`：`leaders.json` 展示欄位（Task 5），Task 15b 起也決定
     `COPY_MAX_TARGET_LEVERAGE` 的注入值（見 `_resolve_leverage_cap`）。
+
+    `referral_code`：Task 6，來自 watcher 自己進程的 `FILET_REFERRAL_CODE`
+    （`_referral_code_from_env`）。`None` → 不寫 `COPY_REFERRAL_CODE`（既有
+    語意：缺鍵＝功能關閉）；非 None → 條件式代入，同 vault 兩鍵。
     """
     text = template_path.read_text()
     # ⭐ 只檢查**非註解行**（2026-07-30 實機部署踩到）：範本與部署者的註解本來就會
@@ -307,6 +339,11 @@ def _compose_env(template_path: Path, *, network: str, account_id: str,
         # 強制成引擎層事實（策略卡「槓桿 ≤ Nx」chip 不再只是展示）。
         block += ("# 策略層強制槓桿帽（leaders.json max_leverage 同源；Task 15b）\n"
                   f"COPY_MAX_TARGET_LEVERAGE={cap}\n")
+    if referral_code is not None:
+        block += (
+            "# 推薦碼 opt-in（客戶簽章後由引擎代設 setReferrer；值來自"
+            " /etc/filet/referral.env）\n"
+            f"COPY_REFERRAL_CODE={referral_code}\n")
     return text + block
 
 
@@ -455,6 +492,7 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                   env_dir: Path, env_template: Path,
                   state_base: Path, owner: str, group: str, state: WatcherState,
                   notifier: Notifier, exchange_dir: str,
+                  referral_code: str | None = None,
                   run_cmd=subprocess.run) -> str:
     """處理單一 pending 條目。回傳結果碼：activated／reactivated／healed_*／
     waiting_leader。失敗以例外冒出，由呼叫端隔離。"""
@@ -616,7 +654,8 @@ def process_entry(entry: dict, *, pending_path: str, manifest_path: str,
                                    risk_settings, account_id,
                                    entry["user_address"], notifier),
                                vault_leader=vault_leader,
-                               max_leverage=max_leverage)
+                               max_leverage=max_leverage,
+                               referral_code=referral_code)
     _ensure_env_file(env_dir / f"{account_id}.env", env_content, owner, group)
     ensure_dir_secure(state_base / account_id, mode=STATE_DIR_MODE,
                       owner_ids=named_owner_ids(owner, group))
@@ -659,6 +698,19 @@ def run_once(*, pending_path: str, manifest_path: str, builder: str,
             f"：{e}",
             dedup_key="auto-activate:bad-template")
         raise
+    # ⭐ Task 6：推薦碼 env 同樣先驗（與範本檢查同一級 fail-closed）——設定壞了
+    # 要在這裡就大聲拒跑，不是等某個條目跑到 _compose_env 才發現（那樣會變成
+    # 「只有這一筆條目失敗」，其他條目仍用壞掉的推薦碼設定啟用，違背整輪
+    # fail-closed 的意圖）。
+    try:
+        referral_code = _referral_code_from_env()
+    except SystemExit as e:
+        notifier.critical(
+            "auto-activate",
+            f"FILET_REFERRAL_CODE 設定不合法，**本輪沒有任何人被啟用**"
+            f"（新客戶會卡在待啟用佇列）：{e}",
+            dedup_key="auto-activate:bad-referral-code")
+        raise
     entries = load_pending(pending_path)
     if not entries:
         return 0
@@ -699,7 +751,8 @@ def run_once(*, pending_path: str, manifest_path: str, builder: str,
                 risk_settings=risk_settings, env_dir=env_dir,
                 env_template=env_template, state_base=state_base,
                 owner=owner, group=group, state=state, notifier=notifier,
-                exchange_dir=exchange_dir, run_cmd=run_cmd)
+                exchange_dir=exchange_dir, referral_code=referral_code,
+                run_cmd=run_cmd)
         except (SystemExit, Exception) as e:  # noqa: BLE001 — 逐條目隔離是本函式的職責
             failures += 1
             # CRIT＋條目保留：下輪自動重試，人工可從 journal／TG 追（工程原則 3）。

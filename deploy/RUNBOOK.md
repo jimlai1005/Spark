@@ -2089,6 +2089,63 @@ curl -s "https://trade.filet.app/api/public/explore?window=month" | python3 -c "
 **為什麼不在正式機上「先起新版再等它建完」**：正式機只有 2GB、與 follower 引擎共機，冷建期間
 的 HL 呼叫與舊版 API 的流量疊在一起會拉高 429；而且 `filet-api` 是單一 unit，沒有藍綠切換可用。
 
+### 5.8d ⭐ 推薦碼 opt-in（2026-09-19，Task 6）
+
+<!-- 2026-09-19: watcher 代入 COPY_REFERRAL_CODE 的部署步驟，plan
+docs/superpowers/plans/2026-09-19-referral-optin.md Task 6。 -->
+
+**背景**：推薦碼**單一來源** `/etc/filet/referral.env`（`FILET_REFERRAL_CODE=XXXX`）。
+`filet-api` 讀它發待簽原文（`GET/POST /api/me/referral*`）；`filet-auto-activate`
+watcher 讀它，啟用新用戶時代入該引擎 env 的 `COPY_REFERRAL_CODE`。兩個 unit 都用
+`EnvironmentFile=-/etc/filet/referral.env`（已內建於 repo 版 `deploy/filet-api.service`
+與 `deploy/filet-auto-activate.service`，`-` 前綴＝檔案不存在不擋啟動）。**不是 secret**
+（推薦碼本身是公開資訊），0644 即可，不必比照 `contact.env`／`telegram.env` 收斂權限。
+
+(a) 建立 `/etc/filet/referral.env`：
+
+```bash
+echo "FILET_REFERRAL_CODE=<使用者提供的碼>" | sudo tee /etc/filet/referral.env
+sudo chmod 644 /etc/filet/referral.env
+```
+
+(b) 兩個 unit 檔加 `EnvironmentFile`（若走 §5.1 的 `cp` 部署新版 unit 檔，這行已內建；
+若走 `systemctl edit --full` 手改現行版，照 §5.1a 的備份還原慣例先備份再加）：
+
+```bash
+sudo cp -a /etc/systemd/system/filet-api.service \
+  /etc/systemd/system/filet-api.service.bak-$(date -u +%Y%m%d)
+sudo cp -a /etc/systemd/system/filet-auto-activate.service \
+  /etc/systemd/system/filet-auto-activate.service.bak-$(date -u +%Y%m%d)
+# 兩檔各加一行（緊接既有 EnvironmentFile= 那行之後即可）：
+#   EnvironmentFile=-/etc/filet/referral.env
+sudo systemctl daemon-reload
+sudo systemctl restart filet-api
+# filet-auto-activate 是 timer 拉起的 oneshot，不必手動 restart，下一次排程自然吃到新 env。
+```
+
+(c) 只影響**之後**啟用的 follower：既有已啟用的引擎 env 沒有 `COPY_REFERRAL_CODE`，
+不受影響、行為不變（不重啟現有 `filet-follower@<id>`，也不回填舊 env）。
+
+(d) 驗證：
+
+```bash
+# filet-api 進程確實讀到了
+systemctl show filet-api -p Environment | tr ' ' '\n' | grep FILET_REFERRAL_CODE
+
+# 新啟用用戶的 per-follower env 含代入值（watcher 跑過一輪之後）
+grep COPY_REFERRAL_CODE /etc/filet/followers/<新啟用的 account_id>.env
+
+# 鏈上驗證該用戶是否已被設定推薦人（引擎的 logger.info 不進 journal，見
+# docs/architecture.md §7；用公開端點查最可靠）
+curl -s https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' \
+  -d '{"type":"referral","user":"<該用戶錶包位址>"}' | jq '.referredBy'
+```
+
+(e) 人工前置條件（不是部署步驟，是產品前提）：推薦人錢包需先在**主網**有 ≥ $10,000
+累積成交量並在 Hyperliquid app 建碼——這是 Hyperliquid 官方的建碼門檻，本專案無法代勞。
+未完成這一步就先填 `FILET_REFERRAL_CODE` 沒有意義：`setReferrer` 會收到
+`Referral code not registered`（引擎端分類為 critical，見 `src/spark/filet/referral_apply.py`）。
+
 ## 6. nginx + certbot
 
 ```bash

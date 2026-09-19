@@ -309,3 +309,4 @@ UI 行為：
 ## 4. 狀態
 
 - 2026-09-19：plan 撰寫完成；使用者確認裁決 (5)(6) 後改為 watcher 代入版。推薦碼與推薦人錢包待使用者交付（不阻擋 Task 1–6 實作，只阻擋上線步驟 1）。
+- 2026-09-19：Task 1–6 實作完成，待 reviewer（Task 7）。Task 6 的 `_referral_code_from_env()` 實際呼叫點在 `run_once`（範本檢查之後、entries 迴圈之前）而非逐條目的 `process_entry` 內部——理由：`process_entry` 的例外會被 `run_once` 迴圈的 per-entry try/except 吸收成「這一筆失敗」，若在那裡驗證 `FILET_REFERRAL_CODE` 會讓壞設定只擋掉一個用戶而非整輪，與 plan 敘述的「整輪 fail-closed，理由同 REPLACE_WITH」矛盾；驗證結果（`str | None`）改用參數 `referral_code` 一路往下傳進 `process_entry` → `_compose_env`（呼叫端仍是 `_compose_env(..., referral_code=referral_code)`，只是這個值現在來自上游算好的變數，不是行內呼叫 `_referral_code_from_env()`）。

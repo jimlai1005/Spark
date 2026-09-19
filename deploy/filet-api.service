@@ -63,6 +63,10 @@ Environment=FILET_API_PORT=8700
 # 落地會是 0644、`systemctl cat` 對所有帳號可讀）——改走下方 EnvironmentFile 指到的
 # `/etc/filet/contact.env`（0640 root:filet-api，絕不進 repo）。申請與落地見 RUNBOOK §5.8b。
 EnvironmentFile=-/etc/filet/contact.env
+# 推薦碼 opt-in（Task 6）：`FILET_REFERRAL_CODE` 單一來源，watcher 與本 unit
+# 都讀同一個檔（不是 secret，0644 即可）。`-` 前綴＝檔案不存在不擋啟動——
+# 功能預設關閉（未設＝ /api/me/referral 端點回 503，行為與改動前相同）。
+EnvironmentFile=-/etc/filet/referral.env
 StateDirectory=filet-api
 ExecStart=/opt/filet/spark/.venv/bin/python -m scripts.run_api
 Restart=on-failure
