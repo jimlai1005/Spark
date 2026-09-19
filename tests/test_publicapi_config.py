@@ -316,3 +316,32 @@ def test_tg_token_not_in_config_repr():
     """bot token 是 secret：不進 repr/log（沿 stripe key 的同一遮蔽慣例）。"""
     cfg = ApiConfig.from_env(_env(FILET_API_TG_BOT_TOKEN="123:secret-token"))
     assert "secret-token" not in repr(cfg)
+
+
+# ---------- HL 權重限流上限（Task 1.4，2026-09-20）----------
+
+def test_hl_weight_caps_default_to_900_and_300():
+    """未設 env → 900／300（HL 每 IP 1200／分鐘，900 留 300 給不在本進程的
+    follower 引擎與 timer，見 hl_budget.py 檔頭）。"""
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.hl_global_weight_cap == 900
+    assert cfg.hl_explore_weight_cap == 300
+
+
+def test_hl_weight_caps_read_from_env():
+    cfg = ApiConfig.from_env(_env(FILET_HL_GLOBAL_WEIGHT_CAP="800",
+                                  FILET_HL_EXPLORE_WEIGHT_CAP="200"))
+    assert cfg.hl_global_weight_cap == 800
+    assert cfg.hl_explore_weight_cap == 200
+
+
+def test_hl_explore_weight_cap_exceeding_global_raises():
+    with pytest.raises(ValueError, match="FILET_HL_EXPLORE_WEIGHT_CAP"):
+        ApiConfig.from_env(_env(FILET_HL_EXPLORE_WEIGHT_CAP="1000"))
+
+
+def test_hl_weight_caps_non_positive_raises():
+    with pytest.raises(ValueError):
+        ApiConfig.from_env(_env(FILET_HL_GLOBAL_WEIGHT_CAP="0"))
+    with pytest.raises(ValueError):
+        ApiConfig.from_env(_env(FILET_HL_EXPLORE_WEIGHT_CAP="-5"))

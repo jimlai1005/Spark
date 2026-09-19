@@ -18,9 +18,13 @@ from fastapi.testclient import TestClient
 
 from spark.exchange.base import UserFill
 from spark.filet.followers import FollowerRef
+from spark.publicapi.app import create_app
+from spark.publicapi.hl_budget import WeightLimiter
 from spark.publicapi.ops import (customer_pnl, load_accrued_series,
                                  revenue_reconciliation)
-from tests.publicapi_helpers import BUILDER, login, make_app, make_cfg
+from spark.publicapi.store import ApiStore
+from tests.publicapi_helpers import (BUILDER, FakeHL, FakeKeysvc, login,
+                                     make_app, make_cfg)
 
 _REAL_SOCKET = socket.socket
 
@@ -1715,3 +1719,32 @@ def test_health_panel_never_exposes_signature_material(tmp_path):
 
     for part in FORBIDDEN_KEY_PARTS:
         assert f'"{part}"' not in raw, f"健康面板外流了 {part}"
+
+
+# ---------- hl_budget（Task 1.4，2026-09-20：預算快照觀測）----------
+
+def test_health_hl_budget_null_when_no_limiter_injected(tmp_path):
+    """未注入 limiter（沿 create_app 預設）→ `hl_budget: null`，不是空 dict
+    ——與本端點「讀不到就說讀不到」的既有原則一致（未接線 ≠ 已接線但空）。"""
+    client, _cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert body["hl_budget"] is None
+
+
+def test_health_hl_budget_snapshot_when_limiter_injected(tmp_path):
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    limiter = WeightLimiter(global_cap=900, scope_caps={"explore": 300})
+    app = create_app(cfg, store, keysvc, hl, hl_limiter=limiter)
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert body["hl_budget"]["global_cap"] == 900
+    assert body["hl_budget"]["scope_caps"]["explore"] == 300

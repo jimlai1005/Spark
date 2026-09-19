@@ -25,11 +25,17 @@ def main() -> None:
     from spark.publicapi.app import create_app
     from spark.publicapi.billing import StripeGateway
     from spark.publicapi.hl import HLGateway
+    from spark.publicapi.hl_budget import WeightLimiter
     from spark.publicapi.store import ApiStore
     billing = (StripeGateway(cfg.stripe_secret_key) if cfg.billing_enabled else None)
-    gateway = HLGateway(cfg.api_url)
+    # Task 1.4（spec §5）：同出口 IP 的權重帳本，filet-api 進程內單例，
+    # 全域與 explore 子預算上限來自 cfg（環境變數可覆寫，見 config.py）。
+    limiter = WeightLimiter(global_cap=cfg.hl_global_weight_cap,
+                            scope_caps={"explore": cfg.hl_explore_weight_cap})
+    gateway = HLGateway(cfg.api_url, limiter=limiter)
     app = create_app(cfg, ApiStore(cfg.db_path), KeysvcClient(cfg.keysvc_sock),
-                     gateway, billing=billing, referral_lookup=gateway.referred_by)
+                     gateway, billing=billing, referral_lookup=gateway.referred_by,
+                     hl_limiter=limiter)
     uvicorn.run(app, host="127.0.0.1",
                 port=int(os.environ.get("FILET_API_PORT", "8700")))
 

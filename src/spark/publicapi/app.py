@@ -43,7 +43,7 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.filet.trader_stats import fills_stats, live_days_from_av, window_stats
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
-from spark.publicapi.hl_budget import BudgetExhausted
+from spark.publicapi.hl_budget import BudgetExhausted, WeightLimiter
 from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
                                      build_contact_email, clip, decoy_ticket, notify_text,
                                      PAGE_URL_MAX, USER_AGENT_MAX, validate_contact)
@@ -1345,9 +1345,15 @@ def filter_authorizations(txs: list, limit: int) -> list[dict]:
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                billing=None, notifier=None, leaderboard_get_fn=None,
                mailer=None,
-               referral_lookup: Callable[[str], str | None] | None = None) -> FastAPI:
+               referral_lookup: Callable[[str], str | None] | None = None,
+               hl_limiter: WeightLimiter | None = None) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
+
+    # Task 1.4（spec §5）：同 IP 權重帳本，未注入 → None（測試與尚未接線的呼叫端
+    # 行為不變）。唯讀 introspection seam（沿 explore_index／notifier 既有慣例），
+    # `/api/ops/health` 讀它揭露 `hl_budget` 快照。
+    app.state.hl_limiter = hl_limiter
 
     # 營運告警通道（vault 准入 advisory FAIL 用；CLAUDE.md：通知一律走 Notifier 注入）。
     # 未注入 → 由 cfg 建預設：TG 兩鍵齊 → TelegramNotifier；否則 NullNotifier
@@ -2319,7 +2325,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
     _explore_index = hl_explore.ExploreIndex(
         leaderboard_source_fn=_leaderboard_cache.get,
-        hl=hl,
+        # Task 1.4（spec §5.1）：explore 走獨立 scope、共用同一個限流器與 post_fn；
+        # 測試的 FakeHL 沒有 `scoped()`（未接線行為不變，直接用原物件）。
+        hl=hl.scoped("explore") if hasattr(hl, "scoped") else hl,
         excluded_fn=_explore_excluded_addresses,
         cfg=hl_explore.ExploreConfig.from_env(),
         now_fn=now_fn,
@@ -4545,6 +4553,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             findings, lc_errors = None, [f"換 leader 積壓掃描失敗：{e!r}"]
 
         backlog = None if (findings is None or lc_errors) else len(findings)
+        # Task 1.4（spec §11 觀測指標第一批）：HL 權重預算快照。未注入 limiter
+        # （尚未接線的呼叫端、或測試）→ `null`，同本端點「讀不到就說讀不到」的
+        # 既有原則——不得折疊成看起來健康的空 dict。
+        limiter = app.state.hl_limiter
         return jsonable({
             "checked_at": datetime.fromtimestamp(now_s, timezone.utc).isoformat(),
             "engine_stale_after_s": ENGINE_STALE_S,
@@ -4555,6 +4567,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 for f in (findings or [])],
             "summary": health_summary(rows, backlog, lc_errors),
             "manifest_errors": manifest_errors,
+            "hl_budget": limiter.snapshot() if limiter is not None else None,
         })
 
     @app.get("/api/ops/trade-quality")

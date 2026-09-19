@@ -142,8 +142,21 @@ class ApiConfig:
     # 已 normalize（`referral_optin.normalize_referral_code`）——與記錄裡的 code
     # 用同一個定義；`from_env` 收到不合法值直接拒絕啟動（設定錯了寧可起不來）。
     referral_code: str | None = None
+    # --- HL 權重限流（Task 1.4，2026-09-20，spec §5）---
+    # HL 每 IP 每分鐘 1200 權重；filet-api 只留 900，餘下 300 是給不接入本進程
+    # 限流器的 follower 引擎與三個每日 timer（`hl_budget.py` 檔頭「覆蓋範圍」節）。
+    # `hl_explore_weight_cap` 是 900 內給背景 explore 更新的子預算，其餘（dashboard／
+    # onboard／traders 詳情）共用剩下的額度。
+    hl_global_weight_cap: int = 900
+    hl_explore_weight_cap: int = 300
 
     def __post_init__(self):
+        if self.hl_global_weight_cap <= 0 or self.hl_explore_weight_cap <= 0:
+            raise ValueError(
+                "FILET_HL_GLOBAL_WEIGHT_CAP／FILET_HL_EXPLORE_WEIGHT_CAP 必須為正整數")
+        if self.hl_explore_weight_cap > self.hl_global_weight_cap:
+            raise ValueError(
+                "FILET_HL_EXPLORE_WEIGHT_CAP 不得大於 FILET_HL_GLOBAL_WEIGHT_CAP")
         if self.stripe_secret_key is not None and \
                 not self.stripe_secret_key.startswith("sk_test_"):
             raise ValueError(
@@ -351,4 +364,8 @@ class ApiConfig:
                    contact_to=env.get("FILET_CONTACT_TO") or None,
                    tg_bot_token=env.get("FILET_API_TG_BOT_TOKEN", ""),
                    tg_chat_id=env.get("FILET_API_TG_CHAT_ID", ""),
-                   referral_code=_referral_code_from_env(env))
+                   referral_code=_referral_code_from_env(env),
+                   hl_global_weight_cap=int(env.get("FILET_HL_GLOBAL_WEIGHT_CAP")
+                                            or cls.hl_global_weight_cap),
+                   hl_explore_weight_cap=int(env.get("FILET_HL_EXPLORE_WEIGHT_CAP")
+                                             or cls.hl_explore_weight_cap))
