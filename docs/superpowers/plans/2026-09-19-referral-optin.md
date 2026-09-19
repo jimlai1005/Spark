@@ -234,6 +234,12 @@ class ReferralOptinApplier:
 
 **驗收指令**：`uv run pytest tests/test_api_referral.py -q` ≥ 8 個全綠；`uv run pytest -q` 全綠。
 
+**Task 4b（2026-09-19 主線程裁決，補正式接線）**：Task 4 執行時 `create_app` 以 `referral_lookup` 注入實作，但正式入口 `scripts/run_api.py` 沒接，正式機 `onchain_code` 恆 null。修法：
+- `src/spark/publicapi/hl.py` 的 `HLGateway` 新增 `referred_by(self, address: str) -> str | None`：`self._info({"type": "referral", "user": address}, "HL referral 查詢")` 取 `referredBy.code`，null → None（形狀對齊同檔 `max_builder_fee` 等唯讀方法）。
+- `scripts/run_api.py`：`create_app(..., referral_lookup=gateway.referred_by)`（先把 `HLGateway(cfg.api_url)` 存成變數）。
+- 測試：`tests/` 既有 HLGateway 測試檔追加 `referred_by` 兩例（有碼／null）。
+- 驗收：`uv run pytest -q` 全綠；`grep -n "referral_lookup" scripts/run_api.py` 命中 1。
+
 ---
 
 ### Task 5 `@inline`：前端（api.ts、referralFlow.ts、StepConfirm 可選卡片、settings 卡片、文案、法務）
