@@ -17,6 +17,8 @@ from fastapi.testclient import TestClient
 from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
 from spark.filet.trader_stats import WindowStats
+from spark.publicapi.hl import HLGateway
+from spark.publicapi.hl_budget import WeightLimiter
 from spark.publicapi.hl_explore import (SORT_FIELDS, ExploreConfig, ExploreIndex,
                                         ExploreRow, candidate_addresses,
                                         clamp_explore_params, enrich_candidate,
@@ -52,6 +54,54 @@ def _leaderboard_payload(*rows):
 def _lb_row(address, display_name=None, roi="0.10"):
     return {"ethAddress": address, "displayName": display_name,
            "windowPerformances": [["month", {"pnl": "1", "roi": roi, "vlm": "1"}]]}
+
+
+def _payload(n):
+    """Task 1.3：`n` 個候選地址的 leaderboard payload（同既有 `_lb_row` 批次寫法，
+    見既有 `[f"0x{i:040x}" for i in range(...)]` 慣例）。"""
+    return _leaderboard_payload(*[_lb_row(f"0x{i:040x}", roi=str(i)) for i in range(n)])
+
+
+class Clock:
+    """Task 1.3：決定性假時鐘（同 `tests/test_hl_gateway_budget.py` 的 `Clock`，
+    本檔獨立定義，不跨測試檔共用，避免耦合）。"""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+class FakePost:
+    """Task 1.3：把 `HLGateway(post_fn=...)` 的 `post(url, body)` 介面分派到既有
+    方法級 `FakeHL`（`portfolio`/`clearinghouse_state`/`get_fills_raw_paged`）。
+    `fills_error`：注入時，任何 `userFillsByTime` 呼叫直接拋出這個例外（模擬
+    plan 示意的 `FakeHL(fail_fills_with=...)`），不查 `FakeHL.fills_raw_error`
+    這個 per-address 字典——三個候選地址都用同一個例外，測試不需要逐位址設定。
+    `self.calls` 記錄每次呼叫的 `body["type"]`，供斷言「零上游呼叫」。"""
+
+    def __init__(self, hl: FakeHL, *, fills_error: Exception | None = None):
+        self._hl = hl
+        self._fills_error = fills_error
+        self.calls: list[str] = []
+
+    def __call__(self, url, body):
+        self.calls.append(body["type"])
+        t = body["type"]
+        if t == "portfolio":
+            return self._hl.portfolio(body["user"])
+        if t == "clearinghouseState":
+            return self._hl.clearinghouse_state(body["user"])
+        if t == "userFillsByTime":
+            if self._fills_error is not None:
+                raise self._fills_error
+            fills, _truncated = self._hl.get_fills_raw_paged(body["user"], None, None)
+            return fills
+        raise NotImplementedError(t)
 
 
 def _av_series(start_ms, values, step_ms=86_400_000):
@@ -515,89 +565,99 @@ def _seed_hl(hl: FakeHL, address: str, *, roi_ret_pct=("1000", "1100"),
 
 
 # ============================================================
-# ExploreIndex._call_hl：節流間隔 ＋ 429 退避重試 ＋ 中止整輪建置（2026-08-30
-# mainnet 整合實跑 burst 429 事故修法）
+# ExploreIndex._call_hl：Task 1.3（2026-09-20）——節流與 429 退避已全部移到
+# `HLGateway`／`WeightLimiter`（`hl_budget.py`），`_call_hl` 現在只做例外轉譯
+# （`BudgetExhausted`/`ScopePaused` → `_BudgetUnavailable`；429 → 立即
+# `_RateLimitedAbort`，不再重試、不再 sleep）。
 # ============================================================
 
 _429_MESSAGE = ("Client error '429 Too Many Requests' for url "
                "'https://api.hyperliquid.xyz/info'")
 
 
-def test_call_hl_sleeps_configured_interval_between_every_single_hl_call():
-    """節流間隔套用在**每個 HL 請求之間**（不是地址之間）：一個地址 3 個
-    HL 呼叫，呼叫與呼叫之間都要有一次設定值的 sleep。"""
+def test_build_uses_explore_scope_and_aborts_on_429_without_sleeping():
+    """429 經 `HLGateway` 回報給 `WeightLimiter`（暫停 explore scope）後，原始
+    例外原樣往上傳；`_call_hl` 立即中止本輪建置，過程完全不 sleep（節流已
+    全部移到限流器，見模組檔頭 2026-09-20 更新）。"""
+    clock = Clock()
+    lim = WeightLimiter(global_cap=900, scope_caps={"explore": 300},
+                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
     hl = FakeHL()
-    _seed_hl(hl, _A, alltime_days=60)
-    calls: list[str] = []
-    orig_portfolio, orig_fills, orig_ch = (hl.portfolio, hl.get_fills_raw_paged,
-                                           hl.clearinghouse_state)
+    post = FakePost(hl, fills_error=RuntimeError("429 Too Many Requests"))
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=clock.sleep, limiter=lim)
+    idx = ExploreIndex(leaderboard_source_fn=lambda: _payload(3), hl=gw.scoped("explore"),
+                       excluded_fn=set, cfg=ExploreConfig(min_trading_days=0, min_fills=0),
+                       now_fn=clock.now, sleep_fn=clock.sleep)
+    idx.build_sync()
+    assert idx._rows is None                                   # 中止、保舊（舊＝None）
+    assert clock.t == 0.0                                      # 不再 sleep 2/8/30
+    assert lim.snapshot()["paused_until"]["explore"] == pytest.approx(60.0)
+    assert lim.snapshot()["used"]["explore"] == 20 + 120       # portfolio + 一頁 fills 各付一次
 
-    def portfolio(address):
-        calls.append("call:portfolio")
+
+def test_build_stops_when_explore_budget_exhausted_and_keeps_old_rows():
+    """explore scope 子預算已被打穿（`BudgetExhausted`）→ `_call_hl` 轉譯成
+    `_BudgetUnavailable`，`build_sync` 中止整輪（只碰第一個候選就停，不是
+    「每個候選各自跳過」——舊版把 `_BudgetUnavailable` 當一般例外，會對三個
+    候選各自呼叫一次 `portfolio` 才得到同樣的 `rows == []` 結果；新版第一次
+    就中止，`portfolio` 只被呼叫一次，這是唯二能分辨新舊行為的訊號）。"""
+    clock = Clock()
+    lim = WeightLimiter(global_cap=900, scope_caps={"explore": 300},
+                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
+    for _ in range(15):
+        lim.try_reserve(20, "explore")         # 子預算先用光（15*20=300==cap）
+    hl = FakeHL()
+    post = FakePost(hl)
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=clock.sleep, limiter=lim)
+    scoped_hl = gw.scoped("explore")
+    portfolio_calls = {"n": 0}
+    orig_portfolio = scoped_hl.portfolio
+
+    def counting_portfolio(address):
+        portfolio_calls["n"] += 1
         return orig_portfolio(address)
 
-    def fills(address, start, end, *, max_pages=None):
-        calls.append("call:fills")
-        return orig_fills(address, start, end, max_pages=max_pages)
-
-    def clearinghouse(address):
-        calls.append("call:clearinghouse")
-        return orig_ch(address)
-
-    hl.portfolio, hl.get_fills_raw_paged, hl.clearinghouse_state = (portfolio, fills, clearinghouse)
-
-    def sleep_fn(seconds):
-        calls.append(f"sleep:{seconds}")
-
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.7)
-    index = ExploreIndex(leaderboard_source_fn=lambda: _leaderboard_payload(_lb_row(_A, roi="0.5")),
-                         hl=hl, excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=sleep_fn)
-    index.build_sync()
-
-    assert calls == ["call:portfolio", "sleep:0.7", "call:fills", "sleep:0.7",
-                     "call:clearinghouse", "sleep:0.7"]
+    scoped_hl.portfolio = counting_portfolio
+    idx = ExploreIndex(leaderboard_source_fn=lambda: _payload(3), hl=scoped_hl,
+                       excluded_fn=set, cfg=ExploreConfig(min_trading_days=0, min_fills=0),
+                       now_fn=clock.now, sleep_fn=clock.sleep)
+    idx._rows, idx._rows_version = [], hl_explore.EXPLORE_INDEX_VERSION
+    idx.build_sync()
+    assert idx._rows == [] and post.calls == []                # 零上游呼叫
+    assert portfolio_calls["n"] == 1                            # 只碰第一個候選就中止
 
 
-def test_call_hl_retries_429_with_exponential_backoff_then_succeeds():
-    """429 視為 transient（讀操作冪等，工程原則 2）：前兩次 429，第三次成功
-    → 該地址仍正常進榜；退避延遲依序為 `RATE_LIMIT_RETRY_DELAYS_S` 的前兩個
-    （2s/8s）。"""
-    hl = FakeHL()
-    _seed_hl(hl, _A, alltime_days=60)
-    real_portfolio = hl.portfolio
-    state = {"n": 0}
+def test_call_hl_no_longer_retries_429_aborts_on_first_attempt():
+    """`_call_hl` 不再自己重試 429（舊版 `RATE_LIMIT_RETRY_DELAYS_S` 2s/8s/30s
+    三次退避已刪，見模組檔頭 2026-09-20 更新）：第一次 429 就立即
+    `_RateLimitedAbort`，`fn` 只被呼叫一次。"""
+    calls = {"n": 0}
 
-    def flaky_portfolio(address):
-        state["n"] += 1
-        if state["n"] <= 2:
-            raise RuntimeError(_429_MESSAGE)
-        return real_portfolio(address)
+    def always_429():
+        calls["n"] += 1
+        raise RuntimeError(_429_MESSAGE)
 
-    hl.portfolio = flaky_portfolio
-    sleeps: list[float] = []
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.1)
-    index = ExploreIndex(leaderboard_source_fn=lambda: _leaderboard_payload(_lb_row(_A, roi="0.5")),
-                         hl=hl, excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
-    index.build_sync()
+    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
+                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
+                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
 
-    result = index.query(require_sample=False)
-    assert len(result["rows"]) == 1  # 429 兩次後第三次成功，該地址仍進榜
-    assert sleeps[:2] == [2.0, 8.0]  # 429 退避延遲（RATE_LIMIT_RETRY_DELAYS_S 前兩個）
+    with pytest.raises(hl_explore._RateLimitedAbort):
+        index._call_hl(always_429, what="test address=0xabc")
+
+    assert calls["n"] == 1
 
 
-def test_build_aborts_on_persistent_rate_limit_and_keeps_old_snapshot(caplog):
-    """退避重試耗盡仍 429 → 中止整輪建置（不繼續燒剩餘候選）、保留舊
-    snapshot（fail-open）、`building: False`（有舊值可回）、且大聲留痕
-    `build aborted: rate limited`。"""
+def test_build_aborts_on_rate_limit_and_keeps_old_snapshot(caplog):
+    """429 → 中止整輪建置（不繼續燒剩餘候選，且不再像舊版等三次退避耗盡才
+    中止——第一次就中止）、保留舊 snapshot（fail-open）、`building: False`
+    （有舊值可回）、且大聲留痕『中止本輪建置』。"""
     hl = FakeHL()
     _seed_hl(hl, _A, alltime_days=60)
     payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.0)
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
     # ⭐ enrich_ttl_s=0：固定的 now_fn（1000.0）會讓第二輪 build_sync 命中
     # per-address enrich 快取、完全不再打 `hl.portfolio`——這裡要測的正是
-    # 「第二輪重新打上游、遇到持續 429」，把快取關掉才會真的走到重試路徑。
+    # 「第二輪重新打上游、遇到 429」，把快取關掉才會真的走到中止路徑。
     index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
                          excluded_fn=lambda: set(), cfg=cfg,
                          now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
@@ -612,9 +672,9 @@ def test_build_aborts_on_persistent_rate_limit_and_keeps_old_snapshot(caplog):
     hl.portfolio = always_429
 
     with caplog.at_level("ERROR"):
-        index.build_sync()  # 第二輪：持續 429，三次退避耗盡
+        index.build_sync()  # 第二輪：429，立即中止（不重試）
 
-    assert "build aborted: rate limited" in caplog.text
+    assert "中止本輪建置" in caplog.text
     second = index.query(require_sample=False)
     assert second["rows"] == first["rows"]   # 舊 snapshot 保留，不是空清單
     assert second["building"] is False        # 有舊值 → 不是 building 態
@@ -637,7 +697,7 @@ def test_call_hl_non_429_error_still_skips_only_that_address_not_whole_build():
         return real_portfolio(address)
 
     hl.portfolio = bad_for_a
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0, enrich_call_interval_s=0.0)
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
     payload = _leaderboard_payload(_lb_row(_A, roi="0.9"), _lb_row(_B, roi="0.5"))
     index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
                          excluded_fn=lambda: set(), cfg=cfg,
@@ -650,45 +710,42 @@ def test_call_hl_non_429_error_still_skips_only_that_address_not_whole_build():
     assert result["building"] is False
 
 
-def test_call_hl_non_429_exception_still_sleeps_the_throttle_interval():
-    """C4 殘洞修法：`_call_hl` 的節流不再只掛在成功路徑——上游丟出非 429 的
-    錯誤（例如連線重置／5xx，`_is_rate_limited` 判斷為 False，立即上拋、不
-    重試）時，也必須先睡滿一次 `enrich_call_interval_s` 才離開這個函式，
-    否則地址與地址之間的節流在上游故障時會退化回無節流的 burst（見模組
-    檔頭 C4 記錄）。"""
+def test_call_hl_non_429_exception_does_not_sleep():
+    """節流已全部移到 `HLGateway`／`WeightLimiter`：上游丟出非 429 的錯誤
+    （例如連線重置／5xx，`_is_rate_limited` 判斷為 False，立即上拋、不重試）
+    時，`_call_hl` 不再睡任何節流間隔（舊版 C4 殘洞修法的 `finally` sleep
+    已隨節流一起刪除，見模組檔頭 2026-09-20 更新）。"""
     sleeps: list[float] = []
 
     def always_fails():
         raise ConnectionError("connection reset by peer")
 
     index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(),
-                         cfg=ExploreConfig(enrich_call_interval_s=0.7),
+                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
                          now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
 
     with pytest.raises(ConnectionError):
         index._call_hl(always_fails, what="test address=0xabc")
 
-    assert sleeps == [0.7]
+    assert sleeps == []
 
 
-def test_call_hl_rate_limited_abort_path_still_sleeps_the_throttle_interval():
-    """同一條 finally 保底也涵蓋 429 退避耗盡的 `_RateLimitedAbort` 路徑。"""
+def test_call_hl_rate_limited_abort_path_does_not_sleep():
+    """429 中止路徑同樣不 sleep（舊版三次退避 2s/8s/30s ＋ finally 節流
+    0.7s 全部已刪）。"""
     sleeps: list[float] = []
 
     def always_429():
         raise RuntimeError(_429_MESSAGE)
 
     index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(),
-                         cfg=ExploreConfig(enrich_call_interval_s=0.7),
+                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
                          now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
 
     with pytest.raises(hl_explore._RateLimitedAbort):
         index._call_hl(always_429, what="test address=0xabc")
 
-    # 三次退避延遲（2s/8s/30s）之後，finally 補一次節流間隔（0.7s）。
-    assert sleeps == [2.0, 8.0, 30.0, 0.7]
+    assert sleeps == []
 
 
 def test_index_query_never_built_returns_building_true_and_empty_rows_without_blocking():

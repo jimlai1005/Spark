@@ -28,33 +28,48 @@
    呼叫端。已有舊版時，即使背景正在重建或本輪上游故障，一律**回舊版**
    （fail-open，同 `LeaderboardCache` 檔頭精神）。
 
-⚠️ 2026-08-30 mainnet 整合實跑事故（本機起 API 對真實 HL）：節流原本只設在
-「地址與地址之間」（`batch_sleep_s`），同一地址內連續 3 個 HL 請求
-（portfolio/fills/clearinghouse）**之間完全沒有間隔**，實測 burst 到約
-60 req/s，觸發大量 429，enrich 把 429 當成「該地址失敗→跳過」燒完整個
-候選池，index 以近乎 0 列完成建置＝空榜上線。修法（`_call_hl`）：
-1. 節流改成「每個 HL 請求之間」（`ExploreConfig.enrich_call_interval_s`，
-   預設 0.7s），不是地址之間——`batch_sleep_s` 已移除，不再併存兩套節流。
-2. 429 視為 transient（讀操作冪等，工程原則 2）：指數退避重試
-   `RATE_LIMIT_RETRY_DELAYS_S`（2s/8s/30s）。刻意**不**改
-   `spark/resilience.py` 的 `_TRANSIENT_MARKERS` 去收 429——那是與實盤引擎
-   共用的邊界，改寬鬆會連坐交易路徑；本模組自己在 `hl.py` 之上再包一層
-   429 專屬重試（見 `_is_rate_limited`／`_call_hl`）。
+⚠️ 2026-08-30 mainnet 整合實跑事故（本機起 API 對真實 HL，**歷史記錄，
+下方 2026-09-20 段落有更新**）：節流原本只設在「地址與地址之間」
+（`batch_sleep_s`），同一地址內連續 3 個 HL 請求（portfolio/fills/
+clearinghouse）**之間完全沒有間隔**，實測 burst 到約 60 req/s，觸發大量
+429，enrich 把 429 當成「該地址失敗→跳過」燒完整個候選池，index 以近乎
+0 列完成建置＝空榜上線。當時的修法（`_call_hl`，**已於 2026-09-20 全部
+移除，見下方段落**）：
+1. 節流改成「每個 HL 請求之間」都固定睡一段秒數（預設 0.7 秒），不是地址
+   之間——`batch_sleep_s` 已移除，不再併存兩套節流。
+2. 429 視為 transient（讀操作冪等，工程原則 2）：指數退避重試三次
+   （2 秒／8 秒／30 秒）。刻意**不**改 `spark/resilience.py` 的
+   `_TRANSIENT_MARKERS` 去收 429——那是與實盤引擎共用的邊界，改寬鬆會連坐
+   交易路徑；本模組自己在 `hl.py` 之上再包一層 429 專屬重試（見
+   `_is_rate_limited`／`_call_hl`）。
 3. 重試耗盡仍 429 → 判定「額度已被打穿，繼續燒剩餘候選只會全部繼續 429」，
    **中止整輪建置**（`_RateLimitedAbort`，非單一地址跳過）、保留舊 snapshot
    （fail-open，同上游故障的既有語意）、log 一行 `build aborted: rate
    limited`。單一地址的**非** 429 錯誤（真的讀不到、格式錯誤…）維持原本
    「跳過該列」語意，不觸發中止。
 
-⚠️ 2026-08-30 review 修正輪殘洞（C4）：上一版 `_call_hl` 的節流只掛在成功路徑
-（`fn()` 不丟例外才 `_sleep_fn`）。上游若大量回連線重置／5xx 這類**非** 429 的
-錯誤，地址的第一個 HL 呼叫就失敗、立刻 `raise` 出去給 `_enrich_one` 跳過整列，
-`_call_hl` 從未走到那行 sleep——節流形同虛設，退化回 burst（與本節開頭那次
-事故同一種症狀，只是觸發條件從「429」換成「非 429 的 transient 故障」）。
-修法：節流改掛在 `finally`，包住整個 `_call_hl` 呼叫（含其內部的 429 重試
-迴圈）——不論最終是成功回傳、非 429 例外原樣往上拋、還是 429 退避耗盡拋出
-`_RateLimitedAbort`，離開這個函式之前都會先睡滿一次
-`enrich_call_interval_s`，讓節流不再取決於「這次呼叫有沒有成功」。
+⚠️ 2026-08-30 review 修正輪殘洞（C4，**歷史記錄，同上已於 2026-09-20 移除**）：
+上一版 `_call_hl` 的節流只掛在成功路徑（`fn()` 不丟例外才睡）。上游若大量
+回連線重置／5xx 這類**非** 429 的錯誤，地址的第一個 HL 呼叫就失敗、立刻
+`raise` 出去給 `_enrich_one` 跳過整列，`_call_hl` 從未走到那行 sleep——節流
+形同虛設，退化回 burst（與本節開頭那次事故同一種症狀，只是觸發條件從
+「429」換成「非 429 的 transient 故障」）。當時的修法：節流改掛在
+`finally`，包住整個 `_call_hl` 呼叫（含其內部的 429 重試迴圈）——不論最終
+是成功回傳、非 429 例外原樣往上拋、還是 429 退避耗盡拋出
+`_RateLimitedAbort`，離開這個函式之前都會先睡滿一次那段固定間隔，讓節流
+不再取決於「這次呼叫有沒有成功」。
+
+⚠️ 2026-09-20 更新（Task 1.3，spec §5 權重限流重構）：上面兩段記錄的固定
+間隔節流（預設 0.7 秒／請求）與 429 指數退避重試（三次：2/8/30 秒）已
+**全部刪除**，本模組不再 sleep、不再自己重試——這正是把 429 當節流器用的
+舊模式（2026-09-19 事故根因）。節流與 429 暫停現在統一由
+`spark.publicapi.hl_budget.WeightLimiter` ＋ `HLGateway`（`hl.py`）負責
+（`ExploreIndex` 建構時收到的 `hl` 必須是 `gateway.scoped("explore")`）。
+`_call_hl` 現在只是一層例外轉譯：額度不足（`BudgetExhausted`）／scope 暫停
+（`ScopePaused`）→ `_BudgetUnavailable`；429 → `_RateLimitedAbort`；兩者都讓
+`build_sync` **立即**中止本輪（不再等退避耗盡），保留舊 snapshot。以上歷史
+段落保留供事故背景考證，其中提到的具體節流數值／重試次數已不適用於現行
+程式，現況見 `_call_hl` 現行 docstring。
 
 W1（trading_days → live_days）：`trading_days` 原本量 perpAllTime 降採樣序列
 的 distinct UTC 曆日數——但 `leader_perf.py` 檔頭已言明長帳戶的降採樣間隔約
@@ -205,11 +220,11 @@ import json
 import logging
 import os
 import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
+from time import sleep as _default_sleep_fn
 from typing import Callable, Mapping
 
 from spark.filet.leader_perf import extract_window
@@ -217,6 +232,7 @@ from spark.filet.trader_stats import SPARK_POINTS  # noqa: F401 — 保留名稱
 from spark.filet.trader_stats import (FillsStats, WindowStats, fills_stats,
                                       live_days_from_av, window_stats)
 from spark.publicapi import hl_leaderboard
+from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused
 
 logger = logging.getLogger(__name__)
 
@@ -255,12 +271,6 @@ INDEX_TTL_S = 600.0          # 10 分鐘（D1）
 ENRICH_CACHE_TTL_S = 1800.0  # 30 分鐘 per-address enrich 快取（D1）
 ENRICH_CACHE_MAX = 256       # LRU 上限（D1）
 FILLS_WINDOW_DAYS = 30
-
-# 每個 HL 請求之間的節流間隔（2026-08-30 mainnet burst 429 事故修法，見模組檔頭）。
-# 100 址 × 3 call ≈ 300 次請求 × 0.7s ≈ 3.5 分鐘一輪，相對 10 分鐘 index TTL 可接受。
-DEFAULT_ENRICH_CALL_INTERVAL_S = 0.7
-# 429（rate limited）指數退避重試序列（三次：2s/8s/30s）；耗盡仍 429 → 中止整輪建置。
-RATE_LIMIT_RETRY_DELAYS_S = (2.0, 8.0, 30.0)
 
 # ---------------------------------------------------------------------------
 # R4-3：四窗（見模組檔頭「R4-3」節）。
@@ -325,11 +335,21 @@ def clamp_explore_params(*, min_live_days: int, min_fills: int,
 
 
 class _RateLimitedAbort(Exception):
-    """單一 HL 呼叫退避重試耗盡後仍 429——內部控制流訊號，不對外匯出。
+    """單一 HL 呼叫遇到 429——內部控制流訊號，不對外匯出（2026-09-20 起不再
+    重試，第一次 429 就轉譯成這個訊號，見模組檔頭「2026-09-20 更新」段）。
     `_enrich_one` 讓它原樣往上傳，`build_sync` 是唯一的攔截點（中止整輪建置，
     保留舊 snapshot），不得被 `_enrich_one`／`_call_hl` 自己的 `except Exception`
     吞掉，否則會退化成「跳過這一個地址」，失去「額度已被打穿，停止繼續燒」
     的語意（見模組檔頭事故記錄）。"""
+
+
+class _BudgetUnavailable(Exception):
+    """單一 HL 呼叫因權重額度不足（`BudgetExhausted`）或 scope 暫停中
+    （`ScopePaused`）而被 `HLGateway`／`WeightLimiter` 擋下——內部控制流訊號，
+    不對外匯出。與 `_RateLimitedAbort` 同一等級：`_enrich_one` 讓它原樣往上
+    傳，`build_sync` 是唯一的攔截點（中止整輪建置，保留舊 snapshot），不得被
+    `except Exception` 吞掉退化成「跳過這一個地址」（見模組檔頭「2026-09-20
+    更新」段）。"""
 
 
 def _is_rate_limited(exc: Exception) -> bool:
@@ -357,8 +377,6 @@ class ExploreConfig:
     max_drawdown_pct: Decimal = DEFAULT_MAX_DRAWDOWN_PCT
     max_concentration_pct: Decimal = DEFAULT_MAX_CONCENTRATION_PCT
     page_size: int = DEFAULT_PAGE_SIZE
-    # 每個 HL 請求之間的節流間隔（秒）。D3／2026-08-30 429 事故修法，見模組檔頭。
-    enrich_call_interval_s: float = DEFAULT_ENRICH_CALL_INTERVAL_S
     # D5（2026-09-05）：`hl.get_fills_raw_paged` 分頁上限，每頁 2000 筆、3 頁
     # 上限 ≤ 6000 筆，供 `trader_stats.fills_stats` 用。
     fills_max_pages: int = DEFAULT_FILLS_MAX_PAGES
@@ -378,10 +396,6 @@ class ExploreConfig:
             v = env.get(key)
             return Decimal(v) if v else default
 
-        def _float(key: str, default: float) -> float:
-            v = env.get(key)
-            return float(v) if v else default
-
         return cls(
             candidate_pool=_int("EXPLORE_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL),
             # 名稱保留（見 ExploreConfig.min_trading_days 欄位註記），語意已改
@@ -392,8 +406,6 @@ class ExploreConfig:
             max_concentration_pct=_dec("EXPLORE_MAX_COIN_CONCENTRATION_PCT",
                                        DEFAULT_MAX_CONCENTRATION_PCT),
             page_size=_int("EXPLORE_PAGE_SIZE", DEFAULT_PAGE_SIZE),
-            enrich_call_interval_s=_float("EXPLORE_ENRICH_CALL_INTERVAL_S",
-                                          DEFAULT_ENRICH_CALL_INTERVAL_S),
             fills_max_pages=fills_max_pages_from_env(env),
         )
 
@@ -865,7 +877,7 @@ class ExploreIndex:
 
     def __init__(self, *, leaderboard_source_fn: Callable[[], dict | None],
                 hl, excluded_fn: Callable[[], set[str]], cfg: ExploreConfig,
-                now_fn: Callable[[], float], sleep_fn=time.sleep,
+                now_fn: Callable[[], float], sleep_fn=_default_sleep_fn,
                 index_ttl_s: float = INDEX_TTL_S,
                 enrich_ttl_s: float = ENRICH_CACHE_TTL_S,
                 enrich_cache_max: int = ENRICH_CACHE_MAX,
@@ -907,56 +919,33 @@ class ExploreIndex:
                 self._total_scanned = snap["total_scanned"]
 
     def _call_hl(self, fn: Callable[[], object], *, what: str) -> object:
-        """單一 HL 呼叫的節流＋429 退避重試邊界（見類別所在模組檔頭 2026-08-30
-        事故記錄＋ review 修正輪 C4 殘洞記錄）。每個請求之間（不是每個地址之間）
-        睡 `cfg.enrich_call_interval_s`，保護與實盤引擎共用的 HL 額度。
-
-        429（rate limited；讀操作冪等 → 視為 transient，工程原則 2）→ 指數退避
-        `RATE_LIMIT_RETRY_DELAYS_S`（2s/8s/30s）；退避耗盡仍 429 → `_RateLimitedAbort`
-        （額度已被打穿，往上傳給 `build_sync` 中止整輪建置，不是跳過這一個地址）。
-        非 429 的其他錯誤 → 不重試，直接上拋（呼叫端 `_enrich_one` 既有的
-        「跳過該列」語意，不變）。
-
-        ⭐ C4 殘洞修法：節流 sleep 掛在 `finally`，包住**整個** `_call_hl`
-        呼叫（含內部的 429 重試迴圈），而不是只掛在成功的那一行。這樣不論
-        最終走哪條退出路徑——`fn()` 成功回傳、非 429 例外原樣往上拋、還是
-        429 退避耗盡拋出 `_RateLimitedAbort`——離開這個函式之前都會先睡滿
-        一次 `enrich_call_interval_s`。舊版把 sleep 放在 try 區塊內「成功」
-        分支的最後一行，非 429 例外會直接從 `except` 的 `raise` 跳出整個
-        函式、完全不經過那一行，節流因此對這條路徑形同不存在（見模組檔頭
-        C4 記錄）。429 重試迴圈內部各次退避已有自己的延遲（2s/8s/30s，遠大於
-        `enrich_call_interval_s`），多睡一次介於 finally 的間隔不影響整體
-        退避節奏，只是多一層保底。
+        """單一 HL 呼叫。節流與 429 處理已**全部**移到 `HLGateway`＋`WeightLimiter`
+        （spec §5；本物件拿到的 `hl` 必須是 `gateway.scoped("explore")`）：
+        - 額度不足（`BudgetExhausted`）或 scope 暫停（`ScopePaused`）→ `_BudgetUnavailable`
+          → `build_sync` 中止本輪、保留舊版（P3 的 worker 改為逐 job 讓位）。
+        - 429 → gateway 已向 limiter 回報並暫停 explore scope；這裡同樣以
+          `_RateLimitedAbort` 中止本輪。舊版 2/8/30 秒退避與 0.7 秒 sleep 已刪：
+          它們把 429 當節流器用，正是 2026-09-19 事故的根因。
+        - 其他錯誤 → 原樣上拋（`_enrich_one` 的「跳過該列」語意不變）。
         """
-        delays = RATE_LIMIT_RETRY_DELAYS_S
         try:
-            for attempt in range(len(delays) + 1):
-                try:
-                    return fn()
-                except Exception as e:
-                    if not _is_rate_limited(e):
-                        raise
-                    if attempt == len(delays):
-                        logger.error(
-                            "build aborted: rate limited（%s，退避 %d 次仍 429）",
-                            what, len(delays))
-                        raise _RateLimitedAbort(what) from e
-                    delay = delays[attempt]
-                    logger.warning(
-                        "explore %s：429 rate limited（第 %d/%d 次退避），%.0fs 後重試",
-                        what, attempt + 1, len(delays), delay)
-                    self._sleep_fn(delay)
-            raise RuntimeError("unreachable")  # pragma: no cover
-        finally:
-            self._sleep_fn(self._cfg.enrich_call_interval_s)
+            return fn()
+        except (BudgetExhausted, ScopePaused) as e:
+            raise _BudgetUnavailable(what) from e
+        except Exception as e:
+            if _is_rate_limited(e):
+                logger.error("build aborted: rate limited（%s）", what)
+                raise _RateLimitedAbort(what) from e
+            raise
 
     def _enrich_one(self, address: str, display_name: str | None) -> ExploreRow | None:
         """per-address enrich，帶 30 分鐘 TTL、LRU 256 上限快取（近似 LRU：
         淘汰最舊寫入時間，同 `app.py._cached_trader_data` 既有寫法）。任何一步
-        （portfolio/fills/clearinghouse）非 429 失敗 → 整列跳過（`None`），記入
-        快取，60 天內同一輪重建不會重複打壞地址的上游（enrich TTL 本身就是
-        負面快取）。429 退避耗盡 → `_RateLimitedAbort` 原樣往上傳（不快取、
-        不當成「這個地址壞掉」，見 `_call_hl` 與 `build_sync`）。
+        （portfolio/fills/clearinghouse）非 429、非額度問題的失敗 → 整列跳過
+        （`None`），記入快取，60 天內同一輪重建不會重複打壞地址的上游（enrich
+        TTL 本身就是負面快取）。429（`_RateLimitedAbort`）或額度不足／scope
+        暫停（`_BudgetUnavailable`）→ 原樣往上傳（不快取、不當成「這個地址
+        壞掉」，見 `_call_hl` 與 `build_sync`）。
         """
         now = self._now_fn()
         with self._lock:
@@ -980,7 +969,7 @@ class ExploreIndex:
                                      what=f"clearinghouse address={address}")
             row = enrich_candidate(address, display_name, portfolio_raw, fills, ch_state,
                                    fills_truncated=fills_truncated)
-        except _RateLimitedAbort:
+        except (_RateLimitedAbort, _BudgetUnavailable):
             raise  # 中止整輪建置的訊號，不得被下面這個 except 吞成「跳過該列」
         except Exception as e:  # noqa: BLE001 — 展示端點：單一地址失敗不得中斷整批建置
             logger.error("explore enrich 失敗 address=%s: %r", address, e)
@@ -1003,10 +992,10 @@ class ExploreIndex:
         （寧可這一輪意外把 Filet 自營地址也掃進候選池——下一輪排除清單恢復
         就會自然排除——也不要整個建置流程被一個旁支查詢拖垮）。
 
-        任一地址的 HL 呼叫 429 退避耗盡（`_RateLimitedAbort`）→ **中止整輪建置**
-        （不繼續掃剩餘候選——額度已被打穿，繼續燒只會全部繼續 429）、**不動**
-        `self._rows`（fail-open 到舊版，同上游故障的既有語意），見模組檔頭
-        2026-08-30 事故記錄。
+        任一地址的 HL 呼叫遇到 429（`_RateLimitedAbort`）或權重額度不足／scope
+        暫停（`_BudgetUnavailable`）→ **立即中止整輪建置**（不繼續掃剩餘候選、
+        不再像舊版等退避重試耗盡）、**不動** `self._rows`（fail-open 到舊版，
+        同上游故障的既有語意），見模組檔頭「2026-09-20 更新」段。
         """
         try:
             payload = self._leaderboard_source_fn()
@@ -1029,9 +1018,8 @@ class ExploreIndex:
                 row = self._enrich_one(address, display_name)
                 if row is not None:
                     rows.append(row)
-        except _RateLimitedAbort as e:
-            logger.error(
-                "build aborted: rate limited（%s）——中止本輪建置，保留舊 snapshot", e)
+        except (_RateLimitedAbort, _BudgetUnavailable) as e:
+            logger.error("中止本輪建置（%s），保留舊 snapshot", e)
             return
         rows = _apply_tags(rows, self._cfg)
         built_at = self._now_fn()
