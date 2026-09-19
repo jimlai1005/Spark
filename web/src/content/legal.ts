@@ -110,7 +110,19 @@ export const LEGAL_ZH = {
         ],
       },
       {
-        heading: "9. 聯絡方式",
+        heading: "9. 推薦碼授權（選填）",
+        paragraphs: [
+          "你可以選擇簽署一則訊息，授權本服務用你已核准的下單 agent，代你在 Hyperliquid "
+            + "設定推薦碼。這是選填功能：是否簽署完全不影響跟單的啟用或執行。",
+          "設定推薦碼可能讓你的帳戶取得 Hyperliquid 的手續費折扣，並使本服務就你所支付的"
+            + "手續費取得一部分分潤，此分潤由 Hyperliquid 支付，不會另外向你收取任何費用。"
+            + "推薦碼在同一個 Hyperliquid 帳戶只能設定一次且事後無法更改；若你的帳戶已經"
+            + "設定過推薦碼（不論是否透過本服務），簽署本授權不會有任何效果，也不會覆蓋"
+            + "既有設定。",
+        ],
+      },
+      {
+        heading: "10. 聯絡方式",
         paragraphs: ["https://trade.filet.app/contact"],
       },
     ],
@@ -238,6 +250,16 @@ export const LEGAL_ZH = {
             + "要約或招攬。是否跟單、投入多少、設定何種風險限制，均為你的獨立決策。",
         ],
       },
+      {
+        heading: "9. 推薦碼授權的風險與限制",
+        paragraphs: [
+          "推薦碼授權為選填功能，不影響跟單本身的執行或風控；是否簽署、何時簽署，"
+            + "均由你自行決定。",
+          "推薦碼只能在你的 Hyperliquid 帳戶設定一次且事後無法變更；本服務不會、也無法"
+            + "覆蓋你帳戶既有的推薦人設定。本服務因此取得的分潤來自 Hyperliquid 支付的"
+            + "手續費分成，不會另外向你收取費用。",
+        ],
+      },
     ],
   },
 } as const;
@@ -347,7 +369,23 @@ export const LEGAL_EN: DeepString<typeof LEGAL_ZH> = {
         ],
       },
       {
-        heading: "9. Contact",
+        heading: "9. Referral Code Authorization (Optional)",
+        paragraphs: [
+          "You may choose to sign a message authorizing the Service to set a Hyperliquid "
+            + "referral code on your behalf, using the trading agent you have already "
+            + "approved. This is optional: whether or not you sign has no effect on whether "
+            + "copy trading is enabled or how it runs.",
+          "Setting a referral code may give your account a fee discount on Hyperliquid, and "
+            + "gives the Service a share of the trading fees you pay; that share is paid by "
+            + "Hyperliquid and does not result in any additional charge to you. A referral "
+            + "code can be set only once per Hyperliquid account and cannot be changed "
+            + "afterward; if your account already has a referral code (whether set through "
+            + "the Service or not), signing this authorization has no effect and does not "
+            + "override the existing setting.",
+        ],
+      },
+      {
+        heading: "10. Contact",
         paragraphs: ["https://trade.filet.app/contact"],
       },
     ],
@@ -506,6 +544,19 @@ export const LEGAL_EN: DeepString<typeof LEGAL_ZH> = {
             + "constitute investment advice, an offer, or a solicitation. Whether to copy "
             + "trade, how much to allocate, and what risk limits to set are entirely your "
             + "own independent decisions.",
+        ],
+      },
+      {
+        heading: "9. Risks and Limits of Referral Code Authorization",
+        paragraphs: [
+          "Referral code authorization is optional and does not affect the execution of "
+            + "copy trading itself or your risk controls; whether and when to sign is "
+            + "entirely your own decision.",
+          "A referral code can be set only once on your Hyperliquid account and cannot be "
+            + "changed afterward; the Service will not and cannot override any referrer "
+            + "already set on your account. The share the Service receives as a result comes "
+            + "from the portion of trading fees paid by Hyperliquid, and does not result in "
+            + "any additional charge to you.",
         ],
       },
     ],

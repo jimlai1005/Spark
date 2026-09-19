@@ -345,7 +345,7 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
   // 帶簽名，不進本清單——它照樣受下面的黑名單掃描約束。
   const EXCLUDED = new Set([
     "ApiError", "authVerify", "postLeaderSelect", "postMyRisk", "postRiskUnlock",
-    "postCapitalSettings", "postCloseAll",
+    "postCapitalSettings", "postCloseAll", "submitReferralOptin",
   ]);
   const reflected = Object.entries(api).filter(
     ([name, value]) => typeof value === "function" && !EXCLUDED.has(name),
@@ -375,7 +375,10 @@ describe("⭐ 反射式結構掃描：api.ts 每個匯出函式都不外洩簽�
     //   不帶簽名、不進 EXCLUDED）⇒ 反射清單淨增 1（28 → 29）。
     // 2026-09-02（/contact 聯絡頁 Task 3）：+1 匯出（postContact，無需登入、
     //   不帶簽名、不進 EXCLUDED）⇒ 反射清單淨增 1（29 → 30）。
-    const HAND_WRITTEN_LIST_LENGTH = 30;
+    // 2026-09-19（推薦碼 opt-in Task 5）：+3 匯出（getReferralStatus、
+    //   getReferralMessage、submitReferralOptin），其中 submitReferralOptin 進
+    //   EXCLUDED（帶簽名）⇒ 反射清單淨增 2（30 → 32）。
+    const HAND_WRITTEN_LIST_LENGTH = 32;
     expect(reflected.length).toBe(HAND_WRITTEN_LIST_LENGTH);
   });
 

@@ -2,7 +2,7 @@
  * lib/api.ts — 後端 Public API 的唯一出口（工程原則 5 的前端鏡射）。
  * 一律同源相對路徑 + credentials:"include"（紅線 5）。
  * 錯誤分類（工程原則 2）：auth(401)/client(4xx)/upstream(502|503)/network。
- * ⭐ 紅線 3：帶簽名的後端呼叫共**六支**，全都是 EIP-191 personal_sign，且六支的
+ * ⭐ 紅線 3：帶簽名的後端呼叫共**七支**，全都是 EIP-191 personal_sign，且七支的
  *   **原文都由伺服器產生**（前端不組字串）：
  *     1. authVerify —— SIWE 登入簽名；
  *     2. postLeaderSelect —— 換 leader 授權簽名（原文來自 getLeaderSelectMessage）。
@@ -17,9 +17,14 @@
  *        ——2026-08-28 Task 15 kill switch 第二級：一次性、不可逆動作，形狀沿
  *        postRiskUnlock（見 `src/spark/filet/close_all.py` 檔頭）。kill switch
  *        第一級（暫停）刻意**不簽章**（`postPause`，見該函式註解）。
- *   4／5／6 三支的域分隔（一份「調門檻」「改資金配置」或「平倉並撤銷」的簽章
- *   不得被兌換成另一種動作，任兩兩之間皆然）由各自伺服器版型的第一行在結構上
- *   確立，見 src/spark/filet/risk_settings.py／capital_settings.py／close_all.py 檔頭。
+ *     7. submitReferralOptin —— 推薦碼 opt-in 授權簽名（原文來自
+ *        getReferralMessage）——2026-09-19 新增：可選功能，授權引擎用已核准的
+ *        agent 代設 Hyperliquid 推薦碼；不簽不影響跟單（見
+ *        `src/spark/filet/referral_optin.py` 檔頭）。
+ *   4／5／6／7 四支的域分隔（一份「調門檻」「改資金配置」「平倉並撤銷」或
+ *   「設定推薦碼」的簽章不得被兌換成另一種動作，任兩兩之間皆然）由各自伺服器
+ *   版型的第一行在結構上確立，見 src/spark/filet/risk_settings.py／
+ *   capital_settings.py／close_all.py／referral_optin.py 檔頭。
  *   EIP-712 的鏈上授權簽名走 lib/hl.ts 直送 HL，本模組結構上沒有那條路。
  */
 import type { HlTypedData } from "./hl";
@@ -1642,4 +1647,69 @@ export interface MyAuthorizationRow {
  */
 export function getMyAuthorizations(): Promise<{ authorizations: MyAuthorizationRow[] }> {
   return request<{ authorizations: MyAuthorizationRow[] }>("/api/me/authorizations");
+}
+
+// ---------- 推薦碼 opt-in（選填；2026-09-19；對照 publicapi/app.py
+// GET /api/me/referral、POST /api/me/referral/message、POST /api/me/referral）----------
+
+/**
+ * 推薦碼 opt-in 現況（唯讀）。`signed` 只看記錄檔是否存在該帳號的條目——**不代表
+ * 已驗章**（驗章是引擎與送出端點的事，這裡只是顯示用）。`enabled` 為 false 時
+ * 功能整個未設定，顯示層應整塊不渲染。`onchain_error` 為 true 時 `onchain_code`
+ * 恆為 null，但這只是一句提示（工程原則 3 的反向：非關鍵展示查詢失敗不擋按鈕）。
+ */
+export interface ReferralStatusResp {
+  enabled: boolean;
+  code: string | null;
+  signed: boolean;
+  signed_at: string | null;
+  onchain_code: string | null;
+  onchain_error: boolean;
+}
+
+export function getReferralStatus(): Promise<ReferralStatusResp> {
+  return request<ReferralStatusResp>("/api/me/referral");
+}
+
+/**
+ * 推薦碼 opt-in 的 canonical 待簽原文 ＋ 一次性 nonce（需 session）。功能未設定
+ * （`enabled:false`）時後端回 503——呼叫端不得在功能未開放時仍嘗試取得原文。
+ */
+export interface ReferralMessageResp {
+  message: string;
+  nonce: string;
+  issued_at: string;
+  account_id: string;
+  code: string;
+}
+
+export function getReferralMessage(): Promise<ReferralMessageResp> {
+  return post<ReferralMessageResp>("/api/me/referral/message");
+}
+
+/** 送出推薦碼 opt-in 授權的回應。`effective` 恆為 `"next_engine_cycle"`。 */
+export interface ReferralOptinResp {
+  ok: boolean;
+  account_id: string;
+  code: string;
+  effective: string;
+}
+
+/**
+ * 送出推薦碼 opt-in 授權。沿 `postMyRisk`／`postRiskUnlock` 的形狀，收整包
+ * payload 物件而不是散裝欄位（工程原則 1：簽的與送的同源，結構上不可能拼錯）。
+ * 非冪等寫入 ＋ nonce 一次性：**不得自動重試**。
+ */
+export function submitReferralOptin(
+  payload: ReferralMessageResp,
+  signature: string,
+): Promise<ReferralOptinResp> {
+  return post<ReferralOptinResp>("/api/me/referral", {
+    account_id: payload.account_id,
+    code: payload.code,
+    nonce: payload.nonce,
+    issued_at: payload.issued_at,
+    signature,
+    message: payload.message,
+  });
 }

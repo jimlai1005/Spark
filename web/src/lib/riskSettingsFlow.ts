@@ -154,7 +154,7 @@ export async function runRiskSettingsFlow(
     return { ok: false, kind: "content-mismatch" };
   }
 
-  return finish(deps, payload, opts.expectedSigner);
+  return signRecoverSubmit(deps, payload, opts.expectedSigner);
 }
 
 export async function runRiskUnlockFlow(
@@ -178,18 +178,21 @@ export async function runRiskUnlockFlow(
     return { ok: false, kind: "content-mismatch" };
   }
 
-  return finish(deps, payload, opts.expectedSigner);
+  return signRecoverSubmit(deps, payload, opts.expectedSigner);
 }
 
 /**
- * 兩條流程的共同尾段：簽名 → 本地 recover 預驗 → 送出。
+ * 兩條流程的共同尾段：簽名 → 本地 recover 預驗 → 送出。**已 export**：
+ * `referralFlow.ts`（推薦碼 opt-in，2026-09-19）是同一種「伺服器發原文 →
+ * 前端內容預驗 → 簽 → recover 預驗 → 送出」編排的第三條流程，尾段邏輯與這裡
+ * 逐字相同，直接複用而不是另抄一份。
  *
  * ⭐ 本地 recover 預驗是錢包切錯帳號簽的唯一攔截點。這條路徑上**不得**有任何網路
  * 請求——不符就是不符，連問後端都不問（錯的簽名送出去，最好的情況是被拒，最壞的
  * 情況是被記成另一個人的意圖）。recover 本身拋錯（簽名格式壞）同樣視為不符：
  * 證明不了是本人簽的就不送（fail closed）。
  */
-async function finish<P extends { message: string }, R>(
+export async function signRecoverSubmit<P extends { message: string }, R>(
   deps: {
     signMessage: (message: string) => Promise<string>;
     recover: (message: string, signature: string) => Promise<string>;

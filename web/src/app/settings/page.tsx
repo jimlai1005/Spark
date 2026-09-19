@@ -32,6 +32,8 @@ import {
   getMyCapital,
   getMyLeader,
   getMyRisk,
+  getReferralMessage,
+  getReferralStatus,
   getRiskSettingsMessage,
   getRiskUnlockMessage,
   getStatus,
@@ -39,12 +41,14 @@ import {
   postMyRisk,
   postPause,
   postRiskUnlock,
+  submitReferralOptin,
   type DashboardResp,
   type MyCapitalResp,
   type MyLeaderPendingChange,
   type MyLeaderResp,
   type MyRiskResp,
   type OnboardStatus,
+  type ReferralStatusResp,
   type RiskParamName,
   type RiskParamSpec,
   type RiskPrefs,
@@ -56,6 +60,7 @@ import { runCapitalSettingsFlow, type CapitalFlowFailure } from "@/lib/capitalSe
 import { fmtRatioPct, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
+import { runReferralOptinFlow, type ReferralOptinFlowResult } from "@/lib/referralFlow";
 import { runRiskSettingsFlow, runRiskUnlockFlow, type RiskFlowFailure } from "@/lib/riskSettingsFlow";
 import { capitalNoteOf, leaderNoteOf, paramCopyOf } from "@/lib/settingsCopy";
 import { recoverPersonalSigner } from "@/lib/sign";
@@ -448,6 +453,119 @@ function RiskSection({ me }: { me: Me }) {
   );
 }
 
+// ==================== 1b. 推薦碼 opt-in（選填） ====================
+
+function referralErrorCopy(
+  r: Extract<ReferralOptinFlowResult, { ok: false }>,
+  c: Copy["wizard"],
+): string {
+  const e = c.errors;
+  switch (r.kind) {
+    case "wallet-rejected": return e.walletRejected;
+    case "signer-mismatch": return e.signerMismatch;
+    case "content-mismatch": return e.contentMismatch;
+    case "message-failed": return e.payloadFailed;
+    case "submit-failed": return e.submitFailed;
+  }
+}
+
+/**
+ * ⭐ 推薦碼卡片（選填）：`enabled` 為 false → 整塊不渲染（功能未設定，沿
+ * `lib/referralFlow.ts` 檔頭的預驗設計動機）。三態顯示：未簽署→按鈕；
+ * 已簽署待引擎套用；鏈上已設定（`onchain_code` 非 null，優先於「已簽署」——
+ * 那是比記錄檔更接近事實的來源；不等於 Filet 的碼時顯示「已由其他推薦人推薦」）。
+ * `onchain_error` 只是一句提示，不擋按鈕（工程原則 3 的反向：非關鍵展示查詢
+ * 失敗不該拖累整個功能）。錯誤文案沿 `wizard.errors.*` 既有鍵，不另開一份。
+ */
+function ReferralSection({ me }: { me: Me }) {
+  const COPY = useCopy();
+  const c = COPY.settings.referral;
+  const { signMessageAsync } = useSignMessage();
+  const queryClient = useQueryClient();
+  const status = useQuery<ReferralStatusResp>({ queryKey: ["me-referral"], queryFn: getReferralStatus });
+  const risk = useQuery<MyRiskResp>({ queryKey: ["me-risk"], queryFn: getMyRisk });
+  const [signing, setSigning] = useState(false);
+  const [signedNote, setSignedNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (status.isLoading) return null;
+  if (status.error) {
+    return (
+      <section className="risk-section" aria-label={c.title}>
+        <h2 className="panel-title">{c.title}</h2>
+        <p className="hint">{c.loadError}</p>
+      </section>
+    );
+  }
+  if (!status.data || !status.data.enabled) return null;
+  const data = status.data;
+  if (data.code === null) return null; // 防禦：enabled 理論上意味 code 非 null
+  const code = data.code;
+
+  async function sign() {
+    if (!risk.data) return;
+    setSigning(true);
+    setError(null);
+    setSignedNote(null);
+    const r = await runReferralOptinFlow(
+      {
+        fetchMessage: getReferralMessage,
+        signMessage: (message) => signMessageAsync({ message }),
+        recover: recoverPersonalSigner,
+        submit: submitReferralOptin,
+      },
+      {
+        expectedSigner: me.address,
+        expectedAccountId: me.account_id,
+        expectedCode: code,
+        riskParamNames: risk.data.specs.map((s) => s.name),
+      },
+    );
+    setSigning(false);
+    if (r.ok) {
+      setSignedNote(c.signedNote);
+      void queryClient.invalidateQueries({ queryKey: ["me-referral"] });
+    } else {
+      setError(referralErrorCopy(r, COPY.wizard));
+    }
+  }
+
+  const onchainMine = data.onchain_code !== null && data.onchain_code === data.code;
+  const onchainOther = data.onchain_code !== null && data.onchain_code !== data.code;
+  const showSignButton = !onchainMine && !onchainOther && !data.signed;
+
+  return (
+    <section className="risk-section" aria-label={c.title}>
+      <h2 className="panel-title">{c.title}</h2>
+      <p className="hint">{c.subtitle}</p>
+      <p className="hint mono">{c.codeLabel}: {code}</p>
+      <p className="hint mono">
+        {c.statusLabel}: {
+          onchainMine ? c.onchainMineStatus
+            : onchainOther ? c.onchainOtherStatus
+              : data.signed ? c.signedStatus
+                : c.notSignedStatus
+        }
+      </p>
+      {data.onchain_error && <p className="hint">{c.onchainErrorNote}</p>}
+      {showSignButton && (
+        <>
+          <div className="step-actions">
+            <button type="button" className="btn btn-secondary"
+              disabled={signing || !risk.data} onClick={() => void sign()}>
+              {signing ? c.signing : c.signButton}
+            </button>
+          </div>
+          <p className="hint">{c.signNote}</p>
+        </>
+      )}
+      <p className="hint">{c.body}</p>
+      {signedNote && <p className="hint risk-saved" role="status">{signedNote}</p>}
+      {error && <Toast message={error} onDismiss={() => setError(null)} dismissLabel={COPY.settings.toast.dismiss} />}
+    </section>
+  );
+}
+
 // ==================== 2. 資金配置 ====================
 
 function capitalErrorCopy(r: CapitalFlowFailure, c: Copy["settings"]["capital"]): string {
@@ -784,6 +902,7 @@ export default function SettingsPage() {
       <p className="hint">{c.subtitle}</p>
 
       <RiskSection me={me.data} />
+      <ReferralSection me={me.data} />
       <CapitalSection me={me.data} />
       <AuthorizationSection me={me.data} />
       <LeaderSection />

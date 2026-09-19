@@ -271,6 +271,23 @@ export const COPY_ZH = {
     step4CheckRevoke: "我理解可隨時撤銷",
     step4SubmitButton: "確認並開始跟單",
     step4Submitting: "送出中…",
+    /**
+     * ⭐ referral opt-in（2026-09-19，選填，`StepConfirm` 內嵌卡片）：只在
+     * `enabled && !signed` 時渲染，不簽不影響本頁的完成按鈕與行為。錯誤文案
+     * 直接沿用下方 `errors.*`（walletRejected／signerMismatch／contentMismatch／
+     * payloadFailed／submitFailed），不另開一份。
+     */
+    referralOptin: {
+      title: "推薦碼（選填）",
+      body:
+        "簽署這則訊息，授權 Filet 用你已核准的下單 agent 幫你設定 Hyperliquid 推薦碼。"
+        + "設定後你可在前 $25M 成交量享 4% 手續費折扣，Filet 則從你支付的手續費中取得一部分分潤。"
+        + "推薦碼在你的帳戶只能設定一次且無法更改；如果你的帳戶已經有推薦碼，簽署這則訊息不會有任何影響。"
+        + "這是選填功能：不簽署一樣可以完成開通並開始跟單。",
+      signButton: "簽署啟用",
+      signing: "等待錢包簽署…",
+      signedNote: "已簽署，引擎會在下一輪套用。",
+    },
     errors: {
       walletRejected: "簽署被拒絕——請在錢包中重試。Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
       signerMismatch: "簽名帳號與登入帳號不符——請在錢包中切回登入時使用的帳號後重試。這筆簽名不會被送出。",
@@ -1489,6 +1506,36 @@ export const COPY_ZH = {
         unknown: "目前無法確認你的風控是否被觸發（引擎狀態讀不到）。",
       },
     },
+    /**
+     * ⭐ 推薦碼 opt-in（2026-09-19，選填）：授權引擎用已核准的下單 agent 代設
+     * Hyperliquid 推薦碼——客戶拿手續費折扣，Filet 拿分潤。`enabled` 為 false
+     * 時（功能未設定）呼叫端整塊不渲染，不需要這裡的任何文案。錯誤文案沿
+     * `wizard.errors.*` 既有鍵（walletRejected／signerMismatch／contentMismatch／
+     * payloadFailed／submitFailed），不在此重複一份。
+     */
+    referral: {
+      title: "推薦碼",
+      subtitle:
+        "選擇性授權 Filet 代你在 Hyperliquid 設定推薦碼——你拿到手續費折扣，"
+        + "Filet 從你支付的手續費中取得分潤，不影響跟單本身的執行。",
+      body:
+        "推薦碼在你的帳戶只能設定一次且無法更改；如果你的帳戶已經有推薦碼"
+        + "（不論是否透過 Filet），簽署這則訊息不會有任何影響。",
+      loadError: "推薦碼資訊暫時讀不到，請稍後重新整理本頁。",
+      codeLabel: "Filet 推薦碼",
+      statusLabel: "狀態",
+      notSignedStatus: "尚未簽署",
+      signedStatus: "已簽署，等待引擎套用（約一分鐘內）",
+      onchainMineStatus: "已在鏈上生效",
+      onchainOtherStatus: "你的帳戶已由其他推薦人推薦",
+      onchainErrorNote: "無法讀取鏈上狀態，你仍然可以簽署。",
+      signButton: "簽署啟用",
+      signing: "等待錢包簽署…",
+      signedNote: "已送出簽署，引擎會在下一輪套用。",
+      signNote:
+        "接下來會請你在錢包簽署一則訊息（不上鏈、不花費 gas）。"
+        + "Filet 永遠不會請你輸入私鑰或助記詞；簽署只會在你自己的錢包中完成。",
+    },
     /** ⭐ Task 10b：投入比例直接乘進部位大小，與換 leader 同級的簽章防線。 */
     capital: {
       title: "資金配置",
@@ -2023,6 +2070,19 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     step4CheckRevoke: "I understand I can revoke at any time",
     step4SubmitButton: "Confirm & start copy trading",
     step4Submitting: "Submitting…",
+    referralOptin: {
+      title: "Referral code (optional)",
+      body:
+        "Sign this message to authorise Filet to set a Hyperliquid referral code for you, "
+        + "using the trading agent you've already approved. Once set, you get a 4% fee "
+        + "discount on your first $25M of trading volume, and Filet receives a share of the "
+        + "trading fees you pay. A referral code can be set only once per account and cannot "
+        + "be changed later — if your account already has one, signing this has no effect. "
+        + "This is optional: you can complete onboarding and start copy trading without signing.",
+      signButton: "Sign to enable",
+      signing: "Waiting for wallet signature…",
+      signedNote: "Signed — the engine will apply it on the next cycle.",
+    },
     errors: {
       walletRejected: "Signature rejected — please try again in your wallet. Filet will never ask for your private key or "
         + "seed phrase; signing only happens in your own wallet.",
@@ -3065,6 +3125,29 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
           + "threshold was tripped. This kind can't be resumed by yourself — please choose another leader instead.",
         unknown: "Whether your risk controls have tripped can't be confirmed right now (engine status unavailable).",
       },
+    },
+    referral: {
+      title: "Referral code",
+      subtitle:
+        "Optionally authorise Filet to set a Hyperliquid referral code for you — you get a "
+        + "fee discount, Filet gets a share of the fees you pay, and copy trading itself is unaffected.",
+      body:
+        "A referral code can be set only once per account and cannot be changed later; if your "
+        + "account already has one (whether via Filet or not), signing this message has no effect.",
+      loadError: "Referral info is temporarily unavailable — please refresh this page shortly.",
+      codeLabel: "Filet referral code",
+      statusLabel: "Status",
+      notSignedStatus: "Not signed yet",
+      signedStatus: "Signed — waiting for the engine to apply it (within about a minute)",
+      onchainMineStatus: "Active on-chain",
+      onchainOtherStatus: "Your account is already referred by someone else",
+      onchainErrorNote: "Couldn't read the on-chain status — you can still sign.",
+      signButton: "Sign to enable",
+      signing: "Waiting for wallet signature…",
+      signedNote: "Signature submitted — the engine will apply it on the next cycle.",
+      signNote:
+        "Next, you'll be asked to sign a message in your wallet (no on-chain transaction, no gas). "
+        + "Filet will never ask for your private key or seed phrase; signing only happens in your own wallet.",
     },
     capital: {
       title: "Capital allocation",
