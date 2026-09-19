@@ -1750,6 +1750,27 @@ def test_health_hl_budget_snapshot_when_limiter_injected(tmp_path):
     assert body["hl_budget"]["scope_caps"]["explore"] == 300
 
 
+def test_health_hl_budget_snapshot_has_paused_remaining_s(tmp_path):
+    """2026-09-20 opus 複審 W3：`paused_until` 是 `now_fn`（正式路徑
+    `time.monotonic`）時基，與本端點 `checked_at` 的 wall clock 不可比——
+    ops/health 揭露的快照必須含 `paused_remaining_s` 這把同時基算好的鑰匙。"""
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    limiter = WeightLimiter(global_cap=900, scope_caps={"explore": 300})
+    app = create_app(cfg, store, keysvc, hl, hl_limiter=limiter)
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert "paused_remaining_s" in body["hl_budget"]
+
+
 # ---------- explore_index（Task 1.5，reviewer W3：凍結快照的年齡要可觀測）----------
 
 def test_health_explore_index_status_shape(tmp_path):
@@ -1760,3 +1781,25 @@ def test_health_explore_index_status_shape(tmp_path):
     assert set(body["explore_index"].keys()) == {"rows", "built_at", "version", "building"}
     assert body["explore_index"]["rows"] is None      # 從未建置過（本測試不觸發建置）
     assert body["explore_index"]["building"] is False
+
+
+def test_health_explore_index_reports_built_snapshot_after_build_sync(tmp_path):
+    """C：`idx.build_sync()` 之後 `rows`／`built_at` 必須翻轉成非 None——確認
+    這兩個欄位真的反映建置狀態，不是恆為 None 也會通過上一條測試。"""
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    app = create_app(cfg, store, keysvc, hl,
+                     leaderboard_get_fn=lambda url: {"leaderboardRows": []})
+    app.state.explore_index.build_sync()
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert body["explore_index"]["rows"] is not None
+    assert body["explore_index"]["built_at"] is not None

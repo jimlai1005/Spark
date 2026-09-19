@@ -122,6 +122,66 @@ def test_settle_refunds_down_only():
     assert lim.snapshot()["used"]["interactive"] == 23
 
 
+def test_retry_after_is_floor_not_clamped():
+    """2026-09-20 opus 複審 W1：Retry-After 是「至少等這麼久」的下限，不得被
+    `PAUSE_MAX_S`（指數退避的上限）夾住——舊版 `min(max(retry_after, 指數),
+    PAUSE_MAX_S)` 會讓一個很長的 Retry-After 被我們自己的退避上限截斷變短。"""
+    lim, c = _lim()
+    c.t = 2000.0
+    lim.note_429("explore", retry_after_s=1800)
+    assert lim.snapshot()["paused_until"]["explore"] == pytest.approx(3800.0)
+
+
+def test_escalation_survives_interactive_success():
+    """2026-09-20 opus 複審 W2（撤回 1.5-A4）：`interactive` 的成功不歸零
+    `explore` 的連續 429 計數——升級階梯要靠 `explore` 自己的 429 累積。"""
+    lim, c = _lim()
+    lim.note_429("explore")                               # n=1，until=1060
+    c.t = 1061.0                                           # 暫停已解除
+    lim.note_ok("interactive")                             # 不歸零（撤回 1.5-A4）
+    lim.note_429("explore")                                # 再犯 → 升級
+    s = lim.snapshot()
+    assert s["consecutive_429"]["explore"] == 2
+    assert s["paused_until"]["explore"] == pytest.approx(1061.0 + 120.0)
+
+
+def test_explore_success_resets_escalation():
+    """`explore` 自己成功才歸零自己的連續 429 計數。"""
+    lim, c = _lim()
+    lim.note_429("explore")
+    c.t = 1061.0
+    lim.note_ok("explore")
+    assert lim.snapshot()["consecutive_429"]["explore"] == 0
+    c.t = 1062.0
+    lim.note_429("explore")
+    assert lim.snapshot()["consecutive_429"]["explore"] == 1   # 沒有殘留升級
+
+
+def test_settle_after_prune_does_not_count_refund():
+    """S1：token 已滑出 60 秒視窗（被 `_prune` 移出帳本）後 `settle` 是 no-op，
+    連 `refunded_weight` 計數器都不該累計——那筆 weight 早已不計入 `_used()`，
+    算進退款會虛報一筆從未真正佔額度的退款。"""
+    lim, c = _lim()
+    token = lim.try_reserve(120, "explore")
+    c.t = 1061.0                                          # 超過 WINDOW_S(60)
+    lim.snapshot()                                        # 觸發 _prune，token 被移出 deque
+    lim.settle(token, 20)
+    assert lim.snapshot()["counters"]["refunded_weight"] == 0
+
+
+def test_snapshot_has_paused_remaining_s():
+    """W3：`paused_until` 是 `now_fn` 時基（正式路徑 monotonic），ops/health 的
+    wall-clock `checked_at` 不可比——`paused_remaining_s` 用同一次快照的
+    `now_fn` 算出剩餘秒數，供 ops 直接讀。"""
+    lim, c = _lim()
+    lim.note_429("explore")                               # until=1060
+    assert lim.snapshot()["paused_remaining_s"]["explore"] == pytest.approx(60.0)
+    c.t = 1030.0
+    assert lim.snapshot()["paused_remaining_s"]["explore"] == pytest.approx(30.0)
+    c.t = 1200.0                                          # 已過期，不得為負
+    assert lim.snapshot()["paused_remaining_s"]["explore"] == pytest.approx(0.0)
+
+
 def test_scope_paused_message_has_no_digits():
     """reviewer W1：訊息不含任何數字，避免十進位的 `until` 偶然含 "502"/"503"/
     "504" 子字串被 `spark.resilience._TRANSIENT_MARKERS` 誤判成 transient。"""

@@ -366,6 +366,35 @@ def test_portfolio_budget_exhausted_is_502_not_negative_cached(tmp_path):
     assert hl.portfolio_calls == 2
 
 
+def test_fills_budget_exhausted_degrades_without_caching(tmp_path):
+    """2026-09-20 opus 複審 W4：`get_fills_raw_paged` 額度不足是 transient——
+    次要欄位（fills）降級為 `None`，但整頁仍 200（主欄位 portfolio 正常）；
+    這份不完整結果**不得**進 5 分鐘快取，額度恢復後下一次 GET 必須重打
+    portfolio（`portfolio_calls == 2`），證明沒有把降級結果快取住。"""
+    cfg = make_cfg(tmp_path)
+    store = ApiStore(cfg.db_path)
+    keysvc = FakeKeysvc()
+    hl = _CountingHL()
+    hl.portfolios[_A] = sixty_day_rows()
+    hl.fills_raw_error[_A] = BudgetExhausted(
+        "hl budget exhausted for scope=interactive weight=120")
+    clock = {"t": 1_000_000.0}
+    app = create_app(cfg, store, keysvc, hl, now_fn=lambda: clock["t"])
+    c = _client(app)
+
+    r = c.get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    assert r.json()["fills_30d"] is None
+    assert hl.portfolio_calls == 1
+
+    clock["t"] += 1.0  # 遠低於 300 秒快取 TTL——若被誤快取，這裡仍會命中快取
+    del hl.fills_raw_error[_A]
+    r2 = c.get(f"/api/public/traders/{_A}")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["fills_30d"] is not None
+    assert hl.portfolio_calls == 2  # 沒有進快取：重新打了一次 portfolio
+
+
 # ============================================================
 # [W4] follow_blocked：已撤銷 leader 不該在交易員頁看到跟單 CTA
 # ============================================================

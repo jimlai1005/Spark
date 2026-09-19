@@ -177,10 +177,16 @@ class WeightLimiter:
         類預留 120 是上限，實際 = 20 + ceil(筆數/20)；不結算會讓自訂帳本比 HL
         真實計費高 3–6 倍，造成 HL 沒擋、我們自己先擋的假陽性。`token` 可能
         已因超過 60 秒視窗被 `_prune` 移出帳本——此時就地修改一個已經不在
-        deque 裡的 list 沒有任何效果，等同 no-op（該筆本就已經不計入 `_used`），
-        安全。"""
+        deque 裡的 list 沒有任何效果，等同 no-op（該筆本就已經不計入 `_used`）。
+
+        2026-09-20 opus 複審 S1：token 已滑出視窗（`token[0] <= now - WINDOW_S`）
+        時不只是「改它沒效果」，還必須連 `refunded_weight` 計數器都不計——那筆
+        weight 早已不在 `_used()` 裡，計進 `refunded_weight` 會虛報一筆從未真正
+        佔額度的退款，讓 `snapshot()["counters"]` 對不上實際發生過的預留。"""
         with self._lock:
             if token is None or actual_weight >= token[1]:
+                return
+            if token[0] <= self._now() - WINDOW_S:
                 return
             self._counters["refunded_weight"] += token[1] - actual_weight
             token[1] = actual_weight
@@ -194,10 +200,11 @@ class WeightLimiter:
           `max(既有, now + max(PAUSE_MIN_S, retry_after_s or 0) + jitter)`——
           重複收到同一輪的 429 不該讓退避指數暴衝。
         - 只有「暫停已解除、又再犯」才真正升級：`n` 遞增，
-          `pause = min(max(retry_after_s or 0, PAUSE_MIN_S * 2**(n-1)),
-          PAUSE_MAX_S) + jitter`——Retry-After 是「至少等這麼久」的下限，
-          不再被乘上指數（舊版 `base * 2**(n-1)` 會讓伺服器給的短暫 Retry-After
-          被不成比例放大）。
+          `pause = max(retry_after_s or 0, min(PAUSE_MIN_S * 2**(n-1),
+          PAUSE_MAX_S)) + jitter`——Retry-After 是「至少等這麼久」的下限，
+          只有指數部分被 `PAUSE_MAX_S` 夾住，Retry-After 本身不夾（2026-09-20
+          opus 複審 W1：舊版把 `max(retry_after, 指數)` 整體夾在 `PAUSE_MAX_S`，
+          等於用我們自己的退避上限去縮短伺服器明講的「至少等這麼久」，方向反了）。
         """
         with self._lock:
             now = self._now()
@@ -211,14 +218,26 @@ class WeightLimiter:
                 return
             self._consecutive_429[DEFERRABLE_SCOPE] += 1
             n = self._consecutive_429[DEFERRABLE_SCOPE]
-            pause = min(max(retry_after, PAUSE_MIN_S * (2 ** (n - 1))), PAUSE_MAX_S) + jitter
+            pause = max(retry_after, min(PAUSE_MIN_S * (2 ** (n - 1)), PAUSE_MAX_S)) + jitter
             self._paused_until[DEFERRABLE_SCOPE] = max(current_until, now + pause)
 
     def note_ok(self, scope: str) -> None:
+        """2026-09-20 opus 複審 W2（撤回 1.5-A4）：只有 `explore` 自己成功才歸零
+        `explore` 的連續 429 計數。`interactive` 的低權重（通常 2/20）成功不證明
+        `explore` 的 120 權重請求也能過——若任何 scope 成功都歸零，升級階梯永遠
+        到不了第二級（`interactive` 幾乎每次都成功），撤銷／重試節奏形同虛設。
+        升級要靠 `explore` 自己的 429 累積、也要靠 `explore` 自己的成功歸零。"""
+        if scope != DEFERRABLE_SCOPE:
+            return
         with self._lock:
             self._consecutive_429[DEFERRABLE_SCOPE] = 0
 
     def snapshot(self) -> dict:
+        """`paused_until` 是 `now_fn` 時基——正式路徑注入 `time.monotonic`，
+        與 ops/health 讀取當下用的 wall clock（`checked_at`）不可比較（2026-09-20
+        opus 複審 W3）。要看「還要暫停多久」一律讀 `paused_remaining_s`
+        （`max(0.0, until - now)`，在同一次快照裡用同一個 `now_fn` 算出，
+        不受時基混用影響）。"""
         with self._lock:
             now = self._now()
             self._prune(now)
@@ -229,6 +248,8 @@ class WeightLimiter:
                 "window_s": int(WINDOW_S), "global_cap": self._global_cap,
                 "scope_caps": dict(self._scope_caps), "used": dict(used),
                 "paused_until": dict(self._paused_until),
+                "paused_remaining_s": {scope: max(0.0, until - now)
+                                      for scope, until in self._paused_until.items()},
                 "consecutive_429": dict(self._consecutive_429),
                 "counters": {k: self._counters.get(k, 0) for k in self._COUNTER_KEYS},
             }

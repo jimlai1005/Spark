@@ -2472,6 +2472,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
 
         回傳 `(rows, account_value, initial_deposit_usd, ch_state, fills,
         fills_truncated)`。"""
+        # 2026-09-20 opus 複審 W4：ledger／fills 是次要欄位，額度不足（transient）
+        # 只降級該欄位為 None，不得把整頁上拋成 502——但這份不完整結果也不得進
+        # 5 分鐘快取（額度隨時可能已恢復，快取住半份資料會讓後續 300s 內的請求
+        # 都看不到本可取得的次要欄位）。`skip_cache` 是本次呼叫是否命中過這種
+        # transient 降級的旗標；portfolio／clearinghouseState 兩個主欄位仍維持
+        # 上拋（見下方兩處 raise）——主欄位缺就是整頁不可用，不是「降級」的範圍。
+        skip_cache = False
         now = now_fn()
         with _trader_portfolio_lock:
             cached = _trader_portfolio_cache.get(address)
@@ -2508,7 +2515,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         try:
             ledger_raw = hl.non_funding_ledger_updates(address, 0)
             deposit = sum_ledger_deposits(ledger_raw)
-        except (BudgetExhausted, ScopePaused): raise  # noqa: E701 — reviewer C2：單行短路，緊鄰下面的 except Exception 降級分支
+        except (BudgetExhausted, ScopePaused) as e:
+            # W4：額度不足是 transient，不是「這個地址查不到」——降級該欄位為
+            # None（`deposit` 已預設 None），但整份結果不得快取（見 skip_cache）。
+            logger.warning("交易員真實入金查詢額度不足，降級 address=%s: %s", address, e)
+            skip_cache = True
         except Exception as e:  # noqa: BLE001 — 額外欄位，失敗只降級該欄位
             logger.error("交易員真實入金查詢失敗 address=%s: %s", address, e)
         # 2026-09-05 Task 8 Step 3（reviewer Warning 2）：失敗降級為 `None`，不是
@@ -2521,11 +2532,20 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             start_dt = end_dt - timedelta(days=hl_explore.FILLS_WINDOW_DAYS)
             fills, fills_truncated = hl.get_fills_raw_paged(
                 address, start_dt, end_dt, max_pages=hl_explore.fills_max_pages_from_env())
-        except (BudgetExhausted, ScopePaused): raise  # noqa: E701 — reviewer C2：單行短路，緊鄰下面的 except Exception 降級分支
+        except (BudgetExhausted, ScopePaused) as e:
+            # W4：同 ledger 降級——fills 已預設 None／fills_truncated=False，
+            # 整份結果不得快取（見 skip_cache）。
+            logger.warning("交易員近 30 天成交查詢額度不足，降級 address=%s: %s", address, e)
+            skip_cache = True
         except Exception as e:  # noqa: BLE001 — 額外欄位（成交統計），失敗只降級該欄位
             logger.error("交易員近 30 天成交查詢失敗 address=%s: %s", address, e)
         with _trader_portfolio_lock:
             _trader_portfolio_negative_cache.pop(address, None)
+            if skip_cache:
+                # W4：額度不足降級的不完整結果不得寫進 5 分鐘快取（負面快取也已
+                # 在上一行清掉——這不是「這個地址查不到」，下一次請求要能立刻
+                # 重打上游，額度可能已恢復）。
+                return rows, account_value, deposit, ch_state, fills, fills_truncated
             if (address not in _trader_portfolio_cache
                     and len(_trader_portfolio_cache) >= TRADER_PORTFOLIO_CACHE_MAX):
                 oldest = min(_trader_portfolio_cache,
