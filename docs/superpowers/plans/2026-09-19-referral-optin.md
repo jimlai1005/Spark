@@ -330,3 +330,18 @@ tests/test_referral_apply.py tests/test_api_referral.py -q` 22→29（+7）；
 - 2026-09-19：plan 撰寫完成；使用者確認裁決 (5)(6) 後改為 watcher 代入版。推薦碼與推薦人錢包待使用者交付（不阻擋 Task 1–6 實作，只阻擋上線步驟 1）。
 - 2026-09-19：Task 1–6 實作完成，待 reviewer（Task 7）。Task 6 的 `_referral_code_from_env()` 實際呼叫點在 `run_once`（範本檢查之後、entries 迴圈之前）而非逐條目的 `process_entry` 內部——理由：`process_entry` 的例外會被 `run_once` 迴圈的 per-entry try/except 吸收成「這一筆失敗」，若在那裡驗證 `FILET_REFERRAL_CODE` 會讓壞設定只擋掉一個用戶而非整輪，與 plan 敘述的「整輪 fail-closed，理由同 REPLACE_WITH」矛盾；驗證結果（`str | None`）改用參數 `referral_code` 一路往下傳進 `process_entry` → `_compose_env`（呼叫端仍是 `_compose_env(..., referral_code=referral_code)`，只是這個值現在來自上游算好的變數，不是行內呼叫 `_referral_code_from_env()`）。
 - 2026-09-19：reviewer（opus）PASS、無 Critical；3 Warning＋S1 已由 Task 8 修正並 commit（e2fcc70）。後端 2927、前端 710 測試全綠。**未部署**。待辦：(1) 使用者交付推薦人錢包與推薦碼，主線程用 `/info referral` 確認 `referrerState.stage == "ready"`；(2) 依 §3 上線；(3) testnet 端到端一次（§3 步驟 4）。
+
+### Task 9 `@inline`：testnet 端到端（接進 `tests/integration/test_e2e_noncustodial.py` 的既有劇本）
+
+**動機**：上線前必須有一段真實資料流證據（工程原則 #6）：用戶簽署 opt-in → watcher 產生含 `COPY_REFERRAL_CODE` 的 env → 引擎第一輪送出 `setReferrer` → 鏈上 `referredBy.code` 等於設定碼。testnet 上唯一已知註冊的碼是 `HYPERLIQUID`（`JIMLAI1005` 只在主網註冊，testnet 回 `Referral code not registered`），所以 testnet 劇本用 `HYPERLIQUID`。
+
+**Files:** `tests/integration/test_e2e_noncustodial.py`（追加步驟，既有 S1–S13 不改語意）；必要時 `tests/integration/harness.py`（`make_real_app` 若無法帶 `referral_code` 就加參數）。
+
+- [ ] app fixture 的 `ApiConfig` 帶 `referral_code="HYPERLIQUID"`（找 `make_real_app` 建 cfg 的地方）。
+- [ ] 新增 **S7b**（在 S7 風控之後、S8 watcher 之前）：`GET /api/me/referral` → `enabled=True, signed=False`；`POST /api/me/referral/message` → 用 customer 錢包 `sign_text` 簽原文 → `POST /api/me/referral` → 200；再 `GET` → `signed=True`。
+- [ ] S8 watcher 呼叫的環境加 `FILET_REFERRAL_CODE=HYPERLIQUID`（看該測試怎麼給 watcher env／`run_once` 參數），並斷言產生的 env 檔含 `COPY_REFERRAL_CODE=HYPERLIQUID`。
+- [ ] S9 引擎跑完第一輪後追加斷言：`Info(TESTNET_URL).query_referral_state(customer.address)["referredBy"]["code"] == "HYPERLIQUID"`（查詢前先確認 S8 之前該地址 `referredBy` 為 None，證明是這一輪設的）。`_extra_engine_env` 若需要補 `COPY_REFERRAL_CODE` 就補（以 env 檔為準，不要雙重來源）。
+- [ ] 實跑整個 testnet 劇本（integration 標記的啟用方式見 `tests/integration/conftest.py`）；貼 S7b、S8、S9 的 PASS 輸出與 `referredBy` 查詢結果。
+- [ ] commit `test: testnet 端到端加入推薦碼 opt-in（S7b 簽署、S8 env、S9 鏈上驗證）`。
+
+**驗收**：integration 劇本 S1–S13 全 PASS（含新增斷言）；主線程另跑一次同指令複驗。
