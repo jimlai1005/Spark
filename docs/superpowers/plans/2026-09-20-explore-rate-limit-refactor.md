@@ -1033,4 +1033,7 @@ class ExplorePublisher:
 | 1.3 | 2026-09-20 | 6cb73a8 | 86 passed；hl_explore 零 `time.sleep`／退避常數；`_BudgetUnavailable` 中止保舊 |
 | **P1 驗收** | 2026-09-20 | — | `uv run pytest -q` 2957 passed；`ruff check src tests scripts` 乾淨；`rg limiter scripts/run_api.py` 3 命中 |
 | P1 審查 | 2026-09-20 | — | opus reviewer：2 Critical／5 Warning／3 Suggestion，主線程逐條實跑確認 → Task 1.5 |
-| 1.5 | 2026-09-20 | a41c189 | 三判準（ScopePaused 非 transient／JSON column 429 不誤判／真 429 命中）主線程實跑 False/False/True；settle 120→23 退 97；2965 passed；ruff 乾淨。複審派工中；第一次部署（D8）待使用者確認 |
+| 1.5 | 2026-09-20 | a41c189 | 三判準（ScopePaused 非 transient／JSON column 429 不誤判／真 429 命中）主線程實跑 False/False/True；settle 120→23 退 97；2965 passed；ruff 乾淨 |
+| P1 複審 | 2026-09-20 | — | opus fresh reviewer：前輪七項全部「已關閉」（附實跑）；0 Critical／4 Warning／3 Suggestion；結論可部署 → 主線程裁決四項 Warning 部署前修（Task 1.6） |
+| 1.6 | 2026-09-20 | cc28baa | 主線程實跑 `floor 3800.0`／`n 2 remaining 120.0`；app.py 只剩 2 處 raise；2973 passed；ruff 乾淨；vitest 716 passed |
+| **P1 最終驗收** | 2026-09-20 | — | 全量 pytest 2973、vitest 716、ruff 乾淨。**待使用者確認第一次部署（D8）**；prod 快照 2026-09-19T15:00 v3 299 列、五個 drop-in 齊全、prod 版本 b9e5649 已含於本分支 |
