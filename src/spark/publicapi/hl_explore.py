@@ -1082,7 +1082,11 @@ class ExploreIndex:
              require_sample: bool = True, max_dd_filter: bool = True,
              exclude_concentrated: bool = True,
              sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> dict:
-        """讀路徑：永不阻塞（觸發背景建置後立即用目前狀態回應）。回傳形狀見
+        """讀路徑：**只讀本地已建置版本，永不觸發上游**（2026-09-20 spec §3／§9.2：
+        Explore 頁面刷新不得發 HL info、不得開 rebuild——2026-09-19 事故：請求觸發
+        的 300 池重建把同 IP 額度燒到 429，dashboard／onboard 一起失效）。
+        上游更新改由 explore_scheduler（P3）負責；本函式在那之前只會端出啟動時
+        從磁碟快照載入的資料。回傳形狀見
         `app.py` 端點層文件字串：`{rows, page, page_size, total_qualified,
         total_scanned, pool, updated_at, building}`（`pool`：I-17，鏡射
         `total_scanned`——這一輪實際掃描的候選數，前端榜首常駐提示句「自
@@ -1123,7 +1127,6 @@ class ExploreIndex:
             rows_version = self._rows_version
             built_at = self._built_at
             total_scanned = self._total_scanned
-        self._maybe_trigger_build()
         if rows is None or rows_version != EXPLORE_INDEX_VERSION:
             return {"rows": [], "page": page, "page_size": self._cfg.page_size,
                    "total_qualified": 0, "total_scanned": 0, "pool": 0,

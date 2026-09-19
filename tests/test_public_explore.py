@@ -692,15 +692,15 @@ def test_call_hl_rate_limited_abort_path_still_sleeps_the_throttle_interval():
 
 
 def test_index_query_never_built_returns_building_true_and_empty_rows_without_blocking():
-    """建置中或**從未成功過** → `building: True` ＋空 rows，且讀路徑不阻塞
-    （呼叫立即返回，不等背景 thread 跑完）。"""
+    """尚無任何可用版本 → `building: True` ＋空 rows，讀路徑不阻塞、且**不**觸發
+    背景建置（2026-09-20 止血，Task 0.1：`query()` 只讀本地已建置版本，上游更新
+    改由 explore_scheduler（P3）負責；`_maybe_trigger_build`／`build_sync` 仍可被
+    其他呼叫端同步呼叫，見下方 `index.build_sync()`）。"""
     started = threading.Event()
-    release = threading.Event()
 
     def slow_source():
         started.set()
-        assert release.wait(timeout=5), "release 逾時未被觸發"
-        return _leaderboard_payload()  # 沒有候選人，building 很快跑完
+        return _leaderboard_payload()  # 沒有候選人，build_sync 很快跑完
 
     index = ExploreIndex(leaderboard_source_fn=slow_source, hl=FakeHL(),
                          excluded_fn=lambda: set(), cfg=ExploreConfig(),
@@ -710,12 +710,16 @@ def test_index_query_never_built_returns_building_true_and_empty_rows_without_bl
     result = index.query()
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.5, f"query() 被背景建置卡住了（耗時 {elapsed}s）"
+    assert elapsed < 0.5, f"query() 耗時過長（{elapsed}s）"
     assert result == {"rows": [], "page": 1, "page_size": ExploreConfig().page_size,
                       "total_qualified": 0, "total_scanned": 0, "pool": 0,
                       "updated_at": None, "building": True}
-    assert started.wait(timeout=5), "背景建置未啟動"
-    release.set()
+    assert not started.is_set(), "query() 不應觸發背景建置（2026-09-19 429 事故止血）"
+
+    index.build_sync()  # 上游更新改走同步呼叫（P3 前的暫時介面）
+    built = index.query()
+    assert started.is_set()
+    assert built["building"] is False
 
 
 def test_index_build_sync_fails_open_to_previous_snapshot_on_upstream_failure():
@@ -1178,3 +1182,38 @@ def test_explore_config_from_env_reads_fills_max_pages_from_given_env_not_os_env
     monkeypatch.setenv("EXPLORE_FILLS_MAX_PAGES", "9")
     cfg2 = ExploreConfig.from_env(env={})
     assert cfg2.fills_max_pages == hl_explore.DEFAULT_FILLS_MAX_PAGES
+
+
+# ============================================================
+# Task 0.1（2026-09-20 止血）：query() 不再觸發上游重建
+# ============================================================
+
+class _CallCountingHL:
+    """包一層共用 `FakeHL`，記錄所有被呼叫的方法名——不改共用 helper 本身
+    （`tests/publicapi_helpers.py` 被其他測試檔共用，避免動到 plan 範圍外的檔案），
+    每個對外方法呼叫都會 append 自己的名字到 `self.calls`。"""
+
+    def __init__(self):
+        self._inner = FakeHL()
+        self.calls: list[str] = []
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if callable(attr):
+            def wrapper(*a, **kw):
+                self.calls.append(name)
+                return attr(*a, **kw)
+            return wrapper
+        return attr
+
+
+def test_explore_get_never_calls_upstream_nor_builds(tmp_path):
+    """spec §3 不變條件一：刷新 Explore 頁面不發 HL info、不開 rebuild。"""
+    hl = _CallCountingHL()
+    client = _client(_app(tmp_path, hl=hl))
+    for _ in range(1000):
+        r = client.get("/api/public/explore")
+        assert r.status_code == 200
+    assert hl.calls == []
+    idx = client.app.state.explore_index
+    assert idx._building is False
