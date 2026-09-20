@@ -91,7 +91,7 @@ def app(tmp_path_factory, builder_address: str, keysvc: KeysvcThread, leader: Wa
     （D3：可控、可反手、可平倉，見 plan §4）。
 
     `referral_code="HYPERLIQUID"`（Task 9，推薦碼 opt-in testnet 端到端）：這是
-    testnet 上唯一已知已註冊的碼（主網碼 `JIMLAI1005` 在 testnet 會回
+    testnet 上唯一已知已註冊的碼（主網碼 `FILET`（2026-09-21 前為 `JIMLAI1005`）在 testnet 會回
     `Referral code not registered`，見 docs/superpowers/plans/
     2026-09-19-referral-optin.md §0）。"""
     tmp_path = tmp_path_factory.mktemp("app")

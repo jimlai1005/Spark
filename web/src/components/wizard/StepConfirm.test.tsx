@@ -41,7 +41,7 @@ import { StepConfirm } from "./StepConfirm";
 function referralStatus(over: Partial<ReferralStatusResp> = {}): ReferralStatusResp {
   return {
     enabled: true,
-    code: "JIMLAI1005",
+    code: "FILET",
     signed: false,
     signed_at: null,
     onchain_code: null,

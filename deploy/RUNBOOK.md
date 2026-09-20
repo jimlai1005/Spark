@@ -2146,6 +2146,24 @@ curl -s https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' \
 未完成這一步就先填 `FILET_REFERRAL_CODE` 沒有意義：`setReferrer` 會收到
 `Referral code not registered`（引擎端分類為 critical，見 `src/spark/filet/referral_apply.py`）。
 
+(f) 換碼（2026-09-21 首次實跑，`JIMLAI1005` → `FILET`）：推薦碼不在程式碼裡，換碼＝改 env 檔＋重啟 `filet-api`。
+
+```bash
+# 0. 先確認新碼已在主網註冊在目標推薦人錢包下（stage 必須是 ready、code 必須等於新碼）
+curl -s https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' \
+  -d '{"type":"referral","user":"<推薦人錢包位址>"}' | jq '.referrerState'
+# 1. 備份 → 覆寫 → 重啟 api（watcher 是 timer 拉起的 oneshot，下一輪自然吃到；dashboard 不必重啟）
+sudo cp -a /etc/filet/referral.env /etc/filet/referral.env.bak-$(date -u +%Y%m%d-%H%M%S)
+echo "FILET_REFERRAL_CODE=<新碼>" | sudo tee /etc/filet/referral.env && sudo chmod 644 /etc/filet/referral.env
+sudo systemctl restart filet-api
+# 2. 驗證（environ，不是 -p Environment）
+sudo cat /proc/$(systemctl show filet-api -p MainPID --value)/environ | tr '\0' '\n' | grep FILET_REFERRAL_CODE
+```
+
+注意兩件事：(1) 已簽但尚未被引擎套用的 opt-in 記錄（`/var/lib/filet-exchange/referral_optin.json`）帶的是**舊碼**，
+該帳號啟用時 `referral_apply` 會發 `referral_code_mismatch` critical（記錄碼比對在鏈上查詢**之前**），要請用戶重簽；
+(2) 已在鏈上設成舊碼的用戶不受影響（Hyperliquid 推薦碼一經設定不可改），只有之後簽署的新用戶會走新碼。
+
 ### 5.8e ⭐⭐ Explore 背景刷新（scheduler／publisher，2026-09-20）
 
 <!-- 2026-09-20: 2026-09-19 429 事故修法第二階段。第一階段（4295ece）已把請求觸發的重建拆掉，
@@ -2768,3 +2786,13 @@ concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶�
 遮罩生效）→ `DEPLOYED_VERSION` → `filet_regression_check` 67/67 → **flag 改 1**（16:43）→ 16:44 首次發布（`.v3.bak`／`.daily` 產生）、16:45 第二次
 （`.prev`）；公開榜合格 2／待確認 288／不合格 10、coverage backfilling 293／complete 7；零 Traceback／429／來源故障。
 之後每 5 分鐘觀測 pending 轉換與 `as_of`；**24 小時觀測期自 16:45 UTC 起算**；Explore 預算維持 300 不動；follower 引擎限流關係仍未結案。
+
+**2026-09-21 設定變更（無程式碼部署，19:21 UTC 09-20，推薦碼 `JIMLAI1005` → `FILET`）：** 使用者指示換碼並把推薦人錢包改為
+Filet Alpha `0xfB9C52f56F03D786AD5D435aa70fe45D80569760`。前置確認：主網 `referral` 端點回 `referrerState.stage == ready`、
+`code == FILET`（該錢包 `cumVlm` 70,766，已過建碼門檻）。流程照 §5.8d (f)：`cp -a` 備份 `/etc/filet/referral.env.bak-20260920-192110`
+→ 覆寫 `FILET_REFERRAL_CODE=FILET`（644）→ `restart filet-api`（watcher 是 timer oneshot 不重啟；dashboard 不重啟——推薦碼由
+`/api/me/referral` 執行期回傳，前端沒有 build 期烘入）。驗證：`/proc/<api pid>/environ` 含 `FILET_REFERRAL_CODE=FILET`；
+`systemctl --failed` 空；API journal 零 Traceback；`filet_regression_check --http --ssh` 67/67 PASS。既有 fb8c353 引擎 env 無
+`COPY_REFERRAL_CODE`，不受影響。⚠️ 殘留：`/var/lib/filet-exchange/referral_optin.json` 有一筆 2026-09-20 以舊碼簽的記錄
+（account `ffb9c5…9760`＝Filet Alpha 自己，鏈上 `referredBy` 已是 `RABBYWALLET`，無 follower unit）；未刪。若該帳號日後啟用引擎，
+`referral_apply` 會因記錄碼≠`COPY_REFERRAL_CODE` 發 `referral_code_mismatch` critical（記錄碼比對先於鏈上查詢），請該帳號重簽即可。
