@@ -1143,4 +1143,5 @@ class ExplorePublisher:
 | 3.3 | 2026-09-20 | 97a8e92 | 110 passed（traders＋explore）；`TraderData` dataclass；池內零上游、stale 入列去重、準入上限；回應加 source／refreshing／as_of／fills_coverage |
 | 3.1 | 2026-09-20 | 80155fc | 33 passed（scheduler 8＋store）；零 `time.sleep`／`logger.info`；含 ledger kind；store 加 `set_sync_error`／`oldest_due_at`；300 池 6,600 權重 ≥22 分鐘、任一分鐘 ≤300 |
 | 4.2 | 2026-09-20 | 0b29710 | vitest 724 passed；`fillsIncomplete()` 單一判準、型別全 optional（新舊後端混跑窗口）。<!-- 裁決：探索頁原本就沒有完整性提示，本輪不加新 UI（D5 精神），欄位已進型別供後續使用 --> |
+| 4.1 | 2026-09-20 | 8cdbf4e | 118 passed（publisher＋explore＋traders）；v4 快照、v3 相容載入；`enrich_candidate` 容忍 None（`_apply_tags`／`qualify` 加 None 守衛）；既有三條版本測試改為 `VERSION-2` 表「不相容」 |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
