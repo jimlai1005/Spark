@@ -1061,6 +1061,22 @@ status 露 min_portfolio_ratio。S3 備份失敗 log。S4 count_with_payload 用
 - [ ] **D. 測試**：publisher：有版本＋`n==0` → 不發布、`gate_skips+1`、快照未寫；有版本＋`with_pf==0` 同；`force=True` 在 10% 下仍發布；`status()["min_portfolio_ratio"] == 0.8`。scheduler：非候選地址（未 `upsert_candidates`）的 fills job 三頁滿頁 → 三個 tick 都續頁（`pages_done` 到 3），第四 tick 短頁 done 後才 `dropped`；候選輪空 rows → 300 候選仍 active、job 數不變、tick 回 `retry`。store：`explore.db-wal`／`-shm` 若存在為 0600（用一次寫入觸發 WAL 後檢查）；`count_with_payload` 對同地址兩個 `params_fp` 只算 1。
 - [ ] **E. Commit** `fix: 3.5 複審修正（門檻 n==0/with_pf==0 不換版、候選空 rows 不停用、續頁不看 active、WAL 側檔 0600、force 繞過門檻）`
 
+### Task 3.7 @inline：3.6 複審修正（2026-09-20 opus 第三輪：1 Critical／2 Warning／2 Suggestion）
+
+<!-- 裁決：C 門檻量輸入（payload 數）、換版看輸出（compose 列數）不同源 → 門檻改判在 compose 輸出：有版本時
+rows 為空或 meta.with_portfolio < ratio×candidates 一律不換版；輸入端預檢只當省算的捷徑。每次覆寫快照前保留 .prev
+（v3.bak 只保護第一次）。W1 候選來源長期壞掉無外部證據 → warning log＋status last_candidates_ok_at。
+W2 count_with_payload 與 compose 基礎不同（params_fp）→ 限 params_fp=''。S1 單輪續頁加硬上限 20 頁→partial/page_cap。 -->
+
+**Files:** `explore_publisher.py`、`explore_scheduler.py`、`explore_store.py`、`explore_fills_sync.py`；對應測試。
+
+- [ ] **A. publisher**：compose 之後、換版之前：`if has_version and not force and (not rows or meta["with_portfolio"] < ratio * max(meta["candidates"], 1) or meta["with_portfolio"] == 0)` → `gate_skips+1`、`last_gate=f"out:{meta['with_portfolio']}/{meta['candidates']}"`、`_last_attempt_at=now`、回 False（不寫快照、不換版）。輸入端預檢保留（同條件的捷徑，`last_gate` 用 `in:` 前綴）。`force=True` 仍繞過兩道門檻。每次 `dump_snapshot` 前：若目標檔存在 → `shutil.copyfile(path, path + ".prev")`（best effort、warning on failure）；`.v3.bak` 邏輯保留。
+- [ ] **B. scheduler**：空 rows → `logger.warning("explore scheduler: 候選來源回空 rows（%s），60s 後重試；候選池維持不動", ...)`；`status()` 加 `last_candidates_ok_at`（成功 upsert 的 wall 時間，None 表示從未）與 `candidates_empty_streak`（連續空 rows 次數，成功歸零）。
+- [ ] **C. store**：`count_with_payload(endpoint)` 加 `AND e.params_fp = ''`（與 `compose_rows` 讀的同一基礎，工程原則 #1），維持 `COUNT(DISTINCT e.address)`。
+- [ ] **D. fills_sync**：`apply_page` 加參數 `max_pages_per_round: int = 20`；`state.pages_done + 1 >= max_pages_per_round` 且仍滿頁 → `completeness="partial"`、`reason="page_cap"`、`synced_through=cursor`、`done=True`（20 頁＝40,000 筆 > 留存上限 10,000，正常資料到不了）。
+- [ ] **E. 測試**：publisher：`with_pf/n = 10/10` 但 compose 出 0 列（monkeypatch `compose_rows` 回 `([], {"published_at":..,"candidates":10,"with_portfolio":0})`）→ 不換版、快照未寫、`last_gate` 以 `out:` 開頭；有版本且 compose 正常 → 換版且 `.prev` 存在、內容＝前一版；`force` 仍發布。scheduler：空 rows 三次 → `candidates_empty_streak 3`、`last_candidates_ok_at None`，成功一次後歸零並有時間。store：`params_fp='x'` 有 payload、`''` 無 → 計 0。fills_sync：連續 20 滿頁 → 第 20 頁 `partial/page_cap/done`。
+- [ ] **F. Commit** `fix: 3.6 複審修正（門檻判 compose 輸出、快照 .prev、候選空 rows 可觀測、count 同基礎、續頁硬上限）`
+
 ## P4 漸進發布（任務卡）
 
 ### Task 4.1 @inline：`explore_publisher.py`
