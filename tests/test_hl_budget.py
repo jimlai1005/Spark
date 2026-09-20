@@ -17,10 +17,18 @@ class Clock:
     def sleep(self, s): self.t += s
 
 
-def _lim(**kw):
+def _lim(*, scope_caps=None, **kw):
     c = Clock()
-    return WeightLimiter(global_cap=900, scope_caps={"explore": 300},
+    caps = {"explore": 300} if scope_caps is None else scope_caps
+    return WeightLimiter(global_cap=900, scope_caps=caps,
                          now_fn=c.now, sleep_fn=c.sleep, rng=lambda: 0.0, **kw), c
+
+
+def _lim_fc(**kw):
+    """Task 7.4a：explore（父，300）／explore_base（子，180）／explore_fills（子，120）
+    的標準父子 fixture，沿用 `_lim`（同 Clock／同全域 900）。"""
+    return _lim(scope_caps={"explore": 300, "explore_base": 180, "explore_fills": 120},
+               scope_parents={"explore_base": "explore", "explore_fills": "explore"}, **kw)
 
 
 def test_weight_table_matches_hl_docs():
@@ -310,3 +318,103 @@ def test_concurrent_reservations_never_exceed_cap():
     for t0, _ in ledger:
         assert sum(w for t, w in ledger if t0 < t <= t0 + 60) <= 900
     assert lim.snapshot()["counters"]["reserved_weight"] <= 900
+
+
+# ---------- Task 7.4a（2026-09-21：父子 scope 保留額度） ----------
+
+
+def test_child_reservation_counts_toward_parent_and_global():
+    """base 預留滿 180 後，父 `explore` 與全域帳目都要看到這 180（同源同基準：
+    子的每一筆預留同時計入自己、父、全域三個帳，不是三份獨立配額）。"""
+    lim, c = _lim_fc()
+    for _ in range(9):
+        assert lim.try_reserve(20, "explore_base")
+    s = lim.snapshot()
+    assert s["used"]["explore_base"] == 180
+    assert s["used"]["explore"] == 180
+    assert lim._used(None) == 180
+
+
+def test_parent_cap_rejects_child_even_if_child_has_room():
+    """base 用滿 180、fills 用滿 120 → 父 explore 帳滿 300；再 base 20 被拒
+    （denied_scope），即使不看父帳、單看 base 自身理論上早就滿了——這裡刻意讓
+    父帳先滿，驗證父 cap 這一關真的有在擋，不是只有自身 cap 在擋。"""
+    lim, c = _lim_fc()
+    for _ in range(9):
+        assert lim.try_reserve(20, "explore_base")
+    for _ in range(6):
+        assert lim.try_reserve(20, "explore_fills")
+    before = lim.snapshot()["counters"]["denied_scope"]
+    assert lim.try_reserve(20, "explore_base") is None
+    assert lim.snapshot()["counters"]["denied_scope"] == before + 1
+
+
+def test_sibling_still_available_when_parent_not_full():
+    """base 用掉 180（父帳到 180，離 300 還有餘量）→ fills 仍可用滿 120
+    （父帳 180+120=300，剛好貼齊，不多不少）。"""
+    lim, c = _lim_fc()
+    for _ in range(9):
+        assert lim.try_reserve(20, "explore_base")
+    for _ in range(6):
+        assert lim.try_reserve(20, "explore_fills")
+    assert lim.snapshot()["used"]["explore"] == 300
+
+
+def test_parent_pause_blocks_children():
+    """子 scope 的 429 暫停父：`explore_base` 429 → `explore` 暫停 → 另一個子
+    `explore_fills` 立刻被擋（不能繞過父的退避）；`interactive` 不受影響。"""
+    lim, c = _lim_fc()
+    lim.note_429("explore_base")
+    with pytest.raises(ScopePaused):
+        lim.try_reserve(2, "explore_fills")
+    assert lim.try_reserve(2, "interactive")
+
+
+def test_available_is_min_of_self_parent_global():
+    """`available()` = min(自身餘量, 父餘量, 全域餘量)，三種情境各驗一次
+    「哪一個是真正卡住的那一關」。"""
+    # 情境一：自身 cap 最小（全新 limiter，own 180 < parent 300 < global 900）。
+    lim, c = _lim_fc()
+    assert lim.available("explore_base") == 180
+
+    # 情境二：父 cap 最小——直接在父 scope 記 150（模擬「非子路徑」的父帳目，
+    # 驗證 available 讀的是父的『合計』餘量，不是只看子自己的帳）；
+    # own 180、parent 300-150=150、global 900-150=750 → 父餘量最小。
+    lim, c = _lim_fc()
+    assert lim.try_reserve(150, "explore")
+    assert lim.available("explore_base") == 150
+
+    # 情境三：全域最小——interactive 吃掉 850，全域只剩 50，遠小於 own(180)／
+    # parent(300)（兩者都完全沒被動到）。
+    lim, c = _lim_fc()
+    for _ in range(17):
+        assert lim.try_reserve(50, "interactive")
+    assert lim.available("explore_base") == 50
+
+
+def test_concurrent_children_never_exceed_parent_cap():
+    """8 條 thread 混合 explore_base／explore_fills 用真實 time.monotonic 搶額度；
+    任一 60 秒切片的父 scope（explore）合計不得超過 300。"""
+    lim = WeightLimiter(global_cap=900,
+                        scope_caps={"explore": 300, "explore_base": 180, "explore_fills": 120},
+                        scope_parents={"explore_base": "explore", "explore_fills": "explore"})
+    ledger: list[tuple[float, int]] = []
+    ledger_lock = threading.Lock()
+
+    def worker(scope, weight, n):
+        for _ in range(n):
+            token = lim.try_reserve(weight, scope)
+            if token:
+                with ledger_lock:
+                    ledger.append((lim._now(), weight))
+
+    threads = ([threading.Thread(target=worker, args=("explore_base", 20, 100)) for _ in range(4)]
+              + [threading.Thread(target=worker, args=("explore_fills", 30, 100)) for _ in range(4)])
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert ledger, "至少要有一些成功預留才能驗證上限"
+    for t0, _ in ledger:
+        assert sum(w for t, w in ledger if t0 < t <= t0 + 60) <= 300

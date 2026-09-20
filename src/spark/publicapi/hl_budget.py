@@ -17,6 +17,19 @@ scope：`interactive`（dashboard／onboard／traders 詳情等使用者請求�
 （spec §5.2「其他服務觀察到 429 也應通知 Explore 暫停」），`interactive` 自己不暫停
 （必要查詢不停，由呼叫端的既有失敗路徑處理）。
 
+父子 scope（Task 7.4a，2026-09-21 使用者裁決：fills 類別級飢餓修法）：`scope_parents`
+把子 scope 對映到父 scope（例如 `explore_base`／`explore_fills` → `explore`）。子 scope
+的每一筆預留**同時**計入自己、父與全域三個帳——這是同一本帳的三種切面，不是三份
+獨立配額（工程原則 1：比較雙方須同源同基準）。用途：有 fills 待處理時，基礎抓取
+（state／portfolio／ledger）走 `explore_base`（cap 180），fills 走 `explore_fills`
+（cap 120，保證每分鐘至少擠進一頁 120 權重的 `userFillsByTime`）——嚴格優先級曾讓
+fills 在一小時內拿不到一次額度（正式機觀測，2026-09-21）；子 cap 是父 cap（300）內的
+**保留切片**，不是額外配額，兩個子 cap 之和（300）等於父 cap，父 cap 又受全域 900
+限制。無 fills 待處理時基礎類別改直接走父 scope `explore`（可用滿 300）。父 scope 暫停
+（429）時所有子 scope 一併暫停；子 scope 的 429 也會暫停父（`note_429` 解析出「要暫停
+的 scope」＝該 scope 的父，沒有父才退回 `DEFERRABLE_SCOPE`），確保暫停語意不因走子
+scope 而失效。
+
 覆蓋範圍（誠實標註）：只有 filet-api 這個進程。follower 引擎與三個每日 timer 各自是
 獨立進程、不經本模組；全域上限取 900 而非 1200 就是給它們留的餘量。
 
@@ -130,9 +143,13 @@ class WeightLimiter:
 
     def __init__(self, *, global_cap: int = DEFAULT_GLOBAL_CAP,
                  scope_caps: dict[str, int] | None = None,
+                 scope_parents: dict[str, str] | None = None,
                  now_fn=time.monotonic, sleep_fn=time.sleep, rng=random.random):
         self._global_cap = global_cap
         self._scope_caps = dict(DEFAULT_SCOPE_CAPS if scope_caps is None else scope_caps)
+        # Task 7.4a：子 scope → 父 scope 對映（例如 explore_base/explore_fills → explore）。
+        # 空 dict＝沒有父子關係，行為與改動前完全一致。
+        self._scope_parents: dict[str, str] = dict(scope_parents or {})
         self._now, self._sleep, self._rng = now_fn, sleep_fn, rng
         self._lock = threading.Lock()
         # 項目改為可變 `[ts, weight, scope]`（原為 tuple）：`settle()` 需要在
@@ -157,7 +174,13 @@ class WeightLimiter:
             self._log.popleft()
 
     def _used(self, scope: str | None = None) -> int:
-        return sum(w for _, w, s in self._log if scope is None or s == scope)
+        """`scope is None` → 全部帳目（全域用量）。否則含**自己＋子 scope**的帳目
+        （Task 7.4a）：一筆記在 `explore_base` 的預留，查 `_used("explore")` 時
+        要算進去——父 cap 與全域 cap 檢查都靠這個「自己或父」判準同源同基準。"""
+        if scope is None:
+            return sum(w for _, w, _ in self._log)
+        return sum(w for _, w, s in self._log
+                   if s == scope or self._scope_parents.get(s) == scope)
 
     # ---- 公開 ----
     def try_reserve(self, weight: int, scope: str) -> list | None:
@@ -168,12 +191,26 @@ class WeightLimiter:
         with self._lock:
             now = self._now()
             self._prune(now)
+            parent = self._scope_parents.get(scope)
+            # (1) 暫停：自身或父暫停中都拒（Task 7.4a：子 scope 不得繞過父的 429 暫停）。
             until = self._paused_until.get(scope, 0.0)
             if until > now:
                 raise ScopePaused(scope, until)
+            if parent is not None:
+                parent_until = self._paused_until.get(parent, 0.0)
+                if parent_until > now:
+                    raise ScopePaused(scope, parent_until)
+            # (2) 全域。
             if self._used() + weight > self._global_cap:
                 self._counters["denied_global"] += 1
                 return None
+            # (3) 父 cap（若有父且父有設 cap）：子 cap 是父 cap 內的保留切片，
+            # 父帳滿了子照樣被拒——即使子自己的 cap 還有餘量。
+            if parent is not None and parent in self._scope_caps:
+                if self._used(parent) + weight > self._scope_caps[parent]:
+                    self._counters["denied_scope"] += 1
+                    return None
+            # (4) 自身 cap。
             cap = self._scope_caps.get(scope)
             if cap is not None and self._used(scope) + weight > cap:
                 self._counters["denied_scope"] += 1
@@ -183,6 +220,29 @@ class WeightLimiter:
             self._counters["reservations"] += 1
             self._counters["reserved_weight"] += weight
             return token
+
+    def available(self, scope: str) -> int:
+        """目前這個 scope 還能預留多少權重（Task 7.4a，供 scheduler 判斷「fills
+        有沒有一頁 120 的額度」用，不消耗額度）。三個上限（自身／父／全域）取
+        同源同基準的最小值：`min(global_cap - _used(None), cap_scope - _used(scope)
+        [若有自身 cap], cap_parent - _used(parent) [若有父且父有 cap])`，夾在
+        `[0, +inf)`（永不回負數）。暫停中（自身或父）視為 0——暫停期間 `try_reserve`
+        會直接拋 `ScopePaused`，`available` 若回報非 0 會誤導呼叫端以為可以領工。"""
+        with self._lock:
+            now = self._now()
+            self._prune(now)
+            if self._paused_until.get(scope, 0.0) > now:
+                return 0
+            parent = self._scope_parents.get(scope)
+            if parent is not None and self._paused_until.get(parent, 0.0) > now:
+                return 0
+            avail = self._global_cap - self._used()
+            cap = self._scope_caps.get(scope)
+            if cap is not None:
+                avail = min(avail, cap - self._used(scope))
+            if parent is not None and parent in self._scope_caps:
+                avail = min(avail, self._scope_caps[parent] - self._used(parent))
+            return max(0, avail)
 
     def reserve(self, weight: int, scope: str, *, wait_s: float = 0.0) -> list:
         """取得額度（回傳 token，見 `try_reserve`）或拋 BudgetExhausted；最多等
@@ -238,10 +298,14 @@ class WeightLimiter:
             token[1] = actual_weight
 
     def note_429(self, scope: str, retry_after_s: float | None = None) -> None:
-        """任一 scope 的 429 → 暫停 explore。
+        """任一 scope 的 429 → 暫停「該 scope 要暫停的目標」：有父就暫停父
+        （Task 7.4a：`explore_base`／`explore_fills` 的 429 都要暫停 `explore`，
+        子 scope 不能自己扛一個獨立的暫停時鐘，否則另一個子 scope 會誤以為安全
+        而繼續打，繞過父的退避），沒有父就退回舊行為 `DEFERRABLE_SCOPE`
+        （`interactive`／`explore` 本身皆無父對映，維持改動前語意不變）。
 
         2026-09-20 reviewer 修正：
-        - 暫停已在生效中（`now < paused_until[explore]`）視為同一次違規的
+        - 暫停已在生效中（`now < paused_until[target]`）視為同一次違規的
           延續，不升級 `_consecutive_429`，只把 `paused_until` 延到
           `max(既有, now + max(PAUSE_MIN_S, retry_after_s or 0) + jitter)`——
           重複收到同一輪的 429 不該讓退避指數暴衝。
@@ -254,26 +318,31 @@ class WeightLimiter:
         """
         with self._lock:
             now = self._now()
+            target = self._scope_parents.get(scope, DEFERRABLE_SCOPE)
             self._counters["rate_limited"] += 1
             jitter = self._rng() * PAUSE_JITTER_MAX_S
-            current_until = self._paused_until.get(DEFERRABLE_SCOPE, 0.0)
+            current_until = self._paused_until.get(target, 0.0)
             retry_after = float(retry_after_s or 0.0)
             if now < current_until:
                 base = max(PAUSE_MIN_S, retry_after)
-                self._paused_until[DEFERRABLE_SCOPE] = max(current_until, now + base + jitter)
+                self._paused_until[target] = max(current_until, now + base + jitter)
                 return
-            self._consecutive_429[DEFERRABLE_SCOPE] += 1
-            n = self._consecutive_429[DEFERRABLE_SCOPE]
+            self._consecutive_429[target] += 1
+            n = self._consecutive_429[target]
             pause = max(retry_after, min(PAUSE_MIN_S * (2 ** (n - 1)), PAUSE_MAX_S)) + jitter
-            self._paused_until[DEFERRABLE_SCOPE] = max(current_until, now + pause)
+            self._paused_until[target] = max(current_until, now + pause)
 
     def note_ok(self, scope: str) -> None:
         """2026-09-20 opus 複審 W2（撤回 1.5-A4）：只有 `explore` 自己成功才歸零
         `explore` 的連續 429 計數。`interactive` 的低權重（通常 2/20）成功不證明
         `explore` 的 120 權重請求也能過——若任何 scope 成功都歸零，升級階梯永遠
         到不了第二級（`interactive` 幾乎每次都成功），撤銷／重試節奏形同虛設。
-        升級要靠 `explore` 自己的 429 累積、也要靠 `explore` 自己的成功歸零。"""
-        if scope != DEFERRABLE_SCOPE:
+        升級要靠 `explore` 自己的 429 累積、也要靠 `explore` 自己的成功歸零。
+
+        Task 7.4a：子 scope（`explore_base`／`explore_fills`）成功一樣歸零父
+        `explore` 的計數——子的成功就是父的成功，同一本帳沒有理由分兩套。"""
+        resolved = self._scope_parents.get(scope, scope)
+        if resolved != DEFERRABLE_SCOPE:
             return
         with self._lock:
             self._consecutive_429[DEFERRABLE_SCOPE] = 0
@@ -290,9 +359,16 @@ class WeightLimiter:
             used: Counter[str] = Counter()
             for _, w, s in self._log:
                 used[s] += w
+            # Task 7.4a：父 scope 的 `used` 鍵是**合計**（自己＋所有子），用 `_used`
+            # 覆寫而非疊加——第一輪迴圈已把父的直接帳目算進去，`_used(parent)`
+            # 本身就是「直接＋子」的同一份總和，覆寫等於補上子的部分、不會重複計。
+            for parent in set(self._scope_parents.values()):
+                used[parent] = self._used(parent)
             return {
                 "window_s": int(WINDOW_S), "global_cap": self._global_cap,
-                "scope_caps": dict(self._scope_caps), "used": dict(used),
+                "scope_caps": dict(self._scope_caps),
+                "scope_parents": dict(self._scope_parents),
+                "used": dict(used),
                 "paused_until": dict(self._paused_until),
                 "paused_remaining_s": {scope: max(0.0, until - now)
                                       for scope, until in self._paused_until.items()},
