@@ -1311,6 +1311,19 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 - 共享預算修復候選（不在本輪實作）：(a) 引擎改經 publicapi 同一個 `WeightLimiter`——需跨進程，走檔案鎖或 unix socket；(b) 引擎自帶同規格
   限流器並各自留餘量（現行做法，靠 900 上限的 300 餘量）；(c) 引擎讀 publicapi 的 `hl_budget` 快照做退讓。待使用者裁決。
 
+### 觀測發現 O-1（2026-09-21 19:13 UTC，主線程）：基礎資料重抓佔滿 explore 預算，fills 類別級飢餓
+
+實測 15 分鐘：state 298 次（596 權重）、ledger 100（2,000）、portfolio 85（1,700）＝約 286／分鐘，貼著 300 上限；
+fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfolio 到期積壓 52／63 持續不歸零。原因：spec §6 估 240／分鐘用的是
+名目週期，實際 jitter −10%＋15 分鐘 state 讓穩態約 280／分鐘，剩餘 <20／分鐘塞不進一頁 fills 的 120 預留；優先級 0/1 永遠先於 2/3。
+**結論：現行參數下 fills 在 24 小時內不會推進**，觀測期會一直看到 backfilling 293。
+
+候選修法（Task 7.4，待使用者裁決，觀測期內不動）：
+(a) 週期放寬：state 900→1800s、portfolio／ledger 3600→7200s → 基礎約 20＋50＋50＝120／分鐘，留 ~180 給 fills（~1.5 頁／分鐘）。
+(b) 公平配額：scheduler 每 N 個 job 至少領一個 fills（或 fills 到期超過 T 分鐘即臨時提升優先級），避免類別級飢餓。
+(c) 提高 explore 預算——使用者已裁決不做。
+建議 (a)＋(b) 併行；(a) 是參數、(b) 是行為，都需部署。
+
 ## P5 驗收與啟用準備（任務卡）
 
 - Task 5.1 @sdd：`deploy/RUNBOOK.md` 新節「Explore 背景刷新」：env（`FILET_HL_GLOBAL_WEIGHT_CAP`、`FILET_HL_EXPLORE_WEIGHT_CAP`、`FILET_EXPLORE_DB`、`EXPLORE_UPSTREAM_REFRESH`）、drop-in 檔名、觀察 `/api/ops/health.hl_budget`／`.explore_refresh`、停用刷新（設 `EXPLORE_UPSTREAM_REFRESH=0` 重啟，快照續讀）、回退（不重新啟用舊 rebuild；程式已刪）。`deploy/filet-api.service.d/explore-refresh.conf` 範本；`var/lib/filet-api/explore.db` 權限 `filet-api` 0600。
