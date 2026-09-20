@@ -1132,4 +1132,5 @@ class ExplorePublisher:
 | 2.3 | 2026-09-20 | aa8a292 | 140 passed（config＋ops）；`FILET_EXPLORE_DB` 可選（P3 起必填）；run_api 注入；health `explore_store` |
 | 2.2 | 2026-09-20 | d57365b＋7add2b8 | 17 passed；零 `unknown`、cursor 零 `+1`；增量輪 `fills_in_window` 重置（主線程驗收時抓到、已修） |
 | 3.2 | 2026-09-20 | 77ebea2 | `pytest tests/test_hl_fills_page.py` 6 passed；body 與分頁器第一頁相同；經 limiter 預留 120 結算 23 |
+| 3.3 | 2026-09-20 | 97a8e92 | 110 passed（traders＋explore）；`TraderData` dataclass；池內零上游、stale 入列去重、準入上限；回應加 source／refreshing／as_of／fills_coverage |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
