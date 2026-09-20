@@ -123,6 +123,8 @@ class ExploreScheduler:
         self._last_tick_at: float | None = None
         self._last_result: str | None = None
         self._results: dict[str, int] = {}
+        self._last_candidates_ok_at: float | None = None
+        self._candidates_empty_streak = 0
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -172,6 +174,8 @@ class ExploreScheduler:
             "results": dict(self._results),
             "queue_depth": stats["refresh_job"],
             "oldest_due_age_s": None if oldest is None else max(0.0, now - oldest),
+            "last_candidates_ok_at": self._last_candidates_ok_at,
+            "candidates_empty_streak": self._candidates_empty_streak,
         }
 
     # ---- 內部：一次 tick ----
@@ -241,7 +245,12 @@ class ExploreScheduler:
             # Task 3.6 B(1)（Critical C1 修法）：候選來源整批回空（上游壞掉、
             # payload 格式跑掉、被排除清單濾光……）不能當成「所有人退池」——
             # 不呼叫 upsert_candidates／deactivate_missing，保留既有候選池，
-            # 60 秒後重試。
+            # 60 秒後重試。Task 3.7 B（W1 修法）：長期回空之前無外部證據——
+            # 記警告與 streak，供 `status()` 揭露。
+            self._candidates_empty_streak += 1
+            logger.warning(
+                "explore scheduler: 候選來源回空 rows（streak=%d），60s 後重試；"
+                "候選池維持不動", self._candidates_empty_streak)
             self._reschedule(job, now + 60, err="empty candidate rows", bump_attempts=False)
             return "retry"
         roi_by_addr = _roi_lookup(payload, excluded)
@@ -252,6 +261,8 @@ class ExploreScheduler:
             seen.add(address.lower())
             upsert_rows.append((address, display_name, rank, roi_by_addr.get(address.lower())))
         self._store.upsert_candidates(upsert_rows, now)
+        self._candidates_empty_streak = 0
+        self._last_candidates_ok_at = now
         dropped = self._store.deactivate_missing(seen)
         for addr in dropped:
             self._store.delete_jobs(addr)

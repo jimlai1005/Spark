@@ -407,6 +407,18 @@ def test_count_with_payload_only_counts_active_candidates_with_non_null_payload(
     assert store.count_with_payload("portfolio") == 0
 
 
+def test_count_with_payload_only_counts_default_params_fp(tmp_path):
+    """Task 3.7 C（W2 修法）：`count_with_payload` 與 `compose_rows`（走
+    `store.get_cache(addr, endpoint)`，預設 `params_fp=""`）要讀同一個基礎
+    （工程原則 #1）——只有非預設 `params_fp` 的 payload 不能計入，否則輸入端
+    看起來已覆蓋、compose 卻讀不到。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.1)], as_of=c.now())
+    store.put_cache_ok("0xaaa", "portfolio", {"x": 1}, fetched_at=c.now(), refresh_after=c.now(),
+                       params_fp="x")
+    assert store.count_with_payload("portfolio") == 0
+
+
 def test_count_with_payload_distinct_address_not_per_params_fp(tmp_path):
     """Task 3.6 C（S4 修法）：同一地址在 `endpoint_cache` 有兩個不同 `params_fp`
     的列（例如多 dex）只算一次候選，不是每個 `params_fp` 各算一筆。"""

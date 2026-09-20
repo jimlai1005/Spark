@@ -33,6 +33,22 @@ from spark.publicapi.hl_explore import (FILLS_WINDOW_DAYS, ExploreConfig, Explor
 logger = logging.getLogger(__name__)
 
 
+def _gate_reason(with_pf: int, n: int, rows: list | None, *, ratio: float) -> str | None:
+    """發布門檻共用判斷式（Task 3.7 A，C 修法：門檻量的是輸入 `with_pf`／`n`，
+    換版看的是 `compose_rows` 輸出 `rows`，兩者不同源會漏掉「輸入端看似齊全、
+    compose 卻整批丟列」的情況——HL portfolio 結構一變、`enrich_candidate`
+    整列丟棄就是這個形狀）。`with_pf == 0` 或 `with_pf < ratio * max(n, 1)`
+    （`n == 0` 時 `with_pf` 必為 0，已被前一條擋下，`max(n, 1)` 只是避免除以
+    零）視為門檻不通過；`rows` 非 `None` 時空列表也視為不通過——這一項只在
+    compose 輸出側才有意義，輸入端預檢當下 compose 還沒跑，傳 `rows=None`
+    跳過。回傳 `None` 代表通過門檻。"""
+    if with_pf == 0 or with_pf < ratio * max(n, 1):
+        return f"{with_pf}/{n}"
+    if rows is not None and not rows:
+        return f"{with_pf}/{n}"
+    return None
+
+
 def compose_rows(store: ExploreStore, *, now: float, cfg: ExploreConfig,
                  fills_window_days: int = FILLS_WINDOW_DAYS) -> tuple[list[ExploreRow], dict]:
     """純函式：`store` 目前的資料 → `(rows, meta)`。零網路——只讀
@@ -136,22 +152,30 @@ class ExplorePublisher:
         成功或失敗都算）不足 `min_interval_s` 且非強制 → `False`（節流，spec §9.2：
         每分鐘至多一次）。
 
-        C2 修法（Task 3.6 A 再修正）：compose 之前先檢查發布門檻——`with_pf =
-        store.count_with_payload("portfolio")`、`n = admission_counts()[1]`；只要
-        `ExploreIndex` **已經有版本**（`index.status()["rows"] is not None`——從未有
-        版本例外，首次上線本來就要接受不完整資料）且 `n == 0` 或 `with_pf == 0` 或
-        `with_pf < min_portfolio_ratio * n`，代表本輪資料還太不完整或候選來源整批
-        回空（例如上游壞掉、300 候選全被停用——`n == 0` 這個形狀原本會被舊公式
-        `with_pf < ratio * n` 誤判放行，因為 `0 < ratio * 0` 恆為 False），不換版、
-        不覆寫既有快照，只記 `_gate_skips`／`_last_gate`／`_last_attempt_at`，回
-        `False`（`_dirty` 保留，下次 tick 會重試）。`force=True` 完全繞過本段門檻
-        （仍會更新 `_last_attempt_at`），供人工強制換版使用。
+        Task 3.7 A（opus 第三輪 Critical 修法）：門檻**改判 compose 輸出**，不再只信
+        輸入端的 payload 計數——`with_pf`／`n` 量的是「store 裡有多少候選有 payload」，
+        但換版真正端出去的是 `compose_rows` 的 `rows`／`meta`；HL portfolio 結構一變，
+        `enrich_candidate` 可能整列丟棄，導致輸入端看起來齊全（`with_pf/n` 過門檻）
+        但 compose 出來是空列表——這種形狀舊版會誤放行、把 0 列覆寫上 index 與快照。
+        兩道門檻（`_gate_reason`）：
+        1. **輸入端預檢**（`rows=None`，只當省算 compose 的捷徑，不是正確性依據）：
+           `ExploreIndex` **已經有版本**時，`with_pf = store.count_with_payload("portfolio")`
+           與 `n = admission_counts()[1]` 未過門檻 → 直接跳過 compose，記
+           `_gate_skips`／`last_gate=f"in:{reason}"`，回 `False`。
+        2. **輸出端門檻**（compose 之後、換版之前）：用 `meta["with_portfolio"]`／
+           `meta["candidates"]`／`rows` 本身（空列表視為不過）再判一次；未過 →
+           `last_gate=f"out:{reason}"`，不寫快照、不呼叫 `set_published`，回 `False`。
+        `force=True` 完全繞過兩道門檻（仍會更新 `_last_attempt_at`），供人工強制換版
+        使用。首次上線（`index.status()["rows"] is None`）兩道門檻都不套用。
 
-        通過門檻才 `compose_rows` → （若快照是 v3 來源且尚未備份）備份一份 `.v3.bak`
-        → `ExploreIndex.set_published` → （有設 `snapshot_path` 才）`dump_snapshot`；
-        任一步例外 → 記錄失敗次數與訊息、**不清 `_dirty`**（下次 tick 會重試）、保留
-        `ExploreIndex` 目前版本（不呼叫 `set_published`），回 `False`。成功 → 清
-        `_dirty`、更新 `_last_published_at`、`_publishes+=1`、回 `True`。"""
+        通過門檻才 → （若快照是 v3 來源且尚未備份）備份一份 `.v3.bak`；每次即將覆寫
+        快照前，若磁碟上已有一份 → 備份 `.prev`（Task 3.7 A：`.v3.bak` 只保護第一次
+        v3→v4 轉換，`.prev` 保護「每一次」換版——2026-09-19 事故的教訓是換版當下若
+        出問題無法回退）→ `ExploreIndex.set_published` → （有設 `snapshot_path` 才）
+        `dump_snapshot`；任一步例外 → 記錄失敗次數與訊息、**不清 `_dirty`**（下次
+        tick 會重試）、保留 `ExploreIndex` 目前版本（不呼叫 `set_published`），回
+        `False`。成功 → 清 `_dirty`、更新 `_last_published_at`、`_publishes+=1`、回
+        `True`。"""
         if not self._dirty and not force:
             return False
         now = self._now_fn()
@@ -159,19 +183,31 @@ class ExplorePublisher:
                 and now - self._last_attempt_at < self._min_interval_s):
             return False
         try:
-            with_pf = self._store.count_with_payload("portfolio")
-            _, n = self._store.admission_counts()
             has_version = self._index.status()["rows"] is not None
-            gate_blocked = has_version and (
-                n == 0 or with_pf == 0 or with_pf < self._min_portfolio_ratio * n)
-            if gate_blocked and not force:
-                self._gate_skips += 1
-                self._last_gate = f"{with_pf}/{n}"
-                self._last_attempt_at = now
-                return False
+            if has_version and not force:
+                with_pf = self._store.count_with_payload("portfolio")
+                _, n = self._store.admission_counts()
+                reason = _gate_reason(with_pf, n, None, ratio=self._min_portfolio_ratio)
+                if reason is not None:
+                    self._gate_skips += 1
+                    self._last_gate = f"in:{reason}"
+                    self._last_attempt_at = now
+                    return False
+
             rows, meta = compose_rows(self._store, now=now, cfg=self._cfg)
+
+            if has_version and not force:
+                reason = _gate_reason(meta["with_portfolio"], meta["candidates"], rows,
+                                      ratio=self._min_portfolio_ratio)
+                if reason is not None:
+                    self._gate_skips += 1
+                    self._last_gate = f"out:{reason}"
+                    self._last_attempt_at = now
+                    return False
+
             if self._snapshot_path is not None:
                 self._backup_v3_snapshot_once()
+                self._backup_prev_snapshot()
                 dump_snapshot(self._snapshot_path, rows=rows, built_at=meta["published_at"],
                              total_scanned=meta["candidates"])
             self._index.set_published(rows, meta)
@@ -205,6 +241,19 @@ class ExplorePublisher:
             return
         if isinstance(payload, dict) and payload.get("version") == 3:
             shutil.copyfile(p, bak)
+
+    def _backup_prev_snapshot(self) -> None:
+        """Task 3.7 A：每一次即將以新版覆寫快照前（不限第一次），若磁碟上已有
+        一份 → `shutil.copyfile` 成 `<path>.prev`（best effort，讀寫失敗只記
+        warning，不阻擋本次發布——快照備份是額外保險，不是發布正確性的一部分，
+        與 `_backup_v3_snapshot_once` 同一取捨）。"""
+        p = Path(self._snapshot_path)
+        if not p.exists():
+            return
+        try:
+            shutil.copyfile(p, str(p) + ".prev")
+        except OSError as e:
+            logger.warning("explore publisher：快照 .prev 備份失敗（不影響發布）: %r", e)
 
     def status(self) -> dict:
         """`/api/ops/health` 揭露用（Task 3.4／5.1；`gate_skips`／`last_gate`／

@@ -264,6 +264,31 @@ def test_end_to_end_three_full_pages_then_short_page_completes():
     assert r4.state.observed_to_ms == 6
 
 
+def test_apply_page_hits_page_cap_on_20th_consecutive_full_page():
+    """Task 3.7 D（S1 修法）：單輪續頁加硬上限（預設 20 頁＝40,000 筆 >
+    留存上限 10,000，正常資料到不了）——連續 20 個滿頁後，第 20 頁改判
+    `partial`／`reason="page_cap"`／`synced_through=cursor`／`done=True`，
+    不再無界續頁。"""
+    small_state = dataclasses.replace(
+        _backfilling_state(window_end_ms=10_000), cursor_ms=0)
+    plan = PagePlan(start_ms=0, end_ms=10_000, state=small_state)
+    cursor = 0
+    result = None
+    for i in range(20):
+        page = [_fill(cursor + 1, 2 * i + 1), _fill(cursor + 2, 2 * i + 2)]
+        result = apply_page(plan, page, page_limit=2, retention_limit=10_000, now_ms=1000)
+        if result.done:
+            break
+        cursor = result.state.cursor_ms
+        plan = PagePlan(start_ms=cursor, end_ms=10_000, state=result.state)
+
+    assert result.done is True
+    assert result.state.completeness == "partial"
+    assert result.state.reason == "page_cap"
+    assert result.state.pages_done == 20
+    assert result.state.synced_through_ms == result.state.cursor_ms
+
+
 def test_integration_with_store_replaying_page_is_idempotent(tmp_path):
     store = ExploreStore(tmp_path / "x.db")
     plan = plan_page(None, address=ADDR, now_ms=1000)

@@ -590,6 +590,35 @@ def test_run_candidates_empty_rows_keeps_existing_pool_active(tmp_path):
     assert store.stats()["refresh_job"] == jobs_before
 
 
+def test_run_candidates_empty_rows_tracks_streak_and_resets_on_success(tmp_path):
+    """Task 3.7 B（W1 修法）：候選來源長期回空 rows 之前無外部證據——
+    連續空 rows 要能從 `status()` 讀到 `candidates_empty_streak` 遞增、
+    `last_candidates_ok_at` 維持 `None`；成功一次後歸零並記錄時間。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    empty_payload = {"leaderboardRows": []}
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: empty_payload,
+                  clock=clock, cfg=ExploreConfig(candidate_pool=300))
+    sched._bootstrapped = True
+    store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+
+    for _ in range(3):
+        assert sched.tick() == "retry"
+        store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+
+    status = sched.status()
+    assert status["candidates_empty_streak"] == 3
+    assert status["last_candidates_ok_at"] is None
+
+    ok_payload = _payload(["0xAAA0000000000000000000000000000000AAA1"])
+    sched._leaderboard_source_fn = lambda: ok_payload
+    assert sched.tick() == "ran:candidates"
+
+    status = sched.status()
+    assert status["candidates_empty_streak"] == 0
+    assert status["last_candidates_ok_at"] == clock.now()
+
+
 def test_fills_non_candidate_continues_paging_until_done_then_dropped(tmp_path):
     """B(2)（W1 修法）：非候選地址（例如詳情頁按需入列，未 `upsert_candidates`）
     的多頁 fills 不因中途檢查 `is_active` 而提早被判 `dropped`——只有整輪

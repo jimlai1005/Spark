@@ -251,7 +251,8 @@ def test_maybe_publish_blocked_when_below_portfolio_ratio_threshold(tmp_path):
     index／快照都不變。（Task 3.6 A：`force` 改為連這個比例門檻也一併繞過，
     這裡改用可變 clock 越過 `min_interval_s` 節流，不再借用 `force=True` 來
     測試節流——`force=True` 的比例門檻繞過另見
-    `test_maybe_publish_force_bypasses_ratio_gate`。）"""
+    `test_maybe_publish_force_bypasses_ratio_gate`。Task 3.7 A：輸入端預檢命中
+    時 `last_gate` 前綴為 `in:`——compose 根本沒被呼叫到。）"""
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
     portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
@@ -273,7 +274,7 @@ def test_maybe_publish_blocked_when_below_portfolio_ratio_threshold(tmp_path):
     pub.mark_dirty()
     assert pub.maybe_publish() is False
     assert pub.status()["gate_skips"] == 1
-    assert pub.status()["last_gate"] == "1/10"
+    assert pub.status()["last_gate"] == "in:1/10"
     assert index.query() == first
 
 
@@ -330,7 +331,7 @@ def test_maybe_publish_blocked_when_with_pf_is_zero(tmp_path):
     pub.mark_dirty()
     assert pub.maybe_publish() is False
     assert pub.status()["gate_skips"] == 1
-    assert pub.status()["last_gate"] == "0/1"
+    assert pub.status()["last_gate"] == "in:0/1"
 
 
 def test_maybe_publish_no_gate_when_index_never_published(tmp_path):
@@ -424,6 +425,88 @@ def test_v3_snapshot_backed_up_once_before_first_v4_overwrite(tmp_path):
     pub.mark_dirty()
     assert pub.maybe_publish(force=True) is True
     assert bak_path.stat().st_mtime_ns == bak_mtime
+
+
+# ============================================================
+# Task 3.7 A/E：門檻改判 compose 輸出（不再只看輸入端 payload 數）
+# ============================================================
+
+def test_maybe_publish_blocked_when_compose_output_is_empty(tmp_path, monkeypatch):
+    """Critical 修法：輸入端 `with_pf/n = 10/10` 全數通過預檢，但
+    `compose_rows` 實際輸出 0 列（HL portfolio 結構一變、`enrich_candidate`
+    整列丟棄）→ 換版前的輸出側門檻要擋下，不寫快照、不換版，`last_gate` 以
+    `out:` 開頭。"""
+    from spark.publicapi import explore_publisher as ep
+
+    store = ExploreStore(tmp_path / "explore.db")
+    for i in range(10):
+        addr = "0x" + f"{i:02d}" * 20
+        store.upsert_candidates([(addr, f"trader{i}", i + 1, 0.0)], as_of=1000.0)
+        portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+        store.put_cache_ok(addr, "portfolio", portfolio_raw, fetched_at=900.0,
+                           refresh_after=2000.0)
+    index = _dummy_index()
+    index.set_published([], {"published_at": 1.0, "candidates": 1, "with_portfolio": 1})
+    snap_path = tmp_path / "snap.json"
+    pub = ep.ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                              snapshot_path=str(snap_path))
+
+    monkeypatch.setattr(ep, "compose_rows", lambda *a, **kw: (
+        [], {"published_at": 1000.0, "candidates": 10, "with_portfolio": 0}))
+
+    pub.mark_dirty()
+    assert pub.maybe_publish() is False
+    assert pub.status()["gate_skips"] == 1
+    assert pub.status()["last_gate"].startswith("out:")
+    assert pub.status()["last_gate"] == "out:0/10"
+    assert not snap_path.exists()
+
+
+def test_maybe_publish_passes_when_compose_output_normal_and_prev_backed_up(tmp_path):
+    """有版本且 compose 正常輸出 → 正常換版；每次覆寫快照前保留 `.prev`，
+    內容＝前一版。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    snap_path = tmp_path / "snap.json"
+    index = ExploreIndex(cfg=_cfg(), now_fn=lambda: 1000.0, snapshot_path=str(snap_path))
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=str(snap_path))
+
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+    first_content = snap_path.read_text()
+    prev_path = tmp_path / "snap.json.prev"
+    assert not prev_path.exists()   # 第一次發布，磁碟上尚無舊檔可備份
+
+    store.upsert_candidates([(_B, "Bob", 2, 0.2)], as_of=1000.0)
+    store.put_cache_ok(_B, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert prev_path.exists()
+    assert prev_path.read_text() == first_content
+
+
+def test_maybe_publish_blocked_output_gate_still_bypassed_by_force(tmp_path, monkeypatch):
+    """`force=True` 仍繞過輸出側門檻。"""
+    from spark.publicapi import explore_publisher as ep
+
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    index = _dummy_index()
+    pub = ep.ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                              snapshot_path=None)
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True   # 首次發布建立版本
+
+    monkeypatch.setattr(ep, "compose_rows", lambda *a, **kw: (
+        [], {"published_at": 1000.0, "candidates": 1, "with_portfolio": 0}))
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert index.query()["rows"] == []
 
 
 def test_publish_snapshot_write_leaves_no_leftover_tmp_file(tmp_path):

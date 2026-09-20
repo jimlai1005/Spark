@@ -241,12 +241,16 @@ class ExploreStore:
         （`ExplorePublisher` 的發布門檻用，Task 3.5 C）。`COUNT(DISTINCT
         e.address)`（Task 3.6 C，S4 修法）——同一地址可能有多個 `params_fp`
         （目前皆為 `''`，未來多 dex／參數指紋擴充時）的列，只算一次候選，
-        不是每個 `params_fp` 各算一筆。"""
+        不是每個 `params_fp` 各算一筆。`AND e.params_fp = ''`（Task 3.7 C，W2
+        修法）：與 `compose_rows` 實際讀的基礎（`store.get_cache(addr, endpoint)`
+        預設 `params_fp=""`）對齊（工程原則 #1）——否則輸入端門檻可能因為
+        非預設 `params_fp` 的 payload 而誤判已覆蓋，但 compose 讀的是另一個
+        基礎，讀不到任何東西。"""
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT COUNT(DISTINCT e.address) FROM endpoint_cache e JOIN candidate c "
                 "USING(address) WHERE e.endpoint=? AND e.payload IS NOT NULL "
-                "AND c.active=1", (endpoint,)).fetchone()
+                "AND e.params_fp = '' AND c.active=1", (endpoint,)).fetchone()
         return row[0]
 
     # --- endpoint_cache ---

@@ -21,6 +21,11 @@
 PRIMARY KEY，本模組不做去重判斷。同毫秒佔滿整頁（`same_ms_overflow`）與理論上不可能
 發生的「滿頁但游標未推進」（`no_progress`，防禦用）都视为無法繼續往前分頁，
 標記 `partial` 並終止本輪，避免無界重試同一頁。
+
+單輪續頁另設硬上限 `max_pages_per_round`（預設 20，Task 3.7 D，S1 修法）：
+20 頁＝40,000 筆已超過留存上限 `RETENTION_LIMIT`（10,000），正常資料到不了
+這個頁數，達到即代表卡在異常續頁——終止本輪並標記 `partial`／
+`reason="page_cap"`，避免無界重試。
 """
 from __future__ import annotations
 
@@ -143,7 +148,8 @@ def _validate_page(page: list[dict], start_ms: int, end_ms: int) -> str | None:
 
 
 def apply_page(plan: PagePlan, page: list[dict], *, page_limit: int = PAGE_LIMIT,
-               retention_limit: int = RETENTION_LIMIT, now_ms: int) -> PageResult:
+               retention_limit: int = RETENTION_LIMIT, max_pages_per_round: int = 20,
+               now_ms: int) -> PageResult:
     """套用一頁 HL 回應，算出新狀態與是否結束本輪。呼叫端負責把 `plan.start_ms`／
     `plan.end_ms` 當成這次 `userFillsByTime` 的 `startTime`／`endTime`。"""
     state = plan.state
@@ -199,9 +205,22 @@ def apply_page(plan: PagePlan, page: list[dict], *, page_limit: int = PAGE_LIMIT
         )
         return PageResult(state=new_state, accepted=list(page), done=True, note="no_progress")
 
+    new_pages_done = state.pages_done + 1
+    if new_pages_done >= max_pages_per_round:
+        # Task 3.7 D（S1 修法）：單輪續頁硬上限——20 頁＝40,000 筆遠超留存上限
+        # 10,000，正常資料到不了這個頁數；到頂代表卡在異常續頁（例如上游回應
+        # 有問題但每頁都恰好滿頁推進），終止本輪並標記 partial，避免無界重試。
+        new_state = dataclasses.replace(
+            state, cursor_ms=new_cursor, synced_through_ms=new_cursor,
+            observed_from_ms=observed_from, observed_to_ms=observed_to,
+            completeness="partial", reason="page_cap", fills_in_window=fills_in_window,
+            pages_done=new_pages_done, last_error=None, updated_at=now_ms / 1000,
+        )
+        return PageResult(state=new_state, accepted=list(page), done=True, note="page_cap")
+
     new_state = dataclasses.replace(
         state, cursor_ms=new_cursor, observed_from_ms=observed_from,
         observed_to_ms=observed_to, fills_in_window=fills_in_window,
-        pages_done=state.pages_done + 1, last_error=None, updated_at=now_ms / 1000,
+        pages_done=new_pages_done, last_error=None, updated_at=now_ms / 1000,
     )
     return PageResult(state=new_state, accepted=list(page), done=False, note=None)
