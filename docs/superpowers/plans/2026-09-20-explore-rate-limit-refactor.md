@@ -1324,6 +1324,32 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 (c) 提高 explore 預算——使用者已裁決不做。
 建議 (a)＋(b) 併行；(a) 是參數、(b) 是行為，都需部署。
 
+### Task 7.4（2026-09-21 使用者裁決：立即做，部署後觀測期重新起算；預算維持 300）
+
+**原因修正**：已證實的機制是「嚴格優先級＋沒有為大請求（fills 一頁 120）保留額度」；286／分鐘可能含清理積壓、jitter 不必然拉高長期均值，不當成穩態結論。
+
+**設計**：
+- 限流器父子 scope：`explore`（父，cap 300）、`explore_base`（子，cap 180）、`explore_fills`（子，cap 120）。子 scope 的預留同時計入父與全域；父 scope 暫停（429）時子 scope 一併暫停。有 fills 待處理時基礎類別走 `explore_base`（≤180）、fills 走 `explore_fills`（保證 120＝每分鐘至少一頁）；無 fills 待處理時基礎類別走父 scope `explore`（可用到 300）。
+- 週期：state 900→1800s、portfolio／ledger 3600→7200s（各欄位 `as_of`／`fetched_at` 保持真實時間）。
+- 重排既有 overdue：scheduler 啟動後第一個 tick 對基礎類別 job 中 `next_attempt_at < now − period` 者重設為 `now + spread(addr, period)`（把積壓攤平到一個週期內，避免改週期後仍先被舊積壓占滿）；job key 為 (address, kind) 主鍵，結構上無重複。
+- 類別感知的領工：tick 先看 `store.due_count("fills") > 0` 且 `limiter.available("explore_fills") >= 120` → 只從 fills 領；否則從基礎類別領（fills 不領）。fills 類別內：每地址一頁後 `reschedule(next=now)` 回到 FIFO 尾端；領工排序加等待時間加權（`priority − min(3, floor(wait_s/600))`，等 10 分鐘升一級），避免 hot 地址持續占用保留額度。無法補齊者已由 fills_sync 標 partial/reason，不重試同頁。
+
+#### Task 7.4a @inline：限流器父子 scope＋`available()`
+**Files:** `src/spark/publicapi/hl_budget.py`、`tests/test_hl_budget.py`。
+- `WeightLimiter(..., scope_parents: dict[str, str] | None = None)`；`_used(scope)` 含子 scope 的項目（項目記錄自己的 scope，查父時把 `scope_parents[s] == parent` 的也算）；`try_reserve` 依序檢查：暫停（自身或父）、全域、父 cap（若有）、自身 cap。`available(scope) -> int` ＝ min(自身餘量, 父餘量, 全域餘量)。`note_429(scope)` 對子 scope 的 429 一律暫停父 `explore`（子自動跟著）。`snapshot()` 的 `used` 含子 scope 各自數字與父的合計。
+- 測試：子預留計入父與全域；父滿時子被拒；子滿時另一子仍可（父未滿）；父暫停子拋 `ScopePaused`；`available` 三者取最小；並發不超父 cap。
+
+#### Task 7.4b @inline：scheduler 週期、重排、類別感知領工、等待加權
+**Files:** `src/spark/publicapi/explore_scheduler.py`、`src/spark/publicapi/explore_store.py`；`tests/test_explore_scheduler.py`、`tests/test_explore_store.py`。
+- store：`claim_due(now, owner, lease_s, *, kinds: tuple[str, ...] | None = None)`（`kinds` 限定領哪些 kind）；排序 `ORDER BY (priority - MIN(3, CAST((? - next_attempt_at)/600 AS INTEGER))) , next_attempt_at`；`due_count(kind, now) -> int`；`rebalance_overdue(kind, now, period_s, spread_fn) -> int`（只動 `next_attempt_at < now − period_s` 者）。
+- scheduler：建構子 `hl_base`／`hl_fills` 兩個 scoped gateway（`hl.scoped("explore_base")`／`hl.scoped("explore_fills")`）＋既有 `hl`（父 scope）；`state_every_s=1800`、`portfolio_every_s=7200`、`ledger_every_s=7200`；第一個 tick 先 `rebalance_overdue` 三個基礎 kind；tick 領工邏輯如「設計」；基礎 job 執行時依「fills 是否待處理」選 `hl_base` 或 `hl`；fills 用 `hl_fills`。`status()` 加 `fills_pages_total`、`last_fills_at`、`base_scope_in_use`。
+- 測試（含使用者第 4 點的飢餓重現）：300 地址、state 週期設極短讓基礎類別永遠有積壓、fake HL 正常、全域 900／explore 300／base 180／fills 120，fake clock 驅動 30 分鐘 → fills 頁數 ≥ 25（≈每分鐘一頁）、基礎類別仍持續推進（state 抓取數 > 0 且遞增）、任一 60 秒切片：explore 合計 ≤300、base ≤180（fills 待處理期間）；無 fills 待處理時基礎可用到 300；等待加權：priority 3 的 fills 等 20 分鐘後排在剛到期的 priority 2 前面；重排：啟動時 100 個 overdue state job 被攤到未來 1800s 內、不在同一秒。
+
+#### Task 7.4c @inline：接線、設定、health、RUNBOOK
+**Files:** `src/spark/publicapi/config.py`、`scripts/run_api.py`、`src/spark/publicapi/app.py`、`deploy/RUNBOOK.md` §5.8e、`deploy/filet-api.service.d/explore-refresh.conf.example`；`tests/test_publicapi_config.py`、`tests/test_api_ops.py`。
+- config：`hl_explore_base_weight_cap`（env `FILET_HL_EXPLORE_BASE_WEIGHT_CAP`，預設 180）、`hl_explore_fills_weight_cap`（`FILET_HL_EXPLORE_FILLS_WEIGHT_CAP`，預設 120）；驗證 base＋fills ≤ explore ≤ global。run_api：`WeightLimiter(global_cap, scope_caps={"explore":300,"explore_base":180,"explore_fills":120}, scope_parents={"explore_base":"explore","explore_fills":"explore"})`；scheduler 傳三個 gateway。health：`hl_budget.used` 已含子 scope；`explore_refresh` 加 `fills_pages_total`／`last_fills_at`／`base_scope_in_use`。RUNBOOK §5.8e：新 env、新週期、保留額度說明、部署後 15–30 分鐘檢查項（fills 頁數、不同地址進展、最老等待）。
+- 部署程序（主線程）：flag 0 部署→驗證→flag 1→15–30 分鐘看 `fills_pages_15m > 0`、多個不同地址推進、最老到期回落→重新起算 24h 觀測。
+
 ## P5 驗收與啟用準備（任務卡）
 
 - Task 5.1 @sdd：`deploy/RUNBOOK.md` 新節「Explore 背景刷新」：env（`FILET_HL_GLOBAL_WEIGHT_CAP`、`FILET_HL_EXPLORE_WEIGHT_CAP`、`FILET_EXPLORE_DB`、`EXPLORE_UPSTREAM_REFRESH`）、drop-in 檔名、觀察 `/api/ops/health.hl_budget`／`.explore_refresh`、停用刷新（設 `EXPLORE_UPSTREAM_REFRESH=0` 重啟，快照續讀）、回退（不重新啟用舊 rebuild；程式已刪）。`deploy/filet-api.service.d/explore-refresh.conf` 範本；`var/lib/filet-api/explore.db` 權限 `filet-api` 0600。
