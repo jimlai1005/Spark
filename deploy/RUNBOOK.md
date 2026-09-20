@@ -2187,18 +2187,34 @@ sudo ls -l /var/lib/filet-api/explore.db*
 
 **觀測（admin session，`GET /api/ops/health`）**：
 - `hl_budget`：`used.explore` 任一分鐘 ≤ 300、`counters.rate_limited` 不遞增、`paused_remaining_s.explore` 為 0。
+  `wait_ms.{scope}`（P6 Task 6.3，D15）：按 scope 的等待額度時間 p50/p95/max（毫秒，樣本數 `n`）——
+  `interactive` 的 p95 若持續偏高，代表使用者請求常常在排隊等額度。
+  `http.{scope}.{class}`（同上）：每個 scope 的 HTTP 結果計數，含 `2xx/4xx/429/5xx/timeout/conn_error/
+  budget_exhausted/scope_paused`，**每次重試各計一次**——不是「發生過幾種錯誤」而是「發生過幾次」。
+  `follower_budget_note`：`follower 引擎同主機同出口 IP、不經本限流器、獨立計數；本頁零 429 不證明引擎受保護；
+  看 journalctl -u 'filet-follower@*'`——**follower 引擎的限流關係是未結案項目**，本節與本 flag 都不改引擎程式，
+  這句話只是把「看不到的地方」講清楚，不是「已驗證安全」。
+- `dashboard_latency`（P6 Task 6.3，D15）：`/api/me/dashboard` 端點耗時 p50/p95/max（毫秒）＋樣本數 `n`；
+  `n=0` 時三個百分位皆 `null`（還沒量到，不是延遲為 0）。
 - `explore_refresh`：`enabled`、`last_tick_at` 持續前進、`last_result` 多為 `ran:*`／`idle`、`queue_depth` 由高走低、`oldest_due_age_s` 不無限成長。
-- `explore_publisher`：`last_published_at` 每分鐘級前進、`failures` 為 0；`gate_skips` 在冷啟動期間（見下）遞增屬正常——`last_gate`（例如 `"12/300"`）代表目前已有 portfolio 的候選數／active 候選數，未達 80% 門檻前 publisher 會持續 compose 但不換版、不覆寫快照（C2 修法，見 plan Task 3.5）。
-- `explore_index`：`built_at` 前進（不再是 2026-09-19T15:00）、`rows` ≈ 候選數。
+- `explore_publisher`（P6／D12 之後：**沒有發布門檻**，舊版「候選覆蓋率不足門檻就擋下換版」的判準與其對應計數器已整組刪除——
+  只要候選來源有效、組版成功就發布，即使 eligible 掉到個位數甚至 0 也正常換版，見 plan P6 契約 C）：
+  `last_published_at` 每分鐘級前進、`failures` 為 0；`source_failures` 不遞增（遞增＝候選來源整批故障，例如
+  `active_candidates()` 回空——這時 publisher 保留最後一次成功發布的舊版、不覆寫快照）；
+  `last_skip_reason` 平時為 `null`，出現值（例如 `"no_active_candidates"`）代表最近一次來源故障的原因。
+- `explore_index`：`built_at` 前進（不再是 2026-09-19T15:00）、`rows` ≈ 候選數（eligible＋pending，D13 三態）。
 - `explore_store`：各表列數；`completeness` 分佈從 backfilling 逐步轉 complete／partial。
-- 公開端點：`/api/public/explore` 的 `published_at` 前進、`initializing=false`。
+- 公開端點：`/api/public/explore` 的 `published_at` 前進、`initializing=false`；D13 之後榜單同時含
+  `eligible`（合格）與 `pending`（成交資料不足以判定，非不合格）兩組，冷啟動期間 rows 多數落在 pending 屬正常，
+  不是門檻卡住。
 - **冷啟動時間預期**：300 候選池首次全量抓齊 state(2)＋portfolio(20)＋ledger(20) 需要
   約 (2+20+20)×300 = 12,600 weight，explore 子預算 300/分鐘 → 理論下限 42 分鐘；
   **本機 10 分鐘主網實跑**（`docs/superpowers/research/2026-09-20-explore-refresh-observation.md`）
-  只抓到 39 個 portfolio／10 分鐘（state 優先、fills 分食同一預算），換算 ≥80% 候選有
-  portfolio、達到換版門檻約 **50–65 分鐘**，全部到位 60–80 分鐘；在此之前 `/api/public/explore` 持續回應
-  上一版快照（部署當下若是空 DB 冷啟，就是舊快照或 `initializing=true`），
-  `explore_publisher.gate_skips` 遞增是預期行為，不是故障。
+  只抓到 39 個 portfolio／10 分鐘（state 優先、fills 分食同一預算）。D12 之後沒有換版門檻，
+  publisher 每分鐘就會用目前已抓到的資料換版一次（大部分列先以 `pending` 出現），
+  完整輪替（多數候選轉 eligible／ineligible）預期需要 60–80 分鐘；在此之前
+  `/api/public/explore` 持續有回應（部署當下若是空 DB 冷啟，就是舊快照或 `initializing=true`），
+  `pending` 佔多數是預期行為，不是故障。
 判準（工程原則 #6）：**程序活著 ≠ 在工作**——`last_tick_at` 不動或 `built_at` 不動就是 unhealthy，不管 `systemctl` 說什麼。
 
 **停用刷新**：`EXPLORE_UPSTREAM_REFRESH=0` → daemon-reload → restart。榜單維持最後一次發布的快照（v4）。SQLite 資料保留，再開啟時 cursor 續接。
@@ -2206,7 +2222,8 @@ sudo ls -l /var/lib/filet-api/explore.db*
 **回退**：程式回退照 §9.3 以 commit 為單位；**不要**重新啟用舊的請求觸發重建（程式已刪除，D6）。`explore.db` 與 drop-in 留著無害。
 榜單資料回退：publisher 每次覆寫 `explore_index.json` 前會留 `.prev`（上一版，每分鐘輪替）與 `.daily`（每 24 小時至多輪替一次、≥24 小時前的版本（未經品質驗證）），
 首次由 v3 轉 v4 時另留 `.v3.bak`；要回到某版就把對應檔案 `install` 回原名後 restart（`EXPLORE_UPSTREAM_REFRESH=0` 時不會再被覆寫）。
-門檻擋下時 journal 有 `explore publisher：發布門檻擋下（第 N 次，in:/out:…）`（第 1 次與每 10 次各一行）。
+P6（D12）之後**沒有發布門檻**，不會有「擋下」這件事；只有候選來源整批故障（保留舊版）才會有 journal
+訊息 `explore publisher：候選來源整批回空（第 N 次），榜單維持舊版`——對應 `explore_publisher.source_failures` 遞增。
 
 ## 6. nginx + certbot
 

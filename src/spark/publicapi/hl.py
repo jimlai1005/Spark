@@ -14,7 +14,8 @@ import httpx
 from spark.config import API_URLS, EXPLORER_URLS
 from spark.exchange.base import USER_FILLS_PAGE_LIMIT, UserFill
 from spark.publicapi.hl_budget import (INTERACTIVE_SCOPE, INTERACTIVE_WAIT_S,
-                                       WeightLimiter, is_rate_limited, weight_for)
+                                       BudgetExhausted, ScopePaused, WeightLimiter,
+                                       is_rate_limited, weight_for)
 from spark.resilience import run
 
 _TIMEOUT_S = 10.0
@@ -122,6 +123,31 @@ def _is_429(exc: Exception) -> bool:
     return is_rate_limited(exc)
 
 
+def _classify_attempt_exc(exc: Exception) -> str:
+    """P6 Task 6.3（D15，2026-09-20）：把一次 `_info` 嘗試的例外分成
+    `limiter.note_http` 認得的類別，供 `/api/ops/health.hl_budget.http` 的
+    per-scope 結果計數用。分類詞彙：`4xx|429|5xx|timeout|conn_error|
+    budget_exhausted|scope_paused|other`（成功另在呼叫端記 `"2xx"`）。"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code == 429:
+            return "429"
+        if 400 <= code < 500:
+            return "4xx"
+        if 500 <= code < 600:
+            return "5xx"
+        return "other"
+    if isinstance(exc, BudgetExhausted):
+        return "budget_exhausted"
+    if isinstance(exc, ScopePaused):
+        return "scope_paused"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, ConnectionError):
+        return "conn_error"
+    return "other"
+
+
 def _retry_after_s(exc: Exception) -> float | None:
     resp = getattr(exc, "response", None)
     raw = getattr(getattr(resp, "headers", None), "get", lambda k, d=None: None)("retry-after")
@@ -161,16 +187,26 @@ class HLGateway:
             token = None
             if self._limiter is not None:
                 # 每一次嘗試（含 resilience 的重試）各自預留；預留後立即發送。
-                token = self._limiter.reserve(weight_for(body["type"]), self._scope,
-                                              wait_s=self._wait_s)
+                # P6 Task 6.3（D15）：`reserve` 本身可能拋 BudgetExhausted／
+                # ScopePaused——這也是一次「嘗試的結果」，一併計進 http 計數，
+                # 不然逾時/暫停中的嘗試會在觀測面板上憑空消失。
+                try:
+                    token = self._limiter.reserve(weight_for(body["type"]), self._scope,
+                                                  wait_s=self._wait_s)
+                except Exception as e:
+                    self._limiter.note_http(self._scope, _classify_attempt_exc(e))
+                    raise
             try:
                 result = self._post(f"{self._base}/info", body)
             except Exception as e:
-                if self._limiter is not None and _is_429(e):
-                    self._limiter.note_429(self._scope, _retry_after_s(e))
+                if self._limiter is not None:
+                    if _is_429(e):
+                        self._limiter.note_429(self._scope, _retry_after_s(e))
+                    self._limiter.note_http(self._scope, _classify_attempt_exc(e))
                 raise
             if self._limiter is not None:
                 self._limiter.note_ok(self._scope)
+                self._limiter.note_http(self._scope, "2xx")
                 # reviewer C1：fills 類預留的 120 是「一頁上限」，HL 實際計費是
                 # 20 + ceil(筆數/20)——回應到手、知道實際筆數後立刻結算下修，
                 # 不結算會讓自訂帳本比 HL 真實計費高 3–6 倍（假陽性）。

@@ -132,6 +132,80 @@ def test_fills_page_settles_to_actual_weight():
     assert lim.snapshot()["used"] == {"interactive": 23}   # 20 + ceil(50/20) = 20+3
 
 
+# ---------- P6 Task 6.3（D15，2026-09-20：觀測補齊）----------
+
+def test_http_counts_include_each_retry():
+    """`resilience.run` 對 transient 錯誤重試 3 次——每次嘗試（含重試）都要
+    各自記一筆 `conn_error`，不是只記最後一次。"""
+    c = Clock()
+
+    def post(url, body):
+        raise ConnectionError("connection reset")
+    gw, lim = _gw(post, c)
+    with pytest.raises(ConnectionError):
+        gw.clearinghouse_state("0xabc")
+    assert lim.snapshot()["http"]["interactive"] == {"conn_error": 3}
+
+
+def test_http_counts_timeout_class():
+    c = Clock()
+
+    def post(url, body):
+        raise TimeoutError("hl info timed out")
+    gw, lim = _gw(post, c)
+    with pytest.raises(TimeoutError):
+        gw.clearinghouse_state("0xabc")
+    assert lim.snapshot()["http"]["interactive"] == {"timeout": 3}
+
+
+def test_http_counts_success_is_2xx():
+    c = Clock()
+
+    def post(url, body):
+        return {"marginSummary": {"accountValue": "1"}}
+    gw, lim = _gw(post, c)
+    gw.clearinghouse_state("0xabc")
+    gw.clearinghouse_state("0xabc")
+    assert lim.snapshot()["http"]["interactive"] == {"2xx": 2}
+
+
+def test_http_counts_429_and_5xx_and_4xx_classes():
+    c = Clock()
+    codes = iter([429, 500, 404])
+
+    def post(url, body):
+        raise _http_error(next(codes))
+    gw, lim = _gw(post, c)
+    for _ in range(3):
+        with pytest.raises(httpx.HTTPStatusError):
+            gw.portfolio("0xabc")
+    assert lim.snapshot()["http"]["interactive"] == {"429": 1, "5xx": 1, "4xx": 1}
+
+
+def test_http_counts_budget_exhausted_and_scope_paused_classes():
+    c = Clock()
+
+    def post(url, body):
+        return {}
+    gw, lim = _gw(post, c, wait_s=0.0)
+    for _ in range(45):
+        lim.try_reserve(20, "interactive")
+    with pytest.raises(BudgetExhausted):
+        gw.portfolio("0xabc")
+    assert lim.snapshot()["http"]["interactive"] == {"budget_exhausted": 1}
+
+    lim.note_429("interactive")
+    with pytest.raises(ScopePaused):
+        gw.scoped("explore").clearinghouse_state("0xabc")
+    assert lim.snapshot()["http"]["explore"] == {"scope_paused": 1}
+
+
+def test_no_limiter_does_not_count_http():
+    c = Clock()
+    gw = HLGateway("https://x", post_fn=lambda u, b: {}, sleep_fn=c.sleep)
+    gw.portfolio("0xabc")   # 不炸即可——limiter 為 None 時不計（也無處可讀計數）
+
+
 def test_json_decode_error_is_not_reported_as_429():
     """reviewer W2：`JSONDecodeError` 訊息可能含 "column 429"，不得被誤判成
     速率限制而暫停 explore scope。"""

@@ -34,11 +34,16 @@ W2 舊版用「訊息含 429 子字串就判定」的鬆散判準，會把 `JSON
 """
 from __future__ import annotations
 
+import math
 import random
 import re
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
+
+# P6 Task 6.3（D15，2026-09-20）：等待額度秒數／HTTP 結果計數的樣本上限——
+# 兩者都是「近期健康狀態」的觀測窗，不是全歷史帳本，maxlen 界定記憶體與視窗大小。
+WAIT_SAMPLES_MAXLEN = 500
 
 WINDOW_S = 60.0
 DEFAULT_GLOBAL_CAP = 900
@@ -71,6 +76,21 @@ _RATE_LIMIT_RE = re.compile(r"^429\b|429 Too Many Requests")
 
 def weight_for(info_type: str) -> int:
     return ENDPOINT_WEIGHTS.get(info_type, DEFAULT_WEIGHT)
+
+
+def percentile(values: list[float], pct: float) -> float | None:
+    """Nearest-rank 百分位數，不引入 numpy（P6 Task 6.3，D15）。
+
+    `rank = ceil(pct/100 * n)`（1-based，夾在 `[1, n]`）——例如 n=2 時
+    `pct=50 → rank=1`（排序後較小值）、`pct=95 → rank=2`（排序後較大值，
+    此例等於 max）。空清單回 `None`（沒有樣本，不是 0——工程原則 1：未知≠0）。
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    rank = max(1, min(n, math.ceil(pct / 100.0 * n)))
+    return ordered[rank - 1]
 
 
 def is_rate_limited(exc: Exception) -> bool:
@@ -122,6 +142,13 @@ class WeightLimiter:
         self._paused_until: dict[str, float] = {}
         self._consecutive_429: Counter[str] = Counter()
         self._counters: Counter[str] = Counter()
+        # P6 Task 6.3（D15）：per-scope 等待秒數樣本（`reserve` 從第一次
+        # `try_reserve` 失敗到成功／逾時的耗時；立即成功記 0）與 HTTP 結果計數
+        # （成功／各類例外，含每次重試各記一次）。只在 defaultdict 被存取的
+        # scope 才會出現在 snapshot——未觸發的 scope 不虛報任何鍵。
+        self._wait_samples: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=WAIT_SAMPLES_MAXLEN))
+        self._http_counts: dict[str, Counter[str]] = defaultdict(Counter)
 
     # ---- 內部（呼叫端須持鎖） ----
     def _prune(self, now: float) -> None:
@@ -160,17 +187,36 @@ class WeightLimiter:
     def reserve(self, weight: int, scope: str, *, wait_s: float = 0.0) -> list:
         """取得額度（回傳 token，見 `try_reserve`）或拋 BudgetExhausted；最多等
         wait_s 秒（0.25 秒輪詢）。取得後呼叫端必須**立即**發送（spec §5.1：
-        不先扣額再排長隊）。"""
-        deadline = self._now() + wait_s
+        不先扣額再排長隊）。
+
+        P6 Task 6.3（D15）：無論成功或逾時都記一筆等待秒數樣本（`_record_wait`）
+        ——立即成功記 0，逾時記實際等到的秒數；`snapshot()["wait_ms"]` 靠這份
+        樣本算 p50/p95/max，讓「這個 scope 平常要等多久」看得見。"""
+        start = self._now()
+        deadline = start + wait_s
         while True:
             token = self.try_reserve(weight, scope)
             if token is not None:
+                self._record_wait(scope, self._now() - start)
                 return token
             remaining = deadline - self._now()
             if remaining <= 0:
                 self._counters["exhausted"] += 1
+                self._record_wait(scope, self._now() - start)
                 raise BudgetExhausted(f"hl budget exhausted for scope={scope} weight={weight}")
             self._sleep(min(0.25, remaining))
+
+    def _record_wait(self, scope: str, wait_s: float) -> None:
+        with self._lock:
+            self._wait_samples[scope].append(max(0.0, wait_s))
+
+    def note_http(self, scope: str, cls: str) -> None:
+        """記一次 HTTP 嘗試的結果分類（`hl.py` 的 `attempt()` 每次嘗試結束——
+        成功或例外——都呼叫一次；重試每次各計，P6 Task 6.3 D15）。分類詞彙見
+        `hl.py._classify_attempt_exc`：`2xx|4xx|429|5xx|timeout|conn_error|
+        budget_exhausted|scope_paused|other`。"""
+        with self._lock:
+            self._http_counts[scope][cls] += 1
 
     def settle(self, token: list | None, actual_weight: int) -> None:
         """回應到手後依實際計費**下修**預留（只降不升，reviewer C1）。fills
@@ -252,4 +298,16 @@ class WeightLimiter:
                                       for scope, until in self._paused_until.items()},
                 "consecutive_429": dict(self._consecutive_429),
                 "counters": {k: self._counters.get(k, 0) for k in self._COUNTER_KEYS},
+                # P6 Task 6.3（D15）：只有實際發生過等待/HTTP 嘗試的 scope 才出現
+                # 鍵——未觸發的 scope 不虛報一筆全 0 的統計（工程原則 1：未知≠0）。
+                "wait_ms": {
+                    scope: {
+                        "n": len(samples),
+                        "p50": round(percentile(list(samples), 50) * 1000),
+                        "p95": round(percentile(list(samples), 95) * 1000),
+                        "max": round(max(samples) * 1000),
+                    }
+                    for scope, samples in self._wait_samples.items() if samples
+                },
+                "http": {scope: dict(counts) for scope, counts in self._http_counts.items()},
             }

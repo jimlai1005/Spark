@@ -222,6 +222,71 @@ def test_snapshot_shape():
     assert s["counters"]["reservations"] == 2 and s["counters"]["rate_limited"] == 0
 
 
+# ---------- P6 Task 6.3（D15，2026-09-20：觀測補齊）----------
+
+def test_wait_ms_stats_have_n_p50_p95_max():
+    """`reserve` 等待 0.5s 與 2s 兩筆樣本 → wait_ms 用 nearest-rank 百分位數：
+    n=2 時 p50=較小值（rank=ceil(0.5*2)=1）、p95=較大值（rank=ceil(0.95*2)=2，
+    此例等於 max）。立即成功（wait_s=0）記 0，不進同一 scope 就不干擾。"""
+    lim, c = _lim()
+    for _ in range(45):
+        lim.try_reserve(20, "interactive")           # 900 用完，之後的 reserve 得等
+
+    class _AdvancingSleep:
+        """`sleep_fn` 每次呼叫推進時鐘，並在指定次數後釋放一筆額度，讓
+        `reserve` 的輪詢在預期的等待時間點成功——用來精準控制「等了多久」。"""
+        def __init__(self, clock, release_after_s):
+            self.clock, self.release_after_s, self.start = clock, release_after_s, clock.t
+
+        def __call__(self, s):
+            self.clock.t += s
+            if self.clock.t - self.start >= self.release_after_s:
+                lim._log.popleft()                    # 讓出一筆額度（模擬視窗滑出）
+
+    lim._sleep = _AdvancingSleep(c, 0.5)
+    lim.reserve(20, "interactive", wait_s=5.0)
+    lim._sleep = _AdvancingSleep(c, 2.0)
+    lim.reserve(20, "interactive", wait_s=5.0)
+
+    stats = lim.snapshot()["wait_ms"]["interactive"]
+    assert stats["n"] == 2
+    assert stats["p50"] == pytest.approx(500, abs=50)
+    assert stats["p95"] == pytest.approx(2000, abs=50)
+    assert stats["max"] == pytest.approx(2000, abs=50)
+
+
+def test_wait_ms_records_zero_for_immediate_success():
+    lim, c = _lim()
+    lim.reserve(20, "explore")
+    stats = lim.snapshot()["wait_ms"]["explore"]
+    assert stats == {"n": 1, "p50": 0, "p95": 0, "max": 0}
+
+
+def test_wait_ms_absent_for_untouched_scope():
+    lim, c = _lim()
+    lim.reserve(20, "explore")
+    assert "interactive" not in lim.snapshot()["wait_ms"]
+
+
+def test_note_http_counts_by_class_and_scope():
+    lim, c = _lim()
+    lim.note_http("interactive", "2xx")
+    lim.note_http("interactive", "2xx")
+    lim.note_http("interactive", "timeout")
+    lim.note_http("explore", "429")
+    s = lim.snapshot()["http"]
+    assert s["interactive"] == {"2xx": 2, "timeout": 1}
+    assert s["explore"] == {"429": 1}
+
+
+def test_percentile_nearest_rank():
+    from spark.publicapi.hl_budget import percentile
+    assert percentile([], 50) is None
+    assert percentile([10.0], 50) == 10.0
+    assert percentile([1.0, 2.0, 3.0, 4.0], 50) == 2.0
+    assert percentile([1.0, 2.0, 3.0, 4.0], 95) == 4.0
+
+
 def test_concurrent_reservations_never_exceed_cap():
     """8 條 thread 用真實 time.monotonic 搶額度；任何 60 秒切片總和不得超過全域上限
     （派工 prompt 額外要求：plan §3 自審提到要補的並發驗證）。"""

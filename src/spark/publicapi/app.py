@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -44,7 +45,7 @@ from spark.filet.strategies import (build_cagr_fields, build_equity_index,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.filet.trader_stats import fills_stats, live_days_from_av, window_stats
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
-from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, WeightLimiter
+from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, WeightLimiter, percentile
 from spark.publicapi.contact import (ContactValidationError, SmtpMailer,
                                      build_contact_email, clip, decoy_ticket, notify_text,
                                      PAGE_URL_MAX, USER_AGENT_MAX, validate_contact)
@@ -691,6 +692,15 @@ def _dashboard_guards(hb: "HeartbeatRead", mine, acct: dict | None,
 # （絕大多數 cycle，scripts/run_copytrade.py:828）。`tripped` 不在內。
 # 2026-09-19 事故：只認 "ok" 讓面板幾乎永遠顯示「訊號來源狀態未知」。
 _HEALTHY_CYCLE_RESULTS = ("ok", "no_action")
+
+# P6 Task 6.3（D15，2026-09-20）：`follower` 引擎與四個每日 timer 是獨立進程，
+# 完全不經 `hl_budget`（本模組的權重限流器）——同主機、同出口 IP，但各自向 HL
+# 發請求、各自被 HL 計費。`hl_budget` 觀測到零 429 只能證明 filet-api 這個進程
+# 沒被擋，**不能**推論 follower 也沒被擋（未結案項目，本輪不改引擎程式）。
+FOLLOWER_BUDGET_NOTE = (
+    "follower 引擎同主機同出口 IP、不經本限流器、獨立計數；"
+    "本頁零 429 不證明引擎受保護；看 journalctl -u 'filet-follower@*'"
+)
 
 
 def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
@@ -1383,6 +1393,20 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     # 發布邏輯消費它，接線先行）。`/api/ops/health` 讀它揭露 `explore_store` 統計，
     # 沿 hl_limiter 同一個「未接線 ≠ 已接線但空」的 introspection 慣例。
     app.state.explore_store = explore_store
+
+    # P6 Task 6.3（D15，2026-09-20）：dashboard 端點耗時（rolling 最近 200 筆，
+    # 毫秒）——`/api/ops/health.dashboard_latency` 讀它算 p50/p95/max。只計
+    # `/api/me/dashboard` 這一條路由（觀測補齊的具體標的，不是全站 APM）。
+    app.state.dashboard_latency_ms: deque[float] = deque(maxlen=200)
+
+    @app.middleware("http")
+    async def _dashboard_latency_mw(request: Request, call_next):
+        if request.url.path != "/api/me/dashboard":
+            return await call_next(request)
+        start = time.monotonic()
+        response = await call_next(request)
+        app.state.dashboard_latency_ms.append((time.monotonic() - start) * 1000.0)
+        return response
 
     # 營運告警通道（vault 准入 advisory FAIL 用；CLAUDE.md：通知一律走 Notifier 注入）。
     # 未注入 → 由 cfg 建預設：TG 兩鍵齊 → TelegramNotifier；否則 NullNotifier
@@ -4714,6 +4738,15 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             findings, lc_errors = None, [f"換 leader 積壓掃描失敗：{e!r}"]
 
         backlog = None if (findings is None or lc_errors) else len(findings)
+        # P6 Task 6.3（D15）：dashboard 端點延遲，n=0（尚未有請求）→ 三個百分位
+        # 皆 null（工程原則 1：未知≠0，不得讓「還沒量到」看起來像「延遲是 0」）。
+        _dash_samples = list(app.state.dashboard_latency_ms)
+        dashboard_latency = {
+            "n": len(_dash_samples),
+            "p50_ms": (round(percentile(_dash_samples, 50)) if _dash_samples else None),
+            "p95_ms": (round(percentile(_dash_samples, 95)) if _dash_samples else None),
+            "max_ms": (round(max(_dash_samples)) if _dash_samples else None),
+        }
         # Task 1.4（spec §11 觀測指標第一批）：HL 權重預算快照。未注入 limiter
         # （尚未接線的呼叫端、或測試）→ `null`，同本端點「讀不到就說讀不到」的
         # 既有原則——不得折疊成看起來健康的空 dict。
@@ -4734,6 +4767,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "summary": health_summary(rows, backlog, lc_errors),
             "manifest_errors": manifest_errors,
             "hl_budget": limiter.snapshot() if limiter is not None else None,
+            # P6 Task 6.3（D15）：dashboard 端點延遲樣本統計＋ follower 限流關係
+            # 的誠實標註（常數字串，未結案項目——本輪不改引擎程式）。
+            "dashboard_latency": dashboard_latency,
+            "follower_budget_note": FOLLOWER_BUDGET_NOTE,
             # Task 2.3（spec P2）：Explore store 統計快照。未注入 → `null`，同
             # `hl_budget` 的「讀不到就說讀不到」原則——P2 階段尚無排程消費它，
             # 這裡只是讓 ops 看得到接線是否生效。

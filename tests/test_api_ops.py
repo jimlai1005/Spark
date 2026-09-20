@@ -1887,3 +1887,49 @@ def test_health_explore_refresh_and_publisher_populated_when_injected(tmp_path):
     assert body["explore_publisher"]["dirty"] is False
     assert {"last_published_at", "dirty", "publishes", "failures",
            "last_error"} <= set(body["explore_publisher"])
+
+
+# ---------- P6 Task 6.3（D15，2026-09-20：觀測補齊）----------
+
+def test_health_dashboard_latency_null_when_no_samples(tmp_path):
+    """尚未有任何 `/api/me/dashboard` 請求 → n=0，三個百分位皆 `None`
+    （工程原則 1：未知≠0，不得讓「還沒量到」看起來像「延遲是 0」）。"""
+    client, _cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert body["dashboard_latency"] == {
+        "n": 0, "p50_ms": None, "p95_ms": None, "max_ms": None}
+
+
+def test_health_dashboard_latency_reports_samples(tmp_path):
+    """middleware 只計 `/api/me/dashboard`；打兩次後 `/api/ops/health` 看得到
+    `n==2` 且百分位是數字（跨兩個不同登入身分的 client，共用同一個 app 實例，
+    middleware 記在 `app.state` 上，不受呼叫端 client／session 影響）。"""
+    admin_wallet, customer_wallet = Account.create(), Account.create()
+    manifest = tmp_path / "followers.json"
+    manifest.write_text(json.dumps({"followers": []}))
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({admin_wallet.address.lower()}),
+                   followers_path=str(manifest))
+    app, cfg, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+
+    customer = _client(app)
+    login(customer, wallet=customer_wallet)
+    for _ in range(2):
+        r = customer.get("/api/me/dashboard")
+        assert r.status_code == 200, r.text
+
+    admin = _client(app)
+    login(admin, wallet=admin_wallet)
+    body = admin.get("/api/ops/health").json()
+    lat = body["dashboard_latency"]
+    assert lat["n"] == 2
+    assert isinstance(lat["p50_ms"], int)
+    assert isinstance(lat["max_ms"], int)
+
+
+def test_health_follower_budget_note_present_and_honest(tmp_path):
+    """D15：follower 引擎的限流關係是未結案項目——本頁零 429 不能被讀成
+    「引擎也受保護」，常數字串要把這句誠實標註帶到 ops 面板上。"""
+    client, _cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert "不證明引擎受保護" in body["follower_budget_note"]
+    assert "filet-follower@" in body["follower_budget_note"]
