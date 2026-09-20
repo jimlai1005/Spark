@@ -1012,9 +1012,17 @@ class ExploreScheduler:
   5. 準入上限：預先塞滿 job → `refreshing is False` 且不新增。
 
 ### Task 3.4 @inline：接線與 D6 清理
-- `create_app(..., explore_scheduler=None)`；`run_api.py` 建 scheduler，`EXPLORE_UPSTREAM_REFRESH=1` 才 `threading.Thread(target=run_forever, daemon=True).start()`；`/api/ops/health` 加 `explore_refresh: {enabled, last_tick_at, last_result, queue_depth, oldest_due_age_s, paused_until}`。
-- 刪 `ExploreIndex.build_sync`／`_maybe_trigger_build`／`_enrich_one`／`_call_hl`／`_RateLimitedAbort`／`_BudgetUnavailable`／enrich LRU；`ExploreIndex` 只剩讀路徑、`set_published(rows, meta)`（Task 4.1）、snapshot。`tests/test_public_explore.py` 對應測試改由 publisher 測試覆蓋後刪除。
-- 驗收：`rg -n "build_sync|_enrich_one|_call_hl" src` 零命中；全測試綠。
+
+<!-- 2026-09-20 展開；在 4.1 之後做（同改 hl_explore.py）。 -->
+
+**Files:** `src/spark/publicapi/config.py`、`scripts/run_api.py`、`src/spark/publicapi/app.py`、`src/spark/publicapi/hl_explore.py`；`tests/test_publicapi_config.py`、`tests/test_api_ops.py`、`tests/test_public_explore.py`、`tests/test_run_api_wiring.py`（新，若無既有）。
+
+1. **config**：`explore_upstream_refresh: bool`（env `EXPLORE_UPSTREAM_REFRESH`，`"1"/"true"` → True，預設 False）；`explore_db_path` 在 `explore_upstream_refresh=True` 時**必填**（缺 → `ValueError`，訊息含兩個 env 名）。
+2. **run_api.py**：`explore_store` 存在時建 `ExplorePublisher(store=..., index=app.state.explore_index, cfg=hl_explore.ExploreConfig.from_env(), now_fn=time.time, snapshot_path=cfg.explore_cache_path)` 與 `ExploreScheduler(store=..., hl=gateway.scoped("explore"), leaderboard_source_fn=<同 app 內 `_leaderboard_cache.get`——把它暴露成 `app.state.leaderboard_get`>, excluded_fn=<同 app 內 `_explore_excluded_addresses`——暴露成 `app.state.explore_excluded_fn`>, cfg=..., now_fn=time.time, sleep_fn=time.sleep, on_dirty=publisher.mark_dirty, on_tick=publisher.maybe_publish)`；`app.state.explore_scheduler`／`app.state.explore_publisher`；`cfg.explore_upstream_refresh` 為 True 才 `threading.Thread(target=scheduler.run_forever, args=(stop_event,), daemon=True, name="explore-scheduler").start()`，並在 uvicorn 結束後 `stop_event.set()`（`try/finally` 包 `uvicorn.run`）。**不在 `create_app` 內起 thread**（測試建 app 不得有背景執行）。
+3. **app.py**：`create_app` 不新增 thread；`/api/ops/health` 加 `"explore_refresh": {"enabled": cfg.explore_upstream_refresh, **scheduler.status()} if scheduler else None` 與 `"explore_publisher": publisher.status() if publisher else None`（讀 `app.state`，未注入 → null）。
+4. **D6 清理（hl_explore.py）**：刪 `build_sync`、`_maybe_trigger_build`、`_enrich_one`、`_call_hl`、`_RateLimitedAbort`、`_BudgetUnavailable`、`_enrich_cache`／`_enrich_cache_max`／`_enrich_ttl_s`／`_building`、建構子的 `hl`／`sleep_fn`／`leaderboard_source_fn`／`excluded_fn`／`cfg` 中不再被讀路徑使用的參數（`query()` 仍需 `cfg` 做 qualify 門檻；`candidate_addresses` 純函式保留給 scheduler）；`query()` 的 `building` 改由 `initializing` 推導。`app.py:2325` 的 `ExploreIndex(...)` 建構改為新簽名。
+5. **測試**：`tests/test_public_explore.py` 中測 build_sync／429 中止／enrich 快取的測試刪除（功能已由 scheduler／publisher 測試覆蓋——回報列出刪了哪些與對應的新測試名）；query／qualify／sort／snapshot 測試保留。config 新增 3 條（預設 False、開啟需 db path、開啟且有 db path 通過）。ops/health 新增 2 條（未注入 null；注入 scheduler＋publisher → 兩個 dict 含 `enabled`／`last_tick_at`／`dirty` 等鍵）。`run_api` 接線：若無既有測試檔，加 `tests/test_run_api_wiring.py` 用 monkeypatch 把 `uvicorn.run` 換成 no-op、env 設 `EXPLORE_UPSTREAM_REFRESH=1`＋`FILET_EXPLORE_DB=tmp`，斷言 `threading.enumerate()` 內出現名為 `explore-scheduler` 的 thread（或斷言 `Thread.start` 被呼叫一次），且 `EXPLORE_UPSTREAM_REFRESH` 未設時沒有。
+6. **驗收**：`rg -n "build_sync|_enrich_one|_call_hl|_RateLimitedAbort|_BudgetUnavailable|_maybe_trigger_build" src` 零命中；`rg -n "explore-scheduler" scripts/run_api.py` 命中；全測試綠；ruff 乾淨；`uv run python -c "import scripts.run_api"` OK。
 
 ---
 
