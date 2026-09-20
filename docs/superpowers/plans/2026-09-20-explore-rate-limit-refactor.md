@@ -1204,6 +1204,6 @@ class ExplorePublisher:
 | 3.6 複審 | 2026-09-20 | — | opus 第三輪：7 項全關閉；新 1 Critical（門檻輸入／輸出不同源）／2 Warning／2 Suggestion → Task 3.7 |
 | 3.7 | 2026-09-20 | 1f0978f | 主線程驗：`_gate_reason`／`.prev` 9 命中、`params_fp=''`、`page_cap`、streak；3077 passed；ruff 乾淨。第四輪聚焦複審派工中 |
 | 3.7 複審 | 2026-09-20 | — | opus 第四輪：5 項全關閉、0 Critical、2 Warning（`.prev` 一分鐘窗口、門檻擋下無 log）；結論**可部署** |
-| 3.8（主線程） | 2026-09-20 | bb71e23 | 主線程自修兩個 Warning：`_note_gate` 第 1 次與每 10 次 warning；`.daily` 每 24h 至多輪替一次；publisher 21 passed |
+| 3.8（主線程） | 2026-09-20 | bb71e23＋3e71249 | 主線程自修兩個 Warning：`_note_gate` 第 1 次與每 10 次 warning；`.daily` 每 24h 至多輪替一次。小型 fresh reviewer PASS，其 2 Warning（時基混用、非原子 copy）已於 3e71249 修：以快照 mtime 同基底判斷、`.tmp`＋`os.replace`；3079 passed |
 | 5.2 本機觀測 | 2026-09-20 | — | 10 分鐘主網唯讀實跑：0 次 429、explore 視窗最高 300 不超、退款 574、state 191／portfolio 39／fills 10 頁、7 地址 complete、publisher 10 次 0 失敗；**實證 C2**（300 列只 1 列合格）；冷啟動估 60–80 分鐘。報告：`docs/superpowers/research/2026-09-20-explore-refresh-observation.md` |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
