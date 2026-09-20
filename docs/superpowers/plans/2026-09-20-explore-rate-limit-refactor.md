@@ -1207,6 +1207,21 @@ class ExplorePublisher:
 4. `/api/ops/health` 加 `follower_budget_note: "follower 引擎同主機同出口 IP、不經本限流器、獨立計數；本頁零 429 不證明引擎受保護；看 journalctl -u 'filet-follower@*'"`（常數字串，D15）。RUNBOOK §5.8e 同句。
 5. 測試：等待統計、HTTP 計數含重試與 timeout、dashboard 延遲有 n。
 
+### Task 6.5 @inline：契約 A 的輸出層遮罩（主線程整合檢查發現）
+
+<!-- 2026-09-21 本機以正式機 v3 快照起 API 實測：pending 列（coverage=backfilling）仍輸出 close_win_rate_pct=13.33、
+concentration_pct=28.6、coins=[...]——遮罩只在 compose 時做，遷移列與任何非 compose 來源的列沒經過。契約 A 要求
+coverage≠complete 時這些欄位一律 null／[]。修法：遮罩移到唯一出口 ExploreRow.to_dict()（結構性，工程原則 #5），
+compose 時的遮罩保留（雙保險）；tags 的 concentrated 同樣在輸出層剔除。 -->
+
+**Files:** `src/spark/publicapi/hl_explore.py`（`ExploreRow.to_dict`、`load_snapshot` v3 遷移）；`tests/test_public_explore.py`、`tests/test_explore_publisher.py`。
+
+1. `ExploreRow.to_dict()`：若 `fills_coverage["state"] != "complete"` → 輸出 `close_win_rate_pct=None`、`concentration_pct=None`、`closed_positions_30d=None`、`realized_pnl_30d_usd=None`、`coins=[]`、`tags` 去掉 `"concentrated"`；`order_count_30d` 保留（下限）。`complete` 照舊。
+2. `load_snapshot` 的 v3→v4 遷移：列 dict 同樣遮罩（讓快照檔本身也符合契約，`.v3.bak` 不動）。
+3. `sort_rows` 依勝率排序時用**遮罩後**的值（非 complete 視為 None → 組尾）。
+4. 測試：v3 快照載入後 `query()` 的 pending 列四欄為 None、coins 為 []、tags 無 concentrated；compose 的 complete 列不受影響；勝率排序時 backfilling 列在組尾；既有 `test_load_snapshot_v3_migrates_*` 更新斷言。
+5. 主線程驗收：本機 API（正式機 v3 快照）`GET /api/public/explore` 第一列 `close_win_rate_pct is None`、`coins == []`。
+
 ### Task 6.4（主線程＋builder 測試）：三個重現驗收與恢復程序
 
 - 測試（放 `tests/test_explore_publisher.py`，用真 `ExploreStore`＋`ExploreIndex`）：
