@@ -1076,4 +1076,6 @@ class ExplorePublisher:
 | 1.6 | 2026-09-20 | cc28baa | 主線程實跑 `floor 3800.0`／`n 2 remaining 120.0`；app.py 只剩 2 處 raise；2973 passed；ruff 乾淨；vitest 716 passed |
 | **P1 最終驗收** | 2026-09-20 | — | 全量 pytest 2973、vitest 716、ruff 乾淨；prod 快照 2026-09-19T15:00 v3 299 列、五個 drop-in 齊全、prod 版本 b9e5649 已含於本分支 |
 | 2.1 | 2026-09-20 | ea8acb7 | `pytest tests/test_explore_store.py` 21 passed；ruff 乾淨；`claim_due` 用 RETURNING（本機與 prod SQLite 皆 3.53.1）；transaction 採 `with self._db:` 隱式（builder 裁決，與 ApiStore 一致） |
+| 2.3 | 2026-09-20 | aa8a292 | 140 passed（config＋ops）；`FILET_EXPLORE_DB` 可選（P3 起必填）；run_api 注入；health `explore_store` |
+| 2.2 | 2026-09-20 | d57365b＋7add2b8 | 17 passed；零 `unknown`、cursor 零 `+1`；增量輪 `fills_in_window` 重置（主線程驗收時抓到、已修） |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
