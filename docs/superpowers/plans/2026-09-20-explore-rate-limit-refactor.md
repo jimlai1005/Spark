@@ -1341,6 +1341,7 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 | P6 複審 | 2026-09-21 | — | opus：後端契約符合、v3 分類獨立重現一致（177 ineligible 合理）；1 Critical（前端 live_days null→0）／5 Warning → Task 6.6（前端）、6.7（後端） |
 | 6.5 | 2026-09-21 | 21357d5 | 主線程整合實測發現遷移列未遮罩→修：`to_dict` 統一遮罩、v3 遷移 `order_count_30d`=0；實跑 `pending None None [] [] 0`、頁面預設篩選 0／287／12；3112 passed |
 | 6.6 | 2026-09-21 | 9156223 | vitest 743 passed；live_days／成交衍生欄位 null 不補 0、型別 `number|null`；組標題 CSS 與格線內；`getPublicStrategies`／詳情頁的既有補 0 未在範圍（記後續） |
+| 6.7 | 2026-09-21 | 7da81e2 | compose／v3 遷移列帶預設門檻分類（主線程實跑 Counter ineligible 177／pending 122）；6.4(b)(c) 改非 force（推進 clock）；3114 passed；6.4 三案例在最終 commit 3 passed |
 | 6.2 | 2026-09-20 | 2d1e255 | vitest 736 passed；分組不重排、pending 無名次、分析待完成、僅合格切換、詳情頁觀測期間（epoch ms）；集中度目前無欄位故無需標示 |
 | **第二次部署（D8）** | 2026-09-20 14:20 UTC | 8ead8e8 | 使用者授權（「請繼續」）。flag 0 部署→驗證→67/67→flag 1（14:21）；90 秒後候選 300、快取 36、門檻擋下 in:0/300、快照未動、零 Traceback／429。冷啟動觀測進行中（每 10 分鐘），預期 50–65 分鐘首次換版 |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
