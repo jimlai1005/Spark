@@ -399,6 +399,18 @@ class HLGateway:
         `truncated` 語意同 `_paged_fills_raw`。"""
         return self._paged_fills_raw(address, start, end, max_pages=max_pages)
 
+    def get_fills_page(self, address: str, start_ms: int, end_ms: int) -> list[dict]:
+        """單頁 `userFillsByTime` 查詢（spec §8.2，scheduler 一次只抓一頁，翻頁與游標由
+        explore_fills_sync 決定）。請求體與 `_paged_fills_raw` 第一頁逐欄位相同
+        （含 aggregateByTime 設定），回**原始** list、不裁切欄位、不翻頁。
+        時間邊界 inclusive（HL 文件）。回應非 list → 拋 ValueError。"""
+        raw = self._info({"type": "userFillsByTime", "user": address,
+                          "startTime": int(start_ms), "endTime": int(end_ms)},
+                         "HL userFillsByTime 查詢")
+        if not isinstance(raw, list):
+            raise ValueError(f"userFillsByTime 回應非 list: {type(raw).__name__}")
+        return raw
+
     def agent_addresses(self, user: str) -> list[str]:
         """使用者已授權的 agent 地址清單（extraAgents）；小寫正規化供同基準比對。"""
         agents = self._info({"type": "extraAgents", "user": user}, "HL extraAgents 查詢")
