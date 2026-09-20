@@ -1243,6 +1243,15 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 3. `enrich_candidate` docstring 與 P6 行為對齊（省略 coverage＝complete）。
 4. 測試：dump 後快照第一列 `eligibility` 與 `query()` 預設門檻結果一致；v3 遷移列亦然。
 
+### Task 6.8 @inline：探索頁總數與標題用「合格＋待確認」（主線程整合截圖發現）
+
+<!-- 2026-09-21 本機整合截圖：待確認 25 列在榜上，分頁文字「顯示 1–25 / 0」、標題「（目前 0 檔）」都拿 total_qualified 當總數。 -->
+
+**Files:** `web/src/app/explore/page.tsx`（`totalPages`、範圍文字、pool note）、`web/src/lib/copy.ts`；vitest。
+1. 榜上總列數 `shownTotal = total_qualified + (僅合格開啟 ? 0 : (total_pending ?? 0))`；`totalPages` 與「顯示 a–b / N」都用 `shownTotal`。
+2. pool note 改為「自 {pool} 個候選帳戶中：合格 {total_qualified}、資格待確認 {total_pending}；未列入者為鏈上資料不合格或缺失」（ZH／EN 對稱，新增或改既有文案鍵；`total_pending` 缺（舊後端）時只顯示合格數、行為同今天）。
+3. vitest：pending 25 列＋qualified 0 → 範圍文字 `1–25 / 25`、頁數 ≥1、pool note 含「待確認 25」；僅合格開啟時總數只算 qualified。
+
 ### Task 6.4（主線程＋builder 測試）：三個重現驗收與恢復程序
 
 - 測試（放 `tests/test_explore_publisher.py`，用真 `ExploreStore`＋`ExploreIndex`）：
