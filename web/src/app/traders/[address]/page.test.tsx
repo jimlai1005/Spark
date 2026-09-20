@@ -479,6 +479,32 @@ describe("TraderDetailPage", () => {
       await screen.findByRole("heading", { level: 1 });
       expect(screen.getByText(COPY.traders.fillsTruncatedNote)).toBeInTheDocument();
     });
+
+    // Task 4.2（2026-09-20）：`fills_coverage` 存在時取代 `fills_30d.truncated`
+    // 成為唯一判準——見 `fillsIncomplete()`（lib/publicApi.ts）。
+    it("fills_coverage.state !== \"complete\" → 顯示下限值提示（即使 truncated: false）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_30d: { ...DETAIL.fills_30d, truncated: false },
+        fills_coverage: { state: "partial", observed_from: 1, observed_to: 2, reason: "page_limit" },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.getByText(COPY.traders.fillsTruncatedNote)).toBeInTheDocument();
+    });
+
+    it("fills_coverage.state === \"complete\" → 不顯示提示（即使舊欄位 truncated: true）", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_30d: { ...DETAIL.fills_30d, truncated: true },
+        fills_coverage: { state: "complete", observed_from: 1, observed_to: 2, reason: null },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.queryByText(COPY.traders.fillsTruncatedNote)).not.toBeInTheDocument();
+    });
   });
 
   describe("Task 7：起訖淨值補回（帳戶價值下方一行）", () => {

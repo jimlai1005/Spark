@@ -396,12 +396,67 @@ export interface ExploreRow {
   closed_positions_30d: number;
   /** D3：Σ closedPnl（未扣手續費／funding）。 */
   realized_pnl_30d_usd: number;
-  /** R-A/W2：30D fills 讀到分頁上限仍滿頁 → true（三個 *_30d 欄位為下限值）。 */
+  /** R-A/W2：30D fills 讀到分頁上限仍滿頁 → true（三個 *_30d 欄位為下限值）。
+   * Task 4.2（2026-09-20）：`fills_coverage` 上線後這是 fallback——兩者並存
+   * 期間優先讀 `fills_coverage`，見 `fillsIncomplete()`。 */
   fills_truncated?: boolean;
+  /** Task 4.2：探索發布時各子來源的 fetched_at（wall epoch 秒，或 `null`＝
+   * 尚未取得），鍵至少含 `portfolio`／`state`／`fills`（`ledger` 視地址型態
+   * 可能缺席）。第二次部署前舊後端不會回這個鍵，故整體 optional。 */
+  as_of?: Record<string, number | null>;
+  /** Task 4.2：成交資料完整性狀態（取代單一布林 `fills_truncated`）。
+   * 同上，舊後端不回這個鍵時整體缺席，呼叫端須 fallback 到 `fills_truncated`。 */
+  fills_coverage?: FillsCoverage;
   close_win_rate_pct: number | null;
   concentration_pct: number | null;
   exposure: { dir: "long" | "short" | null; pct: number | null };
   tags: string[];
+}
+
+/** Task 4.2（2026-09-20）：探索列／交易員詳情共用的成交完整性狀態
+ * （後端 `FillsCoverage.to_dict()`）。`state` 三態：`backfilling`（首次尚未補齊）／
+ * `partial`（已知不完整，例如分頁到上限）／`complete`（已知完整）。 */
+export interface FillsCoverage {
+  state: "backfilling" | "partial" | "complete";
+  observed_from: number | null;
+  observed_to: number | null;
+  reason: string | null;
+}
+
+function normalizeAsOf(v: unknown): Record<string, number | null> | undefined {
+  if (v == null || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const out: Record<string, number | null> = {};
+  for (const k of Object.keys(r)) {
+    out[k] = toNumberOrNull(r[k]);
+  }
+  return out;
+}
+
+function normalizeFillsCoverage(v: unknown): FillsCoverage | undefined {
+  if (v == null || typeof v !== "object") return undefined;
+  const r = v as Record<string, unknown>;
+  if (r.state !== "backfilling" && r.state !== "partial" && r.state !== "complete") return undefined;
+  return {
+    state: r.state,
+    observed_from: toNumberOrNull(r.observed_from),
+    observed_to: toNumberOrNull(r.observed_to),
+    reason: typeof r.reason === "string" ? r.reason : null,
+  };
+}
+
+/**
+ * Task 4.2：「成交資料可能不完整」提示的單一判準——`fills_coverage` 存在時
+ * 一律以它為準（`state !== "complete"`），只有它整體缺席（舊後端、或這個
+ * 呼叫端形狀本來就沒有）才 fallback 到舊布林 `fills_truncated`。呼叫端不得
+ * 自行比較兩者或各自判斷一次，避免兩處提示在部署過渡期給出不同答案
+ * （工程原則 1：同一個問題只能有一個判準）。
+ */
+export function fillsIncomplete(
+  row: { fills_truncated?: boolean; fills_coverage?: FillsCoverage | null },
+): boolean {
+  if (row.fills_coverage != null) return row.fills_coverage.state !== "complete";
+  return !!row.fills_truncated;
 }
 
 export interface ExploreResp {
@@ -420,6 +475,17 @@ export interface ExploreResp {
    * `order` 鍵），供 URL 狀態初始化／還原用。 */
   sort: ExploreSort;
   order: ExploreOrder;
+  /** Task 4.2：每分鐘發布版本的 wall epoch 秒（`ExplorePublisher.maybe_publish`
+   * 成功發布時打的時間戳）——與 `updated_at`（index 上次成功 build 完成時間）
+   * 不同源，不得混用比較（工程原則 1）。舊後端不回這個鍵時為 `undefined`。 */
+  published_at?: number | null;
+  /** Task 4.2：從未有版本可讀（新 publisher 尚未發布第一版）。取代舊
+   * `building` 語意（`building` 保留供前端相容，兩者現在同值）。 */
+  initializing?: boolean;
+  /** Task 4.2：這一頁各 `fills_coverage.state` 的列數統計（例如
+   * `{backfilling: 3, complete: 47}`），供之後可能的整頁提示使用；本 task
+   * 不消費它，只補型別。 */
+  coverage_counts?: Record<string, number>;
 }
 
 /**
@@ -503,6 +569,9 @@ function normalizeExploreRow(v: unknown): ExploreRow | null {
       pct: toNumberOrNull(exposure.pct),
     },
     tags: Array.isArray(r.tags) ? r.tags.filter((t): t is string => typeof t === "string") : [],
+    fills_truncated: typeof r.fills_truncated === "boolean" ? r.fills_truncated : undefined,
+    as_of: normalizeAsOf(r.as_of),
+    fills_coverage: normalizeFillsCoverage(r.fills_coverage),
   };
 }
 
@@ -552,7 +621,23 @@ export async function getPublicExplore(
     building: !!body.building,
     sort: EXPLORE_SORT_FIELDS.includes(body.sort as ExploreSort) ? (body.sort as ExploreSort) : filters.sort,
     order: EXPLORE_ORDERS.includes(body.order as ExploreOrder) ? (body.order as ExploreOrder) : filters.order,
+    published_at: body.published_at === null
+      ? null
+      : (typeof body.published_at === "number" ? body.published_at : undefined),
+    initializing: typeof body.initializing === "boolean" ? body.initializing : undefined,
+    coverage_counts: normalizeCoverageCounts(body.coverage_counts),
   };
+}
+
+function normalizeCoverageCounts(v: unknown): Record<string, number> | undefined {
+  if (v == null || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const out: Record<string, number> = {};
+  for (const k of Object.keys(r)) {
+    if (typeof r[k] !== "number") return undefined;
+    out[k] = r[k];
+  }
+  return out;
 }
 
 /** `/api/public/traders/{address}` 的 `fills_30d`（近 30 天成交統計，
@@ -663,6 +748,17 @@ export interface PublicTraderDetail {
   /** `sample_days < sample_threshold` 時後端整個不回傳這個鍵——同
    * `PublicStrategyDetail.cagr_pct` 的結構性防呆。 */
   cagr_pct?: string | null;
+  /** Task 4.2（2026-09-20）：這筆詳情是從本地 explore 快照組出來（`"local"`）
+   * 還是即時打上游組出來（`"upstream"`，例如尚未進池或快取未命中）。舊後端
+   * 不回這個鍵時為 `undefined`。 */
+  source?: "local" | "upstream";
+  /** Task 4.2：`source === "upstream"` 時，是否已排入背景補齊佇列、之後會
+   * 轉為 `"local"`。舊後端不回這個鍵時為 `undefined`。 */
+  refreshing?: boolean;
+  /** Task 4.2：同 `ExploreRow.as_of`，各子來源的 fetched_at。 */
+  as_of?: Record<string, number | null>;
+  /** Task 4.2：同 `ExploreRow.fills_coverage`，見 `fillsIncomplete()`。 */
+  fills_coverage?: FillsCoverage;
 }
 
 /**
@@ -717,6 +813,10 @@ export async function getPublicTraderDetail(address: string): Promise<PublicTrad
       sample_days: typeof body.sample_days === "number" ? body.sample_days : 0,
       sample_threshold: typeof body.sample_threshold === "number" ? body.sample_threshold : 30,
       cagr_pct: typeof body.cagr_pct === "string" ? body.cagr_pct : null,
+      source: body.source === "local" || body.source === "upstream" ? body.source : undefined,
+      refreshing: typeof body.refreshing === "boolean" ? body.refreshing : undefined,
+      as_of: normalizeAsOf(body.as_of),
+      fills_coverage: normalizeFillsCoverage(body.fills_coverage),
     };
   } catch {
     return null;

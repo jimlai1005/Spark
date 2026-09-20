@@ -57,7 +57,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 import {
-  EXPLORE_WINDOWS, getPublicTraderDetail, type ExploreWindow, type PublicTraderDetail,
+  EXPLORE_WINDOWS, fillsIncomplete, getPublicTraderDetail, type ExploreWindow, type PublicTraderDetail,
 } from "@/lib/publicApi";
 import { loginWithSiwe } from "@/lib/siwe";
 import { metricText, type MetricCardDef } from "@/lib/strategyMetrics";
@@ -439,7 +439,12 @@ function TraderDetailInner() {
                     </div>
                   </div>
                 </div>
-                {fills.truncated && <p className="hint">{c.fillsTruncatedNote}</p>}
+                {/* Task 4.2（2026-09-20）：`fills_coverage` 存在時一律以它為準
+                    （`state !== "complete"`），只有它整體缺席（舊後端）才
+                    fallback 到舊布林 `fills.truncated`——見 `fillsIncomplete()`。 */}
+                {fillsIncomplete({ fills_truncated: fills.truncated, fills_coverage: trader.fills_coverage }) && (
+                  <p className="hint">{c.fillsTruncatedNote}</p>
+                )}
               </>
             )}
           </div>

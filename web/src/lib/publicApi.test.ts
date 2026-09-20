@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  fillsIncomplete,
   getPublicLeaderboard,
   getPublicStats,
   getPublicStatus,
@@ -340,6 +341,57 @@ describe("getPublicTraderDetail", () => {
     mockFetchOnce(() => jsonResponse({ ...DETAIL, fills_30d: "x" }));
     const r = await getPublicTraderDetail(DETAIL.address);
     expect(r?.fills_30d).toBeNull();
+  });
+
+  // Task 4.2（2026-09-20）：新欄位（第二次部署前後端混跑）——舊後端不回這些鍵
+  // 時全部 `undefined`（見「原樣回傳交易員詳情」，DETAIL 沒帶這些鍵仍
+  // `toEqual` 通過），新後端回傳時要原樣解析出來。
+  it("Task 4.2：source／refreshing／as_of／fills_coverage 有回傳時原樣解析", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      source: "upstream",
+      refreshing: true,
+      as_of: { portfolio: 111, state: 111, fills: null },
+      fills_coverage: { state: "partial", observed_from: 1, observed_to: null, reason: "page_limit" },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.source).toBe("upstream");
+    expect(r?.refreshing).toBe(true);
+    expect(r?.as_of).toEqual({ portfolio: 111, state: 111, fills: null });
+    expect(r?.fills_coverage).toEqual({ state: "partial", observed_from: 1, observed_to: null, reason: "page_limit" });
+  });
+
+  it("Task 4.2：source 非法值／fills_coverage 畸形 → undefined，不拋錯", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, source: "weird", fills_coverage: "x" }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.source).toBeUndefined();
+    expect(r?.fills_coverage).toBeUndefined();
+  });
+});
+
+// Task 4.2（2026-09-20）：`fills_coverage` 上線後的單一判準——存在時優先讀它，
+// 只有整體缺席（舊後端）才 fallback 到 `fills_truncated`。
+describe("fillsIncomplete", () => {
+  it("fills_coverage.state === \"complete\" → false（即使 fills_truncated 為 true 也不理它）", () => {
+    expect(fillsIncomplete({
+      fills_truncated: true,
+      fills_coverage: { state: "complete", observed_from: 1, observed_to: 2, reason: null },
+    })).toBe(false);
+  });
+
+  it("fills_coverage.state === \"partial\" → true", () => {
+    expect(fillsIncomplete({
+      fills_coverage: { state: "partial", observed_from: null, observed_to: null, reason: "page_limit" },
+    })).toBe(true);
+  });
+
+  it("無 fills_coverage 且 fills_truncated: true → true（fallback）", () => {
+    expect(fillsIncomplete({ fills_truncated: true })).toBe(true);
+  });
+
+  it("無 fills_coverage 且 fills_truncated 缺席／false → false", () => {
+    expect(fillsIncomplete({})).toBe(false);
+    expect(fillsIncomplete({ fills_truncated: false })).toBe(false);
   });
 });
 
