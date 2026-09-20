@@ -1260,6 +1260,32 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
   (c) 已有版本 eligible 20 → 新資料完整且證明只剩 12 個合格 → 發布成功、`total_qualified==12`（榜縮小，不被擋）。
 - 恢復程序（主線程）：6.1–6.4 全綠＋opus 複審通過 → 第三次部署（flag 0 → 驗證 → flag 1）→ 觀察連續兩次發布（`published_at` 前進、pending 數下降、eligible/ineligible 上升、rows 的 `as_of.fills` 等於該地址 sync 時間而非 published_at）→ 之後才起算 24 小時觀測期；預算不動。
 
+## P7 觀測期間平行工作（2026-09-21 使用者裁決：不打斷觀測、不調預算；實作後**觀測期滿再部署**）
+
+觀測：台北 9/23 00:45（UTC 9/22 16:45）滿 24 小時。取樣：正式機 `/home/ubuntu/explore-obs/sample.py`（ubuntu crontab 每 15 分鐘，唯讀，
+輸出 `samples.jsonl`；cohort 基線 `cohort_t0.json`＝flag 開啟後 300 候選的名單與狀態）。決策依「資料新鮮度、回補進展、queue 積壓、
+引擎健康」，不追求 300 人全 complete。回報五項：回補 vs 無法補齊（completeness／reason 分佈）、同批地址進度（原候選完成數、新增候選、
+游標推進數、最老到期趨勢）、fills 時間語義（last_success vs synced_through）、null→0 稽核、follower 同 IP 缺口（引擎 429／重試／延遲）。
+
+### Task 7.1 @inline：契約補 `fills_coverage.synced_through`／`last_success_at`
+
+<!-- 使用者第 3 點：as_of.fills 目前＝sync.updated_at＝最近一次抓頁成功時間，不代表「確認同步到哪裡」。 -->
+- `fills_coverage` 加 `synced_through`（epoch ms｜null，＝`fills_sync.synced_through_ms`）與 `last_success_at`（epoch 秒｜null，＝`updated_at`）；
+  `as_of.fills` 維持＝`last_success_at`（相容）並在契約表註明語義。詳情頁 `TraderData` 同步。前端型別 optional；詳情頁「觀測期間」文案改用
+  `observed_from`～`synced_through`（缺則沿用現行）。測試：compose 列兩欄等於 store 值；v3 遷移列兩欄 null。
+
+### Task 7.2 @inline：詳情頁／策略頁 null→0 稽核與修正
+
+<!-- 使用者第 4 點：影響勝率、績效或策略資格者列對外驗收前必修；純展示也不得把未知顯示成 0。 -->
+- 盤點 `web/src/lib/publicApi.ts` 的 `getPublicStrategies`（`live_days`）、`getPublicTraderDetail`（`FillsStats` 的 `closed_positions`／`realized_pnl_usd`／
+  `live_days`）與其他 `: 0` 補值；對每一處判定「參與資格／排序／指標計算」或「純展示」，前者改 null 並修消費端，後者改 null 且顯示 NO_VALUE。
+- 產出對照表寫進本卡片；vitest 覆蓋 null 保持 null 與畫面「—」。
+
+### Task 7.3（主線程）：follower 同 IP 缺口
+- 觀測期間每筆取樣含引擎 429／同步錯誤／重試／心跳年齡；期滿一併呈報。
+- 共享預算修復候選（不在本輪實作）：(a) 引擎改經 publicapi 同一個 `WeightLimiter`——需跨進程，走檔案鎖或 unix socket；(b) 引擎自帶同規格
+  限流器並各自留餘量（現行做法，靠 900 上限的 300 餘量）；(c) 引擎讀 publicapi 的 `hl_budget` 快照做退讓。待使用者裁決。
+
 ## P5 驗收與啟用準備（任務卡）
 
 - Task 5.1 @sdd：`deploy/RUNBOOK.md` 新節「Explore 背景刷新」：env（`FILET_HL_GLOBAL_WEIGHT_CAP`、`FILET_HL_EXPLORE_WEIGHT_CAP`、`FILET_EXPLORE_DB`、`EXPLORE_UPSTREAM_REFRESH`）、drop-in 檔名、觀察 `/api/ops/health.hl_budget`／`.explore_refresh`、停用刷新（設 `EXPLORE_UPSTREAM_REFRESH=0` 重啟，快照續讀）、回退（不重新啟用舊 rebuild；程式已刪）。`deploy/filet-api.service.d/explore-refresh.conf` 範本；`var/lib/filet-api/explore.db` 權限 `filet-api` 0600。
