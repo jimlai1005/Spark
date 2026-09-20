@@ -200,7 +200,26 @@ def test_plan_page_increment_after_grace_period_preserves_completeness_and_shift
     assert plan.state.cursor_ms == plan.start_ms
     assert plan.state.completeness == "partial"  # 保留，不重置
     assert plan.state.pages_done == 0
-    assert plan.state.fills_in_window == 42  # 未被歸零（規格只明列 pages_done 歸零）
+    assert plan.state.fills_in_window == 0  # 歸零（2026-09-20 主線程裁決：門檻只看本輪區間）
+
+
+def test_plan_page_increment_resets_fills_in_window_so_stale_count_does_not_flip_complete():
+    # 第一輪已 complete，fills_in_window=7900（本身未達門檻）；增量輪若不歸零，
+    # 光是舊計數就會讓門檻在沒有新資料時逐輪逼近，甚至疊加新頁後立刻跨過 8000。
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="complete", fills_in_window=7900,
+    )
+    now = 1000 + 5 * 3600 * 1000
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    assert plan.state.fills_in_window == 0
+
+    page = [_fill(now - 300 + i, i) for i in range(200)]  # 短頁（200 < PAGE_LIMIT），時間落在區間內
+    result = apply_page(plan, page, page_limit=PAGE_LIMIT, retention_limit=RETENTION_LIMIT,
+                         now_ms=now)
+    assert result.done is True
+    assert result.state.completeness == "complete"  # 7900 的舊帳不該讓 0+200 觸頂
+    assert result.state.reason is None
 
 
 def test_end_to_end_three_full_pages_then_short_page_completes():

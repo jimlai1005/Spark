@@ -77,7 +77,11 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
       游標從 `max(新 window_start, synced_through_ms - overlap_ms)` 開始（inclusive
       重疊，去重交給 PK）、`pages_done` 歸零；`completeness` 原樣保留（`partial`
       仍是 `partial`——增量輪只從尾端續抓，沒有重新掃過整個區間，不能因為新抓到幾筆
-      就宣稱已補完先前無法證明完整的部分）。
+      就宣稱已補完先前無法證明完整的部分）。`fills_in_window` 同樣歸零（2026-09-20
+      主線程裁決）：留存門檻判的是「這一輪查詢區間內觀測到的筆數」，增量輪的查詢區間
+      只有 `synced_through_ms` 到 `now` 這一小段缺口，門檻要對這段缺口套用；若跨輪
+      累加舊區間的計數，會在無新增風險的情況下隨時間單調上升，幾輪之後無條件觸頂，
+      把本來 `complete` 的地址誤標 `partial`。
       若還沒到增量寬限期 → 回傳 `start_ms == end_ms == synced_through_ms` 的空計畫
       （`PagePlan.is_noop` 為 True），呼叫端據此不打上游。
     """
@@ -101,7 +105,7 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
                               - overlap_ms)
             new_state = dataclasses.replace(
                 state, window_start_ms=new_window_start, window_end_ms=now_ms,
-                cursor_ms=new_cursor, pages_done=0,
+                cursor_ms=new_cursor, pages_done=0, fills_in_window=0,
             )
             return PagePlan(start_ms=new_cursor, end_ms=now_ms, state=new_state)
         through = state.synced_through_ms
