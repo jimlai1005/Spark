@@ -1046,6 +1046,21 @@ S4 candidates 週期 1800s（36MB 下載每 30 分鐘一次）。S2（地址小�
 - [ ] **H. 測試**：store 四個新方法＋0600；scheduler：退池地址 job 全刪、之後零上游、`purge(now+30d)` 能刪它、準入不再卡死、`run_forever` 例外後有 sleep（sleep_fn 記錄）、`ScopePaused` 不計 attempts；publisher：門檻擋下（index 有版本＋10% portfolio → False、`gate_skips==1`、index 未變、快照未寫）、無版本不套門檻、80% 以上通過、失敗路徑 60s 內不重算（compose 計數）、v3 備份檔存在且只備一次；fills_sync 常數同源（`PAGE_LIMIT is USER_FILLS_PAGE_LIMIT`）；traders 既有五條綠。
 - [ ] **I. Commit** `fix: P2–P5 審查修正（job 生命週期、發布門檻＋v3 備份、緊迴圈、準入 COUNT、常數同源、db 0600）`
 
+### Task 3.6 @inline：3.5 複審修正（2026-09-20 opus 複審：1 Critical／3 Warning／4 Suggestion）
+
+<!-- 裁決：C1 門檻 n==0 旁路 → 有現役版本時 with_pf==0 或 n==0 一律不換版；候選輪拿到空 rows 視為失敗不停用任何人。
+W1 非候選地址多頁 fills 續頁被 dropped → 續頁不看 active，只在整輪 done 後決定是否排下一輪。W2 WAL/SHM 側檔 0644 →
+連線後 chmod 側檔。W3 補「job 地址不在 candidate 表」測試。S1 發布順序（先快照後換版）寫回：接受。S2 force 繞過門檻＋
+status 露 min_portfolio_ratio。S3 備份失敗 log。S4 count_with_payload 用 COUNT(DISTINCT address)。 -->
+
+**Files:** `explore_publisher.py`、`explore_scheduler.py`、`explore_store.py`；`tests/test_explore_publisher.py`、`tests/test_explore_scheduler.py`、`tests/test_explore_store.py`。
+
+- [ ] **A. publisher 門檻**：`has_version = index.status()["rows"] is not None`；`gate_blocked = has_version and (n == 0 or with_pf == 0 or with_pf < ratio * n)`；`force=True` 繞過門檻（但仍走節流以外的所有步驟）；`status()` 加 `min_portfolio_ratio`；備份讀檔／解析失敗 `logger.warning` 一行後繼續。發布順序維持「先 dump_snapshot 再 set_published」（3.5 實作的偏離，接受並記錄：快照沒落地就不換記憶體版本）。
+- [ ] **B. scheduler**：(1) `_run_candidates`：`candidate_addresses(...)` 回空 list → 不呼叫 `upsert_candidates`／`deactivate_missing`，`reschedule(now+60, err="empty candidate rows")`、回 `retry`（候選來源壞掉不能等於「所有人退池」）；(2) `_run_fills`：`res.done is False`（續頁）→ 直接 `reschedule(next=now, bump_attempts=False)`，**不看** `is_active`；只有 `res.done` 後排下一輪前才查 `is_active`，非 active → `complete`、回 `dropped`。`_run_cache_kind` 維持 3.5 行為。
+- [ ] **C. store**：`__init__` 在 PRAGMA 與建表後，對 `db_path`、`db_path + "-wal"`、`db_path + "-shm"` 存在者逐一 `os.chmod(0o600)`（best effort）；`count_with_payload` 改 `COUNT(DISTINCT e.address)`。
+- [ ] **D. 測試**：publisher：有版本＋`n==0` → 不發布、`gate_skips+1`、快照未寫；有版本＋`with_pf==0` 同；`force=True` 在 10% 下仍發布；`status()["min_portfolio_ratio"] == 0.8`。scheduler：非候選地址（未 `upsert_candidates`）的 fills job 三頁滿頁 → 三個 tick 都續頁（`pages_done` 到 3），第四 tick 短頁 done 後才 `dropped`；候選輪空 rows → 300 候選仍 active、job 數不變、tick 回 `retry`。store：`explore.db-wal`／`-shm` 若存在為 0600（用一次寫入觸發 WAL 後檢查）；`count_with_payload` 對同地址兩個 `params_fp` 只算 1。
+- [ ] **E. Commit** `fix: 3.5 複審修正（門檻 n==0/with_pf==0 不換版、候選空 rows 不停用、續頁不看 active、WAL 側檔 0600、force 繞過門檻）`
+
 ## P4 漸進發布（任務卡）
 
 ### Task 4.1 @inline：`explore_publisher.py`
