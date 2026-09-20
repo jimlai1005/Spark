@@ -19,7 +19,8 @@ from spark.filet.trader_stats import WindowStats
 from spark.publicapi.hl_explore import (SORT_FIELDS, ExploreConfig, ExploreIndex,
                                         ExploreRow, candidate_addresses, classify,
                                         clamp_explore_params, enrich_candidate,
-                                        paginate, qualify, sort_key, sort_rows)
+                                        mask_incomplete_fills, paginate, qualify,
+                                        sort_key, sort_rows)
 from spark.publicapi.store import ApiStore
 from tests.publicapi_helpers import FakeHL, FakeKeysvc, make_cfg
 
@@ -541,6 +542,61 @@ def test_sort_rows_secondary_key_is_address_ascending_stable_within_group():
     asc = sort_rows([r_hi_addr, r_lo_addr], window="month", sort="pnl", order="asc")
     assert [r.address for r in desc] == [addr_lo, addr_hi]
     assert [r.address for r in asc] == [addr_lo, addr_hi]
+
+
+def test_mask_incomplete_fills_leaves_complete_row_unchanged():
+    """Task 6.5：`fills_coverage.state == "complete"` 時原樣回傳（compose 出的
+    complete 列不受輸出層遮罩影響）。"""
+    row = _row(coins=("BTC", "ETH"), win_rate=80.0, concentration_pct=42.0,
+              closed_positions_30d=9, realized_pnl_30d_usd=123.0,
+              tags=("concentrated", "low_drawdown"))
+    assert mask_incomplete_fills(row) is row
+
+
+def test_mask_incomplete_fills_nulls_derived_fields_when_not_complete():
+    """Task 6.5：coverage 非 complete → 四個成交衍生欄位 None、coins 清空、
+    `concentrated` tag 剔除（非成交衍生的 `low_drawdown` tag 保留）。"""
+    row = _row(coins=("BTC", "ETH"), win_rate=80.0, concentration_pct=42.0,
+              closed_positions_30d=9, realized_pnl_30d_usd=123.0,
+              tags=("concentrated", "low_drawdown"),
+              fills_coverage={"state": "backfilling", "observed_from": None,
+                              "observed_to": None, "reason": None})
+    masked = mask_incomplete_fills(row)
+    assert masked.close_win_rate_pct is None
+    assert masked.concentration_pct is None
+    assert masked.closed_positions_30d is None
+    assert masked.realized_pnl_30d_usd is None
+    assert masked.coins == ()
+    assert masked.tags == ("low_drawdown",)
+    assert masked.order_count_30d == row.order_count_30d   # 不受遮罩影響
+
+
+def test_to_dict_masks_incomplete_fills_for_manually_built_partial_row():
+    """Task 6.5：直接建構（不經 `enrich_candidate`）、coverage=partial 且
+    `close_win_rate_pct` 已有值的列，`to_dict()` 仍要在輸出層被遮成 None——
+    唯一出口不能依賴呼叫端記得先遮。"""
+    row = _row(win_rate=50.0,
+              fills_coverage={"state": "partial", "observed_from": 1,
+                              "observed_to": 2, "reason": None})
+    d = row.to_dict()
+    assert d["close_win_rate_pct"] is None
+    assert d["concentration_pct"] is None
+    assert d["coins"] == []
+
+
+def test_sort_rows_win_rate_masks_partial_coverage_row_to_group_tail():
+    """Task 6.5：`sort_rows(..., sort="win_rate")` 用遮罩後的值排序——即使
+    partial 列自身欄位還帶著未遮蔽的高勝率值，排序時仍視為未知、落到組尾。"""
+    addr_complete = "0x" + "01" * 20
+    addr_partial = "0x" + "02" * 20
+    complete = _row(address=addr_complete, win_rate=80.0, eligibility="eligible")
+    partial = _row(address=addr_partial, win_rate=99.0, eligibility="eligible",
+                   fills_coverage={"state": "partial", "observed_from": 1,
+                                   "observed_to": 2, "reason": None})
+    desc = sort_rows([partial, complete], window="month", sort="win_rate", order="desc")
+    asc = sort_rows([partial, complete], window="month", sort="win_rate", order="asc")
+    assert [r.address for r in desc] == [addr_complete, addr_partial]
+    assert [r.address for r in asc] == [addr_complete, addr_partial]
 
 
 def test_sort_rows_missing_sort_value_tiebreak_by_address_within_missing_group():

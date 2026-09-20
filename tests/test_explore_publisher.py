@@ -241,6 +241,39 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
     assert result["initializing"] is False
 
 
+def test_load_snapshot_v3_migrates_masks_incomplete_fills_and_zeroes_order_count(tmp_path):
+    """Task 6.5：主線程本機以正式機 v3 快照實測發現——舊快照列本身可能帶有
+    非空的成交衍生欄位（v3 時代沒有「未知≠0」語意，`enrich_candidate` 尚未
+    遮蔽），遷移到 v4 後必須被輸出層遮罩補上，且 `order_count_30d` 歸零
+    （v3 的值不是「本輪已觀測筆數」，沿用會讓 `classify` 誤判 eligible）。"""
+    row_dict = _v3_row_dict()
+    row_dict.update(coins=["ZEC", "BTC"], order_count_30d=886, closed_positions_30d=12,
+                    realized_pnl_30d_usd=345.6, close_win_rate_pct=13.33,
+                    concentration_pct=28.6, tags=["concentrated", "low_drawdown"])
+    path = tmp_path / "explore_snapshot.json"
+    path.write_text(json.dumps({"version": 3, "built_at": 555.0, "total_scanned": 1,
+                                "rows": [row_dict]}))
+
+    loaded = hl_explore.load_snapshot(str(path))
+    assert loaded is not None
+    row = loaded["rows"][0]
+    assert row.close_win_rate_pct is None
+    assert row.concentration_pct is None
+    assert row.closed_positions_30d is None
+    assert row.realized_pnl_30d_usd is None
+    assert row.coins == ()
+    assert "concentrated" not in row.tags
+    assert "low_drawdown" in row.tags   # 非成交衍生標籤不受本遮罩影響
+    assert row.order_count_30d == 0
+
+    index = ExploreIndex(cfg=_cfg(), now_fn=lambda: 1000.0, snapshot_path=str(path))
+    result = index.query(min_live_days=30, min_fills=200, max_dd_pct=100.0,
+                         max_concentration_pct=100.0)
+    # 修法前：舊 order_count_30d=886 >= min_fills(200) 讓這列被誤判 eligible。
+    assert result["total_qualified"] == 0
+    assert result["rows"][0]["eligibility"] in ("pending", "ineligible")
+
+
 # ============================================================
 # 原子寫（驗收 6）
 # ============================================================

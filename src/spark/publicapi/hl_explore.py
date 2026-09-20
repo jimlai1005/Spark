@@ -415,28 +415,53 @@ class ExploreRow:
                                             # fills_unknown/enrich_error；eligible 為 None
 
     def to_dict(self) -> dict:
+        row = mask_incomplete_fills(self)
         return {
-            "address": self.address,
-            "display_name": self.display_name,
-            "label": self.label,
-            "coins": list(self.coins),
-            "account_bucket": self.account_bucket,
+            "address": row.address,
+            "display_name": row.display_name,
+            "label": row.label,
+            "coins": list(row.coins),
+            "account_bucket": row.account_bucket,
             "windows": {k: (v.to_dict() if v is not None else None)
-                       for k, v in self.windows.items()},
-            "live_days": self.live_days,
-            "order_count_30d": self.order_count_30d,
-            "closed_positions_30d": self.closed_positions_30d,
-            "realized_pnl_30d_usd": self.realized_pnl_30d_usd,
-            "close_win_rate_pct": self.close_win_rate_pct,
-            "concentration_pct": self.concentration_pct,
-            "exposure": {"dir": self.exposure_dir, "pct": self.exposure_pct},
-            "tags": list(self.tags),
-            "fills_truncated": self.fills_truncated,
-            "as_of": dict(self.as_of),
-            "fills_coverage": dict(self.fills_coverage),
-            "eligibility": self.eligibility,
-            "eligibility_reason": self.eligibility_reason,
+                       for k, v in row.windows.items()},
+            "live_days": row.live_days,
+            "order_count_30d": row.order_count_30d,
+            "closed_positions_30d": row.closed_positions_30d,
+            "realized_pnl_30d_usd": row.realized_pnl_30d_usd,
+            "close_win_rate_pct": row.close_win_rate_pct,
+            "concentration_pct": row.concentration_pct,
+            "exposure": {"dir": row.exposure_dir, "pct": row.exposure_pct},
+            "tags": list(row.tags),
+            "fills_truncated": row.fills_truncated,
+            "as_of": dict(row.as_of),
+            "fills_coverage": dict(row.fills_coverage),
+            "eligibility": row.eligibility,
+            "eligibility_reason": row.eligibility_reason,
         }
+
+
+def mask_incomplete_fills(row: ExploreRow) -> ExploreRow:
+    """Task 6.5（P6 契約 A，工程原則 5 結構性修法）：`fills_coverage.state !=
+    "complete"` 時，成交衍生欄位一律 `None`／空——未知 ≠ 0，前端不得自行推算。
+    這是**唯一輸出口**的把關（`ExploreRow.to_dict()`／`load_snapshot` v3 遷移／
+    `sort_rows` 排序鍵取值都經過這裡），`enrich_candidate` 裡的等價遮蔽
+    （P6，D13）是雙保險，不是被取代——兩處任一漏改，這裡仍兜底。
+
+    `order_count_30d` 刻意不在遮蔽範圍：它是「本輪已觀測筆數的下限」，即使
+    coverage 未完整仍是已知量（見 `enrich_candidate` P6 段的欄位註記）；
+    `load_snapshot` 對 v3 舊快照另有專門處理（見該函式），因為那些值完全
+    不是「本輪觀測」，不能只靠這裡的通用遮罩覆蓋。"""
+    if row.fills_coverage.get("state") == "complete":
+        return row
+    return dataclasses.replace(
+        row,
+        close_win_rate_pct=None,
+        concentration_pct=None,
+        closed_positions_30d=None,
+        realized_pnl_30d_usd=None,
+        coins=(),
+        tags=tuple(t for t in row.tags if t != "concentrated"),
+    )
 
 
 def _row_from_dict(d: dict) -> ExploreRow:
@@ -521,11 +546,24 @@ def load_snapshot(path: str) -> dict | None:
         total_scanned = int(payload["total_scanned"])
         raw_rows = payload["rows"]
         if version == 3:
+            # Task 6.5：v3 快照的 `order_count_30d` 是舊語意（`enrich_candidate`
+            # 在成交完整時才會寫這欄，v3 時代沒有「本輪已觀測筆數下限」這個
+            # 概念）——沿用舊值會讓 `classify` 把它當成「已滿足 min_fills」
+            # 而誤判 eligible（主線程本機實測：886 筆舊值讓 96 個本應 pending
+            # 的地址假合格）。歸零後與 `fills_coverage.state=="backfilling"`
+            # 一致（未知，不是已知的 0，`classify` 的 fills_pending 分支會
+            # 正確判定「未定」）。
             migrated_as_of = {"portfolio": built_at, "state": built_at, "fills": built_at}
             raw_rows = [dict(r, as_of=migrated_as_of,
-                            fills_coverage=dict(DEFAULT_FILLS_COVERAGE))
+                            fills_coverage=dict(DEFAULT_FILLS_COVERAGE),
+                            order_count_30d=0)
                        for r in raw_rows]
         rows = [_row_from_dict(r) for r in raw_rows]
+        if version == 3:
+            # 讓快照本身（進了記憶體的 `ExploreRow` 集合）也符合契約 A——
+            # `to_dict()` 序列化時會再遮一次（雙保險），這裡先做是為了
+            # `sort_rows`／`classify` 等其他讀路徑不必個別記得呼叫遮罩。
+            rows = [mask_incomplete_fills(r) for r in rows]
     except (KeyError, TypeError, ValueError) as e:
         logger.error("explore index 快照形狀不符，忽略（冷建）: %s", e)
         return None
@@ -919,7 +957,12 @@ def _sort_group(rows: list[ExploreRow], *, window: str, sort: str, order: str) -
     次排序鍵固定 `address` 升冪、與 `order` 無關（P6 契約 B）——先用 address
     做一次穩定排序墊底，再用主鍵排序，Python `sort` 的穩定性讓同值列維持
     address 升冪（標準的「先次鍵、後主鍵」技巧，不必手寫 tuple 比較函式）。"""
-    keyed = [(sort_value(r, window=window, sort=sort), r) for r in rows]
+    # Task 6.5：排序鍵取值前先遮罩（`sort="win_rate"` 讀 `close_win_rate_pct`）
+    # ——coverage 未完整的列即使欄位本身還沒被序列化遮蔽（例如尚未經
+    # `to_dict()`／`mask_incomplete_fills` 的呼叫端直接建構的列），排序語意
+    # 仍要視為「未知」（組尾），不得讓未遮蔽的舊值影響名次；回傳的仍是原始
+    # `r`（遮罩只影響這裡的鍵計算，不影響輸出列本身，見 `to_dict`）。
+    keyed = [(sort_value(mask_incomplete_fills(r), window=window, sort=sort), r) for r in rows]
     present = [(k, r) for k, r in keyed if k is not None]
     missing = [r for k, r in keyed if k is None]
     present.sort(key=lambda kr: kr[1].address)
