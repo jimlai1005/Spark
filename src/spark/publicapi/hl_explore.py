@@ -220,7 +220,7 @@ import json
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -307,7 +307,17 @@ MAX_CONCENTRATION_PCT_RANGE = (1, 100)
 # 2 → 3（2026-09-04／D7）：`windows[w]` 內部欄位改（損益金額＋權益指數回撤取代
 # 舊版百分比報酬）、30D 訂單數欄位改語意＝distinct 訂單數並新增
 # `closed_positions_30d`／`realized_pnl_30d_usd`——結構不相容，部署後強制重建。
-EXPLORE_INDEX_VERSION = 3
+# 3 → 4（2026-09-20，Task 4.1，spec §9.2）：`ExploreRow` 新增 `as_of`／
+# `fills_coverage` 兩欄（漸進發布：每列各自的資料新鮮度／成交完整性，不再靠
+# 單一 `published_at` 冒充全部欄位同時新鮮）——`load_snapshot` 讀到 v3 快照
+# 會就地補上這兩欄（`as_of` 全填 `built_at`、`fills_coverage` 為
+# `backfilling`）後當 v4 載入，不因版號不符就整份丟棄（D7：不丟棄舊快照）。
+EXPLORE_INDEX_VERSION = 4
+
+# Task 4.1：`fills_coverage` 的預設值（`ExploreRow` 欄位預設值與 v3→v4 快照
+# 遷移共用同一份常數，避免兩處手寫字面量漂移）。
+DEFAULT_FILLS_COVERAGE: dict = {"state": "backfilling", "observed_from": None,
+                                "observed_to": None, "reason": None}
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -426,14 +436,17 @@ class ExploreRow:
     display_name: str | None
     label: str                     # display_name 有值就用它，否則縮寫地址（D10）
     coins: tuple[str, ...]         # 近 30D 成交額（perp only，D4）最大的前 2-3 個幣種
-    account_bucket: str
+    account_bucket: str | None     # Task 4.1：`ch_state` 缺席（尚未 enrich 過）→ None，
+                                    # 不得冒充「—」（那個字面值原本代表「查過但算不出」）
     # R4-3：四窗（`WINDOW_KEYS`）各自的 `WindowStats`（`spark.filet.trader_stats`）；
     # `"month"`／`"allTime"` 是 enrich 的 gating 條件（缺席或不足兩點 → 整列跳過整個
     # ExploreRow 都不會被建構），保證這兩鍵在成功建構的列上恆非 None；`"day"`／
     # `"week"`是 best-effort，缺席／無效 → 該鍵存 None（不得用其他窗的數字冒充，見
     # 模組檔頭「R4-3」節）。
     windows: dict[str, "WindowStats | None"]
-    live_days: int                 # W1：allTime 首末點日曆跨距天數（非 distinct 日數）
+    live_days: int | None          # W1：allTime 首末點日曆跨距天數（非 distinct 日數）；
+                                    # Task 4.1：`portfolio_raw` 缺席（尚未 enrich 過）→
+                                    # None（「分析待完成」，不是 0——`qualify` 因此不合格）
     order_count_30d: int           # D3：distinct 訂單數（不是 fills 數）
     closed_positions_30d: int      # D3：部位歸零的生命週期數（Hyperbot 定義）
     realized_pnl_30d_usd: float    # D3：Σ closedPnl（未扣手續費／funding）
@@ -446,6 +459,14 @@ class ExploreRow:
                                     # locale 中性代碼，前端自行對映顯示文案）
     fills_truncated: bool = False  # D5：分頁抓到 fills_max_pages 上限仍滿頁
                                     # → 成交統計三個 *_30d 欄位是下限值/樣本估計
+    # Task 4.1（spec §9.2）：漸進發布——每列各自的資料新鮮度／成交完整性，不能
+    # 用單一 `published_at` 冒充全部欄位同時新鮮。`as_of` 三鍵
+    # `portfolio`/`state`/`fills` 對應各自來源的 `fetched_at`/`updated_at`
+    # （epoch 秒），缺該來源快取 → 該鍵 None。`fills_coverage` 同
+    # `app.py._local_trader_data` 的 `coverage` 形狀（`state`／`observed_from`／
+    # `observed_to`／`reason`），兩頁共用同一份定義（工程原則 1）。
+    as_of: dict[str, float | None] = field(default_factory=dict)
+    fills_coverage: dict = field(default_factory=lambda: dict(DEFAULT_FILLS_COVERAGE))
 
     def to_dict(self) -> dict:
         return {
@@ -465,6 +486,8 @@ class ExploreRow:
             "exposure": {"dir": self.exposure_dir, "pct": self.exposure_pct},
             "tags": list(self.tags),
             "fills_truncated": self.fills_truncated,
+            "as_of": dict(self.as_of),
+            "fills_coverage": dict(self.fills_coverage),
         }
 
 
@@ -493,6 +516,8 @@ def _row_from_dict(d: dict) -> ExploreRow:
         exposure_pct=exposure.get("pct"),
         tags=tuple(d.get("tags") or ()),
         fills_truncated=bool(d.get("fills_truncated", False)),
+        as_of=dict(d.get("as_of") or {}),
+        fills_coverage=dict(d.get("fills_coverage") or DEFAULT_FILLS_COVERAGE),
     )
 
 
@@ -512,10 +537,18 @@ def dump_snapshot(path: str, *, rows: list[ExploreRow], built_at: float,
 
 
 def load_snapshot(path: str) -> dict | None:
-    """I-17：讀快照。不存在／解析失敗／版本不符 → `None`（呼叫端視為「沒有
-    可用快照」，忽略、走既有冷建語意，不拋例外——這是加速路徑，不是資料正確
-    性的一部分，讀不到就當作沒發生過）。成功時回傳
-    `{"rows": [ExploreRow, ...], "built_at": float, "total_scanned": int}`。"""
+    """I-17：讀快照。不存在／解析失敗／版本不符（且非可遷移的 v3） → `None`
+    （呼叫端視為「沒有可用快照」，忽略、走既有冷建語意，不拋例外——這是加速
+    路徑，不是資料正確性的一部分，讀不到就當作沒發生過）。成功時回傳
+    `{"rows": [ExploreRow, ...], "built_at": float, "total_scanned": int}`。
+
+    Task 4.1（D7）：`version == 3`（`ExploreRow` 尚無 `as_of`／`fills_coverage`
+    兩欄的舊快照）不當成不相容直接丟棄——逐列補上 `as_of`（三鍵皆＝
+    `built_at`，這份快照本身就是那一刻拍下的，沒有更精確的每欄位時間戳可用）
+    與 `fills_coverage`（`backfilling`，尚未驗證完整性）後**當作 v4 載入**，
+    不丟棄舊快照（部署當下不必等一輪全新背景建置才有資料）。其他版本
+    （＜3 或介於 3 與 `EXPLORE_INDEX_VERSION` 之間、或未來版本）→ `None`，
+    既有語意不變。"""
     try:
         raw = Path(path).read_text()
     except OSError:
@@ -525,12 +558,21 @@ def load_snapshot(path: str) -> dict | None:
     except (json.JSONDecodeError, ValueError):
         logger.error("explore index 快照解析失敗，忽略（冷建）: %s", path)
         return None
-    if not isinstance(payload, dict) or payload.get("version") != EXPLORE_INDEX_VERSION:
+    if not isinstance(payload, dict):
+        return None
+    version = payload.get("version")
+    if version not in (EXPLORE_INDEX_VERSION, 3):
         return None
     try:
-        rows = [_row_from_dict(r) for r in payload["rows"]]
         built_at = float(payload["built_at"])
         total_scanned = int(payload["total_scanned"])
+        raw_rows = payload["rows"]
+        if version == 3:
+            migrated_as_of = {"portfolio": built_at, "state": built_at, "fills": built_at}
+            raw_rows = [dict(r, as_of=migrated_as_of,
+                            fills_coverage=dict(DEFAULT_FILLS_COVERAGE))
+                       for r in raw_rows]
+        rows = [_row_from_dict(r) for r in raw_rows]
     except (KeyError, TypeError, ValueError) as e:
         logger.error("explore index 快照形狀不符，忽略（冷建）: %s", e)
         return None
@@ -624,26 +666,42 @@ def _abbreviate_address(address: str) -> str:
 
 
 def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
-                     fills: list[dict], ch_state: dict, *,
-                     fills_truncated: bool = False) -> ExploreRow | None:
+                     fills: list[dict], ch_state: dict | None, *,
+                     fills_truncated: bool = False,
+                     as_of: dict[str, float | None] | None = None,
+                     fills_coverage: dict | None = None) -> ExploreRow | None:
     """純函式：候選地址的三份原始 HL 回應 → `ExploreRow`，或 `None`（該列整筆
     跳過，見模組檔頭第 2 點）。損益／回撤／sparkline／成交統計的公式全部委派
     給 `spark.filet.trader_stats`（`window_stats`／`fills_stats`），本函式只
     負責組裝與 gating（工程原則 1：同一窗的三個數字出自同一次 `window_stats`
     呼叫，不混用）。
 
-    `portfolio_raw`：`hl.portfolio(address)` 的原始回應。
+    `portfolio_raw`：`hl.portfolio(address)` 的原始回應，或 `None`（Task 4.1：
+    `explore_publisher.compose_rows` 讀 `ExploreStore` 合成列時，該地址可能
+    尚未被 scheduler enrich 過——`portfolio_raw is None` 不再整列跳過，而是
+    `windows` 全部設為 `None`、`live_days` 設為 `None`（「分析待完成」，不是
+    0——`qualify` 因 `live_days is None` 判定不合格，不會被誤判成不合格的
+    0 天，也不會被誤判成合格）。
     `fills`：`hl.get_fills_raw_paged(address, start, end)` 的輸出（原始 HL
     `userFillsByTime` 形狀，含 `dir`/`oid`/`startPosition`/`closedPnl`——
-    `trader_stats.fills_stats` 需要這些欄位，見 Task 3a）；`fills_truncated`：
-    同一次分頁呼叫的截斷旗標，原樣透傳進 `ExploreRow.fills_truncated`（D5）。
-    `ch_state`：`hl.clearinghouse_state(address)` 的原始回應。
+    `trader_stats.fills_stats` 需要這些欄位，見 Task 3a）；空 list 是合法值
+    （0 筆成交，照常算出 0），`fills_truncated`：同一次分頁呼叫的截斷旗標，
+    原樣透傳進 `ExploreRow.fills_truncated`（D5）。
+    `ch_state`：`hl.clearinghouse_state(address)` 的原始回應，或 `None`
+    （Task 4.1：尚未 enrich 過）→ `account_bucket`／`exposure_dir`／
+    `exposure_pct` 皆為 `None`（與「查過但算不出」的既有 `"—"`／`None` 語意
+    分開，見 `ExploreRow.account_bucket` 欄位註記）。
+    `as_of`／`fills_coverage`：Task 4.1，`compose_rows` 傳入的每欄位新鮮度／
+    成交完整性描述，原樣透傳進 `ExploreRow`；省略（`None`）→ 沿用
+    `ExploreRow` 的欄位預設值（空 dict／`backfilling`），既有呼叫端
+    （`ExploreIndex._enrich_one`）不必跟著改。
 
-    跳過整列的情況（讀不到就跳過，不編數字）：`month` 或 `allTime` 視窗缺席／
-    形狀不符／不足兩個取樣點（`window_stats` 回傳 `None`）——不再檢查淨值
-    首點是否為正（2026-09-04：報酬改用損益金額，不需要正分母，見 D2）；
-    day／week 是 best-effort，缺席只讓 `windows["day"/"week"]` 為 `None`，
-    不連坐整列（見模組檔頭「R4-3」節）。
+    跳過整列的情況（讀不到就跳過，不編數字；僅在 `portfolio_raw` 非 `None`
+    時適用——見上）：`month` 或 `allTime` 視窗缺席／形狀不符／不足兩個取樣點
+    （`window_stats` 回傳 `None`）——不再檢查淨值首點是否為正（2026-09-04：
+    報酬改用損益金額，不需要正分母，見 D2）；day／week 是 best-effort，
+    缺席只讓 `windows["day"/"week"]` 為 `None`，不連坐整列（見模組檔頭
+    「R4-3」節）。
     `tags` 留空（`()`）——集中度與低回撤兩個 tag 需要「這一批候選池」的相對
     資訊（門檻常數／同批分位數），由 `ExploreIndex.build_sync` 建完整批後
     再用 `_apply_tags` 統一補上，不在單一地址的純函式裡決定。
@@ -652,30 +710,45 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     # （"low_drawdown"/"concentrated"、"long"/"short"），不回傳中文顯示字串——
     # 顯示文案改由前端 `explore/page.tsx` 對映 `copy.ts`（見 `_exposure`／
     # `_apply_tags` 的實際賦值）。
-    month = window_stats(portfolio_raw, WINDOW_TO_PERIOD["month"])
-    if month is None:
-        return None
-    all_time_window = extract_window(portfolio_raw, WINDOW_TO_PERIOD["allTime"])
-    if all_time_window is None:
-        return None
-    av_all, _ = all_time_window
-    live_days = live_days_from_av(av_all)
-    all_time_stats = window_stats(portfolio_raw, WINDOW_TO_PERIOD["allTime"])
-    if all_time_stats is None:
-        return None
+    if portfolio_raw is None:
+        windows: dict[str, WindowStats | None] = {k: None for k in WINDOW_KEYS}
+        live_days: int | None = None
+    else:
+        month = window_stats(portfolio_raw, WINDOW_TO_PERIOD["month"])
+        if month is None:
+            return None
+        all_time_window = extract_window(portfolio_raw, WINDOW_TO_PERIOD["allTime"])
+        if all_time_window is None:
+            return None
+        av_all, _ = all_time_window
+        live_days = live_days_from_av(av_all)
+        all_time_stats = window_stats(portfolio_raw, WINDOW_TO_PERIOD["allTime"])
+        if all_time_stats is None:
+            return None
 
-    windows: dict[str, WindowStats | None] = {
-        "day": window_stats(portfolio_raw, WINDOW_TO_PERIOD["day"]),
-        "week": window_stats(portfolio_raw, WINDOW_TO_PERIOD["week"]),
-        "month": month,
-        "allTime": all_time_stats,
-    }
+        windows = {
+            "day": window_stats(portfolio_raw, WINDOW_TO_PERIOD["day"]),
+            "week": window_stats(portfolio_raw, WINDOW_TO_PERIOD["week"]),
+            "month": month,
+            "allTime": all_time_stats,
+        }
 
     fs: FillsStats = fills_stats(fills or [], truncated=fills_truncated)
-    account_value = _account_value(ch_state)
-    bucket = _account_bucket(account_value)
-    positions = _parse_positions(ch_state)
-    exp_dir, exp_pct = _exposure(positions)
+    if ch_state is None:
+        bucket: str | None = None
+        exp_dir: str | None = None
+        exp_pct: float | None = None
+    else:
+        account_value = _account_value(ch_state)
+        bucket = _account_bucket(account_value)
+        positions = _parse_positions(ch_state)
+        exp_dir, exp_pct = _exposure(positions)
+
+    extra_fields: dict = {}
+    if as_of is not None:
+        extra_fields["as_of"] = as_of
+    if fills_coverage is not None:
+        extra_fields["fills_coverage"] = fills_coverage
 
     return ExploreRow(
         address=address,
@@ -694,6 +767,7 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
         exposure_pct=exp_pct,
         tags=(),
         fills_truncated=fs.truncated,
+        **extra_fields,
     )
 
 
@@ -713,13 +787,17 @@ def _apply_tags(rows: list[ExploreRow], cfg: ExploreConfig) -> list[ExploreRow]:
     # 2026-09-04：`max_dd_pct` 可能是 `None`（該窗 perf 非 ok，見
     # `trader_stats.WindowStats`）——分位數只用有證據的列計算，`None` 的列
     # 永不掛 `low_drawdown`（沒有回撤數字，無從判斷它是不是「低回撤」）。
+    # Task 4.1：`windows["month"]` 本身也可能是 `None`（`portfolio_raw` 缺席的
+    # 「分析待完成」列，見 `enrich_candidate`）——同樣視為無證據，不掛 tag。
     dds = sorted(abs(Decimal(str(r.windows["month"].max_dd_pct)))
-                for r in rows if r.windows["month"].max_dd_pct is not None)
+                for r in rows
+                if r.windows["month"] is not None and r.windows["month"].max_dd_pct is not None)
     threshold = dds[max(0, -(-len(dds) // 4) - 1)] if dds else None
     out = []
     for r in rows:
         tags = []
-        month_dd = r.windows["month"].max_dd_pct
+        month_stats = r.windows["month"]
+        month_dd = month_stats.max_dd_pct if month_stats is not None else None
         if (threshold is not None and month_dd is not None
                 and abs(Decimal(str(month_dd))) <= threshold):
             tags.append("low_drawdown")
@@ -755,7 +833,13 @@ def qualify(row: ExploreRow, cfg: ExploreConfig, *, window: str = DEFAULT_WINDOW
       缺資料就先假設它超標）。
     """
     if require_sample:
-        if row.live_days < cfg.min_trading_days:
+        # Task 4.1：`live_days is None`（`portfolio_raw` 缺席的「分析待完成」
+        # 列）→ 不合格，不是「0 天」也不是「無條件通過」——沒有足夠證據能確認
+        # 已滿足「實盤 ≥ min_trading_days 天」，比照上面樣本門檻缺資料不能算
+        # 通過的方向處理（與回撤／集中度「缺資料算通過」是相反的方向：後兩者
+        # 是「上限」語意，缺資料不能假設超標；這裡是「下限」語意，缺資料不能
+        # 假設已達標，見模組檔頭本函式檔頭）。
+        if row.live_days is None or row.live_days < cfg.min_trading_days:
             return False
         if row.order_count_30d < cfg.min_fills:
             return False
@@ -905,6 +989,12 @@ class ExploreIndex:
         self._total_scanned = 0
         self._building = False                         # single-flight：背景建置中
         self._enrich_cache: dict[str, tuple[float, ExploreRow | None]] = {}
+        # Task 4.1：`ExplorePublisher.maybe_publish` 換版時一併寫入的批次統計
+        # （`candidates`／`with_portfolio`／`coverage_counts`／`as_of_oldest`，
+        # 見 `explore_publisher.compose_rows`）；`query()` 的 `coverage_counts`
+        # 讀這裡，無則 `{}`（尚未經 publisher 換過版，例如剛從舊版磁碟快照
+        # 載入、還沒有 meta 可用——磁碟快照本身不落 meta，見模組檔頭「I-17」節）。
+        self._meta: dict = {}
 
         # I-17：啟動時嘗試從磁碟快照灌一份舊資料，讓「程序重啟後第一個請求」
         # 不必等一輪背景建置（數分鐘）才有資料可查（見模組檔頭「I-17」節）。
@@ -928,6 +1018,23 @@ class ExploreIndex:
             return {"rows": None if self._rows is None else len(self._rows),
                     "built_at": self._built_at, "version": self._rows_version,
                     "building": self._building}
+
+    def set_published(self, rows: list[ExploreRow], meta: dict) -> None:
+        """Task 4.1：`ExplorePublisher.maybe_publish` 的原子換版入口——取代舊版
+        `build_sync` 直接寫 `self._rows` 三件組的角色。持鎖設 `_rows`、
+        `_rows_version`（＝目前的 `EXPLORE_INDEX_VERSION`，發布出來的列一律是
+        最新結構）、`_built_at`（＝`meta["published_at"]`）、`_total_scanned`
+        （＝`meta["candidates"]`）、`_meta`（原樣保留，供 `query()` 的
+        `coverage_counts` 用）。呼叫端（`ExplorePublisher`）負責先組好
+        `rows`/`meta` 再呼叫本方法——本方法本身不做任何 compose 或 IO，失敗
+        與否全在呼叫端決定（compose 失敗就不呼叫本方法，見
+        `explore_publisher.py`）。"""
+        with self._lock:
+            self._rows = rows
+            self._rows_version = EXPLORE_INDEX_VERSION
+            self._built_at = meta["published_at"]
+            self._total_scanned = meta["candidates"]
+            self._meta = meta
 
     def _call_hl(self, fn: Callable[[], object], *, what: str) -> object:
         """單一 HL 呼叫。節流與 429 處理已**全部**移到 `HLGateway`＋`WeightLimiter`
@@ -1126,10 +1233,14 @@ class ExploreIndex:
             rows_version = self._rows_version
             built_at = self._built_at
             total_scanned = self._total_scanned
+            meta = self._meta
         if rows is None or rows_version != EXPLORE_INDEX_VERSION:
+            # Task 4.1：`initializing`＝從未有可服務版本；`building` 保留同義
+            # （前端相容，見類別檔頭「Task 4.1」段）。
             return {"rows": [], "page": page, "page_size": self._cfg.page_size,
                    "total_qualified": 0, "total_scanned": 0, "pool": 0,
-                   "updated_at": None, "building": True}
+                   "updated_at": None, "building": True,
+                   "published_at": None, "initializing": True, "coverage_counts": {}}
         cfg = self._cfg
         if (min_live_days, min_fills, max_dd_pct, max_concentration_pct) != (None, None, None, None):
             cfg = dataclasses.replace(
@@ -1152,4 +1263,11 @@ class ExploreIndex:
                "total_qualified": len(qualified_rows), "total_scanned": total_scanned,
                "pool": total_scanned,
                "updated_at": int(built_at) if built_at is not None else None,
-               "building": False, "sort": sort, "order": order}
+               "building": False, "sort": sort, "order": order,
+               # Task 4.1（spec §9.2）：`published_at`（原始 epoch 秒，未經
+               # `int()` 截斷，供 `explore_publisher` 與 `query()` 呼叫端做
+               # 精確比較）、`initializing: False`（已有可服務版本）、
+               # `coverage_counts`（`ExplorePublisher.maybe_publish` 換版時
+               # 寫入的 meta，見 `set_published`；沒有 meta 可用 → `{}`）。
+               "published_at": built_at, "initializing": False,
+               "coverage_counts": meta.get("coverage_counts", {})}

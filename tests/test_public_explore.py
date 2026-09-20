@@ -768,9 +768,14 @@ def test_index_query_never_built_returns_building_true_and_empty_rows_without_bl
     elapsed = time.monotonic() - start
 
     assert elapsed < 0.5, f"query() 耗時過長（{elapsed}s）"
-    assert result == {"rows": [], "page": 1, "page_size": ExploreConfig().page_size,
-                      "total_qualified": 0, "total_scanned": 0, "pool": 0,
-                      "updated_at": None, "building": True}
+    # Task 4.1：整份 dict `==` 比對改包含式——`query()` 新增 `published_at`／
+    # `initializing`／`coverage_counts` 三鍵（見 hl_explore.py `query()`），
+    # 既有九個鍵的斷言維持精確值，不因新鍵而重寫。
+    assert result.items() >= {"rows": [], "page": 1, "page_size": ExploreConfig().page_size,
+                              "total_qualified": 0, "total_scanned": 0, "pool": 0,
+                              "updated_at": None, "building": True,
+                              "initializing": True, "published_at": None,
+                              "coverage_counts": {}}.items()
     assert not started.is_set(), "query() 不應觸發背景建置（2026-09-19 429 事故止血）"
 
     index.build_sync()  # 上游更新改走同步呼叫（P3 前的暫時介面）
@@ -929,10 +934,12 @@ def test_index_starts_with_no_rows_version_before_first_build():
     assert index._rows_version is None
 
 
-def test_snapshot_version_bumped_to_3():
-    """D7（2026-09-04）：`ExploreRow` 形狀變更（`windows[w]` 內部欄位＋成交統計
-    三欄改名／新增）——結構不相容，部署後須強制重建。"""
-    assert hl_explore.EXPLORE_INDEX_VERSION == 3
+def test_snapshot_version_bumped_to_4():
+    """D7（2026-09-04）3；Task 4.1（2026-09-20）3→4：`ExploreRow` 新增
+    `as_of`／`fills_coverage` 兩欄（漸進發布，spec §9.2）——`load_snapshot`
+    對 v3 快照有專門的相容遷移路徑（見 `test_snapshot_load_version_mismatch_
+    returns_none` 旁的 v3 測試），本測試只釘住目前版號本身。"""
+    assert hl_explore.EXPLORE_INDEX_VERSION == 4
 
 
 # ============================================================
@@ -978,9 +985,11 @@ def test_snapshot_load_corrupt_json_returns_none(tmp_path):
 
 def test_snapshot_load_version_mismatch_returns_none(tmp_path):
     """版本不符（例如上一版程式碼寫的舊形狀快照）→ 忽略，視同沒有可用快照
-    （呼叫端走既有冷建語意）。"""
+    （呼叫端走既有冷建語意）。Task 4.1：`EXPLORE_INDEX_VERSION - 1`（＝3）現在
+    是有專門遷移路徑的相容版本（見 `test_explore_publisher.py` 的 v3 遷移
+    測試），不再適合當「不相容」的例子——這裡改用真正沒有遷移路徑的舊版號。"""
     path = tmp_path / "explore_snapshot.json"
-    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 1,
+    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 2,
                                 "built_at": 1.0, "total_scanned": 0, "rows": []}))
     assert hl_explore.load_snapshot(str(path)) is None
 
@@ -1005,8 +1014,10 @@ def test_index_loads_snapshot_at_construction_and_is_immediately_queryable(tmp_p
 
 
 def test_index_snapshot_version_mismatch_on_disk_ignored_falls_back_to_cold_build(tmp_path):
+    """Task 4.1：同上，`EXPLORE_INDEX_VERSION - 1`（3）已是相容版本，改用
+    `- 2` 當真正不相容的例子。"""
     path = tmp_path / "explore_snapshot.json"
-    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 1,
+    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 2,
                                 "built_at": 1.0, "total_scanned": 0, "rows": []}))
     index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
                          excluded_fn=lambda: set(), cfg=ExploreConfig(),
