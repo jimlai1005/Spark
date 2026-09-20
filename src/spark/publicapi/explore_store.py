@@ -354,6 +354,27 @@ class ExploreStore:
                 (next_attempt_at, 1 if bump_attempts else 0, err, job.key, fencing))
         return cur.rowcount == 1
 
+    def set_sync_error(self, address: str, err: str, at: float) -> None:
+        """`fills` kind 隔離時的錯誤落地（Task 3.1 scheduler 用；2.1 未涵蓋，
+        本 task 卡片允許新增的最小方法）：只 UPDATE `last_error`／`updated_at`，
+        列不存在（從未成功跑過一輪 `plan_page`/`apply_page`）則不動——與
+        `put_cache_error` 對「從未成功過」補一列的語意不同，`fills_sync` 沒有
+        「只有錯誤沒有游標」這種中間狀態可插入。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE fills_sync SET last_error=?, updated_at=? WHERE address=?",
+                (err, at, addr))
+
+    def oldest_due_at(self, now: float) -> float | None:
+        """目前到期（`next_attempt_at <= now`）的工作中最早的到期時刻；沒有到期
+        工作回 `None`（scheduler `status()` 的 `oldest_due_age_s` 用）。"""
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT MIN(next_attempt_at) FROM refresh_job WHERE next_attempt_at <= ?",
+                (now,)).fetchone()
+        return row[0]
+
     # --- maintenance ---
     def purge(self, now: float, *, candidate_keep_s: float = 7 * 86400,
               fills_keep_s: float = 35 * 86400) -> dict[str, int]:

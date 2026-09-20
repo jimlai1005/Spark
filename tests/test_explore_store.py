@@ -276,6 +276,40 @@ def test_concurrent_enqueue_thread_safe(tmp_path):
     assert count == 100
 
 
+# --- set_sync_error / oldest_due_at (Task 3.1 加) ---
+
+def test_set_sync_error_updates_existing_row(tmp_path):
+    store, c = _store(tmp_path)
+    store.insert_fills_page("0xabc", [_fill(tid=1, time_ms=100)],
+                            _checkpoint(completeness="complete"))
+    store.set_sync_error("0xABC", "boom", at=c.now() + 10)
+    sync = store.get_sync("0xabc")
+    assert sync.last_error == "boom"
+    assert sync.updated_at == c.now() + 10
+    # 其餘欄位不動
+    assert sync.completeness == "complete"
+
+
+def test_set_sync_error_noop_when_row_missing(tmp_path):
+    store, c = _store(tmp_path)
+    store.set_sync_error("0xnope", "boom", at=c.now())
+    assert store.get_sync("0xnope") is None
+
+
+def test_oldest_due_at_returns_none_when_nothing_due(tmp_path):
+    store, c = _store(tmp_path)
+    store.enqueue("0xabc:state", "0xabc", "state", priority=0, next_attempt_at=c.now() + 100)
+    assert store.oldest_due_at(c.now()) is None
+
+
+def test_oldest_due_at_returns_earliest_due_next_attempt(tmp_path):
+    store, c = _store(tmp_path)
+    store.enqueue("0xabc:state", "0xabc", "state", priority=0, next_attempt_at=c.now() - 50)
+    store.enqueue("0xabc:portfolio", "0xabc", "portfolio", priority=1,
+                  next_attempt_at=c.now() - 10)
+    assert store.oldest_due_at(c.now()) == c.now() - 50
+
+
 def test_stats_reports_counts_and_completeness(tmp_path):
     store, c = _store(tmp_path)
     store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
