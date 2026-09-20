@@ -34,7 +34,7 @@ import { Suspense, type Dispatch, type SetStateAction, useEffect, useState } fro
 import { NO_VALUE, fmtSignedUsd, fmtUpdatedAtUtc } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
 import {
-  EXPLORE_ORDERS, EXPLORE_SORT_FIELDS, EXPLORE_WINDOWS, getPublicExplore,
+  EXPLORE_ORDERS, EXPLORE_SORT_FIELDS, EXPLORE_WINDOWS, fillsIncomplete, getPublicExplore,
   type ExploreFilters, type ExploreOrder, type ExploreResp, type ExploreRow,
   type ExploreSort, type ExploreWindow,
 } from "@/lib/publicApi";
@@ -110,6 +110,39 @@ function exposureDirLabel(dir: string, c: ReturnType<typeof useCopy>["explore"])
   if (dir === "long") return c.exposureDir.long;
   if (dir === "short") return c.exposureDir.short;
   return dir;
+}
+
+/** Task 6.2（P6 契約 A）：`eligibility_reason` → 小字原因文案，只認得列在
+ * `COPY.explore.pendingReason` 裡的代碼；`null`／未知代碼回傳 `null`（呼叫端
+ * 此時只顯示 `groupPending` 本身，不額外顯示原因——防禦性，同 `tagLabel`）。 */
+function pendingReasonLabel(
+  reason: string | null | undefined, c: ReturnType<typeof useCopy>["explore"],
+): string | null {
+  if (reason == null) return null;
+  const map = c.pendingReason as Record<string, string | undefined>;
+  return map[reason] ?? null;
+}
+
+type EligibilityGroupKey = "eligible" | "pending";
+
+/** Task 6.2（P6 契約 B）：後端已經把 rows 排成 eligible 組在前、pending 組在後
+ * （組內依 sort key 排序），前端**不重新排序**——只依 `eligibility` 欄位把既有
+ * 順序切成連續的組，插入組標題。`ineligible`／未知值防禦性併入 `eligible`
+ * 組（列表 API 契約上不會回傳 ineligible 列，這裡只是不讓意外值讓頁面壞掉）。 */
+function groupRowsByEligibility(
+  rows: ExploreRow[],
+): { key: EligibilityGroupKey; items: { row: ExploreRow; index: number }[] }[] {
+  const groups: { key: EligibilityGroupKey; items: { row: ExploreRow; index: number }[] }[] = [];
+  rows.forEach((row, index) => {
+    const key: EligibilityGroupKey = row.eligibility === "pending" ? "pending" : "eligible";
+    const last = groups[groups.length - 1];
+    if (last && last.key === key) {
+      last.items.push({ row, index });
+    } else {
+      groups.push({ key, items: [{ row, index }] });
+    }
+  });
+  return groups;
 }
 
 /** values → SVG polyline 的 `points` 字串（等距 x，y 依 min/max 正規化，同
@@ -197,6 +230,9 @@ function ExploreInner() {
   // 空榜比寬鬆預設更糟。品質基線（實盤天數/成交筆數）維持預設開。
   const [maxDdChip, setMaxDdChip] = useState(() => parseBoolFlag(searchParams.get("dd"), false));
   const [concentratedChip, setConcentratedChip] = useState(() => parseBoolFlag(searchParams.get("conc"), false));
+  // Task 6.2（P6 契約 B）：預設關閉——關閉時完全不帶 `eligibility` 查詢參數
+  // （沿用後端預設 `all`），開啟時只查 eligible（不混入 pending）。
+  const [onlyEligibleChip, setOnlyEligibleChip] = useState(() => parseBoolFlag(searchParams.get("elig"), false));
   const [page, setPage] = useState(() => parsePositiveIntParam(searchParams.get("page"), 1));
   const [sort, setSort] = useState<ExploreSort>(() => parseSortParam(searchParams.get("sort")));
   const [order, setOrder] = useState<ExploreOrder>(() => parseOrderParam(searchParams.get("order")));
@@ -214,6 +250,7 @@ function ExploreInner() {
     maxConcentrationPct: concentratedChip ? MAX_CONCENTRATION_PCT_THRESHOLD : 100,
     sort,
     order,
+    eligibility: onlyEligibleChip ? "eligible" : undefined,
   };
 
   useEffect(() => {
@@ -242,6 +279,7 @@ function ExploreInner() {
       url.searchParams.set("fills", fillsChip ? "1" : "0");
       url.searchParams.set("dd", maxDdChip ? "1" : "0");
       url.searchParams.set("conc", concentratedChip ? "1" : "0");
+      url.searchParams.set("elig", onlyEligibleChip ? "1" : "0");
       url.searchParams.set("page", String(page));
       url.searchParams.set("sort", sort);
       url.searchParams.set("order", order);
@@ -252,7 +290,10 @@ function ExploreInner() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, window_, liveDaysChip, fillsChip, maxDdChip, concentratedChip, sort, order, reloadKey]);
+  }, [
+    page, window_, liveDaysChip, fillsChip, maxDdChip, concentratedChip, onlyEligibleChip,
+    sort, order, reloadKey,
+  ]);
 
   function toggleChip(setter: Dispatch<SetStateAction<boolean>>) {
     setter((v) => !v);
@@ -375,6 +416,17 @@ function ExploreInner() {
         >
           {c.filters.concentrated}
         </button>
+        {/* Task 6.2（P6 契約 B）：「僅合格」——開啟時查詢只回 eligible（不混入
+            pending），關閉（預設）時不帶 `eligibility` 查詢參數。 */}
+        <button
+          type="button"
+          className="explore-chip"
+          data-active={onlyEligibleChip}
+          aria-pressed={onlyEligibleChip}
+          onClick={() => toggleChip(setOnlyEligibleChip)}
+        >
+          {c.onlyEligible}
+        </button>
         <span className="explore-count mono">
           {c.countPrefix}
           {(resp?.total_scanned ?? 0).toLocaleString()}
@@ -440,14 +492,33 @@ function ExploreInner() {
               <div>{c.table.exposure}</div>
               <div>{c.table.actions}</div>
             </div>
-            {resp.rows.map((row, i) => (
-              <ExploreRowView
-                key={row.address}
-                row={row}
-                window={window_}
-                rank={(resp.page - 1) * resp.page_size + i + 1}
-              />
-            ))}
+            {/* Task 6.2（P6 契約 B）：rows 若任一列帶 `eligibility` 欄位 → 依
+                既有順序分組渲染（不重新排序），pending 組不給名次。缺欄位
+                （舊後端）→ 完全沿用單一列表，行為與改動前相同。 */}
+            {resp.rows.some((row) => row.eligibility != null)
+              ? groupRowsByEligibility(resp.rows).map((group, gi) => (
+                <div key={`group-${gi}`} className="explore-group" data-group={group.key}>
+                  <div className="explore-group-header">
+                    {group.key === "pending" ? c.groupPending : c.groupEligible}
+                  </div>
+                  {group.items.map(({ row, index }) => (
+                    <ExploreRowView
+                      key={row.address}
+                      row={row}
+                      window={window_}
+                      rank={group.key === "pending" ? null : (resp.page - 1) * resp.page_size + index + 1}
+                    />
+                  ))}
+                </div>
+              ))
+              : resp.rows.map((row, i) => (
+                <ExploreRowView
+                  key={row.address}
+                  row={row}
+                  window={window_}
+                  rank={(resp.page - 1) * resp.page_size + i + 1}
+                />
+              ))}
           </div>
 
           <div className="explore-pagination">
@@ -499,7 +570,8 @@ function ExploreInner() {
 }
 
 function ExploreRowView(
-  { row, window: windowKey, rank }: { row: ExploreRow; window: ExploreWindow; rank: number },
+  // Task 6.2（P6 契約 B）：pending 列不給名次，`rank` 為 `null` 時顯示 NO_VALUE。
+  { row, window: windowKey, rank }: { row: ExploreRow; window: ExploreWindow; rank: number | null },
 ) {
   const COPY = useCopy();
   const c = COPY.explore;
@@ -522,9 +594,15 @@ function ExploreRowView(
     setCopied(true);
   }
 
-  const sub = row.coins.length > 0
-    ? `${row.coins.join(" ")}${c.subSep}${row.account_bucket}`
-    : row.account_bucket;
+  // Task 6.2（D14）：coverage 非 complete 時幣種副標顯示「分析待完成」，不是
+  // 悄悄變成空字串（coverage != complete 時 `coins` 恆為 `[]`，見 P6 契約 A）。
+  const incomplete = fillsIncomplete(row);
+  const sub = incomplete
+    ? `${c.analysisPending}${c.subSep}${row.account_bucket}`
+    : row.coins.length > 0
+      ? `${row.coins.join(" ")}${c.subSep}${row.account_bucket}`
+      : row.account_bucket;
+  const pendingReason = row.eligibility === "pending" ? pendingReasonLabel(row.eligibility_reason, c) : null;
   const exposureLabel = row.exposure.dir != null && row.exposure.pct != null
     ? `${exposureDirLabel(row.exposure.dir, c)} ${row.exposure.pct.toFixed(1)}%`
     : NO_VALUE;
@@ -536,7 +614,7 @@ function ExploreRowView(
 
   return (
     <div className="explore-table-row">
-      <div className="mono explore-rank">{rank}</div>
+      <div className="mono explore-rank">{rank == null ? NO_VALUE : rank}</div>
       <div className="explore-account">
         <div className="explore-account-top">
           {/* D14（2026-09-05，Task 12）：地址 label 點進詳情頁，與「查看」同目標
@@ -560,6 +638,9 @@ function ExploreRowView(
           ))}
         </div>
         <div className="explore-sub">{sub}</div>
+        {/* Task 6.2（P6 契約 A）：pending 列的小字原因——已知代碼才顯示，未知／
+            缺席時只靠上面的 groupPending 組標題傳達「資格待確認」，不硬湊文案。 */}
+        {pendingReason != null && <div className="hint explore-pending-reason">{pendingReason}</div>}
       </div>
       <div className="explore-spark">
         <svg
@@ -589,7 +670,7 @@ function ExploreRowView(
           : `${stats.max_dd_pct.toFixed(1)}%`}
       </div>
       <div className="mono explore-days">{row.live_days}</div>
-      <div className="mono explore-wr">{fmtPct1(row.close_win_rate_pct)}</div>
+      <div className="mono explore-wr">{incomplete ? c.analysisPending : fmtPct1(row.close_win_rate_pct)}</div>
       <div className="explore-exposure">
         {/* 無持倉（dir null）不畫 bar：bar 底色是空方紅，畫出來會像 100% 空單 */}
         {row.exposure.dir != null && (

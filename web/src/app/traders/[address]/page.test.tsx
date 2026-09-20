@@ -507,6 +507,52 @@ describe("TraderDetailPage", () => {
     });
   });
 
+  // Task 6.2（2026-09-20，D14）：coverage 非 complete 時，成交統計標題旁附
+  // 已觀測期間（observed_from～observed_to，epoch 毫秒，見 app.py
+  // `sync.observed_from_ms`）；缺日期時只顯示文案主體，不強行拼出無效日期。
+  describe("Task 6.2：成交統計已觀測期間（D14）", () => {
+    it("coverage 非 complete 且有日期 → 標題旁附觀測期間日期範圍", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_coverage: {
+          state: "partial",
+          observed_from: 1_700_000_000_000,
+          observed_to: 1_700_500_000_000,
+          reason: "page_limit",
+        },
+      }));
+      const { container } = render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const rangeEl = container.querySelector(".trader-fills-observed-range");
+      expect(rangeEl?.textContent).toContain(COPY.traders.fillsObservedRange);
+      expect(rangeEl?.textContent).toContain("2023-11-14");
+      expect(rangeEl?.textContent).toContain("2023-11-20");
+    });
+
+    it("coverage 非 complete 但日期缺席 → 只顯示文案主體，不顯示日期", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_coverage: { state: "backfilling", observed_from: null, observed_to: null, reason: null },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.getByText(COPY.traders.fillsObservedRange)).toBeInTheDocument();
+    });
+
+    it("coverage === complete → 不顯示觀測期間文案", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_coverage: { state: "complete", observed_from: 1, observed_to: 2, reason: null },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      expect(screen.queryByText(new RegExp(COPY.traders.fillsObservedRange))).not.toBeInTheDocument();
+    });
+  });
+
   describe("Task 7：起訖淨值補回（帳戶價值下方一行）", () => {
     it("start_equity_usd/end_equity_usd 有值、initial_deposit_usd 為 null → 顯示起訖淨值兩側金額，不出現初始入金列", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));

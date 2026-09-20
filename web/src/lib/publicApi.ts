@@ -411,6 +411,16 @@ export interface ExploreRow {
   concentration_pct: number | null;
   exposure: { dir: "long" | "short" | null; pct: number | null };
   tags: string[];
+  /** Task 6.2（2026-09-20，P6 契約 A）：後端 `classify` 決定的三態資格，列表
+   * API 不回傳 `ineligible` 列（只會是 `eligible`／`pending`）。前端**不得**自行
+   * 由其他欄位推導這個值，只能原樣讀取——第二次部署前舊後端不回這個鍵時整體
+   * 缺席，呼叫端需 fallback 到「不分組」的既有行為（見 `explore/page.tsx`）。 */
+  eligibility?: "eligible" | "pending" | "ineligible";
+  /** Task 6.2：`eligibility !== "eligible"` 時說明哪一條未定／不合格，值域見
+   * P6 契約 A（`live_days`／`max_dd`／`min_fills`／`concentration`／
+   * `portfolio_missing`／`fills_unknown`／`enrich_error`）；`eligible` 時為
+   * `null`。未知代碼防禦性地不顯示額外文案（同 `tagLabel` 慣例）。 */
+  eligibility_reason?: string | null;
 }
 
 /** Task 4.2（2026-09-20）：探索列／交易員詳情共用的成交完整性狀態
@@ -486,6 +496,11 @@ export interface ExploreResp {
    * `{backfilling: 3, complete: 47}`），供之後可能的整頁提示使用；本 task
    * 不消費它，只補型別。 */
   coverage_counts?: Record<string, number>;
+  /** Task 6.2（P6 契約 B）：這一頁 pending／ineligible 列數（ineligible 恆不入
+   * `rows`）。`total_qualified` 維持＝eligible 數（前端相容，既有讀法不變）。
+   * 舊後端不回這兩個鍵時為 `undefined`。 */
+  total_pending?: number;
+  total_ineligible?: number;
 }
 
 /**
@@ -502,6 +517,10 @@ export interface ExploreFilters {
   maxConcentrationPct: number;
   sort: ExploreSort;
   order: ExploreOrder;
+  /** Task 6.2（P6 契約 B）：`"eligible"` → 後端只回 eligible 列（不混入
+   * pending）。`undefined`／`"all"` → 不帶這個查詢參數（沿用後端預設 `"all"`，
+   * 見 `getPublicExplore` 只在有值時才帶 query）。 */
+  eligibility?: "all" | "eligible";
 }
 
 /**
@@ -572,6 +591,12 @@ function normalizeExploreRow(v: unknown): ExploreRow | null {
     fills_truncated: typeof r.fills_truncated === "boolean" ? r.fills_truncated : undefined,
     as_of: normalizeAsOf(r.as_of),
     fills_coverage: normalizeFillsCoverage(r.fills_coverage),
+    eligibility: r.eligibility === "eligible" || r.eligibility === "pending" || r.eligibility === "ineligible"
+      ? r.eligibility
+      : undefined,
+    eligibility_reason: typeof r.eligibility_reason === "string"
+      ? r.eligibility_reason
+      : (r.eligibility_reason === null ? null : undefined),
   };
 }
 
@@ -603,6 +628,11 @@ export async function getPublicExplore(
     sort: filters.sort,
     order: filters.order,
   });
+  // Task 6.2（P6 契約 B）：只有明確要求「僅合格」才帶這個查詢參數；`undefined`／
+  // `"all"` 都不帶，沿用後端預設（`all`＝eligible＋pending）。
+  if (filters.eligibility === "eligible") {
+    params.set("eligibility", filters.eligibility);
+  }
   const res = await fetch(`/api/public/explore?${params.toString()}`);
   if (!res.ok) throw new Error(`explore fetch failed: ${res.status}`);
   const body = (await res.json()) as Partial<ExploreResp> | null;
@@ -626,6 +656,8 @@ export async function getPublicExplore(
       : (typeof body.published_at === "number" ? body.published_at : undefined),
     initializing: typeof body.initializing === "boolean" ? body.initializing : undefined,
     coverage_counts: normalizeCoverageCounts(body.coverage_counts),
+    total_pending: typeof body.total_pending === "number" ? body.total_pending : undefined,
+    total_ineligible: typeof body.total_ineligible === "number" ? body.total_ineligible : undefined,
   };
 }
 

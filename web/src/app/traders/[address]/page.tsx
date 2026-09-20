@@ -62,6 +62,16 @@ import {
 import { loginWithSiwe } from "@/lib/siwe";
 import { metricText, type MetricCardDef } from "@/lib/strategyMetrics";
 
+/** Task 6.2（2026-09-20，D14）：`fills_coverage.observed_from`／`observed_to`
+ * 是 epoch **毫秒**（後端 `sync.observed_from_ms`，見 app.py），不是
+ * `fmtUpdatedAtUtc` 慣用的 epoch 秒——不得直接餵給那個函式（會多乘一次 1000）。
+ * 只取日期（`YYYY-MM-DD`），成交統計標題旁的範圍提示不需要到分鐘精度。 */
+function fmtDateFromMs(ms: number): string {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return NO_VALUE;
+  return d.toISOString().slice(0, 10);
+}
+
 type ConnectPhase = "idle" | "connecting" | "signing";
 
 const DEFAULT_WINDOW: ExploreWindow = "month"; // D10（2026-09-05）：與探索清單預設一致，最穩的窗。
@@ -412,7 +422,26 @@ function TraderDetailInner() {
           )}
 
           <div className="trader-fills-card card">
-            <div className="methodology-heading">{c.fillsHeading}</div>
+            <div className="methodology-heading">
+              {c.fillsHeading}
+              {/* Task 6.2（D14）：coverage 非 complete 時，標題旁附已觀測期間；
+                  日期缺席（尚未回補到任何一頁）時只顯示文案主體，不強行拼出
+                  無效日期。 */}
+              {trader.fills_coverage != null && trader.fills_coverage.state !== "complete" && (
+                <span className="hint trader-fills-observed-range">
+                  {" "}
+                  {c.fillsObservedRange}
+                  {trader.fills_coverage.observed_from != null && trader.fills_coverage.observed_to != null && (
+                    <>
+                      {" "}
+                      {fmtDateFromMs(trader.fills_coverage.observed_from)}
+                      {c.fillsObservedRangeSep}
+                      {fmtDateFromMs(trader.fills_coverage.observed_to)}
+                    </>
+                  )}
+                </span>
+              )}
+            </div>
             {fills == null ? (
               <p className="hint">{c.fillsUnavailable}</p>
             ) : (

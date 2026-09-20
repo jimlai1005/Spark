@@ -514,6 +514,150 @@ describe("ExplorePage — Task 12 地址連結（D14）", () => {
 
 // D13（2026-09-05，Task 12）：表頭排序按鈕——第一次點某欄＝desc，再點＝翻轉；
 // 切換排序回第一頁；作用中的欄顯示箭頭（▼desc／▲asc），非作用中的欄不顯示。
+// Task 6.2（2026-09-20，D13/D14）：資格三態分組——後端已排序分組（eligible 前、
+// pending 後），前端只依 rows 既有順序渲染、在第一個 pending 列前插組標題，
+// 不得自行排序（P6 契約 B）。
+const ROW_ELIGIBLE: ExploreRow = {
+  ...ROW_A,
+  address: "0xeeee00000000000000000000000000000000eeee",
+  label: "Eligible1",
+  eligibility: "eligible",
+  eligibility_reason: null,
+};
+
+const ROW_PENDING: ExploreRow = {
+  ...ROW_B,
+  address: "0xdddd00000000000000000000000000000000dddd",
+  label: "Pending1",
+  eligibility: "pending",
+  eligibility_reason: "min_fills",
+  fills_coverage: { state: "backfilling", observed_from: null, observed_to: null, reason: null },
+  close_win_rate_pct: null,
+  coins: [],
+};
+
+describe("ExplorePage — Task 6.2 資格三態分組（D13）", () => {
+  it("rows 含 eligibility 欄位 → 分兩組渲染、pending 列不給名次", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [ROW_ELIGIBLE, ROW_PENDING],
+      total_qualified: 1,
+      total_pending: 1,
+      total_ineligible: 0,
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Eligible1");
+
+    expect(screen.getByText(COPY.explore.groupEligible)).toBeInTheDocument();
+    expect(screen.getByText(COPY.explore.groupPending)).toBeInTheDocument();
+
+    const rankCells = container.querySelectorAll(".explore-rank");
+    expect(rankCells[0].textContent).toBe("1");
+    expect(rankCells[1].textContent).toBe("—");
+  });
+
+  it("pending 列旁顯示已知原因文案（min_fills）", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [ROW_ELIGIBLE, ROW_PENDING],
+    })));
+    render(<ExplorePage />);
+    await screen.findByText("Pending1");
+    expect(screen.getByText(COPY.explore.pendingReason.min_fills)).toBeInTheDocument();
+  });
+
+  it("pending 列原因未知／缺席 → 只顯示「資格待確認」，不額外顯示原因文案", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [ROW_ELIGIBLE, { ...ROW_PENDING, eligibility_reason: null }],
+    })));
+    render(<ExplorePage />);
+    await screen.findByText("Pending1");
+    expect(screen.getByText(COPY.explore.groupPending)).toBeInTheDocument();
+    for (const label of Object.values(COPY.explore.pendingReason)) {
+      expect(screen.queryByText(label)).not.toBeInTheDocument();
+    }
+  });
+
+  it("rows 沒有 eligibility 欄位（舊後端）→ 完全不分組，沿用既有單一列表", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.queryByText(COPY.explore.groupEligible)).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY.explore.groupPending)).not.toBeInTheDocument();
+  });
+});
+
+// Task 6.2（D14）：coverage 非 complete（含 fallback 的 fills_truncated）時，
+// 勝率／幣種副標顯示「分析待完成」，不是空白或誤導的「—」。
+describe("ExplorePage — Task 6.2 分析待完成（D14）", () => {
+  it("fills_coverage.state !== complete → 勝率與幣種副標顯示「分析待完成」", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{
+        ...ROW_A,
+        fills_coverage: { state: "backfilling", observed_from: null, observed_to: null, reason: null },
+        close_win_rate_pct: null,
+        coins: [],
+      }],
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const wrCells = container.querySelectorAll(".explore-wr");
+    expect(wrCells[0].textContent).toBe(COPY.explore.analysisPending);
+    expect(screen.getByText((_, el) => (el?.textContent ?? "").includes(COPY.explore.analysisPending)
+      && el?.classList.contains("explore-sub"))).toBeInTheDocument();
+  });
+
+  it("舊 fallback fills_truncated:true（無 fills_coverage）→ 同樣顯示「分析待完成」", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{ ...ROW_A, fills_truncated: true, close_win_rate_pct: null, coins: [] }],
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const wrCells = container.querySelectorAll(".explore-wr");
+    expect(wrCells[0].textContent).toBe(COPY.explore.analysisPending);
+  });
+
+  it("coverage complete → 勝率正常顯示數字，不顯示「分析待完成」", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const wrCells = container.querySelectorAll(".explore-wr");
+    expect(wrCells[0].textContent).toBe("61.2%");
+    expect(wrCells[0].textContent).not.toBe(COPY.explore.analysisPending);
+  });
+});
+
+// Task 6.2（D13）：「僅合格」切換，開啟帶 eligibility=eligible，關閉不帶參數。
+describe("ExplorePage — Task 6.2 僅合格切換", () => {
+  it("預設關閉 → 首次請求不帶 eligibility 參數", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
+    expect(firstUrl).not.toContain("eligibility=");
+  });
+
+  it("點擊「僅合格」→ 打 API 帶 eligibility=eligible；再點一次移除參數", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.onlyEligible }));
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).toContain("eligibility=eligible");
+    });
+
+    fetchMock.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.onlyEligible }));
+    await waitFor(() => {
+      const lastUrl = fetchMock.mock.calls.at(-1)?.[0] as string;
+      expect(lastUrl).not.toContain("eligibility=");
+    });
+  });
+});
+
 describe("ExplorePage — Task 12 表頭排序（D13）", () => {
   // ⚠️ 每次排序切換都會經過 loading（`setState("loading")` 同步觸發、fetch resolve
   // 後才 `setState("ready")`），期間表格整個卸載重掛，舊的表頭按鈕 DOM 節點會

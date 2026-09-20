@@ -1809,6 +1809,25 @@ export const COPY_ZH = {
     building: "探索榜建置中，約數分鐘後就緒",
     errorPrefix: "探索榜讀取失敗 · ",
     empty: "目前沒有符合條件的地址。",
+    // Task 6.2（2026-09-20，D13/D14，P6 契約）：資格三態分組——後端已排序
+    // 分組（eligible 前、pending 後），前端只依 `eligibility` 欄位插組標題，
+    // 不自行排序。`pendingReason` 對映 `eligibility_reason` 值域，未知代碼／
+    // `null` 只顯示 `groupPending` 本身（防禦性，同 `tagLabel` 慣例）。
+    groupEligible: "合格",
+    groupPending: "資格待確認",
+    pendingReason: {
+      live_days: "實盤天數尚待確認",
+      max_dd: "最大回撤尚待確認",
+      min_fills: "訂單筆數尚待確認",
+      concentration: "集中度尚待確認",
+      portfolio_missing: "帳戶資料尚未取得",
+      fills_unknown: "成交資料尚未取得",
+      enrich_error: "資料處理發生錯誤",
+    },
+    // coverage 非 complete 時，勝率／幣種等成交推導欄位顯示這個文案，不是空白
+    // 或誤導的「—」（工程原則 1：未知不能冒充已知）。
+    analysisPending: "分析待完成",
+    onlyEligible: "僅合格",
     pagination: {
       showing: "顯示 ",
       rangeSep: "–",
@@ -1855,6 +1874,11 @@ export const COPY_ZH = {
     // 2026-09-05（Task 9 Step 1，reviewer W2）：`fills_30d` 為 `null`（上游抓取
     // 失敗）時顯示這一行，不得渲染四個偽造的 0。
     fillsUnavailable: "成交統計暫時無法取得",
+    // Task 6.2（2026-09-20，D14）：coverage 非 complete 時附在成交統計標題旁，
+    // 說明目前的統計只涵蓋已觀測到的期間；日期（observed_from～observed_to）
+    // 缺席時只顯示這段文案本身，不強行拼出無效日期。
+    fillsObservedRange: "已觀測區間",
+    fillsObservedRangeSep: "–",
     pnlCurveLabel: "損益曲線",
     pnlSourceNote: "損益含未實現損益、資金費率與手續費，已排除出入金（HL pnlHistory）",
     // 2026-09-05（explore/trader 指標統一 plan Task 7）：Task 6 移除了
@@ -3366,6 +3390,19 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     building: "Building the explore index, ready in a few minutes",
     errorPrefix: "Failed to load the explore index · ",
     empty: "No addresses match the current filters.",
+    groupEligible: "Eligible",
+    groupPending: "Pending review",
+    pendingReason: {
+      live_days: "Live days pending confirmation",
+      max_dd: "Max drawdown pending confirmation",
+      min_fills: "Order count pending confirmation",
+      concentration: "Concentration pending confirmation",
+      portfolio_missing: "Account data not yet fetched",
+      fills_unknown: "Fill data not yet fetched",
+      enrich_error: "Data processing error",
+    },
+    analysisPending: "Analysis pending",
+    onlyEligible: "Eligible only",
     pagination: {
       showing: "Showing ",
       rangeSep: "–",
@@ -3404,6 +3441,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     realizedPnl: "Realized PnL (USD)",
     fillsTruncatedNote: "Fill count exceeded the fetch limit; figures above are lower bounds",
     fillsUnavailable: "Fill stats are temporarily unavailable",
+    fillsObservedRange: "Observed range",
+    fillsObservedRangeSep: "–",
     pnlCurveLabel: "PnL curve",
     pnlSourceNote: "PnL includes unrealized PnL, funding, and fees, net of deposits/withdrawals (HL pnlHistory)",
     startEndEquityLabel: "Start → end equity (allTime)",
