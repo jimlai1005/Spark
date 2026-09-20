@@ -1146,6 +1146,32 @@ class ExplorePublisher:
 - D15 觀測補齊：等待時間按 scope p50/p95、HTTP 計數含重試與 timeout、dashboard 延遲附樣本數。**follower 引擎的限流關係是未結案項目**：同主機同出口 IP、獨立計數；publicapi 零 429 不證明引擎受保護；本輪不改引擎程式，只在文件與 health 明示。
 - D16 恢復發布前三個重現驗收（Task 6.4）；之後觀察連續兩次更新（pending 逐步轉合格／不合格、各欄位時間正確）才開始 24 小時觀測期；預算不動。
 
+### P6 契約（2026-09-20 使用者要求，前後端共同遵守；先於實作固定）
+
+**A. 列（`ExploreRow.to_dict()`）**
+| 欄位 | 型別 | 語義 |
+|---|---|---|
+| `eligibility` | `"eligible"｜"pending"｜"ineligible"` | 由後端 `classify` 決定；列表 API **不回傳** ineligible 列 |
+| `eligibility_reason` | string｜null | `live_days`／`max_dd`／`min_fills`／`concentration`／`portfolio_missing`／`fills_unknown`／`enrich_error`；eligible 為 null |
+| `fills_coverage` | `{state: "backfilling"｜"partial"｜"complete", observed_from: epoch_ms｜null, observed_to: epoch_ms｜null, reason: string｜null}` | 成交資料完整性；freshness 另看 `as_of.fills` |
+| `as_of` | `{portfolio, state, ledger, fills}`，各 epoch 秒｜null | 各欄位**來源取得時間**，不是發布時間；缺該來源為 null |
+| `close_win_rate_pct`、`concentration_pct`、`closed_positions_30d`、`realized_pnl_30d_usd` | number｜null | coverage ≠ complete 時**一律 null**（未知≠0） |
+| `coins` | string[] | coverage ≠ complete 時 `[]` |
+| `order_count_30d` | int | **已觀測筆數（下限）**；coverage ≠ complete 時只作下限用 |
+| `live_days`、`windows[w]` | number／object｜null | portfolio 缺 → null |
+| `fills_truncated` | bool | ＝`fills_coverage.state != "complete"`（相容） |
+**前端不得**把 null 轉成 0、不得自行推算 eligibility、不得對 pending 列給名次。
+
+**B. 列表回應（`GET /api/public/explore`）**：後端依序 **篩選 → classify → 分組（eligible 前、pending 後）→ 組內排序（sort key；次排序鍵 `address` 升冪，穩定）→ 分頁**；`page`／`page_size` 對合併後序列切片。回應：`rows`、`total_qualified`（＝eligible 數）、`total_pending`、`total_ineligible`、`published_at`（版本生成時間）、`initializing`、`coverage_counts`、`sort`／`order`、`eligibility`（echo）。`eligibility=eligible` 時 rows 只含 eligible。勝率排序：null 恆在組尾。
+
+**C. 發布語義（publisher）**：
+- 有效空結果：候選來源有效、組版成功、但 eligible 為 0 → **正常發布**（榜可為空）。
+- 來源故障：`active_candidates` 為空（候選從未載入或全數停用）、或 compose 整體例外（store 讀取失敗）→ **保留最後成功版本**、`source_failures+1`、`last_skip_reason`。
+- 單一地址 enrich 例外（payload 格式錯、timeout 留下的壞資料）→ 該列以 `pending/enrich_error` 出列、`meta.row_errors+1`、不阻擋其他列；**不得**把它靜默轉成空列或丟棄。
+- 快照備份 `.prev`／`.daily`／`.v3.bak` 不變。
+
+**D. 驗收順序**：各分支測試綠 → 合併到同一 commit → 在該 commit 跑 6.4 三案例＋前後端整合（本機起 API＋web，探索頁看得到兩組、僅合格切換、詳情頁範圍）→ 部署並確認 `DEPLOYED_VERSION` 等於該 commit → 觀察連續兩次更新 → 起算 24 小時。
+
 ### Task 6.1 @inline：三態資格、成交欄位 None、發布只看來源與組版
 
 **Files:** `src/spark/publicapi/hl_explore.py`（`ExploreRow`、`enrich_candidate`、`qualify`→`classify`、`sort_rows`、`_apply_tags`、`ExploreIndex.query`）、`src/spark/publicapi/explore_publisher.py`、`src/spark/publicapi/app.py`（`/api/public/explore` 參數）；`tests/test_public_explore.py`、`tests/test_explore_publisher.py`。
