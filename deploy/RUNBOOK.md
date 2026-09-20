@@ -2146,6 +2146,54 @@ curl -s https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' \
 未完成這一步就先填 `FILET_REFERRAL_CODE` 沒有意義：`setReferrer` 會收到
 `Referral code not registered`（引擎端分類為 critical，見 `src/spark/filet/referral_apply.py`）。
 
+### 5.8e ⭐⭐ Explore 背景刷新（scheduler／publisher，2026-09-20）
+
+<!-- 2026-09-20: 2026-09-19 429 事故修法第二階段。第一階段（4295ece）已把請求觸發的重建拆掉，
+探索榜凍結在磁碟快照；本節把背景刷新接上。plan：docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md -->
+
+**機制一句話**：filet-api 進程內一條 daemon thread（`explore-scheduler`）逐 job 向 HL 抓 state／portfolio／ledger／一頁 fills，
+寫進 SQLite `FILET_EXPLORE_DB`；publisher 每分鐘有變更就把本地資料合成榜單、原子換版、寫回 `FILET_EXPLORE_CACHE_PATH`（v4 快照）。
+所有 HL 呼叫走同一個權重限流器的 `explore` scope（子預算 `FILET_HL_EXPLORE_WEIGHT_CAP`，預設 300/分鐘；全域 900 留 300 給
+follower 引擎與三個 timer——它們**不經**限流）。`GET /api/public/explore` 只讀本地，**永遠不會**觸發上游。
+
+**環境變數（全部走 drop-in，不動 unit 主檔）**：
+
+| 變數 | 值 | 說明 |
+|---|---|---|
+| `FILET_HL_GLOBAL_WEIGHT_CAP` | `900` | 已在 `hl-budget.conf`（4295ece 部署） |
+| `FILET_HL_EXPLORE_WEIGHT_CAP` | `300` | 同上 |
+| `FILET_EXPLORE_DB` | `/var/lib/filet-api/explore.db` | SQLite WAL；落在既有 `ReadWritePaths`。刷新開啟時**必填**（缺 → 拒絕啟動，訊息含兩個 env 名） |
+| `EXPLORE_UPSTREAM_REFRESH` | `0`／`1` | 預設 `0`＝不起 thread、榜單維持快照；`1`＝起背景刷新 |
+
+```bash
+# 1) drop-in（第二次部署先設 0，觀察 hl_budget 24 小時再改 1）
+sudo tee /etc/systemd/system/filet-api.service.d/explore-refresh.conf >/dev/null <<'EOF'
+[Service]
+Environment=FILET_EXPLORE_DB=/var/lib/filet-api/explore.db
+Environment=EXPLORE_UPSTREAM_REFRESH=0
+EOF
+sudo systemctl daemon-reload && sudo systemctl restart filet-api.service
+# 2) 有效值（不要 grep 主檔；⚠️ 全量 Environment 含 TG token，只 grep 這幾個 key）
+systemctl show filet-api -p Environment --value | tr ' ' '\n' | grep -E '^(FILET_EXPLORE_DB|EXPLORE_UPSTREAM_REFRESH|FILET_HL_)'
+# 3) 開啟刷新：把 EXPLORE_UPSTREAM_REFRESH 改 1 → daemon-reload → restart；journal 應出現 thread 啟動、之後無 Traceback
+sudo journalctl -u filet-api --since '5 min ago' --no-pager | grep -iE 'explore|traceback' | tail -20
+# 4) DB 檔會由 filet-api 自建；權限應為 filet-api 0600（WAL 會多 -wal／-shm 兩檔）
+sudo ls -l /var/lib/filet-api/explore.db*
+```
+
+**觀測（admin session，`GET /api/ops/health`）**：
+- `hl_budget`：`used.explore` 任一分鐘 ≤ 300、`counters.rate_limited` 不遞增、`paused_remaining_s.explore` 為 0。
+- `explore_refresh`：`enabled`、`last_tick_at` 持續前進、`last_result` 多為 `ran:*`／`idle`、`queue_depth` 由高走低、`oldest_due_age_s` 不無限成長。
+- `explore_publisher`：`last_published_at` 每分鐘級前進、`failures` 為 0。
+- `explore_index`：`built_at` 前進（不再是 2026-09-19T15:00）、`rows` ≈ 候選數。
+- `explore_store`：各表列數；`completeness` 分佈從 backfilling 逐步轉 complete／partial。
+- 公開端點：`/api/public/explore` 的 `published_at` 前進、`initializing=false`。
+判準（工程原則 #6）：**程序活著 ≠ 在工作**——`last_tick_at` 不動或 `built_at` 不動就是 unhealthy，不管 `systemctl` 說什麼。
+
+**停用刷新**：`EXPLORE_UPSTREAM_REFRESH=0` → daemon-reload → restart。榜單維持最後一次發布的快照（v4）。SQLite 資料保留，再開啟時 cursor 續接。
+
+**回退**：程式回退照 §9.3 以 commit 為單位；**不要**重新啟用舊的請求觸發重建（程式已刪除，D6）。`explore.db` 與 drop-in 留著無害。
+
 ## 6. nginx + certbot
 
 ```bash
