@@ -1167,6 +1167,19 @@ class ExplorePublisher:
 
 ## 4. 執行狀態
 
+### 4.0 目前狀態（2026-09-20 15:00 UTC 更新）
+
+- **全部 task（P0–P5）完成並兩次部署到正式機**；`main`＝`feat/explore-rate-limit`＝54b214e（GitHub 同步）。
+- 正式機：8ead8e8，`EXPLORE_UPSTREAM_REFRESH=1` 自 14:21 UTC 起刷新。14:58 讀值：portfolio 170/300、state 301、ledger 171、
+  fills 14,247（7 complete／4 backfilling）、job 錯誤 0、零 Traceback、零 HTTP 429（journal grep「429」會誤中舊 PID 429066，看時間戳）。
+  首次換版門檻 240/300，預計 15:10 前後；換版時 `explore_index.json.v3.bak` 出現、公開榜 `published_at` 前進。
+- **後續待辦（非阻塞，下一輪再排）**：
+  1. 探索頁本身沒有「成交資料不完整」提示（4.2 發現；`fills_coverage` 已進型別）——是否加 UI 由使用者決定。
+  2. 第四輪／小審的 Suggestion：門檻 `out:` 訊息帶原因字串；`page_cap` 持續出現時調高上限的 RUNBOOK 提醒；`.daily` 只是「≥24h 前的版本」非 last-good（已改文字）。
+  3. `tests/publicapi_helpers.py:36` 殘留 `build_sync` 文字（3.4 builder 回報，文件字串）。
+  4. spec §11 指標中尚未做的：Prometheus 式 metrics（目前以 `/api/ops/health` 快照代替）。
+  5. 觀察 24 小時後決定是否調整 `FILET_HL_EXPLORE_WEIGHT_CAP`／週期（spec §6 起始值）。
+
 分支 `feat/explore-rate-limit`（自 main 54c038b 切出）。主線程逐 task 親跑驗收後記錄。
 
 | Task | 日期 | commit | 主線程驗收 |
