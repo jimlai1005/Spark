@@ -55,6 +55,7 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
                                      has_active_subscription, plan_catalog,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
+from spark.publicapi.explore_store import ExploreStore
 # 健康面板讀的是**引擎自己寫的**狀態檔——路徑常數與判定一律引用引擎的定義，
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
 from spark.copytrade.equity import sample_coverage
@@ -1346,7 +1347,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                billing=None, notifier=None, leaderboard_get_fn=None,
                mailer=None,
                referral_lookup: Callable[[str], str | None] | None = None,
-               hl_limiter: WeightLimiter | None = None) -> FastAPI:
+               hl_limiter: WeightLimiter | None = None,
+               explore_store: ExploreStore | None = None) -> FastAPI:
     app = FastAPI(title="filet public api",
                   docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -1354,6 +1356,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     # 行為不變）。唯讀 introspection seam（沿 explore_index／notifier 既有慣例），
     # `/api/ops/health` 讀它揭露 `hl_budget` 快照。
     app.state.hl_limiter = hl_limiter
+
+    # Task 2.3（spec P2）：Explore 持久化 store，未注入 → None（P2 階段尚無排程／
+    # 發布邏輯消費它，接線先行）。`/api/ops/health` 讀它揭露 `explore_store` 統計，
+    # 沿 hl_limiter 同一個「未接線 ≠ 已接線但空」的 introspection 慣例。
+    app.state.explore_store = explore_store
 
     # 營運告警通道（vault 准入 advisory FAIL 用；CLAUDE.md：通知一律走 Notifier 注入）。
     # 未注入 → 由 cfg 建預設：TG 兩鍵齊 → TelegramNotifier；否則 NullNotifier
@@ -4604,6 +4611,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "summary": health_summary(rows, backlog, lc_errors),
             "manifest_errors": manifest_errors,
             "hl_budget": limiter.snapshot() if limiter is not None else None,
+            # Task 2.3（spec P2）：Explore store 統計快照。未注入 → `null`，同
+            # `hl_budget` 的「讀不到就說讀不到」原則——P2 階段尚無排程消費它，
+            # 這裡只是讓 ops 看得到接線是否生效。
+            "explore_store": (app.state.explore_store.stats()
+                              if app.state.explore_store is not None else None),
             # reviewer W3：P1-only 部署期間 Explore 建置仍是舊版 build_sync（背景
             # scheduler 是 P3 才做的事），榜單暫時凍結在最後一次成功建置——ops
             # 要看得到「服務中的是哪一版、建於何時」，不是空白猜測。

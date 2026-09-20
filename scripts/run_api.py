@@ -24,6 +24,7 @@ def main() -> None:
     from spark.keysvc.client import KeysvcClient
     from spark.publicapi.app import create_app
     from spark.publicapi.billing import StripeGateway
+    from spark.publicapi.explore_store import ExploreStore
     from spark.publicapi.hl import HLGateway
     from spark.publicapi.hl_budget import WeightLimiter
     from spark.publicapi.store import ApiStore
@@ -33,9 +34,12 @@ def main() -> None:
     limiter = WeightLimiter(global_cap=cfg.hl_global_weight_cap,
                             scope_caps={"explore": cfg.hl_explore_weight_cap})
     gateway = HLGateway(cfg.api_url, limiter=limiter)
+    # Task 2.3（spec P2）：未設 FILET_EXPLORE_DB → 不建 store（None），沿
+    # config.py 的 explore_db_path docstring——P2 階段尚無排程／發布消費它。
+    explore_store = ExploreStore(cfg.explore_db_path) if cfg.explore_db_path else None
     app = create_app(cfg, ApiStore(cfg.db_path), KeysvcClient(cfg.keysvc_sock),
                      gateway, billing=billing, referral_lookup=gateway.referred_by,
-                     hl_limiter=limiter)
+                     hl_limiter=limiter, explore_store=explore_store)
     uvicorn.run(app, host="127.0.0.1",
                 port=int(os.environ.get("FILET_API_PORT", "8700")))
 

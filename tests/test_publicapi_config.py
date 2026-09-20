@@ -345,3 +345,17 @@ def test_hl_weight_caps_non_positive_raises():
         ApiConfig.from_env(_env(FILET_HL_GLOBAL_WEIGHT_CAP="0"))
     with pytest.raises(ValueError):
         ApiConfig.from_env(_env(FILET_HL_EXPLORE_WEIGHT_CAP="-5"))
+
+
+# ---------- explore_db_path（Task 2.3，2026-09-20）----------
+
+def test_explore_db_path_defaults_to_none():
+    """未設 FILET_EXPLORE_DB → None（P2 階段 store 尚無生產用途，None 表示
+    「不建 store」，讓第二次部署前的正式機不需要新 env 也能起）。"""
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.explore_db_path is None
+
+
+def test_explore_db_path_read_from_env():
+    cfg = ApiConfig.from_env(_env(FILET_EXPLORE_DB="/var/lib/filet-api/explore.db"))
+    assert cfg.explore_db_path == "/var/lib/filet-api/explore.db"

@@ -149,6 +149,14 @@ class ApiConfig:
     # onboard／traders 詳情）共用剩下的額度。
     hl_global_weight_cap: int = 900
     hl_explore_weight_cap: int = 300
+    # --- Explore 持久化（Task 2.3，2026-09-20，spec P2）---
+    # `FILET_EXPLORE_DB`：`ExploreStore`（SQLite WAL）落盤路徑。⚠️ 刻意**不**沿
+    # `exchange_dir`／`state_base`／`leaders_path` 的必填慣例：P2 階段 store 尚無
+    # 生產用途（排程與發布是 P3／P4 才做的事），未設 → None＝「不建 store」，
+    # 讓現在的正式機不必為這個 task 先加新 env 就能繼續起。P3 排程上線起這裡
+    # 改為必填（比照 exchange_dir 的處理）。正式機應設
+    # `/var/lib/filet-api/explore.db`（落在 filet-api.service 既有 ReadWritePaths）。
+    explore_db_path: str | None = None
 
     def __post_init__(self):
         if self.hl_global_weight_cap <= 0 or self.hl_explore_weight_cap <= 0:
@@ -368,4 +376,5 @@ class ApiConfig:
                    hl_global_weight_cap=int(env.get("FILET_HL_GLOBAL_WEIGHT_CAP")
                                             or cls.hl_global_weight_cap),
                    hl_explore_weight_cap=int(env.get("FILET_HL_EXPLORE_WEIGHT_CAP")
-                                             or cls.hl_explore_weight_cap))
+                                             or cls.hl_explore_weight_cap),
+                   explore_db_path=env.get("FILET_EXPLORE_DB") or None)

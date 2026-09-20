@@ -1771,6 +1771,38 @@ def test_health_hl_budget_snapshot_has_paused_remaining_s(tmp_path):
     assert "paused_remaining_s" in body["hl_budget"]
 
 
+# ---------- explore_store（Task 2.3，2026-09-20：接線與 ops 可見）----------
+
+def test_health_explore_store_null_when_not_injected(tmp_path):
+    """未注入 explore_store（沿 create_app 預設）→ `explore_store: null`，
+    不是空 dict——與本端點「讀不到就說讀不到」的既有原則一致。"""
+    client, _cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert body["explore_store"] is None
+
+
+def test_health_explore_store_stats_when_injected(tmp_path):
+    from spark.publicapi.explore_store import ExploreStore
+
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    explore_store = ExploreStore(tmp_path / "explore.db")
+    app = create_app(cfg, store, keysvc, hl, explore_store=explore_store)
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert isinstance(body["explore_store"], dict)
+    for key in ("candidate", "endpoint_cache", "fills", "fills_sync", "refresh_job"):
+        assert key in body["explore_store"]
+
+
 # ---------- explore_index（Task 1.5，reviewer W3：凍結快照的年齡要可觀測）----------
 
 def test_health_explore_index_status_shape(tmp_path):
