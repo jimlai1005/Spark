@@ -957,6 +957,7 @@ class ExploreScheduler:
    - `candidates`：`payload = leaderboard_source_fn()`；`None` → `reschedule(now+60, err="no payload")`。否則 `rows = candidate_addresses(payload, cfg.candidate_pool, excluded)`（既有純函式，回 `[(address, display_name)]`；rank＝list 索引＋1，roi 從 payload row 取 `_roi_sort_key`），`store.upsert_candidates(...)`、`deactivate_missing(seen)`；對每個 active 地址 `enqueue(f"{addr}:state", addr, "state", 0, now + spread(addr, state_every_s))`、`portfolio`（priority 1）、`fills`（rank ≤ hot_rank → priority 2，否則 3；`next = now + spread(addr, fills_every_s)`）。`spread(addr, T) = (int(addr[-8:], 16) % T)`（首次到期分散，spec §6）。準入上限：`store.stats()` 的 `refresh_job` 列數 > 4 × active 數 → 本輪不再新增、log 一行。`complete(job)`；`enqueue("candidates:candidates", ..., now + candidates_every_s)`。
    - `state`：`payload = hl.clearinghouse_state(addr)` → `put_cache_ok(addr, "clearinghouseState", payload, now, now + jit(state_every_s))`；`complete`；`enqueue(同 key, next=refresh_after)`；`on_dirty()`。
    - `portfolio`：同上，`hl.portfolio(addr)` → endpoint `"portfolio"`，週期 `portfolio_every_s`。
+   - `ledger`（<!-- 2026-09-20 追加，供 3.3 詳情頁讀本地 -->）：`hl.non_funding_ledger_updates(addr, 0)` → endpoint `"ledger"`，priority 1，週期 `ledger_every_s=3600`。容量：state 40＋portfolio 100＋ledger 100＝240／分鐘，fills 用剩餘 60；準入上限 5×active。
    - `fills`：`st = store.get_sync(addr)`；`plan = plan_page(st, address=addr, now_ms=now*1000)`；`plan.is_noop` → `complete`＋`enqueue(next = plan.state.window_end_ms/1000 + fills_every_s)`。否則 `page = hl.get_fills_page(addr, plan.start_ms, plan.end_ms)`（Task 3.2）；`res = apply_page(plan, page, now_ms=...)`；`store.insert_fills_page(addr, res.accepted, res.state)`；`on_dirty()`；`res.done` → `complete`＋`enqueue(next = now + jit(fills_every_s))`；未完成 → `reschedule(next=now, bump_attempts=False)`（讓位給其他 job，下一 tick 再續）。
    `jit(T) = T * (1 + (rng()*2-1) * jitter_pct)`。
 4. 例外分類（每個 kind 共用一個 `_run_job` 包裝）：
@@ -1020,12 +1021,50 @@ class ExploreScheduler:
 ## P4 漸進發布（任務卡）
 
 ### Task 4.1 @inline：`explore_publisher.py`
+
+<!-- 2026-09-20 展開。順序：4.1 在 3.4（刪舊 build_sync）之前做，兩者都改 hl_explore.py 故不平行。 -->
+
 ```python
-def compose_rows(store, *, now, cfg) -> tuple[list[ExploreRow], dict]   # 純函式：從 store 讀 active 候選 → 每地址 enrich_candidate(portfolio or None, fills, state or None, coverage) → _apply_tags；meta={published_at, as_of_min/max per endpoint, coverage_counts}
+# src/spark/publicapi/explore_publisher.py
+def compose_rows(store: ExploreStore, *, now: float, cfg: ExploreConfig,
+                 fills_window_days: int = FILLS_WINDOW_DAYS) -> tuple[list[ExploreRow], dict]:
+    """純函式（只讀 store，零網路）。對每個 active 候選：
+    portfolio = get_cache(addr,"portfolio").payload or None；ch_state 同理；
+    fills = get_fills(addr, now_ms-window, now_ms)；sync = get_sync(addr)；
+    coverage = {"state": sync.completeness if sync else "backfilling", "observed_from": ..., "observed_to": ..., "reason": ...}
+    row = enrich_candidate(addr, display_name, portfolio, fills, ch_state,
+                           fills_truncated=(coverage["state"] != "complete"),
+                           as_of={"portfolio": pf.fetched_at, "state": st.fetched_at, "fills": sync.updated_at}, fills_coverage=coverage)
+    portfolio 為 None → 仍出列：windows 全 None、live_days None（qualify 會因 live_days None 不合格→這是「分析待完成」的正確狀態，不是 0）。
+    rows = _apply_tags(rows, cfg)；meta = {"published_at": now, "candidates": n, "with_portfolio": k,
+    "coverage_counts": Counter(state), "as_of_oldest": min fetched_at or None}。"""
+
 class ExplorePublisher:
-    def __init__(self, store, index: ExploreIndex, cfg, now_fn, snapshot_path)
-    def maybe_publish(self, *, force=False) -> bool   # dirty 且距上次 ≥60s → compose → index.set_published → dump_snapshot v4
+    def __init__(self, *, store, index: ExploreIndex, cfg, now_fn, snapshot_path: str | None,
+                 min_interval_s: float = 60.0)
+    def mark_dirty(self) -> None                 # scheduler 的 on_dirty
+    def maybe_publish(self, *, force: bool = False) -> bool
+        # not dirty and not force → False；now - last_published < min_interval and not force → False
+        # rows, meta = compose_rows(...)；index.set_published(rows, meta)；snapshot_path → dump_snapshot(v4)；dirty=False；True
+        # compose 或 dump 例外 → logger.error，保留 index 舊版（spec §9.2：整體失敗保留最後成功版本），回 False
+    def status(self) -> dict                     # last_published_at, dirty, publishes, failures, last_error
 ```
+
+`hl_explore.py` 改動：
+- `enrich_candidate(address, display_name, portfolio_raw, fills, ch_state, *, fills_truncated=False, as_of=None, fills_coverage=None)`：`portfolio_raw is None` → `windows={k: None}`、`live_days=None`；`ch_state is None` → `account_bucket=None`、`exposure_dir=None`、`exposure_pct=None`；`fills` 為空 list 照常算（0 筆是合法值）。
+- `ExploreRow` 新增 `as_of: dict[str, float | None]`（預設 `{}`）與 `fills_coverage: dict`（預設 `{"state": "backfilling", "observed_from": None, "observed_to": None, "reason": None}`）；`to_dict()` 輸出兩鍵；`fills_truncated` 保留＝`fills_coverage["state"] != "complete"`（前端相容）。
+- `EXPLORE_INDEX_VERSION = 4`；`dump_snapshot` 寫 `as_of`／`fills_coverage`；`load_snapshot` 讀到 `version == 3` → 逐列補 `as_of = {portfolio: built_at, state: built_at, fills: built_at}`、`fills_coverage = backfilling` 後**當作 v4 載入**（D7：不丟棄舊快照）；其他版本 → None（既有語意）。
+- `ExploreIndex.set_published(rows, meta)`：持鎖設 `_rows`、`_rows_version=EXPLORE_INDEX_VERSION`、`_built_at=meta["published_at"]`、`_total_scanned=meta["candidates"]`、`_meta=meta`。
+- `query()` 回應加 `published_at`（＝`_built_at`）、`initializing`（＝`_rows is None`）、`coverage_counts`（meta，無則 `{}`）；`building` 保留＝`initializing`（前端相容）。
+
+驗收測試（`tests/test_explore_publisher.py`）：
+1. 單地址只有 portfolio 快取、無 state／fills → 出列、`exposure_pct is None`、`fills_coverage.state=="backfilling"`、`order_count_30d==0`。
+2. 完整地址（三種快取＋complete sync）→ `to_dict()` 含 `as_of`（三鍵等於塞入的 fetched_at）與 `fills_coverage.state=="complete"`、`fills_truncated is False`。
+3. `maybe_publish`：未 dirty → False；dirty 但 60s 內第二次 → False；`force=True` → True。
+4. compose 途中 store 拋例外（monkeypatch `get_fills`）→ 回 False、`index.query()` 仍是上一版、`status().failures==1`。
+5. v3 快照檔（用既有 `dump_snapshot` 的 v3 形狀手寫 JSON）→ `load_snapshot` 回 v4 結構、每列 `as_of.portfolio == built_at`、`fills_coverage.state == "backfilling"`；`query()["published_at"]` 等於 built_at、`initializing is False`。
+6. 快照落檔用 `safe_fs.write_json_atomic`（或既有 `dump_snapshot` 已是原子寫；讀它確認並在測試斷言目錄內無殘留 tmp 檔）。
+7. `tests/test_public_explore.py` 既有測試全綠（`to_dict` 多鍵不破壞既有斷言；若有 `==` 整 dict 比對的斷言，改為包含式比對並在回報說明）。
 - `enrich_candidate` 改為接受 `portfolio_raw=None`／`ch_state=None`：對應欄位（`windows`、`live_days`／`account_bucket`、`exposure_*`）為 None，不當成 0；`fills_stats` 吃 store 的 fills（30 天窗）＋`coverage`；`ExploreRow` 新增 `as_of: dict[str, float | None]`、`fills_coverage: dict`（`to_dict` 輸出，D5），`fills_truncated` 保留＝`coverage.state != "complete"`（前端相容）。
 - `EXPLORE_INDEX_VERSION` 3→4；`load_snapshot` 讀到 v3 → 轉為 v4（`as_of` 全＝`built_at`、coverage backfilling，D7），不丟棄。
 - `query()` 回應加 `published_at`、`initializing: bool`（＝從未有版本）；`building` 保留＝`initializing`（前端相容）。
