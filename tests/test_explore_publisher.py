@@ -43,10 +43,10 @@ def _ch_state(account_value="50000", positions=None):
 
 
 def _sync(address, *, completeness="complete", updated_at=1000.0,
-          observed_from_ms=1, observed_to_ms=2, reason=None):
+          observed_from_ms=1, observed_to_ms=2, reason=None, synced_through_ms=2):
     return FillsSyncState(
         address=address, window_start_ms=1, window_end_ms=2, cursor_ms=2,
-        synced_through_ms=2, observed_from_ms=observed_from_ms,
+        synced_through_ms=synced_through_ms, observed_from_ms=observed_from_ms,
         observed_to_ms=observed_to_ms, completeness=completeness, reason=reason,
         pages_done=1, fills_in_window=0, updated_at=updated_at, last_error=None)
 
@@ -147,6 +147,42 @@ def test_compose_rows_full_address_reports_as_of_and_complete_coverage(tmp_path)
     assert meta["coverage_counts"] == {"complete": 1}
 
 
+def test_compose_rows_fills_coverage_synced_through_and_last_success_at_from_store(tmp_path):
+    """Task 7.1（2026-09-21）：`fills_coverage.synced_through`＝
+    `fills_sync.synced_through_ms`、`last_success_at`＝`fills_sync.updated_at`
+    ——刻意用互不相同的三個值（`synced_through_ms` 落後於 `observed_to_ms`，
+    模擬回補中的真實情境）驗證兩鍵各自對應正確來源、不是互相抄襲或抄
+    `observed_to`。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=111.0, refresh_after=2000.0)
+    store.insert_fills_page(_A, [], _sync(
+        _A, completeness="partial", updated_at=333.0,
+        observed_from_ms=10_000, observed_to_ms=99_000, synced_through_ms=50_000))
+
+    rows, _meta = compose_rows(store, now=1000.0, cfg=_cfg())
+
+    d = rows[0].to_dict()
+    assert d["fills_coverage"]["synced_through"] == 50_000
+    assert d["fills_coverage"]["last_success_at"] == 333.0
+    assert d["as_of"]["fills"] == 333.0   # 相容：as_of.fills 仍＝ last_success_at
+
+
+def test_compose_rows_fills_coverage_synced_through_null_when_no_sync(tmp_path):
+    """無 sync（尚未回補過）→ 兩鍵皆 null（同 `observed_from`／`observed_to`）。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+
+    rows, _meta = compose_rows(store, now=1000.0, cfg=_cfg())
+
+    d = rows[0].to_dict()
+    assert d["fills_coverage"]["synced_through"] is None
+    assert d["fills_coverage"]["last_success_at"] is None
+
+
 # ============================================================
 # ExplorePublisher（驗收 3／4）
 # ============================================================
@@ -233,8 +269,11 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
     assert loaded is not None
     row = loaded["rows"][0]
     assert row.as_of == {"portfolio": 555.0, "state": 555.0, "fills": 555.0}
+    # Task 7.1（2026-09-21）：v3 快照沒有游標／最後成功時間可推導，兩鍵補 null
+    # （沿用 `DEFAULT_FILLS_COVERAGE`，與 `observed_from`／`observed_to` 同語意）。
     assert row.fills_coverage == {"state": "backfilling", "observed_from": None,
-                                  "observed_to": None, "reason": None}
+                                  "observed_to": None, "reason": None,
+                                  "synced_through": None, "last_success_at": None}
 
     index = ExploreIndex(cfg=_cfg(), now_fn=lambda: 1000.0, snapshot_path=str(path))
     result = index.query()

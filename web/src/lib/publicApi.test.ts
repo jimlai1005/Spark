@@ -418,7 +418,25 @@ describe("getPublicTraderDetail", () => {
     expect(r?.source).toBe("upstream");
     expect(r?.refreshing).toBe(true);
     expect(r?.as_of).toEqual({ portfolio: 111, state: 111, fills: null });
-    expect(r?.fills_coverage).toEqual({ state: "partial", observed_from: 1, observed_to: null, reason: "page_limit" });
+    // Task 7.1（2026-09-21）：`normalizeFillsCoverage` 一律補上 `synced_through`／
+    // `last_success_at`（缺席時 null），即使後端沒回這兩個新鍵也一樣。
+    expect(r?.fills_coverage).toEqual({
+      state: "partial", observed_from: 1, observed_to: null, reason: "page_limit",
+      synced_through: null, last_success_at: null,
+    });
+  });
+
+  it("Task 7.1：後端回傳 synced_through／last_success_at 時原樣解析", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      fills_coverage: {
+        state: "partial", observed_from: 1, observed_to: 2, reason: "page_limit",
+        synced_through: 1_700_000_000_000, last_success_at: 1_700_000_500,
+      },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_coverage?.synced_through).toBe(1_700_000_000_000);
+    expect(r?.fills_coverage?.last_success_at).toBe(1_700_000_500);
   });
 
   it("Task 4.2：source 非法值／fills_coverage 畸形 → undefined，不拋錯", async () => {

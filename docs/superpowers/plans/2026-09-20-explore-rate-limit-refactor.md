@@ -1153,7 +1153,7 @@ class ExplorePublisher:
 |---|---|---|
 | `eligibility` | `"eligible"｜"pending"｜"ineligible"` | 由後端 `classify` 決定；列表 API **不回傳** ineligible 列 |
 | `eligibility_reason` | string｜null | `live_days`／`max_dd`／`min_fills`／`concentration`／`portfolio_missing`／`fills_unknown`／`enrich_error`；eligible 為 null |
-| `fills_coverage` | `{state: "backfilling"｜"partial"｜"complete", observed_from: epoch_ms｜null, observed_to: epoch_ms｜null, reason: string｜null}` | 成交資料完整性；freshness 另看 `as_of.fills` |
+| `fills_coverage` | `{state: "backfilling"｜"partial"｜"complete", observed_from: epoch_ms｜null, observed_to: epoch_ms｜null, reason: string｜null, synced_through: epoch_ms｜null, last_success_at: epoch_秒｜null}` | 成交資料完整性；`synced_through`＝已確認同步到的游標（回補中常落後）、`last_success_at`＝最近一次抓頁成功時間（＝`as_of.fills`，只證明「最近打過招呼」不證明「同步到哪」，2026-09-21 Task 7.1） |
 | `as_of` | `{portfolio, state, ledger, fills}`，各 epoch 秒｜null | 各欄位**來源取得時間**，不是發布時間；缺該來源為 null |
 | `close_win_rate_pct`、`concentration_pct`、`closed_positions_30d`、`realized_pnl_30d_usd` | number｜null | coverage ≠ complete 時**一律 null**（未知≠0） |
 | `coins` | string[] | coverage ≠ complete 時 `[]` |

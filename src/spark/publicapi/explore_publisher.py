@@ -86,6 +86,11 @@ def compose_rows(store: ExploreStore, *, now: float, cfg: ExploreConfig,
                 "observed_from": sync.observed_from_ms if sync is not None else None,
                 "observed_to": sync.observed_to_ms if sync is not None else None,
                 "reason": sync.reason if sync is not None else None,
+                # Task 7.1：`synced_through`＝已確認同步到的游標（epoch ms），
+                # `last_success_at`＝最近一次抓頁成功時間（epoch 秒，＝下面
+                # `as_of["fills"]`）——回補未完成時前者常落後於後者。
+                "synced_through": sync.synced_through_ms if sync is not None else None,
+                "last_success_at": sync.updated_at if sync is not None else None,
             }
             as_of = {
                 "portfolio": pf.fetched_at if pf is not None else None,

@@ -427,20 +427,27 @@ function TraderDetailInner() {
               {/* Task 6.2（D14）：coverage 非 complete 時，標題旁附已觀測期間；
                   日期缺席（尚未回補到任何一頁）時只顯示文案主體，不強行拼出
                   無效日期。 */}
-              {trader.fills_coverage != null && trader.fills_coverage.state !== "complete" && (
-                <span className="hint trader-fills-observed-range">
-                  {" "}
-                  {c.fillsObservedRange}
-                  {trader.fills_coverage.observed_from != null && trader.fills_coverage.observed_to != null && (
-                    <>
-                      {" "}
-                      {fmtDateFromMs(trader.fills_coverage.observed_from)}
-                      {c.fillsObservedRangeSep}
-                      {fmtDateFromMs(trader.fills_coverage.observed_to)}
-                    </>
-                  )}
-                </span>
-              )}
+              {trader.fills_coverage != null && trader.fills_coverage.state !== "complete" && (() => {
+                // Task 7.1（2026-09-21）：區間終點優先用 `synced_through`（已確認
+                // 同步到的游標）而非 `observed_to`（可能只是最近一次抓頁掃到的
+                // 頁尾，不代表回補進度）；`synced_through` 缺席（舊後端）時沿用
+                // 現行 `observed_to`。
+                const rangeEnd = trader.fills_coverage.synced_through ?? trader.fills_coverage.observed_to;
+                return (
+                  <span className="hint trader-fills-observed-range">
+                    {" "}
+                    {c.fillsObservedRange}
+                    {trader.fills_coverage.observed_from != null && rangeEnd != null && (
+                      <>
+                        {" "}
+                        {fmtDateFromMs(trader.fills_coverage.observed_from)}
+                        {c.fillsObservedRangeSep}
+                        {fmtDateFromMs(rangeEnd)}
+                      </>
+                    )}
+                  </span>
+                );
+              })()}
             </div>
             {fills == null ? (
               <p className="hint">{c.fillsUnavailable}</p>

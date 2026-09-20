@@ -437,6 +437,12 @@ export interface FillsCoverage {
   observed_from: number | null;
   observed_to: number | null;
   reason: string | null;
+  /** Task 7.1（2026-09-21）：已確認同步到的游標（epoch 毫秒），回補未完成時
+   * 常落後於 `last_success_at`。第二次部署前舊後端不會回這個鍵，故 optional。 */
+  synced_through?: number | null;
+  /** Task 7.1：最近一次抓頁成功時間（epoch 秒，＝ `as_of.fills`）——只證明
+   * 「最近打過招呼」，不代表同步到哪裡；同上 optional。 */
+  last_success_at?: number | null;
 }
 
 function normalizeAsOf(v: unknown): Record<string, number | null> | undefined {
@@ -458,6 +464,8 @@ function normalizeFillsCoverage(v: unknown): FillsCoverage | undefined {
     observed_from: toNumberOrNull(r.observed_from),
     observed_to: toNumberOrNull(r.observed_to),
     reason: typeof r.reason === "string" ? r.reason : null,
+    synced_through: toNumberOrNull(r.synced_through),
+    last_success_at: toNumberOrNull(r.last_success_at),
   };
 }
 

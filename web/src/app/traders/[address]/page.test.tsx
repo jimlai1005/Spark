@@ -541,6 +541,47 @@ describe("TraderDetailPage", () => {
       expect(screen.getByText(COPY.traders.fillsObservedRange)).toBeInTheDocument();
     });
 
+    // Task 7.1（2026-09-21）：區間終點優先用 `synced_through`（已確認同步到的
+    // 游標）而非 `observed_to`（可能只是最近一次抓頁掃到的頁尾）。
+    it("有 synced_through → 區間終點用 synced_through，不是 observed_to", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_coverage: {
+          state: "partial",
+          observed_from: 1_700_000_000_000,
+          observed_to: 1_700_500_000_000,
+          synced_through: 1_700_172_800_000,
+          last_success_at: 1_700_500_000,
+          reason: "page_limit",
+        },
+      }));
+      const { container } = render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const rangeEl = container.querySelector(".trader-fills-observed-range");
+      expect(rangeEl?.textContent).toContain("2023-11-14");
+      expect(rangeEl?.textContent).toContain("2023-11-16");   // synced_through 的日期
+      expect(rangeEl?.textContent).not.toContain("2023-11-20"); // observed_to 的日期不應出現
+    });
+
+    it("無 synced_through（舊後端）→ 沿用 observed_to", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_coverage: {
+          state: "partial",
+          observed_from: 1_700_000_000_000,
+          observed_to: 1_700_500_000_000,
+          reason: "page_limit",
+        },
+      }));
+      const { container } = render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const rangeEl = container.querySelector(".trader-fills-observed-range");
+      expect(rangeEl?.textContent).toContain("2023-11-14");
+      expect(rangeEl?.textContent).toContain("2023-11-20");
+    });
+
     it("coverage === complete → 不顯示觀測期間文案", async () => {
       getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
       stubFetch(() => jsonResponse({

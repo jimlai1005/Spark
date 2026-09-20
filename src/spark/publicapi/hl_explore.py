@@ -275,8 +275,14 @@ EXPLORE_INDEX_VERSION = 4
 
 # Task 4.1：`fills_coverage` 的預設值（`ExploreRow` 欄位預設值與 v3→v4 快照
 # 遷移共用同一份常數，避免兩處手寫字面量漂移）。
+# Task 7.1（2026-09-21，使用者裁決）：加 `synced_through`（epoch ms｜null，＝
+# `fills_sync.synced_through_ms`——已確認同步到的游標，不代表最新成交）與
+# `last_success_at`（epoch 秒｜null，＝`fills_sync.updated_at`——最近一次抓頁
+# 成功時間）。`as_of.fills` 語意不變、仍＝`last_success_at`（相容）；兩者分開
+# 是因為回補中時 `last_success_at` 會一直前進但 `synced_through` 可能落後很多。
 DEFAULT_FILLS_COVERAGE: dict = {"state": "backfilling", "observed_from": None,
-                                "observed_to": None, "reason": None}
+                                "observed_to": None, "reason": None,
+                                "synced_through": None, "last_success_at": None}
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -780,7 +786,8 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     # `concentration_pct`／`closed_positions_30d`／`realized_pnl_30d_usd` 全部
     # 存 `None`（`[]` for coins），`order_count_30d` 仍保留已觀測筆數下限。
     effective_coverage = fills_coverage if fills_coverage is not None else {
-        "state": "complete", "observed_from": None, "observed_to": None, "reason": None}
+        "state": "complete", "observed_from": None, "observed_to": None, "reason": None,
+        "synced_through": None, "last_success_at": None}
     fills_complete = effective_coverage.get("state") == "complete"
     if fills_complete:
         coins = fs.coins

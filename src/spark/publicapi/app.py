@@ -2527,6 +2527,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "observed_from": sync.observed_from_ms if sync is not None else None,
             "observed_to": sync.observed_to_ms if sync is not None else None,
             "reason": sync.reason if sync is not None else None,
+            # Task 7.1（P7）：同 `explore_publisher.compose_rows` 的兩個新鍵，
+            # 兩頁共用同一份定義（工程原則 1）。
+            "synced_through": sync.synced_through_ms if sync is not None else None,
+            "last_success_at": sync.updated_at if sync is not None else None,
         }
         # 準入上限（去重＋容量）：`refresh_job` 總數已達 5×active 候選數＋20 →
         # 本輪不再新增，只 log 一行——這是保護 scheduler 不被詳情頁流量灌爆的
@@ -2602,6 +2606,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     "state": "complete" if not fills_truncated else "partial",
                     "observed_from": None, "observed_to": None,
                     "reason": "page_cap" if fills_truncated else None,
+                    # Task 7.1：upstream 路徑沒有 `ExploreStore.fills_sync` 游標可查——
+                    # 兩鍵一律 null（同 `explore_publisher.compose_rows` 的 sync=None 分支）。
+                    "synced_through": None, "last_success_at": None,
                 })
 
         # Task 3.3（D4）：池內地址（`explore_store` 已注入且已抓到 portfolio）

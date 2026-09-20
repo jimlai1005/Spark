@@ -660,6 +660,33 @@ def test_pool_local_path_fresh_zero_upstream(tmp_path):
     assert body["as_of"]["portfolio"] == now
 
 
+def test_pool_local_path_fills_coverage_synced_through_and_last_success_at(tmp_path):
+    """Task 7.1（2026-09-21）：本地路徑 `fills_coverage.synced_through`／
+    `last_success_at` 分別對應 `fills_sync.synced_through_ms`／`updated_at`。"""
+    now = 1_000_000.0
+    app, hl, explore_store = _make_pool_app(tmp_path, now)
+    explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now, now + 3600)
+    explore_store.put_cache_ok(
+        _A, "clearinghouseState",
+        {"marginSummary": {"accountValue": "5000.00"}, "assetPositions": []},
+        now, now + 3600)
+    explore_store.put_cache_ok(_A, "ledger", [], now, now + 3600)
+    sync = FillsSyncState(
+        address=_A, window_start_ms=0, window_end_ms=int(now * 1000),
+        cursor_ms=int(now * 1000), synced_through_ms=123_000,
+        observed_from_ms=0, observed_to_ms=int(now * 1000),
+        completeness="partial", reason="page_limit", pages_done=1, fills_in_window=0,
+        updated_at=now - 10, last_error=None)
+    explore_store.insert_fills_page(_A, [], sync)
+
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fills_coverage"]["synced_through"] == 123_000
+    assert body["fills_coverage"]["last_success_at"] == now - 10
+    assert body["as_of"]["fills"] == now - 10
+
+
 def test_pool_local_path_stale_portfolio_enqueues_single_job(tmp_path):
     now = 1_000_000.0
     app, hl, explore_store = _make_pool_app(tmp_path, now)
@@ -725,8 +752,11 @@ def test_pool_out_of_scope_address_uses_upstream_path(tmp_path):
     assert body["source"] == "upstream"
     assert body["refreshing"] is False
     assert body["as_of"] == {"portfolio": now, "state": now, "ledger": now, "fills": now}
+    # Task 7.1（2026-09-21）：upstream 路徑沒有 `ExploreStore.fills_sync` 游標
+    # 可查，兩個新鍵一律 null。
     assert body["fills_coverage"] == {"state": "complete", "observed_from": None,
-                                      "observed_to": None, "reason": None}
+                                      "observed_to": None, "reason": None,
+                                      "synced_through": None, "last_success_at": None}
 
 
 def test_pool_local_path_admission_cap_skips_enqueue(tmp_path):
