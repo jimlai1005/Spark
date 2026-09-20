@@ -1134,6 +1134,61 @@ class ExplorePublisher:
 
 ---
 
+## P6 資料語義修正（2026-09-20 使用者裁決；恢復發布的前置）
+
+<!-- 背景：第二次部署開 flag 後主線程發現「成交回補未完成＝0 筆＝落榜」會讓首次換版把公開榜從 19 列砍到個位數，
+15:11 UTC 先關 flag 保住現役榜。使用者裁決：不用數量門檻掩蓋資料語義問題。 -->
+
+**使用者裁決（逐字精神）**
+- D12 取消 portfolio 覆蓋率與「新版列數 ≥ 舊版 80%」兩種發布門檻。合格人數真的下降就讓榜縮小甚至為空。發布只檢查：來源取得成功、資料格式與組版成功；來源失敗保留舊版；來源有效但結果為空則正常發布。
+- D13 缺成交採 None、**不沿用舊成交統計**（舊值是不同 30 天窗口）。資格三態：`eligible`（成交完整且符合條件）／`pending`（成交不足以判定，列表可見、標「資格待確認」）／`ineligible`（已有充分資料證明不符合）。`qualify(None)` 不得回傳合格；其他已知條件明確不合格時不因成交未知而放行。預設頁同時顯示合格與待確認但分組；勝率排名只對可比較資料排序，待確認放後面、不給名次；「僅合格」查詢不混入 pending。
+- D14 探索頁提示必做：coverage 非 complete 時勝率、成交推導的幣種／集中度顯示「分析待完成」，不產生 `concentrated`。詳情頁可保留已觀測統計但標明範圍。
+- D15 觀測補齊：等待時間按 scope p50/p95、HTTP 計數含重試與 timeout、dashboard 延遲附樣本數。**follower 引擎的限流關係是未結案項目**：同主機同出口 IP、獨立計數；publicapi 零 429 不證明引擎受保護；本輪不改引擎程式，只在文件與 health 明示。
+- D16 恢復發布前三個重現驗收（Task 6.4）；之後觀察連續兩次更新（pending 逐步轉合格／不合格、各欄位時間正確）才開始 24 小時觀測期；預算不動。
+
+### Task 6.1 @inline：三態資格、成交欄位 None、發布只看來源與組版
+
+**Files:** `src/spark/publicapi/hl_explore.py`（`ExploreRow`、`enrich_candidate`、`qualify`→`classify`、`sort_rows`、`_apply_tags`、`ExploreIndex.query`）、`src/spark/publicapi/explore_publisher.py`、`src/spark/publicapi/app.py`（`/api/public/explore` 參數）；`tests/test_public_explore.py`、`tests/test_explore_publisher.py`。
+
+1. **`ExploreRow`** 新增 `eligibility: str`（`eligible|pending|ineligible`）、`eligibility_reason: str | None`；`to_dict` 輸出。
+2. **成交欄位語義**：`enrich_candidate` 在 `fills_coverage.state != "complete"` 時：`close_win_rate_pct=None`、`coins=[]`、`concentration_pct=None`、`closed_positions_30d=None`、`realized_pnl_30d_usd=None`；`order_count_30d` 保留已觀測筆數（下限，語意由 coverage 標示）。`complete` 時照舊。
+3. **`classify(row, cfg, *, window, min_live_days, min_fills, max_dd_pct, max_concentration_pct) -> tuple[str, str | None]`**（取代 `qualify` 的布林；保留 `qualify()` 為 `classify(...)[0] == "eligible"` 的薄包裝供既有呼叫端）：
+   - 已知條件先判：`live_days is not None and live_days < min_live_days` → `ineligible/live_days`；`windows[window].max_dd_pct is not None and 超過` → `ineligible/max_dd`；`coverage == complete`：`order_count_30d < min_fills` → `ineligible/min_fills`、`concentration_pct > max` → `ineligible/concentration`。
+   - `coverage != complete`：`order_count_30d >= min_fills` 視為該條已滿足（下限）；否則該條「未定」。集中度未定，除非 `max_concentration_pct >= 100`（等於不過濾）。
+   - 任一條 ineligible → `ineligible`；無 ineligible 但有未定（含 `live_days is None`／portfolio 缺）→ `pending/<哪一條未定>`；否則 `eligible`。
+4. **`_apply_tags`**：`concentrated` 只對 `coverage == complete` 判；`low_drawdown` 不變。
+5. **`sort_rows`**：先分組（eligible 在前、pending 在後、ineligible 不列），組內依 sort key；勝率排序時 `None` 恆在組尾。
+6. **`ExploreIndex.query(..., eligibility: str = "all")`**：`"all"` → rows＝eligible＋pending（分組順序）；`"eligible"` → 只 eligible。回應加 `total_pending`、`total_ineligible`；`total_qualified` 維持＝eligible 數（前端相容）。`app.py` 端點加同名 query 參數（只接受 `all|eligible`，其他 400）。
+7. **publisher**：刪 `min_portfolio_ratio`／`_gate_reason`／輸入輸出兩道門檻／`gate_skips`／`last_gate`。`maybe_publish`：`candidates = store.active_candidates()`；`len(candidates) == 0 and index 已有版本` → `source_failures += 1`、`last_skip_reason="no_active_candidates"`、保留舊版、回 False（來源失敗）；否則 compose → 快照備份（`.prev`／`.daily`／`.v3.bak` 不變）→ dump → `set_published`。compose 空列＝正常發布。`status()`：`source_failures`、`last_skip_reason`、`last_published_at`、`publishes`、`failures`、`last_error`、`last_attempt_at`、`dirty`。
+8. **測試**：`classify` 三態各情境（含「已知不合格＋成交未知 → ineligible」、「全部已知通過＋成交未知 → pending」、「complete 但 min_fills 不足 → ineligible」、「partial 且 order_count ≥ min_fills 且集中度不過濾 → eligible？」→ 否，集中度未定→ pending，除非 `max_concentration_pct>=100`）；`sort_rows` 分組與 None 在尾；`query(eligibility="eligible")` 不含 pending；publisher：無門檻（10% portfolio 照發）、空候選保留舊版、compose 空列正常發布且 `total_qualified==0`。
+
+### Task 6.2 @inline：探索頁分組、「分析待完成」標示、「僅合格」切換；詳情頁範圍
+
+**Files:** `web/src/lib/publicApi.ts`、`web/src/lib/copy.ts`、`web/src/app/explore/page.tsx`（及其列元件）、`web/src/app/traders/[address]/page.tsx`；對應 vitest。
+
+1. 型別：`ExploreRow.eligibility?`、`eligibility_reason?`；回應 `total_pending?`、`total_ineligible?`；`getPublicExplore` 加 `eligibility` 參數。
+2. 探索頁：rows 依 `eligibility` 分兩組渲染（組標題文案鍵 `explore.groupEligible`／`explore.groupPending`，ZH「合格」／「資格待確認」、EN "Eligible"／"Pending review"）；pending 列不顯示名次。勝率、幣種、集中度相關欄在 `fillsIncomplete(row)` 時顯示「分析待完成」（文案鍵 `explore.analysisPending`）。新增「僅合格」切換（文案鍵 `explore.onlyEligible`），開啟時查詢帶 `eligibility=eligible`。
+3. 詳情頁：coverage 非 complete 時，成交統計區塊標題附範圍文字（`observed_from`～`observed_to` 的日期，文案鍵 `trader.fillsObservedRange`），現有提示保留。
+4. vitest：分組渲染、pending 無名次、分析待完成標示、僅合格切換帶參數、詳情頁範圍文字。`npm test` 全綠、`npm run build` 成功。
+
+### Task 6.3 @inline：觀測補齊（6.1 之後，同改 app.py）
+
+**Files:** `src/spark/publicapi/hl_budget.py`、`hl.py`、`app.py`；`tests/test_hl_budget.py`、`tests/test_hl_gateway_budget.py`、`tests/test_api_ops.py`；`deploy/RUNBOOK.md` §5.8e。
+
+1. `WeightLimiter.reserve` 記錄每次等待秒數（per scope，rolling 最近 500 筆）；`snapshot()` 加 `wait_ms: {scope: {n, p50, p95, max}}`。
+2. `HLGateway._info` 每次嘗試後記 `http_counts[scope][class]`，class ∈ `2xx|4xx|429|5xx|timeout|conn_error|budget_exhausted|scope_paused`（含重試每次各計）；掛在 limiter 上（`limiter.note_http(scope, cls)`），`snapshot()` 加 `http: {scope: {class: n}}`。
+3. `app.py` middleware：對 `/api/me/dashboard` 記錄耗時（rolling 200 筆），`/api/ops/health` 加 `dashboard_latency: {n, p50_ms, p95_ms}`。
+4. `/api/ops/health` 加 `follower_budget_note: "follower 引擎同主機同出口 IP、不經本限流器、獨立計數；本頁零 429 不證明引擎受保護；看 journalctl -u 'filet-follower@*'"`（常數字串，D15）。RUNBOOK §5.8e 同句。
+5. 測試：等待統計、HTTP 計數含重試與 timeout、dashboard 延遲有 n。
+
+### Task 6.4（主線程＋builder 測試）：三個重現驗收與恢復程序
+
+- 測試（放 `tests/test_explore_publisher.py`，用真 `ExploreStore`＋`ExploreIndex`）：
+  (a) 300 候選、全部有 portfolio（live_days 足、dd 合格）、只有 11 個 fills complete（其中 8 個 ≥200 筆）→ 發布後 rows＝300（eligible 8＋pending 292）、無一被丟；`total_qualified==8`、`total_pending==292`。
+  (b) 已有版本 300 列 → 候選換掉 80 個（新地址無任何資料）→ 發布成功，新 80 個為 pending（reason 含 live_days／portfolio 缺），舊 80 個不在 rows。
+  (c) 已有版本 eligible 20 → 新資料完整且證明只剩 12 個合格 → 發布成功、`total_qualified==12`（榜縮小，不被擋）。
+- 恢復程序（主線程）：6.1–6.4 全綠＋opus 複審通過 → 第三次部署（flag 0 → 驗證 → flag 1）→ 觀察連續兩次發布（`published_at` 前進、pending 數下降、eligible/ineligible 上升、rows 的 `as_of.fills` 等於該地址 sync 時間而非 published_at）→ 之後才起算 24 小時觀測期；預算不動。
+
 ## P5 驗收與啟用準備（任務卡）
 
 - Task 5.1 @sdd：`deploy/RUNBOOK.md` 新節「Explore 背景刷新」：env（`FILET_HL_GLOBAL_WEIGHT_CAP`、`FILET_HL_EXPLORE_WEIGHT_CAP`、`FILET_EXPLORE_DB`、`EXPLORE_UPSTREAM_REFRESH`）、drop-in 檔名、觀察 `/api/ops/health.hl_budget`／`.explore_refresh`、停用刷新（設 `EXPLORE_UPSTREAM_REFRESH=0` 重啟，快照續讀）、回退（不重新啟用舊 rebuild；程式已刪）。`deploy/filet-api.service.d/explore-refresh.conf` 範本；`var/lib/filet-api/explore.db` 權限 `filet-api` 0600。
