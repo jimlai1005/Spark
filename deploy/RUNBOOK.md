@@ -2726,3 +2726,16 @@ ruff；正式機 `systemctl --failed` 空、`systemctl show filet-api` 兩個 ca
 67/67 PASS；**20 次 `/api/public/explore` 請求後 journal 零上游／重建行**（事故路徑已關）。
 ⚠️ **已知過渡狀態（D8）**：探索榜凍結在 2026-09-19T15:00 快照（299 列）直到 P3 背景排程上線；快照年齡看 `/api/ops/health.explore_index`。
 follower 引擎與三個 timer 不經限流（全域 900 留 300 給它們）。
+
+**2026-09-20 第二次部署（commit `8ead8e8`，14:20 UTC，Explore 背景刷新 P2–P5）：** 同一份 plan（Task 2.1–5.2；opus 四輪審查＋一輪小審，
+Task 3.5／3.6／3.7／3.8 修正後「可部署」；本機主網實跑報告 `docs/superpowers/research/2026-09-20-explore-refresh-observation.md`）。
+內容：SQLite `explore.db`（候選／endpoint 快取／fills／同步游標／工作佇列）、進程內 `explore-scheduler` thread 逐 job 抓 state／portfolio／
+ledger／一頁 fills（explore 子預算 300/分鐘）、publisher 每分鐘合成榜單（換版門檻：80% 候選有 portfolio，且 compose 輸出非空；
+每次覆寫前留 `.prev`／`.daily`、首次 v3→v4 留 `.v3.bak`）、詳情頁池內地址讀本地、舊 `build_sync` 路徑刪除、前端 `fills_coverage`。
+流程照 §3.2 rsync 兩段 → `uv sync` 略過（pyproject 無變動）→ import 檢查 → §4.2 build → chown root → `cp` 快照為
+`explore_index.json.pre-refresh.bak` → 新 drop-in `explore-refresh.conf`（§5.8e，先 `EXPLORE_UPSTREAM_REFRESH=0`）→ `daemon-reload` →
+restart `filet-api`＋`filet-dashboard` → 驗證（failed 0、`explore.db*` 三檔 `filet-api` 0600、探索頁仍 19 列且列含 `as_of`、無 thread）
+→ `DEPLOYED_VERSION` → `filet_regression_check --http --ssh` 67/67 PASS → **改 `EXPLORE_UPSTREAM_REFRESH=1` 重啟**（14:21 UTC）→
+90 秒後：候選 300、endpoint 快取 36、`發布門檻擋下（第 1 次，in:0/300）`、快照未動、零 Traceback／429。
+⚠️ Python 3.11 的 thread 名不會寫進 OS，`ps -T` 看不到 `explore-scheduler`；判斷它在跑要看 `explore.db` 成長或 `/api/ops/health.explore_refresh`。
+冷啟動觀測：每 10 分鐘看 failed／Traceback／429／門檻／portfolio 覆蓋數／快照 mtime／`.v3.bak`，直到第一次換版（預期 50–65 分鐘）。
