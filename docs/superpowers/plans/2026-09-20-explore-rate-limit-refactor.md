@@ -1295,7 +1295,7 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 
 ### 4.0 目前狀態（2026-09-20 15:00 UTC 更新）
 
-- **全部 task（P0–P5）完成並兩次部署到正式機**；`main`＝`feat/explore-rate-limit`＝54b214e（GitHub 同步）。
+- **P0–P6 全部完成並三次部署到正式機**（最新 5e2ec8e，2026-09-21 16:42 UTC，背景刷新已開、無門檻、三態資格）；`main`＝`feat/explore-rate-limit`（GitHub 同步）。
 - 正式機：8ead8e8，`EXPLORE_UPSTREAM_REFRESH=1` 自 14:21 UTC 起刷新。14:58 讀值：portfolio 170/300、state 301、ledger 171、
   fills 14,247（7 complete／4 backfilling）、job 錯誤 0、零 Traceback、零 HTTP 429（journal grep「429」會誤中舊 PID 429066，看時間戳）。
   首次換版門檻 240/300，預計 15:10 前後；換版時 `explore_index.json.v3.bak` 出現、公開榜 `published_at` 前進。
@@ -1355,5 +1355,6 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 | 6.8 | 2026-09-21 | 6004632 | vitest 746 passed；總數／頁數／候選說明用合格＋待確認；舊後端行為不變 |
 | **P6 最終驗收** | 2026-09-21 | 6004632 | 全量 pytest 3115、vitest 746、ruff 乾淨；6.4 三案例 3 passed；本機前後端整合（API 8700＋web 3100、正式機 v3 快照、flag 0）：嚴格與預設篩選皆 0 合格、第一頁「資格待確認」組、遮罩生效、無集中度標籤、僅合格切換帶參數且空榜、零 console 錯誤。**待第三次部署** |
 | 6.2 | 2026-09-20 | 2d1e255 | vitest 736 passed；分組不重排、pending 無名次、分析待完成、僅合格切換、詳情頁觀測期間（epoch ms）；集中度目前無欄位故無需標示 |
+| **第三次部署（P6）** | 2026-09-21 16:42 UTC | 5e2ec8e | flag 0 驗證與本機一致 → 67/67 → flag 1（16:43）→ 16:44 首次發布、16:45 第二次；合格 2／待確認 288／不合格 10；零錯誤。24h 觀測期自 16:45 UTC 起算 |
 | **第二次部署（D8）** | 2026-09-20 14:20 UTC | 8ead8e8 | 使用者授權（「請繼續」）。flag 0 部署→驗證→67/67→flag 1（14:21）；90 秒後候選 300、快取 36、門檻擋下 in:0/300、快照未動、零 Traceback／429。冷啟動觀測進行中（每 10 分鐘），預期 50–65 分鐘首次換版 |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |

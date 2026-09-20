@@ -2747,7 +2747,7 @@ follower 引擎與三個 timer 不經限流（全域 900 留 300 給它們）。
 **2026-09-20 第二次部署（commit `8ead8e8`，14:20 UTC，Explore 背景刷新 P2–P5）：** 同一份 plan（Task 2.1–5.2；opus 四輪審查＋一輪小審，
 Task 3.5／3.6／3.7／3.8 修正後「可部署」；本機主網實跑報告 `docs/superpowers/research/2026-09-20-explore-refresh-observation.md`）。
 內容：SQLite `explore.db`（候選／endpoint 快取／fills／同步游標／工作佇列）、進程內 `explore-scheduler` thread 逐 job 抓 state／portfolio／
-ledger／一頁 fills（explore 子預算 300/分鐘）、publisher 每分鐘合成榜單（換版門檻：80% 候選有 portfolio，且 compose 輸出非空；
+ledger／一頁 fills（explore 子預算 300/分鐘）、publisher 每分鐘合成榜單（當時有換版門檻：80% 候選有 portfolio，且 compose 輸出非空——**P6 已於 2026-09-21 取消**，見下一條；
 每次覆寫前留 `.prev`／`.daily`、首次 v3→v4 留 `.v3.bak`）、詳情頁池內地址讀本地、舊 `build_sync` 路徑刪除、前端 `fills_coverage`。
 流程照 §3.2 rsync 兩段 → `uv sync` 略過（pyproject 無變動）→ import 檢查 → §4.2 build → chown root → `cp` 快照為
 `explore_index.json.pre-refresh.bak` → 新 drop-in `explore-refresh.conf`（§5.8e，先 `EXPLORE_UPSTREAM_REFRESH=0`）→ `daemon-reload` →
@@ -2756,3 +2756,15 @@ restart `filet-api`＋`filet-dashboard` → 驗證（failed 0、`explore.db*` �
 90 秒後：候選 300、endpoint 快取 36、`發布門檻擋下（第 1 次，in:0/300）`、快照未動、零 Traceback／429。
 ⚠️ Python 3.11 的 thread 名不會寫進 OS，`ps -T` 看不到 `explore-scheduler`；判斷它在跑要看 `explore.db` 成長或 `/api/ops/health.explore_refresh`。
 冷啟動觀測：每 10 分鐘看 failed／Traceback／429／門檻／portfolio 覆蓋數／快照 mtime／`.v3.bak`，直到第一次換版（預期 50–65 分鐘）。
+→ 15:11 UTC **主線程主動關 flag**（portfolio 218/300，尚未換版）：發現成交回補未完成＝0 筆＝落榜，首次換版會把公開榜砍到個位數；
+使用者裁決 P6（不用門檻掩蓋資料語義）。
+
+**2026-09-21 第三次部署（commit `5e2ec8e`，16:42 UTC，P6 資料語義修正）：** plan P6（D12–D16、契約 A–D；Task 6.1–6.8；opus 三輪審查）。
+內容：取消發布門檻（來源故障保留舊版、有效空結果正常發布、單址 enrich 例外出列 pending/enrich_error）；資格三態
+`eligible|pending|ineligible`（`classify`；未知≠0；已知不合格優先）；coverage≠complete 的成交衍生欄位在 `to_dict` 一律 null／coins []／無
+concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶預設門檻分類；後端分組→排序（次鍵 address）→分頁；`eligibility=eligible`
+查詢；前端分組、待確認不給名次、分析待完成、僅合格切換、null 不轉 0、總數含待確認；觀測 `wait_ms`／`http`／`dashboard_latency`／
+`follower_budget_note`。流程：rsync 兩段 → import → build → chown → flag 仍 0 restart → 驗證公開榜與本機整合一致（嚴格 0/122/177、預設 0/287/12、
+遮罩生效）→ `DEPLOYED_VERSION` → `filet_regression_check` 67/67 → **flag 改 1**（16:43）→ 16:44 首次發布（`.v3.bak`／`.daily` 產生）、16:45 第二次
+（`.prev`）；公開榜合格 2／待確認 288／不合格 10、coverage backfilling 293／complete 7；零 Traceback／429／來源故障。
+之後每 5 分鐘觀測 pending 轉換與 `as_of`；**24 小時觀測期自 16:45 UTC 起算**；Explore 預算維持 300 不動；follower 引擎限流關係仍未結案。
