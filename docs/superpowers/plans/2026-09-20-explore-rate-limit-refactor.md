@@ -991,10 +991,24 @@ class ExploreScheduler:
 ### Task 3.2 @sdd：`hl.py` 加 `get_fills_page(address, start_ms, end_ms) -> list[dict]`（單次 `userFillsByTime`，`aggregateByTime` 沿既有 `_paged_fills_raw` 所用值並寫進 docstring；回原始 list）。測試：body 形狀與既有分頁器第一頁一致。
 
 ### Task 3.3 @inline：`/api/traders/{address}` 改讀本地（D4）
-- 池內地址：`_cached_trader_data` 先查 `store.get_cache` 三種＋`store.get_fills`；`fetched_at` 超過 300s → `store.enqueue(f"{addr}:portfolio", priority=1, next=now)` 等（去重、pending ≤ 20），回應加 `refreshing: true`、`as_of`；不等待。
-- 池外地址：維持既有同步抓取（interactive scope、經 limiter）。
-- `non_funding_ledger_updates` 池內地址也入 endpoint_cache（endpoint='ledger'，refresh 3600s）。
-- 驗收：既有 traders 測試全綠；新測試：池內地址 1000 次 GET 零上游呼叫、只產生一個 pending job。
+
+<!-- 2026-09-20 展開。scheduler（3.1）已含 kind：state／portfolio／ledger／fills。 -->
+
+**Files:** `src/spark/publicapi/app.py`（`_cached_trader_data` 約 2443-2557、`public_trader_detail` 約 2540-2650）；`tests/test_public_traders.py`。
+
+- **判定池內**：`explore_store is not None` 且 `store.get_cache(addr, "portfolio")` 存在且 `payload is not None` → 本地路徑；否則（未注入 store、非候選、候選但尚未抓到 portfolio）→ 既有 upstream 路徑（interactive scope、經 limiter，行為不變）。
+- **本地路徑**（不打 HL、不進 `_trader_portfolio_cache`）：
+  - `rows = cache.portfolio.payload`；`ch_state = cache.clearinghouseState.payload`（可 None → `account_value=None`）；`deposit = sum_ledger_deposits(cache.ledger.payload)`（cache 缺或 payload None → `deposit=None`）；
+  - `fills = store.get_fills(addr, now_ms-30d, now_ms)`；`sync = store.get_sync(addr)`；`fills_truncated = (sync is None) or sync.completeness != "complete"`；`fills_coverage = {"state": sync.completeness if sync else "backfilling", "observed_from": sync.observed_from_ms, "observed_to": sync.observed_to_ms, "reason": sync.reason}`（sync None → 三欄 None）。
+  - **stale → 入列刷新、不等待**：對 `("portfolio","clearinghouseState","ledger")` 逐一：`entry is None or now >= entry.refresh_after` → `store.enqueue(f"{addr}:{kind}", addr, kind, 1, now)`（kind 對應 `portfolio`／`state`／`ledger`；去重由 store 保證）；`sync is None or now - sync.updated_at >= 4h` → `enqueue(f"{addr}:fills", addr, "fills", 2, now)`。準入：`store.stats()` 的 refresh_job 數 ≥ 5 × active 候選數 + 20 → 不入列、log warning。任一入列 → `refreshing=True`。
+  - 回應新增鍵（`public_trader_detail`）：`source: "local"|"upstream"`、`refreshing: bool`、`as_of: {portfolio, state, ledger, fills}`（wall epoch 秒或 None；fills 取 `sync.updated_at`）、`fills_coverage`（upstream 路徑：`{"state": "complete" if not fills_truncated else "partial", "observed_from": None, "observed_to": None, "reason": "page_cap" if fills_truncated else None}`）。既有鍵一個不改。
+  - `_cached_trader_data` 回傳 tuple 已有 6 欄；本地路徑需要多回 `coverage`／`as_of`／`refreshing`／`source` → 改回一個小 dataclass `TraderData`（既有 6 欄＋4 新欄），呼叫端同步改；upstream 路徑填 `source="upstream"`、`refreshing=False`、`as_of` 用 `now`。
+- **測試**（`tests/test_public_traders.py`，沿既有 `make_app`／FakeHL；`create_app(..., explore_store=ExploreStore(tmp_path/"e.db"))`）：
+  1. 池內且新鮮：先用 store 塞 portfolio／state／ledger 快取（`put_cache_ok`，`refresh_after=now+3600`）與兩筆 fills＋`insert_fills_page` 的 complete sync → 1000 次 GET 零上游呼叫、`source=="local"`、`refreshing is False`、`fills_coverage.state=="complete"`、`as_of.portfolio` 等於塞入的 `fetched_at`。
+  2. 池內但 portfolio stale（`refresh_after=now-1`）→ 200、`refreshing is True`、`store.stats()` 多恰好 1 個 job（key `addr:portfolio`），連打 50 次仍只有 1 個。
+  3. 池內但只有 portfolio、無 state／ledger／sync → 200、`account_value is None`、`deposit is None`、`fills_coverage.state=="backfilling"`、三個對應 job 入列。
+  4. 非候選地址 → `source=="upstream"`、走既有路徑（既有測試全部不變）。
+  5. 準入上限：預先塞滿 job → `refreshing is False` 且不新增。
 
 ### Task 3.4 @inline：接線與 D6 清理
 - `create_app(..., explore_scheduler=None)`；`run_api.py` 建 scheduler，`EXPLORE_UPSTREAM_REFRESH=1` 才 `threading.Thread(target=run_forever, daemon=True).start()`；`/api/ops/health` 加 `explore_refresh: {enabled, last_tick_at, last_result, queue_depth, oldest_due_age_s, paused_until}`。
@@ -1078,4 +1092,5 @@ class ExplorePublisher:
 | 2.1 | 2026-09-20 | ea8acb7 | `pytest tests/test_explore_store.py` 21 passed；ruff 乾淨；`claim_due` 用 RETURNING（本機與 prod SQLite 皆 3.53.1）；transaction 採 `with self._db:` 隱式（builder 裁決，與 ApiStore 一致） |
 | 2.3 | 2026-09-20 | aa8a292 | 140 passed（config＋ops）；`FILET_EXPLORE_DB` 可選（P3 起必填）；run_api 注入；health `explore_store` |
 | 2.2 | 2026-09-20 | d57365b＋7add2b8 | 17 passed；零 `unknown`、cursor 零 `+1`；增量輪 `fills_in_window` 重置（主線程驗收時抓到、已修） |
+| 3.2 | 2026-09-20 | 77ebea2 | `pytest tests/test_hl_fills_page.py` 6 passed；body 與分頁器第一頁相同；經 limiter 預留 120 結算 23 |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
