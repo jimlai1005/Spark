@@ -171,8 +171,11 @@ def test_maybe_publish_gated_by_dirty_and_min_interval_force_bypasses():
 
 
 def test_maybe_publish_keeps_old_version_on_compose_failure(tmp_path, monkeypatch):
-    """驗收 4：compose 途中 store 拋例外 → 回 False、`index.query()` 仍是上一版、
-    `status().failures==1`。"""
+    """驗收 4：compose **整體**拋例外（`store.active_candidates()` 本身壞掉，
+    在任何一個地址的 per-row try/except 之外——P6 契約 C：這才是「來源故障」
+    的例外形狀）→ 回 False、`index.query()` 仍是上一版、`status().failures==1`。
+    （單一地址 enrich 失敗改由 `test_compose_rows_...enrich_error` 系列覆蓋：
+    P6 之後那種失敗不再讓整批 compose 失敗，見 `compose_rows` 檔頭。）"""
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
     portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
@@ -188,7 +191,7 @@ def test_maybe_publish_keeps_old_version_on_compose_failure(tmp_path, monkeypatc
 
     def boom(*a, **kw):
         raise RuntimeError("boom")
-    monkeypatch.setattr(store, "get_fills", boom)
+    monkeypatch.setattr(store, "active_candidates", boom)
 
     pub.mark_dirty()
     assert pub.maybe_publish(force=True) is False
@@ -243,16 +246,16 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
 # ============================================================
 
 # ============================================================
-# Task 3.5 C：發布門檻（min_portfolio_ratio）＋ v3 快照備份
+# P6（D12，2026-09-20）：取消 portfolio 覆蓋率／新版列數兩種發布門檻——
+# 合格人數真的下降就讓榜縮小甚至為空；發布只檢查來源是否有候選、組版是否
+# 成功（見 `ExplorePublisher.maybe_publish` 檔頭）。以下測試取代已刪除的
+# Task 3.5 C／3.6 A／3.7 A 整組「輸入/輸出端門檻」測試。
 # ============================================================
 
-def test_maybe_publish_blocked_when_below_portfolio_ratio_threshold(tmp_path):
-    """既有版本＋只有 10% 候選有 portfolio、非 force → 擋下發布、`gate_skips==1`、
-    index／快照都不變。（Task 3.6 A：`force` 改為連這個比例門檻也一併繞過，
-    這裡改用可變 clock 越過 `min_interval_s` 節流，不再借用 `force=True` 來
-    測試節流——`force=True` 的比例門檻繞過另見
-    `test_maybe_publish_force_bypasses_ratio_gate`。Task 3.7 A：輸入端預檢命中
-    時 `last_gate` 前綴為 `in:`——compose 根本沒被呼叫到。）"""
+def test_maybe_publish_publishes_normally_even_with_near_zero_portfolio_coverage(tmp_path):
+    """P6：候選來源本身有候選（不是空），即使 portfolio 覆蓋率只有 10%（9 個
+    候選完全沒 enrich 過），也**不擋**——沒有 portfolio 的候選改列
+    `pending`／`portfolio_missing`，不是被整批擋下（見 `hl_explore.classify`）。"""
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
     portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
@@ -262,50 +265,26 @@ def test_maybe_publish_blocked_when_below_portfolio_ratio_threshold(tmp_path):
     pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: now[0],
                            snapshot_path=None)
     pub.mark_dirty()
-    assert pub.maybe_publish() is True   # 第一次發布：index 從未有版本，不套門檻
-    first = index.query()
+    assert pub.maybe_publish() is True   # 第一次發布
 
     # 新增 9 個沒有 portfolio 的候選，10 個裡只有 1 個（10%）有 portfolio。
     for i in range(9):
         addr = "0x" + f"{i:02d}" * 20
         store.upsert_candidates([(addr, f"trader{i}", i + 2, 0.0)], as_of=1000.0)
 
-    now[0] += 60.0   # 越過 min_interval，非 force 也能重新嘗試
+    now[0] += 60.0   # 越過 min_interval
     pub.mark_dirty()
-    assert pub.maybe_publish() is False
-    assert pub.status()["gate_skips"] == 1
-    assert pub.status()["last_gate"] == "in:1/10"
-    assert index.query() == first
+    assert pub.maybe_publish() is True   # P6：無門檻，正常換版
+    result = index.query()
+    assert result["total_scanned"] == 10
+    assert len(result["rows"]) == 10   # 全數出列（1 eligible/pending + 9 pending）
+    assert pub.status()["source_failures"] == 0
 
 
-def test_maybe_publish_force_bypasses_ratio_gate(tmp_path):
-    """Task 3.6 A：`force=True` 繞過門檻檢查——10% 覆蓋率下仍發布，
-    `gate_skips` 不遞增（Task 3.6 D 驗收點）。"""
-    store = ExploreStore(tmp_path / "explore.db")
-    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
-    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
-    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
-    index = _dummy_index()
-    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
-                           snapshot_path=None)
-    pub.mark_dirty()
-    assert pub.maybe_publish() is True
-
-    for i in range(9):
-        addr = "0x" + f"{i:02d}" * 20
-        store.upsert_candidates([(addr, f"trader{i}", i + 2, 0.0)], as_of=1000.0)
-
-    pub.mark_dirty()
-    assert pub.maybe_publish(force=True) is True
-    assert pub.status()["gate_skips"] == 0
-    assert index.query()["total_scanned"] == 10
-
-
-def test_maybe_publish_blocked_when_n_is_zero(tmp_path):
-    """Critical 修法：候選來源整批回空（`n == 0`，例如 300 候選全被停用）時，
-    舊公式 `with_pf < ratio * n` 在 `n == 0` 恆為 False，會誤放行、把 0 列
-    發布上 index 並覆寫快照——新公式 `n == 0` 直接判定 `gate_blocked`，
-    快照不落地（`status()["min_portfolio_ratio"]` 一併驗證）。"""
+def test_maybe_publish_blocked_when_active_candidates_empty_and_has_version(tmp_path):
+    """P6 契約 C：來源故障的唯一形狀——`active_candidates()` 整批回空、且已有
+    版本可保護 → 擋下、`source_failures==1`、`last_skip_reason==
+    "no_active_candidates"`，index／快照都不變。"""
     store = ExploreStore(tmp_path / "explore.db")
     index = _dummy_index()
     index.set_published([], {"published_at": 1.0, "candidates": 0})
@@ -314,66 +293,45 @@ def test_maybe_publish_blocked_when_n_is_zero(tmp_path):
                            snapshot_path=str(snap_path))
     pub.mark_dirty()
     assert pub.maybe_publish() is False
-    assert pub.status()["gate_skips"] == 1
-    assert pub.status()["min_portfolio_ratio"] == 0.8
+    assert pub.status()["source_failures"] == 1
+    assert pub.status()["last_skip_reason"] == "no_active_candidates"
     assert not snap_path.exists()
 
 
-def test_maybe_publish_blocked_when_with_pf_is_zero(tmp_path):
-    """Critical 修法的另一形狀：`n > 0` 但沒有任何候選有 portfolio
-    （`with_pf == 0`）——同樣要擋下，不因 `ratio * n` 較小的邊界情況誤放行。"""
+def test_maybe_publish_force_bypasses_active_candidates_empty_check(tmp_path):
+    """`force=True` 連「來源故障」檢查也繞過（人工強制換版逃生門）。"""
     store = ExploreStore(tmp_path / "explore.db")
-    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
     index = _dummy_index()
-    index.set_published([], {"published_at": 1.0, "candidates": 0})
+    index.set_published([], {"published_at": 1.0, "candidates": 0})   # 已有版本
     pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
                            snapshot_path=None)
     pub.mark_dirty()
-    assert pub.maybe_publish() is False
-    assert pub.status()["gate_skips"] == 1
-    assert pub.status()["last_gate"] == "in:0/1"
+    assert pub.maybe_publish(force=True) is True   # store 沒有任何候選，但 force 繞過檢查
+    assert pub.status()["source_failures"] == 0
+    assert index.query()["total_scanned"] == 0
 
 
-def test_maybe_publish_no_gate_when_index_never_published(tmp_path):
-    """index 從未有版本（`rows is None`）→ 不套門檻，即使 portfolio 覆蓋率 0%
-    也照樣發布（首次上線必經狀態）。"""
+def test_maybe_publish_first_ever_publish_succeeds_even_with_zero_candidates(tmp_path):
+    """`index` 從未發布過版本（`rows is None`）時，即使候選整批為空，也不算
+    「來源故障」（沒有舊版可保護）——照常 compose（結果是空列表）並成功換版，
+    是「有效空結果」（P6 契約 C）。"""
     store = ExploreStore(tmp_path / "explore.db")
-    store.upsert_candidates([(_A, "Alice", 1, 0.1), (_B, "Bob", 2, 0.2)], as_of=1000.0)
-    # 兩個候選都沒有 portfolio 快取（0% 覆蓋率）。
     index = _dummy_index()
     pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
                            snapshot_path=None)
     pub.mark_dirty()
     assert pub.maybe_publish() is True
-    assert index.query()["initializing"] is False
+    result = index.query()
+    assert result["initializing"] is False
+    assert result["rows"] == []
+    assert result["total_qualified"] == 0
+    assert pub.status()["source_failures"] == 0
 
 
-def test_maybe_publish_passes_gate_at_or_above_threshold(tmp_path):
-    """80% 以上有 portfolio → 通過門檻，正常換版。"""
-    store = ExploreStore(tmp_path / "explore.db")
-    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
-    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
-    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
-    index = _dummy_index()
-    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
-                           snapshot_path=None)
-    pub.mark_dirty()
-    assert pub.maybe_publish() is True
-    for i in range(1):  # 補一個有 portfolio 的候選，仍是 100% 覆蓋率。
-        addr = _B
-        store.upsert_candidates([(addr, "Bob", 2, 0.2)], as_of=1000.0)
-        store.put_cache_ok(addr, "portfolio", portfolio_raw, fetched_at=900.0,
-                          refresh_after=2000.0)
-    pub.mark_dirty()
-    assert pub.maybe_publish(force=True) is True
-    assert pub.status()["gate_skips"] == 0
-
-
-def test_maybe_publish_gate_skip_still_updates_last_attempt_but_not_last_published(tmp_path):
-    """節流改看 `last_attempt_at`（成功與失敗都更新）；`last_published_at`
-    只在成功時更新。門檻擋下（失敗）也要更新 `last_attempt_at`，讓下一次
-    `force=False` 的呼叫仍受 `min_interval_s` 節流保護（不會被擋下之後立刻
-    重新一直嘗試 compose）。"""
+def test_maybe_publish_source_failure_updates_last_attempt_but_not_last_published(tmp_path):
+    """節流看 `last_attempt_at`（成功與失敗都更新）；`last_published_at` 只在
+    成功時更新——來源故障（失敗）也要更新 `last_attempt_at`，讓下一次
+    `force=False` 呼叫仍受 `min_interval_s` 節流保護。"""
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
     portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
@@ -384,18 +342,16 @@ def test_maybe_publish_gate_skip_still_updates_last_attempt_but_not_last_publish
                            snapshot_path=None, min_interval_s=60.0)
     pub.mark_dirty()
     assert pub.maybe_publish() is True
-    for i in range(9):
-        addr = "0x" + f"{i:02d}" * 20
-        store.upsert_candidates([(addr, f"trader{i}", i + 2, 0.0)], as_of=1000.0)
 
+    store.deactivate_missing(set())   # 全部停用 → active_candidates() 回空
     now[0] += 100.0
     pub.mark_dirty()
-    assert pub.maybe_publish() is False   # 門檻擋下
+    assert pub.maybe_publish() is False   # 來源故障擋下
     last_published_before = pub.status()["last_published_at"]
 
     now[0] += 10.0   # 未滿 60s
     pub.mark_dirty()
-    assert pub.maybe_publish() is False   # 應仍被 min_interval 節流，不會又跑一次 compose
+    assert pub.maybe_publish() is False   # 仍被 min_interval 節流
     assert pub.status()["last_published_at"] == last_published_before
 
 
@@ -428,14 +384,15 @@ def test_v3_snapshot_backed_up_once_before_first_v4_overwrite(tmp_path):
 
 
 # ============================================================
-# Task 3.7 A/E：門檻改判 compose 輸出（不再只看輸入端 payload 數）
+# P6（D12）：compose 輸出空列表＝「有效空結果」，正常發布（原 Task 3.7 A/E
+# 的輸出側門檻已整段刪除，見 `ExplorePublisher.maybe_publish` 檔頭）。
 # ============================================================
 
-def test_maybe_publish_blocked_when_compose_output_is_empty(tmp_path, monkeypatch):
-    """Critical 修法：輸入端 `with_pf/n = 10/10` 全數通過預檢，但
-    `compose_rows` 實際輸出 0 列（HL portfolio 結構一變、`enrich_candidate`
-    整列丟棄）→ 換版前的輸出側門檻要擋下，不寫快照、不換版，`last_gate` 以
-    `out:` 開頭。"""
+def test_maybe_publish_publishes_normally_when_compose_output_is_empty(tmp_path, monkeypatch):
+    """P6 契約 C：候選來源有效（`active_candidates()` 非空）、`compose_rows`
+    組版成功但輸出 0 列（例如全部候選都被 `classify` 判定不合格——這裡直接用
+    monkeypatch 模擬 compose 輸出空列表）→ **正常發布**，`total_qualified==0`，
+    快照照常落地，不是門檻擋下。"""
     from spark.publicapi import explore_publisher as ep
 
     store = ExploreStore(tmp_path / "explore.db")
@@ -455,11 +412,12 @@ def test_maybe_publish_blocked_when_compose_output_is_empty(tmp_path, monkeypatc
         [], {"published_at": 1000.0, "candidates": 10, "with_portfolio": 0}))
 
     pub.mark_dirty()
-    assert pub.maybe_publish() is False
-    assert pub.status()["gate_skips"] == 1
-    assert pub.status()["last_gate"].startswith("out:")
-    assert pub.status()["last_gate"] == "out:0/10"
-    assert not snap_path.exists()
+    assert pub.maybe_publish() is True
+    assert pub.status()["source_failures"] == 0
+    assert snap_path.exists()
+    result = index.query()
+    assert result["rows"] == []
+    assert result["total_qualified"] == 0
 
 
 def test_maybe_publish_passes_when_compose_output_normal_and_prev_backed_up(tmp_path):
@@ -488,27 +446,6 @@ def test_maybe_publish_passes_when_compose_output_normal_and_prev_backed_up(tmp_
     assert prev_path.read_text() == first_content
 
 
-def test_maybe_publish_blocked_output_gate_still_bypassed_by_force(tmp_path, monkeypatch):
-    """`force=True` 仍繞過輸出側門檻。"""
-    from spark.publicapi import explore_publisher as ep
-
-    store = ExploreStore(tmp_path / "explore.db")
-    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
-    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
-    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
-    index = _dummy_index()
-    pub = ep.ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
-                              snapshot_path=None)
-    pub.mark_dirty()
-    assert pub.maybe_publish() is True   # 首次發布建立版本
-
-    monkeypatch.setattr(ep, "compose_rows", lambda *a, **kw: (
-        [], {"published_at": 1000.0, "candidates": 1, "with_portfolio": 0}))
-    pub.mark_dirty()
-    assert pub.maybe_publish(force=True) is True
-    assert index.query()["rows"] == []
-
-
 def test_publish_snapshot_write_leaves_no_leftover_tmp_file(tmp_path):
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
@@ -527,33 +464,27 @@ def test_publish_snapshot_write_leaves_no_leftover_tmp_file(tmp_path):
     assert [p.name for p in snap_dir.iterdir()] == [snap_path.name]
 
 
-def test_gate_block_logs_warning_on_first_and_every_tenth_skip(tmp_path, monkeypatch, caplog):
-    """2026-09-20 第四輪複審 W2：門檻擋下要「會叫」——第 1 次與之後每 10 次記一行
-    warning（冷啟動期間每分鐘擋一次屬預期，不能洪水）。"""
+def test_source_failure_logs_warning_each_time(tmp_path, caplog):
+    """P6：來源故障（`active_candidates()` 整批回空、已有版本）每次都要「會叫」
+    （工程原則 #6——進度不推進得有人知道）；沒有 gate 之後不再需要「每 10 次」
+    節流（來源故障預期是罕見事件，不像舊版「冷啟動期間每分鐘擋一次」那樣
+    高頻，見 `ExplorePublisher.maybe_publish` 的來源故障分支）。"""
     import logging
 
-    from spark.publicapi import explore_publisher as ep
-
     store = ExploreStore(tmp_path / "explore.db")
-    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
-    store.put_cache_ok(_A, "portfolio", _portfolio_raw([1000, 1000], [1000] * 60),
-                       fetched_at=900.0, refresh_after=2000.0)
     index = _dummy_index()
-    index.set_published([], {"published_at": 1.0, "candidates": 1, "with_portfolio": 1})
+    index.set_published([], {"published_at": 1.0, "candidates": 0})
     clock = [1000.0]
-    pub = ep.ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: clock[0],
-                              snapshot_path=None)
-    monkeypatch.setattr(ep, "compose_rows", lambda *a, **kw: (
-        [], {"published_at": 1000.0, "candidates": 1, "with_portfolio": 0}))
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: clock[0],
+                           snapshot_path=None, min_interval_s=0.0)
     with caplog.at_level(logging.WARNING):
-        for _ in range(12):
+        for _ in range(3):
             pub.mark_dirty()
-            clock[0] += 61.0
+            clock[0] += 1.0
             assert pub.maybe_publish() is False
-    msgs = [r.getMessage() for r in caplog.records if "發布門檻擋下" in r.getMessage()]
-    assert len(msgs) == 2
-    assert "第 1 次" in msgs[0] and "第 10 次" in msgs[1]
-    assert pub.status()["gate_skips"] == 12
+    msgs = [r.getMessage() for r in caplog.records if "候選來源整批回空" in r.getMessage()]
+    assert len(msgs) == 3
+    assert pub.status()["source_failures"] == 3
 
 
 def test_daily_snapshot_rotates_at_most_once_per_day(tmp_path):
@@ -593,3 +524,201 @@ def test_daily_snapshot_rotates_at_most_once_per_day(tmp_path):
     pub.mark_dirty()
     assert pub.maybe_publish(force=True) is True
     assert daily.read_text() == v3              # 超過 24h：輪替成覆寫前那一版
+
+
+# ============================================================
+# P6 契約 C：單一地址 enrich 例外 → pending/enrich_error，不阻擋其他列
+# ============================================================
+
+def test_compose_rows_single_address_enrich_exception_becomes_pending_enrich_error(
+        tmp_path, monkeypatch):
+    """單一地址在 enrich 途中拋例外（模擬 payload 格式錯／timeout 留下的壞
+    資料）→ 該列改列 `pending`／`enrich_error`（不是整批 compose 失敗、也不是
+    被丟棄），`meta["row_errors"]` 累計，其他地址正常出列。"""
+    from spark.publicapi import explore_publisher as ep
+
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1), (_B, "Bob", 2, 0.2)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    store.put_cache_ok(_B, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+
+    real_enrich = ep.enrich_candidate
+
+    def flaky_enrich(address, *a, **kw):
+        if address == _B:
+            raise ValueError("malformed payload")
+        return real_enrich(address, *a, **kw)
+
+    monkeypatch.setattr(ep, "enrich_candidate", flaky_enrich)
+
+    rows, meta = compose_rows(store, now=1000.0, cfg=_cfg())
+
+    assert meta["row_errors"] == 1
+    by_addr = {r.address: r for r in rows}
+    assert set(by_addr) == {_A, _B}
+    assert by_addr[_B].eligibility == "pending"
+    assert by_addr[_B].eligibility_reason == "enrich_error"
+    assert by_addr[_B].windows == {"day": None, "week": None, "month": None, "allTime": None}
+    assert by_addr[_A].eligibility_reason != "enrich_error"
+
+
+# ============================================================
+# Task 6.4（D16）：三個重現驗收（放行前置）
+# ============================================================
+
+def _stats_fill(tid, oid, time_ms, *, coin="BTC", dir_="Open Long", start_position="0",
+                sz="1", closed_pnl="0", px="100"):
+    """同時滿足 `ExploreStore.insert_fills_page`（`coin`/`tid`/`time`）與
+    `trader_stats.fills_stats`（`oid`/`dir`/`startPosition`/`sz`/`closedPnl`）
+    兩邊要求的原始 HL 成交形狀。"""
+    return {"coin": coin, "tid": tid, "time": time_ms, "oid": oid, "dir": dir_,
+           "startPosition": start_position, "sz": sz, "px": px, "closedPnl": closed_pnl}
+
+
+def _stats_fills(n, *, coins=("BTC", "ETH"), time_ms=1_700_000_000_000):
+    """`n` 筆 distinct-oid 開倉單，兩幣輪流（避免單幣頂到 100% 集中度，同
+    `tests/test_public_explore.py::_many_perp_fills`）。"""
+    return [_stats_fill(i, i, time_ms, coin=coins[i % len(coins)]) for i in range(n)]
+
+
+def test_recovery_a_300_candidates_11_complete_8_qualify_rest_pending_or_ineligible(tmp_path):
+    """(a) 300 候選、全部有 portfolio（live_days 足、dd 合格）；只有 11 個地址
+    fills sync 為 `complete`，其中 8 個 ≥200 筆（`eligible`）、3 個 <200 筆
+    （`ineligible/min_fills`——資料已齊全、確定不足）；其餘 289 個從未同步過
+    （`backfilling` → `pending/fills_unknown`）。發布後**無一被丟**：
+    300 個候選全部出現在 store／compose 的處理範圍內，只是 3 個 ineligible
+    不進 `rows`（契約 A：列表 API 不回傳 ineligible 列）。
+
+    ⚠️ 數字修正（相對 plan 原文 Task 6.4(a)）：plan 原文寫「rows==300
+    （8 eligible + 292 pending）」——這沒有把 3 個「complete 但 <200 筆」算成
+    ineligible。按 `classify()` 的定義（coverage==complete 時 `order_count_30d
+    < min_fills` 直接判 ineligible，不是「未定」），正確數字是
+    `rows==297`／`total_pending==289`／`total_ineligible==3`
+    （8+289+3==300，候選無一遺漏，只是 3 個不合格的沒有進 rows）。本測試以
+    此為準（派工單已預先核可這個修正）。
+    """
+    store = ExploreStore(tmp_path / "explore.db")
+    now = 1_800_000_000.0
+    now_ms = int(now * 1000)
+    portfolio_raw = _portfolio_raw([1000, 1050], [1000] * 60)   # live_days=59、dd 小
+    for i in range(300):
+        addr = f"0x{i:040x}"
+        store.upsert_candidates([(addr, f"trader{i}", i, 0.0)], as_of=now)
+        store.put_cache_ok(addr, "portfolio", portfolio_raw, fetched_at=now - 100,
+                          refresh_after=now + 1000)
+        if i < 8:
+            store.insert_fills_page(addr, _stats_fills(200, time_ms=now_ms - 1000),
+                                    _sync(addr, completeness="complete", updated_at=now))
+        elif i < 11:
+            store.insert_fills_page(addr, _stats_fills(50, time_ms=now_ms - 1000),
+                                    _sync(addr, completeness="complete", updated_at=now))
+        # 其餘 11..299（289 個）完全不同步——`store.get_sync` 回 None。
+
+    snap_path = tmp_path / "snap.json"
+    index = ExploreIndex(cfg=ExploreConfig(page_size=500), now_fn=lambda: now,
+                         snapshot_path=str(snap_path))
+    pub = ExplorePublisher(store=store, index=index, cfg=ExploreConfig(), now_fn=lambda: now,
+                           snapshot_path=str(snap_path))
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+
+    result = index.query()
+    assert len(result["rows"]) == 297
+    assert result["total_qualified"] == 8
+    assert result["total_pending"] == 289
+    assert result["total_ineligible"] == 3
+
+
+def test_recovery_b_swap_80_of_300_candidates_new_ones_pending_old_ones_gone(tmp_path):
+    """(b) 已有版本 300 列（全部 eligible）→ 候選換掉其中 80 個（新地址從未
+    被 enrich 過，任何資料都沒有）→ 發布成功；新 80 個以 `pending`／
+    `portfolio_missing` 出列，舊 80 個（已停用、不在 `active_candidates()`）
+    完全不在 `rows`。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    now = 1_800_000_000.0
+    now_ms = int(now * 1000)
+    portfolio_raw = _portfolio_raw([1000, 1050], [1000] * 60)
+    old_addrs = [f"0x{i:040x}" for i in range(300)]
+    for addr in old_addrs:
+        store.upsert_candidates([(addr, addr[:8], 1, 0.0)], as_of=now)
+        store.put_cache_ok(addr, "portfolio", portfolio_raw, fetched_at=now - 100,
+                          refresh_after=now + 1000)
+        store.insert_fills_page(addr, _stats_fills(200, time_ms=now_ms - 1000),
+                                _sync(addr, completeness="complete", updated_at=now))
+
+    snap_path = tmp_path / "snap.json"
+    index = ExploreIndex(cfg=ExploreConfig(page_size=500), now_fn=lambda: now,
+                         snapshot_path=str(snap_path))
+    pub = ExplorePublisher(store=store, index=index, cfg=ExploreConfig(), now_fn=lambda: now,
+                           snapshot_path=str(snap_path))
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+    first = index.query()
+    assert first["total_qualified"] == 300
+    assert len(first["rows"]) == 300
+
+    removed = set(old_addrs[:80])
+    kept = old_addrs[80:]
+    new_addrs = [f"0x{i:040x}" for i in range(1000, 1080)]
+    for addr in new_addrs:
+        store.upsert_candidates([(addr, addr[:8], 1, 0.0)], as_of=now)
+    store.deactivate_missing(set(kept) | set(new_addrs))
+
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    second = index.query()
+    addrs_in_rows = {r["address"] for r in second["rows"]}
+    assert not (removed & addrs_in_rows)           # 舊 80 個不在 rows
+    assert set(new_addrs) <= addrs_in_rows         # 新 80 個出列
+    new_rows = [r for r in second["rows"] if r["address"] in new_addrs]
+    assert all(r["eligibility"] == "pending" for r in new_rows)
+    assert all(r["eligibility_reason"] == "portfolio_missing" for r in new_rows)
+    assert second["total_qualified"] == 220        # 220 個舊候選仍 eligible
+    assert second["total_pending"] == 80
+
+
+def test_recovery_c_shrinking_from_20_eligible_to_12_not_blocked(tmp_path):
+    """(c) 已有版本 20 列皆 `eligible` → 新資料（更新後的 portfolio 快取）
+    證明其中 8 個 `live_days` 不足 30 天 → 發布成功、`total_qualified==12`
+    （榜縮小到 60%，不被任何門檻擋下——P6 D12：合格人數真的下降就讓榜縮小，
+    不用數量門檻掩蓋）。
+
+    （用 `live_days` 而非 `order_count_30d` 示範「新資料證明不合格」：
+    `fills` 在 store 裡是只增不減的累加表——同地址重新 `insert_fills_page`
+    無法讓已收到的筆數變少，`portfolio` 快取則是 upsert 語意，改一次
+    `put_cache_ok` 就能代表「重新抓到的最新資料」，兩者都是 `classify()`
+    四個已知維度之一，示範的是同一條程式碼路徑：`ineligible` 不擋發布。）"""
+    store = ExploreStore(tmp_path / "explore.db")
+    now = 1_800_000_000.0
+    now_ms = int(now * 1000)
+    healthy_portfolio = _portfolio_raw([1000, 1050], [1000] * 60)   # live_days=59
+    addrs = [f"0x{i:040x}" for i in range(20)]
+    for addr in addrs:
+        store.upsert_candidates([(addr, addr[:8], 1, 0.0)], as_of=now)
+        store.put_cache_ok(addr, "portfolio", healthy_portfolio, fetched_at=now - 100,
+                          refresh_after=now + 1000)
+        store.insert_fills_page(addr, _stats_fills(200, time_ms=now_ms - 1000),
+                                _sync(addr, completeness="complete", updated_at=now))
+
+    snap_path = tmp_path / "snap.json"
+    index = ExploreIndex(cfg=ExploreConfig(page_size=100), now_fn=lambda: now,
+                         snapshot_path=str(snap_path))
+    pub = ExplorePublisher(store=store, index=index, cfg=ExploreConfig(), now_fn=lambda: now,
+                           snapshot_path=str(snap_path))
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+    assert index.query()["total_qualified"] == 20
+
+    # 新資料揭露：前 8 個地址重新抓到的 portfolio 只有 5 天的 allTime 序列
+    # （live_days=4 < min_trading_days=30）。
+    degraded_portfolio = _portfolio_raw([1000, 1050], [1000] * 5)
+    for addr in addrs[:8]:
+        store.put_cache_ok(addr, "portfolio", degraded_portfolio, fetched_at=now + 10,
+                          refresh_after=now + 2000)
+
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    result = index.query()
+    assert result["total_qualified"] == 12
+    assert result["total_ineligible"] == 8

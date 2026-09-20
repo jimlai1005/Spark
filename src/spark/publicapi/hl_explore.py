@@ -380,10 +380,13 @@ class ExploreRow:
     live_days: int | None          # W1：allTime 首末點日曆跨距天數（非 distinct 日數）；
                                     # Task 4.1：`portfolio_raw` 缺席（尚未 enrich 過）→
                                     # None（「分析待完成」，不是 0——`qualify` 因此不合格）
-    order_count_30d: int           # D3：distinct 訂單數（不是 fills 數）
-    closed_positions_30d: int      # D3：部位歸零的生命週期數（Hyperbot 定義）
-    realized_pnl_30d_usd: float    # D3：Σ closedPnl（未扣手續費／funding）
-    close_win_rate_pct: float | None   # None＝無結倉樣本（closed_positions_30d==0）
+    order_count_30d: int           # D3：distinct 訂單數（不是 fills 數）；P6：coverage
+                                    # 非 complete 時仍是已觀測筆數的**下限**，語意由
+                                    # `fills_coverage` 標示（見 `enrich_candidate` P6 段）
+    closed_positions_30d: int | None   # D3：部位歸零的生命週期數；P6：coverage 非
+                                    # complete → None（未知≠0，見 `enrich_candidate`）
+    realized_pnl_30d_usd: float | None  # D3：Σ closedPnl；P6：coverage 非 complete → None
+    close_win_rate_pct: float | None   # None＝無結倉樣本，或 P6：coverage 非 complete（未知）
     concentration_pct: float | None
     exposure_dir: str | None       # "long" / "short" / None（無倉位或無法解析；
                                     # D14：locale 中性代碼，前端自行對映顯示文案）
@@ -400,6 +403,16 @@ class ExploreRow:
     # `observed_to`／`reason`），兩頁共用同一份定義（工程原則 1）。
     as_of: dict[str, float | None] = field(default_factory=dict)
     fills_coverage: dict = field(default_factory=lambda: dict(DEFAULT_FILLS_COVERAGE))
+    # P6（2026-09-20，D13）：三態資格，取代單純布林 `qualify`——由 `classify()` 決定
+    # （`ExploreIndex.query()` 依當次請求門檻動態算，見該函式；直接建構
+    # `ExploreRow`（測試／舊快照遷移）沒有門檻可算，預設 `"eligible"`／`None`，
+    # 之後一律被 `query()` 的 `classify()` 覆寫，僅 `eligibility_reason ==
+    # "enrich_error"` 的列（`explore_publisher.compose_rows` 單一地址 enrich 失敗
+    # 直接構造，見該函式）例外——`query()` 對這類列跳過重新分類，見該函式檔頭）。
+    eligibility: str = "eligible"          # "eligible" | "pending" | "ineligible"
+    eligibility_reason: str | None = None  # 值域：live_days/max_dd/min_fills/
+                                            # concentration/portfolio_missing/
+                                            # fills_unknown/enrich_error；eligible 為 None
 
     def to_dict(self) -> dict:
         return {
@@ -421,6 +434,8 @@ class ExploreRow:
             "fills_truncated": self.fills_truncated,
             "as_of": dict(self.as_of),
             "fills_coverage": dict(self.fills_coverage),
+            "eligibility": self.eligibility,
+            "eligibility_reason": self.eligibility_reason,
         }
 
 
@@ -451,6 +466,11 @@ def _row_from_dict(d: dict) -> ExploreRow:
         fills_truncated=bool(d.get("fills_truncated", False)),
         as_of=dict(d.get("as_of") or {}),
         fills_coverage=dict(d.get("fills_coverage") or DEFAULT_FILLS_COVERAGE),
+        # P6：舊快照（發布於本欄位新增之前）缺這兩鍵 → 落回 `ExploreRow` 的類別
+        # 預設（"eligible"/None）——`ExploreIndex.query()` 下一次讀取會用當次
+        # 門檻重新 `classify()`，不會讓過期的預設值長期冒充真正的資格。
+        eligibility=d.get("eligibility", "eligible"),
+        eligibility_reason=d.get("eligibility_reason"),
     )
 
 
@@ -676,25 +696,54 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
         positions = _parse_positions(ch_state)
         exp_dir, exp_pct = _exposure(positions)
 
+    # P6（D13，2026-09-20）：呼叫端省略 `fills_coverage`（既有直接呼叫
+    # `enrich_candidate` 的呼叫端／測試，不參與 `ExploreStore` 分頁追蹤——不是
+    # 「未知」，是這次呼叫本身就餵了一份完整的 `fills`）→ 視為 `"complete"`，
+    # 不遮蔽成交欄位（向下相容既有行為）。只有**顯式**傳入非 `"complete"` 的
+    # `fills_coverage`（`explore_publisher.compose_rows` 的正式資料流）才會
+    # 觸發下面的「未知≠0」遮蔽——`close_win_rate_pct`／`coins`／
+    # `concentration_pct`／`closed_positions_30d`／`realized_pnl_30d_usd` 全部
+    # 存 `None`（`[]` for coins），`order_count_30d` 仍保留已觀測筆數下限。
+    effective_coverage = fills_coverage if fills_coverage is not None else {
+        "state": "complete", "observed_from": None, "observed_to": None, "reason": None}
+    fills_complete = effective_coverage.get("state") == "complete"
+    if fills_complete:
+        coins = fs.coins
+        closed_positions_30d: int | None = fs.closed_positions
+        realized_pnl_30d_usd: float | None = fs.realized_pnl_usd
+        close_win_rate_pct: float | None = fs.win_rate_pct
+        concentration_pct: float | None = fs.concentration_pct
+    else:
+        coins = ()
+        closed_positions_30d = None
+        realized_pnl_30d_usd = None
+        close_win_rate_pct = None
+        concentration_pct = None
+
     extra_fields: dict = {}
     if as_of is not None:
         extra_fields["as_of"] = as_of
     if fills_coverage is not None:
         extra_fields["fills_coverage"] = fills_coverage
+    else:
+        # 同上：省略時把「complete」寫回 `ExploreRow.fills_coverage`本身
+        # （不留 `DEFAULT_FILLS_COVERAGE` 的 `"backfilling"` 類別預設值）——否則
+        # `classify()` 會誤判這批本來資料齊全的列成「成交未知」。
+        extra_fields["fills_coverage"] = dict(effective_coverage)
 
     return ExploreRow(
         address=address,
         display_name=display_name,
         label=display_name if display_name else _abbreviate_address(address),
-        coins=fs.coins,
+        coins=coins,
         account_bucket=bucket,
         windows=windows,
         live_days=live_days,
         order_count_30d=fs.order_count,
-        closed_positions_30d=fs.closed_positions,
-        realized_pnl_30d_usd=fs.realized_pnl_usd,
-        close_win_rate_pct=fs.win_rate_pct,
-        concentration_pct=fs.concentration_pct,
+        closed_positions_30d=closed_positions_30d,
+        realized_pnl_30d_usd=realized_pnl_30d_usd,
+        close_win_rate_pct=close_win_rate_pct,
+        concentration_pct=concentration_pct,
         exposure_dir=exp_dir,
         exposure_pct=exp_pct,
         tags=(),
@@ -733,58 +782,114 @@ def _apply_tags(rows: list[ExploreRow], cfg: ExploreConfig) -> list[ExploreRow]:
         if (threshold is not None and month_dd is not None
                 and abs(Decimal(str(month_dd))) <= threshold):
             tags.append("low_drawdown")
-        if (r.concentration_pct is not None
+        # P6（D14）：集中度只在成交完整（`fills_coverage.state == "complete"`）
+        # 才判——`enrich_candidate` 已在非 complete 時把 `concentration_pct`
+        # 遮成 `None`，這裡的 coverage 檢查是防禦性的（例如直接建構
+        # `ExploreRow` 略過 `enrich_candidate` 的測試/呼叫端）。
+        if (r.fills_coverage.get("state") == "complete"
+                and r.concentration_pct is not None
                 and Decimal(str(r.concentration_pct)) > cfg.max_concentration_pct):
             tags.append("concentrated")
         out.append(dataclasses.replace(r, tags=tuple(tags)))
     return out
 
 
+def classify(row: ExploreRow, cfg: ExploreConfig, *, window: str = DEFAULT_WINDOW,
+            min_live_days: int, min_fills: int,
+            max_dd_pct: float | None, max_concentration_pct: float | None
+            ) -> tuple[str, str | None]:
+    """P6（D13，2026-09-20）：三態資格判定，取代 `qualify` 的布林。`cfg` 目前不
+    參與門檻計算（四個門檻改由呼叫端明確傳入——`ExploreIndex.query()` 用當次
+    請求 clamp 過的值；`qualify()` 依 toggle 決定要不要覆寫成「不過濾」值，
+    見該函式），保留只是與既有簽名慣例（`qualify(row, cfg, ...)`）一致。
+
+    回傳 `(eligibility, reason)`，`eligibility ∈ {"eligible","pending","ineligible"}`：
+
+    1. **已知條件先判**（任一命中 → 立刻 `("ineligible", reason)`，reason 值域
+       `live_days`／`max_dd`／`min_fills`／`concentration`）：
+       - `live_days is not None and live_days < min_live_days` → `"live_days"`。
+       - 所選窗 `max_dd_pct` 存在且 `abs(...) > max_dd_pct` 門檻（`max_dd_pct`
+         參數為 `None` → 整個維度不過濾，見下）→ `"max_dd"`。
+       - `fills_coverage.state == "complete"` 時：`order_count_30d < min_fills`
+         → `"min_fills"`；`concentration_pct` 存在且 `> max_concentration_pct`
+         （參數為 `None` → 不過濾）→ `"concentration"`。
+    2. **`fills_coverage.state != "complete"`**（成交統計未知，`enrich_candidate`
+       已把 `concentration_pct` 等欄位遮成 `None`，見該函式 P6 段）：
+       `order_count_30d >= min_fills`（下限）視為該條已滿足；否則「未定」。
+       集中度視為「未定」，除非 `max_concentration_pct >= 100`（等於不過濾，
+       此時視為已滿足）。
+    3. 無 ineligible 但有「未定」（`live_days is None`＝`portfolio_missing`，
+       或上一步的成交「未定」＝`fills_unknown`）→ `("pending", reason)`
+       （`portfolio_missing` 優先於 `fills_unknown`）。
+    4. 以上皆無 → `("eligible", None)`。
+
+    `max_dd_pct`／`max_concentration_pct` 為 `None`：供 `qualify()` 的
+    `max_dd_filter=False`／`exclude_concentrated=False` 逃生門使用，代表整個
+    維度不參與判定（永遠視為已滿足，不產生 pending 也不產生 ineligible）；
+    `ExploreIndex.query()` 的正式請求路徑一律傳明確數值。
+    """
+    portfolio_missing = row.live_days is None
+    if not portfolio_missing and row.live_days < min_live_days:
+        return "ineligible", "live_days"
+
+    if max_dd_pct is not None:
+        stats = row.windows.get(window)
+        dd = stats.max_dd_pct if stats is not None else None
+        if dd is not None and abs(Decimal(str(dd))) > Decimal(str(max_dd_pct)):
+            return "ineligible", "max_dd"
+
+    fills_complete = (row.fills_coverage or {}).get("state") == "complete"
+    fills_pending = False
+    if fills_complete:
+        if row.order_count_30d < min_fills:
+            return "ineligible", "min_fills"
+        if (max_concentration_pct is not None and row.concentration_pct is not None
+                and Decimal(str(row.concentration_pct)) > Decimal(str(max_concentration_pct))):
+            return "ineligible", "concentration"
+    else:
+        if row.order_count_30d < min_fills:
+            fills_pending = True
+        if max_concentration_pct is not None and max_concentration_pct < 100:
+            fills_pending = True
+
+    if portfolio_missing:
+        return "pending", "portfolio_missing"
+    if fills_pending:
+        return "pending", "fills_unknown"
+    return "eligible", None
+
+
+def _effective_thresholds(cfg: ExploreConfig, *, require_sample: bool,
+                          max_dd_filter: bool, exclude_concentrated: bool
+                          ) -> tuple[int, int, float | None, float]:
+    """`qualify()`／`ExploreIndex.query()` 共用：三個舊版布林 chip → `classify()`
+    的四個門檻參數（`None`＝該維度不過濾，見 `classify` 檔頭）。"""
+    return (
+        cfg.min_trading_days if require_sample else 0,
+        cfg.min_fills if require_sample else 0,
+        float(cfg.max_drawdown_pct) if max_dd_filter else None,
+        float(cfg.max_concentration_pct) if exclude_concentrated else 100.0,
+    )
+
+
 def qualify(row: ExploreRow, cfg: ExploreConfig, *, window: str = DEFAULT_WINDOW,
            require_sample: bool = True, max_dd_filter: bool = True,
            exclude_concentrated: bool = True) -> bool:
-    """資格過濾（R2-01，全在後端）。三個布林是內部/測試逃生門（R4-3：公開端點
-    已改成四個自由數值門檻，不再對外送布林 chip，見模組檔頭「R4-3」節）；
-    `window` 決定回撤門檻要看**哪一窗**的 `max_dd_pct`（R4-3：不再永遠用
-    month——使用者切換顯示窗，回撤過濾也跟著切換，"誠實揭露"見同節）。
-
-    邊界（equal 一律算通過——常數描述的是「上限」/「下限」，卡在門檻上不該被
-    無聲刷掉；本模組唯一的權威定義，測試逐條釘死）：
-    - 樣本門檻：`live_days >= min_trading_days`（W1：live_days＝allTime
-      首末點日曆跨距天數，門檻語意＝「實盤 ≥ min_trading_days 天」，與
-      `window` 無關）且 `order_count_30d >= min_fills`（下限，"至少"語意，
-      等於門檻通過；D5：`fills_truncated=True` 時 `order_count_30d` 本身是
-      下限值，真實筆數只會更多，這條比較方向不受影響）。
-    - 回撤上限：`abs(windows[window].max_dd_pct) <= max_drawdown_pct`（等於
-      門檻通過）；該窗對這一列是 `None`（day/week best-effort 缺席），或該窗
-      存在但 `max_dd_pct is None`（perf 非 ok，見 `WindowStats`）→ 皆視為
-      通過——沒有證據代表回撤超標，比照下面集中度 `None` 的既有慣例，不得
-      因為缺資料就先假設它超標。
-    - 集中度上限：`concentration_pct <= max_concentration_pct`（等於門檻通過；
-      `None`＝無成交量資料可算集中度，視為通過——沒有證據代表集中，不得因為
-      缺資料就先假設它超標）。
+    """資格過濾（R2-01，全在後端）——**薄包裝**：`classify(...)[0] == "eligible"`
+    （P6，D13）。三個布林是內部/測試逃生門（R4-3：公開端點已改成四個自由數值
+    門檻，不再對外送布林 chip，見模組檔頭「R4-3」節）；`window` 決定回撤門檻
+    看**哪一窗**的 `max_dd_pct`。既有呼叫端／測試的語意不變：`True` ⇔
+    `classify` 判定 `"eligible"`（`"pending"`／`"ineligible"` 皆為 `False`——
+    D13：`qualify(None)` 不得回傳合格）。邊界值與 None-容忍慣例見 `classify`
+    docstring，本函式不重複定義。
     """
-    if require_sample:
-        # Task 4.1：`live_days is None`（`portfolio_raw` 缺席的「分析待完成」
-        # 列）→ 不合格，不是「0 天」也不是「無條件通過」——沒有足夠證據能確認
-        # 已滿足「實盤 ≥ min_trading_days 天」，比照上面樣本門檻缺資料不能算
-        # 通過的方向處理（與回撤／集中度「缺資料算通過」是相反的方向：後兩者
-        # 是「上限」語意，缺資料不能假設超標；這裡是「下限」語意，缺資料不能
-        # 假設已達標，見模組檔頭本函式檔頭）。
-        if row.live_days is None or row.live_days < cfg.min_trading_days:
-            return False
-        if row.order_count_30d < cfg.min_fills:
-            return False
-    if max_dd_filter:
-        stats = row.windows.get(window)
-        if (stats is not None and stats.max_dd_pct is not None
-                and abs(Decimal(str(stats.max_dd_pct))) > cfg.max_drawdown_pct):
-            return False
-    if exclude_concentrated:
-        if (row.concentration_pct is not None
-                and Decimal(str(row.concentration_pct)) > cfg.max_concentration_pct):
-            return False
-    return True
+    min_live_days, min_fills, max_dd_pct, max_concentration_pct = _effective_thresholds(
+        cfg, require_sample=require_sample, max_dd_filter=max_dd_filter,
+        exclude_concentrated=exclude_concentrated)
+    eligibility, _ = classify(row, cfg, window=window, min_live_days=min_live_days,
+                              min_fills=min_fills, max_dd_pct=max_dd_pct,
+                              max_concentration_pct=max_concentration_pct)
+    return eligibility == "eligible"
 
 
 def sort_value(row: ExploreRow, *, window: str = DEFAULT_WINDOW,
@@ -793,10 +898,13 @@ def sort_value(row: ExploreRow, *, window: str = DEFAULT_WINDOW,
     best-effort 缺席）退回 `"month"`（`enrich_candidate` 保證恆非 `None`）；
     `live_days`／`win_rate` 與 `window` 無關。值本身為 `None`（`max_dd_pct`
     算不出、或該帳戶沒有已歸零的成交生命週期）時原樣回傳 `None`——由
-    `sort_rows` 決定「None 一律排最後」，這裡不做排序決策，只負責誠實取值。"""
+    `sort_rows` 決定「None 一律排最後」，這裡不做排序決策，只負責誠實取值。
+    P6：`windows["month"]` 本身也可能是 `None`（`portfolio_missing` 的
+    `pending` 列，見 `enrich_candidate`——這類列現在會被 `sort_rows` 分到
+    pending 組一起排序，不再保證退回鍵恆非 `None`），一併回傳 `None`。"""
     if sort in ("pnl", "max_dd"):
         stats = row.windows.get(window) or row.windows["month"]
-        v = stats.pnl_usd if sort == "pnl" else stats.max_dd_pct
+        v = None if stats is None else (stats.pnl_usd if sort == "pnl" else stats.max_dd_pct)
     elif sort == "live_days":
         v = row.live_days
     elif sort == "win_rate":
@@ -806,18 +914,34 @@ def sort_value(row: ExploreRow, *, window: str = DEFAULT_WINDOW,
     return None if v is None else Decimal(str(v))
 
 
-def sort_rows(rows: list[ExploreRow], *, window: str = DEFAULT_WINDOW,
-             sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> list[ExploreRow]:
-    """D12（2026-09-05）：`ExploreIndex.query` 的排序責任——分頁在後端切，
-    排序也必須在後端做（前端只拿得到當頁列，排不動全體）。`None` 值（例如
-    `max_dd_pct` 算不出、或沒有已歸零的成交生命週期）不論 `order` 一律排
-    最後：回撤算不出的列不能因為 `asc` 排到最前面冒充「回撤最小」。穩定
-    排序（Python `sort` 本身穩定）：同值列維持輸入順序。"""
+def _sort_group(rows: list[ExploreRow], *, window: str, sort: str, order: str) -> list[ExploreRow]:
+    """單一資格分組內的排序：`sort_value` 缺值（`None`）不論 `order` 一律排最後；
+    次排序鍵固定 `address` 升冪、與 `order` 無關（P6 契約 B）——先用 address
+    做一次穩定排序墊底，再用主鍵排序，Python `sort` 的穩定性讓同值列維持
+    address 升冪（標準的「先次鍵、後主鍵」技巧，不必手寫 tuple 比較函式）。"""
     keyed = [(sort_value(r, window=window, sort=sort), r) for r in rows]
     present = [(k, r) for k, r in keyed if k is not None]
     missing = [r for k, r in keyed if k is None]
+    present.sort(key=lambda kr: kr[1].address)
     present.sort(key=lambda kr: kr[0], reverse=(order == "desc"))
+    missing.sort(key=lambda r: r.address)
     return [r for _, r in present] + missing
+
+
+def sort_rows(rows: list[ExploreRow], *, window: str = DEFAULT_WINDOW,
+             sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> list[ExploreRow]:
+    """D12（2026-09-05）；P6（D13，2026-09-20）擴充分組：`ExploreIndex.query` 的
+    排序＋分組責任——分頁在後端切，排序也必須在後端做（前端只拿得到當頁列，
+    排不動全體）。**先依 `row.eligibility` 分組**（`"eligible"` 全部在前、
+    `"pending"` 全部在後，`"ineligible"` 整批不列——呼叫端須已對每列跑過
+    `classify()` 並用 `dataclasses.replace` 寫回 `eligibility`，見
+    `ExploreIndex.query`），**組內**再依 `sort`／`order`／`address` 排序
+    （見 `_sort_group`）。`None` 值（例如 `max_dd_pct` 算不出、或沒有已歸零的
+    成交生命週期）不論 `order` 一律排該組最後。"""
+    eligible = [r for r in rows if r.eligibility == "eligible"]
+    pending = [r for r in rows if r.eligibility == "pending"]
+    return (_sort_group(eligible, window=window, sort=sort, order=order)
+           + _sort_group(pending, window=window, sort=sort, order=order))
 
 
 def sort_key(row: ExploreRow, *, window: str = DEFAULT_WINDOW) -> Decimal:
@@ -951,7 +1075,8 @@ class ExploreIndex:
              max_dd_pct: float | None = None, max_concentration_pct: float | None = None,
              require_sample: bool = True, max_dd_filter: bool = True,
              exclude_concentrated: bool = True,
-             sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> dict:
+             sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER,
+             eligibility: str = "all") -> dict:
         """讀路徑：**只讀本地已發布版本，永不觸發上游**（2026-09-20 spec §3／§9.2：
         Explore 頁面刷新不得發 HL info、不得開 rebuild——2026-09-19 事故：請求觸發
         的 300 池重建把同 IP 額度燒到 429，dashboard／onboard 一起失效）。上游更新
@@ -981,6 +1106,22 @@ class ExploreIndex:
         `sort`／`order`：Task 11（D12／D13），排序在資格過濾**之後**、分頁
         **之前**做（對合格全集排序，不是只排當頁）；回傳 dict 原樣 echo 這兩個
         值（`"sort"`／`"order"` 鍵）供前端表頭箭頭顯示對照，見 `sort_rows`。
+
+        `eligibility`：P6（D13）契約 B——`"all"`（預設）→ rows＝eligible＋pending
+        （`sort_rows` 分組順序，eligible 在前）；`"eligible"` → 只 eligible。
+        `"ineligible"` 一律不進 `rows`（不論本參數為何）。非法值由呼叫端
+        （`app.py` 端點層）驗證，本函式不驗證，原樣 echo 回傳（`"eligibility"`
+        鍵）。回應另加 `total_pending`／`total_ineligible`（`total_qualified`
+        維持＝eligible 數，前端相容）。
+
+        三態分類（`classify()`）在**每次查詢時**用當次生效門檻重新計算——
+        `ExploreRow.eligibility`／`eligibility_reason` 欄位本身只是預設值／
+        快照回填的佔位（見 `ExploreRow` 檔頭），不是發布時就凍結的最終結果，
+        因為門檻本身可依請求覆寫（`min_live_days` 等四個參數）。唯一例外：
+        `eligibility_reason == "enrich_error"` 的列（`explore_publisher.
+        compose_rows` 單一地址 enrich 失敗時直接構造，見該函式）——這類列沒有
+        可供 `classify()` 判斷的真實資料，維持原樣（`pending`／`enrich_error`），
+        不被重新分類覆寫。
         """
         with self._lock:
             rows = self._rows
@@ -992,8 +1133,9 @@ class ExploreIndex:
             # Task 4.1：`initializing`＝從未有可服務版本；`building` 保留同義
             # （前端相容，見類別檔頭「Task 4.1」段）。
             return {"rows": [], "page": page, "page_size": self._cfg.page_size,
-                   "total_qualified": 0, "total_scanned": 0, "pool": 0,
-                   "updated_at": None, "building": True,
+                   "total_qualified": 0, "total_pending": 0, "total_ineligible": 0,
+                   "total_scanned": 0, "pool": 0,
+                   "updated_at": None, "building": True, "eligibility": eligibility,
                    "published_at": None, "initializing": True, "coverage_counts": {}}
         cfg = self._cfg
         if (min_live_days, min_fills, max_dd_pct, max_concentration_pct) != (None, None, None, None):
@@ -1006,18 +1148,31 @@ class ExploreIndex:
                 max_concentration_pct=(cfg.max_concentration_pct if max_concentration_pct is None
                                        else Decimal(str(max_concentration_pct))),
             )
-        qualified_rows = [r for r in rows
-                          if qualify(r, cfg, window=window, require_sample=require_sample,
-                                    max_dd_filter=max_dd_filter,
-                                    exclude_concentrated=exclude_concentrated)]
-        qualified_rows = sort_rows(qualified_rows, window=window, sort=sort, order=order)
-        page_rows = paginate(qualified_rows, page, self._cfg.page_size)
+        eff_min_live_days, eff_min_fills, eff_max_dd_pct, eff_max_concentration_pct = (
+            _effective_thresholds(cfg, require_sample=require_sample, max_dd_filter=max_dd_filter,
+                                  exclude_concentrated=exclude_concentrated))
+        classified: list[ExploreRow] = []
+        for r in rows:
+            if r.eligibility_reason == "enrich_error":
+                classified.append(dataclasses.replace(r, eligibility="pending"))
+                continue
+            elig, reason = classify(r, cfg, window=window, min_live_days=eff_min_live_days,
+                                    min_fills=eff_min_fills, max_dd_pct=eff_max_dd_pct,
+                                    max_concentration_pct=eff_max_concentration_pct)
+            classified.append(dataclasses.replace(r, eligibility=elig, eligibility_reason=reason))
+        eligible_rows = [r for r in classified if r.eligibility == "eligible"]
+        pending_rows = [r for r in classified if r.eligibility == "pending"]
+        ineligible_count = sum(1 for r in classified if r.eligibility == "ineligible")
+        visible_rows = eligible_rows if eligibility == "eligible" else eligible_rows + pending_rows
+        visible_rows = sort_rows(visible_rows, window=window, sort=sort, order=order)
+        page_rows = paginate(visible_rows, page, self._cfg.page_size)
         return {"rows": [r.to_dict() for r in page_rows], "page": page,
                "page_size": self._cfg.page_size,
-               "total_qualified": len(qualified_rows), "total_scanned": total_scanned,
+               "total_qualified": len(eligible_rows), "total_pending": len(pending_rows),
+               "total_ineligible": ineligible_count, "total_scanned": total_scanned,
                "pool": total_scanned,
                "updated_at": int(built_at) if built_at is not None else None,
-               "building": False, "sort": sort, "order": order,
+               "building": False, "sort": sort, "order": order, "eligibility": eligibility,
                # Task 4.1（spec §9.2）：`published_at`（原始 epoch 秒，未經
                # `int()` 截斷，供 `explore_publisher` 與 `query()` 呼叫端做
                # 精確比較）、`initializing: False`（已有可服務版本）、

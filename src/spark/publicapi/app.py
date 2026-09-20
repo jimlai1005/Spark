@@ -2384,7 +2384,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                        max_dd_pct: float = float(hl_explore.DEFAULT_MAX_DRAWDOWN_PCT),
                        max_concentration_pct: float = float(hl_explore.DEFAULT_MAX_CONCENTRATION_PCT),
                        sort: str = hl_explore.DEFAULT_SORT,
-                       order: str = hl_explore.DEFAULT_ORDER):
+                       order: str = hl_explore.DEFAULT_ORDER,
+                       eligibility: str = "all"):
         """探索跟單對象榜（無需登入）。R4-3（2026-08-30 使用者裁決 6）：四窗全開
         （`window` ∈ `hl_explore.WINDOW_KEYS`＝day/week/month/allTime，UI 標籤
         對映見 `hl_explore.py` 檔頭——HL `portfolio()` 沒有「90 天」窗，不是
@@ -2404,7 +2405,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         （pnl/max_dd/live_days/win_rate）、`order` ∈ `hl_explore.SORT_ORDERS`
         （asc/desc），皆為封閉列舉，非法值 → 422；預設 `pnl`/`desc`（與既有
         R4-3 排序一致）。缺該欄位資料的列（例如回撤算不出、或無已歸零成交
-        生命週期）不論 `order` 一律排最後，見 `hl_explore.sort_rows`。"""
+        生命週期）不論 `order` 一律排最後，見 `hl_explore.sort_rows`。
+
+        `eligibility`（P6 契約 B，2026-09-20）：`"all"`（預設，eligible＋pending
+        分組顯示）或 `"eligible"`（只顯示合格）；其他值 → 400（此參數與
+        `window`/`sort`/`order` 等封閉列舉不同——plan 明確指定用 400，不是
+        422，見 plan Task 6.1 第 6 點）。"""
         if window not in hl_explore.WINDOW_KEYS:
             raise HTTPException(status_code=422,
                                 detail=f"window 須為 {hl_explore.WINDOW_KEYS} 其一")
@@ -2416,6 +2422,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         if order not in hl_explore.SORT_ORDERS:
             raise HTTPException(status_code=422,
                                 detail=f"order 須為 {hl_explore.SORT_ORDERS} 其一")
+        if eligibility not in ("all", "eligible"):
+            raise HTTPException(status_code=400, detail="eligibility 須為 all 或 eligible")
         min_live_days, min_fills, max_dd_pct, max_concentration_pct = (
             hl_explore.clamp_explore_params(
                 min_live_days=min_live_days, min_fills=min_fills,
@@ -2423,7 +2431,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         return _explore_index.query(page=page, window=window, min_live_days=min_live_days,
                                     min_fills=min_fills, max_dd_pct=max_dd_pct,
                                     max_concentration_pct=max_concentration_pct,
-                                    sort=sort, order=order)
+                                    sort=sort, order=order, eligibility=eligibility)
 
     # ---------- /api/public/traders/{address}（M3 round2 Task 6；2026-09-05 改吃
     # trader_stats，見 docs/superpowers/plans/2026-09-04-explore-trader-pnl-metrics.md

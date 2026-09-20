@@ -17,7 +17,7 @@ from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
 from spark.filet.trader_stats import WindowStats
 from spark.publicapi.hl_explore import (SORT_FIELDS, ExploreConfig, ExploreIndex,
-                                        ExploreRow, candidate_addresses,
+                                        ExploreRow, candidate_addresses, classify,
                                         clamp_explore_params, enrich_candidate,
                                         paginate, qualify, sort_key, sort_rows)
 from spark.publicapi.store import ApiStore
@@ -124,12 +124,21 @@ def _row(**over):
         # Task 11：`sort_rows` 測試用 `win_rate=` 當 `close_win_rate_pct` 的簡寫
         # （欄位真名較長，且與 `sort` 查詢參數同名容易誤讀）。
         over["close_win_rate_pct"] = over.pop("win_rate")
+    # P6（D13，2026-09-20）：`classify()` 只在 `fills_coverage.state == "complete"`
+    # 時才對 `order_count_30d`/`concentration_pct` 做「已知不合格」判定——這批
+    # `qualify`/`sort_key`/`sort_rows` 邊界測試是在測「單一維度剛好卡在門檻上」
+    # 這件事本身，資料本來就是完整的（不是探索 P6 的成交完整性語意），預設給
+    # `"complete"` 才不會讓每一列都因為「成交未知」掉進 `pending`（見
+    # `hl_explore.classify` docstring；覆寫方式同其他欄位，傳 `fills_coverage=`）。
+    fills_coverage = over.pop("fills_coverage", None) or {
+        "state": "complete", "observed_from": 0, "observed_to": 1, "reason": None}
     base = dict(address=_A, display_name=None, label="0xaaaa…aaaa", coins=(),
                account_bucket="<$10K", windows=windows,
                live_days=60, order_count_30d=200, closed_positions_30d=10,
                realized_pnl_30d_usd=0.0,
                close_win_rate_pct=50.0, concentration_pct=10.0,
-               exposure_dir=None, exposure_pct=None, tags=(), fills_truncated=False)
+               exposure_dir=None, exposure_pct=None, tags=(), fills_truncated=False,
+               fills_coverage=fills_coverage)
     base.update(over)
     return ExploreRow(**base)
 
@@ -369,6 +378,92 @@ def test_qualify_max_dd_none_within_present_window_passes_no_evidence_no_penalty
 
 
 # ============================================================
+# 純函式：classify（P6／D13，2026-09-20：三態資格，取代 qualify 的布林）
+# Task 6.1 第 8 點列舉的情境，逐一釘死。
+# ============================================================
+
+_PARTIAL_COVERAGE = {"state": "backfilling", "observed_from": None,
+                     "observed_to": None, "reason": None}
+_COMPLETE_COVERAGE = {"state": "complete", "observed_from": 1, "observed_to": 2, "reason": None}
+
+
+def test_classify_known_ineligible_overrides_unknown_fills():
+    """已知條件（live_days）確定不合格＋成交未知（partial coverage）→
+    `ineligible`（已知的不合格優先於「未定」，不會被沖淡成 pending）。"""
+    row = _row(live_days=10, fills_coverage=_PARTIAL_COVERAGE)
+    result = classify(row, ExploreConfig(), window="month",
+                      min_live_days=30, min_fills=200,
+                      max_dd_pct=30.0, max_concentration_pct=90.0)
+    assert result == ("ineligible", "live_days")
+
+
+def test_classify_all_known_pass_but_fills_unknown_is_pending():
+    """已知條件全部通過（live_days／dd）＋成交未知（partial coverage、集中度
+    門檻仍生效 <100）→ `pending`／`fills_unknown`（不是 eligible，也不是
+    ineligible——`qualify(None)` 不得回傳合格，D13）。"""
+    row = _row(live_days=60, dd_pct=-5.0, order_count_30d=500,
+              fills_coverage=_PARTIAL_COVERAGE)
+    result = classify(row, ExploreConfig(), window="month",
+                      min_live_days=30, min_fills=200,
+                      max_dd_pct=30.0, max_concentration_pct=90.0)
+    assert result == ("pending", "fills_unknown")
+
+
+def test_classify_complete_coverage_min_fills_insufficient_is_ineligible():
+    """`fills_coverage.state == "complete"` 時才有證據判 `min_fills`——不足即
+    `ineligible/min_fills`（不是 pending，因為資料已經齊全、確定不足）。"""
+    row = _row(live_days=60, order_count_30d=50, fills_coverage=_COMPLETE_COVERAGE)
+    result = classify(row, ExploreConfig(), window="month",
+                      min_live_days=30, min_fills=200,
+                      max_dd_pct=30.0, max_concentration_pct=90.0)
+    assert result == ("ineligible", "min_fills")
+
+
+def test_classify_partial_coverage_order_count_sufficient_but_concentration_filter_active_is_pending():
+    """partial coverage 下即使 `order_count_30d >= min_fills`（該條已滿足），
+    集中度門檻仍生效（`max_concentration_pct < 100`）時集中度本身「未定」
+    （`enrich_candidate` 已把 `concentration_pct` 遮成 None）→ 整體仍是
+    `pending`，不是 `eligible`。"""
+    row = _row(live_days=60, order_count_30d=500, concentration_pct=None,
+              fills_coverage=_PARTIAL_COVERAGE)
+    result = classify(row, ExploreConfig(), window="month",
+                      min_live_days=30, min_fills=200,
+                      max_dd_pct=30.0, max_concentration_pct=90.0)
+    assert result == ("pending", "fills_unknown")
+
+
+def test_classify_partial_coverage_no_concentration_filter_is_eligible():
+    """同上，但 `max_concentration_pct=100`（等於不過濾，見 `classify`
+    docstring）——集中度維度視為已滿足，其餘皆已知通過 → `eligible`。"""
+    row = _row(live_days=60, order_count_30d=500, concentration_pct=None,
+              fills_coverage=_PARTIAL_COVERAGE)
+    result = classify(row, ExploreConfig(), window="month",
+                      min_live_days=30, min_fills=200,
+                      max_dd_pct=30.0, max_concentration_pct=100.0)
+    assert result == ("eligible", None)
+
+
+def test_classify_portfolio_missing_is_pending():
+    """`live_days is None`（`portfolio_raw` 缺席）→ `pending`／
+    `portfolio_missing`（不是 ineligible、也不是 eligible）。"""
+    row = _row(live_days=None, windows={k: None for k in ("day", "week", "month", "allTime")})
+    result = classify(row, ExploreConfig(), window="month",
+                      min_live_days=30, min_fills=200,
+                      max_dd_pct=30.0, max_concentration_pct=90.0)
+    assert result == ("pending", "portfolio_missing")
+
+
+def test_classify_all_known_and_complete_coverage_pass_is_eligible():
+    """已知條件全部通過＋成交完整（`complete`）且未超門檻 → `eligible`。"""
+    row = _row(live_days=60, dd_pct=-5.0, order_count_30d=500, concentration_pct=10.0,
+              fills_coverage=_COMPLETE_COVERAGE)
+    result = classify(row, ExploreConfig(), window="month",
+                      min_live_days=30, min_fills=200,
+                      max_dd_pct=30.0, max_concentration_pct=90.0)
+    assert result == ("eligible", None)
+
+
+# ============================================================
 # 純函式：sort_key（風險調整排序鍵，D2）
 # ============================================================
 
@@ -419,6 +514,43 @@ def test_sort_rows_missing_window_falls_back_to_month():
 
 def test_sort_fields_constant():
     assert SORT_FIELDS == ("pnl", "max_dd", "live_days", "win_rate")
+
+
+# ============================================================
+# 純函式：sort_rows — P6 契約 B 擴充：eligibility 分組＋次排序鍵 address 升冪
+# ============================================================
+
+def test_sort_rows_groups_eligible_before_pending_ineligible_excluded():
+    """`eligible` 全部在前、`pending` 全部在後、`ineligible` 整批不列——即使
+    `ineligible` 列的 `pnl_usd` 排序值本來會排最前面。"""
+    hi_ineligible = _row(address="0x" + "a1" * 20, pnl_usd=9999.0, eligibility="ineligible")
+    lo_eligible = _row(address="0x" + "b2" * 20, pnl_usd=1.0, eligibility="eligible")
+    hi_pending = _row(address="0x" + "c3" * 20, pnl_usd=500.0, eligibility="pending")
+    result = sort_rows([hi_ineligible, lo_eligible, hi_pending], window="month")
+    assert [r.address for r in result] == [lo_eligible.address, hi_pending.address]
+
+
+def test_sort_rows_secondary_key_is_address_ascending_stable_within_group():
+    """P6 契約 B：組內排序次鍵固定 `address` 升冪、與 `order` 無關——同一
+    `sort` 值的多列在 `desc`／`asc` 兩種排序方向下，address 順序都要一致
+    （升冪），不隨主排序方向翻轉。"""
+    addr_lo, addr_hi = "0x" + "01" * 20, "0x" + "02" * 20
+    r_hi_addr = _row(address=addr_hi, pnl_usd=100.0, eligibility="eligible")
+    r_lo_addr = _row(address=addr_lo, pnl_usd=100.0, eligibility="eligible")   # 同一 pnl 值
+    desc = sort_rows([r_hi_addr, r_lo_addr], window="month", sort="pnl", order="desc")
+    asc = sort_rows([r_hi_addr, r_lo_addr], window="month", sort="pnl", order="asc")
+    assert [r.address for r in desc] == [addr_lo, addr_hi]
+    assert [r.address for r in asc] == [addr_lo, addr_hi]
+
+
+def test_sort_rows_missing_sort_value_tiebreak_by_address_within_missing_group():
+    """`sort_value` 為 `None` 的列（例如 `max_dd_pct` 算不出）彼此之間也用
+    `address` 升冪排序，不是輸入順序。"""
+    addr_lo, addr_hi = "0x" + "01" * 20, "0x" + "02" * 20
+    r_hi_addr = _row(address=addr_hi, dd_pct=None, eligibility="eligible")
+    r_lo_addr = _row(address=addr_lo, dd_pct=None, eligibility="eligible")
+    result = sort_rows([r_hi_addr, r_lo_addr], window="month", sort="max_dd")
+    assert [r.address for r in result] == [addr_lo, addr_hi]
 
 
 # ============================================================
@@ -633,6 +765,36 @@ def test_index_query_window_selects_ranking_and_response_row_content():
     row = by_month["rows"][0]
     assert set(row["windows"]["month"]) == {"pnl_usd", "max_dd_pct", "max_dd_reason", "spark"}
     assert {"order_count_30d", "closed_positions_30d", "realized_pnl_30d_usd"} <= set(row)
+
+
+# ============================================================
+# ExploreIndex：P6（D13）eligibility 參數——"eligible" 不含 pending
+# ============================================================
+
+def test_index_query_eligibility_eligible_excludes_pending_rows():
+    """`eligibility="eligible"` → rows 只含 eligible；`"all"`（預設）含
+    eligible＋pending；`total_pending`／`total_ineligible` 分開計數。"""
+    hl = FakeHL()
+    _seed_hl(hl, _A, alltime_days=60)               # 完整資料、通過門檻 → eligible
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
+    index = ExploreIndex(cfg=cfg, now_fn=lambda: 1000.0)
+    # 直接構造兩列而不經 `_built_rows`／候選池，更清楚地控制 B 的「分析待完成」
+    # 狀態（B 從未被 enrich 過，`portfolio_raw`／`ch_state` 皆 `None`）。
+    row_a = enrich_candidate(_A, "Alice", hl.portfolio(_A), [], hl.clearinghouse_state(_A))
+    row_b = enrich_candidate(_B, "Bob", None, [], None)
+    rows = hl_explore._apply_tags([row_a, row_b], cfg)
+    _publish(index, rows, 2)
+
+    all_result = index.query(eligibility="all")
+    assert {r["address"] for r in all_result["rows"]} == {_A, _B}
+    assert all_result["total_qualified"] == 1
+    assert all_result["total_pending"] == 1
+    assert all_result["total_ineligible"] == 0
+    assert all_result["eligibility"] == "all"
+
+    eligible_only = index.query(eligibility="eligible")
+    assert [r["address"] for r in eligible_only["rows"]] == [_A]
+    assert eligible_only["eligibility"] == "eligible"
 
 
 # ============================================================
@@ -928,6 +1090,24 @@ def test_endpoint_sort_order_passthrough_and_echo(client_after_build):
     days = [r["live_days"] for r in body["rows"]]
     assert len(days) == 2               # 兩地址都應通過 min_fills=200/min_live_days=30 預設門檻
     assert days == sorted(days)
+
+
+# ============================================================
+# 端點：GET /api/public/explore?eligibility=（P6 契約 B）
+# ============================================================
+
+def test_endpoint_rejects_bad_eligibility_with_400_not_422(client_after_build):
+    """P6 Task 6.1 第 6 點：`eligibility` 非法值 → 400（與 window/sort/order 等
+    封閉列舉的 422 慣例刻意不同，plan 明確指定）。"""
+    r = client_after_build.get("/api/public/explore?eligibility=bogus")
+    assert r.status_code == 400
+
+
+def test_endpoint_eligibility_echo_and_default(client_after_build):
+    body = client_after_build.get("/api/public/explore").json()
+    assert body["eligibility"] == "all"
+    body_eligible = client_after_build.get("/api/public/explore?eligibility=eligible").json()
+    assert body_eligible["eligibility"] == "eligible"
 
 
 # --- 2026-09-05 複審修正（Task 10 Step 2）：`fills_max_pages_from_env` 原本無條件讀
