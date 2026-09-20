@@ -323,7 +323,12 @@ function ExploreInner() {
   // W3：index 成功建置過（非 building）就有意義的 `updated_at`，不論這頁是否為空。
   const showUpdatedAt = (showTable || showEmpty) && resp?.updated_at != null;
 
-  const totalPages = resp ? Math.max(1, Math.ceil(resp.total_qualified / Math.max(1, resp.page_size))) : 1;
+  // Task 6.8：榜上總列數＝合格＋（僅合格未開啟時的）待確認，數字一律來自後端回應
+  // （`total_qualified`／`total_pending`），不在前端推算資格。舊後端無
+  // `total_pending` 時 `?? 0` 讓 shownTotal 退回等於 `total_qualified`，行為與
+  // 改動前相同。
+  const shownTotal = resp ? resp.total_qualified + (onlyEligibleChip ? 0 : (resp.total_pending ?? 0)) : 0;
+  const totalPages = resp ? Math.max(1, Math.ceil(shownTotal / Math.max(1, resp.page_size))) : 1;
   const rangeStart = resp && resp.rows.length > 0 ? (resp.page - 1) * resp.page_size + 1 : 0;
   const rangeEnd = resp && resp.rows.length > 0 ? rangeStart + resp.rows.length - 1 : 0;
 
@@ -348,7 +353,21 @@ function ExploreInner() {
               篩選條件太嚴——數字（`pool`／`total_qualified`）一律來自後端回應，
               不寫死候選池上限常數。與「資料更新於」同一個顯示條件（成功且非
               building 態才有意義的數字）。 */}
-          {showUpdatedAt && resp && (
+          {/* Task 6.8：`total_pending` 存在（新後端）時改用合格＋待確認的兩段式
+              說明，避免「待確認列已在榜上、卻只報合格數」誤導使用者；舊後端
+              （無 `total_pending`）沿用原句，行為與改動前相同。 */}
+          {showUpdatedAt && resp && resp.total_pending != null && (
+            <p className="hint explore-pool-note">
+              {c.poolNotePendingPrefix}
+              {resp.pool}
+              {c.poolNotePendingPoolSuffix}
+              {resp.total_qualified}
+              {c.poolNotePendingQualifiedSuffix}
+              {resp.total_pending}
+              {c.poolNotePendingSuffix}
+            </p>
+          )}
+          {showUpdatedAt && resp && resp.total_pending == null && (
             <p className="hint explore-pool-note">
               {c.poolNotePrefix}
               {resp.pool}
@@ -528,7 +547,7 @@ function ExploreInner() {
               {c.pagination.rangeSep}
               {rangeEnd}
               {c.pagination.ofTotal}
-              {resp.total_qualified}
+              {shownTotal}
               {c.pagination.perPagePrefix}
               {resp.page_size}
               {c.pagination.perPageSuffix}

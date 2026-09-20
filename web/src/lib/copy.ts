@@ -1754,6 +1754,15 @@ export const COPY_ZH = {
     poolNotePrefix: "自 ",
     poolNoteMid: " 個候選帳戶中列出鏈上資料完整者（目前 ",
     poolNoteSuffix: " 檔）；未列入者為鏈上資料缺席——帳戶太新、抓取失敗或期間資料無效。",
+    // Task 6.8（2026-09-21，主線程整合截圖發現）：P6 之後榜上同時列合格與
+    // 「資格待確認」兩組，`total_pending` 存在時改用這組兩段式文案，說明
+    // 「合格 X、待確認 Y」而不是只報合格數（否則待確認列在榜上、pool note
+    // 卻顯示 0 檔，數字與畫面對不上）。`total_pending` 缺（舊後端）時沿用
+    // 上面三個既有鍵。
+    poolNotePendingPrefix: "自 ",
+    poolNotePendingPoolSuffix: " 個候選帳戶中：合格 ",
+    poolNotePendingQualifiedSuffix: "、資格待確認 ",
+    poolNotePendingSuffix: "；未列入者為鏈上資料不合格或缺失",
     // R4-10（2026-08-31 使用者裁決）：期間鍵對映 HL 實際回傳的窗
     // （day/week/month/allTime），四個都可點——不是 90 天，Hyperliquid
     // portfolio() 沒有 90 天窗。
@@ -3354,6 +3363,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     poolNotePrefix: "Listing accounts with complete on-chain data out of ",
     poolNoteMid: " candidates screened (currently ",
     poolNoteSuffix: " qualify); accounts not listed are missing on-chain data — too new, a failed fetch, or invalid data for the period.",
+    poolNotePendingPrefix: "Out of ",
+    poolNotePendingPoolSuffix: " candidates screened: ",
+    poolNotePendingQualifiedSuffix: " qualified, ",
+    poolNotePendingSuffix: " pending confirmation; accounts not listed have disqualifying or missing on-chain data",
     windows: { day: "1D", week: "7D", month: "30D", allTime: "All" },
     filters: {
       liveDays: "Live ≥ 30 days",

@@ -752,3 +752,96 @@ describe("ExplorePage — Task 12 表頭排序（D13）", () => {
     });
   });
 });
+
+// Task 6.8（2026-09-21，主線程整合截圖發現）：P6 之後榜上同時列合格與待確認，
+// 分頁文字／pool note 之前只用 `total_qualified` 當總數，待確認列已經在榜上時
+// 會顯示「1–25 / 0」「（目前 0 檔）」——數字與畫面對不上。改用
+// `shownTotal = total_qualified + (僅合格開啟 ? 0 : total_pending)`。
+function makePendingRows(n: number): ExploreRow[] {
+  return Array.from({ length: n }, (_, i) => ({
+    ...ROW_PENDING,
+    address: `0xpend${String(i).padStart(35, "0")}`,
+    label: `Pending${i}`,
+  }));
+}
+
+function makeEligibleRows(n: number): ExploreRow[] {
+  return Array.from({ length: n }, (_, i) => ({
+    ...ROW_ELIGIBLE,
+    address: `0xelig${String(i).padStart(35, "0")}`,
+    label: `Eligible${i}`,
+  }));
+}
+
+describe("ExplorePage — Task 6.8 總數／頁數／pool note 用合格＋待確認", () => {
+  it("total_qualified:0、25 列待確認 → 範圍文字 1–25 / 25，pool note 顯示合格 0、待確認 25", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: makePendingRows(25),
+      total_qualified: 0,
+      total_pending: 25,
+      total_ineligible: 0,
+      page_size: 25,
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Pending0");
+
+    const summary = container.querySelector(".explore-pagination-summary")?.textContent ?? "";
+    expect(summary).toBe(
+      `${COPY.explore.pagination.showing}1${COPY.explore.pagination.rangeSep}25`
+      + `${COPY.explore.pagination.ofTotal}25${COPY.explore.pagination.perPagePrefix}25`
+      + `${COPY.explore.pagination.perPageSuffix}`,
+    );
+
+    const note = container.querySelector(".explore-pool-note")?.textContent ?? "";
+    expect(note).toBe(
+      `${COPY.explore.poolNotePendingPrefix}100${COPY.explore.poolNotePendingPoolSuffix}0`
+      + `${COPY.explore.poolNotePendingQualifiedSuffix}25${COPY.explore.poolNotePendingSuffix}`,
+    );
+  });
+
+  it("僅合格開啟 → 總數只算 total_qualified，不加 total_pending", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      const eligOnly = new URL(url, "https://x.test").searchParams.get("eligibility") === "eligible";
+      return Promise.resolve(jsonResponse(buildResp({
+        rows: eligOnly ? makeEligibleRows(3) : [ROW_ELIGIBLE, ROW_PENDING],
+        total_qualified: eligOnly ? 3 : 1,
+        total_pending: 25,
+        total_ineligible: 0,
+        page_size: 25,
+      })));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Eligible1");
+
+    await userEvent.click(screen.getByRole("button", { name: COPY.explore.onlyEligible }));
+    await screen.findByText("Eligible0");
+
+    await waitFor(() => {
+      const summary = container.querySelector(".explore-pagination-summary")?.textContent ?? "";
+      expect(summary).toBe(
+        `${COPY.explore.pagination.showing}1${COPY.explore.pagination.rangeSep}3`
+        + `${COPY.explore.pagination.ofTotal}3${COPY.explore.pagination.perPagePrefix}25`
+        + `${COPY.explore.pagination.perPageSuffix}`,
+      );
+    });
+  });
+
+  it("舊後端（無 total_pending）→ 範圍文字與 pool note 沿用改動前行為", async () => {
+    stubFetch(() => jsonResponse(buildResp({ pool: 300, total_qualified: 7 })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+
+    const summary = container.querySelector(".explore-pagination-summary")?.textContent ?? "";
+    expect(summary).toBe(
+      `${COPY.explore.pagination.showing}1${COPY.explore.pagination.rangeSep}2`
+      + `${COPY.explore.pagination.ofTotal}7${COPY.explore.pagination.perPagePrefix}25`
+      + `${COPY.explore.pagination.perPageSuffix}`,
+    );
+
+    const note = container.querySelector(".explore-pool-note")?.textContent ?? "";
+    expect(note).toBe(
+      `${COPY.explore.poolNotePrefix}300${COPY.explore.poolNoteMid}7${COPY.explore.poolNoteSuffix}`,
+    );
+  });
+});
