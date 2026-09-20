@@ -50,6 +50,22 @@
 - 觀測用的是 Task 3.5 之前的程式；3.5 落地後應以 5 分鐘短跑確認門檻行為（預期：無舊版本時照常發布；
   有舊版本時 `gate_skips` 遞增直到 80%）。
 
+## 補跑：Task 3.5 之後、以正式機 v3 快照為種子的 5 分鐘短跑（同日）
+
+程式 3c70459；種子＝正式機 `/var/lib/filet-api/explore_index.json`（v3，299 列，2026-09-19T15:00）。
+
+| 指標 | 值 | 判讀 |
+|---|---|---|
+| 429 | 0；explore 視窗最高 286 | 同上，限流主動生效 |
+| 上游 | state 96、portfolio 22、ledger 22、fills 1 頁、`no_budget` 163 | 與 10 分鐘跑同節奏 |
+| publisher | `publishes 0`、`gate_skips 5`、`last_gate "20/300"`、`failures 0` | **門檻擋住空榜**：20/300 未達 80%，五次都不換版 |
+| index | rows 299、`built_at`＝種子的 built_at、`published_at` 同 | 讀路徑端出遷移後的 v3 榜單，`total_qualified 19` 與正式機現況一致 |
+| 磁碟快照 | `version 3`、mtime 未變 | 未被覆寫；`.v3.bak` 尚未產生（只在第一次真正覆寫前才備份，符合設計） |
+| explore.db | mode 0600 | W5 修法生效 |
+
+結論不變；第二次部署開 flag 後的預期畫面：探索頁維持 9/19 的榜單、`gate_skips` 每分鐘 +1、
+`last_gate` 分子逐步上升，約 50–65 分鐘後第一次換版並產生 `.v3.bak`。
+
 ## 結論
 
 可進入第二次部署，條件：Task 3.5 完成並複審通過；RUNBOOK §5.8e 冷啟動時間改為 60–80 分鐘；
