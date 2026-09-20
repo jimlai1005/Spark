@@ -1026,6 +1026,26 @@ class ExploreScheduler:
 
 ---
 
+### Task 3.5 @inline：P2–P5 reviewer 修正（2026-09-20 opus 審查：2 Critical／5 Warning／4 Suggestion）
+
+<!-- 裁決：C1 候選退池 job 洩漏（預算漏、準入卡死、purge 失效）→ 退池即刪 job＋續排前查 active。
+C2 第一次發布以全空 portfolio 列蓋掉現役榜單並覆寫 v3 快照 → 發布門檻（80% 候選有 portfolio 才換版；
+從未有版本例外）＋首次覆寫前備份 .v3.bak。W1/W2 緊迴圈 → 例外後 sleep、失敗也節流。W3 詳情頁每請求
+COUNT 五表 → 專用兩個 COUNT。W4 PAGE_LIMIT 同源。W5 db 0600。S1 暫停不計 attempts。S3 docstring。
+S4 candidates 週期 1800s（36MB 下載每 30 分鐘一次）。S2（地址小寫）接受、記觀察。 -->
+
+**Files:** `explore_store.py`、`explore_scheduler.py`、`explore_publisher.py`、`explore_fills_sync.py`、`hl.py`（docstring）、`app.py`（`_local_trader_data`）、`deploy/RUNBOOK.md` §5.8e；對應測試。
+
+- [ ] **A. store**：`delete_jobs(address) -> int`；`is_active(address) -> bool`；`admission_counts() -> tuple[int, int]`（refresh_job 數、active 候選數，兩個 COUNT）；`count_with_payload(endpoint) -> int`；`__init__` 連線後 `os.chmod(db_path, 0o600)`（best effort）。
+- [ ] **B. scheduler**：(1) `_run_candidates` 在 `deactivate_missing(seen)` 後對每個退池地址 `delete_jobs`；(2) `_run_cache_kind`／`_run_fills` 續排前 `if not store.is_active(job.address): complete(job); return "dropped"`；(3) `run_forever` 的 `except` 後 `self._sleep(1.0)`；(4) `ScopePaused` → `bump_attempts=False`；(5) `candidates_every_s` 預設 1800，docstring 註明 stats-data 36MB 每 30 分鐘至多一次；(6) 準入計數改用 `admission_counts()`。
+- [ ] **C. publisher**：(1) 建構子加 `min_portfolio_ratio: float = 0.8`；`maybe_publish` 在 compose **之前**：`with_pf = store.count_with_payload("portfolio")`、`n = len(active)`（用 `admission_counts()[1]`）；若 `index.status()["rows"] is not None and with_pf < min_portfolio_ratio * n` → 不發布、`_gate_skips += 1`、`_last_gate = f"{with_pf}/{n}"`、`_last_attempt_at = now`、回 False（`_dirty` 保留）；index 從未有版本（`rows is None`）→ 不套門檻；(2) 節流改看 `_last_attempt_at`（成功與失敗都更新），`_last_published_at` 只在成功時更新（status 用）；(3) 首次以 v4 覆寫既有快照前：若檔案存在且 `load_snapshot` 判為 v3 來源（或直接讀 JSON `version == 3`）且 `<path>.v3.bak` 不存在 → `shutil.copyfile` 備份一次；(4) `status()` 加 `gate_skips`、`last_gate`、`last_attempt_at`。
+- [ ] **D. fills_sync**：`PAGE_LIMIT` 改 import 自 `hl.py` 使用的同一常數來源（`rg -n "USER_FILLS_PAGE_LIMIT" src/spark/publicapi/hl.py` 看它從哪 import），刪本地定義。
+- [ ] **E. app.py `_local_trader_data`**：準入判定改 `admission_counts()`，不再呼叫 `active_candidates()`＋`stats()`。
+- [ ] **F. hl.py `get_fills_page` docstring**：刪「含 aggregateByTime 設定」（請求體沒有這個欄位；欄位名是假設不是事實）。
+- [ ] **G. RUNBOOK §5.8e**：加三行——開 flag 前 `sudo cp explore_index.json explore_index.json.pre-refresh.bak`；冷啟動預算約 12,600 權重（state 2＋portfolio 20＋ledger 20 × 300）≈ 42 分鐘才會第一次換版；換版門檻＝80% 候選已有 portfolio，之前 `/api/public/explore` 續端舊快照、`explore_publisher.gate_skips` 會遞增屬正常。
+- [ ] **H. 測試**：store 四個新方法＋0600；scheduler：退池地址 job 全刪、之後零上游、`purge(now+30d)` 能刪它、準入不再卡死、`run_forever` 例外後有 sleep（sleep_fn 記錄）、`ScopePaused` 不計 attempts；publisher：門檻擋下（index 有版本＋10% portfolio → False、`gate_skips==1`、index 未變、快照未寫）、無版本不套門檻、80% 以上通過、失敗路徑 60s 內不重算（compose 計數）、v3 備份檔存在且只備一次；fills_sync 常數同源（`PAGE_LIMIT is USER_FILLS_PAGE_LIMIT`）；traders 既有五條綠。
+- [ ] **I. Commit** `fix: P2–P5 審查修正（job 生命週期、發布門檻＋v3 備份、緊迴圈、準入 COUNT、常數同源、db 0600）`
+
 ## P4 漸進發布（任務卡）
 
 ### Task 4.1 @inline：`explore_publisher.py`
