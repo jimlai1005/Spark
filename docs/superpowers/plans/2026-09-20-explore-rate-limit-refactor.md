@@ -1337,6 +1337,9 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 | 3.8（主線程） | 2026-09-20 | bb71e23＋3e71249 | 主線程自修兩個 Warning：`_note_gate` 第 1 次與每 10 次 warning；`.daily` 每 24h 至多輪替一次。小型 fresh reviewer PASS，其 2 Warning（時基混用、非原子 copy）已於 3e71249 修：以快照 mtime 同基底判斷、`.tmp`＋`os.replace`；3079 passed |
 | 5.2 本機觀測 | 2026-09-20 | — | 10 分鐘主網唯讀實跑：0 次 429、explore 視窗最高 300 不超、退款 574、state 191／portfolio 39／fills 10 頁、7 地址 complete、publisher 10 次 0 失敗；**實證 C2**（300 列只 1 列合格）；冷啟動估 60–80 分鐘。報告：`docs/superpowers/research/2026-09-20-explore-refresh-observation.md` |
 | 6.1＋6.4 測試 | 2026-09-20 | 2e0797c | 主線程實跑 classify 三判準（pending/fills_unknown、ineligible/live_days、ineligible/min_fills）；門檻殘留零；3093 passed；ruff 乾淨。⚠️ 以正式機 v3 快照本地驗：新規則下 qualified 0／pending 122／ineligible 177（D13 不沿用舊成交，遷移列 coverage=backfilling）——部署後公開榜會先顯示 122 列待確認，直到回補完成 |
+| 6.3 | 2026-09-21 | edd3aea | wait_ms p50/p95、note_http 含重試、dashboard_latency、follower_budget_note；RUNBOOK §5.8e 去門檻語義；3107 passed |
+| P6 複審 | 2026-09-21 | — | opus：後端契約符合、v3 分類獨立重現一致（177 ineligible 合理）；1 Critical（前端 live_days null→0）／5 Warning → Task 6.6（前端）、6.7（後端） |
+| 6.5 | 2026-09-21 | 21357d5 | 主線程整合實測發現遷移列未遮罩→修：`to_dict` 統一遮罩、v3 遷移 `order_count_30d`=0；實跑 `pending None None [] [] 0`、頁面預設篩選 0／287／12；3112 passed |
 | 6.2 | 2026-09-20 | 2d1e255 | vitest 736 passed；分組不重排、pending 無名次、分析待完成、僅合格切換、詳情頁觀測期間（epoch ms）；集中度目前無欄位故無需標示 |
 | **第二次部署（D8）** | 2026-09-20 14:20 UTC | 8ead8e8 | 使用者授權（「請繼續」）。flag 0 部署→驗證→67/67→flag 1（14:21）；90 秒後候選 300、快取 36、門檻擋下 in:0/300、快照未動、零 Traceback／429。冷啟動觀測進行中（每 10 分鐘），預期 50–65 分鐘首次換版 |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
