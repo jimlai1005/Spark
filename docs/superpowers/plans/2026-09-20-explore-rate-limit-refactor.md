@@ -1183,5 +1183,7 @@ class ExplorePublisher:
 | 3.4 | 2026-09-20 | 4d851e5 | 舊 build_sync 路徑 `rg` 零命中；`run_api` 起 `explore-scheduler` thread（僅 `EXPLORE_UPSTREAM_REFRESH=1`）；config 開啟時 db 必填；ops/health `explore_refresh`／`explore_publisher`；216 passed（explore＋config＋ops＋wiring）；全專案 3043 |
 | **P2–P5 程式完成** | 2026-09-20 | — | opus reviewer：2 Critical／5 Warning／4 Suggestion → 主線程逐條讀碼確認 → Task 3.5（派工中） |
 | 3.5 | 2026-09-20 | 3c70459 | 主線程實跑五判準（0600、jobs (4,2)→退池刪 4→(0,1)、常數同源）全對；`self._sleep(1.0)` 於例外路徑；publisher 門檻／備份 13 命中；3064 passed；ruff 乾淨。複審派工中。5 分鐘短跑（正式機 v3 種子）：`gate_skips 5`／`last_gate 20/300`／`publishes 0`、快照未覆寫、`total_qualified 19` 與正式機一致、0 次 429、db 0600 |
+| 3.5 複審 | 2026-09-20 | — | opus：前輪 11 項 10 關閉 1 部分；新 1 Critical（門檻 n==0 旁路）／3 Warning／4 Suggestion → Task 3.6 |
+| 3.6 | 2026-09-20 | 4ff01cf | 主線程實跑：側檔三個 0600、`n==0` 不發布且快照未寫、`force` 發布、`empty candidate rows` 路徑存在；3071 passed；ruff 乾淨。第三輪複審派工中 |
 | 5.2 本機觀測 | 2026-09-20 | — | 10 分鐘主網唯讀實跑：0 次 429、explore 視窗最高 300 不超、退款 574、state 191／portfolio 39／fills 10 頁、7 地址 complete、publisher 10 次 0 失敗；**實證 C2**（300 列只 1 列合格）；冷啟動估 60–80 分鐘。報告：`docs/superpowers/research/2026-09-20-explore-refresh-observation.md` |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
