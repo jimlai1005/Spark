@@ -818,3 +818,19 @@ def test_recovery_c_shrinking_from_20_eligible_to_12_not_blocked(tmp_path):
     result = index.query()
     assert result["total_qualified"] == 12
     assert result["total_ineligible"] == 8
+
+
+def test_load_snapshot_v3_migration_sets_fills_truncated_true(tmp_path):
+    """2026-09-21 複審 W1：契約 A `fills_truncated == (coverage.state != "complete")`；
+    v3 遷移列 coverage 為 backfilling，旗標必須同步為 True。"""
+    snap = tmp_path / "snap.json"
+    row = _v3_row_dict(_A)
+    row["fills_truncated"] = False
+    snap.write_text(json.dumps({"version": 3, "built_at": 1000.0, "total_scanned": 1,
+                                "rows": [row]}))
+    loaded = hl_explore.load_snapshot(str(snap))
+    assert loaded is not None
+    r = loaded["rows"][0]
+    assert r.fills_coverage["state"] == "backfilling"
+    assert r.fills_truncated is True
+    assert r.to_dict()["fills_truncated"] is True

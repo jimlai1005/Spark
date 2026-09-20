@@ -563,9 +563,13 @@ def load_snapshot(path: str, *, cfg: "ExploreConfig | None" = None) -> dict | No
             # 一致（未知，不是已知的 0，`classify` 的 fills_pending 分支會
             # 正確判定「未定」）。
             migrated_as_of = {"portfolio": built_at, "state": built_at, "fills": built_at}
+            # <!-- 2026-09-21 複審 W1 -->：契約 A 規定 `fills_truncated ＝
+            # coverage.state != "complete"`，遷移列 coverage 是 backfilling，
+            # 旗標必須同步為 True（fallback 到舊旗標的消費者才不會把遮成 null
+            # 的列當成「資料完整」）。
             raw_rows = [dict(r, as_of=migrated_as_of,
                             fills_coverage=dict(DEFAULT_FILLS_COVERAGE),
-                            order_count_30d=0)
+                            order_count_30d=0, fills_truncated=True)
                        for r in raw_rows]
         rows = [_row_from_dict(r) for r in raw_rows]
         if version == 3:

@@ -137,6 +137,10 @@ def compose_rows(store: ExploreStore, *, now: float, cfg: ExploreConfig,
     # （見上方 try/except 分支）已經是 `pending`／`enrich_error`——沒有真實
     # 資料可供 `classify()` 判斷，保留原樣不覆寫（與 `ExploreIndex.query()`
     # 對這類列的既有處理一致，見該函式）。
+    # ⚠️（2026-09-21 複審 W2）這裡的門檻＝**本行程的 `cfg`**（正式機來自
+    # `ExploreConfig.from_env()`），不是端點層的模組預設常數；兩者只在 env 未覆寫
+    # `EXPLORE_MIN_*`／`EXPLORE_MAX_*` 時相等。快照檔的 `eligibility` 反映的是
+    # 本行程 cfg 下的分類；`query()` 仍依每次請求的門檻重算，API 永遠正確。
     min_live_days, min_fills, max_dd_pct, max_concentration_pct = _effective_thresholds(
         cfg, require_sample=True, max_dd_filter=True, exclude_concentrated=True)
     classified_rows: list[ExploreRow] = []
