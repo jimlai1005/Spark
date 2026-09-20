@@ -1638,6 +1638,15 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-sort-btn { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
 .explore-sort-btn[data-active="true"] { color: var(--text); font-weight: 600; }
 .explore-table-row { border-top: 1px solid var(--border); }
+/* Task 6.6（P6 契約 B 組標題，W5）：組標題與資料列共用同一個 `min-width`，讓它
+   跟著 `.explore-table` 的 `overflow-x:auto` 一起橫向捲動，不會在窄螢幕下
+   停在原地與已捲動的列錯位。字級／顏色沿用表頭 token，不新造。 */
+.explore-group-header {
+  min-width: 960px; padding: 10px 18px; border-top: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim);
+  letter-spacing: .08em; background: var(--inset);
+}
+.explore-group:first-child .explore-group-header { border-top: none; }
 .explore-table-head > div:nth-child(n+4), .explore-table-row > div:nth-child(n+4) { text-align: right; }
 .explore-table-head > div:nth-child(8), .explore-table-row > div:nth-child(8) { text-align: left; }
 /* 2026-09-05（explore/trader 指標統一 plan Task 5）：報酬率欄改損益金額，
@@ -1656,6 +1665,9 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-copy-btn { background: none; border: none; cursor: pointer; color: var(--text-dim); font-size: 11px; padding: 0; }
 .explore-copy-btn:hover { color: var(--text); }
 .explore-sub { font-size: 11.5px; color: var(--text-dim); }
+/* Task 6.6（W5）：pending 列的原因小字——沿 `.explore-sub` 字級，比 `.hint`
+   （13px）再小一階，貼在帳戶欄下方不搶主要資訊的視覺重量。 */
+.explore-pending-reason { font-size: 11px; margin-top: 1px; }
 .explore-tag { font-size: 10.5px; padding: 2px 7px; border-radius: 5px; border: 1px solid; white-space: nowrap; }
 .explore-tag[data-tag="low_drawdown"] { color: var(--primary); border-color: rgba(var(--primary-rgb), .3); background: rgba(var(--primary-rgb), .1); }
 .explore-tag[data-tag="concentrated"] { color: var(--warn); border-color: rgba(var(--warn-rgb), .3); background: rgba(var(--warn-rgb), .1); }

@@ -388,14 +388,20 @@ export interface ExploreRow {
   coins: string[];
   account_bucket: string;
   windows: Record<ExploreWindow, ExploreWindowStats | null>;
-  /** 實盤天數＝perpAllTime 首末快照的日曆跨距（後端欄位 `live_days`）。 */
-  live_days: number;
-  /** D3（2026-09-05）：distinct 訂單數（原欄位名帶「fill」字樣，不是 fills 數）。 */
-  order_count_30d: number;
-  /** D3：部位歸零的生命週期數（Hyperbot 定義，見 `trader_stats.fills_stats`）。 */
-  closed_positions_30d: number;
-  /** D3：Σ closedPnl（未扣手續費／funding）。 */
-  realized_pnl_30d_usd: number;
+  /** 實盤天數＝perpAllTime 首末快照的日曆跨距（後端欄位 `live_days`）。
+   * Task 6.6（P6 契約 A）：portfolio 缺（pending／portfolio_missing）時後端送
+   * `null`——未知≠0，前端不得補 0。 */
+  live_days: number | null;
+  /** D3（2026-09-05）：distinct 訂單數（原欄位名帶「fill」字樣，不是 fills 數）。
+   * Task 6.6：非 number 時 normalize 為 `null`（不補 0），語意見 P6 契約 A
+   * 「已觀測筆數（下限）」——沒有觀測到就是未知，不是零。 */
+  order_count_30d: number | null;
+  /** D3：部位歸零的生命週期數（Hyperbot 定義，見 `trader_stats.fills_stats`）。
+   * Task 6.6（P6 契約 A）：coverage≠complete 時後端送 `null`——不得補 0。 */
+  closed_positions_30d: number | null;
+  /** D3：Σ closedPnl（未扣手續費／funding）。
+   * Task 6.6（P6 契約 A）：coverage≠complete 時後端送 `null`——不得補 0。 */
+  realized_pnl_30d_usd: number | null;
   /** R-A/W2：30D fills 讀到分頁上限仍滿頁 → true（三個 *_30d 欄位為下限值）。
    * Task 4.2（2026-09-20）：`fills_coverage` 上線後這是 fallback——兩者並存
    * 期間優先讀 `fills_coverage`，見 `fillsIncomplete()`。 */
@@ -577,10 +583,12 @@ function normalizeExploreRow(v: unknown): ExploreRow | null {
     coins: Array.isArray(r.coins) ? r.coins.filter((c): c is string => typeof c === "string") : [],
     account_bucket: typeof r.account_bucket === "string" ? r.account_bucket : NO_VALUE_PLACEHOLDER,
     windows,
-    live_days: typeof r.live_days === "number" ? r.live_days : 0,
-    order_count_30d: typeof r.order_count_30d === "number" ? r.order_count_30d : 0,
-    closed_positions_30d: typeof r.closed_positions_30d === "number" ? r.closed_positions_30d : 0,
-    realized_pnl_30d_usd: typeof r.realized_pnl_30d_usd === "number" ? r.realized_pnl_30d_usd : 0,
+    // Task 6.6（P6 契約 A）：非 number 一律 null，不得補 0（那是偽造出「0 天」／
+    // 「0 筆」／「$0」的假數字）。
+    live_days: typeof r.live_days === "number" ? r.live_days : null,
+    order_count_30d: typeof r.order_count_30d === "number" ? r.order_count_30d : null,
+    closed_positions_30d: typeof r.closed_positions_30d === "number" ? r.closed_positions_30d : null,
+    realized_pnl_30d_usd: typeof r.realized_pnl_30d_usd === "number" ? r.realized_pnl_30d_usd : null,
     close_win_rate_pct: toNumberOrNull(r.close_win_rate_pct),
     concentration_pct: toNumberOrNull(r.concentration_pct),
     exposure: {

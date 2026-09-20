@@ -625,6 +625,47 @@ describe("ExplorePage — Task 6.2 分析待完成（D14）", () => {
   });
 });
 
+// Task 6.6（P6 契約 A、Critical C1）：`live_days` 為 null（pending／portfolio_missing）
+// 時實盤天數欄必須顯示 NO_VALUE，不得顯示假數字「0」——舊 bug 是
+// `normalizeExploreRow` 把 null 轉成 0，畫面上會出現「實盤天數 0 天」。
+describe("ExplorePage — Task 6.6 live_days null 顯示 NO_VALUE", () => {
+  it("live_days: null → 實盤天數欄顯示「—」，不顯示 0", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{ ...ROW_A, live_days: null }],
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const daysCells = container.querySelectorAll(".explore-days");
+    expect(daysCells[0].textContent).toBe("—");
+    expect(daysCells[0].textContent).not.toBe("0");
+  });
+
+  it("live_days 為正常 number → 照舊顯示天數", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const daysCells = container.querySelectorAll(".explore-days");
+    expect(daysCells[0].textContent).toBe("118");
+  });
+});
+
+// Task 6.6（W5）：組標題列必須落在 `.explore-table` 的格線容器內，窄螢幕橫向捲動
+// 時才會跟資料列一起對齊（`.explore-table` 有 `overflow-x:auto`，列有
+// `min-width:960px`）。
+describe("ExplorePage — Task 6.6 組標題在表格格線容器內", () => {
+  it(".explore-group-header 是 .explore-table 的後代元素", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [ROW_ELIGIBLE, ROW_PENDING],
+      total_qualified: 1,
+      total_pending: 1,
+      total_ineligible: 0,
+    })));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Eligible1");
+    expect(container.querySelector(".explore-table .explore-group-header")).not.toBeNull();
+  });
+});
+
 // Task 6.2（D13）：「僅合格」切換，開啟帶 eligibility=eligible，關閉不帶參數。
 describe("ExplorePage — Task 6.2 僅合格切換", () => {
   it("預設關閉 → 首次請求不帶 eligibility 參數", async () => {

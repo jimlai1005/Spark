@@ -669,7 +669,9 @@ function ExploreRowView(
           ? <span title={c.table.ddUnavailableTitle}>{c.table.ddUnavailable}</span>
           : `${stats.max_dd_pct.toFixed(1)}%`}
       </div>
-      <div className="mono explore-days">{row.live_days}</div>
+      {/* Task 6.6（P6 契約 A，Critical C1）：`live_days` 為 null（portfolio 缺，
+          pending 列常見）時顯示 NO_VALUE，不得顯示假數字「0」。 */}
+      <div className="mono explore-days">{row.live_days == null ? NO_VALUE : row.live_days}</div>
       <div className="mono explore-wr">{incomplete ? c.analysisPending : fmtPct1(row.close_win_rate_pct)}</div>
       <div className="explore-exposure">
         {/* 無持倉（dir null）不畫 bar：bar 底色是空方紅，畫出來會像 100% 空單 */}

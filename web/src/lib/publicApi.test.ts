@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   fillsIncomplete,
+  getPublicExplore,
   getPublicLeaderboard,
   getPublicStats,
   getPublicStatus,
@@ -8,6 +9,7 @@ import {
   getPublicStrategy,
   getPublicTraderDetail,
 } from "./publicApi";
+import type { ExploreFilters } from "./publicApi";
 
 function mockFetchOnce(impl: () => Response | Promise<Response>) {
   vi.stubGlobal("fetch", vi.fn(impl));
@@ -236,6 +238,64 @@ describe("getPublicLeaderboard", () => {
     vi.stubGlobal("fetch", fetchMock);
     await getPublicLeaderboard("allTime");
     expect(fetchMock).toHaveBeenCalledWith("/api/public/leaderboard?window=allTime");
+  });
+});
+
+// Task 6.6（P6 契約 A）：`live_days`／`closed_positions_30d`／`realized_pnl_30d_usd`
+// 後端送 `null`（pending／portfolio_missing、coverage≠complete）時前端不得補 0——
+// 那會讓探索頁顯示「實盤天數 0 天」這種假數字。三欄非 number 一律 normalize 成 null。
+const EXPLORE_FILTERS: ExploreFilters = {
+  window: "month", minLiveDays: 0, minFills: 0, maxDdPct: 100, maxConcentrationPct: 100,
+  sort: "pnl", order: "desc",
+};
+
+function exploreRowBody(over: Record<string, unknown> = {}) {
+  return {
+    address: "0xaaaa00000000000000000000000000000000aaaa",
+    display_name: null,
+    label: "0xaaaa…aaaa",
+    coins: [],
+    account_bucket: "$10K–$100K",
+    windows: {},
+    live_days: null,
+    order_count_30d: 5,
+    closed_positions_30d: null,
+    realized_pnl_30d_usd: null,
+    close_win_rate_pct: null,
+    concentration_pct: null,
+    exposure: { dir: null, pct: null },
+    tags: [],
+    ...over,
+  };
+}
+
+describe("getPublicExplore — normalizeExploreRow null 欄位不得轉 0（P6 契約 A / Task 6.6）", () => {
+  it("live_days: null → 保持 null（不得補 0）", async () => {
+    mockFetchOnce(() => jsonResponse({ rows: [exploreRowBody({ live_days: null })] }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].live_days).toBeNull();
+  });
+
+  it("closed_positions_30d: null → 保持 null（不得補 0）", async () => {
+    mockFetchOnce(() => jsonResponse({ rows: [exploreRowBody({ closed_positions_30d: null })] }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].closed_positions_30d).toBeNull();
+  });
+
+  it("realized_pnl_30d_usd: null → 保持 null（不得補 0）", async () => {
+    mockFetchOnce(() => jsonResponse({ rows: [exploreRowBody({ realized_pnl_30d_usd: null })] }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].realized_pnl_30d_usd).toBeNull();
+  });
+
+  it("三欄為正常 number 時原樣保留", async () => {
+    mockFetchOnce(() => jsonResponse({
+      rows: [exploreRowBody({ live_days: 118, closed_positions_30d: 20, realized_pnl_30d_usd: 5000 })],
+    }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].live_days).toBe(118);
+    expect(r.rows[0].closed_positions_30d).toBe(20);
+    expect(r.rows[0].realized_pnl_30d_usd).toBe(5000);
   });
 });
 
