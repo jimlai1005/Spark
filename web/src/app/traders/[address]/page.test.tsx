@@ -16,6 +16,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COPY_ZH as COPY } from "@/lib/copy";
+import { NO_VALUE } from "@/lib/format";
 
 const push = vi.fn();
 let paramsAddress = "0xfefefefefefefefefefefefefefefefefefefefe";
@@ -504,6 +505,43 @@ describe("TraderDetailPage", () => {
       render(wrap(<TraderDetailPage />));
       await screen.findByRole("heading", { level: 1 });
       expect(screen.queryByText(COPY.traders.fillsTruncatedNote)).not.toBeInTheDocument();
+    });
+
+    // Task 7.2（2026-09-21，P7 null→0 稽核）：`live_days`／`fills_30d.closed_positions`／
+    // `fills_30d.realized_pnl_usd` 讀不到時後端送 `null`——顯示 NO_VALUE，不得偽造 0。
+    it("live_days: null → 顯示 NO_VALUE，不顯示 0", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({ ...DETAIL, live_days: null }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const liveDaysCell = screen.getByText(COPY.traders.liveDaysLabel).closest(".metric-card") as HTMLElement;
+      expect(liveDaysCell.querySelector(".metric-card-value")?.textContent).toBe(NO_VALUE);
+    });
+
+    it("fills_30d.closed_positions: null（coverage 未知）→ 顯示 NO_VALUE，不顯示 0", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_30d: { ...DETAIL.fills_30d, closed_positions: null },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const cell = screen.getByText(COPY.traders.closedPositions).closest(".metric-card") as HTMLElement;
+      expect(cell.querySelector(".metric-card-value")?.textContent).toBe(NO_VALUE);
+    });
+
+    it("fills_30d.realized_pnl_usd: null（coverage 未知）→ 顯示 NO_VALUE，不套用 pos/neg 樣式", async () => {
+      getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+      stubFetch(() => jsonResponse({
+        ...DETAIL,
+        fills_30d: { ...DETAIL.fills_30d, realized_pnl_usd: null },
+      }));
+      render(wrap(<TraderDetailPage />));
+      await screen.findByRole("heading", { level: 1 });
+      const cell = screen.getByText(COPY.traders.realizedPnl).closest(".metric-card") as HTMLElement;
+      const valueEl = cell.querySelector(".metric-card-value") as HTMLElement;
+      expect(valueEl.textContent).toBe(NO_VALUE);
+      expect(valueEl.className).not.toMatch(/\bpos\b|\bneg\b/);
     });
   });
 

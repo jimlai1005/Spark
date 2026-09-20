@@ -6,6 +6,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { COPY_ZH as COPY, FOLLOWER_COUNT_DISPLAY_MIN } from "@/lib/copy";
+import { NO_VALUE } from "@/lib/format";
 import HomePage from "./page";
 
 function jsonResponse(body: unknown, ok = true): Response {
@@ -187,5 +188,23 @@ describe("HomePage", () => {
       const panel = document.querySelector(".home-hero-featured-metrics") as HTMLElement;
       expect(panel.children.length).toBe(3);
     });
+  });
+
+  // Task 7.2（2026-09-21，P7 null→0 稽核）：`live_days` 讀不到 perf 時後端送
+  // `null`——主推策略卡三處顯示位置一律改顯示 NO_VALUE，不得偽造 0 天實盤。
+  it("featured.live_days: null（perf 不可用）→ 三處皆顯示 NO_VALUE，不顯示 0", async () => {
+    const strategy = { ...STRATEGY, live_days: null };
+    stubFetch((url) => {
+      if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [strategy], updated_at: 1 });
+      return jsonResponse({ routed_volume_usd_total: "1", builder_fee_bps: 2, live_days: null, updated_at: 1 });
+    });
+    render(<HomePage />);
+    await screen.findByText("Filet Core");
+    const panel = document.querySelector(".home-hero-featured-metrics") as HTMLElement;
+    const liveDaysValueEl = panel.children[2].querySelector(".home-hero-featured-value");
+    expect(liveDaysValueEl?.textContent).toBe(NO_VALUE);
+    const footnote = document.querySelector(".home-hero-featured-footnote") as HTMLElement;
+    expect(footnote.textContent).toContain(NO_VALUE);
+    expect(footnote.textContent).not.toMatch(/\b0\b/);
   });
 });

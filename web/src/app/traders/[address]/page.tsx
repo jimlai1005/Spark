@@ -384,7 +384,11 @@ function TraderDetailInner() {
             </div>
             <div className="card metric-card">
               <div className="metric-card-label">{c.liveDaysLabel}</div>
-              <div className="mono metric-card-value">{trader.live_days}</div>
+              {/* Task 7.2（2026-09-21，P7 null→0 稽核）：`live_days` 讀不到 perf
+                  時後端送 `null`——純展示欄位，未知顯示 NO_VALUE 而非偽造 0。 */}
+              <div className="mono metric-card-value">
+                {trader.live_days == null ? NO_VALUE : trader.live_days}
+              </div>
             </div>
             <div className="card metric-card">
               <div className="metric-card-label">{c.exposureLabel}</div>
@@ -460,7 +464,11 @@ function TraderDetailInner() {
                   </div>
                   <div className="card metric-card">
                     <div className="metric-card-label">{c.closedPositions}</div>
-                    <div className="mono metric-card-value">{fills.closed_positions}</div>
+                    {/* Task 7.2（2026-09-21，P7 null→0 稽核）：coverage 未知時後端
+                        送 `null`——不得偽造成 0 次平倉。 */}
+                    <div className="mono metric-card-value">
+                      {fills.closed_positions == null ? NO_VALUE : fills.closed_positions}
+                    </div>
                   </div>
                   <div className="card metric-card">
                     <div className="metric-card-label">{c.winRate}</div>
@@ -470,8 +478,14 @@ function TraderDetailInner() {
                   </div>
                   <div className="card metric-card">
                     <div className="metric-card-label">{c.realizedPnl}</div>
-                    <div className={`mono metric-card-value${fills.realized_pnl_usd >= 0 ? " pos" : " neg"}`}>
-                      {fmtSignedUsd(fills.realized_pnl_usd)}
+                    {/* Task 7.2：同上，`null` 不得偽造成損益為零（也不得誤判
+                        `null >= 0` 為 true 而套用 pos 樣式）。 */}
+                    <div
+                      className={`mono metric-card-value${
+                        fills.realized_pnl_usd == null ? "" : fills.realized_pnl_usd >= 0 ? " pos" : " neg"
+                      }`}
+                    >
+                      {fills.realized_pnl_usd == null ? NO_VALUE : fmtSignedUsd(fills.realized_pnl_usd)}
                     </div>
                   </div>
                 </div>

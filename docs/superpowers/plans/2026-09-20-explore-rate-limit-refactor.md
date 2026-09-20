@@ -1281,6 +1281,31 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
   `live_days`）與其他 `: 0` 補值；對每一處判定「參與資格／排序／指標計算」或「純展示」，前者改 null 並修消費端，後者改 null 且顯示 NO_VALUE。
 - 產出對照表寫進本卡片；vitest 覆蓋 null 保持 null 與畫面「—」。
 
+**2026-09-21 builder 回報（實作完成）：**
+
+命名澄清：程式碼中實際持有 `live_days: 0` 補值的策略頁函式是 `getPublicStrategy`
+（單數，`/api/public/strategies/{slug}` 詳情端點；`PublicStrategyDetail extends PublicStrategy`
+共用 `live_days` 欄位定義）——`getPublicStrategies`（複數，列表端點）本身不逐項 normalize，
+直接透傳 `body.strategies`。兩者共用同一個 `PublicStrategy.live_days` 型別，故本次一併把
+該型別改為 `number | null`，其唯一實際消費端（首頁 `page.tsx` 主推策略卡）一併修正。
+
+對照表（`rg -n ": 0[,)]|\? [a-z_.]* : 0" web/src/lib/publicApi.ts` 全量掃描結果）：
+
+| 檔案:行號（修正前） | 欄位 | 用途 | 分類 | 處置 |
+|---|---|---|---|---|
+| `publicApi.ts:276`（`getPublicStrategy`） | `PublicStrategy.live_days` | 首頁主推策略卡 3 處純展示（`page.tsx:163,180,195` 原 `featured.live_days`） | (b) 純展示 | **改 null**；型別 `number\|null`；消費端改 `featuredLiveDaysText`（null→NO_VALUE） |
+| `publicApi.ts:847`（`getPublicTraderDetail`） | `PublicTraderDetail.live_days` | 交易員詳情頁純展示（`traders/[address]/page.tsx:387`） | (b) 純展示 | **改 null**；型別 `number\|null`；消費端 null→NO_VALUE |
+| `publicApi.ts:711`（`normalizeTraderFillsStats`） | `TraderFillsStats.closed_positions` | 交易員詳情頁純展示（`page.tsx:463`） | (b) 純展示 | **改 null**；型別 `number\|null`；消費端 null→NO_VALUE |
+| `publicApi.ts:714`（`normalizeTraderFillsStats`） | `TraderFillsStats.realized_pnl_usd` | 交易員詳情頁純展示＋CSS pos/neg 判斷（`page.tsx:473-474`） | (b) 純展示（但發現隱藏計算陷阱：`null >= 0` 在 JS 為 `true`，會誤套 `pos` 樣式） | **改 null**；消費端 null→NO_VALUE，且 CSS class 判斷加 null 短路，不落入 `>= 0` 比較 |
+| `publicApi.ts:719`（同函式） | `TraderFillsStats.order_count` | 同一物件的手足欄位，理論上與 `closed_positions` 同款 coverage 依賴 | 未命名於本 task 範圍 | **維持現狀（`: 0`）**——本 task 明確只列 `closed_positions`／`realized_pnl_usd`；與 `wins` 一併記錄為後續稽核候選，避免超出派工範圍 |
+| `publicApi.ts:720`（同函式） | `TraderFillsStats.wins` | 同上 | 未命名於本 task 範圍 | **維持現狀（`: 0`）**，同上理由，記錄待後續 task |
+| `publicApi.ts:284,853`（`getPublicStrategy`／`getPublicTraderDetail`） | `sample_days` | CAGR 摺疊門檻比較（`sample_days < sample_threshold`）——真正的 (a) 類（資格計算），但 `publicApi.test.ts:187` 有既有 pinned 測試斷言缺鍵時 `sample_days` 為 `0` | 未命名於本 task 範圍 | **維持現狀**——本 task 未列名，且改動會破壞既有 pinned 測試（不得動既有測試）；記錄為需要主線程裁決的候選（0 在此語意上與「近端後端 `sample_days_from_perf` 失敗即 0」一致，是否需要區分「未知」與「confirmed 0」待裁決） |
+| `publicApi.ts:161,178,193,229,249,356,666-668,752,764,872,909,945,968` | `updated_at`／`sample_count`（metrics/methodology）／`total_qualified`／`total_scanned`／`pool` | 時間戳或計數，均非本 task 命名欄位、非 `live_days`/`closed_positions`/`realized_pnl_usd` | 未命名於本 task 範圍 | **維持現狀**——不在委派 prompt 明列範圍內（`getPublicStrategies`／`getPublicTraderDetail` 的 `live_days`／`FillsStats`），避免與 Task 7.1 同時編輯 `publicApi.ts` 造成衝突面擴大 |
+
+實作檔案：`web/src/lib/publicApi.ts`（型別＋normalize）、`web/src/app/page.tsx`（首頁主推卡消費端）、
+`web/src/app/traders/[address]/page.tsx`（交易員詳情頁消費端）；測試：`web/src/lib/publicApi.test.ts`、
+`web/src/app/page.test.tsx`、`web/src/app/traders/[address]/page.test.tsx`。
+
 ### Task 7.3（主線程）：follower 同 IP 缺口
 - 觀測期間每筆取樣含引擎 429／同步錯誤／重試／心跳年齡；期滿一併呈報。
 - 共享預算修復候選（不在本輪實作）：(a) 引擎改經 publicapi 同一個 `WeightLimiter`——需跨進程，走檔案鎖或 unix socket；(b) 引擎自帶同規格

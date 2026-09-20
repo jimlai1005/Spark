@@ -190,6 +190,14 @@ describe("getPublicStrategy", () => {
     expect(r?.sample_threshold).toBe(30);
     expect(r?.cagr_pct).toBeNull();
   });
+
+  // Task 7.2（2026-09-21，P7 null→0 稽核）：`live_days` 讀不到 perf 時後端送
+  // `null`——前端不得補 0（那會讓策略卡顯示假的「0 天實盤」）。
+  it("live_days: null（perf 不可用）→ 保持 null（不得補 0）", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, live_days: null }));
+    const r = await getPublicStrategy("core");
+    expect(r?.live_days).toBeNull();
+  });
 });
 
 describe("getPublicLeaderboard", () => {
@@ -444,6 +452,32 @@ describe("getPublicTraderDetail", () => {
     const r = await getPublicTraderDetail(DETAIL.address);
     expect(r?.source).toBeUndefined();
     expect(r?.fills_coverage).toBeUndefined();
+  });
+
+  // Task 7.2（2026-09-21，P7 null→0 稽核）：`live_days`／`fills_30d.closed_positions`／
+  // `fills_30d.realized_pnl_usd` 讀不到時後端送 `null`——前端不得補 0（工程原則 1）。
+  it("live_days: null（上游 schema 漂移）→ 保持 null（不得補 0）", async () => {
+    mockFetchOnce(() => jsonResponse({ ...DETAIL, live_days: null }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.live_days).toBeNull();
+  });
+
+  it("fills_30d.closed_positions: null（coverage 未知）→ 保持 null（不得補 0）", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      fills_30d: { ...DETAIL.fills_30d, closed_positions: null },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_30d?.closed_positions).toBeNull();
+  });
+
+  it("fills_30d.realized_pnl_usd: null（coverage 未知）→ 保持 null（不得補 0）", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      fills_30d: { ...DETAIL.fills_30d, realized_pnl_usd: null },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_30d?.realized_pnl_usd).toBeNull();
   });
 });
 

@@ -45,7 +45,10 @@ export interface PublicStrategy {
   leader_address: string;
   status: "running" | "paused";
   listable: boolean;
-  live_days: number;
+  /** Task 7.2（2026-09-21，P7 null→0 稽核）：後端讀不到 perf（`status != "ok"`）
+   * 時送 `null`（沿探索列 P6 契約 A 同款語意：未知≠0）——前端不得補 0，
+   * 純展示用途，null 時呼叫端顯示 `NO_VALUE`。 */
+  live_days: number | null;
   follower_count: number | null;
   min_notional_usd: string | null;
   max_leverage: string | null;
@@ -273,7 +276,7 @@ export async function getPublicStrategy(slug: string): Promise<PublicStrategyDet
       leader_address: typeof body.leader_address === "string" ? body.leader_address : "",
       status: body.status === "paused" ? "paused" : "running",
       listable: !!body.listable,
-      live_days: typeof body.live_days === "number" ? body.live_days : 0,
+      live_days: typeof body.live_days === "number" ? body.live_days : null,
       follower_count: typeof body.follower_count === "number" ? body.follower_count : null,
       min_notional_usd: body.min_notional_usd ?? null,
       max_leverage: body.max_leverage ?? null,
@@ -694,10 +697,13 @@ function normalizeCoverageCounts(v: unknown): Record<string, number> | undefined
  * `docs/superpowers/plans/2026-09-04-explore-trader-pnl-metrics.md`。 */
 export interface TraderFillsStats {
   order_count: number;
-  closed_positions: number;
+  /** Task 7.2（2026-09-21，P7 null→0 稽核）：非 number（後端 coverage 未知）時
+   * 保持 `null`——影響交易員詳情頁的「平倉次數」展示，未知不得顯示成 0。 */
+  closed_positions: number | null;
   wins: number;
   win_rate_pct: number | null;
-  realized_pnl_usd: number;
+  /** Task 7.2：同上，`null` 表示尚不知道已實現損益，非「損益為零」。 */
+  realized_pnl_usd: number | null;
   concentration_pct: number | null;
   coins: string[];
   truncated: boolean;
@@ -716,10 +722,12 @@ function normalizeTraderFillsStats(v: unknown): TraderFillsStats | null {
   const m = v as Partial<TraderFillsStats>;
   return {
     order_count: typeof m.order_count === "number" ? m.order_count : 0,
-    closed_positions: typeof m.closed_positions === "number" ? m.closed_positions : 0,
+    // Task 7.2：closed_positions／realized_pnl_usd 保持 null（不補 0）——見型別
+    // 檔頭；order_count／wins 不在本 task 命名範圍內，維持既有行為。
+    closed_positions: typeof m.closed_positions === "number" ? m.closed_positions : null,
     wins: typeof m.wins === "number" ? m.wins : 0,
     win_rate_pct: toNumberOrNull(m.win_rate_pct),
-    realized_pnl_usd: typeof m.realized_pnl_usd === "number" ? m.realized_pnl_usd : 0,
+    realized_pnl_usd: typeof m.realized_pnl_usd === "number" ? m.realized_pnl_usd : null,
     concentration_pct: toNumberOrNull(m.concentration_pct),
     coins: Array.isArray(m.coins) ? m.coins.filter((x): x is string => typeof x === "string") : [],
     truncated: !!m.truncated,
@@ -780,7 +788,10 @@ export interface PublicTraderDetail {
   // ⭐ [W4] 2026-08-29 opus 審查修正：地址若被平台安全撤銷（精選白名單
   // enabled=false），後端回 true——前端隱藏跟單 CTA，不讓新客戶點進去。
   follow_blocked: boolean;
-  live_days: number;
+  /** Task 7.2（2026-09-21，P7 null→0 稽核）：同 `PublicStrategy.live_days`——
+   * 上游 schema 漂移或 perf 不可用時後端可能送非 number，前端保持 `null`，
+   * 不得補 0；純展示用途，顯示 `NO_VALUE`。 */
+  live_days: number | null;
   exposure: { dir: "long" | "short"; pct: number | null } | null;
   windows: Record<ExploreWindow, ExploreWindowStats | null>;
   metrics: Record<ExploreWindow, PublicStrategyMetrics>;
@@ -852,7 +863,7 @@ export async function getPublicTraderDetail(address: string): Promise<PublicTrad
       // `_trader_follow_blocked` 同方向——欄位缺漏或格式異常一律視為「已封鎖」
       // （隱藏 CTA），不得因為解析失敗就預設放行去跟一個可能已被撤銷的地址。
       follow_blocked: body.follow_blocked !== false,
-      live_days: typeof body.live_days === "number" ? body.live_days : 0,
+      live_days: typeof body.live_days === "number" ? body.live_days : null,
       exposure,
       windows,
       metrics,

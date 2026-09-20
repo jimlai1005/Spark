@@ -75,6 +75,10 @@ export default function HomePage() {
 
   const featured = pickFeatured(strategies);
   const featuredTagline = featured ? resolveTagline(featured, lang) : "";
+  // Task 7.2（2026-09-21，P7 null→0 稽核）：`live_days` 讀不到 perf 時後端送
+  // `null`（見 publicApi.ts 型別檔頭），純展示欄位，未知顯示 NO_VALUE 而非
+  // 偽造成 0 天實盤。
+  const featuredLiveDaysText = featured?.live_days == null ? NO_VALUE : featured.live_days;
   const explorerBase = "https://app.hyperliquid.xyz/explorer/address";
   const leaderExplorerHref = featured ? `${explorerBase}/${featured.leader_address}` : "https://app.hyperliquid.xyz";
 
@@ -160,7 +164,7 @@ export default function HomePage() {
                 <div>
                   <div className="strategy-metric-label">
                     {home.hero.featuredCard.returnLabelPrefix}
-                    {featured.live_days}
+                    {featuredLiveDaysText}
                     {home.hero.featuredCard.returnLabelSuffix}
                   </div>
                   <div className="mono home-hero-featured-value pos">
@@ -177,7 +181,7 @@ export default function HomePage() {
                 </div>
                 <div>
                   <div className="strategy-metric-label">{home.hero.featuredCard.liveDaysLabel}</div>
-                  <div className="mono home-hero-featured-value">{featured.live_days}</div>
+                  <div className="mono home-hero-featured-value">{featuredLiveDaysText}</div>
                 </div>
                 {/* ⭐ M3 round3 Task 9 修正（主線程實機走查退回，2026-08-30）：<10 或 null
                     時原本改渲染「連續實盤天數」，但值與第三格「實盤天數」完全相同
@@ -192,7 +196,7 @@ export default function HomePage() {
               </div>
               <div className="home-hero-featured-footnote">
                 {home.hero.featuredCard.sampleNotePrefix}
-                {featured.live_days}
+                {featuredLiveDaysText}
                 {home.hero.featuredCard.sampleNoteSuffix}{" "}
                 <Link href={`/strategies/${featured.slug}`}>{home.hero.featuredCard.methodologyLink}</Link>
               </div>
