@@ -1222,10 +1222,31 @@ compose 時的遮罩保留（雙保險）；tags 的 concentrated 同樣在輸�
 4. 測試：v3 快照載入後 `query()` 的 pending 列四欄為 None、coins 為 []、tags 無 concentrated；compose 的 complete 列不受影響；勝率排序時 backfilling 列在組尾；既有 `test_load_snapshot_v3_migrates_*` 更新斷言。
 5. 主線程驗收：本機 API（正式機 v3 快照）`GET /api/public/explore` 第一列 `close_win_rate_pct is None`、`coins == []`。
 
+### Task 6.6 @inline：前端契約修正（P6 reviewer：1 Critical／2 Warning）
+
+<!-- 2026-09-21 裁決：C1 `live_days` null→0 違反契約 A；W1 `closed_positions_30d`／`realized_pnl_30d_usd` 同型且型別說謊；
+W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在格線外窄螢幕錯位。 -->
+
+**Files:** `web/src/lib/publicApi.ts`、`web/src/app/explore/page.tsx`、`web/src/styles/globals.css`（或該頁既有樣式檔）；對應 vitest。
+1. `normalizeExploreRow`：`live_days`、`closed_positions_30d`、`realized_pnl_30d_usd`、`close_win_rate_pct`、`concentration_pct` 一律 `number | null`（非 number → null，**不得**補 0）；型別同步改 `number | null`。
+2. 探索頁：`live_days` null 顯示 NO_VALUE（「—」）；其餘欄位既有 null 處理沿用。
+3. CSS：`.explore-group-header`／`.explore-pending-reason` 補樣式（沿該頁既有 token）；組標題列放進 `.explore-table` 的格線內（同 `min-width`），窄螢幕橫捲時與列對齊。
+4. vitest：pending/portfolio_missing 列 `live_days` 顯示「—」而非 0；normalize 對 null 保持 null；組標題在表格容器內。
+
+### Task 6.7 @inline：後端契約修正（P6 reviewer W2／W3；6.5 之後）
+
+<!-- W2 快照檔每列硬寫 eligibility=eligible（query 才重算）→ 讀檔的人被誤導；W3 6.4(b)(c) 用 force 無鑑別力。 -->
+
+**Files:** `src/spark/publicapi/hl_explore.py`、`explore_publisher.py`；`tests/test_explore_publisher.py`、`tests/test_public_explore.py`。
+1. `compose_rows` 末尾對每列以 `classify(row, cfg, **預設門檻)` 設 `eligibility`／`eligibility_reason`（快照反映預設門檻下的分類；`query()` 仍依請求門檻重算）；`load_snapshot` v3→v4 遷移同樣以預設門檻分類後再寫入 rows。
+2. 6.4(b)(c) 改為非 `force`：推進 fake clock ≥ `min_interval_s` 後 `maybe_publish()`。
+3. `enrich_candidate` docstring 與 P6 行為對齊（省略 coverage＝complete）。
+4. 測試：dump 後快照第一列 `eligibility` 與 `query()` 預設門檻結果一致；v3 遷移列亦然。
+
 ### Task 6.4（主線程＋builder 測試）：三個重現驗收與恢復程序
 
 - 測試（放 `tests/test_explore_publisher.py`，用真 `ExploreStore`＋`ExploreIndex`）：
-  (a) 300 候選、全部有 portfolio（live_days 足、dd 合格）、只有 11 個 fills complete（其中 8 個 ≥200 筆）→ 發布後 rows＝300（eligible 8＋pending 292）、無一被丟；`total_qualified==8`、`total_pending==292`。
+  (a) 300 候選、全部有 portfolio（live_days 足、dd 合格）、只有 11 個 fills complete（其中 8 個 ≥200 筆、3 個 <200 筆）→ 發布後 rows＝297（eligible 8＋pending 289；3 個 complete 但不足 200 筆＝ineligible，依契約不入 rows）；`total_qualified==8`、`total_pending==289`、`total_ineligible==3`。<!-- 2026-09-21 依 6.1 實作修正數字 -->
   (b) 已有版本 300 列 → 候選換掉 80 個（新地址無任何資料）→ 發布成功，新 80 個為 pending（reason 含 live_days／portfolio 缺），舊 80 個不在 rows。
   (c) 已有版本 eligible 20 → 新資料完整且證明只剩 12 個合格 → 發布成功、`total_qualified==12`（榜縮小，不被擋）。
 - 恢復程序（主線程）：6.1–6.4 全綠＋opus 複審通過 → 第三次部署（flag 0 → 驗證 → flag 1）→ 觀察連續兩次發布（`published_at` 前進、pending 數下降、eligible/ineligible 上升、rows 的 `as_of.fills` 等於該地址 sync 時間而非 published_at）→ 之後才起算 24 小時觀測期；預算不動。
