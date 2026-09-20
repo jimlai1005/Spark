@@ -525,3 +525,71 @@ def test_publish_snapshot_write_leaves_no_leftover_tmp_file(tmp_path):
 
     assert snap_path.exists()
     assert [p.name for p in snap_dir.iterdir()] == [snap_path.name]
+
+
+def test_gate_block_logs_warning_on_first_and_every_tenth_skip(tmp_path, monkeypatch, caplog):
+    """2026-09-20 第四輪複審 W2：門檻擋下要「會叫」——第 1 次與之後每 10 次記一行
+    warning（冷啟動期間每分鐘擋一次屬預期，不能洪水）。"""
+    import logging
+
+    from spark.publicapi import explore_publisher as ep
+
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    store.put_cache_ok(_A, "portfolio", _portfolio_raw([1000, 1000], [1000] * 60),
+                       fetched_at=900.0, refresh_after=2000.0)
+    index = _dummy_index()
+    index.set_published([], {"published_at": 1.0, "candidates": 1, "with_portfolio": 1})
+    clock = [1000.0]
+    pub = ep.ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: clock[0],
+                              snapshot_path=None)
+    monkeypatch.setattr(ep, "compose_rows", lambda *a, **kw: (
+        [], {"published_at": 1000.0, "candidates": 1, "with_portfolio": 0}))
+    with caplog.at_level(logging.WARNING):
+        for _ in range(12):
+            pub.mark_dirty()
+            clock[0] += 61.0
+            assert pub.maybe_publish() is False
+    msgs = [r.getMessage() for r in caplog.records if "發布門檻擋下" in r.getMessage()]
+    assert len(msgs) == 2
+    assert "第 1 次" in msgs[0] and "第 10 次" in msgs[1]
+    assert pub.status()["gate_skips"] == 12
+
+
+def test_daily_snapshot_rotates_at_most_once_per_day(tmp_path):
+    """2026-09-20 第四輪複審 W1：`.prev` 每分鐘輪替只有一分鐘回退窗口；另留 `.daily`
+    每 24 小時至多輪替一次（以 mtime 判斷），提供至少一天前的回退點。"""
+    import os
+    import time
+
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    pr = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", pr, fetched_at=900.0, refresh_after=2000.0)
+    snap = tmp_path / "snap.json"
+    daily = tmp_path / "snap.json.daily"
+    index = ExploreIndex(cfg=_cfg(), now_fn=time.time, snapshot_path=str(snap))
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=time.time,
+                           snapshot_path=str(snap))
+
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True          # 第一次：磁碟無舊檔，不備份
+    assert not daily.exists()
+    v1 = snap.read_text()
+
+    store.upsert_candidates([(_B, "Bob", 2, 0.2)], as_of=1000.0)
+    store.put_cache_ok(_B, "portfolio", pr, fetched_at=900.0, refresh_after=2000.0)
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert daily.read_text() == v1              # 第一次覆寫：.daily＝v1
+
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert daily.read_text() == v1              # 同一天再覆寫：.daily 不動
+    v3 = snap.read_text()
+
+    old = time.time() - 90_000
+    os.utime(daily, (old, old))                 # 讓 .daily 看起來超過 24 小時
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert daily.read_text() == v3              # 超過 24h：輪替成覆寫前那一版
