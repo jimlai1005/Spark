@@ -10,7 +10,8 @@ from decimal import Decimal
 from spark.publicapi import hl_explore
 from spark.publicapi.explore_publisher import ExplorePublisher, compose_rows
 from spark.publicapi.explore_store import ExploreStore, FillsSyncState
-from spark.publicapi.hl_explore import ExploreConfig, ExploreIndex, enrich_candidate
+from spark.publicapi.hl_explore import (ExploreConfig, ExploreIndex, dump_snapshot,
+                                        enrich_candidate)
 
 _A = "0x" + "a1" * 20
 _B = "0x" + "b2" * 20
@@ -272,6 +273,61 @@ def test_load_snapshot_v3_migrates_masks_incomplete_fills_and_zeroes_order_count
     # 修法前：舊 order_count_30d=886 >= min_fills(200) 讓這列被誤判 eligible。
     assert result["total_qualified"] == 0
     assert result["rows"][0]["eligibility"] in ("pending", "ineligible")
+
+
+# ============================================================
+# Task 6.7（P6 reviewer W2）：快照列必須帶預設門檻下的真實分類，
+# 不能讓 `ExploreRow.eligibility` 的類別預設值 "eligible" 冒充進快照檔。
+# ============================================================
+
+def test_compose_rows_and_dump_snapshot_row_eligibility_matches_query_default_thresholds(
+        tmp_path):
+    """驗收 4(a)：`compose_rows`（進而 `dump_snapshot` 落盤）產出的列，其
+    `eligibility`／`eligibility_reason` 必須等於 `ExploreIndex.query()` 在
+    預設門檻（`ExploreConfig()`）下對同一份 rows 算出的結果——不是類別預設值
+    `"eligible"`（修法前 `dump_snapshot` 會原封不動寫出這個佔位值）。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    # 無 fills sync → coverage backfilling、order_count_30d==0，預設 min_fills=200 未滿足。
+    cfg = ExploreConfig()
+
+    rows, meta = compose_rows(store, now=1000.0, cfg=cfg)
+    snap_path = tmp_path / "snap.json"
+    dump_snapshot(str(snap_path), rows=rows, built_at=meta["published_at"],
+                 total_scanned=meta["candidates"])
+    dumped_row = json.loads(snap_path.read_text())["rows"][0]
+
+    index = ExploreIndex(cfg=cfg, now_fn=lambda: 1000.0)
+    index.set_published(rows, meta)
+    queried_row = index.query()["rows"][0]
+
+    assert dumped_row["eligibility"] == queried_row["eligibility"]
+    assert dumped_row["eligibility_reason"] == queried_row["eligibility_reason"]
+    # 明確錨定（不是修法前的類別預設值 "eligible"）：
+    assert dumped_row["eligibility"] == "pending"
+    assert dumped_row["eligibility_reason"] == "fills_unknown"
+
+
+def test_load_snapshot_v3_migration_default_thresholds_yield_pending_and_ineligible(tmp_path):
+    """驗收 4(b)：v3→v4 遷移列以預設門檻（`ExploreConfig()`）分類，不是全部
+    `"eligible"`——`live_days` 足但成交未知的一列是 `pending`／`fills_unknown`，
+    `live_days` 不足（5 < 預設門檻 30）的一列是 `ineligible`／`live_days`。"""
+    row_sufficient = _v3_row_dict(_A)   # live_days=60
+    row_thin = _v3_row_dict(_B)
+    row_thin["live_days"] = 5
+    path = tmp_path / "explore_snapshot.json"
+    path.write_text(json.dumps({"version": 3, "built_at": 555.0, "total_scanned": 2,
+                                "rows": [row_sufficient, row_thin]}))
+
+    loaded = hl_explore.load_snapshot(str(path))
+    assert loaded is not None
+    by_addr = {r.address: r for r in loaded["rows"]}
+    assert by_addr[_A].eligibility == "pending"
+    assert by_addr[_A].eligibility_reason == "fills_unknown"
+    assert by_addr[_B].eligibility == "ineligible"
+    assert by_addr[_B].eligibility_reason == "live_days"
 
 
 # ============================================================
@@ -681,9 +737,10 @@ def test_recovery_b_swap_80_of_300_candidates_new_ones_pending_old_ones_gone(tmp
                                 _sync(addr, completeness="complete", updated_at=now))
 
     snap_path = tmp_path / "snap.json"
-    index = ExploreIndex(cfg=ExploreConfig(page_size=500), now_fn=lambda: now,
+    clock = [now]
+    index = ExploreIndex(cfg=ExploreConfig(page_size=500), now_fn=lambda: clock[0],
                          snapshot_path=str(snap_path))
-    pub = ExplorePublisher(store=store, index=index, cfg=ExploreConfig(), now_fn=lambda: now,
+    pub = ExplorePublisher(store=store, index=index, cfg=ExploreConfig(), now_fn=lambda: clock[0],
                            snapshot_path=str(snap_path))
     pub.mark_dirty()
     assert pub.maybe_publish() is True
@@ -698,8 +755,11 @@ def test_recovery_b_swap_80_of_300_candidates_new_ones_pending_old_ones_gone(tmp
         store.upsert_candidates([(addr, addr[:8], 1, 0.0)], as_of=now)
     store.deactivate_missing(set(kept) | set(new_addrs))
 
+    # Task 6.7（W3）：非 force——推進 fake clock 越過 `min_interval_s`（預設
+    # 60s），證明門檻真的移除（不是靠 force 繞過所有節流/來源故障檢查）。
+    clock[0] += 61.0
     pub.mark_dirty()
-    assert pub.maybe_publish(force=True) is True
+    assert pub.maybe_publish() is True
     second = index.query()
     addrs_in_rows = {r["address"] for r in second["rows"]}
     assert not (removed & addrs_in_rows)           # 舊 80 個不在 rows
@@ -735,9 +795,10 @@ def test_recovery_c_shrinking_from_20_eligible_to_12_not_blocked(tmp_path):
                                 _sync(addr, completeness="complete", updated_at=now))
 
     snap_path = tmp_path / "snap.json"
-    index = ExploreIndex(cfg=ExploreConfig(page_size=100), now_fn=lambda: now,
+    clock = [now]
+    index = ExploreIndex(cfg=ExploreConfig(page_size=100), now_fn=lambda: clock[0],
                          snapshot_path=str(snap_path))
-    pub = ExplorePublisher(store=store, index=index, cfg=ExploreConfig(), now_fn=lambda: now,
+    pub = ExplorePublisher(store=store, index=index, cfg=ExploreConfig(), now_fn=lambda: clock[0],
                            snapshot_path=str(snap_path))
     pub.mark_dirty()
     assert pub.maybe_publish() is True
@@ -750,8 +811,10 @@ def test_recovery_c_shrinking_from_20_eligible_to_12_not_blocked(tmp_path):
         store.put_cache_ok(addr, "portfolio", degraded_portfolio, fetched_at=now + 10,
                           refresh_after=now + 2000)
 
+    # Task 6.7（W3）：非 force——推進 fake clock 越過 `min_interval_s`。
+    clock[0] += 61.0
     pub.mark_dirty()
-    assert pub.maybe_publish(force=True) is True
+    assert pub.maybe_publish() is True
     result = index.query()
     assert result["total_qualified"] == 12
     assert result["total_ineligible"] == 8

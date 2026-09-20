@@ -25,6 +25,7 @@ Explore 榜單的漸進發布層（spec `docs/superpowers/specs/2026-09-20-hl-le
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -33,9 +34,10 @@ from collections import Counter
 from pathlib import Path
 
 from spark.publicapi.explore_store import ExploreStore
-from spark.publicapi.hl_explore import (DEFAULT_FILLS_COVERAGE, FILLS_WINDOW_DAYS,
-                                        WINDOW_KEYS, ExploreConfig, ExploreIndex,
-                                        ExploreRow, _abbreviate_address, _apply_tags,
+from spark.publicapi.hl_explore import (DEFAULT_FILLS_COVERAGE, DEFAULT_WINDOW,
+                                        FILLS_WINDOW_DAYS, WINDOW_KEYS, ExploreConfig,
+                                        ExploreIndex, ExploreRow, _abbreviate_address,
+                                        _apply_tags, _effective_thresholds, classify,
                                         dump_snapshot, enrich_candidate)
 
 logger = logging.getLogger(__name__)
@@ -124,6 +126,30 @@ def compose_rows(store: ExploreStore, *, now: float, cfg: ExploreConfig,
         as_of_values.extend(v for v in as_of.values() if v is not None)
 
     rows = _apply_tags(rows, cfg)
+
+    # Task 6.7（P6 reviewer W2）：快照必須反映「這一輪資料在預設門檻下的分類」
+    # ——不能讓 `ExploreRow.eligibility` 的類別預設值（"eligible"，見該類別
+    # 檔頭）原封不動寫進 `dump_snapshot`，那個預設值只是「還沒被 `classify()`
+    # 算過」的佔位；直接讀快照檔的人（RUNBOOK 回退流程、部署預建流程）會被
+    # 誤導成全部合格。這裡的「預設門檻」＝`cfg` 本身四個門檻（不像
+    # `ExploreIndex.query()` 那樣可被單次請求的 `min_live_days` 等參數覆寫），
+    # 與 `qualify()` 未傳入任何逃生門旗標時的預設行為等價。`enrich_error` 列
+    # （見上方 try/except 分支）已經是 `pending`／`enrich_error`——沒有真實
+    # 資料可供 `classify()` 判斷，保留原樣不覆寫（與 `ExploreIndex.query()`
+    # 對這類列的既有處理一致，見該函式）。
+    min_live_days, min_fills, max_dd_pct, max_concentration_pct = _effective_thresholds(
+        cfg, require_sample=True, max_dd_filter=True, exclude_concentrated=True)
+    classified_rows: list[ExploreRow] = []
+    for r in rows:
+        if r.eligibility_reason == "enrich_error":
+            classified_rows.append(r)
+            continue
+        elig, reason = classify(r, cfg, window=DEFAULT_WINDOW, min_live_days=min_live_days,
+                                min_fills=min_fills, max_dd_pct=max_dd_pct,
+                                max_concentration_pct=max_concentration_pct)
+        classified_rows.append(dataclasses.replace(r, eligibility=elig, eligibility_reason=reason))
+    rows = classified_rows
+
     meta = {
         "published_at": now,
         "candidates": len(candidates),

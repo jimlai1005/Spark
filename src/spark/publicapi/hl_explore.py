@@ -514,7 +514,7 @@ def dump_snapshot(path: str, *, rows: list[ExploreRow], built_at: float,
     os.replace(tmp, p)
 
 
-def load_snapshot(path: str) -> dict | None:
+def load_snapshot(path: str, *, cfg: "ExploreConfig | None" = None) -> dict | None:
     """I-17：讀快照。不存在／解析失敗／版本不符（且非可遷移的 v3） → `None`
     （呼叫端視為「沒有可用快照」，忽略、走既有冷建語意，不拋例外——這是加速
     路徑，不是資料正確性的一部分，讀不到就當作沒發生過）。成功時回傳
@@ -526,7 +526,16 @@ def load_snapshot(path: str) -> dict | None:
     與 `fills_coverage`（`backfilling`，尚未驗證完整性）後**當作 v4 載入**，
     不丟棄舊快照（部署當下不必等一輪全新背景建置才有資料）。其他版本
     （＜3 或介於 3 與 `EXPLORE_INDEX_VERSION` 之間、或未來版本）→ `None`，
-    既有語意不變。"""
+    既有語意不變。
+
+    Task 6.7（P6 reviewer W2）：v3 快照的 `eligibility` 欄位在來源檔裡根本
+    不存在（`_row_from_dict` 落回 `ExploreRow` 類別預設值 `"eligible"`），
+    沿用會讓遷移出來的舊列全部冒充合格——遷移完成後（含上方遮罩／
+    `order_count_30d` 歸零）以 `cfg` 的預設門檻（`cfg` 省略 → `ExploreConfig()`
+    模組預設值；`ExploreIndex.__init__` 呼叫本函式時傳自己的 `self._cfg`）
+    重新 `classify()` 一次，寫回真實分類。`ExploreIndex.query()` 之後仍會依
+    當次請求門檻重新分類（見該函式），這裡只是不讓快照落盤／剛載入那一刻的
+    讀者看到失真的預設值。"""
     try:
         raw = Path(path).read_text()
     except OSError:
@@ -564,6 +573,21 @@ def load_snapshot(path: str) -> dict | None:
             # `to_dict()` 序列化時會再遮一次（雙保險），這裡先做是為了
             # `sort_rows`／`classify` 等其他讀路徑不必個別記得呼叫遮罩。
             rows = [mask_incomplete_fills(r) for r in rows]
+            # Task 6.7：遮罩之後才分類——`classify()` 依 `fills_coverage`／
+            # 已遮罩過的 `order_count_30d` 等欄位判斷，順序不能反過來。
+            eff_cfg = cfg if cfg is not None else ExploreConfig()
+            min_live_days, min_fills, max_dd_pct, max_concentration_pct = (
+                _effective_thresholds(eff_cfg, require_sample=True, max_dd_filter=True,
+                                      exclude_concentrated=True))
+            reclassified = []
+            for r in rows:
+                elig, reason = classify(r, eff_cfg, window=DEFAULT_WINDOW,
+                                        min_live_days=min_live_days, min_fills=min_fills,
+                                        max_dd_pct=max_dd_pct,
+                                        max_concentration_pct=max_concentration_pct)
+                reclassified.append(dataclasses.replace(r, eligibility=elig,
+                                                        eligibility_reason=reason))
+            rows = reclassified
     except (KeyError, TypeError, ValueError) as e:
         logger.error("explore index 快照形狀不符，忽略（冷建）: %s", e)
         return None
@@ -683,8 +707,17 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     `exposure_pct` 皆為 `None`（與「查過但算不出」的既有 `"—"`／`None` 語意
     分開，見 `ExploreRow.account_bucket` 欄位註記）。
     `as_of`／`fills_coverage`：Task 4.1，`compose_rows` 傳入的每欄位新鮮度／
-    成交完整性描述，原樣透傳進 `ExploreRow`；省略（`None`）→ 沿用
-    `ExploreRow` 的欄位預設值（空 dict／`backfilling`）。
+    成交完整性描述，原樣透傳進 `ExploreRow`；`as_of` 省略（`None`）→ 沿用
+    `ExploreRow` 的欄位預設值（空 dict）。`fills_coverage` 省略（`None`）
+    **不是**「未知」——這代表呼叫端（既有直接呼叫本函式的呼叫端／測試）不參與
+    `ExploreStore` 分頁追蹤，餵進來的 `fills` 本身就是一份完整清單，因此視為
+    `"complete"`：成交衍生欄位（`coins`／`concentration_pct`／
+    `closed_positions_30d`／`realized_pnl_30d_usd`／`close_win_rate_pct`）
+    照常計算，不遮蔽（向下相容既有行為）。只有 `compose_rows`（正式資料流）
+    **顯式**傳入非 `"complete"` 的 `fills_coverage`，才會觸發「未知≠0」遮蔽
+    （見下方 P6 段的實作）——`ExploreRow.fills_coverage` 欄位本身的類別預設值
+    （`DEFAULT_FILLS_COVERAGE`，`"backfilling"`）只用於 `_row_from_dict` 這類
+    繞過本函式直接建構 `ExploreRow` 的路徑，不是本函式省略參數時的行為。
 
     跳過整列的情況（讀不到就跳過，不編數字；僅在 `portfolio_raw` 非 `None`
     時適用——見上）：`month` 或 `allTime` 視窗缺席／形狀不符／不足兩個取樣點
@@ -1079,7 +1112,7 @@ class ExploreIndex:
         # 版本不符／檔不存在／檔壞 → `load_snapshot` 回 `None`，維持既有冷建
         # 語意（`self._rows` 留 `None`），不拋例外、不阻塞建構子。
         if self._snapshot_path is not None:
-            snap = load_snapshot(self._snapshot_path)
+            snap = load_snapshot(self._snapshot_path, cfg=self._cfg)
             if snap is not None:
                 self._rows = snap["rows"]
                 self._rows_version = EXPLORE_INDEX_VERSION
