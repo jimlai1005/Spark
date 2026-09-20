@@ -2647,3 +2647,20 @@ step 4 的「推薦碼（選填）」原為獨立卡片掛在「確認並開始�
 unit 檔未動）→ `DEPLOYED_VERSION`。驗證：本機四項全綠（`npm test` 716、`pytest` 2927、ruff、build）；正式機
 `filet_regression_check --http --ssh` 67/67 PASS；`systemctl --failed` 空；dashboard journal `Ready in 831ms`；
 `.next/static/chunks` 含 `referral-optin`；`/`、`/onboarding` 200。回歸第 2、3 層（testnet E2E／瀏覽器）**未跑**：本次無後端與簽章流程改動，屬刻意略過。
+
+**2026-09-20 部署（commit `4295ece`，04:09 UTC，Explore 限流重構 P0＋P1 ＋ dashboard 四修）：** plan
+`docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md`（spec 同日 specs/；兩輪 opus 審查，Task 1.5／1.6 修正後「可部署」）。
+事故：2026-09-19 12:38 UTC 使用者開 dashboard 全空＋「引擎狀態讀取失敗」——根因是探索榜 300 池請求觸發重建（0.7s/請求節流，
+但 HL 按權重計費、fills 一頁 120）把同 IP 額度燒到 429，dashboard／onboard 一起失效；另有 `signal_source_ok` 只認 `ok`
+不認 `no_action` 的獨立 bug。內容：(P0) `GET /api/public/explore` 不再觸發重建、只讀磁碟快照；訊號來源判定接受 `no_action`；
+sync 快取不釘 error；HL 4xx/5xx 全域轉 502；文案改「鏈上資料讀取失敗」。(P1) `hl_budget.WeightLimiter` 滑動視窗權重帳
+（全域 900／explore 300，fills 預留 120 後依實際筆數結算）；`HLGateway` 每次嘗試先預留、429 回報；額度不足經全域 handler 502、
+不進任何快取；`/api/ops/health` 新增 `hl_budget`／`explore_index`。**新 drop-in** `filet-api.service.d/hl-budget.conf`
+（`FILET_HL_GLOBAL_WEIGHT_CAP=900`、`FILET_HL_EXPLORE_WEIGHT_CAP=300`；`config.py` 有預設，缺檔不會拒啟）。流程照 §3.2 rsync 兩段 →
+`uv sync` 略過（pyproject 無變動，uv.lock mtime 仍 07-17）→ `.venv/bin/python -c "import spark.publicapi.hl_budget"` OK → §4.2
+`npm ci`＋`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app` build → chown root（非 root 檔 0、var 未動）→ drop-in → `daemon-reload` →
+restart `filet-api`＋`filet-dashboard`（keysvc／follower 未動，unit 主檔未動）→ `DEPLOYED_VERSION`。驗證：本機 pytest 2973、vitest 716、
+ruff；正式機 `systemctl --failed` 空、`systemctl show filet-api` 兩個 cap 生效、journal 無 Traceback、`filet_regression_check --http --ssh`
+67/67 PASS；**20 次 `/api/public/explore` 請求後 journal 零上游／重建行**（事故路徑已關）。
+⚠️ **已知過渡狀態（D8）**：探索榜凍結在 2026-09-19T15:00 快照（299 列）直到 P3 背景排程上線；快照年齡看 `/api/ops/health.explore_index`。
+follower 引擎與三個 timer 不經限流（全域 900 留 300 給它們）。
