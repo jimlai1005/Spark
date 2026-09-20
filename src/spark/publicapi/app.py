@@ -2360,16 +2360,19 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             logger.error("explore 排除清單（精選白名單）載入失敗，本輪視為空清單: %s", e)
             return set()
 
+    # Task 3.4（D6）：`ExploreIndex` 不再自己打上游、不再自己建置（見
+    # `hl_explore.ExploreIndex` 類別檔頭）——`leaderboard_source_fn`／`excluded_fn`
+    # 這兩個閉包改暴露成 `app.state`，供 `run_api.py` 在 `create_app` **之後**
+    # 建 `ExploreScheduler` 時取用（scheduler 是背景 thread，`create_app` 內
+    # 絕不起 thread）。
+    app.state.leaderboard_get = _leaderboard_cache.get
+    app.state.explore_excluded_fn = _explore_excluded_addresses
+
     _explore_index = hl_explore.ExploreIndex(
-        leaderboard_source_fn=_leaderboard_cache.get,
-        # Task 1.4（spec §5.1）：explore 走獨立 scope、共用同一個限流器與 post_fn；
-        # 測試的 FakeHL 沒有 `scoped()`（未接線行為不變，直接用原物件）。
-        hl=hl.scoped("explore") if hasattr(hl, "scoped") else hl,
-        excluded_fn=_explore_excluded_addresses,
         cfg=hl_explore.ExploreConfig.from_env(),
         now_fn=now_fn,
         # I-17（2026-08-31 使用者裁決）：常駐磁碟快照——程序重啟後第一個請求
-        # 不必等一輪背景建置（見 hl_explore.py 檔頭「I-17」節）。
+        # 不必等 `ExplorePublisher` 換第一版（見 hl_explore.py 檔頭「I-17」節）。
         snapshot_path=cfg.explore_cache_path,
     )
     app.state.explore_index = _explore_index  # 唯讀 introspection seam（沿既有慣例）
@@ -4706,6 +4709,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # （尚未接線的呼叫端、或測試）→ `null`，同本端點「讀不到就說讀不到」的
         # 既有原則——不得折疊成看起來健康的空 dict。
         limiter = app.state.hl_limiter
+        # Task 3.4：scheduler／publisher 由 `run_api.py` 在 `create_app` **之後**
+        # 建構、直接寫進 `app.state`（本函式建構時尚未存在）——`getattr` 預設
+        # `None`，測試建 app／未接線的呼叫端不受影響（同 `hl_limiter` 慣例）。
+        scheduler = getattr(app.state, "explore_scheduler", None)
+        publisher = getattr(app.state, "explore_publisher", None)
         return jsonable({
             "checked_at": datetime.fromtimestamp(now_s, timezone.utc).isoformat(),
             "engine_stale_after_s": ENGINE_STALE_S,
@@ -4722,10 +4730,15 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             # 這裡只是讓 ops 看得到接線是否生效。
             "explore_store": (app.state.explore_store.stats()
                               if app.state.explore_store is not None else None),
-            # reviewer W3：P1-only 部署期間 Explore 建置仍是舊版 build_sync（背景
-            # scheduler 是 P3 才做的事），榜單暫時凍結在最後一次成功建置——ops
-            # 要看得到「服務中的是哪一版、建於何時」，不是空白猜測。
+            # reviewer W3：ops 要看得到「服務中的是哪一版、建於何時」，不是空白
+            # 猜測——`ExploreIndex.status()` 只反映目前發布的版本本身（見
+            # `explore_index` 類別檔頭），排程／發布的動態訊號在下面兩個新鍵。
             "explore_index": _explore_index.status(),
+            # Task 3.4：`EXPLORE_UPSTREAM_REFRESH` 是否開啟＋排程進度（未接線
+            # → `null`，同 `hl_budget`／`explore_store` 的既有原則）。
+            "explore_refresh": ({"enabled": cfg.explore_upstream_refresh, **scheduler.status()}
+                                if scheduler is not None else None),
+            "explore_publisher": publisher.status() if publisher is not None else None,
         })
 
     @app.get("/api/ops/trade-quality")

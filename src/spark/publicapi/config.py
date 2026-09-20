@@ -156,9 +156,21 @@ class ApiConfig:
     # 讓現在的正式機不必為這個 task 先加新 env 就能繼續起。P3 排程上線起這裡
     # 改為必填（比照 exchange_dir 的處理）。正式機應設
     # `/var/lib/filet-api/explore.db`（落在 filet-api.service 既有 ReadWritePaths）。
+    # ⚠️ Task 3.4（2026-09-20）起：`explore_upstream_refresh=True` 時本欄位改為
+    # **必填**（`__post_init__` 拒絕啟動）——P3 排程／發布已上線，開了刷新開關
+    # 卻沒有 store 可寫，等於 scheduler 每輪都在做白工且無處持久化。
     explore_db_path: str | None = None
+    # --- Explore 背景刷新總開關（Task 3.4，2026-09-20，spec D8）---
+    # `EXPLORE_UPSTREAM_REFRESH`：`"1"`／`"true"`（大小寫不拘）→ True，其餘（含
+    # 未設）→ False。預設關閉：D8 裁決——先部署 P0+P1 止血，P2–P5 完成、正式機
+    # 觀察過 `hl_budget` 再手動打開，不隨程式碼上線自動啟動背景排程。
+    explore_upstream_refresh: bool = False
 
     def __post_init__(self):
+        if self.explore_upstream_refresh and self.explore_db_path is None:
+            raise ValueError(
+                "EXPLORE_UPSTREAM_REFRESH=1 時必須設定 FILET_EXPLORE_DB"
+                "（背景排程需要持久化 store 才能運作）")
         if self.hl_global_weight_cap <= 0 or self.hl_explore_weight_cap <= 0:
             raise ValueError(
                 "FILET_HL_GLOBAL_WEIGHT_CAP／FILET_HL_EXPLORE_WEIGHT_CAP 必須為正整數")
@@ -377,4 +389,6 @@ class ApiConfig:
                                             or cls.hl_global_weight_cap),
                    hl_explore_weight_cap=int(env.get("FILET_HL_EXPLORE_WEIGHT_CAP")
                                              or cls.hl_explore_weight_cap),
-                   explore_db_path=env.get("FILET_EXPLORE_DB") or None)
+                   explore_db_path=env.get("FILET_EXPLORE_DB") or None,
+                   explore_upstream_refresh=(env.get("EXPLORE_UPSTREAM_REFRESH", "")
+                                             .strip().lower() in ("1", "true")))

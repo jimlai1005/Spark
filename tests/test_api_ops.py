@@ -1806,18 +1806,19 @@ def test_health_explore_store_stats_when_injected(tmp_path):
 # ---------- explore_index（Task 1.5，reviewer W3：凍結快照的年齡要可觀測）----------
 
 def test_health_explore_index_status_shape(tmp_path):
-    """P1-only 部署期間 Explore 仍是舊版 build_sync、榜單凍結在最後一次成功建置
-    ——ops/health 要能看到「服務中的是哪一版、建於何時」（reviewer W3）。"""
+    """Explore 榜單凍結在最後一次 `ExplorePublisher` 換版——ops/health 要能
+    看到「服務中的是哪一版、建於何時」（reviewer W3）。Task 3.4 起 `building`
+    鍵已從 `ExploreIndex.status()` 移除（本類別不再自己建置，見
+    `explore_refresh`／`explore_publisher` 兩個新鍵）。"""
     client, _cfg = _h_app(tmp_path)
     body = client.get("/api/ops/health").json()
-    assert set(body["explore_index"].keys()) == {"rows", "built_at", "version", "building"}
-    assert body["explore_index"]["rows"] is None      # 從未建置過（本測試不觸發建置）
-    assert body["explore_index"]["building"] is False
+    assert set(body["explore_index"].keys()) == {"rows", "built_at", "version"}
+    assert body["explore_index"]["rows"] is None      # 從未發布過（本測試不觸發發布）
 
 
-def test_health_explore_index_reports_built_snapshot_after_build_sync(tmp_path):
-    """C：`idx.build_sync()` 之後 `rows`／`built_at` 必須翻轉成非 None——確認
-    這兩個欄位真的反映建置狀態，不是恆為 None 也會通過上一條測試。"""
+def test_health_explore_index_reports_published_snapshot(tmp_path):
+    """C：`set_published()` 之後 `rows`／`built_at` 必須翻轉成非 None——確認
+    這兩個欄位真的反映發布狀態，不是恆為 None 也會通過上一條測試。"""
     wallet = Account.create()
     refs = [_lref()]
     cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
@@ -1828,10 +1829,61 @@ def test_health_explore_index_reports_built_snapshot_after_build_sync(tmp_path):
     keysvc, hl = FakeKeysvc(), FakeHL()
     app = create_app(cfg, store, keysvc, hl,
                      leaderboard_get_fn=lambda url: {"leaderboardRows": []})
-    app.state.explore_index.build_sync()
+    app.state.explore_index.set_published([], {"published_at": 1000.0, "candidates": 0})
     client = _client(app)
     login(client, wallet=wallet)
 
     body = client.get("/api/ops/health").json()
     assert body["explore_index"]["rows"] is not None
     assert body["explore_index"]["built_at"] is not None
+
+
+# ---------- explore_refresh／explore_publisher（Task 3.4，2026-09-20）----------
+
+def test_health_explore_refresh_and_publisher_null_when_not_injected(tmp_path):
+    """未注入 scheduler／publisher（`run_api.py` 在 `create_app` **之後**才建構
+    寫進 `app.state`，見 Task 3.4）→ 兩鍵皆 `null`，同 `hl_budget`／
+    `explore_store` 的「讀不到就說讀不到」既有原則。"""
+    client, _cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert body["explore_refresh"] is None
+    assert body["explore_publisher"] is None
+
+
+def test_health_explore_refresh_and_publisher_populated_when_injected(tmp_path):
+    from spark.publicapi.explore_publisher import ExplorePublisher
+    from spark.publicapi.explore_scheduler import ExploreScheduler
+    from spark.publicapi.explore_store import ExploreStore
+    from spark.publicapi.hl_explore import ExploreConfig
+
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"),
+                   explore_upstream_refresh=True,
+                   explore_db_path=str(tmp_path / "explore.db"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    explore_store = ExploreStore(cfg.explore_db_path)
+    app = create_app(cfg, store, keysvc, hl, explore_store=explore_store)
+    publisher = ExplorePublisher(store=explore_store, index=app.state.explore_index,
+                                 cfg=ExploreConfig(), now_fn=lambda: 1000.0,
+                                 snapshot_path=None)
+    scheduler = ExploreScheduler(store=explore_store, hl=hl, leaderboard_source_fn=lambda: None,
+                                 excluded_fn=lambda: set(), cfg=ExploreConfig(),
+                                 now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                                 on_dirty=publisher.mark_dirty)
+    app.state.explore_scheduler = scheduler
+    app.state.explore_publisher = publisher
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert body["explore_refresh"]["enabled"] is True
+    assert {"last_tick_at", "last_result", "ticks", "results", "queue_depth",
+           "oldest_due_age_s"} <= set(body["explore_refresh"])
+    assert body["explore_publisher"]["dirty"] is False
+    assert {"last_published_at", "dirty", "publishes", "failures",
+           "last_error"} <= set(body["explore_publisher"])

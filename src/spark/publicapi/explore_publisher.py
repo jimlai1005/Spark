@@ -14,7 +14,7 @@ Explore 榜單的漸進發布層（spec `docs/superpowers/specs/2026-09-20-hl-le
   呼叫 `mark_dirty()`，scheduler thread 每 tick 末呼叫 `maybe_publish()`；每分鐘至多
   換版一次（`min_interval_s`，spec §9.2：有變更就發布、不等 300 人全部完成，但也不必
   每個 tick 都重算一次全池）。`compose_rows` 或落快照途中任何例外 → 記錄失敗、
-  **保留 `ExploreIndex` 目前正在服務的版本**（fail-open，同 `build_sync` 既有語意），
+  **保留 `ExploreIndex` 目前正在服務的版本**（fail-open，同既有的展示端點語意），
   不讓一次瞬間的 store 讀取失敗把已經在服務的榜單打掉。
 """
 from __future__ import annotations

@@ -19,11 +19,17 @@ def main() -> None:
         print(__doc__)
         print(f"設定錯誤: {e}")
         raise SystemExit(2) from e
+    import threading
+    import time
+
     import uvicorn
 
     from spark.keysvc.client import KeysvcClient
+    from spark.publicapi import hl_explore
     from spark.publicapi.app import create_app
     from spark.publicapi.billing import StripeGateway
+    from spark.publicapi.explore_publisher import ExplorePublisher
+    from spark.publicapi.explore_scheduler import ExploreScheduler
     from spark.publicapi.explore_store import ExploreStore
     from spark.publicapi.hl import HLGateway
     from spark.publicapi.hl_budget import WeightLimiter
@@ -40,8 +46,38 @@ def main() -> None:
     app = create_app(cfg, ApiStore(cfg.db_path), KeysvcClient(cfg.keysvc_sock),
                      gateway, billing=billing, referral_lookup=gateway.referred_by,
                      hl_limiter=limiter, explore_store=explore_store)
-    uvicorn.run(app, host="127.0.0.1",
-                port=int(os.environ.get("FILET_API_PORT", "8700")))
+
+    # Task 3.4（spec P3）：`explore_store` 存在時把 scheduler／publisher 接起來
+    # ——建構本身零 IO、不落任何背景 thread（`create_app` 內絕不起 thread，見
+    # `hl_explore.ExploreIndex` 類別檔頭）；只有 `EXPLORE_UPSTREAM_REFRESH=1`
+    # （D8，__post_init__ 已保證此時 `explore_store` 一定非 None）才真的啟動
+    # 排程 thread。`leaderboard_source_fn`／`excluded_fn` 沿用 `create_app` 內
+    # 暴露的同一個 `_leaderboard_cache`／精選白名單閉包（`app.state`），不重建
+    # 第二份 36MB stats-data 快取。
+    stop_event = threading.Event()
+    if explore_store is not None:
+        publisher = ExplorePublisher(
+            store=explore_store, index=app.state.explore_index,
+            cfg=hl_explore.ExploreConfig.from_env(), now_fn=time.time,
+            snapshot_path=cfg.explore_cache_path)
+        scheduler = ExploreScheduler(
+            store=explore_store, hl=gateway.scoped("explore"),
+            leaderboard_source_fn=app.state.leaderboard_get,
+            excluded_fn=app.state.explore_excluded_fn,
+            cfg=hl_explore.ExploreConfig.from_env(), now_fn=time.time,
+            sleep_fn=time.sleep, on_dirty=publisher.mark_dirty,
+            on_tick=publisher.maybe_publish)
+        app.state.explore_scheduler = scheduler
+        app.state.explore_publisher = publisher
+        if cfg.explore_upstream_refresh:
+            threading.Thread(target=scheduler.run_forever, args=(stop_event,),
+                             daemon=True, name="explore-scheduler").start()
+
+    try:
+        uvicorn.run(app, host="127.0.0.1",
+                   port=int(os.environ.get("FILET_API_PORT", "8700")))
+    finally:
+        stop_event.set()
 
 
 if __name__ == "__main__":

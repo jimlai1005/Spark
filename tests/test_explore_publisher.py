@@ -57,9 +57,10 @@ def _cfg(**over):
 
 
 def _dummy_index(now=1000.0):
-    return ExploreIndex(leaderboard_source_fn=lambda: None, hl=object(),
-                        excluded_fn=lambda: set(), cfg=_cfg(),
-                        now_fn=lambda: now, sleep_fn=lambda s: None)
+    # Task 3.4（D6）：`ExploreIndex` 不再接受 `leaderboard_source_fn`／`hl`／
+    # `excluded_fn`／`sleep_fn`——它不再打上游、不再自己建置（見
+    # `hl_explore.ExploreIndex` 類別檔頭）。
+    return ExploreIndex(cfg=_cfg(), now_fn=lambda: now)
 
 
 # ============================================================
@@ -231,10 +232,7 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
     assert row.fills_coverage == {"state": "backfilling", "observed_from": None,
                                   "observed_to": None, "reason": None}
 
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=object(),
-                         excluded_fn=lambda: set(), cfg=_cfg(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
-                         snapshot_path=str(path))
+    index = ExploreIndex(cfg=_cfg(), now_fn=lambda: 1000.0, snapshot_path=str(path))
     result = index.query()
     assert result["published_at"] == 555.0
     assert result["initializing"] is False

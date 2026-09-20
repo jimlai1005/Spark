@@ -6,7 +6,6 @@
 """
 import json
 import socket
-import threading
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -17,8 +16,6 @@ from fastapi.testclient import TestClient
 from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
 from spark.filet.trader_stats import WindowStats
-from spark.publicapi.hl import HLGateway
-from spark.publicapi.hl_budget import WeightLimiter
 from spark.publicapi.hl_explore import (SORT_FIELDS, ExploreConfig, ExploreIndex,
                                         ExploreRow, candidate_addresses,
                                         clamp_explore_params, enrich_candidate,
@@ -54,54 +51,6 @@ def _leaderboard_payload(*rows):
 def _lb_row(address, display_name=None, roi="0.10"):
     return {"ethAddress": address, "displayName": display_name,
            "windowPerformances": [["month", {"pnl": "1", "roi": roi, "vlm": "1"}]]}
-
-
-def _payload(n):
-    """Task 1.3：`n` 個候選地址的 leaderboard payload（同既有 `_lb_row` 批次寫法，
-    見既有 `[f"0x{i:040x}" for i in range(...)]` 慣例）。"""
-    return _leaderboard_payload(*[_lb_row(f"0x{i:040x}", roi=str(i)) for i in range(n)])
-
-
-class Clock:
-    """Task 1.3：決定性假時鐘（同 `tests/test_hl_gateway_budget.py` 的 `Clock`，
-    本檔獨立定義，不跨測試檔共用，避免耦合）。"""
-
-    def __init__(self):
-        self.t = 0.0
-
-    def now(self):
-        return self.t
-
-    def sleep(self, s):
-        self.t += s
-
-
-class FakePost:
-    """Task 1.3：把 `HLGateway(post_fn=...)` 的 `post(url, body)` 介面分派到既有
-    方法級 `FakeHL`（`portfolio`/`clearinghouse_state`/`get_fills_raw_paged`）。
-    `fills_error`：注入時，任何 `userFillsByTime` 呼叫直接拋出這個例外（模擬
-    plan 示意的 `FakeHL(fail_fills_with=...)`），不查 `FakeHL.fills_raw_error`
-    這個 per-address 字典——三個候選地址都用同一個例外，測試不需要逐位址設定。
-    `self.calls` 記錄每次呼叫的 `body["type"]`，供斷言「零上游呼叫」。"""
-
-    def __init__(self, hl: FakeHL, *, fills_error: Exception | None = None):
-        self._hl = hl
-        self._fills_error = fills_error
-        self.calls: list[str] = []
-
-    def __call__(self, url, body):
-        self.calls.append(body["type"])
-        t = body["type"]
-        if t == "portfolio":
-            return self._hl.portfolio(body["user"])
-        if t == "clearinghouseState":
-            return self._hl.clearinghouse_state(body["user"])
-        if t == "userFillsByTime":
-            if self._fills_error is not None:
-                raise self._fills_error
-            fills, _truncated = self._hl.get_fills_raw_paged(body["user"], None, None)
-            return fills
-        raise NotImplementedError(t)
 
 
 def _av_series(start_ms, values, step_ms=86_400_000):
@@ -553,7 +502,7 @@ def test_clamp_explore_params_boundary_values_pass_through_unchanged():
 
 
 # ============================================================
-# ExploreIndex：building 態、fail-open、排除、分頁（endpoint 前的直接測試）
+# ExploreIndex：building 態、fail-open、分頁（endpoint 前的直接測試）
 # ============================================================
 
 def _seed_hl(hl: FakeHL, address: str, *, roi_ret_pct=("1000", "1100"),
@@ -564,264 +513,54 @@ def _seed_hl(hl: FakeHL, address: str, *, roi_ret_pct=("1000", "1100"),
     hl.clearinghouse[address.lower()] = _ch_state()
 
 
-# ============================================================
-# ExploreIndex._call_hl：Task 1.3（2026-09-20）——節流與 429 退避已全部移到
-# `HLGateway`／`WeightLimiter`（`hl_budget.py`），`_call_hl` 現在只做例外轉譯
-# （`BudgetExhausted`/`ScopePaused` → `_BudgetUnavailable`；429 → 立即
-# `_RateLimitedAbort`，不再重試、不再 sleep）。
-# ============================================================
-
-_429_MESSAGE = ("Client error '429 Too Many Requests' for url "
-               "'https://api.hyperliquid.xyz/info'")
-
-
-def test_build_uses_explore_scope_and_aborts_on_429_without_sleeping():
-    """429 經 `HLGateway` 回報給 `WeightLimiter`（暫停 explore scope）後，原始
-    例外原樣往上傳；`_call_hl` 立即中止本輪建置，過程完全不 sleep（節流已
-    全部移到限流器，見模組檔頭 2026-09-20 更新）。"""
-    clock = Clock()
-    lim = WeightLimiter(global_cap=900, scope_caps={"explore": 300},
-                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
-    hl = FakeHL()
-    post = FakePost(hl, fills_error=RuntimeError("429 Too Many Requests"))
-    gw = HLGateway("https://x", post_fn=post, sleep_fn=clock.sleep, limiter=lim)
-    idx = ExploreIndex(leaderboard_source_fn=lambda: _payload(3), hl=gw.scoped("explore"),
-                       excluded_fn=set, cfg=ExploreConfig(min_trading_days=0, min_fills=0),
-                       now_fn=clock.now, sleep_fn=clock.sleep)
-    idx.build_sync()
-    assert idx._rows is None                                   # 中止、保舊（舊＝None）
-    assert clock.t == 0.0                                      # 不再 sleep 2/8/30
-    assert lim.snapshot()["paused_until"]["explore"] == pytest.approx(60.0)
-    assert lim.snapshot()["used"]["explore"] == 20 + 120       # portfolio + 一頁 fills 各付一次
+def _built_rows(payload, hl, *, excluded=frozenset(), pool_size=1000, cfg=None):
+    """Task 3.4（D6）：`ExploreIndex.build_sync` 已刪除——候選池選取、逐地址
+    enrich、429／額度節流全部移交 `ExploreScheduler`／`ExplorePublisher`（見
+    `tests/test_explore_scheduler.py`／`tests/test_explore_publisher.py`）。
+    這裡用同一套純函式串接（`candidate_addresses` → `enrich_candidate` →
+    `_apply_tags`）重現舊版 `build_sync` 產生的 `(rows, total_scanned)`，
+    純粹是為了不必為每個既有的 `ExploreIndex.query()` 測試各自重寫資料組裝，
+    不代表這是正式的資料流（正式資料流見 `explore_scheduler.py`／
+    `explore_publisher.py`）。"""
+    candidates = candidate_addresses(payload, pool_size, {a.lower() for a in excluded})
+    rows = []
+    for address, display_name in candidates:
+        portfolio_raw = hl.portfolio(address)
+        fills, truncated = hl.get_fills_raw_paged(address, None, None)
+        ch_state = hl.clearinghouse_state(address)
+        row = enrich_candidate(address, display_name, portfolio_raw, fills, ch_state,
+                               fills_truncated=truncated)
+        if row is not None:
+            rows.append(row)
+    rows = hl_explore._apply_tags(rows, cfg or ExploreConfig())
+    return rows, len(candidates)
 
 
-def test_build_stops_when_explore_budget_exhausted_and_keeps_old_rows():
-    """explore scope 子預算已被打穿（`BudgetExhausted`）→ `_call_hl` 轉譯成
-    `_BudgetUnavailable`，`build_sync` 中止整輪（只碰第一個候選就停，不是
-    「每個候選各自跳過」——舊版把 `_BudgetUnavailable` 當一般例外，會對三個
-    候選各自呼叫一次 `portfolio` 才得到同樣的 `rows == []` 結果；新版第一次
-    就中止，`portfolio` 只被呼叫一次，這是唯二能分辨新舊行為的訊號）。"""
-    clock = Clock()
-    lim = WeightLimiter(global_cap=900, scope_caps={"explore": 300},
-                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
-    for _ in range(15):
-        lim.try_reserve(20, "explore")         # 子預算先用光（15*20=300==cap）
-    hl = FakeHL()
-    post = FakePost(hl)
-    gw = HLGateway("https://x", post_fn=post, sleep_fn=clock.sleep, limiter=lim)
-    scoped_hl = gw.scoped("explore")
-    portfolio_calls = {"n": 0}
-    orig_portfolio = scoped_hl.portfolio
-
-    def counting_portfolio(address):
-        portfolio_calls["n"] += 1
-        return orig_portfolio(address)
-
-    scoped_hl.portfolio = counting_portfolio
-    idx = ExploreIndex(leaderboard_source_fn=lambda: _payload(3), hl=scoped_hl,
-                       excluded_fn=set, cfg=ExploreConfig(min_trading_days=0, min_fills=0),
-                       now_fn=clock.now, sleep_fn=clock.sleep)
-    idx._rows, idx._rows_version = [], hl_explore.EXPLORE_INDEX_VERSION
-    idx.build_sync()
-    assert idx._rows == [] and post.calls == []                # 零上游呼叫
-    assert portfolio_calls["n"] == 1                            # 只碰第一個候選就中止
-
-
-def test_call_hl_no_longer_retries_429_aborts_on_first_attempt():
-    """`_call_hl` 不再自己重試 429（舊版 `RATE_LIMIT_RETRY_DELAYS_S` 2s/8s/30s
-    三次退避已刪，見模組檔頭 2026-09-20 更新）：第一次 429 就立即
-    `_RateLimitedAbort`，`fn` 只被呼叫一次。"""
-    calls = {"n": 0}
-
-    def always_429():
-        calls["n"] += 1
-        raise RuntimeError(_429_MESSAGE)
-
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-
-    with pytest.raises(hl_explore._RateLimitedAbort):
-        index._call_hl(always_429, what="test address=0xabc")
-
-    assert calls["n"] == 1
-
-
-def test_build_aborts_on_rate_limit_and_keeps_old_snapshot(caplog):
-    """429 → 中止整輪建置（不繼續燒剩餘候選，且不再像舊版等三次退避耗盡才
-    中止——第一次就中止）、保留舊 snapshot（fail-open）、`building: False`
-    （有舊值可回）、且大聲留痕『中止本輪建置』。"""
-    hl = FakeHL()
-    _seed_hl(hl, _A, alltime_days=60)
-    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
-    # ⭐ enrich_ttl_s=0：固定的 now_fn（1000.0）會讓第二輪 build_sync 命中
-    # per-address enrich 快取、完全不再打 `hl.portfolio`——這裡要測的正是
-    # 「第二輪重新打上游、遇到 429」，把快取關掉才會真的走到中止路徑。
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
-                         enrich_ttl_s=0.0)
-    index.build_sync()  # 第一輪成功，建立舊 snapshot
-    first = index.query(require_sample=False)
-    assert len(first["rows"]) == 1
-
-    def always_429(address):
-        raise RuntimeError(_429_MESSAGE)
-
-    hl.portfolio = always_429
-
-    with caplog.at_level("ERROR"):
-        index.build_sync()  # 第二輪：429，立即中止（不重試）
-
-    assert "中止本輪建置" in caplog.text
-    second = index.query(require_sample=False)
-    assert second["rows"] == first["rows"]   # 舊 snapshot 保留，不是空清單
-    assert second["building"] is False        # 有舊值 → 不是 building 態
-
-
-def test_call_hl_non_429_error_still_skips_only_that_address_not_whole_build():
-    """非 429 的錯誤維持既有「跳過該地址」語意，不觸發整輪中止——與 429
-    中止路徑明確分流。"""
-    hl = FakeHL()
-    _seed_hl(hl, _A, alltime_days=60)
-    _seed_hl(hl, _B, alltime_days=60)
-    real_portfolio = hl.portfolio
-
-    def bad_for_a(address):
-        if address.lower() == _A.lower():
-            # ⚠️ 訊息刻意不含 "429" 三個字元——`_is_rate_limited` 是字串子字串
-            # 比對，混進這串數字會被誤判成 rate limit，這裡要測的正是「非
-            # rate limit 錯誤」的分流。
-            raise ValueError("資料格式不符（欄位缺失）")
-        return real_portfolio(address)
-
-    hl.portfolio = bad_for_a
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
-    payload = _leaderboard_payload(_lb_row(_A, roi="0.9"), _lb_row(_B, roi="0.5"))
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
-    result = index.query(require_sample=False)
-    addrs = [r["address"] for r in result["rows"]]
-    assert _A not in addrs
-    assert _B in addrs
-    assert result["building"] is False
-
-
-def test_call_hl_non_429_exception_does_not_sleep():
-    """節流已全部移到 `HLGateway`／`WeightLimiter`：上游丟出非 429 的錯誤
-    （例如連線重置／5xx，`_is_rate_limited` 判斷為 False，立即上拋、不重試）
-    時，`_call_hl` 不再睡任何節流間隔（舊版 C4 殘洞修法的 `finally` sleep
-    已隨節流一起刪除，見模組檔頭 2026-09-20 更新）。"""
-    sleeps: list[float] = []
-
-    def always_fails():
-        raise ConnectionError("connection reset by peer")
-
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
-
-    with pytest.raises(ConnectionError):
-        index._call_hl(always_fails, what="test address=0xabc")
-
-    assert sleeps == []
-
-
-def test_call_hl_rate_limited_abort_path_does_not_sleep():
-    """429 中止路徑同樣不 sleep（舊版三次退避 2s/8s/30s ＋ finally 節流
-    0.7s 全部已刪）。"""
-    sleeps: list[float] = []
-
-    def always_429():
-        raise RuntimeError(_429_MESSAGE)
-
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: sleeps.append(s))
-
-    with pytest.raises(hl_explore._RateLimitedAbort):
-        index._call_hl(always_429, what="test address=0xabc")
-
-    assert sleeps == []
+def _publish(index: ExploreIndex, rows, total_scanned: int, *, now: float = 1000.0) -> None:
+    index.set_published(list(rows), {"published_at": now, "candidates": total_scanned})
 
 
 def test_index_query_never_built_returns_building_true_and_empty_rows_without_blocking():
-    """尚無任何可用版本 → `building: True` ＋空 rows，讀路徑不阻塞、且**不**觸發
-    背景建置（2026-09-20 止血，Task 0.1：`query()` 只讀本地已建置版本，上游更新
-    改由 explore_scheduler（P3）負責；`_maybe_trigger_build`／`build_sync` 仍可被
-    其他呼叫端同步呼叫，見下方 `index.build_sync()`）。"""
-    started = threading.Event()
-
-    def slow_source():
-        started.set()
-        return _leaderboard_payload()  # 沒有候選人，build_sync 很快跑完
-
-    index = ExploreIndex(leaderboard_source_fn=slow_source, hl=FakeHL(),
-                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
+    """尚無任何可用版本 → `building`／`initializing: True` ＋空 rows，讀路徑
+    不阻塞（Task 3.4：`ExploreIndex` 不再接受 `hl`／`leaderboard_source_fn`／
+    `excluded_fn`，也不再自己觸發任何建置——「不阻塞、不觸發背景建置」這條
+    既有語意現在是結構性保證，不必再用假時鐘／背景 thread 驗證）。"""
+    index = ExploreIndex(cfg=ExploreConfig(), now_fn=lambda: 1000.0)
 
     start = time.monotonic()
     result = index.query()
     elapsed = time.monotonic() - start
 
     assert elapsed < 0.5, f"query() 耗時過長（{elapsed}s）"
-    # Task 4.1：整份 dict `==` 比對改包含式——`query()` 新增 `published_at`／
-    # `initializing`／`coverage_counts` 三鍵（見 hl_explore.py `query()`），
-    # 既有九個鍵的斷言維持精確值，不因新鍵而重寫。
     assert result.items() >= {"rows": [], "page": 1, "page_size": ExploreConfig().page_size,
                               "total_qualified": 0, "total_scanned": 0, "pool": 0,
                               "updated_at": None, "building": True,
                               "initializing": True, "published_at": None,
                               "coverage_counts": {}}.items()
-    assert not started.is_set(), "query() 不應觸發背景建置（2026-09-19 429 事故止血）"
 
-    index.build_sync()  # 上游更新改走同步呼叫（P3 前的暫時介面）
+    index.set_published([], {"published_at": 1000.0, "candidates": 0})
     built = index.query()
-    assert started.is_set()
     assert built["building"] is False
-
-
-def test_index_build_sync_fails_open_to_previous_snapshot_on_upstream_failure():
-    """上游故障（本輪來源回 None）→ 沿用舊版，不清空、不 building。"""
-    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
-    hl = FakeHL()
-    _seed_hl(hl, _A)
-    state = {"call": 0}
-
-    def source_fn():
-        state["call"] += 1
-        return payload if state["call"] == 1 else None
-
-    index = ExploreIndex(leaderboard_source_fn=source_fn, hl=hl,
-                         excluded_fn=lambda: set(),
-                         cfg=ExploreConfig(min_trading_days=0, min_fills=0),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
-    first = index.query()
-    assert len(first["rows"]) == 1
-    assert first["building"] is False
-
-    index.build_sync()  # 第二輪上游失效
-    second = index.query()
-    assert second["rows"] == first["rows"]
-    assert second["building"] is False
-
-
-def test_index_excludes_filet_own_address_end_to_end():
-    payload = _leaderboard_payload(_lb_row(_A, roi="0.9"), _lb_row(_FILET_OWN, roi="0.99"))
-    hl = FakeHL()
-    _seed_hl(hl, _A)
-    _seed_hl(hl, _FILET_OWN)
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: {_FILET_OWN.lower()}, cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
-    addrs = [r["address"] for r in index.query(require_sample=False)["rows"]]
-    assert _A in addrs
-    assert _FILET_OWN not in addrs
 
 
 def test_index_pagination_across_pages():
@@ -831,10 +570,9 @@ def test_index_pagination_across_pages():
     for i in range(60):
         _seed_hl(hl, f"0x{i:040x}")
     cfg = ExploreConfig(page_size=25, min_trading_days=0, min_fills=0)
-    index = ExploreIndex(leaderboard_source_fn=lambda: rows_payload, hl=hl,
-                         excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
+    index = ExploreIndex(cfg=cfg, now_fn=lambda: 1000.0)
+    rows, total_scanned = _built_rows(rows_payload, hl, cfg=cfg)
+    _publish(index, rows, total_scanned)
     page1 = index.query(page=1)
     page2 = index.query(page=2)
     page3 = index.query(page=3)
@@ -882,10 +620,9 @@ def test_index_query_window_selects_ranking_and_response_row_content():
     hl.clearinghouse[_B.lower()] = _ch_state()
     payload = _leaderboard_payload(_lb_row(_A, roi="0.5"), _lb_row(_B, roi="0.4"))
     cfg = ExploreConfig(min_trading_days=0, min_fills=0)
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
+    index = ExploreIndex(cfg=cfg, now_fn=lambda: 1000.0)
+    rows, total_scanned = _built_rows(payload, hl, cfg=cfg)
+    _publish(index, rows, total_scanned)
 
     by_day = index.query(window="day")
     assert [r["address"] for r in by_day["rows"]] == [_A, _B]   # A 的 day pnl 較高（100 vs 0）
@@ -899,21 +636,19 @@ def test_index_query_window_selects_ranking_and_response_row_content():
 
 
 # ============================================================
-# ExploreIndex：R4-3 index 結構版本——不相容快照視同未建置，強制重建
+# ExploreIndex：R4-3 index 結構版本——不相容快照視同未發布，等待重新換版
 # ============================================================
 
 def test_index_version_mismatch_forces_rebuild_even_within_ttl():
-    """把記憶體內快照的版本標記竄改成舊版後，即使 TTL 未過期，`query()` 也
-    必須回 `building: True`（不得把不相容形狀的舊列序列化給前端），並忽略
-    TTL 觸發背景重建。"""
+    """把記憶體內快照的版本標記竄改成舊版後，`query()` 也必須回
+    `building: True`（不得把不相容形狀的舊列序列化給前端）。"""
     hl = FakeHL()
     _seed_hl(hl, _A)
     payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(),
-                         cfg=ExploreConfig(min_trading_days=0, min_fills=0),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
+    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
+    index = ExploreIndex(cfg=cfg, now_fn=lambda: 1000.0)
+    rows, total_scanned = _built_rows(payload, hl, cfg=cfg)
+    _publish(index, rows, total_scanned)
     first = index.query()
     assert first["building"] is False
     assert len(first["rows"]) == 1
@@ -928,9 +663,7 @@ def test_index_version_mismatch_forces_rebuild_even_within_ttl():
 
 
 def test_index_starts_with_no_rows_version_before_first_build():
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
+    index = ExploreIndex(cfg=ExploreConfig(), now_fn=lambda: 1000.0)
     assert index._rows_version is None
 
 
@@ -995,16 +728,13 @@ def test_snapshot_load_version_mismatch_returns_none(tmp_path):
 
 
 def test_index_loads_snapshot_at_construction_and_is_immediately_queryable(tmp_path):
-    """I-17：啟動時載入——版本相符 → 建構子跑完當下就能查，不必等一輪背景
-    建置（數分鐘）才有資料。"""
+    """I-17：啟動時載入——版本相符 → 建構子跑完當下就能查，不必等
+    `ExplorePublisher` 換上第一版。"""
     path = str(tmp_path / "explore_snapshot.json")
     row = _row(address=_A)
     hl_explore.dump_snapshot(path, rows=[row], built_at=1000.0, total_scanned=1)
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(),
-                         cfg=ExploreConfig(min_trading_days=0, min_fills=0),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
-                         snapshot_path=path)
+    index = ExploreIndex(cfg=ExploreConfig(min_trading_days=0, min_fills=0),
+                         now_fn=lambda: 1000.0, snapshot_path=path)
 
     result = index.query()
 
@@ -1019,56 +749,28 @@ def test_index_snapshot_version_mismatch_on_disk_ignored_falls_back_to_cold_buil
     path = tmp_path / "explore_snapshot.json"
     path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 2,
                                 "built_at": 1.0, "total_scanned": 0, "rows": []}))
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(), cfg=ExploreConfig(),
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+    index = ExploreIndex(cfg=ExploreConfig(), now_fn=lambda: 1000.0,
                          snapshot_path=str(path))
     assert index._rows is None
     assert index._rows_version is None
 
 
 def test_index_ttl_expired_serves_stale_snapshot_rows_not_empty_building_rows(tmp_path):
-    """stale-while-revalidate：TTL 早已過期時查詢立即回舊 rows（非空）、
-    `building: False`——「building:true＋空 rows」只允許出現在「從未建成且
-    無可用快照」的第一次，磁碟快照存在時 TTL 過期不得退化成那個狀態。"""
+    """Task 3.4：`ExploreIndex` 不再有 TTL 概念（新鮮度完全交給
+    `ExploreScheduler`／`ExplorePublisher` 的更新頻率）——磁碟快照無論建於
+    多久之前，`query()` 都直接服務它，不會退化成「building:true＋空 rows」
+    （那只允許出現在從未成功發布過**且**磁碟無可用快照的唯一情況）。"""
     path = str(tmp_path / "explore_snapshot.json")
     row = _row(address=_A)
     hl_explore.dump_snapshot(path, rows=[row], built_at=0.0, total_scanned=1)
-    index = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                         excluded_fn=lambda: set(),
-                         cfg=ExploreConfig(min_trading_days=0, min_fills=0),
-                         now_fn=lambda: 100_000.0, sleep_fn=lambda s: None,
-                         index_ttl_s=600.0, snapshot_path=path)
+    index = ExploreIndex(cfg=ExploreConfig(min_trading_days=0, min_fills=0),
+                         now_fn=lambda: 100_000.0, snapshot_path=path)
 
     result = index.query()
 
     assert result["building"] is False
     assert len(result["rows"]) == 1
     assert result["updated_at"] == 0
-
-
-def test_index_build_sync_writes_snapshot_that_next_index_can_load(tmp_path):
-    """端到端：`build_sync` 成功建置後落一份新快照；下一個（模擬程序重啟）
-    `ExploreIndex` 讀到同一個路徑立即可查，不必等自己那輪背景建置。"""
-    path = str(tmp_path / "explore_snapshot.json")
-    hl = FakeHL()
-    _seed_hl(hl, _A, alltime_days=60)
-    payload = _leaderboard_payload(_lb_row(_A, roi="0.5"))
-    cfg = ExploreConfig(min_trading_days=0, min_fills=0)
-    first = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
-                         snapshot_path=path)
-    first.build_sync()
-    assert Path(path).exists()
-
-    second = ExploreIndex(leaderboard_source_fn=lambda: None, hl=FakeHL(),
-                          excluded_fn=lambda: set(), cfg=cfg,
-                          now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
-                          snapshot_path=path)
-    result = second.query()
-    assert result["building"] is False
-    assert [r["address"] for r in result["rows"]] == [_A]
 
 
 def test_query_response_includes_pool_field_not_hardcoded():
@@ -1078,10 +780,9 @@ def test_query_response_includes_pool_field_not_hardcoded():
         _seed_hl(hl, f"0x{i:040x}")
     payload = _leaderboard_payload(*[_lb_row(f"0x{i:040x}", roi=str(i)) for i in range(3)])
     cfg = ExploreConfig(page_size=25, min_trading_days=0, min_fills=0)
-    index = ExploreIndex(leaderboard_source_fn=lambda: payload, hl=hl,
-                         excluded_fn=lambda: set(), cfg=cfg,
-                         now_fn=lambda: 1000.0, sleep_fn=lambda s: None)
-    index.build_sync()
+    index = ExploreIndex(cfg=cfg, now_fn=lambda: 1000.0)
+    rows, total_scanned = _built_rows(payload, hl, cfg=cfg)
+    _publish(index, rows, total_scanned)
     result = index.query()
     assert result["pool"] == 3 == result["total_scanned"]
 
@@ -1158,24 +859,18 @@ def test_endpoint_no_auth_required_and_no_cookie_side_effect(tmp_path):
 
 
 def test_endpoint_full_flow_after_build_completes(tmp_path):
-    """走完整條管線：上游 leaderboard → enrich → 過濾 → 排序 → 分頁，一路到
-    HTTP 回應；並驗證 Filet 自營地址在端點層也被排除（讀精選白名單）。
-
-    2026-09-20（Task 1.3）起節流與 429 重試已全部移到 `HLGateway`／
-    `WeightLimiter`，`hl_explore` 不再自己 sleep，測試不需要（也不再能）靠環境
-    變數歸零節流間隔（reviewer S1：舊的節流間隔環境變數已隨
-    `ExploreConfig.enrich_call_interval_s` 一起移除）。"""
-    payload = _leaderboard_payload(_lb_row(_A, display_name="Alice", roi="0.5"),
-                                   _lb_row(_FILET_OWN, roi="0.99"))
+    """走完整條管線（enrich → 過濾 → 排序 → 分頁）一路到 HTTP 回應。Filet
+    自營地址排除（D8）已下放到 `ExploreScheduler`（見 `app.py` 接線裡的
+    `_explore_excluded_addresses`）——它不在 `ExploreIndex`／端點層做，
+    純函式層的排除邏輯覆蓋見 `test_candidate_addresses_excludes_filet_own_
+    leaders`，本測試不再重複驗證。"""
     hl = FakeHL()
     _seed_hl(hl, _A, alltime_days=65)
-    _seed_hl(hl, _FILET_OWN, alltime_days=65)
-    app = _app(tmp_path, hl=hl, leaderboard_get_fn=lambda url: payload,
-              leaders=[{"address": _FILET_OWN, "name": "Filet 自營", "enabled": True}])
+    payload = _leaderboard_payload(_lb_row(_A, display_name="Alice", roi="0.5"))
+    app = _app(tmp_path)
+    rows, total_scanned = _built_rows(payload, hl)
+    _publish(app.state.explore_index, rows, total_scanned)
     client = _client(app)
-
-    index = app.state.explore_index
-    index.build_sync()  # 測試直接同步建置一次，不等背景 thread（見 hl_explore 檔頭）
 
     # R4-3：`qualified=0` chip 已移除——改送 min_live_days=0/min_fills=0
     # 停用樣本門檻（`_seed_hl` 的假地址 fills_raw 是空清單，預設
@@ -1184,9 +879,6 @@ def test_endpoint_full_flow_after_build_completes(tmp_path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["building"] is False
-    addrs = [row["address"] for row in body["rows"]]
-    assert _A in addrs
-    assert _FILET_OWN not in addrs
     row = next(row for row in body["rows"] if row["address"] == _A)
     assert row["display_name"] == "Alice"
     assert row["label"] == "Alice"
@@ -1219,8 +911,9 @@ def client_after_build(tmp_path):
     hl.fills_raw[_A.lower()] = _many_perp_fills(200)
     hl.fills_raw[_B.lower()] = _many_perp_fills(200)
     payload = _leaderboard_payload(_lb_row(_A, roi="0.5"), _lb_row(_B, roi="0.4"))
-    app = _app(tmp_path, hl=hl, leaderboard_get_fn=lambda url: payload)
-    app.state.explore_index.build_sync()
+    app = _app(tmp_path)
+    rows, total_scanned = _built_rows(payload, hl)
+    _publish(app.state.explore_index, rows, total_scanned)
     return _client(app)
 
 
@@ -1282,4 +975,4 @@ def test_explore_get_never_calls_upstream_nor_builds(tmp_path):
         assert r.status_code == 200
     assert hl.calls == []
     idx = client.app.state.explore_index
-    assert idx._building is False
+    assert idx._rows is None  # 從未發布過任何一版——沒有背景建置動過它

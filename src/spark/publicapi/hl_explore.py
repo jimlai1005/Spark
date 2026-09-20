@@ -21,55 +21,29 @@
    （`None`），不進榜、不編數字（工程原則 3 的展示版）。
 3. **資格過濾與風險調整排序**（`qualify`／`sort_key`）**全在後端**（R2-01），
    前端只送布林 chip 開關，不自己算。
-4. **`ExploreIndex`**：仿 `hl_leaderboard.LeaderboardCache` 的 TTL＋
-   single-flight 模式，多一層 per-address enrich 結果快取（TTL 30 分鐘、
-   LRU 上限 256）。建置在背景 thread 跑（`build_sync` 是實際工作，序列執行）；
-   **從未成功建置過**時 `query()` 立即回 `building: True` ＋空 rows，不阻塞
-   呼叫端。已有舊版時，即使背景正在重建或本輪上游故障，一律**回舊版**
-   （fail-open，同 `LeaderboardCache` 檔頭精神）。
+4. **`ExploreIndex`**（Task 3.4 起純讀路徑，見類別檔頭）：只服務
+   `ExplorePublisher` 換上來的最新一版 `ExploreRow`；候選池選取、逐地址
+   enrich、429／額度節流全部移交 `ExploreScheduler`（背景 thread，逐 job
+   執行，見 `explore_scheduler.py`）與 `ExplorePublisher`（定期合成換版，
+   見 `explore_publisher.py`）。**從未成功發布過**時 `query()` 立即回
+   `building`／`initializing: True` ＋空 rows，不阻塞呼叫端；已有舊版時，
+   即使排程正在更新或上游故障，一律**回舊版**（fail-open，同
+   `LeaderboardCache` 檔頭精神）。
 
-⚠️ 2026-08-30 mainnet 整合實跑事故（本機起 API 對真實 HL，**歷史記錄，
-下方 2026-09-20 段落有更新**）：節流原本只設在「地址與地址之間」
-（`batch_sleep_s`），同一地址內連續 3 個 HL 請求（portfolio/fills/
-clearinghouse）**之間完全沒有間隔**，實測 burst 到約 60 req/s，觸發大量
-429，enrich 把 429 當成「該地址失敗→跳過」燒完整個候選池，index 以近乎
-0 列完成建置＝空榜上線。當時的修法（`_call_hl`，**已於 2026-09-20 全部
-移除，見下方段落**）：
-1. 節流改成「每個 HL 請求之間」都固定睡一段秒數（預設 0.7 秒），不是地址
-   之間——`batch_sleep_s` 已移除，不再併存兩套節流。
-2. 429 視為 transient（讀操作冪等，工程原則 2）：指數退避重試三次
-   （2 秒／8 秒／30 秒）。刻意**不**改 `spark/resilience.py` 的
-   `_TRANSIENT_MARKERS` 去收 429——那是與實盤引擎共用的邊界，改寬鬆會連坐
-   交易路徑；本模組自己在 `hl.py` 之上再包一層 429 專屬重試（見
-   `_is_rate_limited`／`_call_hl`）。
-3. 重試耗盡仍 429 → 判定「額度已被打穿，繼續燒剩餘候選只會全部繼續 429」，
-   **中止整輪建置**（`_RateLimitedAbort`，非單一地址跳過）、保留舊 snapshot
-   （fail-open，同上游故障的既有語意）、log 一行 `build aborted: rate
-   limited`。單一地址的**非** 429 錯誤（真的讀不到、格式錯誤…）維持原本
-   「跳過該列」語意，不觸發中止。
-
-⚠️ 2026-08-30 review 修正輪殘洞（C4，**歷史記錄，同上已於 2026-09-20 移除**）：
-上一版 `_call_hl` 的節流只掛在成功路徑（`fn()` 不丟例外才睡）。上游若大量
-回連線重置／5xx 這類**非** 429 的錯誤，地址的第一個 HL 呼叫就失敗、立刻
-`raise` 出去給 `_enrich_one` 跳過整列，`_call_hl` 從未走到那行 sleep——節流
-形同虛設，退化回 burst（與本節開頭那次事故同一種症狀，只是觸發條件從
-「429」換成「非 429 的 transient 故障」）。當時的修法：節流改掛在
-`finally`，包住整個 `_call_hl` 呼叫（含其內部的 429 重試迴圈）——不論最終
-是成功回傳、非 429 例外原樣往上拋、還是 429 退避耗盡拋出
-`_RateLimitedAbort`，離開這個函式之前都會先睡滿一次那段固定間隔，讓節流
-不再取決於「這次呼叫有沒有成功」。
-
-⚠️ 2026-09-20 更新（Task 1.3，spec §5 權重限流重構）：上面兩段記錄的固定
-間隔節流（預設 0.7 秒／請求）與 429 指數退避重試（三次：2/8/30 秒）已
-**全部刪除**，本模組不再 sleep、不再自己重試——這正是把 429 當節流器用的
-舊模式（2026-09-19 事故根因）。節流與 429 暫停現在統一由
-`spark.publicapi.hl_budget.WeightLimiter` ＋ `HLGateway`（`hl.py`）負責
-（`ExploreIndex` 建構時收到的 `hl` 必須是 `gateway.scoped("explore")`）。
-`_call_hl` 現在只是一層例外轉譯：額度不足（`BudgetExhausted`）／scope 暫停
-（`ScopePaused`）→ `_BudgetUnavailable`；429 → `_RateLimitedAbort`；兩者都讓
-`build_sync` **立即**中止本輪（不再等退避耗盡），保留舊 snapshot。以上歷史
-段落保留供事故背景考證，其中提到的具體節流數值／重試次數已不適用於現行
-程式，現況見 `_call_hl` 現行 docstring。
+⚠️ 事故沿革（2026-08-30～2026-09-19，機制本身已於 2026-09-20 Task 1.3／
+Task 3.4 全部移除——本段只留教訓，不再列出已刪除的內部函式／例外名稱）：
+早期版本讓 `ExploreIndex` 自己在背景 thread 序列建置整個候選池，同一地址
+連續數個 HL 請求之間完全沒有節流間隔，實測 burst 到約 60 req/s，觸發大量
+429；enrich 把 429 誤判成「該地址失敗→跳過」，燒完整個候選池後以近乎
+0 列完成建置＝空榜上線（2026-08-30 mainnet 整合實跑事故）。後續兩輪修法
+（改成固定間隔 sleep、429 指數退避重試三次、退避耗盡才中止整輪並保留舊
+snapshot）仍然是把 429 當節流器用——2026-09-19 正式機事故重演同一症狀，
+且燒穿同 IP 額度殃及 dashboard／onboard。根本修法：Task 1.3 起 429／額度
+節流全部移交 `spark.publicapi.hl_budget.WeightLimiter` ＋ `HLGateway`
+（`ExploreIndex`／排程器拿到的 `hl` 必須是 `gateway.scoped("explore")`），
+`ExploreIndex` 本身不再打任何上游、不再自己 sleep 或重試；Task 3.4 起連
+「建置」這件事本身也移交 `ExploreScheduler`／`ExplorePublisher`，
+`ExploreIndex` 只剩讀路徑與快照載入（見這兩個模組各自的檔頭）。
 
 W1（trading_days → live_days）：`trading_days` 原本量 perpAllTime 降採樣序列
 的 distinct UTC 曆日數——但 `leader_perf.py` 檔頭已言明長帳戶的降採樣間隔約
@@ -135,17 +109,12 @@ R4-3（2026-08-30，plan `2026-08-30-m3-ui-round4.md` Task R4-3，使用者裁�
   的同名布林 kwargs 保留成內部/測試用逃生門（各自獨立開關整個過濾維度，
   預設 `True`），純粹為了不必為每個既有的純函式測試重寫成大量門檻組合。
 - **index 結構版本**：`ExploreRow` 形狀變了（`ret_30d_pct`/`max_dd_30d_pct`/
-  `spark` 三個頂層欄位→`windows` dict）。本模組沒有把 index 落盤（純記憶體，
-  `ExploreIndex._rows` 只在 process 存活期間由 `build_sync()` 寫入，程式重啟
-  必定從 `None` 重新建置一次——結構上不可能出現「半舊半新形狀」混雜的快照）。
-  仍加 `EXPLORE_INDEX_VERSION` 版本標記＋`ExploreIndex._rows_version`，讓
-  「偵測不相容→視為未建置、強制重建」這條語意變成可測試、可驗證的行為
-  （`query()`／`_maybe_trigger_build()` 一旦看到 `_rows_version !=
-  EXPLORE_INDEX_VERSION` 就當作沒有可用快照，忽略 TTL 立即回
-  `building: True` 並觸發重建），也替未來若真的加上跨行程快取/落盤留一個
-  現成的相容性檢查點。**與既有「中止保舊」語義正交、不衝突**：429 中止整輪
-  建置那條路徑完全不動 `self._rows`/`self._rows_version`，版本仍相容的舊
-  snapshot 照常繼續服務（fail-open，見上面 2026-08-30 事故記錄）。
+  `spark` 三個頂層欄位→`windows` dict）。`EXPLORE_INDEX_VERSION` 版本標記＋
+  `ExploreIndex._rows_version` 讓「偵測不相容→視為未發布、等待重新換版」這條
+  語意變成可測試、可驗證的行為（`query()` 一旦看到 `_rows_version !=
+  EXPLORE_INDEX_VERSION` 就當作沒有可用快照，回 `building`／
+  `initializing: True`），也替未來若真的加上跨行程快取/落盤留一個現成的
+  相容性檢查點。
 
 I-15（2026-08-31，issue log 使用者裁決「改！」；**取代**上面 R4-3 段
 `WINDOW_TO_PERIOD` 的映射值，其餘 R4-3 內容不變）
@@ -161,9 +130,9 @@ month/allTime`，`leader_perf.COMBINED_PERIODS`）——`extract_window` 的閘�
 I-17（2026-08-31，issue log 使用者裁決）：候選池 100→300 ＋ 常駐磁碟快取。
 ----------------------------------------------------------------------------
 `DEFAULT_CANDIDATE_POOL` 100→300（實測 60 天門檻下 300 候選才有夠多合格列，
-見 D15 段）。原版 index 只在記憶體（見「index 結構版本」節「本模組沒有把
-index 落盤」），程序重啟後第一個請求必定 `building: True` ＋空 rows、要等一輪
-背景建置（300 址 enrich，數分鐘）才有資料——本輪加**磁碟快照快取**：
+見 D15 段）。`ExploreIndex` 本身純記憶體、不落盤，程序重啟後第一個請求
+在 `ExplorePublisher` 換上第一版之前必定 `building: True` ＋空 rows——本輪
+加**磁碟快照快取**：
 
 - `dump_snapshot`／`load_snapshot`：`ExploreIndex._rows` 的 JSON 序列化（含
   `EXPLORE_INDEX_VERSION` 與 `built_at`），原子寫入（`os.replace`，同
@@ -173,19 +142,15 @@ index 落盤」），程序重啟後第一個請求必定 `building: True` ＋�
 - `ExploreIndex.__init__` 新增可選 `snapshot_path`：非 `None` 時嘗試
   `load_snapshot`——版本相符 → 立即灌進 `self._rows`／`_rows_version`／
   `_built_at`／`_total_scanned`，程序重啟後第一個請求就有資料可查（不必等
-  一輪背景建置）；版本不符／檔不存在／檔壞 → 忽略，`self._rows` 維持
-  `None`，行為等同沒有快照（冷建，既有語意不變）。
-- `build_sync` 成功建置一輪後（`self._rows` 換版的同一刻）順手落一份新快照
-  （`snapshot_path` 有設才寫；寫入失敗只記錄、不影響本輪建置結果——快取是
-  加速手段，不是資料正確性的一部分）。
-- **與既有 TTL／stale-while-revalidate 語意正交**：`query()` 讀路徑本來就是
-  「先讀目前快照 → 觸發背景重建（若已過期）→ 用讀到的快照回應」（見
-  `query()` docstring「⭐ 讀值必須在觸發背景建置之前取得快照」段）——`
-  building: True` ＋空 rows 只會出現在 `self._rows is None`（從未成功建置過
-  **且**磁碟無可用快照）這唯一情況；TTL 過期時一律服務舊 rows、背景才重建。
-  磁碟快照只是把「有沒有舊版可服務」這件事從「這個 process 有沒有跑過至少
-  一輪」放寬成「這個 process **或前一個 process** 有沒有跑過至少一輪」，不
-  改變上述判斷邏輯本身。
+  `ExplorePublisher` 換第一版）；版本不符／檔不存在／檔壞 → 忽略，
+  `self._rows` 維持 `None`，行為等同沒有快照（冷啟，既有語意不變）。
+- `ExplorePublisher.maybe_publish` 每次成功換版後（`ExploreIndex.set_published`
+  的同一刻）順手落一份新快照（`snapshot_path` 有設才寫；寫入失敗只記錄、
+  不影響本次換版結果——快取是加速手段，不是資料正確性的一部分，見
+  `explore_publisher.py`）。
+- 磁碟快照把「有沒有舊版可服務」這件事從「這個 process 有沒有成功發布過至少
+  一次」放寬成「這個 process **或前一個 process** 有沒有成功發布過至少
+  一次」，`query()` 的讀路徑判斷邏輯本身不變。
 - ⚠️ 與 issue log 另一條裁決 I-04（「同步誤差不得落盤累積」）無關：I-04 限
   的是 dashboard 同步誤差這類**對帳指標**（落盤會讓誤差逐輪累積、失真），
   這裡落的是**榜單快照**（純展示排序結果），過期後照 stale-while-revalidate
@@ -221,10 +186,8 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
-from time import sleep as _default_sleep_fn
 from typing import Callable, Mapping
 
 from spark.filet.leader_perf import extract_window
@@ -232,8 +195,6 @@ from spark.filet.trader_stats import SPARK_POINTS  # noqa: F401 — 保留名稱
 from spark.filet.trader_stats import (FillsStats, WindowStats, fills_stats,
                                       live_days_from_av, window_stats)
 from spark.publicapi import hl_leaderboard
-from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused
-from spark.publicapi.hl_budget import is_rate_limited as _hl_budget_is_rate_limited
 
 logger = logging.getLogger(__name__)
 
@@ -247,8 +208,9 @@ DEFAULT_MAX_DRAWDOWN_PCT = Decimal("30")
 DEFAULT_MAX_CONCENTRATION_PCT = Decimal("90")
 DEFAULT_PAGE_SIZE = 25
 # D5（2026-09-05）：`hl.get_fills_raw_paged` 分頁上限，每頁 2000 筆，3 頁
-# ≤ 6000 筆——`_call_hl` 的節流包住整個分頁呼叫，頁與頁之間沒有額外間隔，這是
-# 已知的 burst 面，上限 3 就是為了壓它（見 Task 3a）。
+# ≤ 6000 筆——分頁呼叫之間沒有額外節流間隔（節流全在 `HLGateway`／
+# `WeightLimiter` 這一層做），這是已知的 burst 面，上限 3 就是為了壓它
+# （見 Task 3a）。
 DEFAULT_FILLS_MAX_PAGES = 3
 # Task 8 Step 4（2026-09-05，reviewer Warning 3）：探索清單與交易員詳情頁原本
 # 各自讀一份 `EXPLORE_FILLS_MAX_PAGES`（`ExploreConfig.fills_max_pages` 與
@@ -268,9 +230,6 @@ def fills_max_pages_from_env(env: Mapping[str, str] | None = None) -> int:
     v = src.get(FILLS_MAX_PAGES_ENV)
     return int(v) if v else DEFAULT_FILLS_MAX_PAGES
 
-INDEX_TTL_S = 600.0          # 10 分鐘（D1）
-ENRICH_CACHE_TTL_S = 1800.0  # 30 分鐘 per-address enrich 快取（D1）
-ENRICH_CACHE_MAX = 256       # LRU 上限（D1）
 FILLS_WINDOW_DAYS = 30
 
 # ---------------------------------------------------------------------------
@@ -343,32 +302,6 @@ def clamp_explore_params(*, min_live_days: int, min_fills: int,
         _clamp_float(max_dd_pct, *MAX_DD_PCT_RANGE),
         _clamp_float(max_concentration_pct, *MAX_CONCENTRATION_PCT_RANGE),
     )
-
-
-class _RateLimitedAbort(Exception):
-    """單一 HL 呼叫遇到 429——內部控制流訊號，不對外匯出（2026-09-20 起不再
-    重試，第一次 429 就轉譯成這個訊號，見模組檔頭「2026-09-20 更新」段）。
-    `_enrich_one` 讓它原樣往上傳，`build_sync` 是唯一的攔截點（中止整輪建置，
-    保留舊 snapshot），不得被 `_enrich_one`／`_call_hl` 自己的 `except Exception`
-    吞掉，否則會退化成「跳過這一個地址」，失去「額度已被打穿，停止繼續燒」
-    的語意（見模組檔頭事故記錄）。"""
-
-
-class _BudgetUnavailable(Exception):
-    """單一 HL 呼叫因權重額度不足（`BudgetExhausted`）或 scope 暫停中
-    （`ScopePaused`）而被 `HLGateway`／`WeightLimiter` 擋下——內部控制流訊號，
-    不對外匯出。與 `_RateLimitedAbort` 同一等級：`_enrich_one` 讓它原樣往上
-    傳，`build_sync` 是唯一的攔截點（中止整輪建置，保留舊 snapshot），不得被
-    `except Exception` 吞掉退化成「跳過這一個地址」（見模組檔頭「2026-09-20
-    更新」段）。"""
-
-
-def _is_rate_limited(exc: Exception) -> bool:
-    """429 偵測：委派 `hl_budget.is_rate_limited`（reviewer W2，2026-09-20）——
-    與 `hl.py._is_429` 共用同一份判準，不再各自維護一份鬆散的
-「訊息含 429 子字串就判定」這種鬆散判準（會把 `JSONDecodeError ... column 429` 這種訊息誤判成
-    429）。函式名與呼叫端保留：`build_sync`／`_call_hl` 不必跟著改。"""
-    return _hl_budget_is_rate_limited(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -525,8 +458,8 @@ def dump_snapshot(path: str, *, rows: list[ExploreRow], built_at: float,
                   total_scanned: int) -> None:
     """I-17：原子寫入榜單快照（`.tmp` 寫完再 `os.replace`，避免行程被中斷時
     留下半寫壞檔——同 repo 既有落檔慣例）。寫入失敗（例如目錄不可寫）由
-    呼叫端（`ExploreIndex.build_sync`）自行 try/except 決定要不要吞掉；本函式
-    本身不吞錯，讓呼叫端能記錄清楚是哪一步壞的。"""
+    呼叫端（`ExplorePublisher.maybe_publish`）自行 try/except 決定要不要吞掉；
+    本函式本身不吞錯，讓呼叫端能記錄清楚是哪一步壞的。"""
     payload = {"version": EXPLORE_INDEX_VERSION, "built_at": built_at,
               "total_scanned": total_scanned, "rows": [r.to_dict() for r in rows]}
     p = Path(path)
@@ -693,8 +626,7 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     分開，見 `ExploreRow.account_bucket` 欄位註記）。
     `as_of`／`fills_coverage`：Task 4.1，`compose_rows` 傳入的每欄位新鮮度／
     成交完整性描述，原樣透傳進 `ExploreRow`；省略（`None`）→ 沿用
-    `ExploreRow` 的欄位預設值（空 dict／`backfilling`），既有呼叫端
-    （`ExploreIndex._enrich_one`）不必跟著改。
+    `ExploreRow` 的欄位預設值（空 dict／`backfilling`）。
 
     跳過整列的情況（讀不到就跳過，不編數字；僅在 `portfolio_raw` 非 `None`
     時適用——見上）：`month` 或 `allTime` 視窗缺席／形狀不符／不足兩個取樣點
@@ -703,8 +635,8 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     缺席只讓 `windows["day"/"week"]` 為 `None`，不連坐整列（見模組檔頭
     「R4-3」節）。
     `tags` 留空（`()`）——集中度與低回撤兩個 tag 需要「這一批候選池」的相對
-    資訊（門檻常數／同批分位數），由 `ExploreIndex.build_sync` 建完整批後
-    再用 `_apply_tags` 統一補上，不在單一地址的純函式裡決定。
+    資訊（門檻常數／同批分位數），由呼叫端（`ExplorePublisher.compose_rows`）
+    合成完整批後再用 `_apply_tags` 統一補上，不在單一地址的純函式裡決定。
     """
     # D14（2026-08-30 主線程裁決）：`tags`／`exposure_dir` 一律用 locale 中性代碼
     # （"low_drawdown"/"concentrated"、"long"/"short"），不回傳中文顯示字串——
@@ -941,54 +873,33 @@ def candidate_addresses(payload: dict, pool_size: int,
 # ExploreIndex：背景建置、原子換版（D1）
 # ---------------------------------------------------------------------------
 class ExploreIndex:
-    """`GET /api/public/explore` 的資料索引。仿 `hl_leaderboard.LeaderboardCache`
-    的 TTL 精神，但建置成本遠高於一次 GET（要序列 enrich 上百個地址），所以
-    改用「背景 thread 建置、讀路徑永不阻塞」而非該類別的『等進行中那條 thread』
-    模式——見 `query()`。
+    """`GET /api/public/explore` 的資料索引——**純讀路徑**（Task 3.4／D6）：本類別
+    不再打任何上游 HL 呼叫，也不再自己建置。資料的取得與更新全部交給
+    `ExploreScheduler`（背景逐 job 更新 `ExploreStore`）與 `ExplorePublisher`
+    （定期把 store 合成一批 `ExploreRow`、原子換版）；`ExploreIndex` 只保存
+    `set_published()` 換上來的最新一版，`query()` 只讀這一份。
 
-    `leaderboard_source_fn`：回傳 stats-data month 窗原始 payload 或 `None`
-    （沿用既有 `LeaderboardCache` 實例，不重複下載 36MB，見 `app.py` 接線）。
-    `hl`：需提供 `.portfolio()` / `.get_fills_raw_paged()` / `.clearinghouse_state()`
-    （唯讀，見 `hl.py`；D5：`get_fills_raw_paged` 見 Task 3a，回傳未裁切的原始
-    HL fills 形狀）。
-    `excluded_fn`：回傳 Filet 自營 leader 地址集合（D8，見 `app.py` 接線，讀精選
-    白名單）。
+    `cfg`：`qualify()`／`sort_rows()` 用的門檻與分頁大小。
     `snapshot_path`：I-17 磁碟快照路徑，`None`＝不落盤（沿用純記憶體既有語意，
     多數測試直接構造 `ExploreIndex` 時不傳，行為不變）；有設時建構子會嘗試
-    `load_snapshot` 立即灌一份舊資料（見模組檔頭「I-17」節），`build_sync`
-    每次成功建置後會寫回一份新的。
+    `load_snapshot` 立即灌一份舊資料（見模組檔頭「I-17」節），`ExplorePublisher.
+    maybe_publish` 每次成功換版後會寫回一份新的（見 `explore_publisher.py`）。
     """
 
-    def __init__(self, *, leaderboard_source_fn: Callable[[], dict | None],
-                hl, excluded_fn: Callable[[], set[str]], cfg: ExploreConfig,
-                now_fn: Callable[[], float], sleep_fn=_default_sleep_fn,
-                index_ttl_s: float = INDEX_TTL_S,
-                enrich_ttl_s: float = ENRICH_CACHE_TTL_S,
-                enrich_cache_max: int = ENRICH_CACHE_MAX,
-                fills_window_days: int = FILLS_WINDOW_DAYS,
+    def __init__(self, *, cfg: ExploreConfig, now_fn: Callable[[], float],
                 snapshot_path: str | None = None):
-        self._leaderboard_source_fn = leaderboard_source_fn
-        self._hl = hl
-        self._excluded_fn = excluded_fn
         self._cfg = cfg
         self._now_fn = now_fn
-        self._sleep_fn = sleep_fn
-        self._ttl_s = index_ttl_s
-        self._enrich_ttl_s = enrich_ttl_s
-        self._enrich_cache_max = enrich_cache_max
-        self._fills_window_days = fills_window_days
         self._snapshot_path = snapshot_path
 
         self._lock = threading.Lock()
         self._rows: list[ExploreRow] | None = None   # 目前對外服務的一版
         # R4-3：`self._rows` 是用哪個 `EXPLORE_INDEX_VERSION` 建的（見模組檔頭
         # 「index 結構版本」節）；`None` 表示尚未建置過，與版本不相容視為同一種
-        # 「沒有可用快照」——`query()`／`_maybe_trigger_build()` 兩處都檢查。
+        # 「沒有可用快照」——`query()` 據此判斷是否回 `initializing: True`。
         self._rows_version: int | None = None
         self._built_at: float | None = None
         self._total_scanned = 0
-        self._building = False                         # single-flight：背景建置中
-        self._enrich_cache: dict[str, tuple[float, ExploreRow | None]] = {}
         # Task 4.1：`ExplorePublisher.maybe_publish` 換版時一併寫入的批次統計
         # （`candidates`／`with_portfolio`／`coverage_counts`／`as_of_oldest`，
         # 見 `explore_publisher.compose_rows`）；`query()` 的 `coverage_counts`
@@ -1009,19 +920,18 @@ class ExploreIndex:
                 self._total_scanned = snap["total_scanned"]
 
     def status(self) -> dict:
-        """`/api/ops/health` 揭露用（reviewer W3，2026-09-20）：P1-only 部署期間
-        Explore 建置仍是舊版 `build_sync`（背景 scheduler 是 P3 才做的事），
-        意味著榜單暫時凍結在最後一次成功建置／磁碟快照——ops 需要能看到
-        「現在服務的是哪一版、建於何時」，否則一份已經凍結數天的榜單會被誤讀成
-        「持續在更新」。"""
+        """`/api/ops/health` 揭露用（reviewer W3，2026-09-20；Task 3.4 起 `building`
+        鍵已移除——本類別不再自己建置，`app.state.explore_scheduler`／
+        `explore_publisher` 的 `status()` 才有進行中/最近一次的動態訊號）。
+        ops 需要能看到「現在服務的是哪一版、建於何時」，否則一份已經凍結數天的
+        榜單會被誤讀成「持續在更新」。"""
         with self._lock:
             return {"rows": None if self._rows is None else len(self._rows),
-                    "built_at": self._built_at, "version": self._rows_version,
-                    "building": self._building}
+                    "built_at": self._built_at, "version": self._rows_version}
 
     def set_published(self, rows: list[ExploreRow], meta: dict) -> None:
-        """Task 4.1：`ExplorePublisher.maybe_publish` 的原子換版入口——取代舊版
-        `build_sync` 直接寫 `self._rows` 三件組的角色。持鎖設 `_rows`、
+        """Task 4.1：`ExplorePublisher.maybe_publish` 的原子換版入口——本類別
+        唯一寫 `self._rows` 三件組的地方。持鎖設 `_rows`、
         `_rows_version`（＝目前的 `EXPLORE_INDEX_VERSION`，發布出來的列一律是
         最新結構）、`_built_at`（＝`meta["published_at"]`）、`_total_scanned`
         （＝`meta["candidates"]`）、`_meta`（原樣保留，供 `query()` 的
@@ -1036,180 +946,34 @@ class ExploreIndex:
             self._total_scanned = meta["candidates"]
             self._meta = meta
 
-    def _call_hl(self, fn: Callable[[], object], *, what: str) -> object:
-        """單一 HL 呼叫。節流與 429 處理已**全部**移到 `HLGateway`＋`WeightLimiter`
-        （spec §5；本物件拿到的 `hl` 必須是 `gateway.scoped("explore")`）：
-        - 額度不足（`BudgetExhausted`）或 scope 暫停（`ScopePaused`）→ `_BudgetUnavailable`
-          → `build_sync` 中止本輪、保留舊版（P3 的 worker 改為逐 job 讓位）。
-        - 429 → gateway 已向 limiter 回報並暫停 explore scope；這裡同樣以
-          `_RateLimitedAbort` 中止本輪。舊版 2/8/30 秒退避與 0.7 秒 sleep 已刪：
-          它們把 429 當節流器用，正是 2026-09-19 事故的根因。
-        - 其他錯誤 → 原樣上拋（`_enrich_one` 的「跳過該列」語意不變）。
-        """
-        try:
-            return fn()
-        except (BudgetExhausted, ScopePaused) as e:
-            raise _BudgetUnavailable(what) from e
-        except Exception as e:
-            if _is_rate_limited(e):
-                logger.error("build aborted: rate limited（%s）", what)
-                raise _RateLimitedAbort(what) from e
-            raise
-
-    def _enrich_one(self, address: str, display_name: str | None) -> ExploreRow | None:
-        """per-address enrich，帶 30 分鐘 TTL、LRU 256 上限快取（近似 LRU：
-        淘汰最舊寫入時間，同 `app.py._cached_trader_data` 既有寫法）。任何一步
-        （portfolio/fills/clearinghouse）非 429、非額度問題的失敗 → 整列跳過
-        （`None`），記入快取，60 天內同一輪重建不會重複打壞地址的上游（enrich
-        TTL 本身就是負面快取）。429（`_RateLimitedAbort`）或額度不足／scope
-        暫停（`_BudgetUnavailable`）→ 原樣往上傳（不快取、不當成「這個地址
-        壞掉」，見 `_call_hl` 與 `build_sync`）。
-        """
-        now = self._now_fn()
-        with self._lock:
-            cached = self._enrich_cache.get(address)
-        if cached is not None and now - cached[0] < self._enrich_ttl_s:
-            return cached[1]
-        row: ExploreRow | None = None
-        try:
-            portfolio_raw = self._call_hl(lambda: self._hl.portfolio(address),
-                                          what=f"portfolio address={address}")
-            end = datetime.fromtimestamp(now, tz=timezone.utc)
-            start = end - timedelta(days=self._fills_window_days)
-            # D5（2026-09-05）：改走原始形狀分頁出口（Task 3a）——`fills_stats`
-            # 需要 dir/oid/startPosition/closedPnl，`get_fills_detail_paged` 會
-            # 把這些欄位裁掉，見 hl.get_fills_raw_paged docstring。
-            fills, fills_truncated = self._call_hl(
-                lambda: self._hl.get_fills_raw_paged(address, start, end,
-                                                     max_pages=self._cfg.fills_max_pages),
-                what=f"fills address={address}")
-            ch_state = self._call_hl(lambda: self._hl.clearinghouse_state(address),
-                                     what=f"clearinghouse address={address}")
-            row = enrich_candidate(address, display_name, portfolio_raw, fills, ch_state,
-                                   fills_truncated=fills_truncated)
-        except (_RateLimitedAbort, _BudgetUnavailable):
-            raise  # 中止整輪建置的訊號，不得被下面這個 except 吞成「跳過該列」
-        except Exception as e:  # noqa: BLE001 — 展示端點：單一地址失敗不得中斷整批建置
-            logger.error("explore enrich 失敗 address=%s: %r", address, e)
-            row = None
-        with self._lock:
-            if (address not in self._enrich_cache
-                    and len(self._enrich_cache) >= self._enrich_cache_max):
-                oldest = min(self._enrich_cache, key=lambda k: self._enrich_cache[k][0])
-                del self._enrich_cache[oldest]
-            self._enrich_cache[address] = (now, row)
-        return row
-
-    def build_sync(self) -> None:
-        """實際建置工作（背景 thread 的 target；亦可在測試中直接同步呼叫取得
-        決定性行為，不必跑真線程）。
-
-        上游候選池來源失敗／無資料 → 直接返回、**不動** `self._rows`
-        （fail-open 到舊版；若本來就沒有舊版，`query()` 會繼續回
-        `building: True`，見類別檔頭）。排除清單載入失敗 → 視為空清單
-        （寧可這一輪意外把 Filet 自營地址也掃進候選池——下一輪排除清單恢復
-        就會自然排除——也不要整個建置流程被一個旁支查詢拖垮）。
-
-        任一地址的 HL 呼叫遇到 429（`_RateLimitedAbort`）或權重額度不足／scope
-        暫停（`_BudgetUnavailable`）→ **立即中止整輪建置**（不繼續掃剩餘候選、
-        不再像舊版等退避重試耗盡）、**不動** `self._rows`（fail-open 到舊版，
-        同上游故障的既有語意），見模組檔頭「2026-09-20 更新」段。
-        """
-        try:
-            payload = self._leaderboard_source_fn()
-        except Exception as e:  # noqa: BLE001 — fail-open，見上
-            logger.error("explore index：候選池來源查詢失敗: %r", e)
-            payload = None
-        if payload is None:
-            logger.error("explore index：leaderboard 來源無資料，本輪建置跳過（沿用舊版）")
-            return
-        try:
-            excluded = {a.lower() for a in (self._excluded_fn() or set())}
-        except Exception as e:  # noqa: BLE001
-            logger.error("explore index：Filet 自營地址排除清單載入失敗，本輪視為空清單: %r", e)
-            excluded = set()
-
-        candidates = candidate_addresses(payload, self._cfg.candidate_pool, excluded)
-        rows: list[ExploreRow] = []
-        try:
-            for address, display_name in candidates:
-                row = self._enrich_one(address, display_name)
-                if row is not None:
-                    rows.append(row)
-        except (_RateLimitedAbort, _BudgetUnavailable) as e:
-            logger.error("中止本輪建置（%s），保留舊 snapshot", e)
-            return
-        rows = _apply_tags(rows, self._cfg)
-        built_at = self._now_fn()
-        total_scanned = len(candidates)
-
-        with self._lock:
-            self._rows = rows
-            self._rows_version = EXPLORE_INDEX_VERSION
-            self._built_at = built_at
-            self._total_scanned = total_scanned
-
-        # I-17：成功建置一輪後順手落一份磁碟快照，供下次程序重啟時立即可查
-        # （見模組檔頭「I-17」節）。寫入失敗（例如目錄權限）只記錄、不影響
-        # 本輪建置已經成功換版這件事——快取是加速手段，不是正確性的一部分。
-        if self._snapshot_path is not None:
-            try:
-                dump_snapshot(self._snapshot_path, rows=rows, built_at=built_at,
-                             total_scanned=total_scanned)
-            except OSError as e:
-                logger.error("explore index 快照落檔失敗（不影響本輪建置結果）: %s", e)
-
-    def _maybe_trigger_build(self) -> None:
-        """TTL 過期（或從未建置過，或現有快照的結構版本已不相容——R4-3，見
-        `EXPLORE_INDEX_VERSION`）且目前沒有背景建置在跑 → 開一條 daemon
-        thread 執行 `build_sync`；呼叫本身立即返回，不等 thread 結束
-        （見類別檔頭：讀路徑永不阻塞）。"""
-        now = self._now_fn()
-        with self._lock:
-            fresh = (self._built_at is not None
-                     and now - self._built_at < self._ttl_s
-                     and self._rows_version == EXPLORE_INDEX_VERSION)
-            if fresh or self._building:
-                return
-            self._building = True
-
-        def worker():
-            try:
-                self.build_sync()
-            finally:
-                with self._lock:
-                    self._building = False
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def query(self, *, page: int = 1, window: str = DEFAULT_WINDOW,
              min_live_days: int | None = None, min_fills: int | None = None,
              max_dd_pct: float | None = None, max_concentration_pct: float | None = None,
              require_sample: bool = True, max_dd_filter: bool = True,
              exclude_concentrated: bool = True,
              sort: str = DEFAULT_SORT, order: str = DEFAULT_ORDER) -> dict:
-        """讀路徑：**只讀本地已建置版本，永不觸發上游**（2026-09-20 spec §3／§9.2：
+        """讀路徑：**只讀本地已發布版本，永不觸發上游**（2026-09-20 spec §3／§9.2：
         Explore 頁面刷新不得發 HL info、不得開 rebuild——2026-09-19 事故：請求觸發
-        的 300 池重建把同 IP 額度燒到 429，dashboard／onboard 一起失效）。
-        上游更新改由 explore_scheduler（P3）負責；本函式在那之前只會端出啟動時
-        從磁碟快照載入的資料。回傳形狀見
-        `app.py` 端點層文件字串：`{rows, page, page_size, total_qualified,
-        total_scanned, pool, updated_at, building}`（`pool`：I-17，鏡射
-        `total_scanned`——這一輪實際掃描的候選數，前端榜首常駐提示句「自
-        {pool} 個候選帳戶中列出…」用這個數字，不寫死候選池上限常數，見
-        `explore/page.tsx`）。
+        的 300 池重建把同 IP 額度燒到 429，dashboard／onboard 一起失效）。上游更新
+        全部交給 `ExploreScheduler`（背景逐 job 更新 `ExploreStore`）與
+        `ExplorePublisher`（定期 `set_published` 原子換版，見 Task 3.4／4.1）；
+        本函式**不再**自己觸發任何建置。回傳形狀見 `app.py` 端點層文件字串：
+        `{rows, page, page_size, total_qualified, total_scanned, pool, updated_at,
+        building}`（`pool`：I-17，鏡射 `total_scanned`——這一輪實際掃描的候選數，
+        前端榜首常駐提示句「自 {pool} 個候選帳戶中列出…」用這個數字，不寫死候選池
+        上限常數，見 `explore/page.tsx`）。
 
-        從未成功建置過，或現有快照的結構版本已不相容（`self._rows is None`
+        從未成功發布過，或現有版本的結構版本已不相容（`self._rows is None`
         或 `self._rows_version != EXPLORE_INDEX_VERSION`，R4-3，見模組檔頭
-        「index 結構版本」節）→ `building: True`、空 rows、計數皆 0、
-        `updated_at: None`（前端 R2·C 態二）——版本不相容的快照結構上不能
-        安全地拿去 `qualify`/`sort_key`/`to_dict`（欄位形狀已經換過），視同
-        「沒有可用快照」，觸發重建。
+        「index 結構版本」節）→ `building`／`initializing: True`、空 rows、
+        計數皆 0、`updated_at: None`（前端 R2·C 態二）——版本不相容的快照結構
+        上不能安全地拿去 `qualify`/`sort_key`/`to_dict`（欄位形狀已經換過），
+        視同「沒有可用快照」，等待 `ExplorePublisher` 下一次成功換版。
 
         `window`：所選期間（`WINDOW_KEYS` 之一），決定 `qualify` 的回撤過濾
-        看哪一窗、`sort_rows` 用哪一窗排序（R4-3；不影響候選池——候選池仍是
-        `build_sync` 固定用 stats-data month 窗 roi 選出，見模組檔頭「R4-3」節
-        「誠實揭露」段）。
+        看哪一窗、`sort_rows` 用哪一窗排序（R4-3；不影響候選池——候選池由
+        `ExploreScheduler` 固定用 stats-data month 窗 roi 選出，見模組檔頭
+        「R4-3」節「誠實揭露」段）。
         `min_live_days`／`min_fills`／`max_dd_pct`／`max_concentration_pct`：
         R4-3 自由門檻（`None`＝沿用 `self._cfg` 的預設值，供內部/測試呼叫端在
         不關心門檻時省略；`app.py` 端點層一律夾取後傳入明確數值，見
@@ -1217,16 +981,6 @@ class ExploreIndex:
         `sort`／`order`：Task 11（D12／D13），排序在資格過濾**之後**、分頁
         **之前**做（對合格全集排序，不是只排當頁）；回傳 dict 原樣 echo 這兩個
         值（`"sort"`／`"order"` 鍵）供前端表頭箭頭顯示對照，見 `sort_rows`。
-
-        ⭐ 讀值**必須**在觸發背景建置**之前**取得快照，不能反過來：`_maybe_trigger_
-        build()` 開的背景 thread 若剛好在本次呼叫的極短時間內就跑完（例如注入的
-        `leaderboard_source_fn`/`hl` 全同步、無阻塞——單元測試最常見的情境），
-        會在本函式讀 `self._rows` 之前就把它從 `None` 換成新版，讓「從未建置過
-        → building: True」這個判斷變成競態、非決定性（2026-08-30 全量跑
-        `test_endpoint_never_built_returns_building_true` flake 的根因：機械可
-        重現，見 commit message）。反過來寫（先讀快照、後觸發背景建置）本次呼叫
-        的回應內容只取決於呼叫**當下**已完成的版本，與背景 thread 之後何時完成
-        無關——讀路徑永不阻塞、且結果決定性，兩者同時成立。
         """
         with self._lock:
             rows = self._rows

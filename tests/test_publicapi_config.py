@@ -359,3 +359,22 @@ def test_explore_db_path_defaults_to_none():
 def test_explore_db_path_read_from_env():
     cfg = ApiConfig.from_env(_env(FILET_EXPLORE_DB="/var/lib/filet-api/explore.db"))
     assert cfg.explore_db_path == "/var/lib/filet-api/explore.db"
+
+
+# ---------- explore_upstream_refresh（Task 3.4，2026-09-20）----------
+
+def test_explore_upstream_refresh_defaults_to_false():
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.explore_upstream_refresh is False
+
+
+def test_explore_upstream_refresh_enabled_without_db_path_raises():
+    with pytest.raises(ValueError, match="EXPLORE_UPSTREAM_REFRESH.*FILET_EXPLORE_DB"):
+        ApiConfig.from_env(_env(EXPLORE_UPSTREAM_REFRESH="1"))
+
+
+def test_explore_upstream_refresh_enabled_with_db_path_passes():
+    cfg = ApiConfig.from_env(_env(EXPLORE_UPSTREAM_REFRESH="true",
+                                  FILET_EXPLORE_DB="/var/lib/filet-api/explore.db"))
+    assert cfg.explore_upstream_refresh is True
+    assert cfg.explore_db_path == "/var/lib/filet-api/explore.db"
