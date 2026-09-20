@@ -919,11 +919,12 @@ def apply_page(state, page: list[dict], *, page_limit=2000, retention_limit=10_0
     #     否則 cursor = page[-1]['time']（inclusive，重疊由 PK 去重），pages_done += 1，continue
 ```
 
+<!-- 2026-09-20 裁決（2.2 驗收）：增量輪 `fills_in_window` 重置為 0，`completeness` 保留——留存門檻只看本輪查詢區間內的觀測筆數，跨輪累加會在數天後誤標 partial。 -->
 留存判準（誠實標註於 docstring）：HL 只保留最近 10,000 筆可查。區間內的成交比區間外更新，所以若區間內觀測筆數 < 10,000 − 一頁，區間內成交必然全在可查範圍內 → `complete`；達到門檻 → `partial`／`reason='retention_limit'`。初次回補在遍歷完成前恆為 `backfilling`（使用者裁決 2026-09-20：不用 `unknown`，這個字像「不清楚狀況」；`backfilling` 明確表示第一輪回補尚未完成）。空頁與 HTTP 200 不改變 completeness。
 
 驗收：`tests/test_explore_fills_sync.py`——滿頁續抓 cursor＝最後一筆時間（無 +1）；重疊頁去重；同毫秒溢出 → partial＋有界終止；短頁 → complete 或 partial（依門檻）；亂序頁 → invalid 不推進；增量模式沿用 synced_through 重疊。
 
-### Task 2.3 @sdd：`config.py` 加 `explore_db_path`（`FILET_EXPLORE_DB`，必填如 `explore_cache_path` 慣例）；`run_api.py` 建 `ExploreStore` 注入 `create_app(explore_store=...)`；測試用 `tmp_path`。
+### Task 2.3 @sdd：`config.py` 加 `explore_db_path`（`FILET_EXPLORE_DB`；<!-- 2026-09-20 裁決：P2 階段**可選**、未設→None 不建 store，避免正式機先加 env；P3 上線（Task 3.4）起改必填 -->）；`run_api.py` 建 `ExploreStore` 注入 `create_app(explore_store=...)`；`/api/ops/health` 加 `explore_store` 統計；測試用 `tmp_path`。
 
 **P2 驗收：** 三個新測試檔全綠；`uv run python -c "import sqlite3; print(sqlite3.sqlite_version)"` ≥ 3.24（UPSERT）。
 
@@ -933,12 +934,49 @@ def apply_page(state, page: list[dict], *, page_limit=2000, retention_limit=10_0
 
 ### Task 3.1 @inline：`explore_scheduler.py`
 
+<!-- 2026-09-20 展開（2.1/2.2/2.3 完成後）：介面與 tick 演算法釘死，builder 不需再做設計判斷。 -->
+
 ```python
 class ExploreScheduler:
-    def __init__(self, *, store, hl_explore_scoped, leaderboard_source_fn, excluded_fn, cfg, now_fn, sleep_fn, notify_dirty: Callable[[], None])
-    def tick(self) -> str          # 單步：'idle'|'ran:<kind>'|'paused'|'no_budget'；測試逐步驅動
-    def run_forever(self, stop: threading.Event)   # thread target：while not stop: tick(); sleep(1 if idle else 0)
+    """單 thread、逐 job 執行；每個 job＝一次 HL 呼叫（或一頁 fills）。所有持久化走 ExploreStore，
+    所有 HL 呼叫走 `hl`（必須是 gateway.scoped("explore")，wait_s=0）。"""
+    def __init__(self, *, store: ExploreStore, hl, leaderboard_source_fn, excluded_fn,
+                 cfg: ExploreConfig, now_fn, sleep_fn, on_dirty: Callable[[], None],
+                 owner: str = "api", lease_s: float = 60.0,
+                 candidates_every_s=600, state_every_s=900, portfolio_every_s=3600,
+                 fills_every_s=14400, hot_rank=50, jitter_pct=0.10, rng=random.random)
+    def tick(self) -> str      # 'idle'|'ran:<kind>'|'no_budget'|'paused'|'rate_limited'|'retry'|'quarantined'
+    def run_forever(self, stop: threading.Event) -> None
+    def status(self) -> dict   # last_tick_at, last_result, ticks, queue_depth, oldest_due_age_s, per-result counters
 ```
+
+`tick()` 演算法：
+1. 首次：`store.enqueue("candidates:candidates", None, "candidates", 0, now)`（去重，已存在不動）。
+2. `job = store.claim_due(now, owner, lease_s)`；`None` → 回 `idle`。
+3. 依 `job.kind`：
+   - `candidates`：`payload = leaderboard_source_fn()`；`None` → `reschedule(now+60, err="no payload")`。否則 `rows = candidate_addresses(payload, cfg.candidate_pool, excluded)`（既有純函式，回 `[(address, display_name)]`；rank＝list 索引＋1，roi 從 payload row 取 `_roi_sort_key`），`store.upsert_candidates(...)`、`deactivate_missing(seen)`；對每個 active 地址 `enqueue(f"{addr}:state", addr, "state", 0, now + spread(addr, state_every_s))`、`portfolio`（priority 1）、`fills`（rank ≤ hot_rank → priority 2，否則 3；`next = now + spread(addr, fills_every_s)`）。`spread(addr, T) = (int(addr[-8:], 16) % T)`（首次到期分散，spec §6）。準入上限：`store.stats()` 的 `refresh_job` 列數 > 4 × active 數 → 本輪不再新增、log 一行。`complete(job)`；`enqueue("candidates:candidates", ..., now + candidates_every_s)`。
+   - `state`：`payload = hl.clearinghouse_state(addr)` → `put_cache_ok(addr, "clearinghouseState", payload, now, now + jit(state_every_s))`；`complete`；`enqueue(同 key, next=refresh_after)`；`on_dirty()`。
+   - `portfolio`：同上，`hl.portfolio(addr)` → endpoint `"portfolio"`，週期 `portfolio_every_s`。
+   - `fills`：`st = store.get_sync(addr)`；`plan = plan_page(st, address=addr, now_ms=now*1000)`；`plan.is_noop` → `complete`＋`enqueue(next = plan.state.window_end_ms/1000 + fills_every_s)`。否則 `page = hl.get_fills_page(addr, plan.start_ms, plan.end_ms)`（Task 3.2）；`res = apply_page(plan, page, now_ms=...)`；`store.insert_fills_page(addr, res.accepted, res.state)`；`on_dirty()`；`res.done` → `complete`＋`enqueue(next = now + jit(fills_every_s))`；未完成 → `reschedule(next=now, bump_attempts=False)`（讓位給其他 job，下一 tick 再續）。
+   `jit(T) = T * (1 + (rng()*2-1) * jitter_pct)`。
+4. 例外分類（每個 kind 共用一個 `_run_job` 包裝）：
+   - `BudgetExhausted` → `reschedule(now+5, bump=False)` → `no_budget`。
+   - `ScopePaused as e` → `reschedule(max(now+5, e.until_wall))`，其中 `e.until` 是 limiter 時基（monotonic）——**不要**拿它當 wall clock；改讀 `hl` 的 limiter `snapshot()["paused_remaining_s"]["explore"]`（若 `hl` 沒有 limiter 屬性就用 60）→ `paused`。
+   - `is_rate_limited(e)` → `reschedule(now+60)` → `rate_limited`（gateway 已 `note_429`）。
+   - `ConnectionError`／`TimeoutError`／`httpx.HTTPStatusError`（5xx）→ `attempts+1`，`next = now + min(30 * 2**attempts, 900) + rng()*10` → `retry`。
+   - 其他 `Exception`（4xx 非 429、資料形狀錯）→ `put_cache_error(addr, endpoint, repr(e), now, now+86400)`（fills kind 則寫 `fills_sync.last_error`：用 `insert_fills_page(addr, [], replace(st, last_error=...))` 或 store 提供的 `set_sync_error`——2.1 沒有就在本 task 加一個最小方法）＋`reschedule(now+86400)` → `quarantined`。
+   - `lease` 過期後被別人領走的 `complete`／`reschedule` 回 False → log warning，不重試。
+5. `run_forever`：`while not stop.is_set(): r = tick(); sleep_fn(1.0 if r in ("idle","no_budget","retry") else 5.0 if r == "paused" else 0.0)`；每個 tick 結尾呼叫 `self._on_tick()`（P4 掛 `publisher.maybe_publish`；預設 no-op）。所有例外在 `run_forever` 層 `except Exception: logger.exception(...)` 後繼續（scheduler thread 不得因單一 bug 死掉；spec §3 條件五）。
+
+驗收測試（`tests/test_explore_scheduler.py`，fake clock、FakeHL 計數、`ExploreStore(tmp_path)`）：
+- 首 tick 只建 candidates job；第二 tick 跑 candidates 後每個地址有 state／portfolio／fills 三個 job，`next_attempt_at` 分散（不全等於 now）。
+- 300 地址初次 state＋portfolio（6,600 權重）在 `WeightLimiter(scope_caps={"explore":300})` 下：逐 tick 驅動 fake clock，任一 60 秒切片 `used["explore"] ≤ 300`，且完成時間 ≥ 22 分鐘（spec §6）。
+- `ScopePaused` 期間 tick 回 `paused` 且零上游呼叫。
+- fills 三頁滿頁＋一短頁：分 4 個 tick 完成，期間另一地址的 state job 有機會執行（優先級 0 先於 fills 的 2/3）。
+- 重啟：同一 `tmp_path` 新建 scheduler，`get_sync` 的 cursor 續接，不從頭。
+- 候選進出：第二輪 candidates 少了一個地址 → 該地址 `active=0` 但 cache／fills 仍在；多一個地址只新增它的三個 job。
+- `hl.portfolio` 拋 `RuntimeError("bad shape")` → `quarantined`，`endpoint_cache.last_error` 有值、`payload` 仍 NULL、job 的 `next_attempt_at ≈ now+86400`。
+- `run_forever` 內 tick 拋任意例外不會結束 thread（用 stop event 與計數驗）。
 
 排程規則（spec §6）：
 - `candidates` job：每 600s；呼叫 `leaderboard_source_fn()`（不計 info 權重），`upsert_candidates` 前 `cfg.candidate_pool` 名、`deactivate_missing`；新地址的 portfolio／state 到期時間用 `hash(address) % 分散區間` 打散。
