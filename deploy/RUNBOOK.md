@@ -2193,8 +2193,10 @@ sudo ls -l /var/lib/filet-api/explore.db*
 - `explore_store`：各表列數；`completeness` 分佈從 backfilling 逐步轉 complete／partial。
 - 公開端點：`/api/public/explore` 的 `published_at` 前進、`initializing=false`。
 - **冷啟動時間預期**：300 候選池首次全量抓齊 state(2)＋portfolio(20)＋ledger(20) 需要
-  約 (2+20+20)×300 = 12,600 weight，explore 子預算 300/分鐘 → 至少 42 分鐘才會有
-  ≥80% 候選有 portfolio、達到換版門檻；在此之前 `/api/public/explore` 持續回應
+  約 (2+20+20)×300 = 12,600 weight，explore 子預算 300/分鐘 → 理論下限 42 分鐘；
+  **本機 10 分鐘主網實跑**（`docs/superpowers/research/2026-09-20-explore-refresh-observation.md`）
+  只抓到 39 個 portfolio／10 分鐘（state 優先、fills 分食同一預算），換算 ≥80% 候選有
+  portfolio、達到換版門檻約 **50–65 分鐘**，全部到位 60–80 分鐘；在此之前 `/api/public/explore` 持續回應
   上一版快照（部署當下若是空 DB 冷啟，就是舊快照或 `initializing=true`），
   `explore_publisher.gate_skips` 遞增是預期行為，不是故障。
 判準（工程原則 #6）：**程序活著 ≠ 在工作**——`last_tick_at` 不動或 `built_at` 不動就是 unhealthy，不管 `systemctl` 說什麼。

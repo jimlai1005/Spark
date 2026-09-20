@@ -1167,5 +1167,6 @@ class ExplorePublisher:
 | 5.1 | 2026-09-20 | 89957c9 | RUNBOOK §5.8e（env／drop-in／觀測／停用／回退）＋`deploy/filet-api.service.d/explore-refresh.conf.example`；`test_deploy_artifacts` 28 passed |
 | 3.4 | 2026-09-20 | 4d851e5 | 舊 build_sync 路徑 `rg` 零命中；`run_api` 起 `explore-scheduler` thread（僅 `EXPLORE_UPSTREAM_REFRESH=1`）；config 開啟時 db 必填；ops/health `explore_refresh`／`explore_publisher`；216 passed（explore＋config＋ops＋wiring）；全專案 3043 |
 | **P2–P5 程式完成** | 2026-09-20 | — | opus reviewer：2 Critical／5 Warning／4 Suggestion → 主線程逐條讀碼確認 → Task 3.5（派工中） |
+| 3.5 | 2026-09-20 | 3c70459 | 主線程實跑五判準（0600、jobs (4,2)→退池刪 4→(0,1)、常數同源）全對；`self._sleep(1.0)` 於例外路徑；publisher 門檻／備份 13 命中；3064 passed；ruff 乾淨。複審派工中；5 分鐘短跑（v3 種子）驗門檻進行中 |
 | 5.2 本機觀測 | 2026-09-20 | — | 10 分鐘主網唯讀實跑：0 次 429、explore 視窗最高 300 不超、退款 574、state 191／portfolio 39／fills 10 頁、7 地址 complete、publisher 10 次 0 失敗；**實證 C2**（300 列只 1 列合格）；冷啟動估 60–80 分鐘。報告：`docs/superpowers/research/2026-09-20-explore-refresh-observation.md` |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
