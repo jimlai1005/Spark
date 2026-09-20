@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from collections import Counter
 from pathlib import Path
@@ -227,8 +228,11 @@ class ExplorePublisher:
         self._last_gate = f"{prefix}:{reason}"
         self._last_attempt_at = now
         if self._gate_skips == 1 or self._gate_skips % 10 == 0:
-            logger.warning("explore publisher：發布門檻擋下（第 %d 次，%s），榜單維持舊版",
-                           self._gate_skips, self._last_gate)
+            age = (None if self._last_published_at is None
+                   else int(now - self._last_published_at))
+            logger.warning("explore publisher：發布門檻擋下（第 %d 次，%s），榜單維持舊版"
+                           "（上次成功發布距今 %s 秒）", self._gate_skips, self._last_gate,
+                           "從未" if age is None else age)
 
     def _backup_v3_snapshot_once(self) -> None:
         """C(3)：第一次以 v4 覆寫既有快照前，若磁碟上那份是 v3 來源且尚未備份
@@ -265,11 +269,16 @@ class ExplorePublisher:
         # 「非空但劣化」的版本連續兩分鐘就會把 .prev 也蓋掉。另留一份 `.daily`：
         # 每 24 小時至多輪替一次（以 .daily 的 mtime 對 now_fn 判斷），提供至少
         # 一天前的 last-good 回退點。同樣 best effort。
+        # 兩個時間都取檔案系統 mtime（快照本身 vs .daily），同一基底（工程原則 #1）；
+        # 不拿注入的 now_fn 跟 mtime 比——fake clock 會讓 24h 閘門靜默失效。
+        # 複製先寫 .tmp 再 os.replace：ENOSPC／中途被砍不會留下截斷的 .daily。
         daily = Path(str(p) + ".daily")
         try:
-            stale = (not daily.exists()) or (self._now_fn() - daily.stat().st_mtime >= 86400)
+            stale = (not daily.exists()) or (p.stat().st_mtime - daily.stat().st_mtime >= 86400)
             if stale:
-                shutil.copyfile(p, daily)
+                tmp = Path(str(daily) + ".tmp")
+                shutil.copyfile(p, tmp)
+                os.replace(tmp, daily)
         except OSError as e:
             logger.warning("explore publisher：快照 .daily 備份失敗（不影響發布）: %r", e)
 

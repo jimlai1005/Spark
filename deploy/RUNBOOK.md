@@ -2204,7 +2204,7 @@ sudo ls -l /var/lib/filet-api/explore.db*
 **停用刷新**：`EXPLORE_UPSTREAM_REFRESH=0` → daemon-reload → restart。榜單維持最後一次發布的快照（v4）。SQLite 資料保留，再開啟時 cursor 續接。
 
 **回退**：程式回退照 §9.3 以 commit 為單位；**不要**重新啟用舊的請求觸發重建（程式已刪除，D6）。`explore.db` 與 drop-in 留著無害。
-榜單資料回退：publisher 每次覆寫 `explore_index.json` 前會留 `.prev`（上一版，每分鐘輪替）與 `.daily`（每 24 小時至多輪替一次的 last-good），
+榜單資料回退：publisher 每次覆寫 `explore_index.json` 前會留 `.prev`（上一版，每分鐘輪替）與 `.daily`（每 24 小時至多輪替一次、≥24 小時前的版本（未經品質驗證）），
 首次由 v3 轉 v4 時另留 `.v3.bak`；要回到某版就把對應檔案 `install` 回原名後 restart（`EXPLORE_UPSTREAM_REFRESH=0` 時不會再被覆寫）。
 門檻擋下時 journal 有 `explore publisher：發布門檻擋下（第 N 次，in:/out:…）`（第 1 次與每 10 次各一行）。
 
