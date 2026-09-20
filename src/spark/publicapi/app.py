@@ -2500,8 +2500,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # 本輪不再新增，只 log 一行——這是保護 scheduler 不被詳情頁流量灌爆的
         # 準入閘門（spec §9.1），不是「查不到就不刷新」。
         refreshing = False
-        admission_limit = 5 * len(explore_store.active_candidates()) + 20
-        if explore_store.stats()["refresh_job"] >= admission_limit:
+        jobs, active_n = explore_store.admission_counts()
+        admission_limit = 5 * active_n + 20
+        if jobs >= admission_limit:
             logger.warning(
                 "交易員詳情頁刷新入列已達準入上限（%d），本輪跳過 address=%s",
                 admission_limit, addr)

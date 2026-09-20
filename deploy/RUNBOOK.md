@@ -2166,6 +2166,10 @@ follower 引擎與三個 timer——它們**不經**限流）。`GET /api/public
 | `EXPLORE_UPSTREAM_REFRESH` | `0`／`1` | 預設 `0`＝不起 thread、榜單維持快照；`1`＝起背景刷新 |
 
 ```bash
+# 0) 開 flag 前先備份目前的快照（換版門檻若卡住，至少能手動回退看得到舊榜單；
+#    Task 3.5 C2 修法：發布門檻本身已經會擋住「幾乎全空」的換版，這份備份是
+#    額外一層，防的是備份腳本人為失誤或磁碟層面的意外）：
+sudo cp /var/lib/filet-api/explore_index.json /var/lib/filet-api/explore_index.json.pre-refresh.bak
 # 1) drop-in（第二次部署先設 0，觀察 hl_budget 24 小時再改 1）
 sudo tee /etc/systemd/system/filet-api.service.d/explore-refresh.conf >/dev/null <<'EOF'
 [Service]
@@ -2184,10 +2188,15 @@ sudo ls -l /var/lib/filet-api/explore.db*
 **觀測（admin session，`GET /api/ops/health`）**：
 - `hl_budget`：`used.explore` 任一分鐘 ≤ 300、`counters.rate_limited` 不遞增、`paused_remaining_s.explore` 為 0。
 - `explore_refresh`：`enabled`、`last_tick_at` 持續前進、`last_result` 多為 `ran:*`／`idle`、`queue_depth` 由高走低、`oldest_due_age_s` 不無限成長。
-- `explore_publisher`：`last_published_at` 每分鐘級前進、`failures` 為 0。
+- `explore_publisher`：`last_published_at` 每分鐘級前進、`failures` 為 0；`gate_skips` 在冷啟動期間（見下）遞增屬正常——`last_gate`（例如 `"12/300"`）代表目前已有 portfolio 的候選數／active 候選數，未達 80% 門檻前 publisher 會持續 compose 但不換版、不覆寫快照（C2 修法，見 plan Task 3.5）。
 - `explore_index`：`built_at` 前進（不再是 2026-09-19T15:00）、`rows` ≈ 候選數。
 - `explore_store`：各表列數；`completeness` 分佈從 backfilling 逐步轉 complete／partial。
 - 公開端點：`/api/public/explore` 的 `published_at` 前進、`initializing=false`。
+- **冷啟動時間預期**：300 候選池首次全量抓齊 state(2)＋portfolio(20)＋ledger(20) 需要
+  約 (2+20+20)×300 = 12,600 weight，explore 子預算 300/分鐘 → 至少 42 分鐘才會有
+  ≥80% 候選有 portfolio、達到換版門檻；在此之前 `/api/public/explore` 持續回應
+  上一版快照（部署當下若是空 DB 冷啟，就是舊快照或 `initializing=true`），
+  `explore_publisher.gate_skips` 遞增是預期行為，不是故障。
 判準（工程原則 #6）：**程序活著 ≠ 在工作**——`last_tick_at` 不動或 `built_at` 不動就是 unhealthy，不管 `systemctl` 說什麼。
 
 **停用刷新**：`EXPLORE_UPSTREAM_REFRESH=0` → daemon-reload → restart。榜單維持最後一次發布的快照（v4）。SQLite 資料保留，再開啟時 cursor 續接。

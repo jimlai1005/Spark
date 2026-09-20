@@ -27,9 +27,10 @@ from __future__ import annotations
 import dataclasses
 from typing import NamedTuple
 
+from spark.exchange.base import USER_FILLS_PAGE_LIMIT
 from spark.publicapi.explore_store import FillsSyncState
 
-PAGE_LIMIT = 2000          # HL userFillsByTime 單頁上限
+PAGE_LIMIT = USER_FILLS_PAGE_LIMIT   # HL userFillsByTime 單頁上限（同 hl.py 常數來源，Task 3.5 D）
 RETENTION_LIMIT = 10_000   # HL 只保留最近這麼多筆可查
 WINDOW_DAYS = 30
 OVERLAP_MS = 1

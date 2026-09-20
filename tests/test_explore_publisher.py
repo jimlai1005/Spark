@@ -242,6 +242,129 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
 # 原子寫（驗收 6）
 # ============================================================
 
+# ============================================================
+# Task 3.5 C：發布門檻（min_portfolio_ratio）＋ v3 快照備份
+# ============================================================
+
+def test_maybe_publish_blocked_when_below_portfolio_ratio_threshold(tmp_path):
+    """既有版本＋只有 10% 候選有 portfolio → 擋下發布、`gate_skips==1`、
+    index／快照都不變。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    index = _dummy_index()
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=None)
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True   # 第一次發布：index 從未有版本，不套門檻
+    first = index.query()
+
+    # 新增 9 個沒有 portfolio 的候選，10 個裡只有 1 個（10%）有 portfolio。
+    for i in range(9):
+        addr = "0x" + f"{i:02d}" * 20
+        store.upsert_candidates([(addr, f"trader{i}", i + 2, 0.0)], as_of=1000.0)
+
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is False
+    assert pub.status()["gate_skips"] == 1
+    assert pub.status()["last_gate"] == "1/10"
+    assert index.query() == first
+
+
+def test_maybe_publish_no_gate_when_index_never_published(tmp_path):
+    """index 從未有版本（`rows is None`）→ 不套門檻，即使 portfolio 覆蓋率 0%
+    也照樣發布（首次上線必經狀態）。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1), (_B, "Bob", 2, 0.2)], as_of=1000.0)
+    # 兩個候選都沒有 portfolio 快取（0% 覆蓋率）。
+    index = _dummy_index()
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=None)
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+    assert index.query()["initializing"] is False
+
+
+def test_maybe_publish_passes_gate_at_or_above_threshold(tmp_path):
+    """80% 以上有 portfolio → 通過門檻，正常換版。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    index = _dummy_index()
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=None)
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+    for i in range(1):  # 補一個有 portfolio 的候選，仍是 100% 覆蓋率。
+        addr = _B
+        store.upsert_candidates([(addr, "Bob", 2, 0.2)], as_of=1000.0)
+        store.put_cache_ok(addr, "portfolio", portfolio_raw, fetched_at=900.0,
+                          refresh_after=2000.0)
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert pub.status()["gate_skips"] == 0
+
+
+def test_maybe_publish_gate_skip_still_updates_last_attempt_but_not_last_published(tmp_path):
+    """節流改看 `last_attempt_at`（成功與失敗都更新）；`last_published_at`
+    只在成功時更新。門檻擋下（失敗）也要更新 `last_attempt_at`，讓下一次
+    `force=False` 的呼叫仍受 `min_interval_s` 節流保護（不會被擋下之後立刻
+    重新一直嘗試 compose）。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    index = _dummy_index()
+    now = [1000.0]
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: now[0],
+                           snapshot_path=None, min_interval_s=60.0)
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+    for i in range(9):
+        addr = "0x" + f"{i:02d}" * 20
+        store.upsert_candidates([(addr, f"trader{i}", i + 2, 0.0)], as_of=1000.0)
+
+    now[0] += 100.0
+    pub.mark_dirty()
+    assert pub.maybe_publish() is False   # 門檻擋下
+    last_published_before = pub.status()["last_published_at"]
+
+    now[0] += 10.0   # 未滿 60s
+    pub.mark_dirty()
+    assert pub.maybe_publish() is False   # 應仍被 min_interval 節流，不會又跑一次 compose
+    assert pub.status()["last_published_at"] == last_published_before
+
+
+def test_v3_snapshot_backed_up_once_before_first_v4_overwrite(tmp_path):
+    """C(3)：首次以 v4 覆寫既有 v3 快照前，備份一份 `.v3.bak`；已存在則不重複備份。"""
+    snap_path = tmp_path / "explore_snapshot.json"
+    snap_path.write_text(json.dumps({"version": 3, "built_at": 500.0, "total_scanned": 1,
+                                     "rows": [_v3_row_dict()]}))
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    index = ExploreIndex(cfg=_cfg(), now_fn=lambda: 1000.0, snapshot_path=str(snap_path))
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=str(snap_path))
+
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+
+    bak_path = snap_path.with_name(snap_path.name + ".v3.bak")
+    assert bak_path.exists()
+    backed_up = json.loads(bak_path.read_text())
+    assert backed_up["version"] == 3
+
+    # 再發布一次不應該再覆寫備份（已存在即跳過）。
+    bak_mtime = bak_path.stat().st_mtime_ns
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert bak_path.stat().st_mtime_ns == bak_mtime
+
+
 def test_publish_snapshot_write_leaves_no_leftover_tmp_file(tmp_path):
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)

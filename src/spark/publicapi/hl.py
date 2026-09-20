@@ -401,8 +401,8 @@ class HLGateway:
 
     def get_fills_page(self, address: str, start_ms: int, end_ms: int) -> list[dict]:
         """單頁 `userFillsByTime` 查詢（spec §8.2，scheduler 一次只抓一頁，翻頁與游標由
-        explore_fills_sync 決定）。請求體與 `_paged_fills_raw` 第一頁逐欄位相同
-        （含 aggregateByTime 設定），回**原始** list、不裁切欄位、不翻頁。
+        explore_fills_sync 決定）。請求體與 `_paged_fills_raw` 第一頁逐欄位相同，
+        回**原始** list、不裁切欄位、不翻頁。
         時間邊界 inclusive（HL 文件）。回應非 list → 拋 ValueError。"""
         raw = self._info({"type": "userFillsByTime", "user": address,
                           "startTime": int(start_ms), "endTime": int(end_ms)},

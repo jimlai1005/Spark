@@ -136,6 +136,11 @@ def test_weight_budget_bounded_and_takes_at_least_22_minutes(tmp_path):
     # 不用循序 i——循序 i 的 spread 幾乎等於 i 本身，前段地址會扎堆在同一小段
     # 時間內全部到期，退化成一次性 burst，量不出 §6 描述的穩態節流時間。
     addresses = [f"0x{'0' * 24}{(i * 2654435761) % (2**32):08x}" for i in range(300)]
+    # is_active gate（Task 3.5 B(2)）要求 job 的地址真的是 active 候選，否則第一次
+    # 抓完就被判為 "dropped" 不再續排——這裡先把 300 個地址登記成候選，複製真實
+    # candidates job 跑過一輪後的狀態。
+    store.upsert_candidates([(addr, None, i + 1, None) for i, addr in enumerate(addresses)],
+                            as_of=clock.now())
     for addr in addresses:
         store.enqueue(f"{addr}:state", addr, "state", 0, _spread(addr, 900))
         store.enqueue(f"{addr}:portfolio", addr, "portfolio", 1, _spread(addr, 3600))
@@ -240,6 +245,8 @@ def test_fills_multi_page_completes_over_four_ticks_and_state_gets_a_turn(tmp_pa
     page4 = _fills_page(500, cursor4)  # 短頁，觸發 done
 
     hl = SequencedFillsHL([page1, page2, page3, page4])
+    store.upsert_candidates([("0xabc", None, 1, None), ("0xdef", None, 2, None)],
+                            as_of=clock.now())
     store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
     store.enqueue("0xdef:state", "0xdef", "state", 0, clock.now())
 
@@ -271,6 +278,7 @@ def test_restart_continues_fills_cursor_not_from_scratch(tmp_path):
     store1 = ExploreStore(db_path, now_fn=clock.now)
     page1 = _fills_page(PAGE_LIMIT, window_start_ms)
     hl1 = SequencedFillsHL([page1])
+    store1.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
     store1.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
     sched1 = _sched(store1, hl1, clock=clock)
     sched1._bootstrapped = True
@@ -383,6 +391,173 @@ class ExplodingStore(ExploreStore):
             self._boom_left -= 1
             raise RuntimeError("boom")
         return super().claim_due(*a, **kw)
+
+
+# --- Task 3.5 B：job 生命週期／緊迴圈／準入 COUNT／ScopePaused 不計 attempts ---
+
+def test_candidate_churn_deletes_dropped_addresses_jobs(tmp_path):
+    """B(1)：候選退池後，它的（state/portfolio/ledger/fills）job 全部被刪除
+    （C1 修法——不刪會永久洩漏預算並卡死準入與 purge）。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.5), ("0xbbb", "Bob", 2, 0.4)],
+                            as_of=clock.now())
+    far_future = clock.now() + 10**8
+    for addr in ("0xaaa", "0xbbb"):
+        for kind, prio in (("state", 0), ("portfolio", 1), ("ledger", 1), ("fills", 2)):
+            store.enqueue(f"{addr}:{kind}", addr, kind, prio, far_future)
+
+    payload = {"leaderboardRows": [
+        {"ethAddress": "0xBBB", "displayName": "Bob",
+         "windowPerformances": [["month", {"roi": "0.4"}]]},
+    ]}
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=5))
+    sched._bootstrapped = True
+    store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+
+    r = sched.tick()
+    assert r == "ran:candidates"
+
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM refresh_job WHERE address='0xaaa'").fetchone()[0] == 0
+    # 0xbbb 仍在池內，它原本的四個 job（本輪又補新的一批，key 相同只會更新時間）仍存在。
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM refresh_job WHERE address='0xbbb'").fetchone()[0] == 4
+    # 退池地址的 job 洩漏被清除後，purge 才能真正刪掉候選（C1 的下游效果）。
+    store.deactivate_missing({"0xbbb"})  # 已由 candidates job 完成，這裡僅確認 is_active
+    assert store.is_active("0xaaa") is False
+
+
+def test_dropped_address_job_does_not_reenqueue_itself(tmp_path):
+    """B(2)：`_run_cache_kind` 續排前查 `is_active`——候選已退池 → 回 `"dropped"`，
+    不再自我續排（否則預算永遠漏給非候選）。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", "Alice", 1, 0.5)], as_of=clock.now())
+    store.deactivate_missing(set())  # 0xabc 退池
+    store.enqueue("0xabc:state", "0xabc", "state", 0, clock.now())
+    sched = _sched(store, FakeHL(), clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+    assert r == "dropped"
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM refresh_job WHERE key='0xabc:state'").fetchone()[0] == 0
+
+
+def test_dropped_address_fills_job_does_not_reenqueue(tmp_path):
+    """同上，`_run_fills` 版本（`plan.is_noop` 分支）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", "Alice", 1, 0.5)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.insert_fills_page("0xabc", [], FillsSyncState(
+        address="0xabc", window_start_ms=window_start_ms, window_end_ms=now_ms,
+        cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete", reason=None,
+        pages_done=1, fills_in_window=0, updated_at=clock.now(), last_error=None))
+    store.deactivate_missing(set())  # 0xabc 退池
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    sched = _sched(store, SequencedFillsHL([]), clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+    assert r == "dropped"
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM refresh_job WHERE key='0xabc:fills'").fetchone()[0] == 0
+
+
+def test_run_forever_sleeps_after_unexpected_exception(tmp_path):
+    """B(3)：`run_forever` 的例外路徑也要 `self._sleep(1.0)`，否則是緊迴圈
+    （W1/W2 修法）。用一個獨立於 `sleep_fn` 的 tick 計數器判定何時停止，
+    確保無論本項有沒有修好都會在有限步數內結束（不會真的卡死整個測試）：
+    改好後每一次 tick（含例外）都呼叫一次 `sleep_fn`，`len(sleeps) == ticks`；
+    沒修好時前三次例外 tick 不呼叫 `sleep_fn`，兩者會不相等。"""
+    clock = Clock()
+    store = ExplodingStore(tmp_path / "explore.db", now_fn=clock.now, boom_times=3)
+    orig_claim = store.claim_due
+    ticks = {"n": 0}
+
+    def counting_claim(*a, **kw):
+        ticks["n"] += 1
+        return orig_claim(*a, **kw)
+    store.claim_due = counting_claim
+
+    stop = threading.Event()
+    sleeps: list[float] = []
+
+    def sleep_fn(s):
+        sleeps.append(s)
+        if ticks["n"] >= 5:
+            stop.set()
+
+    sched = ExploreScheduler(
+        store=store, hl=FakeHL(), leaderboard_source_fn=lambda: None,
+        excluded_fn=lambda: set(), cfg=ExploreConfig(), now_fn=clock.now,
+        sleep_fn=sleep_fn, on_dirty=lambda: None)
+
+    thread = threading.Thread(target=sched.run_forever, args=(stop,))
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    # +1：bootstrap 那一次 tick 從不呼叫 claim_due（因此不計入 ticks），但它走的是
+    # 正常完成路徑，一定會呼叫一次 sleep_fn——這是唯一的固定位移。
+    assert len(sleeps) == ticks["n"] + 1
+
+
+def test_scope_paused_does_not_bump_attempts(tmp_path):
+    """B(4)：`ScopePaused` 重排不計 attempts（S1 裁決：暫停不是失敗）。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    lim = WeightLimiter(global_cap=900, scope_caps={"explore": 300},
+                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
+    hl = HLGateway("https://x", post_fn=lambda url, body: {}, sleep_fn=clock.sleep,
+                  limiter=lim).scoped("explore", wait_s=0.0)
+    lim.note_429("interactive")
+
+    store.enqueue("0xabc:state", "0xabc", "state", 0, clock.now())
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+    assert r == "paused"
+    row = store._db.execute(
+        "SELECT attempts FROM refresh_job WHERE key='0xabc:state'").fetchone()
+    assert row[0] == 0
+
+
+def test_candidates_every_s_default_is_1800(tmp_path):
+    """B(5)：`candidates_every_s` 預設 1800（stats-data 36MB 每 30 分鐘至多一次）。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    sched = _sched(store, FakeHL(), clock=clock)
+    assert sched._candidates_every_s == 1800
+
+
+def test_admission_cap_uses_admission_counts_not_stale_len_seen(tmp_path):
+    """B(6)：準入計數改用 `admission_counts()`（同一 lock 內兩個 COUNT，與
+    `active_n = len(seen)` 語意等價但走共用口徑）。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    # 預先塞大量非候選 job，撐爆準入上限（ADMISSION_MULTIPLIER * active_n）。
+    for i in range(100):
+        store.enqueue(f"dummy:{i}", None, "dummy", 5, clock.now())
+
+    payload = _payload(["0xAAA0000000000000000000000000000000AAA1"])
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=1))
+    sched._bootstrapped = True
+    store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+
+    r = sched.tick()
+    assert r == "ran:candidates"
+    # 準入上限被撐爆（100 job > 5*1 active）→ 本輪不新增 per-address job。
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM refresh_job WHERE kind != 'candidates' AND kind != 'dummy'"
+    ).fetchone()[0] == 0
 
 
 def test_run_forever_survives_tick_exceptions(tmp_path):

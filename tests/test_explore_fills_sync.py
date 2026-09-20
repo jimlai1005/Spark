@@ -32,6 +32,13 @@ def test_module_constants_match_spec():
     assert OVERLAP_MS == 1
 
 
+def test_page_limit_same_object_as_hl_module_constant():
+    """Task 3.5 D：`PAGE_LIMIT` 與 `hl.py` 用的是同一個常數來源
+    （`spark.exchange.base.USER_FILLS_PAGE_LIMIT`），不是兩處各自硬編 2000。"""
+    from spark.exchange.base import USER_FILLS_PAGE_LIMIT
+    assert PAGE_LIMIT is USER_FILLS_PAGE_LIMIT
+
+
 def test_plan_page_new_state_none():
     plan = plan_page(None, address=ADDR, now_ms=NOW)
     assert plan.end_ms == NOW

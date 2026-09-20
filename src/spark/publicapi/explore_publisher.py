@@ -19,8 +19,11 @@ Explore 榜單的漸進發布層（spec `docs/superpowers/specs/2026-09-20-hl-le
 """
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 from collections import Counter
+from pathlib import Path
 
 from spark.publicapi.explore_store import ExploreStore
 from spark.publicapi.hl_explore import (FILLS_WINDOW_DAYS, ExploreConfig, ExploreIndex,
@@ -106,57 +109,105 @@ class ExplorePublisher:
     本身，不接線）。"""
 
     def __init__(self, *, store: ExploreStore, index: ExploreIndex, cfg: ExploreConfig,
-                now_fn, snapshot_path: str | None, min_interval_s: float = 60.0):
+                now_fn, snapshot_path: str | None, min_interval_s: float = 60.0,
+                min_portfolio_ratio: float = 0.8):
         self._store = store
         self._index = index
         self._cfg = cfg
         self._now_fn = now_fn
         self._snapshot_path = snapshot_path
         self._min_interval_s = min_interval_s
+        self._min_portfolio_ratio = min_portfolio_ratio
 
         self._dirty = False
         self._last_published_at: float | None = None
+        self._last_attempt_at: float | None = None
         self._publishes = 0
         self._failures = 0
         self._last_error: str | None = None
+        self._gate_skips = 0
+        self._last_gate: str | None = None
 
     def mark_dirty(self) -> None:
         self._dirty = True
 
     def maybe_publish(self, *, force: bool = False) -> bool:
-        """未 dirty 且非強制 → `False`（沒有東西可發布）。距上次發布不足
-        `min_interval_s` 且非強制 → `False`（節流，spec §9.2：每分鐘至多一次）。
-        否則 `compose_rows` → `ExploreIndex.set_published` → （有設
-        `snapshot_path` 才）`dump_snapshot`；任一步例外 → 記錄失敗次數與訊息、
-        **不清 `_dirty`**（下次 tick 會重試）、保留 `ExploreIndex` 目前版本
-        （不呼叫 `set_published`），回 `False`。成功 → 清 `_dirty`、更新
-        `_last_published_at`、`_publishes+=1`、回 `True`。"""
+        """未 dirty 且非強制 → `False`（沒有東西可發布）。距上次嘗試（`_last_attempt_at`，
+        成功或失敗都算）不足 `min_interval_s` 且非強制 → `False`（節流，spec §9.2：
+        每分鐘至多一次）。
+
+        C2 修法：compose 之前先檢查發布門檻——`with_pf = store.count_with_payload
+        ("portfolio")`、`n = admission_counts()[1]`；只要 `ExploreIndex` **已經有版本**
+        （`index.status()["rows"] is not None`——從未有版本例外，首次上線本來就要
+        接受不完整資料）且 `with_pf < min_portfolio_ratio * n`，代表本輪資料還太不完整
+        （例如剛換一批新候選、scheduler 才剛開始 enrich），不換版、不覆寫既有快照，
+        只記 `_gate_skips`／`_last_gate`／`_last_attempt_at`，回 `False`（`_dirty` 保留，
+        下次 tick 會重試）。
+
+        通過門檻才 `compose_rows` → （若快照是 v3 來源且尚未備份）備份一份 `.v3.bak`
+        → `ExploreIndex.set_published` → （有設 `snapshot_path` 才）`dump_snapshot`；
+        任一步例外 → 記錄失敗次數與訊息、**不清 `_dirty`**（下次 tick 會重試）、保留
+        `ExploreIndex` 目前版本（不呼叫 `set_published`），回 `False`。成功 → 清
+        `_dirty`、更新 `_last_published_at`、`_publishes+=1`、回 `True`。"""
         if not self._dirty and not force:
             return False
         now = self._now_fn()
-        if (not force and self._last_published_at is not None
-                and now - self._last_published_at < self._min_interval_s):
+        if (not force and self._last_attempt_at is not None
+                and now - self._last_attempt_at < self._min_interval_s):
             return False
         try:
+            with_pf = self._store.count_with_payload("portfolio")
+            _, n = self._store.admission_counts()
+            has_version = self._index.status()["rows"] is not None
+            if has_version and with_pf < self._min_portfolio_ratio * n:
+                self._gate_skips += 1
+                self._last_gate = f"{with_pf}/{n}"
+                self._last_attempt_at = now
+                return False
             rows, meta = compose_rows(self._store, now=now, cfg=self._cfg)
-            self._index.set_published(rows, meta)
             if self._snapshot_path is not None:
+                self._backup_v3_snapshot_once()
                 dump_snapshot(self._snapshot_path, rows=rows, built_at=meta["published_at"],
                              total_scanned=meta["candidates"])
+            self._index.set_published(rows, meta)
         except Exception as e:  # noqa: BLE001 — 展示端點：一次發布失敗不得中斷 scheduler
             logger.error("explore publisher：發布失敗，保留舊版: %r", e)
             self._failures += 1
             self._last_error = repr(e)
+            self._last_attempt_at = now
             return False
         self._dirty = False
+        self._last_attempt_at = now
         self._last_published_at = now
         self._publishes += 1
         return True
 
+    def _backup_v3_snapshot_once(self) -> None:
+        """C(3)：第一次以 v4 覆寫既有快照前，若磁碟上那份是 v3 來源且尚未備份
+        過，複製一份 `<path>.v3.bak`（C2 修法的一部分——2026-09-19 事故的教訓是
+        換版當下若出問題無法回退，先留一份舊版本在旁邊）。讀檔／解析失敗一律
+        跳過備份、不阻擋本次發布（快照備份是額外保險，不是發布正確性的一部分）。"""
+        p = Path(self._snapshot_path)
+        if not p.exists():
+            return
+        bak = p.with_name(p.name + ".v3.bak")
+        if bak.exists():
+            return
+        try:
+            payload = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError, ValueError):
+            return
+        if isinstance(payload, dict) and payload.get("version") == 3:
+            shutil.copyfile(p, bak)
+
     def status(self) -> dict:
-        """`/api/ops/health` 揭露用（Task 3.4／5.1）：`last_published_at`、
+        """`/api/ops/health` 揭露用（Task 3.4／5.1；`gate_skips`／`last_gate`／
+        `last_attempt_at` 為 Task 3.5 C(4) 新增）：`last_published_at`、
         `dirty`（尚有未發布的變更）、`publishes`／`failures` 累計次數、
-        `last_error`（最近一次失敗的訊息，從未失敗過 → `None`）。"""
+        `last_error`（最近一次失敗的訊息，從未失敗過 → `None`）、`gate_skips`
+        （因發布門檻擋下的累計次數）、`last_gate`（最近一次擋下的 `"with_pf/n"`
+        字串，從未擋過 → `None`）、`last_attempt_at`（成功或失敗都更新）。"""
         return {"last_published_at": self._last_published_at, "dirty": self._dirty,
                "publishes": self._publishes, "failures": self._failures,
-               "last_error": self._last_error}
+               "last_error": self._last_error, "gate_skips": self._gate_skips,
+               "last_gate": self._last_gate, "last_attempt_at": self._last_attempt_at}

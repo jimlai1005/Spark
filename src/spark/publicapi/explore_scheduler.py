@@ -18,6 +18,9 @@ plan `docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md` Task 3.1
 四種 kind：`state`（priority 0）、`portfolio`／`ledger`（priority 1，同級）、
 `fills`（前 `hot_rank` 名 priority 2，其餘 3）；`candidates`（priority 0）
 是每輪重新選池的 bootstrap／週期 job，本身不佔上述 4 個 per-address job 之列。
+`candidates_every_s` 預設 1800（Task 3.5 B(5)）：candidates job 每次都要整批下載
+stats-data leaderboard payload（約 36MB），拉太頻繁本身就是一筆不小的頻寬／延遲
+成本，30 分鐘一次至多已經足夠偵測候選進出。
 
 單一 job 失敗不影響其他 job：例外分類（`BudgetExhausted`／`ScopePaused`／429／
 transient／其他）各自決定下一次 `next_attempt_at`，thread 本身只在
@@ -90,7 +93,7 @@ class ExploreScheduler:
     def __init__(self, *, store: ExploreStore, hl, leaderboard_source_fn: Callable[[], dict | None],
                  excluded_fn: Callable[[], set[str]], cfg: ExploreConfig, now_fn, sleep_fn,
                  on_dirty: Callable[[], None], owner: str = "api", lease_s: float = 60.0,
-                 candidates_every_s: float = 600, state_every_s: float = 900,
+                 candidates_every_s: float = 1800, state_every_s: float = 900,
                  portfolio_every_s: float = 3600, ledger_every_s: float = 3600,
                  fills_every_s: float = 14400, hot_rank: int = 50, jitter_pct: float = 0.10,
                  rng: Callable[[], float] = random.random,
@@ -154,6 +157,9 @@ class ExploreScheduler:
                 self._sleep(delay)
             except Exception:
                 logger.exception("explore scheduler: tick 拋出未預期例外，繼續下一輪")
+                # W1/W2 修法：例外路徑也要節流，否則是緊迴圈（連續拋例外時
+                # 會不斷佔用 CPU 狂打 claim_due）。
+                self._sleep(1.0)
 
     def status(self) -> dict:
         stats = self._store.stats()
@@ -186,7 +192,8 @@ class ExploreScheduler:
             return "no_budget"
         except ScopePaused:
             remaining = self._paused_remaining_s()
-            self._reschedule(job, max(now + 5, now + remaining))
+            # S1 裁決：限流暫停不是這個 job 自己的失敗，不計 attempts。
+            self._reschedule(job, max(now + 5, now + remaining), bump_attempts=False)
             return "paused"
         except Exception as e:  # noqa: BLE001 — 唯一的分類點，見檔頭
             if is_rate_limited(e):
@@ -238,14 +245,15 @@ class ExploreScheduler:
             seen.add(address.lower())
             upsert_rows.append((address, display_name, rank, roi_by_addr.get(address.lower())))
         self._store.upsert_candidates(upsert_rows, now)
-        self._store.deactivate_missing(seen)
+        dropped = self._store.deactivate_missing(seen)
+        for addr in dropped:
+            self._store.delete_jobs(addr)
 
-        stats = self._store.stats()
-        active_n = len(seen)
-        if stats["refresh_job"] > ADMISSION_MULTIPLIER * active_n:
+        jobs, active_n = self._store.admission_counts()
+        if jobs > ADMISSION_MULTIPLIER * active_n:
             logger.warning(
                 "explore scheduler: admission cap reached (%d jobs, %d active) — "
-                "本輪不再新增 per-address job", stats["refresh_job"], active_n)
+                "本輪不再新增 per-address job", jobs, active_n)
         else:
             for rank, (address, _display_name) in enumerate(rows, start=1):
                 self._enqueue_address_jobs(address, rank, now)
@@ -271,8 +279,14 @@ class ExploreScheduler:
         refresh_after = now + self._jit(period_s)
         self._store.put_cache_ok(job.address, endpoint, payload, now, refresh_after)
         self._complete(job)
-        self._store.enqueue(job.key, job.address, job.kind, job.priority, refresh_after)
         self._on_dirty()
+        if not self._store.is_active(job.address):
+            # Task 3.5 B(2)（C1 修法）：候選已退池，續排前先檢查——不然這個
+            # job 會無條件永遠自我續排，預算持續漏給非候選、`refresh_job` 只增
+            # 不減，最終觸發準入上限讓新候選拿不到 job、也讓 `purge` 的
+            # `NOT EXISTS(refresh_job)` 條件永久卡住。
+            return "dropped"
+        self._store.enqueue(job.key, job.address, job.kind, job.priority, refresh_after)
         return f"ran:{job.kind}"
 
     def _run_fills(self, job: Job, now: float) -> str:
@@ -280,6 +294,8 @@ class ExploreScheduler:
         plan = plan_page(st, address=job.address, now_ms=int(now * 1000))
         if plan.is_noop:
             self._complete(job)
+            if not self._store.is_active(job.address):
+                return "dropped"
             next_at = plan.state.window_end_ms / 1000 + self._fills_every_s
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
             return "ran:fills"
@@ -290,8 +306,15 @@ class ExploreScheduler:
         self._on_dirty()
         if res.done:
             self._complete(job)
+            if not self._store.is_active(job.address):
+                return "dropped"
             next_at = now + self._jit(self._fills_every_s)
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
+        elif not self._store.is_active(job.address):
+            # 已抓到的這一頁仍寫入（上面的 insert_fills_page），但地址已退池——
+            # 完成本 job、不再排下一頁，停止繼續上游支出。
+            self._complete(job)
+            return "dropped"
         else:
             self._reschedule(job, now, bump_attempts=False)
         return "ran:fills"

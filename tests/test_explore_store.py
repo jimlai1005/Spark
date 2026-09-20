@@ -192,10 +192,20 @@ def test_enqueue_dedupe_only_raises_priority_and_advances_time(tmp_path):
 def test_deactivate_missing_and_active_candidates(tmp_path):
     store, c = _store(tmp_path)
     store.upsert_candidates([("0xAAA", "Alice", 1, 0.1), ("0xBBB", "Bob", 2, 0.2)], as_of=c.now())
-    store.deactivate_missing({"0xaaa"})
+    dropped = store.deactivate_missing({"0xaaa"})
+    assert dropped == ["0xbbb"]
     active = store.active_candidates()
     assert [row.address for row in active] == ["0xaaa"]
     assert active[0].display_name == "Alice"
+
+
+def test_deactivate_missing_empty_seen_returns_all_previously_active(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.1), ("0xbbb", "Bob", 2, 0.2)], as_of=c.now())
+    dropped = store.deactivate_missing(set())
+    assert sorted(dropped) == ["0xaaa", "0xbbb"]
+    # 第二次呼叫（已全部 active=0）不再回傳同一批。
+    assert store.deactivate_missing(set()) == []
 
 
 def test_purge_keeps_candidate_with_pending_job(tmp_path):
@@ -319,3 +329,63 @@ def test_stats_reports_counts_and_completeness(tmp_path):
     assert stats["candidate"] == 1
     assert stats["fills"] == 1
     assert stats["completeness"] == {"complete": 1}
+
+
+# --- Task 3.5 A：job 生命週期新方法 / db 0600 ---
+
+def test_db_file_created_with_0600_permissions(tmp_path):
+    store, c = _store(tmp_path)
+    mode = tmp_path.joinpath("explore.db").stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_delete_jobs_returns_count_and_removes_only_that_address(tmp_path):
+    store, c = _store(tmp_path)
+    for kind in ("state", "portfolio", "ledger", "fills"):
+        store.enqueue(f"0xabc:{kind}", "0xabc", kind, 1, c.now())
+    store.enqueue("0xdef:state", "0xdef", "state", 0, c.now())
+    deleted = store.delete_jobs("0xABC")
+    assert deleted == 4
+    remaining = [r[0] for r in
+                store._db.execute("SELECT key FROM refresh_job").fetchall()]
+    assert remaining == ["0xdef:state"]
+
+
+def test_delete_jobs_returns_zero_when_no_jobs(tmp_path):
+    store, c = _store(tmp_path)
+    assert store.delete_jobs("0xnope") == 0
+
+
+def test_is_active_reflects_candidate_active_flag(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.1)], as_of=c.now())
+    assert store.is_active("0xAAA") is True
+    store.deactivate_missing(set())
+    assert store.is_active("0xaaa") is False
+
+
+def test_is_active_false_for_unknown_address(tmp_path):
+    store, c = _store(tmp_path)
+    assert store.is_active("0xnope") is False
+
+
+def test_admission_counts_returns_job_count_and_active_candidate_count(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.1), ("0xbbb", "Bob", 2, 0.2)],
+                            as_of=c.now())
+    store.deactivate_missing({"0xaaa"})
+    for kind in ("state", "portfolio", "ledger", "fills"):
+        store.enqueue(f"0xaaa:{kind}", "0xaaa", kind, 1, c.now())
+    assert store.admission_counts() == (4, 1)
+
+
+def test_count_with_payload_only_counts_active_candidates_with_non_null_payload(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.1), ("0xbbb", "Bob", 2, 0.2)],
+                            as_of=c.now())
+    store.put_cache_ok("0xaaa", "portfolio", {"x": 1}, fetched_at=c.now(), refresh_after=c.now())
+    store.put_cache_error("0xbbb", "portfolio", "boom", at=c.now(), next_after=c.now())
+    assert store.count_with_payload("portfolio") == 1
+    # 候選退池後不再計入，即使 payload 仍在。
+    store.deactivate_missing({"0xbbb"})
+    assert store.count_with_payload("portfolio") == 0

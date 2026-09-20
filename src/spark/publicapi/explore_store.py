@@ -26,12 +26,16 @@ ROLLBACK），寫入方法一律 `with self._lock, self._db:`。這是本 task �
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
 import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -152,6 +156,12 @@ class ExploreStore:
             row = self._db.execute("SELECT version FROM schema_version").fetchone()
             if row is None:
                 self._db.execute("INSERT INTO schema_version (version) VALUES (1)")
+        if str(db_path) != ":memory:":
+            try:
+                os.chmod(db_path, 0o600)
+            except OSError:
+                logger.warning("explore store: chmod 0600 失敗（best effort，例如 Windows）",
+                               exc_info=True)
 
     # --- candidate ---
     def upsert_candidates(self, rows: list[tuple[str, str | None, int | None, float | None]],
@@ -168,17 +178,26 @@ class ExploreStore:
                     "last_seen_at=excluded.last_seen_at",
                     (addr, display_name, rank, roi, as_of, as_of))
 
-    def deactivate_missing(self, seen: set[str]) -> None:
+    def deactivate_missing(self, seen: set[str]) -> list[str]:
+        """把不在 `seen` 內的目前 active 候選標記 `active=0`。回傳被停用的地址清單
+        （Task 3.5 B(1)：呼叫端用這份清單對每個退池地址 `delete_jobs`，停止一切
+        對它的上游支出）。"""
         norm_seen = {_norm(a) for a in seen}
         with self._lock, self._db:
             if not norm_seen:
+                dropped = [r[0] for r in self._db.execute(
+                    "SELECT address FROM candidate WHERE active=1").fetchall()]
                 self._db.execute("UPDATE candidate SET active=0 WHERE active=1")
-                return
+                return dropped
             placeholders = ",".join("?" * len(norm_seen))
+            dropped = [r[0] for r in self._db.execute(
+                f"SELECT address FROM candidate WHERE active=1 "
+                f"AND address NOT IN ({placeholders})", tuple(norm_seen)).fetchall()]
             self._db.execute(
                 f"UPDATE candidate SET active=0 WHERE active=1 "
                 f"AND address NOT IN ({placeholders})",
                 tuple(norm_seen))
+        return dropped
 
     def active_candidates(self) -> list[Candidate]:
         with self._lock, self._db:
@@ -189,6 +208,34 @@ class ExploreStore:
         return [Candidate(address=r[0], display_name=r[1], source_rank=r[2], source_roi=r[3],
                            source_as_of=r[4], active=bool(r[5]), last_seen_at=r[6])
                 for r in rows]
+
+    def is_active(self, address: str) -> bool:
+        """候選是否仍在池內（`active=1`）；地址未知 → `False`（Task 3.5 B(2)：
+        續排前查此方法，退池即停止一切上游支出）。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT active FROM candidate WHERE address=?", (addr,)).fetchone()
+        return row is not None and bool(row[0])
+
+    def admission_counts(self) -> tuple[int, int]:
+        """`(refresh_job 總數, active 候選數)`——同一 lock 內兩個 COUNT，供
+        scheduler／`app.py` 的準入上限判斷共用同一份口徑（Task 3.5 A）。"""
+        with self._lock, self._db:
+            jobs = self._db.execute("SELECT COUNT(*) FROM refresh_job").fetchone()[0]
+            active_n = self._db.execute(
+                "SELECT COUNT(*) FROM candidate WHERE active=1").fetchone()[0]
+        return jobs, active_n
+
+    def count_with_payload(self, endpoint: str) -> int:
+        """目前 active 候選中，`endpoint` 快取已有非 NULL payload 的數量
+        （`ExplorePublisher` 的發布門檻用，Task 3.5 C）。"""
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM endpoint_cache e JOIN candidate c "
+                "USING(address) WHERE e.endpoint=? AND e.payload IS NOT NULL "
+                "AND c.active=1", (endpoint,)).fetchone()
+        return row[0]
 
     # --- endpoint_cache ---
     def get_cache(self, address: str, endpoint: str, params_fp: str = "") -> CacheEntry | None:
@@ -313,6 +360,15 @@ class ExploreStore:
                 "next_attempt_at=MIN(next_attempt_at, ?) WHERE key=?",
                 (priority, next_attempt_at, key))
             return False
+
+    def delete_jobs(self, address: str) -> int:
+        """刪除某地址所有 `refresh_job`（退池即刪，Task 3.5 B(1)：C1 修法——
+        不刪的話 job 永不消失，預算漏給非候選、準入上限被洩漏的 job 卡死、
+        `purge` 的 `NOT EXISTS(refresh_job)` 條件永久卡住）。回傳刪除筆數。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            cur = self._db.execute("DELETE FROM refresh_job WHERE address=?", (addr,))
+        return cur.rowcount
 
     def due_jobs_count(self, now: float) -> int:
         with self._lock, self._db:
