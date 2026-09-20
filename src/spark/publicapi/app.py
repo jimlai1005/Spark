@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -55,7 +56,7 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
                                      has_active_subscription, plan_catalog,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
-from spark.publicapi.explore_store import ExploreStore
+from spark.publicapi.explore_store import CacheEntry, ExploreStore
 # 健康面板讀的是**引擎自己寫的**狀態檔——路徑常數與判定一律引用引擎的定義，
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
 from spark.copytrade.equity import sample_coverage
@@ -1343,6 +1344,27 @@ def filter_authorizations(txs: list, limit: int) -> list[dict]:
     return out[:limit]
 
 
+@dataclass
+class TraderData:
+    """`_cached_trader_data` 的回傳型別（Task 3.3，D4：`/api/public/traders/
+    {address}` 池內地址改讀本地 `ExploreStore`，不等待、零上游呼叫）。既有 6 欄
+    （`rows`／`account_value`／`deposit`／`ch_state`／`fills`／`fills_truncated`，
+    語意與呼叫端既有慣例不變，見 `_cached_trader_data` 檔頭）＋ 4 新欄：
+    `source`（`"local"|"upstream"`）、`refreshing`（本次是否有 stale 欄位已入列
+    刷新）、`as_of`（各欄位資料的 wall epoch 秒，缺則 `None`）、`coverage`
+    （fills 的完整性描述，見 `public_trader_detail` 的 `fills_coverage`）。"""
+    rows: list | None
+    account_value: str | None
+    deposit: Decimal | None
+    ch_state: dict | None
+    fills: list | None
+    fills_truncated: bool
+    source: str
+    refreshing: bool
+    as_of: dict
+    coverage: dict
+
+
 def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                billing=None, notifier=None, leaderboard_get_fn=None,
                mailer=None,
@@ -2447,9 +2469,60 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     _trader_portfolio_negative_cache: dict[str, float] = {}
     TRADER_PORTFOLIO_NEGATIVE_TTL_S = 60.0
 
-    def _cached_trader_data(
-        address: str, ratelimit_key: str
-    ) -> tuple[list | None, str | None, Decimal | None, dict | None, list | None, bool]:
+    def _local_trader_data(addr: str, portfolio_cache: CacheEntry, now: float) -> TraderData:
+        """Task 3.3（D4）：池內地址（`explore_store` 已有非 None 的 `portfolio`
+        快取）——完全不打上游，直接讀 `ExploreStore`（由 `ExploreScheduler`，
+        Task 3.1，定期背景刷新）。stale 欄位只入列刷新（去重、有容量上限），
+        不等待、不在本次請求內完成（spec §9.2 不變條件 1：開頁不發 info）。"""
+        rows = portfolio_cache.payload
+        ch_cache = explore_store.get_cache(addr, "clearinghouseState")
+        ch_state = ch_cache.payload if ch_cache is not None else None
+        account_value = (ch_state.get("marginSummary", {}).get("accountValue")
+                         if ch_state else None)
+        ledger_cache = explore_store.get_cache(addr, "ledger")
+        deposit = (sum_ledger_deposits(ledger_cache.payload)
+                  if ledger_cache is not None and ledger_cache.payload is not None else None)
+        now_ms = int(now * 1000)
+        window_ms = hl_explore.FILLS_WINDOW_DAYS * 86400000
+        fills = explore_store.get_fills(addr, now_ms - window_ms, now_ms)
+        sync = explore_store.get_sync(addr)
+        fills_truncated = sync is None or sync.completeness != "complete"
+        coverage = {
+            "state": sync.completeness if sync is not None else "backfilling",
+            "observed_from": sync.observed_from_ms if sync is not None else None,
+            "observed_to": sync.observed_to_ms if sync is not None else None,
+            "reason": sync.reason if sync is not None else None,
+        }
+        # 準入上限（去重＋容量）：`refresh_job` 總數已達 5×active 候選數＋20 →
+        # 本輪不再新增，只 log 一行——這是保護 scheduler 不被詳情頁流量灌爆的
+        # 準入閘門（spec §9.1），不是「查不到就不刷新」。
+        refreshing = False
+        admission_limit = 5 * len(explore_store.active_candidates()) + 20
+        if explore_store.stats()["refresh_job"] >= admission_limit:
+            logger.warning(
+                "交易員詳情頁刷新入列已達準入上限（%d），本輪跳過 address=%s",
+                admission_limit, addr)
+        else:
+            for kind, cache_entry in (("portfolio", portfolio_cache), ("state", ch_cache),
+                                      ("ledger", ledger_cache)):
+                if cache_entry is None or now >= cache_entry.refresh_after:
+                    explore_store.enqueue(f"{addr}:{kind}", addr, kind, 1, now)
+                    refreshing = True
+            if sync is None or now - sync.updated_at >= 4 * 3600:
+                explore_store.enqueue(f"{addr}:fills", addr, "fills", 2, now)
+                refreshing = True
+        as_of = {
+            "portfolio": portfolio_cache.fetched_at,
+            "state": ch_cache.fetched_at if ch_cache is not None else None,
+            "ledger": ledger_cache.fetched_at if ledger_cache is not None else None,
+            "fills": sync.updated_at if sync is not None else None,
+        }
+        return TraderData(rows=rows, account_value=account_value, deposit=deposit,
+                          ch_state=ch_state, fills=fills, fills_truncated=fills_truncated,
+                          source="local", refreshing=refreshing, as_of=as_of,
+                          coverage=coverage)
+
+    def _cached_trader_data(address: str, ratelimit_key: str) -> TraderData:
         """`hl.portfolio()` ＋ `hl.clearinghouse_state()` ＋
         `hl.non_funding_ledger_updates()` ＋ `hl.get_fills_raw_paged()`（D5，
         2026-09-05 新增，供 `trader_stats.fills_stats` 使用）的 5 分鐘
@@ -2477,8 +2550,32 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         `public_trader_detail`），不是位址——按位址計費擋不住「同一個 client
         輪流枚舉不同位址」這個真正的上游放大面（見 [C1]）。
 
-        回傳 `(rows, account_value, initial_deposit_usd, ch_state, fills,
-        fills_truncated)`。"""
+回傳一個 `TraderData`（Task 3.3，D4：`source`／`refreshing`／`as_of`／
+        `coverage` 四個新欄，`upstream` 路徑一律 `source="upstream"`、
+        `refreshing=False`、`as_of` 四欄皆為本次 `now`）。"""
+        now = now_fn()
+
+        def _upstream(rows, account_value, deposit, ch_state, fills,
+                      fills_truncated) -> TraderData:
+            return TraderData(
+                rows=rows, account_value=account_value, deposit=deposit,
+                ch_state=ch_state, fills=fills, fills_truncated=fills_truncated,
+                source="upstream", refreshing=False,
+                as_of={"portfolio": now, "state": now, "ledger": now, "fills": now},
+                coverage={
+                    "state": "complete" if not fills_truncated else "partial",
+                    "observed_from": None, "observed_to": None,
+                    "reason": "page_cap" if fills_truncated else None,
+                })
+
+        # Task 3.3（D4）：池內地址（`explore_store` 已注入且已抓到 portfolio）
+        # 完全不打上游，改讀本地 `ExploreStore`——未注入 store、非候選、或候選
+        # 但尚未抓到 portfolio 三種情形一律落回既有 upstream 路徑（行為不變）。
+        if explore_store is not None:
+            portfolio_cache = explore_store.get_cache(address, "portfolio")
+            if portfolio_cache is not None and portfolio_cache.payload is not None:
+                return _local_trader_data(address, portfolio_cache, now)
+
         # 2026-09-20 opus 複審 W4：ledger／fills 是次要欄位，額度不足（transient）
         # 只降級該欄位為 None，不得把整頁上拋成 502——但這份不完整結果也不得進
         # 5 分鐘快取（額度隨時可能已恢復，快取住半份資料會讓後續 300s 內的請求
@@ -2486,14 +2583,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # transient 降級的旗標；portfolio／clearinghouseState 兩個主欄位仍維持
         # 上拋（見下方兩處 raise）——主欄位缺就是整頁不可用，不是「降級」的範圍。
         skip_cache = False
-        now = now_fn()
         with _trader_portfolio_lock:
             cached = _trader_portfolio_cache.get(address)
             failed_at = _trader_portfolio_negative_cache.get(address)
         if cached is not None and now - cached[0] < TRADER_PORTFOLIO_CACHE_TTL_S:
-            return cached[1], cached[2], cached[3], cached[4], cached[5], cached[6]
+            return _upstream(cached[1], cached[2], cached[3], cached[4], cached[5], cached[6])
         if failed_at is not None and now - failed_at < TRADER_PORTFOLIO_NEGATIVE_TTL_S:
-            return None, None, None, None, None, False
+            return _upstream(None, None, None, None, None, False)
         # ⭐ [C1] per-client rate limit：只在真的要打上游（快取未命中、負面快取也
         # 已過期）這一刻才計費——cache/negative-cache 命中不消耗額度，因為那兩條
         # 路徑本來就不會產生上游流量，計費在那兩條路徑上只會誤傷正常瀏覽。
@@ -2509,7 +2605,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             logger.error("交易員績效上游查詢失敗 address=%s: %s", address, e)
             with _trader_portfolio_lock:
                 _trader_portfolio_negative_cache[address] = now
-            return None, None, None, None, None, False
+            return _upstream(None, None, None, None, None, False)
         account_value = None
         ch_state = None
         try:
@@ -2552,7 +2648,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 # W4：額度不足降級的不完整結果不得寫進 5 分鐘快取（負面快取也已
                 # 在上一行清掉——這不是「這個地址查不到」，下一次請求要能立刻
                 # 重打上游，額度可能已恢復）。
-                return rows, account_value, deposit, ch_state, fills, fills_truncated
+                return _upstream(rows, account_value, deposit, ch_state, fills,
+                                fills_truncated)
             if (address not in _trader_portfolio_cache
                     and len(_trader_portfolio_cache) >= TRADER_PORTFOLIO_CACHE_MAX):
                 oldest = min(_trader_portfolio_cache,
@@ -2560,7 +2657,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 del _trader_portfolio_cache[oldest]
             _trader_portfolio_cache[address] = (
                 now, rows, account_value, deposit, ch_state, fills, fills_truncated)
-        return rows, account_value, deposit, ch_state, fills, fills_truncated
+        return _upstream(rows, account_value, deposit, ch_state, fills, fills_truncated)
 
     def _trader_follow_blocked(addr: str) -> bool:
         """[W4] 已被安全撤銷（`enabled=false`）的 leader 不該在交易員詳情頁看到
@@ -2620,8 +2717,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             raise HTTPException(status_code=422, detail="位址格式不合法（需 0x 開頭 + 40 hex）")
 
         client_host = request.client.host if request.client else "unknown"
-        rows, account_value, initial_deposit_usd, ch_state, fills, fills_truncated = (
-            _cached_trader_data(addr, _TRADER_PROBE_KEY_PREFIX + client_host))
+        data = _cached_trader_data(addr, _TRADER_PROBE_KEY_PREFIX + client_host)
+        rows = data.rows
+        account_value = data.account_value
+        initial_deposit_usd = data.deposit
+        ch_state = data.ch_state
+        fills = data.fills
+        fills_truncated = data.fills_truncated
         if rows is None:
             raise HTTPException(status_code=503, detail="鏈上績效查詢暫時不可用，請稍後重試")
 
@@ -2690,6 +2792,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                         if initial_deposit_usd is not None else None),
                 "mdd_note": MDD_SAMPLING_NOTE,
             },
+            "source": data.source,
+            "refreshing": data.refreshing,
+            "as_of": data.as_of,
+            "fills_coverage": data.coverage,
         }
         view.update(build_cagr_fields(all_time_perf,
                                       sample_days=sample_days_from_perf(all_time_perf)))

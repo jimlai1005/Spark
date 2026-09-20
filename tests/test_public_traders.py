@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from spark.publicapi import hl_explore
 from spark.publicapi.app import create_app
+from spark.publicapi.explore_store import ExploreStore, FillsSyncState
 from spark.publicapi.hl_budget import BudgetExhausted
 from spark.publicapi.store import ApiStore
 from tests.publicapi_helpers import FakeHL, FakeKeysvc, make_app, make_cfg
@@ -599,3 +600,143 @@ def test_live_days_from_av_exception_degrades_to_zero_not_whole_page(tmp_path, m
     body = r.json()
     assert body["live_days"] == 0
     assert body["windows"]["month"] is not None   # 其他區塊不受影響
+
+
+# ============================================================
+# Task 3.3（D4）：池內地址改讀 ExploreStore 本地快取，零上游查詢
+# ============================================================
+
+def _fills_sync(addr, *, now, completeness="complete", observed_from_ms=0,
+                observed_to_ms=None, reason=None):
+    return FillsSyncState(
+        address=addr, window_start_ms=0, window_end_ms=int(now * 1000),
+        cursor_ms=int(now * 1000), synced_through_ms=int(now * 1000),
+        observed_from_ms=observed_from_ms,
+        observed_to_ms=observed_to_ms if observed_to_ms is not None else int(now * 1000),
+        completeness=completeness, reason=reason, pages_done=1, fills_in_window=2,
+        updated_at=now, last_error=None)
+
+
+def _make_pool_app(tmp_path, now):
+    cfg = make_cfg(tmp_path)
+    store = ApiStore(cfg.db_path)
+    keysvc = FakeKeysvc()
+    hl = _CountingHL()
+    explore_store = ExploreStore(tmp_path / "e.db")
+    app = create_app(cfg, store, keysvc, hl, now_fn=lambda: now, explore_store=explore_store)
+    return app, hl, explore_store
+
+
+def test_pool_local_path_fresh_zero_upstream(tmp_path):
+    now = 1_000_000.0
+    app, hl, explore_store = _make_pool_app(tmp_path, now)
+    explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now, now + 3600)
+    explore_store.put_cache_ok(
+        _A, "clearinghouseState",
+        {"marginSummary": {"accountValue": "5000.00"}, "assetPositions": []},
+        now, now + 3600)
+    explore_store.put_cache_ok(
+        _A, "ledger",
+        [{"time": 0, "hash": "0x1", "delta": {"type": "deposit", "usdc": "1000.0"}}],
+        now, now + 3600)
+    explore_store.insert_fills_page(
+        _A,
+        [{"coin": "BTC", "tid": 1, "time": 0},
+         {"coin": "BTC", "tid": 2, "time": 1000}],
+        _fills_sync(_A, now=now))
+
+    c = _client(app)
+    body = None
+    for _ in range(1000):
+        r = c.get(f"/api/public/traders/{_A}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+    assert hl.portfolio_calls == 0
+
+    assert body["account_value"] == "5000.00"
+    assert body["source"] == "local"
+    assert body["refreshing"] is False
+    assert body["fills_coverage"]["state"] == "complete"
+    assert body["as_of"]["portfolio"] == now
+
+
+def test_pool_local_path_stale_portfolio_enqueues_single_job(tmp_path):
+    now = 1_000_000.0
+    app, hl, explore_store = _make_pool_app(tmp_path, now)
+    explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now - 7200, now - 1)
+    explore_store.put_cache_ok(
+        _A, "clearinghouseState",
+        {"marginSummary": {"accountValue": "5000.00"}, "assetPositions": []},
+        now, now + 3600)
+    explore_store.put_cache_ok(_A, "ledger", [], now, now + 3600)
+    explore_store.insert_fills_page(_A, [], _fills_sync(_A, now=now))
+
+    c = _client(app)
+    r = c.get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    assert r.json()["refreshing"] is True
+    assert hl.portfolio_calls == 0
+
+    keys = [row[0] for row in
+            explore_store._db.execute("SELECT key FROM refresh_job").fetchall()]
+    assert keys == [f"{_A}:portfolio"]
+
+    for _ in range(50):
+        assert c.get(f"/api/public/traders/{_A}").status_code == 200
+    keys = [row[0] for row in
+            explore_store._db.execute("SELECT key FROM refresh_job").fetchall()]
+    assert keys == [f"{_A}:portfolio"]
+
+
+def test_pool_local_path_missing_state_ledger_sync_enqueues_three_jobs(tmp_path):
+    now = 1_000_000.0
+    app, hl, explore_store = _make_pool_app(tmp_path, now)
+    explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now, now + 3600)
+
+    c = _client(app)
+    r = c.get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert hl.portfolio_calls == 0
+    assert body["account_value"] is None
+    assert body["methodology"]["initial_deposit_usd"] is None
+    assert body["fills_coverage"]["state"] == "backfilling"
+    assert body["refreshing"] is True
+
+    keys = sorted(row[0] for row in
+                  explore_store._db.execute("SELECT key FROM refresh_job").fetchall())
+    assert keys == sorted([f"{_A}:state", f"{_A}:ledger", f"{_A}:fills"])
+
+
+def test_pool_out_of_scope_address_uses_upstream_path(tmp_path):
+    """非候選地址（explore_store 有注入但沒有該地址的 portfolio 快取）－既有
+    upstream 路徑行為不變，只是回應多了 source/refreshing/as_of/fills_coverage
+    四個新鍵。"""
+    now = 1_000_000.0
+    app, hl, explore_store = _make_pool_app(tmp_path, now)
+    hl.portfolios[_A] = sixty_day_rows()
+    hl.clearinghouse[_A] = {"marginSummary": {"accountValue": "5000.00"},
+                            "assetPositions": []}
+
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert hl.portfolio_calls == 1
+    assert body["source"] == "upstream"
+    assert body["refreshing"] is False
+    assert body["as_of"] == {"portfolio": now, "state": now, "ledger": now, "fills": now}
+    assert body["fills_coverage"] == {"state": "complete", "observed_from": None,
+                                      "observed_to": None, "reason": None}
+
+
+def test_pool_local_path_admission_cap_skips_enqueue(tmp_path):
+    now = 1_000_000.0
+    app, hl, explore_store = _make_pool_app(tmp_path, now)
+    explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now - 7200, now - 1)
+    for i in range(20):
+        explore_store.enqueue(f"dummy:{i}", None, "dummy", 5, now)
+
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    assert r.json()["refreshing"] is False
+    assert explore_store.stats()["refresh_job"] == 20
