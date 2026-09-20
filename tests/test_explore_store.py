@@ -379,6 +379,22 @@ def test_admission_counts_returns_job_count_and_active_candidate_count(tmp_path)
     assert store.admission_counts() == (4, 1)
 
 
+def test_wal_and_shm_side_files_created_with_0600_permissions(tmp_path):
+    """Task 3.6 C（W2 修法）：`journal_mode=WAL` 會在 db 旁邊建 `-wal`／`-shm`
+    側檔，這兩個檔案先前沒被 chmod 過（預設 0644）。用一次寫入觸發側檔落地後
+    檢查——存在者一律 0600。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.1)], as_of=c.now())
+    found_any = False
+    for suffix in ("-wal", "-shm"):
+        p = tmp_path / f"explore.db{suffix}"
+        if p.exists():
+            found_any = True
+            mode = p.stat().st_mode & 0o777
+            assert mode == 0o600, f"{p} mode is {oct(mode)}"
+    assert found_any, "測試環境未產生 WAL/SHM 側檔，無法驗證本項（預期至少一個存在）"
+
+
 def test_count_with_payload_only_counts_active_candidates_with_non_null_payload(tmp_path):
     store, c = _store(tmp_path)
     store.upsert_candidates([("0xaaa", "Alice", 1, 0.1), ("0xbbb", "Bob", 2, 0.2)],
@@ -389,3 +405,14 @@ def test_count_with_payload_only_counts_active_candidates_with_non_null_payload(
     # 候選退池後不再計入，即使 payload 仍在。
     store.deactivate_missing({"0xbbb"})
     assert store.count_with_payload("portfolio") == 0
+
+
+def test_count_with_payload_distinct_address_not_per_params_fp(tmp_path):
+    """Task 3.6 C（S4 修法）：同一地址在 `endpoint_cache` 有兩個不同 `params_fp`
+    的列（例如多 dex）只算一次候選，不是每個 `params_fp` 各算一筆。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "Alice", 1, 0.1)], as_of=c.now())
+    store.put_cache_ok("0xaaa", "portfolio", {"x": 1}, fetched_at=c.now(), refresh_after=c.now())
+    store.put_cache_ok("0xaaa", "portfolio", {"y": 2}, fetched_at=c.now(), refresh_after=c.now(),
+                       params_fp="dex1")
+    assert store.count_with_payload("portfolio") == 1

@@ -136,13 +136,16 @@ class ExplorePublisher:
         成功或失敗都算）不足 `min_interval_s` 且非強制 → `False`（節流，spec §9.2：
         每分鐘至多一次）。
 
-        C2 修法：compose 之前先檢查發布門檻——`with_pf = store.count_with_payload
-        ("portfolio")`、`n = admission_counts()[1]`；只要 `ExploreIndex` **已經有版本**
-        （`index.status()["rows"] is not None`——從未有版本例外，首次上線本來就要
-        接受不完整資料）且 `with_pf < min_portfolio_ratio * n`，代表本輪資料還太不完整
-        （例如剛換一批新候選、scheduler 才剛開始 enrich），不換版、不覆寫既有快照，
-        只記 `_gate_skips`／`_last_gate`／`_last_attempt_at`，回 `False`（`_dirty` 保留，
-        下次 tick 會重試）。
+        C2 修法（Task 3.6 A 再修正）：compose 之前先檢查發布門檻——`with_pf =
+        store.count_with_payload("portfolio")`、`n = admission_counts()[1]`；只要
+        `ExploreIndex` **已經有版本**（`index.status()["rows"] is not None`——從未有
+        版本例外，首次上線本來就要接受不完整資料）且 `n == 0` 或 `with_pf == 0` 或
+        `with_pf < min_portfolio_ratio * n`，代表本輪資料還太不完整或候選來源整批
+        回空（例如上游壞掉、300 候選全被停用——`n == 0` 這個形狀原本會被舊公式
+        `with_pf < ratio * n` 誤判放行，因為 `0 < ratio * 0` 恆為 False），不換版、
+        不覆寫既有快照，只記 `_gate_skips`／`_last_gate`／`_last_attempt_at`，回
+        `False`（`_dirty` 保留，下次 tick 會重試）。`force=True` 完全繞過本段門檻
+        （仍會更新 `_last_attempt_at`），供人工強制換版使用。
 
         通過門檻才 `compose_rows` → （若快照是 v3 來源且尚未備份）備份一份 `.v3.bak`
         → `ExploreIndex.set_published` → （有設 `snapshot_path` 才）`dump_snapshot`；
@@ -159,7 +162,9 @@ class ExplorePublisher:
             with_pf = self._store.count_with_payload("portfolio")
             _, n = self._store.admission_counts()
             has_version = self._index.status()["rows"] is not None
-            if has_version and with_pf < self._min_portfolio_ratio * n:
+            gate_blocked = has_version and (
+                n == 0 or with_pf == 0 or with_pf < self._min_portfolio_ratio * n)
+            if gate_blocked and not force:
                 self._gate_skips += 1
                 self._last_gate = f"{with_pf}/{n}"
                 self._last_attempt_at = now
@@ -195,19 +200,23 @@ class ExplorePublisher:
             return
         try:
             payload = json.loads(p.read_text())
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            logger.warning("explore publisher：v3 快照備份失敗（不影響發布）: %r", e)
             return
         if isinstance(payload, dict) and payload.get("version") == 3:
             shutil.copyfile(p, bak)
 
     def status(self) -> dict:
         """`/api/ops/health` 揭露用（Task 3.4／5.1；`gate_skips`／`last_gate`／
-        `last_attempt_at` 為 Task 3.5 C(4) 新增）：`last_published_at`、
-        `dirty`（尚有未發布的變更）、`publishes`／`failures` 累計次數、
-        `last_error`（最近一次失敗的訊息，從未失敗過 → `None`）、`gate_skips`
-        （因發布門檻擋下的累計次數）、`last_gate`（最近一次擋下的 `"with_pf/n"`
-        字串，從未擋過 → `None`）、`last_attempt_at`（成功或失敗都更新）。"""
+        `last_attempt_at` 為 Task 3.5 C(4) 新增；`min_portfolio_ratio` 為 Task 3.6 A
+        新增）：`last_published_at`、`dirty`（尚有未發布的變更）、`publishes`／
+        `failures` 累計次數、`last_error`（最近一次失敗的訊息，從未失敗過 →
+        `None`）、`gate_skips`（因發布門檻擋下的累計次數）、`last_gate`（最近一次
+        擋下的 `"with_pf/n"` 字串，從未擋過 → `None`）、`last_attempt_at`（成功或
+        失敗都更新）、`min_portfolio_ratio`（目前生效的門檻比例，供人工判讀
+        `last_gate` 用）。"""
         return {"last_published_at": self._last_published_at, "dirty": self._dirty,
                "publishes": self._publishes, "failures": self._failures,
                "last_error": self._last_error, "gate_skips": self._gate_skips,
-               "last_gate": self._last_gate, "last_attempt_at": self._last_attempt_at}
+               "last_gate": self._last_gate, "last_attempt_at": self._last_attempt_at,
+               "min_portfolio_ratio": self._min_portfolio_ratio}

@@ -157,11 +157,20 @@ class ExploreStore:
             if row is None:
                 self._db.execute("INSERT INTO schema_version (version) VALUES (1)")
         if str(db_path) != ":memory:":
-            try:
-                os.chmod(db_path, 0o600)
-            except OSError:
-                logger.warning("explore store: chmod 0600 失敗（best effort，例如 Windows）",
-                               exc_info=True)
+            # Task 3.6 C（W2 修法）：WAL 模式會在 db 旁邊建 `-wal`／`-shm` 側檔，
+            # 這兩個檔案原本沒被 chmod 過（預設 0644，會外洩地址／portfolio 等
+            # 資料到同機其他使用者）。建表（上面）已經觸發至少一次寫入，側檔
+            # 此時應已落地；存在者一律 chmod 0600（best effort）。
+            for suffix in ("", "-wal", "-shm"):
+                side_path = f"{db_path}{suffix}"
+                if not os.path.exists(side_path):
+                    continue
+                try:
+                    os.chmod(side_path, 0o600)
+                except OSError:
+                    logger.warning(
+                        "explore store: chmod 0600 失敗（best effort，例如 Windows）: %s",
+                        side_path, exc_info=True)
 
     # --- candidate ---
     def upsert_candidates(self, rows: list[tuple[str, str | None, int | None, float | None]],
@@ -229,10 +238,13 @@ class ExploreStore:
 
     def count_with_payload(self, endpoint: str) -> int:
         """目前 active 候選中，`endpoint` 快取已有非 NULL payload 的數量
-        （`ExplorePublisher` 的發布門檻用，Task 3.5 C）。"""
+        （`ExplorePublisher` 的發布門檻用，Task 3.5 C）。`COUNT(DISTINCT
+        e.address)`（Task 3.6 C，S4 修法）——同一地址可能有多個 `params_fp`
+        （目前皆為 `''`，未來多 dex／參數指紋擴充時）的列，只算一次候選，
+        不是每個 `params_fp` 各算一筆。"""
         with self._lock, self._db:
             row = self._db.execute(
-                "SELECT COUNT(*) FROM endpoint_cache e JOIN candidate c "
+                "SELECT COUNT(DISTINCT e.address) FROM endpoint_cache e JOIN candidate c "
                 "USING(address) WHERE e.endpoint=? AND e.payload IS NOT NULL "
                 "AND c.active=1", (endpoint,)).fetchone()
         return row[0]

@@ -237,6 +237,13 @@ class ExploreScheduler:
 
         excluded = self._excluded_fn()
         rows = candidate_addresses(payload, self._cfg.candidate_pool, excluded)
+        if not rows:
+            # Task 3.6 B(1)（Critical C1 修法）：候選來源整批回空（上游壞掉、
+            # payload 格式跑掉、被排除清單濾光……）不能當成「所有人退池」——
+            # 不呼叫 upsert_candidates／deactivate_missing，保留既有候選池，
+            # 60 秒後重試。
+            self._reschedule(job, now + 60, err="empty candidate rows", bump_attempts=False)
+            return "retry"
         roi_by_addr = _roi_lookup(payload, excluded)
 
         seen: set[str] = set()
@@ -304,19 +311,17 @@ class ExploreScheduler:
         res = apply_page(plan, page, now_ms=int(now * 1000))
         self._store.insert_fills_page(job.address, res.accepted, res.state)
         self._on_dirty()
-        if res.done:
-            self._complete(job)
-            if not self._store.is_active(job.address):
-                return "dropped"
-            next_at = now + self._jit(self._fills_every_s)
-            self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
-        elif not self._store.is_active(job.address):
-            # 已抓到的這一頁仍寫入（上面的 insert_fills_page），但地址已退池——
-            # 完成本 job、不再排下一頁，停止繼續上游支出。
-            self._complete(job)
-            return "dropped"
-        else:
+        if not res.done:
+            # Task 3.6 B(2)（W1 修法）：續頁不看 is_active——非候選地址（例如
+            # 詳情頁按需入列）多頁回補若中途被判 dropped，會永遠停在
+            # backfilling，整份成交補不完。是否退池只在整輪 done 之後才判斷。
             self._reschedule(job, now, bump_attempts=False)
+            return "ran:fills"
+        self._complete(job)
+        if not self._store.is_active(job.address):
+            return "dropped"
+        next_at = now + self._jit(self._fills_every_s)
+        self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
         return "ran:fills"
 
     # ---- 內部：例外收尾 ----

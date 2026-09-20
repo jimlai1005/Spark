@@ -247,14 +247,18 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
 # ============================================================
 
 def test_maybe_publish_blocked_when_below_portfolio_ratio_threshold(tmp_path):
-    """既有版本＋只有 10% 候選有 portfolio → 擋下發布、`gate_skips==1`、
-    index／快照都不變。"""
+    """既有版本＋只有 10% 候選有 portfolio、非 force → 擋下發布、`gate_skips==1`、
+    index／快照都不變。（Task 3.6 A：`force` 改為連這個比例門檻也一併繞過，
+    這裡改用可變 clock 越過 `min_interval_s` 節流，不再借用 `force=True` 來
+    測試節流——`force=True` 的比例門檻繞過另見
+    `test_maybe_publish_force_bypasses_ratio_gate`。）"""
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
     portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
     store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
     index = _dummy_index()
-    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+    now = [1000.0]
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: now[0],
                            snapshot_path=None)
     pub.mark_dirty()
     assert pub.maybe_publish() is True   # 第一次發布：index 從未有版本，不套門檻
@@ -265,11 +269,68 @@ def test_maybe_publish_blocked_when_below_portfolio_ratio_threshold(tmp_path):
         addr = "0x" + f"{i:02d}" * 20
         store.upsert_candidates([(addr, f"trader{i}", i + 2, 0.0)], as_of=1000.0)
 
+    now[0] += 60.0   # 越過 min_interval，非 force 也能重新嘗試
     pub.mark_dirty()
-    assert pub.maybe_publish(force=True) is False
+    assert pub.maybe_publish() is False
     assert pub.status()["gate_skips"] == 1
     assert pub.status()["last_gate"] == "1/10"
     assert index.query() == first
+
+
+def test_maybe_publish_force_bypasses_ratio_gate(tmp_path):
+    """Task 3.6 A：`force=True` 繞過門檻檢查——10% 覆蓋率下仍發布，
+    `gate_skips` 不遞增（Task 3.6 D 驗收點）。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=900.0, refresh_after=2000.0)
+    index = _dummy_index()
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=None)
+    pub.mark_dirty()
+    assert pub.maybe_publish() is True
+
+    for i in range(9):
+        addr = "0x" + f"{i:02d}" * 20
+        store.upsert_candidates([(addr, f"trader{i}", i + 2, 0.0)], as_of=1000.0)
+
+    pub.mark_dirty()
+    assert pub.maybe_publish(force=True) is True
+    assert pub.status()["gate_skips"] == 0
+    assert index.query()["total_scanned"] == 10
+
+
+def test_maybe_publish_blocked_when_n_is_zero(tmp_path):
+    """Critical 修法：候選來源整批回空（`n == 0`，例如 300 候選全被停用）時，
+    舊公式 `with_pf < ratio * n` 在 `n == 0` 恆為 False，會誤放行、把 0 列
+    發布上 index 並覆寫快照——新公式 `n == 0` 直接判定 `gate_blocked`，
+    快照不落地（`status()["min_portfolio_ratio"]` 一併驗證）。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    index = _dummy_index()
+    index.set_published([], {"published_at": 1.0, "candidates": 0})
+    snap_path = tmp_path / "snap.json"
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=str(snap_path))
+    pub.mark_dirty()
+    assert pub.maybe_publish() is False
+    assert pub.status()["gate_skips"] == 1
+    assert pub.status()["min_portfolio_ratio"] == 0.8
+    assert not snap_path.exists()
+
+
+def test_maybe_publish_blocked_when_with_pf_is_zero(tmp_path):
+    """Critical 修法的另一形狀：`n > 0` 但沒有任何候選有 portfolio
+    （`with_pf == 0`）——同樣要擋下，不因 `ratio * n` 較小的邊界情況誤放行。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    index = _dummy_index()
+    index.set_published([], {"published_at": 1.0, "candidates": 0})
+    pub = ExplorePublisher(store=store, index=index, cfg=_cfg(), now_fn=lambda: 1000.0,
+                           snapshot_path=None)
+    pub.mark_dirty()
+    assert pub.maybe_publish() is False
+    assert pub.status()["gate_skips"] == 1
+    assert pub.status()["last_gate"] == "0/1"
 
 
 def test_maybe_publish_no_gate_when_index_never_published(tmp_path):

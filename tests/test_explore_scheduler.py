@@ -560,6 +560,69 @@ def test_admission_cap_uses_admission_counts_not_stale_len_seen(tmp_path):
     ).fetchone()[0] == 0
 
 
+def test_run_candidates_empty_rows_keeps_existing_pool_active(tmp_path):
+    """B(1)（Critical C1 修法）：候選來源整批回空 rows（例如上游壞掉、payload
+    格式跑掉）不能當成「所有人退池」——不呼叫 `upsert_candidates`／
+    `deactivate_missing`，既有候選仍 active、`refresh_job` 數不變，
+    tick 回 `retry`。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addresses = ["0xAAA0000000000000000000000000000000AAA1",
+                "0xBBB0000000000000000000000000000000BBB2",
+                "0xCCC0000000000000000000000000000000CCC3"]
+    store.upsert_candidates([(a, None, i + 1, None) for i, a in enumerate(addresses)],
+                            as_of=clock.now())
+    for a in addresses:
+        for kind, prio in (("state", 0), ("portfolio", 1), ("ledger", 1), ("fills", 2)):
+            store.enqueue(f"{a}:{kind}", a, kind, prio, clock.now() + 10**6)
+
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: {"leaderboardRows": []},
+                  clock=clock, cfg=ExploreConfig(candidate_pool=300))
+    sched._bootstrapped = True
+    store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+    jobs_before = store.stats()["refresh_job"]
+
+    r = sched.tick()
+
+    assert r == "retry"
+    for a in addresses:
+        assert store.is_active(a.lower()) is True
+    assert store.stats()["refresh_job"] == jobs_before
+
+
+def test_fills_non_candidate_continues_paging_until_done_then_dropped(tmp_path):
+    """B(2)（W1 修法）：非候選地址（例如詳情頁按需入列，未 `upsert_candidates`）
+    的多頁 fills 不因中途檢查 `is_active` 而提早被判 `dropped`——只有整輪
+    `res.done` 之後才查 `is_active` 決定要不要排下一輪。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+
+    page1 = _fills_page(PAGE_LIMIT, window_start_ms)
+    cursor2 = page1[-1]["time"]
+    page2 = _fills_page(PAGE_LIMIT, cursor2)
+    cursor3 = page2[-1]["time"]
+    page3 = _fills_page(PAGE_LIMIT, cursor3)
+    cursor4 = page3[-1]["time"]
+    page4 = _fills_page(100, cursor4)  # 短頁，觸發 done
+
+    hl = SequencedFillsHL([page1, page2, page3, page4])
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    # 刻意不 upsert_candidates("0xabc")：非候選地址（詳情頁入列）。
+
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    results = [sched.tick() for _ in range(4)]
+    assert results == ["ran:fills", "ran:fills", "ran:fills", "dropped"]
+
+    sync = store.get_sync("0xabc")
+    assert sync.pages_done == 3
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM refresh_job WHERE key='0xabc:fills'").fetchone()[0] == 0
+
+
 def test_run_forever_survives_tick_exceptions(tmp_path):
     clock = Clock()
     store = ExplodingStore(tmp_path / "explore.db", now_fn=clock.now, boom_times=3)
