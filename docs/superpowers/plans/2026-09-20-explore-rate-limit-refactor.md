@@ -1145,4 +1145,6 @@ class ExplorePublisher:
 | 4.2 | 2026-09-20 | 0b29710 | vitest 724 passed；`fillsIncomplete()` 單一判準、型別全 optional（新舊後端混跑窗口）。<!-- 裁決：探索頁原本就沒有完整性提示，本輪不加新 UI（D5 精神），欄位已進型別供後續使用 --> |
 | 4.1 | 2026-09-20 | 8cdbf4e | 118 passed（publisher＋explore＋traders）；v4 快照、v3 相容載入；`enrich_candidate` 容忍 None（`_apply_tags`／`qualify` 加 None 守衛）；既有三條版本測試改為 `VERSION-2` 表「不相容」 |
 | 5.1 | 2026-09-20 | 89957c9 | RUNBOOK §5.8e（env／drop-in／觀測／停用／回退）＋`deploy/filet-api.service.d/explore-refresh.conf.example`；`test_deploy_artifacts` 28 passed |
+| 3.4 | 2026-09-20 | 4d851e5 | 舊 build_sync 路徑 `rg` 零命中；`run_api` 起 `explore-scheduler` thread（僅 `EXPLORE_UPSTREAM_REFRESH=1`）；config 開啟時 db 必填；ops/health `explore_refresh`／`explore_publisher`；216 passed（explore＋config＋ops＋wiring）；全專案 3043 |
+| **P2–P5 程式完成** | 2026-09-20 | — | reviewer 派工中；5.2 本機觀測待跑 |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |
