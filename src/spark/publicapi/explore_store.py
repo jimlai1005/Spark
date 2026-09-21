@@ -43,9 +43,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +138,36 @@ CREATE INDEX IF NOT EXISTS job_due ON refresh_job(next_attempt_at, priority);
 
 def _norm(address: str) -> str:
     return address.lower()
+
+
+def _require_inc_from(value: int | None, address: str) -> int:
+    """Task 7.9c D6：`fills_sync.inc_from_ms`（增量軌起點）的寫入邊界守門。
+
+    任何會寫 `fills_sync` 的路徑（`bootstrap_address_fills`／
+    `insert_fills_page`／v2→v3 遷移）都先經過這裡，`None` 一律
+    `ValueError`（整筆寫入不落地）——非空性靠**寫入邊界**保證，不靠讀取端
+    各自加 `is None` 退路（工程原則 5：結構性守門優於「記得檢查」）。"""
+    if value is None:
+        raise ValueError(
+            f"explore store: fills_sync.inc_from_ms 不得為 NULL（address={address}）")
+    return value
+
+
+def _merge_min(a: int | None, b: int | None) -> int | None:
+    """兩個可為 `None` 的觀測極值取較小者（Task 7.9c D2）；都是 `None` → `None`。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
+
+
+def _merge_max(a: int | None, b: int | None) -> int | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
 
 
 def _migration_spread_s(address: str, period_s: float) -> float:
@@ -258,6 +290,29 @@ class Job:
     last_error: str | None
 
 
+class ScanWriteback(str, Enum):
+    """`ExploreStore.complete_scan` 的回傳（Task 7.9c D3）——CAS 落空不再是
+    一個沉默的 `False`，呼叫端（`explore_scheduler._run_scan`）必須能分辨
+    「正常收尾」「重複套用」「被更新的遍歷取代」「增量軌列不見了」四種
+    結局並各自反應（S5）。`str` Enum：值可直接進 log／`status()` 計數鍵。
+
+    - `APPLIED`：CAS 命中，`fills_sync` 的 completeness／reason／scan_id 已更新。
+    - `DUPLICATE`：`fills_sync.scan_id` 已經是這一筆 scan（同一次完成被套用
+      兩次，例如 job 重跑）——不重寫，視為正常收尾。
+    - `STALE`：`fills_sync.scan_id` 指向 `started_at` 更晚的另一筆 scan（這次
+      的結論已經過期）——不覆蓋新結論。
+    - `MISSING`：該地址沒有 `fills_sync` 列（退池後被 purge、或資料被人工刪除）
+      ——沒有增量軌可寫回。
+
+    四種結局都**不影響**「fills 落地」與「`fills_scan` 標記 done」：資料不丟，
+    只有對增量軌的寫回被擋下。"""
+
+    APPLIED = "applied"
+    DUPLICATE = "duplicate"
+    STALE = "stale"
+    MISSING = "missing"
+
+
 class _CasMiss(Exception):
     """Task 7.9b：CAS 未命中時用來觸發 `with self._db:` 隱式 transaction
     的 ROLLBACK（見模組檔頭）。只在 store 內部使用，不逸出到呼叫端。"""
@@ -275,18 +330,23 @@ class ExploreStore:
         self._db.execute("PRAGMA foreign_keys=ON")
         self._lock = threading.Lock()
         self._now = now_fn
-        with self._lock, self._db:
-            self._db.executescript(_SCHEMA)
-            row = self._db.execute("SELECT version FROM schema_version").fetchone()
-            if row is None:
-                self._db.execute(
-                    "INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
-            elif row[0] < _SCHEMA_VERSION:
+        with self._lock:
+            with self._db:
+                self._db.executescript(_SCHEMA)
+                row = self._db.execute("SELECT version FROM schema_version").fetchone()
+                if row is None:
+                    self._db.execute(
+                        "INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
+            if row is not None and row[0] < _SCHEMA_VERSION:
                 if row[0] < 2:
-                    self._migrate_v1_to_v2()
+                    with self._db:
+                        self._migrate_v1_to_v2()
+                        self._db.execute("UPDATE schema_version SET version=2")
                 if row[0] < 3:
+                    # 版本更新在 `_migrate_v2_to_v3` 自己的顯式 transaction 內
+                    # （Task 7.9c D5：列迴圈失敗 → 版本仍停在 2、整段回滾）。
                     self._migrate_v2_to_v3()
-                self._db.execute("UPDATE schema_version SET version=?", (_SCHEMA_VERSION,))
+            self._assert_inc_from_not_null()
         if str(db_path) != ":memory:":
             # Task 3.6 C（W2 修法）：WAL 模式會在 db 旁邊建 `-wal`／`-shm` 側檔，
             # 這兩個檔案原本沒被 chmod 過（預設 0644，會外洩地址／portfolio 等
@@ -302,6 +362,46 @@ class ExploreStore:
                     logger.warning(
                         "explore store: chmod 0600 失敗（best effort，例如 Windows）: %s",
                         side_path, exc_info=True)
+
+    def _assert_inc_from_not_null(self) -> None:
+        """Task 7.9c D6：啟動檢查——`fills_sync.inc_from_ms` 是增量軌起點，
+        整個覆蓋連續性判斷（`complete_scan` 的 gap 檢查）與增量規劃
+        （`explore_fills_sync.plan_incremental`）都以它為基準。空值代表
+        遷移沒跑完或有人繞過寫入邊界改過資料——**啟動即失敗**，不要帶著
+        破掉的不變式跑起來然後在執行時到處補 `is None` 退路（工程原則 5：
+        結構性的守門，不是每個呼叫點各自記得檢查）。
+
+        呼叫端（`__init__`）已持有 `self._lock`，本方法不再自行取鎖。"""
+        n = self._db.execute(
+            "SELECT COUNT(*) FROM fills_sync WHERE inc_from_ms IS NULL").fetchone()[0]
+        if n:
+            raise RuntimeError(
+                f"explore store: {n} 列 fills_sync.inc_from_ms 為 NULL（增量軌起點缺失）"
+                "——遷移未完成或資料被外部改動，拒絕啟動")
+
+    @contextmanager
+    def _explicit_transaction(self) -> Iterator[None]:
+        """顯式 `BEGIN IMMEDIATE … COMMIT`／例外時 `ROLLBACK`（Task 7.9c D5）。
+
+        為什麼不能沿用模組檔頭的 `with self._db:` 隱式 transaction：Python
+        `sqlite3` 的 legacy isolation 模式只在 DML 前自動 BEGIN，**DDL 不在
+        transaction 內**，而遷移需要「列迴圈＋版本更新」這一整段要嘛全成功、
+        要嘛全不留痕跡（7.9b 複審 W1：遷移到一半被殺 → 重開時撞
+        UNIQUE／重複建 verify job）。做法：暫時把連線切到真正的 autocommit
+        （`isolation_level=None`），自己下 `BEGIN IMMEDIATE`，離開時
+        COMMIT／ROLLBACK 並還原原本的 isolation_level。"""
+        prev = self._db.isolation_level
+        self._db.isolation_level = None
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+            self._db.execute("COMMIT")
+        finally:
+            self._db.isolation_level = prev
 
     def _migrate_v1_to_v2(self) -> None:
         """Task 7.5 點 4／5：schema v1→v2——`fills_sync` 補 `params_fp`（既有 DB
@@ -330,9 +430,20 @@ class ExploreStore:
             (REASON_COUNT_BELOW_RETENTION_THRESHOLD,))
 
     def _migrate_v2_to_v3(self) -> None:
-        """Task 7.9b B5：遍歷軌／增量軌分離。同 `_migrate_v1_to_v2`——`ALTER
-        TABLE`／`CREATE TABLE` 是 DDL，各步各自冪等（欄位／表已存在則跳過），
-        不假設整段在同一個 transaction 內（同上函式 docstring 的教訓）。
+        """Task 7.9b B5：遍歷軌／增量軌分離。DDL（`ALTER TABLE`／`CREATE TABLE
+        IF NOT EXISTS`）各自冪等（欄位／表已存在則跳過），且**不在** transaction
+        內（Python `sqlite3` legacy isolation 模式只對 DML 自動 BEGIN）。
+
+        Task 7.9c D5（7.9b 複審 W1）：DDL 之後的「列迴圈＋`schema_version`
+        更新」包在一個顯式 `BEGIN IMMEDIATE … COMMIT`（`_explicit_transaction`）
+        ——中途失敗則整段回滾、版本仍停在 2，下次啟動從頭重跑。同時列迴圈
+        本身**實際**冪等（7.9b 只在 docstring 宣稱冪等，實作會重複建 scan 列
+        與重複改 job）：
+        - 該地址已有任何 `fills_scan` 列 → 整列跳過（這一列已遷移過）。
+        - 新增 job 一律 `INSERT OR IGNORE`；`refresh_job` 改名加
+          `NOT EXISTS`（目標 key 已存在就不改名，避免撞 PRIMARY KEY）。
+        - `fills_verify` 的攤開時間用地址雜湊（`_migration_spread_s`）決定，
+          重跑同一顆 DB 得到同一個時間。
 
         逐列處理既有 `fills_sync`（v2 形狀，尚無新欄位）：
         - `completeness == 'backfilling'`（首輪回補尚未完成）：舊列本身就是
@@ -406,9 +517,20 @@ class ExploreStore:
             "observed_from_ms, observed_to_ms, completeness, reason, pages_done, "
             "fills_in_window, params_fp, updated_at FROM fills_sync"
         ).fetchall()
+        with self._explicit_transaction():
+            self._migrate_v2_to_v3_rows(rows, now)
+            self._db.execute("UPDATE schema_version SET version=3")
+
+    def _migrate_v2_to_v3_rows(self, rows: list[tuple], now: float) -> None:
+        """`_migrate_v2_to_v3` 的列迴圈（拆出來只是為了讓 transaction 的範圍
+        在呼叫端一眼可見，並讓測試能對「列迴圈中途丟例外」注入）。"""
         for (addr, win_start, win_end, cursor_ms, synced_through, obs_from, obs_to,
              completeness, reason, pages_done, fills_in_window, params_fp,
              updated_at) in rows:
+            already = self._db.execute(
+                "SELECT 1 FROM fills_scan WHERE address=? LIMIT 1", (addr,)).fetchone()
+            if already is not None:
+                continue   # 這一列已經遷移過（冪等）。
             if completeness == "backfilling":
                 scan_id = uuid.uuid4().hex
                 self._db.execute(
@@ -425,22 +547,27 @@ class ExploreStore:
                 # `window_start_ms` 維持舊值（`win_start`）不動，僅
                 # `window_end_ms` 同步到 `win_end`（增量軌與遍歷軌此刻共享
                 # 同一個「目前前沿」，之後兩軌各自推進、互不覆蓋）。
+                inc_from = _require_inc_from(win_end, addr)
                 self._db.execute(
                     "UPDATE fills_sync SET inc_from_ms=?, synced_through_ms=?, cursor_ms=?, "
                     "window_end_ms=?, scan_id=NULL, evidence_unknown=0, "
                     "coverage_gap=0 WHERE address=?",
-                    (win_end, win_end, win_end, win_end, addr))
+                    (inc_from, inc_from, inc_from, inc_from, addr))
                 old_job = self._db.execute(
                     "SELECT priority, next_attempt_at, attempts, created_at FROM refresh_job "
                     "WHERE key=?", (f"{addr}:fills",)).fetchone()
                 if old_job is not None:
                     priority, next_attempt_at, attempts, created_at = old_job
+                    # 改名守門（D5）：目標 key 已存在（前一次遷移改過、但版本
+                    # 沒寫成功）→ 不改，避免撞 PRIMARY KEY 讓整段遷移失敗。
                     self._db.execute(
-                        "UPDATE refresh_job SET key=?, kind='fills_scan' WHERE key=?",
-                        (f"{addr}:fills_scan", f"{addr}:fills"))
+                        "UPDATE refresh_job SET key=?, kind='fills_scan' WHERE key=? "
+                        "AND NOT EXISTS (SELECT 1 FROM refresh_job WHERE key=?)",
+                        (f"{addr}:fills_scan", f"{addr}:fills", f"{addr}:fills_scan"))
                     self._db.execute(
-                        "INSERT INTO refresh_job (key, address, kind, priority, created_at, "
-                        "next_attempt_at, attempts) VALUES (?, ?, 'fills', ?, ?, ?, 0)",
+                        "INSERT OR IGNORE INTO refresh_job (key, address, kind, priority, "
+                        "created_at, next_attempt_at, attempts) "
+                        "VALUES (?, ?, 'fills', ?, ?, ?, 0)",
                         (f"{addr}:fills", addr, priority, created_at, now))
             else:  # complete | partial
                 scan_id = uuid.uuid4().hex
@@ -453,10 +580,17 @@ class ExploreStore:
                     (scan_id, addr, "initial", win_start, win_end, cursor_ms, pages_done,
                      fills_in_window, obs_from, obs_to, completeness, reason, updated_at,
                      updated_at, params_fp))
+                # D6：增量軌起點＝舊 `synced_through_ms`（B5 字面：「從現在的
+                # 前沿起算」）。舊列理論上恆有前沿（`complete`／`partial` 都是
+                # 跑完至少一輪才會標上），但 v2 schema 允許 NULL——退回
+                # `window_end_ms`（該輪窗口末端，與 backfilling 分支同一個
+                # 原則），絕不讓 NULL 落地。
+                inc_from = _require_inc_from(
+                    synced_through if synced_through is not None else win_end, addr)
                 self._db.execute(
                     "UPDATE fills_sync SET inc_from_ms=?, scan_id=?, evidence_unknown=?, "
                     "coverage_gap=0 WHERE address=?",
-                    (synced_through, scan_id, 0 if verified else 1, addr))
+                    (inc_from, scan_id, 0 if verified else 1, addr))
                 if not verified:
                     self._db.execute(
                         "INSERT OR IGNORE INTO refresh_job (key, address, kind, priority, "
@@ -606,6 +740,7 @@ class ExploreStore:
         不做任何欄位級的保護——欄位級保護（CAS）只在 `complete_scan`／
         `apply_probe_result` 這兩個真正會被競爭寫入的路徑才需要。"""
         addr = _norm(address)
+        _require_inc_from(checkpoint.inc_from_ms, addr)   # D6：寫入邊界守門
         new_count = 0
         with self._lock, self._db:
             for f in fills:
@@ -685,9 +820,13 @@ class ExploreStore:
         避免任一方單獨落地留下不一致的一半狀態。`fills_sync` 列已存在（同一
         地址重新入池、或候選抖動重複呼叫）→ 不動、回 `False`；新建 → 回
         `True`（呼叫端據此判斷要不要另外入列 `fills_scan` job，見
-        `explore_scheduler._enqueue_address_jobs`）。"""
+        `explore_scheduler._enqueue_address_jobs`）。
+
+        Task 7.9c D6：`inc_from_ms` 由 `now` 直接算出（`int(now * 1000)`），
+        結構上不可能為 `None`——仍走 `_require_inc_from` 這道共同閘門，讓
+        「寫 `fills_sync` 的路徑都經過同一個守門」是結構性的、不是記憶性的。"""
         addr = _norm(address)
-        now_ms = int(now * 1000)
+        now_ms = _require_inc_from(int(now * 1000), addr)
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT 1 FROM fills_sync WHERE address=?", (addr,)).fetchone()
@@ -748,6 +887,24 @@ class ExploreStore:
                 "WHERE address=? AND status='running'", (addr,)).fetchone()
         return None if row is None else self._scan_from_row(row)
 
+    def running_scan(self, address: str) -> FillsScan | None:
+        """Task 7.9c D8：`get_active_scan` 的契約名（S 端依狀態推導排程動作時
+        用的名字，見 plan §7.9c 介面契約）。同一個查詢，不另開實作。"""
+        return self.get_active_scan(address)
+
+    def latest_done_scan(self, address: str) -> FillsScan | None:
+        """Task 7.9c D8：該地址 `status='done'` 中 `finished_at` 最大的一筆
+        （`NULL` 的 finished_at 排最後）——排程端用它判斷 partial 重掃是否
+        到期（`explore_fills_sync.partial_rescan_due`）。沒有任何完成過的
+        遍歷 → `None`。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            row = self._db.execute(
+                f"SELECT {self._SCAN_COLUMNS} FROM fills_scan "
+                "WHERE address=? AND status='done' "
+                "ORDER BY finished_at IS NULL, finished_at DESC LIMIT 1", (addr,)).fetchone()
+        return None if row is None else self._scan_from_row(row)
+
     def create_scan(self, address: str, *, kind: str, window_start_ms: int, window_end_ms: int,
                      cursor_ms: int, started_at: float, params_fp: str = "") -> FillsScan:
         addr = _norm(address)
@@ -790,17 +947,25 @@ class ExploreStore:
                  scan.observed_to_ms, scan.last_error, scan.scan_id))
         return new_count
 
-    def complete_scan(self, address: str, fills: list[dict], scan: FillsScan) -> bool:
-        """遍歷軌完成（Task 7.9b B3）：落地終止頁 fills＋標記 `fills_scan`
-        `status='done'`＋**CAS** 寫回 `fills_sync`（`UPDATE ... WHERE address=?
-        AND (scan_id IS NULL OR scan_id != ?)`——只防同一個 `scan_id` 被重複
-        套用兩次，同一地址同時只有一個 running scan，實務上不會有兩個不同
-        `scan_id` 競爭同一次 apply，這裡按 plan 字面實作）。覆蓋連續性
-        （B1）：`scan.window_end_ms < fills_sync.inc_from_ms` → `coverage_gap=1`。
-        `evidence_unknown` 無條件清 0（任何一次完成的遍歷都是新鮮證據，不論
-        `initial`／`partial_rescan`／`verify`，也不論 `result` 是 `complete`
-        還是 `partial`——B5：「核驗 scan 完成……不強行升級」指的是不強改
-        `result`，不是不清除 unknown 旗標）。回傳 CAS 是否命中。"""
+    def complete_scan(self, address: str, fills: list[dict],
+                       scan: FillsScan) -> ScanWriteback:
+        """遍歷軌完成（Task 7.9b B3／7.9c D3）：落地終止頁 fills＋標記
+        `fills_scan` `status='done'`＋**CAS** 寫回 `fills_sync`。
+
+        覆蓋連續性（B1）：`scan.window_end_ms < fills_sync.inc_from_ms` →
+        `coverage_gap=1`（語義見 `explore_fills_sync.external_coverage_state`
+        的 D7 段：落後是 stale，不是 gap）。`evidence_unknown` 無條件清 0
+        （任何一次完成的遍歷都是新鮮證據，不論 `initial`／`partial_rescan`／
+        `verify`，也不論 `result` 是 `complete` 還是 `partial`——B5：「核驗
+        scan 完成……不強行升級」指的是不強改 `result`，不是不清除 unknown
+        旗標）。D2：本次遍歷觀測到的 `observed_from/to_ms` 以 min／max 併入
+        `fills_sync`（兩軌各自看到的極值合成對外的觀測區間）。
+
+        回傳 `ScanWriteback`（7.9b 的 `bool` 讓 CAS 落空變成靜默的正常收尾）：
+        `MISSING`（無 `fills_sync` 列）／`DUPLICATE`（已經指向這筆 scan）／
+        `STALE`（目前指向 `started_at` 更晚的 scan）／`APPLIED`。三種非
+        `APPLIED` 都不動 `fills_sync`，但 fills 仍落地、`fills_scan` 仍標
+        `done`——資料不丟。DB 例外照常往外拋（不吞）。"""
         addr = _norm(address)
         with self._lock, self._db:
             for f in fills:
@@ -818,15 +983,38 @@ class ExploreStore:
                 (scan.cursor_ms, scan.pages_done, scan.fills_in_window, scan.observed_from_ms,
                  scan.observed_to_ms, scan.result, scan.reason, scan.finished_at,
                  scan.last_error, scan.scan_id))
-            inc_row = self._db.execute(
-                "SELECT inc_from_ms FROM fills_sync WHERE address=?", (addr,)).fetchone()
-            inc_from_ms = inc_row[0] if inc_row is not None else None
+            sync_row = self._db.execute(
+                "SELECT inc_from_ms, scan_id, observed_from_ms, observed_to_ms "
+                "FROM fills_sync WHERE address=?", (addr,)).fetchone()
+            if sync_row is None:
+                return ScanWriteback.MISSING
+            inc_from_ms, current_scan_id, sync_obs_from, sync_obs_to = sync_row
+            if current_scan_id == scan.scan_id:
+                return ScanWriteback.DUPLICATE
+            if current_scan_id is not None:
+                started_row = self._db.execute(
+                    "SELECT started_at FROM fills_scan WHERE scan_id=?",
+                    (current_scan_id,)).fetchone()
+                if started_row is not None and started_row[0] > scan.started_at:
+                    return ScanWriteback.STALE
             gap = 1 if (inc_from_ms is not None and scan.window_end_ms < inc_from_ms) else 0
+            obs_from = _merge_min(sync_obs_from, scan.observed_from_ms)
+            obs_to = _merge_max(sync_obs_to, scan.observed_to_ms)
             cur = self._db.execute(
                 "UPDATE fills_sync SET completeness=?, reason=?, scan_id=?, coverage_gap=?, "
-                "evidence_unknown=0 WHERE address=? AND (scan_id IS NULL OR scan_id != ?)",
-                (scan.result, scan.reason, scan.scan_id, gap, addr, scan.scan_id))
-        return cur.rowcount == 1
+                "evidence_unknown=0, observed_from_ms=?, observed_to_ms=? "
+                "WHERE address=? AND (scan_id IS NULL OR scan_id != ?)",
+                (scan.result, scan.reason, scan.scan_id, gap, obs_from, obs_to, addr,
+                 scan.scan_id))
+            # 讀與寫在同一把 `self._lock`＋同一個 transaction 內，理論上必然
+            # 命中；不命中代表有人繞過 store 直接改了 DB——當成 STALE 處理
+            # （寧可不覆蓋），並留下 warning 讓它可被觀測，不靜默。
+            if cur.rowcount != 1:
+                logger.warning(
+                    "explore store: complete_scan CAS 落空（address=%s scan_id=%s）", addr,
+                    scan.scan_id)
+                return ScanWriteback.STALE
+        return ScanWriteback.APPLIED
 
     def apply_probe_result(self, scan_id: str, address: str, *, old_reason: str,
                             new_reason: str) -> bool:
@@ -910,6 +1098,16 @@ class ExploreStore:
         with self._lock, self._db:
             cur = self._db.execute("DELETE FROM refresh_job WHERE address=?", (addr,))
         return cur.rowcount
+
+    def job_kinds(self, address: str) -> set[str]:
+        """Task 7.9c D8：該地址目前 `refresh_job` 的 kind 集合——排程端
+        「算需要的 job 集合 → 扣掉已存在的 → 逐項准入」用它做去重（W4／S3），
+        不再用「job 列不存在」當成「該建一個新 scan」的觸發條件。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            rows = self._db.execute(
+                "SELECT kind FROM refresh_job WHERE address=?", (addr,)).fetchall()
+        return {r[0] for r in rows}
 
     def due_jobs_count(self, now: float) -> int:
         with self._lock, self._db:
@@ -1024,26 +1222,49 @@ class ExploreStore:
             self._db.execute(
                 "UPDATE fills_scan SET last_error=? WHERE scan_id=?", (err, scan_id))
 
-    def oldest_due_at(self, now: float) -> float | None:
+    def oldest_due_at(self, now: float, *,
+                      kinds: tuple[str, ...] | None = None) -> float | None:
         """目前到期（`next_attempt_at <= now`）的工作中最早的到期時刻；沒有到期
-        工作回 `None`（scheduler `status()` 的 `oldest_due_age_s` 用）。"""
+        工作回 `None`（scheduler `status()` 的 `oldest_due_age_s` 用）。
+
+        Task 7.9c D8：`kinds` 限定 kind 集合（`None` ＝不限定，維持舊行為）
+        ——S 端用 `kinds=("fills_verify",)` 量測核驗軌已經等多久，以實作
+        「有界等待」（等 ≥ `VERIFY_MAX_WAIT_S` 就給一次名額），不讓嚴格讓位
+        變成永久飢餓。"""
+        kind_filter = ""
+        kind_params: tuple = ()
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            kind_filter = f" AND kind IN ({placeholders})"
+            kind_params = tuple(kinds)
         with self._lock, self._db:
             row = self._db.execute(
-                "SELECT MIN(next_attempt_at) FROM refresh_job WHERE next_attempt_at <= ?",
-                (now,)).fetchone()
+                "SELECT MIN(next_attempt_at) FROM refresh_job WHERE next_attempt_at <= ?"
+                + kind_filter, (now, *kind_params)).fetchone()
         return row[0]
 
     # --- maintenance ---
     def purge(self, now: float, *, candidate_keep_s: float = 7 * 86400,
-              fills_keep_s: float = 35 * 86400) -> dict[str, int]:
+              fills_keep_s: float = 35 * 86400,
+              scan_keep_s: float = 30 * 86400) -> dict[str, int]:
         """刪除已停用超過 `candidate_keep_s` 的候選（及其 endpoint_cache／fills／
         fills_sync／fills_scan）——但若該地址仍有 `refresh_job` 列則跳過（避免刪掉
         正在跑的工作依賴的資料）。另外刪除超過 `fills_keep_s` 的 fills，但保留仍落在
         該地址目前同步視窗內（`time_ms >= fills_sync.window_start_ms`）的列。回傳
-        各表刪除筆數。"""
+        各表刪除筆數。
+
+        Task 7.9c D4（7.9b 複審 W3：`fills_scan` 無界成長）：另外刪除
+        `status='done'` 且 `finished_at` 早於 `now - scan_keep_s`（預設 30 天）
+        的歷史遍歷列——但**永遠保留** `fills_sync.scan_id` 目前指向的那一筆
+        （對外 `fills_coverage.evidence` 要能回查它，刪了證據就斷鏈）。
+        兩條清理路徑（退池地址連帶刪除＋保留期清理）都計入
+        `counts["fills_scan"]`——7.9b 的退池連帶刪除連 rowcount 都沒收，
+        清了多少沒人知道。"""
         cutoff_candidate = now - candidate_keep_s
         cutoff_fills_ms = int((now - fills_keep_s) * 1000)
-        counts = {"candidate": 0, "endpoint_cache": 0, "fills": 0, "fills_sync": 0}
+        cutoff_scan = now - scan_keep_s
+        counts = {"candidate": 0, "endpoint_cache": 0, "fills": 0, "fills_sync": 0,
+                  "fills_scan": 0}
         with self._lock, self._db:
             stale = [r[0] for r in self._db.execute(
                 "SELECT c.address FROM candidate c WHERE c.active=0 AND c.last_seen_at < ? "
@@ -1055,6 +1276,7 @@ class ExploreStore:
                 cur = self._db.execute("DELETE FROM fills WHERE address=?", (addr,))
                 counts["fills"] += cur.rowcount
                 cur = self._db.execute("DELETE FROM fills_scan WHERE address=?", (addr,))
+                counts["fills_scan"] += cur.rowcount
                 cur = self._db.execute("DELETE FROM fills_sync WHERE address=?", (addr,))
                 counts["fills_sync"] += cur.rowcount
                 cur = self._db.execute("DELETE FROM candidate WHERE address=?", (addr,))
@@ -1065,6 +1287,13 @@ class ExploreStore:
                 "AND fills.time_ms >= s.window_start_ms)",
                 (cutoff_fills_ms,))
             counts["fills"] += cur.rowcount
+            cur = self._db.execute(
+                "DELETE FROM fills_scan WHERE status='done' AND finished_at IS NOT NULL "
+                "AND finished_at < ? AND NOT EXISTS ("
+                "SELECT 1 FROM fills_sync s WHERE s.address = fills_scan.address "
+                "AND s.scan_id = fills_scan.scan_id)",
+                (cutoff_scan,))
+            counts["fills_scan"] += cur.rowcount
         return counts
 
     def stats(self) -> dict:

@@ -12,6 +12,8 @@ from spark.publicapi.explore_fills_sync import (
     OVERLAP_MS,
     PAGE_LIMIT,
     PARAMS_FP,
+    PARTIAL_RESCAN_AFTER_MS,
+    PARTIAL_RESCAN_AFTER_S,
     RETENTION_SAFETY_MARGIN,
     RETENTION_SAFETY_THRESHOLD,
     WINDOW_DAYS,
@@ -22,6 +24,7 @@ from spark.publicapi.explore_fills_sync import (
     build_fills_coverage,
     external_coverage_state,
     fresh_scan_window,
+    partial_rescan_due,
     plan_incremental,
     plan_scan,
 )
@@ -405,3 +408,119 @@ def test_integration_with_store_replaying_incremental_page_is_idempotent(tmp_pat
     assert added_replay == 0
     after = store.get_sync(ADDR)
     assert after == before
+
+
+# --- Task 7.9c-D：partial 重掃期限（D1）／observed 維護（D2）／
+#     inc_from 非空（D6）／gap 語義（D7 (iii) 的增量側） ---
+
+def test_partial_rescan_after_s_is_the_single_source_in_seconds():
+    """C1／D1：排程時間是秒制——毫秒常數（7.9b 的 `PARTIAL_RESCAN_AFTER_MS`
+    被直接加到秒制 `now` 上，重掃排到 1,000 天後）不得再被當成期限用。"""
+    assert PARTIAL_RESCAN_AFTER_S == 24 * 3600
+    assert PARTIAL_RESCAN_AFTER_MS == PARTIAL_RESCAN_AFTER_S * 1000
+
+
+def test_partial_rescan_due_none_finished_at_is_due():
+    assert partial_rescan_due(None, now=0.0) is True
+
+
+def test_partial_rescan_due_boundary_is_exactly_24h():
+    finished = 1_700_000_000.0
+    assert partial_rescan_due(finished, now=finished + PARTIAL_RESCAN_AFTER_S - 1) is False
+    assert partial_rescan_due(finished, now=finished + PARTIAL_RESCAN_AFTER_S) is True
+    assert partial_rescan_due(finished, now=finished + PARTIAL_RESCAN_AFTER_S + 1) is True
+
+
+def test_apply_incremental_page_short_page_merges_observed_range():
+    """D2（W2）：增量軌也要維護 `observed_from/to_ms`，否則首次遍歷之後才
+    出現的成交永遠不會反映到對外的觀測區間。"""
+    state = _sync(window_end_ms=1000, cursor_ms=1000, synced_through_ms=1000,
+                  observed_from_ms=None, observed_to_ms=None)
+    plan = IncrementalPlan(start_ms=1000, end_ms=2000,
+                           state=dataclasses.replace(state, window_end_ms=2000))
+    result = apply_incremental_page(plan, [_fill(1200, 1), _fill(1800, 2)], now_ms=2000)
+    assert result.state.observed_from_ms == 1200
+    assert result.state.observed_to_ms == 1800
+
+
+def test_apply_incremental_page_observed_is_min_max_not_overwrite():
+    state = _sync(window_end_ms=1000, cursor_ms=1000, synced_through_ms=1000,
+                  observed_from_ms=100, observed_to_ms=900)
+    plan = IncrementalPlan(start_ms=1000, end_ms=2000,
+                           state=dataclasses.replace(state, window_end_ms=2000))
+    result = apply_incremental_page(plan, [_fill(1500, 1)], now_ms=2000)
+    assert result.state.observed_from_ms == 100     # 舊的更早，不被收窄
+    assert result.state.observed_to_ms == 1500      # 新的更晚，前進
+
+
+def test_apply_incremental_page_empty_page_keeps_observed_unchanged():
+    state = _sync(observed_from_ms=100, observed_to_ms=900)
+    plan = IncrementalPlan(start_ms=1000, end_ms=2000,
+                           state=dataclasses.replace(state, window_end_ms=2000))
+    result = apply_incremental_page(plan, [], now_ms=2000)
+    assert result.state.observed_from_ms == 100
+    assert result.state.observed_to_ms == 900
+
+
+def test_apply_incremental_page_full_page_also_merges_observed():
+    state = _sync(window_end_ms=5000, cursor_ms=1000, observed_from_ms=None,
+                  observed_to_ms=None)
+    plan = IncrementalPlan(start_ms=1000, end_ms=5000, state=state)
+    result = apply_incremental_page(plan, [_fill(1000 + i, i) for i in range(3)],
+                                    page_limit=3, now_ms=2000)
+    assert result.done is False
+    assert result.state.observed_from_ms == 1000
+    assert result.state.observed_to_ms == 1002
+
+
+def test_observed_range_end_to_end_scan_then_increment(tmp_path):
+    """D2 行為級：新地址 → initial scan 完成（observed 來自遍歷軌）→ 一輪
+    增量抓到更晚的成交 → 對外 `observed_to` 前進、`observed_from` 不倒退。"""
+    store = ExploreStore(tmp_path / "x.db")
+    now_ms = 10_000_000
+    store.bootstrap_address_fills(ADDR, now_ms / 1000, window_start_ms=now_ms - 5000,
+                                  window_end_ms=now_ms, params_fp=PARAMS_FP)
+    scan = store.get_active_scan(ADDR)
+    scan_fills = [_fill(now_ms - 4000, 1), _fill(now_ms - 100, 2)]
+    finished = dataclasses.replace(
+        scan, cursor_ms=now_ms, observed_from_ms=now_ms - 4000, observed_to_ms=now_ms - 100,
+        fills_in_window=2, result="complete",
+        reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, finished_at=now_ms / 1000)
+    store.complete_scan(ADDR, scan_fills, finished)
+    cov = build_fills_coverage(store.get_sync(ADDR), store)
+    assert cov["observed_from"] == now_ms - 4000
+    assert cov["observed_to"] == now_ms - 100
+
+    later_ms = now_ms + 7 * 3600 * 1000
+    plan = plan_incremental(store.get_sync(ADDR), now_ms=later_ms, period_s=6 * 3600)
+    assert not plan.is_noop
+    res = apply_incremental_page(plan, [_fill(later_ms - 1000, 3)], now_ms=later_ms)
+    store.insert_fills_page(ADDR, res.accepted, res.state)
+    cov2 = build_fills_coverage(store.get_sync(ADDR), store)
+    assert cov2["observed_from"] == now_ms - 4000     # 不倒退
+    assert cov2["observed_to"] == later_ms - 1000     # 前進
+
+
+def test_plan_incremental_has_no_none_fallback_for_inc_from():
+    """D6：`inc_from_ms` 非空由寫入邊界保證，`plan_incremental` 不再有
+    `None` 退路——真的傳 `None` 進來會 `TypeError`（讓不變式破掉時大聲失敗，
+    而不是悄悄用別的值當起點）。"""
+    state = _sync(inc_from_ms=None, synced_through_ms=None, cursor_ms=0, window_end_ms=0)
+    try:
+        plan_incremental(state, now_ms=10**12, period_s=3600)
+    except TypeError:
+        return
+    raise AssertionError("expected TypeError when inc_from_ms is None")
+
+
+def test_external_coverage_state_lagging_increment_is_stale_not_gap():
+    """D7 語義：增量軌落後（`synced_through` 距今很久）只是資料舊，覆蓋區間
+    仍完整——不得被算成 `coverage_gap`。gap 只由 `complete_scan` 依
+    `scan.window_end_ms < inc_from_ms` 設定。"""
+    state = _sync(completeness="complete", reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+                  inc_from_ms=0, synced_through_ms=1000, window_end_ms=1000,
+                  coverage_gap=False, evidence_unknown=False)
+    assert external_coverage_state(state) == ("complete",
+                                              REASON_COUNT_BELOW_RETENTION_THRESHOLD)
+    cov_window = (state.inc_from_ms, state.synced_through_ms)
+    assert cov_window == (0, 1000)

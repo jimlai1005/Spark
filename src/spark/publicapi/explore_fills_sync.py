@@ -47,7 +47,7 @@ PRIMARY KEY，本模組不做去重判斷。同毫秒佔滿整頁（`same_ms_ove
 `partial` 的復原路徑：增量軌不做完整性判定，`partial` 若像 `complete` 一樣被增量軌
 悄悄「延伸」也不會改變它的證據狀態——真正的復原只能靠遍歷軌重新做一次全區間遍歷
 （`partial_rescan`，`explore_scheduler` 在遍歷完成 `result=="partial"` 時自動排程
-下一次，見 `PARTIAL_RESCAN_AFTER_MS`）。
+下一次，見 `PARTIAL_RESCAN_AFTER_S`／`partial_rescan_due`）。
 """
 from __future__ import annotations
 
@@ -84,7 +84,24 @@ _DEFAULT_INCREMENTAL_PERIOD_S = DEFAULT_FILLS_PERIOD_S
 
 # Task 7.7 W2（partial 復原路徑）／Task 7.9b B3：`partial` 遍歷完成後，
 # `explore_scheduler` 自動排程下一次 `partial_rescan`，間隔即此常數。
-PARTIAL_RESCAN_AFTER_MS = 24 * 3600 * 1000
+# Task 7.9c C1／D1（2026-09-22 裁決）：**秒制唯一來源**——7.9b 的毫秒常數被
+# 直接加到秒制的 `now` 上（`now + PARTIAL_RESCAN_AFTER_MS`），重掃排到 1,000
+# 天後。排程時間一律用秒，毫秒只在「呼叫 planner」那一個邊界才換算。
+PARTIAL_RESCAN_AFTER_S = 24 * 3600
+PARTIAL_RESCAN_AFTER_MS = PARTIAL_RESCAN_AFTER_S * 1000  # 過渡：7.9c-S 移除引用後刪
+
+
+def partial_rescan_due(finished_at: float | None, now: float) -> bool:
+    """`partial` 地址是否該重新做一次全區間遍歷（Task 7.9c D1）——單一判斷點，
+    排程端不得另寫一份時間比較（工程原則 1：比較的兩個量同源、同單位）。
+
+    `finished_at`＝該地址**最近一次完成**的 `fills_scan.finished_at`（秒）；
+    `None`（從未完成過任何一次遍歷，或遷移列尚無完成時間）→ `True`
+    （視為早該重掃，交給呼叫端的其他條件——例如「有沒有 running scan」——
+    把關）。兩個參數都必須是秒制 epoch。"""
+    if finished_at is None:
+        return True
+    return now - finished_at >= PARTIAL_RESCAN_AFTER_S
 
 # Task 7.5 點 4／7.6 點 8（查詢參數留證）：`hl.get_fills_page` 實際請求體只送
 # `type/user/startTime/endTime`——刻意不送 `aggregateByTime`。字串只描述「送了
@@ -116,9 +133,10 @@ class IncrementalPlan(NamedTuple):
 
 class IncrementalResult(NamedTuple):
     """`apply_incremental_page()` 的輸出——`state` 只更新增量軌自己的欄位
-    （`cursor_ms`／`synced_through_ms`／`pages_done`／`last_error`／
-    `updated_at`），**不動** `completeness`／`reason`／`scan_id`／
-    `evidence_unknown`／`coverage_gap`（遍歷軌專屬，見模組檔頭）。"""
+    （`cursor_ms`／`synced_through_ms`／`observed_from_ms`／`observed_to_ms`／
+    `pages_done`／`last_error`／`updated_at`），**不動** `completeness`／
+    `reason`／`scan_id`／`evidence_unknown`／`coverage_gap`（遍歷軌專屬，
+    見模組檔頭）。"""
     state: FillsSyncState
     accepted: list[dict]
     done: bool
@@ -134,21 +152,26 @@ def plan_incremental(state: FillsSyncState, *, now_ms: int, period_s: float = No
 
     「輪進行中」：`cursor_ms` 大於目前基準（`synced_through_ms`，首次尚未
     完成任何一輪時用 `inc_from_ms`）代表本輪尚未跑到底，續抓，不看週期。
+
+    Task 7.9c D6：`state.inc_from_ms` **保證非空**——非空性在寫入邊界
+    （`ExploreStore.bootstrap_address_fills`／`insert_fills_page`／v2→v3 遷移）
+    與啟動檢查（`ExploreStore.__init__`）就守住了，本函式不再對 `None` 留
+    退路（舊版的 `baseline or state.inc_from_ms` 退路會在 `baseline == 0`
+    時誤取 `inc_from_ms`，而且讓「不變式破了」變成靜默的錯誤資料）。
     """
     period_s = DEFAULT_FILLS_PERIOD_S if period_s is None else period_s
     period_ms = int(period_s * 1000)
     baseline = state.synced_through_ms if state.synced_through_ms is not None \
         else state.inc_from_ms
-    if baseline is not None and state.cursor_ms > baseline:
+    if state.cursor_ms > baseline:
         return IncrementalPlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)
     if now_ms - state.window_end_ms >= period_ms:
         new_end = now_ms
-        new_cursor = max(state.inc_from_ms, (baseline or state.inc_from_ms) - overlap_ms)
+        new_cursor = max(state.inc_from_ms, baseline - overlap_ms)
         new_state = dataclasses.replace(
             state, window_end_ms=new_end, cursor_ms=new_cursor, pages_done=0)
         return IncrementalPlan(start_ms=new_cursor, end_ms=new_end, state=new_state)
-    through = baseline if baseline is not None else state.window_end_ms
-    return IncrementalPlan(start_ms=through, end_ms=through, state=state,
+    return IncrementalPlan(start_ms=baseline, end_ms=baseline, state=state,
                            next_due_ms=state.window_end_ms + period_ms)
 
 
@@ -185,7 +208,13 @@ def apply_incremental_page(plan: IncrementalPlan, page: list[dict], *, page_limi
                            max_pages_per_round: int = 20, now_ms: int) -> IncrementalResult:
     """套用一頁到增量軌。短頁／空頁 → `synced_through_ms` 推到 `end_ms`、本輪
     結束；滿頁 → 續抓（同遍歷軌的同毫秒溢位／無進展／頁數上限三個終止條件，
-    純防禦，正常增量缺口極小很少觸發）。全程不判定 `completeness`／`reason`。"""
+    純防禦，正常增量缺口極小很少觸發）。全程不判定 `completeness`／`reason`。
+
+    Task 7.9c D2：本頁看到的成交時間併入 `observed_from_ms`／`observed_to_ms`
+    （min／max，與 `apply_scan_page` 同一份規則）——7.9b 拆軌時漏掉這段，
+    導致「首次遍歷之後才有成交」的新地址對外 `observed_from/to` 永遠是
+    `None`（遍歷軌算出的極值也只留在 `fills_scan`，沒有併回 `fills_sync`；
+    併回的那一半在 `ExploreStore.complete_scan`）。空頁不動極值。"""
     state = plan.state
     start_ms, end_ms = plan.start_ms, plan.end_ms
 
@@ -196,15 +225,22 @@ def apply_incremental_page(plan: IncrementalPlan, page: list[dict], *, page_limi
         return IncrementalResult(state=new_state, accepted=[], done=True, note=invalid_reason)
 
     times = [int(f["time"]) for f in page]
+    observed_from = state.observed_from_ms
+    observed_to = state.observed_to_ms
+    if times:
+        observed_from = min(times) if observed_from is None else min(observed_from, min(times))
+        observed_to = max(times) if observed_to is None else max(observed_to, max(times))
+
     if len(page) < page_limit:
         new_state = dataclasses.replace(
-            state, cursor_ms=end_ms, synced_through_ms=end_ms, last_error=None,
-            updated_at=now_ms / 1000)
+            state, cursor_ms=end_ms, synced_through_ms=end_ms, observed_from_ms=observed_from,
+            observed_to_ms=observed_to, last_error=None, updated_at=now_ms / 1000)
         return IncrementalResult(state=new_state, accepted=list(page), done=True, note=None)
 
     if all(t == start_ms for t in times):
         new_state = dataclasses.replace(
             state, cursor_ms=start_ms, synced_through_ms=start_ms,
+            observed_from_ms=observed_from, observed_to_ms=observed_to,
             last_error="same_ms_overflow", updated_at=now_ms / 1000)
         return IncrementalResult(state=new_state, accepted=list(page), done=True,
                                  note="same_ms_overflow")
@@ -212,8 +248,9 @@ def apply_incremental_page(plan: IncrementalPlan, page: list[dict], *, page_limi
     new_cursor = times[-1]
     if new_cursor == start_ms:
         new_state = dataclasses.replace(
-            state, cursor_ms=start_ms, synced_through_ms=start_ms, last_error="no_progress",
-            updated_at=now_ms / 1000)
+            state, cursor_ms=start_ms, synced_through_ms=start_ms,
+            observed_from_ms=observed_from, observed_to_ms=observed_to,
+            last_error="no_progress", updated_at=now_ms / 1000)
         return IncrementalResult(state=new_state, accepted=list(page), done=True,
                                  note="no_progress")
 
@@ -221,12 +258,14 @@ def apply_incremental_page(plan: IncrementalPlan, page: list[dict], *, page_limi
     if new_pages_done >= max_pages_per_round:
         new_state = dataclasses.replace(
             state, cursor_ms=new_cursor, synced_through_ms=new_cursor,
+            observed_from_ms=observed_from, observed_to_ms=observed_to,
             pages_done=new_pages_done, last_error="page_cap", updated_at=now_ms / 1000)
         return IncrementalResult(state=new_state, accepted=list(page), done=True,
                                  note="page_cap")
 
     new_state = dataclasses.replace(
-        state, cursor_ms=new_cursor, pages_done=new_pages_done, last_error=None,
+        state, cursor_ms=new_cursor, observed_from_ms=observed_from,
+        observed_to_ms=observed_to, pages_done=new_pages_done, last_error=None,
         updated_at=now_ms / 1000)
     return IncrementalResult(state=new_state, accepted=list(page), done=False, note=None)
 
@@ -323,7 +362,16 @@ def external_coverage_state(sync: FillsSyncState) -> tuple[str, str | None]:
     `result == complete AND coverage_gap == 0 AND evidence_unknown == 0`；
     否則依序降級為 `partial`／`reason` 為 `coverage_gap` 或
     `evidence_unknown`。`backfilling`／`partial` 內部值本來就等於對外值，
-    原樣透傳（gap／unknown 只有在內部值是 `complete` 時才可能造成降級）。"""
+    原樣透傳（gap／unknown 只有在內部值是 `complete` 時才可能造成降級）。
+
+    Task 7.9c D7（gap 語義，2026-09-22 裁決，維持 7.9b 的「覆蓋區間」定義）：
+    `coverage_gap` 問的是「**遍歷軌的窗口有沒有接上增量軌的起點**」
+    （`scan.window_end_ms >= inc_from_ms`，見 `ExploreStore.complete_scan`），
+    **不是**「增量軌有沒有落後」。增量軌落後（`synced_through_ms` 距今很久）
+    只是 **stale**——資料舊，但 `[inc_from, synced_through]` 這段區間仍然
+    是完整覆蓋的，下一輪增量就會補上，不該對外報成缺口。真正的 gap 只在
+    遍歷窗口未接上增量軌起點時成立，來源只有三種：v2→v3 遷移把增量起點
+    設錯（7.9b 第一版的事故）、時鐘異常、人工修資料。"""
     if sync.completeness != "complete":
         return sync.completeness, sync.reason
     if sync.coverage_gap:
