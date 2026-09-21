@@ -341,11 +341,21 @@ class ExploreStore:
           指向這個地址的 `refresh_job`（`key=f"{addr}:fills"`，舊語意是
           「backfill 進度」）**改名**為 `fills_scan` kind——它接下來要推進的
           是遍歷軌，不是增量軌。同時另外插入一筆全新的 `fills` 增量 job
-          （`next_attempt_at=now`，讓它下一輪自然算出 noop／到期）。增量軌
-          （`fills_sync` 本列）的 `inc_from_ms`／`synced_through_ms`／
-          `cursor_ms`／`window_end_ms` 一律設為遷移當下的 `now`（舊列從未
-          完成過一輪，沒有真實的「已同步到」可用，見模組 docstring 的
-          「不同於 B5 字面」附註）。
+          （`next_attempt_at=now`，讓它下一輪自然算出 noop／到期）。
+
+          2026-09-21 主線程二次裁決（正式機 287 列快照實跑抓到的缺口）：
+          增量軌（`fills_sync` 本列）的 `inc_from_ms`／`synced_through_ms`／
+          `cursor_ms`／`window_end_ms` **不得**設為遷移當下的 `now`——那會在
+          「舊 scan 的 `window_end_ms`（幾小時前開輪時的值）」與「遷移當下
+          的 `now`」之間留下一段沒有任何一軌會抓的成交（scan 完成時
+          `scan.window_end_ms < inc_from_ms` 被判 `coverage_gap`，對外
+          `partial` 直到 24 小時後 `partial_rescan` 才修復——這是遷移造成的
+          真實缺口，不該靠重掃收拾）。改為 `inc_from_ms = synced_through_ms
+          = cursor_ms = win_end`（沿用該 running scan 的 `window_end_ms`，
+          `fills_sync.window_end_ms` 同步設為同一個值，維持「同一列自身欄位
+          彼此一致」）——增量軌從 scan 窗口末端起算，第一次增量輪會抓
+          `[win_end-1, now]` 把這段缺口補上，與 `bootstrap_address_fills`
+          「新地址 `scan.window_end == inc_from`」的連續性原則一致。
         - `completeness in ('complete', 'partial')`：舊列的 `window_*`／
           `cursor_ms`／`synced_through_ms`／`observed_*`／`pages_done`／
           `fills_in_window` 這些欄位**原樣保留**，直接變成增量軌自己的欄位
@@ -409,12 +419,17 @@ class ExploreStore:
                     "?,NULL,NULL,?)",
                     (scan_id, addr, "initial", win_start, win_end, cursor_ms, pages_done,
                      fills_in_window, obs_from, obs_to, updated_at, params_fp))
-                now_ms = int(now * 1000)
+                # 2026-09-21 主線程二次裁決：增量軌起點＝該 running scan 的
+                # `window_end_ms`（`win_end`，舊值，不是遷移當下的 `now`）——
+                # 見上方 docstring「正式機 287 列快照實跑抓到的缺口」。
+                # `window_start_ms` 維持舊值（`win_start`）不動，僅
+                # `window_end_ms` 同步到 `win_end`（增量軌與遍歷軌此刻共享
+                # 同一個「目前前沿」，之後兩軌各自推進、互不覆蓋）。
                 self._db.execute(
                     "UPDATE fills_sync SET inc_from_ms=?, synced_through_ms=?, cursor_ms=?, "
-                    "window_start_ms=?, window_end_ms=?, scan_id=NULL, evidence_unknown=0, "
+                    "window_end_ms=?, scan_id=NULL, evidence_unknown=0, "
                     "coverage_gap=0 WHERE address=?",
-                    (now_ms, now_ms, now_ms, now_ms, now_ms, addr))
+                    (win_end, win_end, win_end, win_end, addr))
                 old_job = self._db.execute(
                     "SELECT priority, next_attempt_at, attempts, created_at FROM refresh_job "
                     "WHERE key=?", (f"{addr}:fills",)).fetchone()

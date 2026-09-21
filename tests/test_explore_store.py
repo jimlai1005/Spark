@@ -517,6 +517,97 @@ def test_migration_v2_to_v3_partial_row_also_gets_evidence_unknown_and_verify_jo
     assert job is not None
 
 
+def _write_v2_schema(db_path, *, window_start_ms=0, window_end_ms, cursor_ms) -> None:
+    """手刻一份 Task 7.9b 之前的 v2 DB（含 `params_fp`，尚無遍歷軌新欄位）：
+    單一 backfilling 列，`window_end_ms` 由呼叫端指定（用來重現「舊 scan 開輪
+    時刻早於遷移當下」的缺口情境）。"""
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (2);
+        CREATE TABLE candidate (
+          address TEXT PRIMARY KEY, display_name TEXT, source_rank INTEGER,
+          source_roi REAL, source_as_of REAL NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1, last_seen_at REAL NOT NULL);
+        CREATE TABLE endpoint_cache (
+          address TEXT NOT NULL, endpoint TEXT NOT NULL,
+          params_fp TEXT NOT NULL DEFAULT '', payload TEXT,
+          fetched_at REAL, refresh_after REAL NOT NULL,
+          last_error TEXT, last_error_at REAL,
+          PRIMARY KEY (address, endpoint, params_fp));
+        CREATE TABLE fills (
+          address TEXT NOT NULL, coin TEXT NOT NULL, tid INTEGER NOT NULL,
+          time_ms INTEGER NOT NULL, raw TEXT NOT NULL,
+          PRIMARY KEY (address, coin, tid));
+        CREATE TABLE fills_sync (
+          address TEXT PRIMARY KEY,
+          window_start_ms INTEGER NOT NULL, window_end_ms INTEGER NOT NULL,
+          cursor_ms INTEGER NOT NULL, synced_through_ms INTEGER,
+          observed_from_ms INTEGER, observed_to_ms INTEGER,
+          completeness TEXT NOT NULL DEFAULT 'backfilling',
+          reason TEXT, pages_done INTEGER NOT NULL DEFAULT 0,
+          fills_in_window INTEGER NOT NULL DEFAULT 0,
+          params_fp TEXT NOT NULL DEFAULT '',
+          updated_at REAL NOT NULL, last_error TEXT);
+        CREATE TABLE refresh_job (
+          key TEXT PRIMARY KEY, address TEXT, kind TEXT NOT NULL,
+          priority INTEGER NOT NULL, created_at REAL NOT NULL,
+          next_attempt_at REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          lease_until REAL, lease_owner TEXT, fencing INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT);
+    """)
+    raw.execute(
+        "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
+        "synced_through_ms, completeness, reason, pages_done, fills_in_window, params_fp, "
+        "updated_at) VALUES ('0xgap', ?, ?, ?, NULL, 'backfilling', NULL, 2, 0, '', 1000.0)",
+        (window_start_ms, window_end_ms, cursor_ms))
+    raw.execute(
+        "INSERT INTO refresh_job (key, address, kind, priority, created_at, next_attempt_at) "
+        "VALUES ('0xgap:fills', '0xgap', 'fills', 2, 0.0, 500.0)")
+    raw.commit()
+    raw.close()
+
+
+def test_migration_v2_to_v3_backfilling_row_inc_from_uses_scan_window_end_not_now(tmp_path):
+    """主線程二次裁決（2026-09-21，正式機 287 列快照實跑抓到的缺口）：
+    backfilling 列的增量軌起點不能設成遷移當下的 `now`——那會在舊 scan 的
+    `window_end_ms`（幾小時前開輪時的值）與 `now` 之間留下一段沒有任何一軌
+    會抓的成交，scan 完成時 `window_end < inc_from` 會被誤判 `coverage_gap`。
+    修法：`inc_from_ms = synced_through_ms = cursor_ms = window_end_ms`
+    （增量軌從 scan 窗口末端起算）。"""
+    db_path = tmp_path / "explore.db"
+    now = time.time()
+    window_end_ms = int((now - 6 * 3600) * 1000)  # 6 小時前開的輪
+    cursor_ms = window_end_ms - 500
+    _write_v2_schema(db_path, window_end_ms=window_end_ms, cursor_ms=cursor_ms)
+    store = ExploreStore(db_path, now_fn=lambda: now)
+
+    sync = store.get_sync("0xgap")
+    assert sync.inc_from_ms == window_end_ms
+    assert sync.synced_through_ms == window_end_ms
+    assert sync.cursor_ms == window_end_ms
+    assert sync.window_end_ms == window_end_ms
+
+    # 增量軌從 scan 窗口末端起算：`now` 立即開增量輪（1 小時週期遠小於 6
+    # 小時已過的間隔），抓 `[window_end_ms, now]` 把缺口補上——`start_ms`
+    # 沒有再減 1ms overlap，因為 `inc_from_ms` 本身就等於 `window_end_ms`，
+    # `plan_incremental` 的 `max(inc_from_ms, baseline-overlap_ms)` 地板擋住
+    # 了往回超過增量軌起點（見該函式）。
+    from spark.publicapi.explore_fills_sync import plan_incremental
+    plan = plan_incremental(sync, now_ms=int(now * 1000), period_s=3600)
+    assert not plan.is_noop
+    assert plan.start_ms == window_end_ms
+
+    # scan 完成時窗口末端＝inc_from，不會被誤判 gap。
+    scan = store.get_active_scan("0xgap")
+    assert scan.window_end_ms == window_end_ms
+    finished = dataclasses.replace(scan, cursor_ms=scan.window_end_ms, result="complete",
+                                   reason="count_below_retention_threshold", finished_at=now)
+    ok = store.complete_scan("0xgap", [], finished)
+    assert ok is True
+    assert store.get_sync("0xgap").coverage_gap is False
+
+
 def test_oldest_due_at_returns_none_when_nothing_due(tmp_path):
     store, c = _store(tmp_path)
     store.enqueue("0xabc:state", "0xabc", "state", priority=0, next_attempt_at=c.now() + 100)
