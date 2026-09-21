@@ -11,6 +11,7 @@ from spark.publicapi.explore_fills_sync import (
     OVERLAP_MS,
     PAGE_LIMIT,
     PARAMS_FP,
+    PARTIAL_RESCAN_AFTER_MS,
     RETENTION_SAFETY_MARGIN,
     RETENTION_SAFETY_THRESHOLD,
     WINDOW_DAYS,
@@ -220,10 +221,14 @@ def test_plan_page_increment_within_grace_period_is_noop():
 
 
 def test_plan_page_increment_after_grace_period_preserves_completeness_and_shifts_window():
+    # Task 7.7 W2（正確性修正）：這個測試原本用 `completeness="partial"` 驗證
+    # 「grace period 後開新增量輪、completeness 保留不重置」的共用邏輯——
+    # Task 7.7 起 `partial` 不再走增量（見 `test_plan_page_partial_*` 系列），
+    # 這條共用邏輯現在只適用於 `complete`，改用 `complete` 驗證同一件事。
     state = _backfilling_state(
         window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
-        synced_through_ms=1000, completeness="partial", reason="retention_limit",
-        fills_in_window=42,
+        synced_through_ms=1000, completeness="complete",
+        reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, fills_in_window=42,
     )
     now = 1000 + 5 * 3600 * 1000  # 5 小時後，超過 4 小時寬限期
     plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000,
@@ -234,9 +239,113 @@ def test_plan_page_increment_after_grace_period_preserves_completeness_and_shift
     assert plan.state.window_end_ms == now
     assert plan.state.window_start_ms == now - WINDOW_DAYS * 86_400_000
     assert plan.state.cursor_ms == plan.start_ms
-    assert plan.state.completeness == "partial"  # 保留，不重置
+    assert plan.state.completeness == "complete"  # 保留，不重置
     assert plan.state.pages_done == 0
     assert plan.state.fills_in_window == 0  # 歸零（2026-09-20 主線程裁決：門檻只看本輪區間）
+
+
+# --- Task 7.7 W2：partial 不再走增量，改成 24 小時整窗重掃 ---
+
+def test_plan_page_partial_before_24h_is_noop_even_past_old_grace_period():
+    """partial 不做增量（W2）——5 小時已過舊的 4 小時增量寬限期，但遠低於
+    `PARTIAL_RESCAN_AFTER_MS`（24 小時），仍應是 noop，不像 7.6（含）以前那樣
+    開新增量輪。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="partial", reason="retention_limit",
+        fills_in_window=42,
+    )
+    now = 1000 + 5 * 3600 * 1000
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    assert plan.is_noop
+    assert plan.start_ms == 1000
+    assert plan.end_ms == 1000
+    assert plan.state is state
+
+
+def test_plan_page_partial_after_24h_opens_fresh_backfilling_round():
+    """partial 滿 `PARTIAL_RESCAN_AFTER_MS`（24 小時）→ 回傳與 `state is None`
+    相同形狀的全新首輪：新視窗 `[now-30d, now]`、`completeness="backfilling"`、
+    `reason=None`、游標回到新視窗起點、`synced_through_ms=None`、observed
+    兩欄清 None（W2 復原路徑）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="partial", reason="retention_limit",
+        pages_done=3, fills_in_window=8500, observed_from_ms=10, observed_to_ms=999,
+    )
+    now = 1000 + PARTIAL_RESCAN_AFTER_MS
+    plan = plan_page(state, address=ADDR, now_ms=now)
+    assert not plan.is_noop
+    assert plan.start_ms == now - WINDOW_DAYS * 86_400_000
+    assert plan.end_ms == now
+    assert plan.state.completeness == "backfilling"
+    assert plan.state.reason is None
+    assert plan.state.cursor_ms == plan.start_ms
+    assert plan.state.window_start_ms == plan.start_ms
+    assert plan.state.window_end_ms == now
+    assert plan.state.synced_through_ms is None
+    assert plan.state.observed_from_ms is None
+    assert plan.state.observed_to_ms is None
+    assert plan.state.pages_done == 0
+    assert plan.state.fills_in_window == 0
+    assert plan.state.address == ADDR
+    assert plan.state.params_fp == PARAMS_FP
+
+
+def test_plan_page_partial_rescan_recovers_to_complete_when_below_threshold():
+    """端到端（正式機重現場景的鏡像）：partial 滿 24 小時 → 開新首輪 → 短頁
+    收尾且筆數低於門檻 → `complete`／`count_below_retention_threshold`（W2
+    復原成功）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="partial", reason="retention_limit",
+    )
+    now = 1000 + PARTIAL_RESCAN_AFTER_MS
+    plan = plan_page(state, address=ADDR, now_ms=now)
+    page = [_fill(plan.start_ms + 1, 1)]  # 短頁
+    result = apply_page(plan, page, now_ms=now)
+    assert result.done is True
+    assert result.state.completeness == "complete"
+    assert result.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD
+
+
+def test_plan_page_partial_rescan_stays_partial_when_still_over_threshold():
+    """重掃後短頁收尾筆數仍超標 → 仍是 `partial`／`retention_limit`（W2：合法
+    降級，不是誤判）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="partial", reason="retention_limit",
+    )
+    now = 1000 + PARTIAL_RESCAN_AFTER_MS
+    plan = plan_page(state, address=ADDR, now_ms=now)
+    page = [_fill(plan.start_ms + i, i) for i in range(6000)]  # 短頁但缺口本身就超標
+    result = apply_page(plan, page, page_limit=8000, retention_threshold=6000, now_ms=now)
+    assert result.done is True
+    assert result.state.completeness == "partial"
+    assert result.state.reason == "retention_limit"
+
+
+def test_plan_page_partial_rescan_multi_page_continues_via_round_in_progress():
+    """partial 重掃多頁中途：滿頁後 `cursor_ms > synced_through_ms`（此時
+    `completeness` 已因重掃而變成 `backfilling`——與 `state.completeness ==
+    "backfilling"` 分支的無條件續抓等價，驗證「輪進行中」判斷（A1）在重掃
+    途中不受影響，也不會被誤判成又要重新開一次 24 小時計時）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="partial", reason="retention_limit",
+    )
+    now = 1000 + PARTIAL_RESCAN_AFTER_MS
+    plan1 = plan_page(state, address=ADDR, now_ms=now)
+    page1 = [_fill(plan1.start_ms + i, i) for i in range(PAGE_LIMIT)]  # 滿頁
+    r1 = apply_page(plan1, page1, now_ms=now)
+    assert r1.done is False
+    assert r1.state.completeness == "backfilling"
+
+    now2 = now + 1_000  # 1 秒後，遠低於 PARTIAL_RESCAN_AFTER_MS
+    plan2 = plan_page(r1.state, address=ADDR, now_ms=now2)
+    assert not plan2.is_noop
+    assert plan2.start_ms == r1.state.cursor_ms
+    assert plan2.end_ms == r1.state.window_end_ms
 
 
 def test_plan_page_increment_resets_fills_in_window_so_stale_count_does_not_flip_complete():

@@ -44,11 +44,13 @@ from __future__ import annotations
 import logging
 import random
 import threading
+from collections import deque
 from decimal import Decimal
 from typing import Callable
 
 from spark.publicapi.explore_fills_sync import apply_page, plan_page, validate_page
 from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+                                           REASON_PROBE_NO_EARLIER_FILLS,
                                            REASON_RETENTION_BOUNDARY_VERIFIED, ExploreStore,
                                            Job)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
@@ -65,6 +67,12 @@ FILLS_PAGE_WEIGHT = weight_for("userFillsByTime")
 # `explore_fills_sync._DAY_MS` 同數值，不 import 該私有名稱（避免跨模組耦合
 # 私有常數），供 `_probe_retention_boundary` 算探測窗口用。
 _PROBE_WINDOW_MS = 86_400_000
+
+# Task 7.7 點 8（正式機實證：`explore_fills` 保留額度下探測永遠 BudgetExhausted）：
+# 額度不足時把探測延後到下個 tick，而不是白白花一次失敗的上游呼叫；deque 上限
+# 64（同地址去重，見 `_enqueue_probe_deferred`）只是防止極端情境下無界增長，
+# 正常運作下佇列深度應該很快被領工排空。
+_PROBE_DEFERRED_MAXLEN = 64
 
 # Task 7.4b：非 fills 的四種 kind，領工時一起用 `kinds=` 限定（`claim_due` 的
 # IN 子句）——candidates 本身也走這個集合，它不吃 explore_base／explore_fills
@@ -183,6 +191,12 @@ class ExploreScheduler:
         self._probe_verified = 0
         self._probe_empty = 0
         self._probe_failed = 0
+        # Task 7.7 點 8：額度不足時延後探測的佇列（`(address, window_start_ms)`，
+        # 同地址去重，見 `_enqueue_probe_deferred`）；`deferred_total` 是累計
+        # 進過佇列的次數（含被去重覆寫的），`status()["probe"]["deferred"]`
+        # 回報的是目前佇列深度（`len`），兩者語意不同，見 `status()`。
+        self._probe_deferred: deque = deque(maxlen=_PROBE_DEFERRED_MAXLEN)
+        self._probe_deferred_total = 0
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -246,6 +260,10 @@ class ExploreScheduler:
                 "verified": self._probe_verified,
                 "empty": self._probe_empty,
                 "failed": self._probe_failed,
+                # Task 7.7 點 8：`deferred` 是目前佇列深度（額度不足、等下一次
+                # 補打的探測數），`deferred_total` 是累計進過佇列的次數。
+                "deferred": len(self._probe_deferred),
+                "deferred_total": self._probe_deferred_total,
             },
         }
 
@@ -269,6 +287,11 @@ class ExploreScheduler:
             self._bootstrapped = True
             self._store.enqueue("candidates:candidates", None, "candidates", 0, now)
             return "idle"
+
+        # Task 7.7 點 8（領工之前）：至多補打一個先前因額度不足延後的探測——
+        # 佇列為空時 `_drain_one_deferred_probe` 立刻回，不觸碰 `_fills_available()`
+        # 的無 limiter fallback 交替旗標（避免影響既有不涉及探測的測試）。
+        self._drain_one_deferred_probe(now)
 
         # Task 7.4b（2026-09-21 主線程二次裁決）：類別感知的領工——有 fills
         # 待處理且 `explore_fills` 保留額度足夠擠進一整頁時，優先從 fills 領；
@@ -453,17 +476,20 @@ class ExploreScheduler:
             # backfilling，整份成交補不完。是否退池只在整輪 done 之後才判斷。
             self._reschedule(job, now, bump_attempts=False)
             return "ran:fills"
-        # Task 7.6 點 4：順序改為 complete → is_active 檢查（退池→"dropped"，不
-        # 探）→ 探測 → enqueue——退池地址不值得再花預算探測；探測條件同時收緊
-        # 為「completeness=='complete' 且 reason 仍是門檻推論」（A2 讓
-        # `retention_boundary_verified` 跨輪存活，所以已 verified 的地址不會再
-        # 進到這個分支，每個地址最多探到成功為止，不會每輪重探）。
+        # Task 7.6 點 4／7.7 點 2：順序改為 complete → is_active 檢查
+        # （退池→"dropped"，不探）→ 探測 → enqueue——退池地址不值得再花預算
+        # 探測；探測條件維持「completeness=='complete' 且 reason 仍是門檻
+        # 推論」（`REASON_COUNT_BELOW_RETENTION_THRESHOLD`）——`verified` 與
+        # `probe_empty`（Task 7.7 W3）都會跨輪存活（見 apply_page A2），兩者
+        # 都自然排除這個分支，每次全區間遍歷後至多探到有結論（verified 或
+        # probe_empty）為止，不會每輪重探。額度不足時探測本身會自行延後
+        # （見 `_probe_retention_boundary`／`_drain_one_deferred_probe`）。
         self._complete(job)
         if not self._store.is_active(job.address):
             return "dropped"
         if (res.state.completeness == "complete"
                 and res.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD):
-            self._probe_retention_boundary(job.address, res.state, hl_fills)
+            self._probe_retention_boundary(job.address, res.state.window_start_ms, hl_fills)
         next_at = now + self._jit(self._fills_every_s)
         self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
         return "ran:fills"
@@ -481,16 +507,35 @@ class ExploreScheduler:
                          job.kind, err)
         self._reschedule(job, now + 86400, err=err)
 
-    def _probe_retention_boundary(self, address: str, state, hl_fills) -> None:
-        """Task 7.5 點 3／7.6 點 5、6：查詢 `[window_start_ms - 1 天,
+    def _probe_retention_boundary(self, address: str, window_start_ms: int, hl_fills) -> None:
+        """Task 7.5 點 3／7.6 點 5、6／7.7 點 8：查詢 `[window_start_ms - 1 天,
         window_start_ms - 1]` 是否仍有可查成交——回 >=1 筆合法成交代表 HL 的
         實際留存邊界早於本輪窗口起點，是比 `count_below_retention_threshold`
         （門檻推論）更強的直接證據，升級 reason 為
-        `REASON_RETENTION_BOUNDARY_VERIFIED`；回空頁則維持現有 reason
-        （門檻推論本身沒有變得更弱，只是探測沒有提供額外證據）。
+        `REASON_RETENTION_BOUNDARY_VERIFIED`；回空頁代表已探過、探測起點前一天
+        無可查成交、無法升級，記為 `REASON_PROBE_NO_EARLIER_FILLS`（Task 7.7
+        W3——探測條件排除這個 reason，讓每次全區間遍歷後至多探到有結論為止，
+        不再每輪重探）。
+
+        參數改吃 `window_start_ms`（而非整個 `FillsSyncState`，7.6 版本）：
+        延後補打時（見 `_drain_one_deferred_probe`）要用「地址進 deferred 佇列
+        當下那次遍歷」的視窗起點，不是重讀 `get_sync` 之後可能已經被後續增量
+        輪推進過的視窗——兩者在延後期間可能不同，探測要驗證的是原本那次
+        `complete` 判定的視窗邊界，不是重讀當下的最新視窗。
 
         探測走同一個 `hl_fills`（與本輪實際抓頁同一個 gateway／scope，計入
         `explore_fills` 預算，工程原則 1：判斷與實際發送同源）。
+
+        Task 7.7 點 8（正式機實證：`explore_fills` 保留額度下探測永遠
+        `BudgetExhausted`——本輪 fills 頁剛預留過，同一分鐘內再打一次 120
+        權重的探測必然被拒）：發送前先用 `_fills_available()`（與
+        `_run_fills` 判斷「值不值得把工作分給 fills」同一個方法，同源同基準）
+        確認額度夠一整頁才打；不夠 → 進 `_probe_deferred` 佇列，**不 log**（這
+        是預期常態，不是異常）、不計入 `_probe_total`（沒有真的發送，不算一次
+        嘗試）。實際發送後若仍拋 `BudgetExhausted`／`ScopePaused`／
+        `hl_budget.is_rate_limited` 判定為真的例外（pre-check 與實際發送之間
+        的競態，理論上單 thread scheduler 不會發生，但防禦）→ 同樣視為額度
+        不足，進 deferred、不計入 `_probe_total`。
 
         Task 7.6 點 5（複審 W2 修法）：探測回應必須先通過
         `explore_fills_sync.validate_page(page, probe_start, probe_end)`——舊版
@@ -499,24 +544,38 @@ class ExploreScheduler:
         `time_out_of_range`：HL 回應的成交時間跑到探測窗外）→ 記一行 warning、
         不升級，計入 `_probe_failed`。
 
-        探測本身失敗（額度不足、429、暫停、網路錯誤……不分類，與「回應不合法」
+        探測本身失敗（額度不足以外的例外、網路錯誤……不分類，與「回應不合法」
         一律視為同一種失敗，見 `stats` 計數器不細分失敗原因）→ 記一行 warning、
         不改 reason、不重試——本輪 fills 已經跑完，不能因為「錦上添花」的探測
         失敗而讓整個 job 被誤判成失敗重跑；下一次這個地址進入新的一輪且再次以
         `complete` 收尾、reason 仍是 `count_below_retention_threshold` 時，
         會再探一次（見呼叫端 `_run_fills` 的探測條件）。
+
+        Task 7.7 點 5（S4 修法）：`set_sync_reason` 落在 try 內——store 寫入
+        失敗不得逸出（工程原則 3 的反向：這裡是錦上添花的動作，不是關鍵動作，
+        失敗要吞但要出聲），記警告、計入 `_probe_failed`，不算 verified／empty。
         """
-        probe_start = state.window_start_ms - _PROBE_WINDOW_MS
-        probe_end = state.window_start_ms - 1
-        self._probe_total += 1
+        if self._fills_available() < FILLS_PAGE_WEIGHT:
+            self._enqueue_probe_deferred(address, window_start_ms)
+            return
+        probe_start = window_start_ms - _PROBE_WINDOW_MS
+        probe_end = window_start_ms - 1
         try:
             page = hl_fills.get_fills_page(address, probe_start, probe_end)
-        except Exception as e:  # noqa: BLE001 — 探測失敗不得阻擋本輪已完成的事實
+        except (BudgetExhausted, ScopePaused):
+            self._enqueue_probe_deferred(address, window_start_ms)
+            return
+        except Exception as e:  # noqa: BLE001 — 唯一的分類點，見上方 docstring
+            if is_rate_limited(e):
+                self._enqueue_probe_deferred(address, window_start_ms)
+                return
             logger.warning(
                 "explore scheduler：留存邊界探測失敗 address=%s window=[%d,%d]: %r",
                 address, probe_start, probe_end, e)
+            self._probe_total += 1
             self._probe_failed += 1
             return
+        self._probe_total += 1
         invalid_reason = validate_page(page, probe_start, probe_end)
         if invalid_reason is not None:
             logger.warning(
@@ -524,11 +583,55 @@ class ExploreScheduler:
                 "reason=%s", address, probe_start, probe_end, invalid_reason)
             self._probe_failed += 1
             return
+        reason = REASON_RETENTION_BOUNDARY_VERIFIED if page else REASON_PROBE_NO_EARLIER_FILLS
+        try:
+            self._store.set_sync_reason(address, reason)
+        except Exception:
+            logger.warning(
+                "explore scheduler：留存邊界探測結果落地失敗 address=%s reason=%s",
+                address, reason, exc_info=True)
+            self._probe_failed += 1
+            return
+        self._on_dirty()   # Task 7.7 S2：reason 落地也是一種變更，通知 dirty。
         if page:
-            self._store.set_sync_reason(address, REASON_RETENTION_BOUNDARY_VERIFIED)
             self._probe_verified += 1
         else:
             self._probe_empty += 1
+
+    def _enqueue_probe_deferred(self, address: str, window_start_ms: int) -> None:
+        """Task 7.7 點 8：額度不足時把探測排進去，下個 tick 領工前優先補打
+        （見 `_drain_one_deferred_probe`）。同地址去重——同一地址若已在佇列
+        中，先移除舊項再補新的（新的 `window_start_ms` 更新，理論上同一地址
+        在還沒補打前不該進兩次不同視窗，但這裡以新覆舊，不留兩筆）。
+        `deferred_total` 每次呼叫都遞增（含覆蓋既有項的情況），是「累計進過
+        佇列的次數」，與 `status()["probe"]["deferred"]`（目前佇列深度）語意
+        不同，見 `status()`。"""
+        for item in list(self._probe_deferred):
+            if item[0] == address:
+                self._probe_deferred.remove(item)
+                break
+        self._probe_deferred.append((address, window_start_ms))
+        self._probe_deferred_total += 1
+
+    def _drain_one_deferred_probe(self, now: float) -> None:
+        """Task 7.7 點 8：`_tick_once` 領工之前呼叫，每 tick 至多補打一個延後
+        的探測，讓探測與 fills 頁公平輪流分同一 `explore_fills` 保留額度，不
+        會餓死任何一方。探測前重讀 `get_sync`／`is_active`——地址退池或
+        completeness／reason 已經因為其他路徑改變（例如又跑了一輪增量，
+        `reason` 已經是 `retention_boundary_verified`／`probe_empty`，或降級
+        成 `partial`）都代表這筆延後的探測已經沒有意義，直接丟棄、不重新排。"""
+        if not self._probe_deferred:
+            return
+        if self._fills_available() < FILLS_PAGE_WEIGHT:
+            return
+        address, window_start_ms = self._probe_deferred.popleft()
+        st = self._store.get_sync(address)
+        if (st is None or st.completeness != "complete"
+                or st.reason != REASON_COUNT_BELOW_RETENTION_THRESHOLD
+                or not self._store.is_active(address)):
+            return
+        hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
+        self._probe_retention_boundary(address, window_start_ms, hl_fills)
 
     def _paused_remaining_s(self) -> float:
         limiter = getattr(self._hl, "_limiter", None)

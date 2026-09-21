@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from spark.publicapi.explore_scheduler import ExploreScheduler, _spread
+from spark.publicapi.explore_scheduler import FILLS_PAGE_WEIGHT, ExploreScheduler, _spread
 from spark.publicapi.explore_store import ExploreStore, FillsSyncState
 from spark.publicapi.hl import HLGateway
 from spark.publicapi.hl_budget import WeightLimiter
@@ -981,7 +981,11 @@ def test_retention_boundary_probe_positive_upgrades_reason(tmp_path):
     assert probe_start == sync.window_start_ms - 86_400_000
 
 
-def test_retention_boundary_probe_negative_keeps_threshold_reason(tmp_path):
+def test_retention_boundary_probe_negative_marks_probe_empty_reason(tmp_path):
+    """Task 7.7 W3（正確性修正）：探測回空頁不再維持原 reason 不變——記為
+    `count_below_retention_threshold_probe_empty`，讓探測條件天然排除它，
+    每次全區間遍歷後至多探到有結論為止（見同檔案
+    `test_probe_not_called_when_reason_already_probe_empty`）。"""
     clock = Clock(t=40 * 86400.0)
     store, hl, sched = _single_short_round(tmp_path, clock, probe_result=[])
 
@@ -990,8 +994,11 @@ def test_retention_boundary_probe_negative_keeps_threshold_reason(tmp_path):
 
     sync = store.get_sync("0xabc")
     assert sync.completeness == "complete"
-    assert sync.reason == "count_below_retention_threshold"
+    assert sync.reason == "count_below_retention_threshold_probe_empty"
     assert len(hl.probe_calls) == 1
+    assert sched.status()["probe"] == {
+        "total": 1, "verified": 0, "empty": 1, "failed": 0, "deferred": 0, "deferred_total": 0,
+    }
 
 
 def test_retention_boundary_probe_exception_does_not_fail_round(tmp_path):
@@ -1024,7 +1031,9 @@ def test_probe_response_out_of_window_does_not_upgrade_and_counts_failed(tmp_pat
     assert sync.completeness == "complete"
     assert sync.reason == "count_below_retention_threshold"  # 不升級
     assert len(hl.probe_calls) == 1
-    assert sched.status()["probe"] == {"total": 1, "verified": 0, "empty": 0, "failed": 1}
+    assert sched.status()["probe"] == {
+        "total": 1, "verified": 0, "empty": 0, "failed": 1, "deferred": 0, "deferred_total": 0,
+    }
 
 
 def test_probe_not_called_when_address_dropped(tmp_path):
@@ -1076,6 +1085,39 @@ def test_probe_not_called_when_reason_already_verified(tmp_path):
     assert sched.status()["probe"]["total"] == 0
 
 
+def test_probe_not_called_when_reason_already_probe_empty(tmp_path):
+    """Task 7.7 W3：`REASON_PROBE_NO_EARLIER_FILLS` 同樣跨輪存活——已經探過、
+    確認沒有更早成交的地址，下一輪增量收尾也不該再探一次（探測條件收緊為
+    reason 仍是門檻推論本身，這個 reason 值自然被排除）。"""
+    from spark.publicapi.explore_store import FillsSyncState
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    checkpoint = FillsSyncState(
+        address="0xabc", window_start_ms=window_start_ms, window_end_ms=now_ms,
+        cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete",
+        reason="count_below_retention_threshold_probe_empty", pages_done=0,
+        fills_in_window=0, updated_at=clock.now(), last_error=None, params_fp="",
+    )
+    store.insert_fills_page("0xabc", [], checkpoint)
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    hl = ProbeAwareHL(real_pages=[[]], probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    clock.t += 5 * 3600  # 過寬限期，開新增量輪
+
+    r = sched.tick()
+    assert r == "ran:fills"
+    assert hl.probe_calls == []
+    sync = store.get_sync("0xabc")
+    assert sync.reason == "count_below_retention_threshold_probe_empty"   # 維持
+    assert sched.status()["probe"]["total"] == 0
+
+
 def test_probe_verified_does_not_change_updated_at(tmp_path):
     """B6/B7：探測命中只補強 reason，不得讓 `updated_at`（對外＝
     `last_success_at`）看起來像剛抓過一頁——store 用一個與 scheduler 時鐘脫鉤
@@ -1096,4 +1138,199 @@ def test_probe_verified_does_not_change_updated_at(tmp_path):
     sync = store.get_sync("0xabc")
     assert sync.reason == "retention_boundary_verified"
     assert sync.updated_at == clock.now()   # 抓頁完成當下寫入的值，不是 store 自己的鐘
-    assert sched.status()["probe"] == {"total": 1, "verified": 1, "empty": 0, "failed": 0}
+    assert sched.status()["probe"] == {
+        "total": 1, "verified": 1, "empty": 0, "failed": 0, "deferred": 0, "deferred_total": 0,
+    }
+
+
+# --- Task 7.7 點 8：探測在 explore_fills 保留額度下的延後佇列 ---
+
+class ControllableLimiter:
+    """`available(scope)` 的回傳值由測試直接控制（不模擬真實滑動視窗帳本，
+    只用來讓 `_fills_available()` 讀到可控的可用額度）。"""
+
+    def __init__(self, value: int = 0):
+        self.value = value
+
+    def available(self, scope: str) -> int:
+        return self.value
+
+
+class ProbeAwareHLWithLimiter:
+    """`ProbeAwareHL` 加上 `_limiter`／`_scope`，讓 `_fills_available()` 走
+    `getattr(self._hl_fills, "_limiter", None)` 那條真實 limiter 路徑，而不是
+    無 limiter 時的交替 fallback。"""
+
+    def __init__(self, real_pages: list[list[dict]], probe_result, limiter,
+                scope: str = "explore_fills"):
+        self._real_pages = list(real_pages)
+        self._probe_result = probe_result
+        self._limiter = limiter
+        self._scope = scope
+        self.probe_calls: list[tuple] = []
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        if self._real_pages:
+            return self._real_pages.pop(0)
+        self.probe_calls.append((address, start_ms, end_ms))
+        if isinstance(self._probe_result, Exception):
+            raise self._probe_result
+        return self._probe_result
+
+
+def test_probe_deferred_when_budget_insufficient_then_drained_next_tick(tmp_path, caplog):
+    """點 8：`_fills_available()` 回 0（不足一整頁 120）→ 探測進 deferred、無
+    上游呼叫、無 warning、不計入 `_probe_total`；下一 tick 額度回來（回
+    `FILLS_PAGE_WEIGHT`）→ `_tick_once` 領工前先補打，探測送出、佇列清空。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+
+    window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
+    probe_time = window_start_ms - 1  # 落在探測窗內，補打成功時應驗證升級
+    limiter = ControllableLimiter(value=0)
+    hl_fills = ProbeAwareHLWithLimiter(
+        real_pages=[[]], probe_result=[{"coin": "BTC", "tid": 1, "time": probe_time}],
+        limiter=limiter)
+    sched = _sched(store, hl_fills, hl_fills=hl_fills, clock=clock)
+    sched._bootstrapped = True
+
+    with caplog.at_level("WARNING"):
+        r = sched.tick()
+    assert r == "ran:fills"
+    assert hl_fills.probe_calls == []   # 額度不足，沒有真的發送探測
+    assert sched.status()["probe"] == {
+        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 1, "deferred_total": 1,
+    }
+    assert not any("探測" in rec.message for rec in caplog.records)   # 不 log
+
+    sync = store.get_sync("0xabc")
+    assert sync.reason == "count_below_retention_threshold"   # 尚未探測，維持原值
+
+    limiter.value = FILLS_PAGE_WEIGHT   # 下一 tick 額度回來
+    r2 = sched.tick()
+    assert r2 == "idle"   # 沒有其他到期 job；drain 補打探測後正常領工拿不到工作
+    assert len(hl_fills.probe_calls) == 1
+    assert sched.status()["probe"]["deferred"] == 0
+    assert sched.status()["probe"]["deferred_total"] == 1   # 只進過一次佇列
+    assert sched.status()["probe"]["verified"] == 1
+
+    sync2 = store.get_sync("0xabc")
+    assert sync2.reason == "retention_boundary_verified"
+
+
+def test_probe_call_raising_budget_exhausted_is_deferred_not_failed(tmp_path):
+    """點 8 第 3 條（例外分類）：pre-check 通過但實際呼叫本身拋
+    `BudgetExhausted`（pre-check 與實際發送之間的競態，單 thread scheduler
+    理論上不會發生，但要防禦）→ 視同額度不足進 deferred，不計入
+    `_probe_total`／`_probe_failed`。"""
+    from spark.publicapi.hl_budget import BudgetExhausted
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    limiter = ControllableLimiter(value=FILLS_PAGE_WEIGHT)   # pre-check 通過
+    hl_fills = ProbeAwareHLWithLimiter(
+        real_pages=[[]], probe_result=BudgetExhausted("boom"), limiter=limiter)
+    sched = _sched(store, hl_fills, hl_fills=hl_fills, clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+    assert r == "ran:fills"
+    assert len(hl_fills.probe_calls) == 1   # 有實際打，但拋例外
+    assert sched.status()["probe"] == {
+        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 1, "deferred_total": 1,
+    }
+
+
+def test_enqueue_probe_deferred_dedupes_same_address(tmp_path):
+    """點 8：同地址進兩次 deferred queue 只留一筆（新覆舊），`deferred_total`
+    （累計進過佇列的次數）照樣遞增兩次——對應「同地址兩次 complete 只留一筆」
+    的驗收要求。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    sched = _sched(store, FakeHL(), clock=clock)
+
+    sched._enqueue_probe_deferred("0xabc", 100)
+    sched._enqueue_probe_deferred("0xabc", 200)
+
+    assert list(sched._probe_deferred) == [("0xabc", 200)]
+    assert sched.status()["probe"]["deferred"] == 1
+    assert sched.status()["probe"]["deferred_total"] == 2
+
+
+def test_drain_deferred_probe_discards_when_address_dropped(tmp_path):
+    """點 8：補打前重讀狀態——地址已退池（`is_active` 為 False）→ 丟棄，不
+    探測、不重排回佇列。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.insert_fills_page("0xabc", [], FillsSyncState(
+        address="0xabc", window_start_ms=window_start_ms, window_end_ms=now_ms,
+        cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete",
+        reason="count_below_retention_threshold", pages_done=0, fills_in_window=0,
+        updated_at=clock.now(), last_error=None))
+    # 刻意不 upsert_candidates：地址不是 active 候選。
+    hl = ProbeAwareHL(real_pages=[], probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+    sched = _sched(store, hl, clock=clock)
+    sched._enqueue_probe_deferred("0xabc", window_start_ms)
+
+    sched._drain_one_deferred_probe(clock.now())
+
+    assert hl.probe_calls == []
+    assert sched.status()["probe"]["deferred"] == 0
+    assert sched.status()["probe"]["deferred_total"] == 1
+
+
+def test_drain_deferred_probe_discards_when_reason_changed(tmp_path):
+    """點 8：補打前重讀狀態——reason 已經不是門檻推論（例如已經探到有結論
+    或降級成別的狀態）→ 這筆延後探測已經沒有意義，丟棄。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.insert_fills_page("0xabc", [], FillsSyncState(
+        address="0xabc", window_start_ms=window_start_ms, window_end_ms=now_ms,
+        cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete",
+        reason="retention_boundary_verified", pages_done=0, fills_in_window=0,
+        updated_at=clock.now(), last_error=None))
+    hl = ProbeAwareHL(real_pages=[], probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+    sched = _sched(store, hl, clock=clock)
+    sched._enqueue_probe_deferred("0xabc", window_start_ms)
+
+    sched._drain_one_deferred_probe(clock.now())
+
+    assert hl.probe_calls == []
+    assert sched.status()["probe"]["deferred"] == 0
+
+
+def test_probe_write_failure_counts_as_failed_not_verified(tmp_path):
+    """S4：`set_sync_reason` 拋例外（store 寫入失敗）→ 不逸出，記警告、計入
+    `_probe_failed`，不算 verified／empty。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
+    probe_time = window_start_ms - 1
+    hl = ProbeAwareHL(real_pages=[[]], probe_result=[{"coin": "BTC", "tid": 1, "time": probe_time}])
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    def boom(*a, **kw):
+        raise RuntimeError("disk full")
+    store.set_sync_reason = boom
+
+    r = sched.tick()
+    assert r == "ran:fills"
+    assert sched.status()["probe"] == {
+        "total": 1, "verified": 0, "empty": 0, "failed": 1, "deferred": 0, "deferred_total": 0,
+    }
+    sync = store.get_sync("0xabc")
+    assert sync.reason == "count_below_retention_threshold"   # 落地失敗，reason 未變

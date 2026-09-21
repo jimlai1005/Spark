@@ -48,6 +48,15 @@ logger = logging.getLogger(__name__)
 REASON_COUNT_BELOW_RETENTION_THRESHOLD = "count_below_retention_threshold"
 REASON_RETENTION_BOUNDARY_VERIFIED = "retention_boundary_verified"
 
+# Task 7.7 W3（2026-09-21，7.6 複審）：探測回空頁只證明「這一次探測沒看到更早
+# 的成交」，門檻推論（`REASON_COUNT_BELOW_RETENTION_THRESHOLD`）本身沒有變得
+# 更弱也沒有變強——但若不記下「已經探過」，`explore_scheduler._run_fills` 的
+# 探測條件（`reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD`）會讓同一個
+# 地址每次全區間遍歷後都重探一次，永遠打不出結論就永遠再試。這個第三個 reason
+# 碼把「探過、沒有更早成交、無法升級」記下來，探測條件天然排除它，讓每次全
+# 區間遍歷後至多探到有結論（`verified` 或本碼）為止。
+REASON_PROBE_NO_EARLIER_FILLS = "count_below_retention_threshold_probe_empty"
+
 # schema_version：1（初版）→2（Task 7.5：`fills_sync.params_fp` 欄位＋既有
 # complete／reason=NULL 列補標）。
 _SCHEMA_VERSION = 2

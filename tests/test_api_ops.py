@@ -1970,8 +1970,9 @@ def test_health_explore_refresh_includes_fills_and_base_scope_keys(tmp_path):
 
 
 def test_health_explore_refresh_includes_probe_counters(tmp_path):
-    """Task 7.6 點 6：留存邊界探測的觀測計數器（`_probe_total` 等）透過
-    `**scheduler.status()` 自然出現在 `explore_refresh.probe`，四鍵皆從 0 起算。"""
+    """Task 7.6 點 6／7.7 點 8：留存邊界探測的觀測計數器（`_probe_total` 等，
+    含 7.7 新增的 `deferred`／`deferred_total`）透過 `**scheduler.status()`
+    自然出現在 `explore_refresh.probe`，六鍵皆從 0 起算。"""
     from spark.publicapi.explore_publisher import ExplorePublisher
     from spark.publicapi.explore_scheduler import ExploreScheduler
     from spark.publicapi.explore_store import ExploreStore
@@ -2003,7 +2004,7 @@ def test_health_explore_refresh_includes_probe_counters(tmp_path):
 
     body = client.get("/api/ops/health").json()
     assert body["explore_refresh"]["probe"] == {
-        "total": 0, "verified": 0, "empty": 0, "failed": 0}
+        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 0, "deferred_total": 0}
 
 
 # ---------- P6 Task 6.3（D15，2026-09-20：觀測補齊）----------

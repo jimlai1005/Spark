@@ -47,6 +47,30 @@ PRIMARY KEY，本模組不做去重判斷。同毫秒佔滿整頁（`same_ms_ove
 短頁分支。`window_start_ms`／`window_end_ms` 是**目前這一輪**的查詢區間，
 不是「reason 所描述的那次遍歷」的區間（兩者在增量輪只延伸的情況下會不同——
 `reason` 仍指向較早那次遍歷，`window_*` 已經推進到最新一輪）。
+
+`partial` 的復原路徑（Task 7.7 W2，正確性修正）：7.6 移除了「增量短頁把
+`partial` 誤升回 `complete`」的錯誤路徑之後，`partial` 若像 `complete` 一樣
+永遠只做增量，就成了吸收態——增量只延伸尾端，缺口本身沒超標時原樣保留
+`partial`（見上一段），永遠無法證明「先前無法證明完整的那段」其實是完整的。
+唯一正確的復原手段是整窗重掃：`partial` 每過 `PARTIAL_RESCAN_AFTER_MS`
+（24 小時）就丟棄舊視窗、開一個全新的首輪全區間遍歷（`completeness` 重置為
+`backfilling`、`reason=None`、游標回到新視窗起點），用新的一次完整遍歷重新
+判定門檻——重掃後筆數低於門檻 → `complete`；仍超標 → `partial`（見
+`plan_page` 該分支）。`complete` 分支不受影響，仍走原本的 4 小時增量。
+
+`plan_page` 的「輪進行中」不變量（Task 7.7 W1，docstring 修正——不改判準
+本身，只把敘述寫準確）：輪開始時 `cursor_ms ≤ synced_through_ms`
+（inclusive overlap，`cursor` 從 `synced_through - overlap_ms` 起算）；
+滿頁後 `cursor_ms = 最後一筆時間 ≥ synced_through_ms`，其中 `==` 只在
+「同一毫秒佔滿整頁」（`same_ms_overflow`）時發生，且該分支會立刻把
+`synced_through_ms` 一併推到同一個值並終止本輪為 `partial`（見
+`apply_page`）；短頁收尾同樣不改 `cursor_ms`（見 `apply_page`）。因此
+`cursor_ms > synced_through_ms` ⇒ 輪進行中（成立方向不變，`plan_page`
+靠它判斷是否續抓）；但反向不成立——`cursor_ms == synced_through_ms` 的
+兩種狀態（尚未開新輪、或 `same_ms_overflow` 剛終止本輪）都是「輪已結束」，
+不能反推「輪進行中」。**不要**把判準改成 `>=`：那會讓已經以 `partial`／
+`same_ms_overflow` 結束、`cursor == synced_through == window_end` 的地址
+被誤判成「輪進行中」，下一次 tick 對 `[end, end]` 這個零長度區間無限重抓。
 """
 from __future__ import annotations
 
@@ -69,6 +93,11 @@ WINDOW_DAYS = 30
 OVERLAP_MS = 1
 _DAY_MS = 86_400_000
 _DEFAULT_INCREMENTAL_AFTER_MS = 4 * 3600 * 1000
+
+# Task 7.7 W2（partial 復原路徑，正確性修正）：`partial` 不做增量（見模組
+# 檔頭），每過這麼久就整窗重掃一次，是唯一能讓 `partial` 有機會復原成
+# `complete` 的路徑——否則 7.6 移除誤升路徑之後 `partial` 會變成吸收態。
+PARTIAL_RESCAN_AFTER_MS = 24 * 3600 * 1000
 
 # Task 7.5 點 4／7.6 點 8（查詢參數留證）：`hl.get_fills_page` 實際請求體只送
 # `type/user/startTime/endTime`——刻意不送 `aggregateByTime`。這裡把「送了
@@ -105,6 +134,20 @@ class PageResult(NamedTuple):
     note: str | None
 
 
+def _fresh_backfilling_state(address: str, now_ms: int, window_days: int) -> FillsSyncState:
+    """建一個「從未同步過」形狀的全新首輪狀態（`state is None` 分支、與
+    Task 7.7 W2 的 `partial` 整窗重掃共用——後者要「回傳與 `state is None`
+    相同形狀的全新首輪」，抽成共用函式避免兩處各自維護一份欄位清單而漂移）。"""
+    window_start_ms = now_ms - window_days * _DAY_MS
+    return FillsSyncState(
+        address=address, window_start_ms=window_start_ms, window_end_ms=now_ms,
+        cursor_ms=window_start_ms, synced_through_ms=None, observed_from_ms=None,
+        observed_to_ms=None, completeness="backfilling", reason=None, pages_done=0,
+        fills_in_window=0, updated_at=now_ms / 1000, last_error=None,
+        params_fp=PARAMS_FP,
+    )
+
+
 def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
               window_days: int = WINDOW_DAYS, overlap_ms: int = OVERLAP_MS,
               incremental_after_ms: int = _DEFAULT_INCREMENTAL_AFTER_MS) -> PagePlan:
@@ -114,11 +157,12 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
       游標從區間起點開始，`completeness="backfilling"`。
     - `state.completeness == "backfilling"`：上一輪回補尚未跑完 → 沿用同一個
       `window_end_ms`，從 `cursor_ms` 續抓。
-    - `state.completeness in ("complete", "partial")`：上一輪已經跑到底，
-      **或**目前正在跑一個尚未結束的增量輪（見下方「輪進行中」）。
-      若 `cursor_ms > synced_through_ms`（Task 7.6 A1，正確性修正）：代表增量輪
-      已經開始但尚未跑到 `window_end_ms`（`synced_through_ms` 只在整輪結束時
-      才推進，見 `apply_page`）——續抓本輪剩餘部分：`PagePlan(start_ms=cursor_ms,
+    - `state.completeness == "complete"`：上一輪已經跑到底，**或**目前正在跑
+      一個尚未結束的增量輪（見下方「輪進行中」）。
+      若 `cursor_ms > synced_through_ms`（Task 7.6 A1，正確性修正；不變量見
+      模組檔頭「輪進行中」一段）：代表增量輪已經開始但尚未跑到
+      `window_end_ms`（`synced_through_ms` 只在整輪結束時才推進，見
+      `apply_page`）——續抓本輪剩餘部分：`PagePlan(start_ms=cursor_ms,
       end_ms=window_end_ms, state=state)`，不看增量寬限期、不改 `state`。
       **這個判斷必須排在增量寬限期判斷之前**：否則增量輪第一頁若剛好滿頁
       （`done=False`，`completeness` 未變、仍是舊值），下一次 tick 進來時
@@ -132,34 +176,40 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
       `window_end_ms` 推到 `now`、`window_start_ms` 同步前推到
       `now-window_days`（更早的 fills 由 `ExploreStore.purge` 處理，這裡不刪）、
       游標從 `max(新 window_start, synced_through_ms - overlap_ms)` 開始（inclusive
-      重疊，去重交給 PK）、`pages_done` 歸零；`completeness` 原樣保留（`partial`
-      仍是 `partial`——增量輪只從尾端續抓，沒有重新掃過整個區間，不能因為新抓到幾筆
-      就宣稱已補完先前無法證明完整的部分）。`fills_in_window` 同樣歸零（2026-09-20
-      主線程裁決）：留存門檻判的是「這一輪查詢區間內觀測到的筆數」，增量輪的查詢區間
-      只有 `synced_through_ms` 到 `now` 這一小段缺口，門檻要對這段缺口套用；若跨輪
+      重疊，去重交給 PK）、`pages_done` 歸零；`completeness` 原樣保留為
+      `complete`。`fills_in_window` 同樣歸零（2026-09-20 主線程裁決）：留存
+      門檻判的是「這一輪查詢區間內觀測到的筆數」，增量輪的查詢區間只有
+      `synced_through_ms` 到 `now` 這一小段缺口，門檻要對這段缺口套用；若跨輪
       累加舊區間的計數，會在無新增風險的情況下隨時間單調上升，幾輪之後無條件觸頂，
       把本來 `complete` 的地址誤標 `partial`。
       若還沒到增量寬限期 → 回傳 `start_ms == end_ms == synced_through_ms` 的空計畫
       （`PagePlan.is_noop` 為 True），呼叫端據此不打上游。
+    - `state.completeness == "partial"`：**不做增量**（模組檔頭「`partial` 的
+      復原路徑」一段——增量只延伸尾端，缺口本身沒超標時原樣保留 `partial`，
+      永遠無法補上先前無法證明完整的部分，若比照 `complete` 一直增量下去
+      會變成吸收態）。若 `cursor_ms > synced_through_ms`（Task 7.7：多頁整窗
+      重掃中途，同「輪進行中」判準）→ 續抓本輪剩餘部分，不改 `state`。否則
+      若已過 `PARTIAL_RESCAN_AFTER_MS`（24 小時，Task 7.7 W2）→ 丟棄舊視窗，
+      回傳與 `state is None` 相同形狀的全新首輪（`_fresh_backfilling_state`，
+      `completeness` 重置為 `backfilling`）：用一次全新的完整遍歷重新判定
+      門檻，重掃後筆數低於門檻 → `complete`；仍超標 → `partial`（沿用
+      `apply_page` 的 `backfilling` 收尾邏輯，見該函式）。未滿 24 小時 →
+      回傳 `start_ms == end_ms == synced_through_ms` 的空計畫（同 `complete`
+      的寬限期 noop 形狀），呼叫端不打上游。
     """
     if state is None:
-        window_start_ms = now_ms - window_days * _DAY_MS
-        new_state = FillsSyncState(
-            address=address, window_start_ms=window_start_ms, window_end_ms=now_ms,
-            cursor_ms=window_start_ms, synced_through_ms=None, observed_from_ms=None,
-            observed_to_ms=None, completeness="backfilling", reason=None, pages_done=0,
-            fills_in_window=0, updated_at=now_ms / 1000, last_error=None,
-            params_fp=PARAMS_FP,
-        )
-        return PagePlan(start_ms=window_start_ms, end_ms=now_ms, state=new_state)
+        new_state = _fresh_backfilling_state(address, now_ms, window_days)
+        return PagePlan(start_ms=new_state.window_start_ms, end_ms=new_state.window_end_ms,
+                        state=new_state)
 
     if state.completeness == "backfilling":
         return PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)
 
-    if state.completeness in ("complete", "partial"):
-        # Task 7.6 A1（正確性修正，必須排在增量寬限期判斷之前——見上方 docstring）：
-        # `cursor_ms > synced_through_ms` 代表本輪（增量輪）已經開始抓頁但尚未
-        # 跑到底，續抓剩餘部分，不看寬限期、不改 state。
+    if state.completeness == "complete":
+        # Task 7.6 A1（正確性修正，必須排在增量寬限期判斷之前——見上方 docstring
+        # 與模組檔頭「輪進行中」不變量）：`cursor_ms > synced_through_ms` 代表
+        # 本輪（增量輪）已經開始抓頁但尚未跑到底，續抓剩餘部分，不看寬限期、
+        # 不改 state。
         if (state.synced_through_ms is not None
                 and state.cursor_ms > state.synced_through_ms):
             return PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)
@@ -176,6 +226,19 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
                 params_fp=PARAMS_FP,
             )
             return PagePlan(start_ms=new_cursor, end_ms=now_ms, state=new_state)
+        through = state.synced_through_ms
+        return PagePlan(start_ms=through, end_ms=through, state=state)
+
+    if state.completeness == "partial":
+        # Task 7.7 W2：partial 不做增量（見上方 docstring／模組檔頭）——
+        # 「輪進行中」判準與 complete 分支相同，供整窗重掃多頁續抓時沿用。
+        if (state.synced_through_ms is not None
+                and state.cursor_ms > state.synced_through_ms):
+            return PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)
+        if now_ms - state.window_end_ms >= PARTIAL_RESCAN_AFTER_MS:
+            new_state = _fresh_backfilling_state(state.address, now_ms, window_days)
+            return PagePlan(start_ms=new_state.window_start_ms, end_ms=new_state.window_end_ms,
+                            state=new_state)
         through = state.synced_through_ms
         return PagePlan(start_ms=through, end_ms=through, state=state)
 
