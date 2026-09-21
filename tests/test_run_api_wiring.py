@@ -104,3 +104,30 @@ def test_explore_scheduler_receives_base_and_fills_scoped_gateways(
     assert captured["hl_base"]._scope == "explore_base"
     assert captured["hl_fills"]._scope == "explore_fills"
     assert captured["hl"]._scope == "explore"
+
+
+def test_run_api_limiter_has_parent_scopes_and_caps(tmp_path, monkeypatch):
+    """2026-09-21 複審 W1：接線不變量——run_api 建的 WeightLimiter 必須帶
+    explore→explore_base／explore_fills 的父子對映與三個 cap，否則父 cap 失效、
+    explore 家族在同一視窗可衝到 600。"""
+    import spark.publicapi.hl_budget as hl_budget_mod
+
+    captured: dict = {}
+    real_init = hl_budget_mod.WeightLimiter.__init__
+
+    def fake_init(self, **kwargs):
+        captured.update(kwargs)
+        real_init(self, **kwargs)
+
+    monkeypatch.setattr(hl_budget_mod.WeightLimiter, "__init__", fake_init)
+    env = _env(tmp_path, EXPLORE_UPSTREAM_REFRESH="1",
+               FILET_EXPLORE_DB=str(tmp_path / "explore.db"))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    run_api.main()
+
+    assert captured["scope_parents"] == {"explore_base": "explore", "explore_fills": "explore"}
+    caps = captured["scope_caps"]
+    assert caps["explore"] == 300 and caps["explore_base"] == 180 and caps["explore_fills"] == 120
+    assert captured["global_cap"] == 900

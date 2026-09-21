@@ -891,3 +891,31 @@ def test_run_forever_survives_tick_exceptions(tmp_path):
     assert not thread.is_alive()
     assert store._boom_left == 0
     assert tick_count["n"] >= 6
+
+
+def test_budget_exhausted_keeps_original_due_time_so_wait_keeps_accumulating(tmp_path):
+    """2026-09-21 複審 W3：`BudgetExhausted` 退避不得把 `next_attempt_at` 推到未來
+    （那會把等待加權歸零）。"""
+    from spark.publicapi.hl_budget import BudgetExhausted
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0x" + "ab" * 20
+    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    due_at = clock.now() - 1200.0
+    store.enqueue(f"{addr}:state", addr, "state", 0, due_at)
+
+    class ExhaustedHL:
+        def clearinghouse_state(self, address):
+            raise BudgetExhausted("hl budget exhausted for scope=explore_base weight=2")
+
+    sched = ExploreScheduler(store=store, hl=ExhaustedHL(), leaderboard_source_fn=lambda: None,
+                             excluded_fn=set, cfg=ExploreConfig(), now_fn=clock.now,
+                             sleep_fn=clock.sleep, on_dirty=lambda: None)
+    sched.tick()                      # bootstrap
+    clock.t += 1.0
+    assert sched.tick() == "no_budget"
+    row = store._db.execute("select next_attempt_at, lease_until from refresh_job where key=?",
+                            (f"{addr}:state",)).fetchone()
+    assert row[0] == due_at           # 原到期時間保留
+    assert row[1] is None or row[1] < clock.now()   # lease 已釋放

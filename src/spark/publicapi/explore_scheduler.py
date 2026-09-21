@@ -227,9 +227,15 @@ class ExploreScheduler:
     # ---- 內部：一次 tick ----
     def _tick_once(self, now: float) -> str:
         if not self._first_tick_done:
+            # <!-- 2026-09-21 複審 W2 -->：旗標在重排**成功之後**才設；重排拋例外時
+            # 大聲記錄並在下一 tick 再試（工程原則 #3：關鍵一次性動作不得靜默失敗）。
+            try:
+                self._rebalanced = self._rebalance_overdue_base_jobs(now)
+            except Exception:
+                logger.exception("explore scheduler: 逾期 job 重排失敗，下一 tick 重試")
+                raise
             self._first_tick_done = True
-            self._rebalanced = self._rebalance_overdue_base_jobs(now)
-            logger.info(
+            logger.warning(
                 "explore scheduler: 重排逾期 job（新週期 state=%.0fs portfolio=%.0fs "
                 "ledger=%.0fs）：%s", self._state_every_s, self._portfolio_every_s,
                 self._ledger_every_s, self._rebalanced)
@@ -274,7 +280,10 @@ class ExploreScheduler:
         try:
             return self._run_job(job, now, fills_due=fills_due)
         except BudgetExhausted:
-            self._reschedule(job, now + 5, bump_attempts=False)
+            # <!-- 2026-09-21 複審 W3 -->：額度不足不是這個 job 的錯——保留原本的
+            # `next_attempt_at`（不推到未來），等待加權才能持續累積、老 job 不會
+            # 因為額度緊繃反而被自己的退避重置成「剛到期」。lease 照常釋放。
+            self._reschedule(job, min(job.next_attempt_at, now), bump_attempts=False)
             return "no_budget"
         except ScopePaused:
             remaining = self._paused_remaining_s()
@@ -460,7 +469,9 @@ class ExploreScheduler:
         影響，一律照 `limiter.available("explore_fills")` 的真實保留額度判斷。"""
         limiter = getattr(self._hl_fills, "_limiter", None)
         if limiter is not None:
-            return limiter.available("explore_fills")
+            # <!-- 2026-09-21 複審 W1 -->：用 gateway 自己的 scope 名，不硬編字串
+            # ——判斷與實際發送同源（同一個 `_hl_fills`、同一個 scope）。
+            return limiter.available(getattr(self._hl_fills, "_scope", "explore_fills"))
         now = self._now()
         base_due = any(self._store.due_count(kind, now) > 0 for kind in _BASE_KINDS)
         if not base_due:
