@@ -1505,7 +1505,33 @@ complete 不定期重掃；遷移前缺證據的列標 evidence unknown、低優
 
 **驗收（主線程親跑）**：ruff；pytest 全綠；vitest 全綠；seed DB migration 實跑（version 3、`fills_scan` 列數＝fills_sync 列數、verified 列 unknown=0、其餘 unknown=1、verify job 攤開）；`repro_79b.py`（主線程寫：重掃期間增量前進；舊探測不覆蓋新 scan；9:1）。**部署**：schema v3＋drop-in＋取樣器換版（取樣器加 `fills_scan` 統計、每地址增量輪間隔 p50/p95、health `hl_budget`）→ **至少 6 小時＝一個完整增量週期**，要看到：每個地址至少一次跨輪更新（`window_end_ms` 前進）、積壓（到期 fills 類 job 數與 `oldest_due`）走勢、核驗 scan 進度、探測比例 ≤ 1/10、零 429／Traceback。9/22 09:12 只出分版本階段報告。
 
-<!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b 為準，衝突時以 v2 為準。 -->
+#### 7.9c @inline：7.9b 複審修正（2 Critical＋5 Warning＋守門測試；2026-09-22 主線程裁決；升級 opus 派工）
+
+<!-- 失敗軌跡（給接手者）：7.9b 由 sonnet builder 實作，兩輪都有理解性錯誤——第一輪遷移把 backfilling 列的增量起點設成遷移當下（真實缺口），
+第二輪複審抓到：(C1) `_run_scan` partial 收尾 `enqueue(..., now + PARTIAL_RESCAN_AFTER_MS)` 把毫秒常數加到秒制時間（重掃排到 1,000 天後）；
+(C2) `_enqueue_address_jobs` 每個 candidates 輪（30 分）都無條件 `enqueue(fills_scan)`（忽略 `bootstrap_address_fills` 回傳值），而 `ExploreStore.complete` 是 DELETE，
+job 消失後下一輪又建、`_run_scan` 見 completeness!=backfilling 就開 `partial_rescan` → 主線程實跑複審腳本：單一地址 3 天 144 次 partial_rescan＋224 次增量。
+正式機推估 300 地址每 ~3.5h 一次 30 天整窗遍歷 ≈ 2,000 次/日，fills 保留額度 60 頁/h 完全吃光、`fills_verify` 永久餓死。
+兩次錯誤都是「排程觸發條件從 job 存在與否推導、而不是從狀態推導」這個形狀。 -->
+
+**Files:** `explore_scheduler.py`、`explore_store.py`、`explore_fills_sync.py`；`tests/test_explore_scheduler.py`、`tests/test_explore_store.py`、`tests/test_explore_fills_sync.py`。不動契約鍵、不動前端。
+
+1. **C1 單位**：`explore_fills_sync` 改為秒制單一常數 `PARTIAL_RESCAN_AFTER_S = 24 * 3600`，`PARTIAL_RESCAN_AFTER_MS = PARTIAL_RESCAN_AFTER_S * 1000`（若仍有毫秒用途）；scheduler 一律 `now + PARTIAL_RESCAN_AFTER_S`。測試：partial 收尾 → `fills_scan` job 的 `next_attempt_at` 在 `[now + 86400 − 1, now + 86400 + 1]`。
+2. **C2 觸發條件改由狀態推導**：
+   - `_enqueue_address_jobs`：只有 `bootstrap_address_fills(...)` 回 `True`（真的新建增量軌）時才入列 `fills_scan`（initial）；既有地址一律不入列 scan job。
+   - `_run_scan` 領到 `fills_scan` job 但沒有 running scan 時：只在 `fills_sync.completeness == "partial"` **且** `now − 最近 done scan 的 finished_at ≥ PARTIAL_RESCAN_AFTER_S` 才開 `partial_rescan`；否則 `_complete(job)`、計數 `scan_job_dropped`、回 `"dropped"`（不開 scan、不排下一個）。`complete` 地址永遠不會被 scan job 觸發重掃。
+   - 復原路徑（job 遺失時）：`_run_increment` 每次跑完，若 `completeness == "partial"` 且無 running scan 且 `now − finished_at ≥ PARTIAL_RESCAN_AFTER_S` 且無 `fills_scan` job → `enqueue(fills_scan, priority 3, now)`。partial 收尾時的 `now + 24h` 入列保留（主路徑），復原路徑是保險。
+   - 守門測試：(a) complete 地址跑過 5 個 candidates 輪＋3 天時間，`fills_scan` 列恰好 1（initial）、`partial_rescan` 0、探測 ≤ 1；(b) partial 地址 → 第一次重掃在 +24h（±spread），3 天內 `partial_rescan` ≤ 3；(c) 刪掉 partial 地址的 `fills_scan` job 後，一個增量週期內被重新入列並執行；(d) 用主線程／複審的 `scratchpad/repro_rescan.py` 情境寫成正式測試（3 天、每 30 分 candidates 輪）。
+3. **W1 遷移冪等**：`_migrate_v2_to_v3` 每列先查 `fills_scan` 是否已有該地址的列（有則跳過整列）；`INSERT OR IGNORE` 建 scan／verify job；`refresh_job` 改名用 `UPDATE ... WHERE key=? AND NOT EXISTS (SELECT 1 FROM refresh_job WHERE key=?)`。測試：正式機快照複本遷移後把 `schema_version` 改回 2 再開啟 → 不拋例外、列數與 job 數不變。
+4. **W2 `observed_from/to`**：`apply_incremental_page` 維護 `observed_*`（min/max 併入）；`complete_scan` 把 scan 的 `observed_*` 併入 `fills_sync`（min/max）。測試：新地址 scan 完成後 coverage `observed_from/to` 非 null 且等於 fills 極值；增量後 `observed_to` 前進。
+5. **W3 `purge`**：刪除 `fills_scan` 中 `status='done' AND finished_at < now − 30d AND scan_id != fills_sync.scan_id` 的列，計入 `counts["fills_scan"]`；整個地址 purge 時的連帶刪除也計數。測試。
+6. **W4 準入**：`ADMISSION_MULTIPLIER` 改 7（每地址最多 6 種 kind＋餘裕），並在 `_tick_once` 的準入檢查改為「只擋既有地址的補建，不擋新候選 bootstrap」：新候選（`bootstrap_address_fills` 回 True）永遠允許建 job。測試：300 地址穩態（6 kind）＋129 verify 不觸發跳過；新候選在 cap 邊緣仍拿到 job。
+7. **W5**：`complete_scan` CAS 回 False → `logger.warning`＋`status()["scan_writeback_failed"]`。
+8. **S1 補回五條探測行為測試**（升級／probe_empty／窗外不升級且 failed 計數／例外不中斷 tick／退池不探）；**S2** `status()` 加 `scans_running`、`verify_remaining`、`due_by_kind`；**S3** gap 檢查 docstring 寫明只防遷移／時鐘異常；**S4** `inc_from_ms is None` 防禦（視同 `synced_through_ms`，不拋例外）。
+
+**驗收（主線程親跑）**：ruff；pytest 全綠 > 3212；`repro_rescan.py`（複審腳本）3 天情境：`partial_rescan` ≤ 3、rescan job 到期 ≈ +1 天；`repro_79b.py` 仍 PASS；正式機快照遷移三次（含 version 改回 2 重跑）一致。
+
+<!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c 為準，衝突時以 v2 為準。 -->
 ### Task 7.9 v1（已被 v2 取代，僅供對照）：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
 
 <!-- 裁決：選 (b) 6 小時（不選 5）：單頁基線 300/6h＝50／小時＋新增約 1，才對 60 留出空間，仍須扣多頁與探測成本；排程、詳情頁補排、前端「更新中」共用同一期限，不得留寫死 4 小時。
