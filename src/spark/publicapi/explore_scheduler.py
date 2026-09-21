@@ -197,6 +197,10 @@ class ExploreScheduler:
         # 回報的是目前佇列深度（`len`），兩者語意不同，見 `status()`。
         self._probe_deferred: deque = deque(maxlen=_PROBE_DEFERRED_MAXLEN)
         self._probe_deferred_total = 0
+        # Task 7.8 W3（可觀測性）：deque 帶 maxlen，append 到滿的佇列會讓最舊項
+        # 被靜默擠掉——這個計數器讓「探測需求超過佇列容量」變成可觀測，見
+        # `_enqueue_probe_deferred`。
+        self._probe_dropped = 0
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -264,6 +268,12 @@ class ExploreScheduler:
                 # 補打的探測數），`deferred_total` 是累計進過佇列的次數。
                 "deferred": len(self._probe_deferred),
                 "deferred_total": self._probe_deferred_total,
+                # Task 7.8 W3：deque 溢位（append 到滿佇列擠掉最舊項）與 S1
+                # 過期視窗（drain 時發現 window_start_ms 已被後續增量輪推進）
+                # 各自計數但共用一個累計欄位——兩者語意相同：都是「這筆延後的
+                # 探測需求已經沒有意義／被放棄」，不算 failed（沒有真的發送
+                # 失敗）。
+                "dropped": self._probe_dropped,
             },
         }
 
@@ -456,7 +466,21 @@ class ExploreScheduler:
             self._complete(job)
             if not self._store.is_active(job.address):
                 return "dropped"
-            next_at = plan.state.window_end_ms / 1000 + self._fills_every_s
+            # Task 7.8（Critical，工程原則 1：比較的兩個量要同源）：noop 計畫
+            # 自帶失效時刻（`plan.next_due_ms`），排程端只能用它重排，不得另算
+            # 一份寬限期常數——7.7 把 partial 的 noop 期限改成 24 小時，但這裡
+            # 舊版仍用 `window_end + fills_every_s`（4h），兩者分家後 4 小時一
+            # 到，每次 noop 都排到過去、等待加權讓它永遠贏、餓死其他 job。
+            # `next_due_ms` 為 `None` 是防禦性分支，不應發生（`plan_page` 保證
+            # noop 計畫一律填值）。任何路徑都不得把 `next_attempt_at` 排到
+            # `now` 之前。
+            if plan.next_due_ms is None:
+                logger.error(
+                    "explore scheduler: noop plan 缺少 next_due_ms address=%s，"
+                    "退回 now + fills_every_s", job.address)
+                next_at = now + self._fills_every_s
+            else:
+                next_at = max(plan.next_due_ms / 1000, now + self._jit(60.0))
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
             return "ran:fills"
 
@@ -610,6 +634,16 @@ class ExploreScheduler:
             if item[0] == address:
                 self._probe_deferred.remove(item)
                 break
+        # Task 7.8 W3：`deque(maxlen=...)` append 到滿的佇列會自動擠掉最舊的
+        # 一項而不拋例外——上面的去重迴圈已經處理「同地址覆蓋」，這裡檢查的
+        # 是「佇列已滿、即將擠掉別的地址」這個不同的情境，兩者不可合併。
+        if len(self._probe_deferred) == self._probe_deferred.maxlen:
+            self._probe_dropped += 1
+            dropped_address = self._probe_deferred[0][0]
+            logger.warning(
+                "explore scheduler: deferred probe 佇列已滿（maxlen=%d），"
+                "丟棄最舊項 address=%s，新項 address=%s 入列",
+                self._probe_deferred.maxlen, dropped_address, address)
         self._probe_deferred.append((address, window_start_ms))
         self._probe_deferred_total += 1
 
@@ -619,16 +653,35 @@ class ExploreScheduler:
         會餓死任何一方。探測前重讀 `get_sync`／`is_active`——地址退池或
         completeness／reason 已經因為其他路徑改變（例如又跑了一輪增量，
         `reason` 已經是 `retention_boundary_verified`／`probe_empty`，或降級
-        成 `partial`）都代表這筆延後的探測已經沒有意義，直接丟棄、不重新排。"""
+        成 `partial`）都代表這筆延後的探測已經沒有意義，直接丟棄、不重新排。
+
+        Task 7.8 S1（過期視窗）：`reason` 仍是門檻推論不足以確認「佇列裡記的
+        那次遍歷」還是「目前最新那次遍歷」——增量輪只延伸 `synced_through_ms`
+        不改 `reason`（見 `explore_fills_sync` 檔頭），所以 reason 相同時
+        `window_start_ms` 仍可能已經被後續增量輪推進過。多驗這一個欄位，不同
+        → 這筆延後探測驗證的是舊視窗邊界，已經對不上目前的查詢區間，丟棄、
+        計入 `dropped`（不算 `failed`：沒有發送、也不是探測本身失敗）。"""
         if not self._probe_deferred:
             return
         if self._fills_available() < FILLS_PAGE_WEIGHT:
             return
+        # Task 7.8 S3：`now` 供觀測用——記錄補打嘗試發生的時刻與當下佇列深度，
+        # 供事後從 log 重建「延後探測平均等了多久才被補打」。
+        logger.debug(
+            "explore scheduler: drain deferred probe now=%.3f queue_depth=%d",
+            now, len(self._probe_deferred))
         address, window_start_ms = self._probe_deferred.popleft()
         st = self._store.get_sync(address)
         if (st is None or st.completeness != "complete"
                 or st.reason != REASON_COUNT_BELOW_RETENTION_THRESHOLD
                 or not self._store.is_active(address)):
+            return
+        if st.window_start_ms != window_start_ms:
+            self._probe_dropped += 1
+            logger.warning(
+                "explore scheduler: deferred probe 視窗已過期 address=%s "
+                "佇列值=%d 現值=%d，丟棄不探", address, window_start_ms,
+                st.window_start_ms)
             return
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
         self._probe_retention_boundary(address, window_start_ms, hl_fills)

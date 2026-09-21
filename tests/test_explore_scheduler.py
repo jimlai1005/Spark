@@ -997,7 +997,7 @@ def test_retention_boundary_probe_negative_marks_probe_empty_reason(tmp_path):
     assert sync.reason == "count_below_retention_threshold_probe_empty"
     assert len(hl.probe_calls) == 1
     assert sched.status()["probe"] == {
-        "total": 1, "verified": 0, "empty": 1, "failed": 0, "deferred": 0, "deferred_total": 0,
+        "total": 1, "verified": 0, "empty": 1, "failed": 0, "deferred": 0, "deferred_total": 0, "dropped": 0,
     }
 
 
@@ -1032,7 +1032,7 @@ def test_probe_response_out_of_window_does_not_upgrade_and_counts_failed(tmp_pat
     assert sync.reason == "count_below_retention_threshold"  # 不升級
     assert len(hl.probe_calls) == 1
     assert sched.status()["probe"] == {
-        "total": 1, "verified": 0, "empty": 0, "failed": 1, "deferred": 0, "deferred_total": 0,
+        "total": 1, "verified": 0, "empty": 0, "failed": 1, "deferred": 0, "deferred_total": 0, "dropped": 0,
     }
 
 
@@ -1139,7 +1139,7 @@ def test_probe_verified_does_not_change_updated_at(tmp_path):
     assert sync.reason == "retention_boundary_verified"
     assert sync.updated_at == clock.now()   # 抓頁完成當下寫入的值，不是 store 自己的鐘
     assert sched.status()["probe"] == {
-        "total": 1, "verified": 1, "empty": 0, "failed": 0, "deferred": 0, "deferred_total": 0,
+        "total": 1, "verified": 1, "empty": 0, "failed": 0, "deferred": 0, "deferred_total": 0, "dropped": 0,
     }
 
 
@@ -1201,7 +1201,7 @@ def test_probe_deferred_when_budget_insufficient_then_drained_next_tick(tmp_path
     assert r == "ran:fills"
     assert hl_fills.probe_calls == []   # 額度不足，沒有真的發送探測
     assert sched.status()["probe"] == {
-        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 1, "deferred_total": 1,
+        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 1, "deferred_total": 1, "dropped": 0,
     }
     assert not any("探測" in rec.message for rec in caplog.records)   # 不 log
 
@@ -1241,7 +1241,7 @@ def test_probe_call_raising_budget_exhausted_is_deferred_not_failed(tmp_path):
     assert r == "ran:fills"
     assert len(hl_fills.probe_calls) == 1   # 有實際打，但拋例外
     assert sched.status()["probe"] == {
-        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 1, "deferred_total": 1,
+        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 1, "deferred_total": 1, "dropped": 0,
     }
 
 
@@ -1330,7 +1330,181 @@ def test_probe_write_failure_counts_as_failed_not_verified(tmp_path):
     r = sched.tick()
     assert r == "ran:fills"
     assert sched.status()["probe"] == {
-        "total": 1, "verified": 0, "empty": 0, "failed": 1, "deferred": 0, "deferred_total": 0,
+        "total": 1, "verified": 0, "empty": 0, "failed": 1, "deferred": 0, "deferred_total": 0, "dropped": 0,
     }
     sync = store.get_sync("0xabc")
     assert sync.reason == "count_below_retention_threshold"   # 落地失敗，reason 未變
+
+
+# --- Task 7.8 Critical：noop 重排時間與 noop 期限同源 ---
+
+def test_run_fills_partial_noop_reschedules_using_plan_next_due_ms(tmp_path):
+    """S4 (i)：partial 地址 noop 收尾後，`refresh_job.next_attempt_at` 必須
+    等於 `plan.next_due_ms`（`window_end_ms + PARTIAL_RESCAN_AFTER_MS`，24
+    小時），且必須晚於 `now`——這正是 7.7 之後餓死其他 job 的根因：舊版用
+    `window_end + fills_every_s`（4h）重排，4 小時一到就把 job 排到過去。"""
+    from spark.publicapi.explore_fills_sync import PARTIAL_RESCAN_AFTER_MS
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0xabc"
+    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    window_end_ms = now_ms - 5 * 3600 * 1000  # 5 小時前：已過舊 4h 門檻，未過 24h
+    window_start_ms = window_end_ms - 30 * 86_400_000
+    store.insert_fills_page(addr, [], FillsSyncState(
+        address=addr, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
+        cursor_ms=window_end_ms, synced_through_ms=window_end_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="partial", reason="retention_limit",
+        pages_done=0, fills_in_window=0, updated_at=clock.now(), last_error=None))
+    store.enqueue(f"{addr}:fills", addr, "fills", 2, clock.now())
+    sched = _sched(store, FakeHL(), clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+
+    assert r == "ran:fills"
+    row = store._db.execute(
+        "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)
+    ).fetchone()
+    expected = (window_end_ms + PARTIAL_RESCAN_AFTER_MS) / 1000
+    assert row[0] == expected
+    assert row[0] > clock.now()
+
+
+def test_run_fills_complete_noop_reschedule_unchanged_at_four_hours(tmp_path):
+    """S4 (ii)：`complete` 地址 noop 收尾行為不變——仍等於
+    `window_end_ms + 4h`（`plan_page` 預設的 `incremental_after_ms`），只是
+    現在的值來源改成 `plan.next_due_ms`，不再是排程端自己算的常數。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0xabc"
+    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    window_end_ms = now_ms - 3600 * 1000  # 1 小時前，未過 4h 增量寬限期
+    window_start_ms = window_end_ms - 30 * 86_400_000
+    store.insert_fills_page(addr, [], FillsSyncState(
+        address=addr, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
+        cursor_ms=window_end_ms, synced_through_ms=window_end_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete",
+        reason="count_below_retention_threshold", pages_done=0, fills_in_window=0,
+        updated_at=clock.now(), last_error=None))
+    store.enqueue(f"{addr}:fills", addr, "fills", 2, clock.now())
+    sched = _sched(store, FakeHL(), clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+
+    assert r == "ran:fills"
+    row = store._db.execute(
+        "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)
+    ).fetchone()
+    expected = (window_end_ms + 4 * 3600 * 1000) / 1000
+    assert row[0] == expected
+
+
+def test_run_fills_partial_noop_does_not_starve_other_jobs_over_50_ticks(tmp_path):
+    """S4 (iii)：複審重現腳本
+    `scratchpad/repro_partial_starves_base.py` 的形狀，寫成正式回歸測試——
+    一個 partial 地址（noop 視窗在 4h~24h 之間）＋兩個各自只有一個 state job
+    的地址，連跑 50 tick：`ran:fills` 至多出現一次（noop 重排後 24 小時內不
+    會再到期），兩個 state job 都要被領過，其餘 tick 只能是 `idle` 或
+    `ran:state`——修前 `ran:fills` 會因為排到過去的時刻而佔滿全部 50 tick，
+    兩個 state job 一次都領不到。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    partial_addr = "0xaaa0000000000000000000000000000000aaa1"
+    state_addr_1 = "0xbbb0000000000000000000000000000000bbb2"
+    state_addr_2 = "0xccc0000000000000000000000000000000ccc3"
+    store.upsert_candidates(
+        [(partial_addr, "a", 1, None), (state_addr_1, "b", 2, None),
+         (state_addr_2, "c", 3, None)], as_of=clock.now())
+
+    now_ms = int(clock.now() * 1000)
+    window_end_ms = now_ms - 5 * 3600 * 1000  # 4h~24h 之間，noop 但未達重掃期限
+    window_start_ms = window_end_ms - 30 * 86_400_000
+    store.insert_fills_page(partial_addr, [], FillsSyncState(
+        address=partial_addr, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
+        cursor_ms=window_end_ms, synced_through_ms=window_end_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="partial", reason="retention_limit",
+        pages_done=0, fills_in_window=0, updated_at=clock.now(), last_error=None))
+    store.enqueue(f"{partial_addr}:fills", partial_addr, "fills", 2, clock.now())
+    store.enqueue(f"{state_addr_1}:state", state_addr_1, "state", 0, clock.now())
+    store.enqueue(f"{state_addr_2}:state", state_addr_2, "state", 0, clock.now())
+
+    hl = FakeHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True   # 跳過首 tick 的 overdue 重排，避免干擾到期時間
+
+    results: dict[str, int] = {}
+    for _ in range(50):
+        r = sched.tick()
+        results[r] = results.get(r, 0) + 1
+
+    assert results.get("ran:fills", 0) <= 1
+    assert ("state", state_addr_1) in hl.calls
+    assert ("state", state_addr_2) in hl.calls
+    assert set(results) <= {"ran:fills", "ran:state", "idle"}
+
+
+# --- Task 7.8 W3／S1：deferred probe 溢位可觀測、drain 時過期視窗被丟棄 ---
+
+def test_enqueue_probe_deferred_overflow_increments_dropped_and_logs(tmp_path, caplog):
+    """W3：deque 帶 `maxlen`，append 到滿的佇列會讓最舊項被靜默擠掉——加
+    `_probe_dropped` 計數器與 warning 讓這個溢位可觀測。"""
+    from spark.publicapi.explore_scheduler import _PROBE_DEFERRED_MAXLEN
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    sched = _sched(store, FakeHL(), clock=clock)
+
+    for i in range(_PROBE_DEFERRED_MAXLEN):
+        sched._enqueue_probe_deferred(f"0xfill{i:04d}", 100)
+    assert sched.status()["probe"]["dropped"] == 0
+    assert len(sched._probe_deferred) == _PROBE_DEFERRED_MAXLEN
+
+    with caplog.at_level("WARNING"):
+        sched._enqueue_probe_deferred("0xoverflow", 200)
+
+    assert sched.status()["probe"]["dropped"] == 1
+    assert len(sched._probe_deferred) == _PROBE_DEFERRED_MAXLEN   # 仍是 maxlen，沒有無界增長
+    assert list(sched._probe_deferred)[-1] == ("0xoverflow", 200)
+    assert any("佇列已滿" in rec.message for rec in caplog.records)
+
+
+def test_drain_deferred_probe_discards_stale_window_and_counts_dropped(tmp_path):
+    """S1：drain 前重讀 `get_sync`——`reason` 跨輪存活，不足以判斷佇列裡記的
+    視窗是不是目前最新那一輪；`window_start_ms` 對不上時代表期間又跑過一輪
+    新的增量／重掃，這筆延後探測驗證的邊界已經過期，丟棄、不探測，計入
+    `dropped`（不算 `failed`）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    old_window_start_ms = now_ms - 30 * 86_400_000
+    store.insert_fills_page("0xabc", [], FillsSyncState(
+        address="0xabc", window_start_ms=old_window_start_ms, window_end_ms=now_ms,
+        cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete",
+        reason="count_below_retention_threshold", pages_done=0, fills_in_window=0,
+        updated_at=clock.now(), last_error=None))
+    hl = ProbeAwareHL(real_pages=[], probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+    sched = _sched(store, hl, clock=clock)
+    sched._enqueue_probe_deferred("0xabc", old_window_start_ms)
+
+    # 期間又跑了一輪增量：window_start_ms 前移，reason 維持不變（跨輪存活）。
+    new_window_start_ms = old_window_start_ms + 3600_000
+    store.insert_fills_page("0xabc", [], FillsSyncState(
+        address="0xabc", window_start_ms=new_window_start_ms, window_end_ms=now_ms,
+        cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete",
+        reason="count_below_retention_threshold", pages_done=0, fills_in_window=0,
+        updated_at=clock.now(), last_error=None))
+
+    sched._drain_one_deferred_probe(clock.now())
+
+    assert hl.probe_calls == []
+    assert sched.status()["probe"]["deferred"] == 0
+    assert sched.status()["probe"]["dropped"] == 1
+    assert sched.status()["probe"]["failed"] == 0

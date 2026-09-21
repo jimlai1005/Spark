@@ -112,10 +112,22 @@ PARAMS_FP = "aggregateByTime=<omitted>"
 
 class PagePlan(NamedTuple):
     """`plan_page()` 的輸出：這一輪要向 HL 要哪一段 `[start_ms, end_ms]`，
-    `state` 是本輪起始狀態（可能是尚未落地過的新建狀態）。"""
+    `state` 是本輪起始狀態（可能是尚未落地過的新建狀態）。
+
+    `next_due_ms`（Task 7.8，正確性修正，工程原則 1：比較的兩個量要同源）：
+    只有 noop 計畫（`is_noop`）才會填，值＝這個 noop 計畫本身失效、下次應該
+    重新呼叫 `plan_page()` 的時刻——`complete` noop 是 `window_end_ms +
+    incremental_after_ms`，`partial` noop 是 `window_end_ms +
+    PARTIAL_RESCAN_AFTER_MS`。noop 計畫自帶失效時刻，排程端（`explore_scheduler
+    ._run_fills`）重排 job 只能用它，不得另算一份寬限期常數——7.7 把 partial
+    的 noop 期限改成 24 小時，但排程端仍用寫死的 `window_end + 4h` 重排，兩者
+    分家後 4 小時一到，每次 noop 都排到過去的時刻，等待加權讓它永遠贏、餓死
+    其他所有 job（正式機重現腳本：200 tick 全是 noop 的 `ran:fills`）。非
+    noop 計畫（正在抓頁）不需要重排時刻，維持 `None`。"""
     start_ms: int
     end_ms: int
     state: FillsSyncState
+    next_due_ms: int | None = None
 
     @property
     def is_noop(self) -> bool:
@@ -227,7 +239,8 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
             )
             return PagePlan(start_ms=new_cursor, end_ms=now_ms, state=new_state)
         through = state.synced_through_ms
-        return PagePlan(start_ms=through, end_ms=through, state=state)
+        return PagePlan(start_ms=through, end_ms=through, state=state,
+                        next_due_ms=state.window_end_ms + incremental_after_ms)
 
     if state.completeness == "partial":
         # Task 7.7 W2：partial 不做增量（見上方 docstring／模組檔頭）——
@@ -240,7 +253,8 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
             return PagePlan(start_ms=new_state.window_start_ms, end_ms=new_state.window_end_ms,
                             state=new_state)
         through = state.synced_through_ms
-        return PagePlan(start_ms=through, end_ms=through, state=state)
+        return PagePlan(start_ms=through, end_ms=through, state=state,
+                        next_due_ms=state.window_end_ms + PARTIAL_RESCAN_AFTER_MS)
 
     raise ValueError(f"explore_fills_sync: unexpected completeness {state.completeness!r}")
 

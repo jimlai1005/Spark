@@ -220,6 +220,49 @@ def test_plan_page_increment_within_grace_period_is_noop():
     assert plan.end_ms == 1000
 
 
+# --- Task 7.8 Critical（S4 (iv)）：noop 計畫自帶失效時刻，同源於算出 noop 本身
+# 的寬限期常數（工程原則 1：比較的兩個量要同源）---
+
+def test_plan_page_complete_noop_carries_next_due_ms_same_source_as_grace_period():
+    """`complete` noop 的 `next_due_ms` 必須等於這次判斷 noop 用的
+    `window_end_ms + incremental_after_ms`——排程端重排 job 只能讀這個值，
+    不得另算一份寬限期常數（Task 7.8 根因：7.7 把 partial 的 noop 期限改成
+    24 小時，但排程端仍用寫死的 `window_end + 4h` 重排，兩者分家後每次 noop
+    都排到過去）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="complete", fills_in_window=5,
+    )
+    now = 1000 + 3600 * 1000  # 1 小時後，小於 4 小時寬限期
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    assert plan.is_noop
+    assert plan.next_due_ms == 1000 + 4 * 3600 * 1000
+
+
+def test_plan_page_partial_noop_carries_next_due_ms_from_partial_rescan_after():
+    """`partial` noop 的 `next_due_ms` 必須等於 `window_end_ms +
+    PARTIAL_RESCAN_AFTER_MS`（24 小時），不是 `complete` 分支用的 4 小時增量
+    寬限期——兩個分支的 noop 期限本來就不同，`next_due_ms` 要如實反映各自
+    的判準。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="partial", reason="retention_limit",
+        fills_in_window=42,
+    )
+    now = 1000 + 5 * 3600 * 1000  # 5 小時後，已過舊 4h 門檻但遠低於 24h
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    assert plan.is_noop
+    assert plan.next_due_ms == 1000 + PARTIAL_RESCAN_AFTER_MS
+
+
+def test_plan_page_non_noop_plans_leave_next_due_ms_none():
+    """非 noop 計畫（正在抓頁）不需要重排時刻，`next_due_ms` 維持預設 `None`
+    ——只有 noop 計畫才需要「下次何時再問一次 `plan_page`」這個資訊。"""
+    plan = plan_page(None, address=ADDR, now_ms=NOW)
+    assert not plan.is_noop
+    assert plan.next_due_ms is None
+
+
 def test_plan_page_increment_after_grace_period_preserves_completeness_and_shifts_window():
     # Task 7.7 W2（正確性修正）：這個測試原本用 `completeness="partial"` 驗證
     # 「grace period 後開新增量輪、completeness 保留不重置」的共用邏輯——
