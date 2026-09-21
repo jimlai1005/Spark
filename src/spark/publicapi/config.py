@@ -19,6 +19,12 @@ from spark.filet.risk_settings import risk_settings_path_for, risk_unlock_path_f
 from spark.filet.close_all import close_all_path_for
 from spark.filet.referral_optin import normalize_referral_code, referral_optin_path_for
 from spark.filet.user_leaders import user_leaders_path_for
+# Task 7.9a 補（2026-09-21 主線程裁決）：fills 增量週期預設值單一來源——
+# `explore_fills_sync` 是這條依賴鏈最底層的模組（只依賴 `explore_store`／
+# `spark.exchange.base`，兩者皆不 import `config.py`），被這裡 import 不會
+# 造成循環（`config.py` 不反向被 `explore_scheduler`／`explore_fills_sync`
+# import）。
+from spark.publicapi.explore_fills_sync import DEFAULT_FILLS_PERIOD_S
 
 _HEX = set("0123456789abcdefABCDEF")
 
@@ -158,7 +164,8 @@ class ApiConfig:
     # `explore_fills`；無 fills 待處理時基礎可借滿父 `explore`——300）。
     hl_explore_base_weight_cap: int = 180
     hl_explore_fills_weight_cap: int = 120
-    # --- Explore fills 增量週期單一來源（Task 7.9a，2026-09-21 使用者裁決）---
+    # --- Explore fills 增量週期單一來源（Task 7.9a，2026-09-21 使用者裁決；
+    # 補：預設值本身也要單一來源，見 `DEFAULT_FILLS_PERIOD_S` 匯入）---
     # 舊版把「多久對一個地址開一輪 fills 增量」的 4 小時字面值分開寫死在三處
     # （`explore_fills_sync._DEFAULT_INCREMENTAL_AFTER_MS`、
     # `ExploreScheduler.__init__` 的 `fills_every_s` 預設、`app.py` 詳情頁補排
@@ -166,10 +173,13 @@ class ApiConfig:
     # 不一致。改為本欄位單一來源：`run_api.py` 把它同時餵給
     # `ExploreScheduler(fills_every_s=...)`（重排間隔＋轉給
     # `explore_fills_sync.plan_page(incremental_after_ms=...)`）與詳情頁補排
-    # 條件（`app.py`）。預設 21600（6 小時）——正式機量到消化上限 60 地址／
-    # 小時，300 地址／4 小時＝75 超過上限；6 小時＝50 才留出多頁增量／
-    # partial 重掃／探測的餘裕（見 RUNBOOK §5.8e 容量算式）。
-    explore_fills_period_s: int = 21600
+    # 條件（`app.py`）。預設值直接 import `DEFAULT_FILLS_PERIOD_S`（21600＝
+    # 6 小時），不得在本檔另寫一份字面值——`ExploreScheduler.__init__` 的
+    # `fills_every_s` 預設同樣 import 這個常數，兩處預設值才不會各自漂移
+    # （見該檔案）。正式機量到消化上限 60 地址／小時，300 地址／4 小時＝75
+    # 超過上限；6 小時＝50 才留出多頁增量／partial 重掃／探測的餘裕（見
+    # RUNBOOK §5.8e 容量算式）。
+    explore_fills_period_s: int = DEFAULT_FILLS_PERIOD_S
     # --- Explore 持久化（Task 2.3，2026-09-20，spec P2）---
     # `FILET_EXPLORE_DB`：`ExploreStore`（SQLite WAL）落盤路徑。⚠️ 刻意**不**沿
     # `exchange_dir`／`state_base`／`leaders_path` 的必填慣例：P2 階段 store 尚無

@@ -48,7 +48,8 @@ from collections import deque
 from decimal import Decimal
 from typing import Callable
 
-from spark.publicapi.explore_fills_sync import apply_page, plan_page, validate_page
+from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, apply_page, plan_page,
+                                                validate_page)
 from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
                                            REASON_PROBE_NO_EARLIER_FILLS,
                                            REASON_RETENTION_BOUNDARY_VERIFIED, ExploreStore,
@@ -149,7 +150,13 @@ class ExploreScheduler:
                  state_every_s: float = 1800,
                  portfolio_every_s: float = 7200,
                  ledger_every_s: float = 7200,
-                 fills_every_s: float = 14400, hot_rank: int = 50, jitter_pct: float = 0.10,
+                 # Task 7.9a 補（2026-09-21 主線程裁決）：預設值 import
+                 # `explore_fills_sync.DEFAULT_FILLS_PERIOD_S`（單一來源），
+                 # 不得在這裡另寫一份秒數字面值——生產路徑一律由 `run_api.py`
+                 # 顯式傳入 `cfg.explore_fills_period_s`，這個預設值只給沒有
+                 # 接 config 的呼叫端／測試用。
+                 fills_every_s: float = DEFAULT_FILLS_PERIOD_S, hot_rank: int = 50,
+                 jitter_pct: float = 0.10,
                  rng: Callable[[], float] = random.random,
                  on_tick: Callable[[], None] | None = None):
         self._store = store

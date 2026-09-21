@@ -579,6 +579,18 @@ def test_candidates_every_s_default_is_1800(tmp_path):
     assert sched._candidates_every_s == 1800
 
 
+def test_fills_every_s_default_is_default_fills_period_s_constant(tmp_path):
+    """Task 7.9a 補（2026-09-21 主線程裁決）：`ExploreScheduler` 不傳
+    `fills_every_s` 時，走的是 `explore_fills_sync.DEFAULT_FILLS_PERIOD_S`
+    這個單一來源常數（21600＝6 小時），不是排程端另外寫死的字面值。"""
+    from spark.publicapi.explore_fills_sync import DEFAULT_FILLS_PERIOD_S
+
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    sched = _sched(store, FakeHL(), clock=clock)
+    assert sched._fills_every_s == DEFAULT_FILLS_PERIOD_S
+
+
 def test_admission_cap_uses_admission_counts_not_stale_len_seen(tmp_path):
     """B(6)：準入計數改用 `admission_counts()`（同一 lock 內兩個 COUNT，與
     `active_n = len(seen)` 語意等價但走共用口徑）。"""
@@ -1372,16 +1384,22 @@ def test_run_fills_partial_noop_reschedules_using_plan_next_due_ms(tmp_path):
     assert row[0] > clock.now()
 
 
-def test_run_fills_complete_noop_reschedule_unchanged_at_four_hours(tmp_path):
+def test_run_fills_complete_noop_reschedule_unchanged_at_default_period(tmp_path):
     """S4 (ii)：`complete` 地址 noop 收尾行為不變——仍等於
-    `window_end_ms + 4h`（`plan_page` 預設的 `incremental_after_ms`），只是
-    現在的值來源改成 `plan.next_due_ms`，不再是排程端自己算的常數。"""
+    `window_end_ms + DEFAULT_FILLS_PERIOD_S`（`plan_page` 預設的
+    `incremental_after_ms`，`_sched()` 沒有覆寫 `fills_every_s` 時排程端也是
+    同一個常數，見 `explore_fills_sync.DEFAULT_FILLS_PERIOD_S` 單一來源），
+    只是現在的值來源改成 `plan.next_due_ms`，不再是排程端自己算的常數。
+    Task 7.9a 補（2026-09-21 主線程裁決）：原本斷言釘死 4 小時字面值，
+    改釘同一個常數——常數本身之後若再調整，這條測試不必跟著改字面值。"""
+    from spark.publicapi.explore_fills_sync import DEFAULT_FILLS_PERIOD_S
+
     clock = Clock(t=40 * 86400.0)
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     addr = "0xabc"
     store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
     now_ms = int(clock.now() * 1000)
-    window_end_ms = now_ms - 3600 * 1000  # 1 小時前，未過 4h 增量寬限期
+    window_end_ms = now_ms - 3600 * 1000  # 1 小時前，未過預設增量寬限期
     window_start_ms = window_end_ms - 30 * 86_400_000
     store.insert_fills_page(addr, [], FillsSyncState(
         address=addr, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
@@ -1399,7 +1417,7 @@ def test_run_fills_complete_noop_reschedule_unchanged_at_four_hours(tmp_path):
     row = store._db.execute(
         "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)
     ).fetchone()
-    expected = (window_end_ms + 4 * 3600 * 1000) / 1000
+    expected = (window_end_ms + DEFAULT_FILLS_PERIOD_S * 1000) / 1000
     assert row[0] == expected
 
 

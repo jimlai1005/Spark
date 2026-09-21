@@ -92,13 +92,21 @@ RETENTION_SAFETY_THRESHOLD = HL_FILLS_RETENTION_LIMIT - RETENTION_SAFETY_MARGIN 
 WINDOW_DAYS = 30
 OVERLAP_MS = 1
 _DAY_MS = 86_400_000
-# Task 7.9a（2026-09-21 使用者裁決）：這個預設值只在呼叫端沒有明講
-# `incremental_after_ms` 時才會用到——生產路徑（`explore_scheduler._run_fills`）
-# 一律顯式傳入 `int(self._fills_every_s * 1000)`（`self._fills_every_s` 由
-# `run_api.py` 從 `ApiConfig.explore_fills_period_s` 單一來源注入，預設值同步
-# 改為 21600 秒＝6 小時，見 config.py 檔頭），這裡只是「沒有 config 時」的
-# 保底值，不是三處週期字面值的真相來源之一。
-_DEFAULT_INCREMENTAL_AFTER_MS = 6 * 3600 * 1000
+# Task 7.9a 補（2026-09-21 主線程裁決）：fills 增量週期的**唯一**字面值來源
+# ——`ApiConfig.explore_fills_period_s` 的預設值與 `ExploreScheduler.__init__`
+# 的 `fills_every_s` 預設值都 import 這個常數，不得各自重新寫一份 21600／
+# 6*3600 的字面值（那正是 7.9a 原本要修的「三處各自寫死、容易漂移」問題，
+# 只是把字面值換成新數字沒有解決根因）。`explore_fills_sync` 是這條依賴鏈
+# 最底層的模組（只依賴 `explore_store`／`spark.exchange.base`，兩者都不
+# import `config.py`），被 `config.py` import 不會造成循環。
+DEFAULT_FILLS_PERIOD_S = 6 * 3600
+
+# 這個值只在呼叫端沒有明講 `incremental_after_ms` 時才會用到——生產路徑
+# （`explore_scheduler._run_fills`）一律顯式傳入
+# `int(self._fills_every_s * 1000)`（`self._fills_every_s` 由 `run_api.py`
+# 從 `ApiConfig.explore_fills_period_s` 單一來源注入），這裡只是「沒有
+# config 時」的保底值。
+_DEFAULT_INCREMENTAL_AFTER_MS = DEFAULT_FILLS_PERIOD_S * 1000
 
 # Task 7.7 W2（partial 復原路徑，正確性修正）：`partial` 不做增量（見模組
 # 檔頭），每過這麼久就整窗重掃一次，是唯一能讓 `partial` 有機會復原成

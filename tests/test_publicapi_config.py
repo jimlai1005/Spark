@@ -392,6 +392,17 @@ def test_explore_fills_period_s_defaults_to_21600():
     assert cfg.explore_fills_period_s == 21600
 
 
+def test_explore_fills_period_s_default_matches_scheduler_single_source_constant():
+    """Task 7.9a 補（2026-09-21 主線程裁決）：`ApiConfig.explore_fills_period_s`
+    的預設值與 `ExploreScheduler.__init__` 的 `fills_every_s` 預設值必須是
+    同一個常數（`explore_fills_sync.DEFAULT_FILLS_PERIOD_S`），不是兩處各自
+    寫死剛好相等的字面值——這正是 7.9a 原本要修的問題本身。"""
+    from spark.publicapi.explore_fills_sync import DEFAULT_FILLS_PERIOD_S
+
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.explore_fills_period_s == DEFAULT_FILLS_PERIOD_S
+
+
 def test_explore_fills_period_s_read_from_env():
     cfg = ApiConfig.from_env(_env(FILET_EXPLORE_FILLS_PERIOD_S="7200"))
     assert cfg.explore_fills_period_s == 7200
