@@ -37,8 +37,16 @@ def main() -> None:
     billing = (StripeGateway(cfg.stripe_secret_key) if cfg.billing_enabled else None)
     # Task 1.4（spec §5）：同出口 IP 的權重帳本，filet-api 進程內單例，
     # 全域與 explore 子預算上限來自 cfg（環境變數可覆寫，見 config.py）。
-    limiter = WeightLimiter(global_cap=cfg.hl_global_weight_cap,
-                            scope_caps={"explore": cfg.hl_explore_weight_cap})
+    # Task 7.4a/c（2026-09-21 使用者裁決，fills 類別級飢餓修法）：`explore` 底下
+    # 再切兩個保留額度子 scope——`explore_base`（state／portfolio／ledger）與
+    # `explore_fills`（一頁 fills，保證每分鐘至少一頁）。`scope_parents` 讓子
+    # scope 的預留同時計入父與全域、父暫停時子一併暫停（見 hl_budget.py 檔頭）。
+    limiter = WeightLimiter(
+        global_cap=cfg.hl_global_weight_cap,
+        scope_caps={"explore": cfg.hl_explore_weight_cap,
+                   "explore_base": cfg.hl_explore_base_weight_cap,
+                   "explore_fills": cfg.hl_explore_fills_weight_cap},
+        scope_parents={"explore_base": "explore", "explore_fills": "explore"})
     gateway = HLGateway(cfg.api_url, limiter=limiter)
     # Task 2.3（spec P2）：未設 FILET_EXPLORE_DB → 不建 store（None），沿
     # config.py 的 explore_db_path docstring——P2 階段尚無排程／發布消費它。
@@ -62,6 +70,11 @@ def main() -> None:
             snapshot_path=cfg.explore_cache_path)
         scheduler = ExploreScheduler(
             store=explore_store, hl=gateway.scoped("explore"),
+            # Task 7.4c：保留額度視圖——有 fills 待處理時基礎類別走 `hl_base`
+            # （≤180）、fills 走 `hl_fills`（保證 120）；無 fills 待處理時基礎
+            # 類別改走上面的父 scope `hl`（可借滿 300），見 explore_scheduler.py。
+            hl_base=gateway.scoped("explore_base"),
+            hl_fills=gateway.scoped("explore_fills"),
             leaderboard_source_fn=app.state.leaderboard_get,
             excluded_fn=app.state.explore_excluded_fn,
             cfg=hl_explore.ExploreConfig.from_env(), now_fn=time.time,

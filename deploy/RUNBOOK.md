@@ -2174,12 +2174,29 @@ sudo cat /proc/$(systemctl show filet-api -p MainPID --value)/environ | tr '\0' 
 所有 HL 呼叫走同一個權重限流器的 `explore` scope（子預算 `FILET_HL_EXPLORE_WEIGHT_CAP`，預設 300/分鐘；全域 900 留 300 給
 follower 引擎與三個 timer——它們**不經**限流）。`GET /api/public/explore` 只讀本地，**永遠不會**觸發上游。
 
+<!-- 2026-09-21 Task 7.4（觀測發現 O-1）：（7.4 前）較短的基礎類別週期下，嚴格優先級＋
+沒有為 fills（一頁 120）保留額度，導致 fills 24 小時內不會推進。
+Task 7.4 修法：週期放寬＋父子 scope 保留額度，見下方兩段。 -->
+
+**週期（Task 7.4b，2026-09-21 起）**：基礎類別 state 每 **30 分鐘**、portfolio／ledger 每 **2 小時**
+（各欄位 `as_of`／`fetched_at` 仍是真實抓取時間，只是抓取頻率變低）——比（7.4 前）舊週期更省權重，
+把餘量留給 fills 保留額度（見下段）。scheduler 啟動後第一個 tick 會把舊積壓（`next_attempt_at` 早於
+`now − period`）攤平到一個週期內重新排程，不會因為改週期而讓積壓一次性湧入。
+
+**保留額度（Task 7.4a/c，2026-09-21，fills 類別級飢餓修法）**：`explore`（父，300）底下切兩個保留額度子
+scope——`explore_base`（state／portfolio／ledger，≤180）與 `explore_fills`（一頁 fills，保證 120＝每分鐘至少
+一頁）。有 fills 待處理時基礎類別走 `explore_base`、fills 走 `explore_fills`；無 fills 待處理時基礎類別改走
+父 scope `explore`（可借滿 300）。`GET /api/ops/health` 的 `hl_budget.used` 會看到 `explore_base`／
+`explore_fills`／`explore`（父，合計）三把數字；`explore_budget_note` 是固定說明文案，重述同一段機制。
+
 **環境變數（全部走 drop-in，不動 unit 主檔）**：
 
 | 變數 | 值 | 說明 |
 |---|---|---|
 | `FILET_HL_GLOBAL_WEIGHT_CAP` | `900` | 已在 `hl-budget.conf`（4295ece 部署） |
-| `FILET_HL_EXPLORE_WEIGHT_CAP` | `300` | 同上 |
+| `FILET_HL_EXPLORE_WEIGHT_CAP` | `300` | 同上；`explore` 父 scope 上限 |
+| `FILET_HL_EXPLORE_BASE_WEIGHT_CAP` | `180` | Task 7.4c 新增；`explore_base` 保留額度上限（base+fills ≤ explore，啟動時驗證） |
+| `FILET_HL_EXPLORE_FILLS_WEIGHT_CAP` | `120` | Task 7.4c 新增；`explore_fills` 保留額度上限（保證每分鐘至少一頁 fills） |
 | `FILET_EXPLORE_DB` | `/var/lib/filet-api/explore.db` | SQLite WAL；落在既有 `ReadWritePaths`。刷新開啟時**必填**（缺 → 拒絕啟動，訊息含兩個 env 名） |
 | `EXPLORE_UPSTREAM_REFRESH` | `0`／`1` | 預設 `0`＝不起 thread、榜單維持快照；`1`＝起背景刷新 |
 
@@ -2234,6 +2251,18 @@ sudo ls -l /var/lib/filet-api/explore.db*
   `/api/public/explore` 持續有回應（部署當下若是空 DB 冷啟，就是舊快照或 `initializing=true`），
   `pending` 佔多數是預期行為，不是故障。
 判準（工程原則 #6）：**程序活著 ≠ 在工作**——`last_tick_at` 不動或 `built_at` 不動就是 unhealthy，不管 `systemctl` 說什麼。
+
+**部署後 15–30 分鐘檢查（Task 7.4c，父子 scope 保留額度是否生效）**：
+- `explore_refresh.fills_pages_total` 遞增（不是卡在 0）；`explore_refresh.last_fills_at` 持續前進。
+- `sqlite3 /var/lib/filet-api/explore.db "select address, updated_at from fills_sync order by updated_at desc limit 10"`
+  要看到**多個不同地址**的 `updated_at` 更新（不是同一個地址反覆佔用）。
+- `explore_refresh.oldest_due_age_s` 回落（不再單調成長）。
+- `hl_budget.used.explore` 任一分鐘 ≤ 300（父 scope 上限不因切了子 scope 而失效）；
+  `hl_budget.used.explore_base`／`used.explore_fills` 分別 ≤ 180／≤120。
+- `explore_refresh.base_scope_in_use`：有 fills 待處理時應為 `"explore_base"`，fills 清空後應轉回 `"explore"`。
+
+**觀測期重新起算**：本次部署（週期放寬＋父子 scope 保留額度）會改變 fills 推進速度與基礎類別抓取節奏，
+上線後 24 小時觀測期（P7）從這次部署完成、`flag=1` 生效的時間點**重新起算**，不沿用前一輪的觀測時間窗。
 
 **停用刷新**：`EXPLORE_UPSTREAM_REFRESH=0` → daemon-reload → restart。榜單維持最後一次發布的快照（v4）。SQLite 資料保留，再開啟時 cursor 續接。
 

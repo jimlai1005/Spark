@@ -1771,6 +1771,46 @@ def test_health_hl_budget_snapshot_has_paused_remaining_s(tmp_path):
     assert "paused_remaining_s" in body["hl_budget"]
 
 
+# ---------- 父子 scope 保留額度（Task 7.4c，2026-09-21）----------
+
+def test_health_hl_budget_snapshot_has_parent_child_scopes_when_injected(tmp_path):
+    """limiter 注入父子 scope 後，`hl_budget.scope_caps`／`scope_parents` 要
+    含三個 explore 鍵，且有固定的說明鍵 `explore_budget_note`（與 limiter
+    是否注入無關，見 app.py EXPLORE_BUDGET_NOTE）。"""
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    limiter = WeightLimiter(
+        global_cap=900, scope_caps={"explore": 300, "explore_base": 180,
+                                    "explore_fills": 120},
+        scope_parents={"explore_base": "explore", "explore_fills": "explore"})
+    app = create_app(cfg, store, keysvc, hl, hl_limiter=limiter)
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert set(body["hl_budget"]["scope_caps"]) >= {"explore", "explore_base",
+                                                    "explore_fills"}
+    assert body["hl_budget"]["scope_parents"] == {"explore_base": "explore",
+                                                  "explore_fills": "explore"}
+    assert body["explore_budget_note"] == (
+        "explore 300 為父；有 fills 待處理時基礎類別走 explore_base ≤180、"
+        "fills 走 explore_fills 保留 120；無 fills 待處理時基礎走 explore 可到 300")
+
+
+def test_health_explore_budget_note_present_even_without_limiter(tmp_path):
+    """常數說明鍵不受 `hl_limiter` 是否注入影響——它是固定文案，不是快照。"""
+    client, _cfg = _h_app(tmp_path)
+    body = client.get("/api/ops/health").json()
+    assert body["hl_budget"] is None
+    assert isinstance(body["explore_budget_note"], str) and body["explore_budget_note"]
+
+
 # ---------- explore_store（Task 2.3，2026-09-20：接線與 ops 可見）----------
 
 def test_health_explore_store_null_when_not_injected(tmp_path):
@@ -1887,6 +1927,46 @@ def test_health_explore_refresh_and_publisher_populated_when_injected(tmp_path):
     assert body["explore_publisher"]["dirty"] is False
     assert {"last_published_at", "dirty", "publishes", "failures",
            "last_error"} <= set(body["explore_publisher"])
+
+
+def test_health_explore_refresh_includes_fills_and_base_scope_keys(tmp_path):
+    """Task 7.4c：`explore_refresh` 透過 `**scheduler.status()` 展開，7.4b 新增
+    的 `fills_pages_total`／`last_fills_at`／`base_scope_in_use`／`rebalanced`
+    要自然出現在 ops/health（不需要逐鍵挑選）。"""
+    from spark.publicapi.explore_publisher import ExplorePublisher
+    from spark.publicapi.explore_scheduler import ExploreScheduler
+    from spark.publicapi.explore_store import ExploreStore
+    from spark.publicapi.hl_explore import ExploreConfig
+
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"),
+                   explore_upstream_refresh=True,
+                   explore_db_path=str(tmp_path / "explore.db"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    explore_store = ExploreStore(cfg.explore_db_path)
+    app = create_app(cfg, store, keysvc, hl, explore_store=explore_store)
+    publisher = ExplorePublisher(store=explore_store, index=app.state.explore_index,
+                                 cfg=ExploreConfig(), now_fn=lambda: 1000.0,
+                                 snapshot_path=None)
+    scheduler = ExploreScheduler(store=explore_store, hl=hl, leaderboard_source_fn=lambda: None,
+                                 excluded_fn=lambda: set(), cfg=ExploreConfig(),
+                                 now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                                 on_dirty=publisher.mark_dirty)
+    app.state.explore_scheduler = scheduler
+    app.state.explore_publisher = publisher
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert {"fills_pages_total", "last_fills_at",
+           "base_scope_in_use"} <= set(body["explore_refresh"])
+    assert body["explore_refresh"]["fills_pages_total"] == 0
+    assert body["explore_refresh"]["base_scope_in_use"] == "explore"
 
 
 # ---------- P6 Task 6.3（D15，2026-09-20：觀測補齊）----------

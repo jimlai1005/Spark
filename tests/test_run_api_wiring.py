@@ -77,3 +77,30 @@ def test_explore_upstream_refresh_enabled_starts_scheduler_thread(
     matches = [t for t in _started_threads if t.name == "explore-scheduler"]
     assert len(matches) == 1
     assert matches[0].daemon is True
+
+
+def test_explore_scheduler_receives_base_and_fills_scoped_gateways(
+        tmp_path, monkeypatch, _started_threads):
+    """Task 7.4c：scheduler 建構要拿到 `hl_base`／`hl_fills` 兩個保留額度視圖
+    （分別 scope `explore_base`／`explore_fills`），不是只有父 scope `hl`。"""
+    import spark.publicapi.explore_scheduler as explore_scheduler_mod
+
+    captured: dict = {}
+    real_init = explore_scheduler_mod.ExploreScheduler.__init__
+
+    def fake_init(self, **kwargs):
+        captured.update(kwargs)
+        real_init(self, **kwargs)
+
+    monkeypatch.setattr(explore_scheduler_mod.ExploreScheduler, "__init__", fake_init)
+
+    env = _env(tmp_path, EXPLORE_UPSTREAM_REFRESH="1",
+               FILET_EXPLORE_DB=str(tmp_path / "explore.db"))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    run_api.main()
+
+    assert captured["hl_base"]._scope == "explore_base"
+    assert captured["hl_fills"]._scope == "explore_fills"
+    assert captured["hl"]._scope == "explore"

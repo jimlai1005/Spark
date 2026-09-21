@@ -1,3 +1,7 @@
 [Service]
 Environment=FILET_EXPLORE_DB=/var/lib/filet-api/explore.db
 Environment=EXPLORE_UPSTREAM_REFRESH=0
+# Task 7.4c（2026-09-21）：explore 父子 scope 保留額度上限，皆有 config.py 內建
+# 預設值（180／120），這裡列出來只是讓部署日想調整時有現成的範本可改。
+Environment=FILET_HL_EXPLORE_BASE_WEIGHT_CAP=180
+Environment=FILET_HL_EXPLORE_FILLS_WEIGHT_CAP=120

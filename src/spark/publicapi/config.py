@@ -149,6 +149,15 @@ class ApiConfig:
     # onboard／traders 詳情）共用剩下的額度。
     hl_global_weight_cap: int = 900
     hl_explore_weight_cap: int = 300
+    # --- HL 權重限流父子 scope 保留額度（Task 7.4c，2026-09-21，飢餓修法）---
+    # `explore`（父，300）底下切兩個保留額度子 scope：`explore_base`（state／
+    # portfolio／ledger 等基礎類別，180）與 `explore_fills`（一頁 fills，120，
+    # 保證每分鐘至少一頁）。180+120=300=explore：兩個子 cap 之和不得超過父，
+    # 見 `hl_budget.WeightLimiter(scope_parents=...)` 與 `explore_scheduler.py`
+    # 的類別感知領工（有 fills 待處理時基礎走 `explore_base`≤180、fills 走
+    # `explore_fills`；無 fills 待處理時基礎可借滿父 `explore`——300）。
+    hl_explore_base_weight_cap: int = 180
+    hl_explore_fills_weight_cap: int = 120
     # --- Explore 持久化（Task 2.3，2026-09-20，spec P2）---
     # `FILET_EXPLORE_DB`：`ExploreStore`（SQLite WAL）落盤路徑。⚠️ 刻意**不**沿
     # `exchange_dir`／`state_base`／`leaders_path` 的必填慣例：P2 階段 store 尚無
@@ -177,6 +186,15 @@ class ApiConfig:
         if self.hl_explore_weight_cap > self.hl_global_weight_cap:
             raise ValueError(
                 "FILET_HL_EXPLORE_WEIGHT_CAP 不得大於 FILET_HL_GLOBAL_WEIGHT_CAP")
+        if self.hl_explore_base_weight_cap <= 0 or self.hl_explore_fills_weight_cap <= 0:
+            raise ValueError(
+                "FILET_HL_EXPLORE_BASE_WEIGHT_CAP／FILET_HL_EXPLORE_FILLS_WEIGHT_CAP "
+                "必須為正整數")
+        if (self.hl_explore_base_weight_cap + self.hl_explore_fills_weight_cap
+                > self.hl_explore_weight_cap):
+            raise ValueError(
+                "FILET_HL_EXPLORE_BASE_WEIGHT_CAP + FILET_HL_EXPLORE_FILLS_WEIGHT_CAP "
+                "不得大於 FILET_HL_EXPLORE_WEIGHT_CAP")
         if self.stripe_secret_key is not None and \
                 not self.stripe_secret_key.startswith("sk_test_"):
             raise ValueError(
@@ -389,6 +407,12 @@ class ApiConfig:
                                             or cls.hl_global_weight_cap),
                    hl_explore_weight_cap=int(env.get("FILET_HL_EXPLORE_WEIGHT_CAP")
                                              or cls.hl_explore_weight_cap),
+                   hl_explore_base_weight_cap=int(
+                       env.get("FILET_HL_EXPLORE_BASE_WEIGHT_CAP")
+                       or cls.hl_explore_base_weight_cap),
+                   hl_explore_fills_weight_cap=int(
+                       env.get("FILET_HL_EXPLORE_FILLS_WEIGHT_CAP")
+                       or cls.hl_explore_fills_weight_cap),
                    explore_db_path=env.get("FILET_EXPLORE_DB") or None,
                    explore_upstream_refresh=(env.get("EXPLORE_UPSTREAM_REFRESH", "")
                                              .strip().lower() in ("1", "true")))

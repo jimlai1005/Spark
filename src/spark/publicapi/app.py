@@ -702,6 +702,16 @@ FOLLOWER_BUDGET_NOTE = (
     "本頁零 429 不證明引擎受保護；看 journalctl -u 'filet-follower@*'"
 )
 
+# Task 7.4c（2026-09-21 使用者裁決，父子 scope 保留額度接線）：`explore_budget_note`
+# 是常數說明字串，讓 ops/health 讀者不必自己去翻 hl_budget.py／explore_scheduler.py
+# 就看懂 `hl_budget.used` 裡 `explore`／`explore_base`／`explore_fills` 三把數字
+# 分別代表什麼——機制本身見 hl_budget.py 檔頭「父子 scope」段與
+# explore_scheduler.py 檔頭「類別感知領工」段。
+EXPLORE_BUDGET_NOTE = (
+    "explore 300 為父；有 fills 待處理時基礎類別走 explore_base ≤180、"
+    "fills 走 explore_fills 保留 120；無 fills 待處理時基礎走 explore 可到 300"
+)
+
 
 def _dashboard_status(mine, hb: "HeartbeatRead", acct: dict | None,
                       leaders_path: str, exchange_dir: str) -> dict:
@@ -4774,6 +4784,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "summary": health_summary(rows, backlog, lc_errors),
             "manifest_errors": manifest_errors,
             "hl_budget": limiter.snapshot() if limiter is not None else None,
+            # Task 7.4c：常數說明鍵，與 limiter 是否注入無關（不含在 hl_budget
+            # 底下——它是給人讀的固定文案，不是快照資料，`hl_budget` 維持
+            # 「未注入 → null」的既有原則不受影響）。
+            "explore_budget_note": EXPLORE_BUDGET_NOTE,
             # P6 Task 6.3（D15）：dashboard 端點延遲樣本統計＋ follower 限流關係
             # 的誠實標註（常數字串，未結案項目——本輪不改引擎程式）。
             "dashboard_latency": dashboard_latency,

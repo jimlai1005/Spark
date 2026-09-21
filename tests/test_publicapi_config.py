@@ -329,8 +329,14 @@ def test_hl_weight_caps_default_to_900_and_300():
 
 
 def test_hl_weight_caps_read_from_env():
+    """2026-09-21 Task 7.4c 起：`hl_explore_base_weight_cap`＋
+    `hl_explore_fills_weight_cap` ≤ `hl_explore_weight_cap` 是不變量（見下方
+    Task 7.4c 測試節）——預設 180＋120=300 會讓這裡的 explore cap=200 不合法，
+    故一併覆寫 base／fills 至 100／100，保留本測試「env 覆寫生效」的原意。"""
     cfg = ApiConfig.from_env(_env(FILET_HL_GLOBAL_WEIGHT_CAP="800",
-                                  FILET_HL_EXPLORE_WEIGHT_CAP="200"))
+                                  FILET_HL_EXPLORE_WEIGHT_CAP="200",
+                                  FILET_HL_EXPLORE_BASE_WEIGHT_CAP="100",
+                                  FILET_HL_EXPLORE_FILLS_WEIGHT_CAP="100"))
     assert cfg.hl_global_weight_cap == 800
     assert cfg.hl_explore_weight_cap == 200
 
@@ -345,6 +351,36 @@ def test_hl_weight_caps_non_positive_raises():
         ApiConfig.from_env(_env(FILET_HL_GLOBAL_WEIGHT_CAP="0"))
     with pytest.raises(ValueError):
         ApiConfig.from_env(_env(FILET_HL_EXPLORE_WEIGHT_CAP="-5"))
+
+
+# ---------- HL 權重限流父子 scope 保留額度（Task 7.4c，2026-09-21）----------
+
+def test_hl_explore_base_and_fills_weight_caps_default_to_180_and_120():
+    """未設 env → 180／120（explore 父 300 的保留額度切片，見 hl_budget.py
+    父子 scope 檔頭；base+fills=300=explore，無 fills 待處理時基礎可借滿父）。"""
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.hl_explore_base_weight_cap == 180
+    assert cfg.hl_explore_fills_weight_cap == 120
+
+
+def test_hl_explore_base_and_fills_weight_caps_read_from_env():
+    cfg = ApiConfig.from_env(_env(FILET_HL_EXPLORE_BASE_WEIGHT_CAP="150",
+                                  FILET_HL_EXPLORE_FILLS_WEIGHT_CAP="100"))
+    assert cfg.hl_explore_base_weight_cap == 150
+    assert cfg.hl_explore_fills_weight_cap == 100
+
+
+def test_hl_explore_base_plus_fills_exceeding_explore_cap_raises():
+    with pytest.raises(ValueError, match="FILET_HL_EXPLORE_BASE_WEIGHT_CAP"):
+        ApiConfig.from_env(_env(FILET_HL_EXPLORE_BASE_WEIGHT_CAP="200",
+                                FILET_HL_EXPLORE_FILLS_WEIGHT_CAP="150"))
+
+
+def test_hl_explore_base_and_fills_weight_caps_non_positive_raises():
+    with pytest.raises(ValueError):
+        ApiConfig.from_env(_env(FILET_HL_EXPLORE_BASE_WEIGHT_CAP="0"))
+    with pytest.raises(ValueError):
+        ApiConfig.from_env(_env(FILET_HL_EXPLORE_FILLS_WEIGHT_CAP="-5"))
 
 
 # ---------- explore_db_path（Task 2.3，2026-09-20）----------
