@@ -429,10 +429,11 @@ describe("getPublicTraderDetail", () => {
     // Task 7.1（2026-09-21）：`normalizeFillsCoverage` 一律補上 `synced_through`／
     // `last_success_at`（缺席時 null），即使後端沒回這兩個新鍵也一樣。
     // Task 7.5：同樣一律補上 `window_start`／`window_end`／`params_fp`。
+    // Task 7.9b：同樣一律補上 `evidence`（缺席時 null）。
     expect(r?.fills_coverage).toEqual({
       state: "partial", observed_from: 1, observed_to: null, reason: "page_limit",
       synced_through: null, last_success_at: null,
-      window_start: null, window_end: null, params_fp: null,
+      window_start: null, window_end: null, params_fp: null, evidence: null,
     });
   });
 
@@ -474,6 +475,36 @@ describe("getPublicTraderDetail", () => {
     expect(r?.fills_coverage?.window_start).toBeNull();
     expect(r?.fills_coverage?.window_end).toBeNull();
     expect(r?.fills_coverage?.params_fp).toBeNull();
+  });
+
+  it("Task 7.9b：後端回傳 evidence 時原樣解析（gap／unknown 皆 boolean 化）", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      fills_coverage: {
+        state: "partial", observed_from: 1, observed_to: 2, reason: "evidence_unknown",
+        evidence: {
+          scan_id: "abc123", kind: "initial", window_start: 1_600_000_000_000,
+          window_end: 1_700_000_000_000, finished_at: 1_700_000_500, reason: "count_below_retention_threshold",
+          gap: false, unknown: true,
+        },
+      },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_coverage?.evidence).toEqual({
+      scan_id: "abc123", kind: "initial", window_start: 1_600_000_000_000,
+      window_end: 1_700_000_000_000, finished_at: 1_700_000_500,
+      reason: "count_below_retention_threshold", gap: false, unknown: true,
+    });
+  });
+
+  it("Task 7.9b：evidence 缺席或畸形 → null，不拋錯", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      fills_coverage: { state: "complete", observed_from: null, observed_to: null,
+                       reason: null, evidence: "x" },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_coverage?.evidence).toBeNull();
   });
 
   it("Task 4.2：source 非法值／fills_coverage 畸形 → undefined，不拋錯", async () => {

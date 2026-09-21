@@ -285,10 +285,17 @@ EXPLORE_INDEX_VERSION = 4
 # `params_fp`（string｜null，＝`fills_sync.params_fp`，查詢參數留證——見
 # `explore_fills_sync.PARAMS_FP`）。三者都是「這個 completeness 判定是基於
 # 哪一次查詢」的可追溯證據，不影響 `state`／`reason` 既有語意。
+# Task 7.9b（2026-09-21，B6）：加 `evidence`（`{scan_id, kind, window_start,
+# window_end, finished_at, reason, gap, unknown}`，全部可 None）——回溯「建立
+# 目前 completeness 的那次全區間遍歷」，見 `explore_fills_sync.build_fills_coverage`。
+# `window_start`／`window_end` 語義變更：改為增量軌覆蓋區間
+# `[inc_from, synced_through]`（不再是「目前這一輪」的查詢區間，那個語意現在
+# 放進 `evidence.window_start`／`evidence.window_end`）。
 DEFAULT_FILLS_COVERAGE: dict = {"state": "backfilling", "observed_from": None,
                                 "observed_to": None, "reason": None,
                                 "synced_through": None, "last_success_at": None,
-                                "window_start": None, "window_end": None, "params_fp": None}
+                                "window_start": None, "window_end": None, "params_fp": None,
+                                "evidence": None}
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:

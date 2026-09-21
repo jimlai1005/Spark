@@ -1970,10 +1970,11 @@ def test_health_explore_refresh_includes_fills_and_base_scope_keys(tmp_path):
 
 
 def test_health_explore_refresh_includes_probe_counters(tmp_path):
-    """Task 7.6 點 6／7.7 點 8／7.8 點 3：留存邊界探測的觀測計數器
-    （`_probe_total` 等，含 7.7 新增的 `deferred`／`deferred_total`與 7.8
-    新增的 `dropped`）透過 `**scheduler.status()` 自然出現在
-    `explore_refresh.probe`，七鍵皆從 0 起算。"""
+    """Task 7.9b B4：留存邊界探測的觀測計數器（`_probe_total` 等，改為純 DB
+    推導＋9:1 節流——`deferred`／`deferred_total`／`dropped`（記憶體佇列時代
+    的欄位）已移除，改為 `stale`（CAS 回寫落空次數）與 `candidates`（目前
+    待探候選數，即時查詢）透過 `**scheduler.status()` 自然出現在
+    `explore_refresh.probe`。"""
     from spark.publicapi.explore_publisher import ExplorePublisher
     from spark.publicapi.explore_scheduler import ExploreScheduler
     from spark.publicapi.explore_store import ExploreStore
@@ -2005,8 +2006,7 @@ def test_health_explore_refresh_includes_probe_counters(tmp_path):
 
     body = client.get("/api/ops/health").json()
     assert body["explore_refresh"]["probe"] == {
-        "total": 0, "verified": 0, "empty": 0, "failed": 0, "deferred": 0, "deferred_total": 0,
-        "dropped": 0}
+        "total": 0, "verified": 0, "empty": 0, "failed": 0, "stale": 0, "candidates": 0}
 
 
 def test_health_explore_refresh_includes_dirty_errors_and_quarantine_counter(tmp_path):

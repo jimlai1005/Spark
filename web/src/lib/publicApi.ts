@@ -446,14 +446,33 @@ export interface FillsCoverage {
   /** Task 7.1：最近一次抓頁成功時間（epoch 秒，＝ `as_of.fills`）——只證明
    * 「最近打過招呼」，不代表同步到哪裡；同上 optional。 */
   last_success_at?: number | null;
-  /** Task 7.5（2026-09-21）：本輪固定查詢區間（epoch 毫秒）——`complete`／
-   * `partial` 的判定是針對這個區間做的，不是「全部歷史」。第三次部署前舊
-   * 後端不會回這兩個鍵，故 optional。 */
+  /** Task 7.9b（2026-09-21）：語義變更——不再是「目前這一輪」的查詢區間，
+   * 改為**增量軌覆蓋區間** `[inc_from, synced_through]`（已確認持續同步到
+   * 哪裡）。「建立目前 completeness 的那次遍歷」的查詢區間改放進
+   * `evidence.window_start`／`evidence.window_end`。第三次部署前舊後端不會
+   * 回這兩個鍵，故 optional。 */
   window_start?: number | null;
   window_end?: number | null;
-  /** Task 7.5：查詢參數留證（例如 `"aggregateByTime=default(false)"`）——
+  /** Task 7.5：查詢參數留證（例如 `"aggregateByTime=<omitted>"`）——
    * 同上 optional，只是展示這次判定基於哪一種查詢，不代表可比較性判斷。 */
   params_fp?: string | null;
+  /** Task 7.9b（B6）：回溯「建立目前 completeness 的那次全區間遍歷」——
+   * `scan_id`／`kind`（initial｜partial_rescan｜verify）／`window_start`／
+   * `window_end`／`finished_at`／`reason` 描述那次遍歷本身；`gap` 為 true
+   * 代表那次遍歷沒有伸進增量軌起點（覆蓋不連續）；`unknown` 為 true 代表
+   * 這是遷移前缺乏可追溯窗口證據的舊資料，尚待核驗。整個鍵可為 `null`
+   * （例如仍在首次回補、尚未有任何完成的遍歷）。舊後端不會回這個鍵，故
+   * optional。 */
+  evidence?: {
+    scan_id: string | null;
+    kind: string | null;
+    window_start: number | null;
+    window_end: number | null;
+    finished_at: number | null;
+    reason: string | null;
+    gap: boolean;
+    unknown: boolean;
+  } | null;
 }
 
 function normalizeAsOf(v: unknown): Record<string, number | null> | undefined {
@@ -464,6 +483,21 @@ function normalizeAsOf(v: unknown): Record<string, number | null> | undefined {
     out[k] = toNumberOrNull(r[k]);
   }
   return out;
+}
+
+function normalizeFillsEvidence(v: unknown): FillsCoverage["evidence"] {
+  if (v == null || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  return {
+    scan_id: typeof r.scan_id === "string" ? r.scan_id : null,
+    kind: typeof r.kind === "string" ? r.kind : null,
+    window_start: toNumberOrNull(r.window_start),
+    window_end: toNumberOrNull(r.window_end),
+    finished_at: toNumberOrNull(r.finished_at),
+    reason: typeof r.reason === "string" ? r.reason : null,
+    gap: r.gap === true,
+    unknown: r.unknown === true,
+  };
 }
 
 function normalizeFillsCoverage(v: unknown): FillsCoverage | undefined {
@@ -480,6 +514,7 @@ function normalizeFillsCoverage(v: unknown): FillsCoverage | undefined {
     window_start: toNumberOrNull(r.window_start),
     window_end: toNumberOrNull(r.window_end),
     params_fp: typeof r.params_fp === "string" ? r.params_fp : null,
+    evidence: normalizeFillsEvidence(r.evidence),
   };
 }
 

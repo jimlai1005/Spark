@@ -57,6 +57,7 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
                                      has_active_subscription, plan_catalog,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
+from spark.publicapi.explore_fills_sync import build_fills_coverage
 from spark.publicapi.explore_store import CacheEntry, ExploreStore
 # 健康面板讀的是**引擎自己寫的**狀態檔——路徑常數與判定一律引用引擎的定義，
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
@@ -2531,21 +2532,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         window_ms = hl_explore.FILLS_WINDOW_DAYS * 86400000
         fills = explore_store.get_fills(addr, now_ms - window_ms, now_ms)
         sync = explore_store.get_sync(addr)
-        fills_truncated = sync is None or sync.completeness != "complete"
-        coverage = {
-            "state": sync.completeness if sync is not None else "backfilling",
-            "observed_from": sync.observed_from_ms if sync is not None else None,
-            "observed_to": sync.observed_to_ms if sync is not None else None,
-            "reason": sync.reason if sync is not None else None,
-            # Task 7.1（P7）：同 `explore_publisher.compose_rows` 的兩個新鍵，
-            # 兩頁共用同一份定義（工程原則 1）。
-            "synced_through": sync.synced_through_ms if sync is not None else None,
-            "last_success_at": sync.updated_at if sync is not None else None,
-            # Task 7.5：同 `explore_publisher.compose_rows` 的三個新鍵（工程原則 1）。
-            "window_start": sync.window_start_ms if sync is not None else None,
-            "window_end": sync.window_end_ms if sync is not None else None,
-            "params_fp": sync.params_fp if sync is not None else None,
-        }
+        # Task 7.9b B6：`fills_coverage` 的唯一組裝點，與 `explore_publisher
+        # .compose_rows` 共用（工程原則 1）——`state`／`reason` 已含 gap／
+        # unknown 降級，`fills_truncated` 依降級後的 state 判斷。
+        coverage = build_fills_coverage(sync, explore_store)
+        fills_truncated = coverage["state"] != "complete"
         # 準入上限（去重＋容量）：`refresh_job` 總數已達 5×active 候選數＋20 →
         # 本輪不再新增，只 log 一行——這是保護 scheduler 不被詳情頁流量灌爆的
         # 準入閘門（spec §9.1），不是「查不到就不刷新」。
@@ -2562,9 +2553,9 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 if cache_entry is None or now >= cache_entry.refresh_after:
                     explore_store.enqueue(f"{addr}:{kind}", addr, kind, 1, now)
                     refreshing = True
-            # Task 7.9a A1：週期單一來源——與 `ExploreScheduler.fills_every_s`／
-            # `explore_fills_sync.plan_page` 的增量寬限期同一個 `cfg.explore_fills_period_s`
-            # （config.py 檔頭），不再各自寫死 4 小時。
+            # Task 7.9a A1／7.9b B2：週期單一來源——與 `ExploreScheduler.fills_every_s`／
+            # `explore_fills_sync.plan_incremental` 的增量寬限期同一個
+            # `cfg.explore_fills_period_s`（config.py 檔頭），不再各自寫死 4 小時。
             if sync is None or now - sync.updated_at >= cfg.explore_fills_period_s:
                 explore_store.enqueue(f"{addr}:fills", addr, "fills", 2, now)
                 refreshing = True
@@ -2623,10 +2614,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     "state": "complete" if not fills_truncated else "partial",
                     "observed_from": None, "observed_to": None,
                     "reason": "page_cap" if fills_truncated else None,
-                    # Task 7.1／7.5：upstream 路徑沒有 `ExploreStore.fills_sync` 游標可查——
-                    # 五鍵一律 null（同 `explore_publisher.compose_rows` 的 sync=None 分支）。
+                    # Task 7.1／7.5／7.9b：upstream 路徑沒有
+                    # `ExploreStore.fills_sync` 游標可查——六鍵一律 null（同
+                    # `explore_fills_sync.build_fills_coverage` 的 sync=None
+                    # 分支形狀，但 `state`／`reason` 這裡沿用 upstream 自己的
+                    # `fills_truncated` 推論，不透過該函式）。
                     "synced_through": None, "last_success_at": None,
                     "window_start": None, "window_end": None, "params_fp": None,
+                    "evidence": None,
                 })
 
         # Task 3.3（D4）：池內地址（`explore_store` 已注入且已抓到 portfolio）

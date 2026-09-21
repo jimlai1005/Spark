@@ -793,19 +793,19 @@ def test_pool_out_of_scope_address_uses_upstream_path(tmp_path):
     assert body["source"] == "upstream"
     assert body["refreshing"] is False
     assert body["as_of"] == {"portfolio": now, "state": now, "ledger": now, "fills": now}
-    # Task 7.1／7.5（2026-09-21）：upstream 路徑沒有 `ExploreStore.fills_sync`
-    # 游標可查，五個新鍵一律 null。
+    # Task 7.1／7.5／7.9b（2026-09-21）：upstream 路徑沒有
+    # `ExploreStore.fills_sync` 游標可查，六個新鍵一律 null。
     assert body["fills_coverage"] == {"state": "complete", "observed_from": None,
                                       "observed_to": None, "reason": None,
                                       "synced_through": None, "last_success_at": None,
                                       "window_start": None, "window_end": None,
-                                      "params_fp": None}
+                                      "params_fp": None, "evidence": None}
 
 
 def test_pool_local_path_fills_coverage_window_and_params_fp(tmp_path):
-    """Task 7.5：本地路徑 `fills_coverage.window_start`／`window_end`／
-    `params_fp` 分別對應 `fills_sync.window_start_ms`／`window_end_ms`／
-    `params_fp`。"""
+    """Task 7.9b B6（語義變更）：本地路徑 `fills_coverage.window_start`／
+    `window_end` 改為**增量軌覆蓋區間** `[inc_from_ms, synced_through_ms]`；
+    `params_fp` 對應不變，仍讀 `fills_sync.params_fp`。"""
     now = 1_000_000.0
     app, hl, explore_store = _make_pool_app(tmp_path, now)
     explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now, now + 3600)
@@ -820,13 +820,14 @@ def test_pool_local_path_fills_coverage_window_and_params_fp(tmp_path):
         observed_from_ms=0, observed_to_ms=int(now * 1000),
         completeness="complete", reason="count_below_retention_threshold",
         pages_done=1, fills_in_window=0, updated_at=now,
-        last_error=None, params_fp="aggregateByTime=default(false)")
+        last_error=None, params_fp="aggregateByTime=default(false)",
+        inc_from_ms=50_000)
     explore_store.insert_fills_page(_A, [], sync)
 
     r = _client(app).get(f"/api/public/traders/{_A}")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["fills_coverage"]["window_start"] == 111_000
+    assert body["fills_coverage"]["window_start"] == 50_000
     assert body["fills_coverage"]["window_end"] == 222_000
     assert body["fills_coverage"]["params_fp"] == "aggregateByTime=default(false)"
 

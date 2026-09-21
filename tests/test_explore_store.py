@@ -2,7 +2,9 @@
 
 全離線；純資料層，不碰網路。DB 一律用 `tmp_path`（見 CLAUDE.md 紅線 6：測試全離線）。
 """
+import dataclasses
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
@@ -46,12 +48,17 @@ def test_wal_journal_mode_enabled(tmp_path):
     assert mode == "wal"
 
 
-def test_schema_version_v2_recorded_on_fresh_db(tmp_path):
-    """Task 7.5：schema bump 1→2（`fills_sync.params_fp` 欄位）——全新 DB 直接
-    落地版本 2（`_SCHEMA` 已含新欄，不需要跑遷移）。"""
+def test_schema_version_v3_recorded_on_fresh_db(tmp_path):
+    """Task 7.9b：schema bump 2→3（`fills_scan` 新表＋`fills_sync` 四個新欄）
+    ——全新 DB 直接落地版本 3（`_SCHEMA` 已含新表／新欄，不需要跑遷移）。"""
     store, _ = _store(tmp_path)
     row = store._db.execute("SELECT version FROM schema_version").fetchone()
-    assert row == (2,)
+    assert row == (3,)
+    cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
+    assert {"inc_from_ms", "scan_id", "evidence_unknown", "coverage_gap"} <= cols
+    tables = {r[0] for r in store._db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert "fills_scan" in tables
     # 重開既有 DB 不應該重複塞第二筆 schema_version
     store2, _ = _store(tmp_path)
     assert store2._db.execute("SELECT COUNT(*) FROM schema_version").fetchone() == (1,)
@@ -310,28 +317,10 @@ def test_set_sync_error_noop_when_row_missing(tmp_path):
 
 # --- set_sync_reason / params_fp / schema v1→v2 migration (Task 7.5 加) ---
 
-def test_set_sync_reason_updates_reason_but_not_updated_at(tmp_path):
-    """Task 7.6 點 7（修正）：`set_sync_reason` 只 UPDATE `reason`，不動
-    `updated_at`——該欄對外＝`last_success_at`＝最近一次「抓頁成功」的時間，
-    探測不是抓頁，不該讓它看起來像剛抓過一頁。"""
-    store, c = _store(tmp_path)
-    store.insert_fills_page("0xabc", [], _checkpoint(
-        completeness="complete", reason="count_below_retention_threshold",
-        updated_at=1_000_000.0))
-    c.t += 10
-    store.set_sync_reason("0xABC", "retention_boundary_verified")
-    sync = store.get_sync("0xabc")
-    assert sync.reason == "retention_boundary_verified"
-    assert sync.updated_at == 1_000_000.0   # 原值，不是 c.t（探測發生的時刻）
-    # 其餘欄位不動（completeness／游標不受探測結果影響）
-    assert sync.completeness == "complete"
-    assert sync.cursor_ms == 0
-
-
-def test_set_sync_reason_noop_when_row_missing(tmp_path):
-    store, c = _store(tmp_path)
-    store.set_sync_reason("0xnope", "retention_boundary_verified")
-    assert store.get_sync("0xnope") is None
+# Task 7.9b：`set_sync_reason`（直接 UPDATE `fills_sync.reason`，無版本保護）
+# 已被 `apply_probe_result` 的雙 CAS 取代（B4：探測回寫必須確認地址仍指向探測
+# 當下的那個 `scan_id`，見 `test_apply_probe_result_cas_*` 系列），舊方法與
+# 對應測試一併移除——這是本次架構重構的必要淘汰，不是為了讓測試通過而砍測試。
 
 
 def test_insert_fills_page_round_trips_params_fp(tmp_path):
@@ -398,6 +387,14 @@ def _write_v1_schema(db_path) -> None:
         "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
         "synced_through_ms, completeness, reason, pages_done, fills_in_window, updated_at) "
         "VALUES ('0xzzz', 0, 1000, 1000, 1000, 'partial', 'retention_limit', 20, 9000, 1000.0)")
+    raw.execute(
+        "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
+        "synced_through_ms, completeness, reason, pages_done, fills_in_window, updated_at) "
+        "VALUES ('0xver', 0, 1000, 1000, 1000, 'complete', 'retention_boundary_verified', "
+        "1, 5, 1000.0)")
+    raw.execute(
+        "INSERT INTO refresh_job (key, address, kind, priority, created_at, next_attempt_at) "
+        "VALUES ('0xdef:fills', '0xdef', 'fills', 2, 0.0, 500.0)")
     raw.commit()
     raw.close()
 
@@ -409,7 +406,7 @@ def test_migration_v1_to_v2_adds_params_fp_column_defaulted_empty(tmp_path):
     store = ExploreStore(db_path)
 
     version = store._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 2
+    assert version == 3
     cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
     assert "params_fp" in cols
     params_fp_values = {r[0] for r in store._db.execute(
@@ -442,10 +439,82 @@ def test_migration_is_idempotent_on_reopen(tmp_path):
     db_path = tmp_path / "explore.db"
     _write_v1_schema(db_path)
     ExploreStore(db_path)
-    # 第二次開啟（版本已是 2）不應該再嘗試 ALTER TABLE（會因欄位已存在而炸掉）。
+    # 第二次開啟（版本已是 3）不應該再嘗試 ALTER TABLE／CREATE TABLE（會因
+    # 欄位／表已存在而炸掉，或重複建立歷史 fills_scan／verify job）。
     store2 = ExploreStore(db_path)
     version = store2._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 2
+    assert version == 3
+
+
+# --- Task 7.9b：schema v2→v3 遷移（遍歷軌／增量軌分離） ---
+
+def test_migration_v2_to_v3_backfilling_row_becomes_running_initial_scan_and_renames_job(
+        tmp_path):
+    db_path = tmp_path / "explore.db"
+    _write_v1_schema(db_path)
+    store = ExploreStore(db_path)
+
+    sync = store.get_sync("0xdef")
+    assert sync.completeness == "backfilling"
+    assert sync.evidence_unknown is False
+    assert sync.scan_id is None
+    scan = store.get_active_scan("0xdef")
+    assert scan is not None
+    assert scan.kind == "initial"
+    assert scan.window_start_ms == 0 and scan.window_end_ms == 1000
+    assert scan.cursor_ms == 500  # 游標沿用舊列
+
+    # 舊 `0xdef:fills` job 改名為 `fills_scan`；另有一筆全新的增量 `fills` job。
+    row = store._db.execute(
+        "SELECT kind FROM refresh_job WHERE key='0xdef:fills_scan'").fetchone()
+    assert row is not None and row[0] == "fills_scan"
+    row2 = store._db.execute(
+        "SELECT kind FROM refresh_job WHERE key='0xdef:fills'").fetchone()
+    assert row2 is not None and row2[0] == "fills"
+
+
+def test_migration_v2_to_v3_verified_row_evidence_known_no_verify_job(tmp_path):
+    db_path = tmp_path / "explore.db"
+    _write_v1_schema(db_path)
+    store = ExploreStore(db_path)
+
+    sync = store.get_sync("0xver")
+    assert sync.evidence_unknown is False
+    assert sync.scan_id is not None
+    scan = store.get_scan(sync.scan_id)
+    assert scan.status == "done" and scan.result == "complete"
+    assert scan.reason == "retention_boundary_verified"
+    job = store._db.execute(
+        "SELECT 1 FROM refresh_job WHERE address='0xver' AND kind='fills_verify'").fetchone()
+    assert job is None
+
+
+def test_migration_v2_to_v3_other_complete_row_evidence_unknown_schedules_verify_job(tmp_path):
+    db_path = tmp_path / "explore.db"
+    _write_v1_schema(db_path)
+    now = time.time()
+    store = ExploreStore(db_path, now_fn=lambda: now)
+
+    sync = store.get_sync("0xabc")
+    assert sync.evidence_unknown is True
+    row = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE address='0xabc' "
+        "AND kind='fills_verify'").fetchone()
+    assert row is not None
+    assert now <= row[0] <= now + 48 * 3600
+
+
+def test_migration_v2_to_v3_partial_row_also_gets_evidence_unknown_and_verify_job(tmp_path):
+    db_path = tmp_path / "explore.db"
+    _write_v1_schema(db_path)
+    store = ExploreStore(db_path)
+
+    sync = store.get_sync("0xzzz")
+    assert sync.completeness == "partial"
+    assert sync.evidence_unknown is True
+    job = store._db.execute(
+        "SELECT 1 FROM refresh_job WHERE address='0xzzz' AND kind='fills_verify'").fetchone()
+    assert job is not None
 
 
 def test_oldest_due_at_returns_none_when_nothing_due(tmp_path):
@@ -642,6 +711,226 @@ def test_rebalance_overdue_only_touches_overdue_rows_and_spreads_them(tmp_path):
         "WHERE key='0xb:state'").fetchone()
     assert row_b[0] == c.now()  # 未逾期者不動
     assert (row_b[1], row_b[2]) == lease_before  # lease/fencing 不受影響
+
+
+# --- Task 7.9b：fills_scan（遍歷軌）CRUD／CAS ---
+
+def test_bootstrap_address_fills_creates_fills_sync_and_initial_scan_once(tmp_path):
+    store, c = _store(tmp_path)
+    now_ms = int(c.now() * 1000)
+    created = store.bootstrap_address_fills(
+        "0xNEW", c.now(), window_start_ms=now_ms - 1000, window_end_ms=now_ms,
+        params_fp="pfp")
+    assert created is True
+    sync = store.get_sync("0xnew")
+    assert sync.completeness == "backfilling"
+    assert sync.inc_from_ms == now_ms
+    assert sync.synced_through_ms == now_ms
+    assert sync.scan_id is None
+    scan = store.get_active_scan("0xnew")
+    assert scan is not None
+    assert scan.kind == "initial"
+    assert scan.window_start_ms == now_ms - 1000
+    assert scan.window_end_ms == now_ms
+    assert scan.params_fp == "pfp"
+
+    # 已存在則不動、回 False。
+    created2 = store.bootstrap_address_fills(
+        "0xnew", c.now() + 100, window_start_ms=0, window_end_ms=0, params_fp="other")
+    assert created2 is False
+    assert store.get_sync("0xnew").inc_from_ms == now_ms  # 未被覆蓋
+
+
+def test_create_scan_and_get_active_scan(tmp_path):
+    store, c = _store(tmp_path)
+    scan = store.create_scan("0xabc", kind="initial", window_start_ms=0, window_end_ms=1000,
+                             cursor_ms=0, started_at=c.now(), params_fp="pfp")
+    assert scan.status == "running"
+    active = store.get_active_scan("0xabc")
+    assert active == scan
+    assert store.get_scan(scan.scan_id) == scan
+
+
+def test_get_active_scan_none_when_no_running_scan(tmp_path):
+    store, c = _store(tmp_path)
+    assert store.get_active_scan("0xnope") is None
+
+
+def test_insert_scan_page_updates_progress_not_fills_sync(tmp_path):
+    store, c = _store(tmp_path)
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    sync_before = store.get_sync("0xabc")
+    updated_scan = dataclasses.replace(scan, cursor_ms=500, pages_done=1, fills_in_window=3)
+    n = store.insert_scan_page("0xabc", [_fill(tid=1, time_ms=100)], updated_scan)
+    assert n == 1
+    reloaded = store.get_scan(scan.scan_id)
+    assert reloaded.cursor_ms == 500
+    assert reloaded.pages_done == 1
+    # fills_sync（增量軌）完全不受影響。
+    assert store.get_sync("0xabc") == sync_before
+
+
+def test_complete_scan_cas_writes_back_to_fills_sync_with_gap_check(tmp_path):
+    store, c = _store(tmp_path)
+    now_ms = int(c.now() * 1000)
+    # `window_end_ms` 與 `bootstrap_address_fills` 算出的 `inc_from_ms`
+    # （＝呼叫當下的 `now_ms`）相等，滿足「scan.window_end_ms >= inc_from_ms」
+    # → 無 gap（見下方斷言）。
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=now_ms - 1000,
+                                  window_end_ms=now_ms, params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    finished = dataclasses.replace(scan, cursor_ms=now_ms, result="complete",
+                                   reason="count_below_retention_threshold",
+                                   finished_at=c.now() + 5)
+    ok = store.complete_scan("0xabc", [], finished)
+    assert ok is True
+    sync = store.get_sync("0xabc")
+    assert sync.completeness == "complete"
+    assert sync.reason == "count_below_retention_threshold"
+    assert sync.scan_id == scan.scan_id
+    assert sync.evidence_unknown is False
+    assert sync.coverage_gap is False
+
+
+def test_complete_scan_detects_gap_when_scan_window_end_before_inc_from(tmp_path):
+    store, c = _store(tmp_path)
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    # inc_from_ms 目前 = int(c.now()*1000)（bootstrap 當下）；建一個 window_end
+    # 早於它的 scan，模擬「遍歷完成時窗口沒有伸進增量軌起點」。
+    inc_from_ms = store.get_sync("0xabc").inc_from_ms
+    scan = store.create_scan("0xabc", kind="partial_rescan", window_start_ms=0,
+                             window_end_ms=inc_from_ms - 1, cursor_ms=0, started_at=c.now())
+    finished = dataclasses.replace(scan, cursor_ms=inc_from_ms - 1, result="complete",
+                                   reason="count_below_retention_threshold",
+                                   finished_at=c.now())
+    ok = store.complete_scan("0xabc", [], finished)
+    assert ok is True
+    sync = store.get_sync("0xabc")
+    assert sync.coverage_gap is True
+
+
+def test_apply_probe_result_cas_hits_when_reason_and_scan_id_match(tmp_path):
+    store, c = _store(tmp_path)
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    finished = dataclasses.replace(scan, cursor_ms=1000, result="complete",
+                                   reason="count_below_retention_threshold",
+                                   finished_at=c.now())
+    store.complete_scan("0xabc", [], finished)
+    ok = store.apply_probe_result(scan.scan_id, "0xabc",
+                                  old_reason="count_below_retention_threshold",
+                                  new_reason="retention_boundary_verified")
+    assert ok is True
+    assert store.get_sync("0xabc").reason == "retention_boundary_verified"
+    assert store.get_scan(scan.scan_id).reason == "retention_boundary_verified"
+
+
+def test_apply_probe_result_cas_misses_when_a_new_scan_already_completed(tmp_path):
+    """Task 7.9b B7 (ii)：探測發出後、回寫前，該地址已完成新的一次遍歷
+    （`fills_sync.scan_id` 指向新 scan）→ CAS 落空，舊探測不覆蓋新遍歷。"""
+    store, c = _store(tmp_path)
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    old_scan = store.get_active_scan("0xabc")
+    old_finished = dataclasses.replace(old_scan, cursor_ms=1000, result="complete",
+                                       reason="count_below_retention_threshold",
+                                       finished_at=c.now())
+    store.complete_scan("0xabc", [], old_finished)
+
+    # 新的一次遍歷完成，`fills_sync.scan_id` 改指向新 scan。
+    new_scan = store.create_scan("0xabc", kind="partial_rescan", window_start_ms=0,
+                                 window_end_ms=2000, cursor_ms=0, started_at=c.now())
+    new_finished = dataclasses.replace(new_scan, cursor_ms=2000, result="partial",
+                                       reason="retention_limit", finished_at=c.now() + 1)
+    store.complete_scan("0xabc", [], new_finished)
+
+    ok = store.apply_probe_result(old_scan.scan_id, "0xabc",
+                                  old_reason="count_below_retention_threshold",
+                                  new_reason="retention_boundary_verified")
+    assert ok is False
+    # 新遍歷的結論不被覆蓋。
+    assert store.get_sync("0xabc").reason == "retention_limit"
+    assert store.get_scan(old_scan.scan_id).reason == "count_below_retention_threshold"
+
+
+def test_next_probe_candidate_picks_oldest_finished_and_excludes_evidence_unknown(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", None, 1, None), ("0xbbb", None, 2, None)], as_of=c.now())
+    for addr, finished_at in (("0xaaa", 100.0), ("0xbbb", 50.0)):
+        store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
+                                      params_fp="pfp")
+        scan = store.get_active_scan(addr)
+        finished = dataclasses.replace(scan, cursor_ms=1000, result="complete",
+                                       reason="count_below_retention_threshold",
+                                       finished_at=finished_at)
+        store.complete_scan(addr, [], finished)
+
+    candidate = store.next_probe_candidate()
+    assert candidate is not None
+    assert candidate[0] == "0xbbb"  # finished_at 較舊者優先
+    assert store.count_probe_candidates() == 2
+
+
+def test_next_probe_candidate_excludes_partial_result_and_verified_reason(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", None, 1, None), ("0xbbb", None, 2, None)], as_of=c.now())
+    # 0xaaa：result=partial（不合法候選——只有 complete 才算門檻推論成立）。
+    store.bootstrap_address_fills("0xaaa", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    scan_a = store.get_active_scan("0xaaa")
+    finished_a = dataclasses.replace(scan_a, cursor_ms=1000, result="partial",
+                                     reason="retention_limit", finished_at=1.0)
+    store.complete_scan("0xaaa", [], finished_a)
+    # 0xbbb：已升級為 retention_boundary_verified（不再是候選）。
+    store.bootstrap_address_fills("0xbbb", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    scan_b = store.get_active_scan("0xbbb")
+    finished_b = dataclasses.replace(scan_b, cursor_ms=1000, result="complete",
+                                     reason="retention_boundary_verified", finished_at=1.0)
+    store.complete_scan("0xbbb", [], finished_b)
+
+    assert store.next_probe_candidate() is None
+    assert store.count_probe_candidates() == 0
+
+
+def test_next_probe_candidate_none_when_no_candidates(tmp_path):
+    store, c = _store(tmp_path)
+    assert store.next_probe_candidate() is None
+    assert store.count_probe_candidates() == 0
+
+
+def test_get_scan_returns_none_for_unknown_scan_id(tmp_path):
+    store, c = _store(tmp_path)
+    assert store.get_scan("nope") is None
+
+
+def test_purge_deletes_fills_scan_rows_for_stale_candidate(tmp_path):
+    """Task 7.9b：`purge` 清掉退池滿保留期的候選時，連帶清掉它的
+    `fills_scan`（遍歷軌歷史）——不然孤兒列會一直留在資料庫裡（`fills_sync`
+    本身已有等價清理，`fills_scan` 是新表，需要同一份保護）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xggg", "Gigi", 1, 0.1)], as_of=c.now())
+    store.bootstrap_address_fills("0xggg", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    store.deactivate_missing(set())
+    c.t += 30 * 86400
+    store.purge(c.now(), candidate_keep_s=7 * 86400)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM fills_scan WHERE address='0xggg'").fetchone()[0] == 0
+
+
+def test_set_scan_error_updates_last_error_only(tmp_path):
+    store, c = _store(tmp_path)
+    scan = store.create_scan("0xabc", kind="initial", window_start_ms=0, window_end_ms=1000,
+                             cursor_ms=0, started_at=c.now())
+    store.set_scan_error(scan.scan_id, "boom")
+    reloaded = store.get_scan(scan.scan_id)
+    assert reloaded.last_error == "boom"
+    assert reloaded.status == "running"
 
 
 def test_rebalance_overdue_spreads_many_jobs_not_all_same_time(tmp_path):

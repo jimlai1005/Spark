@@ -189,22 +189,25 @@ def test_compose_rows_fills_coverage_synced_through_null_when_no_sync(tmp_path):
 
 
 def test_compose_rows_fills_coverage_window_and_params_fp_from_store(tmp_path):
-    """Task 7.5：`fills_coverage.window_start`／`window_end`／`params_fp` 分別
-    對應 `fills_sync.window_start_ms`／`window_end_ms`／`params_fp`（工程原則
-    1：三鍵各自讀各自的來源，不是互相抄）。"""
+    """Task 7.9b B6（語義變更）：`fills_coverage.window_start`／`window_end`
+    改為**增量軌覆蓋區間** `[inc_from_ms, synced_through_ms]`（不再是「目前
+    這一輪」的查詢區間，那個語意現在放進 `evidence.window_start`／
+    `evidence.window_end`）；`params_fp` 對應不變，仍讀 `fills_sync.params_fp`
+    （工程原則 1：各鍵各自讀各自的來源，不是互相抄）。"""
     store = ExploreStore(tmp_path / "explore.db")
     store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
     portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
     store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=111.0, refresh_after=2000.0)
     checkpoint = dataclasses.replace(
-        _sync(_A, completeness="complete", updated_at=333.0),
-        window_start_ms=555, window_end_ms=777, params_fp="aggregateByTime=default(false)")
+        _sync(_A, completeness="complete", updated_at=333.0, synced_through_ms=777),
+        window_start_ms=555, window_end_ms=777, params_fp="aggregateByTime=default(false)",
+        inc_from_ms=100)
     store.insert_fills_page(_A, [], checkpoint)
 
     rows, _meta = compose_rows(store, now=1000.0, cfg=_cfg())
 
     d = rows[0].to_dict()
-    assert d["fills_coverage"]["window_start"] == 555
+    assert d["fills_coverage"]["window_start"] == 100
     assert d["fills_coverage"]["window_end"] == 777
     assert d["fills_coverage"]["params_fp"] == "aggregateByTime=default(false)"
 
@@ -297,12 +300,13 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
     assert row.as_of == {"portfolio": 555.0, "state": 555.0, "fills": 555.0}
     # Task 7.1（2026-09-21）：v3 快照沒有游標／最後成功時間可推導，兩鍵補 null
     # （沿用 `DEFAULT_FILLS_COVERAGE`，與 `observed_from`／`observed_to` 同語意）。
-    # Task 7.5：同理再補 window_start／window_end／params_fp 三鍵。
+    # Task 7.5：同理再補 window_start／window_end／params_fp 三鍵。Task 7.9b：
+    # 再補 `evidence`（scan 沒有可回溯的一次遍歷 → None）。
     assert row.fills_coverage == {"state": "backfilling", "observed_from": None,
                                   "observed_to": None, "reason": None,
                                   "synced_through": None, "last_success_at": None,
                                   "window_start": None, "window_end": None,
-                                  "params_fp": None}
+                                  "params_fp": None, "evidence": None}
 
     index = ExploreIndex(cfg=_cfg(), now_fn=lambda: 1000.0, snapshot_path=str(path))
     result = index.query()

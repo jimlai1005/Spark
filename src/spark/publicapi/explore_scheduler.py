@@ -1,39 +1,49 @@
 """src/spark/publicapi/explore_scheduler.py
 Explore 排行榜背景排程（spec `docs/superpowers/specs/2026-09-20-hl-leaderboard-refactor-spec.md`
 §6 頻率／jitter／前 50 優先、§9.1 lease／fencing／dedupe／admission；
-plan `docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md` Task 3.1）。
+plan `docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md` Task 3.1／7.9b）。
 
 單一 thread、逐 job 執行；每個 job＝一次 HL 呼叫（或一頁 fills）。所有持久化走
 `ExploreStore`；所有 HL 呼叫走建構子傳入的 `hl`（正式接線必須是
 `gateway.scoped("explore")`，wait_s=0——本模組不自己等額度，額度不夠就讓位給
 下一輪 tick，spec §3 條件「超過預算就 stale、不暴衝」）。
 
+Task 7.9b（2026-09-21 使用者第二輪裁決）：遍歷軌／增量軌分離之後，job kind 從
+5 種變成 7 種：`candidates`（priority 0）、`state`（priority 0）、`portfolio`／
+`ledger`（priority 1）、`fills`（**增量軌**，前 `hot_rank` 名 priority 2，其餘 3）、
+`fills_scan`（**遍歷軌**：`initial` 建立時 priority 2、`partial_rescan` 排程時
+priority 3）、`fills_verify`（**核驗遍歷**，遷移產生，只在同一 tick 沒有任何
+`candidates`／`state`／`portfolio`／`ledger`／`fills`／`fills_scan` 到期時才領——
+嚴格讓位，見 `_tick_once`）。`fills`／`fills_scan` 共用 `explore_fills` 保留額度
+（`_fills_available()`），`fills_verify` 領工前也要求同樣的額度充足（避免用
+「反正閒著」的錯覺擠掉真正該優先的核驗以外預算）。
+
+留存邊界探測（B4）從舊版「deferred 佇列＋每輪 complete 收尾嘗試」改為**純 DB
+推導＋9:1 節流**：候選由 `ExploreStore.next_probe_candidate()` 查詢（`fills_sync
+.scan_id` 指向的那次遍歷 `result==complete` 且 `reason` 仍是門檻推論），
+`_tick_once` 每個 tick 開頭先問「這次機會給 fills-like（`fills`／`fills_scan`）
+還是探測」：雙方都有積壓時，探測每 9 次 fills-like 服務才輪到 1 次
+（`_fills_served_since_probe` 計數器）；fills-like 這一側沒有到期工作時，探測
+可以直接借用這次機會（不必空等）。探測與工作領取互斥（同一個 tick 只做其中
+一件），這樣才能用「tick 次數」直接控制服務比例（見 `test_explore_scheduler.py`
+的 9:1 行為測試）。回寫走 CAS（`ExploreStore.apply_probe_result`）：探測發出後、
+回寫前，若該地址已完成新的一次遍歷（`fills_sync.scan_id` 已指向別的
+`scan_id`）→ CAS 落空、計 `probe.stale`，不覆蓋新遍歷的結論。
+
 容量估算與 Task 7.4b 修正（2026-09-21 使用者裁決：正式機證實 fills 類別級飢餓——
 嚴格優先級＋沒有為 fills 一頁 120 weight 的大請求保留額度，state/portfolio/ledger
 的穩態流量長期貼著 300 上限，fills 一小時拿不到一次額度）：
-- 週期放寬：state 900→1800s、portfolio／ledger 3600→7200s（各欄位 `as_of`／
-  `fetched_at` 仍是抓取當下的真實時間，只有「多久抓一次」變慢）——約
-  20＋50＋50＝120 weight/分鐘，留 ~180 給 fills。
 - 限流器父子 scope（`hl_budget.WeightLimiter` Task 7.4a）：`explore`（父，300）／
-  `explore_base`（子，180）／`explore_fills`（子，120）。有 fills 待處理
-  （`store.due_count("fills", now) > 0`）時，基礎類別走 `hl_base`（scoped
-  `explore_base`，上限 180）、fills 走 `hl_fills`（scoped `explore_fills`，
-  保證每分鐘至少擠進一頁 120 weight 的 `userFillsByTime`）；無 fills 待處理時
-  基礎類別改走父 scope `hl`（可用滿 300）。`hl_base`／`hl_fills` 皆可為
-  `None`（退回 `hl`），維持舊呼叫端（單一 gateway、無父子 scope）的行為不變。
+  `explore_base`（子，180）／`explore_fills`（子，120）。有 fills-like 待處理時，
+  基礎類別走 `hl_base`（scoped `explore_base`，上限 180）、fills-like 走
+  `hl_fills`（scoped `explore_fills`，保證每分鐘至少擠進一頁 120 weight 的
+  `userFillsByTime`）；無 fills-like 待處理時基礎類別改走父 scope `hl`
+  （可用滿 300）。
 - 領工優先序＋等待加權：`store.claim_due` 的排序公式對等待越久的 job
-  「升級」有效 priority（`priority - min(3, floor(wait_s/600))`，每等 10 分鐘
-  降一級），避免同 priority 內先到期的 job 被持續插隊的新到期 job 永久排擠。
+  「升級」有效 priority，避免同 priority 內先到期的 job 被持續插隊的新到期
+  job 永久排擠。
 - 啟動時重排既有 overdue：第一個 tick 對 state／portfolio／ledger 各自呼叫
-  `store.rebalance_overdue`，把逾期超過新週期的 job 打散到 `(now, now+period]`
-  ——不重排的話，週期改長後這些舊積壓仍會先把新週期的額度占滿。
-
-四種 kind：`state`（priority 0）、`portfolio`／`ledger`（priority 1，同級）、
-`fills`（前 `hot_rank` 名 priority 2，其餘 3）；`candidates`（priority 0）
-是每輪重新選池的 bootstrap／週期 job，本身不佔上述 4 個 per-address job 之列。
-`candidates_every_s` 預設 1800（Task 3.5 B(5)）：candidates job 每次都要整批下載
-stats-data leaderboard payload（約 36MB），拉太頻繁本身就是一筆不小的頻寬／延遲
-成本，30 分鐘一次至多已經足夠偵測候選進出。
+  `store.rebalance_overdue`。
 
 單一 job 失敗不影響其他 job：例外分類（`BudgetExhausted`／`ScopePaused`／429／
 transient／其他）各自決定下一次 `next_attempt_at`，thread 本身只在
@@ -41,15 +51,17 @@ transient／其他）各自決定下一次 `next_attempt_at`，thread 本身只�
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import random
 import threading
-from collections import deque
 from decimal import Decimal
 from typing import Callable
 
-from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, apply_page, plan_page,
-                                                validate_page)
+from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, PARAMS_FP,
+                                                PARTIAL_RESCAN_AFTER_MS, apply_incremental_page,
+                                                apply_scan_page, fresh_scan_window,
+                                                plan_incremental, plan_scan, validate_page)
 from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
                                            REASON_PROBE_NO_EARLIER_FILLS,
                                            REASON_RETENTION_BOUNDARY_VERIFIED, ExploreStore,
@@ -66,35 +78,40 @@ FILLS_PAGE_WEIGHT = weight_for("userFillsByTime")
 
 # Task 7.5 點 3（留存邊界探測）：查詢窗口起點之前一天——與
 # `explore_fills_sync._DAY_MS` 同數值，不 import 該私有名稱（避免跨模組耦合
-# 私有常數），供 `_probe_retention_boundary` 算探測窗口用。
+# 私有常數），供 `_run_probe` 算探測窗口用。
 _PROBE_WINDOW_MS = 86_400_000
 
-# Task 7.7 點 8（正式機實證：`explore_fills` 保留額度下探測永遠 BudgetExhausted）：
-# 額度不足時把探測延後到下個 tick，而不是白白花一次失敗的上游呼叫；deque 上限
-# 64（同地址去重，見 `_enqueue_probe_deferred`）只是防止極端情境下無界增長，
-# 正常運作下佇列深度應該很快被領工排空。
-_PROBE_DEFERRED_MAXLEN = 64
+# Task 7.9b B4：探測與 fills-like（`fills`／`fills_scan`）不可各半——雙方都有
+# 積壓時每服務這麼多次 fills-like 才輪到一次探測（使用者裁決：9:1）。
+PROBE_SERVE_RATIO = 9
 
 # Task 7.4b：非 fills 的四種 kind，領工時一起用 `kinds=` 限定（`claim_due` 的
 # IN 子句）——candidates 本身也走這個集合，它不吃 explore_base／explore_fills
 # 的區分（`_run_job` 直接用 `leaderboard_source_fn`，不經任何 scoped gateway）。
 _BASE_KINDS = ("candidates", "state", "portfolio", "ledger")
 
+# Task 7.9b：增量軌／遍歷軌共用同一份 `explore_fills` 保留額度（B3：「`fills`
+# （增量）與 `fills_scan` 都走 `explore_fills` 保留額度」）。
+_FILLS_LIKE_KINDS = ("fills", "fills_scan")
+
 # Task 7.9a A2（2026-09-21 使用者裁決）：暫時性錯誤（連線／逾時／5xx）連續
 # 達到這麼多次「實際嘗試」→ 改隔離 24 小時，不再無限期每次退避封頂 900 秒
 # 後仍持續重試同一個地址。只計「真的發送過一次請求且失敗」的暫時性錯誤——
-# `BudgetExhausted`／`ScopePaused`（既有 `bump_attempts=False`）與 429（見
-# `_tick_once` 的 `is_rate_limited` 分支，本 task 補上 `bump_attempts=False`）
-# 都不算一次嘗試，見 `_tick_once` 例外分類。
+# `BudgetExhausted`／`ScopePaused`（既有 `bump_attempts=False`）與 429 都不算
+# 一次嘗試，見 `_tick_once` 的例外分類。
 MAX_JOB_ATTEMPTS = 8
 
 # 準入上限：`refresh_job` 總數 ≤ ADMISSION_MULTIPLIER × active 候選數（2026-09-20
-# 主線程裁決：原 4× 因新增 ledger job 而放寬為 5×——四個 per-address job 種類
-# （state/portfolio/ledger/fills）＋候選變動期間的緩衝）。
+# 主線程裁決：原 4× 因新增 ledger job 而放寬為 5×；Task 7.9b 新增
+# `fills_scan`／`fills_verify` 兩種 kind，但 `fills_verify` 只在遷移／partial
+# 復原時短暫出現，不常駐——維持 5× 不變，觀察正式機準入命中率再決定要不要
+# 進一步放寬，見本次派工報告）。
 ADMISSION_MULTIPLIER = 5
 
 # kind → endpoint_cache 的 endpoint 名稱（quarantine 時 `put_cache_error` 用；
-# `fills` 不在這裡——它的錯誤落地在 `fills_sync.last_error`，見 `set_sync_error`）。
+# `fills`／`fills_scan`／`fills_verify` 不在這裡——它們的錯誤落地在
+# `fills_sync.last_error`／`fills_scan.last_error`，見 `set_sync_error`／
+# `set_scan_error`）。
 _ENDPOINT_BY_KIND = {
     "state": "clearinghouseState",
     "portfolio": "portfolio",
@@ -139,8 +156,8 @@ class ExploreScheduler:
 
     Task 7.4b：`hl_base`／`hl_fills` 是 `hl_base=gateway.scoped("explore_base")`／
     `hl_fills=gateway.scoped("explore_fills")` 的保留額度視圖，皆可省略（`None`）
-    ——省略時基礎類別與 fills 一律退回 `hl`（父 scope），與改動前行為一致，供
-    未接父子 scope 的舊呼叫端／測試沿用。"""
+    ——省略時基礎類別與 fills-like 一律退回 `hl`（父 scope），與改動前行為一致，
+    供未接父子 scope 的舊呼叫端／測試沿用。"""
 
     def __init__(self, *, store: ExploreStore, hl, leaderboard_source_fn: Callable[[], dict | None],
                  excluded_fn: Callable[[], set[str]], cfg: ExploreConfig, now_fn, sleep_fn,
@@ -197,25 +214,13 @@ class ExploreScheduler:
         # 2026-09-21 主線程裁決：`_fills_available()` 無 limiter 時的交替旗標
         # ——初值 False，第一次呼叫翻成 True（回 120），第二次翻回 False（回 0）。
         self._fallback_turn = False
-        # Task 7.6 點 6：留存邊界探測的觀測計數器——`total` 是嘗試次數，
-        # `verified`／`empty` 是合法回應的兩種結果，`failed` 是例外或不合法回應
-        # （`validate_page` 判非法，含 `time_out_of_range`）——兩者都算失敗，
-        # 不細分（探測本身是錦上添花，失敗原因對 ops 而言不必分類，見
-        # `_probe_retention_boundary` docstring）。
+        # Task 7.9b B4：留存邊界探測的觀測計數器與 9:1 節流計數器。
         self._probe_total = 0
         self._probe_verified = 0
         self._probe_empty = 0
         self._probe_failed = 0
-        # Task 7.7 點 8：額度不足時延後探測的佇列（`(address, window_start_ms)`，
-        # 同地址去重，見 `_enqueue_probe_deferred`）；`deferred_total` 是累計
-        # 進過佇列的次數（含被去重覆寫的），`status()["probe"]["deferred"]`
-        # 回報的是目前佇列深度（`len`），兩者語意不同，見 `status()`。
-        self._probe_deferred: deque = deque(maxlen=_PROBE_DEFERRED_MAXLEN)
-        self._probe_deferred_total = 0
-        # Task 7.8 W3（可觀測性）：deque 帶 maxlen，append 到滿的佇列會讓最舊項
-        # 被靜默擠掉——這個計數器讓「探測需求超過佇列容量」變成可觀測，見
-        # `_enqueue_probe_deferred`。
-        self._probe_dropped = 0
+        self._probe_stale = 0
+        self._fills_served_since_probe = 0
         # Task 7.9a A2：連續暫時性失敗達到 `MAX_JOB_ATTEMPTS` 而被隔離的次數
         # （與語意錯誤的立即隔離分開計，見 `_quarantine` 的 `max_attempts` 參數）。
         self._quarantined_max_attempts = 0
@@ -282,24 +287,15 @@ class ExploreScheduler:
             # 出現在 `/api/ops/health` 的 `explore_refresh`。
             "quarantined_max_attempts": self._quarantined_max_attempts,
             "dirty_errors": self._dirty_errors,
-            # Task 7.6 點 6：留存邊界探測觀測值，經 app.py `**scheduler.status()`
-            # 自然出現在 `/api/ops/health` 的 `explore_refresh`（同 `fills_pages_total`
-            # 等既有欄位的展開方式，不需要逐鍵挑選）。
+            # Task 7.9b B4：留存邊界探測觀測值，經 app.py `**scheduler.status()`
+            # 自然出現在 `/api/ops/health` 的 `explore_refresh`。
             "probe": {
                 "total": self._probe_total,
                 "verified": self._probe_verified,
                 "empty": self._probe_empty,
                 "failed": self._probe_failed,
-                # Task 7.7 點 8：`deferred` 是目前佇列深度（額度不足、等下一次
-                # 補打的探測數），`deferred_total` 是累計進過佇列的次數。
-                "deferred": len(self._probe_deferred),
-                "deferred_total": self._probe_deferred_total,
-                # Task 7.8 W3：deque 溢位（append 到滿佇列擠掉最舊項）與 S1
-                # 過期視窗（drain 時發現 window_start_ms 已被後續增量輪推進）
-                # 各自計數但共用一個累計欄位——兩者語意相同：都是「這筆延後的
-                # 探測需求已經沒有意義／被放棄」，不算 failed（沒有真的發送
-                # 失敗）。
-                "dropped": self._probe_dropped,
+                "stale": self._probe_stale,
+                "candidates": self._store.count_probe_candidates(),
             },
         }
 
@@ -324,45 +320,54 @@ class ExploreScheduler:
             self._store.enqueue("candidates:candidates", None, "candidates", 0, now)
             return "idle"
 
-        # Task 7.7 點 8（領工之前）：至多補打一個先前因額度不足延後的探測——
-        # 佇列為空時 `_drain_one_deferred_probe` 立刻回，不觸碰 `_fills_available()`
-        # 的無 limiter fallback 交替旗標（避免影響既有不涉及探測的測試）。
-        self._drain_one_deferred_probe(now)
+        fills_like_due = any(self._store.due_count(k, now) > 0 for k in _FILLS_LIKE_KINDS)
 
-        # Task 7.4b（2026-09-21 主線程二次裁決）：類別感知的領工——有 fills
-        # 待處理且 `explore_fills` 保留額度足夠擠進一整頁時，優先從 fills 領；
-        # 否則優先從基礎類別領。但「優先」不是「只」：優先的那一類這一輪如果
-        # 根本沒有到期 job（例如非候選地址只有 fills、沒有任何基礎 job），
-        # 同一個 tick 改領另一類，不浪費這個 tick——否則會把「沒有競爭對象」
-        # 的情境也誤判成節流，讓本來每 tick 都能跑的類別平白變慢一半
-        # （builder 回報：這正是舊測試
-        # `test_fills_non_candidate_continues_paging_until_done_then_dropped`
-        # 被打斷的原因）。`fills_due` 同時決定基礎 job 執行時要不要走受限的
-        # `explore_base`（見 `_run_job`）——這個判斷只看「fills 是否待處理」，
-        # 不受這裡的 fallback 影響。
-        fills_due = self._store.due_count("fills", now) > 0
-        self._base_scope_in_use = "explore_base" if fills_due else "explore"
-        prefer_fills = fills_due and self._fills_available() >= FILLS_PAGE_WEIGHT
+        # Task 7.9b B4：9:1 節流——每個 tick 先決定這次機會是探測還是job 領取，
+        # 兩者互斥（同一 tick 只做其中一件），這樣「tick 次數」才能直接對應
+        # 服務比例。額度不足（`_fills_available() < FILLS_PAGE_WEIGHT`）→
+        # 不查候選，直接跳過（省一次無意義的 DB 查詢）。
+        if self._fills_available() >= FILLS_PAGE_WEIGHT:
+            candidate = self._store.next_probe_candidate()
+            if candidate is not None:
+                do_probe = (not fills_like_due) or (
+                    self._fills_served_since_probe >= PROBE_SERVE_RATIO)
+                if do_probe:
+                    self._fills_served_since_probe = 0
+                    self._run_probe(candidate, now)
+                    return "ran:probe"
+
+        # Task 7.4b（2026-09-21 主線程二次裁決）：類別感知的領工——有
+        # fills-like（`fills`／`fills_scan`）待處理且 `explore_fills` 保留額度
+        # 足夠擠進一整頁時，優先從 fills-like 領；否則優先從基礎類別領。但
+        # 「優先」不是「只」：優先的那一類這一輪如果根本沒有到期 job，同一個
+        # tick 改領另一類，不浪費這個 tick。
+        self._base_scope_in_use = "explore_base" if fills_like_due else "explore"
+        prefer_fills = fills_like_due and self._fills_available() >= FILLS_PAGE_WEIGHT
         job = self._store.claim_due(
-            now, self._owner, self._lease_s, kinds=("fills",) if prefer_fills else _BASE_KINDS)
+            now, self._owner, self._lease_s,
+            kinds=_FILLS_LIKE_KINDS if prefer_fills else _BASE_KINDS)
         if job is None:
-            # fallback：同一 tick 改領另一類。`fills_due` 已經用同一個
-            # `next_attempt_at <= now` 條件查過一次——`fills_due is False`
-            # 時 `claim_due(kinds=("fills",))` 保證也會是 `None`（單一
-            # thread、沒有其他 writer 插隊），省下一次確定沒有意義的查詢，
-            # 讓「兩類都沒有到期 job」的 idle tick 仍只查一次（不因新增的
-            # fallback 機制而變成兩次——這正是舊測試
-            # `test_run_forever_sleeps_after_unexpected_exception` 用
-            # claim_due 呼叫次數對應 tick 次數時會被打亂的地方）。
             if prefer_fills:
                 job = self._store.claim_due(now, self._owner, self._lease_s, kinds=_BASE_KINDS)
-            elif fills_due:
-                job = self._store.claim_due(now, self._owner, self._lease_s, kinds=("fills",))
+            elif fills_like_due:
+                job = self._store.claim_due(
+                    now, self._owner, self._lease_s, kinds=_FILLS_LIKE_KINDS)
+        if job is None:
+            # Task 7.9b B3：`fills_verify`（核驗遍歷）嚴格讓位——只在本 tick
+            # base／fills-like 都沒有到期 job 時才嘗試領（等待加權對它一樣
+            # 適用，但因為只在「沒有其他事可做」時才查，不會搶到本該給其他
+            # 類別的 tick）。同樣要求額度足夠一整頁；先用 `due_count` 快速判斷
+            # 有沒有 verify job 到期，沒有就不必多打一次 `claim_due`（idle tick
+            # 不該平白多一次 DB 呼叫）。
+            if (self._store.due_count("fills_verify", now) > 0
+                    and self._fills_available() >= FILLS_PAGE_WEIGHT):
+                job = self._store.claim_due(
+                    now, self._owner, self._lease_s, kinds=("fills_verify",))
         if job is None:
             return "idle"
 
         try:
-            return self._run_job(job, now, fills_due=fills_due)
+            result = self._run_job(job, now, fills_due=fills_like_due)
         except BudgetExhausted:
             # <!-- 2026-09-21 複審 W3 -->：額度不足不是這個 job 的錯——保留原本的
             # `next_attempt_at`（不推到未來），等待加權才能持續累積、老 job 不會
@@ -397,11 +402,16 @@ class ExploreScheduler:
             self._quarantine(job, now, e)
             return "quarantined"
 
+        if job.kind in _FILLS_LIKE_KINDS or job.kind == "fills_verify":
+            self._fills_served_since_probe += 1
+        return result
+
     def _run_job(self, job: Job, now: float, *, fills_due: bool = False) -> str:
         if job.kind == "candidates":
             return self._run_candidates(job, now)
-        # Task 7.4b：fills 待處理時基礎抓取走受限的 `explore_base`（保留額度
-        # 給 fills）；沒有 `hl_base`（舊呼叫端／測試未接父子 scope）一律退回 `hl`。
+        # Task 7.4b：fills-like 待處理時基礎抓取走受限的 `explore_base`（保留
+        # 額度給 fills-like）；沒有 `hl_base`（舊呼叫端／測試未接父子 scope）
+        # 一律退回 `hl`。
         base_hl = self._hl_base if (fills_due and self._hl_base is not None) else self._hl
         if job.kind == "state":
             return self._run_cache_kind(
@@ -419,7 +429,11 @@ class ExploreScheduler:
                 fetch=lambda addr: base_hl.non_funding_ledger_updates(addr, 0),
                 period_s=self._ledger_every_s)
         if job.kind == "fills":
-            return self._run_fills(job, now)
+            return self._run_increment(job, now)
+        if job.kind == "fills_scan":
+            return self._run_scan(job, now, verify=False)
+        if job.kind == "fills_verify":
+            return self._run_scan(job, now, verify=True)
         raise ValueError(f"explore scheduler: unknown job kind {job.kind!r}")
 
     def _run_candidates(self, job: Job, now: float) -> str:
@@ -480,6 +494,17 @@ class ExploreScheduler:
         fills_priority = 2 if rank <= self._hot_rank else 3
         self._store.enqueue(self._key(address, "fills"), address, "fills", fills_priority,
                             now + _spread(address, self._fills_every_s))
+        # Task 7.9b B1：新地址同時建立增量軌＋初始遍歷（`bootstrap_address_fills`
+        # 只在該地址第一次出現時真的建列，回 `True`——候選抖動重新入池不會
+        # 重建，見該方法 docstring）；`fills_scan` job 一律入列（`enqueue` 本身
+        # 冪等，已存在只會 MIN 優先級／時間，不會重複）。
+        now_ms = int(now * 1000)
+        window_start_ms, window_end_ms = fresh_scan_window(now_ms)
+        self._store.bootstrap_address_fills(
+            address, now, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
+            params_fp=PARAMS_FP)
+        self._store.enqueue(self._key(address, "fills_scan"), address, "fills_scan",
+                            fills_priority, now + _spread(address, self._fills_every_s))
 
     def _run_cache_kind(self, job: Job, now: float, *, endpoint: str, fetch, period_s: float) -> str:
         payload = fetch(job.address)
@@ -500,76 +525,94 @@ class ExploreScheduler:
         self._notify_dirty()
         return f"ran:{job.kind}" if active else "dropped"
 
-    def _run_fills(self, job: Job, now: float) -> str:
+    def _run_increment(self, job: Job, now: float) -> str:
+        """增量軌 job（kind='fills'）——Task 7.9b B2：只延伸
+        `fills_sync.synced_through_ms`，完全不判定 `completeness`／`reason`
+        （那是遍歷軌的事，見 `_run_scan`）。重掃期間增量照常前進（B7 (i)）
+        ——本方法完全不查詢 `fills_scan`，兩軌互不依賴。"""
         st = self._store.get_sync(job.address)
-        # Task 7.9a A1（週期單一來源）：`incremental_after_ms` 不再吃
-        # `plan_page` 自己的模組級預設，一律由 `self._fills_every_s`（run_api
-        # 從 `cfg.explore_fills_period_s` 注入，同一個值也決定本輪完成後的
-        # 重排間隔，見下方 `next_at`）換算——避免排程端「多久重排一次」與
-        # `plan_page`「多久算到期」各自一份常數、彼此漂移。
-        plan = plan_page(st, address=job.address, now_ms=int(now * 1000),
-                         incremental_after_ms=int(self._fills_every_s * 1000))
+        if st is None:
+            # 防禦：`bootstrap_address_fills` 理論上保證這裡恆非 None（見
+            # `_enqueue_address_jobs`）；地址仍存在 job 但 fills_sync 列缺席
+            # 代表 store 資料被外部竄改，跳過不重試。
+            self._complete(job)
+            return "dropped"
+        plan = plan_incremental(st, now_ms=int(now * 1000), period_s=self._fills_every_s)
         if plan.is_noop:
             self._complete(job)
             if not self._store.is_active(job.address):
                 return "dropped"
-            # Task 7.8（Critical，工程原則 1：比較的兩個量要同源）：noop 計畫
-            # 自帶失效時刻（`plan.next_due_ms`），排程端只能用它重排，不得另算
-            # 一份寬限期常數——7.7 把 partial 的 noop 期限改成 24 小時，但這裡
-            # 舊版仍用 `window_end + fills_every_s`（4h），兩者分家後 4 小時一
-            # 到，每次 noop 都排到過去、等待加權讓它永遠贏、餓死其他 job。
-            # `next_due_ms` 為 `None` 是防禦性分支，不應發生（`plan_page` 保證
-            # noop 計畫一律填值）。任何路徑都不得把 `next_attempt_at` 排到
-            # `now` 之前。
-            if plan.next_due_ms is None:
-                logger.error(
-                    "explore scheduler: noop plan 缺少 next_due_ms address=%s，"
-                    "退回 now + fills_every_s", job.address)
-                next_at = now + self._fills_every_s
-            else:
-                next_at = max(plan.next_due_ms / 1000, now + self._jit(60.0))
+            next_at = max(plan.next_due_ms / 1000, now + self._jit(60.0))
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
             return "ran:fills"
 
-        # Task 7.4b：`self._fills_available()` 已檢查（見 `_tick_once`）用
-        # `self._hl_fills` 判斷保留額度；這裡沿同一個 gateway 實際發送——兩處
-        # 用同一個屬性、同一個 scope，才是同源同基準的判斷（工程原則 1）。
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
         page = hl_fills.get_fills_page(job.address, plan.start_ms, plan.end_ms)
         self._fills_pages_total += 1
         self._last_fills_at = now
-        res = apply_page(plan, page, now_ms=int(now * 1000))
+        res = apply_incremental_page(plan, page, now_ms=int(now * 1000))
         self._store.insert_fills_page(job.address, res.accepted, res.state)
         if not res.done:
-            # Task 3.6 B(2)（W1 修法）：續頁不看 is_active——非候選地址（例如
-            # 詳情頁按需入列）多頁回補若中途被判 dropped，會永遠停在
-            # backfilling，整份成交補不完。是否退池只在整輪 done 之後才判斷。
-            # Task 7.9a A3：store 寫入與續排先做完，`_notify_dirty()` 放最後
-            # ——例外不得讓這個尚未完成的 job 漏排。
             self._reschedule(job, now, bump_attempts=False)
             self._notify_dirty()
             return "ran:fills"
-        # Task 7.6 點 4／7.7 點 2：順序改為 complete → is_active 檢查
-        # （退池→"dropped"，不探）→ 探測 → enqueue——退池地址不值得再花預算
-        # 探測；探測條件維持「completeness=='complete' 且 reason 仍是門檻
-        # 推論」（`REASON_COUNT_BELOW_RETENTION_THRESHOLD`）——`verified` 與
-        # `probe_empty`（Task 7.7 W3）都會跨輪存活（見 apply_page A2），兩者
-        # 都自然排除這個分支，每次全區間遍歷後至多探到有結論（verified 或
-        # probe_empty）為止，不會每輪重探。額度不足時探測本身會自行延後
-        # （見 `_probe_retention_boundary`／`_drain_one_deferred_probe`）。
-        # Task 7.9a A3：`_complete` 之後的探測／enqueue 都做完才 `_notify_dirty()`
-        # ——探測內部也可能觸發 dirty 通知（`_probe_retention_boundary` 已改走
-        # `_notify_dirty()`，不會逸出），所以這裡的 enqueue 一定會執行到。
         self._complete(job)
         active = self._store.is_active(job.address)
         if active:
-            if (res.state.completeness == "complete"
-                    and res.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD):
-                self._probe_retention_boundary(job.address, res.state.window_start_ms, hl_fills)
             next_at = now + self._jit(self._fills_every_s)
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
         self._notify_dirty()
         return "ran:fills" if active else "dropped"
+
+    def _run_scan(self, job: Job, now: float, *, verify: bool) -> str:
+        """遍歷軌 job（kind='fills_scan'／'fills_verify'）——Task 7.9b B2／B3：
+        沒有進行中的 scan 時，依 `verify` 與目前增量軌 `completeness` 決定新
+        scan 的 `kind`（`verify` 一律建 `verify`；`backfilling`／缺列 → 建
+        `initial`；否則（`partial` 復原到期後排程進來的後續 job） → 建
+        `partial_rescan`）——三種 `kind` 的頁面套用邏輯相同，只有窗口與收尾
+        後的排程動作不同（`partial` 收尾要自動排下一次 `partial_rescan`，見
+        下方）。"""
+        result_kind = "fills_verify" if verify else "fills_scan"
+        scan = self._store.get_active_scan(job.address)
+        if scan is None:
+            now_ms = int(now * 1000)
+            window_start_ms, window_end_ms = fresh_scan_window(now_ms)
+            if verify:
+                kind = "verify"
+            else:
+                st = self._store.get_sync(job.address)
+                kind = "initial" if (st is None or st.completeness == "backfilling") \
+                    else "partial_rescan"
+            scan = self._store.create_scan(
+                job.address, kind=kind, window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms, cursor_ms=window_start_ms, started_at=now,
+                params_fp=PARAMS_FP)
+
+        plan = plan_scan(scan)
+        hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
+        page = hl_fills.get_fills_page(job.address, plan.start_ms, plan.end_ms)
+        self._fills_pages_total += 1
+        self._last_fills_at = now
+        res = apply_scan_page(plan, page, now_ms=int(now * 1000))
+        if not res.done:
+            self._store.insert_scan_page(job.address, res.accepted, res.scan)
+            self._reschedule(job, now, bump_attempts=False)
+            self._notify_dirty()
+            return f"ran:{result_kind}"
+
+        finished_scan = dataclasses.replace(res.scan, finished_at=now)
+        self._store.complete_scan(job.address, res.accepted, finished_scan)
+        self._complete(job)
+        active = self._store.is_active(job.address)
+        if active and not verify and finished_scan.result == "partial":
+            # Task 7.9b B3：`partial` 的唯一復原路徑——排一次
+            # `partial_rescan`，24 小時後再整窗重掃一次（同一個 `fills_scan`
+            # job key，`_run_scan` 屆時因為沒有進行中的 scan 且增量軌
+            # completeness=='partial' 而建出 `partial_rescan`）。
+            self._store.enqueue(self._key(job.address, "fills_scan"), job.address,
+                                "fills_scan", 3, now + PARTIAL_RESCAN_AFTER_MS)
+        self._notify_dirty()
+        return f"ran:{result_kind}" if active else "dropped"
 
     # ---- 內部：例外收尾 ----
     def _quarantine(self, job: Job, now: float, exc: Exception, *,
@@ -588,72 +631,43 @@ class ExploreScheduler:
             self._store.put_cache_error(job.address, endpoint, err, now, now + 86400)
         elif job.kind == "fills":
             self._store.set_sync_error(job.address, err, now)
+        elif job.kind in ("fills_scan", "fills_verify"):
+            scan = self._store.get_active_scan(job.address)
+            if scan is not None:
+                self._store.set_scan_error(scan.scan_id, err)
         else:
             logger.error("explore scheduler: %s job 隔離、無對應快取欄位可寫（%s）",
                          job.kind, err)
         self._reschedule(job, now + 86400, err=err, bump_attempts=not max_attempts)
 
-    def _probe_retention_boundary(self, address: str, window_start_ms: int, hl_fills) -> None:
-        """Task 7.5 點 3／7.6 點 5、6／7.7 點 8：查詢 `[window_start_ms - 1 天,
-        window_start_ms - 1]` 是否仍有可查成交——回 >=1 筆合法成交代表 HL 的
-        實際留存邊界早於本輪窗口起點，是比 `count_below_retention_threshold`
-        （門檻推論）更強的直接證據，升級 reason 為
-        `REASON_RETENTION_BOUNDARY_VERIFIED`；回空頁代表已探過、探測起點前一天
-        無可查成交、無法升級，記為 `REASON_PROBE_NO_EARLIER_FILLS`（Task 7.7
-        W3——探測條件排除這個 reason，讓每次全區間遍歷後至多探到有結論為止，
-        不再每輪重探）。
+    def _run_probe(self, candidate: tuple[str, str], now: float) -> None:
+        """留存邊界探測（Task 7.9b B4）：`candidate=(address, scan_id)` 來自
+        `ExploreStore.next_probe_candidate()`（純 DB 推導，重啟後照常運作，
+        B7 (vii)）。查詢 `[scan.window_start_ms - 1 天, scan.window_start_ms - 1]`
+        是否仍有可查成交——回 >=1 筆合法成交代表 HL 的實際留存邊界早於這次
+        遍歷的窗口起點，升級 reason 為 `REASON_RETENTION_BOUNDARY_VERIFIED`；
+        回空頁代表已探過、無法升級，記為 `REASON_PROBE_NO_EARLIER_FILLS`（該
+        reason 碼天然被 `next_probe_candidate` 的查詢條件排除，每次遍歷至多
+        探到有結論為止）。
 
-        參數改吃 `window_start_ms`（而非整個 `FillsSyncState`，7.6 版本）：
-        延後補打時（見 `_drain_one_deferred_probe`）要用「地址進 deferred 佇列
-        當下那次遍歷」的視窗起點，不是重讀 `get_sync` 之後可能已經被後續增量
-        輪推進過的視窗——兩者在延後期間可能不同，探測要驗證的是原本那次
-        `complete` 判定的視窗邊界，不是重讀當下的最新視窗。
-
-        探測走同一個 `hl_fills`（與本輪實際抓頁同一個 gateway／scope，計入
-        `explore_fills` 預算，工程原則 1：判斷與實際發送同源）。
-
-        Task 7.7 點 8（正式機實證：`explore_fills` 保留額度下探測永遠
-        `BudgetExhausted`——本輪 fills 頁剛預留過，同一分鐘內再打一次 120
-        權重的探測必然被拒）：發送前先用 `_fills_available()`（與
-        `_run_fills` 判斷「值不值得把工作分給 fills」同一個方法，同源同基準）
-        確認額度夠一整頁才打；不夠 → 進 `_probe_deferred` 佇列，**不 log**（這
-        是預期常態，不是異常）、不計入 `_probe_total`（沒有真的發送，不算一次
-        嘗試）。實際發送後若仍拋 `BudgetExhausted`／`ScopePaused`／
-        `hl_budget.is_rate_limited` 判定為真的例外（pre-check 與實際發送之間
-        的競態，理論上單 thread scheduler 不會發生，但防禦）→ 同樣視為額度
-        不足，進 deferred、不計入 `_probe_total`。
-
-        Task 7.6 點 5（複審 W2 修法）：探測回應必須先通過
-        `explore_fills_sync.validate_page(page, probe_start, probe_end)`——舊版
-        直接看 `if page:` 沒有驗證回應真的落在探測窗內／欄位齊全，一個格式錯
-        或範圍錯的回應也會被當成「驗證成功」升級 reason。不合法（含
-        `time_out_of_range`：HL 回應的成交時間跑到探測窗外）→ 記一行 warning、
-        不升級，計入 `_probe_failed`。
-
-        探測本身失敗（額度不足以外的例外、網路錯誤……不分類，與「回應不合法」
-        一律視為同一種失敗，見 `stats` 計數器不細分失敗原因）→ 記一行 warning、
-        不改 reason、不重試——本輪 fills 已經跑完，不能因為「錦上添花」的探測
-        失敗而讓整個 job 被誤判成失敗重跑；下一次這個地址進入新的一輪且再次以
-        `complete` 收尾、reason 仍是 `count_below_retention_threshold` 時，
-        會再探一次（見呼叫端 `_run_fills` 的探測條件）。
-
-        Task 7.7 點 5（S4 修法）：`set_sync_reason` 落在 try 內——store 寫入
-        失敗不得逸出（工程原則 3 的反向：這裡是錦上添花的動作，不是關鍵動作，
-        失敗要吞但要出聲），記警告、計入 `_probe_failed`，不算 verified／empty。
-        """
-        if self._fills_available() < FILLS_PAGE_WEIGHT:
-            self._enqueue_probe_deferred(address, window_start_ms)
+        回寫用 `ExploreStore.apply_probe_result` 的雙 CAS（B7 (ii)）：探測發出
+        後、回寫前，若該地址已完成新的一次遍歷（`scan_id` 改變）→ CAS 落空、
+        計 `probe.stale`，不覆蓋新遍歷的結論、也不重試（下一輪 tick 若新遍歷
+        仍以「門檻推論」收尾，會自然成為新的探測候選）。"""
+        address, scan_id = candidate
+        scan = self._store.get_scan(scan_id)
+        if scan is None:
+            self._probe_failed += 1
             return
-        probe_start = window_start_ms - _PROBE_WINDOW_MS
-        probe_end = window_start_ms - 1
+        probe_start = scan.window_start_ms - _PROBE_WINDOW_MS
+        probe_end = scan.window_start_ms - 1
+        hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
         try:
             page = hl_fills.get_fills_page(address, probe_start, probe_end)
         except (BudgetExhausted, ScopePaused):
-            self._enqueue_probe_deferred(address, window_start_ms)
             return
         except Exception as e:  # noqa: BLE001 — 唯一的分類點，見上方 docstring
             if is_rate_limited(e):
-                self._enqueue_probe_deferred(address, window_start_ms)
                 return
             logger.warning(
                 "explore scheduler：留存邊界探測失敗 address=%s window=[%d,%d]: %r",
@@ -669,94 +683,22 @@ class ExploreScheduler:
                 "reason=%s", address, probe_start, probe_end, invalid_reason)
             self._probe_failed += 1
             return
-        reason = REASON_RETENTION_BOUNDARY_VERIFIED if page else REASON_PROBE_NO_EARLIER_FILLS
-        try:
-            self._store.set_sync_reason(address, reason)
-        except Exception:
-            logger.warning(
-                "explore scheduler：留存邊界探測結果落地失敗 address=%s reason=%s",
-                address, reason, exc_info=True)
-            self._probe_failed += 1
+        new_reason = REASON_RETENTION_BOUNDARY_VERIFIED if page else REASON_PROBE_NO_EARLIER_FILLS
+        ok = self._store.apply_probe_result(
+            scan_id, address, old_reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+            new_reason=new_reason)
+        if not ok:
+            self._probe_stale += 1
             return
-        # Task 7.7 S2：reason 落地也是一種變更，通知 dirty；Task 7.9a A3 改走
-        # `_notify_dirty()`（吞例外＋計數）——這裡呼叫時 store 寫入已經成功
-        # （上面的 `set_sync_reason` 已經 return 過一次失敗路徑），callback
-        # 本身失敗不該讓探測的觀測計數器（下面 `_probe_verified`／`_probe_empty`）
-        # 漏更新。
         self._notify_dirty()
         if page:
             self._probe_verified += 1
         else:
             self._probe_empty += 1
 
-    def _enqueue_probe_deferred(self, address: str, window_start_ms: int) -> None:
-        """Task 7.7 點 8：額度不足時把探測排進去，下個 tick 領工前優先補打
-        （見 `_drain_one_deferred_probe`）。同地址去重——同一地址若已在佇列
-        中，先移除舊項再補新的（新的 `window_start_ms` 更新，理論上同一地址
-        在還沒補打前不該進兩次不同視窗，但這裡以新覆舊，不留兩筆）。
-        `deferred_total` 每次呼叫都遞增（含覆蓋既有項的情況），是「累計進過
-        佇列的次數」，與 `status()["probe"]["deferred"]`（目前佇列深度）語意
-        不同，見 `status()`。"""
-        for item in list(self._probe_deferred):
-            if item[0] == address:
-                self._probe_deferred.remove(item)
-                break
-        # Task 7.8 W3：`deque(maxlen=...)` append 到滿的佇列會自動擠掉最舊的
-        # 一項而不拋例外——上面的去重迴圈已經處理「同地址覆蓋」，這裡檢查的
-        # 是「佇列已滿、即將擠掉別的地址」這個不同的情境，兩者不可合併。
-        if len(self._probe_deferred) == self._probe_deferred.maxlen:
-            self._probe_dropped += 1
-            dropped_address = self._probe_deferred[0][0]
-            logger.warning(
-                "explore scheduler: deferred probe 佇列已滿（maxlen=%d），"
-                "丟棄最舊項 address=%s，新項 address=%s 入列",
-                self._probe_deferred.maxlen, dropped_address, address)
-        self._probe_deferred.append((address, window_start_ms))
-        self._probe_deferred_total += 1
-
-    def _drain_one_deferred_probe(self, now: float) -> None:
-        """Task 7.7 點 8：`_tick_once` 領工之前呼叫，每 tick 至多補打一個延後
-        的探測，讓探測與 fills 頁公平輪流分同一 `explore_fills` 保留額度，不
-        會餓死任何一方。探測前重讀 `get_sync`／`is_active`——地址退池或
-        completeness／reason 已經因為其他路徑改變（例如又跑了一輪增量，
-        `reason` 已經是 `retention_boundary_verified`／`probe_empty`，或降級
-        成 `partial`）都代表這筆延後的探測已經沒有意義，直接丟棄、不重新排。
-
-        Task 7.8 S1（過期視窗）：`reason` 仍是門檻推論不足以確認「佇列裡記的
-        那次遍歷」還是「目前最新那次遍歷」——增量輪只延伸 `synced_through_ms`
-        不改 `reason`（見 `explore_fills_sync` 檔頭），所以 reason 相同時
-        `window_start_ms` 仍可能已經被後續增量輪推進過。多驗這一個欄位，不同
-        → 這筆延後探測驗證的是舊視窗邊界，已經對不上目前的查詢區間，丟棄、
-        計入 `dropped`（不算 `failed`：沒有發送、也不是探測本身失敗）。"""
-        if not self._probe_deferred:
-            return
-        if self._fills_available() < FILLS_PAGE_WEIGHT:
-            return
-        # Task 7.8 S3：`now` 供觀測用——記錄補打嘗試發生的時刻與當下佇列深度，
-        # 供事後從 log 重建「延後探測平均等了多久才被補打」。
-        logger.debug(
-            "explore scheduler: drain deferred probe now=%.3f queue_depth=%d",
-            now, len(self._probe_deferred))
-        address, window_start_ms = self._probe_deferred.popleft()
-        st = self._store.get_sync(address)
-        if (st is None or st.completeness != "complete"
-                or st.reason != REASON_COUNT_BELOW_RETENTION_THRESHOLD
-                or not self._store.is_active(address)):
-            return
-        if st.window_start_ms != window_start_ms:
-            self._probe_dropped += 1
-            logger.warning(
-                "explore scheduler: deferred probe 視窗已過期 address=%s "
-                "佇列值=%d 現值=%d，丟棄不探", address, window_start_ms,
-                st.window_start_ms)
-            return
-        hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
-        self._probe_retention_boundary(address, window_start_ms, hl_fills)
-
     def _notify_dirty(self) -> None:
         """Task 7.9a A3：`on_dirty`（publisher 用來決定要不要提前組版）是錦上
-        添花的通知，不是關鍵寫入路徑——三個呼叫點（`_run_cache_kind`／
-        `_run_fills`／`_probe_retention_boundary`）都已經把 store 寫入與
+        添花的通知，不是關鍵寫入路徑——所有呼叫點都已經把 store 寫入與
         `_complete`／續排／enqueue 做完才呼叫這裡，例外只吞不逸出（工程原則 3
         的反向：關鍵動作不因這個失敗而跟著失敗），計 `dirty_errors`
         （`status()`／health 可見）供營運端發現 callback 本身壞掉。"""
@@ -774,17 +716,15 @@ class ExploreScheduler:
 
     def _fills_available(self) -> int:
         """`explore_fills` 保留 scope 目前還能預留多少權重（Task 7.4b）——
-        用它判斷「值不值得這一輪把工作分給 fills」。刻意只看 `self._hl_fills`
-        （不像 `_run_job` 那樣在 `None` 時退回 `self._hl`）。
+        用它判斷「值不值得這一輪把工作分給 fills-like」。刻意只看
+        `self._hl_fills`（不像 `_run_job` 那樣在 `None` 時退回 `self._hl`）。
 
         2026-09-21 主線程二次裁決：沒有接父子 scope 的舊呼叫端／測試沒有真正
         的限流器可查，只在「基礎類別也有到期 job」時才交替回
         `FILLS_PAGE_WEIGHT`／`0`（`self._fallback_turn`）——沒有基礎 job 在
-        排隊時，交替毫無意義，只會把本來每 tick 都能跑的 fills 平白拖慢一半
-        （`_tick_once` 的 fallback-claim 已經處理了「優先類別這輪沒 job 就換
-        另一類」，這裡的交替只用來處理『兩類都有 job 排隊、無 limiter 時如何
-        公平分配』這個更窄的情境）。有真實 limiter（生產接線）時完全不受
-        影響，一律照 `limiter.available("explore_fills")` 的真實保留額度判斷。"""
+        排隊時，交替毫無意義，只會把本來每 tick 都能跑的 fills-like 平白拖慢
+        一半。有真實 limiter（生產接線）時完全不受影響，一律照
+        `limiter.available("explore_fills")` 的真實保留額度判斷。"""
         limiter = getattr(self._hl_fills, "_limiter", None)
         if limiter is not None:
             # <!-- 2026-09-21 複審 W1 -->：用 gateway 自己的 scope 名，不硬編字串

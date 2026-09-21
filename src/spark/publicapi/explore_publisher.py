@@ -33,6 +33,7 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
+from spark.publicapi.explore_fills_sync import build_fills_coverage
 from spark.publicapi.explore_store import ExploreStore
 from spark.publicapi.hl_explore import (DEFAULT_FILLS_COVERAGE, DEFAULT_WINDOW,
                                         FILLS_WINDOW_DAYS, WINDOW_KEYS, ExploreConfig,
@@ -81,22 +82,12 @@ def compose_rows(store: ExploreStore, *, now: float, cfg: ExploreConfig,
             fills = store.get_fills(c.address, now_ms - window_ms, now_ms)
             sync = store.get_sync(c.address)
 
-            coverage = {
-                "state": sync.completeness if sync is not None else "backfilling",
-                "observed_from": sync.observed_from_ms if sync is not None else None,
-                "observed_to": sync.observed_to_ms if sync is not None else None,
-                "reason": sync.reason if sync is not None else None,
-                # Task 7.1：`synced_through`＝已確認同步到的游標（epoch ms），
-                # `last_success_at`＝最近一次抓頁成功時間（epoch 秒，＝下面
-                # `as_of["fills"]`）——回補未完成時前者常落後於後者。
-                "synced_through": sync.synced_through_ms if sync is not None else None,
-                "last_success_at": sync.updated_at if sync is not None else None,
-                # Task 7.5：查詢區間與參數留證——`sync=None`（尚未 enrich 過的
-                # 候選）一律 null，與其他鍵的既有慣例一致。
-                "window_start": sync.window_start_ms if sync is not None else None,
-                "window_end": sync.window_end_ms if sync is not None else None,
-                "params_fp": sync.params_fp if sync is not None else None,
-            }
+            # Task 7.9b B6：`fills_coverage` 的唯一組裝點（探索清單／詳情頁
+            # 共用，見 `explore_fills_sync.build_fills_coverage` docstring）——
+            # `state`／`reason` 已含 gap／unknown 降級；`window_start`／
+            # `window_end` 改為增量軌覆蓋區間；`evidence` 回溯「建立目前
+            # completeness 的那次遍歷」。
+            coverage = build_fills_coverage(sync, store)
             as_of = {
                 "portfolio": pf.fetched_at if pf is not None else None,
                 "state": st.fetched_at if st is not None else None,
