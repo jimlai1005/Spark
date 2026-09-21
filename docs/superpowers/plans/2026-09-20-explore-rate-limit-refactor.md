@@ -1374,7 +1374,7 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 **Files:** `src/spark/publicapi/explore_fills_sync.py`、`explore_scheduler.py`、`explore_store.py`、`hl_explore.py`（`_row_from_dict`）；`tests/test_explore_fills_sync.py`、`tests/test_explore_scheduler.py`、`tests/test_explore_store.py`、`tests/test_hl_explore.py`（或既有 v4 快照測試檔）。不動前端、不動契約鍵集合、不動 schema（仍是 v2）。
 
 **A. 增量輪語義（修 (a)(b) 與複審 W3）**
-1. `plan_page` 的 `complete|partial` 分支，在增量寬限期判斷**之前**加「輪進行中」判斷：`state.synced_through_ms is not None and state.cursor_ms > state.synced_through_ms` → 回 `PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)`（續抓本輪，不看寬限期、不改 state）。理由：輪開始時 `cursor = synced_through − overlap ≤ synced_through`；滿頁後 `cursor = 最後一筆時間 > synced_through`，且 `synced_through` 只在輪結束才推進，所以 `cursor > synced_through` ⇔ 本輪未結束。
+1. `plan_page` 的 `complete|partial` 分支，在增量寬限期判斷**之前**加「輪進行中」判斷：`state.synced_through_ms is not None and state.cursor_ms > state.synced_through_ms` → 回 `PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)`（續抓本輪，不看寬限期、不改 state）。理由：輪開始時 `cursor = synced_through − overlap ≤ synced_through`；滿頁後 `cursor = 最後一筆時間 ≥ synced_through`（`==` 只在該毫秒溢出時發生，由 `same_ms_overflow` 終止為 partial）；短頁收尾不改 cursor；`synced_through` 只在輪結束才推進。所以 `cursor > synced_through` ⇒ 本輪未結束；**反向不成立**（`==` 的兩種狀態都是輪已結束，改成 `>=` 會讓下一 tick 無限重抓 `[end,end]`，見 7.7 點 3）。<!-- 2026-09-21 7.7 W1 校正：原寫 ⇔ -->。
 2. `apply_page` 短頁分支改為兩種輪：
    - `state.completeness == "backfilling"`（首輪全區間遍歷）→ 現行：`fills_in_window >= threshold` → `partial`／`retention_limit`，否則 `complete`／`REASON_COUNT_BELOW_RETENTION_THRESHOLD`。
    - 否則（增量輪；前態 `complete` 或 `partial`）→ `fills_in_window >= threshold` → `partial`／`retention_limit`（本輪缺口本身超標，合法降級）；否則 **`completeness` 與 `reason` 原樣保留**（增量輪只延伸 `synced_through`，不重新宣稱整個窗口；`partial` 仍 `partial`；`retention_boundary_verified` 跨輪存活）。其餘欄位（`synced_through=end_ms`、observed、`fills_in_window`、`last_error=None`、`updated_at`）照舊。
@@ -1428,6 +1428,25 @@ W3（探測回空每輪重探）——加第三個 reason 碼記錄「已探過�
    - 測試：fake limiter 讓 `_fills_available()` 先回 0 → 探測進 deferred、無上游呼叫、無 warning；下一 tick 回 120 → 探測送出、佇列清空；同地址兩次 complete 只留一筆；退池／狀態改變者被丟棄。
 
 **驗收（主線程親跑）**：ruff 乾淨；`uv run pytest -q` 全綠且 > 3171；`rg -n "probe_empty" src tests` 有命中；scratchpad `repro_77.py`（主線程寫）：partial 狀態 25h 後 `plan_page` 回 backfilling 首輪、短頁後 complete；探測回空後第二輪不再探；部署後正式機 journal 不再每分鐘出現「探測失敗 … BudgetExhausted」，且 `explore_refresh.probe.verified` 或 `empty` 在 30 分鐘內 > 0。
+
+### Task 7.8 @inline：7.7 複審 Critical——noop 重排時間與 noop 期限同源（2026-09-21 主線程裁決；7.7 不得先於本 task 部署）
+
+<!-- 來源：7.7 fresh review（opus）Critical 1，主線程實跑 reviewer 腳本核實：200 tick 全是 noop 的 `ran:fills`，state job 一次都領不到。
+根因：`_run_fills` noop 分支重排 `next_at = window_end + fills_every_s（4h）`，7.7 之前它恰好等於 noop 失效時刻；7.7 把 partial 的 noop 期限改成 24h
+但重排常數沒跟著改 → `window_end+4h` 之後每次 noop 都排到過去 → 等待加權讓它永遠贏 → 零睡眠緊迴圈、餓死所有 job（工程原則 #1：比較的兩個量要同源）。
+同批順修 7.7 複審 W1（已由主線程改 plan 7.6 A1）、W3、S1、S3、S4；W2（探測與 fills 頁輪流分同一保留額度、冷啟動時吞吐減半）為已接受的暫時代價：
+每地址一生至多一次探測，300 地址上限 300 次，部署後盯 `queue_depth`／`oldest_due_age_s`／`probe.deferred`。 -->
+
+**Files:** `src/spark/publicapi/explore_fills_sync.py`（`PagePlan`、`plan_page`）、`explore_scheduler.py`（`_run_fills` noop 分支、`_drain_one_deferred_probe`、`_enqueue_probe_deferred`、`status`）；`tests/test_explore_fills_sync.py`、`tests/test_explore_scheduler.py`、`tests/test_api_ops.py`。不動 schema、不動前端。
+
+1. **同源（Critical）**：`PagePlan` 加欄位 `next_due_ms: int | None = None`（NamedTuple 預設值，既有建構呼叫不必改）。`plan_page` 產生 noop 計畫時一律填：`complete` → `state.window_end_ms + incremental_after_ms`；`partial` → `state.window_end_ms + PARTIAL_RESCAN_AFTER_MS`。非 noop 計畫維持 `None`。docstring：「noop 計畫自帶失效時刻，排程端只能用它重排，不得另算」。
+2. **排程端**：`_run_fills` noop 分支改為 `next_at = max(plan.next_due_ms / 1000, now + self._jit(60.0))`——`next_due_ms` 為 None 時（防禦，不應發生）記 `logger.error` 並用 `now + self._fills_every_s`。任何路徑都不得把 `next_attempt_at` 排到 `now` 之前。
+3. **W3 溢位可觀測**：`_enqueue_probe_deferred` 在 `len(deque) == maxlen` 且要 append 新項時 `_probe_dropped += 1` 並記一行 warning（含地址）；`status()["probe"]` 加 `dropped`。
+4. **S1 過期視窗**：deferred 項記 `(address, window_start_ms)`；drain 時重讀 `get_sync`，若 `st.window_start_ms != 佇列值` → 丟棄（計入 `dropped`，不算 failed）。
+5. **S3**：移除 `_drain_one_deferred_probe` 未使用的 `now` 參數（或真的用它）。
+6. **S4 測試（回歸守門）**：(i) partial 地址 noop 後 `refresh_job.next_attempt_at > now`，且等於 `window_end + 24h`；(ii) complete 地址 noop 後等於 `window_end + 4h`（既有行為不變）；(iii) 一個 partial（在 4h–24h 區間）＋兩個 state job 的 store，連跑 50 tick：`ran:fills` 恰好出現 ≤1 次、兩個 state job 都被領過、其餘 tick 為 `idle` 或 `ran:state`（用複審腳本 `scratchpad/repro_partial_starves_base.py` 的形狀，但寫成正式測試）；(iv) `plan_page` noop 計畫 `next_due_ms` 兩種值；(v) deferred 溢位 `dropped` 遞增；(vi) 視窗前移的 deferred 項被丟棄且不探。
+
+**驗收（主線程親跑）**：ruff 乾淨；`uv run pytest -q` 全綠且 > 3183；主線程重跑 `scratchpad/repro_partial_starves_base.py`：200 tick 中 `ran:fills` ≤ 2 且 state 有被領；`rg -n "next_due_ms" src` 有命中。
 
 ## P5 驗收與啟用準備（任務卡）
 
