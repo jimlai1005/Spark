@@ -383,6 +383,25 @@ def test_hl_explore_base_and_fills_weight_caps_non_positive_raises():
         ApiConfig.from_env(_env(FILET_HL_EXPLORE_FILLS_WEIGHT_CAP="-5"))
 
 
+# ---------- explore_fills_period_s（Task 7.9a，2026-09-21）----------
+
+def test_explore_fills_period_s_defaults_to_21600():
+    """未設 env → 21600（6 小時）——正式機量到消化上限 60 地址／小時，
+    300 地址／4 小時＝75 超過上限；6 小時＝50 才留出餘裕（見 RUNBOOK §5.8e）。"""
+    cfg = ApiConfig.from_env(_env())
+    assert cfg.explore_fills_period_s == 21600
+
+
+def test_explore_fills_period_s_read_from_env():
+    cfg = ApiConfig.from_env(_env(FILET_EXPLORE_FILLS_PERIOD_S="7200"))
+    assert cfg.explore_fills_period_s == 7200
+
+
+def test_explore_fills_period_s_below_one_hour_raises():
+    with pytest.raises(ValueError, match="FILET_EXPLORE_FILLS_PERIOD_S"):
+        ApiConfig.from_env(_env(FILET_EXPLORE_FILLS_PERIOD_S="3599"))
+
+
 # ---------- explore_db_path（Task 2.3，2026-09-20）----------
 
 def test_explore_db_path_defaults_to_none():

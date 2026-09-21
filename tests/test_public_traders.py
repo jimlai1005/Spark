@@ -715,6 +715,47 @@ def test_pool_local_path_stale_portfolio_enqueues_single_job(tmp_path):
     assert keys == [f"{_A}:portfolio"]
 
 
+@pytest.mark.parametrize("period", [7200, 21600])
+def test_pool_local_path_fills_refresh_uses_configured_period(tmp_path, period):
+    """Task 7.9a A1：詳情頁補排 fills 增量的條件改讀
+    `cfg.explore_fills_period_s`，不再寫死 4 小時——`period − 1s` 不補排、
+    `refreshing` 為 False；`period + 1s` 補排、`refreshing` 為 True。"""
+    now = 1_000_000.0
+    cfg = make_cfg(tmp_path, explore_fills_period_s=period)
+    store = ApiStore(cfg.db_path)
+    keysvc = FakeKeysvc()
+    hl = _CountingHL()
+    explore_store = ExploreStore(tmp_path / "e.db")
+    app = create_app(cfg, store, keysvc, hl, now_fn=lambda: now, explore_store=explore_store)
+
+    explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now, now + 3600)
+    explore_store.put_cache_ok(
+        _A, "clearinghouseState",
+        {"marginSummary": {"accountValue": "5000.00"}, "assetPositions": []},
+        now, now + 3600)
+    explore_store.put_cache_ok(_A, "ledger", [], now, now + 3600)
+    # period − 1s：尚未到期，不補排。
+    explore_store.insert_fills_page(_A, [], _fills_sync(_A, now=now - (period - 1)))
+
+    c = _client(app)
+    r = c.get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    assert r.json()["refreshing"] is False
+    keys = [row[0] for row in
+            explore_store._db.execute("SELECT key FROM refresh_job").fetchall()]
+    assert f"{_A}:fills" not in keys
+
+    # period + 1s：已到期，補排。
+    explore_store.insert_fills_page(_A, [], _fills_sync(_A, now=now - (period + 1)))
+
+    r2 = c.get(f"/api/public/traders/{_A}")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["refreshing"] is True
+    keys2 = [row[0] for row in
+            explore_store._db.execute("SELECT key FROM refresh_job").fetchall()]
+    assert f"{_A}:fills" in keys2
+
+
 def test_pool_local_path_missing_state_ledger_sync_enqueues_three_jobs(tmp_path):
     now = 1_000_000.0
     app, hl, explore_store = _make_pool_app(tmp_path, now)

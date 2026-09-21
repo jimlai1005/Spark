@@ -2183,6 +2183,17 @@ Task 7.4 修法：週期放寬＋父子 scope 保留額度，見下方兩段。 
 把餘量留給 fills 保留額度（見下段）。scheduler 啟動後第一個 tick 會把舊積壓（`next_attempt_at` 早於
 `now − period`）攤平到一個週期內重新排程，不會因為改週期而讓積壓一次性湧入。
 
+**fills 增量週期（Task 7.9a，2026-09-21 使用者裁決；單一來源，`FILET_EXPLORE_FILLS_PERIOD_S`
+＝ `ApiConfig.explore_fills_period_s`，預設 **6 小時**＝21600 秒）**：舊版把「多久對一個地址開一輪
+fills 增量」的 4 小時字面值分開寫死在三處（scheduler 重排間隔、`explore_fills_sync.plan_page` 的
+增量寬限期、詳情頁補排條件），三處各自漂移過。現在三處讀同一個 config 值，改一次全部一起變。
+**容量算式**（6 小時基線，不含 7.9b 才會有的核驗掃描與 9:1 探測比例）：需求／小時 ≈ 300 地址 /
+6h（＝50）＋新增候選（≈1）＋多頁增量（依帳戶活躍度量測）＋partial 每 24 小時整窗重掃（視當時
+partial 地址數攤平）＋留存邊界探測（額度不足時自動延後補打，見 `probe.deferred`）；消化上限＝
+`explore_fills` 保留額度 120＝每分鐘一頁 fills（Task 7.4a/c）。**選 6 小時而非更短**：4 小時＝
+300/4h=75/小時已超過消化上限，6 小時＝50/小時才留出多頁增量與探測的餘裕；短於 1 小時
+（`FILET_EXPLORE_FILLS_PERIOD_S` 啟動時驗證 ≥ 3600）在任何多頁增量情境下都會立即觸頂。
+
 **保留額度（Task 7.4a/c，2026-09-21，fills 類別級飢餓修法）**：`explore`（父，300）底下切兩個保留額度子
 scope——`explore_base`（state／portfolio／ledger，≤180）與 `explore_fills`（一頁 fills，保證 120＝每分鐘至少
 一頁）。有 fills 待處理時基礎類別走 `explore_base`、fills 走 `explore_fills`；無 fills 待處理時基礎類別改走
@@ -2197,6 +2208,7 @@ scope——`explore_base`（state／portfolio／ledger，≤180）與 `explore_f
 | `FILET_HL_EXPLORE_WEIGHT_CAP` | `300` | 同上；`explore` 父 scope 上限 |
 | `FILET_HL_EXPLORE_BASE_WEIGHT_CAP` | `180` | Task 7.4c 新增；`explore_base` 保留額度上限（base+fills ≤ explore，啟動時驗證） |
 | `FILET_HL_EXPLORE_FILLS_WEIGHT_CAP` | `120` | Task 7.4c 新增；`explore_fills` 保留額度上限（保證每分鐘至少一頁 fills） |
+| `FILET_EXPLORE_FILLS_PERIOD_S` | `21600` | Task 7.9a 新增；fills 增量週期單一來源（同時決定 scheduler 重排間隔／增量寬限期／詳情頁補排條件），啟動時驗證 ≥ 3600 |
 | `FILET_EXPLORE_DB` | `/var/lib/filet-api/explore.db` | SQLite WAL；落在既有 `ReadWritePaths`。刷新開啟時**必填**（缺 → 拒絕啟動，訊息含兩個 env 名） |
 | `EXPLORE_UPSTREAM_REFRESH` | `0`／`1` | 預設 `0`＝不起 thread、榜單維持快照；`1`＝起背景刷新 |
 
@@ -2213,7 +2225,7 @@ Environment=EXPLORE_UPSTREAM_REFRESH=0
 EOF
 sudo systemctl daemon-reload && sudo systemctl restart filet-api.service
 # 2) 有效值（不要 grep 主檔；⚠️ 全量 Environment 含 TG token，只 grep 這幾個 key）
-systemctl show filet-api -p Environment --value | tr ' ' '\n' | grep -E '^(FILET_EXPLORE_DB|EXPLORE_UPSTREAM_REFRESH|FILET_HL_)'
+systemctl show filet-api -p Environment --value | tr ' ' '\n' | grep -E '^(FILET_EXPLORE_DB|EXPLORE_UPSTREAM_REFRESH|FILET_HL_|FILET_EXPLORE_FILLS_PERIOD_S)'
 # 3) 開啟刷新：把 EXPLORE_UPSTREAM_REFRESH 改 1 → daemon-reload → restart；journal 應出現 thread 啟動、之後無 Traceback
 sudo journalctl -u filet-api --since '5 min ago' --no-pager | grep -iE 'explore|traceback' | tail -20
 # 4) DB 檔會由 filet-api 自建；權限應為 filet-api 0600（WAL 會多 -wal／-shm 兩檔）

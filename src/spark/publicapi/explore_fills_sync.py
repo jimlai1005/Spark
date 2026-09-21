@@ -92,7 +92,13 @@ RETENTION_SAFETY_THRESHOLD = HL_FILLS_RETENTION_LIMIT - RETENTION_SAFETY_MARGIN 
 WINDOW_DAYS = 30
 OVERLAP_MS = 1
 _DAY_MS = 86_400_000
-_DEFAULT_INCREMENTAL_AFTER_MS = 4 * 3600 * 1000
+# Task 7.9a（2026-09-21 使用者裁決）：這個預設值只在呼叫端沒有明講
+# `incremental_after_ms` 時才會用到——生產路徑（`explore_scheduler._run_fills`）
+# 一律顯式傳入 `int(self._fills_every_s * 1000)`（`self._fills_every_s` 由
+# `run_api.py` 從 `ApiConfig.explore_fills_period_s` 單一來源注入，預設值同步
+# 改為 21600 秒＝6 小時，見 config.py 檔頭），這裡只是「沒有 config 時」的
+# 保底值，不是三處週期字面值的真相來源之一。
+_DEFAULT_INCREMENTAL_AFTER_MS = 6 * 3600 * 1000
 
 # Task 7.7 W2（partial 復原路徑，正確性修正）：`partial` 不做增量（見模組
 # 檔頭），每過這麼久就整窗重掃一次，是唯一能讓 `partial` 有機會復原成

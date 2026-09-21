@@ -158,6 +158,18 @@ class ApiConfig:
     # `explore_fills`；無 fills 待處理時基礎可借滿父 `explore`——300）。
     hl_explore_base_weight_cap: int = 180
     hl_explore_fills_weight_cap: int = 120
+    # --- Explore fills 增量週期單一來源（Task 7.9a，2026-09-21 使用者裁決）---
+    # 舊版把「多久對一個地址開一輪 fills 增量」的 4 小時字面值分開寫死在三處
+    # （`explore_fills_sync._DEFAULT_INCREMENTAL_AFTER_MS`、
+    # `ExploreScheduler.__init__` 的 `fills_every_s` 預設、`app.py` 詳情頁補排
+    # 條件），三處各自漂移就會出現「排程說已增量、詳情頁還在等 4 小時」這種
+    # 不一致。改為本欄位單一來源：`run_api.py` 把它同時餵給
+    # `ExploreScheduler(fills_every_s=...)`（重排間隔＋轉給
+    # `explore_fills_sync.plan_page(incremental_after_ms=...)`）與詳情頁補排
+    # 條件（`app.py`）。預設 21600（6 小時）——正式機量到消化上限 60 地址／
+    # 小時，300 地址／4 小時＝75 超過上限；6 小時＝50 才留出多頁增量／
+    # partial 重掃／探測的餘裕（見 RUNBOOK §5.8e 容量算式）。
+    explore_fills_period_s: int = 21600
     # --- Explore 持久化（Task 2.3，2026-09-20，spec P2）---
     # `FILET_EXPLORE_DB`：`ExploreStore`（SQLite WAL）落盤路徑。⚠️ 刻意**不**沿
     # `exchange_dir`／`state_base`／`leaders_path` 的必填慣例：P2 階段 store 尚無
@@ -195,6 +207,10 @@ class ApiConfig:
             raise ValueError(
                 "FILET_HL_EXPLORE_BASE_WEIGHT_CAP + FILET_HL_EXPLORE_FILLS_WEIGHT_CAP "
                 "不得大於 FILET_HL_EXPLORE_WEIGHT_CAP")
+        if self.explore_fills_period_s < 3600:
+            raise ValueError(
+                "FILET_EXPLORE_FILLS_PERIOD_S 不得小於 3600（1 小時）——太短會讓 fills "
+                "增量頻率超出 explore_fills 保留額度的消化能力")
         if self.stripe_secret_key is not None and \
                 not self.stripe_secret_key.startswith("sk_test_"):
             raise ValueError(
@@ -415,4 +431,6 @@ class ApiConfig:
                        or cls.hl_explore_fills_weight_cap),
                    explore_db_path=env.get("FILET_EXPLORE_DB") or None,
                    explore_upstream_refresh=(env.get("EXPLORE_UPSTREAM_REFRESH", "")
-                                             .strip().lower() in ("1", "true")))
+                                             .strip().lower() in ("1", "true")),
+                   explore_fills_period_s=int(env.get("FILET_EXPLORE_FILLS_PERIOD_S")
+                                              or cls.explore_fills_period_s))

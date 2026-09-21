@@ -2562,7 +2562,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 if cache_entry is None or now >= cache_entry.refresh_after:
                     explore_store.enqueue(f"{addr}:{kind}", addr, kind, 1, now)
                     refreshing = True
-            if sync is None or now - sync.updated_at >= 4 * 3600:
+            # Task 7.9a A1：週期單一來源——與 `ExploreScheduler.fills_every_s`／
+            # `explore_fills_sync.plan_page` 的增量寬限期同一個 `cfg.explore_fills_period_s`
+            # （config.py 檔頭），不再各自寫死 4 小時。
+            if sync is None or now - sync.updated_at >= cfg.explore_fills_period_s:
                 explore_store.enqueue(f"{addr}:fills", addr, "fills", 2, now)
                 refreshing = True
         as_of = {

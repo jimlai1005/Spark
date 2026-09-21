@@ -1508,3 +1508,305 @@ def test_drain_deferred_probe_discards_stale_window_and_counts_dropped(tmp_path)
     assert sched.status()["probe"]["deferred"] == 0
     assert sched.status()["probe"]["dropped"] == 1
     assert sched.status()["probe"]["failed"] == 0
+
+
+# ============================================================
+# Task 7.9a A1：fills 週期單一來源——scheduler 重排間隔與
+# `explore_fills_sync.plan_page` 的增量寬限期必須讀同一個 `fills_every_s`。
+# ============================================================
+
+@pytest.mark.parametrize("period", [7200, 21600])
+def test_fills_period_single_source_ties_reschedule_and_plan_page(tmp_path, period):
+    """完成首輪回補後：(i) 重排間隔 ≈ period；(ii) `period − 1s` 仍是 noop
+    （不打上游）；(iii) `period + 1s` 開新的增量輪（打上游）。三者都隨同一個
+    `fills_every_s` 值變化，不是各自一份常數。"""
+    clock = Clock(t=40 * 86400.0)  # window 起點在 epoch 之後，避免負時間戳
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0xabc"
+    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    store.enqueue(f"{addr}:fills", addr, "fills", 2, clock.now())
+    # 三頁：首輪回補（空頁即完成）、留存邊界探測回應（空頁）、下一輪增量（空頁）
+    # ——首輪與增量輪收尾都會判定 completeness=complete／
+    # reason=count_below_retention_threshold，觸發一次探測（見
+    # `_run_fills`），本測試不驗證探測本身，只需要提供足夠的假頁。
+    hl = SequencedFillsHL([[], [], []])
+    sched = _sched(store, hl, clock=clock, fills_every_s=period)
+    sched._bootstrapped = True
+
+    r1 = sched.tick()
+    assert r1 == "ran:fills"
+
+    row = store._db.execute(
+        "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)).fetchone()
+    # (i) 完成收尾後的重排間隔 ≈ period（±10% jitter）。
+    assert row[0] == pytest.approx(clock.now() + period, rel=0.15)
+
+    sync = store.get_sync(addr)
+    window_end_ms = sync.window_end_ms
+    calls_after_round1 = len(hl.calls)
+
+    # (ii) period − 1s：仍是 noop，不打上游。
+    clock.t = (window_end_ms + period * 1000 - 1000) / 1000
+    store._db.execute("UPDATE refresh_job SET next_attempt_at=? WHERE key=?",
+                      (clock.now(), f"{addr}:fills"))
+    r2 = sched.tick()
+    assert r2 == "ran:fills"
+    assert len(hl.calls) == calls_after_round1
+
+    # (iii) period + 1s：開新的增量輪，打上游。
+    clock.t = (window_end_ms + period * 1000 + 1000) / 1000
+    store._db.execute("UPDATE refresh_job SET next_attempt_at=? WHERE key=?",
+                      (clock.now(), f"{addr}:fills"))
+    r3 = sched.tick()
+    assert r3 == "ran:fills"
+    assert len(hl.calls) == calls_after_round1 + 1
+
+
+def test_run_api_passes_configured_fills_period_to_scheduler(tmp_path, monkeypatch):
+    """`scripts.run_api` 把 `cfg.explore_fills_period_s` 原樣傳給
+    `ExploreScheduler(fills_every_s=...)`（沿 `test_run_api_wiring.py` 的
+    `__init__` 攔截慣例）。"""
+    import threading
+
+    import scripts.run_api as run_api
+
+    monkeypatch.setattr("uvicorn.run", lambda *a, **kw: None)
+    started: list = []
+    monkeypatch.setattr(threading.Thread, "start", lambda self: started.append(self))
+
+    import spark.publicapi.explore_scheduler as explore_scheduler_mod
+    captured: dict = {}
+    real_init = explore_scheduler_mod.ExploreScheduler.__init__
+
+    def fake_init(self, **kwargs):
+        captured.update(kwargs)
+        real_init(self, **kwargs)
+    monkeypatch.setattr(explore_scheduler_mod.ExploreScheduler, "__init__", fake_init)
+
+    env = {
+        "FILET_API_NETWORK": "testnet", "FILET_BUILDER_ADDR": "0x" + "b1" * 20,
+        "FILET_SIWE_DOMAIN": "filet.example", "FILET_SIWE_URI": "https://filet.example",
+        "FILET_API_DB": str(tmp_path / "api.db"),
+        "FILET_KEYSVC_SOCK": str(tmp_path / "keysvc.sock"),
+        "FILET_PENDING_PATH": str(tmp_path / "pending.json"),
+        "FILET_EXCHANGE_DIR": str(tmp_path / "exchange"),
+        "FILET_STATE_BASE": str(tmp_path / "state"),
+        "FILET_LEADERS_PATH": str(tmp_path / "leaders.json"),
+        "EXPLORE_UPSTREAM_REFRESH": "1",
+        "FILET_EXPLORE_DB": str(tmp_path / "explore.db"),
+        "FILET_EXPLORE_FILLS_PERIOD_S": "7200",
+    }
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    run_api.main()
+
+    assert captured["fills_every_s"] == 7200
+
+
+# ============================================================
+# Task 7.9a A2：重試上限——只計實際嘗試過的暫時性失敗，第 8 次隔離 24 小時，
+# 隔離期滿只釋放一次恢復嘗試。
+# ============================================================
+
+class FlakyStateHL:
+    """`clearinghouse_state` 前 `fail_times` 次拋 `exc_factory()`，之後成功。"""
+
+    def __init__(self, fail_times: int, exc_factory=lambda: ConnectionError("boom")):
+        self.fail_times = fail_times
+        self.exc_factory = exc_factory
+        self.calls = 0
+
+    def clearinghouse_state(self, address):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise self.exc_factory()
+        return {"marginSummary": {"accountValue": "1"}}
+
+
+def test_max_job_attempts_quarantines_on_eighth_transient_failure(tmp_path):
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.enqueue("0xabc:state", "0xabc", "state", 0, clock.now())
+    hl = FlakyStateHL(fail_times=8)
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    results = []
+    for _ in range(8):
+        results.append(sched.tick())
+        if results[-1] == "retry":
+            store._db.execute(
+                "UPDATE refresh_job SET next_attempt_at=? WHERE key=?",
+                (clock.now(), "0xabc:state"))
+
+    assert results[:7] == ["retry"] * 7
+    assert results[7] == "quarantined"
+
+    row = store._db.execute(
+        "SELECT attempts, next_attempt_at, last_error FROM refresh_job "
+        "WHERE key='0xabc:state'").fetchone()
+    assert row[0] == 7
+    assert row[1] == pytest.approx(clock.now() + 86400)
+    assert row[2].startswith("max_attempts:")
+    assert sched.status()["quarantined_max_attempts"] == 1
+
+
+def test_quarantine_release_gives_exactly_one_retry_before_requarantine(tmp_path):
+    """隔離期滿後 `attempts` 仍是 `MAX_JOB_ATTEMPTS - 1`（7）——失敗一次立刻
+    再達到上限、再隔離，不會重新給滿 8 次。"""
+    clock = Clock(t=1000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.enqueue("0xabc:state", "0xabc", "state", 0, clock.now())
+    store._db.execute("UPDATE refresh_job SET attempts=7 WHERE key='0xabc:state'")
+    hl = FlakyStateHL(fail_times=1)
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+
+    assert r == "quarantined"
+    row = store._db.execute(
+        "SELECT attempts, next_attempt_at, last_error FROM refresh_job "
+        "WHERE key='0xabc:state'").fetchone()
+    assert row[0] == 7
+    assert row[1] == pytest.approx(clock.now() + 86400)
+    assert row[2].startswith("max_attempts:")
+    assert sched.status()["quarantined_max_attempts"] == 1
+
+
+def test_quarantine_release_success_resets_attempts_to_zero(tmp_path):
+    clock = Clock(t=1000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.enqueue("0xabc:state", "0xabc", "state", 0, clock.now())
+    store._db.execute("UPDATE refresh_job SET attempts=7 WHERE key='0xabc:state'")
+    hl = FakeHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+
+    assert r == "ran:state"
+    row = store._db.execute(
+        "SELECT attempts FROM refresh_job WHERE key='0xabc:state'").fetchone()
+    assert row[0] == 0
+
+
+def test_budget_exhausted_and_scope_paused_interleaved_do_not_advance_attempts(tmp_path):
+    """`BudgetExhausted`／`ScopePaused` 穿插在暫時性失敗之間，不推進
+    attempts——只有真的發送過的 `ConnectionError` 才算一次嘗試。"""
+    from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0x" + "ab" * 20
+    store.enqueue(f"{addr}:state", addr, "state", 0, clock.now())
+
+    class FlakyHL:
+        def __init__(self):
+            self._plan = iter([
+                ConnectionError("boom"),
+                BudgetExhausted("x"),
+                BudgetExhausted("x"),
+                ScopePaused("explore", clock.now() + 1),
+            ])
+
+        def clearinghouse_state(self, address):
+            raise next(self._plan)
+
+    sched = _sched(store, FlakyHL(), clock=clock)
+    sched._bootstrapped = True
+
+    results = []
+    for _ in range(4):
+        results.append(sched.tick())
+        store._db.execute(
+            "UPDATE refresh_job SET next_attempt_at=?, lease_until=NULL WHERE key=?",
+            (clock.now(), f"{addr}:state"))
+
+    assert results == ["retry", "no_budget", "no_budget", "paused"]
+    row = store._db.execute(
+        "SELECT attempts FROM refresh_job WHERE key=?", (f"{addr}:state",)).fetchone()
+    assert row[0] == 1
+
+
+def test_rate_limited_does_not_advance_attempts(tmp_path):
+    """429（`is_rate_limited`）走共享 cooldown，不算一次嘗試（7.9a 使用者修正
+    ——舊版預設 `bump_attempts=True` 會讓 429 悄悄推進 attempts）。"""
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.enqueue("0xabc:state", "0xabc", "state", 0, clock.now())
+
+    class RateLimitedHL:
+        def clearinghouse_state(self, address):
+            raise RuntimeError("429 Too Many Requests")
+
+    sched = _sched(store, RateLimitedHL(), clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+
+    assert r == "rate_limited"
+    row = store._db.execute(
+        "SELECT attempts FROM refresh_job WHERE key='0xabc:state'").fetchone()
+    assert row[0] == 0
+
+
+# ============================================================
+# Task 7.9a A3：callback 不丟工作——`on_dirty` 拋例外不得讓已完成的 job
+# 漏排；例外吞下並計入 `dirty_errors`。
+# ============================================================
+
+def test_notify_dirty_swallows_exception_without_losing_job(tmp_path):
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0xabc"
+    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    store.enqueue(f"{addr}:state", addr, "state", 0, clock.now())
+
+    def boom():
+        raise RuntimeError("dirty boom")
+
+    sched = _sched(store, FakeHL(), clock=clock, on_dirty=boom)
+    sched._bootstrapped = True
+
+    for i in range(20):
+        r = sched.tick()
+        assert r == "ran:state"
+        if i < 19:
+            store._db.execute(
+                "UPDATE refresh_job SET next_attempt_at=? WHERE key=?",
+                (clock.now(), f"{addr}:state"))
+
+    row = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE key=?", (f"{addr}:state",)).fetchone()
+    assert row is not None
+    assert row[0] > clock.now()
+    assert sched.status()["dirty_errors"] == 20
+
+
+def test_notify_dirty_exception_during_probe_does_not_lose_fills_enqueue(tmp_path):
+    """`_probe_retention_boundary` 內部的 dirty 通知也吞例外——探測後續的
+    `enqueue` 一定會執行到（見 `_run_fills` 的呼叫順序：`_complete` → 探測
+    → enqueue → `_notify_dirty()`）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0xabc"
+    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    store.enqueue(f"{addr}:fills", addr, "fills", 2, clock.now())
+    hl = SequencedFillsHL([[], []])  # 首輪回補（空頁）＋探測回應（空頁）
+
+    def boom():
+        raise RuntimeError("dirty boom")
+
+    sched = _sched(store, hl, clock=clock, on_dirty=boom)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+
+    assert r == "ran:fills"
+    row = store._db.execute(
+        "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)).fetchone()
+    assert row is not None and row[0] > clock.now()
+    assert sched.status()["dirty_errors"] == 2   # 一次來自抓頁完成、一次來自探測回寫

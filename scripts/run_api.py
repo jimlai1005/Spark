@@ -79,7 +79,12 @@ def main() -> None:
             excluded_fn=app.state.explore_excluded_fn,
             cfg=hl_explore.ExploreConfig.from_env(), now_fn=time.time,
             sleep_fn=time.sleep, on_dirty=publisher.mark_dirty,
-            on_tick=publisher.maybe_publish)
+            on_tick=publisher.maybe_publish,
+            # Task 7.9a A1：fills 增量週期單一來源——同一個 `cfg.explore_fills_period_s`
+            # 同時決定這裡的重排間隔與 `explore_fills_sync.plan_page` 的增量寬限期
+            # （見 `explore_scheduler._run_fills`），也是 `app.py` 詳情頁補排條件的
+            # 同一個值（config.py 檔頭）。
+            fills_every_s=cfg.explore_fills_period_s)
         app.state.explore_scheduler = scheduler
         app.state.explore_publisher = publisher
         if cfg.explore_upstream_refresh:

@@ -5,3 +5,8 @@ Environment=EXPLORE_UPSTREAM_REFRESH=0
 # 預設值（180／120），這裡列出來只是讓部署日想調整時有現成的範本可改。
 Environment=FILET_HL_EXPLORE_BASE_WEIGHT_CAP=180
 Environment=FILET_HL_EXPLORE_FILLS_WEIGHT_CAP=120
+# Task 7.9a（2026-09-21）：fills 增量週期單一來源，同時決定 scheduler 重排
+# 間隔、`explore_fills_sync.plan_page` 的增量寬限期、詳情頁補排條件三處——
+# config.py 內建預設值 21600（6 小時）也是這個值，這裡列出來只是讓部署日
+# 想調整時有現成的範本可改。
+Environment=FILET_EXPLORE_FILLS_PERIOD_S=21600

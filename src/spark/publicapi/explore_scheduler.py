@@ -79,6 +79,14 @@ _PROBE_DEFERRED_MAXLEN = 64
 # 的區分（`_run_job` 直接用 `leaderboard_source_fn`，不經任何 scoped gateway）。
 _BASE_KINDS = ("candidates", "state", "portfolio", "ledger")
 
+# Task 7.9a A2（2026-09-21 使用者裁決）：暫時性錯誤（連線／逾時／5xx）連續
+# 達到這麼多次「實際嘗試」→ 改隔離 24 小時，不再無限期每次退避封頂 900 秒
+# 後仍持續重試同一個地址。只計「真的發送過一次請求且失敗」的暫時性錯誤——
+# `BudgetExhausted`／`ScopePaused`（既有 `bump_attempts=False`）與 429（見
+# `_tick_once` 的 `is_rate_limited` 分支，本 task 補上 `bump_attempts=False`）
+# 都不算一次嘗試，見 `_tick_once` 例外分類。
+MAX_JOB_ATTEMPTS = 8
+
 # 準入上限：`refresh_job` 總數 ≤ ADMISSION_MULTIPLIER × active 候選數（2026-09-20
 # 主線程裁決：原 4× 因新增 ledger job 而放寬為 5×——四個 per-address job 種類
 # （state/portfolio/ledger/fills）＋候選變動期間的緩衝）。
@@ -201,6 +209,13 @@ class ExploreScheduler:
         # 被靜默擠掉——這個計數器讓「探測需求超過佇列容量」變成可觀測，見
         # `_enqueue_probe_deferred`。
         self._probe_dropped = 0
+        # Task 7.9a A2：連續暫時性失敗達到 `MAX_JOB_ATTEMPTS` 而被隔離的次數
+        # （與語意錯誤的立即隔離分開計，見 `_quarantine` 的 `max_attempts` 參數）。
+        self._quarantined_max_attempts = 0
+        # Task 7.9a A3：`on_dirty` callback 拋例外的次數（`_notify_dirty` 吞例外
+        # 後計數）——job 本身不因此遺失，這個計數器讓 callback 本身壞掉這件事
+        # 變成可觀測（health 可見）。
+        self._dirty_errors = 0
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -256,6 +271,10 @@ class ExploreScheduler:
             "last_fills_at": self._last_fills_at,
             "base_scope_in_use": self._base_scope_in_use,
             "rebalanced": dict(self._rebalanced),
+            # Task 7.9a A2／A3：與 `probe` 一樣經 `**scheduler.status()` 自然
+            # 出現在 `/api/ops/health` 的 `explore_refresh`。
+            "quarantined_max_attempts": self._quarantined_max_attempts,
+            "dirty_errors": self._dirty_errors,
             # Task 7.6 點 6：留存邊界探測觀測值，經 app.py `**scheduler.status()`
             # 自然出現在 `/api/ops/health` 的 `explore_refresh`（同 `fills_pages_total`
             # 等既有欄位的展開方式，不需要逐鍵挑選）。
@@ -350,10 +369,21 @@ class ExploreScheduler:
             return "paused"
         except Exception as e:  # noqa: BLE001 — 唯一的分類點，見檔頭
             if is_rate_limited(e):
-                self._reschedule(job, now + 60, err=repr(e))
+                # Task 7.9a A2（使用者修正）：429 走共享 cooldown（`note_429`／
+                # `ScopePaused` 那一路），不算一次「實際嘗試」——不推進 attempts，
+                # 與 `BudgetExhausted`／`ScopePaused` 既有的 `bump_attempts=False`
+                # 一致。
+                self._reschedule(job, now + 60, err=repr(e), bump_attempts=False)
                 return "rate_limited"
             if isinstance(e, (ConnectionError, TimeoutError)) or _is_5xx(e):
                 attempts = job.attempts + 1
+                if attempts >= MAX_JOB_ATTEMPTS:
+                    # Task 7.9a A2：第 `MAX_JOB_ATTEMPTS` 次實際嘗試仍失敗 → 隔離
+                    # 24 小時，不再重試計畫中的退避。`job.attempts`（隔離前一刻
+                    # 讀到的值）維持不變（`_quarantine(max_attempts=True)` 不
+                    # 推進），隔離期滿只給一次恢復嘗試的額度。
+                    self._quarantine(job, now, e, max_attempts=True)
+                    return "quarantined"
                 next_at = now + min(30 * (2 ** attempts), 900) + self._rng() * 10
                 self._reschedule(job, next_at, err=repr(e))
                 return "retry"
@@ -449,19 +479,29 @@ class ExploreScheduler:
         refresh_after = now + self._jit(period_s)
         self._store.put_cache_ok(job.address, endpoint, payload, now, refresh_after)
         self._complete(job)
-        self._on_dirty()
-        if not self._store.is_active(job.address):
+        # Task 7.9a A3（callback 不丟工作）：store 寫入＋續排都先做完，
+        # `_notify_dirty()`（吞例外＋計數，見該方法）放在最後一步——`on_dirty`
+        # 拋例外不得讓已經 `_complete` 的 job 漏排（工程原則 3 的反向：關鍵動作
+        # 不因錦上添花的通知失敗而跟著失敗）。
+        active = self._store.is_active(job.address)
+        if active:
             # Task 3.5 B(2)（C1 修法）：候選已退池，續排前先檢查——不然這個
             # job 會無條件永遠自我續排，預算持續漏給非候選、`refresh_job` 只增
             # 不減，最終觸發準入上限讓新候選拿不到 job、也讓 `purge` 的
             # `NOT EXISTS(refresh_job)` 條件永久卡住。
-            return "dropped"
-        self._store.enqueue(job.key, job.address, job.kind, job.priority, refresh_after)
-        return f"ran:{job.kind}"
+            self._store.enqueue(job.key, job.address, job.kind, job.priority, refresh_after)
+        self._notify_dirty()
+        return f"ran:{job.kind}" if active else "dropped"
 
     def _run_fills(self, job: Job, now: float) -> str:
         st = self._store.get_sync(job.address)
-        plan = plan_page(st, address=job.address, now_ms=int(now * 1000))
+        # Task 7.9a A1（週期單一來源）：`incremental_after_ms` 不再吃
+        # `plan_page` 自己的模組級預設，一律由 `self._fills_every_s`（run_api
+        # 從 `cfg.explore_fills_period_s` 注入，同一個值也決定本輪完成後的
+        # 重排間隔，見下方 `next_at`）換算——避免排程端「多久重排一次」與
+        # `plan_page`「多久算到期」各自一份常數、彼此漂移。
+        plan = plan_page(st, address=job.address, now_ms=int(now * 1000),
+                         incremental_after_ms=int(self._fills_every_s * 1000))
         if plan.is_noop:
             self._complete(job)
             if not self._store.is_active(job.address):
@@ -493,12 +533,14 @@ class ExploreScheduler:
         self._last_fills_at = now
         res = apply_page(plan, page, now_ms=int(now * 1000))
         self._store.insert_fills_page(job.address, res.accepted, res.state)
-        self._on_dirty()
         if not res.done:
             # Task 3.6 B(2)（W1 修法）：續頁不看 is_active——非候選地址（例如
             # 詳情頁按需入列）多頁回補若中途被判 dropped，會永遠停在
             # backfilling，整份成交補不完。是否退池只在整輪 done 之後才判斷。
+            # Task 7.9a A3：store 寫入與續排先做完，`_notify_dirty()` 放最後
+            # ——例外不得讓這個尚未完成的 job 漏排。
             self._reschedule(job, now, bump_attempts=False)
+            self._notify_dirty()
             return "ran:fills"
         # Task 7.6 點 4／7.7 點 2：順序改為 complete → is_active 檢查
         # （退池→"dropped"，不探）→ 探測 → enqueue——退池地址不值得再花預算
@@ -508,19 +550,32 @@ class ExploreScheduler:
         # 都自然排除這個分支，每次全區間遍歷後至多探到有結論（verified 或
         # probe_empty）為止，不會每輪重探。額度不足時探測本身會自行延後
         # （見 `_probe_retention_boundary`／`_drain_one_deferred_probe`）。
+        # Task 7.9a A3：`_complete` 之後的探測／enqueue 都做完才 `_notify_dirty()`
+        # ——探測內部也可能觸發 dirty 通知（`_probe_retention_boundary` 已改走
+        # `_notify_dirty()`，不會逸出），所以這裡的 enqueue 一定會執行到。
         self._complete(job)
-        if not self._store.is_active(job.address):
-            return "dropped"
-        if (res.state.completeness == "complete"
-                and res.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD):
-            self._probe_retention_boundary(job.address, res.state.window_start_ms, hl_fills)
-        next_at = now + self._jit(self._fills_every_s)
-        self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
-        return "ran:fills"
+        active = self._store.is_active(job.address)
+        if active:
+            if (res.state.completeness == "complete"
+                    and res.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD):
+                self._probe_retention_boundary(job.address, res.state.window_start_ms, hl_fills)
+            next_at = now + self._jit(self._fills_every_s)
+            self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
+        self._notify_dirty()
+        return "ran:fills" if active else "dropped"
 
     # ---- 內部：例外收尾 ----
-    def _quarantine(self, job: Job, now: float, exc: Exception) -> None:
+    def _quarantine(self, job: Job, now: float, exc: Exception, *,
+                    max_attempts: bool = False) -> None:
         err = repr(exc)
+        if max_attempts:
+            # Task 7.9a A2：字首標記讓 ops／測試分得出「連續暫時性失敗達到
+            # MAX_JOB_ATTEMPTS」與既有的語意錯誤立即隔離（下面 `bump_attempts`
+            # 分支不同：語意錯誤仍照舊遞增 attempts，這裡刻意不再推進——
+            # `job.attempts` 在被判定達到上限之前已經是 `MAX_JOB_ATTEMPTS - 1`
+            # ，隔離期滿只釋放一次恢復嘗試，失敗一次就立即再達到上限重新隔離）。
+            err = f"max_attempts:{err}"
+            self._quarantined_max_attempts += 1
         endpoint = _ENDPOINT_BY_KIND.get(job.kind)
         if endpoint is not None:
             self._store.put_cache_error(job.address, endpoint, err, now, now + 86400)
@@ -529,7 +584,7 @@ class ExploreScheduler:
         else:
             logger.error("explore scheduler: %s job 隔離、無對應快取欄位可寫（%s）",
                          job.kind, err)
-        self._reschedule(job, now + 86400, err=err)
+        self._reschedule(job, now + 86400, err=err, bump_attempts=not max_attempts)
 
     def _probe_retention_boundary(self, address: str, window_start_ms: int, hl_fills) -> None:
         """Task 7.5 點 3／7.6 點 5、6／7.7 點 8：查詢 `[window_start_ms - 1 天,
@@ -616,7 +671,12 @@ class ExploreScheduler:
                 address, reason, exc_info=True)
             self._probe_failed += 1
             return
-        self._on_dirty()   # Task 7.7 S2：reason 落地也是一種變更，通知 dirty。
+        # Task 7.7 S2：reason 落地也是一種變更，通知 dirty；Task 7.9a A3 改走
+        # `_notify_dirty()`（吞例外＋計數）——這裡呼叫時 store 寫入已經成功
+        # （上面的 `set_sync_reason` 已經 return 過一次失敗路徑），callback
+        # 本身失敗不該讓探測的觀測計數器（下面 `_probe_verified`／`_probe_empty`）
+        # 漏更新。
+        self._notify_dirty()
         if page:
             self._probe_verified += 1
         else:
@@ -685,6 +745,19 @@ class ExploreScheduler:
             return
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
         self._probe_retention_boundary(address, window_start_ms, hl_fills)
+
+    def _notify_dirty(self) -> None:
+        """Task 7.9a A3：`on_dirty`（publisher 用來決定要不要提前組版）是錦上
+        添花的通知，不是關鍵寫入路徑——三個呼叫點（`_run_cache_kind`／
+        `_run_fills`／`_probe_retention_boundary`）都已經把 store 寫入與
+        `_complete`／續排／enqueue 做完才呼叫這裡，例外只吞不逸出（工程原則 3
+        的反向：關鍵動作不因這個失敗而跟著失敗），計 `dirty_errors`
+        （`status()`／health 可見）供營運端發現 callback 本身壞掉。"""
+        try:
+            self._on_dirty()
+        except Exception:
+            logger.error("explore scheduler: on_dirty callback 拋出例外", exc_info=True)
+            self._dirty_errors += 1
 
     def _paused_remaining_s(self) -> float:
         limiter = getattr(self._hl, "_limiter", None)
