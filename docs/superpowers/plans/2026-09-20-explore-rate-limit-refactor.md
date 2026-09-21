@@ -1153,7 +1153,7 @@ class ExplorePublisher:
 |---|---|---|
 | `eligibility` | `"eligible"｜"pending"｜"ineligible"` | 由後端 `classify` 決定；列表 API **不回傳** ineligible 列 |
 | `eligibility_reason` | string｜null | `live_days`／`max_dd`／`min_fills`／`concentration`／`portfolio_missing`／`fills_unknown`／`enrich_error`；eligible 為 null |
-| `fills_coverage` | `{state: "backfilling"｜"partial"｜"complete", observed_from: epoch_ms｜null, observed_to: epoch_ms｜null, reason: string｜null, synced_through: epoch_ms｜null, last_success_at: epoch_秒｜null}` | 成交資料完整性；`synced_through`＝已確認同步到的游標（回補中常落後）、`last_success_at`＝最近一次抓頁成功時間（＝`as_of.fills`，只證明「最近打過招呼」不證明「同步到哪」，2026-09-21 Task 7.1） |
+| `fills_coverage` | `{state: "backfilling"｜"partial"｜"complete", observed_from: epoch_ms｜null, observed_to: epoch_ms｜null, reason: string｜null, synced_through: epoch_ms｜null, last_success_at: epoch_s｜null, window_start: epoch_ms｜null, window_end: epoch_ms｜null, params_fp: string｜null（Task 7.1／7.5）, synced_through: epoch_ms｜null, last_success_at: epoch_秒｜null}` | 成交資料完整性；`synced_through`＝已確認同步到的游標（回補中常落後）、`last_success_at`＝最近一次抓頁成功時間（＝`as_of.fills`，只證明「最近打過招呼」不證明「同步到哪」，2026-09-21 Task 7.1） |
 | `as_of` | `{portfolio, state, ledger, fills}`，各 epoch 秒｜null | 各欄位**來源取得時間**，不是發布時間；缺該來源為 null |
 | `close_win_rate_pct`、`concentration_pct`、`closed_positions_30d`、`realized_pnl_30d_usd` | number｜null | coverage ≠ complete 時**一律 null**（未知≠0） |
 | `coins` | string[] | coverage ≠ complete 時 `[]` |
@@ -1349,6 +1349,21 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 **Files:** `src/spark/publicapi/config.py`、`scripts/run_api.py`、`src/spark/publicapi/app.py`、`deploy/RUNBOOK.md` §5.8e、`deploy/filet-api.service.d/explore-refresh.conf.example`；`tests/test_publicapi_config.py`、`tests/test_api_ops.py`。
 - config：`hl_explore_base_weight_cap`（env `FILET_HL_EXPLORE_BASE_WEIGHT_CAP`，預設 180）、`hl_explore_fills_weight_cap`（`FILET_HL_EXPLORE_FILLS_WEIGHT_CAP`，預設 120）；驗證 base＋fills ≤ explore ≤ global。run_api：`WeightLimiter(global_cap, scope_caps={"explore":300,"explore_base":180,"explore_fills":120}, scope_parents={"explore_base":"explore","explore_fills":"explore"})`；scheduler 傳三個 gateway。health：`hl_budget.used` 已含子 scope；`explore_refresh` 加 `fills_pages_total`／`last_fills_at`／`base_scope_in_use`。RUNBOOK §5.8e：新 env、新週期、保留額度說明、部署後 15–30 分鐘檢查項（fills 頁數、不同地址進展、最老等待）。
 - 部署程序（主線程）：flag 0 部署→驗證→flag 1→15–30 分鐘看 `fills_pages_15m > 0`、多個不同地址推進、最老到期回落→重新起算 24h 觀測。
+
+### Task 7.5 @inline：complete 判定的證據與標示（正確性缺陷，2026-09-21 使用者裁決立即修正標示）
+
+<!-- 現況：complete＝遍歷到區間末＋fills_in_window < 8,000（內部保守門檻，未命名）；沒有留存邊界證據；官方留存上限是 10,000。
+使用者：相同 API 重抓零差異只證明同步一致，不證明完整 30 天；需確認查詢窗口、aggregation 設定、留存邊界證據。 -->
+
+**Files:** `src/spark/publicapi/explore_fills_sync.py`、`explore_scheduler.py`、`explore_store.py`、`hl_explore.py`（契約鍵）、`explore_publisher.py`／`app.py`（coverage 組裝）；對應測試；plan 契約表。
+
+1. **命名**：`HL_FILLS_RETENTION_LIMIT = 10_000`（官方）、`RETENTION_SAFETY_MARGIN = USER_FILLS_PAGE_LIMIT`、`RETENTION_SAFETY_THRESHOLD = 8_000`（＝上限 − 一頁；docstring 說明為何保守）。舊名 `RETENTION_LIMIT` 移除。
+2. **reason 碼**（`fills_sync.reason`，complete 也要有原因）：`count_below_retention_threshold`（現行判準）、`retention_boundary_verified`（探測到區間起點之前仍有可查成交 ⇒ 留存邊界早於窗口起點）；partial 的 `retention_limit`／`same_ms_overflow`／`no_progress`／`page_cap` 不變。`apply_page` 短頁收尾時先給 `count_below_retention_threshold`。
+3. **留存邊界探測**（scheduler `_run_fills`，第一輪 `res.done` 且 completeness==complete 時做一次）：`hl_fills.get_fills_page(addr, window_start − 86_400_000, window_start − 1)`；回 ≥1 筆 → `store.set_sync_reason(addr, "retention_boundary_verified")`；回空 → 維持 `count_below_retention_threshold`；探測拋例外（額度／429／網路）→ 不改 reason、log 一行、不重試（下一輪增量時若 reason 仍是 count_below… 再探一次）。探測走 `explore_fills` scope、計入預算。
+4. **查詢參數留證**：`fills_sync` 加欄位 `params_fp TEXT NOT NULL DEFAULT ''`（schema v2 migration）；新輪寫 `"aggregateByTime=default(false)"`（與 `hl.get_fills_page` 實際請求體一致，不多不少）；`fills_coverage` 契約加 `window_start`／`window_end`（epoch ms）與 `params_fp`；plan 契約表 A 同步。
+5. **既有列補標**：store 啟動 migration：`UPDATE fills_sync SET reason='count_below_retention_threshold' WHERE completeness='complete' AND reason IS NULL`。
+6. **測試**：`apply_page` 完成時 reason 為 `count_below_retention_threshold`；scheduler 探測正／負／例外三路徑（fake HL 可控）；migration 補標與 params_fp 預設；publisher／詳情頁 coverage 含 `window_start`／`window_end`／`params_fp`／`reason`；`rg -n "RETENTION_LIMIT\b" src` 零命中。
+7. **前端**：`FillsCoverage` 型別加三個 optional 欄位；不改 UI（reason 文案下一輪）。
 
 ## P5 驗收與啟用準備（任務卡）
 
