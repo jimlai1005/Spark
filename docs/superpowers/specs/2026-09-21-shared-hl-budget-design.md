@@ -104,3 +104,5 @@ filet 正式機一顆出口 IP 上有四個會打 Hyperliquid REST 的行程：`
 | 驗收最低集合 | 多 follower 併發、櫃檯重啟、回覆遺失、故障時 Explore 確實停發（§4 驗收 1–4）＋引擎 testnet 演練 |
 
 仍待實測：HL 對 1,200 的計算窗口是否與我方 60 秒滑動一致（部署 budgetd 後以 `snapshot()` 與實際 429 對照）。
+
+**2026-09-21 第二輪裁決追加（方向可繼續設計與演練，不阻擋 7.9）**：必須確認 (1)「程序上限 `N_max`」確實可強制執行——不是只寫在 env：budgetd 對 `engine` scope 的 client 以 SO_PEERCRED（uid＋pid）登記，活躍 follower 程序數超過 `N_max` 時拒絕新 client 註冊並告警；本地有界預算的 cap 由 budgetd 在握手時下發（`local_cap = floor(300 / N_max)`），client 不得自行決定；(2) **重啟不得重置出額外本地額度**：client 的本地保底帳本以檔案持久化（`/run/filet/budget-local-<pid-independent id>.json`，記最近 60 秒的扣帳），程序重啟後讀回，重啟後第一分鐘的可用量＝cap − 檔案內仍在窗內的用量；budgetd 重啟時各 client 同理不重置。演練項加入：kill 單一 follower 程序並立即重啟 → 該程序第一分鐘用量 ≤ 本地 cap 的剩餘；同時起 `N_max+1` 個程序 → 第 `N_max+1` 個被拒且告警。

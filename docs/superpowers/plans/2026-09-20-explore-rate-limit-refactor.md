@@ -1467,7 +1467,46 @@ W3（探測回空每輪重探）——加第三個 reason 碼記錄「已探過�
 | 7.8 noop 同源 | 完成、第六次部署 | 複審重現 200 tick 修前全 `ran:fills`、修後 2；`test_run_fills_partial_noop_does_not_starve_other_jobs_over_50_ticks` | 無 |
 | 公平排程的正式機證據 | **缺** | 只有單元測試；正式機無「每地址兩輪間隔分佈」量測 | 7.9 驗收：部署後量 per-address 輪間隔 p50/p95 |
 
-### Task 7.9 @inline：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
+### Task 7.9 v2（2026-09-21 使用者第二輪裁決後改寫；拆 7.9a／7.9b 兩批派工，a 親驗後才派 b）
+
+<!-- 使用者修正（原文要點）：(6) 探測與 fills 不可各半——雙方都有積壓時每 10 次至少 9 次給 fills、1 次給 probe，另一方無工作時可借用；需求要算入多頁增量與 partial 重掃。
+(2,4,5) 每次全區間遍歷要有持久化、不可重用的 scan_id／generation，探測回寫以它作條件更新；歷史 evidence 可保留但不自動代表目前滾動 30 天完整，還要確認增量覆蓋連續無 gap。
+(3,7,8) 增量與整窗重掃分別保存游標，重掃不得覆蓋增量進度或阻斷新成交保存；8 次上限只計實際嘗試的暫時性失敗（預算不足、scope 暫停不計；429 走共享 cooldown）；隔離期滿只釋放一次恢復嘗試。
+complete 不定期重掃；遷移前缺證據的列標 evidence unknown、低優先級一次性核驗；有可追溯窗口與覆蓋證據者可沿用；重掃仍無法證明就不升級。
+驗收以行為為主：注入不同週期驗證排程／planner／詳情補排／refreshing 一起變；fills／probe 同時積壓；重掃期間增量持續；舊探測回應不覆蓋新遍歷。部署後 6 小時是最低門檻，要看到跨輪更新與積壓走勢。 -->
+
+#### 7.9a @inline：週期單一來源＋重試上限＋callback 不丟工作（先派）
+
+**Files:** `src/spark/publicapi/config.py`、`scripts/run_api.py`、`src/spark/publicapi/app.py`（詳情頁補排）、`explore_fills_sync.py`（預設值）、`explore_scheduler.py`；`deploy/filet-api.service.d/explore-refresh.conf.example`；RUNBOOK §5.8e；對應測試。不動 schema、不動前端。
+
+- **A1 週期單一來源**：同下方原點 1（config `explore_fills_period_s`＝env `FILET_EXPLORE_FILLS_PERIOD_S`，預設 21600，驗證 ≥ 3600；run_api → scheduler `fills_every_s`；scheduler → `plan_page(incremental_after_ms=int(fills_every_s*1000))`；`app.py` 詳情頁補排條件用 cfg；`_DEFAULT_INCREMENTAL_AFTER_MS = 6h` 僅為無 config 預設）。**驗收以行為為主**：測試用同一個 cfg 建 app＋scheduler，注入 `explore_fills_period_s=7200` 與 `=21600` 兩組，斷言 (i) scheduler complete 收尾後 `next_attempt_at ≈ now + period`；(ii) `plan_page` 在 `period − 1s` 為 noop、`period + 1s` 開增量輪；(iii) 詳情頁在 `updated_at` 距今 `period − 1s` 不補排、`refreshing False`，`period + 1s` 補排、`refreshing True`——四者隨同一個值一起變。字面值掃描（`rg "4 \* 3600|14400" src/spark/publicapi` 零命中）只作輔助。
+- **A2 重試上限**（原點 9，加使用者修正）：`MAX_JOB_ATTEMPTS = 8`，**只計實際嘗試過且為暫時性失敗**（`ConnectionError`／`TimeoutError`／5xx 這條分支）；`BudgetExhausted`／`ScopePaused` 不計（既有 `bump_attempts=False`）；429 仍走 `note_429` 共享 cooldown 且不計。第 8 次 → `_quarantine`（24h、`last_error` 前綴 `max_attempts:`、計數 `quarantined_max_attempts`）。**隔離期滿只釋放一次恢復嘗試**：隔離時把 `attempts` 設為 `MAX_JOB_ATTEMPTS − 1`（期滿後失敗一次即再隔離，不會重新給 8 次）；成功一次 → attempts 歸零（確認 store 成功路徑歸零，否則補）。測試：連續 8 次 `ConnectionError` → 第 8 次隔離、`next_attempt_at ≈ now + 86400`、attempts == 7；期滿後再失敗 1 次 → 立即再隔離；期滿後成功 → attempts 0；穿插 `BudgetExhausted` 不推進 attempts。
+- **A3 callback 不丟工作**（原點 7）：`_notify_dirty()` try/except → `logger.error`＋`dirty_errors`（health 可見）；`_run_fills`／`_run_cache_kind` 順序「寫 store → enqueue 下一個 job → notify」。測試：`on_dirty` 每次拋例外，連跑 20 tick，job 仍在且 `next_attempt_at > now`、`dirty_errors == 20`、`run_forever` 不死（用 stop_event 收尾）。
+- drop-in example 加 `FILET_EXPLORE_FILLS_PERIOD_S=21600`；RUNBOOK §5.8e 週期表改 6 小時＋容量算式：需求＝300/6h（50）＋新增（≈1）＋多頁增量＋partial 重掃（4/日×~5 頁）＋核驗掃描＋探測（≤1/10）；消化上限 60，探測佔 ≤6 → fills ≥54。
+
+**驗收（主線程親跑）**：ruff；`uv run pytest -q` 全綠 > 3191；A1 行為測試名列出；`rg -n "4 \* 3600|14400" src/spark/publicapi` 零命中；`repro_79a.py`（主線程寫：period 注入兩值四處同變）。
+
+#### 7.9b @inline：獨立遍歷版本 `scan_id`＋雙游標＋探測 9:1＋證據窗口與 gap 檢查＋遷移核驗（7.9a 親驗後派）
+
+**Files:** `explore_store.py`（schema v3、新表 `fills_scan`、CAS）、`explore_fills_sync.py`（scan planner 與增量 planner 分離）、`explore_scheduler.py`（`fills_scan` job kind、探測 9:1、核驗排程）、`explore_publisher.py`／`app.py`／`hl_explore.py`（`fills_coverage.evidence`）、`web/src/lib/publicApi.ts`（型別＋normalize）；對應測試；plan 契約表 A。
+
+- **B1 資料模型（雙游標）**：
+  - `fills_sync`（**增量軌**，持續前進，永不被重掃覆蓋）：保留 `synced_through_ms`／`cursor_ms`／`window_end_ms`（增量頻率＝7.9a 週期）；新增 `inc_from_ms INTEGER NULL`（增量軌的起點＝這條軌第一次建立時的 `now`；覆蓋區間＝`[inc_from_ms, synced_through_ms]`）；新增 `scan_id TEXT NULL`（最近一次**完成**的全區間遍歷）、`evidence_unknown INTEGER NOT NULL DEFAULT 0`。`completeness`／`reason` 改為「由最近完成的 scan 結果寫入」，增量輪不改。
+  - 新表 `fills_scan`（**遍歷軌**，一個地址同時最多一個進行中）：`scan_id TEXT PRIMARY KEY`（uuid4，不可重用）、`address`、`kind`（`initial`｜`partial_rescan`｜`verify`）、`window_start_ms`、`window_end_ms`（＝開始遍歷時的 now）、`cursor_ms`、`pages_done`、`fills_in_window`、`status`（`running`｜`done`）、`result`（`complete`｜`partial`｜NULL）、`reason`、`started_at`、`finished_at`、`last_error`、`params_fp`。索引 `(address, status)`。
+  - 覆蓋連續性：scan 完成時檢查 `scan.window_end_ms >= inc_from_ms`（遍歷伸進增量軌起點）→ `gap = False`；否則 `gap = True`（寫入 `fills_sync.coverage_gap`，新增欄位 `coverage_gap INTEGER NOT NULL DEFAULT 0`）。對外 `complete` 需同時 `result == complete AND gap == 0 AND evidence_unknown == 0`；否則 `partial`（reason `coverage_gap`／`evidence_unknown`）或原 reason。
+  - 新地址：建 `fills_sync`（`inc_from_ms = synced_through_ms = now`、`completeness = backfilling`）＋一個 `initial` scan `[now−30d, now]`；增量與 scan 兩個 job 各自入列。
+- **B2 planner 分離**：`plan_incremental(state, now, period)`（只做增量：到期開 `[synced_through−1, now]`、noop 自帶 `next_due`）與 `plan_scan(scan, now)`（從 `cursor` 抓到 `window_end`；短頁或既有終止條件收尾 → `result`／`reason`；門檻用 scan 自己的 `fills_in_window`）。`apply_page` 拆成兩個純函式。A1 的「輪進行中」語義保留在各自軌內。
+- **B3 scheduler**：job kind 新增 `fills_scan`（priority：`initial` 2、`partial_rescan` 3、`verify` 4；`verify` 只在同 tick 沒有到期的 `fills`／`initial`／`partial_rescan` 時才領——嚴格讓位，且等待加權對 `verify` 不生效）。`fills`（增量）與 `fills_scan` 都走 `explore_fills` 保留額度、一頁即重排。partial：`fills_sync.completeness == partial AND 沒有進行中的 scan AND now − last_scan.finished_at ≥ 24h` → 建 `partial_rescan` scan。scan 完成 → **CAS** 寫回 `fills_sync`：`UPDATE fills_sync SET completeness=?, reason=?, scan_id=?, coverage_gap=?, evidence_unknown=0 WHERE address=? AND (scan_id IS NULL OR scan_id != ?)`；並保留舊 evidence（`fills_scan` 列不刪，`purge` 只清 `finished_at` 早於 30 天且非最新的）。
+- **B4 探測**：候選＝`fills_sync.scan_id` 對應的 `fills_scan.result == complete AND reason == count_below_retention_threshold`（含 `evidence_unknown == 0`），依 `finished_at` 最舊者；探測窗口＝該 scan 的 `window_start_ms`；回寫 `UPDATE fills_scan SET reason=? WHERE scan_id=? AND reason=?` ＋ `UPDATE fills_sync SET reason=? WHERE address=? AND scan_id=?`（同一 transaction；任一 rowcount 0 → 回滾、計 `probe.stale`）。**9:1**：`_tick_once` 領工前，若探測候選存在且 `_fills_available() >= 120`：雙方都有積壓（有到期 fills 類 job）→ 用計數器 `_fills_served_since_probe`，≥ 9 才給 probe 一次並歸零；fills 類無到期 job → probe 可直接用；無探測候選 → fills 全拿。計數器 `probe.{total,verified,empty,failed,stale,candidates}`；移除 deque 與 `deferred*`／`dropped`。
+- **B5 遷移 v2→v3**：建 `fills_scan`；每個既有 `fills_sync` 列：`inc_from_ms = synced_through_ms`（增量軌從現在的前沿起算）；若 `reason == retention_boundary_verified`（有可追溯窗口：探測時窗口即當時 `window_start_ms`，且探測在增量連續的同一列上）→ 建一筆 `done` scan（`kind=initial`、窗口＝該列現有 `window_start/end`、`result=complete`、`reason` 沿用、`finished_at=updated_at`）、`scan_id` 指向它、`evidence_unknown=0`；其他 complete／partial 列 → 同樣建 `done` scan 保存歷史標籤，但 `evidence_unknown=1`，對外 `partial`／reason `evidence_unknown`，並入列一個 `verify` scan（priority 4，`next_attempt_at` 在 48 小時內均勻攤開）；backfilling 列 → 轉成 `running` 的 `initial` scan（游標沿用）。核驗 scan 完成：`result complete` → 升級（`evidence_unknown=0`）；仍 `partial` → 維持 partial、reason 為核驗結果，不強行升級。docstring 如實：migration 各步冪等、DDL 自動提交。
+- **B6 契約**：`fills_coverage.evidence = {scan_id, kind, window_start, window_end, finished_at, reason, gap: bool, unknown: bool}`（全部可 null）；頂層 `state`／`reason` 維持＝對外判定（含 gap／unknown 降級）；`window_start/window_end` 改為**增量軌覆蓋區間** `[inc_from, synced_through]`（契約表註明語義變更）。前端型別＋normalize，不改 UI。
+- **B7 測試（行為級）**：(i) 重掃期間增量持續前進：partial 地址開 `partial_rescan` 多頁中途，增量到期 → 增量頁照抓、`synced_through` 前進、scan 游標不受影響；(ii) 舊探測回應不覆蓋新遍歷：探測發出後、回寫前，該地址完成新 scan（新 `scan_id`）→ 回寫 rowcount 0、`probe.stale == 1`、新 scan 的 reason 不變；(iii) fills／probe 同時積壓：10 個到期 fills＋10 個探測候選，30 tick 後 probe 次數 ≤ 3 且 ≥ 1，fills ≥ 27；只有探測候選時每 tick 一個 probe；(iv) gap：`inc_from` 晚於 scan `window_end` → `coverage_gap=1`、對外 partial／`coverage_gap`；(v) 遷移 seed DB 複本：verified 列 `evidence_unknown=0` 且無 verify job；其餘 complete 列 `evidence_unknown=1`、對外 partial、verify job 在 48h 內攤開；backfilling 列轉 running scan；(vi) verify scan 讓位：有到期增量時不被領；(vii) 重啟：新建 scheduler 實例後探測候選由 DB 推導照常進行；(viii) 新地址生命週期：建列 → initial scan 完成 → complete → 增量 → 三者順序與欄位。
+- **B8 需求算式（RUNBOOK＋研究報告）**：需求／小時＝增量 300/6h（50）＋新增候選 initial（≈1×1.2）＋多頁增量（量測）＋partial 重掃（4/日）＋核驗掃描（遷移後 48h 內約 130×1.2 頁攤平≈3.3/h）＋探測（≤ 消化的 1/10）；消化上限 60（120 保留額度＝每分鐘一次）。部署後量測兩曲線。
+
+**驗收（主線程親跑）**：ruff；pytest 全綠；vitest 全綠；seed DB migration 實跑（version 3、`fills_scan` 列數＝fills_sync 列數、verified 列 unknown=0、其餘 unknown=1、verify job 攤開）；`repro_79b.py`（主線程寫：重掃期間增量前進；舊探測不覆蓋新 scan；9:1）。**部署**：schema v3＋drop-in＋取樣器換版（取樣器加 `fills_scan` 統計、每地址增量輪間隔 p50/p95、health `hl_budget`）→ **至少 6 小時＝一個完整增量週期**，要看到：每個地址至少一次跨輪更新（`window_end_ms` 前進）、積壓（到期 fills 類 job 數與 `oldest_due`）走勢、核驗 scan 進度、探測比例 ≤ 1/10、零 429／Traceback。9/22 09:12 只出分版本階段報告。
+
+<!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b 為準，衝突時以 v2 為準。 -->
+### Task 7.9 v1（已被 v2 取代，僅供對照）：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
 
 <!-- 裁決：選 (b) 6 小時（不選 5）：單頁基線 300/6h＝50／小時＋新增約 1，才對 60 留出空間，仍須扣多頁與探測成本；排程、詳情頁補排、前端「更新中」共用同一期限，不得留寫死 4 小時。
 partial 不得停抓 24 小時（要持續增量保存）；探測有效性按窗口限定；探測回寫要版本保護；溢位／重啟要能復原；callback 不丟工作；公平排程要有證據。 -->
