@@ -119,3 +119,19 @@
 6. **同 IP 健康**：filet-api 全期零 429、零 Traceback；follower 心跳 59 秒、`no_action`、零錯誤零 429 零重試；四個基礎類別逾期 p95 ≤ 600 秒（在週期內）。**follower 共用預算缺口仍未結案**（本項只證明未撞額度，不證明受保護）。
 7. `fills` 時間語義：`updated_at − synced_through` 中位數 0、最大 32,849 秒（尾端仍在回補的地址）。
 8. 公開榜（14:29）：合格 58／待確認 73／不合格 169；coverage complete 190／backfilling 107／partial 3（快照落後 DB 一次發布）。
+
+## 7.9 分版本階段報告前置（2026-09-22，未部署；B8 需求算式見 RUNBOOK §5.8e）
+
+**現役版（7150d81，第六次部署）觀測到 2026-09-21 17:15 UTC 的分版本結論**：零 429、零 Traceback、follower 心跳正常；fills 消化回到 12–14 頁／15 分鐘（探測待探 11）；原候選 complete 156；最老到期 6.9 小時（需求 75/h > 消化 60/h 的結構性積壓，見期中量測）。**不算現役版完整 24 小時驗收**：期間兩次行為變更（05:54、06:54）。
+
+**7.9a–7.9c（待部署）整合模擬（正式機 287 列 v2 快照，fake HL＋每分鐘一次 fills 預留模型）**
+
+| 指標 | 修前基線（5af2c84，1 天） | 修後（b7b1ac2，3 天） |
+|---|---|---|
+| `partial_rescan` 次數 | 2,174 | 3 |
+| `fills_verify` 129 件 | 0 件完成、最長等待 23.8h | 49 小時內全部完成、單件最長等待 1.82h |
+| `evidence_unknown` 129 列 | 被錯誤重掃「洗白」到 17 | 只因核驗完成遞減到 0 |
+| 六種 job 最老到期 | fills-like 0.02h（重掃佔滿）、verify 23.8h | 全部 < 2h |
+| 探測佔 fills 類比例 | 13% | 5.8% |
+
+模擬的極限：fake HL 一律回 2 筆短頁（沒有多頁增量、沒有 page_cap／retention_limit 的真實 partial），基礎端點無延遲；正式機部署後至少一個完整 6 小時週期再以取樣器 v3 對照（`cross_round.advanced_at_least_once_cum` 應在 6–7 小時內覆蓋全部有 sync 的地址；`scan.verify_backlog` 單調遞減；`fills_scan` 列數增速 ≈ 新增候選＋partial 重掃）。
