@@ -1484,7 +1484,7 @@ complete 不定期重掃；遷移前缺證據的列標 evidence unknown、低優
 - **A3 callback 不丟工作**（原點 7）：`_notify_dirty()` try/except → `logger.error`＋`dirty_errors`（health 可見）；`_run_fills`／`_run_cache_kind` 順序「寫 store → enqueue 下一個 job → notify」。測試：`on_dirty` 每次拋例外，連跑 20 tick，job 仍在且 `next_attempt_at > now`、`dirty_errors == 20`、`run_forever` 不死（用 stop_event 收尾）。
 - drop-in example 加 `FILET_EXPLORE_FILLS_PERIOD_S=21600`；RUNBOOK §5.8e 週期表改 6 小時＋容量算式：需求＝300/6h（50）＋新增（≈1）＋多頁增量＋partial 重掃（4/日×~5 頁）＋核驗掃描＋探測（≤1/10）；消化上限 60，探測佔 ≤6 → fills ≥54。
 
-**驗收（主線程親跑）**：ruff；`uv run pytest -q` 全綠 > 3191；A1 行為測試名列出；`rg -n "4 \* 3600|14400" src/spark/publicapi` 零命中；`repro_79a.py`（主線程寫：period 注入兩值四處同變）。
+**驗收（主線程親跑）**：ruff；`uv run pytest -q` 全綠 > 3191；A1 行為測試名列出；`rg -n "14400|fills_every_s: float = [0-9]" src/spark/publicapi scripts/run_api.py` 零命中<!-- 2026-09-21 主線程裁決：builder 首輪把 scheduler 類別預設留 14400（理由：既有 7.8 測試釘舊值）→ 不接受；改為唯一常數 `explore_fills_sync.DEFAULT_FILLS_PERIOD_S = 6*3600`，config 預設與 scheduler 預設皆 import 它，該測試改釘常數。`PARTIAL_RESCAN_AFTER_MS`（24h 重掃）與 `session_ttl_s`（SIWE）與本裁決無關，維持 -->；`repro_79a.py`（主線程寫：period 注入兩值四處同變）。
 
 #### 7.9b @inline：獨立遍歷版本 `scan_id`＋雙游標＋探測 9:1＋證據窗口與 gap 檢查＋遷移核驗（7.9a 親驗後派）
 
