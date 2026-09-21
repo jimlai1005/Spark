@@ -1969,6 +1969,43 @@ def test_health_explore_refresh_includes_fills_and_base_scope_keys(tmp_path):
     assert body["explore_refresh"]["base_scope_in_use"] == "explore"
 
 
+def test_health_explore_refresh_includes_probe_counters(tmp_path):
+    """Task 7.6 點 6：留存邊界探測的觀測計數器（`_probe_total` 等）透過
+    `**scheduler.status()` 自然出現在 `explore_refresh.probe`，四鍵皆從 0 起算。"""
+    from spark.publicapi.explore_publisher import ExplorePublisher
+    from spark.publicapi.explore_scheduler import ExploreScheduler
+    from spark.publicapi.explore_store import ExploreStore
+    from spark.publicapi.hl_explore import ExploreConfig
+
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"),
+                   explore_upstream_refresh=True,
+                   explore_db_path=str(tmp_path / "explore.db"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    explore_store = ExploreStore(cfg.explore_db_path)
+    app = create_app(cfg, store, keysvc, hl, explore_store=explore_store)
+    publisher = ExplorePublisher(store=explore_store, index=app.state.explore_index,
+                                 cfg=ExploreConfig(), now_fn=lambda: 1000.0,
+                                 snapshot_path=None)
+    scheduler = ExploreScheduler(store=explore_store, hl=hl, leaderboard_source_fn=lambda: None,
+                                 excluded_fn=lambda: set(), cfg=ExploreConfig(),
+                                 now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                                 on_dirty=publisher.mark_dirty)
+    app.state.explore_scheduler = scheduler
+    app.state.explore_publisher = publisher
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    assert body["explore_refresh"]["probe"] == {
+        "total": 0, "verified": 0, "empty": 0, "failed": 0}
+
+
 # ---------- P6 Task 6.3（D15，2026-09-20：觀測補齊）----------
 
 def test_health_dashboard_latency_null_when_no_samples(tmp_path):

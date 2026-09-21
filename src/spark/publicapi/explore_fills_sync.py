@@ -36,6 +36,17 @@ PRIMARY KEY，本模組不做去重判斷。同毫秒佔滿整頁（`same_ms_ove
 20 頁＝40,000 筆已超過留存上限 `HL_FILLS_RETENTION_LIMIT`（10,000），正常資料到不了
 這個頁數，達到即代表卡在異常續頁——終止本輪並標記 `partial`／
 `reason="page_cap"`，避免無界重試。
+
+`reason` 的語意（Task 7.6 A3，正確性修正）：`reason` 描述的是**建立該
+`completeness` 的那次全區間遍歷**（首輪 `backfilling`，或某次增量輪的本輪
+缺口超標而合法降級）所依據的證據，不是「這一秒鐘還成立嗎」的即時判定。
+之後的增量輪只延伸 `synced_through_ms`——本地已經持有的區段不會因為時間
+流逝而受 HL 留存邊界影響（過去的資料不會突然消失），所以增量輪收尾若沒有
+新的降級證據（本輪缺口本身超標），不重新量測、不重寫 `reason`：`partial`
+仍是 `partial`、`retention_boundary_verified` 跨輪存活，見 `apply_page`
+短頁分支。`window_start_ms`／`window_end_ms` 是**目前這一輪**的查詢區間，
+不是「reason 所描述的那次遍歷」的區間（兩者在增量輪只延伸的情況下會不同——
+`reason` 仍指向較早那次遍歷，`window_*` 已經推進到最新一輪）。
 """
 from __future__ import annotations
 
@@ -59,12 +70,15 @@ OVERLAP_MS = 1
 _DAY_MS = 86_400_000
 _DEFAULT_INCREMENTAL_AFTER_MS = 4 * 3600 * 1000
 
-# Task 7.5 點 4（查詢參數留證）：`hl.get_fills_page` 實際請求體只送
-# `type/user/startTime/endTime`——刻意不送 `aggregateByTime`，即採用 HL 的
-# 預設值（false，不聚合）。這裡把「送了什麼參數」明確寫成指紋字串，供
-# `fills_sync.params_fp` 落地；若未來 `get_fills_page` 改送這個參數，這裡要
-# 跟著改（不多不少，字串必須與實際請求體一致，見該函式 docstring）。
-PARAMS_FP = "aggregateByTime=default(false)"
+# Task 7.5 點 4／7.6 點 8（查詢參數留證）：`hl.get_fills_page` 實際請求體只送
+# `type/user/startTime/endTime`——刻意不送 `aggregateByTime`。這裡把「送了
+# 什麼參數」明確寫成指紋字串，供 `fills_sync.params_fp` 落地；若未來
+# `get_fills_page` 改送這個參數，這裡要跟著改（不多不少，字串必須與實際
+# 請求體一致，見該函式 docstring）。字串只描述「請求體沒送這個參數」這個
+# 事實本身，**不宣稱**上游會用什麼值當預設（舊字面值 `default(false)` 是
+# 對上游行為的推測，未經驗證——7.5 複審 S1 修法：工程原則 1，欄位/參數的
+# 語意是假設，不是事實，得先讓讀者看得出來是推測還是已驗證的事實）。
+PARAMS_FP = "aggregateByTime=<omitted>"
 
 
 class PagePlan(NamedTuple):
@@ -100,9 +114,22 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
       游標從區間起點開始，`completeness="backfilling"`。
     - `state.completeness == "backfilling"`：上一輪回補尚未跑完 → 沿用同一個
       `window_end_ms`，從 `cursor_ms` 續抓。
-    - `state.completeness in ("complete", "partial")`：上一輪已經跑到底。
-      若已過增量寬限期（`now - window_end_ms >= incremental_after_ms`）→ 開新的
-      增量輪：`window_end_ms` 推到 `now`、`window_start_ms` 同步前推到
+    - `state.completeness in ("complete", "partial")`：上一輪已經跑到底，
+      **或**目前正在跑一個尚未結束的增量輪（見下方「輪進行中」）。
+      若 `cursor_ms > synced_through_ms`（Task 7.6 A1，正確性修正）：代表增量輪
+      已經開始但尚未跑到 `window_end_ms`（`synced_through_ms` 只在整輪結束時
+      才推進，見 `apply_page`）——續抓本輪剩餘部分：`PagePlan(start_ms=cursor_ms,
+      end_ms=window_end_ms, state=state)`，不看增量寬限期、不改 `state`。
+      **這個判斷必須排在增量寬限期判斷之前**：否則增量輪第一頁若剛好滿頁
+      （`done=False`，`completeness` 未變、仍是舊值），下一次 tick 進來時
+      `now - window_end_ms` 已經 < 寬限期（`window_end_ms` 剛推到 `now`
+      附近），會被誤判成「還沒到增量時間」而回傳 `is_noop`——游標從此卡住，
+      永遠不再前進（正式機尚未觀測到，需重度帳戶 4 小時內 >2,000 筆才觸發，
+      但屬正確性缺陷）。
+      否則（`synced_through_ms is None` 或 `cursor_ms <= synced_through_ms`，
+      代表上一輪已完整跑到底）：若已過增量寬限期
+      （`now - window_end_ms >= incremental_after_ms`）→ 開新的增量輪：
+      `window_end_ms` 推到 `now`、`window_start_ms` 同步前推到
       `now-window_days`（更早的 fills 由 `ExploreStore.purge` 處理，這裡不刪）、
       游標從 `max(新 window_start, synced_through_ms - overlap_ms)` 開始（inclusive
       重疊，去重交給 PK）、`pages_done` 歸零；`completeness` 原樣保留（`partial`
@@ -130,6 +157,12 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
         return PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)
 
     if state.completeness in ("complete", "partial"):
+        # Task 7.6 A1（正確性修正，必須排在增量寬限期判斷之前——見上方 docstring）：
+        # `cursor_ms > synced_through_ms` 代表本輪（增量輪）已經開始抓頁但尚未
+        # 跑到底，續抓剩餘部分，不看寬限期、不改 state。
+        if (state.synced_through_ms is not None
+                and state.cursor_ms > state.synced_through_ms):
+            return PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)
         if now_ms - state.window_end_ms >= incremental_after_ms:
             new_window_start = now_ms - window_days * _DAY_MS
             new_cursor = max(new_window_start, (state.synced_through_ms or new_window_start)
@@ -149,8 +182,10 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
     raise ValueError(f"explore_fills_sync: unexpected completeness {state.completeness!r}")
 
 
-def _validate_page(page: list[dict], start_ms: int, end_ms: int) -> str | None:
-    """回傳 `None` 代表合法；否則回傳簡短原因字串。"""
+def validate_page(page: list[dict], start_ms: int, end_ms: int) -> str | None:
+    """回傳 `None` 代表合法；否則回傳簡短原因字串。公開名（Task 7.6 B5：
+    `explore_scheduler._probe_retention_boundary` 也要用它驗證探測回應是否
+    真的落在探測窗內，不再是本模組私有的實作細節）。"""
     if not isinstance(page, list):
         return "not_a_list"
     prev_time: int | None = None
@@ -184,7 +219,7 @@ def apply_page(plan: PagePlan, page: list[dict], *, page_limit: int = PAGE_LIMIT
     state = plan.state
     start_ms, end_ms = plan.start_ms, plan.end_ms
 
-    invalid_reason = _validate_page(page, start_ms, end_ms)
+    invalid_reason = validate_page(page, start_ms, end_ms)
     if invalid_reason is not None:
         new_state = dataclasses.replace(
             state, last_error=f"invalid_page:{invalid_reason}", updated_at=now_ms / 1000,
@@ -204,8 +239,19 @@ def apply_page(plan: PagePlan, page: list[dict], *, page_limit: int = PAGE_LIMIT
         # Task 7.5：`retention_threshold` 本身已是保守調整後的門檻（見模組檔頭
         # `RETENTION_SAFETY_THRESHOLD`），這裡不再另外減 `page_limit`。complete
         # 也要有 reason——這只是門檻推論，不是留存邊界本身的證據（見模組檔頭）。
+        # Task 7.6 A2（正確性修正）：`state.completeness == "backfilling"` 代表
+        # 這是第一輪全區間遍歷收尾，門檻推論適用於整個窗口，照舊判定。否則
+        # （前態是 `complete` 或 `partial`）是增量輪收尾——增量輪只延伸
+        # `synced_through`，查詢區間只有一小段缺口，不能拿這一小段的觀測筆數
+        # 重新宣稱整個窗口的完整性：本輪缺口本身超標才合法降級為 `partial`
+        # （新的、更強的證據）；沒超標時 `completeness`／`reason` 原樣保留
+        # （`partial` 仍是 `partial`；`retention_boundary_verified` 跨輪存活——
+        # 本地已持有的區段不受 HL 留存影響，不需要重新量測）。
+        is_incremental_round = state.completeness != "backfilling"
         if fills_in_window >= retention_threshold:
             completeness, reason = "partial", "retention_limit"
+        elif is_incremental_round:
+            completeness, reason = state.completeness, state.reason
         else:
             completeness, reason = "complete", REASON_COUNT_BELOW_RETENTION_THRESHOLD
         new_state = dataclasses.replace(

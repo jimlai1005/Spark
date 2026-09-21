@@ -959,8 +959,14 @@ def _single_short_round(tmp_path, clock, probe_result):
 
 def test_retention_boundary_probe_positive_upgrades_reason(tmp_path):
     clock = Clock(t=40 * 86400.0)
+    # Task 7.6 B5：探測回應要先通過 `validate_page(page, probe_start, probe_end)`
+    # 才會升級 reason——這裡的 fill 時間必須落在探測窗內（`window_start_ms` 由
+    # `plan_page` 首次開新輪算出＝`now_ms - WINDOW_DAYS*一天`），不能再用任意
+    # 時間戳（舊版沒有驗證，任意值也會被誤判成「驗證成功」）。
+    window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
+    probe_time = window_start_ms - 1  # 落在探測窗 [window_start-1天, window_start-1] 內
     store, hl, sched = _single_short_round(
-        tmp_path, clock, probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+        tmp_path, clock, probe_result=[{"coin": "BTC", "tid": 1, "time": probe_time}])
 
     r = sched.tick()
     assert r == "ran:fills"
@@ -1000,3 +1006,94 @@ def test_retention_boundary_probe_exception_does_not_fail_round(tmp_path):
     assert sync.completeness == "complete"
     assert sync.reason == "count_below_retention_threshold"  # 探測失敗不改 reason
     assert len(hl.probe_calls) == 1
+
+
+# --- Task 7.6 B：探測驗證、順序、計數器（複審 W1/W2/S2/S3 修法） ---
+
+def test_probe_response_out_of_window_does_not_upgrade_and_counts_failed(tmp_path):
+    """B5：探測回應必須通過 `validate_page`——時間落在探測窗外（例如上游回應
+    格式跑掉、或誤回全部歷史成交）不得升級 reason，計入 `_probe_failed`。"""
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched = _single_short_round(
+        tmp_path, clock, probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])  # 遠在窗外
+
+    r = sched.tick()
+    assert r == "ran:fills"
+
+    sync = store.get_sync("0xabc")
+    assert sync.completeness == "complete"
+    assert sync.reason == "count_below_retention_threshold"  # 不升級
+    assert len(hl.probe_calls) == 1
+    assert sched.status()["probe"] == {"total": 1, "verified": 0, "empty": 0, "failed": 1}
+
+
+def test_probe_not_called_when_address_dropped(tmp_path):
+    """B4：順序改為 complete → is_active 檢查 → 探測——退池地址在 is_active
+    檢查就回 "dropped"，不值得再花預算探測。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    # 刻意不呼叫 upsert_candidates：地址從一開始就不是 active 候選。
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    hl = ProbeAwareHL(real_pages=[[]], probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+    assert r == "dropped"
+    assert hl.probe_calls == []
+    assert sched.status()["probe"]["total"] == 0
+
+
+def test_probe_not_called_when_reason_already_verified(tmp_path):
+    """B4：`REASON_RETENTION_BOUNDARY_VERIFIED` 跨輪存活（A2）——已經驗證過的
+    地址不該每輪都重新探測，探測條件收緊為 reason 仍是門檻推論時才探。"""
+    from spark.publicapi.explore_store import FillsSyncState
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    checkpoint = FillsSyncState(
+        address="0xabc", window_start_ms=window_start_ms, window_end_ms=now_ms,
+        cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
+        observed_to_ms=None, completeness="complete",
+        reason="retention_boundary_verified", pages_done=0, fills_in_window=0,
+        updated_at=clock.now(), last_error=None, params_fp="",
+    )
+    store.insert_fills_page("0xabc", [], checkpoint)
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    hl = ProbeAwareHL(real_pages=[[]], probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    clock.t += 5 * 3600  # 過寬限期，開新增量輪
+
+    r = sched.tick()
+    assert r == "ran:fills"
+    assert hl.probe_calls == []          # 已 verified，不再探
+    sync = store.get_sync("0xabc")
+    assert sync.reason == "retention_boundary_verified"   # 維持
+    assert sched.status()["probe"]["total"] == 0
+
+
+def test_probe_verified_does_not_change_updated_at(tmp_path):
+    """B6/B7：探測命中只補強 reason，不得讓 `updated_at`（對外＝
+    `last_success_at`）看起來像剛抓過一頁——store 用一個與 scheduler 時鐘脫鉤
+    的 `now_fn`，若 `set_sync_reason` 誤用自己的鐘改 `updated_at` 會立刻露餡。"""
+    clock = Clock(t=40 * 86400.0)
+    window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
+    probe_time = window_start_ms - 1  # 落在探測窗內
+    store = ExploreStore(tmp_path / "explore.db", now_fn=lambda: 999_999.0)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    hl = ProbeAwareHL(real_pages=[[]], probe_result=[{"coin": "BTC", "tid": 1, "time": probe_time}])
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    r = sched.tick()
+    assert r == "ran:fills"
+
+    sync = store.get_sync("0xabc")
+    assert sync.reason == "retention_boundary_verified"
+    assert sync.updated_at == clock.now()   # 抓頁完成當下寫入的值，不是 store 自己的鐘
+    assert sched.status()["probe"] == {"total": 1, "verified": 1, "empty": 0, "failed": 0}

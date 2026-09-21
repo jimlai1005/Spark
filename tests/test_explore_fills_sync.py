@@ -49,10 +49,11 @@ def test_retention_constants_named_and_derived(tmp_path):
 
 
 def test_params_fp_constant_matches_actual_hl_request_body():
-    """Task 7.5 點 4：`hl.get_fills_page` 的實際請求體只送
-    `type/user/startTime/endTime`，不送 `aggregateByTime`——字串必須明確標示
-    「採用預設值」而不是憑空杜撰一個查詢參數的值。"""
-    assert PARAMS_FP == "aggregateByTime=default(false)"
+    """Task 7.5 點 4／7.6 點 8：`hl.get_fills_page` 的實際請求體只送
+    `type/user/startTime/endTime`，不送 `aggregateByTime`——字串只描述「沒送
+    這個參數」的事實本身，不宣稱上游會用什麼值當預設（7.6 複審 S1 修法：
+    舊字面值 `default(false)` 是對上游行為未經驗證的推測）。"""
+    assert PARAMS_FP == "aggregateByTime=<omitted>"
 
 
 def test_page_limit_same_object_as_hl_module_constant():
@@ -241,9 +242,13 @@ def test_plan_page_increment_after_grace_period_preserves_completeness_and_shift
 def test_plan_page_increment_resets_fills_in_window_so_stale_count_does_not_flip_complete():
     # 第一輪已 complete，fills_in_window=7900（本身未達門檻）；增量輪若不歸零，
     # 光是舊計數就會讓門檻在沒有新資料時逐輪逼近，甚至疊加新頁後立刻跨過 8000。
+    # `reason` 顯式設為既有判準（Task 7.6 A2 起 reason 跨輪存活，不再由短頁收尾
+    # 無條件覆寫——這裡的初始狀態需要一個真實的既有 reason 才符合「complete
+    # 必有 reason」的不變量，見 explore_store.py 檔頭）。
     state = _backfilling_state(
         window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
         synced_through_ms=1000, completeness="complete", fills_in_window=7900,
+        reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD,
     )
     now = 1000 + 5 * 3600 * 1000
     plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
@@ -315,6 +320,126 @@ def test_apply_page_hits_page_cap_on_20th_consecutive_full_page():
     assert result.state.reason == "page_cap"
     assert result.state.pages_done == 20
     assert result.state.synced_through_ms == result.state.cursor_ms
+
+
+# --- Task 7.6 A：增量輪語義修正（round-in-progress、reason 跨輪存活） ---
+
+def test_plan_page_round_in_progress_continues_regardless_of_grace_period():
+    """A1：`cursor_ms > synced_through_ms` 代表增量輪已開始但尚未跑到底
+    （例如上一次滿頁後 cursor 推進、`synced_through` 尚未更新）——下一次
+    `plan_page` 即使遠低於增量寬限期也要續抓本輪剩餘部分，不能誤判 noop。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=500,
+        synced_through_ms=100, completeness="complete",
+        reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+    )
+    now = 110  # 遠低於任何合理的增量寬限期
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    assert not plan.is_noop
+    assert plan.start_ms == 500
+    assert plan.end_ms == 1000
+    assert plan.state is state  # 不改 state
+
+
+def test_plan_page_synced_through_none_does_not_trigger_round_in_progress():
+    """`synced_through_ms is None` 不得誤觸發 round-in-progress 分支——落回既有
+    的增量寬限期判斷（此例還沒到寬限期 → noop）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=500,
+        synced_through_ms=None, completeness="partial", reason="retention_limit",
+    )
+    now = 100
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    assert plan.is_noop
+
+
+def test_end_to_end_incremental_round_full_page_then_short_page_stays_complete():
+    """A1+A2 端到端（正式機重現場景）：complete 地址過寬限期開新增量輪，第一頁
+    剛好滿頁（`done=False`，`synced_through` 未推進）；1 分鐘後下一次 `plan_page`
+    不能被誤判 noop（A1）；短頁收尾後 `completeness`／`reason` 維持原值，不因
+    這段小缺口而重新宣稱整個窗口的完整性（A2）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="complete",
+        reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, fills_in_window=5,
+    )
+    now1 = 1000 + 5 * 3600 * 1000  # 過寬限期，開新增量輪
+    plan1 = plan_page(state, address=ADDR, now_ms=now1, incremental_after_ms=4 * 3600 * 1000)
+    assert not plan1.is_noop
+    assert plan1.state.completeness == "complete"  # 開新輪時原樣保留
+    assert plan1.state.synced_through_ms == 1000   # 尚未推進
+
+    page1 = [_fill(plan1.start_ms + i, i) for i in range(PAGE_LIMIT)]  # 滿頁
+    r1 = apply_page(plan1, page1, now_ms=now1)
+    assert r1.done is False
+    assert r1.state.completeness == "complete"   # 續頁中，未改判
+    assert r1.state.synced_through_ms == 1000    # 未推進——A1 判斷靠這個
+
+    now2 = now1 + 60_000  # 1 分鐘後，遠低於下一次增量寬限期
+    plan2 = plan_page(r1.state, address=ADDR, now_ms=now2, incremental_after_ms=4 * 3600 * 1000)
+    assert not plan2.is_noop  # A1：本輪未完成，不能被誤判 noop
+    assert plan2.start_ms == r1.state.cursor_ms
+    assert plan2.end_ms == r1.state.window_end_ms
+
+    page2 = [_fill(plan2.start_ms + 1, 99_999)]  # 短頁，結束本輪
+    r2 = apply_page(plan2, page2, now_ms=now2)
+    assert r2.done is True
+    assert r2.state.completeness == "complete"
+    assert r2.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD  # A2：不重寫
+    assert r2.state.synced_through_ms == r1.state.window_end_ms
+
+
+def test_incremental_round_short_page_preserves_partial_reason():
+    """A2：`partial`／`retention_limit` 地址增量輪短頁收尾，不因這段小缺口本身
+    未超標就升級回 `complete`——與 `plan_page` docstring「partial 仍是
+    partial」一致。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="partial", reason="retention_limit",
+        fills_in_window=8500,
+    )
+    now = 1000 + 5 * 3600 * 1000
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    page = [_fill(plan.start_ms + 1, 1)]  # 短頁
+    result = apply_page(plan, page, now_ms=now)
+    assert result.done is True
+    assert result.state.completeness == "partial"
+    assert result.state.reason == "retention_limit"
+
+
+def test_incremental_round_short_page_preserves_retention_boundary_verified_reason():
+    """A2：`retention_boundary_verified`（探測實測證據）跨增量輪存活——本地已
+    持有的區段不受 HL 留存邊界影響，增量輪收尾不需要重新量測。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="complete",
+        reason="retention_boundary_verified",
+    )
+    now = 1000 + 5 * 3600 * 1000
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    page = [_fill(plan.start_ms + 1, 1)]
+    result = apply_page(plan, page, now_ms=now)
+    assert result.done is True
+    assert result.state.completeness == "complete"
+    assert result.state.reason == "retention_boundary_verified"
+
+
+def test_incremental_round_gap_itself_exceeds_threshold_downgrades_to_partial():
+    """A2：增量輪的合法降級路徑不受影響——本輪缺口本身觀測筆數就超過門檻，
+    仍然要降級為 `partial`／`retention_limit`（新的、更強的證據，不是「原樣
+    保留」的情境）。"""
+    state = _backfilling_state(
+        window_start_ms=0, window_end_ms=1000, cursor_ms=1000,
+        synced_through_ms=1000, completeness="complete",
+        reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+    )
+    now = 1000 + 5 * 3600 * 1000
+    plan = plan_page(state, address=ADDR, now_ms=now, incremental_after_ms=4 * 3600 * 1000)
+    page = [_fill(plan.start_ms + i, i) for i in range(6000)]  # 短頁但缺口本身就超標
+    result = apply_page(plan, page, page_limit=8000, retention_threshold=6000, now_ms=now)
+    assert result.done is True
+    assert result.state.completeness == "partial"
+    assert result.state.reason == "retention_limit"
 
 
 def test_integration_with_store_replaying_page_is_idempotent(tmp_path):

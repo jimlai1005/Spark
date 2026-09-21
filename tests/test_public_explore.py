@@ -924,6 +924,33 @@ def test_snapshot_dump_and_load_round_trips_rows(tmp_path):
     assert restored.windows["day"] is None   # `_row()` 預設 day/week 缺席
 
 
+def test_row_from_dict_fills_coverage_missing_new_keys_default_to_none():
+    """Task 7.6 點 10（複審 S4 修法）：v4 快照較早版本落地時 `fills_coverage`
+    可能存在，但缺 Task 7.1／7.5 才新增的五個鍵（`synced_through`／
+    `last_success_at`／`window_start`／`window_end`／`params_fp`）——
+    `_row_from_dict` 要逐鍵合併 `DEFAULT_FILLS_COVERAGE`，缺的鍵補 `None`，
+    不能讓整份鍵直接從輸出消失（舊寫法 `dict(d.get(...) or DEFAULT)` 只在
+    `fills_coverage` 整個鍵缺席時才落回預設值）。"""
+    d = {
+        "address": _A, "display_name": None, "label": "trader", "coins": [],
+        "account_bucket": "small", "windows": {}, "live_days": 10,
+        "order_count_30d": 5, "closed_positions_30d": 2,
+        "realized_pnl_30d_usd": 1.0, "close_win_rate_pct": None,
+        "concentration_pct": None, "exposure": {"dir": None, "pct": None},
+        "tags": [], "fills_truncated": False, "as_of": {},
+        "fills_coverage": {"state": "complete", "observed_from": 1, "observed_to": 2,
+                          "reason": "count_below_retention_threshold"},
+        "eligibility": "eligible", "eligibility_reason": None,
+    }
+    row = hl_explore._row_from_dict(d)
+    assert row.fills_coverage["state"] == "complete"
+    assert row.fills_coverage["observed_from"] == 1
+    assert row.fills_coverage["observed_to"] == 2
+    assert row.fills_coverage["reason"] == "count_below_retention_threshold"
+    for key in ("synced_through", "last_success_at", "window_start", "window_end", "params_fp"):
+        assert row.fills_coverage[key] is None
+
+
 def test_snapshot_load_missing_file_returns_none(tmp_path):
     assert hl_explore.load_snapshot(str(tmp_path / "nope.json")) is None
 

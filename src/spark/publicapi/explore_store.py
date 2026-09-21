@@ -203,8 +203,24 @@ class ExploreStore:
         既存的表補新欄，得自己判斷）；既有 `completeness='complete' AND reason
         IS NULL` 的列補 `REASON_COUNT_BELOW_RETENTION_THRESHOLD`——這批舊列是
         在本次修正前用同一個門檻判完的，只是當時沒有把判準寫進 `reason`（見
-        `explore_fills_sync.apply_page` 檔頭）。呼叫時已在 `__init__` 的
-        `with self._lock, self._db:` transaction 內，不再重複取鎖。"""
+        `explore_fills_sync.apply_page` 檔頭）。
+
+        Task 7.6 點 9（複審 S3 修法，docstring 不實）：呼叫端（`__init__`）雖然
+        包在 `with self._lock, self._db:` 底下，但這**不代表**下面兩步 SQL 是同一個
+        transaction——`ALTER TABLE` 是 DDL，Python `sqlite3` 遇到 DDL 會自動
+        COMMIT 目前的隱式 transaction（stdlib 行為，與呼叫端有沒有包 `with` 無關），
+        所以本 migration 實際上**不在**一個 transaction 內執行，中途（例如
+        `ALTER TABLE` 成功、行程在 `UPDATE` 之前被殺）可能停在中間態。這是安全的，
+        因為兩步都各自冪等：`ALTER TABLE` 前先查 `PRAGMA table_info` 判斷欄位是否
+        已存在（存在則跳過，不會重複 `ALTER` 出錯）；`UPDATE` 的 `WHERE` 條件式
+        （`completeness='complete' AND reason IS NULL`）本身就是「還沒補過」的
+        判斷，重跑不會誤傷已經補過（`reason` 非 NULL）的列。下次啟動時
+        `schema_version` 仍是舊值會重新呼叫本函式，兩步各自的冪等性讓中途失敗
+        的中間態能自癒，不需要顯式 `BEGIN`。**未來**若新增涉及多個 DDL
+        **且**需要搬移既有資料的 migration（例如新表＋把舊表資料搬過去），不能
+        再套用同一份僥倖——DDL 一定會提交、資料搬移必須拆成獨立的、可重覆執行
+        （冪等）的步驟，或改用「新建影子表→驗證→原子改名」的模式，不能假設
+        整段可以一次 rollback。"""
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
         if "params_fp" not in cols:
             self._db.execute(
@@ -527,16 +543,17 @@ class ExploreStore:
                 (err, at, addr))
 
     def set_sync_reason(self, address: str, reason: str) -> None:
-        """Task 7.5 點 3：留存邊界探測結果落地——只 UPDATE `reason`／`updated_at`，
-        不動游標／completeness／其他欄位（探測結果只補強證據描述，不改變
-        completeness 本身的判定）。列不存在則不動（同 `set_sync_error` 慣例：
-        探測只會在一輪 `apply_page` 已經跑完、`fills_sync` 列必然存在之後才呼叫，
-        這裡的「不存在則不動」是防禦，不是預期路徑）。"""
+        """Task 7.5 點 3／7.6 點 7：留存邊界探測結果落地——只 UPDATE `reason`，
+        **不動** `updated_at`（Task 7.6 修正：該欄對外＝`last_success_at`＝
+        最近一次「抓頁成功」的時間，探測不是抓頁，不該讓它看起來像剛抓過
+        一頁）；也不動游標／completeness／其他欄位（探測結果只補強證據描述，
+        不改變 completeness 本身的判定）。列不存在則不動（同 `set_sync_error`
+        慣例：探測只會在一輪 `apply_page` 已經跑完、`fills_sync` 列必然存在
+        之後才呼叫，這裡的「不存在則不動」是防禦，不是預期路徑）。"""
         addr = _norm(address)
         with self._lock, self._db:
             self._db.execute(
-                "UPDATE fills_sync SET reason=?, updated_at=? WHERE address=?",
-                (reason, self._now(), addr))
+                "UPDATE fills_sync SET reason=? WHERE address=?", (reason, addr))
 
     def oldest_due_at(self, now: float) -> float | None:
         """目前到期（`next_attempt_at <= now`）的工作中最早的到期時刻；沒有到期

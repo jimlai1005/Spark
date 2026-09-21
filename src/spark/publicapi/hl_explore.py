@@ -502,7 +502,15 @@ def _row_from_dict(d: dict) -> ExploreRow:
         tags=tuple(d.get("tags") or ()),
         fills_truncated=bool(d.get("fills_truncated", False)),
         as_of=dict(d.get("as_of") or {}),
-        fills_coverage=dict(d.get("fills_coverage") or DEFAULT_FILLS_COVERAGE),
+        # Task 7.6 點 10（複審 S4 修法）：舊寫法 `dict(d.get("fills_coverage") or
+        # DEFAULT_FILLS_COVERAGE)` 只在整個 `fills_coverage` 鍵缺席時才落回預設值
+        # ——若快照的 `fills_coverage` 存在但缺 Task 7.1／7.5 才新增的五個鍵
+        # （`synced_through`／`last_success_at`／`window_start`／`window_end`／
+        # `params_fp`，皆屬 v4 快照新增早期版本可能沒有的鍵），這些鍵會直接從
+        # `ExploreRow.fills_coverage` 消失，而不是「未知＝None」。改成逐鍵合併：
+        # 先鋪 `DEFAULT_FILLS_COVERAGE`（五個新鍵皆 None），再蓋上快照裡實際
+        # 有的鍵。
+        fills_coverage=({**DEFAULT_FILLS_COVERAGE, **(d.get("fills_coverage") or {})}),
         # P6：舊快照（發布於本欄位新增之前）缺這兩鍵 → 落回 `ExploreRow` 的類別
         # 預設（"eligible"/None）——`ExploreIndex.query()` 下一次讀取會用當次
         # 門檻重新 `classify()`，不會讓過期的預設值長期冒充真正的資格。

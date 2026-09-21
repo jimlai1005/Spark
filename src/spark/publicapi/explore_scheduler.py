@@ -47,8 +47,9 @@ import threading
 from decimal import Decimal
 from typing import Callable
 
-from spark.publicapi.explore_fills_sync import apply_page, plan_page
-from spark.publicapi.explore_store import (REASON_RETENTION_BOUNDARY_VERIFIED, ExploreStore,
+from spark.publicapi.explore_fills_sync import apply_page, plan_page, validate_page
+from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+                                           REASON_RETENTION_BOUNDARY_VERIFIED, ExploreStore,
                                            Job)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
 from spark.publicapi.hl_explore import ExploreConfig, _roi_sort_key, candidate_addresses
@@ -173,6 +174,15 @@ class ExploreScheduler:
         # 2026-09-21 主線程裁決：`_fills_available()` 無 limiter 時的交替旗標
         # ——初值 False，第一次呼叫翻成 True（回 120），第二次翻回 False（回 0）。
         self._fallback_turn = False
+        # Task 7.6 點 6：留存邊界探測的觀測計數器——`total` 是嘗試次數，
+        # `verified`／`empty` 是合法回應的兩種結果，`failed` 是例外或不合法回應
+        # （`validate_page` 判非法，含 `time_out_of_range`）——兩者都算失敗，
+        # 不細分（探測本身是錦上添花，失敗原因對 ops 而言不必分類，見
+        # `_probe_retention_boundary` docstring）。
+        self._probe_total = 0
+        self._probe_verified = 0
+        self._probe_empty = 0
+        self._probe_failed = 0
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -228,6 +238,15 @@ class ExploreScheduler:
             "last_fills_at": self._last_fills_at,
             "base_scope_in_use": self._base_scope_in_use,
             "rebalanced": dict(self._rebalanced),
+            # Task 7.6 點 6：留存邊界探測觀測值，經 app.py `**scheduler.status()`
+            # 自然出現在 `/api/ops/health` 的 `explore_refresh`（同 `fills_pages_total`
+            # 等既有欄位的展開方式，不需要逐鍵挑選）。
+            "probe": {
+                "total": self._probe_total,
+                "verified": self._probe_verified,
+                "empty": self._probe_empty,
+                "failed": self._probe_failed,
+            },
         }
 
     # ---- 內部：一次 tick ----
@@ -434,15 +453,17 @@ class ExploreScheduler:
             # backfilling，整份成交補不完。是否退池只在整輪 done 之後才判斷。
             self._reschedule(job, now, bump_attempts=False)
             return "ran:fills"
-        if res.state.completeness == "complete":
-            # Task 7.5 點 3：本輪剛跑到底且判定 complete——趁機探測一次留存邊界
-            # （查詢區間起點之前一天是否仍有可查成交），把「門檻推論」升級成
-            # 「實測證據」。探測失敗／預算不足不影響本輪已經完成的事實，見
-            # `_probe_retention_boundary` docstring。
-            self._probe_retention_boundary(job.address, res.state, hl_fills)
+        # Task 7.6 點 4：順序改為 complete → is_active 檢查（退池→"dropped"，不
+        # 探）→ 探測 → enqueue——退池地址不值得再花預算探測；探測條件同時收緊
+        # 為「completeness=='complete' 且 reason 仍是門檻推論」（A2 讓
+        # `retention_boundary_verified` 跨輪存活，所以已 verified 的地址不會再
+        # 進到這個分支，每個地址最多探到成功為止，不會每輪重探）。
         self._complete(job)
         if not self._store.is_active(job.address):
             return "dropped"
+        if (res.state.completeness == "complete"
+                and res.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD):
+            self._probe_retention_boundary(job.address, res.state, hl_fills)
         next_at = now + self._jit(self._fills_every_s)
         self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
         return "ran:fills"
@@ -461,31 +482,53 @@ class ExploreScheduler:
         self._reschedule(job, now + 86400, err=err)
 
     def _probe_retention_boundary(self, address: str, state, hl_fills) -> None:
-        """Task 7.5 點 3：查詢 `[window_start_ms - 1 天, window_start_ms - 1]` 是否
-        仍有可查成交——回 >=1 筆代表 HL 的實際留存邊界早於本輪窗口起點，是比
-        `count_below_retention_threshold`（門檻推論）更強的直接證據，升級
-        reason 為 `REASON_RETENTION_BOUNDARY_VERIFIED`；回空頁則維持現有 reason
+        """Task 7.5 點 3／7.6 點 5、6：查詢 `[window_start_ms - 1 天,
+        window_start_ms - 1]` 是否仍有可查成交——回 >=1 筆合法成交代表 HL 的
+        實際留存邊界早於本輪窗口起點，是比 `count_below_retention_threshold`
+        （門檻推論）更強的直接證據，升級 reason 為
+        `REASON_RETENTION_BOUNDARY_VERIFIED`；回空頁則維持現有 reason
         （門檻推論本身沒有變得更弱，只是探測沒有提供額外證據）。
 
         探測走同一個 `hl_fills`（與本輪實際抓頁同一個 gateway／scope，計入
-        `explore_fills` 預算，工程原則 1：判斷與實際發送同源）。探測本身失敗
-        （額度不足、429、暫停、網路錯誤……不分類，一律不算這個 job 的失敗）→
-        記一行 warning、不改 reason、不重試——本輪 fills 已經跑完，不能因為
-        「錦上添花」的探測失敗而讓整個 job 被誤判成失敗重跑；下一次這個地址
-        進入新的一輪且再次以 `complete` 收尾時，若 reason 仍是
-        `count_below_retention_threshold`，會再探一次（見呼叫端 `_run_fills`）。
+        `explore_fills` 預算，工程原則 1：判斷與實際發送同源）。
+
+        Task 7.6 點 5（複審 W2 修法）：探測回應必須先通過
+        `explore_fills_sync.validate_page(page, probe_start, probe_end)`——舊版
+        直接看 `if page:` 沒有驗證回應真的落在探測窗內／欄位齊全，一個格式錯
+        或範圍錯的回應也會被當成「驗證成功」升級 reason。不合法（含
+        `time_out_of_range`：HL 回應的成交時間跑到探測窗外）→ 記一行 warning、
+        不升級，計入 `_probe_failed`。
+
+        探測本身失敗（額度不足、429、暫停、網路錯誤……不分類，與「回應不合法」
+        一律視為同一種失敗，見 `stats` 計數器不細分失敗原因）→ 記一行 warning、
+        不改 reason、不重試——本輪 fills 已經跑完，不能因為「錦上添花」的探測
+        失敗而讓整個 job 被誤判成失敗重跑；下一次這個地址進入新的一輪且再次以
+        `complete` 收尾、reason 仍是 `count_below_retention_threshold` 時，
+        會再探一次（見呼叫端 `_run_fills` 的探測條件）。
         """
         probe_start = state.window_start_ms - _PROBE_WINDOW_MS
         probe_end = state.window_start_ms - 1
+        self._probe_total += 1
         try:
             page = hl_fills.get_fills_page(address, probe_start, probe_end)
         except Exception as e:  # noqa: BLE001 — 探測失敗不得阻擋本輪已完成的事實
             logger.warning(
                 "explore scheduler：留存邊界探測失敗 address=%s window=[%d,%d]: %r",
                 address, probe_start, probe_end, e)
+            self._probe_failed += 1
+            return
+        invalid_reason = validate_page(page, probe_start, probe_end)
+        if invalid_reason is not None:
+            logger.warning(
+                "explore scheduler：留存邊界探測回應不合法 address=%s window=[%d,%d] "
+                "reason=%s", address, probe_start, probe_end, invalid_reason)
+            self._probe_failed += 1
             return
         if page:
             self._store.set_sync_reason(address, REASON_RETENTION_BOUNDARY_VERIFIED)
+            self._probe_verified += 1
+        else:
+            self._probe_empty += 1
 
     def _paused_remaining_s(self) -> float:
         limiter = getattr(self._hl, "_limiter", None)

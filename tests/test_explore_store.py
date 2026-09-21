@@ -310,15 +310,19 @@ def test_set_sync_error_noop_when_row_missing(tmp_path):
 
 # --- set_sync_reason / params_fp / schema v1→v2 migration (Task 7.5 加) ---
 
-def test_set_sync_reason_updates_reason_and_updated_at(tmp_path):
+def test_set_sync_reason_updates_reason_but_not_updated_at(tmp_path):
+    """Task 7.6 點 7（修正）：`set_sync_reason` 只 UPDATE `reason`，不動
+    `updated_at`——該欄對外＝`last_success_at`＝最近一次「抓頁成功」的時間，
+    探測不是抓頁，不該讓它看起來像剛抓過一頁。"""
     store, c = _store(tmp_path)
     store.insert_fills_page("0xabc", [], _checkpoint(
-        completeness="complete", reason="count_below_retention_threshold"))
+        completeness="complete", reason="count_below_retention_threshold",
+        updated_at=1_000_000.0))
     c.t += 10
     store.set_sync_reason("0xABC", "retention_boundary_verified")
     sync = store.get_sync("0xabc")
     assert sync.reason == "retention_boundary_verified"
-    assert sync.updated_at == c.t
+    assert sync.updated_at == 1_000_000.0   # 原值，不是 c.t（探測發生的時刻）
     # 其餘欄位不動（completeness／游標不受探測結果影響）
     assert sync.completeness == "complete"
     assert sync.cursor_ms == 0
