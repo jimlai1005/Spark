@@ -49,7 +49,8 @@ def _sync(address, *, completeness="complete", updated_at=1000.0,
         address=address, window_start_ms=1, window_end_ms=2, cursor_ms=2,
         synced_through_ms=synced_through_ms, observed_from_ms=observed_from_ms,
         observed_to_ms=observed_to_ms, completeness=completeness, reason=reason,
-        pages_done=1, fills_in_window=0, updated_at=updated_at, last_error=None)
+        pages_done=1, fills_in_window=0, updated_at=updated_at, last_error=None,
+        inc_from_ms=1)  # Task 7.9c-D：增量軌起點不得為 None（insert_fills_page 守門）
 
 
 def _cfg(**over):

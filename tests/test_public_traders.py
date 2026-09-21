@@ -614,7 +614,8 @@ def _fills_sync(addr, *, now, completeness="complete", observed_from_ms=0,
         observed_from_ms=observed_from_ms,
         observed_to_ms=observed_to_ms if observed_to_ms is not None else int(now * 1000),
         completeness=completeness, reason=reason, pages_done=1, fills_in_window=2,
-        updated_at=now, last_error=None)
+        updated_at=now, last_error=None,
+        inc_from_ms=0)  # Task 7.9c-D：增量軌起點不得為 None（insert_fills_page 守門）
 
 
 def _make_pool_app(tmp_path, now):
@@ -676,7 +677,8 @@ def test_pool_local_path_fills_coverage_synced_through_and_last_success_at(tmp_p
         cursor_ms=int(now * 1000), synced_through_ms=123_000,
         observed_from_ms=0, observed_to_ms=int(now * 1000),
         completeness="partial", reason="page_limit", pages_done=1, fills_in_window=0,
-        updated_at=now - 10, last_error=None)
+        updated_at=now - 10, last_error=None,
+        inc_from_ms=0)  # Task 7.9c-D：增量軌起點不得為 None
     explore_store.insert_fills_page(_A, [], sync)
 
     r = _client(app).get(f"/api/public/traders/{_A}")
