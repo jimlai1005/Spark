@@ -1465,6 +1465,7 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 | 7.4a | 2026-09-21 | fc6a900 | 限流器父子 scope＋`available()`；主線程實跑 base 3×60 後第 4 次拒、fills 仍 120、父滿時兩子歸零；44 passed；3124 全綠 |
 | 7.4b | 2026-09-21 | c184c03 | 週期 1800/7200/7200；首 tick 重排 overdue；類別感知領工＋同 tick 跨類 fallback；等待加權；無 limiter 時交替（僅雙方都到期）；飢餓重現：30 分鐘 30 頁、state 持續、切片 ≤300／base ≤180；94 passed、3135 全綠。<!-- 裁決：舊測試「state 先於 fills」改行為級斷言（被取代的嚴格優先級） --> |
 | 7.4c | 2026-09-21 | aa65274 | config 兩個 cap＋驗證；run_api 三 scope＋parents、scheduler 三 gateway；health `explore_budget_note`；RUNBOOK §5.8e 新週期／保留額度／部署後檢查／觀測重新起算；3143 passed。<!-- 裁決：既有 test_hl_weight_caps_read_from_env 改 env 值使 base+fills≤explore --> |
+| 7.5 | 2026-09-21 | 347c961 | 留存門檻命名、complete reason 碼、留存邊界探測、`params_fp`（schema v2 migration）、契約三鍵；主線程用種子 DB 驗 migration：version 2、complete 無 NULL reason；3159 pytest、759 vitest。**未部署，複審中** |
 | **第四次部署（7.4＋7.1／7.2）** | 2026-09-21 01:11 UTC | 7db0720 | 複審可部署（3 Warning 已修：重排失敗大聲、scope 名同源、額度不足保留到期時間）；本機 6 分鐘實測 fills 6 頁；正式機 flag 1 後 100 秒 fills_sync 2 筆更新、零錯誤。**24h 觀測自 01:12 UTC 重新起算** |
 | **第三次部署（P6）** | 2026-09-20 16:42 UTC<!-- 校正 --> | 5e2ec8e | flag 0 驗證與本機一致 → 67/67 → flag 1（16:43）→ 16:44 首次發布、16:45 第二次；合格 2／待確認 288／不合格 10；零錯誤。24h 觀測期自 16:45 UTC 起算 |
 | **第二次部署（D8）** | 2026-09-20 14:20 UTC | 8ead8e8 | 使用者授權（「請繼續」）。flag 0 部署→驗證→67/67→flag 1（14:21）；90 秒後候選 300、快取 36、門檻擋下 in:0/300、快照未動、零 Traceback／429。冷啟動觀測進行中（每 10 分鐘），預期 50–65 分鐘首次換版 |
