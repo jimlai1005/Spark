@@ -363,13 +363,15 @@ def test_candidate_churn_preserves_removed_cache_and_adds_new_address_jobs(tmp_p
                             as_of=clock.now())
     store.put_cache_ok("0xaaa", "clearinghouseState", {"x": 1}, fetched_at=clock.now(),
                        refresh_after=clock.now() + 900)
+    # Task 7.9c-D D6：`inc_from_ms` 的非空由**寫入邊界**保證（`insert_fills_page`
+    # 對 `None` 拋 `ValueError`），測試的假狀態也必須帶上它。
     store.insert_fills_page("0xaaa", [{"coin": "BTC", "tid": 1, "time": 100}],
                             FillsSyncState(
                                 address="0xaaa", window_start_ms=0, window_end_ms=1000,
                                 cursor_ms=1000, synced_through_ms=1000, observed_from_ms=100,
                                 observed_to_ms=100, completeness="complete", reason=None,
                                 pages_done=1, fills_in_window=1, updated_at=clock.now(),
-                                last_error=None))
+                                last_error=None, inc_from_ms=0))
     far_future = clock.now() + 10**8
     for addr in ("0xaaa", "0xbbb"):
         for kind, prio in (("state", 0), ("portfolio", 1), ("ledger", 1), ("fills", 2)):
@@ -508,7 +510,8 @@ def test_dropped_address_fills_job_does_not_reenqueue(tmp_path):
         address="0xabc", window_start_ms=window_start_ms, window_end_ms=now_ms,
         cursor_ms=now_ms, synced_through_ms=now_ms, observed_from_ms=None,
         observed_to_ms=None, completeness="complete", reason=None,
-        pages_done=1, fills_in_window=0, updated_at=clock.now(), last_error=None))
+        pages_done=1, fills_in_window=0, updated_at=clock.now(), last_error=None,
+        inc_from_ms=window_start_ms))  # 7.9c-D D6：寫入邊界要求非 NULL
     store.deactivate_missing(set())  # 0xabc 退池
     store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
     sched = _sched(store, SequencedFillsHL([]), clock=clock)
@@ -602,14 +605,23 @@ def test_fills_every_s_default_is_default_fills_period_s_constant(tmp_path):
 
 def test_admission_cap_uses_admission_counts_not_stale_len_seen(tmp_path):
     """B(6)：準入計數改用 `admission_counts()`（同一 lock 內兩個 COUNT，與
-    `active_n = len(seen)` 語意等價但走共用口徑）。"""
-    clock = Clock()
+    `active_n = len(seen)` 語意等價但走共用口徑）。
+
+    Task 7.9c-S S3：準入改為逐項——cap 撐爆時**既有地址**的補建被擋（每擋一個
+    計一次 `admission_skipped`），新候選不受限（另見
+    `test_s7e_admission_skips_single_job_for_existing_address_new_candidate_exempt`）。
+    這裡的地址刻意先 `bootstrap_address_fills` 成既有地址，才是被 cap 擋的那一類。"""
+    clock = Clock(t=40 * 86400.0)
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     # 預先塞大量非候選 job，撐爆準入上限（ADMISSION_MULTIPLIER * active_n）。
     for i in range(100):
         store.enqueue(f"dummy:{i}", None, "dummy", 5, clock.now())
 
-    payload = _payload(["0xAAA0000000000000000000000000000000AAA1"])
+    addr = "0xAAA0000000000000000000000000000000AAA1"
+    now_ms = int(clock.now() * 1000)
+    store.bootstrap_address_fills(addr, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")  # 既有地址
+    payload = _payload([addr])
     sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
                   cfg=ExploreConfig(candidate_pool=1))
     sched._bootstrapped = True
@@ -617,10 +629,11 @@ def test_admission_cap_uses_admission_counts_not_stale_len_seen(tmp_path):
 
     r = sched.tick()
     assert r == "ran:candidates"
-    # 準入上限被撐爆（100 job > 5*1 active）→ 本輪不新增 per-address job。
+    # 準入上限被撐爆（101 job > 7*1 active）→ 本輪不新增這個既有地址的 job。
     assert store._db.execute(
         "SELECT COUNT(*) FROM refresh_job WHERE kind != 'candidates' AND kind != 'dummy'"
     ).fetchone()[0] == 0
+    assert sched.status()["admission_skipped"] == 4  # state/portfolio/ledger/fills
 
 
 def test_run_candidates_empty_rows_keeps_existing_pool_active(tmp_path):
@@ -1028,12 +1041,16 @@ def test_b7_ii_stale_probe_writeback_does_not_overwrite_new_scan(tmp_path):
 
         def get_fills_page(self, address, start_ms, end_ms):
             self.calls += 1
+            # 7.9c-D D3：`complete_scan` 用 `started_at` 判斷新舊（指向
+            # `started_at` 更晚的 scan 才算 STALE）——這裡的「新遍歷」必須真的
+            # 比舊 scan 晚開始，否則它自己會被判成過期而不寫回。
             new_scan = self._store.create_scan(
                 self._addr, kind="partial_rescan", window_start_ms=0, window_end_ms=999,
-                cursor_ms=0, started_at=2.0)
+                cursor_ms=0, started_at=self._store._now() + 2.0)
             import dataclasses
             finished = dataclasses.replace(new_scan, cursor_ms=999, result="partial",
-                                           reason="retention_limit", finished_at=3.0)
+                                           reason="retention_limit",
+                                           finished_at=self._store._now() + 3.0)
             self._store.complete_scan(self._addr, [], finished)
             return []
 
@@ -1564,3 +1581,545 @@ def test_notify_dirty_exception_during_probe_does_not_lose_probe_result(tmp_path
     assert r == "ran:probe"
     assert sched.status()["dirty_errors"] == 1
     assert store.get_sync("0xabc").reason == "count_below_retention_threshold_probe_empty"
+
+
+# ============================================================
+# Task 7.9c-S S7：遍歷軌生命週期（Critical C1／C2 的守門回歸測試）、逐項準入、
+# `fills_verify` 有界等待、`ScanWriteback` 四種收尾、探測行為測試恢復。
+# ============================================================
+
+ADDR_A = "0xAAA0000000000000000000000000000000AAA1"
+
+
+class _SameMsFillsHL:
+    """`get_fills_page` 恆回一整頁、且整頁時間戳都等於 `start_ms` ——
+    `apply_scan_page` 的「同毫秒溢位」終止條件會讓遍歷**一頁就以 `partial`
+    收尾**（`reason='same_ms_overflow'`），是測 partial 重掃排程最短的合法
+    路徑（不必真的抓滿 8,000 筆）。"""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.calls.append((address, start_ms, end_ms))
+        return [{"coin": "BTC", "tid": start_ms + i, "time": start_ms} for i in range(PAGE_LIMIT)]
+
+
+def _run_for(sched, clock, horizon_s: float, *, idle_step: float = 30.0) -> list[str]:
+    """驅動 scheduler 直到虛擬時鐘前進 `horizon_s`：有事做的 tick 前進 1 秒、
+    `idle` 快轉 `idle_step` 秒——與複審重現腳本
+    `scratchpad/repro_rescan.py` 同一個驅動方式。"""
+    t0 = clock.t
+    results: list[str] = []
+    while clock.t - t0 < horizon_s:
+        r = sched.tick()
+        results.append(r)
+        clock.t += idle_step if r == "idle" else 1.0
+    return results
+
+
+def _scan_rows(store, address: str) -> list[tuple]:
+    return store._db.execute(
+        "SELECT kind, status, result, reason, started_at, finished_at FROM fills_scan "
+        "WHERE address=? ORDER BY started_at", (address.lower(),)).fetchall()
+
+
+def test_s7a_complete_address_never_rescans_across_candidate_rounds(tmp_path):
+    """(a) Critical C2 守門：`complete` 地址跨多個 candidates 輪（30 分一輪）
+    ＋3 天虛擬時間，`fills_scan` 列**恰好 1**（initial）、`partial_rescan` 0、
+    探測 <= 1。
+
+    舊行為：每個 candidates 輪都無條件 `enqueue(fills_scan)`，而
+    `ExploreStore.complete` 是 DELETE——job 消失後下一輪又建，`_run_scan` 看到
+    `completeness != backfilling` 就開 `partial_rescan`，單一地址 3 天 144 次
+    整窗重掃。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    payload = _payload([ADDR_A])
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=1))
+
+    results = _run_for(sched, clock, 3 * 86400.0)
+
+    assert results.count("ran:candidates") >= 5      # 至少 5 個 candidates 輪
+    rows = _scan_rows(store, ADDR_A)
+    assert len(rows) == 1, rows
+    assert rows[0][0] == "initial" and rows[0][1] == "done" and rows[0][2] == "complete"
+    assert [r for r in rows if r[0] == "partial_rescan"] == []
+    assert results.count("ran:fills_scan") == 1
+    assert store.get_sync(ADDR_A).completeness == "complete"
+    assert sched.status()["probe"]["total"] <= 1
+
+
+def test_s7b_partial_address_rescan_due_in_24h_and_at_most_3_in_3_days(tmp_path):
+    """(b) Critical C1 守門：`partial` 收尾排下一次重掃用的是**秒制**的
+    `PARTIAL_RESCAN_AFTER_S`——到期時刻在 `[finished_at + 86400 - 60,
+    finished_at + 86400 + 60]`（舊版把毫秒常數加到秒制 `now`，排到 1,000 天
+    後）；3 天內 `partial_rescan` <= 3。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    payload = _payload([ADDR_A])
+    sched = _sched(store, _SameMsFillsHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=1))
+
+    # 先跑到首次遍歷以 partial 收尾。
+    for _ in range(200):
+        sync = store.get_sync(ADDR_A)
+        if sync is not None and sync.completeness == "partial":
+            break
+        r = sched.tick()
+        clock.t += 30.0 if r == "idle" else 1.0
+    else:                                            # pragma: no cover - 防呆
+        raise AssertionError("首次遍歷未在時限內以 partial 收尾")
+
+    finished_at = store._db.execute(
+        "SELECT finished_at FROM fills_scan WHERE address=? AND status='done'",
+        (ADDR_A.lower(),)).fetchone()[0]
+    due = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE key=?",
+        (f"{ADDR_A.lower()}:fills_scan",)).fetchone()[0]
+    assert finished_at + 86400 - 60 <= due <= finished_at + 86400 + 60
+
+    results = _run_for(sched, clock, 3 * 86400.0)
+    rescans = [r for r in _scan_rows(store, ADDR_A) if r[0] == "partial_rescan"]
+    assert 1 <= len(rescans) <= 3, rescans
+    assert results.count("ran:candidates") >= 5
+
+
+def test_s7c_lost_scan_job_is_recovered_within_one_increment_period(tmp_path):
+    """(c) 修復路徑：`partial` 地址的 `fills_scan` job 被外部刪掉（且重掃期限
+    已到）→ 一個增量週期內由 `_run_increment` 補排並執行。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    payload = _payload([ADDR_A])
+    sched = _sched(store, _SameMsFillsHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=1))
+    for _ in range(200):
+        sync = store.get_sync(ADDR_A)
+        if sync is not None and sync.completeness == "partial":
+            break
+        r = sched.tick()
+        clock.t += 30.0 if r == "idle" else 1.0
+
+    # job 遺失 ＋ 重掃期限已過。
+    store._db.execute("DELETE FROM refresh_job WHERE key=?", (f"{ADDR_A.lower()}:fills_scan",))
+    store._db.commit()
+    clock.t += 86400.0 + 60.0
+    assert "fills_scan" not in store.job_kinds(ADDR_A)
+
+    results = _run_for(sched, clock, 6 * 3600.0)     # 一個增量週期
+
+    assert "ran:fills_scan" in results
+    assert [r for r in _scan_rows(store, ADDR_A) if r[0] == "partial_rescan"]
+
+
+def test_s7d_repro_rescan_three_day_thirty_minute_rounds_no_repeated_full_scan(tmp_path):
+    """(d) 複審重現腳本 `scratchpad/repro_rescan.py` 的情境照抄：單一地址、
+    每 30 分鐘一個 candidates 輪、3 天虛擬時間、空頁（首次遍歷立刻
+    `complete`）——`partial_rescan == 0`、initial scan == 1。腳本原本跑出
+    144 次 `partial_rescan`＋224 次增量。"""
+    clock = Clock(1_700_000_000.0)
+    store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
+    hl = FakeHL()
+    payload = _payload([ADDR_A])
+    sched = _sched(store, hl, leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=1))
+
+    results = _run_for(sched, clock, 3 * 86400.0)
+
+    rows = _scan_rows(store, ADDR_A)
+    kinds = [r[0] for r in rows]
+    assert kinds.count("partial_rescan") == 0, rows
+    assert kinds.count("initial") == 1, rows
+    assert len(rows) == 1, rows
+    assert results.count("ran:fills_scan") == 1
+    assert sched.status()["scan_job_dropped"] == 0   # 根本不會有多餘的 scan job
+
+
+def test_s7e_admission_skips_single_job_for_existing_address_new_candidate_exempt(tmp_path):
+    """(e) 逐項準入（W4）：cap 滿時只跳過**既有地址缺的那一個 job**
+    （`admission_skipped` 計一次），既有 job 不受影響；同一輪的新候選
+    （`bootstrap_address_fills` 回 True）仍拿到完整的 5 個 job。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    existing = ADDR_A
+    fresh = "0xBBB0000000000000000000000000000000BBB2"
+    now_ms = int(clock.now() * 1000)
+    store.bootstrap_address_fills(existing, clock.now(),
+                                  window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    for kind, prio in (("state", 0), ("portfolio", 1), ("ledger", 1)):
+        store.enqueue(f"{existing.lower()}:{kind}", existing, kind, prio, clock.now() + 10**6)
+    # active_n=2 → cap=14；此刻 refresh_job 共 14 列（candidates 1＋既有 3＋dummy 10）
+    for i in range(10):
+        store.enqueue(f"dummy:{i}", None, "dummy", 5, clock.now() + 10**6)
+
+    payload = _payload([existing, fresh])
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=2))
+    sched._bootstrapped = True
+    store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+
+    assert sched.tick() == "ran:candidates"
+
+    existing_kinds = store.job_kinds(existing)
+    assert existing_kinds == {"state", "portfolio", "ledger"}       # fills 被 cap 擋下
+    assert sched.status()["admission_skipped"] == 1
+    assert store.job_kinds(fresh) == {"state", "portfolio", "ledger", "fills", "fills_scan"}
+
+
+class _VerifyFixture:
+    """`fills_verify` 有界等待測試的共用 setup：一個永遠有積壓的增量地址
+    （`_ContinuingFillsHL` 恆回滿頁）＋一個帶 `fills_verify` job 的地址。"""
+
+    def __init__(self, tmp_path, clock, *, verify_due_ago: float):
+        self.store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+        now_ms = int(clock.now() * 1000)
+        self.store.upsert_candidates([("0xbusy", None, 1, None), ("0xver", None, 2, None)],
+                                     as_of=clock.now())
+        self.store.bootstrap_address_fills("0xbusy", clock.now(),
+                                           window_start_ms=now_ms - 30 * 86_400_000,
+                                           window_end_ms=now_ms + 10**9, params_fp="")
+        sync = self.store.get_sync("0xbusy")
+        import dataclasses as _dc
+        self.store.insert_fills_page(
+            "0xbusy", [], _dc.replace(sync, cursor_ms=now_ms + 1, window_end_ms=now_ms + 10**9))
+        self.store.enqueue("0xbusy:fills", "0xbusy", "fills", 2, clock.now())
+
+        self.store.bootstrap_address_fills("0xver", clock.now(),
+                                           window_start_ms=now_ms - 30 * 86_400_000,
+                                           window_end_ms=now_ms, params_fp="")
+        _complete_scan(self.store, "0xver", result="complete",
+                       reason="retention_boundary_verified", window_end_ms=now_ms,
+                       finished_at=clock.now())
+        self.store._db.execute("UPDATE fills_sync SET evidence_unknown=1 WHERE address='0xver'")
+        self.store.enqueue("0xver:fills_verify", "0xver", "fills_verify", 4,
+                           clock.now() - verify_due_ago)
+
+
+def test_s7f_verify_served_after_bounded_wait(tmp_path):
+    """(f) `fills_verify` 有界等待：到期已超過 `VERIFY_MAX_WAIT_S`（2 小時）
+    時，本 tick 的 fills 類名額改給 verify（計 `verify_served_by_deadline`）；
+    服務過一次之後名額回到增量軌，verify 不會反過來霸佔。"""
+    from spark.publicapi.explore_scheduler import VERIFY_MAX_WAIT_S
+
+    assert VERIFY_MAX_WAIT_S == 2 * 3600
+    clock = Clock(t=40 * 86400.0)
+    fx = _VerifyFixture(tmp_path, clock, verify_due_ago=3 * 3600.0)
+    sched = _sched(fx.store, _ContinuingFillsHL(), clock=clock)
+    sched._bootstrapped = True
+
+    assert sched.tick() == "ran:fills_verify"
+    assert sched.status()["verify_served_by_deadline"] == 1
+    # 下一個 tick：verify 剛被服務過（重排到 now，等待歸零）→ 名額回到增量軌。
+    assert sched.tick() == "ran:fills"
+
+
+def test_s7f_verify_strictly_yields_before_deadline(tmp_path):
+    """(f) 未滿 `VERIFY_MAX_WAIT_S` 時維持嚴格讓位：有到期的增量 job 就先做
+    增量，verify job 不被領（lease 仍是 NULL）。"""
+    clock = Clock(t=40 * 86400.0)
+    fx = _VerifyFixture(tmp_path, clock, verify_due_ago=3600.0)   # 只等了 1 小時
+    sched = _sched(fx.store, _ContinuingFillsHL(), clock=clock)
+    sched._bootstrapped = True
+
+    assert [sched.tick() for _ in range(3)] == ["ran:fills"] * 3
+    assert sched.status()["verify_served_by_deadline"] == 0
+    row = fx.store._db.execute(
+        "SELECT lease_until FROM refresh_job WHERE key='0xver:fills_verify'").fetchone()
+    assert row is not None and row[0] is None
+
+
+def _wb(name: str):
+    """7.9c-D 的 `ScanWriteback` 成員；D 尚未落地時退回同值字串——
+    `explore_scheduler._writeback_kind` 兩者都接受。"""
+    from spark.publicapi import explore_store
+    enum = getattr(explore_store, "ScanWriteback", None)
+    return getattr(enum, name.upper()) if enum is not None else name
+
+
+def _partial_scan_ready(tmp_path, clock):
+    """一個即將以 `partial` 收尾的遍歷：候選地址＋到期的 `fills_scan` job，
+    HL 回同毫秒滿頁（一頁收尾）。"""
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
+    sched = _sched(store, _SameMsFillsHL(), clock=clock)
+    sched._bootstrapped = True
+    return store, sched
+
+
+def _rescan_job_due(store, address: str = "0xabc"):
+    row = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE key=?",
+        (f"{address}:fills_scan",)).fetchone()
+    return None if row is None else row[0]
+
+
+def test_s7g_writeback_applied_schedules_next_rescan(tmp_path):
+    """(g) `ScanWriteback.APPLIED`：既有收尾——結論寫回、24 小時後排下一次重掃。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched = _partial_scan_ready(tmp_path, clock)
+
+    assert sched.tick() == "ran:fills_scan"
+
+    assert store.get_sync("0xabc").completeness == "partial"
+    assert _rescan_job_due(store) == pytest.approx(clock.now() + 86400, abs=60)
+    st = sched.status()
+    assert (st["scan_writeback_duplicate"], st["scan_writeback_stale"],
+            st["scan_writeback_missing"]) == (0, 0, 0)
+
+
+def test_s7g_writeback_duplicate_counts_and_still_finishes(tmp_path):
+    """(g) `DUPLICATE`（結論已經是目前的了）：記 info、照常收尾（job 完成、
+    下一次重掃照排）。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched = _partial_scan_ready(tmp_path, clock)
+    real = store.complete_scan
+    store.complete_scan = lambda *a, **kw: (real(*a, **kw), _wb("duplicate"))[1]
+
+    assert sched.tick() == "ran:fills_scan"
+
+    assert sched.status()["scan_writeback_duplicate"] == 1
+    assert _rescan_job_due(store) == pytest.approx(clock.now() + 86400, abs=60)
+
+
+def test_s7g_writeback_stale_does_not_schedule_rescan(tmp_path):
+    """(g) `STALE`（`fills_sync` 已指向更新的一次遍歷）：記 warning、**不**排
+    下一次重掃——那一次遍歷的結論根本沒被採用。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched = _partial_scan_ready(tmp_path, clock)
+    real = store.complete_scan
+    store.complete_scan = lambda *a, **kw: (real(*a, **kw), _wb("stale"))[1]
+
+    assert sched.tick() == "ran:fills_scan"
+
+    assert sched.status()["scan_writeback_stale"] == 1
+    assert _rescan_job_due(store) is None
+
+
+def test_s7g_writeback_missing_drops_job(tmp_path):
+    """(g) `MISSING`（沒有 `fills_sync` 列）：記 warning、`_complete(job)` 後
+    回 `"dropped"`，不排下一次重掃。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched = _partial_scan_ready(tmp_path, clock)
+    real = store.complete_scan
+    store.complete_scan = lambda *a, **kw: (real(*a, **kw), _wb("missing"))[1]
+
+    assert sched.tick() == "dropped"
+
+    assert sched.status()["scan_writeback_missing"] == 1
+    assert _rescan_job_due(store) is None
+
+
+def test_s7g_writeback_bool_true_is_treated_as_applied(tmp_path):
+    """(g) 過渡相容：`complete_scan` 回舊式 `bool`——`True` 視為 `applied`、
+    `False` 保守地視為 `stale`（不排下一次重掃）。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched = _partial_scan_ready(tmp_path, clock)
+    real = store.complete_scan
+    store.complete_scan = lambda *a, **kw: bool(real(*a, **kw)) or True
+
+    assert sched.tick() == "ran:fills_scan"
+    assert _rescan_job_due(store) == pytest.approx(clock.now() + 86400, abs=60)
+
+    clock2 = Clock(t=40 * 86400.0)
+    store2, sched2 = _partial_scan_ready(tmp_path / "second", clock2)
+    real2 = store2.complete_scan
+    store2.complete_scan = lambda *a, **kw: (real2(*a, **kw), False)[1]
+    assert sched2.tick() == "ran:fills_scan"
+    assert sched2.status()["scan_writeback_stale"] == 1
+    assert _rescan_job_due(store2) is None
+
+
+# --- (h) 恢復的五條探測行為測試（7.9b 拆軌時被刪，改寫為「探測由 DB 推導」版） ---
+
+class _ProbeHL:
+    """探測專用假 HL：`get_fills_page` 回 `probe_result`（`Exception` 實例會被
+    raise）。新架構下探測是獨立的 tick 決策（`next_probe_candidate` 純 DB
+    推導），不再夾在某一輪 fills 之後，所以不需要舊版的 `real_pages`。"""
+
+    def __init__(self, probe_result):
+        self._probe_result = probe_result
+        self.probe_calls: list[tuple] = []
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.probe_calls.append((address, start_ms, end_ms))
+        if isinstance(self._probe_result, Exception):
+            raise self._probe_result
+        return self._probe_result
+
+
+def _probe_ready(tmp_path, clock, probe_result, *, active: bool = True):
+    """一個「已完成遍歷、結論是門檻推論」的候選＝探測候選（見
+    `ExploreStore.next_probe_candidate`）。`active=False` 時地址不是候選。"""
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    if active:
+        store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    scan = _complete_scan(store, "0xabc", result="complete",
+                          reason="count_below_retention_threshold", window_end_ms=now_ms)
+    hl = _ProbeHL(probe_result)
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    return store, hl, sched, scan
+
+
+def test_s7h_probe_positive_upgrades_reason(tmp_path):
+    """(h1) 探測命中（窗內仍有更早的成交）→ reason 升級為
+    `retention_boundary_verified`，探測窗＝`[scan.window_start - 1 天,
+    scan.window_start - 1]`。"""
+    clock = Clock(t=40 * 86400.0)
+    window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
+    store, hl, sched, scan = _probe_ready(
+        tmp_path, clock, [{"coin": "BTC", "tid": 1, "time": window_start_ms - 1}])
+
+    assert sched.tick() == "ran:probe"
+
+    assert store.get_sync("0xabc").reason == "retention_boundary_verified"
+    assert len(hl.probe_calls) == 1
+    addr, probe_start, probe_end = hl.probe_calls[0]
+    assert addr == "0xabc"
+    assert probe_end == scan.window_start_ms - 1
+    assert probe_start == scan.window_start_ms - 86_400_000
+    assert sched.status()["probe"]["verified"] == 1
+
+
+def test_s7h_probe_negative_marks_probe_empty_reason(tmp_path):
+    """(h2) 探測回空頁 → reason 記為
+    `count_below_retention_threshold_probe_empty`（該 reason 天然被探測候選
+    查詢排除，不會每輪重探）。"""
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched, _ = _probe_ready(tmp_path, clock, [])
+
+    assert sched.tick() == "ran:probe"
+
+    assert store.get_sync("0xabc").reason == "count_below_retention_threshold_probe_empty"
+    assert len(hl.probe_calls) == 1
+    probe = sched.status()["probe"]
+    assert (probe["total"], probe["verified"], probe["empty"], probe["failed"],
+            probe["stale"], probe["candidates"]) == (1, 0, 1, 0, 0, 0)
+
+
+def test_s7h_probe_exception_does_not_fail_tick(tmp_path):
+    """(h3) 探測呼叫拋例外 → 不逸出、不改 reason、tick 照常結束。"""
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched, _ = _probe_ready(tmp_path, clock, ConnectionError("boom"))
+
+    assert sched.tick() == "ran:probe"
+
+    assert store.get_sync("0xabc").reason == "count_below_retention_threshold"
+    assert len(hl.probe_calls) == 1
+    assert sched.status()["probe"]["failed"] == 1
+
+
+def test_s7h_probe_response_out_of_window_counts_failed(tmp_path):
+    """(h4) 探測回應落在探測窗之外（上游回應跑掉）→ 不升級 reason、計入
+    `probe.failed`。"""
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched, _ = _probe_ready(tmp_path, clock,
+                                       [{"coin": "BTC", "tid": 1, "time": 1}])
+
+    assert sched.tick() == "ran:probe"
+
+    assert store.get_sync("0xabc").reason == "count_below_retention_threshold"
+    probe = sched.status()["probe"]
+    assert (probe["total"], probe["verified"], probe["empty"], probe["failed"]) == (1, 0, 0, 1)
+
+
+def test_s7h_probe_not_called_when_address_dropped(tmp_path):
+    """(h5) 退池地址不探（`next_probe_candidate` 的 `candidate.active=1`
+    條件）——不值得為非候選花探測預算。"""
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched, _ = _probe_ready(tmp_path, clock,
+                                       [{"coin": "BTC", "tid": 1, "time": 1}], active=False)
+
+    assert sched.tick() == "idle"
+
+    assert hl.probe_calls == []
+    assert sched.status()["probe"]["total"] == 0
+
+
+def test_s7_status_exposes_lifecycle_counters(tmp_path):
+    """S6：`status()` 的新觀測鍵（`/api/ops/health` 的 `explore_refresh` 直接
+    展開這份 dict）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    store.enqueue("0xabc:fills_verify", "0xabc", "fills_verify", 4, clock.now())
+    sched = _sched(store, FakeHL(), clock=clock)
+
+    st = sched.status()
+
+    assert st["scans_running"] == 1          # bootstrap 建的 initial scan 還在跑
+    assert st["verify_remaining"] == 1
+    assert st["due_by_kind"]["fills_verify"] == 1
+    assert st["due_by_kind"]["fills_scan"] == 0
+    assert set(st["due_by_kind"]) == {"candidates", "state", "portfolio", "ledger", "fills",
+                                      "fills_scan", "fills_verify"}
+    assert st["scan_job_dropped"] == 0
+    assert st["admission_skipped"] == 0
+    assert st["verify_served_by_deadline"] == 0
+    assert st["scan_writeback_duplicate"] == 0
+    assert st["scan_writeback_stale"] == 0
+    assert st["scan_writeback_missing"] == 0
+
+
+def test_s7_scan_job_dropped_when_state_says_no_rescan(tmp_path):
+    """S2：`complete` 地址的 `fills_scan` job（例如人工補排、或舊版留下的）
+    被領到時直接丟棄——不開 `partial_rescan`、不排下一個，計
+    `scan_job_dropped`。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, "0xabc", result="complete", reason="retention_boundary_verified",
+                   window_end_ms=now_ms, finished_at=clock.now())
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 3, clock.now())
+    hl = FakeHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    assert sched.tick() == "dropped"
+
+    assert sched.status()["scan_job_dropped"] == 1
+    assert hl.calls == []                                   # 沒有打任何一頁
+    assert _rescan_job_due(store) is None
+    assert [r for r in _scan_rows(store, "0xabc") if r[0] == "partial_rescan"] == []
+
+
+def test_s7_partial_not_yet_due_scan_job_is_dropped_not_rescanned(tmp_path):
+    """S2：`partial` 但距離上一次遍歷還不到 `PARTIAL_RESCAN_AFTER_S` 時，
+    領到 scan job 一樣丟棄（重掃期限是單一來源，不因 job 存在而提前）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, "0xabc", result="partial", reason="retention_limit",
+                   window_end_ms=now_ms, finished_at=clock.now() - 3600.0)   # 1 小時前
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 3, clock.now())
+    hl = FakeHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    assert sched.tick() == "dropped"
+    assert sched.status()["scan_job_dropped"] == 1
+    assert hl.calls == []
+
+    # 期限一過，同樣的 job 被補排後就會真的重掃。
+    clock.t += 86400.0
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 3, clock.now())
+    assert sched.tick() == "ran:fills_scan"
+    assert [r for r in _scan_rows(store, "0xabc") if r[0] == "partial_rescan"]

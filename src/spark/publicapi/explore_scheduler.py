@@ -45,6 +45,30 @@ priority 3）、`fills_verify`（**核驗遍歷**，遷移產生，只在同一 
 - 啟動時重排既有 overdue：第一個 tick 對 state／portfolio／ledger 各自呼叫
   `store.rebalance_overdue`。
 
+Task 7.9c-S（2026-09-22 使用者第二輪裁決，7.9b 複審兩個 Critical 的修法）——
+**遍歷軌 job 的生命週期一律由「狀態」推導，不由「job 列是否存在」推導**：
+- `fills_scan` job 只有三個來源：(a) `_enqueue_address_jobs` 中
+  `bootstrap_address_fills` 回 `True`（該地址第一次入池，真的新建增量軌）；
+  (b) `_run_scan` 的 `partial` 收尾排 `now + PARTIAL_RESCAN_AFTER_S`（秒制單一
+  來源，見 `explore_fills_sync`）；(c) `_run_increment` 跑完後的修復路徑
+  （`partial` 且重掃已到期、沒有進行中的 scan、也沒有 `fills_scan` job）。
+  既有地址在每個 candidates 輪（30 分）**不再**無條件補建 scan job——舊行為讓
+  `complete` 地址每 ~3.5 小時被整窗重掃一次（正式機推估 2,000 次/日，吃光
+  `explore_fills` 保留額度、餓死 `fills_verify`）。
+- `_run_scan` 領到 `fills_scan` job 卻沒有進行中的 scan 時，只有
+  「`completeness == "partial"` 且 `partial_rescan_due(最近一次 done scan 的
+  finished_at, now)`」才開 `partial_rescan`；否則丟棄該 job（`scan_job_dropped`）。
+- 秒／毫秒轉換只發生在呼叫 planner 的邊界（`int(now * 1000)`）；排程時間一律秒制。
+- 準入（`ADMISSION_MULTIPLIER`）改為「先依狀態算出需要哪些 kind → 扣掉已存在的
+  → 逐項准入」：容量滿只跳過**單一個** job（計 `admission_skipped`），不再讓整批
+  候選失去補排；新候選（bootstrap 回 True）的 job 不受 cap 限制。
+- `fills_verify` 仍先讓位，但改為**有界等待**：最舊的到期 verify job 等待
+  `VERIFY_MAX_WAIT_S` 之後，本 tick 的 fills 類名額改給一個 verify
+  （計 `verify_served_by_deadline`），避免永久飢餓。
+- `complete_scan` 的回寫結果（`ScanWriteback`）四種各自收尾：`applied` 照舊、
+  `duplicate` 記 info 後照常收尾、`stale` 記 warning 且**不**排下一次重掃、
+  `missing` 記 warning 並丟棄 job——CAS 落空不再被當成正常收尾。
+
 單一 job 失敗不影響其他 job：例外分類（`BudgetExhausted`／`ScopePaused`／429／
 transient／其他）各自決定下一次 `next_attempt_at`，thread 本身只在
 `run_forever` 層被保護——不因單一 tick 的未預期例外死掉（spec §3 條件五）。
@@ -52,16 +76,18 @@ transient／其他）各自決定下一次 `next_attempt_at`，thread 本身只�
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 import random
 import threading
 from decimal import Decimal
 from typing import Callable
 
+from spark.publicapi import explore_fills_sync
 from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, PARAMS_FP,
-                                                PARTIAL_RESCAN_AFTER_MS, apply_incremental_page,
-                                                apply_scan_page, fresh_scan_window,
-                                                plan_incremental, plan_scan, validate_page)
+                                                apply_incremental_page, apply_scan_page,
+                                                fresh_scan_window, plan_incremental, plan_scan,
+                                                validate_page)
 from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
                                            REASON_PROBE_NO_EARLIER_FILLS,
                                            REASON_RETENTION_BOUNDARY_VERIFIED, ExploreStore,
@@ -101,12 +127,70 @@ _FILLS_LIKE_KINDS = ("fills", "fills_scan")
 # 一次嘗試，見 `_tick_once` 的例外分類。
 MAX_JOB_ATTEMPTS = 8
 
-# 準入上限：`refresh_job` 總數 ≤ ADMISSION_MULTIPLIER × active 候選數（2026-09-20
-# 主線程裁決：原 4× 因新增 ledger job 而放寬為 5×；Task 7.9b 新增
-# `fills_scan`／`fills_verify` 兩種 kind，但 `fills_verify` 只在遷移／partial
-# 復原時短暫出現，不常駐——維持 5× 不變，觀察正式機準入命中率再決定要不要
-# 進一步放寬，見本次派工報告）。
-ADMISSION_MULTIPLIER = 5
+# 準入上限：`refresh_job` 總數 ≤ ADMISSION_MULTIPLIER × active 候選數。
+# Task 7.9c-S（W4）：每個地址最多 6 種 per-address kind——`state`、`portfolio`、
+# `ledger`、`fills`（增量軌）、`fills_scan`（遍歷軌）、`fills_verify`（遷移產生的
+# 核驗遍歷）——外加 `candidates` 這個全域 job 與餘裕，因此 5× 改 7×。cap 只擋
+# 既有地址的補建，新候選一律放行（見 `_enqueue_address_jobs`）。
+ADMISSION_MULTIPLIER = 7
+
+# Task 7.9c-S S4：`fills_verify` 有界等待——最舊的到期 verify job 等超過這個秒數，
+# 本 tick 的 fills 類名額改給一個 verify（嚴格讓位會讓它在 fills-like 永遠有積壓
+# 的正式機上永久飢餓）。verify 佔用一次 fills-like 名額，與 probe 的 9:1 同一套
+# 計數（`_fills_served_since_probe`）。
+VERIFY_MAX_WAIT_S = 2 * 3600
+
+# 每個地址可能存在的 job kind（`status()["due_by_kind"]` 與準入 docstring 的單一
+# 來源）；`candidates` 是全域 job，另外列。
+_PER_ADDRESS_KINDS = ("state", "portfolio", "ledger", "fills", "fills_scan", "fills_verify")
+_ALL_JOB_KINDS = ("candidates",) + _PER_ADDRESS_KINDS
+
+# `ExploreStore.complete_scan` 的回寫結果（Task 7.9c-D `ScanWriteback` 的值）。
+_WB_APPLIED = "applied"
+_WB_DUPLICATE = "duplicate"
+_WB_STALE = "stale"
+_WB_MISSING = "missing"
+
+# 過渡（7.9c-D 未落地時）：`explore_fills_sync.PARTIAL_RESCAN_AFTER_S` 的同值退路，
+# 見 `_partial_rescan_after_s()`。
+_PARTIAL_RESCAN_AFTER_S_FALLBACK = 24 * 3600
+
+
+def _partial_rescan_after_s() -> float:
+    """partial 重掃期限（秒）——單一來源是 `explore_fills_sync
+    .PARTIAL_RESCAN_AFTER_S`（Task 7.9c-D）。過渡期該常數若尚未落地，退回同值
+    的 `_PARTIAL_RESCAN_AFTER_S_FALLBACK`；**不得**再出現毫秒版本的常數被加到
+    秒制的 `now` 上（7.9b 的 Critical C1：重掃排到 1,000 天後）。"""
+    return float(getattr(explore_fills_sync, "PARTIAL_RESCAN_AFTER_S",
+                         _PARTIAL_RESCAN_AFTER_S_FALLBACK))
+
+
+def _partial_rescan_due(finished_at: float | None, now: float) -> bool:
+    """partial 地址距離上一次完成的遍歷是否已滿 `PARTIAL_RESCAN_AFTER_S`
+    （`finished_at is None`＝查不到上一次遍歷 → 視為到期，與 7.9c-D 的
+    `partial_rescan_due` 契約一致）。過渡期 D 的函式若尚未落地，就地以同一個
+    定義計算。"""
+    fn = getattr(explore_fills_sync, "partial_rescan_due", None)
+    if fn is not None:
+        return bool(fn(finished_at, now))
+    return finished_at is None or (now - finished_at) >= _partial_rescan_after_s()
+
+
+def _writeback_kind(result) -> str:
+    """`ExploreStore.complete_scan` 的回傳值正規化成 `_WB_*` 字串。
+
+    Task 7.9c-D 的契約是 `ScanWriteback`（`str` Enum）；過渡期（D 尚未落地）
+    仍是 `bool`——`True` → `applied`，`False` → 保守地當成 `stale`（CAS 落空時
+    寧可不排下一次重掃，也不要把別人的新結論蓋掉／重複觸發遍歷）。無法辨識的
+    值同樣當成 `stale` 並記警告（不拋例外：這裡在 job 收尾路徑上）。"""
+    if isinstance(result, bool):
+        return _WB_APPLIED if result else _WB_STALE
+    value = getattr(result, "value", result)
+    if value in (_WB_APPLIED, _WB_DUPLICATE, _WB_STALE, _WB_MISSING):
+        return str(value)
+    logger.warning("explore scheduler: complete_scan 回傳無法辨識的值 %r，當成 stale 處理",
+                   result)
+    return _WB_STALE
 
 # kind → endpoint_cache 的 endpoint 名稱（quarantine 時 `put_cache_error` 用；
 # `fills`／`fills_scan`／`fills_verify` 不在這裡——它們的錯誤落地在
@@ -224,6 +308,14 @@ class ExploreScheduler:
         # Task 7.9a A2：連續暫時性失敗達到 `MAX_JOB_ATTEMPTS` 而被隔離的次數
         # （與語意錯誤的立即隔離分開計，見 `_quarantine` 的 `max_attempts` 參數）。
         self._quarantined_max_attempts = 0
+        # Task 7.9c-S：遍歷軌生命週期與準入的觀測計數器（皆經 `status()` →
+        # `/api/ops/health` 的 `explore_refresh` 曝光）。
+        self._scan_job_dropped = 0          # 領到 scan job 但狀態顯示不該重掃
+        self._admission_skipped = 0         # 準入滿而跳過的單一 job 數
+        self._verify_served_by_deadline = 0  # 有界等待到期後讓 verify 插隊的次數
+        self._scan_writeback_duplicate = 0
+        self._scan_writeback_stale = 0
+        self._scan_writeback_missing = 0
         # Task 7.9a A3：`on_dirty` callback 拋例外的次數（`_notify_dirty` 吞例外
         # 後計數）——job 本身不因此遺失，這個計數器讓 callback 本身壞掉這件事
         # 變成可觀測（health 可見）。
@@ -236,6 +328,41 @@ class ExploreScheduler:
     @staticmethod
     def _key(address: str, kind: str) -> str:
         return f"{address.lower()}:{kind}"
+
+    # ---- store 介面（Task 7.9c-D 契約；過渡期的退路一律「保守」） ----
+    def _running_scan(self, address: str):
+        """該地址進行中的遍歷（`status='running'`），沒有就 `None`。D 的契約名
+        是 `running_scan`；過渡期沿用同語意的既有 `get_active_scan`。"""
+        fn = getattr(self._store, "running_scan", None) or self._store.get_active_scan
+        return fn(address)
+
+    def _latest_done_finished_at(self, address: str) -> float | None:
+        """該地址最近一次完成的遍歷的 `finished_at`（`store.latest_done_scan`）。
+        過渡期 D 尚未提供時回 `None`——依 `partial_rescan_due` 的契約等同「到期」，
+        重掃的實際間隔在過渡期由 job 的 `next_attempt_at`（收尾時排的 +24h）保證。"""
+        fn = getattr(self._store, "latest_done_scan", None)
+        if fn is None:
+            return None
+        scan = fn(address)
+        return None if scan is None else scan.finished_at
+
+    def _job_kinds(self, address: str) -> set[str] | None:
+        """該地址目前有哪些 kind 的 `refresh_job`（`store.job_kinds`）。過渡期
+        D 尚未提供時回 `None`＝「不知道」——呼叫端必須把它當成「不可判斷」而
+        不是「空集合」：補建路徑寧可不建（不知道有沒有既有 job 時貿然
+        `enqueue` 會因為 `MIN(next_attempt_at)` 把已排好的 +24h 重掃提前）。"""
+        fn = getattr(self._store, "job_kinds", None)
+        return None if fn is None else set(fn(address))
+
+    def _oldest_due_at(self, now: float, kinds: tuple[str, ...]) -> float | None:
+        """指定 kind 集合中最早的到期時刻（`store.oldest_due_at(now, kinds=...)`）。
+        過渡期 D 尚未加上 `kinds` 參數時回 `None`（＝不啟用有界等待，維持嚴格
+        讓位的既有行為，不會誤讓 verify 插隊）。"""
+        fn = self._store.oldest_due_at
+        params = inspect.signature(fn).parameters
+        if "kinds" not in params:
+            return None
+        return fn(now, kinds=kinds)
 
     # ---- 對外 ----
     def tick(self) -> str:
@@ -287,6 +414,19 @@ class ExploreScheduler:
             # 出現在 `/api/ops/health` 的 `explore_refresh`。
             "quarantined_max_attempts": self._quarantined_max_attempts,
             "dirty_errors": self._dirty_errors,
+            # Task 7.9c-S S6：遍歷軌生命週期／準入／核驗飢餓的可觀測面。
+            # `scans_running`／`verify_remaining` 是 DB 推導（重啟後仍正確），
+            # 代價是每次查詢對 active 候選各一次點查詢；`verify_remaining` 在
+            # 7.9c-D 的 `job_kinds` 落地前回 `None`＝「未知」（不是 0）。
+            "scans_running": self._scans_running(),
+            "verify_remaining": self._verify_remaining(),
+            "due_by_kind": {k: self._store.due_count(k, now) for k in _ALL_JOB_KINDS},
+            "scan_job_dropped": self._scan_job_dropped,
+            "admission_skipped": self._admission_skipped,
+            "verify_served_by_deadline": self._verify_served_by_deadline,
+            "scan_writeback_duplicate": self._scan_writeback_duplicate,
+            "scan_writeback_stale": self._scan_writeback_stale,
+            "scan_writeback_missing": self._scan_writeback_missing,
             # Task 7.9b B4：留存邊界探測觀測值，經 app.py `**scheduler.status()`
             # 自然出現在 `/api/ops/health` 的 `explore_refresh`。
             "probe": {
@@ -298,6 +438,26 @@ class ExploreScheduler:
                 "candidates": self._store.count_probe_candidates(),
             },
         }
+
+    def _scans_running(self) -> int:
+        """目前進行中的遍歷數（active 候選逐一查 `running_scan`）——同一地址
+        同時最多一筆，所以這也等於「正在被遍歷的地址數」。"""
+        return sum(1 for c in self._store.active_candidates()
+                   if self._running_scan(c.address) is not None)
+
+    def _verify_remaining(self) -> int | None:
+        """還沒做完的核驗遍歷數（有 `fills_verify` job 的 active 候選數）——
+        `due_by_kind["fills_verify"]` 只看「已到期」，遷移把 129 筆攤在 48 小時
+        內，要看整體進度必須看總數。`store.job_kinds`（7.9c-D）尚未落地時回
+        `None`＝未知。"""
+        total = 0
+        for c in self._store.active_candidates():
+            kinds = self._job_kinds(c.address)
+            if kinds is None:
+                return None
+            if "fills_verify" in kinds:
+                total += 1
+        return total
 
     # ---- 內部：一次 tick ----
     def _tick_once(self, now: float) -> str:
@@ -342,10 +502,23 @@ class ExploreScheduler:
         # 「優先」不是「只」：優先的那一類這一輪如果根本沒有到期 job，同一個
         # tick 改領另一類，不浪費這個 tick。
         self._base_scope_in_use = "explore_base" if fills_like_due else "explore"
+
+        # Task 7.9c-S S4：`fills_verify` 有界等待——最舊的到期 verify job 等超過
+        # `VERIFY_MAX_WAIT_S` 時，本 tick 的 fills 類名額改給一個 verify（仍要求
+        # 額度夠一整頁）。嚴格讓位在 fills-like 長期有積壓的正式機上等於永久
+        # 飢餓（遷移產生的 129 筆核驗永遠做不完，對外一直是 `evidence_unknown`）。
+        job = None
+        if self._verify_overdue(now) and self._fills_available() >= FILLS_PAGE_WEIGHT:
+            job = self._store.claim_due(
+                now, self._owner, self._lease_s, kinds=("fills_verify",))
+            if job is not None:
+                self._verify_served_by_deadline += 1
+
         prefer_fills = fills_like_due and self._fills_available() >= FILLS_PAGE_WEIGHT
-        job = self._store.claim_due(
-            now, self._owner, self._lease_s,
-            kinds=_FILLS_LIKE_KINDS if prefer_fills else _BASE_KINDS)
+        if job is None:
+            job = self._store.claim_due(
+                now, self._owner, self._lease_s,
+                kinds=_FILLS_LIKE_KINDS if prefer_fills else _BASE_KINDS)
         if job is None:
             if prefer_fills:
                 job = self._store.claim_due(now, self._owner, self._lease_s, kinds=_BASE_KINDS)
@@ -405,6 +578,12 @@ class ExploreScheduler:
         if job.kind in _FILLS_LIKE_KINDS or job.kind == "fills_verify":
             self._fills_served_since_probe += 1
         return result
+
+    def _verify_overdue(self, now: float) -> bool:
+        """最舊的到期 `fills_verify` job 是否已等超過 `VERIFY_MAX_WAIT_S`
+        （Task 7.9c-S S4 的有界等待判準）。"""
+        due_at = self._oldest_due_at(now, ("fills_verify",))
+        return due_at is not None and (now - due_at) >= VERIFY_MAX_WAIT_S
 
     def _run_job(self, job: Job, now: float, *, fills_due: bool = False) -> str:
         if job.kind == "candidates":
@@ -470,41 +649,63 @@ class ExploreScheduler:
         for addr in dropped:
             self._store.delete_jobs(addr)
 
+        # Task 7.9c-S S3（W4 修法）：準入從「整批候選一起被擋」改為「逐項准入」
+        # ——cap 滿只跳過單一個 job，其餘候選照常補排；新候選（第一次入池）的
+        # job 不受 cap 限制，否則一個被舊 job 撐滿的佇列會讓新地址永遠拿不到
+        # 任何補排機會（既有 job 又因為地址還活著而不會被回收）。
         jobs, active_n = self._store.admission_counts()
-        if jobs > ADMISSION_MULTIPLIER * active_n:
+        cap = ADMISSION_MULTIPLIER * active_n
+        skipped_before = self._admission_skipped
+        for rank, (address, _display_name) in enumerate(rows, start=1):
+            jobs = self._enqueue_address_jobs(address, rank, now, jobs=jobs, cap=cap)
+        skipped = self._admission_skipped - skipped_before
+        if skipped:
             logger.warning(
-                "explore scheduler: admission cap reached (%d jobs, %d active) — "
-                "本輪不再新增 per-address job", jobs, active_n)
-        else:
-            for rank, (address, _display_name) in enumerate(rows, start=1):
-                self._enqueue_address_jobs(address, rank, now)
+                "explore scheduler: admission cap reached (%d jobs, %d active, cap %d) — "
+                "本輪跳過 %d 個既有地址的補建 job（新候選不受限）",
+                jobs, active_n, cap, skipped)
 
         self._complete(job)
         self._store.enqueue(job.key, None, "candidates", job.priority,
                             now + self._candidates_every_s)
         return "ran:candidates"
 
-    def _enqueue_address_jobs(self, address: str, rank: int, now: float) -> None:
-        self._store.enqueue(self._key(address, "state"), address, "state", 0,
-                            now + _spread(address, self._state_every_s))
-        self._store.enqueue(self._key(address, "portfolio"), address, "portfolio", 1,
-                            now + _spread(address, self._portfolio_every_s))
-        self._store.enqueue(self._key(address, "ledger"), address, "ledger", 1,
-                            now + _spread(address, self._ledger_every_s))
-        fills_priority = 2 if rank <= self._hot_rank else 3
-        self._store.enqueue(self._key(address, "fills"), address, "fills", fills_priority,
-                            now + _spread(address, self._fills_every_s))
-        # Task 7.9b B1：新地址同時建立增量軌＋初始遍歷（`bootstrap_address_fills`
-        # 只在該地址第一次出現時真的建列，回 `True`——候選抖動重新入池不會
-        # 重建，見該方法 docstring）；`fills_scan` job 一律入列（`enqueue` 本身
-        # 冪等，已存在只會 MIN 優先級／時間，不會重複）。
+    def _enqueue_address_jobs(self, address: str, rank: int, now: float, *,
+                              jobs: int, cap: int) -> int:
+        """依**狀態**決定這個候選現在需要哪些 job，去重後逐項准入（Task 7.9c-S
+        S3）。回傳更新後的 `refresh_job` 估計總數（呼叫端逐個候選累加）。
+
+        `fills_scan`（遍歷軌）只在 `bootstrap_address_fills` 回 `True`（該地址
+        第一次入池、真的新建增量軌）時入列——既有地址一律不補建：`ExploreStore
+        .complete` 是 DELETE，舊版「每輪無條件 enqueue」等於每 30 分鐘把已經
+        `complete` 的地址重新排一次整窗遍歷（7.9b Critical C2）。遺失 job 的
+        復原改走 `_run_increment` 的修復路徑（只在 partial 且重掃到期時）。"""
         now_ms = int(now * 1000)
         window_start_ms, window_end_ms = fresh_scan_window(now_ms)
-        self._store.bootstrap_address_fills(
+        is_new = self._store.bootstrap_address_fills(
             address, now, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
             params_fp=PARAMS_FP)
-        self._store.enqueue(self._key(address, "fills_scan"), address, "fills_scan",
-                            fills_priority, now + _spread(address, self._fills_every_s))
+        fills_priority = 2 if rank <= self._hot_rank else 3
+        needed: list[tuple[str, int, float]] = [
+            ("state", 0, self._state_every_s),
+            ("portfolio", 1, self._portfolio_every_s),
+            ("ledger", 1, self._ledger_every_s),
+            ("fills", fills_priority, self._fills_every_s),
+        ]
+        if is_new:
+            needed.append(("fills_scan", fills_priority, self._fills_every_s))
+
+        existing = self._job_kinds(address)
+        for kind, priority, period_s in needed:
+            if existing is not None and kind in existing:
+                continue   # 已經有這個 kind 的 job，不重排（也不把它提前）
+            if not is_new and jobs >= cap:
+                self._admission_skipped += 1
+                continue
+            if self._store.enqueue(self._key(address, kind), address, kind, priority,
+                                   now + _spread(address, period_s)):
+                jobs += 1
+        return jobs
 
     def _run_cache_kind(self, job: Job, now: float, *, endpoint: str, fetch, period_s: float) -> str:
         payload = fetch(job.address)
@@ -542,8 +743,11 @@ class ExploreScheduler:
             self._complete(job)
             if not self._store.is_active(job.address):
                 return "dropped"
+            # `plan.next_due_ms` 是 planner 的毫秒制輸出——秒／毫秒轉換只發生在
+            # 這個邊界（Task 7.9c-S S1）。
             next_at = max(plan.next_due_ms / 1000, now + self._jit(60.0))
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
+            self._maybe_recover_scan_job(job.address, now)
             return "ran:fills"
 
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
@@ -561,19 +765,44 @@ class ExploreScheduler:
         if active:
             next_at = now + self._jit(self._fills_every_s)
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
+            self._maybe_recover_scan_job(job.address, now)
         self._notify_dirty()
         return "ran:fills" if active else "dropped"
 
+    def _maybe_recover_scan_job(self, address: str, now: float) -> None:
+        """遍歷軌 job 的**修復**路徑（Task 7.9c-S S2 (c)）：增量輪跑完後，若該
+        地址是 `partial`、沒有進行中的遍歷、重掃期限已到、而且現在確實沒有
+        `fills_scan` job（job 列被外部刪除／流程異常遺失），才立刻補排一次。
+
+        這是保險，不是主路徑——主路徑是 `_run_scan` 的 partial 收尾排
+        `now + PARTIAL_RESCAN_AFTER_S`。四個條件缺一不可：只要少一個，這個
+        方法就會退化成「job 不見就重建」，也就是 7.9b Critical C2 的形狀。
+        `job_kinds` 未知（7.9c-D 未落地）時一律不補排（見 `_job_kinds`）。"""
+        st = self._store.get_sync(address)
+        if st is None or st.completeness != "partial":
+            return
+        kinds = self._job_kinds(address)
+        if kinds is None or "fills_scan" in kinds:
+            return
+        if not _partial_rescan_due(self._latest_done_finished_at(address), now):
+            return
+        if self._running_scan(address) is not None:
+            return
+        if self._store.enqueue(self._key(address, "fills_scan"), address, "fills_scan", 3, now):
+            logger.warning(
+                "explore scheduler: %s 的 fills_scan job 遺失且 partial 重掃已到期 → 補排",
+                address)
+
     def _run_scan(self, job: Job, now: float, *, verify: bool) -> str:
-        """遍歷軌 job（kind='fills_scan'／'fills_verify'）——Task 7.9b B2／B3：
-        沒有進行中的 scan 時，依 `verify` 與目前增量軌 `completeness` 決定新
-        scan 的 `kind`（`verify` 一律建 `verify`；`backfilling`／缺列 → 建
-        `initial`；否則（`partial` 復原到期後排程進來的後續 job） → 建
-        `partial_rescan`）——三種 `kind` 的頁面套用邏輯相同，只有窗口與收尾
-        後的排程動作不同（`partial` 收尾要自動排下一次 `partial_rescan`，見
-        下方）。"""
+        """遍歷軌 job（kind='fills_scan'／'fills_verify'）——Task 7.9b B2／B3＋
+        7.9c-S S2：沒有進行中的 scan 時，新 scan 的 `kind` 由**狀態**決定：
+        `verify` job 一律建 `verify`；`backfilling`／缺 `fills_sync` 列 → 建
+        `initial`；`partial` **且**距離最近一次完成的遍歷已滿
+        `PARTIAL_RESCAN_AFTER_S` → 建 `partial_rescan`；其餘（`complete`、或
+        重掃未到期的 `partial`）→ 丟棄這個 job 並計 `scan_job_dropped`。三種
+        `kind` 的頁面套用邏輯相同，只有窗口與收尾後的排程動作不同。"""
         result_kind = "fills_verify" if verify else "fills_scan"
-        scan = self._store.get_active_scan(job.address)
+        scan = self._running_scan(job.address)
         if scan is None:
             now_ms = int(now * 1000)
             window_start_ms, window_end_ms = fresh_scan_window(now_ms)
@@ -581,8 +810,23 @@ class ExploreScheduler:
                 kind = "verify"
             else:
                 st = self._store.get_sync(job.address)
-                kind = "initial" if (st is None or st.completeness == "backfilling") \
-                    else "partial_rescan"
+                if st is None or st.completeness == "backfilling":
+                    kind = "initial"
+                elif st.completeness == "partial" and _partial_rescan_due(
+                        self._latest_done_finished_at(job.address), now):
+                    kind = "partial_rescan"
+                else:
+                    # Task 7.9c-S S2（Critical C2）：**有 job 不等於該重掃**。
+                    # `complete` 地址、以及重掃期限未到的 `partial` 地址，一律
+                    # 丟棄這個 job（不開 scan、也不排下一個）——舊版在這裡無
+                    # 條件建 `partial_rescan`，配合「每個 candidates 輪重建
+                    # scan job」讓已完成的地址每幾小時被整窗重掃一次。
+                    self._complete(job)
+                    self._scan_job_dropped += 1
+                    logger.info(
+                        "explore scheduler: 丟棄 %s 的 fills_scan job（completeness=%s，"
+                        "重掃未到期）", job.address, st.completeness)
+                    return "dropped"
             scan = self._store.create_scan(
                 job.address, kind=kind, window_start_ms=window_start_ms,
                 window_end_ms=window_end_ms, cursor_ms=window_start_ms, started_at=now,
@@ -601,16 +845,39 @@ class ExploreScheduler:
             return f"ran:{result_kind}"
 
         finished_scan = dataclasses.replace(res.scan, finished_at=now)
-        self._store.complete_scan(job.address, res.accepted, finished_scan)
+        writeback = _writeback_kind(
+            self._store.complete_scan(job.address, res.accepted, finished_scan))
+        # Task 7.9c-S S5：CAS 落空不得被當成正常收尾。fills 與 `fills_scan` 的
+        # `done` 標記在任一種結果下都已由 store 落地（資料不丟），差別只在
+        # 要不要把結論寫進 `fills_sync`、以及要不要排下一次重掃。
+        if writeback == _WB_MISSING:
+            logger.warning(
+                "explore scheduler: %s 的遍歷完成但 fills_sync 列不存在（scan_id=%s）——"
+                "丟棄 job，不排下一次重掃", job.address, finished_scan.scan_id)
+            self._scan_writeback_missing += 1
+            self._complete(job)
+            return "dropped"
+        if writeback == _WB_DUPLICATE:
+            logger.info("explore scheduler: %s 的遍歷結論已套用過（scan_id=%s），照常收尾",
+                        job.address, finished_scan.scan_id)
+            self._scan_writeback_duplicate += 1
+        elif writeback == _WB_STALE:
+            logger.warning(
+                "explore scheduler: %s 的遍歷結論過期（scan_id=%s，fills_sync 已指向更新的"
+                "一次遍歷）——不覆寫、不排下一次重掃", job.address, finished_scan.scan_id)
+            self._scan_writeback_stale += 1
         self._complete(job)
         active = self._store.is_active(job.address)
-        if active and not verify and finished_scan.result == "partial":
-            # Task 7.9b B3：`partial` 的唯一復原路徑——排一次
-            # `partial_rescan`，24 小時後再整窗重掃一次（同一個 `fills_scan`
-            # job key，`_run_scan` 屆時因為沒有進行中的 scan 且增量軌
-            # completeness=='partial' 而建出 `partial_rescan`）。
+        if (active and not verify and writeback != _WB_STALE
+                and finished_scan.result == "partial"):
+            # Task 7.9b B3／7.9c-S S1：`partial` 的主要復原路徑——排一次
+            # `partial_rescan`，`PARTIAL_RESCAN_AFTER_S`（秒）之後再整窗重掃
+            # 一次（同一個 `fills_scan` job key，`_run_scan` 屆時因為沒有進行
+            # 中的 scan、completeness 仍是 `partial` 且重掃已到期而建出
+            # `partial_rescan`）。`stale` 時不排：那一次遍歷的結論根本沒被採用，
+            # 由採用中的那次遍歷自己決定要不要重掃。
             self._store.enqueue(self._key(job.address, "fills_scan"), job.address,
-                                "fills_scan", 3, now + PARTIAL_RESCAN_AFTER_MS)
+                                "fills_scan", 3, now + _partial_rescan_after_s())
         self._notify_dirty()
         return f"ran:{result_kind}" if active else "dropped"
 
@@ -632,7 +899,7 @@ class ExploreScheduler:
         elif job.kind == "fills":
             self._store.set_sync_error(job.address, err, now)
         elif job.kind in ("fills_scan", "fills_verify"):
-            scan = self._store.get_active_scan(job.address)
+            scan = self._running_scan(job.address)
             if scan is not None:
                 self._store.set_scan_error(scan.scan_id, err)
         else:

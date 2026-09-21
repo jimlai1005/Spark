@@ -2009,6 +2009,56 @@ def test_health_explore_refresh_includes_probe_counters(tmp_path):
         "total": 0, "verified": 0, "empty": 0, "failed": 0, "stale": 0, "candidates": 0}
 
 
+def test_health_explore_refresh_includes_scan_lifecycle_counters(tmp_path):
+    """Task 7.9c-S S6：遍歷軌生命週期／準入／核驗飢餓的觀測鍵透過
+    `**scheduler.status()` 出現在 `explore_refresh`——`scans_running`／
+    `verify_remaining`（DB 推導）、`due_by_kind`（六種 per-address kind ＋
+    `candidates`）、`scan_job_dropped`／`admission_skipped`／
+    `verify_served_by_deadline`／三個 `scan_writeback_*` 計數器。"""
+    from spark.publicapi.explore_publisher import ExplorePublisher
+    from spark.publicapi.explore_scheduler import ExploreScheduler
+    from spark.publicapi.explore_store import ExploreStore
+    from spark.publicapi.hl_explore import ExploreConfig
+
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"),
+                   explore_upstream_refresh=True,
+                   explore_db_path=str(tmp_path / "explore.db"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    explore_store = ExploreStore(cfg.explore_db_path)
+    app = create_app(cfg, store, keysvc, hl, explore_store=explore_store)
+    publisher = ExplorePublisher(store=explore_store, index=app.state.explore_index,
+                                 cfg=ExploreConfig(), now_fn=lambda: 1000.0,
+                                 snapshot_path=None)
+    scheduler = ExploreScheduler(store=explore_store, hl=hl, leaderboard_source_fn=lambda: None,
+                                 excluded_fn=lambda: set(), cfg=ExploreConfig(),
+                                 now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                                 on_dirty=publisher.mark_dirty)
+    app.state.explore_scheduler = scheduler
+    app.state.explore_publisher = publisher
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    body = client.get("/api/ops/health").json()
+    refresh = body["explore_refresh"]
+    assert refresh["scans_running"] == 0
+    assert refresh["verify_remaining"] == 0
+    assert set(refresh["due_by_kind"]) == {"candidates", "state", "portfolio", "ledger",
+                                           "fills", "fills_scan", "fills_verify"}
+    assert refresh["due_by_kind"]["fills_scan"] == 0
+    assert refresh["scan_job_dropped"] == 0
+    assert refresh["admission_skipped"] == 0
+    assert refresh["verify_served_by_deadline"] == 0
+    assert refresh["scan_writeback_duplicate"] == 0
+    assert refresh["scan_writeback_stale"] == 0
+    assert refresh["scan_writeback_missing"] == 0
+
+
 def test_health_explore_refresh_includes_dirty_errors_and_quarantine_counter(tmp_path):
     """Task 7.9a A2／A3：`quarantined_max_attempts`／`dirty_errors` 透過
     `**scheduler.status()` 自然出現在 `explore_refresh`，兩者從 0 起算。"""
