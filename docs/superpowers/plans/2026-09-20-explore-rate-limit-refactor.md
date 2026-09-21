@@ -1531,6 +1531,58 @@ job 消失後下一輪又建、`_run_scan` 見 completeness!=backfilling 就開 
 
 **驗收（主線程親跑）**：ruff；pytest 全綠 > 3212；`repro_rescan.py`（複審腳本）3 天情境：`partial_rescan` ≤ 3、rescan job 到期 ≈ +1 天；`repro_79b.py` 仍 PASS；正式機快照遷移三次（含 version 改回 2 重跑）一致。
 
+##### 7.9c 第二輪裁決（2026-09-22 使用者）：拆成 7.9c-D（資料層）與 7.9c-S（排程）平行派工，介面先釘死；最後主線程用正式機資料庫複本整合驗收
+
+<!-- 使用者裁決要點：兩個 Critical 一起修、守住排程生命週期（秒／毫秒轉換集中在排程邊界、partial 重掃期限單一來源、fills_scan 只能因首次回補／partial 到期／明確修復需求建立，不能因 job 列已刪就重建）；
+「partial 24h 後重掃」「complete 跨多次 candidates 輪不重掃」升為正式回歸測試；準入與核驗飢餓列為部署阻擋項（W4 不能只提高 cap：先依狀態決定需要哪些 job、逐項去重與准入，容量滿不能讓整批候選失去補排；
+fills_verify 不能永久嚴格讓位，要有界等待或服務份額並納入額度與需求算式）；資料層 Warning 本批補齊（遷移保留原子交易並實作冪等；恢復 observed_*；scan 保留與清理計數；complete_scan 回傳區分成功／重複／過期／異常，CAS 落空不得被排程器當成正常收尾）；
+coverage gap 不能改成「同步落後＝缺口」（落後＝stale；是否漏資料要看覆蓋區間與留存證據），補真正跨缺口案例，恢復仍存在的 probe 行為測試；inc_from_ms 非空在寫入／遷移邊界保證，不靠執行時隔離；
+舊 complete 因缺證據轉 pending 符合契約，不以「維持約 214 個合格者」為驗收目標。 -->
+
+**檔案所有權（兩個 builder 不得互改對方檔案）**
+- **7.9c-D（資料層）**：`src/spark/publicapi/explore_store.py`、`src/spark/publicapi/explore_fills_sync.py`、`tests/test_explore_store.py`、`tests/test_explore_fills_sync.py`。
+- **7.9c-S（排程）**：`src/spark/publicapi/explore_scheduler.py`、`tests/test_explore_scheduler.py`、`tests/test_api_ops.py`（只改 health 斷言）。
+- 主線程：整合驗收、`explore_publisher.py`／`app.py` 若需微調、B8 文件（RUNBOOK／研究報告）。
+
+**介面契約（D 提供、S 依賴；兩邊都以此為準，S 在 D 未完成前可先用 monkeypatch／fake store 寫測試）**
+```python
+# explore_fills_sync.py（D）
+PARTIAL_RESCAN_AFTER_S = 24 * 3600          # 唯一來源（秒）；不得再出現 *_MS 版本
+def partial_rescan_due(finished_at: float | None, now: float) -> bool   # finished_at None → True
+# explore_store.py（D）
+class ScanWriteback(str, Enum): APPLIED = "applied"; DUPLICATE = "duplicate"; STALE = "stale"; MISSING = "missing"
+def complete_scan(self, address, fills, scan) -> ScanWriteback   # DB 例外照常拋出（不吞）
+def bootstrap_address_fills(...) -> bool                          # 只有真的新建增量軌才 True
+def latest_done_scan(self, address) -> FillsScan | None           # finished_at 最大者
+def running_scan(self, address) -> FillsScan | None
+def job_kinds(self, address) -> set[str]                          # 該地址現有 refresh_job 的 kind 集合
+def oldest_due_at(self, now, *, kinds: tuple[str, ...] | None = None) -> float | None   # 既有方法加 kinds 參數
+def purge(...) -> dict   # counts 加 "fills_scan" 鍵
+```
+
+**7.9c-D 工作項**
+- D1 常數與判斷：`PARTIAL_RESCAN_AFTER_S`、`partial_rescan_due()`；刪除 `PARTIAL_RESCAN_AFTER_MS`（全 repo 零命中，S 那邊由 S 改）。
+- D2 `apply_incremental_page` 維護 `observed_from/to_ms`（min/max 併入）；`complete_scan` 把 scan 的 `observed_*` 併入 `fills_sync`（min/max）。
+- D3 `complete_scan` 回 `ScanWriteback`：CAS 命中 → APPLIED；`fills_sync.scan_id == scan.scan_id` 已是目前 → DUPLICATE（不重寫）；`fills_sync.scan_id` 指向 `started_at` 更晚的 scan → STALE；無 `fills_sync` 列 → MISSING。三種非 APPLIED 都**不改** `fills_sync`，但 `fills_scan` 仍標 done、fills 仍落地（資料不丟）。
+- D4 `purge`：`fills_scan` 刪 `status='done' AND finished_at < now − 30d AND scan_id != fills_sync.scan_id`；整址 purge 連帶刪除；兩者都計入 `counts["fills_scan"]`。
+- D5 遷移 v2→v3：DDL（`ALTER`／`CREATE TABLE IF NOT EXISTS`）各自冪等；**列迴圈＋版本更新包在一個顯式 `BEGIN IMMEDIATE … COMMIT`**（失敗全回滾）；列迴圈冪等（該地址已有 `fills_scan` 列則整列跳過；`INSERT OR IGNORE` 建 job；`refresh_job` 改名用 `NOT EXISTS` 守門）；`verify` job 攤開用地址雜湊決定（重跑不變）。測試：v2 快照複本遷移後把 version 改回 2 再開 → 無例外、列數與各 kind job 數不變；列迴圈中途注入例外 → version 仍 2、`fills_scan` 為空（回滾）。
+- D6 `inc_from_ms` 非空邊界：`bootstrap_address_fills`／`insert_fills_page`／遷移寫入時 `inc_from_ms is None` → `ValueError`（不落地）；`ExploreStore.__init__` 遷移後檢查 `SELECT count(*) FROM fills_sync WHERE inc_from_ms IS NULL`，>0 → 拋 `RuntimeError`（啟動失敗、訊息含筆數）。`plan_incremental` 不再對 None 做退路。
+- D7 gap 語義維持「覆蓋區間」定義（`scan.window_end_ms >= inc_from_ms`），docstring 寫明：落後＝stale 不是 gap；gap 只在遍歷窗口未接上增量軌起點時成立（遷移異常、時鐘異常、人工修復）。**真正跨缺口案例測試**：(i) 手寫 v2 backfilling 列且 `window_end` 早於 now 6h → 遷移後 `inc_from == window_end` → scan 完成 gap=0（修好的路徑）；(ii) 直接寫入 `inc_from_ms` 晚於 scan `window_end_ms` 的列 → `complete_scan` 後 `coverage_gap=1`、`external_coverage_state` 回 `("partial","coverage_gap")`；(iii) 之後一次 `partial_rescan`（`window_end=now ≥ inc_from`）完成 → gap 清 0。
+- D8 `latest_done_scan`／`running_scan`／`job_kinds`／`oldest_due_at(kinds=)`。
+- 驗收：ruff；`uv run pytest -q tests/test_explore_store.py tests/test_explore_fills_sync.py` 全綠；正式機快照（`scratchpad/prod_meta_v2.db` cp 後）遷移三次（含 version 回 2）一致且無例外；`rg -n "PARTIAL_RESCAN_AFTER_MS" src tests` 只剩 scheduler（S 會清）。
+
+**7.9c-S 工作項**
+- S1 單位：所有 `now + …` 用 `PARTIAL_RESCAN_AFTER_S`（秒）；scheduler 內任何毫秒換算只在呼叫 planner 的邊界（`int(now*1000)`），不得出現其他 `* 1000`／`/ 1000` 於排程時間。
+- S2 `fills_scan` 建立只有三種來源：(a) `_enqueue_address_jobs` 中 `bootstrap_address_fills` 回 True（首次回補）；(b) `_run_scan` partial 收尾排 `now + PARTIAL_RESCAN_AFTER_S`（partial 到期）；(c) 修復：`_run_increment` 跑完後 `completeness=="partial" and partial_rescan_due(latest_done_scan.finished_at, now) and running_scan is None and "fills_scan" not in job_kinds` → 立即入列。其他路徑一律不建。`_run_scan` 領到 job 但無 running scan 時：`completeness=="partial" and partial_rescan_due(...)` 才開 `partial_rescan`；否則 `_complete(job)`、`scan_job_dropped += 1`、回 `"dropped"`。
+- S3 依狀態決定需要的 job（W4）：`_enqueue_address_jobs(address, rank, now)` 改為「算需要集合 → 去重 → 逐項准入」：需要集合＝`{state, portfolio, ledger, fills}` ∪ (`{fills_scan}` 若 bootstrap True)；去重＝扣掉 `store.job_kinds(address)`；逐項准入＝每入列一個 job 前檢查 `jobs < cap`，cap 到了就只跳過**這一個**並計 `admission_skipped`，不跳過整批候選；新候選（bootstrap True）的 4＋1 個 job **不受 cap 限制**（保證新地址永遠有補排機會）。`ADMISSION_MULTIPLIER` 改 7 並在 docstring 列出 6 種 kind。
+- S4 `fills_verify` 有界等待：維持「先讓位」，但若 `store.oldest_due_at(now, kinds=("fills_verify",))` 的等待 ≥ `VERIFY_MAX_WAIT_S = 2 * 3600`，本 tick 的 fills 類名額改給一個 verify（與 probe 的 9:1 同一套名額計算：verify 佔用一次 fills-like 名額）；計數 `verify_served_by_deadline`。需求算式（B8，主線程寫）納入：verify 份額上限＝每 2h 至少 1 次 ⇒ 129 列最慢 ~11 天，實際在 fills 空檔會更快。
+- S5 `complete_scan` 回傳處理：APPLIED → 既有收尾；DUPLICATE → `logger.info`＋`scan_writeback_duplicate`，照常收尾；STALE → `logger.warning`＋`scan_writeback_stale`，**不**排 partial_rescan、不探測；MISSING → `logger.warning`＋`scan_writeback_missing`、`_complete(job)` 回 `"dropped"`。
+- S6 `status()` 加 `scans_running`、`verify_remaining`、`due_by_kind`（六種 kind 到期數）、`scan_job_dropped`、`admission_skipped`、`verify_served_by_deadline`、三個 writeback 計數。
+- S7 測試（全部正式回歸測試，放 `tests/test_explore_scheduler.py`）：(a) **complete 地址跨 5 個 candidates 輪＋3 天：`fills_scan` 列恰 1（initial）、`partial_rescan` 0**；(b) **partial 地址 → 第一次重掃到期在 `[now+86400−60, now+86400+60]`，3 天內 partial_rescan ≤ 3**；(c) 刪掉 partial 地址的 `fills_scan` job → 一個增量週期內修復入列並執行；(d) 複審腳本 `scratchpad/repro_rescan.py` 的 3 天／每 30 分 candidates 輪情境照抄成測試（斷言同 (a)）；(e) 準入：cap 邊緣時既有地址只跳過超額的單一 job、新候選仍拿到全部 job；(f) verify 等待 ≥2h 後被服務（且不超過名額）、未滿 2h 時嚴格讓位；(g) 四種 `ScanWriteback` 各自的收尾行為（用 fake store 或 monkeypatch）；(h) 恢復五條 probe 行為測試（升級／probe_empty／窗外不升級且 failed 計數／例外不中斷 tick／退池不探）。
+- 驗收：ruff；`uv run pytest -q tests/test_explore_scheduler.py tests/test_api_ops.py` 全綠（D 未完成時允許以 fake store 通過，整合後主線程重跑）；`rg -n "PARTIAL_RESCAN_AFTER_MS|\* 1000|/ 1000" src/spark/publicapi/explore_scheduler.py` 只剩呼叫 planner 的 `int(now * 1000)`。
+
+**主線程整合驗收（兩批 commit 後）**：全量 pytest＋vitest＋ruff；正式機快照複本（`prod_meta_v2.db` cp）：遷移 → 關閉重開（模擬重啟）→ 以 fake HL 模擬 3 天運行（每 30 分 candidates 輪、6h 增量、真實 300 地址）→ 斷言：`fills_scan` 新增列數 ≤ 初始 running 完成數＋partial 重掃數（無反覆新增）、`fills_verify` 129 列持續遞減至 0、六種 kind 的 `oldest_due` 都有界（無飢餓）、探測 ≤ fills-like 的 1/10；`repro_rescan.py`／`repro_79b.py` PASS；B8 文件（需求算式含 verify 份額）。之後才派 fresh reviewer、再部署。
+
 <!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c 為準，衝突時以 v2 為準。 -->
 ### Task 7.9 v1（已被 v2 取代，僅供對照）：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
 
