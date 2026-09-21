@@ -230,7 +230,14 @@ class SequencedFillsHL:
         return []
 
 
-def test_fills_multi_page_completes_over_four_ticks_and_state_gets_a_turn(tmp_path):
+def test_fills_multi_page_completes_and_state_also_gets_a_turn(tmp_path):
+    """Task 7.4b（2026-09-21 主線程裁決）：舊斷言釘住的是「state（priority 0）
+    嚴格優先於 fills（priority 2）」——這正是本 task 用 fills 保留額度
+    （`explore_fills`）取代嚴格優先級所要改變的行為（嚴格優先級曾讓 fills
+    在正式機一小時內完全拿不到額度）。改為行為級斷言：fills 四頁在有限
+    tick 內全部完成、且過程中 state job 至少執行一次一一兩個方向都不能被
+    對方餓死（`_fills_available()` 無 limiter 時交替 120/0，見同檔案
+    `test_fills_available_alternates_without_limiter_neither_side_starves`）。"""
     clock = Clock(t=40 * 86400.0)  # window 起點在 epoch 之後，避免負時間戳
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     now_ms = int(clock.now() * 1000)
@@ -253,11 +260,16 @@ def test_fills_multi_page_completes_over_four_ticks_and_state_gets_a_turn(tmp_pa
     sched = _sched(store, hl, clock=clock)
     sched._bootstrapped = True
 
-    results = [sched.tick() for _ in range(5)]
-    assert results.count("ran:state") == 1
+    results: list[str] = []
+    for _ in range(20):
+        r = sched.tick()
+        results.append(r)
+        sync = store.get_sync("0xabc")
+        if sync is not None and sync.completeness == "complete":
+            break
+
     assert results.count("ran:fills") == 4
-    # state（priority 0）比 fills（priority 2）先跑
-    assert results.index("ran:state") < results.index("ran:fills")
+    assert results.count("ran:state") >= 1
 
     sync = store.get_sync("0xabc")
     assert sync.completeness == "complete"
@@ -265,6 +277,36 @@ def test_fills_multi_page_completes_over_four_ticks_and_state_gets_a_turn(tmp_pa
     # 相鄰兩頁 inclusive 重疊 1 筆（上一頁最後一筆＝下一頁第一筆，同 tid），
     # 3 個頁界共去重 3 筆：2000*3+500-3。
     assert len(store.get_fills("0xabc", 0, cursor4 + 500)) == PAGE_LIMIT * 3 + 500 - 3
+
+
+def test_fills_available_alternates_without_limiter_neither_side_starves(tmp_path):
+    """裁決 2（2026-09-21）：`_fills_available()` 沒有 limiter 時不再恆回
+    `FILLS_PAGE_WEIGHT`（那會讓有 fills 待處理的 tick 永遠選中 fills、反向
+    餓死基礎類別）——改成每次呼叫交替 120/0。無 limiter、fills 與 state
+    同時到期，4 個 tick 內兩類各至少領工 2 次。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates(
+        [("0xaaa", None, 1, None), ("0xbbb", None, 2, None), ("0xfff", None, 3, None)],
+        as_of=clock.now())
+    store.enqueue("0xaaa:state", "0xaaa", "state", 0, clock.now())
+    store.enqueue("0xbbb:state", "0xbbb", "state", 0, clock.now())
+    store.enqueue("0xfff:fills", "0xfff", "fills", 2, clock.now())
+
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    page1 = _fills_page(PAGE_LIMIT, window_start_ms)
+    cursor2 = page1[-1]["time"]
+    page2 = _fills_page(500, cursor2)  # 短頁，觸發 done
+
+    hl = SequencedFillsHL([page1, page2])
+    sched = _sched(store, hl, clock=clock)  # 不傳 hl_base/hl_fills：無 limiter
+    sched._bootstrapped = True
+
+    results = [sched.tick() for _ in range(4)]
+
+    assert results.count("ran:state") >= 2
+    assert results.count("ran:fills") >= 2
 
 
 # --- 5. 重啟：新 scheduler 接續 cursor，不從頭 ---
@@ -650,6 +692,180 @@ def test_fills_non_candidate_continues_paging_until_done_then_dropped(tmp_path):
     assert sync.pages_done == 3
     assert store._db.execute(
         "SELECT COUNT(*) FROM refresh_job WHERE key='0xabc:fills'").fetchone()[0] == 0
+
+
+# --- Task 7.4b: 週期放寬、重排 overdue、類別感知領工、等待加權（飢餓重現） ---
+
+def test_scheduler_default_periods_widened(tmp_path):
+    clock = Clock()
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    sched = _sched(store, FakeHL(), clock=clock)
+    assert sched._state_every_s == 1800
+    assert sched._portfolio_every_s == 7200
+    assert sched._ledger_every_s == 7200
+
+
+def test_first_tick_rebalances_overdue_state_jobs_and_reports_status(tmp_path):
+    """Task 7.4b「重排」：啟動時 100 個嚴重逾期（超過新週期 1800s）的 state job，
+    第一個 tick 後全部被攤到 `(now, now+1800]` 內、不全部相同，`status()["rebalanced"]`
+    揭露筆數。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addresses = [f"0x{'0' * 24}{(i * 2654435761) % (2**32):08x}" for i in range(100)]
+    store.upsert_candidates([(a, None, i + 1, None) for i, a in enumerate(addresses)],
+                            as_of=clock.now())
+    for a in addresses:
+        store.enqueue(f"{a}:state", a, "state", 0, clock.now() - 4000.0)
+
+    sched = _sched(store, FakeHL(), clock=clock, rng=lambda: 0.0)
+    sched._bootstrapped = True  # 略過 candidates bootstrap，直接驗證第一個 tick 的重排
+
+    sched.tick()
+
+    rows = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE kind='state'").fetchall()
+    assert len(rows) == 100
+    times = {r[0] for r in rows}
+    for (t,) in rows:
+        assert clock.now() <= t <= clock.now() + 1800.0
+    assert len(times) > 1  # 攤平後不再全部相同
+
+    status = sched.status()
+    assert status["rebalanced"]["state"] == 100
+
+    # 第二次 tick 不再重排（只做一次）。
+    store.enqueue("0xzzz:state", "0xzzz", "state", 0, clock.now() - 4000.0)
+    sched.tick()
+    status2 = sched.status()
+    assert status2["rebalanced"]["state"] == 100  # 沒有再把新塞進去的那筆算進來
+
+
+def test_no_fills_pending_base_jobs_use_parent_scope_up_to_300(tmp_path):
+    """無 fills 待處理時，基礎類別（此測試用 portfolio）走父 scope `explore`，
+    可用到超過 `explore_base`(180) 的上限。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addresses = [f"0x{'0' * 24}{(i * 2654435761) % (2**32):08x}" for i in range(30)]
+    store.upsert_candidates([(a, None, i + 1, None) for i, a in enumerate(addresses)],
+                            as_of=clock.now())
+    for a in addresses:
+        store.enqueue(f"{a}:portfolio", a, "portfolio", 1, clock.now())
+    # 刻意不排任何 fills job：due_count("fills", now) 永遠是 0。
+
+    def post(url, body):
+        assert body["type"] == "portfolio"
+        return [["day", {}]]
+
+    lim = WeightLimiter(global_cap=900,
+                        scope_caps={"explore": 300, "explore_base": 180, "explore_fills": 120},
+                        scope_parents={"explore_base": "explore", "explore_fills": "explore"},
+                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=clock.sleep, limiter=lim)
+    hl = gw.scoped("explore", wait_s=0.0)
+    hl_base = gw.scoped("explore_base", wait_s=0.0)
+    hl_fills = gw.scoped("explore_fills", wait_s=0.0)
+
+    sched = _sched(store, hl, hl_base=hl_base, hl_fills=hl_fills, clock=clock,
+                  state_every_s=10**9, portfolio_every_s=10**9, ledger_every_s=10**9,
+                  fills_every_s=10**9, rng=lambda: 0.0)
+    sched._bootstrapped = True
+
+    max_explore_used = 0
+    for _ in range(200):
+        r = sched.tick()
+        if r in ("idle", "no_budget"):
+            break
+        snap = lim.snapshot()
+        max_explore_used = max(max_explore_used, snap["used"].get("explore", 0))
+        assert snap["used"].get("explore_base", 0) == 0
+
+    assert max_explore_used >= 240  # 遠超 explore_base 的 180 上限
+    assert sched.status()["base_scope_in_use"] == "explore"
+
+
+class _FillsPager:
+    """依實際請求的 `start_ms` 動態產生分頁內容（避免預先算好的頁內容因為
+    測試迴圈的虛擬時間不對齊而落在 plan 的 `[start_ms, end_ms]` 之外）：
+    每個地址前 3 頁滿頁（`PAGE_LIMIT`），第 4 頁短頁（500 筆）觸發 `done`。"""
+
+    def __init__(self):
+        self._page_idx: dict[str, int] = {}
+        self.state_calls = 0
+        self.fills_calls = 0
+
+    def next_fills_page(self, address: str, start_ms: int, end_ms: int) -> list[dict]:
+        self.fills_calls += 1
+        idx = self._page_idx.get(address, 0)
+        self._page_idx[address] = idx + 1
+        n = PAGE_LIMIT if idx < 3 else 500
+        return [{"coin": "BTC", "tid": start_ms + i, "time": start_ms + i} for i in range(n)]
+
+
+def test_fills_starvation_reproduction_bounded_and_progressing(tmp_path):
+    """使用者第 4 點的飢餓重現：300 地址、`state_every_s=1`（基礎永遠有積壓）、
+    fake HL 全部成功、fills 每地址 3 滿頁＋1 短頁；驅動 fake clock 30 分鐘 →
+    fills 頁數 >= 25、state 抓取在前後 15 分鐘都持續發生、任一 60 秒切片：
+    explore 合計 <=300 且（fills 全程待處理）base <=180。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addresses = [f"0x{'0' * 24}{(i * 2654435761) % (2**32):08x}" for i in range(300)]
+    store.upsert_candidates([(a, None, i + 1, None) for i, a in enumerate(addresses)],
+                            as_of=clock.now())
+    for a in addresses:
+        store.enqueue(f"{a}:state", a, "state", 0, clock.now())
+        store.enqueue(f"{a}:fills", a, "fills", 2, clock.now())
+    # 刻意不排 portfolio/ledger job（本次重現聚焦 state vs fills 的類別級飢餓；
+    # portfolio/ledger 已由 Task 3.1 的權重預算測試覆蓋）。
+
+    pager = _FillsPager()
+
+    def post(url, body):
+        t = body["type"]
+        if t == "clearinghouseState":
+            pager.state_calls += 1
+            return {"marginSummary": {"accountValue": "1"}}
+        if t == "userFillsByTime":
+            return pager.next_fills_page(body["user"], body["startTime"], body["endTime"])
+        raise AssertionError(f"unexpected type {t}")
+
+    lim = WeightLimiter(global_cap=900,
+                        scope_caps={"explore": 300, "explore_base": 180, "explore_fills": 120},
+                        scope_parents={"explore_base": "explore", "explore_fills": "explore"},
+                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=clock.sleep, limiter=lim)
+    hl = gw.scoped("explore", wait_s=0.0)
+    hl_base = gw.scoped("explore_base", wait_s=0.0)
+    hl_fills = gw.scoped("explore_fills", wait_s=0.0)
+
+    sched = _sched(store, hl, hl_base=hl_base, hl_fills=hl_fills, clock=clock,
+                  state_every_s=1, portfolio_every_s=10**9, ledger_every_s=10**9,
+                  fills_every_s=10**9, rng=lambda: 0.0)
+    sched._bootstrapped = True
+
+    start_time = clock.now()
+    end_time = start_time + 1800.0
+    state_times: list[float] = []
+    ticks = 0
+    while clock.now() < end_time:
+        ticks += 1
+        assert ticks < 5_000_000, "測試迴圈超過安全上限，可能卡住"
+        r = sched.tick()
+        if r == "ran:state":
+            state_times.append(clock.now() - start_time)
+        if r in ("idle", "no_budget"):
+            clock.t += 1.0
+        snap = lim.snapshot()
+        assert snap["used"].get("explore", 0) <= 300
+        assert snap["used"].get("explore_base", 0) <= 180
+
+    assert pager.fills_calls >= 25
+    assert any(t < 900.0 for t in state_times), "前 15 分鐘應有 state 抓取"
+    assert any(t >= 900.0 for t in state_times), "後 15 分鐘應持續有 state 抓取"
+
+    status = sched.status()
+    assert status["fills_pages_total"] == pager.fills_calls
+    assert status["last_fills_at"] is not None
+    assert status["base_scope_in_use"] == "explore_base"  # 全程 fills 都待處理
 
 
 def test_run_forever_survives_tick_exceptions(tmp_path):

@@ -428,3 +428,94 @@ def test_count_with_payload_distinct_address_not_per_params_fp(tmp_path):
     store.put_cache_ok("0xaaa", "portfolio", {"y": 2}, fetched_at=c.now(), refresh_after=c.now(),
                        params_fp="dex1")
     assert store.count_with_payload("portfolio") == 1
+
+
+# --- Task 7.4b: claim_due(kinds=) / due_count / rebalance_overdue ---
+
+def test_claim_due_kinds_filter_only_claims_listed_kinds(tmp_path):
+    store, c = _store(tmp_path)
+    store.enqueue("0xabc:fills", "0xabc", "fills", priority=2, next_attempt_at=c.now())
+    store.enqueue("0xabc:state", "0xabc", "state", priority=0, next_attempt_at=c.now())
+
+    job = store.claim_due(c.now(), "owner1", lease_s=60, kinds=("fills",))
+    assert job is not None
+    assert job.kind == "fills"
+    # 只剩 state（fills 已被領走並上鎖）；再限定 kinds=("fills",) 應拿不到。
+    assert store.claim_due(c.now(), "owner1", lease_s=60, kinds=("fills",)) is None
+    job2 = store.claim_due(c.now(), "owner1", lease_s=60, kinds=("state",))
+    assert job2 is not None
+    assert job2.kind == "state"
+
+
+def test_claim_due_without_kinds_still_works(tmp_path):
+    """向後相容：不傳 `kinds` 行為與改動前相同。"""
+    store, c = _store(tmp_path)
+    store.enqueue("0xabc:state", "0xabc", "state", priority=0, next_attempt_at=c.now())
+    job = store.claim_due(c.now(), "owner1", lease_s=60)
+    assert job is not None
+    assert job.kind == "state"
+
+
+def test_claim_due_orders_by_priority_with_wait_time_escalation(tmp_path):
+    """priority 3 等了 20 分鐘（1200s）→ 升 2 級（floor(1200/600)=2，夾 3）
+    ＝有效 priority 1；priority 2 剛到期（wait=0）→ 有效 priority 2。
+    等待較久的（priority 3、已升級）先被領。"""
+    store, c = _store(tmp_path)
+    store.enqueue("0xhot:fills", "0xhot", "fills", priority=2, next_attempt_at=c.now())
+    store.enqueue("0xcold:fills", "0xcold", "fills", priority=3,
+                 next_attempt_at=c.now() - 1200.0)
+
+    job = store.claim_due(c.now(), "owner1", lease_s=60, kinds=("fills",))
+    assert job is not None
+    assert job.key == "0xcold:fills"
+
+
+def test_due_count_counts_only_matching_kind_and_due(tmp_path):
+    store, c = _store(tmp_path)
+    store.enqueue("0xabc:fills", "0xabc", "fills", priority=2, next_attempt_at=c.now())
+    store.enqueue("0xdef:fills", "0xdef", "fills", priority=2, next_attempt_at=c.now() + 100)
+    store.enqueue("0xabc:state", "0xabc", "state", priority=0, next_attempt_at=c.now())
+
+    assert store.due_count("fills", c.now()) == 1
+    assert store.due_count("state", c.now()) == 1
+    assert store.due_count("portfolio", c.now()) == 0
+
+
+def test_rebalance_overdue_only_touches_overdue_rows_and_spreads_them(tmp_path):
+    store, c = _store(tmp_path)
+    # A 嚴重逾期（超過 period 4000s）；B 只是普通到期（未逾期 period）。
+    store.enqueue("0xa:state", "0xa", "state", priority=0, next_attempt_at=c.now() - 4000.0)
+    store.enqueue("0xb:state", "0xb", "state", priority=0, next_attempt_at=c.now())
+    lease_before = store._db.execute(
+        "SELECT lease_until, fencing FROM refresh_job WHERE key='0xb:state'").fetchone()
+
+    n = store.rebalance_overdue("state", c.now(), 1800.0, lambda addr: 42.0)
+
+    assert n == 1
+    row_a = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE key='0xa:state'").fetchone()
+    assert row_a[0] == pytest.approx(c.now() + 42.0)
+    row_b = store._db.execute(
+        "SELECT next_attempt_at, lease_until, fencing FROM refresh_job "
+        "WHERE key='0xb:state'").fetchone()
+    assert row_b[0] == c.now()  # 未逾期者不動
+    assert (row_b[1], row_b[2]) == lease_before  # lease/fencing 不受影響
+
+
+def test_rebalance_overdue_spreads_many_jobs_not_all_same_time(tmp_path):
+    store, c = _store(tmp_path)
+    for i in range(20):
+        addr = f"0x{i:040x}"
+        store.enqueue(f"{addr}:state", addr, "state", priority=0,
+                      next_attempt_at=c.now() - 4000.0)
+
+    from spark.publicapi.explore_scheduler import _spread
+    n = store.rebalance_overdue("state", c.now(), 1800.0, lambda a: _spread(a, 1800.0))
+
+    assert n == 20
+    rows = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE kind='state'").fetchall()
+    times = {r[0] for r in rows}
+    assert len(times) > 1
+    for (t,) in rows:
+        assert c.now() <= t <= c.now() + 1800.0

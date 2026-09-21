@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -393,22 +393,69 @@ class ExploreStore:
                 "AND (lease_until IS NULL OR lease_until < ?)", (now, now)).fetchone()
         return row[0]
 
-    def claim_due(self, now: float, owner: str, lease_s: float) -> Job | None:
+    def claim_due(self, now: float, owner: str, lease_s: float, *,
+                  kinds: tuple[str, ...] | None = None) -> Job | None:
         """單一條件式 `UPDATE ... RETURNING`：挑最早到期且無有效 lease 的一列，
         設 `lease_until`／`lease_owner`、`fencing+=1`。SQLite ≥ 3.35 支援 RETURNING
-        （本環境 3.53.1，見驗收證據）。"""
+        （本環境 3.53.1，見驗收證據）。
+
+        Task 7.4b（2026-09-21，fills 類別級飢餓修法）：
+        - `kinds`：只在指定的 kind 集合內挑選（`AND kind IN (...)`）——scheduler
+          用它區分「這一輪只領 fills」還是「這一輪只領基礎類別」，`None` 維持
+          舊行為（不限定，向後相容既有呼叫端與測試）。
+        - 排序改為等待時間加權：`priority - MIN(3, floor((now - next_attempt_at)
+          / 600))`——每多等 10 分鐘、有效 priority 降一級（數字越小越優先），
+          最多降 3 級，避免同一 priority 內先到期的 job 被持續插隊的新 job
+          永久排擠（正式機觀測：hot 地址不斷有新 job 到期，讓老 job 一直排不到）。
+          `CAST(... AS INTEGER)` 對非負值等於 floor（本查詢只會挑
+          `next_attempt_at <= now` 的列，差值恆 >= 0）。
+        """
+        kind_filter = ""
+        kind_params: tuple = ()
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            kind_filter = f" AND kind IN ({placeholders})"
+            kind_params = tuple(kinds)
         with self._lock, self._db:
             row = self._db.execute(
                 "UPDATE refresh_job SET lease_until=?, lease_owner=?, fencing=fencing+1 "
                 "WHERE key = (SELECT key FROM refresh_job WHERE next_attempt_at <= ? "
-                "AND (lease_until IS NULL OR lease_until < ?) "
-                "ORDER BY priority, next_attempt_at LIMIT 1) "
+                "AND (lease_until IS NULL OR lease_until < ?)" + kind_filter +
+                " ORDER BY (priority - MIN(3, CAST((? - next_attempt_at) / 600 AS INTEGER))), "
+                "next_attempt_at LIMIT 1) "
                 "RETURNING key, address, kind, priority, created_at, next_attempt_at, "
                 "attempts, lease_until, lease_owner, fencing, last_error",
-                (now + lease_s, owner, now, now)).fetchone()
+                (now + lease_s, owner, now, now, *kind_params, now)).fetchone()
         if row is None:
             return None
         return Job(*row)
+
+    def due_count(self, kind: str, now: float) -> int:
+        """`kind` 目前到期（`next_attempt_at <= now`）且無有效 lease 的工作筆數
+        （Task 7.4b：scheduler 用它判斷「fills 有沒有待處理」）。"""
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM refresh_job WHERE kind=? AND next_attempt_at<=? "
+                "AND (lease_until IS NULL OR lease_until < ?)", (kind, now, now)).fetchone()
+        return row[0]
+
+    def rebalance_overdue(self, kind: str, now: float, period_s: float,
+                          spread_fn: Callable[[str], float]) -> int:
+        """把 `kind` 且逾期超過一個週期（`next_attempt_at < now - period_s`）的
+        job 重設到 `now + spread_fn(address)`（Task 7.4b：週期改長之後，舊積壓
+        若不重排會先把新週期的額度占滿；未逾期的 job 不動、lease 不動）。回傳
+        被重排的筆數。地址為 `NULL`（例如全域性 kind，本模組目前無此案例）時
+        傳 `key` 給 `spread_fn`，避免 `spread_fn(None)` 出錯。"""
+        cutoff = now - period_s
+        with self._lock, self._db:
+            rows = self._db.execute(
+                "SELECT key, address FROM refresh_job WHERE kind=? AND next_attempt_at<?",
+                (kind, cutoff)).fetchall()
+            for key, address in rows:
+                next_at = now + spread_fn(address if address is not None else key)
+                self._db.execute(
+                    "UPDATE refresh_job SET next_attempt_at=? WHERE key=?", (next_at, key))
+        return len(rows)
 
     def complete(self, job: Job, fencing: int) -> bool:
         with self._lock, self._db:

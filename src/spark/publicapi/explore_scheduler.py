@@ -8,12 +8,25 @@ plan `docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md` Task 3.1
 `gateway.scoped("explore")`，wait_s=0——本模組不自己等額度，額度不夠就讓位給
 下一輪 tick，spec §3 條件「超過預算就 stale、不暴衝」）。
 
-容量估算（300 候選池，spec §6，2026-09-20 主線程裁決追加 ledger）：
-- state：`clearinghouseState` 2 weight／900s ≈ 40 weight/分鐘。
-- portfolio：`portfolio` 20 weight／3600s ≈ 100 weight/分鐘。
-- ledger：`userNonFundingLedgerUpdates` 20 weight／3600s ≈ 100 weight/分鐘。
-合計 240 weight/分鐘，explore 子預算 300/分鐘尚餘 60 weight/分鐘給 fills
-（14400s 週期、每頁上限 120 weight，實際頁數視回補進度而定）。
+容量估算與 Task 7.4b 修正（2026-09-21 使用者裁決：正式機證實 fills 類別級飢餓——
+嚴格優先級＋沒有為 fills 一頁 120 weight 的大請求保留額度，state/portfolio/ledger
+的穩態流量長期貼著 300 上限，fills 一小時拿不到一次額度）：
+- 週期放寬：state 900→1800s、portfolio／ledger 3600→7200s（各欄位 `as_of`／
+  `fetched_at` 仍是抓取當下的真實時間，只有「多久抓一次」變慢）——約
+  20＋50＋50＝120 weight/分鐘，留 ~180 給 fills。
+- 限流器父子 scope（`hl_budget.WeightLimiter` Task 7.4a）：`explore`（父，300）／
+  `explore_base`（子，180）／`explore_fills`（子，120）。有 fills 待處理
+  （`store.due_count("fills", now) > 0`）時，基礎類別走 `hl_base`（scoped
+  `explore_base`，上限 180）、fills 走 `hl_fills`（scoped `explore_fills`，
+  保證每分鐘至少擠進一頁 120 weight 的 `userFillsByTime`）；無 fills 待處理時
+  基礎類別改走父 scope `hl`（可用滿 300）。`hl_base`／`hl_fills` 皆可為
+  `None`（退回 `hl`），維持舊呼叫端（單一 gateway、無父子 scope）的行為不變。
+- 領工優先序＋等待加權：`store.claim_due` 的排序公式對等待越久的 job
+  「升級」有效 priority（`priority - min(3, floor(wait_s/600))`，每等 10 分鐘
+  降一級），避免同 priority 內先到期的 job 被持續插隊的新到期 job 永久排擠。
+- 啟動時重排既有 overdue：第一個 tick 對 state／portfolio／ledger 各自呼叫
+  `store.rebalance_overdue`，把逾期超過新週期的 job 打散到 `(now, now+period]`
+  ——不重排的話，週期改長後這些舊積壓仍會先把新週期的額度占滿。
 
 四種 kind：`state`（priority 0）、`portfolio`／`ledger`（priority 1，同級）、
 `fills`（前 `hot_rank` 名 priority 2，其餘 3）；`candidates`（priority 0）
@@ -36,10 +49,20 @@ from typing import Callable
 
 from spark.publicapi.explore_fills_sync import apply_page, plan_page
 from spark.publicapi.explore_store import ExploreStore, Job
-from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited
+from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
 from spark.publicapi.hl_explore import ExploreConfig, _roi_sort_key, candidate_addresses
 
 logger = logging.getLogger(__name__)
+
+# Task 7.4b（2026-09-21 使用者裁決，fills 類別級飢餓修法）：一頁 `userFillsByTime`
+# 預留的上限權重（與 `hl_budget.ENDPOINT_WEIGHTS["userFillsByTime"]` 同源，工程原則
+# 1）——`_fills_available()` 用它判斷 `explore_fills` 保留額度是否夠讓一整頁擠進去。
+FILLS_PAGE_WEIGHT = weight_for("userFillsByTime")
+
+# Task 7.4b：非 fills 的四種 kind，領工時一起用 `kinds=` 限定（`claim_due` 的
+# IN 子句）——candidates 本身也走這個集合，它不吃 explore_base／explore_fills
+# 的區分（`_run_job` 直接用 `leaderboard_source_fn`，不經任何 scoped gateway）。
+_BASE_KINDS = ("candidates", "state", "portfolio", "ledger")
 
 # 準入上限：`refresh_job` 總數 ≤ ADMISSION_MULTIPLIER × active 候選數（2026-09-20
 # 主線程裁決：原 4× 因新增 ledger job 而放寬為 5×——四個 per-address job 種類
@@ -88,18 +111,28 @@ def _roi_lookup(payload: dict, excluded: set[str]) -> dict[str, float | None]:
 
 class ExploreScheduler:
     """單 thread、逐 job 執行；每個 job＝一次 HL 呼叫（或一頁 fills）。所有持久化走
-    ExploreStore，所有 HL 呼叫走 `hl`（必須是 gateway.scoped("explore")，wait_s=0）。"""
+    ExploreStore，所有 HL 呼叫走 `hl`（必須是 gateway.scoped("explore")，wait_s=0）。
+
+    Task 7.4b：`hl_base`／`hl_fills` 是 `hl_base=gateway.scoped("explore_base")`／
+    `hl_fills=gateway.scoped("explore_fills")` 的保留額度視圖，皆可省略（`None`）
+    ——省略時基礎類別與 fills 一律退回 `hl`（父 scope），與改動前行為一致，供
+    未接父子 scope 的舊呼叫端／測試沿用。"""
 
     def __init__(self, *, store: ExploreStore, hl, leaderboard_source_fn: Callable[[], dict | None],
                  excluded_fn: Callable[[], set[str]], cfg: ExploreConfig, now_fn, sleep_fn,
                  on_dirty: Callable[[], None], owner: str = "api", lease_s: float = 60.0,
-                 candidates_every_s: float = 1800, state_every_s: float = 900,
-                 portfolio_every_s: float = 3600, ledger_every_s: float = 3600,
+                 hl_base=None, hl_fills=None,
+                 candidates_every_s: float = 1800,
+                 state_every_s: float = 1800,
+                 portfolio_every_s: float = 7200,
+                 ledger_every_s: float = 7200,
                  fills_every_s: float = 14400, hot_rank: int = 50, jitter_pct: float = 0.10,
                  rng: Callable[[], float] = random.random,
                  on_tick: Callable[[], None] | None = None):
         self._store = store
         self._hl = hl
+        self._hl_base = hl_base
+        self._hl_fills = hl_fills
         self._leaderboard_source_fn = leaderboard_source_fn
         self._excluded_fn = excluded_fn
         self._cfg = cfg
@@ -119,12 +152,21 @@ class ExploreScheduler:
         self._on_tick = on_tick
 
         self._bootstrapped = False
+        self._first_tick_done = False
         self._ticks = 0
         self._last_tick_at: float | None = None
         self._last_result: str | None = None
         self._results: dict[str, int] = {}
         self._last_candidates_ok_at: float | None = None
         self._candidates_empty_streak = 0
+        # Task 7.4b：fills 保留額度的類別感知領工觀測值。
+        self._fills_pages_total = 0
+        self._last_fills_at: float | None = None
+        self._base_scope_in_use = "explore"
+        self._rebalanced: dict[str, int] = {}
+        # 2026-09-21 主線程裁決：`_fills_available()` 無 limiter 時的交替旗標
+        # ——初值 False，第一次呼叫翻成 True（回 120），第二次翻回 False（回 0）。
+        self._fallback_turn = False
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -176,21 +218,61 @@ class ExploreScheduler:
             "oldest_due_age_s": None if oldest is None else max(0.0, now - oldest),
             "last_candidates_ok_at": self._last_candidates_ok_at,
             "candidates_empty_streak": self._candidates_empty_streak,
+            "fills_pages_total": self._fills_pages_total,
+            "last_fills_at": self._last_fills_at,
+            "base_scope_in_use": self._base_scope_in_use,
+            "rebalanced": dict(self._rebalanced),
         }
 
     # ---- 內部：一次 tick ----
     def _tick_once(self, now: float) -> str:
+        if not self._first_tick_done:
+            self._first_tick_done = True
+            self._rebalanced = self._rebalance_overdue_base_jobs(now)
+            logger.info(
+                "explore scheduler: 重排逾期 job（新週期 state=%.0fs portfolio=%.0fs "
+                "ledger=%.0fs）：%s", self._state_every_s, self._portfolio_every_s,
+                self._ledger_every_s, self._rebalanced)
+
         if not self._bootstrapped:
             self._bootstrapped = True
             self._store.enqueue("candidates:candidates", None, "candidates", 0, now)
             return "idle"
 
-        job = self._store.claim_due(now, self._owner, self._lease_s)
+        # Task 7.4b（2026-09-21 主線程二次裁決）：類別感知的領工——有 fills
+        # 待處理且 `explore_fills` 保留額度足夠擠進一整頁時，優先從 fills 領；
+        # 否則優先從基礎類別領。但「優先」不是「只」：優先的那一類這一輪如果
+        # 根本沒有到期 job（例如非候選地址只有 fills、沒有任何基礎 job），
+        # 同一個 tick 改領另一類，不浪費這個 tick——否則會把「沒有競爭對象」
+        # 的情境也誤判成節流，讓本來每 tick 都能跑的類別平白變慢一半
+        # （builder 回報：這正是舊測試
+        # `test_fills_non_candidate_continues_paging_until_done_then_dropped`
+        # 被打斷的原因）。`fills_due` 同時決定基礎 job 執行時要不要走受限的
+        # `explore_base`（見 `_run_job`）——這個判斷只看「fills 是否待處理」，
+        # 不受這裡的 fallback 影響。
+        fills_due = self._store.due_count("fills", now) > 0
+        self._base_scope_in_use = "explore_base" if fills_due else "explore"
+        prefer_fills = fills_due and self._fills_available() >= FILLS_PAGE_WEIGHT
+        job = self._store.claim_due(
+            now, self._owner, self._lease_s, kinds=("fills",) if prefer_fills else _BASE_KINDS)
+        if job is None:
+            # fallback：同一 tick 改領另一類。`fills_due` 已經用同一個
+            # `next_attempt_at <= now` 條件查過一次——`fills_due is False`
+            # 時 `claim_due(kinds=("fills",))` 保證也會是 `None`（單一
+            # thread、沒有其他 writer 插隊），省下一次確定沒有意義的查詢，
+            # 讓「兩類都沒有到期 job」的 idle tick 仍只查一次（不因新增的
+            # fallback 機制而變成兩次——這正是舊測試
+            # `test_run_forever_sleeps_after_unexpected_exception` 用
+            # claim_due 呼叫次數對應 tick 次數時會被打亂的地方）。
+            if prefer_fills:
+                job = self._store.claim_due(now, self._owner, self._lease_s, kinds=_BASE_KINDS)
+            elif fills_due:
+                job = self._store.claim_due(now, self._owner, self._lease_s, kinds=("fills",))
         if job is None:
             return "idle"
 
         try:
-            return self._run_job(job, now)
+            return self._run_job(job, now, fills_due=fills_due)
         except BudgetExhausted:
             self._reschedule(job, now + 5, bump_attempts=False)
             return "no_budget"
@@ -211,23 +293,26 @@ class ExploreScheduler:
             self._quarantine(job, now, e)
             return "quarantined"
 
-    def _run_job(self, job: Job, now: float) -> str:
+    def _run_job(self, job: Job, now: float, *, fills_due: bool = False) -> str:
         if job.kind == "candidates":
             return self._run_candidates(job, now)
+        # Task 7.4b：fills 待處理時基礎抓取走受限的 `explore_base`（保留額度
+        # 給 fills）；沒有 `hl_base`（舊呼叫端／測試未接父子 scope）一律退回 `hl`。
+        base_hl = self._hl_base if (fills_due and self._hl_base is not None) else self._hl
         if job.kind == "state":
             return self._run_cache_kind(
                 job, now, endpoint="clearinghouseState",
-                fetch=lambda addr: self._hl.clearinghouse_state(addr),
+                fetch=lambda addr: base_hl.clearinghouse_state(addr),
                 period_s=self._state_every_s)
         if job.kind == "portfolio":
             return self._run_cache_kind(
                 job, now, endpoint="portfolio",
-                fetch=lambda addr: self._hl.portfolio(addr),
+                fetch=lambda addr: base_hl.portfolio(addr),
                 period_s=self._portfolio_every_s)
         if job.kind == "ledger":
             return self._run_cache_kind(
                 job, now, endpoint="ledger",
-                fetch=lambda addr: self._hl.non_funding_ledger_updates(addr, 0),
+                fetch=lambda addr: base_hl.non_funding_ledger_updates(addr, 0),
                 period_s=self._ledger_every_s)
         if job.kind == "fills":
             return self._run_fills(job, now)
@@ -318,7 +403,13 @@ class ExploreScheduler:
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
             return "ran:fills"
 
-        page = self._hl.get_fills_page(job.address, plan.start_ms, plan.end_ms)
+        # Task 7.4b：`self._fills_available()` 已檢查（見 `_tick_once`）用
+        # `self._hl_fills` 判斷保留額度；這裡沿同一個 gateway 實際發送——兩處
+        # 用同一個屬性、同一個 scope，才是同源同基準的判斷（工程原則 1）。
+        hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
+        page = hl_fills.get_fills_page(job.address, plan.start_ms, plan.end_ms)
+        self._fills_pages_total += 1
+        self._last_fills_at = now
         res = apply_page(plan, page, now_ms=int(now * 1000))
         self._store.insert_fills_page(job.address, res.accepted, res.state)
         self._on_dirty()
@@ -353,6 +444,43 @@ class ExploreScheduler:
         if limiter is None:
             return 60.0
         return limiter.snapshot()["paused_remaining_s"].get("explore", 60.0)
+
+    def _fills_available(self) -> int:
+        """`explore_fills` 保留 scope 目前還能預留多少權重（Task 7.4b）——
+        用它判斷「值不值得這一輪把工作分給 fills」。刻意只看 `self._hl_fills`
+        （不像 `_run_job` 那樣在 `None` 時退回 `self._hl`）。
+
+        2026-09-21 主線程二次裁決：沒有接父子 scope 的舊呼叫端／測試沒有真正
+        的限流器可查，只在「基礎類別也有到期 job」時才交替回
+        `FILLS_PAGE_WEIGHT`／`0`（`self._fallback_turn`）——沒有基礎 job 在
+        排隊時，交替毫無意義，只會把本來每 tick 都能跑的 fills 平白拖慢一半
+        （`_tick_once` 的 fallback-claim 已經處理了「優先類別這輪沒 job 就換
+        另一類」，這裡的交替只用來處理『兩類都有 job 排隊、無 limiter 時如何
+        公平分配』這個更窄的情境）。有真實 limiter（生產接線）時完全不受
+        影響，一律照 `limiter.available("explore_fills")` 的真實保留額度判斷。"""
+        limiter = getattr(self._hl_fills, "_limiter", None)
+        if limiter is not None:
+            return limiter.available("explore_fills")
+        now = self._now()
+        base_due = any(self._store.due_count(kind, now) > 0 for kind in _BASE_KINDS)
+        if not base_due:
+            return FILLS_PAGE_WEIGHT
+        self._fallback_turn = not self._fallback_turn
+        return FILLS_PAGE_WEIGHT if self._fallback_turn else 0
+
+    def _rebalance_overdue_base_jobs(self, now: float) -> dict[str, int]:
+        """第一個 tick 對三個基礎 kind 各自呼叫 `store.rebalance_overdue`
+        （Task 7.4b：週期改長之後，舊積壓若不重排會先把新週期的額度占滿）。
+        用 default-arg 綁定當下迴圈的 `period`——lambda 直接閉包 `period`
+        會在迴圈跑完後統一指到最後一次賦值（ledger 的週期），造成三個 kind
+        全部用同一個週期打散。"""
+        rebalanced: dict[str, int] = {}
+        for kind, period in (("state", self._state_every_s),
+                             ("portfolio", self._portfolio_every_s),
+                             ("ledger", self._ledger_every_s)):
+            rebalanced[kind] = self._store.rebalance_overdue(
+                kind, now, period, lambda addr, period=period: _spread(addr, period))
+        return rebalanced
 
     # ---- 內部：lease/fencing 收尾（輸家 log warning、不重試） ----
     def _complete(self, job: Job) -> bool:
