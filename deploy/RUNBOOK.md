@@ -2827,6 +2827,19 @@ concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶�
 本機 6 分鐘主網實測（部署前）：fills 6 頁／6 分鐘、base ≤174、explore ≤294、零 429。opus 複審可部署（3 Warning 已於 7db0720 修）。
 **24 小時觀測期自 2026-09-21 01:12 UTC（台北 9/21 09:12）重新起算，期末 2026-09-22 01:12 UTC（台北 9/22 09:12）**；Explore 預算維持 300；follower 同 IP 缺口仍未結案。觀測結束只移除臨時取樣 cron（`/home/ubuntu/explore-obs`），先把 `samples.jsonl`／`cohort_t0.json` 複製到本機 `docs/superpowers/research/` 保存；`/api/ops/health` 指標與 journal 告警不動。
 
+**2026-09-21 第五次部署（commit `85942cc`，05:54 UTC，Task 7.5＋7.6：complete 判定證據與增量輪正確性）：** 使用者授權（「部署，7.5 7.6都上去」）。
+內容：留存門檻命名（`HL_FILLS_RETENTION_LIMIT=10,000`／`RETENTION_SAFETY_THRESHOLD=8,000`）、complete 一律帶 reason（`count_below_retention_threshold`／
+`retention_boundary_verified`）、留存邊界探測（每地址至多探到有結論、回應經 `validate_page`、health `explore_refresh.probe` 四計數器）、`fills_sync.params_fp`
+（**schema v1→v2 migration**，啟動時自動；`ALTER` 為 DDL 自動提交、兩步各自冪等）、`fills_coverage` 契約加 `window_start`／`window_end`／`params_fp`；7.6 修增量輪
+兩個正確性缺陷（滿頁後誤判 noop 停滯；partial 在增量短頁被誤升 complete）——增量輪保留 completeness／reason，reason 語義＝建立該狀態的那次全區間遍歷的證據。
+流程：rsync 兩段 → `uv sync` 略過（pyproject 無變動）→ import 檢查（`PARAMS_FP`、`_SCHEMA_VERSION=2`）→ §4.2 build → chown root → **DB 備份**
+`sudo python3`（sqlite3 `backup()` API，WAL 下安全）→ `/var/lib/filet-api/explore.db.pre-75.bak`（filet-api 0600）＋快照 `explore_index.json.pre-75.bak`
+→ restart `filet-api`＋`filet-dashboard`（flag 維持 1，不做 0→1）→ 8 秒後：schema 2、complete 無 NULL reason（140 列補標）、`params_fp` 舊列 `''`（新輪自癒）、
+零 Traceback／429 → `DEPLOYED_VERSION` → `filet_regression_check --http --ssh` 67/67 PASS。⚠️ 重啟當下探測撞 `BudgetExhausted`（explore_fills 保留額度剛被
+本輪 fills 用掉）屬預期，記 warning、reason 不變、下輪再探。**觀測期不重新起算**（排程與預算行為不變）。
+回退：程式回退照 §9.3；DB 回退＝停 filet-api → `install -o filet-api -g filet-api -m 600 explore.db.pre-75.bak explore.db`（並刪 `-wal`／`-shm`）→ 起服務；舊程式讀 v2 DB 亦可運作（只多一欄）。
+→ 7.6 複審（opus）三條 Warning：partial 自 7.6 起成吸收態（7.6 前會被錯誤升回 complete）、探測回空每輪重探、A1 不變量敘述——修法 Task 7.7（partial 每 24h 整窗重掃、`probe_empty` reason、docstring），部署後修正。
+
 **2026-09-21 設定變更（無程式碼部署，19:21 UTC 09-20，推薦碼 `JIMLAI1005` → `FILET`）：** 使用者指示換碼並把推薦人錢包改為
 Filet Alpha `0xfB9C52f56F03D786AD5D435aa70fe45D80569760`。前置確認：主網 `referral` 端點回 `referrerState.stage == ready`、
 `code == FILET`（該錢包 `cumVlm` 70,766，已過建碼門檻）。流程照 §5.8d (f)：`cp -a` 備份 `/etc/filet/referral.env.bak-20260920-192110`

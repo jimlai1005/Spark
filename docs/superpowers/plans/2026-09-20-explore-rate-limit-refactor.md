@@ -1400,6 +1400,35 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 
 **驗收（主線程親跑）**：`uv run ruff check src tests scripts`；`uv run pytest -q`（全綠，數量 > 3159）；`rg -n "_validate_page" src tests` 零命中；主線程重跑重現腳本（scratchpad `repro_76.py`）：增量滿頁後 `is_noop False`、partial 增量後仍 partial。
 
+### Task 7.7 @inline：7.6 複審修正——partial 復原路徑、探測只做一次、docstring 不變量（2026-09-21 主線程裁決）
+
+<!-- 來源：7.6 fresh review（opus）W1–W3／S1–S4。7.6 已於 2026-09-21 05:54 UTC 隨 7.5 部署（使用者授權），本 task 是部署後的修正批，
+完成後再部署一次（無 schema 變更）。主線程裁決：
+W1（`cursor == synced_through` 邊界）——不改述語為 `>=`：短頁收尾不改 cursor，`cursor == synced_through == end_ms` 是合法的「輪已結束」狀態，
+改 `>=` 會讓下一 tick 無限重抓 `[end,end]`。複審重現的卡死情境（同一毫秒 ≥2,000 筆）是 `same_ms_overflow` 既有的吸收態，7.6 前後皆然，
+不在本批修；只改 docstring／plan 把不變量寫準確。
+W2（partial 成吸收態）——7.6 前 partial 會在增量短頁被（錯誤地）升回 complete；7.6 移除後缺復原路徑。裁決：partial 地址不做增量輪，
+每 24 小時整窗重掃一次（正確的復原：重新全區間遍歷，門檻重新判）。成本：每個 partial 地址每日約 4–5 頁（≤600 權重），正式機現有 3 列。
+W3（探測回空每輪重探）——加第三個 reason 碼記錄「已探過、無更早成交」，探測條件排除它 ⇒ 每次全區間遍歷後至多探一次。 -->
+
+**Files:** `src/spark/publicapi/explore_fills_sync.py`、`explore_scheduler.py`、`explore_store.py`；對應測試；plan 契約表 A 的 reason 說明。不動 schema、不動前端（前端不解讀 reason 字串）。
+
+1. **partial 復原（W2）**：`explore_fills_sync` 加常數 `PARTIAL_RESCAN_AFTER_MS = 24 * 3600 * 1000`；`plan_page` 的 `partial` 分支改為：`now_ms - state.window_end_ms >= PARTIAL_RESCAN_AFTER_MS` → 回傳與 `state is None` 相同形狀的全新首輪（新窗 `[now-30d, now]`、`cursor=window_start`、`completeness="backfilling"`、`reason=None`、`pages_done=0`、`fills_in_window=0`、`synced_through_ms=None`、observed 兩欄清 None、`params_fp=PARAMS_FP`）；未滿 24 小時 → noop（`start==end==synced_through`）。「輪進行中」判斷（A1）仍在最前面，partial 多頁重掃中途不受影響。`complete` 分支不變（仍 4 小時增量）。docstring 寫明：partial 不做增量，因為增量只延伸尾端、無法證明先前無法證明的部分；復原只能靠整窗重掃。
+2. **探測只做一次（W3）**：`explore_store` 加 `REASON_PROBE_NO_EARLIER_FILLS = "count_below_retention_threshold_probe_empty"`（語義：門檻推論成立，且探測起點前一天無可查成交、無法升級）；scheduler 探測回空頁 → `set_sync_reason(addr, REASON_PROBE_NO_EARLIER_FILLS)`；探測條件維持 `completeness=="complete" and reason==REASON_COUNT_BELOW_RETENTION_THRESHOLD`（新碼自然排除）；探測失敗（例外／非法回應）仍不改 reason（下輪再試）。`_run_fills` 註解改成「每次全區間遍歷後至多探到有結論（verified 或 probe_empty）為止」。
+3. **docstring 不變量（W1）**：`plan_page` docstring 與 plan 7.6 A1 的敘述改為：「輪開始時 `cursor ≤ synced_through`（overlap）；滿頁後 `cursor = 最後一筆時間 ≥ synced_through`，其中 `==` 只在該毫秒溢出時發生並由 `same_ms_overflow` 終止為 partial；短頁收尾不改 cursor。故 `cursor > synced_through` ⇒ 輪進行中；反向不成立（`==` 的兩種狀態都是輪已結束）。」
+4. **S2**：`_probe_retention_boundary` 任一次 `set_sync_reason` 後呼叫 `self._on_dirty()`。
+5. **S4**：`set_sync_reason` 移入 try（store 寫入失敗 → warning、`_probe_failed += 1`、不逸出）。
+6. **S1**：探測回空測試斷言 `status()["probe"] == {"total":1,"verified":0,"empty":1,"failed":0}` 且 reason 變為 `count_below_retention_threshold_probe_empty`；再跑一輪增量 → fake HL 不再收到探測呼叫、`probe.total` 仍 1。
+7. **測試**：partial 未滿 24h → noop；partial 滿 24h → 首輪形狀（backfilling、reason None、cursor=window_start、synced_through None）；重掃後筆數低於門檻 → complete／count_below（復原成功）；重掃仍超標 → partial／retention_limit；partial 重掃多頁中途 A1 續抓；`complete` 分支行為不變。
+8. **探測在保留額度下永遠失敗（正式機 2026-09-21 05:54–05:57 實證，主線程裁決）**：`explore_fills` 子預算 cap 120，本輪 fills 頁剛預留／結算過（短頁結算後仍佔 20+），同一分鐘內再預留 120 必然 `BudgetExhausted`——正式機每個 complete 收尾都印一行「留存邊界探測失敗 … BudgetExhausted」，探測從未成功過。修法：
+   - `_probe_retention_boundary` 改成只在**額度足夠時**發送：先 `self._fills_available() >= FILLS_PAGE_WEIGHT`（沿用 7.4b 同源判斷）才打；不足 → 把 `(address, window_start_ms)` 放進 `self._probe_deferred: collections.deque`（maxlen 64，同地址去重），計數 `probe.deferred += 1`，**不 log**。
+   - `_tick_once` 開頭（領工之前）：若 `_probe_deferred` 非空且 `_fills_available() >= FILLS_PAGE_WEIGHT` → pop 一個做探測（用 deque 裡記的 `window_start_ms` 算探測窗；探測前重讀 `get_sync`，若該列已不是 `complete`／`count_below_retention_threshold` 或地址已退池則丟棄）；每 tick 至多一個，然後照常領工。這讓探測與 fills 頁公平輪流分同一保留額度，不會餓死任何一方。
+   - 例外分類：`BudgetExhausted`／`ScopePaused`（`hl_budget.is_rate_limited` 或型別判斷）→ 視同「額度不足」進 deferred、不 log；其他例外 → warning＋`probe.failed`。
+   - `status()["probe"]` 加 `deferred`（目前佇列長度）與 `deferred_total`。
+   - 測試：fake limiter 讓 `_fills_available()` 先回 0 → 探測進 deferred、無上游呼叫、無 warning；下一 tick 回 120 → 探測送出、佇列清空；同地址兩次 complete 只留一筆；退池／狀態改變者被丟棄。
+
+**驗收（主線程親跑）**：ruff 乾淨；`uv run pytest -q` 全綠且 > 3171；`rg -n "probe_empty" src tests` 有命中；scratchpad `repro_77.py`（主線程寫）：partial 狀態 25h 後 `plan_page` 回 backfilling 首輪、短頁後 complete；探測回空後第二輪不再探；部署後正式機 journal 不再每分鐘出現「探測失敗 … BudgetExhausted」，且 `explore_refresh.probe.verified` 或 `empty` 在 30 分鐘內 > 0。
+
 ## P5 驗收與啟用準備（任務卡）
 
 - Task 5.1 @sdd：`deploy/RUNBOOK.md` 新節「Explore 背景刷新」：env（`FILET_HL_GLOBAL_WEIGHT_CAP`、`FILET_HL_EXPLORE_WEIGHT_CAP`、`FILET_EXPLORE_DB`、`EXPLORE_UPSTREAM_REFRESH`）、drop-in 檔名、觀察 `/api/ops/health.hl_budget`／`.explore_refresh`、停用刷新（設 `EXPLORE_UPSTREAM_REFRESH=0` 重啟，快照續讀）、回退（不重新啟用舊 rebuild；程式已刪）。`deploy/filet-api.service.d/explore-refresh.conf` 範本；`var/lib/filet-api/explore.db` 權限 `filet-api` 0600。
