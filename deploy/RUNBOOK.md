@@ -2840,6 +2840,14 @@ concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶�
 回退：程式回退照 §9.3；DB 回退＝停 filet-api → `install -o filet-api -g filet-api -m 600 explore.db.pre-75.bak explore.db`（並刪 `-wal`／`-shm`）→ 起服務；舊程式讀 v2 DB 亦可運作（只多一欄）。
 → 7.6 複審（opus）三條 Warning：partial 自 7.6 起成吸收態（7.6 前會被錯誤升回 complete）、探測回空每輪重探、A1 不變量敘述——修法 Task 7.7（partial 每 24h 整窗重掃、`probe_empty` reason、docstring），部署後修正。
 
+**2026-09-21 第六次部署（commit `7150d81`，06:54 UTC，Task 7.7＋7.8：partial 復原、探測延後、noop 重排同源）：** 7.6 複審修正批。內容：`partial` 不做增量、每 24h 整窗重掃
+（`PARTIAL_RESCAN_AFTER_MS`）；探測回空落 `count_below_retention_threshold_probe_empty`（每次全區間遍歷至多探到有結論）；探測額度不足 → deferred 佇列、下 tick 領工前補打一個
+（health `explore_refresh.probe` 七鍵：total/verified/empty/failed/deferred/deferred_total/dropped）；7.8 修 7.7 複審 Critical——noop 計畫自帶 `next_due_ms`、排程端 `max(next_due, now+jit)`，
+任何路徑不得排到過去（7.7 單獨部署會讓 partial 地址在 4h 後把 scheduler 拖成緊迴圈餓死全部 job；7.7 從未單獨上線）。流程：rsync 兩段 → import（`PagePlan` 含 `next_due_ms`）→ web／pyproject 無變動
+略過 build 與 `uv sync` → chown root → DB 備份 `explore.db.pre-78.bak` → **只 restart `filet-api`** → 8 秒後 active、零 Traceback → `DEPLOYED_VERSION` → 回歸 67/67。觀測期不重新起算。
+部署後盯：journal 不再每分鐘出現「探測失敗 … BudgetExhausted」；`fills_sync.reason` 出現 `…_probe_empty`／`retention_boundary_verified`；`explore_refresh.queue_depth`／`oldest_due_age_s` 不因探測與 fills 頁輪流分保留額度而單調上升（每地址一生至多一次探測，上限 300 次，暫時代價）。
+待辦（7.7＋7.8 合併複審 Warning，下一批）：`test_incremental_round_short_page_preserves_partial_reason` 已成空測試（走 invalid_page 分支）；詳情頁按需入列用 `updated_at ≥ 4h` 判斷，partial 地址 24h 內每次詳情頁請求都會把 fills job 拉回 now 換一次 noop（不打上游、不餓死他人）。
+
 **2026-09-21 設定變更（無程式碼部署，19:21 UTC 09-20，推薦碼 `JIMLAI1005` → `FILET`）：** 使用者指示換碼並把推薦人錢包改為
 Filet Alpha `0xfB9C52f56F03D786AD5D435aa70fe45D80569760`。前置確認：主網 `referral` 端點回 `referrerState.stage == ready`、
 `code == FILET`（該錢包 `cumVlm` 70,766，已過建碼門檻）。流程照 §5.8d (f)：`cp -a` 備份 `/etc/filet/referral.env.bak-20260920-192110`
