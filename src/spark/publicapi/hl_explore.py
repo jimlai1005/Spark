@@ -280,9 +280,15 @@ EXPLORE_INDEX_VERSION = 4
 # `last_success_at`（epoch 秒｜null，＝`fills_sync.updated_at`——最近一次抓頁
 # 成功時間）。`as_of.fills` 語意不變、仍＝`last_success_at`（相容）；兩者分開
 # 是因為回補中時 `last_success_at` 會一直前進但 `synced_through` 可能落後很多。
+# Task 7.5（2026-09-21，使用者裁決）：加 `window_start`／`window_end`（epoch ms｜null，
+# ＝`fills_sync.window_start_ms`／`window_end_ms`，本輪固定查詢區間）與
+# `params_fp`（string｜null，＝`fills_sync.params_fp`，查詢參數留證——見
+# `explore_fills_sync.PARAMS_FP`）。三者都是「這個 completeness 判定是基於
+# 哪一次查詢」的可追溯證據，不影響 `state`／`reason` 既有語意。
 DEFAULT_FILLS_COVERAGE: dict = {"state": "backfilling", "observed_from": None,
                                 "observed_to": None, "reason": None,
-                                "synced_through": None, "last_success_at": None}
+                                "synced_through": None, "last_success_at": None,
+                                "window_start": None, "window_end": None, "params_fp": None}
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -787,7 +793,8 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
     # 存 `None`（`[]` for coins），`order_count_30d` 仍保留已觀測筆數下限。
     effective_coverage = fills_coverage if fills_coverage is not None else {
         "state": "complete", "observed_from": None, "observed_to": None, "reason": None,
-        "synced_through": None, "last_success_at": None}
+        "synced_through": None, "last_success_at": None,
+        "window_start": None, "window_end": None, "params_fp": None}
     fills_complete = effective_coverage.get("state") == "complete"
     if fills_complete:
         coins = fs.coins

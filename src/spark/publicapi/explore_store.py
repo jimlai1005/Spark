@@ -37,6 +37,21 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
+# Task 7.5（2026-09-21，使用者裁決：complete 判定的證據與標示）：completeness
+# 的 reason 碼——`complete` 也要有原因，不再是「留白代表沒問題」。
+# `REASON_COUNT_BELOW_RETENTION_THRESHOLD`：現行判準（`explore_fills_sync.apply_page`
+# 短頁收尾、本輪觀測筆數低於 `RETENTION_SAFETY_THRESHOLD`）；
+# `REASON_RETENTION_BOUNDARY_VERIFIED`：留存邊界探測（`explore_scheduler._run_fills`）
+# 實測區間起點之前一天仍有可查成交，代表留存邊界早於窗口起點，比門檻推論更強的證據。
+# 兩個 reason 碼與（`ExploreStore`）schema migration 共用，放在資料層而非
+# `explore_fills_sync`（後者反向 import 本模組的 `FillsSyncState`，避免循環 import）。
+REASON_COUNT_BELOW_RETENTION_THRESHOLD = "count_below_retention_threshold"
+REASON_RETENTION_BOUNDARY_VERIFIED = "retention_boundary_verified"
+
+# schema_version：1（初版）→2（Task 7.5：`fills_sync.params_fp` 欄位＋既有
+# complete／reason=NULL 列補標）。
+_SCHEMA_VERSION = 2
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS candidate (
@@ -66,6 +81,7 @@ CREATE TABLE IF NOT EXISTS fills_sync (
       CHECK (completeness IN ('backfilling', 'partial', 'complete')),
   reason TEXT, pages_done INTEGER NOT NULL DEFAULT 0,
   fills_in_window INTEGER NOT NULL DEFAULT 0,
+  params_fp TEXT NOT NULL DEFAULT '',   -- Task 7.5：查詢參數留證（見 explore_fills_sync.PARAMS_FP）
   updated_at REAL NOT NULL, last_error TEXT);
 CREATE TABLE IF NOT EXISTS refresh_job (
   key TEXT PRIMARY KEY,                -- f"{address}:{kind}"  kind∈portfolio|state|fills|candidates
@@ -121,6 +137,11 @@ class FillsSyncState:
     fills_in_window: int
     updated_at: float
     last_error: str | None
+    # Task 7.5：查詢參數留證（例如 `"aggregateByTime=default(false)"`）——放在
+    # dataclass 最後一個欄位並給預設值 `""`，讓既有呼叫端（測試 fixture／舊資料）
+    # 不必逐一改動就能繼續建構本類別（frozen dataclass 的欄位預設值規則：
+    # 有預設值的欄位必須排在最後）。
+    params_fp: str = ""
 
 
 @dataclass(frozen=True)
@@ -155,7 +176,11 @@ class ExploreStore:
             self._db.executescript(_SCHEMA)
             row = self._db.execute("SELECT version FROM schema_version").fetchone()
             if row is None:
-                self._db.execute("INSERT INTO schema_version (version) VALUES (1)")
+                self._db.execute(
+                    "INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
+            elif row[0] < _SCHEMA_VERSION:
+                self._migrate_v1_to_v2()
+                self._db.execute("UPDATE schema_version SET version=?", (_SCHEMA_VERSION,))
         if str(db_path) != ":memory:":
             # Task 3.6 C（W2 修法）：WAL 模式會在 db 旁邊建 `-wal`／`-shm` 側檔，
             # 這兩個檔案原本沒被 chmod 過（預設 0644，會外洩地址／portfolio 等
@@ -171,6 +196,22 @@ class ExploreStore:
                     logger.warning(
                         "explore store: chmod 0600 失敗（best effort，例如 Windows）: %s",
                         side_path, exc_info=True)
+
+    def _migrate_v1_to_v2(self) -> None:
+        """Task 7.5 點 4／5：schema v1→v2——`fills_sync` 補 `params_fp`（既有 DB
+        若缺此欄，`ALTER TABLE ADD COLUMN`；`CREATE TABLE IF NOT EXISTS` 不會幫
+        既存的表補新欄，得自己判斷）；既有 `completeness='complete' AND reason
+        IS NULL` 的列補 `REASON_COUNT_BELOW_RETENTION_THRESHOLD`——這批舊列是
+        在本次修正前用同一個門檻判完的，只是當時沒有把判準寫進 `reason`（見
+        `explore_fills_sync.apply_page` 檔頭）。呼叫時已在 `__init__` 的
+        `with self._lock, self._db:` transaction 內，不再重複取鎖。"""
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
+        if "params_fp" not in cols:
+            self._db.execute(
+                "ALTER TABLE fills_sync ADD COLUMN params_fp TEXT NOT NULL DEFAULT ''")
+        self._db.execute(
+            "UPDATE fills_sync SET reason=? WHERE completeness='complete' AND reason IS NULL",
+            (REASON_COUNT_BELOW_RETENTION_THRESHOLD,))
 
     # --- candidate ---
     def upsert_candidates(self, rows: list[tuple[str, str | None, int | None, float | None]],
@@ -322,10 +363,10 @@ class ExploreStore:
             self._db.execute(
                 "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
                 "synced_through_ms, observed_from_ms, observed_to_ms, completeness, reason, "
-                "pages_done, fills_in_window, updated_at, last_error) "
+                "pages_done, fills_in_window, params_fp, updated_at, last_error) "
                 "VALUES (:address, :window_start_ms, :window_end_ms, :cursor_ms, "
                 ":synced_through_ms, :observed_from_ms, :observed_to_ms, :completeness, "
-                ":reason, :pages_done, :fills_in_window, :updated_at, :last_error) "
+                ":reason, :pages_done, :fills_in_window, :params_fp, :updated_at, :last_error) "
                 "ON CONFLICT(address) DO UPDATE SET "
                 "window_start_ms=excluded.window_start_ms, "
                 "window_end_ms=excluded.window_end_ms, cursor_ms=excluded.cursor_ms, "
@@ -333,8 +374,8 @@ class ExploreStore:
                 "observed_from_ms=excluded.observed_from_ms, "
                 "observed_to_ms=excluded.observed_to_ms, completeness=excluded.completeness, "
                 "reason=excluded.reason, pages_done=excluded.pages_done, "
-                "fills_in_window=excluded.fills_in_window, updated_at=excluded.updated_at, "
-                "last_error=excluded.last_error",
+                "fills_in_window=excluded.fills_in_window, params_fp=excluded.params_fp, "
+                "updated_at=excluded.updated_at, last_error=excluded.last_error",
                 payload)
         return new_count
 
@@ -352,7 +393,7 @@ class ExploreStore:
             row = self._db.execute(
                 "SELECT address, window_start_ms, window_end_ms, cursor_ms, "
                 "synced_through_ms, observed_from_ms, observed_to_ms, completeness, reason, "
-                "pages_done, fills_in_window, updated_at, last_error "
+                "pages_done, fills_in_window, updated_at, last_error, params_fp "
                 "FROM fills_sync WHERE address=?", (addr,)).fetchone()
         if row is None:
             return None
@@ -484,6 +525,18 @@ class ExploreStore:
             self._db.execute(
                 "UPDATE fills_sync SET last_error=?, updated_at=? WHERE address=?",
                 (err, at, addr))
+
+    def set_sync_reason(self, address: str, reason: str) -> None:
+        """Task 7.5 點 3：留存邊界探測結果落地——只 UPDATE `reason`／`updated_at`，
+        不動游標／completeness／其他欄位（探測結果只補強證據描述，不改變
+        completeness 本身的判定）。列不存在則不動（同 `set_sync_error` 慣例：
+        探測只會在一輪 `apply_page` 已經跑完、`fills_sync` 列必然存在之後才呼叫，
+        這裡的「不存在則不動」是防禦，不是預期路徑）。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE fills_sync SET reason=?, updated_at=? WHERE address=?",
+                (reason, self._now(), addr))
 
     def oldest_due_at(self, now: float) -> float | None:
         """目前到期（`next_attempt_at <= now`）的工作中最早的到期時刻；沒有到期

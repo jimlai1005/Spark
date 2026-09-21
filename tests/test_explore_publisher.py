@@ -4,6 +4,7 @@
 全離線（autouse socket-ban，見 conftest.py）：只用 `ExploreStore`（SQLite，`tmp_path`）
 與 `hl_explore` 純函式，不打上游。
 """
+import dataclasses
 import json
 from decimal import Decimal
 
@@ -181,6 +182,31 @@ def test_compose_rows_fills_coverage_synced_through_null_when_no_sync(tmp_path):
     d = rows[0].to_dict()
     assert d["fills_coverage"]["synced_through"] is None
     assert d["fills_coverage"]["last_success_at"] is None
+    # Task 7.5：無 sync → 三個新鍵也一律 null。
+    assert d["fills_coverage"]["window_start"] is None
+    assert d["fills_coverage"]["window_end"] is None
+    assert d["fills_coverage"]["params_fp"] is None
+
+
+def test_compose_rows_fills_coverage_window_and_params_fp_from_store(tmp_path):
+    """Task 7.5：`fills_coverage.window_start`／`window_end`／`params_fp` 分別
+    對應 `fills_sync.window_start_ms`／`window_end_ms`／`params_fp`（工程原則
+    1：三鍵各自讀各自的來源，不是互相抄）。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    store.upsert_candidates([(_A, "Alice", 1, 0.1)], as_of=1000.0)
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    store.put_cache_ok(_A, "portfolio", portfolio_raw, fetched_at=111.0, refresh_after=2000.0)
+    checkpoint = dataclasses.replace(
+        _sync(_A, completeness="complete", updated_at=333.0),
+        window_start_ms=555, window_end_ms=777, params_fp="aggregateByTime=default(false)")
+    store.insert_fills_page(_A, [], checkpoint)
+
+    rows, _meta = compose_rows(store, now=1000.0, cfg=_cfg())
+
+    d = rows[0].to_dict()
+    assert d["fills_coverage"]["window_start"] == 555
+    assert d["fills_coverage"]["window_end"] == 777
+    assert d["fills_coverage"]["params_fp"] == "aggregateByTime=default(false)"
 
 
 # ============================================================
@@ -271,9 +297,12 @@ def test_load_snapshot_v3_migrates_rows_with_backfilling_coverage(tmp_path):
     assert row.as_of == {"portfolio": 555.0, "state": 555.0, "fills": 555.0}
     # Task 7.1（2026-09-21）：v3 快照沒有游標／最後成功時間可推導，兩鍵補 null
     # （沿用 `DEFAULT_FILLS_COVERAGE`，與 `observed_from`／`observed_to` 同語意）。
+    # Task 7.5：同理再補 window_start／window_end／params_fp 三鍵。
     assert row.fills_coverage == {"state": "backfilling", "observed_from": None,
                                   "observed_to": None, "reason": None,
-                                  "synced_through": None, "last_success_at": None}
+                                  "synced_through": None, "last_success_at": None,
+                                  "window_start": None, "window_end": None,
+                                  "params_fp": None}
 
     index = ExploreIndex(cfg=_cfg(), now_fn=lambda: 1000.0, snapshot_path=str(path))
     result = index.query()

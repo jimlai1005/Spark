@@ -7,11 +7,21 @@
 算出新狀態與是否結束 → 呼叫端自行 `ExploreStore.insert_fills_page()` 落地並視 `done`
 決定要不要排下一頁。
 
-留存判準（HL `userFillsByTime` 只保留最近 `RETENTION_LIMIT` 筆可查，spec §8）：
-區間內的成交比區間外更新，所以若本輪回補全程觀測到的筆數
-`fills_in_window < RETENTION_LIMIT - PAGE_LIMIT`，代表區間內成交必然全部落在
-「最近 RETENTION_LIMIT 筆」的可查範圍內 → `complete`；一旦達到或超過這個門檻，
-無法再證明區間更早的部分沒有被擠出可查窗口 → `partial`（`reason="retention_limit"`）。
+留存判準（HL `userFillsByTime` 官方只保留最近 `HL_FILLS_RETENTION_LIMIT`（10,000）
+筆可查，spec §8；Task 7.5，2026-09-21 使用者裁決：這是「正確性缺陷」等級的標示
+修正——舊版把內部保守門檻直接寫成 `RETENTION_LIMIT` 且未命名為何保守，容易被誤讀成
+官方數字本身）：
+`RETENTION_SAFETY_MARGIN`＝一頁（`USER_FILLS_PAGE_LIMIT`），
+`RETENTION_SAFETY_THRESHOLD = HL_FILLS_RETENTION_LIMIT - RETENTION_SAFETY_MARGIN`
+（＝8,000）。區間內的成交比區間外更新，所以若本輪回補全程觀測到的筆數
+`fills_in_window < RETENTION_SAFETY_THRESHOLD`，代表區間內成交必然全部落在
+「最近 `HL_FILLS_RETENTION_LIMIT` 筆」的可查範圍內 → `complete`／
+`reason="count_below_retention_threshold"`（**這仍然只是門檻推論，不是留存邊界
+本身的證據**——「相同 API 重抓零差異」只證明同步一致，不證明留存邊界早於窗口起點；
+更強的證據見 `explore_scheduler._run_fills` 的留存邊界探測，探測成功會把 reason
+升級為 `"retention_boundary_verified"`，見 `explore_store.REASON_RETENTION_BOUNDARY_VERIFIED`）；
+一旦達到或超過這個門檻，無法再證明區間更早的部分沒有被擠出可查窗口 →
+`partial`（`reason="retention_limit"`）。
 第一輪回補在遍歷完成前恆為 `backfilling`（2026-09-20 使用者裁決：不用那個代表
 「狀況不明」的英文字——`backfilling` 明確表示第一輪回補尚未完成）。空頁與正常 200
 回應不改變 completeness（只有短頁／空頁終止時才會依上面的門檻判定一次）。
@@ -23,7 +33,7 @@ PRIMARY KEY，本模組不做去重判斷。同毫秒佔滿整頁（`same_ms_ove
 標記 `partial` 並終止本輪，避免無界重試同一頁。
 
 單輪續頁另設硬上限 `max_pages_per_round`（預設 20，Task 3.7 D，S1 修法）：
-20 頁＝40,000 筆已超過留存上限 `RETENTION_LIMIT`（10,000），正常資料到不了
+20 頁＝40,000 筆已超過留存上限 `HL_FILLS_RETENTION_LIMIT`（10,000），正常資料到不了
 這個頁數，達到即代表卡在異常續頁——終止本輪並標記 `partial`／
 `reason="page_cap"`，避免無界重試。
 """
@@ -33,14 +43,28 @@ import dataclasses
 from typing import NamedTuple
 
 from spark.exchange.base import USER_FILLS_PAGE_LIMIT
-from spark.publicapi.explore_store import FillsSyncState
+from spark.publicapi.explore_store import REASON_COUNT_BELOW_RETENTION_THRESHOLD, FillsSyncState
 
 PAGE_LIMIT = USER_FILLS_PAGE_LIMIT   # HL userFillsByTime 單頁上限（同 hl.py 常數來源，Task 3.5 D）
-RETENTION_LIMIT = 10_000   # HL 只保留最近這麼多筆可查
+
+# Task 7.5（命名修正，工程原則 1：門檻是假設，不是事實，得先讓讀者看得出來）：
+# `HL_FILLS_RETENTION_LIMIT` 是 HL 官方文件的留存上限；本模組的實際判準
+# `RETENTION_SAFETY_THRESHOLD` 比官方數字保守一頁（`RETENTION_SAFETY_MARGIN`），
+# 舊名 `RETENTION_LIMIT` 把兩者混為一談、且未命名保守幅度，已移除。
+HL_FILLS_RETENTION_LIMIT = 10_000   # HL 官方文件：只保留最近這麼多筆可查
+RETENTION_SAFETY_MARGIN = USER_FILLS_PAGE_LIMIT   # 保守緩衝＝一頁
+RETENTION_SAFETY_THRESHOLD = HL_FILLS_RETENTION_LIMIT - RETENTION_SAFETY_MARGIN   # 8_000
 WINDOW_DAYS = 30
 OVERLAP_MS = 1
 _DAY_MS = 86_400_000
 _DEFAULT_INCREMENTAL_AFTER_MS = 4 * 3600 * 1000
+
+# Task 7.5 點 4（查詢參數留證）：`hl.get_fills_page` 實際請求體只送
+# `type/user/startTime/endTime`——刻意不送 `aggregateByTime`，即採用 HL 的
+# 預設值（false，不聚合）。這裡把「送了什麼參數」明確寫成指紋字串，供
+# `fills_sync.params_fp` 落地；若未來 `get_fills_page` 改送這個參數，這裡要
+# 跟著改（不多不少，字串必須與實際請求體一致，見該函式 docstring）。
+PARAMS_FP = "aggregateByTime=default(false)"
 
 
 class PagePlan(NamedTuple):
@@ -98,6 +122,7 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
             cursor_ms=window_start_ms, synced_through_ms=None, observed_from_ms=None,
             observed_to_ms=None, completeness="backfilling", reason=None, pages_done=0,
             fills_in_window=0, updated_at=now_ms / 1000, last_error=None,
+            params_fp=PARAMS_FP,
         )
         return PagePlan(start_ms=window_start_ms, end_ms=now_ms, state=new_state)
 
@@ -112,6 +137,10 @@ def plan_page(state: FillsSyncState | None, *, address: str, now_ms: int,
             new_state = dataclasses.replace(
                 state, window_start_ms=new_window_start, window_end_ms=now_ms,
                 cursor_ms=new_cursor, pages_done=0, fills_in_window=0,
+                # Task 7.5：每個新輪重寫查詢參數指紋——既是「新輪寫入本輪實際
+                # 用的參數」，也順帶自我修復 migration 帶來的舊值 `''`（見
+                # `explore_store._migrate_v1_to_v2`）。
+                params_fp=PARAMS_FP,
             )
             return PagePlan(start_ms=new_cursor, end_ms=now_ms, state=new_state)
         through = state.synced_through_ms
@@ -148,8 +177,8 @@ def _validate_page(page: list[dict], start_ms: int, end_ms: int) -> str | None:
 
 
 def apply_page(plan: PagePlan, page: list[dict], *, page_limit: int = PAGE_LIMIT,
-               retention_limit: int = RETENTION_LIMIT, max_pages_per_round: int = 20,
-               now_ms: int) -> PageResult:
+               retention_threshold: int = RETENTION_SAFETY_THRESHOLD,
+               max_pages_per_round: int = 20, now_ms: int) -> PageResult:
     """套用一頁 HL 回應，算出新狀態與是否結束本輪。呼叫端負責把 `plan.start_ms`／
     `plan.end_ms` 當成這次 `userFillsByTime` 的 `startTime`／`endTime`。"""
     state = plan.state
@@ -172,10 +201,13 @@ def apply_page(plan: PagePlan, page: list[dict], *, page_limit: int = PAGE_LIMIT
 
     if len(page) < page_limit:
         # 短頁或空頁：確認遍歷到本輪 end_ms，依留存門檻判定完整性。
-        if fills_in_window >= retention_limit - page_limit:
+        # Task 7.5：`retention_threshold` 本身已是保守調整後的門檻（見模組檔頭
+        # `RETENTION_SAFETY_THRESHOLD`），這裡不再另外減 `page_limit`。complete
+        # 也要有 reason——這只是門檻推論，不是留存邊界本身的證據（見模組檔頭）。
+        if fills_in_window >= retention_threshold:
             completeness, reason = "partial", "retention_limit"
         else:
-            completeness, reason = "complete", None
+            completeness, reason = "complete", REASON_COUNT_BELOW_RETENTION_THRESHOLD
         new_state = dataclasses.replace(
             state, synced_through_ms=end_ms, observed_from_ms=observed_from,
             observed_to_ms=observed_to, completeness=completeness, reason=reason,

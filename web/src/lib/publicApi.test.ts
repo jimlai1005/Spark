@@ -428,9 +428,11 @@ describe("getPublicTraderDetail", () => {
     expect(r?.as_of).toEqual({ portfolio: 111, state: 111, fills: null });
     // Task 7.1（2026-09-21）：`normalizeFillsCoverage` 一律補上 `synced_through`／
     // `last_success_at`（缺席時 null），即使後端沒回這兩個新鍵也一樣。
+    // Task 7.5：同樣一律補上 `window_start`／`window_end`／`params_fp`。
     expect(r?.fills_coverage).toEqual({
       state: "partial", observed_from: 1, observed_to: null, reason: "page_limit",
       synced_through: null, last_success_at: null,
+      window_start: null, window_end: null, params_fp: null,
     });
   });
 
@@ -445,6 +447,33 @@ describe("getPublicTraderDetail", () => {
     const r = await getPublicTraderDetail(DETAIL.address);
     expect(r?.fills_coverage?.synced_through).toBe(1_700_000_000_000);
     expect(r?.fills_coverage?.last_success_at).toBe(1_700_000_500);
+  });
+
+  it("Task 7.5：後端回傳 window_start／window_end／params_fp 時原樣解析", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      fills_coverage: {
+        state: "complete", observed_from: 1, observed_to: 2, reason: "count_below_retention_threshold",
+        window_start: 1_600_000_000_000, window_end: 1_700_000_000_000,
+        params_fp: "aggregateByTime=default(false)",
+      },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_coverage?.window_start).toBe(1_600_000_000_000);
+    expect(r?.fills_coverage?.window_end).toBe(1_700_000_000_000);
+    expect(r?.fills_coverage?.params_fp).toBe("aggregateByTime=default(false)");
+  });
+
+  it("Task 7.5：window_start／window_end／params_fp 缺席或畸形 → null，不拋錯", async () => {
+    mockFetchOnce(() => jsonResponse({
+      ...DETAIL,
+      fills_coverage: { state: "complete", observed_from: null, observed_to: null,
+                       reason: null, params_fp: 123 },
+    }));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.fills_coverage?.window_start).toBeNull();
+    expect(r?.fills_coverage?.window_end).toBeNull();
+    expect(r?.fills_coverage?.params_fp).toBeNull();
   });
 
   it("Task 4.2：source 非法值／fills_coverage 畸形 → undefined，不拋錯", async () => {

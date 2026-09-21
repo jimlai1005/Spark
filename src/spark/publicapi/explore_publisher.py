@@ -91,6 +91,11 @@ def compose_rows(store: ExploreStore, *, now: float, cfg: ExploreConfig,
                 # `as_of["fills"]`）——回補未完成時前者常落後於後者。
                 "synced_through": sync.synced_through_ms if sync is not None else None,
                 "last_success_at": sync.updated_at if sync is not None else None,
+                # Task 7.5：查詢區間與參數留證——`sync=None`（尚未 enrich 過的
+                # 候選）一律 null，與其他鍵的既有慣例一致。
+                "window_start": sync.window_start_ms if sync is not None else None,
+                "window_end": sync.window_end_ms if sync is not None else None,
+                "params_fp": sync.params_fp if sync is not None else None,
             }
             as_of = {
                 "portfolio": pf.fetched_at if pf is not None else None,

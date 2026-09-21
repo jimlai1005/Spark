@@ -48,7 +48,8 @@ from decimal import Decimal
 from typing import Callable
 
 from spark.publicapi.explore_fills_sync import apply_page, plan_page
-from spark.publicapi.explore_store import ExploreStore, Job
+from spark.publicapi.explore_store import (REASON_RETENTION_BOUNDARY_VERIFIED, ExploreStore,
+                                           Job)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
 from spark.publicapi.hl_explore import ExploreConfig, _roi_sort_key, candidate_addresses
 
@@ -58,6 +59,11 @@ logger = logging.getLogger(__name__)
 # 預留的上限權重（與 `hl_budget.ENDPOINT_WEIGHTS["userFillsByTime"]` 同源，工程原則
 # 1）——`_fills_available()` 用它判斷 `explore_fills` 保留額度是否夠讓一整頁擠進去。
 FILLS_PAGE_WEIGHT = weight_for("userFillsByTime")
+
+# Task 7.5 點 3（留存邊界探測）：查詢窗口起點之前一天——與
+# `explore_fills_sync._DAY_MS` 同數值，不 import 該私有名稱（避免跨模組耦合
+# 私有常數），供 `_probe_retention_boundary` 算探測窗口用。
+_PROBE_WINDOW_MS = 86_400_000
 
 # Task 7.4b：非 fills 的四種 kind，領工時一起用 `kinds=` 限定（`claim_due` 的
 # IN 子句）——candidates 本身也走這個集合，它不吃 explore_base／explore_fills
@@ -428,6 +434,12 @@ class ExploreScheduler:
             # backfilling，整份成交補不完。是否退池只在整輪 done 之後才判斷。
             self._reschedule(job, now, bump_attempts=False)
             return "ran:fills"
+        if res.state.completeness == "complete":
+            # Task 7.5 點 3：本輪剛跑到底且判定 complete——趁機探測一次留存邊界
+            # （查詢區間起點之前一天是否仍有可查成交），把「門檻推論」升級成
+            # 「實測證據」。探測失敗／預算不足不影響本輪已經完成的事實，見
+            # `_probe_retention_boundary` docstring。
+            self._probe_retention_boundary(job.address, res.state, hl_fills)
         self._complete(job)
         if not self._store.is_active(job.address):
             return "dropped"
@@ -447,6 +459,33 @@ class ExploreScheduler:
             logger.error("explore scheduler: %s job 隔離、無對應快取欄位可寫（%s）",
                          job.kind, err)
         self._reschedule(job, now + 86400, err=err)
+
+    def _probe_retention_boundary(self, address: str, state, hl_fills) -> None:
+        """Task 7.5 點 3：查詢 `[window_start_ms - 1 天, window_start_ms - 1]` 是否
+        仍有可查成交——回 >=1 筆代表 HL 的實際留存邊界早於本輪窗口起點，是比
+        `count_below_retention_threshold`（門檻推論）更強的直接證據，升級
+        reason 為 `REASON_RETENTION_BOUNDARY_VERIFIED`；回空頁則維持現有 reason
+        （門檻推論本身沒有變得更弱，只是探測沒有提供額外證據）。
+
+        探測走同一個 `hl_fills`（與本輪實際抓頁同一個 gateway／scope，計入
+        `explore_fills` 預算，工程原則 1：判斷與實際發送同源）。探測本身失敗
+        （額度不足、429、暫停、網路錯誤……不分類，一律不算這個 job 的失敗）→
+        記一行 warning、不改 reason、不重試——本輪 fills 已經跑完，不能因為
+        「錦上添花」的探測失敗而讓整個 job 被誤判成失敗重跑；下一次這個地址
+        進入新的一輪且再次以 `complete` 收尾時，若 reason 仍是
+        `count_below_retention_threshold`，會再探一次（見呼叫端 `_run_fills`）。
+        """
+        probe_start = state.window_start_ms - _PROBE_WINDOW_MS
+        probe_end = state.window_start_ms - 1
+        try:
+            page = hl_fills.get_fills_page(address, probe_start, probe_end)
+        except Exception as e:  # noqa: BLE001 — 探測失敗不得阻擋本輪已完成的事實
+            logger.warning(
+                "explore scheduler：留存邊界探測失敗 address=%s window=[%d,%d]: %r",
+                address, probe_start, probe_end, e)
+            return
+        if page:
+            self._store.set_sync_reason(address, REASON_RETENTION_BOUNDARY_VERIFIED)
 
     def _paused_remaining_s(self) -> float:
         limiter = getattr(self._hl, "_limiter", None)

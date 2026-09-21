@@ -863,7 +863,11 @@ def test_fills_starvation_reproduction_bounded_and_progressing(tmp_path):
     assert any(t >= 900.0 for t in state_times), "後 15 分鐘應持續有 state 抓取"
 
     status = sched.status()
-    assert status["fills_pages_total"] == pager.fills_calls
+    # Task 7.5 點 3：`fills_pages_total` 只計本輪實際分頁抓取，不含留存邊界
+    # 探測（每輪 complete 收尾多打一次 `get_fills_page`，也會被 `pager` 算進
+    # `fills_calls`，但探測不是「一頁分頁」，不計進這個計數器）——
+    # `pager.fills_calls` 因此 >= `fills_pages_total`，不再嚴格相等。
+    assert status["fills_pages_total"] <= pager.fills_calls
     assert status["last_fills_at"] is not None
     assert status["base_scope_in_use"] == "explore_base"  # 全程 fills 都待處理
 
@@ -919,3 +923,80 @@ def test_budget_exhausted_keeps_original_due_time_so_wait_keeps_accumulating(tmp
                             (f"{addr}:state",)).fetchone()
     assert row[0] == due_at           # 原到期時間保留
     assert row[1] is None or row[1] < clock.now()   # lease 已釋放
+
+
+# --- Task 7.5 點 3：留存邊界探測（正／負／例外三路徑） ---
+
+class ProbeAwareHL:
+    """先吐 `real_pages`（本輪實際分頁），吐完之後任何呼叫都視為「留存邊界
+    探測」——回傳 `probe_result`（`list` 或 `Exception` 實例，後者會被 raise）。"""
+
+    def __init__(self, real_pages: list[list[dict]], probe_result):
+        self._real_pages = list(real_pages)
+        self._probe_result = probe_result
+        self.probe_calls: list[tuple] = []
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        if self._real_pages:
+            return self._real_pages.pop(0)
+        self.probe_calls.append((address, start_ms, end_ms))
+        if isinstance(self._probe_result, Exception):
+            raise self._probe_result
+        return self._probe_result
+
+
+def _single_short_round(tmp_path, clock, probe_result):
+    """單一短頁立刻 complete 的最小場景（`state=None` 起手，第一頁就短頁），
+    供三個探測測試共用：一個 tick 內完成整輪＋探測。"""
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
+    hl = ProbeAwareHL(real_pages=[[]], probe_result=probe_result)
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    return store, hl, sched
+
+
+def test_retention_boundary_probe_positive_upgrades_reason(tmp_path):
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched = _single_short_round(
+        tmp_path, clock, probe_result=[{"coin": "BTC", "tid": 1, "time": 1}])
+
+    r = sched.tick()
+    assert r == "ran:fills"
+
+    sync = store.get_sync("0xabc")
+    assert sync.completeness == "complete"
+    assert sync.reason == "retention_boundary_verified"
+    assert len(hl.probe_calls) == 1
+    addr, probe_start, probe_end = hl.probe_calls[0]
+    assert addr == "0xabc"
+    assert probe_end == sync.window_start_ms - 1
+    assert probe_start == sync.window_start_ms - 86_400_000
+
+
+def test_retention_boundary_probe_negative_keeps_threshold_reason(tmp_path):
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched = _single_short_round(tmp_path, clock, probe_result=[])
+
+    r = sched.tick()
+    assert r == "ran:fills"
+
+    sync = store.get_sync("0xabc")
+    assert sync.completeness == "complete"
+    assert sync.reason == "count_below_retention_threshold"
+    assert len(hl.probe_calls) == 1
+
+
+def test_retention_boundary_probe_exception_does_not_fail_round(tmp_path):
+    clock = Clock(t=40 * 86400.0)
+    store, hl, sched = _single_short_round(
+        tmp_path, clock, probe_result=ConnectionError("boom"))
+
+    r = sched.tick()
+    assert r == "ran:fills"          # 探測失敗不影響本輪已完成的事實
+
+    sync = store.get_sync("0xabc")
+    assert sync.completeness == "complete"
+    assert sync.reason == "count_below_retention_threshold"  # 探測失敗不改 reason
+    assert len(hl.probe_calls) == 1

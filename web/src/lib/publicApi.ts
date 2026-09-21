@@ -446,6 +446,14 @@ export interface FillsCoverage {
   /** Task 7.1：最近一次抓頁成功時間（epoch 秒，＝ `as_of.fills`）——只證明
    * 「最近打過招呼」，不代表同步到哪裡；同上 optional。 */
   last_success_at?: number | null;
+  /** Task 7.5（2026-09-21）：本輪固定查詢區間（epoch 毫秒）——`complete`／
+   * `partial` 的判定是針對這個區間做的，不是「全部歷史」。第三次部署前舊
+   * 後端不會回這兩個鍵，故 optional。 */
+  window_start?: number | null;
+  window_end?: number | null;
+  /** Task 7.5：查詢參數留證（例如 `"aggregateByTime=default(false)"`）——
+   * 同上 optional，只是展示這次判定基於哪一種查詢，不代表可比較性判斷。 */
+  params_fp?: string | null;
 }
 
 function normalizeAsOf(v: unknown): Record<string, number | null> | undefined {
@@ -469,6 +477,9 @@ function normalizeFillsCoverage(v: unknown): FillsCoverage | undefined {
     reason: typeof r.reason === "string" ? r.reason : null,
     synced_through: toNumberOrNull(r.synced_through),
     last_success_at: toNumberOrNull(r.last_success_at),
+    window_start: toNumberOrNull(r.window_start),
+    window_end: toNumberOrNull(r.window_end),
+    params_fp: typeof r.params_fp === "string" ? r.params_fp : null,
   };
 }
 

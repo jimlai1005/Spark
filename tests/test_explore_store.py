@@ -46,10 +46,12 @@ def test_wal_journal_mode_enabled(tmp_path):
     assert mode == "wal"
 
 
-def test_schema_version_v1_recorded(tmp_path):
+def test_schema_version_v2_recorded_on_fresh_db(tmp_path):
+    """Task 7.5：schema bump 1→2（`fills_sync.params_fp` 欄位）——全新 DB 直接
+    落地版本 2（`_SCHEMA` 已含新欄，不需要跑遷移）。"""
     store, _ = _store(tmp_path)
     row = store._db.execute("SELECT version FROM schema_version").fetchone()
-    assert row == (1,)
+    assert row == (2,)
     # 重開既有 DB 不應該重複塞第二筆 schema_version
     store2, _ = _store(tmp_path)
     assert store2._db.execute("SELECT COUNT(*) FROM schema_version").fetchone() == (1,)
@@ -304,6 +306,142 @@ def test_set_sync_error_noop_when_row_missing(tmp_path):
     store, c = _store(tmp_path)
     store.set_sync_error("0xnope", "boom", at=c.now())
     assert store.get_sync("0xnope") is None
+
+
+# --- set_sync_reason / params_fp / schema v1→v2 migration (Task 7.5 加) ---
+
+def test_set_sync_reason_updates_reason_and_updated_at(tmp_path):
+    store, c = _store(tmp_path)
+    store.insert_fills_page("0xabc", [], _checkpoint(
+        completeness="complete", reason="count_below_retention_threshold"))
+    c.t += 10
+    store.set_sync_reason("0xABC", "retention_boundary_verified")
+    sync = store.get_sync("0xabc")
+    assert sync.reason == "retention_boundary_verified"
+    assert sync.updated_at == c.t
+    # 其餘欄位不動（completeness／游標不受探測結果影響）
+    assert sync.completeness == "complete"
+    assert sync.cursor_ms == 0
+
+
+def test_set_sync_reason_noop_when_row_missing(tmp_path):
+    store, c = _store(tmp_path)
+    store.set_sync_reason("0xnope", "retention_boundary_verified")
+    assert store.get_sync("0xnope") is None
+
+
+def test_insert_fills_page_round_trips_params_fp(tmp_path):
+    store, _ = _store(tmp_path)
+    store.insert_fills_page("0xabc", [], _checkpoint(
+        params_fp="aggregateByTime=default(false)"))
+    sync = store.get_sync("0xabc")
+    assert sync.params_fp == "aggregateByTime=default(false)"
+
+
+def test_fills_sync_state_params_fp_defaults_to_empty_string():
+    """既有呼叫端／測試 fixture 不必逐一加 `params_fp` 就能繼續建構
+    `FillsSyncState`（frozen dataclass，`params_fp` 是唯一有預設值、排在最後
+    的欄位）。"""
+    state = _checkpoint()
+    assert state.params_fp == ""
+
+
+def _write_v1_schema(db_path) -> None:
+    """手刻一份 Task 7.5 之前的 v1 DB（`fills_sync` 無 `params_fp` 欄）："""
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (1);
+        CREATE TABLE candidate (
+          address TEXT PRIMARY KEY, display_name TEXT, source_rank INTEGER,
+          source_roi REAL, source_as_of REAL NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1, last_seen_at REAL NOT NULL);
+        CREATE TABLE endpoint_cache (
+          address TEXT NOT NULL, endpoint TEXT NOT NULL,
+          params_fp TEXT NOT NULL DEFAULT '', payload TEXT,
+          fetched_at REAL, refresh_after REAL NOT NULL,
+          last_error TEXT, last_error_at REAL,
+          PRIMARY KEY (address, endpoint, params_fp));
+        CREATE TABLE fills (
+          address TEXT NOT NULL, coin TEXT NOT NULL, tid INTEGER NOT NULL,
+          time_ms INTEGER NOT NULL, raw TEXT NOT NULL,
+          PRIMARY KEY (address, coin, tid));
+        CREATE TABLE fills_sync (
+          address TEXT PRIMARY KEY,
+          window_start_ms INTEGER NOT NULL, window_end_ms INTEGER NOT NULL,
+          cursor_ms INTEGER NOT NULL, synced_through_ms INTEGER,
+          observed_from_ms INTEGER, observed_to_ms INTEGER,
+          completeness TEXT NOT NULL DEFAULT 'backfilling',
+          reason TEXT, pages_done INTEGER NOT NULL DEFAULT 0,
+          fills_in_window INTEGER NOT NULL DEFAULT 0,
+          updated_at REAL NOT NULL, last_error TEXT);
+        CREATE TABLE refresh_job (
+          key TEXT PRIMARY KEY, address TEXT, kind TEXT NOT NULL,
+          priority INTEGER NOT NULL, created_at REAL NOT NULL,
+          next_attempt_at REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          lease_until REAL, lease_owner TEXT, fencing INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT);
+    """)
+    raw.execute(
+        "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
+        "synced_through_ms, completeness, reason, pages_done, fills_in_window, updated_at) "
+        "VALUES ('0xabc', 0, 1000, 1000, 1000, 'complete', NULL, 1, 5, 1000.0)")
+    raw.execute(
+        "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
+        "synced_through_ms, completeness, reason, pages_done, fills_in_window, updated_at) "
+        "VALUES ('0xdef', 0, 1000, 500, NULL, 'backfilling', NULL, 0, 0, 1000.0)")
+    raw.execute(
+        "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
+        "synced_through_ms, completeness, reason, pages_done, fills_in_window, updated_at) "
+        "VALUES ('0xzzz', 0, 1000, 1000, 1000, 'partial', 'retention_limit', 20, 9000, 1000.0)")
+    raw.commit()
+    raw.close()
+
+
+def test_migration_v1_to_v2_adds_params_fp_column_defaulted_empty(tmp_path):
+    db_path = tmp_path / "explore.db"
+    _write_v1_schema(db_path)
+
+    store = ExploreStore(db_path)
+
+    version = store._db.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 2
+    cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
+    assert "params_fp" in cols
+    params_fp_values = {r[0] for r in store._db.execute(
+        "SELECT params_fp FROM fills_sync").fetchall()}
+    assert params_fp_values == {""}
+
+
+def test_migration_v1_to_v2_backfills_reason_only_for_complete_null_rows(tmp_path):
+    db_path = tmp_path / "explore.db"
+    _write_v1_schema(db_path)
+
+    store = ExploreStore(db_path)
+
+    rows = {r[0]: r[1] for r in store._db.execute(
+        "SELECT address, reason FROM fills_sync").fetchall()}
+    # complete/reason=NULL → 補標。
+    assert rows["0xabc"] == "count_below_retention_threshold"
+    # backfilling/reason=NULL → 不補（尚未跑完一輪，沒有可歸因的判準）。
+    assert rows["0xdef"] is None
+    # partial/reason 原本就有值 → 不覆寫。
+    assert rows["0xzzz"] == "retention_limit"
+
+    remaining = store._db.execute(
+        "SELECT COUNT(*) FROM fills_sync WHERE completeness='complete' AND reason IS NULL"
+    ).fetchone()[0]
+    assert remaining == 0
+
+
+def test_migration_is_idempotent_on_reopen(tmp_path):
+    db_path = tmp_path / "explore.db"
+    _write_v1_schema(db_path)
+    ExploreStore(db_path)
+    # 第二次開啟（版本已是 2）不應該再嘗試 ALTER TABLE（會因欄位已存在而炸掉）。
+    store2 = ExploreStore(db_path)
+    version = store2._db.execute("SELECT version FROM schema_version").fetchone()[0]
+    assert version == 2
 
 
 def test_oldest_due_at_returns_none_when_nothing_due(tmp_path):
