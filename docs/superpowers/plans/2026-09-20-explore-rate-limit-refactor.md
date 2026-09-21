@@ -1153,7 +1153,7 @@ class ExplorePublisher:
 |---|---|---|
 | `eligibility` | `"eligible"｜"pending"｜"ineligible"` | 由後端 `classify` 決定；列表 API **不回傳** ineligible 列 |
 | `eligibility_reason` | string｜null | `live_days`／`max_dd`／`min_fills`／`concentration`／`portfolio_missing`／`fills_unknown`／`enrich_error`；eligible 為 null |
-| `fills_coverage` | `{state: "backfilling"｜"partial"｜"complete", observed_from: epoch_ms｜null, observed_to: epoch_ms｜null, reason: string｜null, synced_through: epoch_ms｜null, last_success_at: epoch_s｜null, window_start: epoch_ms｜null, window_end: epoch_ms｜null, params_fp: string｜null（Task 7.1／7.5）, synced_through: epoch_ms｜null, last_success_at: epoch_秒｜null}` | 成交資料完整性；`synced_through`＝已確認同步到的游標（回補中常落後）、`last_success_at`＝最近一次抓頁成功時間（＝`as_of.fills`，只證明「最近打過招呼」不證明「同步到哪」，2026-09-21 Task 7.1） |
+| `fills_coverage` | `{state: "backfilling"｜"partial"｜"complete", observed_from: epoch_ms｜null, observed_to: epoch_ms｜null, reason: string｜null, synced_through: epoch_ms｜null, last_success_at: epoch_s｜null, window_start: epoch_ms｜null, window_end: epoch_ms｜null, params_fp: string｜null}`（後五鍵 Task 7.1／7.5） | 成交資料完整性；`synced_through`＝已確認同步到的游標（回補中常落後）、`last_success_at`＝最近一次抓頁成功時間（＝`as_of.fills`，只證明「最近打過招呼」不證明「同步到哪」，2026-09-21 Task 7.1）；`reason` 描述**建立該 state 的那次全區間遍歷**的證據（`count_below_retention_threshold`＝門檻推論、`retention_boundary_verified`＝實測起點前仍有可查成交），之後的增量輪只延伸 `synced_through`、不重寫 reason；`window_start`／`window_end` 是目前輪的查詢區間（Task 7.6） |
 | `as_of` | `{portfolio, state, ledger, fills}`，各 epoch 秒｜null | 各欄位**來源取得時間**，不是發布時間；缺該來源為 null |
 | `close_win_rate_pct`、`concentration_pct`、`closed_positions_30d`、`realized_pnl_30d_usd` | number｜null | coverage ≠ complete 時**一律 null**（未知≠0） |
 | `coins` | string[] | coverage ≠ complete 時 `[]` |
@@ -1365,6 +1365,41 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 6. **測試**：`apply_page` 完成時 reason 為 `count_below_retention_threshold`；scheduler 探測正／負／例外三路徑（fake HL 可控）；migration 補標與 params_fp 預設；publisher／詳情頁 coverage 含 `window_start`／`window_end`／`params_fp`／`reason`；`rg -n "RETENTION_LIMIT\b" src` 零命中。
 7. **前端**：`FillsCoverage` 型別加三個 optional 欄位；不改 UI（reason 文案下一輪）。
 
+### Task 7.6 @inline：7.5 複審修正＋增量輪語義缺陷（2026-09-21 主線程裁決；與 7.5 同批部署）
+
+<!-- 來源：7.5 fresh review（opus）W1–W4／S1–S4，主線程逐條在 code 核實；另主線程實跑重現兩個複審沒抓到的缺陷：
+(a) 增量輪第一頁滿頁 → `completeness` 仍是 complete → 下一 tick `plan_page` 判 noop（`is_noop True`）→ 4 小時後再從舊 `synced_through` 重抓同一頁，游標永遠不前進（重度帳戶 4h+ 內 >2,000 筆才觸發；正式機 2026-09-21 05:30 UTC 查無卡住列，但屬正確性缺陷）；
+(b) `partial`（`retention_limit`）地址在增量輪跑一頁短頁就被改成 `complete`／`count_below_retention_threshold`（與 `plan_page` docstring「partial 仍是 partial」相反；正式機現有 2 列 partial 會在下一輪增量被誤標）。 -->
+
+**Files:** `src/spark/publicapi/explore_fills_sync.py`、`explore_scheduler.py`、`explore_store.py`、`hl_explore.py`（`_row_from_dict`）；`tests/test_explore_fills_sync.py`、`tests/test_explore_scheduler.py`、`tests/test_explore_store.py`、`tests/test_hl_explore.py`（或既有 v4 快照測試檔）。不動前端、不動契約鍵集合、不動 schema（仍是 v2）。
+
+**A. 增量輪語義（修 (a)(b) 與複審 W3）**
+1. `plan_page` 的 `complete|partial` 分支，在增量寬限期判斷**之前**加「輪進行中」判斷：`state.synced_through_ms is not None and state.cursor_ms > state.synced_through_ms` → 回 `PagePlan(start_ms=state.cursor_ms, end_ms=state.window_end_ms, state=state)`（續抓本輪，不看寬限期、不改 state）。理由：輪開始時 `cursor = synced_through − overlap ≤ synced_through`；滿頁後 `cursor = 最後一筆時間 > synced_through`，且 `synced_through` 只在輪結束才推進，所以 `cursor > synced_through` ⇔ 本輪未結束。
+2. `apply_page` 短頁分支改為兩種輪：
+   - `state.completeness == "backfilling"`（首輪全區間遍歷）→ 現行：`fills_in_window >= threshold` → `partial`／`retention_limit`，否則 `complete`／`REASON_COUNT_BELOW_RETENTION_THRESHOLD`。
+   - 否則（增量輪；前態 `complete` 或 `partial`）→ `fills_in_window >= threshold` → `partial`／`retention_limit`（本輪缺口本身超標，合法降級）；否則 **`completeness` 與 `reason` 原樣保留**（增量輪只延伸 `synced_through`，不重新宣稱整個窗口；`partial` 仍 `partial`；`retention_boundary_verified` 跨輪存活）。其餘欄位（`synced_through=end_ms`、observed、`fills_in_window`、`last_error=None`、`updated_at`）照舊。
+   - `same_ms_overflow`／`no_progress`／`page_cap` 三條降級路徑不變。
+3. 語義文件化（模組檔頭與 `REASON_*` 註解、plan 契約表 A）：`reason` 描述的是**建立該 completeness 的那次全區間遍歷**所依據的證據；之後的增量輪只延伸 `synced_through`，本地已持有的區段不受 HL 留存影響，故不重新量測、不重寫 reason。`window_start`／`window_end` 是目前輪的查詢區間。
+
+**B. 留存邊界探測（複審 W1、W2、S2、S3）**
+4. `_run_fills` 探測條件改為：`res.state.completeness == "complete" and res.state.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD`（已 verified 者不再探——A2 讓 verified 跨輪存活，所以每地址最多探到成功為止）；順序改為 `_complete(job)` → `is_active` 檢查（退池 → `"dropped"`，不探）→ 探測 → enqueue。
+5. 探測回應必須通過 `validate_page(page, probe_start, probe_end)`（把 `explore_fills_sync._validate_page` 改為公開名 `validate_page`，所有引用一起改，不留 alias）：`None` 且 `len(page) >= 1` → `set_sync_reason(addr, REASON_RETENTION_BOUNDARY_VERIFIED)`；非法（含 `time_out_of_range`）→ warning 一行、不升級。
+6. 計數器：scheduler 加 `_probe_total`／`_probe_verified`／`_probe_empty`／`_probe_failed`（例外＋非法回應都算 failed），`stats()` 輸出 `"probe": {"total","verified","empty","failed"}`；確認 `/api/ops/health` 的 `explore_refresh` 直接帶出 `stats()`（若是挑鍵輸出則補這一鍵）。
+7. `ExploreStore.set_sync_reason` 只 UPDATE `reason`，**不動 `updated_at`**（該欄對外＝`last_success_at`＝最近一次抓頁成功時間；探測不是抓頁）。docstring 同步。
+
+**C. 其他複審項**
+8. `PARAMS_FP = "aggregateByTime=<omitted>"`（只描述事實：請求體沒送這個參數；不再宣稱上游預設值）；註解同步。
+9. `_migrate_v1_to_v2` docstring 改寫：`ALTER TABLE` 是 DDL，Python sqlite3 會自動提交、**不在** `with self._db` transaction 內；本 migration 兩步都冪等（欄位存在則跳過、UPDATE 條件式），中途失敗的中間態下次啟動自癒；未來多 DDL＋搬資料的 migration 需顯式 `BEGIN`／分步驗證。
+10. `hl_explore._row_from_dict`：`fills_coverage=({**DEFAULT_FILLS_COVERAGE, **(d.get("fills_coverage") or {})})`，先確認 `DEFAULT_FILLS_COVERAGE` 含 7.1／7.5 的五個新鍵（`synced_through`、`last_success_at`、`window_start`、`window_end`、`params_fp`）皆為 None，缺則補。
+
+**測試（新增或改寫，全部離線）**
+- `test_explore_fills_sync.py`：(i) complete 態＋`cursor > synced_through` → `plan_page` 非 noop、`start==cursor`、`end==window_end`；`synced_through None` 不觸發。(ii) 端到端：complete → 5h 後增量輪、第一頁 2,000 筆滿頁（`done False`）→ 1 分鐘後 `plan_page` **非 noop** → 短頁 → `complete`、reason 仍原值、`synced_through == window_end`。(iii) `partial`／`retention_limit` 增量短頁 → 仍 `partial`／`retention_limit`。(iv) `retention_boundary_verified` 經增量短頁保留。(v) 增量輪 `fills_in_window >= 8_000` → `partial`／`retention_limit`。(vi) 首輪行為不變（既有測試）。
+- `test_explore_scheduler.py`：reason 已 verified → fake HL 不收到探測呼叫；探測回傳 time 在探測窗外 → 不升級、`stats()["probe"]["failed"]==1`；退池地址不探；正常命中 → `verified==1` 且 `fills_sync.updated_at` 不變。
+- `test_explore_store.py`：`set_sync_reason` 後 `updated_at` 等於原值。
+- 快照測試：v4 快照列缺五個新鍵 → `_row_from_dict` 後五鍵為 None。
+
+**驗收（主線程親跑）**：`uv run ruff check src tests scripts`；`uv run pytest -q`（全綠，數量 > 3159）；`rg -n "_validate_page" src tests` 零命中；主線程重跑重現腳本（scratchpad `repro_76.py`）：增量滿頁後 `is_noop False`、partial 增量後仍 partial。
+
 ## P5 驗收與啟用準備（任務卡）
 
 - Task 5.1 @sdd：`deploy/RUNBOOK.md` 新節「Explore 背景刷新」：env（`FILET_HL_GLOBAL_WEIGHT_CAP`、`FILET_HL_EXPLORE_WEIGHT_CAP`、`FILET_EXPLORE_DB`、`EXPLORE_UPSTREAM_REFRESH`）、drop-in 檔名、觀察 `/api/ops/health.hl_budget`／`.explore_refresh`、停用刷新（設 `EXPLORE_UPSTREAM_REFRESH=0` 重啟，快照續讀）、回退（不重新啟用舊 rebuild；程式已刪）。`deploy/filet-api.service.d/explore-refresh.conf` 範本；`var/lib/filet-api/explore.db` 權限 `filet-api` 0600。
@@ -1465,7 +1500,8 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 | 7.4a | 2026-09-21 | fc6a900 | 限流器父子 scope＋`available()`；主線程實跑 base 3×60 後第 4 次拒、fills 仍 120、父滿時兩子歸零；44 passed；3124 全綠 |
 | 7.4b | 2026-09-21 | c184c03 | 週期 1800/7200/7200；首 tick 重排 overdue；類別感知領工＋同 tick 跨類 fallback；等待加權；無 limiter 時交替（僅雙方都到期）；飢餓重現：30 分鐘 30 頁、state 持續、切片 ≤300／base ≤180；94 passed、3135 全綠。<!-- 裁決：舊測試「state 先於 fills」改行為級斷言（被取代的嚴格優先級） --> |
 | 7.4c | 2026-09-21 | aa65274 | config 兩個 cap＋驗證；run_api 三 scope＋parents、scheduler 三 gateway；health `explore_budget_note`；RUNBOOK §5.8e 新週期／保留額度／部署後檢查／觀測重新起算；3143 passed。<!-- 裁決：既有 test_hl_weight_caps_read_from_env 改 env 值使 base+fills≤explore --> |
-| 7.5 | 2026-09-21 | 347c961 | 留存門檻命名、complete reason 碼、留存邊界探測、`params_fp`（schema v2 migration）、契約三鍵；主線程用種子 DB 驗 migration：version 2、complete 無 NULL reason；3159 pytest、759 vitest。**未部署，複審中** |
+| 7.5 | 2026-09-21 | 347c961 | 留存門檻命名、complete reason 碼、留存邊界探測、`params_fp`（schema v2 migration）、契約三鍵；主線程用種子 DB 驗 migration：version 2、complete 無 NULL reason；3159 pytest、759 vitest。**未部署**；複審（opus）：無 Critical、W1–W4／S1–S4 → 主線程核實後併入 Task 7.6；主線程另重現增量輪停滯與 partial 誤升兩缺陷（7.6 卡註解） |
+| 7.6 | 2026-09-21 | 045472c | 增量輪「輪進行中」續抓（修停滯）；增量短頁保留 completeness／reason（partial 不誤升、verified 跨輪存活）；探測只在未 verified 且在池時做、回應經 `validate_page`、四計數器進 health；`set_sync_reason` 不動 `updated_at`；`PARAMS_FP="aggregateByTime=<omitted>"`；migration docstring 誠實化；`_row_from_dict` coverage 補鍵。主線程親驗：repro PASS（修前 FAIL）、ruff 乾淨、3171 passed、`_validate_page` 零命中。**未部署，複審中**<!-- 裁決：plan 寫 `stats()` 實為 scheduler `status()`，builder 依既有慣例掛在 status()，health 經 `**scheduler.status()` 自然帶出 --> |
 | **第四次部署（7.4＋7.1／7.2）** | 2026-09-21 01:11 UTC | 7db0720 | 複審可部署（3 Warning 已修：重排失敗大聲、scope 名同源、額度不足保留到期時間）；本機 6 分鐘實測 fills 6 頁；正式機 flag 1 後 100 秒 fills_sync 2 筆更新、零錯誤。**24h 觀測自 01:12 UTC 重新起算** |
 | **第三次部署（P6）** | 2026-09-20 16:42 UTC<!-- 校正 --> | 5e2ec8e | flag 0 驗證與本機一致 → 67/67 → flag 1（16:43）→ 16:44 首次發布、16:45 第二次；合格 2／待確認 288／不合格 10；零錯誤。24h 觀測期自 16:45 UTC 起算 |
 | **第二次部署（D8）** | 2026-09-20 14:20 UTC | 8ead8e8 | 使用者授權（「請繼續」）。flag 0 部署→驗證→67/67→flag 1（14:21）；90 秒後候選 300、快取 36、門檻擋下 in:0/300、快照未動、零 Traceback／429。冷啟動觀測進行中（每 10 分鐘），預期 50–65 分鐘首次換版 |
