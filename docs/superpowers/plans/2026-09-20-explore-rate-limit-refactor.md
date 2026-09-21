@@ -1262,7 +1262,7 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 
 ## P7 觀測期間平行工作（2026-09-21 使用者裁決：不打斷觀測、不調預算；實作後**觀測期滿再部署**）
 
-觀測：台北 9/23 00:45（UTC 9/22 16:45）滿 24 小時。取樣：正式機 `/home/ubuntu/explore-obs/sample.py`（ubuntu crontab 每 15 分鐘，唯讀，
+觀測：<!-- 2026-09-21 校正 -->7.4 部署後自 2026-09-21 01:12 UTC 重新起算，期末 2026-09-22 01:12 UTC（台北 9/22 09:12）。取樣：正式機 `/home/ubuntu/explore-obs/sample.py`（ubuntu crontab 每 15 分鐘，唯讀，
 輸出 `samples.jsonl`；cohort 基線 `cohort_t0.json`＝flag 開啟後 300 候選的名單與狀態）。決策依「資料新鮮度、回補進展、queue 積壓、
 引擎健康」，不追求 300 人全 complete。回報五項：回補 vs 無法補齊（completeness／reason 分佈）、同批地址進度（原候選完成數、新增候選、
 游標推進數、最老到期趨勢）、fills 時間語義（last_success vs synced_through）、null→0 稽核、follower 同 IP 缺口（引擎 429／重試／延遲）。
@@ -1311,7 +1311,7 @@ W5 `.explore-group-header`／`.explore-pending-reason` 無 CSS、組標題落在
 - 共享預算修復候選（不在本輪實作）：(a) 引擎改經 publicapi 同一個 `WeightLimiter`——需跨進程，走檔案鎖或 unix socket；(b) 引擎自帶同規格
   限流器並各自留餘量（現行做法，靠 900 上限的 300 餘量）；(c) 引擎讀 publicapi 的 `hl_budget` 快照做退讓。待使用者裁決。
 
-### 觀測發現 O-1（2026-09-21 19:13 UTC，主線程）：基礎資料重抓佔滿 explore 預算，fills 類別級飢餓
+### 觀測發現 O-1（2026-09-20 19:13 UTC，主線程；<!-- 2026-09-21 校正日期 -->）：基礎資料重抓佔滿 explore 預算，fills 類別級飢餓
 
 實測 15 分鐘：state 298 次（596 權重）、ledger 100（2,000）、portfolio 85（1,700）＝約 286／分鐘，貼著 300 上限；
 fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfolio 到期積壓 52／63 持續不歸零。原因：spec §6 估 240／分鐘用的是
@@ -1451,6 +1451,6 @@ fills 60 分鐘 0 頁、最老 fills job 已到期 16,216 秒；ledger／portfol
 | 7.4b | 2026-09-21 | c184c03 | 週期 1800/7200/7200；首 tick 重排 overdue；類別感知領工＋同 tick 跨類 fallback；等待加權；無 limiter 時交替（僅雙方都到期）；飢餓重現：30 分鐘 30 頁、state 持續、切片 ≤300／base ≤180；94 passed、3135 全綠。<!-- 裁決：舊測試「state 先於 fills」改行為級斷言（被取代的嚴格優先級） --> |
 | 7.4c | 2026-09-21 | aa65274 | config 兩個 cap＋驗證；run_api 三 scope＋parents、scheduler 三 gateway；health `explore_budget_note`；RUNBOOK §5.8e 新週期／保留額度／部署後檢查／觀測重新起算；3143 passed。<!-- 裁決：既有 test_hl_weight_caps_read_from_env 改 env 值使 base+fills≤explore --> |
 | **第四次部署（7.4＋7.1／7.2）** | 2026-09-21 01:11 UTC | 7db0720 | 複審可部署（3 Warning 已修：重排失敗大聲、scope 名同源、額度不足保留到期時間）；本機 6 分鐘實測 fills 6 頁；正式機 flag 1 後 100 秒 fills_sync 2 筆更新、零錯誤。**24h 觀測自 01:12 UTC 重新起算** |
-| **第三次部署（P6）** | 2026-09-21 16:42 UTC | 5e2ec8e | flag 0 驗證與本機一致 → 67/67 → flag 1（16:43）→ 16:44 首次發布、16:45 第二次；合格 2／待確認 288／不合格 10；零錯誤。24h 觀測期自 16:45 UTC 起算 |
+| **第三次部署（P6）** | 2026-09-20 16:42 UTC<!-- 校正 --> | 5e2ec8e | flag 0 驗證與本機一致 → 67/67 → flag 1（16:43）→ 16:44 首次發布、16:45 第二次；合格 2／待確認 288／不合格 10；零錯誤。24h 觀測期自 16:45 UTC 起算 |
 | **第二次部署（D8）** | 2026-09-20 14:20 UTC | 8ead8e8 | 使用者授權（「請繼續」）。flag 0 部署→驗證→67/67→flag 1（14:21）；90 秒後候選 300、快取 36、門檻擋下 in:0/300、快照未動、零 Traceback／429。冷啟動觀測進行中（每 10 分鐘），預期 50–65 分鐘首次換版 |
 | **第一次部署（D8）** | 2026-09-20 04:09 UTC | 4295ece | 使用者授權。rsync 兩段、web build、drop-in `hl-budget.conf`、restart api＋dashboard、DEPLOYED_VERSION；`filet_regression_check --http --ssh` 67/67；20 次 explore GET 零上游行。記錄：RUNBOOK 部署日誌 2026-09-20 條 |

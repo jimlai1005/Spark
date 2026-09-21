@@ -2806,7 +2806,7 @@ restart `filet-api`＋`filet-dashboard` → 驗證（failed 0、`explore.db*` �
 → 15:11 UTC **主線程主動關 flag**（portfolio 218/300，尚未換版）：發現成交回補未完成＝0 筆＝落榜，首次換版會把公開榜砍到個位數；
 使用者裁決 P6（不用門檻掩蓋資料語義）。
 
-**2026-09-21 第三次部署（commit `5e2ec8e`，16:42 UTC，P6 資料語義修正）：** plan P6（D12–D16、契約 A–D；Task 6.1–6.8；opus 三輪審查）。
+**2026-09-20 第三次部署（commit `5e2ec8e`，16:42 UTC，P6 資料語義修正）：**<!-- 2026-09-21 校正：原誤寫 09-21，DEPLOYED_VERSION 記錄 2026-09-20T16:42:42Z --> plan P6（D12–D16、契約 A–D；Task 6.1–6.8；opus 三輪審查）。
 內容：取消發布門檻（來源故障保留舊版、有效空結果正常發布、單址 enrich 例外出列 pending/enrich_error）；資格三態
 `eligible|pending|ineligible`（`classify`；未知≠0；已知不合格優先）；coverage≠complete 的成交衍生欄位在 `to_dict` 一律 null／coins []／無
 concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶預設門檻分類；後端分組→排序（次鍵 address）→分頁；`eligibility=eligible`
@@ -2815,7 +2815,7 @@ concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶�
 遮罩生效）→ `DEPLOYED_VERSION` → `filet_regression_check` 67/67 → **flag 改 1**（16:43）→ 16:44 首次發布（`.v3.bak`／`.daily` 產生）、16:45 第二次
 （`.prev`）；公開榜合格 2／待確認 288／不合格 10、coverage backfilling 293／complete 7；零 Traceback／429／來源故障。
 之後每 5 分鐘觀測 pending 轉換與 `as_of`；**24 小時觀測期自 16:45 UTC 起算**；Explore 預算維持 300 不動；follower 引擎限流關係仍未結案。
-→ 19:13 UTC 觀測發現 O-1：fills 類別級飢餓（一小時 0 頁；嚴格優先級＋沒有為 120 權重的大請求保留額度）。使用者裁決立即修（7.4），觀測期重新起算。
+→ 2026-09-20 19:13 UTC 觀測發現 O-1：fills 類別級飢餓（一小時 0 頁；嚴格優先級＋沒有為 120 權重的大請求保留額度）。使用者裁決立即修（7.4），觀測期重新起算。
 
 **2026-09-21 第四次部署（commit `7db0720`，01:11 UTC，Task 7.4a/b/c＋7.1／7.2）：** 限流器父子 scope（explore 300 為父；有 fills 待處理時基礎
 類別走 explore_base ≤180、fills 走 explore_fills 保留 120）；週期 state 30 分鐘、portfolio／ledger 2 小時；首 tick 重排逾期超過一個週期的基礎 job；
@@ -2825,7 +2825,7 @@ concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶�
 流程：rsync 兩段 → import → build → chown → flag 0 restart → 驗證（公開榜不變）→ `DEPLOYED_VERSION` → 回歸 PASS → **flag 1**（01:12）→ 100 秒：
 重排 `{state:0, portfolio:0, ledger:0}`（無逾期超過一個週期者，屬正常）、fills_sync 2 筆更新、fills 列 14,247→17,390、publisher 01:13 發布、零 Traceback／429。
 本機 6 分鐘主網實測（部署前）：fills 6 頁／6 分鐘、base ≤174、explore ≤294、零 429。opus 複審可部署（3 Warning 已於 7db0720 修）。
-**24 小時觀測期自 01:12 UTC（台北 9/21 09:12）重新起算**；Explore 預算維持 300；follower 同 IP 缺口仍未結案。
+**24 小時觀測期自 2026-09-21 01:12 UTC（台北 9/21 09:12）重新起算，期末 2026-09-22 01:12 UTC（台北 9/22 09:12）**；Explore 預算維持 300；follower 同 IP 缺口仍未結案。觀測結束只移除臨時取樣 cron（`/home/ubuntu/explore-obs`），先把 `samples.jsonl`／`cohort_t0.json` 複製到本機 `docs/superpowers/research/` 保存；`/api/ops/health` 指標與 journal 告警不動。
 
 **2026-09-21 設定變更（無程式碼部署，19:21 UTC 09-20，推薦碼 `JIMLAI1005` → `FILET`）：** 使用者指示換碼並把推薦人錢包改為
 Filet Alpha `0xfB9C52f56F03D786AD5D435aa70fe45D80569760`。前置確認：主網 `referral` 端點回 `referrerState.stage == ready`、
