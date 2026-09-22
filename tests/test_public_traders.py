@@ -867,7 +867,7 @@ def test_pool_local_path_admission_cap_skips_enqueue(tmp_path):
     app, hl, explore_store = _make_pool_app(tmp_path, now)
     explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now - 7200, now - 1)
     # Task 7.9d：準入上限與 scheduler 同源（ADMISSION_MULTIPLIER × active + 20），_A 為唯一 active 候選
-    from spark.publicapi.explore_scheduler import ADMISSION_MULTIPLIER
+    from spark.publicapi.explore_store import ADMISSION_MULTIPLIER
     limit = ADMISSION_MULTIPLIER * 1 + 20
     for i in range(limit):
         explore_store.enqueue(f"dummy:{i}", None, "dummy", 5, now)

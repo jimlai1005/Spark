@@ -58,8 +58,7 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.explore_fills_sync import build_fills_coverage
-from spark.publicapi.explore_scheduler import ADMISSION_MULTIPLIER
-from spark.publicapi.explore_store import CacheEntry, ExploreStore
+from spark.publicapi.explore_store import ADMISSION_MULTIPLIER, CacheEntry, ExploreStore
 # 健康面板讀的是**引擎自己寫的**狀態檔——路徑常數與判定一律引用引擎的定義，
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
 from spark.copytrade.equity import sample_coverage
