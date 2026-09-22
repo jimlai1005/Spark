@@ -1583,7 +1583,30 @@ def purge(...) -> dict   # counts 加 "fills_scan" 鍵
 
 **主線程整合驗收（兩批 commit 後）**：全量 pytest＋vitest＋ruff；正式機快照複本（`prod_meta_v2.db` cp）：遷移 → 關閉重開（模擬重啟）→ 以 fake HL 模擬 3 天運行（每 30 分 candidates 輪、6h 增量、真實 300 地址）→ 斷言：`fills_scan` 新增列數 ≤ 初始 running 完成數＋partial 重掃數（無反覆新增）、`fills_verify` 129 列持續遞減至 0、六種 kind 的 `oldest_due` 都有界（無飢餓）、探測 ≤ fills-like 的 1/10；`repro_rescan.py`／`repro_79b.py` PASS；B8 文件（需求算式含 verify 份額）。之後才派 fresh reviewer、再部署。
 
-<!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c 為準，衝突時以 v2 為準。 -->
+#### 7.9d：7.9c 複審修正（1 Critical＋4 Warning＋3 Suggestion；2026-09-22 主線程裁決；仍按所有權拆 D／S）
+
+<!-- 複審（opus，主線程實跑核實）：C1 地址掉出候選池（`delete_jobs` 刪掉 fills_scan job）再回池 → `bootstrap` 回 False、`_maybe_recover_scan_job` 只認 partial → backfilling 地址永久無 scan job（5 天模擬仍 backfilling）；
+W1 verify 有界等待是「逾期就一直給」，8 件逾期連佔 8 個名額，可搶光增量；W2 `scans_running`／`verify_remaining` 母體用 active_candidates 與 refresh_job／fills_scan 不同源（129 顯示 112），且退池地址的 verify／scan job 仍被領走打上游；
+W3 `PARTIAL_RESCAN_AFTER_MS` 未刪且被測試釘住；W4 過渡相容層是 fail-silent 死碼。S1 status 21ms/次；S2 s7a 守不到 enqueue 那一半；S3 遷移逐列冪等閘門 docstring。 -->
+
+**7.9d-D（`explore_store.py`、`explore_fills_sync.py`、兩個對應測試檔）**
+- D1 刪除 `PARTIAL_RESCAN_AFTER_MS` 與釘它的斷言（全 repo 零命中；S 端不再引用）。
+- D2 彙總查詢（同源、單句 SQL）：`count_running_scans() -> int`（`fills_scan.status='running'`）、`count_jobs_by_kind() -> dict[str,int]`（全部 `refresh_job` 依 kind）、`count_due_by_kind(now) -> dict[str,int]`；docstring 註明母體＝被排程的列本身，不經 active 過濾。
+- D3 `_migrate_v2_to_v3` 逐列閘門 docstring 寫明：原子交易下部分遷移狀態不可持久化，此閘門只防「version 被人工改回 2」的重跑。
+- 驗收：ruff；兩個測試檔全綠；`rg -n "PARTIAL_RESCAN_AFTER_MS" src tests` 零命中。
+
+**7.9d-S（`explore_scheduler.py`、`tests/test_explore_scheduler.py`、`tests/test_api_ops.py`）**
+- S1 **修復路徑改為「狀態需要一次遍歷且沒有可推進的 job」**（C1）：`_needs_scan_job(address, now) -> str | None` 回傳原因碼或 None，條件依序：(a) `running_scan(address)` 存在且 `"fills_scan" not in job_kinds` → `"resume_running"`；(b) 無 running scan 且 `completeness == "backfilling"`（首次回補從未完成，例如孤兒）→ `"initial_missing"`（`_run_scan` 遇此狀態要**建新 initial scan**，不是丟棄）；(c) `completeness == "partial"` 且 `partial_rescan_due(latest_done_scan.finished_at, now)` 且無 running scan 且無 job → `"partial_due"`；其餘 None。呼叫點：`_enqueue_address_jobs`（既有地址的需要集合也納入 `fills_scan`，用同一函式）、`_run_increment` 兩條路徑。`_run_scan` 的丟棄條件同步改為 `_needs_scan_job(...) is None and running_scan is None`。守門測試：複審腳本 `scratchpad/rv_churn_backfill.py` 情境（回補中掉池→回池→一個 candidates 輪內拿回 job 並完成 initial）、partial 重掃中掉池→回池同樣恢復、孤兒 backfilling（有 sync 列無 scan 列）→ 建新 initial。
+- S2 退池地址不打上游（W2）：`_run_scan`／`_run_increment`／`_run_probe` 在**發送前**檢查 `is_active`；非 active → `_complete(job)`、計 `inactive_job_dropped`、回 `"dropped"`（多頁路徑同樣）。測試：退池地址的 verify job 被領到時零上游呼叫。
+- S3 verify 份額（W1）：把 verify 併進 probe 的名額計數——`_fills_like_served_since_special` 計數器；當「有逾期 ≥2h 的 verify」或「有探測候選」時，每服務 `SPECIAL_SERVE_RATIO = 9` 次 fills-like 才給 1 次 special（verify 優先於 probe，若兩者都在等則輪流）；fills 類無到期 job 時 special 可連續。移除 `_verify_overdue` 的「逾期即 claim」。測試：8 件逾期 verify＋持續積壓的增量 → 20 tick 內 verify ≤ 2、fills ≥ 18；無 fills 到期時 verify 連續。
+- S4 拆掉過渡相容層（W4）：直接 `from explore_fills_sync import PARTIAL_RESCAN_AFTER_S, partial_rescan_due`、直接呼叫 `store.job_kinds`／`latest_done_scan`／`running_scan`／`oldest_due_at(kinds=)`，`complete_scan` 只接受 `ScanWriteback`（其他型別 → `TypeError`，不吞）；刪除 `test_s7g_writeback_bool_true_is_treated_as_applied`。
+- S5 `status()` 改用 D2 彙總（同源、O(1) 查詢）：`scans_running`＝`count_running_scans()`、`verify_remaining`＝`count_jobs_by_kind().get("fills_verify",0)`、`due_by_kind`＝`count_due_by_kind(now)`；`test_api_ops` 對應斷言；health 測試斷言 `verify_remaining` 等於 job 表計數（含退池地址）。
+- S6 s7a 加斷言：3 天內 `scan_job_dropped == 0` 且每輪後 `due_by_kind["fills_scan"] == 0`（守 enqueue 那一半）。
+- 驗收：ruff；`tests/test_explore_scheduler.py`＋`tests/test_api_ops.py` 全綠；`rv_churn_backfill.py` step4 必須 `completeness=complete`／job 回來；`rv_verify_burst.py` 前 20 tick verify ≤ 2；`rg -n "getattr\(self._store|inspect.signature|_writeback_kind|_partial_rescan_after_s" src/spark/publicapi/explore_scheduler.py` 零命中。
+
+**主線程整合**：全量；`integ_79c.py` 3 天（verify 129→0 的時程改以 1/10 份額估：129×1.2 頁 ÷ 6 頁/h ≈ 26h 下限）；`repro_rescan.py`／`repro_79b.py`；B8 算式改「verify 與 probe 共用每 10 次 1 次的名額」。
+
+<!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c／7.9d 為準，衝突時以 v2 為準。 -->
 ### Task 7.9 v1（已被 v2 取代，僅供對照）：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
 
 <!-- 裁決：選 (b) 6 小時（不選 5）：單頁基線 300/6h＝50／小時＋新增約 1，才對 60 留出空間，仍須扣多頁與探測成本；排程、詳情頁補排、前端「更新中」共用同一期限，不得留寫死 4 小時。
@@ -1715,7 +1738,7 @@ partial 不得停抓 24 小時（要持續增量保存）；探測有效性按�
 | 7.9b | 2026-09-22 | 60ae3fa＋5af2c84 | 兩軌分離（`fills_scan` 新表、`scan_id`、CAS 寫回、gap／unknown 降級、`evidence` 契約）、探測 DB 推導＋雙 CAS＋9:1 借用、`fills_verify` 嚴格讓位、v2→v3 遷移（verified 沿用、其餘 unknown＋48h 攤開核驗、backfilling→running scan 且增量起點＝scan 窗口末端）。主線程親驗：正式機 287 列快照遷移兩次一致（69 backfilling 起點正確、218 done scan 無 gap、129 unknown／129 verify job 不同時間）；`repro_79b.py` 四項 PASS；ruff 乾淨；3212 passed、vitest 761。複審（opus）：**2 Critical**（partial 重掃排到 1,000 天後；每 candidates 輪重建 scan job → complete 地址反覆整窗重掃，主線程實跑 3 天 144 次）＋5 Warning → Task 7.9c（升級 opus 派工）。**未部署**。⚠️ 部署可見影響：對外 complete 190→89（129 列 unknown 降 partial），48h 內核驗恢復<!-- 裁決：遷移 backfilling 列增量起點改 scan window_end（原用 now 會留真實缺口）；builder 自決的 `fills_verify` 獨立 kind、observed_* 仍取增量軌、ADMISSION_MULTIPLIER 未調——待複審意見 --> |
 | 7.9c-D | 2026-09-22 | eb9bf78（＋798b005 主線程 fixture 連動） | 秒制 `PARTIAL_RESCAN_AFTER_S`＋`partial_rescan_due`；observed 兩軌維護；`ScanWriteback` 四態；purge scan 保留 30d＋計數；遷移 DDL 冪等＋列迴圈與版本更新顯式 `BEGIN IMMEDIATE`（三次冪等、例外回滾實跑）；`inc_from` 非空三處寫入守門＋啟動檢查；gap 三案例。主線程親驗：正式機快照遷移三次一致<!-- 裁決：synced_through NULL 的 complete/partial 列退回 window_end；主線程補兩個非所有權測試檔的 fixture --> |
 | 7.9c-S | 2026-09-22 | b7b1ac2 | scan 建立只由三種狀態來源；`_run_scan` 狀態守門＋`scan_job_dropped`；修復路徑；秒制；逐項准入（新候選豁免、`ADMISSION_MULTIPLIER=7`）；verify 2h 有界等待；四態收尾；status 九鍵；S7 (a)–(h)＋5 個變異驗證全部命中。主線程親驗：`repro_rescan.py` 空頁 3 天 scans=1、滿頁重掃到期 +1 天；`repro_79b.py` PASS<!-- 裁決：既有 3 條測試改法合理（W4 與舊斷言矛盾者改成既有地址） --> |
-| **7.9c 整合驗收（主線程）** | 2026-09-22 | b7b1ac2 | ruff 乾淨；pytest 3265 passed；vitest 761；`integ_79c.py`（正式機 287 列快照：遷移→重啟→fake HL＋每分鐘一次 fills 預留模型，模擬 3 天）：partial_rescan 3、verify 129→0（49h，最長等待 1.82h）、六種 kind 最老到期皆有界、探測佔 fills-like 5.8%、evidence_unknown 只經核驗遞減；**修前基線**（5af2c84）1 天 partial_rescan 2,174、verify 零推進最長等 23.8h、unknown 被錯誤重掃洗到 17。**未部署，複審中** |
+| **7.9c 整合驗收（主線程）** | 2026-09-22 | b7b1ac2 | ruff 乾淨；pytest 3265 passed；vitest 761；`integ_79c.py`（正式機 287 列快照：遷移→重啟→fake HL＋每分鐘一次 fills 預留模型，模擬 3 天）：partial_rescan 3、verify 129→0（49h，最長等待 1.82h）、六種 kind 最老到期皆有界、探測佔 fills-like 5.8%、evidence_unknown 只經核驗遞減；**修前基線**（5af2c84）1 天 partial_rescan 2,174、verify 零推進最長等 23.8h、unknown 被錯誤重掃洗到 17。複審（opus，5 個變異全重做皆命中）：**Critical** 候選 churn 後回補中地址永久無 scan job（主線程實跑 5 天仍 backfilling）＋W1 verify 逾期連佔名額（實跑 8 連續）＋W2 status 母體不同源／退池 job 仍打上游＋W3 毫秒常數未刪＋W4 相容層死碼 → Task 7.9d。**未部署** |
 | **第六次部署（7.7＋7.8）** | 2026-09-21 06:54 UTC | 7150d81 | rsync 兩段 → import → web／deps 無變動略過 build → chown → DB 備份 `.pre-78.bak` → 只 restart filet-api → active、零 Traceback → `DEPLOYED_VERSION` → 回歸 PASS。觀測期不重新起算 |
 | **第四次部署（7.4＋7.1／7.2）** | 2026-09-21 01:11 UTC | 7db0720 | 複審可部署（3 Warning 已修：重排失敗大聲、scope 名同源、額度不足保留到期時間）；本機 6 分鐘實測 fills 6 頁；正式機 flag 1 後 100 秒 fills_sync 2 筆更新、零錯誤。**24h 觀測自 01:12 UTC 重新起算** |
 | **第三次部署（P6）** | 2026-09-20 16:42 UTC<!-- 校正 --> | 5e2ec8e | flag 0 驗證與本機一致 → 67/67 → flag 1（16:43）→ 16:44 首次發布、16:45 第二次；合格 2／待確認 288／不合格 10；零錯誤。24h 觀測期自 16:45 UTC 起算 |
