@@ -3925,6 +3925,64 @@ class SchedulerHarness:
             "UPDATE fills_sync SET evidence_unknown=1 WHERE address=?", (address.lower(),))
         self._store._db.commit()
 
+    def seed_migrated_unknown_rows(self, *, n: int) -> list[str]:
+        """Task 8b：精確複製 v4 遷移後最大的一群位址（137 個）的真實形狀——
+        對照 `explore_store._migrate_v3_to_v4` 第二條 `UPDATE`（門檻推論或
+        無佐證的探測回空）：`fills_sync.completeness='partial'`、
+        `reason='left_boundary_unknown'`、`left_boundary='unknown'`、
+        `evidence_unknown=0`；`scan_id` 指向一筆 `status='done'`、
+        `cursor_ms==window_end_ms`（已抵達固定終點）、`unresolved_gap=0` 的
+        `fills_scan`；**沒有**任何 `fills_scan`／`fills_verify` job（遷移
+        `_migrate_v3_to_v4` 本身不建立任何 job，這條 UPDATE 只動
+        `fills_sync`／不動 `fills_scan` 本身，也不觸碰 `refresh_job`）。
+
+        這是 Task 4 遷移後**唯一**只能靠 `_serve_special` 的輔助份額 →
+        `next_probe_candidate`（SQL）→ `_run_probe` 這條獨立鏈解出結論的
+        位址形狀——不會走 `_run_scan` 的 inline 探測前置（那需要一個
+        `pages_done==0` 的進行中 scan job；這裡刻意沒有）。位址取自
+        `_t7a_addr(300..)` 區段（在 `candidates=300` 的合法候選位址範圍
+        100..396 內，未被本檔其餘 harness 方法使用），確保 `_run_candidates`
+        的 `leaderboard_source_fn` 看得到它們、`candidate.active` 不會被
+        `deactivate_missing` 誤殺。
+
+        探測窗（`[window_start_ms-1天, window_start_ms-1]`）內放一筆合法
+        成交，讓探測回 `earlier_fills_seen`（正面證據）——驗證真的能解到
+        `complete`，不是卡在 `unknown` 原地踏步。"""
+        import dataclasses
+        now = self._clock.now()
+        now_ms = int(now * 1000)
+        window_start_ms = now_ms - 30 * 86_400_000
+        window_end_ms = now_ms
+        addrs = [_t7a_addr(300 + i) for i in range(n)]
+        for addr in addrs:
+            self._store.upsert_candidates([(addr, None, 1, None)], as_of=now)
+            self._store.bootstrap_address_fills(
+                addr, now, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
+                params_fp="")
+            scan = self._store.get_active_scan(addr)
+            scan = dataclasses.replace(
+                scan, cursor_ms=scan.window_end_ms, result="partial",
+                reason="left_boundary_unknown", finished_at=now)
+            self._store.complete_scan(addr, [], scan)
+            # 探測窗內放一筆合法成交（earlier_fills_seen 的正面證據來源）——
+            # `_T7AUpstream.seed_fills` 是整批覆寫（不是附加），這個位址的
+            # 主窗（`[window_start_ms, window_end_ms]`）本來就不會再被查
+            # （沒有 scan job），放一筆探測窗內的成交不影響任何其他計數。
+            self._upstream.seed_fills(addr, [_t7a_fill_at(window_start_ms - 1_000, 0)])
+        self._store._db.commit()
+        return addrs
+
+    def scan_pages_for(self, addrs: list[str]) -> int:
+        """這些位址目前 `fills_scan.pages_done` 的加總——Task 8b 用它證明
+        `seed_migrated_unknown_rows` 構造的位址全程零遍歷頁（種列時
+        `pages_done` 就是 0，見 `bootstrap_address_fills` 的 INSERT 預設值；
+        run 期間若真的被整窗重掃，這個數字會 > 0）。"""
+        placeholders = ",".join("?" * len(addrs))
+        row = self._store._db.execute(
+            f"SELECT COALESCE(SUM(pages_done), 0) FROM fills_scan WHERE address IN "
+            f"({placeholders})", tuple(a.lower() for a in addrs)).fetchone()
+        return row[0]
+
     def set_probe_always_empty(self, address: str) -> None:
         """未配置任何成交的地址本來就是空探測——保留這個方法只為讓呼叫端
         對 D-F 反向護欄場景的意圖明確表態（即使目前是 no-op）。"""
@@ -4299,3 +4357,53 @@ def test_special_serve_ratio_fails_safe_on_missing_or_invalid_config(tmp_path, k
     sched = _sched(store, FakeHL(), **kw)
     assert sched._special_serve_ratio(0.0) == SPECIAL_SERVE_RATIO
     assert sched._special_serve_ratio(10_000.0) == SPECIAL_SERVE_RATIO
+
+
+# --- Task 8b（2026-09-22 主線程複查裁決）：遷移後形狀必須走得完整條獨立探測鏈 ---
+#
+# Task 8 的 `test_new_verdict_path_is_actually_reached_by_the_scheduler` 只要 inline
+# 探測前置能跑就會過（見該測試上方的改壞→轉紅→revert 證據：必須同時破壞 inline 與
+# `_PROBE_CANDIDATE_WHERE` 才轉紅）。遷移後最大的一群位址（137 個）的真實形狀
+# ——`partial / left_boundary_unknown`、`evidence_unknown=0`、scan 已 done、沒有任何
+# scan job——只能靠 `_serve_special` → `next_probe_candidate`（SQL）→ `_run_probe`
+# 這條獨立鏈，不會走 inline（那需要一個還在跑的 scan job）。本測試專門鎖住這條鏈。
+
+
+def test_migrated_rows_reach_complete_via_standalone_probe_path(tmp_path):
+    """遷移後 137 個位址的真實路徑：無 scan job → 只能靠 `_serve_special` 的輔助份額
+    → `next_probe_candidate` 挑中 → `_run_probe` → `set_left_boundary` →
+    Task 3b 就地重算 → complete。全程由真實排程器驅動，零整窗重掃。
+
+    時限選 24 小時（2026-09-22 主線程裁決，複查 builder 的 19/20 失敗後）：這條
+    測試證明的是**可達性**（獨立探測鏈走得到、且不需要重掃），**不是吞吐**——
+    吞吐類斷言在 Task 7b 已被證明不是這個系統的穩定性質（見
+    `test_period_policy_keeps_incremental_demand_under_budget` 廢棄
+    `test_traversal_track_gets_at_least_half_the_fills_pages` 的理由）。時限的
+    選法因此是「讓輔助名額遠大於需求而飽和」：獨立探測走輔助份額，
+    `SPECIAL_SERVE_RATIO=9`、56 頁/小時上限下約 6 個名額/小時，24 小時
+    ≈ 144 個名額 ≫ 20，任何合理競爭下都該全數完成。6 小時 ≈ 36 個名額，扣掉
+    與另外 280 個新位址的 inline 探測／初始遍歷競爭同一份 fills 預算後貼著 20
+    （builder 實測 19/20，直接對該位址 `_run_probe` 插樁證實它在 6 小時內
+    一次都沒被排到——不是邏輯錯誤，是時限本身設在臨界點上），是時限設計錯誤，
+    不是斷言錯誤。**不縮小候選池**（維持 D-I 的 300 地址競爭）、**不預先解決
+    其他候選的證據**（那會讓 harness 偏離「遷移當下 198 個位址同時缺證據」的
+    正式機實況——正式機其實比這個 harness 更擠，不是更鬆）。
+
+    ⚠️ 巧合陷阱（改這條測試或 `PARTIAL_RESCAN_AFTER_S` 之前必讀）：本測試的
+    `hours=24` 與 `explore_fills_sync.PARTIAL_RESCAN_AFTER_S`（也是
+    `24 * 3600`）數值上撞在一起——若手動驗證「單獨破壞
+    `_PROBE_CANDIDATE_WHERE`」的紅燈證據，**剛好跑滿 24 小時**會在邊界上
+    讓這 20 個位址（全部共享 `finished_at=0`）同時觸發 `partial_rescan`，
+    改建一個新的 `fills_scan` job，經**inline**探測前置（不受這個破壞影響）
+    解掉其中 1 個（1/20 而非乾淨的 0/20）——這不影響本測試本身（正常
+    情況下 20 個早在 ~6.5 小時內就經獨立鏈解完，遠早於 24 小時邊界，根本
+    不會進入 `partial` 狀態去觸發 rescan），純粹是手動紅燈驗證要注意的
+    陷阱：驗證用略短於 24 小時（例如 23.9 小時）跑，才能乾淨隔離、看到
+    真正的 0/20（2026-09-22 主線程裁決時發現，見該次對話）。"""
+    h = _t7a_harness(tmp_path)
+    addrs = h.seed_migrated_unknown_rows(n=20)     # 精確複製 v4 遷移後的列形狀
+    h.run_for(hours=24)
+    resolved = [a for a in addrs if h.published_row(a)["fills_coverage"]["state"] == "complete"]
+    assert len(resolved) == 20
+    assert h.scan_pages_for(addrs) == 0            # 只有探測頁，沒有任何遍歷頁
+    assert h.probes_executed >= 20
