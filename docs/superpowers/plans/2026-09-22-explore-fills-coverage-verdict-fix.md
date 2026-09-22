@@ -1504,6 +1504,30 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 `[window_start − 1d, window_start + 1d)` 一律 unknown。既有 `test_probe_empty_with_clearly_newer_account_is_no_earlier_activity`
 用 +3 天仍過；新增 `+12h → unknown` 的測試。
 
+### W1／W5 裁決（主線程 2026-09-22，builder 回報與既有 plan 測試衝突後）
+
+**W1——plan 自己的兩條規格互相矛盾，物理限制贏**：Task 5 同時寫了「下界 `MIN_PERIOD_S`=6h 對所有位址」
+與「單週期預期成交筆數 ≤ 一頁」（`test_period_keeps_expected_fills_within_one_page`）。對 897.5 筆/小時的
+位址，一頁只夠 0.8×2000/897.5 ≈ 1.8 小時；強制 6h 就是 5,385 筆＝3 頁的補抓——正是 D-H 禁止的形狀。
+裁決：
+- **熱門**（`rank <= hot_rank`）：固定 `MIN_PERIOD_S`（6h，新鮮度需求，D-B）。
+- **非熱門或 `rank is None`**（重啟後快取為空即此情形，兩者同規則，重啟不再造成行為差異）：
+  `clamp(0.8×PAGE_LIMIT/fph×3600, MIN_PERIOD_COLD_S, MAX_PERIOD_S)`，新常數 **`MIN_PERIOD_COLD_S = 3600`**
+  （與 `config.py` 既有 `>= 3600` 驗證同值——reviewer W1 指出的正是穿過了這條驗證）。
+- 一頁不變式測試改寫為分段：`fph <= 0.8×PAGE_LIMIT/1h = 1600` 時預期筆數 ≤ `PAGE_LIMIT`；
+  `fph > 1600` 時 `period == MIN_PERIOD_COLD_S`（下界主導，多頁補抓不可避免，docstring 明寫理由）。
+- Task 5b 的 `test_high_frequency_cold_address_is_not_blanket_24h` 意圖是「不得一律 24h」，斷言
+  `fills_period_s(600, 200) == MIN_PERIOD_S` 改為 `== 9600`（0.8×2000/600×3600）並 `< MAX_PERIOD_S`。
+- 新增：`fills_period_s(5000.0, None) == MIN_PERIOD_COLD_S`、`fills_period_s(5000.0, 200) == MIN_PERIOD_COLD_S`、
+  `fills_period_s(897.5, None) == fills_period_s(897.5, 200)`（rank 未知與非熱門同規則）。
+- Task 7b 政策測試（≤ 30 頁/小時）預期仍過：正式機分佈中 fph ≥ 267 的只有 2 個位址。若轉紅，回報實數。
+
+**W5——修 harness fixture，不放寬判準**：`_t7a_default_portfolio(ws)` 把 `first_activity_ms` 設成**恰好等於**
+`window_start_ms`，在收緊後落在模糊帶是 fixture 不真實，不是判準錯。改成 `ws + 2*DAY`（帳戶明顯在窗口內才
+開始活動 → `no_earlier_activity`，可判定），並在 fixture docstring 寫明「W5 收緊後 ±1 天是模糊帶，fixture
+必須落在可判定區」。不得改成 `ws − 2*DAY`：若探測窗回空，那會變成 `truncation_suspected`，大戶測試會以
+另一種方式失敗。受影響的多條測試共用同一 fixture，改一處即可；改完 Task 7a／7b／8／8b 全部仍須綠。
+
 ### W4（延後，不在本 task）
 `truncation_suspected → unknown` 被允許且降級不觸發重算，`left_boundary` 與 `reason` 可能不一致。
 兩者都是 partial，不影響對外正確性；Task 3b 的 builder 有「防探測飢餓」的理由。部署後再議。
