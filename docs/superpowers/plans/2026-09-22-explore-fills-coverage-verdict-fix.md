@@ -1537,6 +1537,45 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 
 ---
 
+## Task 11: `no_earlier_activity` 改為窗口綁定（部署前，使用者裁決 2026-09-22）`@inline`
+
+> 兩輪審核都指出：`_applicable_boundary` 對正面證據一律 `stored_ws <= query_ws`，但單調性只對
+> `earlier_fills_seen` 成立（更早的起點之前有成交 ⇒ 更晚的起點之前必也有）。`no_earlier_activity`
+> 不成立：帳戶若在舊窗口**內**才開始活動，窗口往前滾後「新起點之前無活動」是假的，卻會被套用；
+> 配合「正面證據終局＋不重探」→ 永久鎖定 complete。觸發需要 HL 真的截斷（實測不會），
+> 但落在錯判完整方向，使用者裁決部署前修。W4 仍延後。
+
+**規格（三處必須一起改，缺一不自洽）**：
+
+1. `explore_store._applicable_boundary`：`earlier_fills_seen` 維持 `stored_ws <= query_ws`（單調）；
+   **`no_earlier_activity` 改為 `stored_ws == query_ws`**（窗口綁定）；`truncation_suspected` 維持 `==`。
+   docstring 逐狀態寫明為什麼（單調 vs 窗口綁定）。
+2. `_PROBE_CANDIDATE_WHERE`：新增 `(s.left_boundary='no_earlier_activity' AND
+   s.left_boundary_window_start_ms != sc.window_start_ms)`，與既有 `truncation_suspected` 那句同形——
+   否則窗口不符的位址會停在 `partial/left_boundary_unknown` 直到 24h 後的 `partial_rescan` 才被重探。
+3. `set_left_boundary` 轉移規則：「正面證據終局」只對**同一窗口起點**成立；stored 為 `no_earlier_activity`
+   且新寫入的 `window_start_ms` 不同 → 允許任何狀態（換窗口＝新問題）。`earlier_fills_seen` 仍**無條件終局**
+   （它是單調的，任何窗口都適用）。同窗口的既有規則不變。
+
+**測試**：
+- `test_no_earlier_activity_does_not_carry_to_a_later_window`：stored `no_earlier_activity@1000`，
+  `get_left_boundary(addr, 5000).state == "unknown"`；同一設定 `earlier_fills_seen@1000` → 仍 `earlier_fills_seen`。
+- `test_recompute_does_not_apply_no_earlier_activity_across_windows`：舊 scan ws=1000、
+  `set_left_boundary(no_earlier_activity, ws=5000)` → 結論維持 `partial/left_boundary_unknown`。
+- `test_window_mismatched_no_earlier_activity_is_a_probe_candidate`：`next_probe_candidate()` 挑得到。
+- `test_no_earlier_activity_may_be_overwritten_for_a_new_window`：stored `no_earlier_activity@1000`，
+  `set_left_boundary(unknown, ws=5000)` → True；`set_left_boundary(unknown, ws=1000)` → False（同窗口仍終局）；
+  stored `earlier_fills_seen@1000`，任何窗口寫 unknown → False。
+- harness `test_rescan_reprobes_when_prior_evidence_was_window_bound`：partial 列帶 `no_earlier_activity@W_old`，
+  `partial_rescan` 到期建新 scan（W_new）→ 探測前置**必須**發出探測（`probes_executed` +1），不得沿用舊證據。
+- 反向護欄：只把 `no_earlier_activity` 的規則改回 `<=` → 第一、二條轉紅。
+
+**驗收**：`uv run pytest -q` 全綠、ruff 過、上述測試齊、反向護欄轉紅輸出、
+`grep -n "stored_ws <= query_ws\|stored_ws == query_ws" src/spark/publicapi/explore_store.py` 仍只在 helper 內。
+**Commit**：`fix: no_earlier_activity 改為窗口綁定——單調性只對 earlier_fills_seen 成立（審核待辦 1）`
+
+---
+
 ## 狀態表（實作期間由主線程更新）
 
 | Task | 狀態 | 驗收證據 |
@@ -1554,6 +1593,7 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 | 8 端到端可達性＋份額自動到期 | ✅ `02d07e3` | 主線程複跑 3357 passed、ruff 全過；  預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
 | 8b 遷移後形狀走完整條獨立探測鏈 | ✅ `05fad87` | 只破壞 `_PROBE_CANDIDATE_WHERE`（不動 inline）→ 0/20 轉紅（23.9h 乾淨隔離；24h 因與 `PARTIAL_RESCAN_AFTER_S` 重合得 1/20，仍紅）；同 seed 下 **6.5 小時** 20/20（1h=2、3h=8、5h=15、6h=19） |
 | 10 審核修正 C1＋W1/W2/W3/W5 | ✅ `71f89fd`；主線程複跑 3367 passed、probe3/probe4 重現已封；針對性複審（opus）**無 Critical、判可部署** | 閘門抽成 `_applicable_boundary` 單一來源；遷移只動 `finished_at`；非熱門下界 1h；reason 永不 None；模糊帶對稱 |
+| 11 `no_earlier_activity` 窗口綁定 | 派工中（使用者裁決：部署前修） | |
 | 9 RUNBOOK §5.8f | ✅ 文件完成 `24f94ab`（**部署未執行，待使用者授權**） | 主線程逐段讀過並修 3 處可執行性問題（ops/health 需 admin session、取樣器無 `probe` 欄位、誤入的 commit 區塊）；取樣器 v4 相容已唯讀查證 |
 
 **待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
