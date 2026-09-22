@@ -2560,9 +2560,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 if cache_entry is None or now >= cache_entry.refresh_after:
                     explore_store.enqueue(f"{addr}:{kind}", addr, kind, 1, now)
                     refreshing = True
-            # Task 7.9a A1／7.9b B2：週期單一來源——與 `ExploreScheduler.fills_every_s`／
-            # `explore_fills_sync.plan_incremental` 的增量寬限期同一個
-            # `cfg.explore_fills_period_s`（config.py 檔頭），不再各自寫死 4 小時。
+            # Task 7.9a A1／7.9b B2／Task 5（2026-09-22，D-B／D-H）：`cfg.explore_fills_period_s`
+            # 現在是 `ExploreScheduler.fills_period_s_for` 逐地址估計的**下界**
+            # （config.py 檔頭）——詳情頁補排用下界當判準，語意是「最保守情形
+            # 下多久沒增量就該補排」，不再是唯一全域週期值，但仍是同一個
+            # config 欄位，不是另外寫死的字面值。
             if sync is None or now - sync.updated_at >= cfg.explore_fills_period_s:
                 explore_store.enqueue(f"{addr}:fills", addr, "fills", 2, now)
                 refreshing = True

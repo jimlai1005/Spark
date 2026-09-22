@@ -11,6 +11,7 @@ import threading
 
 import pytest
 
+from spark.publicapi.explore_fills_sync import MAX_PERIOD_S, MIN_PERIOD_S, fills_period_s
 from spark.publicapi.explore_scheduler import ExploreScheduler, _spread
 from spark.publicapi.explore_store import ExploreStore, FillsSyncState, ScanWriteback
 from spark.publicapi.hl import HLGateway
@@ -109,6 +110,23 @@ def _sched(store, hl, *, leaderboard_source_fn=lambda: None, excluded_fn=lambda:
         now_fn=clock.now, sleep_fn=clock.sleep, on_dirty=on_dirty, **kw)
 
 
+def _set_fills_rate(store, addr: str, *, window_hours: float, fills_in_window: int) -> None:
+    """Task 5 測試工具：直接改寫 `fills_sync.window_start_ms`／`fills_in_window`，
+    模擬「這個位址已經觀測到某個近期成交速率」。`bootstrap_address_fills` 剛
+    建立時 `window_start_ms == window_end_ms`（零寬度）——`fills_period_s_for`
+    在這個狀態下視為「無速率資料」（見該方法），真實速率要等增量軌真的跑過
+    幾輪、`window_end_ms` 被 `plan_incremental` 往前推才會自然出現；這裡跳過
+    那個過程直接寫值，只保留 `window_end_ms`（bootstrap 當下的 now）不動，
+    只往回改 `window_start_ms` 拉出寬度。"""
+    row = store._db.execute(
+        "SELECT window_end_ms FROM fills_sync WHERE address=?", (addr,)).fetchone()
+    window_end_ms = row[0]
+    window_start_ms = window_end_ms - int(window_hours * 3_600_000)
+    store._db.execute(
+        "UPDATE fills_sync SET window_start_ms=?, fills_in_window=? WHERE address=?",
+        (window_start_ms, fills_in_window, addr))
+
+
 # --- 1. 首 tick 只建 candidates job；第二 tick 跑 candidates 後每個地址五個 job ---
 
 def test_bootstrap_then_candidates_creates_five_jobs_per_address(tmp_path):
@@ -180,7 +198,10 @@ def test_weight_budget_bounded_and_takes_at_least_22_minutes(tmp_path):
     sched = _sched(store, hl, clock=clock,
                   # 週期設超大：完成後的重新排程不會在測試視窗內再度到期干擾計數。
                   state_every_s=10**9, portfolio_every_s=10**9,
-                  ledger_every_s=10**9, fills_every_s=10**9, rng=lambda: 0.0)
+                  ledger_every_s=10**9,
+                  # Task 5：min==max 釘死週期為固定值（不論位址名次／速率），
+                  # 與改版前 `fills_every_s=10**9` 的隔離效果等價。
+                  fills_min_period_s=10**9, fills_max_period_s=10**9, rng=lambda: 0.0)
     sched._bootstrapped = True  # 略過 candidates bootstrap，只驗證 state/portfolio 的節流
 
     events: list[tuple[float, int]] = []
@@ -644,16 +665,98 @@ def test_candidates_every_s_default_is_1800(tmp_path):
     assert sched._candidates_every_s == 1800
 
 
-def test_fills_every_s_default_is_default_fills_period_s_constant(tmp_path):
-    """Task 7.9a 補（2026-09-21 主線程裁決）：`ExploreScheduler` 不傳
-    `fills_every_s` 時，走的是 `explore_fills_sync.DEFAULT_FILLS_PERIOD_S`
-    這個單一來源常數（21600＝6 小時），不是排程端另外寫死的字面值。"""
-    from spark.publicapi.explore_fills_sync import DEFAULT_FILLS_PERIOD_S
-
+def test_fills_period_s_for_no_rate_data_is_default_min_period_constant(tmp_path):
+    """Task 5（2026-09-22，D-B／D-H，主線程裁決改寫，原
+    `test_fills_every_s_default_is_default_fills_period_s_constant`）：增量週期
+    不再是單一建構子常數——`ExploreScheduler` 不傳 `fills_min_period_s` 時，
+    對一個沒有 `fills_sync` 資料（速率未知）也沒有 candidates 名次的位址，
+    `fills_period_s_for` 走保守值 `explore_fills_sync.MIN_PERIOD_S`（單一來源
+    常數），不是排程端另外寫死的字面值。"""
     clock = Clock()
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     sched = _sched(store, FakeHL(), clock=clock)
-    assert sched._fills_every_s == DEFAULT_FILLS_PERIOD_S
+    assert sched.fills_period_s_for("0xAAA0000000000000000000000000000000AAA1") == MIN_PERIOD_S
+
+
+# ============================================================
+# Task 5（2026-09-22，D-B／D-H）：`explore_fills_sync.fills_period_s` 的純函式
+# 契約（plan Task 5 Step 1）＋排程端到期判斷與重排同源（7.8 教訓）。
+# ============================================================
+
+def test_period_keeps_expected_fills_within_one_page():
+    """核心不變式：任何地址的預期單週期成交筆數 ≤ PAGE_LIMIT。`rank=None`
+    （名次未知）刻意不套用下界，讓這個不變式在沒有名次可仰賴時仍然成立——見
+    `fills_period_s` docstring。"""
+    for fph in (1, 50, 500, 2_000, 20_000):
+        p = fills_period_s(fills_per_hour=fph, rank=None)
+        assert fph * (p / 3600) <= PAGE_LIMIT
+
+
+def test_high_frequency_cold_address_is_not_blanket_24h():
+    """D-H：名次在 50 名外但高頻的地址，不得一律延長到 24h；速率低則夾到上界。"""
+    assert fills_period_s(fills_per_hour=600, rank=200) == MIN_PERIOD_S
+    assert fills_period_s(fills_per_hour=2, rank=200) == MAX_PERIOD_S
+
+
+def test_hot_rank_never_exceeds_min_period():
+    """前 50 名的新鮮度需求優先於速率估計——即使速率很低也不得延長週期。"""
+    assert fills_period_s(fills_per_hour=0.1, rank=1) == MIN_PERIOD_S
+
+
+def test_unknown_rate_is_conservative():
+    """沒有速率資料時（地址剛入池，尚無 `fills_sync` 觀測）取保守值：不確定就
+    抓密一點，不論名次。"""
+    assert fills_period_s(fills_per_hour=None, rank=200) == MIN_PERIOD_S
+
+
+def test_due_check_and_reschedule_share_one_period_source(tmp_path):
+    """7.8 教訓：改到期條件必同改重排時間，且必須同一來源
+    （`sched.fills_period_s_for`）——不是排程端各自寫一份常數。
+
+    刻意把時鐘推到「這一輪確實到期」（`now_ms - window_end_ms >= period_ms`），
+    讓這一次 `_run_increment` 真的打上游、拿到空頁、**完成一輪**（走
+    `apply_incremental_page` 的 `done` 分支），而不是原地的 noop 續等——
+    7.8 的原始事故正是「noop 重排」與「完成一輪後的重排」各自讀了不同常數，
+    只驗 noop 分支不會抓到那個錯（已用暫時改壞 `_run_increment` 的 done 分支
+    重排這一行、確認本測試會紅之後才改回來，見派工回報）。用一個 cold
+    （`rank=200`，落在 50 名外，速率 2 筆/小時）位址：完成這一輪增量後的實際
+    重排間隔要對得上 `fills_period_s_for` 算出的值（速率公式夾到上界，非
+    「剛好等於 MIN_PERIOD_S 保底值」的巧合——若沒有寫入速率資料，零寬度的
+    `fills_sync` 窗口會讓 `fills_period_s_for` 直接走保守保底值，測不到
+    `_run_increment` 真正讀的是不是同一個來源）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    addr = "0xccc1"
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([(addr, None, 200, None)], as_of=clock.now())
+    store.bootstrap_address_fills(addr, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, addr, result="complete", reason="retention_boundary_verified",
+                   finished_at=clock.now())
+    _set_fills_rate(store, addr, window_hours=100, fills_in_window=200)  # 2 筆/小時
+    sched = _sched(store, SequencedFillsHL([[]]), clock=clock)
+    sched._bootstrapped = True
+    sched._rank_by_address[addr.lower()] = 200
+    expected = sched.fills_period_s_for(addr)
+    assert expected == MAX_PERIOD_S  # 低速率＋非熱門名次 → 夾到上界，不是保底值
+
+    # 推到「這一輪到期」：window_end_ms（=bootstrap 當下的 now_ms）之後至少
+    # 一個 period，`plan_incremental` 才不會判 noop。
+    clock.t += expected + 10
+    store.enqueue(f"{addr}:fills", addr, "fills", 2, clock.now())
+
+    r = sched.tick()
+    assert r == "ran:fills"
+
+    row = store._db.execute(
+        "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)).fetchone()
+    # ⚠️ 比較的是「重排間隔」本身（`row[0] - clock.now()`），不是把它加進
+    # `clock.now()`（此刻已是 4000 萬秒等級的 epoch）後再算相對誤差——後者的
+    # 15% 容差會被巨大的 epoch 基底稀釋到遠大於一個週期，抓不到「重排用了
+    # 錯的來源」這種錯（已用暫時改壞 `_run_increment` 的 done 分支重排驗證過：
+    # 改成 `row[0] == pytest.approx(clock.now() + expected, rel=0.15)` 這種寫法
+    # 抓不到 3600 vs 86400 的差；改成比較 delta 才會紅，見派工回報）。
+    assert row[0] - clock.now() == pytest.approx(expected, rel=0.15)
 
 
 def test_admission_cap_uses_admission_counts_not_stale_len_seen(tmp_path):
@@ -854,7 +957,7 @@ def test_no_fills_pending_base_jobs_use_parent_scope_up_to_300(tmp_path):
 
     sched = _sched(store, hl, hl_base=hl_base, hl_fills=hl_fills, clock=clock,
                   state_every_s=10**9, portfolio_every_s=10**9, ledger_every_s=10**9,
-                  fills_every_s=10**9, rng=lambda: 0.0)
+                  fills_min_period_s=10**9, fills_max_period_s=10**9, rng=lambda: 0.0)
     sched._bootstrapped = True
 
     max_explore_used = 0
@@ -931,7 +1034,7 @@ def test_scan_starvation_reproduction_bounded_and_progressing(tmp_path):
 
     sched = _sched(store, hl, hl_base=hl_base, hl_fills=hl_fills, clock=clock,
                   state_every_s=1, portfolio_every_s=10**9, ledger_every_s=10**9,
-                  fills_every_s=10**9, rng=lambda: 0.0)
+                  fills_min_period_s=10**9, fills_max_period_s=10**9, rng=lambda: 0.0)
     sched._bootstrapped = True
 
     start_time = clock.now()
@@ -1052,7 +1155,7 @@ def test_b7_i_incremental_continues_while_rescan_in_progress(tmp_path):
     # 增量到期，跑增量 job：不看 scan 是否進行中，照常抓一頁並前進。
     store.enqueue("0xabc:fills", "0xabc", "fills", 2, clock.now())
     hl = SequencedFillsHL([[]])  # 空頁，立刻結束增量本輪
-    sched = _sched(store, hl, clock=clock, fills_every_s=1)
+    sched = _sched(store, hl, clock=clock, fills_min_period_s=1, fills_max_period_s=1)
     sched._bootstrapped = True
     r = sched.tick()
 
@@ -1277,20 +1380,26 @@ def test_b7_viii_new_address_lifecycle(tmp_path):
 
 
 # ============================================================
-# Task 7.9a A1：fills 週期單一來源——scheduler 重排間隔與
-# `explore_fills_sync.plan_incremental` 的增量寬限期必須讀同一個 `fills_every_s`。
+# Task 7.9a A1／Task 5（2026-09-22，D-B／D-H，主線程裁決改寫）：fills 週期單一
+# 來源——scheduler 重排間隔與 `explore_fills_sync.plan_incremental` 的增量
+# 寬限期必須讀同一個 `sched.fills_period_s_for(address)`，不是各自一份常數
+# （Task 7.8 教訓）。⚠️ 這條測試守的就是 7.8 事故的不變式，只能改「期望值的
+# 來源」（從建構子傳入的全域 `period` 改成 `fills_period_s_for(address)`），
+# 不准刪。
 # ============================================================
 
-@pytest.mark.parametrize("period", [7200, 21600])
-def test_fills_period_single_source_ties_reschedule_and_plan_incremental(tmp_path, period):
-    """完成一輪增量後：(i) 重排間隔 ≈ period；(ii) `period − 1s` 仍是 noop
-    （不打上游）；(iii) `period + 1s` 開新的增量輪（打上游）。三者都隨同一個
-    `fills_every_s` 值變化，不是各自一份常數。"""
+@pytest.mark.parametrize("rank,addr", [(1, "0xaaa1"), (200, "0xaaa2")])
+def test_fills_period_single_source_ties_reschedule_and_plan_incremental(tmp_path, rank, addr):
+    """完成一輪增量後：(i) 重排間隔 ≈ `fills_period_s_for(addr)`；
+    (ii) `period − 1s` 仍是 noop（不打上游）；(iii) `period + 1s` 開新的增量輪
+    （打上游）。三者都隨同一個 `fills_period_s_for(addr)` 值變化，不是各自一份
+    常數。對 hot（`rank=1`，落在前 50 名，週期由新鮮度需求釘死＝`MIN_PERIOD_S`）
+    與 cold（`rank=200`，無成交紀錄，週期由速率公式夾到上界＝`MAX_PERIOD_S`）
+    各驗一次，確認不是巧合套中同一個數字。"""
     clock = Clock(t=40 * 86400.0)  # window 起點在 epoch 之後，避免負時間戳
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
-    addr = "0xabc"
     now_ms = int(clock.now() * 1000)
-    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    store.upsert_candidates([(addr, None, rank, None)], as_of=clock.now())
     store.bootstrap_address_fills(addr, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
                                   window_end_ms=now_ms, params_fp="")
     # Task 7.9d-S S1：`bootstrap_address_fills` 會建一個 running 的 initial scan，
@@ -1298,18 +1407,34 @@ def test_fills_period_single_source_ties_reschedule_and_plan_incremental(tmp_pat
     # ——本測試只量增量軌的週期，先把首次遍歷收尾掉，免得遍歷軌搶走 tick。
     _complete_scan(store, addr, result="complete", reason="retention_boundary_verified",
                    finished_at=clock.now())
+    # 兩組共用同一份速率資料（2 筆/小時）——hot 靠名次覆寫這個速率
+    # （`fills_period_s_for` 仍算出 MIN_PERIOD_S，不是因為速率沒資料才巧合
+    # 套中同一個保底值），cold 則是這個速率被公式夾到上界。
+    _set_fills_rate(store, addr, window_hours=100, fills_in_window=200)
     store.enqueue(f"{addr}:fills", addr, "fills", 2, clock.now())
     hl = SequencedFillsHL([[], []])
-    sched = _sched(store, hl, clock=clock, fills_every_s=period)
+    sched = _sched(store, hl, clock=clock)
     sched._bootstrapped = True
+    # Task 5：`_rank_by_address` 平常由 `_run_candidates` 寫入（見該方法）——
+    # 本測試不跑 candidates 輪（直接餵手動 enqueue 的 `fills` job），比照
+    # `upsert_candidates` 已寫進 DB 的名次直接灌快取。
+    sched._rank_by_address[addr.lower()] = rank
+
+    period = sched.fills_period_s_for(addr)
+    expected_period = MIN_PERIOD_S if rank <= 50 else MAX_PERIOD_S
+    assert period == expected_period  # 兩組真的踩中不同分支，非巧合套中同一數字
 
     r1 = sched.tick()
     assert r1 == "ran:fills"
 
     row = store._db.execute(
         "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)).fetchone()
-    # (i) 完成收尾後的重排間隔 ≈ period（±10% jitter）。
-    assert row[0] == pytest.approx(clock.now() + period, rel=0.15)
+    # (i) 完成收尾後的重排間隔 ≈ `fills_period_s_for(addr)`（±15% jitter）。比較
+    # delta（`row[0] - clock.now()`）而不是把 period 加進 `clock.now()`（4000
+    # 萬秒等級的 epoch）再比——後者的 15% 容差會被巨大 epoch 基底稀釋到遠大於
+    # 一個週期，抓不到「重排用了錯的來源」（見
+    # `test_due_check_and_reschedule_share_one_period_source` 的派工回報）。
+    assert row[0] - clock.now() == pytest.approx(period, rel=0.15)
 
     sync = store.get_sync(addr)
     window_end_ms = sync.window_end_ms
@@ -1323,19 +1448,28 @@ def test_fills_period_single_source_ties_reschedule_and_plan_incremental(tmp_pat
     assert r2 == "ran:fills"
     assert len(hl.calls) == calls_after_round1
 
-    # (iii) period + 1s：開新的增量輪，打上游。
+    # (iii) period + 1s：開新的增量輪，打上游，真的完成一輪（走 `_run_increment`
+    # 的 done 分支）——順便驗這一輪收尾後的重排間隔同樣對得上 `period`
+    # （done 分支與 noop 分支的重排必須同源，7.8 教訓）。
+    before_round3 = clock.now()
     clock.t = (window_end_ms + period * 1000 + 1000) / 1000
     store._db.execute("UPDATE refresh_job SET next_attempt_at=? WHERE key=?",
                       (clock.now(), f"{addr}:fills"))
     r3 = sched.tick()
     assert r3 == "ran:fills"
     assert len(hl.calls) == calls_after_round1 + 1
+    row3 = store._db.execute(
+        "select next_attempt_at from refresh_job where key=?", (f"{addr}:fills",)).fetchone()
+    assert row3[0] - clock.now() == pytest.approx(period, rel=0.15)
+    assert clock.now() > before_round3  # 確認這確實是新的一輪，不是誤判 noop
 
 
 def test_run_api_passes_configured_fills_period_to_scheduler(tmp_path, monkeypatch):
-    """`scripts.run_api` 把 `cfg.explore_fills_period_s` 原樣傳給
-    `ExploreScheduler(fills_every_s=...)`（沿 `test_run_api_wiring.py` 的
-    `__init__` 攔截慣例）。"""
+    """Task 5（2026-09-22，D-B／D-H，主線程裁決）：`scripts.run_api` 把
+    `cfg.explore_fills_period_s`／`explore_fills_max_period_s` 原樣傳給
+    `ExploreScheduler(fills_min_period_s=, fills_max_period_s=)`（沿
+    `test_run_api_wiring.py` 的 `__init__` 攔截慣例）——兩個參數都要有讀取者，
+    不是傳進去沒人讀的死旋鈕。"""
     import threading
 
     import scripts.run_api as run_api
@@ -1371,7 +1505,8 @@ def test_run_api_passes_configured_fills_period_to_scheduler(tmp_path, monkeypat
 
     run_api.main()
 
-    assert captured["fills_every_s"] == 7200
+    assert captured["fills_min_period_s"] == 7200
+    assert captured["fills_max_period_s"] == MAX_PERIOD_S  # 未設 env，走預設上界
 
 
 # ============================================================

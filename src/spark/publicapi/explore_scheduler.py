@@ -123,11 +123,12 @@ import threading
 from decimal import Decimal
 from typing import Callable
 
-from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, PARAMS_FP,
+from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_S, PARAMS_FP,
                                                 PARTIAL_RESCAN_AFTER_S, apply_incremental_page,
-                                                apply_scan_page, fresh_scan_window,
-                                                partial_rescan_due, plan_incremental, plan_scan,
-                                                scan_verdict, validate_page)
+                                                apply_scan_page, fills_period_s,
+                                                fresh_scan_window, partial_rescan_due,
+                                                plan_incremental, plan_scan, scan_verdict,
+                                                validate_page)
 from spark.publicapi.explore_store import (ADMISSION_MULTIPLIER, JOB_KINDS, ExploreStore, Job,
                                            ScanWriteback)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
@@ -262,12 +263,18 @@ class ExploreScheduler:
                  state_every_s: float = 1800,
                  portfolio_every_s: float = 7200,
                  ledger_every_s: float = 7200,
-                 # Task 7.9a 補（2026-09-21 主線程裁決）：預設值 import
-                 # `explore_fills_sync.DEFAULT_FILLS_PERIOD_S`（單一來源），
-                 # 不得在這裡另寫一份秒數字面值——生產路徑一律由 `run_api.py`
-                 # 顯式傳入 `cfg.explore_fills_period_s`，這個預設值只給沒有
-                 # 接 config 的呼叫端／測試用。
-                 fills_every_s: float = DEFAULT_FILLS_PERIOD_S, hot_rank: int = 50,
+                 # Task 5（2026-09-22，D-B／D-H，主線程裁決）：增量週期不再是
+                 # 單一常數——改由 `fills_period_s_for(address)` 逐地址依近期
+                 # 成交速率與名次決定（見該方法／`explore_fills_sync.fills_period_s`
+                 # docstring）。這兩個參數只覆寫該公式的上下界，預設值 import
+                 # `explore_fills_sync.MIN_PERIOD_S`／`MAX_PERIOD_S`（單一來源），
+                 # 不得在這裡另寫一份秒數字面值。生產路徑由 `run_api.py` 顯式傳入
+                 # `cfg.explore_fills_period_s`／`cfg.explore_fills_max_period_s`
+                 # （`FILET_EXPLORE_FILLS_PERIOD_S` 正式機現值 21600 語意相容地
+                 # 改為下界來源，drop-in 不必改值）。
+                 fills_min_period_s: float = MIN_PERIOD_S,
+                 fills_max_period_s: float = MAX_PERIOD_S,
+                 hot_rank: int = 50,
                  jitter_pct: float = 0.10,
                  rng: Callable[[], float] = random.random,
                  on_tick: Callable[[], None] | None = None):
@@ -287,11 +294,17 @@ class ExploreScheduler:
         self._state_every_s = state_every_s
         self._portfolio_every_s = portfolio_every_s
         self._ledger_every_s = ledger_every_s
-        self._fills_every_s = fills_every_s
+        self._fills_min_period_s = fills_min_period_s
+        self._fills_max_period_s = fills_max_period_s
         self._hot_rank = hot_rank
         self._jitter_pct = jitter_pct
         self._rng = rng
         self._on_tick = on_tick
+        # Task 5：最近一輪 candidates 的 `source_rank` 快取（小寫位址 → 名次，
+        # 1-based）——`fills_period_s_for` 的名次來源，只在 `_run_candidates`
+        # 寫入（見該方法），不落 DB（`candidate.source_rank` 已經是權威持久化
+        # 來源，這裡只是排程端的讀取捷徑，重啟後第一輪 candidates 就會重建）。
+        self._rank_by_address: dict[str, int] = {}
 
         self._bootstrapped = False
         self._first_tick_done = False
@@ -373,6 +386,29 @@ class ExploreScheduler:
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
         return period_s * (1 + (self._rng() * 2 - 1) * self._jitter_pct)
+
+    def fills_period_s_for(self, address: str) -> float:
+        """Task 5（D-B／D-H）：增量週期的**唯一**取用點——`_enqueue_address_jobs`
+        （fills／fills_scan 的排程間隔）與 `_run_increment`（到期判斷傳給
+        `plan_incremental` 的 `period_s`、以及完成一輪後的重排間隔）都必須經
+        這裡，不得各自算一份（Task 7.8 教訓：到期條件與重排時間不同源）。
+
+        `fills_per_hour` 來自 `ExploreStore.get_sync(address).fills_in_window`
+        除以該列的窗口小時數（30 天窗口的實測速率；`fills_in_window` 是上界，
+        見 `explore_fills_sync.fills_period_s` docstring）；地址沒有 `fills_sync`
+        列或窗口長度非正時視為無資料。名次讀 `self._rank_by_address`（最近一輪
+        `_run_candidates` 寫入的 `source_rank` 快取）——地址尚未出現在任何一輪
+        candidates（例如剛入池、還沒跑過 candidates）時為 `None`。"""
+        st = self._store.get_sync(address)
+        fills_per_hour: float | None = None
+        if st is not None:
+            window_hours = (st.window_end_ms - st.window_start_ms) / 3_600_000
+            if window_hours > 0:
+                fills_per_hour = st.fills_in_window / window_hours
+        rank = self._rank_by_address.get(address.lower())
+        return fills_period_s(fills_per_hour, rank,
+                              min_period_s=self._fills_min_period_s,
+                              max_period_s=self._fills_max_period_s)
 
     @staticmethod
     def _key(address: str, kind: str) -> str:
@@ -825,6 +861,9 @@ class ExploreScheduler:
         upsert_rows: list[tuple[str, str | None, int | None, float | None]] = []
         for rank, (address, display_name) in enumerate(rows, start=1):
             seen.add(address.lower())
+            # Task 5：`fills_period_s_for` 的名次來源——寫在 `upsert_candidates`
+            # 之前也沒關係（純記憶體快取，不依賴這次寫入是否成功）。
+            self._rank_by_address[address.lower()] = rank
             upsert_rows.append((address, display_name, rank, roi_by_addr.get(address.lower())))
         self._store.upsert_candidates(upsert_rows, now)
         self._candidates_empty_streak = 0
@@ -886,14 +925,18 @@ class ExploreScheduler:
             address, now, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
             params_fp=PARAMS_FP)
         fills_priority = 2 if rank <= self._hot_rank else 3
+        # Task 5：fills／fills_scan 的排程間隔改走單一取用點
+        # `fills_period_s_for`（同一次呼叫內算一次即可——`rank` 在這次
+        # candidates 輪已寫進 `_rank_by_address`，見 `_run_candidates`）。
+        fills_period = self.fills_period_s_for(address)
         needed: list[tuple[str, int, float]] = [
             ("state", 0, self._state_every_s),
             ("portfolio", 1, self._portfolio_every_s),
             ("ledger", 1, self._ledger_every_s),
-            ("fills", fills_priority, self._fills_every_s),
+            ("fills", fills_priority, fills_period),
         ]
         if is_new:
-            needed.append(("fills_scan", fills_priority, self._fills_every_s))
+            needed.append(("fills_scan", fills_priority, fills_period))
 
         existing = self._store.job_kinds(address)
         for kind, priority, period_s in needed:
@@ -945,7 +988,8 @@ class ExploreScheduler:
             # 代表 store 資料被外部竄改，跳過不重試。
             self._complete(job)
             return "dropped"
-        plan = plan_incremental(st, now_ms=int(now * 1000), period_s=self._fills_every_s)
+        plan = plan_incremental(st, now_ms=int(now * 1000),
+                                period_s=self.fills_period_s_for(job.address))
         if plan.is_noop:
             self._complete(job)
             # `plan.next_due_ms` 是 planner 的毫秒制輸出——秒／毫秒轉換只發生在
@@ -969,7 +1013,11 @@ class ExploreScheduler:
             self._notify_dirty()
             return "ran:fills"
         self._complete(job)
-        next_at = now + self._jit(self._fills_every_s)
+        # Task 5／Task 7.8 教訓：重排間隔跟上面 `plan_incremental` 的到期判斷
+        # 走同一個取用點 `fills_period_s_for`（在此重新呼叫而非沿用上面算好的
+        # 值——本輪剛 `insert_fills_page`，用地址此刻最新的速率估計，同一個
+        # 函式＝同一個來源，不是各自寫一份常數）。
+        next_at = now + self._jit(self.fills_period_s_for(job.address))
         self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
         # Task 7.9d-S S1／7.9e-S S1：增量收尾也跑一次**同一個**對帳函式
         # （`_ensure_scan_job`）——主路徑是 `reconcile_scan_jobs`（啟動＋每次

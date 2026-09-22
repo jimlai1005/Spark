@@ -92,16 +92,15 @@ WINDOW_DAYS = 30
 OVERLAP_MS = 1
 _DAY_MS = 86_400_000
 
-# Task 7.9a 補（2026-09-21 主線程裁決）：fills 增量週期的**唯一**字面值來源
-# ——`ApiConfig.explore_fills_period_s` 的預設值與 `ExploreScheduler.__init__`
-# 的 `fills_every_s` 預設值都 import 這個常數，不得各自重新寫一份 21600／
-# 6*3600 的字面值。
+# Task 7.9a 補（2026-09-21 主線程裁決）：`plan_incremental` 沒有收到明講的
+# `period_s` 時的保底值。Task 5（2026-09-22，D-B／D-H）起，生產路徑
+# （`explore_scheduler._run_increment`）已改為每次呼叫都經
+# `ExploreScheduler.fills_period_s_for(address)` 逐地址算出 `period_s`
+# 顯式傳入——這個常數不再是「單一字面值來源」，只是呼叫端沒有明講時的保底值
+# （例如測試直接呼叫 `plan_incremental` 不帶 `period_s`）。
 DEFAULT_FILLS_PERIOD_S = 6 * 3600
 
-# 這個值只在呼叫端沒有明講 `period_s` 時才會用到——生產路徑
-# （`explore_scheduler._run_increment`）一律顯式傳入
-# `self._fills_every_s`（由 `run_api.py` 從 `ApiConfig.explore_fills_period_s`
-# 單一來源注入），這裡只是「沒有 config 時」的保底值。
+# 這個值只在呼叫端沒有明講 `period_s` 時才會用到（見上）。
 _DEFAULT_INCREMENTAL_PERIOD_S = DEFAULT_FILLS_PERIOD_S
 
 # Task 7.7 W2（partial 復原路徑）／Task 7.9b B3：`partial` 遍歷完成後，
@@ -126,6 +125,70 @@ def partial_rescan_due(finished_at: float | None, now: float) -> bool:
     if finished_at is None:
         return True
     return now - finished_at >= PARTIAL_RESCAN_AFTER_S
+
+
+# Task 5（2026-09-22，D-B／D-H，見 plan
+# docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md
+# 「背景：根因與證據」根因 2）：增量週期不再是單一常數——300 個位址每 6 小時
+# 各抓一次已吃掉 fills 吞吐上限的 83%。改依「近期成交速率」逐地址決定週期，
+# 目標是讓一個週期內的預期成交筆數落在一頁（`PAGE_LIMIT`）之內；`MIN_PERIOD_S`／
+# `MAX_PERIOD_S` 是這個估計值的上下界（可被 `ApiConfig.explore_fills_period_s`／
+# `explore_fills_max_period_s` 透過 `ExploreScheduler(fills_min_period_s=,
+# fills_max_period_s=)` 覆寫，見 `explore_scheduler.fills_period_s_for`）。
+MIN_PERIOD_S = 6 * 3600
+MAX_PERIOD_S = 24 * 3600
+
+# 留 20% 餘裕給成交速率波動——單週期預期筆數目標抓 `PAGE_LIMIT` 的 80%，不是
+# 貼著上限算（貼滿的話速率稍微上升就會變成多頁補抓）。
+TARGET_FILL_RATIO = 0.8
+
+# `fills_per_hour` 分母保護，避免 0 造成除以零；不是「多小算沒有」的業務門檻。
+_EPS_FILLS_PER_HOUR = 1e-6
+
+# D-H：「前 50 名」的新鮮度需求——與 `explore_scheduler.ExploreScheduler` 建構子
+# 的 `hot_rank`（預設同為 50，決定 job priority）是概念上相關但刻意獨立的兩個
+# 常數：`fills_period_s` 的簽名只有 `(fills_per_hour, rank)` 兩個參數（見下、
+# 與 plan Task 5 Step 1 的測試一致），沒有 hot_rank 參數可調；目前沒有呼叫端
+# 會把 `hot_rank` 設成非 50，兩者數值上不會漂移，但這裡先誠實記下這個耦合，
+# 不是憑空假設「反正一樣」。
+_HOT_RANK = 50
+
+
+def fills_period_s(fills_per_hour: float | None, rank: int | None, *,
+                    min_period_s: float = MIN_PERIOD_S,
+                    max_period_s: float = MAX_PERIOD_S) -> float:
+    """增量週期的唯一公式（D-B／D-H）——`explore_scheduler.fills_period_s_for`
+    是本函式在排程端**唯一**的取用點，所有到期判斷與重排都必須經它（Task 7.8
+    教訓：到期條件與重排時間不得各自寫一份常數）。
+
+    `fills_per_hour`：近期成交速率（來源＝`fills_sync.fills_in_window /
+    窗口小時數`，30 天窗口的實測速率）。`fills_in_window` 自 Task 1 起含游標
+    重疊、是**上界**而非精確值（實測高估約 3.7%）——估高會讓這裡估出的週期
+    偏短（更頻繁），方向保守，可接受，但不是精確值。`None`（尚無資料，例如
+    位址剛入池）→ 取保守值 `min_period_s`（不確定就抓密一點）。
+
+    `rank`：`candidate.source_rank`（1-based，越小越熱門）。`None`（尚未併入
+    最近一輪候選排名）與「已知但在前 50 名外」是兩種不同語意：
+    - `rank` 落在前 `_HOT_RANK` 名：新鮮度需求優先於速率估計，一律
+      `min_period_s`，不論實際成交速率多低（D-H：不得因為低速率就把熱門位址
+      排到 24 小時）。
+    - `rank` 已知但在 `_HOT_RANK` 名外：套用速率公式並夾在
+      `[min_period_s, max_period_s]`——下界對這一類位址也適用（D-H：「其餘：
+      6h（下界，不是只給 hot）」），代價是極端高速率的位址可能單週期預期筆數
+      超過一頁、下一輪要多頁補抓；這是刻意的取捨，不是本函式要保的不變式。
+    - `rank` 為 `None`（尚未有排名資訊）：只套用 `max_period_s` 上限，
+      **不套用下界**——讓「單週期預期成交筆數 ≤ PAGE_LIMIT」這個核心不變式
+      （見 `test_period_keeps_expected_fills_within_one_page`）在沒有名次可
+      仰賴時仍然成立。"""
+    if fills_per_hour is None:
+        return min_period_s
+    if rank is not None and rank <= _HOT_RANK:
+        return min_period_s
+    raw_s = (TARGET_FILL_RATIO * PAGE_LIMIT
+             / max(fills_per_hour, _EPS_FILLS_PER_HOUR) * 3600)
+    if rank is None:
+        return min(max_period_s, raw_s)
+    return max(min_period_s, min(max_period_s, raw_s))
 
 
 @dataclasses.dataclass(frozen=True)

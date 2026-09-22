@@ -80,11 +80,12 @@ def main() -> None:
             cfg=hl_explore.ExploreConfig.from_env(), now_fn=time.time,
             sleep_fn=time.sleep, on_dirty=publisher.mark_dirty,
             on_tick=publisher.maybe_publish,
-            # Task 7.9a A1：fills 增量週期單一來源——同一個 `cfg.explore_fills_period_s`
-            # 同時決定這裡的重排間隔與 `explore_fills_sync.plan_page` 的增量寬限期
-            # （見 `explore_scheduler._run_fills`），也是 `app.py` 詳情頁補排條件的
-            # 同一個值（config.py 檔頭）。
-            fills_every_s=cfg.explore_fills_period_s)
+            # Task 5（2026-09-22，D-B／D-H）：增量週期不再是單一全域值——
+            # `cfg.explore_fills_period_s`／`explore_fills_max_period_s` 只覆寫
+            # `ExploreScheduler.fills_period_s_for` 逐地址估計的上下界（見該方法
+            # 與 config.py 檔頭），也是 `app.py` 詳情頁補排條件讀的同一個下界值。
+            fills_min_period_s=cfg.explore_fills_period_s,
+            fills_max_period_s=cfg.explore_fills_max_period_s)
         app.state.explore_scheduler = scheduler
         app.state.explore_publisher = publisher
         if cfg.explore_upstream_refresh:

@@ -19,12 +19,12 @@ from spark.filet.risk_settings import risk_settings_path_for, risk_unlock_path_f
 from spark.filet.close_all import close_all_path_for
 from spark.filet.referral_optin import normalize_referral_code, referral_optin_path_for
 from spark.filet.user_leaders import user_leaders_path_for
-# Task 7.9a 補（2026-09-21 主線程裁決）：fills 增量週期預設值單一來源——
-# `explore_fills_sync` 是這條依賴鏈最底層的模組（只依賴 `explore_store`／
-# `spark.exchange.base`，兩者皆不 import `config.py`），被這裡 import 不會
-# 造成循環（`config.py` 不反向被 `explore_scheduler`／`explore_fills_sync`
-# import）。
-from spark.publicapi.explore_fills_sync import DEFAULT_FILLS_PERIOD_S
+# Task 7.9a 補（2026-09-21 主線程裁決）／Task 5（2026-09-22，D-B／D-H）：fills
+# 增量週期上下界的預設值單一來源——`explore_fills_sync` 是這條依賴鏈最底層的
+# 模組（只依賴 `explore_store`／`spark.exchange.base`，兩者皆不 import
+# `config.py`），被這裡 import 不會造成循環（`config.py` 不反向被
+# `explore_scheduler`／`explore_fills_sync` import）。
+from spark.publicapi.explore_fills_sync import MAX_PERIOD_S, MIN_PERIOD_S
 
 _HEX = set("0123456789abcdefABCDEF")
 
@@ -164,22 +164,25 @@ class ApiConfig:
     # `explore_fills`；無 fills 待處理時基礎可借滿父 `explore`——300）。
     hl_explore_base_weight_cap: int = 180
     hl_explore_fills_weight_cap: int = 120
-    # --- Explore fills 增量週期單一來源（Task 7.9a，2026-09-21 使用者裁決；
-    # 補：預設值本身也要單一來源，見 `DEFAULT_FILLS_PERIOD_S` 匯入）---
-    # 舊版把「多久對一個地址開一輪 fills 增量」的 4 小時字面值分開寫死在三處
-    # （`explore_fills_sync._DEFAULT_INCREMENTAL_AFTER_MS`、
-    # `ExploreScheduler.__init__` 的 `fills_every_s` 預設、`app.py` 詳情頁補排
-    # 條件），三處各自漂移就會出現「排程說已增量、詳情頁還在等 4 小時」這種
-    # 不一致。改為本欄位單一來源：`run_api.py` 把它同時餵給
-    # `ExploreScheduler(fills_every_s=...)`（重排間隔＋轉給
-    # `explore_fills_sync.plan_page(incremental_after_ms=...)`）與詳情頁補排
-    # 條件（`app.py`）。預設值直接 import `DEFAULT_FILLS_PERIOD_S`（21600＝
-    # 6 小時），不得在本檔另寫一份字面值——`ExploreScheduler.__init__` 的
-    # `fills_every_s` 預設同樣 import 這個常數，兩處預設值才不會各自漂移
-    # （見該檔案）。正式機量到消化上限 60 地址／小時，300 地址／4 小時＝75
-    # 超過上限；6 小時＝50 才留出多頁增量／partial 重掃／探測的餘裕（見
-    # RUNBOOK §5.8e 容量算式）。
-    explore_fills_period_s: int = DEFAULT_FILLS_PERIOD_S
+    # --- Explore fills 增量週期上下界（Task 7.9a，2026-09-21 使用者裁決；
+    # Task 5，2026-09-22，D-B／D-H 主線程裁決：語意由「單一全域週期」改為
+    # 「速率估計的上下界」）---
+    # 舊版：一個常數同時決定所有地址的增量週期。Task 5 起，
+    # `ExploreScheduler.fills_period_s_for` 依每個地址近期成交速率與名次逐一
+    # 算出週期（見 `explore_fills_sync.fills_period_s`），這兩個欄位只覆寫該
+    # 公式的上下界。`explore_fills_period_s`（env `FILET_EXPLORE_FILLS_PERIOD_S`）
+    # **語意相容地**改為下界來源——正式機現值 21600（6 小時）剛好等於新規格
+    # 預設下界，drop-in 不必改值；`explore_fills_max_period_s`（新 env
+    # `FILET_EXPLORE_FILLS_MAX_PERIOD_S`）是上界，預設 `MAX_PERIOD_S`（24
+    # 小時）。`run_api.py` 把兩者餵給
+    # `ExploreScheduler(fills_min_period_s=, fills_max_period_s=)`；`app.py`
+    # 詳情頁補排條件仍讀 `explore_fills_period_s`（下界）當作「多久沒增量算
+    # 該補排」的判準，語意不變（下界＝新鮮度要求最高的情形，詳情頁補排本就該
+    # 用最保守的門檻）。預設值直接 import `MIN_PERIOD_S`／`MAX_PERIOD_S`
+    # （單一來源，不得在本檔另寫字面值——`ExploreScheduler.__init__` 的
+    # `fills_min_period_s`／`fills_max_period_s` 預設同樣 import 這兩個常數）。
+    explore_fills_period_s: int = MIN_PERIOD_S
+    explore_fills_max_period_s: int = MAX_PERIOD_S
     # --- Explore 持久化（Task 2.3，2026-09-20，spec P2）---
     # `FILET_EXPLORE_DB`：`ExploreStore`（SQLite WAL）落盤路徑。⚠️ 刻意**不**沿
     # `exchange_dir`／`state_base`／`leaders_path` 的必填慣例：P2 階段 store 尚無
@@ -221,6 +224,10 @@ class ApiConfig:
             raise ValueError(
                 "FILET_EXPLORE_FILLS_PERIOD_S 不得小於 3600（1 小時）——太短會讓 fills "
                 "增量頻率超出 explore_fills 保留額度的消化能力")
+        if self.explore_fills_max_period_s < self.explore_fills_period_s:
+            raise ValueError(
+                "FILET_EXPLORE_FILLS_MAX_PERIOD_S 不得小於 FILET_EXPLORE_FILLS_PERIOD_S"
+                "（上界不得小於下界）")
         if self.stripe_secret_key is not None and \
                 not self.stripe_secret_key.startswith("sk_test_"):
             raise ValueError(
@@ -443,4 +450,7 @@ class ApiConfig:
                    explore_upstream_refresh=(env.get("EXPLORE_UPSTREAM_REFRESH", "")
                                              .strip().lower() in ("1", "true")),
                    explore_fills_period_s=int(env.get("FILET_EXPLORE_FILLS_PERIOD_S")
-                                              or cls.explore_fills_period_s))
+                                              or cls.explore_fills_period_s),
+                   explore_fills_max_period_s=int(
+                       env.get("FILET_EXPLORE_FILLS_MAX_PERIOD_S")
+                       or cls.explore_fills_max_period_s))
