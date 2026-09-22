@@ -2306,6 +2306,46 @@ def test_s7_scan_job_dropped_when_state_says_no_rescan(tmp_path):
     assert [r for r in _scan_rows(store, "0xabc") if r[0] == "partial_rescan"] == []
 
 
+def test_recomputed_complete_drops_the_pending_partial_rescan_job(tmp_path):
+    """Task 3b（D-G）：重算成 `complete` 之後，原本排著、已到期的整窗重掃
+    job 要因狀態推導而被丟棄——不得真的再跑一次 18 頁以上的整窗重掃。
+
+    構造與 `test_s7_scan_job_dropped_when_state_says_no_rescan` 同形（一個
+    `partial` 地址、一個已到期的 `fills_scan` job），差別在於這裡的「狀態已經
+    不需要重掃」不是一開始就是 `complete`，而是在 job 已經排定之後，探測
+    （模擬 `next_probe_candidate` 獨立路徑，事後解出正面證據）才讓
+    `set_left_boundary` 就地把 `partial` 翻成 `complete`——這正是 165 個
+    位址（Task 4 遷移後）要靠這個機制翻身，而不必付一次整窗重掃的場景。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, "0xabc", result="partial", reason="left_boundary_unknown",
+                   window_end_ms=now_ms, finished_at=clock.now())
+    # 24 小時重掃已到期：一個已到期的 `fills_scan` job 排在那裡（Task 4 遷移後
+    # 的 165 個位址正是這個形狀——遍歷資料都在，只差一頁探測）。
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
+    hl = FakeHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+
+    # 探測事後解出正面證據（模擬 `next_probe_candidate` 獨立路徑成功探測；
+    # 直接呼叫 `set_left_boundary`，`_run_probe` 本身的探測邏輯已由 Task 3
+    # 的六條測試覆蓋，這裡只驗重算之後的 job 對帳）。
+    ok = store.set_left_boundary("0xabc", "earlier_fills_seen", window_start_ms, clock.now())
+    assert ok is True
+    assert store.get_sync("0xabc").completeness == "complete"     # 重算先生效
+
+    assert sched.tick() == "dropped"
+
+    assert hl.calls == []                                        # 零上游請求，沒有整窗重掃
+    assert store.job_kinds("0xabc") == set()
+    assert store.get_sync("0xabc").completeness == "complete"     # 結論沒被重掃覆蓋
+
+
 def test_s7_partial_not_yet_due_scan_job_is_dropped_not_rescanned(tmp_path):
     """S2：`partial` 但距離上一次遍歷還不到 `PARTIAL_RESCAN_AFTER_S` 時，
     領到 scan job 一樣丟棄（重掃期限是單一來源，不因 job 存在而提前）。"""

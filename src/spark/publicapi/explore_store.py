@@ -50,7 +50,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, NamedTuple
@@ -95,6 +95,11 @@ REASON_LEFT_BOUNDARY_NO_ACTIVITY = "left_boundary_no_activity"  # 帳戶在窗�
 REASON_LEFT_BOUNDARY_TRUNCATED = "left_boundary_truncated"      # 上游截斷嫌疑
 REASON_LEFT_BOUNDARY_UNKNOWN = "left_boundary_unknown"          # 證據不足，不下結論
 REASON_UNRESOLVED_GAP = "unresolved_gap"                        # 分頁有未解缺口
+
+# Task 3b（2026-09-22，D-G 裁決）：正面左界證據——一旦取得即終局（單調性，見
+# `get_left_boundary` docstring），`get_left_boundary`／`set_left_boundary`
+# 共用同一份值域，不各自重複寫一份 tuple 字面值。
+_POSITIVE_BOUNDARY_STATES = ("earlier_fills_seen", "no_earlier_activity")
 
 # Task 7.9d-D D2：`refresh_job.kind` 的已知集合——彙總查詢（`count_jobs_by_kind`／
 # `count_due_by_kind`）用它把已知 kind 一律補成 0，讓觀測端的鍵集合固定（缺鍵與
@@ -1321,7 +1326,7 @@ class ExploreStore:
         if row is None:
             return LeftBoundary(state="unknown", window_start_ms=None, at=None)
         state, stored_ws, at = row
-        if state in ("earlier_fills_seen", "no_earlier_activity"):
+        if state in _POSITIVE_BOUNDARY_STATES:
             if stored_ws is not None and stored_ws <= window_start_ms:
                 return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
             return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
@@ -1333,25 +1338,85 @@ class ExploreStore:
 
     def set_left_boundary(self, address: str, state: str, window_start_ms: int,
                           at: float) -> bool:
-        """左界證據冪等寫入（Task 3）。只允許 `unknown` → 其他；已有正面證據
-        （`earlier_fills_seen`／`no_earlier_activity`）時不得被 `unknown` 覆蓋
-        ——證據只能加強，不能被「這次探測沒問到」抹掉（同一地址不會同時有
-        兩個探測在跑，這條規則防的是「舊探測回應在新探測之後才落地」這種
-        排序倒置，不是併發 CAS）。沒有 `fills_sync` 列（地址已退池被 purge）
-        → `False`，不落地。"""
+        """左界證據冪等寫入（Task 3；轉移規則於 Task 3b 收緊）。只允許
+        `unknown` → 其他；已有正面證據（`earlier_fills_seen`／
+        `no_earlier_activity`）時**不得被任何後續寫入覆蓋**——終局
+        （Task 3b 不變式 4：正面證據只能加強，不能被「這次探測沒問到」或
+        「這次探測疑似截斷」抹掉；同一地址不會同時有兩個探測在跑，這條規則
+        防的是「舊探測回應在新探測之後才落地」這種排序倒置，不是併發 CAS）。
+        沒有 `fills_sync` 列（地址已退池被 purge）→ `False`，不落地。
+
+        Task 3b（D-G）：成功寫入且新狀態不是 `unknown` 時，在同一個
+        transaction 內就地重算 `fills_sync.completeness`／`reason`（見
+        `_recompute_verdict_locked`）——讓「探測是事後獨立解出證據」這條路徑
+        也能立刻翻盤成 `complete`，不必等 24 小時後的整窗重掃（Task 3b 設計
+        動機，見 plan）。"""
         addr = _norm(address)
         with self._lock, self._db:
             row = self._db.execute(
-                "SELECT left_boundary FROM fills_sync WHERE address=?", (addr,)).fetchone()
+                "SELECT left_boundary, scan_id, completeness, reason FROM fills_sync "
+                "WHERE address=?", (addr,)).fetchone()
             if row is None:
                 return False
-            if row[0] in ("earlier_fills_seen", "no_earlier_activity") and state == "unknown":
+            current_state, scan_id, completeness, reason = row
+            if current_state in _POSITIVE_BOUNDARY_STATES:
                 return False
             self._db.execute(
                 "UPDATE fills_sync SET left_boundary=?, left_boundary_window_start_ms=?, "
                 "left_boundary_at=? WHERE address=?",
                 (state, window_start_ms, at, addr))
+            if state != "unknown":
+                self._recompute_verdict_locked(addr, scan_id, state, window_start_ms, at,
+                                               completeness, reason)
         return True
+
+    def _recompute_verdict_locked(self, addr: str, scan_id: str | None, boundary_state: str,
+                                  boundary_window_start_ms: int, boundary_at: float,
+                                  current_completeness: str, current_reason: str | None) -> None:
+        """Task 3b（D-G）：左界證據事後到齊時，用**同一筆已完成的遍歷**＋新的
+        `LeftBoundary` 就地重算 `scan_verdict`，不必整窗重掃。呼叫端
+        （`set_left_boundary`）已持有 `self._lock` 與所在的 transaction——本
+        方法只能用裸 SQL，**不得**呼叫任何會再次上鎖的 store 方法
+        （`get_scan`／`get_sync` 會在 `threading.Lock`（不可重入）上死鎖）。
+
+        不變式（Task 3b，plan「不變式（不可違反）」段）：
+        1. 結論只能出自 `scan_verdict`——延遲 import（避開 `explore_store`↔
+           `explore_fills_sync` 的循環相依：`explore_fills_sync` 在頂層
+           import 本模組的 `FillsScan`，同一手法已用在 `get_left_boundary`）。
+        2. 只對 `fills_sync.scan_id` 目前指向的那一筆 `status='done'` 遍歷
+           重算——沒有這筆、或還沒完成（被新遍歷取代／進行中）→ 不重算。
+        3. 不重新遍歷：全程只讀既有的 `fills_scan`／`fills_sync` 列，零上游
+           請求。
+        4. 呼叫端已保證正面證據不會被覆蓋（見 `set_left_boundary`）；這裡只
+           負責「證據變強／變已知之後結論要不要跟著變」。
+
+        `FillsScan.stop_reason`／`unresolved_gap` 尚未持久化（Task 1 docstring：
+        DB 往返會遺失這兩欄，完整讀寫接線留給 Task 4 的 schema 遷移）——從已
+        持久化的 `reason`／`cursor_ms`／`window_end_ms` 忠實重建，不是另寫一套
+        判斷：`scan_verdict` 的分支順序保證這個重建無損——
+        `reason == REASON_UNRESOLVED_GAP` 唯若當初 `unresolved_gap=1`；
+        `cursor_ms < window_end_ms` 時，當初寫入的 `reason` 就是原始的
+        `stop_reason` 本身（`scan_verdict` 的第二分支直接回傳它）。"""
+        if scan_id is None:
+            return
+        row = self._db.execute(
+            f"SELECT {self._SCAN_COLUMNS} FROM fills_scan WHERE scan_id=? AND status='done'",
+            (scan_id,)).fetchone()
+        if row is None:
+            return
+        scan = self._scan_from_row(row)
+        unresolved_gap = 1 if scan.reason == REASON_UNRESOLVED_GAP else 0
+        stop_reason = scan.reason if scan.cursor_ms < scan.window_end_ms else None
+        scan = replace(scan, unresolved_gap=unresolved_gap, stop_reason=stop_reason)
+        from spark.publicapi.explore_fills_sync import LeftBoundary, scan_verdict
+        boundary = LeftBoundary(state=boundary_state, window_start_ms=boundary_window_start_ms,
+                                at=boundary_at)
+        new_completeness, new_reason = scan_verdict(scan, boundary)
+        if (new_completeness, new_reason) == (current_completeness, current_reason):
+            return
+        self._db.execute(
+            "UPDATE fills_sync SET completeness=?, reason=? WHERE address=?",
+            (new_completeness, new_reason, addr))
 
     def first_activity_ms(self, address: str) -> int | None:
         """帳戶首次活動時間＝快取的 `portfolio` 回應裡 `allTime`

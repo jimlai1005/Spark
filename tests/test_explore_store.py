@@ -1000,6 +1000,108 @@ def test_next_probe_candidate_none_when_no_candidates(tmp_path):
     assert store.count_probe_candidates() == 0
 
 
+# ============================================================
+# Task 3b（2026-09-22，D-G）：證據事後到齊時就地重算結論，不必整窗重掃。
+# plan docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md
+# Task 3b Step 1 的六條測試（本檔五條；第六條
+# `test_recomputed_complete_drops_the_pending_partial_rescan_job` 需要排程端
+# 的 job 對帳一起驗，見 tests/test_explore_scheduler.py）。
+# ============================================================
+
+def test_verdict_is_recomputed_when_evidence_arrives_later(tmp_path):
+    """探測事後解出正面證據 → 同一筆已完成的遍歷立刻重算成 complete，
+    不需要整窗重掃（D-G 的容量要求）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    finished = dataclasses.replace(scan, cursor_ms=1000, result="partial",
+                                   reason="left_boundary_unknown", finished_at=1.0)
+    store.complete_scan("0xabc", [], finished)
+    assert store.get_sync("0xabc").completeness == "partial"
+
+    ok = store.set_left_boundary("0xabc", "earlier_fills_seen", 0, c.now())
+
+    assert ok is True
+    sync = store.get_sync("0xabc")
+    assert (sync.completeness, sync.reason) == ("complete", "left_boundary_verified")
+
+
+def test_recompute_never_touches_a_superseded_scan(tmp_path):
+    """`fills_sync.scan_id` 目前指向的不是一筆 `status='done'` 的遍歷（被新
+    遍歷取代、或還在進行中）→ 不重算，維持舊結論。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    old_scan = store.get_active_scan("0xabc")
+    old_finished = dataclasses.replace(old_scan, cursor_ms=1000, result="partial",
+                                       reason="left_boundary_unknown", finished_at=1.0)
+    store.complete_scan("0xabc", [], old_finished)   # fills_sync.scan_id -> old_scan（done）
+    # 開一次新的 partial_rescan（尚未完成）並直接把 `fills_sync.scan_id` 改指
+    # 向它——模擬「目前生效」的那次遍歷還在半路，不該被重算碰到。
+    running = store.create_scan("0xabc", kind="partial_rescan", window_start_ms=1000,
+                                window_end_ms=2000, cursor_ms=1000, started_at=c.now())
+    store._db.execute("UPDATE fills_sync SET scan_id=? WHERE address=?",
+                      (running.scan_id, "0xabc"))
+
+    ok = store.set_left_boundary("0xabc", "earlier_fills_seen", 0, c.now())
+
+    assert ok is True                                            # 左界證據本身照常寫入
+    sync = store.get_sync("0xabc")
+    assert (sync.completeness, sync.reason) == ("partial", "left_boundary_unknown")
+
+
+def test_recompute_respects_unresolved_gap(tmp_path):
+    """有未解缺口時，再強的左界證據也不能翻成 complete。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    finished = dataclasses.replace(scan, cursor_ms=500, result="partial",
+                                   reason="unresolved_gap", finished_at=1.0)
+    store.complete_scan("0xabc", [], finished)
+
+    store.set_left_boundary("0xabc", "earlier_fills_seen", 0, c.now())
+
+    sync = store.get_sync("0xabc")
+    assert sync.reason == "unresolved_gap"
+    assert sync.completeness == "partial"
+
+
+def test_positive_evidence_is_terminal(tmp_path):
+    """正面證據不得被 `unknown` 或 `truncation_suspected` 覆蓋。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    store.set_left_boundary("0xabc", "earlier_fills_seen", 0, c.now())
+
+    assert store.set_left_boundary("0xabc", "unknown", 0, c.now()) is False
+    assert store.set_left_boundary("0xabc", "truncation_suspected", 0, c.now()) is False
+    assert store.get_left_boundary("0xabc", 0).state == "earlier_fills_seen"
+
+
+def test_transient_probe_failure_does_not_forfeit_the_window(tmp_path):
+    """429／連線錯誤寫入 `unknown` 之後，該位址必須仍是探測候選（可重試），
+    不得因為「這個窗口已嘗試過」而永久放棄（工程原則 2）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    finished = dataclasses.replace(scan, cursor_ms=1000, result="partial",
+                                   reason="left_boundary_unknown", finished_at=1.0)
+    store.complete_scan("0xabc", [], finished)
+
+    ok = store.set_left_boundary("0xabc", "unknown", 0, c.now())
+
+    assert ok is True
+    assert store.next_probe_candidate() is not None
+
+
 def test_get_scan_returns_none_for_unknown_scan_id(tmp_path):
     store, c = _store(tmp_path)
     assert store.get_scan("nope") is None
