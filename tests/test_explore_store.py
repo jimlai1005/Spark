@@ -9,7 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
-from spark.publicapi.explore_fills_sync import PARTIAL_RESCAN_AFTER_S, external_coverage_state
+from spark.publicapi.explore_fills_sync import (PARTIAL_RESCAN_AFTER_S, external_coverage_state,
+                                                partial_rescan_due)
 from spark.publicapi.explore_store import ExploreStore, FillsSyncState, ScanWriteback
 
 
@@ -1133,6 +1134,65 @@ def test_transient_probe_failure_does_not_forfeit_the_window(tmp_path):
     assert store.next_probe_candidate() is not None
 
 
+# ============================================================
+# Task 10（2026-09-22，reviewer C1）：`_recompute_verdict_locked` 之前直接把
+# `set_left_boundary` 剛寫入的 `(state, window_start_ms)` 組成 `LeftBoundary`
+# 餵給 `scan_verdict`，繞過了 `get_left_boundary` 自己的單調性閘門——探測
+# 前置是對*新建*的那筆 scan（窗口起點較晚）做的，但此刻 `fills_sync.scan_id`
+# 可能仍指向*上一次*已完成的舊 scan（窗口起點較早）；新窗口內解出的證據對
+# 舊窗口的左界一無所證，卻被拿去把舊 scan 判成 complete。見 plan Task 10 C1、
+# reviewer `probe4.py` 重現。
+# ============================================================
+
+def test_recompute_ignores_evidence_from_a_later_window(tmp_path):
+    """C1 反例：`set_left_boundary` 用*較晚*窗口起點寫入的正面證據，不得讓
+    `fills_sync.scan_id` 指向的*較早*窗口起點那筆已完成遍歷被判 complete
+    ——依單調性閘門，這份證據對那個窗口不適用（`get_left_boundary` 也會回
+    `unknown`），重算後應維持原結論不變。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    # 舊的一次遍歷：窗口 [1000, 9000]，游標抵達終點、無缺口、證據仍未知。
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=1000, window_end_ms=9000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    done = dataclasses.replace(scan, cursor_ms=9000, result="partial",
+                               reason="left_boundary_unknown", finished_at=c.now())
+    store.complete_scan("0xabc", [], done)
+    assert store.get_sync("0xabc").completeness == "partial"
+
+    # 新一輪 `partial_rescan` 的窗口起點往前滾到 5000（> 舊窗口起點
+    # 1000）——探測在*新*窗口拿到正面證據，但 `fills_sync.scan_id` 這時仍
+    # 指向上面那筆*舊*（窗口起點 1000）的已完成遍歷。
+    ok = store.set_left_boundary("0xabc", "earlier_fills_seen", 5_000, c.now())
+
+    assert ok is True
+    sync = store.get_sync("0xabc")
+    assert (sync.completeness, sync.reason) == ("partial", "left_boundary_unknown")
+    # 反向確認：單調性閘門本身的判斷（`get_left_boundary`）與重算結果一致
+    # ——證據不適用於舊窗口，两者不能自相矛盾（reviewer C1 指出的原始症狀）。
+    assert store.get_left_boundary("0xabc", 1_000).state == "unknown"
+
+
+def test_recompute_applies_evidence_from_an_earlier_or_equal_window(tmp_path):
+    """正面對照：證據的窗口起點**不晚於**被重算那筆 scan 自己的窗口起點時，
+    閘門判定適用，重算才會把它翻成 complete——確保 C1 修法沒有連正常路徑
+    一起擋掉。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=1000, window_end_ms=9000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    done = dataclasses.replace(scan, cursor_ms=9000, result="partial",
+                               reason="left_boundary_unknown", finished_at=c.now())
+    store.complete_scan("0xabc", [], done)
+
+    ok = store.set_left_boundary("0xabc", "earlier_fills_seen", 1_000, c.now())
+
+    assert ok is True
+    sync = store.get_sync("0xabc")
+    assert (sync.completeness, sync.reason) == ("complete", "left_boundary_verified")
+
+
 def test_scan_round_trip_preserves_stop_reason_and_unresolved_gap(tmp_path):
     """Task 4 Step 0：`FillsScan.stop_reason`／`unresolved_gap` 必須真正持久化
     （`_SCAN_COLUMNS`／`_scan_from_row`），往返（寫入→讀回）不失真——這是
@@ -1695,6 +1755,53 @@ def test_migrate_v3_to_v4_reports_workload(tmp_path):
     assert report["work"]["probes_needed"] == 3
     assert report["work"]["scans_to_resume"] == 1    # 0xdd 的 scan 打回 running
     assert report["work"]["verify_needed"] == 0      # 四條 UPDATE 都把 evidence_unknown 歸零
+    assert report["work"]["rescans_deferred"] == 2   # 0xaa／0xbb：撤銷結論那批的 finished_at 被推遲
+
+
+# ============================================================
+# Task 10（2026-09-22，reviewer W2，實跑重現）：撤銷結論的那批列
+# （`count_below_retention_threshold`／`_probe_empty`）若不推遲
+# `fills_scan.finished_at`，遷移完成的瞬間 `partial_rescan_due` 就已經到期
+# （`finished_at` 是遷移前、往往幾天前的舊值）——下一輪 candidates 巡查會替
+# 每一列各排一次全新的 30 天整窗遍歷，不在任何容量估算內。
+# ============================================================
+
+def test_migrate_v3_to_v4_defers_rescan_for_revoked_rows(tmp_path):
+    """遷移必須把這批列的 `fills_scan.finished_at` 推遲到遷移當下——重掃
+    在遷移完成的瞬間不得到期，要等滿一個 `PARTIAL_RESCAN_AFTER_S` 才到期，
+    與『剛完成一次正常遍歷』同形；探測候選不受影響（推遲的只是整窗重掃
+    這條路，不是探測這條路）。"""
+    db_path = tmp_path / "explore.db"
+    _v3_db_with(db_path, sync_rows=_V3_SNAPSHOT_SYNC_ROWS,
+               scan_overrides=_V3_SNAPSHOT_SCAN_OVERRIDES)
+    clock = Clock()
+
+    store = ExploreStore(db_path, now_fn=clock.now)
+
+    migrated_finished_at = store.latest_done_scan("0xaa").finished_at
+    assert migrated_finished_at == clock.t         # 推遲到遷移當下（`self._now()`）
+    assert store.latest_done_scan("0xbb").finished_at == clock.t   # 同一批一起推遲
+    assert partial_rescan_due(migrated_finished_at, clock.t) is False
+    assert partial_rescan_due(migrated_finished_at, clock.t + PARTIAL_RESCAN_AFTER_S) is True
+    # 推遲的只是整窗重掃這條路——獨立探測路徑（`next_probe_candidate`）仍然
+    #看得到這批列（`left_boundary` 已被同一次遷移改回 `'unknown'`）。
+    assert store.next_probe_candidate() is not None
+
+
+def test_migrate_v3_to_v4_rerun_does_not_move_finished_at_again(tmp_path):
+    """版本閘門：`_migrate_v3_to_v4` 只在 `schema_version < 4` 時執行——連續
+    開啟同一個已是 v4 的 DB 不得再次推遲 `finished_at`，否則每次 `filet-api`
+    重啟都會把重掃時限往後推，這批列會永遠不會真的觸發整窗重掃。"""
+    db_path = tmp_path / "explore.db"
+    _v3_db_with(db_path, sync_rows=_V3_SNAPSHOT_SYNC_ROWS,
+               scan_overrides=_V3_SNAPSHOT_SCAN_OVERRIDES)
+    clock = Clock()
+
+    first = ExploreStore(db_path, now_fn=clock.now).latest_done_scan("0xaa").finished_at
+    clock.t += 3600.0                               # 模擬隔了一段時間才重啟
+    second = ExploreStore(db_path, now_fn=clock.now).latest_done_scan("0xaa").finished_at
+
+    assert first == second
 
 
 # D6：inc_from_ms 非空邊界

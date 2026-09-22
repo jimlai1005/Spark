@@ -88,18 +88,67 @@ REASON_PROBE_NO_EARLIER_FILLS = "count_below_retention_threshold_probe_empty"
 
 # Task 1（2026-09-22 D-A/D-E 裁決）：覆蓋結論改為三項證據合成
 # （`explore_fills_sync.scan_verdict`）——以下四個 reason 對映 `LeftBoundary.state`
-# 的四種值，`REASON_UNRESOLVED_GAP` 對映分頁未解缺口。這是新判準**唯一**會寫入
-# 的 reason 集合（Task 2 起，`fills_scan`／`fills_sync` 的新結論只會是這五者之一）。
+# 的四種值，`REASON_UNRESOLVED_GAP` 對映分頁未解缺口，`REASON_TRAVERSAL_INCOMPLETE`
+# （Task 10 新增，見下）是「沒抵達終點且沒有 stop_reason 可回報」的保底值。這是新
+# 判準**唯一**會寫入的 reason 集合（Task 2 起，`fills_scan`／`fills_sync` 的新結論
+# 只會是這六者之一，或 `FillsScan.stop_reason` 的三個 `local_*` 值域）。
 REASON_LEFT_BOUNDARY_VERIFIED = "left_boundary_verified"        # 探測到窗口起點之前仍有可查成交
 REASON_LEFT_BOUNDARY_NO_ACTIVITY = "left_boundary_no_activity"  # 帳戶在窗口起點前確無活動
 REASON_LEFT_BOUNDARY_TRUNCATED = "left_boundary_truncated"      # 上游截斷嫌疑
 REASON_LEFT_BOUNDARY_UNKNOWN = "left_boundary_unknown"          # 證據不足，不下結論
 REASON_UNRESOLVED_GAP = "unresolved_gap"                        # 分頁有未解缺口
+# Task 10（2026-09-22，reviewer W3）：`scan_verdict` 的「沒抵達固定終點」分支
+# 原本直接回 `scan.stop_reason`——v3 時代以 `page_cap`／`no_progress` 收尾的
+# 舊 scan 沒有這個欄位（v4 遷移只補了新欄位的預設 `NULL`），日後被探測解出
+# 證據觸發重算時就會把 `fills_sync.reason` 寫成 `NULL`，違反 `scan_verdict`
+# 自己宣告的 `tuple[str, str]` 回傳型別（靜默的資訊遺失，非錯判完整）。
+REASON_TRAVERSAL_INCOMPLETE = "traversal_incomplete"  # 遍歷未抵達終點且沒有記錄到停止原因
 
 # Task 3b（2026-09-22，D-G 裁決）：正面左界證據——一旦取得即終局（單調性，見
 # `get_left_boundary` docstring），`get_left_boundary`／`set_left_boundary`
 # 共用同一份值域，不各自重複寫一份 tuple 字面值。
 _POSITIVE_BOUNDARY_STATES = ("earlier_fills_seen", "no_earlier_activity")
+
+
+def _applicable_boundary(state: str, stored_ws: int | None, at: float | None,
+                         query_ws: int) -> "LeftBoundary":
+    """左界證據單調性閘門的**唯一**來源（Task 10，C1 修法，見 plan
+    `2026-09-22-explore-fills-coverage-verdict-fix.md` Task 10 C1）。
+
+    `ExploreStore.get_left_boundary`（讀取）與 `ExploreStore.
+    _recompute_verdict_locked`（Task 3b 就地重算）**都**必須經這個函式判斷
+    一筆已存的證據 `(state, stored_ws)` 是否適用於 `query_ws` 這個窗口起點，
+    不得各自組一份 `LeftBoundary` 直接餵給 `scan_verdict`——舊版
+    `_recompute_verdict_locked` 就是繞過了這道閘門，讓「探測前置對*新*
+    scan 窗口解出的證據」被拿去判*舊*（已完成、`fills_sync.scan_id` 仍指向
+    它）scan 的結論，兩個窗口起點不同、證據對舊窗口一無所證，卻因此把
+    `partial` 錯判成 `complete`（正是 D-E／D-F 要防的「把錯判不完整換成
+    錯判完整」）。
+
+    規則（與原 `get_left_boundary` 的單調性一致，只是抽成單一實作）：
+    正面證據（`earlier_fills_seen`／`no_earlier_activity`）在 `stored_ws <=
+    query_ws` 時適用——窗口只會隨時間往前滾，更早的起點意味著「起點之前
+    仍有成交／帳戶在起點前無活動」這個事實只會更成立，不會因窗口右移而
+    失效；`stored_ws > query_ws`（含 `_recompute_verdict_locked` 用新窗口
+    證據判舊窗口結論的情境）保守地視為不適用，回 `unknown`。
+    `truncation_suspected` 不具單調性——只對取得時的窗口起點（`stored_ws ==
+    query_ws`）成立，窗口一旦往前滾就必須重探。其餘（含 `unknown`）一律
+    `unknown`。
+
+    延遲 import `LeftBoundary`（定義於 `explore_fills_sync`）以避免循環
+    import——該模組在頂層 import 本模組的 `FillsScan`／`FillsSyncState`，
+    反向在頂層 import 會形成循環（工程原則 1 的姊妹問題：模組依賴方向也要
+    單一，不能雙向）。"""
+    from spark.publicapi.explore_fills_sync import LeftBoundary
+    if state in _POSITIVE_BOUNDARY_STATES:
+        if stored_ws is not None and stored_ws <= query_ws:
+            return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
+        return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
+    if state == "truncation_suspected":
+        if stored_ws == query_ws:
+            return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
+        return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
+    return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
 
 # Task 7.9d-D D2：`refresh_job.kind` 的已知集合——彙總查詢（`count_jobs_by_kind`／
 # `count_due_by_kind`）用它把已知 kind 一律補成 0，讓觀測端的鍵集合固定（缺鍵與
@@ -719,7 +768,7 @@ class ExploreStore:
 
         DDL（`ALTER TABLE`）各自冪等（先 `PRAGMA table_info` 檢查欄位是否已
         存在，沿用 `_migrate_v2_to_v3` 的手法）且**不在** transaction 內
-        （Python `sqlite3` 遇 DDL 會自動提交）；四條 `UPDATE`＋`schema_version`
+        （Python `sqlite3` 遇 DDL 會自動提交）；五條 `UPDATE`＋`schema_version`
         更新包在同一個 `_explicit_transaction()` 內，中途失敗整段回滾（同
         Task 7.9c D5）。
 
@@ -734,7 +783,10 @@ class ExploreStore:
         - 純門檻推論或無佐證的探測回空（`REASON_COUNT_BELOW_RETENTION_
           THRESHOLD`／`REASON_PROBE_NO_EARLIER_FILLS`）→ 結論撤銷為
           `partial`／`left_boundary_unknown`，游標與 fills 不動，
-          `evidence_unknown` 歸零（新判準看得懂，不必再靠舊旗標）。
+          `evidence_unknown` 歸零（新判準看得懂，不必再靠舊旗標）；**同時**
+          把這批列指向的 `fills_scan.finished_at` 推遲到遷移當下（Task 10
+          W2）——不推遲的話 `partial_rescan_due` 立刻判定到期，每一列都會被
+          排一次全新的 30 天整窗遍歷，見下方 W2 專節。
         - 被錯門檻中斷的 `partial`／`retention_limit` → 結論作廢回到
           `backfilling`（`reason=NULL`），對應的 `fills_scan` 列打回
           `status='running'`（`result`／`reason`／`finished_at` 清空）讓排程
@@ -778,6 +830,25 @@ class ExploreStore:
                 "WHERE sc.scan_id = fills_sync.scan_id), left_boundary_at=?, reason=? "
                 "WHERE reason=? AND completeness='complete'",
                 (now, REASON_LEFT_BOUNDARY_VERIFIED, REASON_RETENTION_BOUNDARY_VERIFIED))
+            # Task 10（W2，reviewer 實跑重現）：這批列被撤銷結論之前
+            # `fills_scan.finished_at` 是它們原本完成遍歷的時間（往往是幾天
+            # 前）——不推遲的話，`partial_rescan_due` 在遷移完成的瞬間就已經
+            # 判定到期，第一輪 candidates 巡查會替每一列各排一次全新的 30 天
+            # 整窗遍歷，這正是 Task 3b 想省下來的「數百頁重掃」，且完全不在
+            # 任何容量估算內（見 plan Task 10 W2 實跑：165 列會立刻
+            # `partial_rescan_due`）。只推遲「這一個時間戳」（它是結論時間的
+            # metadata，不是抓取進度）——`cursor_ms`／`fills`／`observed_*`
+            # 一律不動（D-G）。必須在改寫 `fills_sync.reason` 之前用**同一個**
+            # reason 篩選子句選出受影響的 `scan_id`，否則下一條 UPDATE 一
+            # 執行，`reason` 就不再是可篩選的依據。
+            rescans_deferred_n = self._db.execute(
+                "SELECT COUNT(*) FROM fills_sync WHERE reason IN (?, ?)",
+                (REASON_COUNT_BELOW_RETENTION_THRESHOLD, REASON_PROBE_NO_EARLIER_FILLS)
+            ).fetchone()[0]
+            self._db.execute(
+                "UPDATE fills_scan SET finished_at=? WHERE scan_id IN ("
+                "SELECT scan_id FROM fills_sync WHERE reason IN (?, ?) AND scan_id IS NOT NULL)",
+                (now, REASON_COUNT_BELOW_RETENTION_THRESHOLD, REASON_PROBE_NO_EARLIER_FILLS))
             self._db.execute(
                 "UPDATE fills_sync SET completeness='partial', reason=?, "
                 "left_boundary='unknown', evidence_unknown=0 WHERE reason IN (?, ?)",
@@ -803,7 +874,8 @@ class ExploreStore:
         report = {
             "before": before, "after": after,
             "work": {"probes_needed": probes_needed, "scans_to_resume": scans_to_resume,
-                     "verify_needed": verify_needed_n},
+                     "verify_needed": verify_needed_n,
+                     "rescans_deferred": rescans_deferred_n},
         }
         self._migration_v3_to_v4_report = report
         logger.warning("explore store: schema v3→v4 遷移完成（D-G 工作量報告）：%s", report)
@@ -1428,39 +1500,25 @@ class ExploreStore:
 
     def get_left_boundary(self, address: str, window_start_ms: int) -> LeftBoundary:
         """左界證據（Task 3，D-E／D-F）——真正的實作，取代 Task 2 的
-        `unknown` 佔位。單調性：正面證據（`earlier_fills_seen`／
-        `no_earlier_activity`）在其取得時的窗口起點**不晚於**查詢窗口起點時
-        仍然適用（窗口只會隨時間往前滾，更早的起點意味著「起點之前仍有
-        成交／帳戶在起點前無活動」這個事實只會更成立，不會因為窗口右移而
-        失效）；起點**晚於**查詢窗口起點是不該發生的情形（時鐘異常／資料
-        被人工改動），保守地視為不適用（回 `unknown`，需重探）。
-        `truncation_suspected` 不具單調性——上游截斷嫌疑只對當初探測的那個
-        窗口起點成立，窗口一旦往前滾就必須重探（見 `_PROBE_CANDIDATE_WHERE`）。
+        `unknown` 佔位。單調性判斷（正面證據在其取得時的窗口起點**不晚於**
+        查詢窗口起點時仍然適用；`truncation_suspected` 只對取得時的窗口起點
+        成立）全部收斂在模組層級的 `_applicable_boundary`（Task 10，C1 修法：
+        `_recompute_verdict_locked` 之前直接組一份 `LeftBoundary` 繞過這個
+        閘門，讓「新窗口探得的證據」誤判成「適用於舊窗口」，見 plan Task 10
+        C1）——本方法與 `_recompute_verdict_locked` **都**經它，閘門比較只
+        寫這一處（工程原則 1）。
 
-        沒有 `fills_sync` 列（地址從未 bootstrap 過或已被 purge）→ `unknown`。
-
-        延遲 import `LeftBoundary`（定義於 `explore_fills_sync`）以避免循環
-        import——該模組在頂層 import 本模組的 `FillsScan`／`FillsSyncState`，
-        反向在頂層 import 會形成循環（工程原則 1 的姊妹問題：模組依賴方向
-        也要單一，不能雙向）。"""
-        from spark.publicapi.explore_fills_sync import LeftBoundary
+        沒有 `fills_sync` 列（地址從未 bootstrap 過或已被 purge）→ `unknown`。"""
         addr = _norm(address)
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT left_boundary, left_boundary_window_start_ms, left_boundary_at "
                 "FROM fills_sync WHERE address=?", (addr,)).fetchone()
         if row is None:
+            from spark.publicapi.explore_fills_sync import LeftBoundary
             return LeftBoundary(state="unknown", window_start_ms=None, at=None)
         state, stored_ws, at = row
-        if state in _POSITIVE_BOUNDARY_STATES:
-            if stored_ws is not None and stored_ws <= window_start_ms:
-                return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
-            return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
-        if state == "truncation_suspected":
-            if stored_ws == window_start_ms:
-                return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
-            return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
-        return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
+        return _applicable_boundary(state, stored_ws, at, window_start_ms)
 
     def set_left_boundary(self, address: str, state: str, window_start_ms: int,
                           at: float) -> bool:
@@ -1520,7 +1578,21 @@ class ExploreStore:
         現在由 `insert_scan_page`／`complete_scan` 真正持久化，`_scan_from_row`
         （經 `_SCAN_COLUMNS`）直接讀回正確的值——不再需要從 `reason`／
         `cursor_ms`／`window_end_ms` 反推（那個反推只在 `scan_verdict` 目前
-        的分支順序下成立，是隱性耦合，已移除）。"""
+        的分支順序下成立，是隱性耦合，已移除）。
+
+        Task 10（C1 修法）：`boundary_state`／`boundary_window_start_ms` 是
+        `set_left_boundary` 這次剛寫入的證據，其窗口起點不一定等於「這筆
+        `scan_id` 指向的已完成遍歷」自己的窗口起點（探測前置是對*正在推進*
+        的那筆 scan 做的，此刻 `fills_sync.scan_id` 可能還指向*上一次*已完成
+        的舊遍歷）。**必須**經 `_applicable_boundary` 這道與 `get_left_boundary`
+        共用的單調性閘門、以 `scan.window_start_ms`（這筆被重算的 scan 自己
+        的窗口起點）當查詢基準，才能判斷這份證據對它是否適用——不得直接把
+        `(boundary_state, boundary_window_start_ms)` 組成 `LeftBoundary` 餵給
+        `scan_verdict`（那正是本次要修的 Critical：把「新窗口的證據」誤判成
+        「適用於舊窗口」）。閘門判為不適用時，`_applicable_boundary` 已經把
+        `boundary.state` 降級成 `unknown`，`scan_verdict` 因此自然算出與
+        `left_boundary_unknown` 等價的結論——不需要另外寫一個「不重算」的
+        分支（若算出的結論剛好等於目前值，下面的比較就會是 no-op）。"""
         if scan_id is None:
             return
         row = self._db.execute(
@@ -1529,9 +1601,9 @@ class ExploreStore:
         if row is None:
             return
         scan = self._scan_from_row(row)
-        from spark.publicapi.explore_fills_sync import LeftBoundary, scan_verdict
-        boundary = LeftBoundary(state=boundary_state, window_start_ms=boundary_window_start_ms,
-                                at=boundary_at)
+        from spark.publicapi.explore_fills_sync import scan_verdict
+        boundary = _applicable_boundary(boundary_state, boundary_window_start_ms, boundary_at,
+                                        scan.window_start_ms)
         new_completeness, new_reason = scan_verdict(scan, boundary)
         if (new_completeness, new_reason) == (current_completeness, current_reason):
             return

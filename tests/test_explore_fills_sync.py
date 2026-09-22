@@ -30,6 +30,7 @@ from spark.publicapi.explore_fills_sync import (
 )
 from spark.publicapi.explore_store import (
     REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+    REASON_TRAVERSAL_INCOMPLETE,
     ExploreStore,
     FillsScan,
     FillsSyncState,
@@ -322,6 +323,19 @@ def test_truncation_suspected_is_partial_not_complete():
     scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=0)
     assert scan_verdict(scan, _boundary("truncation_suspected")) == (
         "partial", "left_boundary_truncated")
+
+
+def test_scan_verdict_never_returns_a_none_reason():
+    """Task 10（reviewer W3）：`scan_verdict` 宣告的回傳型別是
+    `tuple[str, str]`，不是 `tuple[str, str | None]`。`cursor_ms <
+    window_end_ms` 且 `stop_reason is None`（v3 時代以 `page_cap`／
+    `no_progress` 收尾、v4 遷移沒有回填新欄位的舊 scan，日後被探測解出證據
+    觸發重算時會撞到）必須退回 `REASON_TRAVERSAL_INCOMPLETE`，不得把 `None`
+    寫進 `fills_sync.reason`（靜默的資訊遺失，reviewer 實跑重現）。"""
+    scan = _scan(cursor_ms=5000, window_end_ms=9000, unresolved_gap=0, stop_reason=None)
+    state, reason = scan_verdict(scan, _boundary("earlier_fills_seen"))
+    assert (state, reason) == ("partial", REASON_TRAVERSAL_INCOMPLETE)
+    assert reason is not None
 
 
 def test_apply_scan_page_short_page_does_not_decide_completeness():

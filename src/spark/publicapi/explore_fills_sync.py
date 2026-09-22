@@ -77,7 +77,8 @@ from spark.exchange.base import USER_FILLS_PAGE_LIMIT
 from spark.publicapi.explore_store import (REASON_LEFT_BOUNDARY_NO_ACTIVITY,
                                            REASON_LEFT_BOUNDARY_TRUNCATED,
                                            REASON_LEFT_BOUNDARY_UNKNOWN,
-                                           REASON_LEFT_BOUNDARY_VERIFIED, REASON_UNRESOLVED_GAP,
+                                           REASON_LEFT_BOUNDARY_VERIFIED,
+                                           REASON_TRAVERSAL_INCOMPLETE, REASON_UNRESOLVED_GAP,
                                            ExploreStore, FillsScan, FillsSyncState)
 
 PAGE_LIMIT = USER_FILLS_PAGE_LIMIT   # HL userFillsByTime 單頁上限（同 hl.py 常數來源，Task 3.5 D）
@@ -138,6 +139,20 @@ def partial_rescan_due(finished_at: float | None, now: float) -> bool:
 MIN_PERIOD_S = 6 * 3600
 MAX_PERIOD_S = 24 * 3600
 
+# Task 10（2026-09-22，主線程裁決：W1／W5 裁決節，reviewer W1 揭露的是 plan
+# 自己的兩條規格互相矛盾——「下界 `MIN_PERIOD_S`＝6h 對所有位址」與「單週期
+# 預期成交筆數 ≤ 一頁」（`test_period_keeps_expected_fills_within_one_page`）
+# 對高頻位址（例如 897.5 筆/小時，一頁只夠 ~1.8 小時）不可能同時成立——強制
+# 6h 就是 3 頁補抓，正是 D-H 禁止的形狀。物理限制（一頁裝不下）贏過任意定的
+# 新鮮度下界：非熱門位址（含 `rank is None`，兩者現在是**同一規則**——重啟後
+# `_rank_by_address` 快取為空不再造成行為差異，這正是 reviewer W1 的實際
+# 擔憂）改用這個較低的下界，讓高頻位址的週期能貼著一頁的物理極限收斂，不再
+# 被 6h 的新鮮度需求（那是給「熱門」用的，D-B／D-H）綁架成多頁補抓。數值與
+# `config.py`（`ApiConfig.__post_init__`）既有的 `FILET_EXPLORE_FILLS_PERIOD_S
+# >= 3600` 驗證同值——那條驗證原本就允許低到 1 小時，reviewer W1 指出的正是
+# `rank=None` 那條路徑「穿過」了這個下限。
+MIN_PERIOD_COLD_S = 3600
+
 # 留 20% 餘裕給成交速率波動——單週期預期筆數目標抓 `PAGE_LIMIT` 的 80%，不是
 # 貼著上限算（貼滿的話速率稍微上升就會變成多頁補抓）。
 TARGET_FILL_RATIO = 0.8
@@ -170,27 +185,38 @@ def fills_period_s(fills_per_hour: float | None, rank: int | None, *,
     → 取保守值 `min_period_s`（不確定就抓密一點）。
 
     `rank`：`candidate.source_rank`（1-based，越小越熱門）。`None`（尚未併入
-    最近一輪候選排名）與「已知但在前 50 名外」是兩種不同語意：
+    最近一輪候選排名）與「已知但在前 50 名外」**現在是同一規則**（Task 10，
+    W1／W5 裁決節）：
     - `rank` 落在前 `_HOT_RANK` 名：新鮮度需求優先於速率估計，一律
-      `min_period_s`，不論實際成交速率多低（D-H：不得因為低速率就把熱門位址
-      排到 24 小時）。
-    - `rank` 已知但在 `_HOT_RANK` 名外：套用速率公式並夾在
-      `[min_period_s, max_period_s]`——下界對這一類位址也適用（D-H：「其餘：
-      6h（下界，不是只給 hot）」），代價是極端高速率的位址可能單週期預期筆數
-      超過一頁、下一輪要多頁補抓；這是刻意的取捨，不是本函式要保的不變式。
-    - `rank` 為 `None`（尚未有排名資訊）：只套用 `max_period_s` 上限，
-      **不套用下界**——讓「單週期預期成交筆數 ≤ PAGE_LIMIT」這個核心不變式
-      （見 `test_period_keeps_expected_fills_within_one_page`）在沒有名次可
-      仰賴時仍然成立。"""
+      `min_period_s`（`MIN_PERIOD_S`，6h），不論實際成交速率多低（D-H：
+      不得因為低速率就把熱門位址排到 24 小時）。
+    - 其餘情形（`rank` 已知但在 `_HOT_RANK` 名外，**或** `rank` 為 `None`）：
+      套用速率公式並夾在 `[MIN_PERIOD_COLD_S, max_period_s]`——**注意下界是
+      `MIN_PERIOD_COLD_S`（1h），不是 `min_period_s`（6h）**。
+
+    Task 10（2026-09-22，主線程裁決，W1／W5 裁決節）：reviewer W1 指出的
+    `rank=None` 不套下界（重啟後 `_rank_by_address` 是純記憶體快取，重啟即空）
+    揭露的其實是 plan Task 5 自己兩條規格互相矛盾——「下界 `MIN_PERIOD_S`＝6h
+    對所有位址」（D-H：「其餘：6h（下界，不是只給 hot）」）與「單週期預期
+    成交筆數 ≤ 一頁」（`test_period_keeps_expected_fills_within_one_page`）
+    對高頻位址不可能同時成立：`fills_per_hour > TARGET_FILL_RATIO*PAGE_LIMIT
+    /6h ≈ 266.7` 時，週期一旦被夾到 6h，預期筆數就必然超過一頁（實測
+    897.5、5000 筆/小時套 6h 下界分別是 5,385、30,000 筆，都遠超
+    `PAGE_LIMIT=2000`，即 D-H 明文禁止的「一頁的工作變成多頁補抓」）。
+    裁決：物理限制（一頁裝不下）贏過任意定的新鮮度下界——非熱門位址改用
+    較低的 `MIN_PERIOD_COLD_S`（1h，與 `config.py`
+    `FILET_EXPLORE_FILLS_PERIOD_S >= 3600` 既有驗證同值）當下界，讓高頻
+    位址的週期能貼著一頁的物理極限收斂；6h 的新鮮度下界只保留給「熱門」
+    （D-B／D-H 的新鮮度需求本來就是熱門專屬）。`rank is None` 與「已知但
+    非熱門」現在共用這條規則，重啟不再造成行為差異——這正是 reviewer W1
+    的實際擔憂。"""
     if fills_per_hour is None:
         return min_period_s
     if rank is not None and rank <= _HOT_RANK:
         return min_period_s
     raw_s = (TARGET_FILL_RATIO * PAGE_LIMIT
              / max(fills_per_hour, _EPS_FILLS_PER_HOUR) * 3600)
-    if rank is None:
-        return min(max_period_s, raw_s)
-    return max(min_period_s, min(max_period_s, raw_s))
+    return max(MIN_PERIOD_COLD_S, min(max_period_s, raw_s))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -213,11 +239,21 @@ def scan_verdict(scan: FillsScan, boundary: LeftBoundary) -> tuple[str, str]:
     正面（`earlier_fills_seen`／`no_earlier_activity`）。任何「我方停止」的
     情形（`scan.stop_reason` 非 `None`，即游標未抵達終點）都不得產生完整性
     結論（D-F）——`apply_scan_page`／`explore_scheduler` 不得繞過本函式另外
-    寫 `result`／`reason`（工程原則 1：結論只能有一個來源）。"""
+    寫 `result`／`reason`（工程原則 1：結論只能有一個來源）。
+
+    Task 10（reviewer W3）：沒抵達終點時本函式回傳的 reason 一律非 `None`
+    （回傳型別是 `tuple[str, str]`，不是 `tuple[str, str | None]`）——
+    `scan.stop_reason` 可能是 `None`（v3 時代以 `page_cap`／`no_progress`
+    收尾的舊 scan，v4 遷移沒有為它們回填新欄位；理論上「未抵達終點卻沒有
+    停止原因」不該在新程式碼裡發生，但重算舊資料時會撞到），此時退回
+    `REASON_TRAVERSAL_INCOMPLETE` 而不是把 `None` 寫進 `fills_sync.reason`。"""
     if scan.unresolved_gap:
         return ("partial", REASON_UNRESOLVED_GAP)            # 分頁有未解缺口
     if scan.cursor_ms < scan.window_end_ms:
-        return ("partial", scan.stop_reason)                 # 沒抵達固定終點：本系統停止回補
+        # 沒抵達固定終點：本系統停止回補。`stop_reason` 理論上一定有值
+        # （`local_page_cap`／`no_progress`／`same_ms_overflow`），保底值只
+        # 服務 v3 遺留資料。
+        return ("partial", scan.stop_reason or REASON_TRAVERSAL_INCOMPLETE)
     if boundary.state == "earlier_fills_seen":
         return ("complete", REASON_LEFT_BOUNDARY_VERIFIED)
     if boundary.state == "no_earlier_activity":

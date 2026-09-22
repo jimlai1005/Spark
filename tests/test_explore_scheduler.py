@@ -16,7 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_S, fills_period_s,
+from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_COLD_S, MIN_PERIOD_S,
+                                                PARTIAL_RESCAN_AFTER_S, fills_period_s,
                                                 fresh_scan_window)
 from spark.publicapi.explore_publisher import compose_rows
 from spark.publicapi.explore_scheduler import SPECIAL_SERVE_RATIO, ExploreScheduler, _spread
@@ -691,17 +692,28 @@ def test_fills_period_s_for_no_rate_data_is_default_min_period_constant(tmp_path
 # ============================================================
 
 def test_period_keeps_expected_fills_within_one_page():
-    """核心不變式：任何地址的預期單週期成交筆數 ≤ PAGE_LIMIT。`rank=None`
-    （名次未知）刻意不套用下界，讓這個不變式在沒有名次可仰賴時仍然成立——見
-    `fills_period_s` docstring。"""
-    for fph in (1, 50, 500, 2_000, 20_000):
+    """核心不變式，Task 10（W1／W5 裁決節）改成分段：`fph <= TARGET_FILL_RATIO
+    *PAGE_LIMIT/1h = 1600` 時，`MIN_PERIOD_COLD_S`（1h）夾不到（原始估計本來就
+    ≥ 1h），預期筆數 ≤ `PAGE_LIMIT` 這個不變式成立；`fph > 1600` 時下界主導
+    （週期被夾到 `MIN_PERIOD_COLD_S`），多頁補抓不可避免——物理限制（一頁裝
+    不下）贏過任意定的新鮮度下界，這是刻意的取捨，不是本函式要保的不變式，
+    見 `fills_period_s` docstring。"""
+    for fph in (1, 50, 500, 1_600):
         p = fills_period_s(fills_per_hour=fph, rank=None)
         assert fph * (p / 3600) <= PAGE_LIMIT
+    for fph in (2_000, 20_000):
+        p = fills_period_s(fills_per_hour=fph, rank=None)
+        assert p == MIN_PERIOD_COLD_S
 
 
 def test_high_frequency_cold_address_is_not_blanket_24h():
-    """D-H：名次在 50 名外但高頻的地址，不得一律延長到 24h；速率低則夾到上界。"""
-    assert fills_period_s(fills_per_hour=600, rank=200) == MIN_PERIOD_S
+    """D-H：名次在 50 名外但高頻的地址，不得一律延長到 24h。Task 10（W1／W5
+    裁決節）：600 筆/小時原始估計是 9,600s（介於 `MIN_PERIOD_COLD_S` 與
+    `MAX_PERIOD_S` 之間，不夾），意圖本來就只是「不得一律 24h」，不是「一律
+    等於 6h 下界」——舊斷言 `== MIN_PERIOD_S` 是巧合（6h 下界比物理估計值更
+    保守時剛好把它蓋掉），修正後改斷言真正的估計值。"""
+    assert fills_period_s(fills_per_hour=600, rank=200) == 9_600
+    assert fills_period_s(fills_per_hour=600, rank=200) < MAX_PERIOD_S
     assert fills_period_s(fills_per_hour=2, rank=200) == MAX_PERIOD_S
 
 
@@ -714,6 +726,25 @@ def test_unknown_rate_is_conservative():
     """沒有速率資料時（地址剛入池，尚無 `fills_sync` 觀測）取保守值：不確定就
     抓密一點，不論名次。"""
     assert fills_period_s(fills_per_hour=None, rank=200) == MIN_PERIOD_S
+
+
+# --- Task 10（2026-09-22，主線程裁決，W1／W5 裁決節）：`rank is None` 與
+# 「已知但非熱門」現在是同一規則——重啟後 `_rank_by_address` 快取為空不再
+# 造成行為差異，這正是 reviewer W1 的實際擔憂。 ---
+
+def test_cold_period_floor_is_the_lower_cold_constant_not_the_hot_floor():
+    """5,000 筆/小時（原始估計 1,152s，遠低於兩個下界）在 `rank=None` 與
+    `rank=200`（非熱門）下都必須夾到 `MIN_PERIOD_COLD_S`（1h），不是
+    `MIN_PERIOD_S`（6h，熱門專屬的新鮮度下界）。"""
+    assert fills_period_s(fills_per_hour=5_000.0, rank=None) == MIN_PERIOD_COLD_S
+    assert fills_period_s(fills_per_hour=5_000.0, rank=200) == MIN_PERIOD_COLD_S
+
+
+def test_rank_none_and_known_non_hot_rank_agree():
+    """`rank is None`（尚未併入候選排名，含重啟後快取為空）與「已知但在前
+    50 名外」必須算出同一個週期——重啟不得造成行為差異。"""
+    assert fills_period_s(fills_per_hour=897.5, rank=None) == fills_period_s(
+        fills_per_hour=897.5, rank=200)
 
 
 # ============================================================
@@ -777,13 +808,14 @@ def test_rate_uses_observed_span_not_nominal_window(tmp_path):
 
 
 def test_high_density_partial_traversal_gets_min_period(tmp_path):
-    """密度高到一個週期內必然超過一頁（8,000 筆／10 小時＝800 筆/小時）→
-    直接壓到下界，不因為窗口名目上是 30 天就被稀釋。"""
+    """密度高到一個週期內必然超過一頁（8,000 筆／2 小時＝4,000 筆/小時，
+    Task 10 W1／W5 裁決節：下界已改為 `MIN_PERIOD_COLD_S`＝1h，門檻是
+    `fph > 1600`）→ 直接壓到下界，不因為窗口名目上是 30 天就被稀釋。"""
     sched = _scheduler_with_scan(tmp_path, ADDR, fills_in_window=8_000,
-                                 observed_from_ms=T0, observed_to_ms=T0 + 10 * 3_600_000,
+                                 observed_from_ms=T0, observed_to_ms=T0 + 2 * 3_600_000,
                                  window_start_ms=T0, window_end_ms=T0 + 30 * DAY,
                                  status="running", rank=200)
-    assert sched.fills_period_s_for(ADDR) == MIN_PERIOD_S
+    assert sched.fills_period_s_for(ADDR) == MIN_PERIOD_COLD_S
 
 
 def test_falls_back_to_window_hours_when_no_observed_span(tmp_path):
@@ -817,12 +849,14 @@ def test_period_source_is_still_single(tmp_path):
     # 「現在」，不能設在 30 天後（那會讓到期判斷恆假，測試變成沒在測
     # `_run_increment` 的 done 分支）。
     sched = _scheduler_with_scan(tmp_path, ADDR, fills_in_window=8_000,
-                                 observed_from_ms=T0, observed_to_ms=T0 + 10 * 3_600_000,
+                                 observed_from_ms=T0, observed_to_ms=T0 + 2 * 3_600_000,
                                  window_start_ms=T0 - 30 * DAY, window_end_ms=T0,
                                  status="running", rank=200)
     store = sched._store
     expected = sched.fills_period_s_for(ADDR)
-    assert expected == MIN_PERIOD_S  # 高密度、非熱門名次 → 第一層命中，壓到下界
+    # 高密度（4,000 筆/小時）、非熱門名次 → 第一層命中，壓到冷位址下界
+    # （Task 10 W1／W5 裁決節：`MIN_PERIOD_COLD_S`＝1h，不是 `MIN_PERIOD_S`）。
+    assert expected == MIN_PERIOD_COLD_S
 
     clock = sched._test_clock
     clock.t += expected + 10
@@ -2370,6 +2404,29 @@ def test_probe_empty_with_clearly_newer_account_is_no_earlier_activity(tmp_path)
     assert store.get_left_boundary("0xabc", window_start_ms).state == "no_earlier_activity"
 
 
+def test_probe_empty_with_first_activity_just_after_window_start_stays_unknown(tmp_path):
+    """Task 10（reviewer W5）：`no_earlier_activity` 原本零緩衝——`allTime`
+    首點只要晚於（或等於）窗口起點就採信，與 `truncation_suspected` 要求
+    整整一天緩衝不對稱，寬的那一側正是「錯判完整」的方向（首點降採樣、
+    粒度可能到天，晚窗口起點 12 小時不足以『明顯』證明左界無活動）。修法
+    後 `[window_start_ms - 1d, window_start_ms + 1d)` 一律 `unknown`——這裡
+    用 `+12h`（`test_probe_empty_with_clearly_newer_account_is_
+    no_earlier_activity` 用的 `+3d` 之外的另一個代表點）驗證新的模糊帶。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched, scan, window_start_ms = _probe_with_portfolio(
+        tmp_path, clock, first_activity_ms=None)
+    store.put_cache_ok(
+        "0xabc", "portfolio",
+        [["allTime", {"accountValueHistory": [[window_start_ms + 12 * 3600_000, "100"]],
+                      "pnlHistory": [[window_start_ms + 12 * 3600_000, "0"]]}]],
+        clock.now(), clock.now() + 3600)
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "unknown"
+
+
 def test_probe_empty_in_ambiguous_band_stays_unknown(tmp_path):
     """帳戶首次活動落在探測窗內（理應探得到卻回空）＝資料互相矛盾 → 維持 unknown。"""
     clock = Clock(t=40 * 86400.0)
@@ -3658,7 +3715,15 @@ T7A_BURST = _t7a_addr(3)
 def _t7a_default_portfolio(first_activity_ms: int) -> list:
     """`month`／`allTime` 皆有效（`enrich_candidate` 的必要 gating）；
     `allTime.accountValueHistory` 首點 = `first_activity_ms`——
-    `ExploreStore.first_activity_ms` 唯一讀取來源，見該方法 docstring。"""
+    `ExploreStore.first_activity_ms` 唯一讀取來源，見該方法 docstring。
+
+    ⚠️ Task 10（reviewer W5，主線程裁決）：`_run_probe` 收緊後，
+    `[scan.window_start_ms - 1d, scan.window_start_ms + 1d)` 是模糊帶
+    （`unknown`，不可判定）——呼叫端傳入 `first_activity_ms` 時**不得**傳
+    恰好等於某個 scan 的 `window_start_ms` 的值（那會落在模糊帶內、卡在
+    `unknown` 永遠解不出證據），必須明顯早於（`< window_start_ms - 1d`，會被
+    判 `truncation_suspected`）或明顯晚於（`>= window_start_ms + 1d`，見
+    `set_fill_count`／`set_fills_all_same_ms` 傳入 `ws + 2*DAY`）。"""
     av = [[first_activity_ms, "1000"], [first_activity_ms + 86_400_000, "1010"]]
     pnl = [[first_activity_ms, "0"], [first_activity_ms + 86_400_000, "10"]]
     body = {"accountValueHistory": av, "pnlHistory": pnl}
@@ -3894,12 +3959,16 @@ class SchedulerHarness:
     def set_fill_count(self, address: str, *, window_fills: int) -> None:
         ws, we = fresh_scan_window(int(self._clock.now() * 1000))
         self._upstream.seed_fills(address, _t7a_even_fills(ws, we, window_fills))
-        self._upstream.set_portfolio(address, _t7a_default_portfolio(ws))
+        # Task 10（reviewer W5）：`ws` 本身現在落在探測模糊帶
+        # （`[ws-1d, ws+1d)`）——`ws + 2*DAY` 明顯晚於窗口起點，可判定為
+        # `no_earlier_activity`；見 `_t7a_default_portfolio` docstring。
+        self._upstream.set_portfolio(address, _t7a_default_portfolio(ws + 2 * DAY))
 
     def set_fills_all_same_ms(self, address: str, *, count: int, cluster_size: int = 400) -> None:
         ws, _we = fresh_scan_window(int(self._clock.now() * 1000))
         self._upstream.seed_fills(address, _t7a_same_ms_fills(ws, count, cluster_size=cluster_size))
-        self._upstream.set_portfolio(address, _t7a_default_portfolio(ws))
+        # Task 10（reviewer W5）：同上，避開探測模糊帶。
+        self._upstream.set_portfolio(address, _t7a_default_portfolio(ws + 2 * DAY))
 
     def seed_evidence_unknown_address(self, address: str) -> None:
         """Task 7b：構造一個「已有完成遍歷、`evidence_unknown=1`」的地址——
@@ -3971,6 +4040,55 @@ class SchedulerHarness:
             self._upstream.seed_fills(addr, [_t7a_fill_at(window_start_ms - 1_000, 0)])
         self._store._db.commit()
         return addrs
+
+    def seed_stale_partial_row(self, address: str, *, window_start_ms: int, window_end_ms: int,
+                               finished_at: float) -> None:
+        """Task 10（C1 harness 反向護欄）：構造一筆『很久以前完成一次遍歷、
+        `partial/left_boundary_unknown`、`finished_at` 已過
+        `PARTIAL_RESCAN_AFTER_S`』的列——下一輪 candidates 巡查會因
+        `_needs_scan_job` 判 `partial_due` 而建立一個新的 `fills_scan` job。
+        該 job 建立的新 scan（`fresh_scan_window(now)`）窗口起點必然**晚於**
+        `window_start_ms`（時鐘只會往前走），正是 C1 的觸發條件：探測前置
+        對*新* scan 窗口解出的證據，此刻 `fills_sync.scan_id` 卻仍指向這筆
+        *舊*（窗口起點更早）的已完成遍歷——舊結論在證據落地的當下不得被
+        翻成 complete（見 `test_rescan_probe_does_not_flip_the_superseded_
+        verdict`）。與 `seed_migrated_unknown_rows`（Task 8b，`finished_at`
+        故意不過期、不建 job）刻意互補：這裡要的正是『會建 job』的那一種
+        遷移後形狀。"""
+        import dataclasses
+        now = self._clock.now()
+        self._store.upsert_candidates([(address, None, 1, None)], as_of=now)
+        self._store.bootstrap_address_fills(
+            address, now, window_start_ms=window_start_ms, window_end_ms=window_end_ms,
+            params_fp="")
+        scan = self._store.get_active_scan(address)
+        scan = dataclasses.replace(
+            scan, cursor_ms=scan.window_end_ms, result="partial",
+            reason="left_boundary_unknown", finished_at=finished_at)
+        self._store.complete_scan(address, [], scan)
+        self._store._db.commit()
+
+    def seed_dense_fills(self, address: str, *, start_ms: int, end_ms: int,
+                         step_ms: int) -> None:
+        """在 `[start_ms, end_ms]` 之間每隔 `step_ms` 放一筆成交——用來讓
+        C1 harness 測試不必精算新 scan 的確切窗口起點（會隨排程延遲小幅
+        漂移）：只要密集覆蓋『新窗口探測窗可能落點』的範圍，探測就一定能
+        命中 `earlier_fills_seen`，不會卡在 `unknown`。`_T7AUpstream.
+        seed_fills` 是整批覆寫，呼叫前該位址不能已經呼叫過其他 `seed_*`。"""
+        items = [_t7a_fill_at(t, i) for i, t in enumerate(range(start_ms, end_ms, step_ms))]
+        self._upstream.seed_fills(address, items)
+
+    def get_sync(self, address: str):
+        return self._store.get_sync(address)
+
+    def left_boundary_raw(self, address: str) -> str:
+        """`fills_sync.left_boundary` 的原始欄位值（不經 `get_left_boundary`
+        的單調性閘門）——只用來觀察『探測到底有沒有寫過任何東西』，不是
+        『這份證據現在適用嗎』（後者才該用 `ExploreStore.get_left_boundary`）。"""
+        row = self._store._db.execute(
+            "SELECT left_boundary FROM fills_sync WHERE address=?",
+            (address.lower(),)).fetchone()
+        return "unknown" if row is None else row[0]
 
     def scan_pages_for(self, addrs: list[str]) -> int:
         """這些位址目前 `fills_scan.pages_done` 的加總——Task 8b 用它證明
@@ -4407,3 +4525,61 @@ def test_migrated_rows_reach_complete_via_standalone_probe_path(tmp_path):
     assert len(resolved) == 20
     assert h.scan_pages_for(addrs) == 0            # 只有探測頁，沒有任何遍歷頁
     assert h.probes_executed >= 20
+
+
+# ============================================================
+# Task 10（2026-09-22，reviewer C1）：`_recompute_verdict_locked` 之前繞過了
+# `get_left_boundary` 的單調性閘門，harness 版反向護欄——用真實排程器（300
+# 地址競爭、真實限流）重現：遷移後的一筆 `partial/left_boundary_unknown` 列
+# 因 `finished_at` 已過期觸發 `partial_rescan`，新 scan 的探測前置對*新*窗口
+# 解出正面證據時，`fills_sync.scan_id` 這時仍指向*舊*（窗口起點更早）的那筆
+# 已完成遍歷——舊結論在證據落地的當下不得被翻成 complete，必須等到新 scan
+# 自己以短頁收尾才變 complete。見 plan Task 10 C1、reviewer `probe4.py`。
+# ============================================================
+
+def test_rescan_probe_does_not_flip_the_superseded_verdict(tmp_path):
+    """C1 反向護欄（harness 版）：舊 scan 的結論在『新窗口證據落地』與
+    『新 scan 自己短頁收尾』之間必須維持不變——修正前，`set_left_boundary`
+    一寫入就會（在同一個 transaction 內）立刻把舊結論翻成 complete，兩個
+    事件之間不存在可觀測的中間態；修正後，中間態必須是舊結論原樣不動。"""
+    h = _t7a_harness(tmp_path)
+    addr = _t7a_addr(350)
+    old_ws = -90 * DAY
+    old_we = old_ws + 30 * DAY
+    # 舊的一次遍歷：很久以前完成、`partial/left_boundary_unknown`、
+    # `finished_at` 已過 `PARTIAL_RESCAN_AFTER_S`——下一輪 candidates 巡查會
+    # 判 `partial_due` 並建立新的 `fills_scan` job。
+    h.seed_stale_partial_row(
+        addr, window_start_ms=old_ws, window_end_ms=old_we,
+        finished_at=-(PARTIAL_RESCAN_AFTER_S + 3600.0))
+    # 新 scan 的窗口起點約在 `-30*DAY`（`fresh_scan_window` 以排程當下的
+    # 時鐘算，會隨排程延遲在 24 小時模擬時間內小幅漂移）——密集灑一批成交
+    # 涵蓋所有可能落點的探測窗（`[新窗口起點-1d, 新窗口起點-1]`），保證探測
+    # 一定命中 `earlier_fills_seen`，不會卡在 `unknown`。
+    h.seed_dense_fills(addr, start_ms=-32 * DAY, end_ms=-28 * DAY, step_ms=1_800_000)
+
+    boundary_seen = False
+    saw_intermediate_partial = False
+    elapsed_s = 0.0
+    step_s = 5 * 60.0
+    while elapsed_s < 24 * 3600.0:
+        h.run_for(hours=step_s / 3600.0)
+        elapsed_s += step_s
+        sync = h.get_sync(addr)
+        if h.left_boundary_raw(addr) != "unknown":
+            boundary_seen = True
+        if boundary_seen and sync.completeness != "complete":
+            saw_intermediate_partial = True
+            # C1 修正前：這裡會是 ("complete", "left_boundary_verified")——
+            # `_recompute_verdict_locked` 繞過閘門，證據一寫入就立刻翻盤。
+            assert (sync.completeness, sync.reason) == ("partial", "left_boundary_unknown")
+        if sync.completeness == "complete":
+            break
+
+    assert boundary_seen, "24 小時內沒有等到探測解出證據——放寬命中窗或時限"
+    assert saw_intermediate_partial, (
+        "沒有捕捉到『證據已寫入但舊 scan 尚未完成』的中間態——時序假設可能不成立，"
+        "檢查 fills 預算是否讓探測與後續分頁在同一次領工內完成")
+    final = h.get_sync(addr)
+    assert final.completeness == "complete"
+    assert final.reason == "left_boundary_verified"

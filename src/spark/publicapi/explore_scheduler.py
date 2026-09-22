@@ -1417,8 +1417,26 @@ class ExploreScheduler:
         - 回空頁 → 依 `ExploreStore.first_activity_ms`（D-F：只接受 portfolio
           allTime 首點，不得用本機時間頂替）判斷：明顯早於窗口起點（差距
           ≥ `_PROBE_WINDOW_MS`）→ `truncation_suspected`（上游截斷嫌疑）；
-          明顯晚於／等於窗口起點 → `no_earlier_activity`（帳戶當時確無活動）；
-          缺席或落在模糊帶 → `unknown`（證據不足，不宣稱任何一方）。
+          明顯晚於窗口起點（差距 ≥ `_PROBE_WINDOW_MS`，Task 10 W1／W5 裁決節
+          修法——見下）→ `no_earlier_activity`（帳戶當時確無活動）；缺席或
+          落在模糊帶（`[window_start_ms - _PROBE_WINDOW_MS, window_start_ms +
+          _PROBE_WINDOW_MS)`）→ `unknown`（證據不足，不宣稱任何一方）。
+
+          Task 10（reviewer W5，主線程裁決）：`no_earlier_activity` 原本零
+          緩衝（`first_ms >= window_start_ms` 即成立），與 `truncation_
+          suspected` 要求整整一天緩衝不對稱——兩邊用的是同一個 `allTime`
+          首點，plan Task 3 設計要點已明寫它是**降採樣**的權益歷史、粒度
+          可能到天，首點不等於首筆成交，只應在**明顯**早於或晚於窗口時
+          採信。寬的那一側（零緩衝）落在「錯判完整」方向：真實首筆成交
+          可能落在窗口起點前不久，但降採樣後的首點恰好落在起點之後、探測
+          那一天又剛好沒有成交，就會被誤判 `no_earlier_activity` →
+          `complete`，而左界其實從未被驗證過。現在兩側緩衝對稱（都是
+          `_PROBE_WINDOW_MS`＝1 天），模糊帶擴大為
+          `[window_start_ms - 1d, window_start_ms + 1d)`。裁決：收緊後
+          `tests/test_explore_scheduler.py` 的 `_t7a_default_portfolio(ws)`
+          共用樁（`first_activity_ms` 精確等於 `window_start_ms`）落在新
+          模糊帶內是 fixture 不真實（不是判準錯）——已改成
+          `ws + 2*DAY`，見該檔 `_t7a_default_portfolio` docstring。
 
         回寫用 `ExploreStore.set_left_boundary`——地址層級的冪等寫入，不是
         scan_id 範圍的 CAS（左界證據不屬於某一次特定的遍歷，屬於這個地址；
@@ -1484,7 +1502,11 @@ class ExploreScheduler:
             first_ms = self._store.first_activity_ms(address)
             if first_ms is None:
                 state = "unknown"                                    # D-F：不知道就是不知道
-            elif first_ms >= scan.window_start_ms:
+            elif first_ms >= scan.window_start_ms + _PROBE_WINDOW_MS:
+                # Task 10（reviewer W5）：與 `truncation_suspected` 對稱，要求
+                # 明顯晚於（差距 ≥ 1 天）才採信「帳戶當時確無活動」——零緩衝
+                # 會讓降採樣、粒度可能到天的 `allTime` 首點把「其實驗證不到
+                # 左界」誤判成 complete，見本方法 docstring 的 W5 說明。
                 state = "no_earlier_activity"
             elif first_ms < scan.window_start_ms - _PROBE_WINDOW_MS:
                 state = "truncation_suspected"
