@@ -79,6 +79,23 @@ def test_explore_upstream_refresh_enabled_starts_scheduler_thread(
     assert matches[0].daemon is True
 
 
+def test_explore_upstream_refresh_zero_is_an_independent_kill_switch(
+        tmp_path, monkeypatch, _started_threads):
+    """RUNBOOK §5.8f Step 7-pre（2026-09-22 使用者要求「確認背景工作可獨立停用」）：
+    正式機 drop-in 把 `EXPLORE_UPSTREAM_REFRESH` 從 1 改成 **0**、只重啟 `filet-api`，
+    探索背景刷新就必須整個不啟動——而且是「開關本身」造成的，不是靠拿掉
+    `FILET_EXPLORE_DB` 讓它無法啟動（DB 路徑照給，v4 遷移照跑，快照照端）。
+    與 `_unset_` 那條的差別就在這裡：那條驗的是預設值，這條驗的是明確關閉。"""
+    env = _env(tmp_path, EXPLORE_UPSTREAM_REFRESH="0",
+               FILET_EXPLORE_DB=str(tmp_path / "explore.db"))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    run_api.main()
+
+    assert not any(t.name == "explore-scheduler" for t in _started_threads)
+
+
 def test_explore_scheduler_receives_base_and_fills_scoped_gateways(
         tmp_path, monkeypatch, _started_threads):
     """Task 7.4c：scheduler 建構要拿到 `hl_base`／`hl_fills` 兩個保留額度視圖
