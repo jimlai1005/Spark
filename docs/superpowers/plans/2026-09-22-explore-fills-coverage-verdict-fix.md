@@ -1723,6 +1723,17 @@ fills 類積壓已從部署時的 50／22／17（due_n）收斂到 0／6／0—�
 running scans 71 → 66；Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
 對外 complete 部署時 109 → 120，穩定上升；`truncation_suspected` 已達 60，是 complete 增長的主要天花板（1 天探測窗待辦）。
 
+| 20:00 | 0 | 0 | 122／158／20 | 78 | 0／0／1 | ok | |
+| 20:15 | 0 | 0 | 123／158／19 | 76 | 5／0／0 | ok | |
+| 20:30 | 0 | 0 | 124／157／19 | 76 | 0／0／0 | ok | |
+| 20:45 | 0 | 0 | **125**／156／19 | 76 | 0／0／0 | ok | eligible 80 → 82 |
+
+**20:55 排程檢查（+5h10m）**：unknown **193 → 160**（−33/h）、`earlier_fills_seen` 163 → 166（+3）、
+`truncation_suspected` 60 → **89**（+29）、`no_earlier_activity` 5 → 9；completeness 65／164／195；`fills_verify` job 78 → 75；
+running scans 66 → 65；Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
+觀察：這一小時解出的探測 ~9 成落在 `truncation_suspected`——1 天探測窗對這批（多為低頻）帳戶幾乎必然回空。
+不影響安全（全部判 partial），但代表 complete 的自然上限在 ~170 附近，剩下要靠待辦（本地 fills 反證＋7 天探測窗）。
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
