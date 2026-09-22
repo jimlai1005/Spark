@@ -2316,6 +2316,259 @@ sudo journalctl -u filet-api --since '10 min ago' --no-pager | grep -iE 'traceba
 P6（D12）之後**沒有發布門檻**，不會有「擋下」這件事；只有候選來源整批故障（保留舊版）才會有 journal
 訊息 `explore publisher：候選來源整批回空（第 N 次），榜單維持舊版`——對應 `explore_publisher.source_failures` 遞增。
 
+### 5.8f ⭐⭐⭐ 第八次部署程序（schema v4、左界證據判準、輔助份額臨時加速；**跟單中，加倍小心**）
+
+<!-- 2026-09-22: explore fills 覆蓋判準修正與吞吐重分配。plan
+docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md Task 9（D-A～D-I）。
+commit 範圍 dc76440（上一次已部署版本）..HEAD。 -->
+
+> 🛑 **正式機上已有第一個真實用戶正在跟單。** 本節每一步的第一約束是「不得干擾
+> `filet-follower@*`」：本次只重啟 `filet-api`，follower 是獨立 unit、不經 `hl_budget`
+> 限流器，理論上不受影響，但共用同一顆出口 IP 的 HL 權重配額——任何一步觀察到
+> follower 異常或 429，**立即回退**，不等觀測期結束、不猶豫。
+
+**這次動了什麼**：`filet-api` 啟動時會把 `/var/lib/filet-api/explore.db` 從
+schema v3 自動遷移到 v4（`ExploreStore._migrate_v3_to_v4`，原子＋冪等，只撤銷依賴
+舊判準的**結論**，`fills` 原始成交與遍歷游標一筆不少，見 plan「背景：根因與證據」
+與「使用者裁決 D-G」）；覆蓋結論改由三項證據合成（`scan_verdict`：左界證據＋
+無未解缺口＋抵達固定終點），對外 `complete` 的判定會大幅改變。`EXPLORE_INDEX_VERSION`
+本次維持 **4 不變**（不是本次修法的一部分），但覆蓋結論變動仍會讓現有快照的
+`fills_coverage` 大量過期，適用 §5.8c 的「重啟前預熱」程序。
+
+#### Step 1：部署前基線（D-I，全部輸出留存，貼進部署紀錄）
+
+```bash
+# 1a) 有沒有任何 unit 已經是 failed（部署後才能對照「是不是我造成的」）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER 'sudo systemctl --failed --no-pager'
+# 預期：0 loaded units listed
+
+# 1b) follower 存活與每個 instance 的啟動時間（部署後要逐一比對，時間戳必須相同）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+  systemctl list-units --all "filet-follower@*" --no-legend | awk "{print \$1}" | while read u; do
+    echo "=== $u ==="
+    systemctl is-active "$u"
+    systemctl show "$u" -p ActiveEnterTimestamp
+  done'
+# 記下每個 unit 的 ActiveEnterTimestamp——部署後必須逐一相同（follower 完全沒被重啟）
+
+# 1c) follower 最近一次成功對帳的時間（不要求逐字比對，只要「部署後仍在推進」）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo journalctl -u 'filet-follower@*' --since '2 hours ago' --no-pager | grep -i '對帳\|reconcile' | tail -5"
+
+# 1d) 觀測取樣器最後一筆（外部工具，見 §5.8e「取樣器」；不在 repo 內）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  'tail -1 /home/ubuntu/explore-obs/samples.jsonl | python3 -m json.tool' \
+  | tee /tmp/pre-v4-sample.json
+# 記下 .public（coverage_counts 等對外分佈）、.scan（遍歷軌進度）、
+# .overdue_by_kind（各 job kind 的逾期分佈）三段——部署後拿新的一筆比對
+
+# 1e) DB 備份（WAL 模式，用 sqlite backup API，不要直接 cp——同 §5.8e 第七次部署程序）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo python3 - <<PY
+import sqlite3
+src = sqlite3.connect("file:/var/lib/filet-api/explore.db?mode=ro", uri=True)
+dst = sqlite3.connect("/var/lib/filet-api/explore.db.pre-v4.bak")
+src.backup(dst); dst.close()
+PY
+sudo chown filet-api:filet-api /var/lib/filet-api/explore.db.pre-v4.bak
+sudo chmod 600 /var/lib/filet-api/explore.db.pre-v4.bak'
+# 驗收：檔案存在且非空
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  'ls -l /var/lib/filet-api/explore.db.pre-v4.bak'
+
+# 1f) 現有 drop-in 的 FILET_EXPLORE_* 現值——⚠️ 不要印整段 Environment（含 TG token），
+#     只 grep 這幾個 key：
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "systemctl show filet-api -p Environment --value | tr ' ' '\n' | grep FILET_EXPLORE_"
+# 記下現值（部署後用來確認哪些是新增、哪些是沿用）
+```
+
+#### Step 2：快照預熱（§5.8c，本次覆蓋結論大量變動，必做）
+
+本次覆蓋結論的變動幅度遠大於一般部署（`complete` 的判定條件整個換了），會讓現有
+`explore_index.json` 快照裡的 `fills_coverage` 大量顯示過期資訊。依 2026-09-05 使用者
+裁決「以後一律照此」：**先在本機用新版程式建好 300 池快照，`install` 到正式機快取
+路徑，再重啟 `filet-api`**，不讓正式機冷建期間掛著舊的錯誤覆蓋結論。完整步驟照
+§5.8c 原文執行，不在本節重複；本節只補一句：§5.8c 的「本機建快照」那一步用的是
+**本節要部署的這個 commit**（含 Task 1–8b 全部改動）。
+
+#### Step 3：env 變動（drop-in，`/etc/systemd/system/filet-api.service.d/`）
+
+以下逐項對照 `src/spark/publicapi/config.py` 的實際讀取（本表由
+`grep -n "FILET_EXPLORE_\|FILET_HL_" src/spark/publicapi/config.py` 核對，見 Task 9
+驗收證據）：
+
+| 變數 | 動作 | 值 | 語義變化 |
+|---|---|---|---|
+| `FILET_EXPLORE_FILLS_PERIOD_S` | **值不變** | `21600`（沿用） | ⚠️ 語義改變：不再是「唯一的全域週期」，改為 `fills_period_s()` 速率公式的**下界**（`config.py:184` `explore_fills_period_s`，即 `MIN_PERIOD_S` 的覆寫來源）。drop-in 不必改值——現值剛好等於新規格的預設下界。 |
+| `FILET_EXPLORE_FILLS_MAX_PERIOD_S` | 新增（可不設） | `86400` | 週期公式的**上界**；不設時預設即 86400（`MAX_PERIOD_S`），語義相容，不設也不影響行為。 |
+| `FILET_EXPLORE_SPECIAL_SERVE_RATIO` | 新增 | `3` | D-C：暫時把探測／核驗的輔助份額比例從預設 9:1 調緊到 3:1，加速遷移後 137 個 `left_boundary='unknown'` 位址取得左界證據（預設 9 是 2026-09-21 使用者既有裁決，**不得更動**，此覆寫只在到期前生效）。 |
+| `FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL` | 新增 | `2026-09-24T00:00:00Z` | 到期時間（ISO8601 UTC，尾碼 `Z`）。逾期或缺漏由 `ExploreScheduler._special_serve_ratio` **自動**回預設 9（fail-safe，見 `explore_scheduler.py:432-441`）——**不必人工移除**這兩個 env，但到期後可以清掉。 |
+| `FILET_HL_EXPLORE_WEIGHT_CAP` / `FILET_HL_EXPLORE_BASE_WEIGHT_CAP` / `FILET_HL_EXPLORE_FILLS_WEIGHT_CAP` | **完全不動** | 沿用現值（300／180／120） | Task 6（子預算可借用）已被使用者裁決放棄——實測零效益（base p50=164/p95=180 貼頂、`explore_fills` 有效上限仍 120 權重/分＝60 頁/小時、`total_fills_pages` 53→53 零差異），程式碼已 revert。**這三個 cap 的語義仍是硬上限**，本次部署不得把它們寫成或理解成「floor」。 |
+
+```bash
+# 部署前先 grep 現有 drop-in，確認沒有任何本次改動後已無讀取者的 env
+# （判讀：drop-in 裡出現的每個 FILET_EXPLORE_*／FILET_HL_EXPLORE_* key，
+#   必須能在 config.py 的 grep 結果裡找到同名讀取點；找不到就是死旋鈕，先移除再部署）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  'sudo grep -h "^Environment=FILET_EXPLORE_\|^Environment=FILET_HL_" \
+    /etc/systemd/system/filet-api.service.d/*.conf'
+
+# 寫新 drop-in（沿用既有 explore-refresh.conf／accrued-history.conf 的分檔慣例，
+# 這次改動獨立成一個檔，回退時整檔刪掉即可，不動其他 drop-in）：
+sudo tee /etc/systemd/system/filet-api.service.d/explore-v4-verdict.conf >/dev/null <<'EOF'
+[Service]
+# FILET_EXPLORE_FILLS_PERIOD_S 沿用既有 explore-refresh.conf 的 21600（下界，語義改變見上表）
+Environment=FILET_EXPLORE_SPECIAL_SERVE_RATIO=3
+Environment=FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=2026-09-24T00:00:00Z
+EOF
+sudo systemctl daemon-reload
+```
+
+#### Step 4：只重啟 `filet-api`
+
+```bash
+# 部署 rsync（§3.2）與快照安裝（Step 2 / §5.8c）都完成之後才重啟：
+sudo systemctl restart filet-api.service
+sudo systemctl status filet-api.service --no-pager   # 確認 active
+
+# ⚠️ 不重啟、不 reload、不觸碰 filet-follower@* 與四個 timer
+#（filet-perf-series／filet-leaderboard／filet-daily-report／filet-auto-activate 的 timer 不動）
+
+# 立即比對 follower 未被牽連：把下面每一行的輸出跟 Step 1b 記下的值逐一比對，必須完全相同
+systemctl list-units --all 'filet-follower@*' --no-legend | awk '{print $1}' | while read u; do
+  echo "=== $u ==="; systemctl show "$u" -p ActiveEnterTimestamp
+done
+```
+
+不符（任何一個 follower 的 `ActiveEnterTimestamp` 變了）→ **立即回退**（Step 7），
+不要先排查——`filet-api` 理論上不該動到 follower，一旦動到代表對「重啟範圍」的假設
+本身錯了，優先保用戶資金安全。
+
+#### Step 5：遷移報告核對
+
+啟動日誌必定印出一行（`explore_store.py:809`，`logger.warning`——**這條會進
+journald**，root logger 預設停在 WARNING，一般 `logger.info` 不會進，但這行是刻意用
+`.warning` 讓它在部署當下一定看得到）：
+
+```bash
+sudo journalctl -u filet-api --since '5 min ago' --no-pager \
+  | grep "schema v3→v4 遷移完成"
+```
+
+預期格式：`explore store: schema v3→v4 遷移完成（D-G 工作量報告）：{'before': {...},
+'after': {...}, 'work': {...}}`。Task 4 Step 5 在正式機複本上實跑過兩次（2026-09-22
+08:24 UTC，數字一致）：
+
+```
+before {backfilling 83, complete 300, partial 14}
+after  {backfilling 97, complete 135, partial 165}
+work   {probes_needed 198, scans_to_resume 97, verify_needed 0}
+```
+
+**判讀**：正式機部署當下的數字會因為這段時間新增候選／既有遍歷推進而**漂移**，
+要求「同量級」（`complete` 掉到 1xx～低 2xx、`partial` 升到 1xx、`verify_needed`
+應為 **0**——這是 schema v4 遷移吸收了根因 3 的 131 個待核驗列的直接結果），
+不是逐字相等。若 `after.complete` 遠高於 `before.complete`、或 `verify_needed` 明顯
+不是 0、或整行沒出現 → **立即回退**。
+
+同一段啟動流程還會看到約 131 則（正式機部署當下數字可能不同）
+`explore scheduler: 丟棄 <地址> 的 fills_verify job——證據已由別的遍歷補齊`
+（`explore_scheduler.py:1203-1204`，`logger.info`）——**這是正常的，不是錯誤**。
+但這條是 `.info`，**不會**進 journald（root logger 停在 WARNING）；要確認的話改查
+DB：
+
+```bash
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo python3 -c \"import sqlite3; c=sqlite3.connect('file:/var/lib/filet-api/explore.db?mode=ro', uri=True); print(c.execute(\\\"select kind, count(*) from refresh_job where kind='fills_verify'\\\").fetchall())\""
+```
+
+預期：隨部署後推進，這個數字**單調遞減到 0**（不是立刻為 0——遷移只是把大部分待核驗列
+改判為「缺左界證據」而不再需要核驗，殘留的極少數仍走 verify 軌）。
+
+#### Step 6：部署後觀測門檻（至少涵蓋一個完整 24 小時重排週期，D-I）
+
+| 指標 | 來源 | 門檻 | 不達標的動作 |
+|---|---|---|---|
+| follower 存活與對帳 | `journalctl -u 'filet-follower@*'`；`ActiveEnterTimestamp` | 無新增失敗、未重啟、與 Step 1b 一致 | **立即回退** |
+| 429 | `samples.jsonl` 的 `api.r429_15m` | 連續 2 小時為 0 | **立即回退** |
+| Traceback | `api.traceback_15m` | 連續 2 小時為 0 | **立即回退** |
+| explore 父 scope 權重 | `GET /api/ops/health` 的 `hl_budget.used.explore` | 任一分鐘 ≤ 300 | 立即回退 |
+| 全域權重 | 同上 `used.global` | 任一分鐘 ≤ 900 | 立即回退 |
+| 探測進度 | `probe.executed` 累計（取樣器） | 部署後 2 小時內 > 0 | 查候選查詢（`_PROBE_CANDIDATE_WHERE`）是否真的挑得到人——Task 8b 就是釘死這條鏈的測試 |
+| `fills` 類 overdue 是否收斂 | `samples.jsonl` 的 `overdue_by_kind`（`fills`／`fills_scan`／`fills_verify`／`probe` 四個 kind） | 24 小時內四個 kind 的 `overdue_p95_s` 不得單調上升；`fills_verify` 對應的 `refresh_job` 列數（Step 5 那條查詢）單調遞減到 0 | 查是否被 base 類飢餓（`explore_base`／`explore_fills` 保留額度是否各自貼頂），不要調 `WEIGHT_CAP`（Task 6 已放棄） |
+| 對外 complete 曲線 | `public.coverage_counts.complete`（取樣器） | 24 小時內**單調上升**，且不得出現「一次性暴增又打回」——那代表結論來源不只一個（Task 3b／8 的不變式被破壞） | 查 `verdicts_from_legacy_path` 是否真的是 0（Task 8 驗收條件） |
+| base 逾期 | `overdue_by_kind.state.overdue_p95_s` | < 1800 | 調高 base 類優先序（不動 `WEIGHT_CAP`） |
+
+⚠️ **本表已移除舊版「遍歷軌頁面占比 ≥ 0.5」門檻**——Task 7b 已證明它不是穩定性質
+（政策改為對增量需求設下界，而非維持固定占比；沿用舊門檻會在正常運作下誤報）。
+
+> 「至少一個完整 24 小時重排週期」是因為 `FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL`
+> 訂在部署後約 1–2 天內到期（視實際部署時間而定，到期後輔助份額比例自動回 9:1）；
+> 24 小時觀測窗要涵蓋「加速期」與「回到預設後」兩種狀態，才能確認到期自動恢復
+> 真的生效（不是靠人工記得移除）。
+
+#### Step 7：回退（獨立成立，不需要回頭讀其他段）
+
+任何一項達到「立即回退」門檻，或觀測期內出現任何未預期的 follower 異常，依下列步驟：
+
+```bash
+# 1) 停 filet-api（follower 不動）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER 'sudo systemctl stop filet-api.service'
+
+# 2) 還原 DB（用 Step 1e 備份的複本；WAL 檔一併清掉避免舊 -wal 套用到還原後的檔案）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo rm -f /var/lib/filet-api/explore.db-wal /var/lib/filet-api/explore.db-shm
+sudo install -o filet-api -g filet-api -m 600 \
+  /var/lib/filet-api/explore.db.pre-v4.bak /var/lib/filet-api/explore.db'
+
+# 3) 還原上一版程式碼（本機驅動，§9.3 的標準模型：回退＝本機切舊 commit → 重跑 §3.2 rsync）
+cd /Users/jim/projects/spark
+git status --porcelain            # 必須是空的
+git checkout dc76440              # dc76440 = 本次修法之前、上一次已部署的版本（第七次部署，7.9a-7.9e）
+git describe --always --dirty     # 驗收：印出的就是即將回退部署的版本
+# 回 §3.2 從頭整節跑一遍（兩段 rsync、chown ubuntu → uv sync → chown root），
+# 完成後 git checkout 回原本的開發分支（§9.3 步驟 1 的提醒）
+
+# 4) 還原 drop-in：本次新增的 explore-v4-verdict.conf 整檔刪除（不影響同目錄其他 drop-in）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  'sudo rm -f /etc/systemd/system/filet-api.service.d/explore-v4-verdict.conf
+   sudo systemctl daemon-reload'
+
+# 5) 啟動並確認
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo systemctl start filet-api.service
+sudo systemctl status filet-api.service --no-pager
+curl -s "http://127.0.0.1:8700/api/public/explore?window=month" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d[\"building\"],d[\"total_scanned\"])"'
+# 預期：False 300（快照可用，不是冷建中）；journal 無 Traceback
+
+# 6) follower 確認未受影響（照 Step 1b 同樣的指令，比對 ActiveEnterTimestamp 仍與部署前一致）
+systemctl list-units --all 'filet-follower@*' --no-legend | awk '{print $1}' | while read u; do
+  echo "=== $u ==="; systemctl show "$u" -p ActiveEnterTimestamp
+done
+```
+
+回退**不需要動 follower**（步驟中沒有任何一行碰 `filet-follower@*`）。舊程式碼讀
+v4 schema 的 DB 本來就無效——所以先還原 DB 到 v3 複本，再回退程式碼，順序不能反：
+若先回退程式碼、DB 還停在 v4，舊版 `ExploreStore` 會因為多出的欄位／表結構而讀出
+不被舊判準理解的資料（雖然 SQLite 對多餘欄位寬容不會直接炸，但 `evidence_unknown`／
+`left_boundary` 等新欄位在舊程式碼裡沒有任何讀取邏輯，等於整批地址的核驗結果被
+舊版忽略——這正是 §9.3「回滾不會回滾資料」那節警告的情境）。
+
+#### Step 8：`fills_in_window` 語義備忘（觀測用，非判準）
+
+自本次起 `fills_in_window` 是**上界**（分頁游標重疊未去重，實測高估約 3.7%——
+28,000 raw vs 26,976 unique，見 plan「根因 1」附帶缺陷），不是精確筆數；它已不是
+任何覆蓋判準的輸入（`grep -rn fills_in_window src/spark/publicapi/hl_explore.py
+src/spark/publicapi/explore_publisher.py` 應無命中），僅供觀測與 Task 5 的成交速率
+估算——估高會讓週期估短、抓得更密，方向對安全性是保守的。
+
+```bash
+git add deploy/RUNBOOK.md
+git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據判準、週期分層、跟單中注意事項）"
+```
+
 ## 6. nginx + certbot
 
 ```bash
