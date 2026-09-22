@@ -1440,6 +1440,79 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 
 ---
 
+## Task 10: 審核修正（reviewer 2026-09-22：C1＋W1／W2／W3／W5）`@inline`
+
+> fresh-context opus reviewer 的報告在 `<scratchpad>/review-2026-09-22.md`，重現腳本 `probe1–4.py`。
+> **主線程已親自重跑 probe3／probe4 與 W1／W3 的一行驗證，全部成立**；W4 延後（見末）。
+> 部署判斷：**修完 C1 再部署**。
+
+### C1（Critical）：重算結論繞過了左界證據的單調性閘門 → 錯判完整
+
+`explore_store._recompute_verdict_locked` 直接把 `set_left_boundary` 剛寫入的 `(state, window_start_ms)`
+組成 `LeftBoundary` 餵給 `scan_verdict`；而 `get_left_boundary(address, query_ws)` 有單調性閘門
+（正面證據只在 `stored_ws <= query_ws` 時適用，否則視為 unknown）。重算用的 scan 是
+`fills_sync.scan_id` 指向的那筆——遷移後是**舊的**已完成 scan（窗口起點 W_old），但探測前置
+是對 `partial_rescan` **新建**的 scan（W_new > W_old）做的：「W_new 之前有成交」不能證明
+W_old 的左段沒被截斷，卻把舊 scan 判成 `complete / left_boundary_verified`。
+實跑：舊 scan `[1000, 9000]`，`set_left_boundary(ws=5000, earlier_fills_seen)` → 舊結論變 complete；
+`get_left_boundary(A, 1000)` 依規則應為 unknown。遷移後 165 列全部立刻 `partial_rescan_due`（W2），
+部署後數分鐘內大量發生。
+
+**修法**：閘門只能有一個來源。把 `get_left_boundary` 的適用判斷抽成純 helper
+`_applicable_boundary(state, stored_ws, stored_at, query_ws) -> LeftBoundary`，`get_left_boundary`
+與 `_recompute_verdict_locked` **都**經它；重算時 `query_ws = scan.window_start_ms`（該筆 scan 自己的
+窗口起點）。閘門判為 unknown → 不重算（結論維持 partial，等新 scan 自己收尾）。
+
+測試：
+- `test_recompute_ignores_evidence_from_a_later_window`：probe4 的情境，重算後仍 `partial/left_boundary_unknown`。
+- `test_rescan_probe_does_not_flip_the_superseded_verdict`（harness）：種一個遷移形狀列、讓 `partial_rescan` 到期
+  → 新 scan 探測前置寫入 W_new 證據 → 斷言舊結論**不變**，直到新 scan 以短頁收尾才 complete。
+- 反向護欄：只把 `_recompute_verdict_locked` 改回直接組 `LeftBoundary`（繞過 helper）→ 第一條轉紅。
+
+### W2：遷移列立即 `partial_rescan_due` → 165 次整窗重掃，繞過了 Task 3b 的便宜路徑
+
+`_migrate_v3_to_v4` 撤銷結論後，這些列的 `fills_scan.finished_at` 是幾天前 → `PARTIAL_RESCAN_AFTER_S` 早已到期
+→ 第一輪 candidates 就建 `fills_scan` job → 每列一次 30 天整窗遍歷（不在任何容量估算內；Task 8b 的
+harness 刻意種成沒有 job，覆蓋不到這個形狀）。實跑 probe3 證實。
+
+**修法**：遷移對「撤銷結論」的那批列，把其 `fills_sync.scan_id` 指向的 `fills_scan.finished_at` 設為
+遷移當下 `:now`——**只動這一個時間戳**（它是結論時間的 metadata，不是抓取進度；D-G 的游標／
+`fills`／`observed_*` 一律不動），讓便宜的獨立探測路徑先有 24 小時處理它們；探測解出證據後
+Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再排重掃。
+`last_migration_report()["work"]` 新增 `rescans_deferred`。
+
+測試：遷移後 `partial_rescan_due(now)` 為 False、`now + PARTIAL_RESCAN_AFTER_S` 為 True；
+`next_probe_candidate()` 仍回得到該列；連跑兩次遷移 `finished_at` 不再變（版本閘門）。
+
+### W1：`rank=None` 時只套上界不套下界 → 重啟後（rank 快取為空）週期可低於 6h
+
+實跑 `fills_period_s(897.5, None) = 6417.8s`、`(5000, None) = 1152s`；`MIN = 21600`。
+**修法**：`fills_period_s` 一律 clamp 到 `[MIN_PERIOD_S, MAX_PERIOD_S]`，rank 只負責「熱門強制取 MIN」。
+測試：`fills_period_s(897.5, None) == MIN_PERIOD_S`、`fills_period_s(5000.0, None) == MIN_PERIOD_S`。
+
+### W3：`scan_verdict` 可回 `("partial", None)`，違反 `tuple[str, str]`
+
+`cursor < window_end` 且 `stop_reason is None`（例如 v3 的 `page_cap` 列被重算）→ reason 寫成 NULL。
+**修法**：該分支回 `("partial", REASON_TRAVERSAL_INCOMPLETE)`（新常數 `"traversal_incomplete"`，語義＝
+遍歷未抵達終點且沒有記錄到停止原因）。測試釘死回傳型別永不含 None。
+
+### W5：模糊帶不對稱，寬的那側落在錯判完整方向
+
+`no_earlier_activity` 只要 `first_ms >= window_start_ms`（零緩衝），但 `truncation_suspected` 要
+`first_ms < window_start_ms − 1d`。allTime 首點是降採樣的權益歷史，粒度可到一天（plan Task 3 設計要點
+明寫「只在**明顯**晚於時採信」）。**修法**：`no_earlier_activity` 需 `first_ms >= window_start_ms + _PROBE_WINDOW_MS`；
+`[window_start − 1d, window_start + 1d)` 一律 unknown。既有 `test_probe_empty_with_clearly_newer_account_is_no_earlier_activity`
+用 +3 天仍過；新增 `+12h → unknown` 的測試。
+
+### W4（延後，不在本 task）
+`truncation_suspected → unknown` 被允許且降級不觸發重算，`left_boundary` 與 `reason` 可能不一致。
+兩者都是 partial，不影響對外正確性；Task 3b 的 builder 有「防探測飢餓」的理由。部署後再議。
+
+- [ ] 全部修完：`uv run pytest -q` 全綠、`ruff` 過、上述測試全部存在；C1 的反向護欄轉紅證據。
+- [ ] Commit：`fix: 審核修正——重算結論套用單調性閘門（C1）、遷移延後重掃、週期下界、verdict 型別、模糊帶對稱（W1/W2/W3/W5）`
+
+---
+
 ## 狀態表（實作期間由主線程更新）
 
 | Task | 狀態 | 驗收證據 |
@@ -1456,6 +1529,7 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 | 7b 政策需求＋不飢餓＋同毫秒降級 | ✅ `0ca3160` | 主線程複跑 3346 passed；新政策測試實算 22.458 頁/小時（正式機 22.34）；harness 下界保真度 bug 修正 3600→21600 後 7a 四條仍全綠 |
 | 8 端到端可達性＋份額自動到期 | ✅ `02d07e3` | 主線程複跑 3357 passed、ruff 全過；  預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
 | 8b 遷移後形狀走完整條獨立探測鏈 | ✅ `05fad87` | 只破壞 `_PROBE_CANDIDATE_WHERE`（不動 inline）→ 0/20 轉紅（23.9h 乾淨隔離；24h 因與 `PARTIAL_RESCAN_AFTER_S` 重合得 1/20，仍紅）；同 seed 下 **6.5 小時** 20/20（1h=2、3h=8、5h=15、6h=19） |
+| 10 審核修正 C1＋W1/W2/W3/W5 | 派工前（reviewer 判「修完 C1 再部署」） | 主線程親跑 probe3/probe4/W1/W3 重現全部成立 |
 | 9 RUNBOOK §5.8f | ✅ 文件完成 `24f94ab`（**部署未執行，待使用者授權**） | 主線程逐段讀過並修 3 處可執行性問題（ops/health 需 admin session、取樣器無 `probe` 欄位、誤入的 commit 區塊）；取樣器 v4 相容已唯讀查證 |
 
 **待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
