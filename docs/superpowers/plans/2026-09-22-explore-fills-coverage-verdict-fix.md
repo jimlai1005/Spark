@@ -1668,6 +1668,23 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
    線上無指標——RUNBOOK §5.8f 已加一條 DB 查詢當觀測。
 5. 被推遲的 `finished_at` 會出現在對外 `evidence.finished_at`（觀測失真，不影響判準）。
 
+## 部署後觀測日誌（第八次部署 2026-09-22 15:45:03 UTC；24h 窗至 2026-09-23 15:45 UTC）
+
+| 時間 (UTC) | 429 | Traceback | complete／partial／backfilling（對外） | verify_backlog | fills 類 due | follower | 備註 |
+|---|---|---|---|---|---|---|---|
+| 15:30（基線） | 0 | 0 | 144／131／25 | 113 | 50／22／17 | ok | 部署前最後一筆 |
+| 16:00 | 0 | **5**（皆非本次） | 109／145／46 | 112 | 38／24／22 | hb 1s、errors 0 | `evidence.unknown 0`、`external_complete 144`；`scans_finished_15m 180` |
+
+**16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
+→ `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
+（`git diff dc76440..HEAD -- app.py | grep trade-quality` 無命中）、路徑在 `/opt/filet/state`（不在 rsync／chown 的
+`/opt/filet/spark` 範圍）、`fbac652…` 是 2026-09-07 手動 disable 的舊 follower（unit disabled/inactive）；
+部署前 24h 該端點 0 次請求所以 0 次 500——是使用者部署後開 ops 面板才觸發。**不構成回退條件**；
+觀測排程 v2 已把這類 Traceback 排除在回退判準外，只計數。非 `/api/ops/` 路徑的 5xx 為 0。
+
+**新增待辦（非本次回歸）**：`ops.py:157` 讀取已歸檔／已停用 follower 的 `skipped/*.json` 應容錯
+（`FileNotFoundError`／`PermissionError` → 視為 0 或標 unknown），不得讓 ops 面板 500。
+
 ## 資料極限與未決事項（誠實標註）
 
 1. 「HL 不強制 10,000 筆留存」是**單一地址、單一時點**的實測（26,976 筆）＋正式機 8 個
