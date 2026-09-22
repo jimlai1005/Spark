@@ -1553,7 +1553,7 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 | 7b 政策需求＋不飢餓＋同毫秒降級 | ✅ `0ca3160` | 主線程複跑 3346 passed；新政策測試實算 22.458 頁/小時（正式機 22.34）；harness 下界保真度 bug 修正 3600→21600 後 7a 四條仍全綠 |
 | 8 端到端可達性＋份額自動到期 | ✅ `02d07e3` | 主線程複跑 3357 passed、ruff 全過；  預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
 | 8b 遷移後形狀走完整條獨立探測鏈 | ✅ `05fad87` | 只破壞 `_PROBE_CANDIDATE_WHERE`（不動 inline）→ 0/20 轉紅（23.9h 乾淨隔離；24h 因與 `PARTIAL_RESCAN_AFTER_S` 重合得 1/20，仍紅）；同 seed 下 **6.5 小時** 20/20（1h=2、3h=8、5h=15、6h=19） |
-| 10 審核修正 C1＋W1/W2/W3/W5 | 派工前（reviewer 判「修完 C1 再部署」） | 主線程親跑 probe3/probe4/W1/W3 重現全部成立 |
+| 10 審核修正 C1＋W1/W2/W3/W5 | ✅ `71f89fd`（主線程複跑中；針對性複審已派） | 閘門抽成 `_applicable_boundary` 單一來源；遷移只動 `finished_at`；非熱門下界 1h；reason 永不 None；模糊帶對稱 |
 | 9 RUNBOOK §5.8f | ✅ 文件完成 `24f94ab`（**部署未執行，待使用者授權**） | 主線程逐段讀過並修 3 處可執行性問題（ops/health 需 admin session、取樣器無 `probe` 欄位、誤入的 commit 區塊）；取樣器 v4 相容已唯讀查證 |
 
 **待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
