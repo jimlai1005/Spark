@@ -1623,7 +1623,7 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 | 8b 遷移後形狀走完整條獨立探測鏈 | ✅ `05fad87` | 只破壞 `_PROBE_CANDIDATE_WHERE`（不動 inline）→ 0/20 轉紅（23.9h 乾淨隔離；24h 因與 `PARTIAL_RESCAN_AFTER_S` 重合得 1/20，仍紅）；同 seed 下 **6.5 小時** 20/20（1h=2、3h=8、5h=15、6h=19） |
 | 10 審核修正 C1＋W1/W2/W3/W5 | ✅ `71f89fd`；主線程複跑 3367 passed、probe3/probe4 重現已封；針對性複審（opus）**無 Critical、判可部署** | 閘門抽成 `_applicable_boundary` 單一來源；遷移只動 `finished_at`；非熱門下界 1h；reason 永不 None；模糊帶對稱 |
 | 11 `no_earlier_activity` 窗口綁定 | ✅ `04e7c78`（主線程複跑中） | 閘門 `==`、撤回窗口不符進候選、加「有 scan 在跑不進獨立探測」排他；反向護欄轉紅；Task 8 測試一字不改回綠，`probes_executed` 340（基線 301，非 760） |
-| 9 RUNBOOK §5.8f | ✅ 文件完成 `24f94ab`（**部署未執行，待使用者授權**） | 主線程逐段讀過並修 3 處可執行性問題（ops/health 需 admin session、取樣器無 `probe` 欄位、誤入的 commit 區塊）；取樣器 v4 相容已唯讀查證 |
+| 9 RUNBOOK §5.8f＋**部署** | ✅ **已部署 2026-09-22 15:45:03 UTC**（`bbd7adf`） | stop→裝快照→start 3 秒；follower 時間戳與基線相同；遷移報告 before {69/322/23} → after {92/144/178}，`verify_needed 0`、`rescans_deferred 178`；`building False/300`；Traceback 0 | 主線程逐段讀過並修 3 處可執行性問題（ops/health 需 admin session、取樣器無 `probe` 欄位、誤入的 commit 區塊）；取樣器 v4 相容已唯讀查證 |
 
 **待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
 

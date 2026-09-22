@@ -2425,6 +2425,13 @@ EOF
 sudo systemctl daemon-reload
 ```
 
+> **實際執行順序（2026-09-22 第八次部署，與 §5.8c 的差異，之後照此）**：新架構的榜單由 publisher 每分鐘
+> 從 `explore.db` 合成，**先裝快照再 restart 會在 restart 前被覆寫**。實際做法：rsync → 寫 drop-in →
+> `stop filet-api` → 裝快照 → `start filet-api`（間隙 3 秒）。快照的來源也不是 §5.8c 的本機對主網冷建
+> （新架構下要數小時且覆蓋率更差），而是**把剛做好的 `explore.db.pre-v4.bak` 拉到本機、用新程式開啟
+> （自動遷移 v4）、讓 publisher 從完整資料合成**——第一個 tick 就發布，HL 呼叫走本機 IP。成品與正式機
+> 同源一致（`max_dd`／`live_days` 逐項相同，只有筆數門檻因覆蓋變 partial 而由不合格轉待確認）。
+
 #### Step 4：只重啟 `filet-api`
 
 ```bash
