@@ -2892,6 +2892,16 @@ concentrated；v3 遷移列 `order_count_30d`=0、`fills_truncated`=True、帶�
 部署後盯：journal 不再每分鐘出現「探測失敗 … BudgetExhausted」；`fills_sync.reason` 出現 `…_probe_empty`／`retention_boundary_verified`；`explore_refresh.queue_depth`／`oldest_due_age_s` 不因探測與 fills 頁輪流分保留額度而單調上升（每地址一生至多一次探測，上限 300 次，暫時代價）。
 待辦（7.7＋7.8 合併複審 Warning，下一批）：`test_incremental_round_short_page_preserves_partial_reason` 已成空測試（走 invalid_page 分支）；詳情頁按需入列用 `updated_at ≥ 4h` 判斷，partial 地址 24h 內每次詳情頁請求都會把 fills job 拉回 now 換一次 noop（不打上游、不餓死他人）。
 
+**2026-09-22 第七次部署（commit `2048cd0`＝程式 e09cbe3，04:47 UTC，Task 7.9a–7.9e：週期 6h 單一來源、雙軌 scan_id、狀態與工作對帳、輔助份額、退池清理、schema v3）：**
+使用者裁決「五項有證據即進入受控部署」——證據：全量 3309 passed（scheduler 三跑無 flaky）、vitest 761；正式機 287 列快照遷移三次（version 回 2、重啟）一致；`repro_rescan`／`repro_79b`／
+`rv_churn_backfill2`／`rv_verify_burst` PASS；3 天模擬（fake HL、每分鐘一次 fills 預留、20 個回補中地址掉池 1h 再回池、多頁遍歷）：partial_rescan 3、verify 各恰一次、六 kind 最老到期 < 0.4h、
+探測 6%、churn 後無卡住、active 地址 evidence_unknown 0；7.9e 複審「可部署，先修 W1」（已修；W2/W3 小修有守門測試與變異驗證但**未經獨立複審**）。
+流程：rsync 兩段 → import（schema 3／period 21600／rescan 86400／mult 7）→ §4.2 build（`publicApi.ts` evidence 型別）→ chown → DB 備份 `explore.db.pre-79.bak`（backup API）＋快照 `.pre-79.bak`
+→ drop-in 加 `FILET_EXPLORE_FILLS_PERIOD_S=21600` → 取樣器換 v3（舊版留 `sample.v2.bak.py`，cron 不變）→ restart `filet-api`＋`filet-dashboard` → 12 秒後：schema 3；349 列 `fills_sync` ↔ 349 個 `fills_scan`
+（288 done complete／5 done partial／56 running initial 沿用游標）；`evidence_unknown` 163（含退池）；gap 0；`inc_from_ms` NULL 0；job：fills 300／fills_scan 34／fills_verify 131（攤 0.2–47.9h）；
+啟動對帳掃除 32 筆退池殘留 job；零 Traceback → `DEPLOYED_VERSION` → 回歸。**觀測門檻**：至少一個完整 6 小時增量週期（見上方第七次部署程序）；臨時 cron 保留到正式採樣接替。
+待辦（下一批）：7.9e 複審 W4（D4 死欄位 `ScanTarget.evidence_unknown`／`has_done_verify` 接上或砍掉）、S1 探測在核驗積壓期的服務比例觀測、`test_s3_verify_runs_back_to_back` 收緊、`partial_rescan` 孤兒配對測試。
+
 **2026-09-21 設定變更（無程式碼部署，19:21 UTC 09-20，推薦碼 `JIMLAI1005` → `FILET`）：** 使用者指示換碼並把推薦人錢包改為
 Filet Alpha `0xfB9C52f56F03D786AD5D435aa70fe45D80569760`。前置確認：主網 `referral` 端點回 `referrerState.stage == ready`、
 `code == FILET`（該錢包 `cumVlm` 70,766，已過建碼門檻）。流程照 §5.8d (f)：`cp -a` 備份 `/etc/filet/referral.env.bak-20260920-192110`
