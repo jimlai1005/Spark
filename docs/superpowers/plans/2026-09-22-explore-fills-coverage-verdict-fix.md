@@ -1,0 +1,1179 @@
+# Explore fills 覆蓋判準修正與吞吐重分配 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 讓成交量最大的帳戶不再被錯判為「不可能完整」，同時**不把錯判不完整換成錯判完整**——覆蓋結論只在三項證據同時具備時才成立；並把 fills 抓取吞吐從「83% 被增量輪吃掉」重新分配，使積壓在小時級而非週級收斂。
+
+**Architecture:** 覆蓋結論改成「證據合成」而非「單點推論」：complete 需同時具備 (1) 窗口**左界**證據、(2) 分頁**無未解缺口**、(3) 游標抵達**固定的** `window_end`。左界證據來自一次獨立、可快取、對滾動窗口單調有效的留存邊界探測，存在 `fills_sync`（每地址一份），且是每次掃描的**第一個動作**——證據拿不到就不下結論，不是預設任一方向。預算耗盡、游標停滯、我方頁數上限一律只是「本系統停止回補」，不得產生完整性結論。吞吐面：增量週期依**近期成交速率**決定（不是只看名次），限流器子預算改成當前視窗內原子扣帳的可借用底線，父 cap 300 權重/分鐘不變。
+
+**Tech Stack:** Python 3.11 + uv、SQLite（`/var/lib/filet-api/explore.db`）、pytest（全離線，autouse socket-ban）、systemd（`filet-api`）。
+
+---
+
+## ⚠️ 正式機狀態（2026-09-22）
+
+**正式機上已有第一個跟單用戶，引擎正在跟單中。** 本次所有部署動作的第一約束是
+「不得干擾 `filet-follower@*`」：
+
+- follower 是獨立 systemd unit、**不經** `hl_budget` 限流器，重啟 `filet-api` 不會動到它——
+  但兩者共用同一個對外 IP 的 HL 權重配額。本次 Task 6 的借用只在 `explore` 父 scope
+  （300 權重/分鐘）**之內**重分配，全域上限 900（HL 為 1200）不變，follower 的餘裕分毫未動。
+  這是硬不變式，Task 6 必須有測試釘死。
+- 部署程序（Task 9）必須：部署前記錄 follower 基線、部署後確認 follower 未重啟且無新增失敗、
+  觀察至少一個完整的 24 小時重排週期。
+- 任何 429 或 follower 異常 → 立即回退，不等觀測期結束。
+
+---
+
+## 背景：根因與證據（2026-09-22 調查，builder 不必回頭讀對話）
+
+現況（正式機 06:15 UTC 快照，`/home/ubuntu/explore-obs/samples.jsonl`）：300 個池內位址中
+合格 75、資格待確認 145、不合格 80；覆蓋狀態 complete 97、partial 136、backfilling 67
+——即 203 個位址在 `/explore` 顯示「分析待完成」。
+
+### 根因 1（主因）：覆蓋判準建立在一個被證偽的上游前提
+
+`explore_fills_sync.py:64-68` 依 HL 文件「`userFillsByTime` 只保留最近 10,000 筆」推出
+`RETENTION_SAFETY_THRESHOLD = 8_000`；`:336-344` 在遍歷收尾時只要窗口內累計觀測筆數
+≥ 門檻就判 `partial / retention_limit`。`:43` 的 `max_pages_per_round = 20` 也寫明理由是
+「20 頁＝40,000 筆已超過留存上限」——同一個前提。
+
+**實測推翻該前提**（2026-09-22，主線程自本機直接呼叫 HL public info API，唯讀）：
+對 `0xbf732ea04197942783e34730ed6e0f6099575d58` 的 30 天窗口連續分頁，取回 **26,976 筆
+不重複成交（14 頁）且尚未走完**。正式機 `fills_scan` 另有 8 個位址在同一窗口觀測到
+13,000–18,000 筆，獨立佐證。
+
+後果：成交筆數最多的帳戶被永久判為「不可能完整」；D14 契約規定 coverage ≠ complete 時
+成交衍生欄位一律 null → 永遠「分析待完成」。且 `partial` 是吸收態，
+`PARTIAL_RESCAN_AFTER_S`（24 小時）每天整窗重掃，重掃再得到同一個錯結論。
+
+**但「門檻是錯的」不等於「筆數多就代表完整」。** 短頁收尾只證明「從游標起，上游不再給」，
+不證明「窗口左段沒有被截掉」——若上游真的做了留存截斷，第一頁就會從較晚的時間開始，
+而我們從頭到尾看不出來。本計畫的核心就是把這個盲區變成一個顯式、可觀測的證據項。
+
+附帶缺陷：游標重疊沒有去重，`fills_in_window` 直接累加 `len(page)`，實測高估約 3.7%
+（28,000 raw vs 26,976 unique）。門檻移除後它不再是判準輸入
+（`grep -rn fills_in_window src/spark/publicapi/hl_explore.py src/spark/publicapi/explore_publisher.py`
+無命中），降級為純觀測值，但仍需在文件註明它是上界不是精確值。
+
+### 根因 2：fills 吞吐硬上限 60 頁/小時，其中 83% 被增量輪吃掉
+
+一頁 `userFillsByTime` 權重 120（`hl_budget.py:79`），`explore_fills` 子預算 120／60 秒視窗
+（`hl_budget.py:61`，正式機 `FILET_HL_EXPLORE_FILLS_WEIGHT_CAP=120`）→ 硬上限每分鐘 1 頁
+＝ 60 頁/小時，實測 56。300 個位址每 6 小時一次增量（`FILET_EXPLORE_FILLS_PERIOD_S=21600`）
+＝ 50 頁/小時。剩約 12 頁/小時要分給 65 個未完成遍歷 ＋ 131 個待核驗，平均每個位址 5 小時
+才推進一頁（最老的遍歷 26 小時只做 1 頁）。
+
+子 cap 是硬上限而非可借用的底線：`explore_base`（180）的實際需求**推估**約 120 權重/分鐘
+（state 300/30min×2 ＋ portfolio 300/2h×20 ＋ ledger 300/2h×20），多出的額度 fills 借不到。
+**此為推導值，Task 6 Step 0 必須實測後才定 floor。**
+
+### 根因 3：今早 04:47 部署（7.9e）讓 131 列同時變灰
+
+`04:45 complete 219 / pending 51` → `04:55 complete 92 / pending 153`。131 個 `fills_verify`
+job 全排在 29–46 小時後才到期，且核驗只拿「每 9 頁 fills-like 給 1 頁」的輔助份額
+（`explore_scheduler.py:142` `SPECIAL_SERVE_RATIO = 9`）→ 榜單將維持此狀態約 2.5 天。
+
+---
+
+## 使用者裁決
+
+| 代號 | 決策 | 日期 |
+|---|---|---|
+| **D-A** | 覆蓋完整性改用**可觀測的邊界證據**：移除「筆數 ≥ 8,000 ⇒ partial」推論。 | 2026-09-22 |
+| **D-B** | 吞吐：增量週期**分層** ＋ 子預算改為**可借用**的保留底線（父 cap 300 不變）。 | 2026-09-22 |
+| **D-C** | 今早的 131 列：**提前核驗**，並暫時提高輔助份額。 | 2026-09-22 |
+| **D-D** | 顯示契約（D14「coverage ≠ complete 則成交衍生欄位為 null」）**這次不改**。 | 2026-09-22 |
+| **D-E** | **complete 需三項證據同時成立**：左界證據、分頁無未解缺口、抵達固定 `window_end`。預算耗盡與游標停滯不得當作完成。 | 2026-09-22（複審） |
+| **D-F** | 語義限定：我方頁數上限只表示「本系統停止回補」，**不得**表述為上游留存不足；首次活動時間必須有可信來源與明確涵蓋範圍，**本機首次看到該地址的時間不算證據**；探測回空且證據不足 → 維持 **unknown**。 | 2026-09-22（複審） |
+| **D-G** | 遷移只撤銷依賴舊判準的**結論**，保留原始 fills、去重資料與相容的游標；須可重跑、不重複建 job，並輸出遷移前後狀態分佈與待處理工作量。 | 2026-09-22（複審） |
+| **D-H** | 週期不得只看名次：前 50 名以外的高頻地址不應一律延長到 24h；借用必須在當前預算視窗內原子扣帳，不得用平均閒置量放行，且不得讓 base 或 follower 飢餓。 | 2026-09-22（複審） |
+| **D-I** | 驗收須重現 300 地址競爭負載（含增量、其他遍歷、verify、真實限流）；verify 加速設定**到期自動恢復**；部署前記錄基線、部署後至少觀察一個 24h 重排週期。 | 2026-09-22（複審） |
+
+**D-D 與 D-E 的張力（已解）**：D-E 讓 complete 變嚴格，若左界證據排在事後取得，大戶會卡在
+「遍歷完了但證據拿不到」而持續空白。解法是 Task 3 的**探測前置**：探測是掃描的第一個動作，
+走 fills 預算（1 頁），不走輔助份額。證據對滾動窗口單調有效（見 Task 3），每地址一生一次。
+
+---
+
+## 覆蓋結論的單一判準（所有 task 的共同契約）
+
+```python
+def scan_verdict(scan: FillsScan, boundary: LeftBoundary) -> tuple[str, str]:
+    """唯一的覆蓋結論來源。三項證據同時成立才 complete（D-E）。
+    任何「我方停止」的情形都不得產生完整性結論（D-F）。"""
+    if scan.unresolved_gap:
+        return ("partial", "unresolved_gap")            # 分頁有未解缺口
+    if scan.cursor_ms < scan.window_end_ms:
+        return ("partial", scan.stop_reason)            # 沒抵達固定終點：本系統停止回補
+    if boundary.state == "earlier_fills_seen":
+        return ("complete", "left_boundary_verified")
+    if boundary.state == "no_earlier_activity":
+        return ("complete", "left_boundary_no_activity")
+    if boundary.state == "truncation_suspected":
+        return ("partial", "left_boundary_truncated")   # 上游截斷嫌疑
+    return ("partial", "left_boundary_unknown")         # 證據不足：不宣稱完整，也不宣稱截斷
+```
+
+`stop_reason` 值域（**封閉集合，全部語義為「本系統停止」，不描述上游**）：
+`local_page_cap`（達到我方單次掃描頁數硬上限 `MAX_PAGES_PER_SCAN`）、
+`no_progress`（游標停滯）、`same_ms_overflow`（整頁同一毫秒，無法在不漏單的前提下前進）。
+
+⚠️ **「本輪頁數用完」（`max_pages_per_round`）不在這個集合裡，也不得寫任何
+`stop_reason`**（主線程裁決 2026-09-22，builder 第一版誤寫成 `stop_reason="page_cap"`）。
+它是暫停不是停止：`result`、`stop_reason` 兩者皆維持 `None`，游標推進，scan 仍 running。
+寫了的後果是 `scan_verdict` 每 `max_pages_per_round` 頁就對大戶吐出一次
+`("partial", "page_cap")`——這正是 D-E 禁止的「預算耗盡當作結論」。
+測試 `test_round_cap_pauses_without_any_verdict` 就是釘死這件事的。
+
+---
+
+## File Structure
+
+| 檔案 | 本次責任 |
+|---|---|
+| `src/spark/publicapi/explore_fills_sync.py` | 純函式層：`apply_scan_page` 收尾、`scan_verdict`、週期函式、reason 常數。Task 1、2、5。 |
+| `src/spark/publicapi/explore_store.py` | 持久化：`left_boundary` 三欄、`unresolved_gap`、schema v4 遷移、探測候選查詢。Task 1、3、4。 |
+| `src/spark/publicapi/explore_scheduler.py` | 排程：探測前置、verdict 落地、週期單一來源、輔助份額。Task 1、3、5、8。 |
+| `src/spark/publicapi/hl_budget.py` | 限流器：子 scope 改 floor＋當前視窗原子借用。Task 6。 |
+| `src/spark/publicapi/config.py` | 新設定與 env。Task 5、6、8。 |
+| `scripts/ops_expedite_verify.py`（新增） | 一次性運維（D-C），含自動到期。Task 8。 |
+| `deploy/RUNBOOK.md` | §5.8f 第八次部署程序。Task 9。 |
+
+**不得改動**：`src/spark/copytrade/`、`src/spark/filet/`、`/Users/jim/projects/hl-copytrader`
+（唯讀紅線）、`web/`（D-D）。
+
+---
+
+## Task 1: 覆蓋結論改為三項證據合成 `@inline`
+
+> **主線程裁決（2026-09-22，builder 回報 plan 缺口後）**：
+> **Task 1 與 Task 2 合併為同一個 commit 邊界，不各自獨立驗收。**
+> 原因：Task 1 讓 `apply_scan_page` 不再寫 `result`，而 `complete_scan` 有
+> 「`result is None` 就 raise」的 7.9d-D 守門（刻意的），接線在 Task 2。
+> 兩者之間必然有一段 `tests/test_explore_scheduler.py` 紅燈的中間態——這是本 plan
+> 的切分錯誤，不是實作錯誤。Task 1 的驗收條件 2（scheduler 測試全綠）延後到 Task 2 結束時一併驗。
+>
+> 連帶修正 Task 1 驗收條件 4：`REASON_COUNT_BELOW_RETENTION_THRESHOLD` 等三個舊常數
+> **在 Task 3 拆掉舊探測路徑之前不能刪**（`explore_scheduler.py` 仍在用），
+> 保留並標註「僅供 v3 遷移與舊探測路徑，勿在新路徑使用」即可。原本要求「零命中」的寫法有誤。
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_fills_sync.py:25-45`、`:64-68`、`:306-374`
+- Modify: `src/spark/publicapi/explore_store.py:62-70`（reason 常數）
+- Test: `tests/test_explore_fills_sync.py`
+
+- [ ] **Step 1: 寫失敗測試——四種「不得判 complete」與兩種「可判 complete」**
+
+```python
+def test_short_page_alone_is_not_complete():
+    """D-E：短頁只證明遍歷結束，左界證據不到位就不得宣稱完整。
+    （這是本次事故的反向風險：把錯判不完整換成錯判完整。）"""
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=0)
+    assert scan_verdict(scan, _boundary("unknown")) == ("partial", "left_boundary_unknown")
+
+
+def test_complete_requires_left_boundary_evidence():
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=0)
+    assert scan_verdict(scan, _boundary("earlier_fills_seen")) == (
+        "complete", "left_boundary_verified")
+    assert scan_verdict(scan, _boundary("no_earlier_activity")) == (
+        "complete", "left_boundary_no_activity")
+
+
+def test_unresolved_gap_beats_every_other_evidence():
+    """分頁有未解缺口 → 不論左界證據多強都不是完整。"""
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=1)
+    assert scan_verdict(scan, _boundary("earlier_fills_seen")) == ("partial", "unresolved_gap")
+
+
+def test_local_stop_never_yields_completeness():
+    """D-F：我方停止回補（頁數上限／游標停滯／同毫秒溢位）一律不是完整，
+    且 reason 必須描述我方行為，不得描述上游留存。"""
+    for stop in ("local_page_cap", "no_progress", "same_ms_overflow"):
+        scan = _scan(cursor_ms=5000, window_end_ms=9000, unresolved_gap=0, stop_reason=stop)
+        state, reason = scan_verdict(scan, _boundary("earlier_fills_seen"))
+        assert (state, reason) == ("partial", stop)
+        assert "retention" not in reason        # 不得把我方上限說成上游留存
+
+
+def test_truncation_suspected_is_partial_not_complete():
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=0)
+    assert scan_verdict(scan, _boundary("truncation_suspected")) == (
+        "partial", "left_boundary_truncated")
+
+
+def test_apply_scan_page_short_page_does_not_decide_completeness():
+    """收尾函式只負責「遍歷到此結束」，結論交給 scan_verdict。"""
+    plan = ScanPlan(start_ms=1000, end_ms=9000, scan=_scan(fills_in_window=50_000))
+    result = apply_scan_page(plan, [_fill(2000, 1)], page_limit=3, now_ms=NOW)
+    assert result.done is True
+    assert result.scan.cursor_ms == 9000          # 抵達固定終點
+    assert result.scan.result is None             # 不在這裡下結論
+```
+
+`_boundary(state)` 是新 helper，回傳 `LeftBoundary(state=state, window_start_ms=1000, at=NOW)`。
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_fills_sync.py -k "short_page_alone or left_boundary or unresolved_gap or local_stop or truncation_suspected or does_not_decide" -v`
+Expected: FAIL，`ImportError: cannot import name 'scan_verdict'`。
+
+- [ ] **Step 3: 新增型別與 reason 常數**
+
+`explore_store.py` 的 reason 區塊：**刪除** `REASON_COUNT_BELOW_RETENTION_THRESHOLD`，
+新增（並加日期註記 `<!-- 2026-09-22 D-A/D-E：門檻推論移除，改證據合成 -->`）：
+
+```python
+REASON_LEFT_BOUNDARY_VERIFIED = "left_boundary_verified"        # 探測到窗口起點之前仍有可查成交
+REASON_LEFT_BOUNDARY_NO_ACTIVITY = "left_boundary_no_activity"  # 帳戶在窗口起點前確無活動
+REASON_LEFT_BOUNDARY_TRUNCATED = "left_boundary_truncated"      # 上游截斷嫌疑
+REASON_LEFT_BOUNDARY_UNKNOWN = "left_boundary_unknown"          # 證據不足，不下結論
+REASON_UNRESOLVED_GAP = "unresolved_gap"                        # 分頁有未解缺口
+```
+
+`REASON_RETENTION_BOUNDARY_VERIFIED` 保留為**歷史值**（遷移會改寫成新名，見 Task 4），
+但不再被新程式碼寫入；在常數旁註明「僅供 v3 遷移讀取，勿在新路徑使用」。
+
+`explore_fills_sync.py` 新增：
+
+```python
+@dataclasses.dataclass(frozen=True)
+class LeftBoundary:
+    """窗口左界證據。`state` 值域見 `scan_verdict`；`window_start_ms` 是這份
+    證據適用的窗口起點（單調性見 Task 3 docstring）；`at` 是取得時間。"""
+    state: str
+    window_start_ms: int | None
+    at: float | None
+```
+
+並實作上面「覆蓋結論的單一判準」那段 `scan_verdict`。
+
+- [ ] **Step 4: 移除門檻，`apply_scan_page` 不再下結論**
+
+刪除 `HL_FILLS_RETENTION_LIMIT` / `RETENTION_SAFETY_MARGIN` / `RETENTION_SAFETY_THRESHOLD`
+三個常數與 `apply_scan_page` 的 `retention_threshold` 參數。短頁分支改為：
+
+```python
+    if len(page) < page_limit:
+        # D-E：短頁只代表「從游標起上游不再給」。游標推進到固定終點，
+        # 結論交給 scan_verdict（需左界證據與無缺口才可能 complete）。
+        new_scan = dataclasses.replace(
+            scan, cursor_ms=end_ms, observed_from_ms=observed_from, observed_to_ms=observed_to,
+            fills_in_window=fills_in_window, result=None, reason=None, last_error=None)
+        return ScanPageResult(scan=new_scan, accepted=list(page), done=True,
+                              note="reached_window_end")
+```
+
+`no_progress` / `same_ms_overflow` 兩個分支改成寫 `stop_reason`（新欄位）而非 `result`：
+`dataclasses.replace(scan, stop_reason="no_progress", ...)`，`result` 維持 `None`。
+`same_ms_overflow` 另外設 `unresolved_gap=1`（整頁同毫秒代表我們無法在不漏單的前提下
+前進，是真正的缺口）。
+
+模組 docstring `:25-45` 整段改寫：說明門檻推論已被實測推翻（附本 plan 路徑），
+並寫明新判準的三項證據與「我方停止 ≠ 上游沒有」的語義界線。
+
+- [ ] **Step 5: 修既有測試**
+
+移除所有 `retention_threshold=` 參數（:120、:132、:142、:154、:169、:178、:194、:207、
+:227、:245、:251、:256、:261）；刪除 `test_retention_constants_named_and_derived`（:52）
+與 `test_apply_scan_page_short_page_over_retention_threshold_is_partial`（:165）。
+`grep -rn "count_below_retention_threshold\|RETENTION_SAFETY" src/ tests/` 應只剩
+Task 4 遷移那一處。
+
+- [ ] **Step 6: 跑測試**
+
+Run: `uv run pytest tests/test_explore_fills_sync.py -v`
+Expected: PASS。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/spark/publicapi/explore_fills_sync.py src/spark/publicapi/explore_store.py tests/test_explore_fills_sync.py
+git commit -m "fix: 覆蓋結論改為左界證據＋無缺口＋抵達終點三項合成（D-A／D-E）"
+```
+
+---
+
+## Task 2: 頁數上限與停止語義 `@inline`
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_fills_sync.py`（page cap 分支）
+- Modify: `src/spark/publicapi/explore_scheduler.py:1079-1120`（收尾分派）
+- Test: `tests/test_explore_fills_sync.py`、`tests/test_explore_scheduler.py`
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_round_cap_pauses_without_any_verdict():
+    """每輪預算耗盡不是結論（D-E）：本輪結束、游標推進、result 與 stop_reason 皆 None。"""
+    scan = _scan(pages_done=2, cursor_ms=1000)
+    plan = ScanPlan(start_ms=1000, end_ms=9000, scan=scan)
+    result = apply_scan_page(plan, [_fill(1000, 1), _fill(2000, 2)],
+                             page_limit=2, max_pages_per_round=3, now_ms=NOW)
+    assert result.done is True
+    assert result.scan.result is None and result.scan.stop_reason is None
+    assert result.scan.cursor_ms == 2000
+
+
+def test_absolute_cap_is_a_local_stop_not_an_upstream_claim():
+    """D-F：400 頁只表示本系統停止回補。reason 必須是 local_page_cap，
+    且不得出現任何 retention 字樣（那是對上游的主張，我們沒有證據）。"""
+    scan = _scan(pages_done=MAX_PAGES_PER_SCAN - 1, cursor_ms=1000)
+    plan = ScanPlan(start_ms=1000, end_ms=9000, scan=scan)
+    result = apply_scan_page(plan, [_fill(1000, 1), _fill(2000, 2)],
+                             page_limit=2, max_pages_per_round=3, now_ms=NOW)
+    assert result.done is True
+    assert result.scan.stop_reason == "local_page_cap"
+    assert result.scan.result is None                     # 結論仍由 scan_verdict 給
+    assert "retention" not in (result.scan.stop_reason or "")
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_fills_sync.py -k "round_cap_pauses or absolute_cap" -v`
+Expected: FAIL，`NameError: MAX_PAGES_PER_SCAN`。
+
+- [ ] **Step 3: 實作**
+
+```python
+# D-A／D-F（2026-09-22）：單輪頁數上限只決定「本輪做到哪」；MAX_PAGES_PER_SCAN 是
+# **我方**的回補上限（防止單一地址無上限佔用額度），達到時的語義是「本系統停止回補」，
+# 不是「上游沒有更多資料」——我們沒有任何證據支持後者。實測大戶 30 天窗口約需 18 頁。
+MAX_PAGES_PER_SCAN = 400
+```
+
+page cap 分支寫 `stop_reason="local_page_cap"`、`result=None`；
+`new_pages_done % max_pages_per_round == 0` 分支只推進游標、`result`／`stop_reason` 皆 None。
+
+- [ ] **Step 4: 收尾分派——三條路徑要分清楚**
+
+`explore_scheduler.py` 的 `_run_scan`，在 `finished_scan = ...` 之前插入：
+
+```python
+        if res.done and res.scan.result is None and res.scan.stop_reason is None:
+            # (a) 本輪頁數用完：scan 仍 running，不寫結論、不排重掃。
+            #     重排時間與續頁路徑同源（7.8 教訓：到期條件與重排時間必須同一來源）。
+            self._store.insert_scan_page(job.address, res.accepted, res.scan)
+            self._reschedule(job, now, bump_attempts=False)
+            self._notify_dirty()
+            return f"ran:{result_kind}"
+```
+
+(b) 抵達終點或有 `stop_reason` → 取左界證據、算結論、落地：
+
+```python
+        boundary = self._store.get_left_boundary(job.address, res.scan.window_start_ms)
+        completeness, reason = scan_verdict(res.scan, boundary)
+        finished_scan = dataclasses.replace(
+            res.scan, finished_at=now, result=completeness, reason=reason)
+```
+
+其餘 `complete_scan` / `ScanWriteback` 處理維持原樣。
+
+- [ ] **Step 5: 跑測試**
+
+Run: `uv run pytest tests/test_explore_fills_sync.py tests/test_explore_scheduler.py -v`
+Expected: PASS。既有
+`test_apply_scan_page_hits_page_cap_on_20th_consecutive_full_page`（:218）改寫為斷言
+`result.scan.result is None`、`stop_reason is None`（20 頁只是本輪上限）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/spark/publicapi/explore_fills_sync.py src/spark/publicapi/explore_scheduler.py tests/
+git commit -m "fix: 頁數上限改為本輪暫停／我方停止語義，不產生上游主張（D-E／D-F）"
+```
+
+---
+
+## Task 3: 左界證據——探測前置、可快取、單調有效 `@inline`
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_store.py`（`left_boundary` 三欄、讀寫、候選查詢）
+- Modify: `src/spark/publicapi/explore_scheduler.py:1164-1229`（`_run_probe`）、領工分派
+- Test: `tests/test_explore_scheduler.py`、`tests/test_explore_store.py`
+
+### 設計要點（builder 必讀）
+
+**為什麼前置**：左界證據是 complete 的必要條件（D-E）。若證據排在遍歷之後、又走輔助份額
+（每 9 頁 fills 才給 1 頁），大戶會「遍歷完 18 頁卻卡在最後 1 頁證據」而持續空白。
+因此探測是掃描的**第一個動作**：`left_boundary` 為 `unknown` 或不適用當前窗口時，
+`fills_scan` job 的下一個動作是探測（走 `explore_fills` 預算，1 頁），不是抓頁。
+
+**為什麼存在 `fills_sync`（每地址）而不是每次掃描**：證據對滾動窗口具**單調性**——
+「窗口起點之前仍有可查成交」這件事，在窗口起點往前滾之後只會更成立（新的起點更晚，
+更早的成交只會更多）。`no_earlier_activity`（帳戶在舊起點前無活動）在窗口往前滾後，
+新起點前可能出現的是我們自己已抓到的成交，仍不構成截斷。所以**正面證據一旦取得就永久有效**，
+每個地址一生只需要一次探測；只有 `truncation_suspected` 與 `unknown` 需要重探。
+這是本設計不會變成新容量黑洞的關鍵。
+
+**首次活動時間的來源與涵蓋範圍（D-F）**：只接受 HL `portfolio` 回應的 `allTime` 序列首點
+（與 `hl_explore.py` 算 `live_days` 的同一個來源，工程原則 1：同源同基準）。
+**明確不接受**：`candidate.source_as_of`、`candidate.last_seen_at`、`endpoint_cache.fetched_at`
+——那些是「本機第一次看到這個地址」，不是帳戶年齡。
+涵蓋範圍限制（必須寫進 docstring）：allTime 是**權益**歷史且經降採樣（見既有教訓
+`hl-portfolio-series-traps`），首點不等於首筆成交，時間粒度可能到天。因此只在它
+**明顯**早於或晚於窗口時採信，落在模糊帶一律 `unknown`。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_probe_runs_before_first_page_of_a_new_scan():
+    """探測前置：新建的 scan 第一個動作是探測，不是抓頁。"""
+    store = _store_with(address=ADDR, left_boundary="unknown")
+    sched = _scheduler(store, fills_pages=[[_fill(EARLIER_MS, 1)]])
+    sched._run_scan(_scan_job(ADDR), now=NOW)
+    assert sched.probes_total == 1
+    assert sched.scan_pages_total == 0
+    assert store.get_left_boundary(ADDR, WINDOW_START).state == "earlier_fills_seen"
+
+
+def test_positive_boundary_evidence_survives_window_roll_forward():
+    """單調性：窗口往前滾之後，正面證據仍適用，不得重探。"""
+    store = _store_with(address=ADDR, left_boundary="earlier_fills_seen",
+                        left_boundary_window_start_ms=WINDOW_START)
+    later = WINDOW_START + 7 * DAY
+    assert store.get_left_boundary(ADDR, later).state == "earlier_fills_seen"
+    assert store.next_probe_candidate() is None
+
+
+def test_probe_empty_with_clearly_older_account_is_truncation_suspected():
+    store = _store_with(address=ADDR, portfolio_first_activity_ms=WINDOW_START - 30 * DAY)
+    sched = _scheduler(store, fills_pages=[[]])
+    sched._run_probe((ADDR, SCAN_ID), now=NOW)
+    assert store.get_left_boundary(ADDR, WINDOW_START).state == "truncation_suspected"
+
+
+def test_probe_empty_with_clearly_newer_account_is_no_earlier_activity():
+    store = _store_with(address=ADDR, portfolio_first_activity_ms=WINDOW_START + 3 * DAY)
+    sched = _scheduler(store, fills_pages=[[]])
+    sched._run_probe((ADDR, SCAN_ID), now=NOW)
+    assert store.get_left_boundary(ADDR, WINDOW_START).state == "no_earlier_activity"
+
+
+def test_probe_empty_in_ambiguous_band_stays_unknown():
+    """帳戶首次活動落在探測窗內（理應探得到卻回空）＝資料互相矛盾 → 維持 unknown。"""
+    store = _store_with(address=ADDR, portfolio_first_activity_ms=WINDOW_START - 12 * 3600_000)
+    sched = _scheduler(store, fills_pages=[[]])
+    sched._run_probe((ADDR, SCAN_ID), now=NOW)
+    assert store.get_left_boundary(ADDR, WINDOW_START).state == "unknown"
+
+
+def test_probe_never_uses_local_first_seen_as_evidence():
+    """D-F：沒有 portfolio 就是不知道；不得拿 candidate.last_seen_at 頂替。"""
+    store = _store_with(address=ADDR, portfolio_first_activity_ms=None,
+                        candidate_last_seen_at=NOW - 400 * DAY / 1000)
+    sched = _scheduler(store, fills_pages=[[]])
+    sched._run_probe((ADDR, SCAN_ID), now=NOW)
+    assert store.get_left_boundary(ADDR, WINDOW_START).state == "unknown"
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_scheduler.py -k "probe" -v`
+Expected: FAIL。
+
+- [ ] **Step 3: store 層：三欄 ＋ 讀寫 ＋ 首次活動時間**
+
+`fills_sync` 新增（schema v4，Task 4 的遷移負責 ALTER）：
+`left_boundary TEXT NOT NULL DEFAULT 'unknown'`、`left_boundary_window_start_ms INTEGER`、
+`left_boundary_at REAL`。`fills_scan` 新增 `stop_reason TEXT`、`unresolved_gap INTEGER NOT NULL DEFAULT 0`。
+
+```python
+    def get_left_boundary(self, address: str, window_start_ms: int) -> LeftBoundary:
+        """回傳適用於 `window_start_ms` 的左界證據。單調性（見 Task 3 設計要點）：
+        正面證據（earlier_fills_seen／no_earlier_activity）在其取得時的窗口起點
+        **不晚於**查詢窗口起點時仍然適用；否則視為 unknown（需重探）。
+        truncation_suspected 不具單調性，一律只對取得時的窗口起點有效。"""
+
+    def set_left_boundary(self, address: str, state: str, window_start_ms: int,
+                          at: float) -> bool:
+        """冪等寫入。只允許 unknown → 其他；已有正面證據時不得被 unknown 覆蓋
+        （證據只能加強，不能被無證據抹掉）。"""
+
+    def first_activity_ms(self, address: str) -> int | None:
+        """帳戶首次活動時間＝快取 portfolio 的 allTime 序列首點。
+        來源與涵蓋範圍限制見 Task 3 設計要點；任何取不到／結構不符一律回 None＝未知。
+        **不得**改用 candidate.last_seen_at／source_as_of 之類的本機時間。"""
+```
+
+⚠️ 實作 `first_activity_ms` 前先讀 `hl_explore.py` 解析 portfolio 的那段
+（`grep -n "allTime" src/spark/publicapi/hl_explore.py`），欄位名以該處為準——
+工程原則 1：「欄位名是假設，不是事實」，未經真實 payload 驗證的欄位名與未驗證的公式同等可疑。
+
+- [ ] **Step 4: scheduler 層：探測前置與結論分支**
+
+`_run_scan` 開頭，取得／建立 scan 之後、`plan_scan` 之前插入：
+
+```python
+        boundary = self._store.get_left_boundary(job.address, window_start_ms)
+        if boundary.state == "unknown":
+            # 探測前置（D-E）：左界證據是 complete 的必要條件，必須在結論之前到手。
+            # 走 explore_fills 預算而非輔助份額——輔助份額留給 fills_verify。
+            if not self._run_probe((job.address, scan.scan_id), now):
+                self._reschedule(job, now, bump_attempts=False)   # 額度不足：下個 tick 再試
+                return "deferred"
+            return f"ran:{result_kind}"
+```
+
+`_run_probe` 的結論分支改為：
+
+```python
+        if page:
+            state = "earlier_fills_seen"
+        else:
+            first_ms = self._store.first_activity_ms(address)
+            if first_ms is None:
+                state = "unknown"                                  # D-F：不知道就是不知道
+            elif first_ms >= scan.window_start_ms:
+                state = "no_earlier_activity"
+            elif first_ms < scan.window_start_ms - _PROBE_WINDOW_MS:
+                state = "truncation_suspected"
+            else:
+                state = "unknown"                                  # 模糊帶：證據互相矛盾
+        self._store.set_left_boundary(address, state, scan.window_start_ms, now)
+```
+
+`_run_probe` 不再呼叫 `apply_probe_result`（該函式與 `old_reason` 參數一併移除——
+結論已改由 `scan_verdict` 統一產生，留著就是第二個結論來源，違反工程原則 1）。
+
+⚠️ **候選查詢兩處**：`next_probe_candidate`（`explore_store.py:1240-1247`）與
+`count_probe_candidates`（`:1250` 起，同一份條件複製了一份）目前都以
+`sc.reason = REASON_COUNT_BELOW_RETENTION_THRESHOLD AND s.evidence_unknown = 0` 挑候選。
+該 reason 已刪除、且 `evidence_unknown=1` 的列會被排除在外——**兩個條件都要改**，
+否則探測永遠挑不到人，整個 Task 3 等於沒上線。新條件：
+`s.left_boundary = 'unknown'`（或適用窗口不符）`AND c.active = 1`。
+兩份查詢收斂成同一個 SQL 片段常數（工程原則 1）。
+驗證：`grep -c "count_below_retention_threshold" src/spark/publicapi/*.py` 應為 0。
+
+- [ ] **Step 5: 拆掉 Task 2 留下的三處 monkeypatch 掩體（必做）**
+
+Task 2 期間 `get_left_boundary` 是恆回 `unknown` 的佔位，有三條既有測試改用
+monkeypatch 注入假的正面證據，才能測到它們原本的不變式：
+
+- `tests/test_explore_scheduler.py` `test_s7a_complete_address_never_rescans_across_candidate_rounds`
+- `tests/test_explore_scheduler.py` `test_s7d_repro_rescan_three_day_thirty_minute_rounds_no_repeated_full_scan`
+- `tests/test_explore_scheduler.py` `test_w2_deferred_verify_job_is_dropped_once_evidence_is_filled_in`
+
+真實實作落地後，**這三處 monkeypatch 必須移除**，改成在 harness 裡餵一個真的會讓探測
+回到 `earlier_fills_seen` 的上游回應。理由：monkeypatch 繞過的正是本次要驗證的那條路徑，
+留著就等於「程式改了但正式流程永遠走不到」還測得過——這是使用者在複審時特別點名的風險。
+
+Run: `grep -n "get_left_boundary = lambda" tests/`
+Expected: 無命中。
+
+- [ ] **Step 6: 跑測試**
+
+Run: `uv run pytest tests/test_explore_scheduler.py tests/test_explore_store.py -v`
+Expected: PASS。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/spark/publicapi/explore_scheduler.py src/spark/publicapi/explore_store.py tests/
+git commit -m "feat: 左界證據前置、可快取、對滾動窗口單調有效；未知不下結論（D-E／D-F）"
+```
+
+---
+
+## Task 4: schema v4 遷移——只撤銷結論，保留抓取進度 `@inline`
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_store.py:98`、`:383-392`、新增 `_migrate_v3_to_v4`
+- Test: `tests/test_explore_store.py`
+
+**原則（D-G）**：`fills` 原始成交列**一筆都不刪**；`fills_scan` 的游標、`pages_done`、
+`observed_*` 在窗口與 `params_fp` 相容時**全部保留**；只清掉依賴舊判準的**結論欄位**。
+
+正式機現況（2026-09-22 06:10 UTC 實測）與遷移後歸屬：
+
+| 現況 | 列數 | 遷移動作 | 遷移後 |
+|---|---|---|---|
+| `complete` / `retention_boundary_verified`（evidence_unknown=0） | 131 | 探測已見更早成交＝新判準的正面證據，**結論保留** | `complete` / `left_boundary_verified`，`left_boundary='earlier_fills_seen'` |
+| `complete` / `count_below_retention_threshold_probe_empty`（evidence_unknown=1） | 152 | 舊的「探測回空」沒有帳戶年齡佐證＝新判準的 unknown。**已遍歷過，游標保留**，只清結論 | `partial` / `left_boundary_unknown`（對外本來就是 partial，**不新增變灰**） |
+| `complete` / `count_below_retention_threshold` | 6 | 純門檻推論，結論作廢；游標保留 | `partial` / `left_boundary_unknown` |
+| `partial` / `retention_limit` | 10 | 被錯門檻中斷，結論作廢；**游標保留**，續抓 | `backfilling`，`result=NULL` |
+| `backfilling`（進行中） | 95 | 不動結論（本來就沒有）；`left_boundary='unknown'` | `backfilling` |
+
+新增變灰只有 6 列（`count_below_retention_threshold`）。**不得**沿用早期草案的
+「running scan 一律作廢重跑」——那會丟掉 118 頁已付出的抓取成本。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_migrate_v3_to_v4_revokes_verdicts_but_keeps_progress():
+    db = _v3_db_with(
+        sync_rows=[("0xaa", "complete", "count_below_retention_threshold", 1),
+                   ("0xbb", "complete", "count_below_retention_threshold_probe_empty", 1),
+                   ("0xcc", "complete", "retention_boundary_verified", 0),
+                   ("0xdd", "partial", "retention_limit", 0)],
+        scan_rows=[("0xdd", "done", "partial", "retention_limit", 5, CURSOR_MS)],
+        fills_rows=[("0xdd", 1, 111), ("0xdd", 2, 222)])
+    store = ExploreStore(db)
+    assert store.schema_version() == 4
+    assert store.get_sync("0xaa").completeness == "partial"
+    assert store.get_sync("0xaa").reason == "left_boundary_unknown"
+    assert store.get_sync("0xbb").completeness == "partial"
+    assert store.get_sync("0xcc").completeness == "complete"          # 正面證據保留
+    assert store.get_left_boundary("0xcc", WINDOW_START).state == "earlier_fills_seen"
+    assert store.get_sync("0xdd").completeness == "backfilling"
+    assert store.get_scan_for("0xdd").cursor_ms == CURSOR_MS          # 游標保留
+    assert store.count_fills("0xdd") == 2                             # 原始成交一筆不少
+
+
+def test_migrate_v3_to_v4_is_rerunnable_and_creates_no_jobs():
+    db = _v3_db_with(...)                       # 同上
+    before_jobs = _job_rows(db)
+    ExploreStore(db); ExploreStore(db); ExploreStore(db)
+    assert _job_rows(db) == before_jobs         # 遷移本身不建任何 job
+    assert _sync_rows(db) == _sync_rows_after_first_migration
+
+
+def test_migrate_v3_to_v4_reports_workload():
+    """D-G：遷移必須輸出遷移前後狀態分佈與待處理工作量，
+    避免再次大量變灰卻沒有處理容量。"""
+    report = ExploreStore(_v3_db_with(...)).last_migration_report()
+    assert report["before"]["complete"] == 3
+    assert report["after"]["partial"] == 2
+    assert report["work"]["probes_needed"] == 3
+    assert report["work"]["scans_to_resume"] == 1
+    assert report["work"]["verify_needed"] == 0
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_store.py -k migrate_v3_to_v4 -v`
+Expected: FAIL，`assert 3 == 4`。
+
+- [ ] **Step 3: 實作遷移**
+
+`_SCHEMA_VERSION = 4`。`_migrate_v3_to_v4` 比照 `_migrate_v2_to_v3`（`:476`）的
+**原子＋冪等**寫法（顯式 transaction、版本更新在同一個 transaction 內）：
+
+```sql
+ALTER TABLE fills_sync ADD COLUMN left_boundary TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE fills_sync ADD COLUMN left_boundary_window_start_ms INTEGER;
+ALTER TABLE fills_sync ADD COLUMN left_boundary_at REAL;
+ALTER TABLE fills_scan ADD COLUMN stop_reason TEXT;
+ALTER TABLE fills_scan ADD COLUMN unresolved_gap INTEGER NOT NULL DEFAULT 0;
+
+-- 正面證據：探測已見更早成交，直接成為新判準的左界證據（結論保留）
+UPDATE fills_sync SET left_boundary='earlier_fills_seen',
+       left_boundary_window_start_ms=(SELECT sc.window_start_ms FROM fills_scan sc
+                                      WHERE sc.scan_id = fills_sync.scan_id),
+       left_boundary_at=:now, reason='left_boundary_verified'
+ WHERE reason='retention_boundary_verified' AND completeness='complete';
+
+-- 門檻推論與無佐證的探測回空：撤銷結論，保留游標與 fills
+UPDATE fills_sync SET completeness='partial', reason='left_boundary_unknown',
+       left_boundary='unknown', evidence_unknown=0
+ WHERE reason IN ('count_below_retention_threshold',
+                  'count_below_retention_threshold_probe_empty');
+
+-- 被錯門檻中斷的遍歷：結論作廢、回到續抓（游標不動）
+UPDATE fills_sync SET completeness='backfilling', reason=NULL, evidence_unknown=0
+ WHERE reason='retention_limit';
+UPDATE fills_scan SET status='running', result=NULL, reason=NULL, finished_at=NULL
+ WHERE result='partial' AND reason='retention_limit';
+```
+
+`ALTER TABLE` 在 SQLite 會自動提交，因此遷移必須**先檢查欄位是否已存在**再 ALTER
+（`PRAGMA table_info`），讓整個遷移可重跑自癒——沿用 v2→v3 既有的處理方式。
+遷移**不建立任何 job**：排程觸發條件一律由 `_ensure_scan_job` 從狀態推導
+（7.9c 教訓：三輪複審都栽在「從 job 存在與否推導」）。
+
+`last_migration_report()` 回傳遷移前後各 completeness 的列數，以及
+`probes_needed`（`left_boundary='unknown'` 且 active 的地址數）、
+`scans_to_resume`（status='running' 的 scan 數）、`verify_needed`（`evidence_unknown=1` 的列數）。
+`_migrate_v3_to_v4` 結束時以 `logger.warning` 印出整份 report（部署當下一定看得到）。
+
+- [ ] **Step 4: 跑測試**
+
+Run: `uv run pytest tests/test_explore_store.py -v`
+Expected: PASS。
+
+- [ ] **Step 5: 對正式機複本實跑遷移（唯讀取得、本機執行）**
+
+```bash
+ssh -i ~/Downloads/LightsailDefaultKey-ap-northeast-1-spark.pem ubuntu@52.197.137.3 \
+  'sudo cp /var/lib/filet-api/explore.db /tmp/explore.copy.db && sudo chmod 644 /tmp/explore.copy.db'
+scp -i ~/Downloads/LightsailDefaultKey-ap-northeast-1-spark.pem \
+  ubuntu@52.197.137.3:/tmp/explore.copy.db /tmp/explore.copy.db
+uv run python -c "
+from spark.publicapi.explore_store import ExploreStore
+import json; print(json.dumps(ExploreStore('/tmp/explore.copy.db').last_migration_report(), indent=1))"
+```
+
+Expected: 遷移後 `partial` 增加 ≈158、`complete` ≈131、`backfilling` ≈105；
+`probes_needed` ≈ 290、`verify_needed` 0（evidence_unknown 已被本次遷移吸收進
+`left_boundary_unknown`）。**把實際數字填進本 plan 的狀態表**，若
+`probes_needed` × 1 頁 ÷ 實測 fills 吞吐 > 24 小時，回報主線程重新裁決，不得逕行部署。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/spark/publicapi/explore_store.py tests/test_explore_store.py
+git commit -m "feat: explore.db schema v4——撤銷舊判準結論、保留抓取進度、輸出工作量報告（D-G）"
+```
+
+---
+
+## Task 5: 增量週期依近期成交速率決定 `@inline`
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_fills_sync.py`（週期函式與常數）
+- Modify: `src/spark/publicapi/config.py`、`src/spark/publicapi/explore_scheduler.py`
+- Test: `tests/test_explore_scheduler.py`
+
+**D-H**：不得只看名次。一個高頻地址若被排成 24 小時，下一輪增量要補 24 小時的成交，
+很可能超過一頁（2000 筆）而變成多頁補抓——比每 6 小時抓一頁更貴。**週期的目的是讓
+「一個週期內的預期成交筆數」剛好落在一頁之內**：
+
+```
+period_s(address) = clamp(
+    TARGET_FILL_RATIO * PAGE_LIMIT / max(fills_per_hour, EPS) * 3600,
+    MIN_PERIOD_S,      # 前 50 名：6h（新鮮度需求）；其餘：6h（下界，不是只給 hot）
+    MAX_PERIOD_S)      # 24h
+```
+
+`fills_per_hour` 來源：`fills_sync.fills_in_window / (window 小時數)`（30 天窗口的實測速率，
+資料已在手，不需額外請求）；沒有資料時取保守值 = `MIN_PERIOD_S`（不確定就抓密一點）。
+`TARGET_FILL_RATIO = 0.8`（留 20% 餘裕給成交速率波動）。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_period_keeps_expected_fills_within_one_page():
+    """核心不變式：任何地址的預期單週期成交筆數 ≤ PAGE_LIMIT。"""
+    for fph in (1, 50, 500, 2_000, 20_000):
+        p = fills_period_s(fills_per_hour=fph, rank=None)
+        assert fph * (p / 3600) <= PAGE_LIMIT
+
+
+def test_high_frequency_cold_address_is_not_blanket_24h():
+    """D-H：名次在 50 名外但高頻的地址，不得一律延長到 24h。"""
+    assert fills_period_s(fills_per_hour=600, rank=200) == MIN_PERIOD_S
+    assert fills_period_s(fills_per_hour=2, rank=200) == MAX_PERIOD_S
+
+
+def test_hot_rank_never_exceeds_min_period():
+    assert fills_period_s(fills_per_hour=0.1, rank=1) == MIN_PERIOD_S
+
+
+def test_unknown_rate_is_conservative():
+    assert fills_period_s(fills_per_hour=None, rank=200) == MIN_PERIOD_S
+
+
+def test_due_check_and_reschedule_share_one_period_source():
+    """7.8 教訓：改到期條件必同改重排時間，且必須同一來源。"""
+    sched = _scheduler()
+    job = _fills_job(address=COLD_ADDR)
+    sched._run_increment(job, now=NOW)
+    expected = sched.fills_period_s_for(COLD_ADDR)
+    assert sched._store.get_job(job.key).next_attempt_at >= NOW + expected
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_scheduler.py -k "period" -v`
+Expected: FAIL，`ImportError: cannot import name 'fills_period_s'`。
+
+- [ ] **Step 3: 實作**
+
+`explore_fills_sync.py` 加 `MIN_PERIOD_S = 6 * 3600`、`MAX_PERIOD_S = 24 * 3600`、
+`TARGET_FILL_RATIO = 0.8` 與純函式 `fills_period_s(fills_per_hour, rank)`。
+`explore_scheduler.py` 只保留**一個**取用點 `fills_period_s_for(address)`（查 store 拿速率與
+名次後轉呼叫純函式），所有到期判斷與重排都必須經它。
+`config.py` 以 env 覆寫上下界（`FILET_EXPLORE_FILLS_MIN_PERIOD_S` /
+`FILET_EXPLORE_FILLS_MAX_PERIOD_S`），沿用既有 `explore_fills_period_s` 的寫法。
+
+- [ ] **Step 4: 驗證沒有殘留呼叫點**
+
+Run: `grep -n "_fills_every_s\|DEFAULT_FILLS_PERIOD_S" src/spark/publicapi/explore_scheduler.py`
+Expected: 無命中（全部改走 `fills_period_s_for`）。
+
+Run: `uv run pytest tests/test_explore_scheduler.py -v`
+Expected: PASS。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/spark/publicapi/explore_fills_sync.py src/spark/publicapi/config.py src/spark/publicapi/explore_scheduler.py tests/test_explore_scheduler.py
+git commit -m "feat: 增量週期依近期成交速率決定，單週期預期筆數不超過一頁（D-B／D-H）"
+```
+
+---
+
+## Task 6: 限流器子預算改為當前視窗內原子扣帳的可借用底線 `@inline`
+
+**Files:**
+- Modify: `src/spark/publicapi/hl_budget.py:150-250`
+- Test: `tests/test_hl_budget.py`
+
+**硬不變式（三條，都要有測試釘死）**：
+1. 任一 60 秒視窗內 `explore` 父 scope 總權重 ≤ 300。
+2. 全域 ≤ 900（HL 為 1200）——這是留給 follower 引擎與三個 timer 的餘裕，本次不動。
+   **正式機正在跟單中，這條被破壞等於直接影響真實用戶。**
+3. `explore_base` 的 floor 永遠可用（fills 借用不得讓 base 飢餓）。
+
+**D-H**：借用判定必須以**當前視窗**的實際用量（既有的 token deque）在**同一個鎖內**
+完成「檢查＋扣帳」，不得使用平均值、移動平均或任何預估閒置量。
+
+- [ ] **Step 0: 先實測 base 的真實需求，再定 floor**
+
+不要沿用背景段的推導值（約 120 權重/分鐘）。用 Task 7 的 300 地址整合 harness 跑一個
+模擬小時，統計 `explore_base` 每分鐘實際預留權重的 p50／p95，**把數字寫進本 plan 狀態表**。
+floor = p95 向上取整到 10 的倍數，下限 60。未實測不得往下做。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_child_may_borrow_only_current_window_idle():
+    """借用額度＝父 cap −（其他子 scope 的 floor），且以當前視窗實際用量判定。"""
+    lim = _limiter(base_floor=BASE_FLOOR)
+    granted = 0
+    while lim.try_reserve(120, "explore_fills") is not None:
+        granted += 1
+    assert granted == (300 - BASE_FLOOR) // 120
+
+
+def test_borrowing_is_atomic_under_one_lock():
+    """並發下不得超賣：多執行緒同時預留，父 scope 用量永遠 ≤ 300。"""
+    lim = _limiter(base_floor=BASE_FLOOR)
+    peak = _hammer_concurrently(lim, threads=8, weight=120, scope="explore_fills")
+    assert peak <= 300
+
+
+def test_base_floor_is_never_starved_by_fills():
+    lim = _limiter(base_floor=BASE_FLOOR)
+    while lim.try_reserve(120, "explore_fills") is not None:
+        pass
+    assert lim.try_reserve(2, "explore_base") is not None
+
+
+def test_parent_cap_and_global_cap_are_never_exceeded():
+    """follower 的餘裕來自全域 900 與父 cap 300；借用只在父 cap 內重分配。"""
+    lim = _limiter(base_floor=BASE_FLOOR)
+    total = 0
+    while True:
+        if lim.try_reserve(120, "explore_fills") is not None: total += 120
+        elif lim.try_reserve(2, "explore_base") is not None: total += 2
+        else: break
+    assert total <= 300
+    assert lim.status()["global_used"] <= 900
+
+
+def test_floors_exceeding_parent_cap_fail_at_construction():
+    with pytest.raises(ValueError):
+        _limiter(base_floor=250, fills_floor=120)      # 250 + 120 > 300
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_hl_budget.py -k "borrow or floor or atomic or never_exceeded" -v`
+Expected: FAIL，`TypeError: unexpected keyword argument 'scope_floors'`。
+
+- [ ] **Step 3: 實作**
+
+`WeightLimiter.__init__` 新增 `scope_floors`；建構時驗證 `sum(floors) <= parent_cap`
+否則 `ValueError`（結構性防呆，不靠記得）。子 scope 放行條件（**單一鎖內**完成檢查與扣帳）：
+
+```
+child_cap_effective(c) = max(floor(c), parent_cap - sum(floor(其他子 scope)))
+放行 w 到 c 的條件（三者同時，全部用當前視窗的實際用量）：
+  global_used + w <= global_cap
+  parent_used  + w <= parent_cap
+  child_used   + w <= child_cap_effective(c)
+```
+
+移除子 scope 的舊硬 cap 語義（同一件事不留兩個來源）。`config.py:165-166` 改傳
+`scope_floors`；env `FILET_HL_EXPLORE_BASE_WEIGHT_CAP` /
+`FILET_HL_EXPLORE_FILLS_WEIGHT_CAP` 語義改為 floor，在 `config.py` 註解與 RUNBOOK 同步說明。
+
+- [ ] **Step 4: 跑測試**
+
+Run: `uv run pytest tests/test_hl_budget.py tests/test_hl_gateway_budget.py -v`
+Expected: PASS。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/spark/publicapi/hl_budget.py src/spark/publicapi/config.py tests/
+git commit -m "feat: 子預算改為當前視窗原子扣帳的可借用底線，父／全域 cap 不變（D-B／D-H）"
+```
+
+---
+
+## Task 7: 300 地址競爭負載下的整合驗收 `@inline`
+
+**Files:**
+- Modify: `tests/test_explore_scheduler.py`（整合 harness）
+
+**D-I**：驗收必須重現真實競爭——300 個候選、增量輪、其他地址的遍歷、verify、探測，
+全部共用**真實限流模型**（60 秒視窗、權重 120、settle 依實際筆數）。rng 種子釘死
+（7.9 教訓：harness 沒有預算模型／churn／多頁就抓不到問題；種子不釘死結果不可複現）。
+
+- [ ] **Step 1: 寫失敗測試（六條）**
+
+```python
+def _harness():
+    return SchedulerHarness(seed=20260922, candidates=300, budget=RealWeightBudget(),
+                            fills_page_weight=120, window_s=60)
+
+
+def test_whale_reaches_complete_within_24h_under_full_contention():
+    """回歸根因：30 天窗口 20,000 筆的地址，在 300 地址競爭＋真實限流下，
+    必須在模擬 24 小時內成為對外 complete。"""
+    h = _harness(); h.set_fill_count("0xwhale", window_fills=20_000)
+    h.run_for(hours=24)
+    assert h.published_row("0xwhale")["fills_coverage"]["state"] == "complete"
+    assert h.published_row("0xwhale")["win_rate"] is not None
+
+
+def test_missing_left_boundary_evidence_can_never_publish_complete():
+    """反向護欄：探測一直拿不到證據的地址，24 小時後仍不得是 complete。"""
+    h = _harness(); h.set_probe_always_empty("0xmystery"); h.set_portfolio_missing("0xmystery")
+    h.run_for(hours=24)
+    assert h.published_row("0xmystery")["fills_coverage"]["state"] != "complete"
+
+
+def test_same_millisecond_fills_survive_page_boundary():
+    """同毫秒跨頁不漏單：游標 inclusive 重疊＋(time, tid) 去重。"""
+    h = _harness(); h.set_fills_all_same_ms("0xburst", count=4_500)
+    h.run_for(hours=6)
+    assert h.stored_fill_count("0xburst") == 4_500
+
+
+def test_restart_resumes_scan_from_persisted_cursor():
+    h = _harness(); h.set_fill_count("0xwhale", window_fills=20_000)
+    h.run_for(hours=3); before = h.scan_cursor("0xwhale")
+    h.restart()                                   # 重建 scheduler，只留 DB
+    h.run_for(hours=1)
+    assert h.scan_cursor("0xwhale") >= before
+    assert h.pages_refetched_after_restart() <= 1  # 至多重抓游標那一頁
+
+
+def test_traversal_track_gets_at_least_half_the_fills_pages():
+    """D-B 驗收：修改前實測 12/56 ≈ 21%。"""
+    h = _harness(); h.run_for(hours=6)
+    assert h.scan_pages / h.total_fills_pages >= 0.5
+
+
+def test_base_and_verify_are_not_starved_under_fills_pressure():
+    h = _harness(); h.run_for(hours=6)
+    assert h.overdue_p95_s("state") < 1800
+    assert h.verify_completed > 0
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_scheduler.py -k "under_full_contention or never_publish_complete or same_millisecond or restart_resumes or at_least_half or not_starved" -v`
+Expected: FAIL。
+
+- [ ] **Step 3: 補齊 harness 直到測試通過**
+
+只補測試需要的觀測接口與負載模型，不改排程邏輯。若測試揭露排程真的做不到，
+**回報主線程裁決，不得放寬斷言門檻**（judgment.md §4：放寬驗收不是修復）。
+
+- [ ] **Step 4: 全套回歸**
+
+Run: `uv run pytest`
+Expected: 全綠，integration 標記照常 skip。
+
+Run: `uv run ruff check src tests scripts`
+Expected: 無錯誤。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/test_explore_scheduler.py
+git commit -m "test: 300 地址競爭負載下的覆蓋收斂、反向護欄與重啟續抓驗收（D-I）"
+```
+
+---
+
+## Task 8: 新判準真的被正式流程執行——兩個端到端測試 ＋ verify 加速 `@inline`
+
+**Files:**
+- Modify: `tests/test_explore_scheduler.py`
+- Create: `scripts/ops_expedite_verify.py`
+- Modify: `src/spark/publicapi/explore_scheduler.py`、`src/spark/publicapi/config.py`
+
+使用者指定：這兩個測試比「函式回傳正確」更能防止「程式改了但正式流程永遠走不到」。
+本次已經現場抓到兩個這種缺口（候選查詢仍用被刪除的 reason、`evidence_unknown=0` 把
+待核驗列排除在探測母體外）。
+
+- [ ] **Step 1: 寫失敗測試（兩條端到端）**
+
+```python
+def test_new_verdict_path_is_actually_reached_by_the_scheduler():
+    """端到端：跑完排程迴圈後，探測候選查詢必須真的挑到人、
+    左界證據必須真的被寫入、結論必須真的由 scan_verdict 產生。
+    （單元測試證明函式對，這條證明流程走得到。）"""
+    h = _harness()
+    h.run_for(hours=2)
+    assert h.probes_executed > 0                       # 候選查詢挑得到人
+    assert h.addresses_with_left_boundary() > 0        # 證據真的落地
+    assert h.verdicts_from_scan_verdict > 0            # 結論來自新判準
+    assert h.verdicts_from_legacy_path == 0            # 沒有第二條結論來源
+
+
+def test_evidence_unknown_rows_actually_leave_unknown_via_verify():
+    """待核驗列必須真的能經 verify 軌離開 unknown——不是只在單元測試裡能。"""
+    h = _harness()
+    h.seed_rows(evidence_unknown=40)
+    h.run_for(hours=12)
+    assert h.rows_with_evidence_unknown() == 0
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_scheduler.py -k "actually_reached or actually_leave_unknown" -v`
+Expected: FAIL。
+
+- [ ] **Step 3: 補齊觀測接口直到通過**
+
+`verdicts_from_legacy_path` 需要在舊結論路徑（若有殘留）放一個計數器；
+若 Task 1–3 做對，這個計數器永遠是 0，且應在實作結束後**把舊路徑整段刪除**
+（判準只能有一個來源，工程原則 1）。
+
+- [ ] **Step 4: verify 加速——到期自動恢復（D-I）**
+
+`SPECIAL_SERVE_RATIO`（`explore_scheduler.py:142`）改為可由 env 暫時覆寫，
+且**帶到期時間、逾期自動恢復預設值**，不依賴任何人記得移除：
+
+```python
+FILET_EXPLORE_SPECIAL_SERVE_RATIO=3
+FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=2026-09-24T00:00:00Z
+```
+
+```python
+    def _special_serve_ratio(self, now: float) -> int:
+        """暫時加速只在期限內有效；逾期自動回到使用者 2026-09-21 裁決的預設 9。
+        設定缺漏或時間無法解析一律回預設（fail-safe 往保守方向）。"""
+```
+
+**預設值不得更動**——它是使用者的既有裁決。加一條測試：
+`test_special_serve_ratio_reverts_after_deadline`。
+
+- [ ] **Step 5: 運維腳本（預設 dry-run）**
+
+`scripts/ops_expedite_verify.py`：把 `kind='fills_verify' AND lease_until IS NULL` 的 job
+`next_attempt_at` 壓到現在起 N 分鐘內**均勻散開**（避免同一分鐘擠爆額度）。
+`--apply` 才寫入，預設只印「會改幾列、最早／最晚新到期時間」。可重複執行。
+只改 `next_attempt_at`，不碰任何結論欄位。
+
+對複本驗證（不碰正式機）：
+
+```bash
+uv run python scripts/ops_expedite_verify.py --db /tmp/explore.copy.db
+```
+
+Expected: 印出可提前的列數與時間範圍，且未寫入。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add tests/test_explore_scheduler.py scripts/ops_expedite_verify.py src/spark/publicapi/explore_scheduler.py src/spark/publicapi/config.py
+git commit -m "test: 新判準端到端可達性與待核驗列離開 unknown；verify 加速到期自動恢復（D-I）"
+```
+
+---
+
+## Task 9: RUNBOOK §5.8f 與部署（跟單中，加倍小心）`@inline`
+
+**Files:**
+- Modify: `deploy/RUNBOOK.md`
+
+- [ ] **Step 1: 寫 §5.8f**
+
+必含：
+
+1. **部署前基線**（D-I，全部要有輸出留存）：
+   `systemctl --failed`、`systemctl is-active 'filet-follower@*'`、follower 最近一次成功對帳時間、
+   `samples.jsonl` 最後一筆的 `public` / `scan` / `overdue_by_kind`、
+   `sudo cp /var/lib/filet-api/explore.db /var/lib/filet-api/explore.db.pre-v4.bak`。
+2. **快照預熱**（2026-09-05 使用者裁決，RUNBOOK §5.8c）：本次覆蓋結論大量變動會讓探索快照
+   失效——先在本機用新版程式建好 300 池快照、`install` 到正式機快取路徑，再重啟 `filet-api`。
+3. **只重啟 `filet-api`**。`filet-follower@*` 與四個 timer 一律不動；重啟後立即確認
+   follower 未被牽連（`systemctl show filet-follower@<id> -p ActiveEnterTimestamp` 與部署前相同）。
+4. **新 env**：`FILET_EXPLORE_FILLS_MIN_PERIOD_S` / `FILET_EXPLORE_FILLS_MAX_PERIOD_S` /
+   `FILET_EXPLORE_SPECIAL_SERVE_RATIO`＋`_UNTIL`；`FILET_HL_EXPLORE_*_WEIGHT_CAP` 語義由硬 cap
+   改為 floor（值不變，語義變，要在 drop-in 註解寫明）。
+5. **遷移報告**：啟動日誌必定印出 `last_migration_report()`，部署後第一件事是讀它並與
+   Task 4 Step 5 在複本上算出的數字比對；不符就回退。
+6. **回退**：停 `filet-api` → 還原 `explore.db.pre-v4.bak` → 還原上一版程式碼 → 啟動 →
+   確認快照與 follower 正常。回退**不需要**動 follower。
+
+- [ ] **Step 2: 觀測門檻（部署後由主線程親跑驗證，至少涵蓋一個 24h 重排週期）**
+
+| 指標 | 來源 | 門檻 | 不達標的動作 |
+|---|---|---|---|
+| follower 存活與對帳 | `journalctl -u 'filet-follower@*'` | 無新增失敗、未重啟 | **立即回退** |
+| 429 | `samples.jsonl` 的 `api.r429_15m` | 連續 2 小時為 0 | **立即回退** |
+| Traceback | `api.traceback_15m` | 連續 2 小時為 0 | 立即回退 |
+| explore 父 scope 權重 | 限流器 status | 任一分鐘 ≤ 300 | 立即回退 |
+| 全域權重 | 限流器 status | 任一分鐘 ≤ 900 | 立即回退 |
+| 探測進度 | `probe.executed` 累計 | 部署後 2 小時 > 0 | 查「流程走不到」類缺口 |
+| 遍歷軌頁面占比 | `scan_pages_15m / pages_consumed_15m` | 24 小時後 ≥ 0.5 | 檢討週期與 floor |
+| 對外 complete | `public.coverage_counts.complete` | 24 小時後 ≥ 200（現況 97） | 查探測積壓 |
+| base 逾期 | `overdue_by_kind.state.overdue_p95_s` | < 1800 | 調高 base floor |
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add deploy/RUNBOOK.md
+git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據判準、子預算借用、跟單中注意事項）"
+```
+
+---
+
+## 狀態表（實作期間由主線程更新）
+
+| Task | 狀態 | 驗收證據 |
+|---|---|---|
+| 1 覆蓋結論三項證據合成 | 未開始 | |
+| 2 頁數上限與停止語義 | 未開始 | |
+| 3 左界證據前置與快取 | 未開始 | |
+| 4 schema v4 遷移 | 未開始 | |
+| 5 週期依成交速率 | 未開始 | |
+| 6 子預算原子借用 | 未開始 | |
+| 7 300 地址競爭驗收 | 未開始 | |
+| 8 端到端可達性＋verify 加速 | 未開始 | |
+| 9 RUNBOOK 與部署 | 未開始 | |
+
+**待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
+
+**遷移前基線**（正式機線上一致性備份，2026-09-22 08:24 UTC；本機複本
+`<scratchpad>/explore.copy.db`，schema v3，遷移 dry-run 用）：
+
+| completeness | reason | evidence_unknown | 列數 |
+|---|---|---|---|
+| complete | count_below_retention_threshold_probe_empty | 1 | 146 |
+| complete | count_below_retention_threshold_probe_empty | 0 | 6 |
+| complete | retention_boundary_verified | 0 | 135 |
+| complete | count_below_retention_threshold | 0 | 7 |
+| complete | count_below_retention_threshold | 1 | 6 |
+| backfilling | NULL | 0 | 83 |
+| partial | retention_limit | 0 | 9 |
+| partial | retention_limit | 1 | 5 |
+
+合計 397 列（active candidates 300）、`fills` 1,051,273 筆、進行中遍歷 83 個。
+遷移必須保住這 105 萬筆成交與 83 個遍歷的游標（D-G）。
+
+## 資料極限與未決事項（誠實標註）
+
+1. 「HL 不強制 10,000 筆留存」是**單一地址、單一時點**的實測（26,976 筆）＋正式機 8 個
+   地址的旁證。HL 文件仍寫著 10,000。這正是本計畫不把「筆數多」當成完整證據、
+   而改用左界探測的原因：若上游真的在某些帳戶上截斷，會被判 `truncation_suspected`，
+   不會冒充 complete。
+2. `first_activity_ms` 來自 portfolio `allTime` 序列首點——是**權益**歷史、經降採樣，
+   不等於首筆成交時間。因此只用於「明顯早於／明顯晚於窗口起點」的粗判斷，模糊帶維持 unknown。
+   若之後發現有更可信的帳戶年齡來源，這是第一個該換掉的輸入。
+3. `BASE_FLOOR` 在 Task 6 Step 0 實測前是推導值（約 120 權重/分鐘），不得直接採用。
+4. 本次不動 D14 顯示契約（D-D）。修完後仍停在 `left_boundary_unknown` /
+   `left_boundary_truncated` / `local_page_cap` 的位址會繼續顯示「分析待完成」——
+   這是刻意的：沒有證據就不宣稱完整。屆時再議是否改成標註觀測區間後顯示。
+5. `fills_in_window` 自本次起是**上界**（含游標重疊，實測高估約 3.7%），不是精確筆數；
+   它已不是任何判準的輸入，僅供觀測與 Task 5 的速率估算（估高 → 週期估短 → 偏保守，方向安全）。
