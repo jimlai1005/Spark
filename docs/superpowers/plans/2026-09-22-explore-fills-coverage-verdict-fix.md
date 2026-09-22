@@ -950,6 +950,27 @@ def test_due_check_and_reschedule_share_one_period_source():
 Run: `uv run pytest tests/test_explore_scheduler.py -k "period" -v`
 Expected: FAIL，`ImportError: cannot import name 'fills_period_s'`。
 
+> **主線程裁決（2026-09-22，builder 回報既有測試衝突後）**：
+>
+> **(1) 兩條斷言舊全域週期行為的既有測試授權改寫**，它們斷言的正是本 task 要移除的東西：
+> - `test_fills_every_s_default_is_default_fills_period_s_constant`（`:647`）——
+>   純屬性存在性測試，改寫成「無速率資料的位址回 `MIN_PERIOD_S`」。
+> - `test_fills_period_single_source_ties_reschedule_and_plan_incremental`（`:1284`）——
+>   ⚠️ **這條守的是 7.8 事故的不變式（到期條件與重排時間同源），只能「改寫期望值的來源」，
+>   絕對不准刪**。新形式：對一個 hot 與一個 cold 位址各跑一次，斷言實際重排間隔
+>   ≈ `sched.fills_period_s_for(address)`，而不是 ≈ 建構子傳入的全域值。
+>
+> **(2) 否決「保留建構子參數但內部完全不使用」的相容方案。** 靜默接受一個不起作用的參數，
+> 會讓正式機 drop-in 裡的 `FILET_EXPLORE_FILLS_PERIOD_S=21600` 變成設定了卻無效果的死旋鈕
+> ——下一個上機的人會以為改它有用。改用**語義相容**的做法：
+> - `FILET_EXPLORE_FILLS_PERIOD_S` **改為下界** `MIN_PERIOD_S` 的來源（正式機現值 21600
+>   ＝6 小時，剛好等於新規格的下界，語義相容、drop-in 不必改值）。
+> - 新增 `FILET_EXPLORE_FILLS_MAX_PERIOD_S` 作為上界（預設 86400）。
+> - 建構子參數改名為 `fills_min_period_s` / `fills_max_period_s`。
+> **授權改動 `scripts/run_api.py` 與 `app.py` 的呼叫點**（原本不在檔案清單內），
+> 確保沒有任何一個參數是「傳進去但沒人讀」。
+> Task 9 的部署步驟要加一條：檢查 drop-in 裡沒有任何已無讀取者的 env。
+
 - [ ] **Step 3: 實作**
 
 `explore_fills_sync.py` 加 `MIN_PERIOD_S = 6 * 3600`、`MAX_PERIOD_S = 24 * 3600`、
