@@ -2512,7 +2512,40 @@ ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
 > 24 小時觀測窗要涵蓋「加速期」與「回到預設後」兩種狀態，才能確認到期自動恢復
 > 真的生效（不是靠人工記得移除）。
 
+#### Step 7-pre：先試「只停背景工作」——比整體回退更輕的第一道階梯
+
+適用情境：探索背景刷新出現異常（429、積壓不收斂、探測不落地、遷移報告數字合理但排程行為不對），
+**但資料沒有損壞、follower 正常**。此時不必回退程式碼與 DB，先把背景工作獨立關掉，
+快照照常端出、v4 遷移結果保留：
+
+```bash
+# 1) 把 EXPLORE_UPSTREAM_REFRESH 改成 0（既有 drop-in explore-refresh.conf；只改這一個值）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  'sudo sed -i "s/^Environment=EXPLORE_UPSTREAM_REFRESH=1$/Environment=EXPLORE_UPSTREAM_REFRESH=0/" \
+     /etc/systemd/system/filet-api.service.d/explore-refresh.conf
+   sudo systemctl daemon-reload
+   sudo systemctl restart filet-api.service
+   systemctl show filet-api -p Environment --value | tr " " "\n" | grep EXPLORE_UPSTREAM_REFRESH'
+# 預期：EXPLORE_UPSTREAM_REFRESH=0；scripts/run_api.py:95 為 0 時不啟動 explore-scheduler thread
+
+# 2) 確認快照仍在端、follower 未動
+curl -s "http://127.0.0.1:8700/api/public/explore?window=month" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['building'],d['total_scanned'])"   # False 300
+# follower：照 Step 1b 比對 ActiveEnterTimestamp
+```
+
+效果：`/explore` 停在部署後的最後一版快照（遷移後約 135 個 complete），不再消耗任何 HL 權重；
+follower 與四個 timer 完全不受影響。恢復＝把值改回 1、`daemon-reload`、`restart filet-api`。
+這一步**不會**還原 DB 到 v3——若判斷需要回到舊判準，才走 Step 7。
+
+**已預演（2026-09-22，本機）**：`tests/test_run_api_wiring.py` 釘住「`EXPLORE_UPSTREAM_REFRESH=0`
+時 scheduler thread 不啟動、publisher 仍接上」；正式機當下值為 1。
+
 #### Step 7：回退（獨立成立，不需要回頭讀其他段）
+
+**已預演（2026-09-22，本機，正式機 08:24 UTC 複本）**：v3 備份（sqlite backup API）→ 新程式開啟自動遷移到
+v4 → 清 `-wal/-shm`、用備份覆蓋 → **用上一次已部署的程式碼 `dc76440` 開啟**：版本 3、`fills` 1,051,273 筆、
+舊 reason 值 179 列原封不動。步驟順序（先還原 DB、再回退程式碼）正確。
 
 任何一項達到「立即回退」門檻，或觀測期內出現任何未預期的 follower 異常，依下列步驟：
 

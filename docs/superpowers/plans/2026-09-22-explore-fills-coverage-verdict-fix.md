@@ -1615,6 +1615,18 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 合計 397 列（active candidates 300）、`fills` 1,051,273 筆、進行中遍歷 83 個。
 遷移必須保住這 105 萬筆成交與 83 個遍歷的游標（D-G）。
 
+## 部署前追加要求（使用者 2026-09-22，收到於 Task 11 派工後）
+
+> 「除了先修部署後待辦第 1 項再部署，請修掉 Warning 1、針對性測試通過、確認背景工作可獨立停用與
+> 資料庫回滾步驟，然後再部署。不必等所有 Warning 都消失，但不能把已知錯判完整問題留給正式環境驗證。」
+
+| 要求 | 處置 | 證據 |
+|---|---|---|
+| 修掉 Warning 1 | Task 11（派工中） | 五條針對性測試＋反向護欄轉紅 |
+| 背景工作可獨立停用 | `EXPLORE_UPSTREAM_REFRESH=0` → `run_api.py:95` 不起 scheduler thread、快照照端；寫成 RUNBOOK §5.8f **Step 7-pre**（比整體回退輕的第一道） | 補 `tests/test_run_api_wiring.py` 釘住「為 0 時不起 thread」（Task 12，主線程自做） |
+| 資料庫回滾步驟 | 本機完整預演：v3 備份 → 遷移 v4 → 清 wal/shm 還原 → **舊程式 `dc76440` 開啟**讀到 v3、fills 1,051,273、舊 reason 179 列 | 記於 RUNBOOK §5.8f Step 7 |
+| 已知錯判完整不留給正式環境 | Task 10 C1 已封（reviewer 反向護欄驗證）；Task 11 封 `no_earlier_activity` 單調性；W4 兩側皆 partial 不屬錯判完整，延後 | — |
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
