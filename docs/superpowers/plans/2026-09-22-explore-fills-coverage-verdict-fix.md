@@ -1690,6 +1690,19 @@ running scans 95 → 86；follower 時間戳不變、hb 0–1s、errors 0；1 �
 但會壓低大戶轉 complete 的數量——列入部署後待辦：為 `truncation_suspected` 補一個便宜的二次證據
 （例如把探測窗從 1 天拉到 7 天再探一次；仍回空且首筆成交可由其他來源證實晚於窗口 → 改判 `no_earlier_activity`）。
 
+| 17:00 | 0 | 0 | 108／149／43 | 101 | 10／17／13 | ok | |
+| 17:15 | 0 | 0 | 108／151／41 | 98 | 11／15／10 | hb 59s（單筆，週期內） | |
+| 17:30 | 0 | 0 | 110／152／38 | 94 | 9／12／6 | ok | complete 首次上升 |
+| 17:45 | 0 | 0 | 110／153／37 | 91 | 13／12／5 | ok | overdue p95 fills 635s、fills_scan 647s |
+
+**17:55 排程檢查（+2h10m）**：unknown **261 → 248**（穩定約 −13/h）、`earlier_fills_seen` 144 → 147、
+`truncation_suspected` 12 → **23**、`no_earlier_activity` 1 → 2；completeness 83／146／191；`fills_verify` job 102 → 89；
+running scans 86 → 79；1 小時內 Traceback **0**；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
+
+**`truncation_suspected` 量化**（唯讀查 DB，`fills.time_ms`）：23 個之中，**0 個本地 `fills` 表已存有早於探測窗的成交**。本地 `fills` 表**沒有**任何一個存有早於探測窗的成交（3 個完全無成交）——本地資料無法反證，需靠更寬的探測窗（7 天）才能分辨「低頻」與「截斷」。
+**待辦升級為部署後第一優先**：探測前先查本地 `fills` 是否已有早於窗口的成交（零 API 成本、直接判 `earlier_fills_seen`）；
+沒有才發探測，且探測窗改 7 天。方向仍安全（現況只是少判 complete）。
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
