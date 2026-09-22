@@ -1674,6 +1674,22 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 |---|---|---|---|---|---|---|---|
 | 15:30（基線） | 0 | 0 | 144／131／25 | 113 | 50／22／17 | ok | 部署前最後一筆 |
 | 16:00 | 0 | **5**（皆非本次） | 109／145／46 | 112 | 38／24／22 | hb 1s、errors 0 | `evidence.unknown 0`、`external_complete 144`；`scans_finished_15m 180` |
+| 16:15 | 0 | 1（已知類） | 109／146／45 | 111 | 18／21／22 | hb 0s、errors 0 | overdue p95 fills 3207→1680s |
+| 16:30 | 0 | 0 | 109／149／42 | 108 | 18／17／20 | ok | |
+| 16:45 | 0 | 0 | 109／149／42 | 104 | 19／17／16 | ok | overdue p95 fills 1214s、fills_scan 1161s（持續下降） |
+
+**16:55 排程檢查（+70 分）**：DB `left_boundary` unknown **272 → 261**、`earlier_fills_seen` 144、
+**`truncation_suspected` 12**、`no_earlier_activity` 1；completeness 90／144／184；`fills_verify` job 112 → 102（遞減中）；
+running scans 95 → 86；follower 時間戳不變、hb 0–1s、errors 0；1 小時內 Traceback 6 個**全部**是已知的
+`PermissionError fbac652…`（使用者瀏覽 ops 面板），非已知類 0；cron.err 0。**判定：正常，不回退。**
+
+觀察：探測解出率約 9 個/小時（3:1 份額下估 14/小時，同量級偏慢，尚在 fills 積壓消化期）。
+`truncation_suspected` 12 個占已解出探測的一半以上——這些是「探測窗回空、但 portfolio 首次活動明顯早於窗口」
+的位址。合理懷疑其中一部分不是 HL 截斷，而是帳戶**先入金、很久之後才開始交易**（`first_activity_ms` 是權益
+歷史起點，不是首筆成交；Task 3 設計要點已標註此限制）。方向安全（判 partial 不判 complete），
+但會壓低大戶轉 complete 的數量——列入部署後待辦：為 `truncation_suspected` 補一個便宜的二次證據
+（例如把探測窗從 1 天拉到 7 天再探一次；仍回空且首筆成交可由其他來源證實晚於窗口 → 改判 `no_earlier_activity`）。
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
