@@ -997,6 +997,105 @@ git commit -m "feat: 增量週期依近期成交速率決定，單週期預期�
 
 ---
 
+## Task 5b: 速率的分母改成「實際觀測跨度」，否則 Task 5 完全失效 `@inline`
+
+> **主線程裁決（2026-09-22，Task 5 完成後複查發現）**：Task 5 的
+> `fills_period_s_for` 用 `fills_sync.fills_in_window ÷ 窗口小時數（30 天 = 720h）`
+> 當成交速率。**分母錯了**：`fills_in_window` 只計入「我們實際走過的頁」，
+> 對仍在回補中的位址是部分計數，除以整整 30 天必然低估。
+>
+> **實測影響（正式機複本，300 個 active 位址）**：
+>
+> | 速率來源 | 最大值 | 落入「需要短週期」區間（≥66.7 筆/小時）的位址數 |
+> |---|---|---|
+> | 目前實作 `fills_sync ÷ 720h` | 16.7 筆/小時 | **0** |
+> | 觀測密度 `fills_scan.fills_in_window ÷ (observed_to − observed_from)` | 897.5 筆/小時 | 2 |
+>
+> 低估最嚴重者 `0xa483470a…`：真實密度 897.5、被算成 13.4（**差 67 倍**）。
+> 它會被排成 24 小時，而 24 小時累積約 21,500 筆＝**11 頁**——正是 D-H 明文要禁止的
+> 「高頻地址被一律延長到 24h，把一頁的工作變成多頁補抓」。
+> 換句話說，不修這一條，Task 5 對所有非前 50 名的位址等於沒有生效。
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_scheduler.py`（`fills_period_s_for` 的速率取得）
+- Modify: `src/spark/publicapi/explore_store.py`（若需要新增一個取觀測密度的讀取方法）
+- Test: `tests/test_explore_scheduler.py`
+
+**新的速率取得順序（fallback chain，每一層都要有測試）**：
+
+1. 該地址**當前生效**的那次遍歷（`fills_scan.scan_id == fills_sync.scan_id`）若
+   `observed_to_ms > observed_from_ms` 且 `fills_in_window > 0`
+   → `rate = fills_in_window ÷ ((observed_to_ms − observed_from_ms) / 3600000)`。
+2. 否則，若該列的遍歷已完成且窗口長度為正 → 退回 `fills_sync.fills_in_window ÷ 窗口小時數`。
+3. 否則 → `None`＝未知 → `MIN_PERIOD_S`（不確定就抓密一點）。
+
+**為什麼這個分母在兩種情況下都正確或偏保守**（寫進 docstring）：
+- 遍歷未完成：觀測跨度就是我們真正看過的區間，密度正確。
+- 遍歷已完成：觀測跨度可能比窗口短（帳戶在窗口邊緣沒交易），密度會**高估** →
+  週期估短 → 抓得更密。方向安全（工程原則：寧可多抓一頁，不可漏成多頁補抓）。
+- `fills_in_window` 含游標重疊、是上界（高估約 3.7%）→ 同樣是偏保守的方向。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_rate_uses_observed_span_not_nominal_window():
+    """回補中的位址：4,000 筆分布在 2 天的觀測跨度內 → 2,000 筆/天 ≈ 83 筆/小時，
+    不得因為除以 30 天而被當成 5.6 筆/小時。"""
+    sched = _scheduler_with_scan(ADDR, fills_in_window=4_000,
+                                 observed_from_ms=T0, observed_to_ms=T0 + 2 * DAY,
+                                 window_start_ms=T0, window_end_ms=T0 + 30 * DAY,
+                                 status="running", rank=200)
+    assert sched.fills_period_s_for(ADDR) < MAX_PERIOD_S      # 關鍵：不得落在 24h
+
+
+def test_high_density_partial_traversal_gets_min_period():
+    """密度高到一個週期內必然超過一頁 → 直接壓到下界。"""
+    sched = _scheduler_with_scan(ADDR, fills_in_window=18_000,
+                                 observed_from_ms=T0, observed_to_ms=T0 + 21 * DAY,
+                                 window_start_ms=T0, window_end_ms=T0 + 30 * DAY,
+                                 status="running", rank=200)
+    assert sched.fills_period_s_for(ADDR) == MIN_PERIOD_S
+
+
+def test_falls_back_to_window_hours_when_no_observed_span():
+    sched = _scheduler_with_scan(ADDR, fills_in_window=720, observed_from_ms=None,
+                                 observed_to_ms=None, window_start_ms=T0,
+                                 window_end_ms=T0 + 30 * DAY, status="done", rank=200)
+    assert sched.fills_period_s_for(ADDR) == fills_period_s(fills_per_hour=1.0, rank=200)
+
+
+def test_no_data_at_all_stays_conservative():
+    sched = _scheduler_with_scan(ADDR, fills_in_window=0, observed_from_ms=None,
+                                 observed_to_ms=None, status="running", rank=200)
+    assert sched.fills_period_s_for(ADDR) == MIN_PERIOD_S
+
+
+def test_period_source_is_still_single():
+    """7.8 不變式不得因本次改動而失守：到期判斷與重排仍同源。"""
+    # 沿用 Task 5 的 test_due_check_and_reschedule_share_one_period_source 手法
+```
+
+- [ ] **Step 2–4: 執行 → 實作 → 複跑**
+
+Run: `uv run pytest -q` → 全綠；`uv run ruff check src tests scripts` → 無錯誤。
+
+- [ ] **Step 5: 用正式機複本重算需求（與 Task 5 的數字對照）**
+
+唯讀開啟 `<scratchpad>/explore.copy.db`，用**新的**速率取得方式重算：
+(i) 週期分佈（6h／中段／24h 各幾個）——**中段不得再是 0**；
+(ii) 改動後的增量需求（Σ 3600/period）頁/小時；
+(iii) 以 56 頁/小時計，留給遍歷軌多少。
+把三個數字與 Task 5 的舊數字並列回報（舊：50.0 → 23.38 → 32.62）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/spark/publicapi/explore_scheduler.py src/spark/publicapi/explore_store.py tests/
+git commit -m "fix: 成交速率改用實際觀測跨度為分母，修正高頻位址被誤排成 24h（D-H）"
+```
+
+---
+
 ## Task 6: 限流器子預算改為當前視窗內原子扣帳的可借用底線 `@inline`
 
 **Files:**
@@ -1338,7 +1437,8 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 | 3 左界證據前置與快取 | ✅ `0a58e6d` | 主線程複跑 3319 passed；`get_left_boundary = lambda` 零命中（掩體已拆） |
 | 3b 證據到齊就地重算 | ✅ `511f727` | 主線程複跑 3325 passed；`scan_verdict` 呼叫點確認只有 2 處 |
 | 4 schema v4 遷移 | ✅ `c3651ad` | 主線程在複本獨立重現遷移：fills 1,051,273 前後相同、83 個游標零漂移、report 與 builder 一致 |
-| 5 週期依成交速率 | 未開始 | |
+| 5 週期依成交速率 | ✅ `7c458b1`（速率分母有缺陷，見 5b） | 主線程複跑 3334 passed；7.8 不變式測試經「改壞→轉紅→revert」驗證有效 |
+| 5b 速率分母改觀測跨度 | 未開始 | |
 | 6 子預算原子借用 | 未開始 | |
 | 7 300 地址競爭驗收 | 未開始 | |
 | 8 端到端可達性＋verify 加速 | 未開始 | |
