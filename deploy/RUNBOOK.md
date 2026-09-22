@@ -2190,8 +2190,9 @@ fills 增量」的 4 小時字面值分開寫死在三處（scheduler 重排間�
 **容量算式（B8，Task 7.9b／7.9c 之後的完整版；2026-09-22）**——消化上限＝`explore_fills` 保留額度 120＝**每分鐘一次
 fills 類預留＝60 次／小時**（正式機實測結構性上限，Task 7.4a/c；短頁結算後同一分鐘剩 99 塞不下第二次 120 預留）。這 60 次由
 四種工作分：增量頁（`fills`）、遍歷頁（`fills_scan`：首次回補 initial／partial 每 24h 一次 partial_rescan）、核驗頁
-（`fills_verify`：只在遷移產生，嚴格讓位但**最長等 2 小時**就佔一次名額）、留存邊界探測（`probe`：雙方都有積壓時**每 10 次至多
-1 次**，fills 類無到期 job 時可全拿）。需求／小時（穩態）≈ 增量 300/6h（**50**）＋新增候選 initial（≈1×1.2 頁）＋多頁增量（重度帳戶，
+（`fills_verify`：遷移產生，或狀態顯示 `evidence_unknown` 而無任何核驗工作時由對帳補建）、留存邊界探測（`probe`）。
+**核驗與探測共用「輔助份額」**（Task 7.9d 使用者裁決）：雙方都有積壓時每 10 次**頁面准入**至少 9 次給增量／遍歷、至多 1 次給核驗＋探測
+（以頁計，多頁核驗每頁都佔一次）；核驗逾期 2 小時只讓它在輔助類內排在探測前面，且兩者仍輪流，不觸發整批優先；fills 類無到期 job 時輔助可連續。需求／小時（穩態）≈ 增量 300/6h（**50**）＋新增候選 initial（≈1×1.2 頁）＋多頁增量（重度帳戶，
 量測）＋partial 重掃（現況 4 列/日 × ~5 頁 ≈ 1/小時）＋核驗（遷移後一次性 129 列 × ~1.2 頁，靠 2h 有界等待最慢 ~11 天、fills 空檔會更快）
 ＋探測（≤ 6/小時）。**選 6 小時而非更短**：4 小時＝75/小時已超上限；6 小時＝50 才留出約 10/小時給多頁、重掃、核驗與探測。
 主線程整合模擬（正式機 287 列快照、fake HL、同一個每分鐘一次預留模型，3 天）：partial_rescan 3 次、核驗 129→0 用時 49 小時且單件
@@ -2281,6 +2282,31 @@ sudo ls -l /var/lib/filet-api/explore.db*
 
 **觀測期重新起算**：本次部署（週期放寬＋父子 scope 保留額度）會改變 fills 推進速度與基礎類別抓取節奏，
 上線後 24 小時觀測期（P7）從這次部署完成、`flag=1` 生效的時間點**重新起算**，不沿用前一輪的觀測時間窗。
+
+**第七次部署程序（Task 7.9a–7.9e；schema v2→v3，2026-09-22 起）**：
+```bash
+# 0) 備份（WAL 模式下用 sqlite backup API，不要直接 cp）
+sudo python3 - <<'EOF'
+import sqlite3
+src=sqlite3.connect("file:/var/lib/filet-api/explore.db?mode=ro", uri=True)
+dst=sqlite3.connect("/var/lib/filet-api/explore.db.pre-79.bak"); src.backup(dst); dst.close()
+EOF
+sudo chown filet-api:filet-api /var/lib/filet-api/explore.db.pre-79.bak && sudo chmod 600 /var/lib/filet-api/explore.db.pre-79.bak
+sudo cp -p /var/lib/filet-api/explore_index.json /var/lib/filet-api/explore_index.json.pre-79.bak
+# 1) drop-in 加週期變數（單一來源，見上方週期段）
+sudo sed -i '/^Environment=EXPLORE_UPSTREAM_REFRESH/a Environment=FILET_EXPLORE_FILLS_PERIOD_S=21600' /etc/systemd/system/filet-api.service.d/explore-refresh.conf
+sudo systemctl daemon-reload
+# 2) 換取樣器 v3（scratchpad obs_sample_v3.py → /home/ubuntu/explore-obs/sample.py；cron 不變）
+# 3) restart filet-api（migration 在啟動時自動跑：ALTER 各自冪等、列迴圈與版本更新同一顯式交易；失敗整批回滾、version 仍 2）
+sudo systemctl restart filet-api.service
+# 4) 部署後檢查（前 15 分鐘）
+sudo python3 -c "import sqlite3; c=sqlite3.connect('file:/var/lib/filet-api/explore.db?mode=ro', uri=True); print(c.execute('select version from schema_version').fetchone(), c.execute('select kind,status,count(*) from fills_scan group by 1,2').fetchall(), c.execute('select sum(evidence_unknown), sum(coverage_gap), sum(inc_from_ms is null) from fills_sync').fetchone(), c.execute('select kind,count(*) from refresh_job group by 1').fetchall())"
+sudo journalctl -u filet-api --since '10 min ago' --no-pager | grep -iE 'traceback|對帳|reconcile|migration' | tail -10
+```
+預期：version 3；`fills_scan` 列數＝`fills_sync` 列數（backfilling 列轉 running initial、其餘 done）；`inc_from_ms` NULL＝0；`fills_verify` job ≈ 無可追溯證據的 complete／partial 列數（正式機快照估 129），`next_attempt_at` 攤在 48 小時內；journal 出現一行啟動對帳（`inactive_jobs_deleted` ≈ 退池地址殘留 job 數、`resume_running` 0）。
+**部署可見影響（使用者裁決，符合契約，不以維持合格數為目標）**：對外 `complete` 會由 ~215 降到「有可追溯證據」的列數（快照估 129 保留、129 降為 partial／`evidence_unknown`），探索頁合格數隨之下降；核驗依輔助份額推進（每 10 頁 ≤1，估 26 小時以上），`verify_needed.rows` 歸零才算核驗完成（`verify_remaining` 只是 job 列數）。
+**觀測門檻（至少一個完整 6 小時增量週期）**：取樣器 v3 的 `cross_round.advanced_at_least_once_cum` 在 6–7 小時內覆蓋全部有 sync 的 active 地址；`scan.verify_backlog` 與 `evidence.unknown`（active）單調遞減；`fills_scan` 列數增速 ≈ 新增候選＋partial 重掃（不得每輪成長）；health `explore_refresh` 的 `scan_job_dropped`／`scan_job_dropped_kind_mismatch`／`reconcile_errors`／`scan_writeback_*` 不遞增、`verify_job_deferred` 有界、`due_by_kind` 六種 kind 不單調上升；零 429／Traceback；follower 心跳正常。
+**回退**：程式回退照 §9.3；DB：停 filet-api → `install -o filet-api -g filet-api -m 600 explore.db.pre-79.bak explore.db`（刪 `-wal`／`-shm`）→ 起服務（舊程式讀 v3 DB 會因多表多欄而照常運作，但 v3 資料語義不會被舊版維護，回退後應視為只端快照）。
 
 **停用刷新**：`EXPLORE_UPSTREAM_REFRESH=0` → daemon-reload → restart。榜單維持最後一次發布的快照（v4）。SQLite 資料保留，再開啟時 cursor 續接。
 
