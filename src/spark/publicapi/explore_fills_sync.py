@@ -161,11 +161,13 @@ def fills_period_s(fills_per_hour: float | None, rank: int | None, *,
     是本函式在排程端**唯一**的取用點，所有到期判斷與重排都必須經它（Task 7.8
     教訓：到期條件與重排時間不得各自寫一份常數）。
 
-    `fills_per_hour`：近期成交速率（來源＝`fills_sync.fills_in_window /
-    窗口小時數`，30 天窗口的實測速率）。`fills_in_window` 自 Task 1 起含游標
-    重疊、是**上界**而非精確值（實測高估約 3.7%）——估高會讓這裡估出的週期
-    偏短（更頻繁），方向保守，可接受，但不是精確值。`None`（尚無資料，例如
-    位址剛入池）→ 取保守值 `min_period_s`（不確定就抓密一點）。
+    `fills_per_hour`：近期成交速率，本函式不關心怎麼算出來（呼叫端
+    `explore_scheduler.ExploreScheduler.fills_period_s_for` 的責任，見該方法
+    docstring——Task 5b 起優先用「當前生效那次遍歷」的觀測跨度密度，拿不到
+    才退回 `fills_sync` 名目窗口小時數；兩者都含 `fills_in_window` 這個
+    **上界**——游標重疊，實測高估約 3.7%——估高會讓這裡估出的週期偏短
+    （更頻繁），方向保守）。`None`（尚無任何速率資料，例如位址剛入池）
+    → 取保守值 `min_period_s`（不確定就抓密一點）。
 
     `rank`：`candidate.source_rank`（1-based，越小越熱門）。`None`（尚未併入
     最近一輪候選排名）與「已知但在前 50 名外」是兩種不同語意：

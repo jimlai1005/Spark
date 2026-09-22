@@ -709,6 +709,126 @@ def test_unknown_rate_is_conservative():
     assert fills_period_s(fills_per_hour=None, rank=200) == MIN_PERIOD_S
 
 
+# ============================================================
+# Task 5b（2026-09-22，主線程裁決：Task 5 完成後複查發現原版分母錯誤）：速率
+# 分母改成「當前生效那次遍歷的觀測跨度」，否則對回補中位址嚴重低估速率
+# （正式機實測 0xa483470a… 真實 897.5 筆/小時被算成 13.4，差 67 倍）。
+# ============================================================
+
+T0 = 40 * 86_400_000  # ms epoch，避免負時間戳（沿用其他測試 t=40*86400 的慣例）
+DAY = 86_400_000  # ms
+ADDR = "0xddd1"
+
+
+def _scheduler_with_scan(tmp_path, addr, *, fills_in_window, observed_from_ms, observed_to_ms,
+                         window_start_ms=None, window_end_ms=None, status="running", rank=None):
+    """Task 5b 測試工具：直接寫入一筆 `fills_scan`（`status` 為 `'running'` 或
+    `'done'`）並鏡射到 `fills_sync` 的名目窗口，模擬「這個位址目前正在回補」
+    或「剛完成一次遍歷」時的觀測資料，不必真的跑一輪真實遍歷。
+    `window_start_ms`／`window_end_ms` 省略時預設**零寬度**（等於 `T0`）——
+    對映真實 `bootstrap_address_fills` 剛建立、尚無任何窗口資料的預設狀態
+    （見 `test_no_data_at_all_stays_conservative`：省略窗口就是要驗證『真的
+    什麼都不知道』的情形，不能悄悄退回一個看起來合理的 30 天窗口）。"""
+    clock = Clock(t=T0 / 1000)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([(addr, None, rank, None)], as_of=clock.now())
+    w_start = window_start_ms if window_start_ms is not None else T0
+    w_end = window_end_ms if window_end_ms is not None else T0
+    store.bootstrap_address_fills(addr, clock.now(), window_start_ms=w_start,
+                                  window_end_ms=w_end, params_fp="")
+    scan = store.get_active_scan(addr)
+    store._db.execute(
+        "UPDATE fills_scan SET fills_in_window=?, observed_from_ms=?, observed_to_ms=?, "
+        "window_start_ms=?, window_end_ms=?, status=?, result=?, reason=?, finished_at=? "
+        "WHERE scan_id=?",
+        (fills_in_window, observed_from_ms, observed_to_ms, w_start, w_end, status,
+         "complete" if status == "done" else None,
+         "retention_boundary_verified" if status == "done" else None,
+         clock.now() if status == "done" else None, scan.scan_id))
+    # 鏡射到 fills_sync 的名目窗口——只有第一層（觀測跨度）拿不到資料時
+    # （`observed_from_ms`／`observed_to_ms` 為 `None`）才會被第二層用到。
+    store._db.execute(
+        "UPDATE fills_sync SET window_start_ms=?, window_end_ms=?, fills_in_window=? "
+        "WHERE address=?", (w_start, w_end, fills_in_window, addr))
+    sched = _sched(store, FakeHL(), clock=clock)
+    sched._bootstrapped = True
+    sched._test_clock = clock  # 測試專用：讓需要推進時鐘的測試不必另外重建
+    if rank is not None:
+        sched._rank_by_address[addr.lower()] = rank
+    return sched
+
+
+def test_rate_uses_observed_span_not_nominal_window(tmp_path):
+    """回補中的位址：4,000 筆分布在 2 天的觀測跨度內 → 2,000 筆/天 ≈ 83 筆/小時，
+    不得因為除以 30 天名目窗口而被當成 5.6 筆/小時（4000/720h）——後者會讓
+    這個位址被排成 24 小時，累積量遠超一頁。"""
+    sched = _scheduler_with_scan(tmp_path, ADDR, fills_in_window=4_000,
+                                 observed_from_ms=T0, observed_to_ms=T0 + 2 * DAY,
+                                 window_start_ms=T0, window_end_ms=T0 + 30 * DAY,
+                                 status="running", rank=200)
+    assert sched.fills_period_s_for(ADDR) < MAX_PERIOD_S      # 關鍵：不得落在 24h
+
+
+def test_high_density_partial_traversal_gets_min_period(tmp_path):
+    """密度高到一個週期內必然超過一頁（8,000 筆／10 小時＝800 筆/小時）→
+    直接壓到下界，不因為窗口名目上是 30 天就被稀釋。"""
+    sched = _scheduler_with_scan(tmp_path, ADDR, fills_in_window=8_000,
+                                 observed_from_ms=T0, observed_to_ms=T0 + 10 * 3_600_000,
+                                 window_start_ms=T0, window_end_ms=T0 + 30 * DAY,
+                                 status="running", rank=200)
+    assert sched.fills_period_s_for(ADDR) == MIN_PERIOD_S
+
+
+def test_falls_back_to_window_hours_when_no_observed_span(tmp_path):
+    """遍歷已完成但沒有留下觀測跨度（`observed_from_ms`／`observed_to_ms`
+    皆為 `None`，例如舊資料或帳戶全程零成交）→ 退回 `fills_sync` 名目窗口
+    小時數，與 Task 5 原本的算法一致。"""
+    sched = _scheduler_with_scan(tmp_path, ADDR, fills_in_window=720, observed_from_ms=None,
+                                 observed_to_ms=None, window_start_ms=T0,
+                                 window_end_ms=T0 + 30 * DAY, status="done", rank=200)
+    assert sched.fills_period_s_for(ADDR) == fills_period_s(fills_per_hour=1.0, rank=200)
+
+
+def test_no_data_at_all_stays_conservative(tmp_path):
+    """完全沒有速率資料（沒有觀測跨度，名目窗口也是零寬度——省略
+    `window_start_ms`／`window_end_ms`，見 `_scheduler_with_scan` docstring）
+    → 兩層都拿不到資料，取保守值。"""
+    sched = _scheduler_with_scan(tmp_path, ADDR, fills_in_window=0, observed_from_ms=None,
+                                 observed_to_ms=None, status="running", rank=200)
+    assert sched.fills_period_s_for(ADDR) == MIN_PERIOD_S
+
+
+def test_period_source_is_still_single(tmp_path):
+    """7.8 不變式不得因本次改動而失守：到期判斷與重排仍同源。沿用 Task 5 的
+    `test_due_check_and_reschedule_share_one_period_source` 手法——這裡改用
+    一個經 `_scheduler_with_scan` 設定過觀測密度（第一層）的位址，確認新的
+    速率取得路徑一樣只有一個出口。"""
+    # ⚠️ `window_end_ms=T0`（不是 `T0 + 30*DAY`）：`fills_sync.window_end_ms`
+    # 是「名目窗口的終點＝建立當下的 now」（比照 `fresh_scan_window` 往回看
+    # 30 天，見 explore_fills_sync.py），不是往未來看的終點——這裡要真的推進
+    # 時鐘讓 `plan_incremental` 判定到期，`window_end_ms` 必須落在測試起始的
+    # 「現在」，不能設在 30 天後（那會讓到期判斷恆假，測試變成沒在測
+    # `_run_increment` 的 done 分支）。
+    sched = _scheduler_with_scan(tmp_path, ADDR, fills_in_window=8_000,
+                                 observed_from_ms=T0, observed_to_ms=T0 + 10 * 3_600_000,
+                                 window_start_ms=T0 - 30 * DAY, window_end_ms=T0,
+                                 status="running", rank=200)
+    store = sched._store
+    expected = sched.fills_period_s_for(ADDR)
+    assert expected == MIN_PERIOD_S  # 高密度、非熱門名次 → 第一層命中，壓到下界
+
+    clock = sched._test_clock
+    clock.t += expected + 10
+    store.enqueue(f"{ADDR}:fills", ADDR, "fills", 2, clock.now())
+
+    r = sched.tick()
+    assert r == "ran:fills"
+
+    row = store._db.execute(
+        "select next_attempt_at from refresh_job where key=?", (f"{ADDR}:fills",)).fetchone()
+    assert row[0] - clock.now() == pytest.approx(expected, rel=0.15)
+
+
 def test_due_check_and_reschedule_share_one_period_source(tmp_path):
     """7.8 教訓：改到期條件必同改重排時間，且必須同一來源
     （`sched.fills_period_s_for`）——不是排程端各自寫一份常數。

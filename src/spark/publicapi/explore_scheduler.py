@@ -393,22 +393,68 @@ class ExploreScheduler:
         `plan_incremental` 的 `period_s`、以及完成一輪後的重排間隔）都必須經
         這裡，不得各自算一份（Task 7.8 教訓：到期條件與重排時間不同源）。
 
-        `fills_per_hour` 來自 `ExploreStore.get_sync(address).fills_in_window`
-        除以該列的窗口小時數（30 天窗口的實測速率；`fills_in_window` 是上界，
-        見 `explore_fills_sync.fills_period_s` docstring）；地址沒有 `fills_sync`
-        列或窗口長度非正時視為無資料。名次讀 `self._rank_by_address`（最近一輪
-        `_run_candidates` 寫入的 `source_rank` 快取）——地址尚未出現在任何一輪
-        candidates（例如剛入池、還沒跑過 candidates）時為 `None`。"""
-        st = self._store.get_sync(address)
-        fills_per_hour: float | None = None
-        if st is not None:
-            window_hours = (st.window_end_ms - st.window_start_ms) / 3_600_000
-            if window_hours > 0:
-                fills_per_hour = st.fills_in_window / window_hours
+        Task 5b（2026-09-22，主線程裁決：Task 5 完成後複查發現原版分母錯誤，
+        對回補中位址嚴重低估速率，實測差 67 倍）：`fills_per_hour` 改成三層
+        fallback，見 `_observed_span_rate`／`_nominal_window_rate`：
+        1. 觀測跨度密度（優先——對回補中位址是唯一正確的分母）。
+        2. 退回 `fills_sync` 名目窗口（Task 5 原本的算法，資料不可用時的
+           次選）。
+        3. 都沒有 → `None`（`fills_period_s` 內部取保守值 `min_period_s`）。
+
+        名次讀 `self._rank_by_address`（最近一輪 `_run_candidates` 寫入的
+        `source_rank` 快取）——地址尚未出現在任何一輪 candidates（例如剛入池、
+        還沒跑過 candidates）時為 `None`。"""
+        fills_per_hour = self._observed_span_rate(address)
+        if fills_per_hour is None:
+            fills_per_hour = self._nominal_window_rate(address)
         rank = self._rank_by_address.get(address.lower())
         return fills_period_s(fills_per_hour, rank,
                               min_period_s=self._fills_min_period_s,
                               max_period_s=self._fills_max_period_s)
+
+    def _observed_span_rate(self, address: str) -> float | None:
+        """Task 5b 第一層：用「當前生效的那次遍歷」——進行中就用它
+        （`ExploreStore.get_active_scan`），沒有進行中的就用最近一次完成的
+        （`ExploreStore.latest_done_scan`）——的觀測跨度算密度。這是對「回補中」
+        位址**唯一正確**的分母：`fills_sync` 的名目窗口在回補未完成時橫跨整整
+        30 天，但我們只真的看過 `observed_from_ms～observed_to_ms` 這一段，用
+        30 天當分母會嚴重低估速率（正式機複本實測：`0xa483470a…` 真實密度
+        897.5 筆/小時被原版算成 13.4，差 67 倍——24 小時週期會累積約 21,500
+        筆＝11 頁，正是 D-H 明文禁止的「高頻地址被排成 24h，一頁工作變多頁
+        補抓」）。
+
+        兩種情形這個分母都正確或偏保守：
+        - 遍歷進行中：觀測跨度就是我們真正看過的區間，密度正確。
+        - 遍歷已完成：觀測跨度可能比窗口短（帳戶在窗口邊緣沒交易），密度會
+          **高估** → 週期估短 → 抓得更密。方向安全（工程原則：寧可多抓一頁，
+          不可漏成多頁補抓）。`fills_in_window` 本身也含游標重疊、是上界
+          （實測高估約 3.7%）——同樣是偏保守的方向。
+
+        資料不可用（沒有任何遍歷過、觀測欄位為 `None`、跨度非正、或這次遍歷
+        實際上沒觀測到任何成交）→ `None`，交給 `_nominal_window_rate` 接手。"""
+        scan = self._store.get_active_scan(address) or self._store.latest_done_scan(address)
+        if scan is None:
+            return None
+        if scan.observed_from_ms is None or scan.observed_to_ms is None:
+            return None
+        if scan.observed_to_ms <= scan.observed_from_ms or scan.fills_in_window <= 0:
+            return None
+        span_hours = (scan.observed_to_ms - scan.observed_from_ms) / 3_600_000
+        return scan.fills_in_window / span_hours
+
+    def _nominal_window_rate(self, address: str) -> float | None:
+        """Task 5b 第二層（Task 5 原本的算法，降級為 fallback）：
+        `_observed_span_rate` 拿不到可用資料時（例如這個地址從未觀測到任何
+        成交），退回 `fills_sync.fills_in_window` 除以該列自己的名目窗口
+        小時數。地址沒有 `fills_sync` 列或窗口長度非正時回 `None`（無資料，
+        `fills_period_s` 取保守值）。"""
+        st = self._store.get_sync(address)
+        if st is None:
+            return None
+        window_hours = (st.window_end_ms - st.window_start_ms) / 3_600_000
+        if window_hours <= 0:
+            return None
+        return st.fills_in_window / window_hours
 
     @staticmethod
     def _key(address: str, kind: str) -> str:
