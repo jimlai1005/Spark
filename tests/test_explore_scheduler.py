@@ -7,11 +7,16 @@ docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md Task 3.1／7.9b
 """
 from __future__ import annotations
 
+import bisect
+import random
 import threading
+from collections import Counter
 
 import pytest
 
-from spark.publicapi.explore_fills_sync import MAX_PERIOD_S, MIN_PERIOD_S, fills_period_s
+from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_S, fills_period_s,
+                                                fresh_scan_window)
+from spark.publicapi.explore_publisher import compose_rows
 from spark.publicapi.explore_scheduler import ExploreScheduler, _spread
 from spark.publicapi.explore_store import ExploreStore, FillsSyncState, ScanWriteback
 from spark.publicapi.hl import HLGateway
@@ -3613,3 +3618,428 @@ def test_w3_deferred_verify_does_not_burn_the_auxiliary_slot(tmp_path):
     assert sched._fills_pages_since_special == SPECIAL_SERVE_RATIO   # 名額沒被燒掉
     assert sched.status()["verify_served_by_deadline"] == 0
     assert sched.status()["verify_job_deferred"] == 1
+
+
+# ============================================================================
+# Task 7a（plan docs/superpowers/plans/2026-09-22-explore-fills-coverage-
+# verdict-fix.md，D-I）：300 地址競爭負載整合 harness。
+#
+# 與本檔既有 harness 的差異：既有的 `FakeHL`／`_ProbeResolvesThenEmptyHL`
+# 之類的假物件完全繞過 `hl_budget.WeightLimiter`（見各自 docstring：「不經
+# HLGateway／WeightLimiter」），這正是 D-I 明確要求補的缺口——單元測試證明
+# 函式對，證明不了「300 個位址在真實限流下互相競爭時，排程真的把大戶推進到
+# complete」。本節新增 `SchedulerHarness`：真實 `WeightLimiter` ＋ 真實
+# `HLGateway`（`hl_budget.py`／`hl.py` 未改動，即正式機會用到的那份），唯一
+# 假造的是最外層 HTTP `post_fn`（`_T7AUpstream`）。Task 6／7b 可直接沿用本
+# harness（`total_fills_pages`／`scan_pages`／`probes_executed`／
+# `overdue_p95_s`／`verify_completed`／`published_row`／`scan_cursor`／
+# `stored_fill_count`／`pages_refetched_after_restart` 皆已提供）。
+# ============================================================================
+
+
+def _t7a_addr(tag: int) -> str:
+    """短數字 tag → 合法的 40 hex 字元地址。
+
+    `explore_scheduler._spread` 對 `address[-8:]` 做 `int(..., 16)`——plan
+    Task 7 pseudocode 裡的字面地址（`"0xwhale"`／`"0xmystery"`／`"0xburst"`）
+    在真實排程碼路徑上會直接 `ValueError`（"whale"/"mystery"/"burst" 不是合法
+    十六進位）。這是本 harness 唯一偏離 plan 範例字面碼的地方——用有意義的
+    模組常數（`T7A_WHALE` 等）取代，語意不變。"""
+    return f"0x{tag:040x}"
+
+
+T7A_WHALE = _t7a_addr(1)
+T7A_MYSTERY = _t7a_addr(2)
+T7A_BURST = _t7a_addr(3)
+
+
+def _t7a_default_portfolio(first_activity_ms: int) -> list:
+    """`month`／`allTime` 皆有效（`enrich_candidate` 的必要 gating）；
+    `allTime.accountValueHistory` 首點 = `first_activity_ms`——
+    `ExploreStore.first_activity_ms` 唯一讀取來源，見該方法 docstring。"""
+    av = [[first_activity_ms, "1000"], [first_activity_ms + 86_400_000, "1010"]]
+    pnl = [[first_activity_ms, "0"], [first_activity_ms + 86_400_000, "10"]]
+    body = {"accountValueHistory": av, "pnlHistory": pnl}
+    return [["month", body], ["allTime", body]]
+
+
+def _t7a_missing_evidence_portfolio() -> list:
+    """D-F 反向護欄用：`month` 正常（維持列可被 enrich），`allTime.
+    accountValueHistory` 刻意留空——`first_activity_ms` 因此回 `None`（見
+    `ExploreStore.first_activity_ms`：`if not av: return None`），逼探測在
+    回空頁時只能落在 `unknown`（缺 portfolio 佐證）。"""
+    month = {"accountValueHistory": [[0, "1000"], [1, "1010"]],
+             "pnlHistory": [[0, "0"], [1, "10"]]}
+    all_time = {"accountValueHistory": [], "pnlHistory": [[0, "0"], [1, "10"]]}
+    return [["month", month], ["allTime", all_time]]
+
+
+def _t7a_even_fills(window_start_ms: int, window_end_ms: int, count: int) -> list[dict]:
+    """`count` 筆均勻分布在窗口內、時間互不相同的成交——一半 `Open Long`／
+    一半 `Close Long`（`startPosition==sz` 且 `closedPnl>0`），讓
+    `trader_stats.fills_stats` 算出非 null 的 `win_rate_pct`（回歸根因用：
+    大戶必須真的能在 `/explore` 顯示勝率，不是只有覆蓋狀態變綠）。"""
+    span = window_end_ms - window_start_ms
+    step = max(1, (span - 1) // max(1, count))
+    out = []
+    for i in range(count):
+        t = window_start_ms + i * step
+        if i % 2 == 0:
+            dir_, start_pos, pnl = "Open Long", "0", "0"
+        else:
+            dir_, start_pos, pnl = "Close Long", "1", "1.5"
+        out.append({"coin": "BTC", "tid": i, "time": t, "dir": dir_, "px": "100",
+                   "sz": "1", "startPosition": start_pos, "closedPnl": pnl, "oid": i})
+    return out
+
+
+def _t7a_fill_at(t_ms: int, tid: int) -> dict:
+    return {"coin": "BTC", "tid": tid, "time": t_ms, "dir": "Open Long", "px": "100",
+           "sz": "1", "startPosition": "0", "closedPnl": "0", "oid": tid}
+
+
+def _t7a_same_ms_fills(window_start_ms: int, count: int) -> list[dict]:
+    """`count` 筆成交，其中一個 `cluster_size` 筆的叢集全部落在同一毫秒、且
+    刻意排列成該叢集橫跨遍歷軌第一頁／第二頁的分頁邊界（`PAGE_LIMIT` 頁面
+    上限）——其餘成交各自獨立、遞增的毫秒。用來驗證『游標 inclusive 重疊 ＋
+    (address, coin, tid) 去重』：分頁邊界重疊會讓叢集裡的一部分成交同時出現
+    在兩次上游回應裡，去重必須讓最終落地筆數精確等於 `count`。
+
+    ⚠️ 不是把全部 `count` 筆塞在單一毫秒——那個字面讀法在 `PAGE_LIMIT=2000`
+    下數學上不可能被現有（未改動的）`apply_scan_page` 完整取回：只要有任何
+    一頁的成交「全部」等於該頁查詢的 `start_ms`，就會觸發 `same_ms_overflow`
+    （真正的、刻意的資料缺口保護——見 `explore_fills_sync.apply_scan_page`
+    docstring），且 `cursor_ms` 在該頁之後停滯在那個毫秒，下一頁查詢的
+    `start_ms` 還是同一個值，只要叢集大小超過一頁就必然再次觸發、永久卡住。
+    `count=4_500 > 2×PAGE_LIMIT` 時，一輪遍歷最多只能取回 `2×PAGE_LIMIT`
+    （實測：4,000）——這是現有正確、未改動程式碼的真實架構限制，不是本
+    harness 的缺陷。把叢集縮小到能被單一頁面「跨過去」（`cluster_size` 明顯
+    小於 `PAGE_LIMIT`）才是這個測試真正要驗證的情境：同一毫秒的資料**可以**
+    survive 分頁邊界，只要它沒有大到把整頁塞滿。"""
+    cluster_size = 400
+    before = PAGE_LIMIT - 200   # 讓叢集橫跨 page1/page2 邊界（200 落在 page1 尾端）
+    after = count - before - cluster_size
+    assert after > 0, "count 太小，叢集放不進去——調整 cluster_size/before"
+    out: list[dict] = []
+    tid = 0
+    t = window_start_ms + 1
+    for _ in range(before):
+        out.append(_t7a_fill_at(t, tid))
+        tid += 1
+        t += 1000
+    cluster_t = t
+    for _ in range(cluster_size):
+        out.append(_t7a_fill_at(cluster_t, tid))
+        tid += 1
+    t = cluster_t + 1000
+    for _ in range(after):
+        out.append(_t7a_fill_at(t, tid))
+        tid += 1
+        t += 1000
+    return out
+
+
+def _t7a_payload(addresses: list[str]) -> dict:
+    rows = [{"ethAddress": addr, "displayName": f"t7a{i}",
+            "windowPerformances": [["month", {"roi": str(1.0 - i * 0.0001)}]]}
+           for i, addr in enumerate(addresses)]
+    return {"leaderboardRows": rows}
+
+
+class _T7AUpstream:
+    """300 地址整合 harness 的假上游：`clearinghouseState`／`portfolio`／
+    `userNonFundingLedgerUpdates`／`userFillsByTime` 的最小可控實作，作為
+    `HLGateway(post_fn=...)` 的 `post_fn`——`WeightLimiter`／`HLGateway` 本身
+    完全是正式機的那份程式碼，見本節模組檔頭。
+
+    `get_fills_page` 的分頁模型：**純函式**，只依 `(address, start_ms,
+    end_ms)` 從該地址依 (time, tid) 排序好的成交清單裡切出 `time` 落在
+    `[start_ms, end_ms]`（inclusive）的前 `PAGE_LIMIT` 筆。不記「已經供應到
+    哪」——每次都是對同一份靜態資料的獨立查詢，就像對一個真正持久、不會
+    「記得你上次問到哪」的上游資料庫查詢一樣（`hl.py.get_user_fills_paged`
+    docstring：upstream 逐頁分頁行為「僅單頁 fixture 驗證過，未對真實 API
+    逐頁分頁驗證」——這是本 harness 在缺乏該證據下能做的最保守假設：不虛構
+    upstream 有任何超出「時間範圍查詢」以外的狀態）。這個純函式設計是刻意
+    的：`explore_fills_sync` 的 inclusive-overlap 游標會讓同一筆成交在連續
+    兩次分頁請求裡都出現在回應中（下一頁 `startTime` = 上一頁最後一筆的
+    `time`），真正需要落地的是「這個重複會被 `(address, coin, tid)` 去重，
+    不會被重複計數、也不會被漏算」——純函式上游正是唯一能真實重現這個重疊
+    的建模方式；帶「已供應位置」記憶的上游（本檔先前一版）會讓上游自己
+    避開重疊，反而測不到去重路徑。"""
+
+    def __init__(self):
+        self._fills: dict[str, list[dict]] = {}
+        self._times: dict[str, list[int]] = {}
+        self._portfolio: dict[str, list] = {}
+        self.calls: Counter = Counter()
+        self._seen_tids: dict[str, set] = {}
+        self._track_redundant = False
+        self.refetched_pages = 0
+
+    def seed_fills(self, address: str, items: list[dict]) -> None:
+        addr = address.lower()
+        items = sorted(items, key=lambda f: (f["time"], f["tid"]))
+        self._fills[addr] = items
+        self._times[addr] = [f["time"] for f in items]
+        self._seen_tids.setdefault(addr, set())
+
+    def set_portfolio(self, address: str, payload: list) -> None:
+        self._portfolio[address.lower()] = payload
+
+    def mark_restart(self) -> None:
+        """`pages_refetched_after_restart` 起算點——之後每一次
+        `userFillsByTime` 回應若**整頁**的 tid 全部是重啟前已經回應過的
+        （零新 tid），計一次「白打的一頁」。上游本身是純函式（見類別
+        docstring），`_seen_tids` 只是供觀測用的旁路帳本，不影響實際供應
+        的內容。"""
+        self._track_redundant = True
+        self.refetched_pages = 0
+
+    def post(self, url: str, body: dict) -> object:
+        t = body["type"]
+        self.calls[t] += 1
+        if t == "clearinghouseState":
+            return {"marginSummary": {"accountValue": "10000"}}
+        if t == "portfolio":
+            return self._portfolio.get(body["user"].lower(), _t7a_default_portfolio(0))
+        if t == "userNonFundingLedgerUpdates":
+            return []
+        if t == "userFillsByTime":
+            return self._get_fills_page(body["user"], int(body["startTime"]),
+                                        int(body["endTime"]))
+        raise AssertionError(f"_T7AUpstream: 未預期的請求類型 {t!r}")
+
+    def _get_fills_page(self, address: str, start_ms: int, end_ms: int) -> list[dict]:
+        addr = address.lower()
+        items = self._fills.get(addr)
+        if not items:
+            return []
+        times = self._times[addr]
+        pos = bisect.bisect_left(times, start_ms)
+        out: list[dict] = []
+        while pos < len(items) and len(out) < PAGE_LIMIT:
+            f = items[pos]
+            if f["time"] > end_ms:
+                break
+            out.append(f)
+            pos += 1
+        seen = self._seen_tids.setdefault(addr, set())
+        if self._track_redundant and out:
+            if all(f["tid"] in seen for f in out):
+                self.refetched_pages += 1
+        seen.update(f["tid"] for f in out)
+        return out
+
+
+class SchedulerHarness:
+    """Task 7a：300 地址競爭負載下的整合驗收 harness。`seed` 釘死（D-I／7.9
+    教訓：harness 沒有預算模型／churn／多頁就抓不到問題，種子不釘死結果不可
+    複現）——目前只餵給 `ExploreScheduler(rng=...)`（jitter 來源），成交資料
+    本身是確定性生成（不吃 rng），整體結果因此完全可複現。"""
+
+    def __init__(self, *, seed: int = 20260922, candidates: int = 300):
+        self._clock = Clock()
+        self._rng = random.Random(seed)
+        self._upstream = _T7AUpstream()
+        self._limiter = WeightLimiter(
+            global_cap=900,
+            scope_caps={"explore": 300, "explore_base": 180, "explore_fills": 120},
+            scope_parents={"explore_base": "explore", "explore_fills": "explore"},
+            now_fn=self._clock.now, sleep_fn=self._clock.sleep, rng=self._rng.random)
+        self._gateway = HLGateway("https://t7a.invalid", post_fn=self._upstream.post,
+                                  sleep_fn=self._clock.sleep, limiter=self._limiter)
+        self._n = candidates
+        self._addresses = [T7A_WHALE, T7A_MYSTERY, T7A_BURST] + \
+            [_t7a_addr(100 + i) for i in range(candidates - 3)]
+        self._store: ExploreStore | None = None
+        self._sched: ExploreScheduler | None = None
+        self._tick_counts: dict[str, int] = {}
+
+    def build(self, db_path) -> "SchedulerHarness":
+        self._store = ExploreStore(db_path, now_fn=self._clock.now)
+        for addr in self._addresses:
+            self._upstream.set_portfolio(addr, _t7a_default_portfolio(0))
+        self._sched = self._build_scheduler()
+        return self
+
+    def _build_scheduler(self) -> ExploreScheduler:
+        payload = _t7a_payload(self._addresses)
+        return ExploreScheduler(
+            store=self._store, hl=self._gateway.scoped("explore"),
+            hl_base=self._gateway.scoped("explore_base"),
+            hl_fills=self._gateway.scoped("explore_fills"),
+            leaderboard_source_fn=lambda: payload, excluded_fn=lambda: set(),
+            cfg=ExploreConfig(candidate_pool=self._n),
+            now_fn=self._clock.now, sleep_fn=self._clock.sleep, on_dirty=lambda: None,
+            fills_min_period_s=3600, fills_max_period_s=86400, rng=self._rng.random)
+
+    # ---- 場景設定（`run_for` 之前呼叫；此時鐘面仍在 t=0，與 bootstrap 時
+    # `fresh_scan_window` 算出的窗口一致） ----
+    def set_fill_count(self, address: str, *, window_fills: int) -> None:
+        ws, we = fresh_scan_window(int(self._clock.now() * 1000))
+        self._upstream.seed_fills(address, _t7a_even_fills(ws, we, window_fills))
+        self._upstream.set_portfolio(address, _t7a_default_portfolio(ws))
+
+    def set_fills_all_same_ms(self, address: str, *, count: int) -> None:
+        ws, _we = fresh_scan_window(int(self._clock.now() * 1000))
+        self._upstream.seed_fills(address, _t7a_same_ms_fills(ws, count))
+        self._upstream.set_portfolio(address, _t7a_default_portfolio(ws))
+
+    def set_probe_always_empty(self, address: str) -> None:
+        """未配置任何成交的地址本來就是空探測——保留這個方法只為讓呼叫端
+        對 D-F 反向護欄場景的意圖明確表態（即使目前是 no-op）。"""
+        self._upstream.seed_fills(address, [])
+
+    def set_portfolio_missing(self, address: str) -> None:
+        self._upstream.set_portfolio(address, _t7a_missing_evidence_portfolio())
+
+    # ---- 執行 ----
+    def run_for(self, *, hours: float) -> None:
+        target = self._clock.t + hours * 3600.0
+        ticks = 0
+        max_ticks = 3_000_000
+        while self._clock.t <= target:
+            ticks += 1
+            if ticks > max_ticks:
+                raise AssertionError(
+                    f"SchedulerHarness.run_for 超過 {max_ticks} tick 安全上限，可能卡住")
+            r = self._sched.tick()
+            self._tick_counts[r] = self._tick_counts.get(r, 0) + 1
+            if r == "idle":
+                if self._store.due_jobs_count(self._clock.t) > 0:
+                    continue    # 這一輪的 idle 只是「剛排了工作，下一 tick 才領」
+                nxt = self._next_due_at(self._clock.t)
+                if nxt is None or nxt > target:
+                    break
+                self._clock.t = max(nxt, self._clock.t)
+            elif r in ("no_budget", "paused", "retry", "rate_limited", "deferred"):
+                # 與正式 `run_forever` 同形：讓限流視窗／退避真的流逝，不是
+                # 直接跳到「下一個到期時間」（那樣會讓 60 秒滑動視窗窗口失真）。
+                # `deferred`：`_run_scan` 的探測前置在額度不足／限流暫停時也會
+                # 回這個結果並把 job 重排到 `now`（立即可再領）——若當成零延遲
+                # 結果處理，會在額度真的耗盡時對同一個 job 形成無時間推進的
+                # 無限緊迴圈（budget 視窗永遠等不到清空），這是本 harness 實測
+                # 抓到的問題，不是假設性風險。
+                self._clock.sleep(1.0)
+            # 其餘（ran:*／deferred／dropped／quarantined）：delay=0，立即續 tick。
+
+    def restart(self) -> None:
+        """重建 `ExploreScheduler`，只留 DB（模擬 process 重啟；假上游的分頁
+        供應指標也標記重啟點，供 `pages_refetched_after_restart` 判斷）。"""
+        self._upstream.mark_restart()
+        self._sched = self._build_scheduler()
+
+    def _next_due_at(self, now: float) -> float | None:
+        row = self._store._db.execute(
+            "SELECT MIN(next_attempt_at) FROM refresh_job WHERE next_attempt_at > ?",
+            (now,)).fetchone()
+        return row[0]
+
+    # ---- 觀測 ----
+    @property
+    def scan_pages(self) -> int:
+        return self._sched.scan_pages_total
+
+    @property
+    def total_fills_pages(self) -> int:
+        return self._sched.status()["fills_pages_total"]
+
+    @property
+    def probes_executed(self) -> int:
+        return self._sched.probes_total
+
+    def limiter_snapshot(self) -> dict:
+        return self._limiter.snapshot()
+
+    def published_row(self, address: str) -> dict | None:
+        rows, _meta = compose_rows(self._store, now=self._clock.t,
+                                   cfg=ExploreConfig(candidate_pool=self._n))
+        for row in rows:
+            if row.address.lower() == address.lower():
+                return {"fills_coverage": row.fills_coverage,
+                       "win_rate": row.close_win_rate_pct,
+                       "order_count_30d": row.order_count_30d,
+                       "realized_pnl_30d_usd": row.realized_pnl_30d_usd}
+        return None
+
+    def stored_fill_count(self, address: str) -> int:
+        row = self._store._db.execute(
+            "SELECT COUNT(*) FROM fills WHERE address=?", (address.lower(),)).fetchone()
+        return row[0]
+
+    def scan_cursor(self, address: str) -> int | None:
+        scan = self._store.get_active_scan(address) or self._store.latest_done_scan(address)
+        return None if scan is None else scan.cursor_ms
+
+    def pages_refetched_after_restart(self) -> int:
+        return self._upstream.refetched_pages
+
+    def verify_completed(self) -> int:
+        row = self._store._db.execute(
+            "SELECT COUNT(*) FROM fills_scan WHERE kind='verify' AND status='done'").fetchone()
+        return row[0]
+
+    def overdue_p95_s(self, kind: str) -> float:
+        """目前（呼叫當下）該 kind 已到期但尚未被領走的 job，逾期秒數分布的
+        p95——快照式量測，不是整個 run 期間逐次領工延遲的歷史百分位（那需要
+        逐次領工的時間戳，目前的 `ExploreScheduler`/`ExploreStore` 公開介面
+        沒有暴露；這是留給 Task 6／7b 的已知近似，非精確值）。"""
+        now = self._clock.t
+        rows = self._store._db.execute(
+            "SELECT next_attempt_at FROM refresh_job WHERE kind=? AND next_attempt_at<=?",
+            (kind, now)).fetchall()
+        ages = sorted(now - r[0] for r in rows)
+        if not ages:
+            return 0.0
+        idx = min(len(ages) - 1, max(0, -(-95 * len(ages) // 100) - 1))
+        return ages[idx]
+
+
+def _t7a_harness(tmp_path, *, seed: int = 20260922, candidates: int = 300) -> SchedulerHarness:
+    return SchedulerHarness(seed=seed, candidates=candidates).build(tmp_path / "t7a.db")
+
+
+# --- Task 7 Step 1（plan Task 7a 範圍：六條裡的前四條） ---
+
+def test_whale_reaches_complete_within_24h_under_full_contention(tmp_path):
+    """回歸根因：30 天窗口 20,000 筆的地址，在 300 地址競爭＋真實限流下，
+    必須在模擬 24 小時內成為對外 complete，且 win_rate 非 null。"""
+    h = _t7a_harness(tmp_path)
+    h.set_fill_count(T7A_WHALE, window_fills=20_000)
+    h.run_for(hours=24)
+    row = h.published_row(T7A_WHALE)
+    assert row is not None
+    assert row["fills_coverage"]["state"] == "complete"
+    assert row["win_rate"] is not None
+
+
+def test_missing_left_boundary_evidence_can_never_publish_complete(tmp_path):
+    """反向護欄（比大戶那條更重要——防的是「把錯判不完整換成錯判完整」）：
+    探測一直拿不到證據、portfolio 也缺席的位址，24 小時後仍不得是 complete。"""
+    h = _t7a_harness(tmp_path)
+    h.set_probe_always_empty(T7A_MYSTERY)
+    h.set_portfolio_missing(T7A_MYSTERY)
+    h.run_for(hours=24)
+    row = h.published_row(T7A_MYSTERY)
+    assert row is not None
+    assert row["fills_coverage"]["state"] != "complete"
+
+
+def test_same_millisecond_fills_survive_page_boundary(tmp_path):
+    """同毫秒跨頁不漏單：游標 inclusive 重疊＋(time, tid) 去重。"""
+    h = _t7a_harness(tmp_path)
+    h.set_fills_all_same_ms(T7A_BURST, count=4_500)
+    h.run_for(hours=6)
+    assert h.stored_fill_count(T7A_BURST) == 4_500
+
+
+def test_restart_resumes_scan_from_persisted_cursor(tmp_path):
+    h = _t7a_harness(tmp_path)
+    h.set_fill_count(T7A_WHALE, window_fills=20_000)
+    h.run_for(hours=3)
+    before = h.scan_cursor(T7A_WHALE)
+    h.restart()
+    h.run_for(hours=1)
+    after = h.scan_cursor(T7A_WHALE)
+    assert before is not None and after is not None and after >= before
+    assert h.pages_refetched_after_restart() <= 1
