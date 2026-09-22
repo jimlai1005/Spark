@@ -116,8 +116,9 @@ from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, PARAMS_F
                                                 validate_page)
 from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
                                            REASON_PROBE_NO_EARLIER_FILLS,
-                                           REASON_RETENTION_BOUNDARY_VERIFIED, JOB_KINDS,
-                                           ExploreStore, Job, ScanWriteback)
+                                           REASON_RETENTION_BOUNDARY_VERIFIED,
+                                           ADMISSION_MULTIPLIER, JOB_KINDS, ExploreStore, Job,
+                                           ScanWriteback)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
 from spark.publicapi.hl_explore import ExploreConfig, _roi_sort_key, candidate_addresses
 
@@ -156,12 +157,15 @@ _FILLS_LIKE_KINDS = ("fills", "fills_scan")
 # 一次嘗試，見 `_tick_once` 的例外分類。
 MAX_JOB_ATTEMPTS = 8
 
-# 準入上限：`refresh_job` 總數 ≤ ADMISSION_MULTIPLIER × active 候選數。
-# Task 7.9c-S（W4）：每個地址最多 6 種 per-address kind——`state`、`portfolio`、
-# `ledger`、`fills`（增量軌）、`fills_scan`（遍歷軌）、`fills_verify`（遷移產生的
-# 核驗遍歷）——外加 `candidates` 這個全域 job 與餘裕，因此 5× 改 7×。cap 只擋
-# 既有地址的補建，新候選一律放行（見 `_enqueue_address_jobs`）。
-ADMISSION_MULTIPLIER = 7
+# 準入上限（`refresh_job` 總數 ≤ `ADMISSION_MULTIPLIER` × active 候選數）的常數自
+# Task 7.9e-D D3 起住在 `explore_store`（資料層無依賴，`app.py` 的詳情頁準入也用
+# 它，不必為一個常數 import 排程模組）——見該處 docstring 的 6 種 per-address
+# kind 說明。cap 只擋既有地址的補建，新候選一律放行（見 `_enqueue_address_jobs`）。
+
+# Task 7.9e-S S1：`verify_needed` 補排時的首次到期分散窗口——與遷移產生 129 筆
+# 核驗時的攤法同源（`ExploreStore._migration_spread_s`，48 小時內依地址雜湊），
+# 一次補上幾十筆核驗不能全部排在同一秒。
+VERIFY_SPREAD_S = 48 * 3600
 
 # Task 7.9c-S S4／7.9d-S S3：`fills_verify` 的有界等待門檻——最舊的到期 verify job
 # 等超過這個秒數時，**在輔助類別內**排到探測之前（7.9d 第二輪裁決：逾期只調整順序，
@@ -322,6 +326,11 @@ class ExploreScheduler:
         # 殘留 job 數）與「領到非 active 地址的工作、發送前就丟棄」的次數。
         self._reconciled: dict[str, int] = {}
         self._inactive_job_dropped = 0
+        # Task 7.9e-S：kind 不相容時 verify job 被延後（不刪）的次數、`fills_scan`
+        # job 因 kind 不相容被丟棄的次數（與良性丟棄分開計），對帳失敗次數。
+        self._verify_job_deferred = 0
+        self._scan_job_dropped_kind_mismatch = 0
+        self._reconcile_errors = 0
         self._invalid_pages = 0   # 7.9d：非法頁（亂序／窗外）退避次數，見 `_backoff_invalid_page`
         # Task 7.9a A3：`on_dirty` callback 拋例外的次數（`_notify_dirty` 吞例外
         # 後計數）——job 本身不因此遺失，這個計數器讓 callback 本身壞掉這件事
@@ -406,15 +415,25 @@ class ExploreScheduler:
             # 但沒有任何 job 會推進它）與退池後仍 running 的列數。
             "scans_running": scans["running_rows"],
             "scans": dict(scans),
+            # `verify_remaining` ＝ `fills_verify` 的 **job 列數**，不代表核驗
+            # 完成度：job 被刪／被掃除時它會歸零，但該地址對外仍是
+            # `evidence_unknown`（7.9d 複審的兩個 Critical 就長這樣）。核驗真正
+            # 做完的判準是 `verify_needed["rows"] == 0`（Task 7.9e-S S6）。
             "verify_remaining": jobs_by_kind["fills_verify"]["rows"],
+            # `verify_needed`（Task 7.9e-D D2 的單句 SQL）：`rows == 0` 才是
+            # 「核驗真的做完」，`unserved == 0` 才是「排程健康」。
+            "verify_needed": dict(self._store.verify_needed(active)),
             "jobs_by_kind": {k: dict(jobs_by_kind[k]) for k in JOB_KINDS},
             "due_by_kind": {k: due_by_kind[k] for k in JOB_KINDS},
             "scan_job_dropped": self._scan_job_dropped,
+            "scan_job_dropped_kind_mismatch": self._scan_job_dropped_kind_mismatch,
+            "verify_job_deferred": self._verify_job_deferred,
             "inactive_job_dropped": self._inactive_job_dropped,
             "invalid_pages": self._invalid_pages,
             "admission_skipped": self._admission_skipped,
             "verify_served_by_deadline": self._verify_served_by_deadline,
             "reconciled": dict(self._reconciled),
+            "reconcile_errors": self._reconcile_errors,
             "scan_writeback_duplicate": self._scan_writeback_duplicate,
             "scan_writeback_stale": self._scan_writeback_stale,
             "scan_writeback_missing": self._scan_writeback_missing,
@@ -437,7 +456,7 @@ class ExploreScheduler:
 
         2026-09-22 使用者第二輪裁決點 1／3。啟動首 tick 與每次 candidates 更新
         後各跑一次；**冪等**——補排過的 job 讓 `_needs_scan_job` 下一次回 `None`，
-        重跑零變更。三種原因碼見 `_needs_scan_job`；`resume_running` 補的 job 會
+        重跑零變更。四種原因碼見 `_needs_scan_job`；`resume_running` 補的 job 會
         續跑同一個 `scan_id` 與游標（`_run_scan` 見到進行中的遍歷就接著抓），
         不建新 scan、不整窗重抓。
 
@@ -458,20 +477,37 @@ class ExploreScheduler:
         if deleted:
             logger.warning("explore scheduler: 對帳掃除 %d 筆非 active 地址的殘留 job", deleted)
         out["inactive_jobs_deleted"] = deleted
-        for address, running_scan_id in self._store.scan_job_targets(active):
-            running = (None if running_scan_id is None
-                       else self._store.get_scan(running_scan_id))
-            need = self._needs_scan_job(address, now, running_scan=running)
-            if need is None:
-                continue
-            reason, job_kind = need
-            priority = 4 if job_kind == "fills_verify" else 3
-            if self._store.enqueue(self._key(address, job_kind), address, job_kind, priority,
-                                   now):
+        for target in self._store.scan_job_targets(active):
+            # `ScanTarget`（Task 7.9e-D D4）一句 SQL 帶來 `running_scan_id`；
+            # `completeness`／`evidence_unknown` 仍由 `_needs_scan_job` 的
+            # `get_sync` 一次讀齊（同一來源，不讓同一個事實有兩個出處）。
+            running = (None if target.running_scan_id is None
+                       else self._store.get_scan(target.running_scan_id))
+            reason = self._ensure_scan_job(target.address, now, running_scan=running)
+            if reason is not None:
                 out[reason] = out.get(reason, 0) + 1
-                logger.warning("explore scheduler: 對帳補排 %s 的 %s job（%s）",
-                               address, job_kind, reason)
         return out
+
+    def _ensure_scan_job(self, address: str, now: float, *, running_scan=_UNSET) -> str | None:
+        """把 `_needs_scan_job` 的判斷落成一個 job（Task 7.9e-S S1：對帳與
+        `_run_increment` 收尾共用同一個實作，不各寫一份條件）。回傳真的新建了
+        job 的原因碼，否則 `None`（已存在 → `enqueue` 回 False，不重排也不提前）。
+
+        `verify_needed`（新工作）用**地址雜湊攤開**到 48 小時內，與遷移產生 129
+        筆核驗時的攤法同源（`ExploreStore._migration_spread_s`）——一次補上幾十筆
+        不能全部排在同一秒。其餘原因碼都是「已經在半路上或已到期」，一律 `now`。"""
+        need = self._needs_scan_job(address, now, running_scan=running_scan)
+        if need is None:
+            return None
+        reason, job_kind = need
+        priority = 4 if job_kind == "fills_verify" else 3
+        next_at = now + (_spread(address, VERIFY_SPREAD_S) if reason == "verify_needed" else 0.0)
+        if not self._store.enqueue(self._key(address, job_kind), address, job_kind, priority,
+                                   next_at):
+            return None
+        logger.warning("explore scheduler: 對帳補排 %s 的 %s job（%s）",
+                       address, job_kind, reason)
+        return reason
 
     def _needs_scan_job(self, address: str, now: float, *,
                         running_scan=_UNSET,
@@ -490,9 +526,17 @@ class ExploreScheduler:
           ——首次回補從未完成（孤兒：有 `fills_sync` 列、沒有 scan 列）。
         - `"partial_due"`：`partial` 且距離最近一次完成的遍歷已滿
           `PARTIAL_RESCAN_AFTER_S`，沒有進行中的遍歷、也沒有 job。
+        - `"verify_needed"`（Task 7.9e-S S1）：`evidence_unknown == 1`（對外是
+          `evidence_unknown` 降級）、沒有進行中的 verify 遍歷、也沒有
+          `fills_verify` job ——「需要核驗」本來不是狀態推導的需求，verify job
+          只有「遷移」與「resume」兩個來源：kind 不相容閘門刪掉一次、或退池掃除
+          後回池只重建 `fills_scan`，該地址的核驗就**永久消失**（3 天模擬收尾
+          `verify_remaining == 0` 但 17 個地址 `evidence_unknown` 仍是 1）。
 
-        觸發條件一律**由狀態推導**，不由「job 列是否存在」推導（7.9b／7.9c 兩個
-        Critical 都是這個形狀）；job 只用來去重（同一件事不要排兩次）。
+        觸發條件一律**由狀態推導**，不由「job 列是否存在」推導（7.9b／7.9c／7.9d
+        三個 Critical 都是這個形狀）；job 只用來去重（同一件事不要排兩次）。
+        遍歷軌優先於核驗軌：任何一次完成的遍歷都會清掉 `evidence_unknown`
+        （`ExploreStore.complete_scan`），已經要重掃的地址不必再排一次核驗。
         `ignore_existing_job=True` 給 `_run_scan` 用——呼叫端手上那個 job 就是
         「正在推進它的工作」，去重條件對它不適用。`running_scan` 可由呼叫端
         （對帳的單句 SQL ＋一次 `get_scan`）帶入，省一次點查。"""
@@ -507,14 +551,15 @@ class ExploreScheduler:
             # 沒有增量軌可掛載（從未 bootstrap，或資料被外部刪除）——遍歷無處
             # 寫回（`complete_scan` 會回 `MISSING`），不值得花一整輪頁面。
             return None
-        if "fills_scan" in kinds:
-            return None
-        if st.completeness == "backfilling":
-            return "initial_missing", "fills_scan"
-        if st.completeness == "partial":
-            latest = self._store.latest_done_scan(address)
-            if partial_rescan_due(None if latest is None else latest.finished_at, now):
-                return "partial_due", "fills_scan"
+        if "fills_scan" not in kinds:
+            if st.completeness == "backfilling":
+                return "initial_missing", "fills_scan"
+            if st.completeness == "partial":
+                latest = self._store.latest_done_scan(address)
+                if partial_rescan_due(None if latest is None else latest.finished_at, now):
+                    return "partial_due", "fills_scan"
+        if st.evidence_unknown and "fills_verify" not in kinds:
+            return "verify_needed", "fills_verify"
         return None
 
     # ---- 內部：一次 tick ----
@@ -638,20 +683,27 @@ class ExploreScheduler:
         但它屬於輔助份額，不計入 `_fills_pages_since_special`）。"""
         verify_ready = self._store.due_count("fills_verify", now) > 0
         verify_overdue = verify_ready and self._verify_overdue(now)
-        if verify_overdue:
-            order: tuple[str, ...] = ("verify", "probe")
-        elif verify_ready:
-            # 兩邊都在等 → 輪流；只有 verify 在等時順序不影響結果。
+        candidate = self._store.next_probe_candidate()
+        if verify_ready and candidate is not None:
+            # Task 7.9e-S S5（複審 S1）：兩邊都在等就**一律輪流**，逾期也不例外
+            # ——verify 的續頁會保留舊的 `next_attempt_at`（見 `_run_scan`），所以
+            # 核驗積壓期間「逾期」恆真；若逾期就一直優先，探測會零服務。
             self._special_turn = not self._special_turn
-            order = ("verify", "probe") if self._special_turn else ("probe", "verify")
-        else:
+            order: tuple[str, ...] = (("verify", "probe") if self._special_turn
+                                      else ("probe", "verify"))
+        elif verify_ready:
+            order = ("verify",)
+        elif candidate is not None:
             order = ("probe",)
+        else:
+            return None, None
         for who in order:
             if who == "probe":
-                candidate = self._store.next_probe_candidate()
-                if candidate is not None:
+                # Task 7.9e-S S4（複審 S2）：名額只在**真的發出請求**時才歸零
+                # ——候選剛退池／scan 列不見／額度不足時 `_run_probe` 一頁都沒打，
+                # 舊版照樣把計數器歸零，等於白燒一次輔助名額。
+                if candidate is not None and self._run_probe(candidate, now):
                     self._fills_pages_since_special = 0
-                    self._run_probe(candidate, now)
                     return "probe", None
                 continue
             if not verify_ready:
@@ -753,7 +805,15 @@ class ExploreScheduler:
 
         # Task 7.9d-S S1：候選池剛換過血——立刻對帳（回池地址拿回 scan job 續跑
         # 同一個 scan、退池地址的殘留 job 掃除）。冪等，所以每輪跑一次沒有副作用。
-        self._reconciled = self.reconcile_scan_jobs(now)
+        # Task 7.9e-S S3（複審 W2）：對帳失敗不得把 candidates job 拖進隔離——
+        # 它是候選池的唯一更新來源，隔離 24 小時等於整池停更。大聲記錄＋計數
+        # （`reconcile_errors`，health 可見），本輪 candidates 照常收尾續排。
+        try:
+            self._reconciled = self.reconcile_scan_jobs(now)
+        except Exception:
+            self._reconcile_errors += 1
+            logger.error("explore scheduler: candidates 輪的對帳失敗（candidates job 照常收尾）",
+                         exc_info=True)
 
         self._complete(job)
         self._store.enqueue(job.key, None, "candidates", job.priority,
@@ -799,6 +859,14 @@ class ExploreScheduler:
         return jobs
 
     def _run_cache_kind(self, job: Job, now: float, *, endpoint: str, fetch, period_s: float) -> str:
+        """`state`／`portfolio`／`ledger`（endpoint_cache 三種基礎抓取）。
+
+        Task 7.9e-S S7（2026-09-22 使用者裁決點 3 的字面要求「HTTP 發送前確認
+        active」）：非 active 地址在**發送前**就丟棄。舊版是「先抓、抓完才用
+        `is_active` 決定要不要續排」——退池地址的殘留 job 每次被領到都白打一次
+        上游（`explore_base` 額度照樣被吃）。"""
+        if not self._store.is_active(job.address):
+            return self._drop_inactive(job)
         payload = fetch(job.address)
         refresh_after = now + self._jit(period_s)
         self._store.put_cache_ok(job.address, endpoint, payload, now, refresh_after)
@@ -807,15 +875,9 @@ class ExploreScheduler:
         # `_notify_dirty()`（吞例外＋計數，見該方法）放在最後一步——`on_dirty`
         # 拋例外不得讓已經 `_complete` 的 job 漏排（工程原則 3 的反向：關鍵動作
         # 不因錦上添花的通知失敗而跟著失敗）。
-        active = self._store.is_active(job.address)
-        if active:
-            # Task 3.5 B(2)（C1 修法）：候選已退池，續排前先檢查——不然這個
-            # job 會無條件永遠自我續排，預算持續漏給非候選、`refresh_job` 只增
-            # 不減，最終觸發準入上限讓新候選拿不到 job、也讓 `purge` 的
-            # `NOT EXISTS(refresh_job)` 條件永久卡住。
-            self._store.enqueue(job.key, job.address, job.kind, job.priority, refresh_after)
+        self._store.enqueue(job.key, job.address, job.kind, job.priority, refresh_after)
         self._notify_dirty()
-        return f"ran:{job.kind}" if active else "dropped"
+        return f"ran:{job.kind}"
 
     def _run_increment(self, job: Job, now: float) -> str:
         """增量軌 job（kind='fills'）——Task 7.9b B2：只延伸
@@ -841,6 +903,7 @@ class ExploreScheduler:
             # 這個邊界（Task 7.9c-S S1）。
             next_at = max(plan.next_due_ms / 1000, now + self._jit(60.0))
             self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
+            self._ensure_scan_job(job.address, now)
             return "ran:fills"
 
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
@@ -859,8 +922,11 @@ class ExploreScheduler:
         self._complete(job)
         next_at = now + self._jit(self._fills_every_s)
         self._store.enqueue(job.key, job.address, "fills", job.priority, next_at)
-        # Task 7.9d-S S1：遍歷軌 job 的修復不再掛在增量收尾這個單點上——由
-        # `reconcile_scan_jobs`（啟動＋每次 candidates 更新）以狀態對帳處理。
+        # Task 7.9d-S S1／7.9e-S S1：增量收尾也跑一次**同一個**對帳函式
+        # （`_ensure_scan_job`）——主路徑是 `reconcile_scan_jobs`（啟動＋每次
+        # candidates 更新），這裡讓「狀態需要遍歷／核驗但沒有 job」最多等一個
+        # 增量週期就被補上，條件與對帳完全同源（不是另寫一份修復條件）。
+        self._ensure_scan_job(job.address, now)
         self._notify_dirty()
         return "ran:fills"
 
@@ -901,11 +967,23 @@ class ExploreScheduler:
             # `initial`／`partial_rescan` 只能由 `fills_scan` job 推進；接錯了
             # 會把對方的遍歷跑完、對方的 job 卻還留著，下次被服務時就再開一個
             # 新遍歷（3 天模擬 654 次 verify 遍歷）。
+            if verify:
+                # Task 7.9e-S S2（複審 C1）：**不得刪掉 `fills_verify` job**——
+                # 核驗工作的來源很窄（遷移、resume、`verify_needed` 對帳），刪一次
+                # 就要等下一次對帳才補回來，而在那之前對外一直是
+                # `evidence_unknown`。等進行中的遍歷（initial／partial_rescan）
+                # 收尾就好，10 分鐘後再試，零上游呼叫。
+                self._reschedule(job, now + 600, bump_attempts=False)
+                self._verify_job_deferred += 1
+                logger.warning(
+                    "explore scheduler: %s 的 fills_verify job 延後 600s——該地址正在跑 %s 遍歷",
+                    job.address, scan.kind)
+                return "deferred"
             self._complete(job)
-            self._scan_job_dropped += 1
+            self._scan_job_dropped_kind_mismatch += 1
             logger.warning(
-                "explore scheduler: 丟棄 %s 的 %s job——該地址進行中的遍歷是 %s（kind 不相容）",
-                job.address, job.kind, scan.kind)
+                "explore scheduler: 丟棄 %s 的 %s job——該地址進行中的遍歷是 %s（kind 不相容；"
+                "對帳會依 scan kind 補正確的 job）", job.address, job.kind, scan.kind)
             return "dropped"
         if scan is None:
             now_ms = int(now * 1000)
@@ -1049,7 +1127,7 @@ class ExploreScheduler:
                          job.kind, err)
         self._reschedule(job, now + 86400, err=err, bump_attempts=not max_attempts)
 
-    def _run_probe(self, candidate: tuple[str, str], now: float) -> None:
+    def _run_probe(self, candidate: tuple[str, str], now: float) -> bool:
         """留存邊界探測（Task 7.9b B4）：`candidate=(address, scan_id)` 來自
         `ExploreStore.next_probe_candidate()`（純 DB 推導，重啟後照常運作，
         B7 (vii)）。查詢 `[scan.window_start_ms - 1 天, scan.window_start_ms - 1]`
@@ -1062,34 +1140,38 @@ class ExploreScheduler:
         回寫用 `ExploreStore.apply_probe_result` 的雙 CAS（B7 (ii)）：探測發出
         後、回寫前，若該地址已完成新的一次遍歷（`scan_id` 改變）→ CAS 落空、
         計 `probe.stale`，不覆蓋新遍歷的結論、也不重試（下一輪 tick 若新遍歷
-        仍以「門檻推論」收尾，會自然成為新的探測候選）。"""
+        仍以「門檻推論」收尾，會自然成為新的探測候選）。
+
+        回傳「**這次真的發出了一個上游請求嗎**」（Task 7.9e-S S4）：候選剛退池、
+        scan 列不見、額度不足／限流暫停都回 `False`，呼叫端不把輔助名額算成已用
+        （舊版無條件歸零 `_fills_pages_since_special`，等於白燒一次名額）。"""
         address, scan_id = candidate
         if not self._store.is_active(address):
             # Task 7.9d-S S2：發送前確認地址還在候選池內（`next_probe_candidate`
             # 已含 `active=1` 條件，這裡是同一個判準的發送前閘門——查詢與發送
             # 之間候選池可能剛換血）。
             self._inactive_job_dropped += 1
-            return
+            return False
         scan = self._store.get_scan(scan_id)
         if scan is None:
             self._probe_failed += 1
-            return
+            return False
         probe_start = scan.window_start_ms - _PROBE_WINDOW_MS
         probe_end = scan.window_start_ms - 1
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
         try:
             page = hl_fills.get_fills_page(address, probe_start, probe_end)
         except (BudgetExhausted, ScopePaused):
-            return
+            return False            # 額度／暫停：一頁都沒發出去
         except Exception as e:  # noqa: BLE001 — 唯一的分類點，見上方 docstring
             if is_rate_limited(e):
-                return
+                return True         # 429：請求確實發出去了（只是被限流擋回）
             logger.warning(
                 "explore scheduler：留存邊界探測失敗 address=%s window=[%d,%d]: %r",
                 address, probe_start, probe_end, e)
             self._probe_total += 1
             self._probe_failed += 1
-            return
+            return True
         self._probe_total += 1
         invalid_reason = validate_page(page, probe_start, probe_end)
         if invalid_reason is not None:
@@ -1097,19 +1179,20 @@ class ExploreScheduler:
                 "explore scheduler：留存邊界探測回應不合法 address=%s window=[%d,%d] "
                 "reason=%s", address, probe_start, probe_end, invalid_reason)
             self._probe_failed += 1
-            return
+            return True
         new_reason = REASON_RETENTION_BOUNDARY_VERIFIED if page else REASON_PROBE_NO_EARLIER_FILLS
         ok = self._store.apply_probe_result(
             scan_id, address, old_reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD,
             new_reason=new_reason)
         if not ok:
             self._probe_stale += 1
-            return
+            return True
         self._notify_dirty()
         if page:
             self._probe_verified += 1
         else:
             self._probe_empty += 1
+        return True
 
     def _notify_dirty(self) -> None:
         """Task 7.9a A3：`on_dirty`（publisher 用來決定要不要提前組版）是錦上

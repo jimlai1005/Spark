@@ -2060,6 +2060,13 @@ def test_health_explore_refresh_includes_scan_lifecycle_counters(tmp_path):
     # Task 7.9d-S S5：新增的對帳／退池觀測鍵。
     assert refresh["inactive_job_dropped"] == 0
     assert refresh["reconciled"] == {}
+    # Task 7.9e-S S6：核驗需求（`rows == 0` 才是核驗做完、`unserved == 0` 才是
+    # 排程健康）＋ verify job 延後／kind 不相容丟棄／對帳失敗三個計數器。
+    assert refresh["verify_needed"] == {"rows": 0, "with_job": 0, "with_running": 0,
+                                       "unserved": 0}
+    assert refresh["verify_job_deferred"] == 0
+    assert refresh["scan_job_dropped_kind_mismatch"] == 0
+    assert refresh["reconcile_errors"] == 0
 
 
 def test_health_explore_refresh_verify_remaining_counts_inactive_jobs(tmp_path):
@@ -2110,6 +2117,9 @@ def test_health_explore_refresh_verify_remaining_counts_inactive_jobs(tmp_path):
     assert refresh["jobs_by_kind"]["fills_verify"] == {
         "rows": 2, "addresses": 2, "active_rows": 1, "inactive_rows": 1}
     assert refresh["due_by_kind"]["fills_verify"] == 2
+    # Task 7.9e-S S6：`verify_remaining` 是 job 列數，不是核驗完成度——這兩個
+    # 地址都沒有 `fills_sync` 列（沒有 `evidence_unknown`），所以核驗需求是 0。
+    assert refresh["verify_needed"]["rows"] == 0
 
 
 def test_health_explore_refresh_includes_dirty_errors_and_quarantine_counter(tmp_path):
