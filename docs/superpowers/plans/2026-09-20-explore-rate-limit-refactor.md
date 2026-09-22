@@ -1620,7 +1620,31 @@ W3 `PARTIAL_RESCAN_AFTER_MS` 未刪且被測試釘住；W4 過渡相容層是 fa
 - **輔助名額以逾期為前提**：只在 verify 逾期 2h 或有探測候選時才給名額，且多頁 verify 每頁 `_reschedule(now)` 讓等待歸零 → 持續積壓下 8 小時只跑 2 頁。修法：有到期 verify 或探測候選就每 10 頁給 1 次；逾期只決定 verify 先於 probe；進行中的多頁 verify 在類內優先。
 - 主線程另修：詳情頁只對 active 候選按需入列、準入常數同源（`ADMISSION_MULTIPLIER`）；非法頁指數退避＋達上限隔離（`invalid_pages` 計數）。harness 新增斷言：任一地址 verify scan ≤ 1。
 
-<!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c／7.9d 為準，衝突時以 v2 為準。 -->
+#### 7.9e：7.9d 複審修正（2 Critical 同根＋2 Warning＋3 Suggestion；2026-09-22 主線程裁決；仍拆 D／S）
+
+<!-- 複審（opus，主線程用其重現測試核實）：C1 `_run_scan` 的 kind 不相容閘門把 `fills_verify` job `_complete`（刪除），而 verify job 只有遷移與 resume 兩個來源、無狀態推導重建 → evidence_unknown 永久 1；
+C2 退池掃除 verify job 後回池只重建 fills_scan（「需要核驗」不是原因碼）→ 核驗永久消失，3 天模擬收尾 verify_remaining 0 但 evidence_unknown 17 且 health 看不出；同根：狀態需要工作、工作卻不存在（C1 形狀換到核驗軌）。
+W1 `count_scans.orphan_rows` 判準寫死 `fills_scan`，running verify＋正確 fills_verify job 被算孤兒；W2 `_run_candidates` 內對帳例外會讓 candidates job 被隔離 24h。
+S1 verify 續頁保留舊 next_attempt_at → 逾期恆真 → 探測在核驗積壓期零服務；S2 `_fills_pages_since_special` 在 `_run_probe` 可能未發請求時就歸零；S3 app.py 為一個常數 import scheduler。 -->
+
+**7.9e-D（`explore_store.py`、`explore_fills_sync.py`、兩測試檔）**
+- D1 `count_scans`：孤兒判準改為「running scan 且**無對應 kind 的 job**」（verify ↔ `fills_verify`；initial／partial_rescan ↔ `fills_scan`）；測試：running verify＋`fills_verify` job → orphan 0；running verify＋只有 `fills_scan` job → orphan 1。
+- D2 新增 `verify_needed(active: set[str]) -> dict`：`{"rows": evidence_unknown=1 的 active 列數, "with_job": 其中有 fills_verify job 的數, "with_running": 其中有 running verify scan 的數, "unserved": 三者皆無}`（單句 SQL）。
+- D3 `ADMISSION_MULTIPLIER` 常數搬到 `explore_store.py`（資料層無依賴），scheduler 與 app 皆從它 import（S 與主線程改 import）。
+- D4 `scan_job_targets(active)` 回傳加 `evidence_unknown` 與 `has_done_verify`（`fills_scan` 中該地址 kind=verify status=done 是否存在），供 S 的第四原因碼一句 SQL 拿齊。
+
+**7.9e-S（`explore_scheduler.py`、`tests/test_explore_scheduler.py`、`tests/test_api_ops.py`）**
+- S1 **第四原因碼 `verify_needed`**：active 且 `evidence_unknown == 1` 且無 running verify scan 且無 `fills_verify` job → 入列 `fills_verify`（priority 4，`next_attempt_at = now + 地址雜湊攤開 ≤ 48h`，與遷移攤開同法）。對帳（啟動＋每 candidates 輪）與 `_run_increment` 收尾都用同一函式。測試：退池掃除 verify job → 回池一個 candidates 輪內重建；`evidence_unknown` 地址無任何 verify 工作 → 對帳補上；已有 running verify 或 job 時不重複；冪等。
+- S2 **kind 不相容閘門不得刪 verify job**：`fills_verify` job 遇 running 非 verify scan → `_reschedule(job, now + 600, bump_attempts=False)`、計 `verify_job_deferred`，零上游；`fills_scan` job 遇 running verify scan → 維持丟棄（對帳會依 scan kind 重建正確 job），但改計 `scan_job_dropped_kind_mismatch`（與良性丟棄分開，s7a 的「0＝健康」門檻只看良性計數以外的 `scan_job_dropped`）。測試：複審腳本 `rv_verify_loss.py` 兩案例反轉為守門（verify job 不消失、evidence_unknown 最終清 0）。
+- S3 對帳例外不隔離 candidates：`_run_candidates` 內對帳包 try → `logger.error`＋`reconcile_errors` 計數，candidates job 照常收尾；首 tick 的對帳維持記錄後 re-raise。測試：對帳拋 sqlite 例外 → candidates job `next_attempt_at` 仍在正常週期內、`reconcile_errors == 1`。
+- S4 輔助名額只在真的發出請求時歸零：`_run_probe` 回傳是否有發送；未發送 → 計數器不歸零、當 tick 改試 verify（或讓名額回到 fills）。測試：探測候選為退池地址 → 名額不被白燒。
+- S5 逾期 verify 與 probe 至少輪流：`_serve_special` 在 verify 逾期時仍套用 `_special_turn`——連續兩次輔助不得都給同一方（有另一方在等時）。測試：逾期 verify＋探測候選 → 4 次輔助中 probe ≥ 2。
+- S6 `status()` 加 `verify_needed`（D2 四鍵）與 `verify_job_deferred`、`scan_job_dropped_kind_mismatch`、`reconcile_errors`；health 測試同步；`verify_remaining` 的語義註明「job 列數，不代表核驗完成」，核驗完成看 `verify_needed.rows == 0`。
+- S7 `ADMISSION_MULTIPLIER` 改從 `explore_store` import；`state/portfolio/ledger` 的 `_run_cache_kind` 在**發送前**加 active 檢查（裁決 3 字面），非 active → `_drop_inactive`。
+
+**主線程**：`app.py` 改從 `explore_store` import `ADMISSION_MULTIPLIER`；`integ_79c.py` 加斷言「收尾時 active 地址 `evidence_unknown == 0`、`verify_needed.unserved == 0`」；重跑整合五項；複審。
+
+<!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c／7.9d／7.9e 為準，衝突時以 v2 為準。 -->
 ### Task 7.9 v1（已被 v2 取代，僅供對照）：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
 
 <!-- 裁決：選 (b) 6 小時（不選 5）：單頁基線 300/6h＝50／小時＋新增約 1，才對 60 留出空間，仍須扣多頁與探測成本；排程、詳情頁補排、前端「更新中」共用同一期限，不得留寫死 4 小時。
