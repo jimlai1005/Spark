@@ -1703,6 +1703,16 @@ running scans 86 → 79；1 小時內 Traceback **0**；429 0；follower 不變�
 **待辦升級為部署後第一優先**：探測前先查本地 `fills` 是否已有早於窗口的成交（零 API 成本、直接判 `earlier_fills_seen`）；
 沒有才發探測，且探測窗改 7 天。方向仍安全（現況只是少判 complete）。
 
+| 18:00 | 0 | 0 | 109／155／36 | 87 | 5／10／2 | ok | overdue p95 fills 244s、verify 1150s |
+| 18:15 | 0 | 0 | 110／156／34 | 84 | 5／10／0 | ok | fills_verify 逾期歸零 |
+| 18:30 | 0 | 0 | 110／157／33 | 84 | 6／9／0 | ok | |
+| 18:45 | 0 | 0 | **112**／159／29 | 84 | 0／6／0 | ok | **fills 類逾期幾乎清空**（fills_scan p95 13s） |
+
+**18:55 排程檢查（+3h10m）**：unknown **248 → 230**（−18/h，加速）、`earlier_fills_seen` 147 → 153、
+`truncation_suspected` 23 → 33、`no_earlier_activity` 2 → 4；completeness 73／152／195；`fills_verify` job 89 → 84；
+running scans 79 → 71；Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
+fills 類積壓已從部署時的 50／22／17（due_n）收斂到 0／6／0——這是 Task 5b 週期分層釋出額度的直接效果。
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
