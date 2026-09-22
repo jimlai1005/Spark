@@ -3027,3 +3027,70 @@ def test_s7e_cache_kind_sends_nothing_for_inactive_address(tmp_path):
     assert hl.calls == []
     assert sched.status()["inactive_job_dropped"] == 3
     assert store.job_kinds("0xabc") == set()
+
+
+def test_w2_deferred_verify_job_is_dropped_once_evidence_is_filled_in(tmp_path):
+    """7.9e 複審 W2：核驗需求也**由狀態推導**——verify job 被延後期間，別的遍歷
+    （partial_rescan）收尾清掉了 `evidence_unknown`，這次核驗就沒有必要：領到時
+    不開 verify 遍歷、零上游、`_complete(job)`、計 `verify_job_obsolete`。
+
+    少了這一關就是白跑一次 30 天整窗遍歷去確認一件已經確認的事。"""
+    clock = Clock(t=40 * 86400.0)
+    store = _evidence_unknown_address(tmp_path, clock, completeness="partial")
+    store.enqueue(f"{ADDR_A.lower()}:fills_verify", ADDR_A, "fills_verify", 4, clock.now())
+    store.create_scan(ADDR_A, kind="partial_rescan", window_start_ms=0,
+                      window_end_ms=int(clock.now() * 1000),
+                      cursor_ms=int(clock.now() * 1000), started_at=clock.now())
+    hl = FakeHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    # (1) 延後（kind 不相容）。
+    job = store.claim_due(clock.now(), "o", 60, kinds=("fills_verify",))
+    assert sched._run_scan(job, clock.now(), verify=True) == "deferred"
+
+    # (2) 重掃收尾 → `complete_scan` 無條件清 evidence_unknown。
+    store.enqueue(f"{ADDR_A.lower()}:fills_scan", ADDR_A, "fills_scan", 3, clock.now())
+    _drive_until(sched, clock,
+                 lambda rs: store.get_sync(ADDR_A).evidence_unknown is False, limit=50)
+    scan_rows_before = _scan_rows(store, ADDR_A)
+    calls_before = len(hl.calls)
+    clock.t += 601.0
+
+    # (3) 同一個 verify job 到期被領到 → 不開遍歷。
+    job2 = store.claim_due(clock.now(), "o", 60, kinds=("fills_verify",))
+    assert job2 is not None
+    assert sched._run_scan(job2, clock.now(), verify=True) == "dropped"
+
+    assert len(hl.calls) == calls_before                      # 零上游呼叫
+    assert _scan_rows(store, ADDR_A) == scan_rows_before      # 沒有新的 verify 列
+    assert store.job_kinds(ADDR_A) == set()                   # job 收尾刪除
+    assert sched.status()["verify_job_obsolete"] == 1
+
+
+def test_w3_deferred_verify_does_not_burn_the_auxiliary_slot(tmp_path):
+    """7.9e 複審 W3：輔助名額只在 verify **真的抓了一頁**時才算用掉——延後
+    （kind 不相容）時計數器不歸零、`verify_served_by_deadline` 也不加，否則核驗軌
+    要再等 10 頁 fills 才有下一次機會（而它一頁都還沒打）。"""
+    from spark.publicapi.explore_scheduler import SPECIAL_SERVE_RATIO
+
+    clock = Clock(t=40 * 86400.0)
+    store = _evidence_unknown_address(tmp_path, clock, completeness="partial")
+    store.enqueue(f"{ADDR_A.lower()}:fills_verify", ADDR_A, "fills_verify", 4,
+                  clock.now() - 3 * 3600.0)                   # 已逾期 3 小時
+    store.create_scan(ADDR_A, kind="partial_rescan", window_start_ms=0,
+                      window_end_ms=int(clock.now() * 1000),
+                      cursor_ms=int(clock.now() * 1000), started_at=clock.now())
+    hl = FakeHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+    sched._fills_pages_since_special = SPECIAL_SERVE_RATIO     # 輔助名額到位
+
+    assert sched.tick() == "deferred"
+
+    assert hl.calls == []
+    assert sched._fills_pages_since_special == SPECIAL_SERVE_RATIO   # 名額沒被燒掉
+    assert sched.status()["verify_served_by_deadline"] == 0
+    assert sched.status()["verify_job_deferred"] == 1

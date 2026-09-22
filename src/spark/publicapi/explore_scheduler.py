@@ -324,13 +324,18 @@ class ExploreScheduler:
         self._scan_writeback_missing = 0
         # Task 7.9d-S S1／S2：狀態與工作對帳的成果（原因碼 → 補排筆數、掃除的
         # 殘留 job 數）與「領到非 active 地址的工作、發送前就丟棄」的次數。
-        self._reconciled: dict[str, int] = {}
+        # `None` ＝上一輪對帳失敗（沒有結果），`{}` ＝跑過但沒補任何東西。
+        self._reconciled: dict[str, int] | None = {}
         self._inactive_job_dropped = 0
         # Task 7.9e-S：kind 不相容時 verify job 被延後（不刪）的次數、`fills_scan`
         # job 因 kind 不相容被丟棄的次數（與良性丟棄分開計），對帳失敗次數。
         self._verify_job_deferred = 0
+        self._verify_job_obsolete = 0
         self._scan_job_dropped_kind_mismatch = 0
         self._reconcile_errors = 0
+        # 7.9e 複審 W3：本次輔助名額給的 verify job 當時是否已逾期（真的發頁後
+        # 才計入 `verify_served_by_deadline`）。
+        self._verify_overdue_served = False
         self._invalid_pages = 0   # 7.9d：非法頁（亂序／窗外）退避次數，見 `_backoff_invalid_page`
         # Task 7.9a A3：`on_dirty` callback 拋例外的次數（`_notify_dirty` 吞例外
         # 後計數）——job 本身不因此遺失，這個計數器讓 callback 本身壞掉這件事
@@ -428,11 +433,12 @@ class ExploreScheduler:
             "scan_job_dropped": self._scan_job_dropped,
             "scan_job_dropped_kind_mismatch": self._scan_job_dropped_kind_mismatch,
             "verify_job_deferred": self._verify_job_deferred,
+            "verify_job_obsolete": self._verify_job_obsolete,
             "inactive_job_dropped": self._inactive_job_dropped,
             "invalid_pages": self._invalid_pages,
             "admission_skipped": self._admission_skipped,
             "verify_served_by_deadline": self._verify_served_by_deadline,
-            "reconciled": dict(self._reconciled),
+            "reconciled": None if self._reconciled is None else dict(self._reconciled),
             "reconcile_errors": self._reconcile_errors,
             "scan_writeback_duplicate": self._scan_writeback_duplicate,
             "scan_writeback_stale": self._scan_writeback_stale,
@@ -597,11 +603,13 @@ class ExploreScheduler:
         # fills 類沒有到期工作時輔助可連續（借用這個 tick，不空等）。額度不足時
         # 兩邊都不動（省掉無意義的 DB 查詢）。
         job = None
+        special_verify = False
         if fills_budget_ok and (not fills_like_due
                                 or self._fills_pages_since_special >= SPECIAL_SERVE_RATIO):
             served, job = self._serve_special(now)
             if served == "probe":
                 return "ran:probe"
+            special_verify = job is not None
 
         # Task 7.4b（2026-09-21 主線程二次裁決）：類別感知的領工——有
         # fills-like（`fills`／`fills_scan`）待處理且 `explore_fills` 保留額度
@@ -664,6 +672,12 @@ class ExploreScheduler:
             self._quarantine(job, now, e)
             return "quarantined"
 
+        if special_verify and result not in ("deferred", "dropped"):
+            # 7.9e 複審 W3：輔助名額只在 verify **真的抓了一頁**時才算用掉，
+            # `verify_served_by_deadline` 同理（延後／丟棄不算一次服務）。
+            self._fills_pages_since_special = 0
+            if self._verify_overdue_served:
+                self._verify_served_by_deadline += 1
         return result
 
     def _serve_special(self, now: float) -> tuple[str | None, Job | None]:
@@ -679,8 +693,12 @@ class ExploreScheduler:
         287 個地址的探測候選會把每一次輔助名額都吃掉，核驗軌 8 小時只拿到 2 頁
         （4 頁的 verify 遍歷永遠跑不完 → 129 件要拖數十天）。
 
-        任一邊被服務就把頁面計數器歸零（verify 自己那一頁也是 fills 類請求，
-        但它屬於輔助份額，不計入 `_fills_pages_since_special`）。"""
+        名額只在**真的發出一頁**時才算用掉（7.9e 複審 W2／W3）：探測看
+        `_run_probe` 的回傳值；verify 則由呼叫端（`_tick_once`）在 `_run_scan`
+        真的抓了頁（結果不是 `"deferred"`／`"dropped"`）之後才歸零計數器並計
+        `verify_served_by_deadline`——kind 不相容的延後、證據已補齊的丟棄都一頁
+        都沒打，不該讓核驗軌等下一個 10 頁。verify 自己那一頁也是 fills 類請求，
+        但它屬於輔助份額，不計入 `_fills_pages_since_special`。"""
         verify_ready = self._store.due_count("fills_verify", now) > 0
         verify_overdue = verify_ready and self._verify_overdue(now)
         candidate = self._store.next_probe_candidate()
@@ -711,9 +729,9 @@ class ExploreScheduler:
             job = self._store.claim_due(now, self._owner, self._lease_s,
                                         kinds=("fills_verify",))
             if job is not None:
-                self._fills_pages_since_special = 0
-                if verify_overdue:
-                    self._verify_served_by_deadline += 1
+                # 不在 claim 當下歸零：這個 job 可能一頁都不打（kind 不相容 →
+                # 延後、證據已補齊 → 丟棄）。由 `_tick_once` 依結果決定。
+                self._verify_overdue_served = verify_overdue
                 return "verify", job
         return None, None
 
@@ -811,6 +829,9 @@ class ExploreScheduler:
         try:
             self._reconciled = self.reconcile_scan_jobs(now)
         except Exception:
+            # 順手（7.9e 複審）：對帳失敗時不留上一輪的舊值——`None` ＝「這一輪
+            # 沒有對帳結果」，與「對帳跑過但沒補任何東西（`{}`）」區分開。
+            self._reconciled = None
             self._reconcile_errors += 1
             logger.error("explore scheduler: candidates 輪的對帳失敗（candidates job 照常收尾）",
                          exc_info=True)
@@ -989,6 +1010,19 @@ class ExploreScheduler:
             now_ms = int(now * 1000)
             window_start_ms, window_end_ms = fresh_scan_window(now_ms)
             if verify:
+                # Task 7.9e 複審 W2：核驗需求同樣**由狀態推導**——延後（或排隊）
+                # 期間若別的遍歷已經收尾（`complete_scan` 無條件清
+                # `evidence_unknown`），這次核驗就沒有必要了：不開遍歷、零上游、
+                # 收尾這個 job 並計 `verify_job_obsolete`。少了這一關就是「白跑
+                # 一次 30 天整窗遍歷去確認一件已經確認的事」。
+                st = self._store.get_sync(job.address)
+                if st is None or not st.evidence_unknown:
+                    self._complete(job)
+                    self._verify_job_obsolete += 1
+                    logger.info(
+                        "explore scheduler: 丟棄 %s 的 fills_verify job——證據已由別的遍歷補齊"
+                        "（evidence_unknown=0）", job.address)
+                    return "dropped"
                 kind = "verify"
             else:
                 # Task 7.9c-S S2（Critical C2）／7.9d-S S1：**有 job 不等於該
