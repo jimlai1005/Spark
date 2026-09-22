@@ -1456,7 +1456,7 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 | 7b 政策需求＋不飢餓＋同毫秒降級 | ✅ `0ca3160` | 主線程複跑 3346 passed；新政策測試實算 22.458 頁/小時（正式機 22.34）；harness 下界保真度 bug 修正 3600→21600 後 7a 四條仍全綠 |
 | 8 端到端可達性＋份額自動到期 | ✅ `02d07e3` | 主線程複跑 3357 passed、ruff 全過；  預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
 | 8b 遷移後形狀走完整條獨立探測鏈 | 派工中 | |
-| 9 RUNBOOK 與部署 | 未開始 | |
+| 9 RUNBOOK §5.8f | ✅ 文件完成 `24f94ab`（**部署未執行，待使用者授權**） | 主線程逐段讀過並修 3 處可執行性問題（ops/health 需 admin session、取樣器無 `probe` 欄位、誤入的 commit 區塊）；取樣器 v4 相容已唯讀查證 |
 
 **待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
 
