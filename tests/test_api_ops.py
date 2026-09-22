@@ -2057,6 +2057,59 @@ def test_health_explore_refresh_includes_scan_lifecycle_counters(tmp_path):
     assert refresh["scan_writeback_duplicate"] == 0
     assert refresh["scan_writeback_stale"] == 0
     assert refresh["scan_writeback_missing"] == 0
+    # Task 7.9d-S S5：新增的對帳／退池觀測鍵。
+    assert refresh["inactive_job_dropped"] == 0
+    assert refresh["reconciled"] == {}
+
+
+def test_health_explore_refresh_verify_remaining_counts_inactive_jobs(tmp_path):
+    """Task 7.9d-S S5（部署門檻 (iv)）：`explore_refresh` 的母體＝`refresh_job`／
+    `fills_scan` **表本身**——退池地址還沒被掃除的 job 仍計入 `verify_remaining`
+    （它們仍會被 `claim_due` 領走、仍消耗 fills 保留額度）。7.9c 用
+    `active_candidates()` 逐址點查，正式機 129 筆 `fills_verify` 只顯示 112。"""
+    from spark.publicapi.explore_publisher import ExplorePublisher
+    from spark.publicapi.explore_scheduler import ExploreScheduler
+    from spark.publicapi.explore_store import ExploreStore
+    from spark.publicapi.hl_explore import ExploreConfig
+
+    wallet = Account.create()
+    refs = [_lref()]
+    cfg = make_cfg(tmp_path, admin_addresses=frozenset({wallet.address.lower()}),
+                   followers_path=str(_manifest_with_leader(tmp_path, refs)),
+                   state_base=str(tmp_path / "state"),
+                   exchange_dir=str(tmp_path / "exchange"),
+                   explore_upstream_refresh=True,
+                   explore_db_path=str(tmp_path / "explore.db"))
+    store = ApiStore(cfg.db_path)
+    keysvc, hl = FakeKeysvc(), FakeHL()
+    explore_store = ExploreStore(cfg.explore_db_path)
+    explore_store.upsert_candidates([("0xaaa", None, 1, None), ("0xbbb", None, 2, None)],
+                                    as_of=1000.0)
+    explore_store.deactivate_missing({"0xaaa"})           # 0xbbb 退池，job 還在
+    for addr in ("0xaaa", "0xbbb"):
+        explore_store.enqueue(f"{addr}:fills_verify", addr, "fills_verify", 4, 1000.0)
+    app = create_app(cfg, store, keysvc, hl, explore_store=explore_store)
+    publisher = ExplorePublisher(store=explore_store, index=app.state.explore_index,
+                                 cfg=ExploreConfig(), now_fn=lambda: 1000.0,
+                                 snapshot_path=None)
+    scheduler = ExploreScheduler(store=explore_store, hl=hl, leaderboard_source_fn=lambda: None,
+                                 excluded_fn=lambda: set(), cfg=ExploreConfig(),
+                                 now_fn=lambda: 1000.0, sleep_fn=lambda s: None,
+                                 on_dirty=publisher.mark_dirty)
+    app.state.explore_scheduler = scheduler
+    app.state.explore_publisher = publisher
+    client = _client(app)
+    login(client, wallet=wallet)
+
+    refresh = client.get("/api/ops/health").json()["explore_refresh"]
+
+    db_rows = explore_store._db.execute(
+        "SELECT COUNT(*) FROM refresh_job WHERE kind='fills_verify'").fetchone()[0]
+    assert db_rows == 2
+    assert refresh["verify_remaining"] == db_rows                  # 含退池那一筆
+    assert refresh["jobs_by_kind"]["fills_verify"] == {
+        "rows": 2, "addresses": 2, "active_rows": 1, "inactive_rows": 1}
+    assert refresh["due_by_kind"]["fills_verify"] == 2
 
 
 def test_health_explore_refresh_includes_dirty_errors_and_quarantine_counter(tmp_path):
