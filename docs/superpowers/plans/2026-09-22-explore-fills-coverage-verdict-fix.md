@@ -1570,6 +1570,35 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
   `partial_rescan` 到期建新 scan（W_new）→ 探測前置**必須**發出探測（`probes_executed` +1），不得沿用舊證據。
 - 反向護欄：只把 `no_earlier_activity` 的規則改回 `<=` → 第一、二條轉紅。
 
+> **主線程裁決（2026-09-22，builder 實作後回報 Task 8 回歸）**：規格第 2 項**撤回**，並補一條排他規則。
+>
+> builder 隔離出的根因：`left_boundary` 是**每地址一格**，而 `no_earlier_activity` 改成窗口綁定後，
+> `partial_rescan` 期間同一地址有兩個窗口需要證據——舊的生效 scan（`fills_sync.scan_id`，W_old）與
+> 新的進行中 scan（W_new）。第 2 項那句「窗口不符即為候選」讓獨立探測拿**舊窗口**去探、寫回 `@W_old`，
+> 而新 scan 的探測前置拿**新窗口**去探、寫回 `@W_new`；第 3 項又放行了跨窗口覆寫 → 兩者對同一格
+> 互相覆寫、反覆進候選池（harness 實測 `probes_executed=760`），把輔助份額吃光，Task 8 的
+> `test_evidence_unknown_rows_actually_leave_unknown_via_verify` 因此失守。這不是 harness 假象。
+>
+> **修正後的規格**：
+> 1. `_applicable_boundary`：維持第 1 項（`no_earlier_activity` 用 `==`）。
+> 2. **撤回**「`no_earlier_activity AND 窗口不符` 進候選」那句。窗口不符的地址等它自己的 `partial_rescan`
+>    （≤24h），由新 scan 的探測前置在新窗口重探——那才是唯一正確的窗口。代價：這類地址（年齡不滿一個
+>    掃描窗且仍 partial 的帳戶）多等最多 24h；每次 rescan 多付 1 頁探測，直到滿 30 天取得 `earlier_fills_seen`
+>    後永久終局。有界、可接受，寫進 Task 3 設計要點的成本模型。
+> 3. **新增排他規則**：`_PROBE_CANDIDATE_WHERE` 加 `AND NOT EXISTS (select 1 from fills_scan r where
+>    r.address=s.address and r.status='running')`——有 scan 在跑的地址，證據由該 scan 的探測前置獨占；
+>    獨立探測只服務「沒有 job 在跑但證據仍缺」的地址（這正是 `_run_probe` docstring 原本描述的職責，
+>    Task 3 時因正面證據皆單調而沒暴露）。這條同時封掉「inline 探測落在模糊帶回 unknown → 獨立探測用舊窗口
+>    再寫一次」的殘餘乒乓。
+> 4. 第 3 項轉移規則維持（換窗口＝新問題可覆寫；`earlier_fills_seen` 無條件終局）——有了排他規則後，
+>    同一時間只有一個寫入者，跨窗口覆寫不再造成競爭。
+>
+> 測試調整：`test_window_mismatched_no_earlier_activity_is_a_probe_candidate` **反轉**為
+> `test_window_mismatched_no_earlier_activity_waits_for_its_rescan`（不是候選）；新增
+> `test_address_with_running_scan_is_never_a_standalone_probe_candidate`；harness 那條
+> `test_rescan_reprobes_when_prior_evidence_was_window_bound` 維持（新 scan 的探測前置必須真的探）。
+> Task 8 的 `test_evidence_unknown_rows_actually_leave_unknown_via_verify` 必須**不改**就回綠。
+
 **驗收**：`uv run pytest -q` 全綠、ruff 過、上述測試齊、反向護欄轉紅輸出、
 `grep -n "stored_ws <= query_ws\|stored_ws == query_ws" src/spark/publicapi/explore_store.py` 仍只在 helper 內。
 **Commit**：`fix: no_earlier_activity 改為窗口綁定——單調性只對 earlier_fills_seen 成立（審核待辦 1）`
