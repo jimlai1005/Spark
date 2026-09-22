@@ -58,6 +58,7 @@ from spark.publicapi.billing import (PENDING_CHECKOUT_TTL_S, BillingError,
                                      verify_webhook_event)
 from spark.publicapi.config import ApiConfig, derive_account_id, normalize_address
 from spark.publicapi.explore_fills_sync import build_fills_coverage
+from spark.publicapi.explore_scheduler import ADMISSION_MULTIPLIER
 from spark.publicapi.explore_store import CacheEntry, ExploreStore
 # 健康面板讀的是**引擎自己寫的**狀態檔——路徑常數與判定一律引用引擎的定義，
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
@@ -2542,8 +2543,15 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # 準入閘門（spec §9.1），不是「查不到就不刷新」。
         refreshing = False
         jobs, active_n = explore_store.admission_counts()
-        admission_limit = 5 * active_n + 20
-        if jobs >= admission_limit:
+        # Task 7.9d（主線程裁決）：準入上限與 `ExploreScheduler` 同一個常數
+        # （原本這裡寫死 5×、scheduler 已是 7×，兩處不同源）。
+        admission_limit = ADMISSION_MULTIPLIER * active_n + 20
+        if not explore_store.is_active(addr):
+            # Task 7.9d 裁決點 3：退池／非候選地址不再按需入列——這種 job 會在
+            # 排程器對帳時被掃除、被領到也在發送前丟棄（退池後禁止任何新請求）。
+            # 只端本地快取，`refreshing` 保持 False（誠實：沒有人會去刷新它）。
+            pass
+        elif jobs >= admission_limit:
             logger.warning(
                 "交易員詳情頁刷新入列已達準入上限（%d），本輪跳過 address=%s",
                 admission_limit, addr)

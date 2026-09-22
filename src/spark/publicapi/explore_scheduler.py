@@ -319,6 +319,7 @@ class ExploreScheduler:
         # 殘留 job 數）與「領到非 active 地址的工作、發送前就丟棄」的次數。
         self._reconciled: dict[str, int] = {}
         self._inactive_job_dropped = 0
+        self._invalid_pages = 0   # 7.9d：非法頁（亂序／窗外）退避次數，見 `_backoff_invalid_page`
         # Task 7.9a A3：`on_dirty` callback 拋例外的次數（`_notify_dirty` 吞例外
         # 後計數）——job 本身不因此遺失，這個計數器讓 callback 本身壞掉這件事
         # 變成可觀測（health 可見）。
@@ -407,6 +408,7 @@ class ExploreScheduler:
             "due_by_kind": {k: due_by_kind[k] for k in JOB_KINDS},
             "scan_job_dropped": self._scan_job_dropped,
             "inactive_job_dropped": self._inactive_job_dropped,
+            "invalid_pages": self._invalid_pages,
             "admission_skipped": self._admission_skipped,
             "verify_served_by_deadline": self._verify_served_by_deadline,
             "reconciled": dict(self._reconciled),
@@ -820,6 +822,8 @@ class ExploreScheduler:
         res = apply_incremental_page(plan, page, now_ms=int(now * 1000))
         self._store.insert_fills_page(job.address, res.accepted, res.state)
         if not res.done:
+            if (res.state.last_error or "").startswith("invalid_page"):
+                return self._backoff_invalid_page(job, now, res.state.last_error)
             self._reschedule(job, now, bump_attempts=False)
             self._notify_dirty()
             return "ran:fills"
@@ -906,6 +910,8 @@ class ExploreScheduler:
         res = apply_scan_page(plan, page, now_ms=int(now * 1000))
         if not res.done:
             self._store.insert_scan_page(job.address, res.accepted, res.scan)
+            if (res.scan.last_error or "").startswith("invalid_page"):
+                return self._backoff_invalid_page(job, now, res.scan.last_error)
             self._reschedule(job, now, bump_attempts=False)
             self._notify_dirty()
             return f"ran:{result_kind}"
@@ -952,6 +958,22 @@ class ExploreScheduler:
                                 "fills_scan", 3, now + PARTIAL_RESCAN_AFTER_S)
         self._notify_dirty()
         return f"ran:{result_kind}" if active else "dropped"
+
+    def _backoff_invalid_page(self, job: Job, now: float, last_error: str) -> str:
+        """Task 7.9d（主線程裁決）：非法頁（時間亂序／窗外）自 7.9d-D 起不再讓輪次
+        以 `result=None` 收尾，但也不能每 tick 免費重試（持續回壞頁的上游會白吃
+        fills 類名額）——視同一次**實際嘗試過的暫時性失敗**：指數退避＋計
+        `attempts`，達 `MAX_JOB_ATTEMPTS` 就走同一條隔離路徑（24 小時、期滿一次
+        恢復額度），與 `_run_job` 對 `ConnectionError`／5xx 的處理同形。游標不動
+        （planner 已保證），下次重試從同一頁再要。"""
+        self._invalid_pages += 1
+        attempts = job.attempts + 1
+        if attempts >= MAX_JOB_ATTEMPTS:
+            self._quarantine(job, now, ValueError(last_error), max_attempts=True)
+            return "quarantined"
+        next_at = now + min(30 * (2 ** attempts), 900) + self._rng() * 10
+        self._reschedule(job, next_at, err=last_error)
+        return "retry"
 
     # ---- 內部：例外收尾 ----
     def _quarantine(self, job: Job, now: float, exc: Exception, *,

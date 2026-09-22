@@ -2501,3 +2501,50 @@ def test_s5_status_counts_match_db_including_inactive_rows(tmp_path):
     assert set(st["due_by_kind"]) == {"candidates", "state", "portfolio", "ledger", "fills",
                                       "fills_scan", "fills_verify"}
     assert st["due_by_kind"]["fills_verify"] == 2
+
+
+# --- 7.9d（主線程）：非法頁退避——不每 tick 免費重試、達上限隔離 ---
+
+class _OutOfWindowHL(FakeHL):
+    """所有 fills 請求都回一筆落在請求窗口之外的成交（`validate_page` →
+    `time_out_of_range`）；模擬持續回壞頁的上游。"""
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.calls.append(("fills", address, start_ms, end_ms))
+        return [{"coin": "BTC", "tid": 1, "time": start_ms - 86_400_000, "px": "1", "sz": "1"}]
+
+
+def test_invalid_page_backs_off_and_quarantines_after_max_attempts(tmp_path):
+    """7.9d-D 之後非法頁不終止輪次（游標不動、`last_error=invalid_page:*`）；排程端
+    不得每 tick 免費重試：視同一次實際嘗試的暫時性失敗——指數退避、計 attempts，
+    第 `MAX_JOB_ATTEMPTS` 次隔離 24 小時；`status()["invalid_pages"]` 可觀測。"""
+    from spark.publicapi.explore_scheduler import MAX_JOB_ATTEMPTS
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
+    hl = _OutOfWindowHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    results = []
+    for _ in range(MAX_JOB_ATTEMPTS):
+        t_before = clock.now()
+        results.append(sched.tick())
+        job = store._db.execute(
+            "SELECT next_attempt_at, attempts FROM refresh_job WHERE key='0xabc:fills_scan'").fetchone()
+        assert job is not None
+        assert job[0] > clock.now() + 29           # 退避到未來，不是 now
+        clock.t = job[0] + 1                        # 推進到下次到期再試
+    assert results[:-1] == ["retry"] * (MAX_JOB_ATTEMPTS - 1)
+    assert results[-1] == "quarantined"
+    assert job[0] >= t_before + 86400 - 2          # 最後一次：隔離 24 小時
+    assert sched.status()["invalid_pages"] == MAX_JOB_ATTEMPTS
+    assert len(hl.calls) == MAX_JOB_ATTEMPTS        # 每次到期各發一次，沒有 tick 級免費重試
+    scan = store.running_scan("0xabc")
+    assert scan is not None and "invalid_page:" in scan.last_error   # 隔離時前綴 max_attempts:
+    assert store.get_fills("0xabc", 0, now_ms) == []

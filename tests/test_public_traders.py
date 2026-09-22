@@ -624,8 +624,35 @@ def _make_pool_app(tmp_path, now):
     keysvc = FakeKeysvc()
     hl = _CountingHL()
     explore_store = ExploreStore(tmp_path / "e.db")
+    # Task 7.9d 裁決點 3：詳情頁只對 active 候選按需入列——「池內地址」在本檔
+    # 一律代表 active 候選，退池情境另有專測。
+    explore_store.upsert_candidates([(_A, None, 1, None)], as_of=now)
     app = create_app(cfg, store, keysvc, hl, now_fn=lambda: now, explore_store=explore_store)
     return app, hl, explore_store
+
+
+def test_pool_local_path_inactive_address_serves_cache_without_enqueue(tmp_path):
+    """Task 7.9d 裁決點 3：退池地址不再按需入列（job 會被對帳掃除、發送前丟棄），
+    詳情頁只端本地快取、`refreshing` 為 False、零上游呼叫。"""
+    now = 1_000_000.0
+    app, hl, explore_store = _make_pool_app(tmp_path, now)
+    explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now - 7200, now - 1)  # stale
+    explore_store.put_cache_ok(
+        _A, "clearinghouseState",
+        {"marginSummary": {"accountValue": "5000.00"}, "assetPositions": []},
+        now, now + 3600)
+    explore_store.put_cache_ok(_A, "ledger", [], now, now + 3600)
+    explore_store.insert_fills_page(_A, [], _fills_sync(_A, now=now - 10 * 3600))  # 增量也過期
+    with explore_store._lock, explore_store._db:
+        explore_store._db.execute("UPDATE candidate SET active=0 WHERE address=?", (_A,))
+    assert explore_store.is_active(_A) is False
+
+    c = _client(app)
+    r = c.get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    assert r.json()["refreshing"] is False
+    assert hl.portfolio_calls == 0
+    assert explore_store._db.execute("SELECT count(*) FROM refresh_job").fetchone()[0] == 0
 
 
 def test_pool_local_path_fresh_zero_upstream(tmp_path):
@@ -728,6 +755,7 @@ def test_pool_local_path_fills_refresh_uses_configured_period(tmp_path, period):
     keysvc = FakeKeysvc()
     hl = _CountingHL()
     explore_store = ExploreStore(tmp_path / "e.db")
+    explore_store.upsert_candidates([(_A, None, 1, None)], as_of=now)  # Task 7.9d：只對 active 候選按需入列
     app = create_app(cfg, store, keysvc, hl, now_fn=lambda: now, explore_store=explore_store)
 
     explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now, now + 3600)
@@ -838,10 +866,13 @@ def test_pool_local_path_admission_cap_skips_enqueue(tmp_path):
     now = 1_000_000.0
     app, hl, explore_store = _make_pool_app(tmp_path, now)
     explore_store.put_cache_ok(_A, "portfolio", sixty_day_rows(), now - 7200, now - 1)
-    for i in range(20):
+    # Task 7.9d：準入上限與 scheduler 同源（ADMISSION_MULTIPLIER × active + 20），_A 為唯一 active 候選
+    from spark.publicapi.explore_scheduler import ADMISSION_MULTIPLIER
+    limit = ADMISSION_MULTIPLIER * 1 + 20
+    for i in range(limit):
         explore_store.enqueue(f"dummy:{i}", None, "dummy", 5, now)
 
     r = _client(app).get(f"/api/public/traders/{_A}")
     assert r.status_code == 200, r.text
     assert r.json()["refreshing"] is False
-    assert explore_store.stats()["refresh_job"] == 20
+    assert explore_store.stats()["refresh_job"] == limit
