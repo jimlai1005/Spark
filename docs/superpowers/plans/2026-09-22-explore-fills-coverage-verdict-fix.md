@@ -1261,6 +1261,19 @@ def test_base_and_verify_are_not_starved_under_fills_pressure():
     h = _harness(); h.run_for(hours=6)
     assert h.overdue_p95_s("state") < 1800
     assert h.verify_completed > 0
+
+
+def test_massive_same_ms_cluster_degrades_to_partial_not_silent_loss():
+    """Task 7a 揭露的系統性質（主線程 2026-09-22 補）：單一毫秒超過 2×PAGE_LIMIT
+    筆時，`same_ms_overflow` 這個刻意的保護會讓遍歷無法前進。此時**必須**誠實降級
+    成 partial／unresolved_gap，絕不可以少抓了卻宣稱 complete——這是「錯判完整」
+    的最後一道防線，要有整合測試釘住，不能只靠 Task 1 的單元測試。"""
+    h = _harness(); h.set_fills_all_same_ms(BURST, count=6_000)   # > 2×PAGE_LIMIT
+    h.run_for(hours=6)
+    row = h.published_row(BURST)
+    assert row["fills_coverage"]["state"] == "partial"
+    assert row["fills_coverage"]["reason"] == "unresolved_gap"
+    assert row["win_rate"] is None          # D-14：非 complete 不得給成交衍生數字
 ```
 
 - [ ] **Step 2: 執行測試確認失敗**
@@ -1446,7 +1459,8 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 | 5 週期依成交速率 | ✅ `7c458b1`（速率分母有缺陷，見 5b） | 主線程複跑 3334 passed；7.8 不變式測試經「改壞→轉紅→revert」驗證有效 |
 | 5b 速率分母改觀測跨度 | ✅ `eaa801d` | 主線程用**正式程式碼**在複本實算：週期 6h=78／中段=4／24h=218，增量需求 **22.34 頁/小時**（原 50），留給遍歷軌 **33.66**（原 6）；`0xa483470a` 897.5 筆/小時 → 正確判 MIN |
 | 6 子預算原子借用 | 未開始 | |
-| 7 300 地址競爭驗收 | 未開始 | |
+| 7a harness ＋四條正確性驗收 | ✅ `65ac81f` | 主線程複跑 3343 passed；只動測試檔、`src/` 零漂移；反向護欄經「改壞→轉紅→revert」驗證 |
+| 7b 吞吐比例＋同毫秒降級 | 未開始（等 Task 6） | |
 | 8 端到端可達性＋verify 加速 | 未開始 | |
 | 9 RUNBOOK 與部署 | 未開始 | |
 
