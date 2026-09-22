@@ -1029,8 +1029,14 @@ class ExploreStore:
 
         - `rows`：需要一次核驗遍歷的 active 地址數。
         - `with_job`：其中已有 `fills_verify` job 的數。
-        - `with_running`：其中已有進行中（`status='running'`）`verify` 遍歷的數。
-        - `unserved`：兩者皆無——**狀態需要核驗但沒有任何工作在服務它**。
+        - `with_running`：其中已有**任何 kind** 進行中（`status='running'`）遍歷的數
+          ——任何一次完成的遍歷（initial／partial_rescan／verify）都會由
+          `complete_scan` 清 `evidence_unknown`，所以進行中的重掃也算「有工作在
+          服務它」；排程的 `_needs_scan_job` 也是遍歷軌先於核驗軌（7.9e 複審 W1：
+          兩邊必須同源，否則 `partial` 列在 partial_rescan 期間會被誤判 unserved）。
+        - `unserved`：無 `fills_verify` job、無任何 running 遍歷、也無 `fills_scan`
+          job（待跑的 initial／partial_rescan 同樣會清 unknown）——**狀態需要核驗
+          但沒有任何工作在服務它**。
 
         為什麼需要這個而不是看 `count_jobs_by_kind()["fills_verify"]`：job 列數
         歸零可能是「核驗做完了」，也可能是「job 被退池掃除／kind 不相容閘門刪掉，
@@ -1047,13 +1053,15 @@ class ExploreStore:
         has_job = ("EXISTS (SELECT 1 FROM refresh_job j WHERE j.address = f.address "
                    "AND j.kind='fills_verify')")
         has_running = ("EXISTS (SELECT 1 FROM fills_scan v WHERE v.address = f.address "
-                       "AND v.kind='verify' AND v.status='running')")
+                       "AND v.status='running')")
+        has_scan_job = ("EXISTS (SELECT 1 FROM refresh_job j2 WHERE j2.address = f.address "
+                        "AND j2.kind='fills_scan')")
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT COUNT(*), "
                 f"SUM(CASE WHEN {has_job} THEN 1 ELSE 0 END), "
                 f"SUM(CASE WHEN {has_running} THEN 1 ELSE 0 END), "
-                f"SUM(CASE WHEN {has_job} OR {has_running} THEN 0 ELSE 1 END) "
+                f"SUM(CASE WHEN {has_job} OR {has_running} OR {has_scan_job} THEN 0 ELSE 1 END) "
                 "FROM fills_sync f WHERE f.evidence_unknown=1 "
                 f"AND f.address IN ({placeholders})", addrs).fetchone()
         return {"rows": row[0], "with_job": row[1] or 0, "with_running": row[2] or 0,

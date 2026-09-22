@@ -1573,13 +1573,40 @@ def test_count_jobs_by_kind_splits_active_and_inactive_rows(tmp_path):
                                     "inactive_rows": 0}
 
 
-def _mark_evidence_unknown(store, *addresses):
+def _mark_evidence_unknown(store, *addresses, close_running=True):
     """把 `fills_sync.evidence_unknown` 設 1（遷移產生的「證據不明」狀態；
-    資料層沒有公開 setter，這裡直接寫 DB 造狀態）。"""
+    資料層沒有公開 setter，這裡直接寫 DB 造狀態）。同時把 `bootstrap` 建的
+    running initial scan 標成 done——遷移來的列本來就是「遍歷早已完成、只是
+    證據不可追溯」，而 7.9e 複審 W1 之後任何 running 遍歷都算「有工作在服務
+    核驗需求」，留著 running scan 會讓 `unserved` 的斷言失真。"""
     with store._db:
         for addr in addresses:
             store._db.execute(
                 "UPDATE fills_sync SET evidence_unknown=1 WHERE address=?", (addr,))
+            if close_running:
+                store._db.execute(
+                    "UPDATE fills_scan SET status='done', result='complete', "
+                    "reason='count_below_retention_threshold', finished_at=1.0 "
+                    "WHERE address=? AND status='running'", (addr,))
+
+
+def test_verify_needed_counts_any_running_scan_or_pending_scan_job_as_served(tmp_path):
+    """7.9e 複審 W1：`unserved` 必須與排程的 `_needs_scan_job` 同源——遍歷軌先於
+    核驗軌，任何 running 遍歷（例如 partial 列的 partial_rescan）或待跑的
+    `fills_scan` job 完成時都會清 `evidence_unknown`，所以不算「無工作」。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xb1", "A", 1, 0.1), ("0xb2", "B", 2, 0.2),
+                             ("0xb3", "C", 3, 0.3)], as_of=c.now())
+    for addr in ("0xb1", "0xb2", "0xb3"):
+        store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
+                                      params_fp="pfp")
+    _mark_evidence_unknown(store, "0xb1", "0xb2", "0xb3")
+    store.create_scan("0xb1", kind="partial_rescan", window_start_ms=0, window_end_ms=1000,
+                      cursor_ms=0, started_at=c.now())                 # running 重掃 → 已被服務
+    store.enqueue("0xb2:fills_scan", "0xb2", "fills_scan", priority=3,
+                  next_attempt_at=c.now())                             # 待跑的遍歷 job → 已被服務
+    assert store.verify_needed(_active(store)) == {
+        "rows": 3, "with_job": 0, "with_running": 1, "unserved": 1}   # 只有 0xb3 無任何工作
 
 
 def test_count_scans_orphan_requires_job_of_the_matching_kind(tmp_path):
@@ -1765,14 +1792,14 @@ def test_scan_job_targets_reports_evidence_unknown_and_done_verify(tmp_path):
     for addr in ("0xa1", "0xa2"):
         store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
                                       params_fp="pfp")
-    _mark_evidence_unknown(store, "0xa1", "0xa2")
+    _mark_evidence_unknown(store, "0xa1", "0xa2", close_running=False)
     # 0xa2 另外有一次已完成的 verify 遍歷（running 的那個是 initial，不算 done）。
     verify = store.create_scan("0xa2", kind="verify", window_start_ms=0, window_end_ms=500,
                                cursor_ms=0, started_at=c.now())
     store.complete_scan("0xa2", [], dataclasses.replace(
         verify, cursor_ms=500, result="partial", reason="retention_limit",
         finished_at=c.now() + 1))
-    _mark_evidence_unknown(store, "0xa2")   # complete_scan 會清旗標，重新造狀態
+    _mark_evidence_unknown(store, "0xa2", close_running=False)   # complete_scan 會清旗標，重新造狀態
 
     targets = {t.address: t for t in store.scan_job_targets(_active(store))}
     assert targets["0xa1"].evidence_unknown == 1
