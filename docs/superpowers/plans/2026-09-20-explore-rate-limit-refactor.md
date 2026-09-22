@@ -1615,6 +1615,11 @@ W3 `PARTIAL_RESCAN_AFTER_MS` 未刪且被測試釘住；W4 過渡相容層是 fa
 5. **最後一組部署門檻測試（正式回歸）**：(i) initial 與 partial_rescan 兩種 scan 中途退池再回池可**續跑同 scan_id**；(ii) 大量 overdue verify 不壟斷（8 件逾期＋積壓增量 → 每 10 次頁面 ≤1 次輔助）；(iii) inactive 地址不再發出任何新請求（含續頁）；(iv) health 與 DB 同母體（列數／地址數皆一致）；(v) **直接斷言 complete 地址不重建 scan job**（`due_by_kind["fills_scan"]==0`、`scan_job_dropped==0`），不只靠下游守門丟棄。
 6. 流程：修正 → 正式測試 → 正式機複本遷移與重啟 → 多日模擬（含 churn） → 複審；五項有證據即進入受控部署，不因可選清理無限延後。
 
+**主線程整合對帳第一輪（2026-09-22，D 5c1b3b4＋2778e56、S 8831282、主線程 1a9e7e9）**：全量 3287 passed；遷移三次（含 version 回 2、重啟）一致；`repro_rescan`／`repro_79b`／`rv_churn_backfill2`（兩種 scan 掉池回池續跑同 scan_id）／`rv_verify_burst`（逾期 verify 每 10 頁 1 次）全部 PASS；但 3 天模擬（含 churn＋多頁遍歷＋每分鐘一次預留）抓到兩個排程缺陷 → S 補修中：
+- **對帳 resume 用錯 job kind**：running 的 verify scan 沒有 `fills_scan` job → 判 resume → 入列 `fills_scan` → 它接手跑完 verify scan 並刪掉自己，原 `fills_verify` job 永不完成 → 下次被服務時再建新 verify scan。證據：verify 完成 654 次／129 件、27 地址各 13–31 次、fencing 遞增、無 `enqueue(fills_verify)`、無 `complete` 落敗。修法：resume 依 scan kind 決定 job kind；`_run_scan` 拒接 kind 不相容的 running scan。
+- **輔助名額以逾期為前提**：只在 verify 逾期 2h 或有探測候選時才給名額，且多頁 verify 每頁 `_reschedule(now)` 讓等待歸零 → 持續積壓下 8 小時只跑 2 頁。修法：有到期 verify 或探測候選就每 10 頁給 1 次；逾期只決定 verify 先於 probe；進行中的多頁 verify 在類內優先。
+- 主線程另修：詳情頁只對 active 候選按需入列、準入常數同源（`ADMISSION_MULTIPLIER`）；非法頁指數退避＋達上限隔離（`invalid_pages` 計數）。harness 新增斷言：任一地址 verify scan ≤ 1。
+
 <!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c／7.9d 為準，衝突時以 v2 為準。 -->
 ### Task 7.9 v1（已被 v2 取代，僅供對照）：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
 
