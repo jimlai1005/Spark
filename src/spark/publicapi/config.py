@@ -199,6 +199,14 @@ class ApiConfig:
     # 未設）→ False。預設關閉：D8 裁決——先部署 P0+P1 止血，P2–P5 完成、正式機
     # 觀察過 `hl_budget` 再手動打開，不隨程式碼上線自動啟動背景排程。
     explore_upstream_refresh: bool = False
+    # --- Explore 輔助份額臨時加速（Task 8，2026-09-22，D-C／D-I）---
+    # `SPECIAL_SERVE_RATIO`（`explore_scheduler.py`，預設 9）是使用者 2026-09-21
+    # 的既有裁決，**不得更動**；這裡只加一個帶到期時間、逾期自動恢復預設值的
+    # 覆寫。解析與 fail-safe（缺漏／不合法一律回預設）全交給
+    # `ExploreScheduler._special_serve_ratio`（單一來源）——本欄位只透傳
+    # `from_env` 讀到的原始值，不在這裡重複判斷邏輯。
+    explore_special_serve_ratio: int | None = None
+    explore_special_serve_ratio_until: str | None = None
 
     def __post_init__(self):
         if self.explore_upstream_refresh and self.explore_db_path is None:
@@ -407,6 +415,14 @@ class ApiConfig:
         watchlist_dir = (env.get("FILET_WATCHLIST_DIR")
                          or (str(Path(data_dir) / "leaderboard" / "watchlist")
                              if data_dir else cls.watchlist_dir))
+        # Task 8（D-C／D-I）：值不合法（打錯字、非整數）一律回 None——本欄位是
+        # 臨時運維覆寫，不該讓一個手誤的 env 值讓整個 API 拒絕啟動；fail-safe
+        # 的下游行為（回預設 9）見 ExploreScheduler._special_serve_ratio。
+        _raw_special_ratio = env.get("FILET_EXPLORE_SPECIAL_SERVE_RATIO")
+        try:
+            explore_special_serve_ratio = int(_raw_special_ratio) if _raw_special_ratio else None
+        except ValueError:
+            explore_special_serve_ratio = None
         return cls(network=network,
                    builder_address=normalize_address(env["FILET_BUILDER_ADDR"]),
                    siwe_domain=env["FILET_SIWE_DOMAIN"],
@@ -453,4 +469,7 @@ class ApiConfig:
                                               or cls.explore_fills_period_s),
                    explore_fills_max_period_s=int(
                        env.get("FILET_EXPLORE_FILLS_MAX_PERIOD_S")
-                       or cls.explore_fills_max_period_s))
+                       or cls.explore_fills_max_period_s),
+                   explore_special_serve_ratio=explore_special_serve_ratio,
+                   explore_special_serve_ratio_until=(
+                       env.get("FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL") or None))

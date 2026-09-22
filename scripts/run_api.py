@@ -85,7 +85,11 @@ def main() -> None:
             # `ExploreScheduler.fills_period_s_for` 逐地址估計的上下界（見該方法
             # 與 config.py 檔頭），也是 `app.py` 詳情頁補排條件讀的同一個下界值。
             fills_min_period_s=cfg.explore_fills_period_s,
-            fills_max_period_s=cfg.explore_fills_max_period_s)
+            fills_max_period_s=cfg.explore_fills_max_period_s,
+            # Task 8（2026-09-22，D-C／D-I）：輔助份額臨時加速，逾期自動恢復
+            # 預設 9——解析與 fail-safe 見 ExploreScheduler._special_serve_ratio。
+            special_serve_ratio=cfg.explore_special_serve_ratio,
+            special_serve_ratio_until=cfg.explore_special_serve_ratio_until)
         app.state.explore_scheduler = scheduler
         app.state.explore_publisher = publisher
         if cfg.explore_upstream_refresh:

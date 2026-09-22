@@ -120,6 +120,7 @@ import dataclasses
 import logging
 import random
 import threading
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable
 
@@ -152,6 +153,25 @@ _PROBE_WINDOW_MS = 86_400_000
 # 9:1；7.9d 第二輪裁決把計數單位從「tick」釘死成「頁面准入」，因為一個多頁 job
 # 只算一次 tick 會讓輔助份額被低估）。
 SPECIAL_SERVE_RATIO = 9
+
+
+def _parse_iso8601_utc_epoch_s(value: str | None) -> float | None:
+    """Task 8（D-C／D-I）：把 `FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL` 的
+    ISO8601 UTC 字串解析成 epoch 秒。缺漏或格式錯誤一律回 `None`——呼叫端
+    （`ExploreScheduler._special_serve_ratio`）據此 fail-safe 回預設值，不得
+    讓一個打錯的 env 字串變成排程例外或啟動失敗。"""
+    if not value:
+        return None
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 # Task 7.4b：非 fills 的四種 kind，領工時一起用 `kinds=` 限定（`claim_due` 的
 # IN 子句）——candidates 本身也走這個集合，它不吃 explore_base／explore_fills
@@ -277,7 +297,13 @@ class ExploreScheduler:
                  hot_rank: int = 50,
                  jitter_pct: float = 0.10,
                  rng: Callable[[], float] = random.random,
-                 on_tick: Callable[[], None] | None = None):
+                 on_tick: Callable[[], None] | None = None,
+                 # Task 8（2026-09-22，D-C／D-I）：`SPECIAL_SERVE_RATIO`（預設 9，
+                 # 使用者 2026-09-21 裁決，不得更動）的臨時覆寫——只在
+                 # `special_serve_ratio_until`（ISO8601 UTC）之前有效，逾期或
+                 # 設定缺漏／不合法一律回預設，見 `_special_serve_ratio`。
+                 special_serve_ratio: int | None = None,
+                 special_serve_ratio_until: str | None = None):
         self._store = store
         self._hl = hl
         self._hl_base = hl_base
@@ -300,6 +326,22 @@ class ExploreScheduler:
         self._jitter_pct = jitter_pct
         self._rng = rng
         self._on_tick = on_tick
+        # Task 8（D-C／D-I）：覆寫值本身不合法（<=0）就當沒設，直接 fail-safe
+        # 回預設——不必每次呼叫 `_special_serve_ratio` 都重新判斷這一條。到期
+        # 時間只解析一次（建構期），行為與 `special_serve_ratio` 一致：解析
+        # 失敗 → 視為沒有覆寫。
+        self._special_serve_ratio_override = (
+            special_serve_ratio if special_serve_ratio and special_serve_ratio > 0 else None)
+        self._special_serve_ratio_until_ts = (
+            _parse_iso8601_utc_epoch_s(special_serve_ratio_until)
+            if self._special_serve_ratio_override is not None else None)
+        if (self._special_serve_ratio_override is not None
+                and self._special_serve_ratio_until_ts is None):
+            self._special_serve_ratio_override = None
+        # Task 8：結論真的由 `scan_verdict` 產生的次數（`_run_scan` 唯一呼叫
+        # 點）——端到端測試用它證明「新判準真的被排程迴圈走到」，不是只在
+        # 單元測試裡對。
+        self._verdicts_total = 0
         # Task 5：最近一輪 candidates 的 `source_rank` 快取（小寫位址 → 名次，
         # 1-based）——`fills_period_s_for` 的名次來源，只在 `_run_candidates`
         # 寫入（見該方法），不落 DB（`candidate.source_rank` 已經是權威持久化
@@ -382,6 +424,22 @@ class ExploreScheduler:
     @property
     def scan_pages_total(self) -> int:
         return self._scan_pages_total
+
+    @property
+    def verdicts_total(self) -> int:
+        return self._verdicts_total
+
+    def _special_serve_ratio(self, now: float) -> int:
+        """Task 8（D-C／D-I）：暫時加速只在期限內有效；逾期自動回到使用者
+        2026-09-21 裁決的預設 `SPECIAL_SERVE_RATIO`（9）。設定缺漏、覆寫值不
+        合法（<=0）或到期時間無法解析——皆已在建構期正規化成
+        `_special_serve_ratio_override is None`——一律回預設（fail-safe 往
+        保守方向）。"""
+        if self._special_serve_ratio_override is None:
+            return SPECIAL_SERVE_RATIO
+        if now >= self._special_serve_ratio_until_ts:
+            return SPECIAL_SERVE_RATIO
+        return self._special_serve_ratio_override
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -715,7 +773,8 @@ class ExploreScheduler:
         job = None
         special_verify = False
         if fills_budget_ok and (not fills_like_due
-                                or self._fills_pages_since_special >= SPECIAL_SERVE_RATIO):
+                                or self._fills_pages_since_special
+                                >= self._special_serve_ratio(now)):
             served, job = self._serve_special(now)
             if served == "probe":
                 return "ran:probe"
@@ -1259,6 +1318,7 @@ class ExploreScheduler:
         # 呼叫 scan_verdict 算出真正的覆蓋結論，再走既有的 complete_scan 流程。
         boundary = self._store.get_left_boundary(job.address, res.scan.window_start_ms)
         completeness, reason = scan_verdict(res.scan, boundary)
+        self._verdicts_total += 1
         finished_scan = dataclasses.replace(
             res.scan, finished_at=now, result=completeness, reason=reason)
         writeback = self._store.complete_scan(job.address, res.accepted, finished_scan)

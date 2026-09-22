@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import bisect
 import random
+import re
 import threading
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
 from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_S, fills_period_s,
                                                 fresh_scan_window)
 from spark.publicapi.explore_publisher import compose_rows
-from spark.publicapi.explore_scheduler import ExploreScheduler, _spread
+from spark.publicapi.explore_scheduler import SPECIAL_SERVE_RATIO, ExploreScheduler, _spread
 from spark.publicapi.explore_store import ExploreStore, FillsSyncState, ScanWriteback
 from spark.publicapi.hl import HLGateway
 from spark.publicapi.hl_budget import WeightLimiter
@@ -3936,6 +3938,16 @@ class SchedulerHarness:
         target = self._clock.t + hours * 3600.0
         ticks = 0
         max_ticks = 3_000_000
+        # Task 8（2026-09-22 實測抓到）：`idle` 且 `due_jobs_count>0` 不保證是
+        # 「剛排了工作，下一 tick 才領」——也可能是「有到期工作（例如
+        # `fills_verify`）但 `explore_fills` 保留額度這個 tick 不足
+        # （`_fills_available() < FILLS_PAGE_WEIGHT`），`_serve_special`
+        # 整條路徑因此連被呼叫都不會」。後者跟 `no_budget` 同形，需要真的
+        # 睡過一段時間讓限流視窗清空；當成前者無限 `continue` 會是零時間推進
+        # 的無限緊迴圈（40 個 `evidence_unknown` 位址＋300 候選競爭下實測
+        # 命中，不是假設性風險）。分不出兩者就限制連續快轉次數，超過就退化成
+        # 與 `no_budget` 相同的真實睡眠。
+        idle_spins = 0
         while self._clock.t <= target:
             ticks += 1
             if ticks > max_ticks:
@@ -3944,8 +3956,14 @@ class SchedulerHarness:
             r = self._sched.tick()
             self._tick_counts[r] = self._tick_counts.get(r, 0) + 1
             if r == "idle":
-                if self._store.due_jobs_count(self._clock.t) > 0:
+                due = self._store.due_jobs_count(self._clock.t) > 0
+                if due and idle_spins < 3:
+                    idle_spins += 1
                     continue    # 這一輪的 idle 只是「剛排了工作，下一 tick 才領」
+                idle_spins = 0
+                if due:
+                    self._clock.sleep(1.0)
+                    continue
                 nxt = self._next_due_at(self._clock.t)
                 if nxt is None or nxt > target:
                     break
@@ -3959,7 +3977,10 @@ class SchedulerHarness:
                 # 無限緊迴圈（budget 視窗永遠等不到清空），這是本 harness 實測
                 # 抓到的問題，不是假設性風險。
                 self._clock.sleep(1.0)
-            # 其餘（ran:*／deferred／dropped／quarantined）：delay=0，立即續 tick。
+                idle_spins = 0
+            else:
+                # 其餘（ran:*／dropped／quarantined）：delay=0，立即續 tick。
+                idle_spins = 0
 
     def restart(self) -> None:
         """重建 `ExploreScheduler`，只留 DB（模擬 process 重啟；假上游的分頁
@@ -4015,6 +4036,36 @@ class SchedulerHarness:
     def verify_completed(self) -> int:
         row = self._store._db.execute(
             "SELECT COUNT(*) FROM fills_scan WHERE kind='verify' AND status='done'").fetchone()
+        return row[0]
+
+    # ---- Task 8：新判準端到端可達性 ----
+    def addresses_with_left_boundary(self) -> int:
+        """左界證據真的落地的位址數（`left_boundary != 'unknown'`）——證明
+        `_run_probe`／`set_left_boundary` 真的被排程迴圈走到，不是只在單元
+        測試裡對。"""
+        row = self._store._db.execute(
+            "SELECT COUNT(*) FROM fills_sync WHERE left_boundary != 'unknown'").fetchone()
+        return row[0]
+
+    @property
+    def verdicts_from_scan_verdict(self) -> int:
+        return self._sched.verdicts_total
+
+    def seed_rows(self, *, evidence_unknown: int) -> list[str]:
+        """種下 `evidence_unknown` 個「已有完成遍歷、`evidence_unknown=1`」的
+        候選位址（沿用 `seed_evidence_unknown_address`）——這個形狀只有
+        v3→v4 遷移會留下，全新建立的 store 不會自然產生。位址從候選池既有的
+        `_t7a_addr(200..)` 區段取（避開 `T7A_WHALE/MYSTERY/BURST` 與既有
+        `_t7a_addr(150)` 用法），確保它們本來就在 `leaderboard_source_fn`
+        回傳的 active 候選集合內。"""
+        addrs = [_t7a_addr(200 + i) for i in range(evidence_unknown)]
+        for addr in addrs:
+            self.seed_evidence_unknown_address(addr)
+        return addrs
+
+    def rows_with_evidence_unknown(self) -> int:
+        row = self._store._db.execute(
+            "SELECT COUNT(*) FROM fills_sync WHERE evidence_unknown=1").fetchone()
         return row[0]
 
     def overdue_p95_s(self, kind: str) -> float:
@@ -4159,3 +4210,92 @@ def test_massive_same_ms_cluster_degrades_to_partial_not_silent_loss(tmp_path):
     assert row["fills_coverage"]["state"] == "partial"
     assert row["fills_coverage"]["reason"] == "unresolved_gap"
     assert row["win_rate"] is None          # D-14：非 complete 不得給成交衍生數字
+
+
+# --- Task 8：新判準真的被正式流程執行——兩個端到端測試 ＋ 輔助份額臨時加速 ---
+#
+# 使用者指定：這兩個測試比「函式回傳正確」更能防止「程式改了但正式流程永遠走不到」
+# ——本次已經現場抓到兩個這種缺口（探測候選查詢仍用被刪除的 reason、
+# `evidence_unknown=0` 把待核驗列排除在探測母體外，見 plan Task 8 前言）。
+
+
+def _scan_verdict_call_sites() -> set[str]:
+    """`scan_verdict(` 在 `src/spark/publicapi/` 底下所有**指派形式**呼叫
+    （`x, y = scan_verdict(...)`）的 `檔名:行號` 集合。用來斷言結論只有一個
+    來源——比留一個恆為 0 的 `verdicts_from_legacy_path` 死計數器更誠實：
+    Task 1–3 已經把覆蓋判準收斂成單一函式，本專案目前**沒有**第二條結論路徑
+    可數，硬留一個計數器只會是「沒人加新路徑」的替代品，grep 直接測本體
+    （主線程 2026-09-22 裁決，見 plan Task 8 派工 prompt）。"""
+    root = Path(__file__).resolve().parents[1] / "src" / "spark" / "publicapi"
+    pattern = re.compile(r"=\s*scan_verdict\(")
+    hits: set[str] = set()
+    for path in sorted(root.glob("*.py")):
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            if pattern.search(line):
+                hits.add(f"{path.name}:{lineno}")
+    return hits
+
+
+def test_new_verdict_path_is_actually_reached_by_the_scheduler(tmp_path):
+    """端到端：跑完排程迴圈後，探測候選查詢必須真的挑到人、左界證據必須真的
+    被寫入、結論必須真的由 `scan_verdict` 產生（單元測試證明函式對，這條證明
+    流程走得到）。
+
+    `verdicts_from_legacy_path == 0`（plan 字面稿）在本實作沒有對應物可
+    數——結構性斷言取代死計數器，見 `_scan_verdict_call_sites` docstring。"""
+    call_sites = _scan_verdict_call_sites()
+    files = {site.split(":")[0] for site in call_sites}
+    assert len(call_sites) == 2, f"scan_verdict 呼叫點應恰好 2 個，實際：{call_sites}"
+    assert files == {"explore_scheduler.py", "explore_store.py"}
+
+    h = _t7a_harness(tmp_path)
+    h.set_fill_count(T7A_WHALE, window_fills=500)
+    h.run_for(hours=2)
+    assert h.probes_executed > 0
+    assert h.addresses_with_left_boundary() > 0
+    assert h.verdicts_from_scan_verdict > 0
+
+
+def test_evidence_unknown_rows_actually_leave_unknown_via_verify(tmp_path):
+    """待核驗列必須真的能經 verify 軌離開 unknown——不是只在單元測試裡能。"""
+    h = _t7a_harness(tmp_path)
+    h.seed_rows(evidence_unknown=40)
+    assert h.rows_with_evidence_unknown() == 40
+    h.run_for(hours=24)
+    assert h.rows_with_evidence_unknown() == 0
+
+
+# --- Task 8 Step 4：輔助份額臨時加速，到期自動恢復（D-C／D-I）---
+
+
+def test_special_serve_ratio_default_is_nine():
+    """`SPECIAL_SERVE_RATIO` 的預設值 9 是使用者 2026-09-21 裁決，本次不得更動。"""
+    assert SPECIAL_SERVE_RATIO == 9
+
+
+def test_special_serve_ratio_reverts_after_deadline(tmp_path):
+    """D-C／D-I：暫時加速只在期限內有效，逾期自動恢復預設 9——不依賴任何人
+    記得移除 env。"""
+    store = ExploreStore(tmp_path / "explore.db")
+    sched = _sched(store, FakeHL(), special_serve_ratio=3,
+                   special_serve_ratio_until="1970-01-01T00:00:05Z")
+    assert sched._special_serve_ratio(0.0) == 3
+    assert sched._special_serve_ratio(4.999) == 3
+    assert sched._special_serve_ratio(5.0) == SPECIAL_SERVE_RATIO   # 到期當下即恢復
+    assert sched._special_serve_ratio(100.0) == SPECIAL_SERVE_RATIO
+
+
+@pytest.mark.parametrize("kw", [
+    {},                                                                    # 完全未設
+    {"special_serve_ratio": 3},                                           # 缺到期時間
+    {"special_serve_ratio_until": "1970-01-01T00:00:05Z"},                # 缺比例
+    {"special_serve_ratio": 0, "special_serve_ratio_until": "1970-01-01T00:00:05Z"},
+    {"special_serve_ratio": -1, "special_serve_ratio_until": "1970-01-01T00:00:05Z"},
+    {"special_serve_ratio": 3, "special_serve_ratio_until": "not-a-date"},  # 時間無法解析
+    {"special_serve_ratio": 3, "special_serve_ratio_until": ""},
+])
+def test_special_serve_ratio_fails_safe_on_missing_or_invalid_config(tmp_path, kw):
+    store = ExploreStore(tmp_path / "explore.db")
+    sched = _sched(store, FakeHL(), **kw)
+    assert sched._special_serve_ratio(0.0) == SPECIAL_SERVE_RATIO
+    assert sched._special_serve_ratio(10_000.0) == SPECIAL_SERVE_RATIO
