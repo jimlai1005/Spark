@@ -2317,7 +2317,7 @@ def test_s1_reconcile_creates_initial_scan_for_orphan_backfilling_address(tmp_pa
     sched._bootstrapped = True
     sched._first_tick_done = True
 
-    assert sched._needs_scan_job(ADDR_A, clock.now()) == "initial_missing"
+    assert sched._needs_scan_job(ADDR_A, clock.now()) == ("initial_missing", "fills_scan")
     assert sched.reconcile_scan_jobs(clock.now())["initial_missing"] == 1
 
     assert sched.tick() == "ran:fills_scan"
@@ -2548,3 +2548,208 @@ def test_invalid_page_backs_off_and_quarantines_after_max_attempts(tmp_path):
     scan = store.running_scan("0xabc")
     assert scan is not None and "invalid_page:" in scan.last_error   # 隔離時前綴 max_attempts:
     assert store.get_fills("0xabc", 0, now_ms) == []
+
+
+# ---- 2026-09-22 主線程整合模擬（正式機 287 列快照、3 天）抓到的兩個缺陷 ----
+
+def _verify_ready_address(tmp_path, clock, addr: str = "0xver", *, due_ago: float = 0.0):
+    """一個 active、`complete`、`evidence_unknown=1` 且帶到期 `fills_verify` job
+    的地址（＝遷移產生的核驗工作的真實形狀）。"""
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([(addr, None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills(addr, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, addr, result="complete", reason="retention_boundary_verified",
+                   window_end_ms=now_ms, finished_at=clock.now())
+    store._db.execute("UPDATE fills_sync SET evidence_unknown=1 WHERE address=?", (addr,))
+    store.enqueue(f"{addr}:fills_verify", addr, "fills_verify", 4, clock.now() - due_ago)
+    return store
+
+
+def test_s1_reconcile_resumes_running_verify_scan_with_verify_job(tmp_path):
+    """整合模擬 Critical：對帳補的 job kind 必須與進行中的遍歷**同類**。
+
+    舊版一律補 `fills_scan` → `_run_scan(verify=False)` 接手核驗遍歷跑完、原本的
+    `fills_verify` job 還留著 → 下次被服務時看不到 running scan 就再開一個
+    verify 遍歷：3 天模擬跑出 654 次 verify 遍歷（工作只有 129 件），27 個地址
+    各累積 13–31 個 done verify scan。"""
+    clock = Clock(t=40 * 86400.0)
+    store = _verify_ready_address(tmp_path, clock)
+    sched = _sched(store, _ResumableFillsHL(full_pages=1), clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    assert sched.tick() == "ran:fills_verify"                 # 第一頁：verify 遍歷進行中
+    running = store.running_scan("0xver")
+    assert running is not None and running.kind == "verify"
+
+    out = sched.reconcile_scan_jobs(clock.now())
+
+    assert "resume_running" not in out                        # 已經有同類 job，不重排
+    assert store.job_kinds("0xver") == {"fills_verify"}       # **不得**出現 fills_scan
+
+    # 續跑到收尾：verify job 被刪、verify 遍歷恰好一個（不是每輪新開一個）。
+    _drive_until(sched, clock, lambda rs: store.running_scan("0xver") is None, limit=50)
+    assert store.job_kinds("0xver") == set()
+    assert [r[0] for r in _scan_rows(store, "0xver")] == ["initial", "verify"]
+    assert store.get_sync("0xver").evidence_unknown is False
+
+
+def test_s1_reconcile_resumes_orphan_verify_scan_with_verify_job(tmp_path):
+    """同上的對帳面：verify 遍歷進行中、`fills_verify` job 卻不見了（退池再回池、
+    重啟）→ 對帳補的是 `fills_verify`（不是 `fills_scan`），續跑同一個 scan。"""
+    clock = Clock(t=40 * 86400.0)
+    store = _verify_ready_address(tmp_path, clock)
+    sched = _sched(store, _ResumableFillsHL(full_pages=1), clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+    assert sched.tick() == "ran:fills_verify"
+    scan_id = store.running_scan("0xver").scan_id
+    store.delete_jobs("0xver")
+
+    out = sched.reconcile_scan_jobs(clock.now())
+
+    assert out["resume_running"] == 1
+    assert store.job_kinds("0xver") == {"fills_verify"}
+    assert sched.tick() == "ran:fills_verify"
+    assert [r[0] for r in _scan_rows(store, "0xver")] == ["initial", "verify"]
+    assert store.get_sync("0xver").scan_id == scan_id
+
+
+def test_s1_scan_job_does_not_take_over_a_running_verify_scan(tmp_path):
+    """整合模擬 Critical 的下游閘門：兩條遍歷軌不得互相接手——`fills_scan` job
+    遇到進行中的 `verify` 遍歷（反之亦然）→ 丟棄 job、不接手、不建新 scan。"""
+    clock = Clock(t=40 * 86400.0)
+    store = _verify_ready_address(tmp_path, clock)
+    hl = _ResumableFillsHL(full_pages=1)
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+    assert sched.tick() == "ran:fills_verify"
+    scan_id = store.running_scan("0xver").scan_id
+    rows_before = _scan_rows(store, "0xver")
+    calls_before = len(hl.calls)
+
+    # 人工（或舊版對帳）塞一個 fills_scan job。
+    store.enqueue("0xver:fills_scan", "0xver", "fills_scan", 3, clock.now())
+    assert sched.tick() == "dropped"
+
+    assert store.running_scan("0xver").scan_id == scan_id     # 遍歷仍在跑
+    assert _scan_rows(store, "0xver") == rows_before          # 沒有新 scan
+    assert len(hl.calls) == calls_before                      # 零上游呼叫
+    assert sched.status()["scan_job_dropped"] == 1
+    assert store.job_kinds("0xver") == {"fills_verify"}
+
+    # 反向：`fills_verify` job 遇到進行中的 initial／partial_rescan 遍歷。
+    clock2 = Clock(t=40 * 86400.0)
+    store2 = ExploreStore(tmp_path / "second.db", now_fn=clock2.now)
+    now_ms = int(clock2.now() * 1000)
+    store2.upsert_candidates([("0xabc", None, 1, None)], as_of=clock2.now())
+    store2.bootstrap_address_fills("0xabc", clock2.now(),
+                                   window_start_ms=now_ms - 30 * 86_400_000,
+                                   window_end_ms=now_ms, params_fp="")   # initial 進行中
+    store2.enqueue("0xabc:fills_verify", "0xabc", "fills_verify", 4, clock2.now())
+    hl2 = _ResumableFillsHL(full_pages=1)
+    sched2 = _sched(store2, hl2, clock=clock2)
+    sched2._bootstrapped = True
+    sched2._first_tick_done = True
+
+    assert sched2.tick() == "dropped"
+    assert hl2.calls == []
+    assert store2.running_scan("0xabc").kind == "initial"
+    assert sched2.status()["scan_job_dropped"] == 1
+
+
+class _MixedFillsHL:
+    """`verify_addr` 的頁前 `verify_full_pages` 次滿頁、之後短頁收尾；其他地址
+    恆滿頁（增量積壓永不消退）。所有時間戳落在請求窗口內。`pages` 記錄每個
+    地址實際發出的頁數，供份額斷言用。"""
+
+    def __init__(self, verify_addr: str, verify_full_pages: int = 3):
+        self._verify_addr = verify_addr
+        self._verify_full_pages = verify_full_pages
+        self.pages: dict[str, int] = {}
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        n_seen = self.pages.get(address, 0) + 1
+        self.pages[address] = n_seen
+        span = max(0, end_ms - start_ms)
+        want = PAGE_LIMIT
+        if address == self._verify_addr and n_seen > self._verify_full_pages:
+            want = 3
+        n = min(want, max(span - 1, 0))
+        step = max(1, span // (n + 1)) if n else 1
+        return [{"coin": "BTC", "tid": start_ms + (i + 1) * step,
+                 "time": start_ms + (i + 1) * step} for i in range(n)]
+
+
+def test_s3_multi_page_verify_finishes_under_continuous_fills_pressure(tmp_path):
+    """整合模擬 Warning：輔助名額**不以逾期為前提**——只要有到期的 verify job，
+    每 `SPECIAL_SERVE_RATIO` 頁 fills-like 就給一次，進行中的多頁 verify 遍歷
+    才跑得完。舊版只在「逾期 ≥2h 或有探測候選」時給名額，而多頁 verify 每頁
+    `_reschedule(job, now)` 又把等待歸零 → 實測 8 小時只推進 2 頁，129 件核驗
+    要拖數十天。"""
+    import dataclasses as _dc
+
+    clock = Clock(t=40 * 86400.0)
+    store = _verify_ready_address(tmp_path, clock)
+    now_ms = int(clock.now() * 1000)
+    busy = [f"0xbusy{i}" for i in range(10)]
+    store.upsert_candidates([("0xver", None, 1, None)]
+                            + [(a, None, i + 2, None) for i, a in enumerate(busy)],
+                            as_of=clock.now())
+    for a in busy:                                   # 永不消退的增量積壓
+        store.bootstrap_address_fills(a, clock.now(),
+                                      window_start_ms=now_ms - 30 * 86_400_000,
+                                      window_end_ms=now_ms + 10**9, params_fp="")
+        sync = store.get_sync(a)
+        store.insert_fills_page(a, [], _dc.replace(sync, cursor_ms=now_ms + 1,
+                                                   window_end_ms=now_ms + 10**9))
+        store.enqueue(f"{a}:fills", a, "fills", 2, clock.now())
+    hl = _MixedFillsHL("0xver")
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    results = []
+    for _ in range(40):
+        results.append(sched.tick())
+        clock.t += 1.0
+        if store.get_sync("0xver").evidence_unknown is False and "0xver" in hl.pages:
+            break
+
+    assert store.get_sync("0xver").evidence_unknown is False      # 核驗完成
+    assert store.job_kinds("0xver") == set()
+    total_pages = sum(hl.pages.values())
+    assert hl.pages["0xver"] <= total_pages / 10 + 1              # 輔助份額 <= 1/10
+    assert results.count("ran:fills") >= 9 * hl.pages["0xver"]
+
+
+def test_s3_verify_and_probe_take_turns_on_the_auxiliary_slot(tmp_path):
+    """整合模擬 Warning 的另一半：verify 與探測**輪流**用輔助名額——固定
+    「探測優先」時，287 個地址的探測候選會把每一次名額都吃掉（核驗永遠排第二）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = _verify_ready_address(tmp_path, clock)
+    now_ms = int(clock.now() * 1000)
+    probes = [f"0xprobe{i}" for i in range(3)]
+    store.upsert_candidates([("0xver", None, 1, None)]
+                            + [(a, None, i + 2, None) for i, a in enumerate(probes)],
+                            as_of=clock.now())
+    for a in probes:                                 # 探測候選
+        store.bootstrap_address_fills(a, clock.now(),
+                                      window_start_ms=now_ms - 30 * 86_400_000,
+                                      window_end_ms=now_ms, params_fp="")
+        _complete_scan(store, a, result="complete",
+                       reason="count_below_retention_threshold", window_end_ms=now_ms,
+                       finished_at=clock.now())
+    sched = _sched(store, _ResumableFillsHL(full_pages=5), clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    results = [sched.tick() for _ in range(6)]
+
+    assert results.count("ran:probe") == 3
+    assert results.count("ran:fills_verify") == 3
+    # 交錯（不是先連三次探測再連三次 verify）。
+    assert results[:2] in (["ran:fills_verify", "ran:probe"], ["ran:probe", "ran:fills_verify"])

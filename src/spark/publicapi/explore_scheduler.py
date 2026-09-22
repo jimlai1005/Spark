@@ -304,6 +304,9 @@ class ExploreScheduler:
         # （增量／遍歷的每一頁），不是 tick、也不是 job——多頁 job 只算一次 tick
         # 會讓 verify／探測的份額被低估到接近 0。
         self._fills_pages_since_special = 0
+        # Task 7.9d-S S3（2026-09-22 整合模擬 Warning）：輔助名額在 verify 與
+        # 探測之間輪流的旗標——固定順序會讓候選多的那一邊吃光名額。
+        self._special_turn = False
         # Task 7.9a A2：連續暫時性失敗達到 `MAX_JOB_ATTEMPTS` 而被隔離的次數
         # （與語意錯誤的立即隔離分開計，見 `_quarantine` 的 `max_attempts` 參數）。
         self._quarantined_max_attempts = 0
@@ -440,8 +443,15 @@ class ExploreScheduler:
 
         回傳 `{原因碼: 補排筆數, "inactive_jobs_deleted": n}`（`status()
         ["reconciled"]` 揭露）。準入 cap 不套用在這條路徑上：它補的是**狀態已經
-        要求**的工作，且每個地址最多一個 `fills_scan`（結構上受
-        `ADMISSION_MULTIPLIER` 的 6 種 per-address kind 約束），不會膨脹。"""
+        要求**的工作，且每個地址最多一個遍歷軌 job（結構上受
+        `ADMISSION_MULTIPLIER` 的 6 種 per-address kind 約束），不會膨脹。
+
+        補的 job kind 必須與進行中的遍歷**同類**（2026-09-22 主線程整合模擬抓到的
+        Critical）：`verify` 遍歷要補 `fills_verify`、`initial`／`partial_rescan`
+        要補 `fills_scan`。舊版一律補 `fills_scan`，於是核驗遍歷被 `fills_scan`
+        job 接手跑完、原本的 `fills_verify` job 卻還留著 → 下次被服務時看不到
+        running scan 就再開一個 verify 遍歷：3 天模擬跑出 654 次 verify 遍歷
+        （只有 129 件工作），核驗永遠做不完。"""
         active = {c.address for c in self._store.active_candidates()}
         out: dict[str, int] = {}
         deleted = self._store.delete_inactive_jobs(active)
@@ -449,26 +459,33 @@ class ExploreScheduler:
             logger.warning("explore scheduler: 對帳掃除 %d 筆非 active 地址的殘留 job", deleted)
         out["inactive_jobs_deleted"] = deleted
         for address, running_scan_id in self._store.scan_job_targets(active):
-            reason = self._needs_scan_job(address, now, running_scan_id=running_scan_id)
-            if reason is None:
+            running = (None if running_scan_id is None
+                       else self._store.get_scan(running_scan_id))
+            need = self._needs_scan_job(address, now, running_scan=running)
+            if need is None:
                 continue
-            if self._store.enqueue(self._key(address, "fills_scan"), address, "fills_scan", 3,
+            reason, job_kind = need
+            priority = 4 if job_kind == "fills_verify" else 3
+            if self._store.enqueue(self._key(address, job_kind), address, job_kind, priority,
                                    now):
                 out[reason] = out.get(reason, 0) + 1
-                logger.warning("explore scheduler: 對帳補排 %s 的 fills_scan job（%s）",
-                               address, reason)
+                logger.warning("explore scheduler: 對帳補排 %s 的 %s job（%s）",
+                               address, job_kind, reason)
         return out
 
     def _needs_scan_job(self, address: str, now: float, *,
-                        running_scan_id: str | None | _Unset = _UNSET,
-                        ignore_existing_job: bool = False) -> str | None:
+                        running_scan=_UNSET,
+                        ignore_existing_job: bool = False) -> tuple[str, str] | None:
         """「這個地址的**狀態**現在需要一次遍歷，而且沒有可推進它的 job」嗎？
-        回傳原因碼或 `None`（Task 7.9d-S S1）：
+        回傳 `(原因碼, 該補的 job kind)` 或 `None`（Task 7.9d-S S1）：
 
-        - `"resume_running"`：有進行中的遍歷卻沒有 `fills_scan` job ——遍歷停在
+        - `"resume_running"`：有進行中的遍歷卻沒有**同類**的 job ——遍歷停在
           半路，沒有任何工作會推進它（7.9c 的 Critical：地址退池時
           `delete_jobs` 刪掉 job、回池時 `bootstrap_address_fills` 回 `False`
-          → 回補中的地址永遠拿不回 job，5 天模擬仍 `backfilling`）。
+          → 回補中的地址永遠拿不回 job，5 天模擬仍 `backfilling`）。job kind
+          必須對應 scan kind（`verify` → `fills_verify`，其餘 → `fills_scan`）：
+          用錯 kind 會讓另一條軌的 job 接手別人的遍歷（見
+          `reconcile_scan_jobs` docstring 的 654 次 verify 遍歷）。
         - `"initial_missing"`：沒有進行中的遍歷且 `completeness == "backfilling"`
           ——首次回補從未完成（孤兒：有 `fills_sync` 列、沒有 scan 列）。
         - `"partial_due"`：`partial` 且距離最近一次完成的遍歷已滿
@@ -477,28 +494,27 @@ class ExploreScheduler:
         觸發條件一律**由狀態推導**，不由「job 列是否存在」推導（7.9b／7.9c 兩個
         Critical 都是這個形狀）；job 只用來去重（同一件事不要排兩次）。
         `ignore_existing_job=True` 給 `_run_scan` 用——呼叫端手上那個 job 就是
-        「正在推進它的工作」，去重條件對它不適用。`running_scan_id` 可由呼叫端
-        （對帳的單句 SQL）帶入，省一次點查。"""
-        if isinstance(running_scan_id, _Unset):
-            scan = self._store.running_scan(address)
-            running_scan_id = None if scan is None else scan.scan_id
-        has_job = (not ignore_existing_job
-                   and "fills_scan" in self._store.job_kinds(address))
-        if running_scan_id is not None:
-            return None if has_job else "resume_running"
+        「正在推進它的工作」，去重條件對它不適用。`running_scan` 可由呼叫端
+        （對帳的單句 SQL ＋一次 `get_scan`）帶入，省一次點查。"""
+        if isinstance(running_scan, _Unset):
+            running_scan = self._store.running_scan(address)
+        kinds: set[str] = set() if ignore_existing_job else self._store.job_kinds(address)
+        if running_scan is not None:
+            job_kind = "fills_verify" if running_scan.kind == "verify" else "fills_scan"
+            return None if job_kind in kinds else ("resume_running", job_kind)
         st = self._store.get_sync(address)
         if st is None:
             # 沒有增量軌可掛載（從未 bootstrap，或資料被外部刪除）——遍歷無處
             # 寫回（`complete_scan` 會回 `MISSING`），不值得花一整輪頁面。
             return None
-        if has_job:
+        if "fills_scan" in kinds:
             return None
         if st.completeness == "backfilling":
-            return "initial_missing"
+            return "initial_missing", "fills_scan"
         if st.completeness == "partial":
             latest = self._store.latest_done_scan(address)
             if partial_rescan_due(None if latest is None else latest.finished_at, now):
-                return "partial_due"
+                return "partial_due", "fills_scan"
         return None
 
     # ---- 內部：一次 tick ----
@@ -611,13 +627,26 @@ class ExploreScheduler:
         `("verify", job)`＝領到一個 verify job（由呼叫端跑，共用同一套例外分類）、
         `(None, None)`＝兩邊都沒有工作（名額留給 fills-like）。
 
-        順序：預設探測優先，`VERIFY_MAX_WAIT_S` 逾期時 verify 排到探測之前
-        ——逾期**只調整輔助類別內的順序**，不觸發整批優先（7.9c 的「逾期即
-        claim」讓 8 件逾期 verify 連佔 8 個名額、搶光增量軌；主線程實跑核實）。
+        順序：`VERIFY_MAX_WAIT_S` 逾期 → verify 先；否則兩邊都在等就**輪流**
+        （`_special_turn`）。逾期**只調整輔助類別內的順序**，不觸發整批優先
+        （7.9c 的「逾期即 claim」讓 8 件逾期 verify 連佔 8 個名額、搶光增量軌）。
+        輪流是 2026-09-22 主線程整合模擬的 Warning 修法：固定「探測優先」時，
+        287 個地址的探測候選會把每一次輔助名額都吃掉，核驗軌 8 小時只拿到 2 頁
+        （4 頁的 verify 遍歷永遠跑不完 → 129 件要拖數十天）。
+
         任一邊被服務就把頁面計數器歸零（verify 自己那一頁也是 fills 類請求，
         但它屬於輔助份額，不計入 `_fills_pages_since_special`）。"""
-        verify_first = self._verify_overdue(now)
-        for who in (("verify", "probe") if verify_first else ("probe", "verify")):
+        verify_ready = self._store.due_count("fills_verify", now) > 0
+        verify_overdue = verify_ready and self._verify_overdue(now)
+        if verify_overdue:
+            order: tuple[str, ...] = ("verify", "probe")
+        elif verify_ready:
+            # 兩邊都在等 → 輪流；只有 verify 在等時順序不影響結果。
+            self._special_turn = not self._special_turn
+            order = ("verify", "probe") if self._special_turn else ("probe", "verify")
+        else:
+            order = ("probe",)
+        for who in order:
             if who == "probe":
                 candidate = self._store.next_probe_candidate()
                 if candidate is not None:
@@ -625,13 +654,13 @@ class ExploreScheduler:
                     self._run_probe(candidate, now)
                     return "probe", None
                 continue
-            if self._store.due_count("fills_verify", now) == 0:
+            if not verify_ready:
                 continue
             job = self._store.claim_due(now, self._owner, self._lease_s,
                                         kinds=("fills_verify",))
             if job is not None:
                 self._fills_pages_since_special = 0
-                if verify_first:
+                if verify_overdue:
                     self._verify_served_by_deadline += 1
                 return "verify", job
         return None, None
@@ -866,6 +895,18 @@ class ExploreScheduler:
             return self._drop_inactive(job)
         result_kind = "fills_verify" if verify else "fills_scan"
         scan = self._store.running_scan(job.address)
+        if scan is not None and (scan.kind == "verify") != verify:
+            # 2026-09-22 主線程整合模擬的 Critical：**遍歷軌的兩條軌不得互相
+            # 接手**。核驗遍歷（`verify`）只能由 `fills_verify` job 推進、
+            # `initial`／`partial_rescan` 只能由 `fills_scan` job 推進；接錯了
+            # 會把對方的遍歷跑完、對方的 job 卻還留著，下次被服務時就再開一個
+            # 新遍歷（3 天模擬 654 次 verify 遍歷）。
+            self._complete(job)
+            self._scan_job_dropped += 1
+            logger.warning(
+                "explore scheduler: 丟棄 %s 的 %s job——該地址進行中的遍歷是 %s（kind 不相容）",
+                job.address, job.kind, scan.kind)
+            return "dropped"
         if scan is None:
             now_ms = int(now * 1000)
             window_start_ms, window_end_ms = fresh_scan_window(now_ms)
@@ -877,8 +918,9 @@ class ExploreScheduler:
                 # 舊版在這裡無條件建 `partial_rescan`，配合「每個 candidates 輪
                 # 重建 scan job」讓已完成的地址每幾小時被整窗重掃一次；7.9c 則
                 # 反過來把 `backfilling` 的孤兒也丟掉（回補永遠做不完）。
-                reason = self._needs_scan_job(job.address, now, running_scan_id=None,
-                                              ignore_existing_job=True)
+                need = self._needs_scan_job(job.address, now, running_scan=None,
+                                            ignore_existing_job=True)
+                reason = None if need is None else need[0]
                 if reason == "initial_missing":
                     kind = "initial"
                 elif reason == "partial_due":
@@ -912,7 +954,13 @@ class ExploreScheduler:
             self._store.insert_scan_page(job.address, res.accepted, res.scan)
             if (res.scan.last_error or "").startswith("invalid_page"):
                 return self._backoff_invalid_page(job, now, res.scan.last_error)
-            self._reschedule(job, now, bump_attempts=False)
+            # Task 7.9d-S S3（2026-09-22 整合模擬 Warning）：核驗遍歷的續頁**不得
+            # 把等待歸零**——`fills_verify` 的到期時間就是它爭取輔助名額順序
+            # （`_verify_overdue`）與類內優先權（`claim_due` 的等待加權）的依據；
+            # 每頁重設成 `now` 會讓進行中的多頁 verify 永遠排在其他 verify 之後、
+            # 也永遠達不到 `VERIFY_MAX_WAIT_S`（實測 8 小時只推進 2 頁）。
+            next_at = min(job.next_attempt_at, now) if verify else now
+            self._reschedule(job, next_at, bump_attempts=False)
             self._notify_dirty()
             return f"ran:{result_kind}"
 
