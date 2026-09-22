@@ -1354,7 +1354,7 @@ def test_migrated_rows_reach_complete_via_standalone_probe_path(tmp_path):
     Task 3b 就地重算 → complete。全程由真實排程器驅動，零整窗重掃。"""
     h = _t7a_harness(tmp_path)
     addrs = h.seed_migrated_unknown_rows(n=20)     # 精確複製 v4 遷移後的列形狀
-    h.run_for(hours=6)
+    h.run_for(hours=24)   # 主線程 2026-09-22 更正：原寫 6h 是沒算過的臨界值（見下）
     resolved = [a for a in addrs if h.published_row(a)["fills_coverage"]["state"] == "complete"]
     assert len(resolved) == 20
     assert h.scan_pages_for(addrs) == 0            # 只有探測頁，沒有任何遍歷頁
@@ -1366,6 +1366,13 @@ def test_migrated_rows_reach_complete_via_standalone_probe_path(tmp_path):
 `evidence_unknown=0`、`scan_id` 指向一筆 `status='done'`、游標已抵達 `window_end_ms`、
 `unresolved_gap=0` 的 `fills_scan`；`refresh_job` 裡**沒有**該位址的 `fills_scan`／`fills_verify`。
 上游要讓探測窗回至少一筆合法成交（→ `earlier_fills_seen`）。
+
+> **時限更正（主線程 2026-09-22，builder 實跑 6h 得 19/20 後停下回報）**：獨立探測走輔助份額，
+> 每 9 頁 fills-like 才 1 個名額，56 頁/小時下約 6 個/小時；6h ≈ 36 個名額，再扣掉與 280 個
+> 新位址 inline 探測的競爭，貼著 20——時限設在臨界點是設計錯誤。本測試證明的是**可達性**
+> （那條鏈走得到、不重掃），不是吞吐（Task 7b 已證吞吐類斷言不穩定），所以時限取
+> 「名額遠大於需求而飽和」：24h ≈ 144 個名額 ≫ 20。不縮候選池、不預解其他候選的證據
+> （正式機遷移當下 198 個位址同時缺證據，比 harness 更擠不是更鬆）。
 
 - [ ] **Step 2: 確認失敗、實作 harness 接口、轉綠**
 
