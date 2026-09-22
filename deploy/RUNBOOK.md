@@ -2493,11 +2493,10 @@ ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
 | follower 存活與對帳 | `journalctl -u 'filet-follower@*'`；`ActiveEnterTimestamp` | 無新增失敗、未重啟、與 Step 1b 一致 | **立即回退** |
 | 429 | `samples.jsonl` 的 `api.r429_15m` | 連續 2 小時為 0 | **立即回退** |
 | Traceback | `api.traceback_15m` | 連續 2 小時為 0 | **立即回退** |
-| explore 父 scope 權重 | `GET /api/ops/health` 的 `hl_budget.used.explore` | 任一分鐘 ≤ 300 | 立即回退 |
-| 全域權重 | 同上 `used.global` | 任一分鐘 ≤ 900 | 立即回退 |
-| 探測進度 | `probe.executed` 累計（取樣器） | 部署後 2 小時內 > 0 | 查候選查詢（`_PROBE_CANDIDATE_WHERE`）是否真的挑得到人——Task 8b 就是釘死這條鏈的測試 |
-| `fills` 類 overdue 是否收斂 | `samples.jsonl` 的 `overdue_by_kind`（`fills`／`fills_scan`／`fills_verify`／`probe` 四個 kind） | 24 小時內四個 kind 的 `overdue_p95_s` 不得單調上升；`fills_verify` 對應的 `refresh_job` 列數（Step 5 那條查詢）單調遞減到 0 | 查是否被 base 類飢餓（`explore_base`／`explore_fills` 保留額度是否各自貼頂），不要調 `WEIGHT_CAP`（Task 6 已放棄） |
-| 對外 complete 曲線 | `public.coverage_counts.complete`（取樣器） | 24 小時內**單調上升**，且不得出現「一次性暴增又打回」——那代表結論來源不只一個（Task 3b／8 的不變式被破壞） | 查 `verdicts_from_legacy_path` 是否真的是 0（Task 8 驗收條件） |
+| explore 父 scope／全域權重 | `GET /api/ops/health` 的 `hl_budget.used.explore`／`used.global`——⚠️ 需**管理員錢包登入的瀏覽器 session**（`_require_admin`，同 §5.8e「觀測（admin session）」），ssh 拿不到；限流器狀態只在進程內、DB 沒有 | 任一分鐘 explore ≤ 300、global ≤ 900 | 立即回退。無法登入時以下一列的 429 為替代觀測——超額唯一的外顯症狀就是 429 |
+| 探測進度（左界證據是否真的在落地） | DB：`select left_boundary, count(*) from fills_sync group by 1`（唯讀開啟，同 Step 5 那條的寫法） | 部署後 2 小時內 `unknown` 數**開始下降**、`earlier_fills_seen`／`no_earlier_activity` 上升；遷移當下基線約 `unknown 262`／`earlier_fills_seen 135` | 不動 → 查候選查詢（`_PROBE_CANDIDATE_WHERE`）是否真的挑得到人——Task 8b 就是釘死這條鏈的測試；harness 實測 20 個遷移列在輔助份額 3:1 下數小時內全部翻身 |
+| `fills` 類 overdue 是否收斂 | `samples.jsonl` 的 `overdue_by_kind`（取樣器目前只有 `fills`／`fills_scan`／`fills_verify` 三個 fills 類 kind，**沒有** `probe`） | 24 小時內三個 kind 的 `overdue_p95_s` 不得單調上升；`fills_verify` 對應的 `refresh_job` 列數（Step 5 那條查詢）單調遞減到 0 | 查是否被 base 類飢餓（`explore_base`／`explore_fills` 保留額度是否各自貼頂），不要調 `WEIGHT_CAP`（Task 6 已放棄） |
+| 對外 complete 曲線 | `public.coverage_counts.complete`（取樣器） | 24 小時內**單調上升**（部署當下會先從約 219 掉到約 135——那是遷移撤銷舊判準結論的預期一步，不是退化），且之後不得出現「一次性暴增又打回」——那代表結論來源不只一個（Task 3b／8 的不變式被破壞） | 查 `scan_verdict` 的呼叫點是否仍只有 `explore_scheduler.py`／`explore_store.py` 兩處（Task 8 以結構性斷言釘死） |
 | base 逾期 | `overdue_by_kind.state.overdue_p95_s` | < 1800 | 調高 base 類優先序（不動 `WEIGHT_CAP`） |
 
 ⚠️ **本表已移除舊版「遍歷軌頁面占比 ≥ 0.5」門檻**——Task 7b 已證明它不是穩定性質
@@ -2564,10 +2563,13 @@ v4 schema 的 DB 本來就無效——所以先還原 DB 到 v3 複本，再回�
 src/spark/publicapi/explore_publisher.py` 應無命中），僅供觀測與 Task 5 的成交速率
 估算——估高會讓週期估短、抓得更密，方向對安全性是保守的。
 
-```bash
-git add deploy/RUNBOOK.md
-git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據判準、週期分層、跟單中注意事項）"
-```
+#### 取樣器與 v4 的相容性（部署前已查，2026-09-22）
+
+`/home/ubuntu/explore-obs/sample.py`（正式機 cron，每 15 分鐘，不在 repo）只讀 v4 仍存在的
+欄位（`completeness`／`reason`／`evidence_unknown`／`coverage_gap`／`pages_done` 等），
+reason 以字串分組，新的 reason 值只會成為新組別；`external_complete` 的算式
+（`complete AND evidence_unknown=0 AND coverage_gap=0`）與 `external_coverage_state` 仍一致。
+**不需要改取樣器**。部署後仍請看一眼 `cron.err` 是否仍為 0 bytes。
 
 ## 6. nginx + certbot
 
