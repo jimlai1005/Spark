@@ -577,6 +577,128 @@ git commit -m "feat: 左界證據前置、可快取、對滾動窗口單調有�
 
 ---
 
+## Task 3b: 證據到齊時重算結論，不靠整窗重掃 `@inline`
+
+> **主線程裁決（2026-09-22，Task 3 完成後複查發現）**：Task 3 之後，`scan_verdict`
+> 全專案只在 `_run_scan` 的遍歷收尾被呼叫一次。若左界證據是**事後**才由獨立探測路徑
+> （`next_probe_candidate`）解出的，`fills_sync` 的結論不會重算——該位址會一直停在
+> `partial / left_boundary_unknown`，直到 24 小時後的 `partial_rescan` 整窗重掃。
+>
+> **為什麼非修不可**：Task 4 遷移後約 165 個位址（基線表的 152 + 13 列）正是這個狀態
+> ——遍歷資料都在、只差 1 頁探測。沒有重算機制的話，它們每一個都要付一次**整窗重掃**
+> （大戶 18 頁以上）才能翻身，合計數百頁；有重算機制則是 165 頁探測 ＋ 零額外遍歷。
+> 以實測 60 頁/小時的上限計，差距是「約 3 小時」對「8–13 小時且排擠其他所有工作」。
+> 這正是 D-G 要求「避免再次大量變灰卻沒有處理容量」所指的情形。
+> 順帶也修好「探測暫時失敗（429／連線錯誤）→ 寫入 unknown → 該窗口永久放棄證據」這條路徑
+> （工程原則 2：暫時性失敗不得轉成永久結論）。
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_store.py`（`set_left_boundary` 的轉移規則與重算）
+- Modify: `src/spark/publicapi/explore_scheduler.py`（探測成功解出證據後觸發重算）
+- Test: `tests/test_explore_store.py`、`tests/test_explore_scheduler.py`
+
+**不變式（不可違反）**：
+1. 覆蓋結論**只能**由 `scan_verdict` 產生（工程原則 1：一個判斷不留兩個來源）。
+   重算是「拿同一筆已完成的 scan ＋ 新的 `LeftBoundary` 再跑一次 `scan_verdict`」，
+   不是另寫一套升級邏輯。
+2. 只對**當前生效**的那一次遍歷重算：`fills_scan.scan_id == fills_sync.scan_id`
+   且 `status='done'`。被取代（stale）或進行中的 scan 不得參與。
+3. **不得重新遍歷**。重算完全不發任何上游請求。
+4. 正面證據（`earlier_fills_seen`／`no_earlier_activity`）是終局：不得被任何後續寫入
+   覆蓋（現行 `set_left_boundary` 只擋了 `unknown`，`truncation_suspected` 也要擋）。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_verdict_is_recomputed_when_evidence_arrives_later():
+    """探測事後解出正面證據 → 同一筆已完成的遍歷立刻重算成 complete，
+    不需要整窗重掃（D-G 的容量要求）。"""
+    store = _store_with_done_scan(address=ADDR, cursor_ms=WINDOW_END, window_end_ms=WINDOW_END,
+                                  unresolved_gap=0, completeness="partial",
+                                  reason="left_boundary_unknown", left_boundary="unknown")
+    assert store.set_left_boundary(ADDR, "earlier_fills_seen", WINDOW_START, NOW) is True
+    sync = store.get_sync(ADDR)
+    assert (sync.completeness, sync.reason) == ("complete", "left_boundary_verified")
+
+
+def test_recompute_never_touches_a_superseded_scan():
+    """不是當前生效的那次遍歷（scan_id 不符）→ 不重算。"""
+    store = _store_with_done_scan(address=ADDR, scan_id="old", sync_scan_id="new", ...)
+    store.set_left_boundary(ADDR, "earlier_fills_seen", WINDOW_START, NOW)
+    assert store.get_sync(ADDR).completeness == "partial"
+
+
+def test_recompute_respects_unresolved_gap():
+    """有未解缺口時，再強的左界證據也不能翻成 complete。"""
+    store = _store_with_done_scan(address=ADDR, unresolved_gap=1, completeness="partial",
+                                  reason="unresolved_gap", left_boundary="unknown")
+    store.set_left_boundary(ADDR, "earlier_fills_seen", WINDOW_START, NOW)
+    assert store.get_sync(ADDR).reason == "unresolved_gap"
+
+
+def test_positive_evidence_is_terminal():
+    """正面證據不得被 unknown 或 truncation_suspected 覆蓋。"""
+    store = _store_with(address=ADDR, left_boundary="earlier_fills_seen")
+    assert store.set_left_boundary(ADDR, "unknown", WINDOW_START, NOW) is False
+    assert store.set_left_boundary(ADDR, "truncation_suspected", WINDOW_START, NOW) is False
+    assert store.get_left_boundary(ADDR, WINDOW_START).state == "earlier_fills_seen"
+
+
+def test_transient_probe_failure_does_not_forfeit_the_window():
+    """429／連線錯誤寫入 unknown 之後，該位址必須仍是探測候選（可重試），
+    不得因為「這個窗口已嘗試過」而永久放棄（工程原則 2）。"""
+    store = _store_with_done_scan(address=ADDR, left_boundary="unknown")
+    store.set_left_boundary(ADDR, "unknown", WINDOW_START, NOW)
+    assert store.next_probe_candidate() is not None
+
+
+def test_recomputed_complete_drops_the_pending_partial_rescan_job():
+    """重算成 complete 之後，原本排著的整窗重掃要因狀態推導而被丟棄，
+    不得留下一次沒必要的 18 頁重掃。"""
+    h = _harness(); h.seed_partial_with_pending_rescan(ADDR)
+    h.resolve_probe(ADDR, "earlier_fills_seen")
+    h.run_for(minutes=5)
+    assert h.job_kinds(ADDR) == set()
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_store.py tests/test_explore_scheduler.py -k "recompute or evidence_arrives or positive_evidence_is_terminal or transient_probe_failure" -v`
+Expected: FAIL。
+
+- [ ] **Step 3: 實作**
+
+`set_left_boundary` 在成功寫入且**新狀態不是 `unknown`** 時，於**同一個 transaction 內**：
+讀 `fills_sync.scan_id` 指向的那筆 `fills_scan`（須 `status='done'`），用它與新的
+`LeftBoundary` 呼叫 `scan_verdict`，把結果寫回 `fills_sync.completeness/reason`。
+沒有相符的 scan、scan 未完成、或算出來與現值相同 → 不寫。
+
+轉移規則收緊為：正面證據是終局（任何覆蓋一律拒絕並回 `False`）；
+`unknown` → 任何狀態可；`truncation_suspected` → 只能轉成正面證據。
+
+⚠️ `explore_store` import `scan_verdict` 會形成 store→fills_sync 的相依。先確認
+`explore_fills_sync` 沒有 import `explore_store` 的執行期相依（目前只 import 常數，
+若會造成循環 import，改成由 `explore_scheduler` 在探測成功後呼叫一個
+`store.recompute_verdict(address, boundary, verdict_fn)` 之類的注入形式——
+**但結論仍只能出自 `scan_verdict`**，不得在 store 裡重寫一套判斷）。
+
+- [ ] **Step 4: 跑測試**
+
+Run: `uv run pytest -q`
+Expected: 全綠。
+
+Run: `uv run ruff check src tests`
+Expected: 無錯誤。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/spark/publicapi/explore_store.py src/spark/publicapi/explore_scheduler.py tests/
+git commit -m "fix: 左界證據事後到齊時就地重算結論，不必整窗重掃；正面證據終局化（D-G）"
+```
+
+---
+
 ## Task 4: schema v4 遷移——只撤銷結論，保留抓取進度 `@inline`
 
 **Files:**
