@@ -69,6 +69,14 @@ REASON_RETENTION_BOUNDARY_VERIFIED = "retention_boundary_verified"
 # reason 碼把「探過、沒有更早成交、無法升級」記下來，探測候選查詢天然排除它。
 REASON_PROBE_NO_EARLIER_FILLS = "count_below_retention_threshold_probe_empty"
 
+# Task 7.9d-D D2：`refresh_job.kind` 的已知集合——彙總查詢（`count_jobs_by_kind`／
+# `count_due_by_kind`）用它把已知 kind 一律補成 0，讓觀測端的鍵集合固定（缺鍵與
+# 「這個 kind 現在是 0」在儀表板上長得一樣，但後者才是真的；`scheduler.status()`
+# 在 7.9d 之前就是逐 kind 查出七個固定鍵，彙總不該讓鍵集合縮水）。DB 裡出現不在
+# 本清單的 kind（例如未來新增而忘了同步）仍會照實回報，不會被吃掉。
+JOB_KINDS = ("candidates", "state", "portfolio", "ledger", "fills", "fills_scan",
+             "fills_verify")
+
 # schema_version：1（初版）→2（Task 7.5：`fills_sync.params_fp` 欄位＋既有
 # complete／reason=NULL 列補標）→3（Task 7.9b：遍歷軌／增量軌分離，見
 # `_migrate_v2_to_v3`）。
@@ -440,6 +448,15 @@ class ExploreStore:
         本身**實際**冪等（7.9b 只在 docstring 宣稱冪等，實作會重複建 scan 列
         與重複改 job）：
         - 該地址已有任何 `fills_scan` 列 → 整列跳過（這一列已遷移過）。
+          Task 7.9d-D D3（7.9c 複審 S3，說清這道閘門的作用範圍）：**它擋的
+          不是**「上一次遷移做了一半」——外層的 `BEGIN IMMEDIATE` 保證部分
+          遷移狀態根本無法持久化（中途失敗＝整段回滾，`fills_scan` 為空、
+          version 仍 2），所以正常路徑上重跑時這個閘門一定不會命中。它只擋
+          一種情況：**遷移已成功提交，但 `schema_version` 被人工改回 2**
+          （災難演練、降版回滾、手動修 DB）而讓遷移再跑一次——那時
+          `fills_scan` 列已經在了，沒有這道閘門就會重複建 scan 列、重複把
+          `fills` job 改名。下面的 `INSERT OR IGNORE` 與改名的 `NOT EXISTS`
+          同理，都是為這條「人工改版本」路徑準備的第二層保險。
         - 新增 job 一律 `INSERT OR IGNORE`；`refresh_job` 改名加
           `NOT EXISTS`（目標 key 已存在就不改名，避免撞 PRIMARY KEY）。
         - `fills_verify` 的攤開時間用地址雜湊（`_migration_spread_s`）決定，
@@ -892,6 +909,67 @@ class ExploreStore:
         用的名字，見 plan §7.9c 介面契約）。同一個查詢，不另開實作。"""
         return self.get_active_scan(address)
 
+    def count_scans(self, active: set[str] | None = None) -> dict[str, int]:
+        """進行中遍歷的彙總（單句 SQL，Task 7.9d-D D2；2026-09-22 使用者第二輪
+        裁決點 3 的分列版）。回傳四個鍵：
+
+        - `running_rows`：`status='running'` 的 `fills_scan` 列數。
+        - `running_addresses`：上列涵蓋的**地址數**（同址理論上只有一筆
+          running，但列數與地址數要分開回報才看得出異常）。
+        - `orphan_rows`：running 但該地址**沒有** `fills_scan` job 的列數
+          ——這就是「遍歷停在半路、沒有任何 job 會推進它」的孤兒數（對帳
+          `reconcile_scan_jobs` 要把它們補回 job，續跑同一個 `scan_id`）。
+        - `inactive_running_rows`：running 但地址已不在 `active` 集合內；
+          `active=None`（沒問）→ 0，不臆測。
+
+        **母體＝`fills_scan` 列本身，不經候選 active 過濾**：7.9c 的
+        `status()` 走 `active_candidates()` 再逐一 `running_scan(addr)`（300 次
+        點查、正式機實測 21ms/次），母體變成「目前 active 候選」——退池但
+        遍歷還沒收尾的地址就從觀測值裡消失（工程原則 1：這個計數與
+        `refresh_job`／`fills_scan` 的其他計數必須同母體才可比）。`active`
+        只做**分列**，不縮小母體。"""
+        addrs = tuple(sorted(_norm(a) for a in active)) if active is not None else ()
+        if active is not None and addrs:
+            placeholders = ",".join("?" * len(addrs))
+            inactive_expr = f"SUM(CASE WHEN s.address IN ({placeholders}) THEN 0 ELSE 1 END)"
+        elif active is not None:
+            inactive_expr = "COUNT(*)"       # active 集合為空 → 全部都是 inactive
+        else:
+            inactive_expr = "0"              # 沒問就不分列
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT s.address), "
+                "SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM refresh_job j "
+                "  WHERE j.address = s.address AND j.kind='fills_scan') THEN 1 ELSE 0 END), "
+                f"{inactive_expr} "
+                "FROM fills_scan s WHERE s.status='running'", addrs).fetchone()
+        return {"running_rows": row[0], "running_addresses": row[1],
+                "orphan_rows": row[2] or 0, "inactive_running_rows": row[3] or 0}
+
+    def scan_job_targets(self, active: set[str]) -> list[tuple[str, str | None]]:
+        """對帳用（2026-09-22 使用者第二輪裁決點 1／3）：每個 **active** 地址一列
+        `(address, 進行中遍歷的 scan_id 或 None)`，依地址排序。
+
+        單句 SQL（`VALUES` CTE ＋ `LEFT JOIN fills_scan`）——`reconcile_scan_jobs`
+        原本要對 300 個地址各做一次 `running_scan(addr)` 點查（21ms/次）。
+        `None` ＝該地址目前沒有進行中的遍歷（對帳端再依 `completeness`／
+        partial 到期決定要不要建新的；有 `scan_id` 時一律**續跑同一個**
+        scan 與游標，不得整窗重抓）。
+
+        母體就是傳入的 `active` 集合本身（候選表裡沒有的地址也會回一列
+        `(addr, None)`，不靜默吃掉）；空集合 → `[]`（不下 SQL）。"""
+        addrs = sorted({_norm(a) for a in active})
+        if not addrs:
+            return []
+        values = ",".join(["(?)"] * len(addrs))
+        with self._lock, self._db:
+            rows = self._db.execute(
+                f"WITH a(address) AS (VALUES {values}) "
+                "SELECT a.address, s.scan_id FROM a "
+                "LEFT JOIN fills_scan s ON s.address = a.address AND s.status='running' "
+                "ORDER BY a.address", tuple(addrs)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     def latest_done_scan(self, address: str) -> FillsScan | None:
         """Task 7.9c D8：該地址 `status='done'` 中 `finished_at` 最大的一筆
         （`NULL` 的 finished_at 排最後）——排程端用它判斷 partial 重掃是否
@@ -1166,6 +1244,86 @@ class ExploreStore:
                 "SELECT COUNT(*) FROM refresh_job WHERE kind=? AND next_attempt_at<=? "
                 "AND (lease_until IS NULL OR lease_until < ?)", (kind, now, now)).fetchone()
         return row[0]
+
+    def count_jobs_by_kind(self, active: set[str] | None = None) -> dict[str, dict[str, int]]:
+        """每個 `kind` 的 `refresh_job` 統計（單句 `GROUP BY`，Task 7.9d-D D2；
+        2026-09-22 使用者第二輪裁決點 3 的分列版）。每個 kind 四個鍵：
+
+        - `rows`：該 kind 的 job 列數。
+        - `addresses`：涵蓋的**地址數**（`COUNT(DISTINCT address)`；列數與地址
+          數必須分開回報——同址多 job 與多址各一 job 在單一數字下長得一樣）。
+          全域 kind（`address IS NULL`，目前只有 `candidates`）不計入。
+        - `active_rows`／`inactive_rows`：地址在／不在傳入的 `active` 集合內的
+          列數。`active=None`（沒問）→ `active_rows == rows`、`inactive_rows
+          == 0`，不臆測。`address IS NULL` 的全域 job 一律算 active——它沒有
+          「退池」這回事（`delete_inactive_jobs` 同樣不刪它）。
+
+        **母體＝`refresh_job` 列本身，不經候選 active 過濾**——7.9c 的
+        `status()` 用 `active_candidates()` 逐址點查 job，正式機 129 筆
+        `fills_verify` 只顯示 112（17 筆屬於已退池但 job 還沒刪的地址）：對
+        「核驗軌還剩多少工作」這個問題來說，那 17 筆仍會被 `claim_due` 領走、
+        仍會消耗名額，不該從觀測值裡消失（工程原則 1：被比較／被追蹤的量與
+        排程實際作用的集合同源）。`active` 只做分列，不縮小母體。
+
+        `JOB_KINDS` 的已知 kind 一律出現（沒有列時四個鍵都是 0，不是缺鍵）；
+        DB 裡若有清單外的 kind 也會照實回報。"""
+        addrs = tuple(sorted(_norm(a) for a in active)) if active is not None else ()
+        if active is not None and addrs:
+            placeholders = ",".join("?" * len(addrs))
+            active_expr = ("SUM(CASE WHEN address IS NULL OR address IN "
+                           f"({placeholders}) THEN 1 ELSE 0 END)")
+        elif active is not None:
+            active_expr = "SUM(CASE WHEN address IS NULL THEN 1 ELSE 0 END)"
+        else:
+            active_expr = "COUNT(*)"
+        counts = {k: {"rows": 0, "addresses": 0, "active_rows": 0, "inactive_rows": 0}
+                  for k in JOB_KINDS}
+        with self._lock, self._db:
+            rows = self._db.execute(
+                "SELECT kind, COUNT(*), COUNT(DISTINCT address), "
+                f"{active_expr} FROM refresh_job GROUP BY kind", addrs).fetchall()
+        for kind, n_rows, n_addrs, n_active in rows:
+            counts[kind] = {"rows": n_rows, "addresses": n_addrs,
+                            "active_rows": n_active, "inactive_rows": n_rows - n_active}
+        return counts
+
+    def delete_inactive_jobs(self, active: set[str]) -> int:
+        """刪除所有 `address` 不在 `active` 集合內的 `refresh_job`，回傳刪除列數
+        （2026-09-22 使用者第二輪裁決點 3）。
+
+        `delete_jobs` 只清「本輪 `deactivate_missing` 回傳的那幾個地址」——
+        重啟、漏跑一輪、或人工改動之後留下的殘留 job 沒有任何路徑會清，它們
+        照樣被 `claim_due` 領走、照樣打上游、照樣佔準入上限。對帳時用本方法
+        以 active 集合為準做一次全表掃除（冪等：沒有殘留就回 0）。
+
+        `address IS NULL` 的全域 job（目前只有 `candidates`，它就是產生 active
+        集合本身的那個工作）**永不刪除**——刪了就再也沒有東西會更新候選池。
+        `active` 為空集合時同樣只刪有地址的 job。"""
+        addrs = tuple(sorted({_norm(a) for a in active}))
+        sql = "DELETE FROM refresh_job WHERE address IS NOT NULL"
+        if addrs:
+            sql += f" AND address NOT IN ({','.join('?' * len(addrs))})"
+        with self._lock, self._db:
+            cur = self._db.execute(sql, addrs)
+        return cur.rowcount
+
+    def count_due_by_kind(self, now: float) -> dict[str, int]:
+        """每個 `kind` 目前**到期且無有效 lease** 的 job 數（單句 SQL，
+        Task 7.9d-D D2）——`due_count(kind, now)` 的彙總版，兩者共用同一組
+        條件（`next_attempt_at <= now AND (lease_until IS NULL OR
+        lease_until < now)`），不得各自寫一套「到期」定義。
+
+        母體同 `count_jobs_by_kind`（`refresh_job` 列本身，不經 active 過濾）。
+        `JOB_KINDS` 的已知 kind 一律出現（0 表示「這個 kind 現在沒有到期
+        工作」，與缺鍵區分——飢餓觀測要看得出 0 與「沒問過」的差別）。"""
+        counts = dict.fromkeys(JOB_KINDS, 0)
+        with self._lock, self._db:
+            rows = self._db.execute(
+                "SELECT kind, COUNT(*) FROM refresh_job "
+                "WHERE next_attempt_at <= ? AND (lease_until IS NULL OR lease_until < ?) "
+                "GROUP BY kind", (now, now)).fetchall()
+        counts.update({r[0]: r[1] for r in rows})
+        return counts
 
     def rebalance_overdue(self, kind: str, now: float, period_s: float,
                           spread_fn: Callable[[str], float]) -> int:

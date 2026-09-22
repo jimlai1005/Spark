@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import dataclasses
 
+from spark.publicapi import explore_fills_sync
 from spark.publicapi.explore_fills_sync import (
     HL_FILLS_RETENTION_LIMIT,
     OVERLAP_MS,
     PAGE_LIMIT,
     PARAMS_FP,
-    PARTIAL_RESCAN_AFTER_MS,
     PARTIAL_RESCAN_AFTER_S,
     RETENTION_SAFETY_MARGIN,
     RETENTION_SAFETY_THRESHOLD,
@@ -414,10 +414,17 @@ def test_integration_with_store_replaying_incremental_page_is_idempotent(tmp_pat
 #     inc_from 非空（D6）／gap 語義（D7 (iii) 的增量側） ---
 
 def test_partial_rescan_after_s_is_the_single_source_in_seconds():
-    """C1／D1：排程時間是秒制——毫秒常數（7.9b 的 `PARTIAL_RESCAN_AFTER_MS`
-    被直接加到秒制 `now` 上，重掃排到 1,000 天後）不得再被當成期限用。"""
+    """C1／D1：排程時間是秒制——7.9b 的毫秒版期限常數被直接加到秒制 `now`
+    上（重掃排到 1,000 天後）是當時的 Critical。
+
+    Task 7.9d-D D1（7.9c 複審 W3）：毫秒版本**已刪除**，本測試從「釘住兩者
+    的換算關係」改成「守住它不再出現」——模組裡只要還有一個同義的毫秒期限
+    常數，就會有人再把它加到秒制的 `now` 上。名字用組合比對（不寫出舊常數
+    的字面名）以免 `rg` 檢查又把測試本身算成殘留引用。"""
     assert PARTIAL_RESCAN_AFTER_S == 24 * 3600
-    assert PARTIAL_RESCAN_AFTER_MS == PARTIAL_RESCAN_AFTER_S * 1000
+    ms_named = [n for n in vars(explore_fills_sync)
+                if n.startswith("PARTIAL_RESCAN") and n.endswith("_MS")]
+    assert ms_named == []
 
 
 def test_partial_rescan_due_none_finished_at_is_due():

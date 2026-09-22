@@ -1485,3 +1485,173 @@ def test_oldest_due_at_kinds_filter_only_counts_listed_kinds(tmp_path):
     assert store.oldest_due_at(c.now()) == c.now() - 100
     assert store.oldest_due_at(c.now(), kinds=("fills_verify",)) == c.now() - 50
     assert store.oldest_due_at(c.now(), kinds=("candidates",)) is None
+
+
+# --- Task 7.9d-D：同源彙總查詢（D2）／退池 job 清理／scan 對帳目標 ---
+#
+# 7.9c 複審 W2／S1：scheduler 的 `scans_running`／`verify_remaining` 走
+# `active_candidates()` 逐一點查（21ms/次，且母體是「目前 active 候選」而不是
+# 「被排程的列本身」——正式機 129 筆 verify job 只顯示 112）。以下測試釘住
+# 新彙總查詢的母體：**不經 active 過濾**（退池地址的 job／running scan 照樣
+# 計入），`active` 參數只做**分列**（active／inactive／orphan），不縮小母體。
+
+def _inactive_addr_with_job_and_running_scan(store, c, addr="0xdead"):
+    """建一個「已退池但 job／running scan 還在」的地址（正式機真實狀態：
+    `deactivate_missing` 已標 active=0，但 `delete_jobs`／scan 收尾還沒發生）。"""
+    store.upsert_candidates([(addr, "Gone", 9, 0.0)], as_of=c.now())
+    store.deactivate_missing(set())            # 全部踢出池
+    assert store.is_active(addr) is False
+    _bootstrapped(store, c, addr)              # running initial scan
+    store.enqueue(f"{addr}:fills_verify", addr, "fills_verify", priority=4,
+                  next_attempt_at=c.now() - 10)
+    return addr
+
+
+def _active(store):
+    return {cand.address for cand in store.active_candidates()}
+
+
+def test_count_jobs_by_kind_counts_every_job_without_active_filter(tmp_path):
+    """`active=None`：母體＝`refresh_job` 列本身，`active_rows == rows`、
+    `inactive_rows == 0`（沒問就不分列，不假裝知道）。"""
+    store, c = _store(tmp_path)
+    store.enqueue("0xabc:state", "0xabc", "state", priority=0, next_attempt_at=c.now())
+    store.enqueue("0xabc:fills_verify", "0xabc", "fills_verify", priority=4,
+                  next_attempt_at=c.now() + 5000)
+    _inactive_addr_with_job_and_running_scan(store, c)   # 再一筆退池的 fills_verify
+    counts = store.count_jobs_by_kind()
+    # 含退池地址那一筆（W2：129 不是 112）；列數與地址數分開回報。
+    assert counts["fills_verify"] == {"rows": 2, "addresses": 2,
+                                      "active_rows": 2, "inactive_rows": 0}
+    assert counts["state"] == {"rows": 1, "addresses": 1, "active_rows": 1,
+                               "inactive_rows": 0}
+    # 已知 kind 沒有列時是 0，不是缺鍵。
+    assert counts["fills"] == {"rows": 0, "addresses": 0, "active_rows": 0,
+                               "inactive_rows": 0}
+
+
+def test_count_jobs_by_kind_splits_active_and_inactive_rows(tmp_path):
+    """傳入 `active` 集合 → 同一次查詢分列 active／inactive（正式機形狀：
+    `{"fills_verify": {"rows":129,"addresses":129,"active_rows":112,
+    "inactive_rows":17}}`）；列數與地址數分開（同地址兩個 job ≠ 兩個地址）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "A", 1, 0.1), ("0xbbb", "B", 2, 0.2)], as_of=c.now())
+    for addr in ("0xaaa", "0xbbb"):
+        store.enqueue(f"{addr}:fills_verify", addr, "fills_verify", priority=4,
+                      next_attempt_at=c.now())
+    store.enqueue("0xaaa:fills", "0xaaa", "fills", priority=2, next_attempt_at=c.now())
+    store.enqueue("candidates", None, "candidates", priority=0, next_attempt_at=c.now())
+    inactive = _inactive_addr_with_job_and_running_scan(store, c)   # 退池、verify job 還在
+    store.upsert_candidates([("0xaaa", "A", 1, 0.1), ("0xbbb", "B", 2, 0.2)], as_of=c.now())
+    assert inactive not in _active(store)
+
+    counts = store.count_jobs_by_kind(_active(store))
+    assert counts["fills_verify"] == {"rows": 3, "addresses": 3,
+                                      "active_rows": 2, "inactive_rows": 1}
+    assert counts["fills"] == {"rows": 1, "addresses": 1, "active_rows": 1,
+                               "inactive_rows": 0}
+    # 全域 kind（address NULL）永遠算 active——它沒有「退池」這回事，
+    # `delete_inactive_jobs` 也不刪它；`addresses` 不計 NULL。
+    assert counts["candidates"] == {"rows": 1, "addresses": 0, "active_rows": 1,
+                                    "inactive_rows": 0}
+
+
+def test_count_scans_reports_running_orphan_and_inactive_rows(tmp_path):
+    store, c = _store(tmp_path)
+    assert store.count_scans() == {"running_rows": 0, "running_addresses": 0,
+                                   "orphan_rows": 0, "inactive_running_rows": 0}
+    store.upsert_candidates([("0xabc", "Alice", 1, 0.1)], as_of=c.now())
+    active_scan = _bootstrapped(store, c, "0xabc")
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", priority=3,
+                  next_attempt_at=c.now())
+    inactive = _inactive_addr_with_job_and_running_scan(store, c)   # running scan、無 scan job
+    store.upsert_candidates([("0xabc", "Alice", 1, 0.1)], as_of=c.now())   # 0xabc 回池
+
+    # active=None：母體是 fills_scan 列本身（退池的也算），不分 active。
+    assert store.count_scans() == {"running_rows": 2, "running_addresses": 2,
+                                   "orphan_rows": 1, "inactive_running_rows": 0}
+    # 傳 active → 分列；orphan＝running 但該地址沒有 fills_scan job（對帳目標）。
+    assert store.count_scans(_active(store)) == {
+        "running_rows": 2, "running_addresses": 2, "orphan_rows": 1,
+        "inactive_running_rows": 1}
+    assert inactive not in _active(store)
+
+    store.complete_scan("0xabc", [], dataclasses.replace(
+        active_scan, cursor_ms=active_scan.window_end_ms, result="complete",
+        reason="count_below_retention_threshold", finished_at=c.now()))
+    # done 的不算 running。
+    assert store.count_scans(_active(store))["running_rows"] == 1
+
+
+def test_delete_inactive_jobs_removes_only_non_active_addresses(tmp_path):
+    """點 3（使用者第二輪裁決）：對帳時主動掃除既有殘留 job，不只靠本輪
+    `deactivate_missing` 的回傳值——重啟／漏掉的那幾輪不會留下永久殘留。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "A", 1, 0.1)], as_of=c.now())
+    store.enqueue("0xaaa:fills", "0xaaa", "fills", priority=2, next_attempt_at=c.now())
+    store.enqueue("candidates", None, "candidates", priority=0, next_attempt_at=c.now())
+    inactive = _inactive_addr_with_job_and_running_scan(store, c)
+    store.upsert_candidates([("0xaaa", "A", 1, 0.1)], as_of=c.now())        # 0xaaa 回池
+
+    assert store.delete_inactive_jobs(_active(store)) == 1                  # 只刪退池那一筆
+    assert store.job_kinds(inactive) == set()
+    assert store.job_kinds("0xaaa") == {"fills"}
+    assert store.count_jobs_by_kind()["candidates"]["rows"] == 1            # 全域 job 不刪
+    assert store.delete_inactive_jobs(_active(store)) == 0                  # 冪等
+
+
+def test_delete_inactive_jobs_with_empty_active_set_keeps_global_jobs(tmp_path):
+    store, c = _store(tmp_path)
+    store.enqueue("0xaaa:fills", "0xaaa", "fills", priority=2, next_attempt_at=c.now())
+    store.enqueue("candidates", None, "candidates", priority=0, next_attempt_at=c.now())
+    assert store.delete_inactive_jobs(set()) == 1
+    assert store.count_jobs_by_kind()["candidates"]["rows"] == 1
+
+
+def test_scan_job_targets_returns_one_row_per_active_address(tmp_path):
+    """對帳用：每個 active 地址一列 `(address, running_scan_id or None)`
+    ——單句 LEFT JOIN，不做 300 次點查；`None` ＝沒有進行中的遍歷。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xAAA", "A", 1, 0.1), ("0xbbb", "B", 2, 0.2)], as_of=c.now())
+    scan = _bootstrapped(store, c, "0xaaa")
+    _inactive_addr_with_job_and_running_scan(store, c)   # 退池地址不得出現
+    store.upsert_candidates([("0xaaa", "A", 1, 0.1), ("0xbbb", "B", 2, 0.2)], as_of=c.now())
+
+    targets = store.scan_job_targets(_active(store))
+    assert targets == [("0xaaa", scan.scan_id), ("0xbbb", None)]
+    # 完成後同一個地址回 None（不再需要續跑）。
+    store.complete_scan("0xaaa", [], dataclasses.replace(
+        scan, cursor_ms=scan.window_end_ms, result="complete",
+        reason="count_below_retention_threshold", finished_at=c.now()))
+    assert store.scan_job_targets(_active(store)) == [("0xaaa", None), ("0xbbb", None)]
+    assert store.scan_job_targets(set()) == []
+
+
+def test_count_due_by_kind_counts_only_due_and_lease_free_jobs(tmp_path):
+    store, c = _store(tmp_path)
+    store.enqueue("0xabc:fills", "0xabc", "fills", priority=2, next_attempt_at=c.now() - 100)
+    store.enqueue("0xdef:fills", "0xdef", "fills", priority=2, next_attempt_at=c.now() + 100)
+    addr = _inactive_addr_with_job_and_running_scan(store, c)   # 逾期的 verify job
+    due = store.count_due_by_kind(c.now())
+    assert due["fills"] == 1                 # 未到期的那筆不算
+    assert due["fills_verify"] == 1          # 退池地址的到期 job 照樣算
+    assert due["fills_scan"] == 0            # 已知 kind 沒有到期列 → 0
+    # lease 被領走的不算到期（與 `due_count`／`claim_due` 同一組條件）。
+    claimed = store.claim_due(c.now(), "owner", 60.0, kinds=("fills_verify",))
+    assert claimed is not None and claimed.address == addr
+    assert store.count_due_by_kind(c.now())["fills_verify"] == 0
+    assert store.count_jobs_by_kind()["fills_verify"]["rows"] == 1   # job 列還在
+
+
+def test_count_due_by_kind_agrees_with_due_count_per_kind(tmp_path):
+    """彙總與既有逐 kind 查詢同口徑（同源：兩者不得各自算一套到期定義）。"""
+    store, c = _store(tmp_path)
+    for i, kind in enumerate(("state", "portfolio", "ledger", "fills", "fills_scan",
+                              "fills_verify")):
+        store.enqueue(f"0x{i}:{kind}", f"0x{i}", kind, priority=i,
+                      next_attempt_at=c.now() - 1)
+    store.enqueue("0xlate:fills", "0xlate", "fills", priority=2, next_attempt_at=c.now() + 60)
+    due = store.count_due_by_kind(c.now())
+    for kind in due:
+        assert due[kind] == store.due_count(kind, c.now()), kind
+    assert due["fills"] == 1

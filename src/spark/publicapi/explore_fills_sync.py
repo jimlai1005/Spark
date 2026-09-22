@@ -84,11 +84,13 @@ _DEFAULT_INCREMENTAL_PERIOD_S = DEFAULT_FILLS_PERIOD_S
 
 # Task 7.7 W2（partial 復原路徑）／Task 7.9b B3：`partial` 遍歷完成後，
 # `explore_scheduler` 自動排程下一次 `partial_rescan`，間隔即此常數。
-# Task 7.9c C1／D1（2026-09-22 裁決）：**秒制唯一來源**——7.9b 的毫秒常數被
-# 直接加到秒制的 `now` 上（`now + PARTIAL_RESCAN_AFTER_MS`），重掃排到 1,000
-# 天後。排程時間一律用秒，毫秒只在「呼叫 planner」那一個邊界才換算。
+# Task 7.9c C1／D1（2026-09-22 裁決）：**秒制唯一來源**——7.9b 的毫秒版期限
+# 常數被直接加到秒制的 `now` 上（`now + 86_400_000` 秒），重掃排到 1,000 天後。
+# 排程時間一律用秒，毫秒只在「呼叫 planner」那一個邊界才換算。
+# Task 7.9d-D D1（7.9c 複審 W3）：過渡期的毫秒別名已刪除，本模組不再提供任何
+# 毫秒版本的重掃期限——排程期限只有這一個秒制常數可用（測試
+# `test_partial_rescan_after_s_is_the_single_source_in_seconds` 守住它不復活）。
 PARTIAL_RESCAN_AFTER_S = 24 * 3600
-PARTIAL_RESCAN_AFTER_MS = PARTIAL_RESCAN_AFTER_S * 1000  # 過渡：7.9c-S 移除引用後刪
 
 
 def partial_rescan_due(finished_at: float | None, now: float) -> bool:
