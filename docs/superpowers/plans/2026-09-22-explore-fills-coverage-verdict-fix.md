@@ -1734,6 +1734,15 @@ running scans 66 → 65；Traceback 0；429 0；follower 不變；cron.err 0。*
 觀察：這一小時解出的探測 ~9 成落在 `truncation_suspected`——1 天探測窗對這批（多為低頻）帳戶幾乎必然回空。
 不影響安全（全部判 partial），但代表 complete 的自然上限在 ~170 附近，剩下要靠待辦（本地 fills 反證＋7 天探測窗）。
 
+| 21:00 | 0 | 0 | 122／157／21 | 74 | 0／0／0 | ok | complete 125→122：候選池換血的小幅波動 |
+| 21:15 | 0 | 0 | 122／157／21 | 74 | 1／1／1 | ok | |
+| 21:30 | 0 | 0 | 125／156／19 | 70 | 0／0／0 | ok | |
+| 21:45 | 0 | 0 | **127**／154／19 | 70 | 0／0／0 | ok | eligible 85 |
+
+**21:55 排程檢查（+6h10m）**：unknown **160 → 124**（−36/h）、`earlier_fills_seen` 166 → 169、`no_earlier_activity` 9 → 16、
+`truncation_suspected` 89 → 117；completeness 65／171／190；`fills_verify` job 75 → 69；running scans 65；
+Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
