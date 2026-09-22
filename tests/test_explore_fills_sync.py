@@ -9,15 +9,14 @@ import dataclasses
 
 from spark.publicapi import explore_fills_sync
 from spark.publicapi.explore_fills_sync import (
-    HL_FILLS_RETENTION_LIMIT,
     OVERLAP_MS,
     PAGE_LIMIT,
     PARAMS_FP,
     PARTIAL_RESCAN_AFTER_S,
-    RETENTION_SAFETY_MARGIN,
-    RETENTION_SAFETY_THRESHOLD,
     WINDOW_DAYS,
     IncrementalPlan,
+    LeftBoundary,
+    MAX_PAGES_PER_SCAN,
     ScanPlan,
     apply_incremental_page,
     apply_scan_page,
@@ -27,6 +26,7 @@ from spark.publicapi.explore_fills_sync import (
     partial_rescan_due,
     plan_incremental,
     plan_scan,
+    scan_verdict,
 )
 from spark.publicapi.explore_store import (
     REASON_COUNT_BELOW_RETENTION_THRESHOLD,
@@ -47,16 +47,6 @@ def test_module_constants_match_spec():
     assert PAGE_LIMIT == 2000
     assert WINDOW_DAYS == 30
     assert OVERLAP_MS == 1
-
-
-def test_retention_constants_named_and_derived():
-    """Task 7.5 點 1（命名修正）：官方留存上限、保守緩衝（一頁）、與兩者相減得到
-    的實際判準門檻，三個常數各自命名、彼此可追溯（工程原則 1）——舊名
-    `RETENTION_LIMIT` 已移除（見模組 import：不再存在該名稱可 import）。"""
-    assert HL_FILLS_RETENTION_LIMIT == 10_000
-    assert RETENTION_SAFETY_MARGIN == PAGE_LIMIT
-    assert RETENTION_SAFETY_THRESHOLD == HL_FILLS_RETENTION_LIMIT - RETENTION_SAFETY_MARGIN
-    assert RETENTION_SAFETY_THRESHOLD == 8_000
 
 
 def test_params_fp_constant_matches_actual_hl_request_body():
@@ -117,7 +107,7 @@ def test_apply_scan_page_full_page_advances_cursor_no_plus_one():
     scan = _scan(window_end_ms=1000, cursor_ms=0)
     plan = ScanPlan(start_ms=0, end_ms=1000, scan=scan)
     page = [_fill(0, 1), _fill(5, 2), _fill(9, 3)]
-    result = apply_scan_page(plan, page, page_limit=3, retention_threshold=100, now_ms=NOW)
+    result = apply_scan_page(plan, page, page_limit=3, now_ms=NOW)
     assert result.done is False
     assert result.scan.cursor_ms == 9  # 最後一筆 time，無 +1
     assert result.scan.pages_done == 1
@@ -129,55 +119,51 @@ def test_apply_scan_page_overlap_first_record_equals_cursor_accepted():
     scan = _scan(window_end_ms=1000, cursor_ms=9)
     plan = ScanPlan(start_ms=9, end_ms=1000, scan=scan)
     page = [_fill(9, 3), _fill(9, 4), _fill(15, 5)]  # 重疊那一毫秒重複出現
-    result = apply_scan_page(plan, page, page_limit=3, retention_threshold=100, now_ms=NOW)
+    result = apply_scan_page(plan, page, page_limit=3, now_ms=NOW)
     assert result.done is False
     assert result.scan.cursor_ms == 15
     assert len(result.accepted) == 3  # 去重交給 store PK，本層照單全收
 
 
 def test_apply_scan_page_same_ms_overflow_full_page():
+    """D-E／D-F：整頁同一毫秒是真正的分頁缺口，不是完整性結論——
+    `apply_scan_page` 只記 `stop_reason`／`unresolved_gap`，`result`／`reason`
+    維持 `None`（結論交給 `scan_verdict`）。"""
     scan = _scan(window_end_ms=1000, cursor_ms=5)
     plan = ScanPlan(start_ms=5, end_ms=1000, scan=scan)
     page = [_fill(5, 1), _fill(5, 2), _fill(5, 3)]
-    result = apply_scan_page(plan, page, page_limit=3, retention_threshold=100, now_ms=NOW)
+    result = apply_scan_page(plan, page, page_limit=3, now_ms=NOW)
     assert result.done is True
-    assert result.scan.result == "partial"
-    assert result.scan.reason == "same_ms_overflow"
+    assert result.scan.result is None and result.scan.reason is None
+    assert result.scan.stop_reason == "same_ms_overflow"
+    assert result.scan.unresolved_gap == 1
     assert result.scan.cursor_ms == 5  # 不跳過，維持原地
     assert result.note == "same_ms_overflow"
 
 
 def test_apply_scan_page_short_page_completes():
+    """D-E：短頁只代表「從游標起上游不再給」，`apply_scan_page` 不下結論——
+    `result`／`reason` 維持 `None`，游標推進到固定終點。"""
     scan = _scan(window_end_ms=1000, cursor_ms=50, fills_in_window=1)
     plan = ScanPlan(start_ms=50, end_ms=1000, scan=scan)
     page = [_fill(60, 9)]
-    result = apply_scan_page(plan, page, page_limit=3, retention_threshold=100, now_ms=NOW)
+    result = apply_scan_page(plan, page, page_limit=3, now_ms=NOW)
     assert result.done is True
-    assert result.scan.result == "complete"
-    assert result.scan.reason == REASON_COUNT_BELOW_RETENTION_THRESHOLD
-    assert result.note == REASON_COUNT_BELOW_RETENTION_THRESHOLD
+    assert result.scan.result is None and result.scan.reason is None
+    assert result.note == "reached_window_end"
     assert result.scan.cursor_ms == 1000
     assert result.scan.observed_from_ms == 60
     assert result.scan.observed_to_ms == 60
     assert result.scan.fills_in_window == 2
 
 
-def test_apply_scan_page_short_page_over_retention_threshold_is_partial():
-    scan = _scan(window_end_ms=1000, cursor_ms=50, fills_in_window=6)
-    plan = ScanPlan(start_ms=50, end_ms=1000, scan=scan)
-    page = [_fill(60, 9)]  # 短頁（1 < 3），累計 fills_in_window=7 >= 7
-    result = apply_scan_page(plan, page, page_limit=3, retention_threshold=7, now_ms=NOW)
-    assert result.done is True
-    assert result.scan.result == "partial"
-    assert result.scan.reason == "retention_limit"
-
-
 def test_apply_scan_page_empty_page_completes_observed_unchanged():
     scan = _scan(window_end_ms=1000, cursor_ms=50, observed_from_ms=10, observed_to_ms=20)
     plan = ScanPlan(start_ms=50, end_ms=1000, scan=scan)
-    result = apply_scan_page(plan, [], page_limit=3, retention_threshold=100, now_ms=NOW)
+    result = apply_scan_page(plan, [], page_limit=3, now_ms=NOW)
     assert result.done is True
-    assert result.scan.result == "complete"
+    assert result.scan.result is None and result.scan.reason is None
+    assert result.note == "reached_window_end"
     assert result.scan.observed_from_ms == 10
     assert result.scan.observed_to_ms == 20
 
@@ -191,7 +177,7 @@ def test_apply_scan_page_out_of_order_is_invalid_cursor_unchanged():
     scan = _scan(window_end_ms=1000, cursor_ms=50)
     plan = ScanPlan(start_ms=50, end_ms=1000, scan=scan)
     page = [_fill(60, 1), _fill(55, 2)]  # 降冪
-    result = apply_scan_page(plan, page, page_limit=3, retention_threshold=100, now_ms=NOW)
+    result = apply_scan_page(plan, page, page_limit=3, now_ms=NOW)
     assert result.done is False
     assert result.accepted == []
     assert result.scan.cursor_ms == 50
@@ -204,8 +190,7 @@ def test_apply_scan_page_out_of_range_page_retries_same_cursor_next_round():
     scan 不得收尾——`pages_done` 不動、下一次 `plan_scan` 從同一個游標再試。"""
     scan = _scan(window_end_ms=1000, cursor_ms=50, pages_done=2)
     plan = ScanPlan(start_ms=50, end_ms=1000, scan=scan)
-    result = apply_scan_page(plan, [_fill(2000, 1)], page_limit=3, retention_threshold=100,
-                             now_ms=NOW)
+    result = apply_scan_page(plan, [_fill(2000, 1)], page_limit=3, now_ms=NOW)
     assert result.done is False and result.accepted == []
     assert result.scan.result is None
     assert result.scan.pages_done == 2
@@ -216,25 +201,54 @@ def test_apply_scan_page_out_of_range_page_retries_same_cursor_next_round():
 
 
 def test_apply_scan_page_hits_page_cap_on_20th_consecutive_full_page():
-    """Task 3.7 D（S1 修法）：單輪續頁加硬上限（預設 20 頁＝40,000 筆 >
-    留存上限 10,000，正常資料到不了）。"""
+    """Task 3.7 D（S1 修法）；Task 2（D-A／D-E，2026-09-22 主線程裁決）起
+    改為**暫停**而非結論來源——單輪續頁上限（預設 20 頁）達到時只是本輪
+    做太多頁，`result`／`stop_reason` 兩者皆維持 `None`（不得寫
+    `stop_reason="page_cap"`：那會讓 `scan_verdict` 對一個需要多頁才能跑完
+    的大戶每 20 頁就吐出一次「partial」，正是 D-E 禁止的「預算耗盡當結論」）。
+    真正的終止條件是 `MAX_PAGES_PER_SCAN`（見
+    `test_absolute_cap_is_a_local_stop_not_an_upstream_claim`）。"""
     scan = _scan(window_end_ms=10_000, cursor_ms=0)
     plan = ScanPlan(start_ms=0, end_ms=10_000, scan=scan)
     cursor = 0
     result = None
     for i in range(20):
         page = [_fill(cursor + 1, 2 * i + 1), _fill(cursor + 2, 2 * i + 2)]
-        result = apply_scan_page(plan, page, page_limit=2, retention_threshold=10_000, now_ms=1000)
+        result = apply_scan_page(plan, page, page_limit=2, now_ms=1000)
         if result.done:
             break
         cursor = result.scan.cursor_ms
         plan = ScanPlan(start_ms=cursor, end_ms=10_000, scan=result.scan)
 
     assert result.done is True
-    assert result.scan.result == "partial"
-    assert result.scan.reason == "page_cap"
+    assert result.scan.result is None and result.scan.reason is None
+    assert result.scan.stop_reason is None
     assert result.scan.pages_done == 20
     assert result.scan.cursor_ms == result.scan.cursor_ms
+
+
+def test_round_cap_pauses_without_any_verdict():
+    """每輪預算耗盡不是結論（D-E）：本輪結束、游標推進、result 與 stop_reason 皆 None。"""
+    scan = _scan(pages_done=2, cursor_ms=1000)
+    plan = ScanPlan(start_ms=1000, end_ms=9000, scan=scan)
+    result = apply_scan_page(plan, [_fill(1000, 1), _fill(2000, 2)],
+                             page_limit=2, max_pages_per_round=3, now_ms=NOW)
+    assert result.done is True
+    assert result.scan.result is None and result.scan.stop_reason is None
+    assert result.scan.cursor_ms == 2000
+
+
+def test_absolute_cap_is_a_local_stop_not_an_upstream_claim():
+    """D-F：400 頁只表示本系統停止回補。reason 必須是 local_page_cap，
+    且不得出現任何 retention 字樣（那是對上游的主張，我們沒有證據）。"""
+    scan = _scan(pages_done=MAX_PAGES_PER_SCAN - 1, cursor_ms=1000)
+    plan = ScanPlan(start_ms=1000, end_ms=9000, scan=scan)
+    result = apply_scan_page(plan, [_fill(1000, 1), _fill(2000, 2)],
+                             page_limit=2, max_pages_per_round=3, now_ms=NOW)
+    assert result.done is True
+    assert result.scan.stop_reason == "local_page_cap"
+    assert result.scan.result is None                     # 結論仍由 scan_verdict 給
+    assert "retention" not in (result.scan.stop_reason or "")
 
 
 def test_end_to_end_scan_three_full_pages_then_short_page_completes():
@@ -242,29 +256,81 @@ def test_end_to_end_scan_three_full_pages_then_short_page_completes():
     plan = ScanPlan(start_ms=0, end_ms=30, scan=scan)
 
     page1 = [_fill(0, 1), _fill(1, 2), _fill(2, 3)]
-    r1 = apply_scan_page(plan, page1, page_limit=3, retention_threshold=100, now_ms=1000)
+    r1 = apply_scan_page(plan, page1, page_limit=3, now_ms=1000)
     assert r1.done is False
     assert r1.scan.pages_done == 1
 
     plan2 = ScanPlan(start_ms=r1.scan.cursor_ms, end_ms=30, scan=r1.scan)
     page2 = [_fill(2, 4), _fill(3, 5), _fill(4, 6)]
-    r2 = apply_scan_page(plan2, page2, page_limit=3, retention_threshold=100, now_ms=1000)
+    r2 = apply_scan_page(plan2, page2, page_limit=3, now_ms=1000)
     assert r2.done is False
 
     plan3 = ScanPlan(start_ms=r2.scan.cursor_ms, end_ms=30, scan=r2.scan)
     page3 = [_fill(4, 7), _fill(5, 8), _fill(6, 9)]
-    r3 = apply_scan_page(plan3, page3, page_limit=3, retention_threshold=100, now_ms=1000)
+    r3 = apply_scan_page(plan3, page3, page_limit=3, now_ms=1000)
     assert r3.done is False
 
     plan4 = ScanPlan(start_ms=r3.scan.cursor_ms, end_ms=30, scan=r3.scan)
     page4 = [_fill(6, 10)]  # 短頁，結束
-    r4 = apply_scan_page(plan4, page4, page_limit=3, retention_threshold=100, now_ms=1000)
+    r4 = apply_scan_page(plan4, page4, page_limit=3, now_ms=1000)
     assert r4.done is True
-    assert r4.scan.result == "complete"
+    assert r4.scan.result is None and r4.scan.reason is None
     assert r4.scan.pages_done == 3  # 終止頁不計入 pages_done
     assert r4.scan.cursor_ms == 30
     assert r4.scan.observed_from_ms == 0
     assert r4.scan.observed_to_ms == 6
+
+
+# --- Task 1（D-A／D-E／D-F）：scan_verdict——覆蓋結論的唯一來源 ---
+
+def _boundary(state: str) -> LeftBoundary:
+    return LeftBoundary(state=state, window_start_ms=1000, at=NOW)
+
+
+def test_short_page_alone_is_not_complete():
+    """D-E：短頁只證明遍歷結束，左界證據不到位就不得宣稱完整。
+    （這是本次事故的反向風險：把錯判不完整換成錯判完整。）"""
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=0)
+    assert scan_verdict(scan, _boundary("unknown")) == ("partial", "left_boundary_unknown")
+
+
+def test_complete_requires_left_boundary_evidence():
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=0)
+    assert scan_verdict(scan, _boundary("earlier_fills_seen")) == (
+        "complete", "left_boundary_verified")
+    assert scan_verdict(scan, _boundary("no_earlier_activity")) == (
+        "complete", "left_boundary_no_activity")
+
+
+def test_unresolved_gap_beats_every_other_evidence():
+    """分頁有未解缺口 → 不論左界證據多強都不是完整。"""
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=1)
+    assert scan_verdict(scan, _boundary("earlier_fills_seen")) == ("partial", "unresolved_gap")
+
+
+def test_local_stop_never_yields_completeness():
+    """D-F：我方停止回補（頁數上限／游標停滯／同毫秒溢位）一律不是完整，
+    且 reason 必須描述我方行為，不得描述上游留存。"""
+    for stop in ("local_page_cap", "no_progress", "same_ms_overflow"):
+        scan = _scan(cursor_ms=5000, window_end_ms=9000, unresolved_gap=0, stop_reason=stop)
+        state, reason = scan_verdict(scan, _boundary("earlier_fills_seen"))
+        assert (state, reason) == ("partial", stop)
+        assert "retention" not in reason        # 不得把我方上限說成上游留存
+
+
+def test_truncation_suspected_is_partial_not_complete():
+    scan = _scan(cursor_ms=9000, window_end_ms=9000, unresolved_gap=0)
+    assert scan_verdict(scan, _boundary("truncation_suspected")) == (
+        "partial", "left_boundary_truncated")
+
+
+def test_apply_scan_page_short_page_does_not_decide_completeness():
+    """收尾函式只負責「遍歷到此結束」，結論交給 scan_verdict。"""
+    plan = ScanPlan(start_ms=1000, end_ms=9000, scan=_scan(fills_in_window=50_000))
+    result = apply_scan_page(plan, [_fill(2000, 1)], page_limit=3, now_ms=NOW)
+    assert result.done is True
+    assert result.scan.cursor_ms == 9000          # 抵達固定終點
+    assert result.scan.result is None             # 不在這裡下結論
 
 
 # --- 增量軌：plan_incremental / apply_incremental_page ---

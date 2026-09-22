@@ -113,7 +113,7 @@ from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, PARAMS_F
                                                 PARTIAL_RESCAN_AFTER_S, apply_incremental_page,
                                                 apply_scan_page, fresh_scan_window,
                                                 partial_rescan_due, plan_incremental, plan_scan,
-                                                validate_page)
+                                                scan_verdict, validate_page)
 from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
                                            REASON_PROBE_NO_EARLIER_FILLS,
                                            REASON_RETENTION_BOUNDARY_VERIFIED,
@@ -1076,7 +1076,34 @@ class ExploreScheduler:
             self._notify_dirty()
             return f"ran:{result_kind}"
 
-        finished_scan = dataclasses.replace(res.scan, finished_at=now)
+        if (res.done and res.scan.result is None and res.scan.stop_reason is None
+                and res.scan.cursor_ms < res.scan.window_end_ms):
+            # Task 2（D-E）：(a) 本輪頁數用完（`max_pages_per_round` 暫停）——
+            # 預算耗盡不是結論。scan 仍 running：只落地進度並重排，不寫
+            # `result`／`reason`、不排 `partial_rescan`。重排時間與續頁路徑
+            # 同源（7.8 教訓：到期條件與重排時間必須同一來源）。
+            #
+            # `cursor_ms < window_end_ms` 是必要的第四個條件（2026-09-22
+            # 主線程裁決字面稿漏掉、builder 實測抓到）：`apply_scan_page` 對
+            # 「短頁抵達終點」與「本輪暫停」兩種情形都回傳
+            # `result=None, stop_reason=None`（見 Task 1），只差在游標有沒有
+            # 到 `window_end_ms`——少這個條件會把真正跑完的遍歷也當成暫停，
+            # scan 永遠卡在 `running`、`fills_sync` 永遠 `backfilling`／
+            # 舊結論不動（`test_s1_churned_partial_rescan_resumes_same_scan_id`
+            # 實測到：短頁收尾後 `running_scan` 仍非 `None`）。與 `scan_verdict`
+            # 判斷「有沒有抵達固定終點」用的是同一個條件（工程原則 1：同一個
+            # 判斷不能有兩個不同源的版本）。
+            self._store.insert_scan_page(job.address, res.accepted, res.scan)
+            self._reschedule(job, now, bump_attempts=False)
+            self._notify_dirty()
+            return f"ran:{result_kind}"
+
+        # (b) 抵達固定終點或有 `stop_reason`（我方停止）——取左界證據、
+        # 呼叫 scan_verdict 算出真正的覆蓋結論，再走既有的 complete_scan 流程。
+        boundary = self._store.get_left_boundary(job.address, res.scan.window_start_ms)
+        completeness, reason = scan_verdict(res.scan, boundary)
+        finished_scan = dataclasses.replace(
+            res.scan, finished_at=now, result=completeness, reason=reason)
         writeback = self._store.complete_scan(job.address, res.accepted, finished_scan)
         if not isinstance(writeback, ScanWriteback):
             # Task 7.9d-S S4：拆掉 fail-silent 相容層——回傳型別不符就明確失敗

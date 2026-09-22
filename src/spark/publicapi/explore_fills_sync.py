@@ -11,38 +11,57 @@ Task 7.9b（2026-09-21 使用者第二輪裁決）起，舊版單一 `plan_page`
 （同時承載「全區間遍歷」與「增量」兩種輪）拆成兩軌互不覆蓋：
 
 - **遍歷軌**（`plan_scan`／`apply_scan_page`，對映 `ExploreStore.FillsScan`）：
-  一次全區間遍歷（`initial`／`partial_rescan`／`verify`），從頭量測留存門檻，
-  完成後 `result`／`reason` 透過 `ExploreStore.complete_scan` 的 CAS 寫回
-  `fills_sync`。三種 `kind` 的頁面套用邏輯完全相同（都是「量測一次窗口內的
-  成交數，短頁收尾時依門檻判 complete／partial」），差別只在窗口與 CAS
-  之後的排程動作，見 `explore_scheduler._run_scan`。
+  一次全區間遍歷（`initial`／`partial_rescan`／`verify`），完成後 `result`／
+  `reason` 透過 `ExploreStore.complete_scan` 的 CAS 寫回 `fills_sync`。三種
+  `kind` 的頁面套用邏輯完全相同，差別只在窗口與 CAS 之後的排程動作，見
+  `explore_scheduler._run_scan`。Task 1 起（見下）`apply_scan_page` 本身
+  不再判定 `result`／`reason`——那是 `scan_verdict` 的職責，`apply_scan_page`
+  只回報遍歷進度與停止原因。
 - **增量軌**（`plan_incremental`／`apply_incremental_page`，對映
   `ExploreStore.FillsSyncState`）：只延伸 `synced_through_ms`，**永不**判定
   `completeness`／`reason`——這兩欄完全由遍歷軌的 CAS 決定，增量軌讀寫時
   原樣帶著目前值（`dataclasses.replace` 不動它們），確保重掃期間增量仍能
   持續保存新成交、不被遍歷覆蓋、也不會覆蓋遍歷（B7 (i)）。
 
-留存判準（HL `userFillsByTime` 官方只保留最近 `HL_FILLS_RETENTION_LIMIT`（10,000）
-筆可查，spec §8）：
-`RETENTION_SAFETY_MARGIN`＝一頁（`USER_FILLS_PAGE_LIMIT`），
-`RETENTION_SAFETY_THRESHOLD = HL_FILLS_RETENTION_LIMIT - RETENTION_SAFETY_MARGIN`
-（＝8,000）。若本輪遍歷全程觀測到的筆數 `fills_in_window < RETENTION_SAFETY_THRESHOLD`，
-代表區間內成交必然全部落在「最近 `HL_FILLS_RETENTION_LIMIT` 筆」的可查範圍內 →
-`complete`／`reason="count_below_retention_threshold"`（**這仍然只是門檻推論，
-不是留存邊界本身的證據**；更強的證據見 `explore_scheduler._run_probe` 的留存邊界
-探測，探測成功會把 reason 升級為 `"retention_boundary_verified"`，見
-`explore_store.REASON_RETENTION_BOUNDARY_VERIFIED`）；一旦達到或超過這個門檻 →
-`partial`（`reason="retention_limit"`）。
+Task 1（2026-09-22，D-A／D-E 裁決，見
+`docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md`
+「背景：根因與證據」）：舊版留存判準——HL 文件「`userFillsByTime` 只保留最近
+10,000 筆可查」推出的 `RETENTION_SAFETY_THRESHOLD`（8,000）——**已被實測推翻**：
+對成交筆數最多的位址做 30 天窗口連續分頁，實測取回 26,976 筆不重複成交且尚未
+走完。沿用該門檻會把成交量最大的帳戶永久誤判為「不可能完整」。三個相關常數
+（`HL_FILLS_RETENTION_LIMIT`／`RETENTION_SAFETY_MARGIN`／
+`RETENTION_SAFETY_THRESHOLD`）與 `apply_scan_page` 的 `retention_threshold`
+參數已一併移除；`apply_scan_page` 不再對短頁收尾下任何完整性結論。
+
+新判準（`scan_verdict`，本模組）：覆蓋結論改成「證據合成」——`complete` 需
+同時具備三項證據：(1) 窗口**左界**證據（`LeftBoundary`，由
+`explore_scheduler._run_probe` 前置探測產生，Task 3）、(2) 分頁**無未解缺口**
+（`FillsScan.unresolved_gap`）、(3) 游標抵達**固定的** `window_end_ms`
+（`FillsScan.cursor_ms >= window_end_ms`）。`apply_scan_page` 只負責回報「這一輪
+跑到哪、為什麼停」，**不判斷完整性**——`result`／`reason` 完全交給呼叫端在取得
+`LeftBoundary` 之後呼叫 `scan_verdict` 決定，本函式對這兩欄不寫入任何值。
+
+**我方停止 ≠ 上游沒有**（D-F 語義界線）：`FillsScan.stop_reason` 的值域
+（`local_page_cap`／`no_progress`／`same_ms_overflow`）全部描述「本系統為什麼
+不再往下抓」，**不描述**上游留存邊界——我們對上游的留存範圍沒有任何直接證據，
+唯一的證據來源是 `LeftBoundary` 探測。任何以 `stop_reason` 為由宣稱「上游資料
+不足」都是本模組明確禁止的表述。
 
 `cursor_ms` 推進採 inclusive 重疊（下一頁 `startTime` = 上一頁最後一筆的 `time`，
 **游標不額外遞增**）——同一毫秒可能跨頁被拆散，去重交給 `fills` 表的 `(address, coin, tid)`
-PRIMARY KEY，本模組不做去重判斷。同毫秒佔滿整頁（`same_ms_overflow`）與理論上不可能
-發生的「滿頁但游標未推進」（`no_progress`，防禦用）都視為無法繼續往前分頁，
-標記 `partial` 並終止本輪，避免無界重試同一頁。
+PRIMARY KEY，本模組不做去重判斷。同毫秒佔滿整頁（`same_ms_overflow`）代表我們
+無法在不漏單的前提下前進，是真正的分頁缺口，標記 `stop_reason="same_ms_overflow"`
+且 `unresolved_gap=1`（`scan_verdict` 一律判 `partial`，不論左界證據多強）；理論上
+不可能發生的「滿頁但游標未推進」（`no_progress`，防禦用）只標記 `stop_reason`，
+不影響 `unresolved_gap`。兩者都終止本輪，避免無界重試同一頁。
 
-單輪續頁另設硬上限 `max_pages_per_round`（預設 20）：20 頁＝40,000 筆已超過留存上限
-`HL_FILLS_RETENTION_LIMIT`（10,000），正常資料到不了這個頁數，達到即代表卡在異常
-續頁——終止本輪並標記 `partial`／`reason="page_cap"`，避免無界重試。
+`max_pages_per_round`（預設 20）不是停止條件，是**暫停**：達到時只推進游標與
+`pages_done`，`result`／`stop_reason` 兩者皆維持 `None`，`scan` 仍是
+`running`——呼叫端（`explore_scheduler._run_scan`）落地進度後直接重排，下一輪
+從同一個游標續抓，不產生任何完整性結論（D-E 明文禁止「預算耗盡當結論」）。
+真正會終止整次遍歷的是 `MAX_PAGES_PER_SCAN`（我方單次遍歷的絕對頁數上限，
+Task 2）：達到時標記 `stop_reason="local_page_cap"`（**不是** `page_cap`——
+`local_` 前綴刻意表達「本系統停止回補」而非對上游留存的主張，D-F）並終止本輪。
 
 `partial` 的復原路徑：增量軌不做完整性判定，`partial` 若像 `complete` 一樣被增量軌
 悄悄「延伸」也不會改變它的證據狀態——真正的復原只能靠遍歷軌重新做一次全區間遍歷
@@ -55,17 +74,20 @@ import dataclasses
 from typing import NamedTuple
 
 from spark.exchange.base import USER_FILLS_PAGE_LIMIT
-from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD, ExploreStore,
-                                           FillsScan, FillsSyncState)
+from spark.publicapi.explore_store import (REASON_LEFT_BOUNDARY_NO_ACTIVITY,
+                                           REASON_LEFT_BOUNDARY_TRUNCATED,
+                                           REASON_LEFT_BOUNDARY_UNKNOWN,
+                                           REASON_LEFT_BOUNDARY_VERIFIED, REASON_UNRESOLVED_GAP,
+                                           ExploreStore, FillsScan, FillsSyncState)
 
 PAGE_LIMIT = USER_FILLS_PAGE_LIMIT   # HL userFillsByTime 單頁上限（同 hl.py 常數來源，Task 3.5 D）
 
-# Task 7.5（命名修正，工程原則 1：門檻是假設，不是事實，得先讓讀者看得出來）：
-# `HL_FILLS_RETENTION_LIMIT` 是 HL 官方文件的留存上限；本模組的實際判準
-# `RETENTION_SAFETY_THRESHOLD` 比官方數字保守一頁（`RETENTION_SAFETY_MARGIN`）。
-HL_FILLS_RETENTION_LIMIT = 10_000   # HL 官方文件：只保留最近這麼多筆可查
-RETENTION_SAFETY_MARGIN = USER_FILLS_PAGE_LIMIT   # 保守緩衝＝一頁
-RETENTION_SAFETY_THRESHOLD = HL_FILLS_RETENTION_LIMIT - RETENTION_SAFETY_MARGIN   # 8_000
+# Task 2（D-A／D-F，2026-09-22）：單輪頁數上限只決定「本輪做到哪」；
+# `MAX_PAGES_PER_SCAN` 是**我方**的回補上限（防止單一地址無上限佔用額度），
+# 達到時的語義是「本系統停止回補」，不是「上游沒有更多資料」——我們沒有任何
+# 證據支持後者。實測大戶 30 天窗口約需 18 頁，400 頁留了充足餘裕。
+MAX_PAGES_PER_SCAN = 400
+
 WINDOW_DAYS = 30
 OVERLAP_MS = 1
 _DAY_MS = 86_400_000
@@ -104,6 +126,41 @@ def partial_rescan_due(finished_at: float | None, now: float) -> bool:
     if finished_at is None:
         return True
     return now - finished_at >= PARTIAL_RESCAN_AFTER_S
+
+
+@dataclasses.dataclass(frozen=True)
+class LeftBoundary:
+    """窗口左界證據（Task 1，D-E／D-F）。`state` 值域見 `scan_verdict`：
+    `unknown`（尚未探得證據）／`earlier_fills_seen`（探測到窗口起點之前仍有
+    可查成交）／`no_earlier_activity`（帳戶在窗口起點前確無活動）／
+    `truncation_suspected`（上游截斷嫌疑）。`window_start_ms` 是這份證據適用
+    的窗口起點（單調性見 Task 3 `explore_scheduler._run_probe` 的 docstring），
+    `at` 是取得時間（epoch 秒）。探測機制本身是 Task 3 的範圍——本模組只定義
+    這個型別與消費它的 `scan_verdict`。"""
+    state: str
+    window_start_ms: int | None
+    at: float | None
+
+
+def scan_verdict(scan: FillsScan, boundary: LeftBoundary) -> tuple[str, str]:
+    """唯一的覆蓋結論來源（Task 1，D-A／D-E）。三項證據同時成立才 `complete`：
+    (1) 分頁無未解缺口、(2) 游標抵達固定的 `window_end_ms`、(3) 左界證據為
+    正面（`earlier_fills_seen`／`no_earlier_activity`）。任何「我方停止」的
+    情形（`scan.stop_reason` 非 `None`，即游標未抵達終點）都不得產生完整性
+    結論（D-F）——`apply_scan_page`／`explore_scheduler` 不得繞過本函式另外
+    寫 `result`／`reason`（工程原則 1：結論只能有一個來源）。"""
+    if scan.unresolved_gap:
+        return ("partial", REASON_UNRESOLVED_GAP)            # 分頁有未解缺口
+    if scan.cursor_ms < scan.window_end_ms:
+        return ("partial", scan.stop_reason)                 # 沒抵達固定終點：本系統停止回補
+    if boundary.state == "earlier_fills_seen":
+        return ("complete", REASON_LEFT_BOUNDARY_VERIFIED)
+    if boundary.state == "no_earlier_activity":
+        return ("complete", REASON_LEFT_BOUNDARY_NO_ACTIVITY)
+    if boundary.state == "truncation_suspected":
+        return ("partial", REASON_LEFT_BOUNDARY_TRUNCATED)   # 上游截斷嫌疑
+    return ("partial", REASON_LEFT_BOUNDARY_UNKNOWN)         # 證據不足：不宣稱完整，也不宣稱截斷
+
 
 # Task 7.5 點 4／7.6 點 8（查詢參數留證）：`hl.get_fills_page` 實際請求體只送
 # `type/user/startTime/endTime`——刻意不送 `aggregateByTime`。字串只描述「送了
@@ -304,11 +361,15 @@ def plan_scan(scan: FillsScan) -> ScanPlan:
 
 
 def apply_scan_page(plan: ScanPlan, page: list[dict], *, page_limit: int = PAGE_LIMIT,
-                    retention_threshold: int = RETENTION_SAFETY_THRESHOLD,
                     max_pages_per_round: int = 20, now_ms: int) -> ScanPageResult:
     """套用一頁到遍歷軌，算出新 `FillsScan` 與是否結束本輪。呼叫端負責把
     `plan.start_ms`／`plan.end_ms` 當成這次 `userFillsByTime` 的
-    `startTime`／`endTime`。"""
+    `startTime`／`endTime`。
+
+    Task 1（D-A／D-E）：本函式**不判定完整性**——`result`／`reason` 全程不寫
+    （只有 `scan_verdict` 有資格寫），終止本輪時只記錄 `stop_reason`（我方為何
+    停止）與（同毫秒溢位時）`unresolved_gap`。呼叫端取得 `LeftBoundary` 之後
+    呼叫 `scan_verdict(new_scan, boundary)` 才能得到真正的覆蓋結論。"""
     scan = plan.scan
     start_ms, end_ms = plan.start_ms, plan.end_ms
 
@@ -334,20 +395,21 @@ def apply_scan_page(plan: ScanPlan, page: list[dict], *, page_limit: int = PAGE_
     fills_in_window = scan.fills_in_window + len(page)
 
     if len(page) < page_limit:
-        if fills_in_window >= retention_threshold:
-            result, reason = "partial", "retention_limit"
-        else:
-            result, reason = "complete", REASON_COUNT_BELOW_RETENTION_THRESHOLD
+        # D-E：短頁只代表「從游標起上游不再給」。游標推進到固定終點，
+        # 結論交給 scan_verdict（需左界證據與無缺口才可能 complete）。
         new_scan = dataclasses.replace(
             scan, cursor_ms=end_ms, observed_from_ms=observed_from, observed_to_ms=observed_to,
-            fills_in_window=fills_in_window, result=result, reason=reason, last_error=None)
-        return ScanPageResult(scan=new_scan, accepted=list(page), done=True, note=reason)
+            fills_in_window=fills_in_window, last_error=None)
+        return ScanPageResult(scan=new_scan, accepted=list(page), done=True,
+                              note="reached_window_end")
 
     # 滿頁。
     if all(t == start_ms for t in times):
+        # D-F：整頁同一毫秒，我們無法在不漏單的前提下前進——這是真正的分頁
+        # 缺口（unresolved_gap=1），不是完整性結論；scan_verdict 對此一律 partial。
         new_scan = dataclasses.replace(
             scan, cursor_ms=start_ms, observed_from_ms=observed_from, observed_to_ms=observed_to,
-            fills_in_window=fills_in_window, result="partial", reason="same_ms_overflow",
+            fills_in_window=fills_in_window, stop_reason="same_ms_overflow", unresolved_gap=1,
             last_error=None)
         return ScanPageResult(scan=new_scan, accepted=list(page), done=True,
                               note="same_ms_overflow")
@@ -356,17 +418,36 @@ def apply_scan_page(plan: ScanPlan, page: list[dict], *, page_limit: int = PAGE_
     if new_cursor == start_ms:
         new_scan = dataclasses.replace(
             scan, cursor_ms=start_ms, observed_from_ms=observed_from, observed_to_ms=observed_to,
-            fills_in_window=fills_in_window, result="partial", reason="no_progress",
-            last_error=None)
+            fills_in_window=fills_in_window, stop_reason="no_progress", last_error=None)
         return ScanPageResult(scan=new_scan, accepted=list(page), done=True, note="no_progress")
 
     new_pages_done = scan.pages_done + 1
-    if new_pages_done >= max_pages_per_round:
+
+    # Task 2（D-A／D-F）：`MAX_PAGES_PER_SCAN` 是本次遍歷的絕對硬上限（防止
+    # 單一地址無上限佔用額度），達到才終止並標記 `stop_reason`——語義是「本
+    # 系統停止回補」，不是對上游留存的主張，`local_` 前綴刻意表達這一點。
+    # 這個檢查必須排在 `max_pages_per_round` 的暫停判斷之前：兩者的門檻若
+    # 恰好同時整除（例如預設 20 整除 400），絕對上限要贏，才能確保
+    # `local_page_cap` 只在真正達到絕對上限時出現。
+    if new_pages_done >= MAX_PAGES_PER_SCAN:
         new_scan = dataclasses.replace(
             scan, cursor_ms=new_cursor, observed_from_ms=observed_from,
             observed_to_ms=observed_to, fills_in_window=fills_in_window,
-            pages_done=new_pages_done, result="partial", reason="page_cap", last_error=None)
-        return ScanPageResult(scan=new_scan, accepted=list(page), done=True, note="page_cap")
+            pages_done=new_pages_done, stop_reason="local_page_cap", last_error=None)
+        return ScanPageResult(scan=new_scan, accepted=list(page), done=True,
+                              note="local_page_cap")
+
+    # `max_pages_per_round`（預設 20）不是停止條件，是**暫停**：本輪做太多頁
+    # 就先把已抓到的落地、把控制權交還給呼叫端（scheduler 下一次 tick 再從
+    # 同一個游標續抓）——`result`／`stop_reason` 兩者皆不寫，`scan` 仍是
+    # running（D-E：預算耗盡不是結論）。
+    if new_pages_done % max_pages_per_round == 0:
+        new_scan = dataclasses.replace(
+            scan, cursor_ms=new_cursor, observed_from_ms=observed_from,
+            observed_to_ms=observed_to, fills_in_window=fills_in_window,
+            pages_done=new_pages_done, last_error=None)
+        return ScanPageResult(scan=new_scan, accepted=list(page), done=True,
+                              note="round_paused")
 
     new_scan = dataclasses.replace(
         scan, cursor_ms=new_cursor, observed_from_ms=observed_from, observed_to_ms=observed_to,

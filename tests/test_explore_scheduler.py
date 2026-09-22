@@ -272,14 +272,18 @@ def test_scan_multi_page_completes_and_state_also_gets_a_turn(tmp_path):
         r = sched.tick()
         results.append(r)
         sync = store.get_sync("0xabc")
-        if sync is not None and sync.completeness == "complete":
+        # Task 2（D-A/D-E，2026-09-22 主線程裁決）：`get_left_boundary` 是
+        # Task 3 才會實作的佔位（恆回 unknown），遍歷抵達終點後不再是
+        # "complete"——沒有左界證據就不宣稱完整，變成 "partial"。
+        if sync is not None and sync.completeness == "partial":
             break
 
     assert results.count("ran:fills_scan") == 4
     assert results.count("ran:state") >= 1
 
     sync = store.get_sync("0xabc")
-    assert sync.completeness == "complete"
+    assert sync.completeness == "partial"
+    assert sync.reason == "left_boundary_unknown"
     # 相鄰兩頁 inclusive 重疊 1 筆（上一頁最後一筆＝下一頁第一筆，同 tid），
     # 3 個頁界共去重 3 筆：2000*3+500-3。
     assert len(store.get_fills("0xabc", 0, cursor4 + 500)) == PAGE_LIMIT * 3 + 500 - 3
@@ -354,7 +358,10 @@ def test_restart_continues_scan_cursor_not_from_scratch(tmp_path):
     assert r2 == "ran:fills_scan"
     assert hl2.calls[0][1] == cursor  # 從上次游標續抓，不是從 window_start 重新開始
     sync_after = store2.get_sync("0xabc")
-    assert sync_after.completeness == "complete"
+    # Task 2：`get_left_boundary` 佔位恆回 unknown，遍歷完成後是
+    # ("partial", "left_boundary_unknown")，不是 "complete"（Task 3 才會實測證據）。
+    assert sync_after.completeness == "partial"
+    assert sync_after.reason == "left_boundary_unknown"
 
 
 # --- 6. 候選進出：移除的地址 active=0 但 cache/fills 保留；新地址只新增它的五個 job ---
@@ -1253,7 +1260,11 @@ def test_b7_viii_new_address_lifecycle(tmp_path):
     r2 = sched.tick()
     assert r2 == "ran:fills_scan"
     sync2 = store.get_sync(addr)
-    assert sync2.completeness == "complete"
+    # Task 2（D-A/D-E，2026-09-22 主線程裁決）：`get_left_boundary` 是 Task 3
+    # 才會實作的佔位（恆回 unknown）——沒有左界證據就不宣稱完整，遍歷完成後
+    # 是 ("partial", "left_boundary_unknown")，不是 "complete"。
+    assert sync2.completeness == "partial"
+    assert sync2.reason == "left_boundary_unknown"
     assert sync2.scan_id == scan.scan_id
 
     # 增量 job 到期並執行：不影響 completeness，只延伸 synced_through。
@@ -1263,7 +1274,7 @@ def test_b7_viii_new_address_lifecycle(tmp_path):
     r3 = sched.tick()
     assert r3 == "ran:fills"
     sync3 = store.get_sync(addr)
-    assert sync3.completeness == "complete"  # 增量不改變 completeness
+    assert sync3.completeness == "partial"  # 增量不改變 completeness
 
 
 # ============================================================
@@ -1660,6 +1671,15 @@ def test_s7a_complete_address_never_rescans_across_candidate_rounds(tmp_path):
     sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
                   cfg=ExploreConfig(candidate_pool=1))
 
+    # Task 2（2026-09-22 主線程裁決）：`ExploreStore.get_left_boundary` 目前是
+    # Task 3 才會實作的佔位（恆回 unknown），真正的探測機制還不存在——這個
+    # 測試的重點是「complete 地址不會被跨輪重掃」，與左界證據怎麼來無關，
+    # 用一個假的正面證據頂替，讓這條遍歷能合法地判 complete，才測得到
+    # 「complete 之後永不重掃」這個守門本身。
+    from spark.publicapi.explore_fills_sync import LeftBoundary
+    store.get_left_boundary = lambda address, window_start_ms: LeftBoundary(
+        state="earlier_fills_seen", window_start_ms=window_start_ms, at=clock.now())
+
     # Task 7.9d-S S6：守到 **enqueue 那一半**——每個 candidates 輪（含其後的
     # 對帳）跑完，只要地址已經 `complete`，就不該有任何到期的 `fills_scan`
     # job。舊版是「每輪 enqueue、下游 `_run_scan` 再丟棄」，只看 scan 列的話
@@ -1759,6 +1779,14 @@ def test_s7d_repro_rescan_three_day_thirty_minute_rounds_no_repeated_full_scan(t
     payload = _payload([ADDR_A])
     sched = _sched(store, hl, leaderboard_source_fn=lambda: payload, clock=clock,
                   cfg=ExploreConfig(candidate_pool=1))
+
+    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 目前是 Task 3 才會
+    # 實作的佔位（恆回 unknown）。這個測試在測「首次遍歷立刻完整 → 永不
+    # 重掃」，與左界證據怎麼取得無關——用假的正面證據頂替，讓遍歷能合法判
+    # complete，才測得到「complete 之後 partial_rescan 恆為 0」這個不變式。
+    from spark.publicapi.explore_fills_sync import LeftBoundary
+    store.get_left_boundary = lambda address, window_start_ms: LeftBoundary(
+        state="earlier_fills_seen", window_start_ms=window_start_ms, at=clock.now())
 
     results = _run_for(sched, clock, 3 * 86400.0)
 
@@ -2248,7 +2276,11 @@ def test_s1_churned_backfilling_address_regains_scan_job_and_finishes(tmp_path):
                  lambda rs: store.get_sync(ADDR_A).completeness != "backfilling")
 
     sync = store.get_sync(ADDR_A)
-    assert sync.completeness == "complete"
+    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 是 Task 3 才會實作
+    # 的佔位（恆回 unknown），遍歷完成後是 ("partial", "left_boundary_unknown")
+    # ——這個測試在測「續跑同一個 scan_id」，與完整性結論是哪個值無關。
+    assert sync.completeness == "partial"
+    assert sync.reason == "left_boundary_unknown"
     assert sync.scan_id == scan_id                            # 完成的就是原本那次遍歷
     assert [r[0] for r in _scan_rows(store, ADDR_A)] == ["initial"]   # 沒有第二次遍歷
     assert sched.status()["scan_job_dropped"] == 0
@@ -2322,7 +2354,12 @@ def test_s1_reconcile_creates_initial_scan_for_orphan_backfilling_address(tmp_pa
 
     assert sched.tick() == "ran:fills_scan"
     assert [r[0] for r in _scan_rows(store, ADDR_A)] == ["initial"]
-    assert store.get_sync(ADDR_A).completeness == "complete"
+    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 是 Task 3 才會實作
+    # 的佔位（恆回 unknown），沒有左界證據就不宣稱完整——這個測試在測「孤兒
+    # backfilling 地址會被對帳建回一次遍歷」，與完整性結論是哪個值無關。
+    sync = store.get_sync(ADDR_A)
+    assert sync.completeness == "partial"
+    assert sync.reason == "left_boundary_unknown"
 
 
 def test_s1_reconcile_is_idempotent(tmp_path):
@@ -3045,6 +3082,17 @@ def test_w2_deferred_verify_job_is_dropped_once_evidence_is_filled_in(tmp_path):
     sched = _sched(store, hl, clock=clock)
     sched._bootstrapped = True
     sched._first_tick_done = True
+
+    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 目前是 Task 3 才會
+    # 實作的佔位（恆回 unknown）。這個測試在測「核驗需求由狀態推導、evidence
+    # 補齊後 verify job 自動變 obsolete」，與重掃本身判 complete 還是 partial
+    # 無關——但若重掃判 partial，既有（未改動的）`partial_rescan` 復原邏輯會
+    # 對這個地址另外排一個 `fills_scan` job，讓 (3) 之後 `job_kinds(ADDR_A)`
+    # 不再是空集合，測穿了另一個不相干的機制。用假的正面證據頂替，讓重掃
+    # 合法判 complete，保持這個測試只測它原本要測的那件事。
+    from spark.publicapi.explore_fills_sync import LeftBoundary
+    store.get_left_boundary = lambda address, window_start_ms: LeftBoundary(
+        state="earlier_fills_seen", window_start_ms=window_start_ms, at=clock.now())
 
     # (1) 延後（kind 不相容）。
     job = store.claim_due(clock.now(), "o", 60, kinds=("fills_verify",))

@@ -47,18 +47,29 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, NamedTuple
+
+if TYPE_CHECKING:
+    # Task 2：`get_left_boundary` 的回傳型別——只在型別檢查時 import，避免
+    # 與 `explore_fills_sync`（它在頂層 import 本模組的 `FillsScan`／
+    # `FillsSyncState`）形成循環 import（`from __future__ import annotations`
+    # 讓本檔案的所有 annotation 在執行期都是字串，不受影響）。
+    from spark.publicapi.explore_fills_sync import LeftBoundary
 
 logger = logging.getLogger(__name__)
 
 # Task 7.5（2026-09-21，使用者裁決：complete 判定的證據與標示）：completeness
 # 的 reason 碼——`complete` 也要有原因，不再是「留白代表沒問題」。
-# `REASON_COUNT_BELOW_RETENTION_THRESHOLD`：現行判準（`explore_fills_sync.apply_scan_page`
-# 短頁收尾、本輪觀測筆數低於 `RETENTION_SAFETY_THRESHOLD`）；
-# `REASON_RETENTION_BOUNDARY_VERIFIED`：留存邊界探測（`explore_scheduler._run_probe`）
-# 實測區間起點之前一天仍有可查成交，代表留存邊界早於窗口起點，比門檻推論更強的證據。
-# 兩個 reason 碼與（`ExploreStore`）schema migration 共用，放在資料層而非
-# `explore_fills_sync`（後者反向 import 本模組的 `FillsSyncState`，避免循環 import）。
+#
+# Task 1（2026-09-22 D-A/D-E 裁決，見 docs/superpowers/plans/
+# 2026-09-22-explore-fills-coverage-verdict-fix.md）：門檻推論
+# （`RETENTION_SAFETY_THRESHOLD`）已被實測推翻（30 天窗口實測 26,976 筆，遠超
+# 舊門檻 8,000），`explore_fills_sync.apply_scan_page` 短頁收尾不再據此下結論。
+# `REASON_COUNT_BELOW_RETENTION_THRESHOLD` 與 `REASON_RETENTION_BOUNDARY_VERIFIED`
+# **僅供 v3 遷移讀取，勿在新路徑使用**——`explore_scheduler.py` 的舊版留存邊界
+# 探測（`_run_probe`／`apply_probe_result`）仍在讀寫它們，直到 Task 3 把探測機制
+# 換成 `LeftBoundary`／`scan_verdict`（本模組新增，見下）、Task 4 遷移 schema v4
+# 時才會真正停用；Task 1 範圍不含 `explore_scheduler.py`，故此處刻意保留。
 REASON_COUNT_BELOW_RETENTION_THRESHOLD = "count_below_retention_threshold"
 REASON_RETENTION_BOUNDARY_VERIFIED = "retention_boundary_verified"
 
@@ -67,7 +78,18 @@ REASON_RETENTION_BOUNDARY_VERIFIED = "retention_boundary_verified"
 # 更弱也沒有變強——但若不記下「已經探過」，探測條件（`reason ==
 # REASON_COUNT_BELOW_RETENTION_THRESHOLD`）會讓同一次遍歷被重探。這個第三個
 # reason 碼把「探過、沒有更早成交、無法升級」記下來，探測候選查詢天然排除它。
+# 同上：**僅供 v3 遷移讀取／舊版探測機制使用，勿在新路徑使用**。
 REASON_PROBE_NO_EARLIER_FILLS = "count_below_retention_threshold_probe_empty"
+
+# Task 1（2026-09-22 D-A/D-E 裁決）：覆蓋結論改為三項證據合成
+# （`explore_fills_sync.scan_verdict`）——以下四個 reason 對映 `LeftBoundary.state`
+# 的四種值，`REASON_UNRESOLVED_GAP` 對映分頁未解缺口。這是新判準**唯一**會寫入
+# 的 reason 集合（Task 2 起，`fills_scan`／`fills_sync` 的新結論只會是這五者之一）。
+REASON_LEFT_BOUNDARY_VERIFIED = "left_boundary_verified"        # 探測到窗口起點之前仍有可查成交
+REASON_LEFT_BOUNDARY_NO_ACTIVITY = "left_boundary_no_activity"  # 帳戶在窗口起點前確無活動
+REASON_LEFT_BOUNDARY_TRUNCATED = "left_boundary_truncated"      # 上游截斷嫌疑
+REASON_LEFT_BOUNDARY_UNKNOWN = "left_boundary_unknown"          # 證據不足，不下結論
+REASON_UNRESOLVED_GAP = "unresolved_gap"                        # 分頁有未解缺口
 
 # Task 7.9d-D D2：`refresh_job.kind` 的已知集合——彙總查詢（`count_jobs_by_kind`／
 # `count_due_by_kind`）用它把已知 kind 一律補成 0，讓觀測端的鍵集合固定（缺鍵與
@@ -316,6 +338,15 @@ class FillsScan:
     finished_at: float | None
     last_error: str | None
     params_fp: str = ""
+    # Task 1（2026-09-22 D-A/D-E 裁決）：`apply_scan_page` 不再直接決定
+    # `result`／`reason`（那是 `scan_verdict` 的專屬職責），改把「本系統為何
+    # 停止回補」記在這裡——`local_page_cap`／`no_progress`／`same_ms_overflow`
+    # 三值（D-F：語義只描述我方行為，不宣稱上游留存）。`unresolved_gap` 標記
+    # 分頁是否留下未解缺口（目前只有整頁同一毫秒的 `same_ms_overflow` 會設
+    # 為 1）。**持久化尚未接上**（Task 4 才會替 `fills_scan` 加對應欄位）——
+    # 本 task 讀寫全走安全預設值，DB 往返會遺失這兩欄，這是刻意的過渡態。
+    stop_reason: str | None = None
+    unresolved_gap: int = 0
 
 
 @dataclass(frozen=True)
@@ -1259,6 +1290,23 @@ class ExploreStore:
                 "AND sc.result='complete' AND sc.reason=?",
                 (REASON_COUNT_BELOW_RETENTION_THRESHOLD,)).fetchone()
         return row[0]
+
+    def get_left_boundary(self, address: str, window_start_ms: int) -> LeftBoundary:
+        """Task 2（2026-09-22 主線程裁決）：**佔位實作**——真正的左界證據
+        讀取（`left_boundary` 三欄、探測前置、單調性）要到 Task 3 才實作。
+        在那之前一律回傳 `unknown`：沒有證據就不宣稱完整（D-E／D-F），
+        讓 `scan_verdict` 對所有新完成的遍歷暫時給出
+        `("partial", "left_boundary_unknown")`——這是預期且正確的中間態，
+        不是 bug。`window_start_ms` 參數目前未使用（Task 3 起才會依窗口起點
+        判斷證據是否仍適用，見單調性設計），保留在簽名上是為了讓呼叫端
+        （`explore_scheduler._run_scan`）不必在 Task 3 落地時改呼叫點。
+
+        延遲 import `LeftBoundary`（定義於 `explore_fills_sync`）以避免循環
+        import——該模組在頂層 import 本模組的 `FillsScan`／`FillsSyncState`，
+        反向在頂層 import 會形成循環（工程原則 1 的姊妹問題：模組依賴方向
+        也要單一，不能雙向）。"""
+        from spark.publicapi.explore_fills_sync import LeftBoundary
+        return LeftBoundary(state="unknown", window_start_ms=None, at=None)
 
     # --- refresh_job ---
     def enqueue(self, key: str, address: str | None, kind: str, priority: int,
