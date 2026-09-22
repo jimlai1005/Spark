@@ -1752,6 +1752,29 @@ Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回�
 `truncation_suspected` 117 → 135；completeness 65／178／186；`fills_verify` job 69 → 64；running scans 65；
 Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
 
+| 23:00 | 0 | 0 | 135／144／21 | 64 | 0／2／0 | ok | |
+| 23:15 | 0 | 0 | 137／144／19 | 64 | 0／0／0 | ok | |
+| 23:30 | 0 | 0 | 138／144／18 | 64 | 0／0／0 | ok | |
+| 23:45 | 0 | 0 | **138**／144／18 | 63 | 0／0／0 | ok | |
+
+**23:55 排程檢查（+8h10m）**：unknown **102 → 102（持平）**、`earlier_fills_seen` 176 → 179、`no_earlier_activity` 16 → 17、
+`truncation_suspected` 135 → 138；completeness 65／182／189；`fills_verify` job 64 → 61；running scans 65；
+Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退；Step 7-pre 不觸發（見下）。**
+
+**unknown 持平的診斷（唯讀）**：102 個 unknown 裡 **70 個是已退池（inactive）列**（39 帶著永遠不會再被服務的
+running scan、31 partial）——它們不在候選查詢的母體（`c.active=1`），不影響榜單。**池內 unknown 只有 31**
+（25 個 backfilling 帶 running scan、6 個 partial）。這一小時仍解出 +7 個證據（179/17/138 各增），只是被新入池的
+unknown 抵銷，探測**沒有停**。base 軌活著（15 分鐘內 clearinghouseState 152、portfolio/ledger 各 29 筆更新）、
+增量軌活著（fills_sync 60 分鐘 20 筆更新，與 22/h 政策一致）。
+
+**一個要盯的異常：遍歷軌近 45 分鐘 `scan_pages_15m = 0`**（23:00 還有 3），而 `pages_consumed_15m` 只有 2–7
+（上限 ~15）＝**fills 額度大多閒置，卻沒有拿去抓遍歷頁**。53 個 `fills_scan` job attempts 全 0、無 last_error、
+0 個到期但 min next due ≈ 0、隨時 1 個持有 lease——型態像「領到 job → 探測前置／續抓被 deferred → 重排到 now」
+的空轉。無法從 DB 判定原因（限流器暫停狀態、deferred 計數、probe 計數都只在 `/api/ops/health` 的
+`explore_refresh`／`hl_budget` 區塊，需 admin session）。**不是安全問題**（429 0、無錯誤、榜單 complete 仍在升），
+但若下一小時 `scan_pages_15m` 仍為 0 且 `fills_scan` 到期 job > 0，要請使用者貼 `/api/ops/health` 的
+`explore_refresh` 與 `hl_budget` 兩段來判讀；不走 Step 7-pre（停背景工作對吞吐問題沒有幫助）。
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
