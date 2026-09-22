@@ -2400,7 +2400,7 @@ ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
 
 | 變數 | 動作 | 值 | 語義變化 |
 |---|---|---|---|
-| `FILET_EXPLORE_FILLS_PERIOD_S` | **值不變** | `21600`（沿用） | ⚠️ 語義改變：不再是「唯一的全域週期」，改為 `fills_period_s()` 速率公式的**下界**（`config.py:184` `explore_fills_period_s`，即 `MIN_PERIOD_S` 的覆寫來源）。drop-in 不必改值——現值剛好等於新規格的預設下界。 |
+| `FILET_EXPLORE_FILLS_PERIOD_S` | **值不變** | `21600`（沿用） | ⚠️ 語義改變：不再是「唯一的全域週期」，改為**前 50 名熱門位址**的固定週期＝`MIN_PERIOD_S`（`config.py` `explore_fills_period_s`）。非熱門位址（含重啟後名次快取尚空的情形）改依成交速率算週期，下界是程式常數 `MIN_PERIOD_COLD_S=3600`（Task 10 W1 裁決：一頁不變式贏過任意下界，**不由 env 控制**），上界 `FILET_EXPLORE_FILLS_MAX_PERIOD_S`。drop-in 不必改值。 |
 | `FILET_EXPLORE_FILLS_MAX_PERIOD_S` | 新增（可不設） | `86400` | 週期公式的**上界**；不設時預設即 86400（`MAX_PERIOD_S`），語義相容，不設也不影響行為。 |
 | `FILET_EXPLORE_SPECIAL_SERVE_RATIO` | 新增 | `3` | D-C：暫時把探測／核驗的輔助份額比例從預設 9:1 調緊到 3:1，加速遷移後 137 個 `left_boundary='unknown'` 位址取得左界證據（預設 9 是 2026-09-21 使用者既有裁決，**不得更動**，此覆寫只在到期前生效）。 |
 | `FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL` | 新增 | `2026-09-24T00:00:00Z` | 到期時間（ISO8601 UTC，尾碼 `Z`）。逾期或缺漏由 `ExploreScheduler._special_serve_ratio` **自動**回預設 9（fail-safe，見 `explore_scheduler.py:432-441`）——**不必人工移除**這兩個 env，但到期後可以清掉。 |
@@ -2463,8 +2463,12 @@ sudo journalctl -u filet-api --since '5 min ago' --no-pager \
 ```
 before {backfilling 83, complete 300, partial 14}
 after  {backfilling 97, complete 135, partial 165}
-work   {probes_needed 198, scans_to_resume 97, verify_needed 0}
+work   {probes_needed 198, scans_to_resume 97, verify_needed 0, rescans_deferred ≈165}
 ```
+
+`rescans_deferred`（Task 10 W2 新增）＝被撤銷結論的那批列，遷移把它們的 `fills_scan.finished_at`
+設成遷移當下，讓便宜的獨立探測路徑先有 24 小時處理（1 頁探測＋就地重算），而不是立刻排
+165 次 30 天整窗重掃。應與 `after.partial` 同量級；若為 0 而 `after.partial` 不為 0 → 回退。
 
 **判讀**：正式機部署當下的數字會因為這段時間新增候選／既有遍歷推進而**漂移**，
 要求「同量級」（`complete` 掉到 1xx～低 2xx、`partial` 升到 1xx、`verify_needed`
