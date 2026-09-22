@@ -3698,25 +3698,34 @@ def _t7a_fill_at(t_ms: int, tid: int) -> dict:
            "sz": "1", "startPosition": "0", "closedPnl": "0", "oid": tid}
 
 
-def _t7a_same_ms_fills(window_start_ms: int, count: int) -> list[dict]:
+def _t7a_same_ms_fills(window_start_ms: int, count: int, *, cluster_size: int = 400) -> list[dict]:
     """`count` 筆成交，其中一個 `cluster_size` 筆的叢集全部落在同一毫秒、且
     刻意排列成該叢集橫跨遍歷軌第一頁／第二頁的分頁邊界（`PAGE_LIMIT` 頁面
     上限）——其餘成交各自獨立、遞增的毫秒。用來驗證『游標 inclusive 重疊 ＋
     (address, coin, tid) 去重』：分頁邊界重疊會讓叢集裡的一部分成交同時出現
     在兩次上游回應裡，去重必須讓最終落地筆數精確等於 `count`。
 
-    ⚠️ 不是把全部 `count` 筆塞在單一毫秒——那個字面讀法在 `PAGE_LIMIT=2000`
-    下數學上不可能被現有（未改動的）`apply_scan_page` 完整取回：只要有任何
-    一頁的成交「全部」等於該頁查詢的 `start_ms`，就會觸發 `same_ms_overflow`
-    （真正的、刻意的資料缺口保護——見 `explore_fills_sync.apply_scan_page`
-    docstring），且 `cursor_ms` 在該頁之後停滯在那個毫秒，下一頁查詢的
-    `start_ms` 還是同一個值，只要叢集大小超過一頁就必然再次觸發、永久卡住。
-    `count=4_500 > 2×PAGE_LIMIT` 時，一輪遍歷最多只能取回 `2×PAGE_LIMIT`
-    （實測：4,000）——這是現有正確、未改動程式碼的真實架構限制，不是本
-    harness 的缺陷。把叢集縮小到能被單一頁面「跨過去」（`cluster_size` 明顯
-    小於 `PAGE_LIMIT`）才是這個測試真正要驗證的情境：同一毫秒的資料**可以**
-    survive 分頁邊界，只要它沒有大到把整頁塞滿。"""
-    cluster_size = 400
+    ⚠️ 預設（`cluster_size=400`）不是把全部 `count` 筆塞在單一毫秒——那個字面
+    讀法在 `PAGE_LIMIT=2000` 下數學上不可能被現有（未改動的）`apply_scan_page`
+    完整取回：只要有任何一頁的成交「全部」等於該頁查詢的 `start_ms`，就會觸發
+    `same_ms_overflow`（真正的、刻意的資料缺口保護——見
+    `explore_fills_sync.apply_scan_page` docstring），且 `cursor_ms` 在該頁之後
+    停滯在那個毫秒，下一頁查詢的 `start_ms` 還是同一個值，只要叢集大小超過
+    一頁就必然再次觸發、永久卡住。`count=4_500 > 2×PAGE_LIMIT` 時，一輪遍歷
+    最多只能取回 `2×PAGE_LIMIT`（實測：4,000）——這是現有正確、未改動程式碼的
+    真實架構限制，不是本 harness 的缺陷。把叢集縮小到能被單一頁面「跨過去」
+    （`cluster_size` 明顯小於 `PAGE_LIMIT`）才是預設情境真正要驗證的：同一
+    毫秒的資料**可以** survive 分頁邊界，只要它沒有大到把整頁塞滿。
+
+    `cluster_size >= count`（Task 7b 新增）：反過來構造「叢集大到跨不過去」
+    的情境——整批 `count` 筆全部落在同一毫秒（`window_start_ms + 1`）。第一頁
+    查詢的 `start_ms` 是 `window_start_ms`（游標初值），該毫秒與叢集時間不同，
+    所以第一頁會正常前進、游標推到 `window_start_ms + 1`；第二頁查詢的
+    `start_ms` 變成 `window_start_ms + 1`，此時整頁全部等於查詢 `start_ms`，
+    觸發 `same_ms_overflow` 且永久卡死在該游標——用來驗證這個情境必須誠實
+    降級成 `partial`／`unresolved_gap`，不得少抓了卻宣稱 `complete`。"""
+    if cluster_size >= count:
+        return [_t7a_fill_at(window_start_ms + 1, tid) for tid in range(count)]
     before = PAGE_LIMIT - 200   # 讓叢集橫跨 page1/page2 邊界（200 落在 page1 尾端）
     after = count - before - cluster_size
     assert after > 0, "count 太小，叢集放不進去——調整 cluster_size/before"
@@ -3871,7 +3880,12 @@ class SchedulerHarness:
             leaderboard_source_fn=lambda: payload, excluded_fn=lambda: set(),
             cfg=ExploreConfig(candidate_pool=self._n),
             now_fn=self._clock.now, sleep_fn=self._clock.sleep, on_dirty=lambda: None,
-            fills_min_period_s=3600, fills_max_period_s=86400, rng=self._rng.random)
+            # Task 7b（主線程 2026-09-22 裁決）：下界改成正式機真實預設
+            # `FILET_EXPLORE_FILLS_MIN_PERIOD_S`（21600s＝6h）——舊值 3600（1h）
+            # 比正式機密 6 倍，讓 300 個候選裡「前 50 名」（D-H 強制 min_period）
+            # 每小時就要重新增量一次，量出來的任何吞吐比例都不能拿來推論正式機
+            # 行為（保真度 bug，不是刻意的壓力測試設定）。
+            fills_min_period_s=21600, fills_max_period_s=86400, rng=self._rng.random)
 
     # ---- 場景設定（`run_for` 之前呼叫；此時鐘面仍在 t=0，與 bootstrap 時
     # `fresh_scan_window` 算出的窗口一致） ----
@@ -3880,10 +3894,34 @@ class SchedulerHarness:
         self._upstream.seed_fills(address, _t7a_even_fills(ws, we, window_fills))
         self._upstream.set_portfolio(address, _t7a_default_portfolio(ws))
 
-    def set_fills_all_same_ms(self, address: str, *, count: int) -> None:
+    def set_fills_all_same_ms(self, address: str, *, count: int, cluster_size: int = 400) -> None:
         ws, _we = fresh_scan_window(int(self._clock.now() * 1000))
-        self._upstream.seed_fills(address, _t7a_same_ms_fills(ws, count))
+        self._upstream.seed_fills(address, _t7a_same_ms_fills(ws, count, cluster_size=cluster_size))
         self._upstream.set_portfolio(address, _t7a_default_portfolio(ws))
+
+    def seed_evidence_unknown_address(self, address: str) -> None:
+        """Task 7b：構造一個「已有完成遍歷、`evidence_unknown=1`」的地址——
+        這個形狀只有 v3→v4 遷移會留下（見 `explore_store._migrate_v3_to_v4`），
+        全新建立的 store 不會自然產生。沿用本檔既有 `_evidence_unknown_address`
+        手法（`upsert_candidates` → `bootstrap_address_fills` → 收尾一次遍歷 →
+        直接 flip 旗標）在 harness 自己的 store 上構造好*初始狀態*；構造完成後
+        `fills_verify` job 的建立、領工、完成全部交給真實 `ExploreScheduler`
+        在 300 地址競爭下跑（`run_for` 是唯一推進時間與領工的地方）——只有
+        「進入 evidence_unknown 狀態」這一步是構造的。"""
+        import dataclasses
+        now = self._clock.now()
+        now_ms = int(now * 1000)
+        self._store.upsert_candidates([(address, None, 1, None)], as_of=now)
+        self._store.bootstrap_address_fills(
+            address, now, window_start_ms=now_ms - 30 * 86_400_000,
+            window_end_ms=now_ms, params_fp="")
+        scan = self._store.get_active_scan(address)
+        scan = dataclasses.replace(scan, cursor_ms=scan.window_end_ms, result="complete",
+                                   reason="left_boundary_verified", finished_at=now)
+        self._store.complete_scan(address, [], scan)
+        self._store._db.execute(
+            "UPDATE fills_sync SET evidence_unknown=1 WHERE address=?", (address.lower(),))
+        self._store._db.commit()
 
     def set_probe_always_empty(self, address: str) -> None:
         """未配置任何成交的地址本來就是空探測——保留這個方法只為讓呼叫端
@@ -4043,3 +4081,81 @@ def test_restart_resumes_scan_from_persisted_cursor(tmp_path):
     after = h.scan_cursor(T7A_WHALE)
     assert before is not None and after is not None and after >= before
     assert h.pages_refetched_after_restart() <= 1
+
+
+# --- Task 7b（plan Task 7 Step 1 剩下三條，D-I）---
+
+
+def test_period_policy_keeps_incremental_demand_under_budget():
+    """D-B／D-H 迴歸測試（取代已廢棄的
+    `test_traversal_track_gets_at_least_half_the_fills_pages`——主線程
+    2026-09-22 複審裁決）。
+
+    廢棄原因：「遍歷軌佔 fills 頁的比例」不是這個系統的穩定性質，是**工作負載
+    組成**的函數，用 `SchedulerHarness`（300 個候選，其中 297 個是全空的假
+    地址）量測必然失真——全空地址 bootstrap 完後遍歷需求趨近 0（實測 t=48h
+    後 `scan_pages` 封頂不再增長），增量卻依 `fills_min_period_s` 永遠持續
+    累加，長期比例必然單調趨近 0（實測 6h=0.177 → 24h=0.155 → 48h=0.117 →
+    72h=0.078）；反過來把 harness 下界換成正式機真實值（6h）重跑同一個
+    6 小時窗，增量還沒輪到第一次，比例又卡在另一個極端 1.0（`scan_pages ==
+    total_fills_pages == 176`）。兩個極端都不是穩態，這個指標量不出真正要
+    保護的東西。
+
+    真正要保護的性質是**增量輪不可以再吃掉 fills 預算的大半**（事故當下
+    50/56 ≈ 83%，把遍歷軌餓到只剩 12 頁/小時）。這個性質只由週期政策
+    （`fills_period_s`）決定，跟「當下有多少遍歷工作可做」無關，因此是穩定
+    的、不需要跑 harness——直接對一組**貼近正式機形狀**的合成位址算
+    `Σ 3600/period_s` 即可，快、穩定、可重現。
+
+    合成分佈依據：2026-09-22 在正式機複本上用正式程式碼（`fills_period_s_for`）
+    實算出的真實週期分佈——6h=78（50 個 D-H 強制熱門＋28 個排名外但速率天生
+    夠高，自然落在下界）、中段=4（速率介於下界與上界之間）、24h=218（排名外
+    且速率低，自然落在上界），合計 300，對應增量需求 **22.34 頁/小時**
+    （Task 5b 驗收記錄）。事故當下（門檻推論時代、無分層週期）的對照值是
+    50 頁/小時（56 頁/小時實測上限的 83%）。"""
+    demand = 0.0
+    for rank in range(1, 51):          # 50：前 50 名，D-H 強制 6h（不論速率）
+        demand += 3600 / fills_period_s(fills_per_hour=1.0, rank=rank)
+    for rank in range(51, 79):         # 28：排名外，速率天生高（>266.7/h），自然 6h
+        demand += 3600 / fills_period_s(fills_per_hour=500.0, rank=rank)
+    for rank in range(79, 83):         # 4：中段，速率介於 66.7～266.7/h 之間
+        demand += 3600 / fills_period_s(fills_per_hour=150.0, rank=rank)
+    for rank in range(83, 301):        # 218：排名外，速率低（<66.7/h），自然 24h
+        demand += 3600 / fills_period_s(fills_per_hour=1.0, rank=rank)
+
+    demand_pages_per_hour = demand
+    assert demand_pages_per_hour <= 30.0          # 正式機實算 22.34，留餘裕
+    assert demand_pages_per_hour < 56 / 2         # 不得再吃掉 fills 上限的一半
+
+
+def test_base_and_verify_are_not_starved_under_fills_pressure(tmp_path):
+    """base（`state` 輪詢）與 verify（核驗遍歷）在 fills 壓力下不得被餓死。
+
+    `evidence_unknown=1` 這個狀態全新建立的 store 不會自然產生（只有
+    v3→v4 遷移會留下——見 `SchedulerHarness.seed_evidence_unknown_address`
+    docstring），這裡用它構造出「遷移後留下一個待核驗地址」的形狀；構造完成
+    之後，`fills_verify` job 的建立（`reconcile_scan_jobs` 在第一個 tick 對帳）、
+    在 300 地址真實限流競爭下領工、完成（`kind='verify' AND status='done'`）
+    全部交給真實排程跑，不是構造出來的。"""
+    h = _t7a_harness(tmp_path)
+    verify_addr = _t7a_addr(150)
+    h.seed_evidence_unknown_address(verify_addr)
+    h.run_for(hours=6)
+    assert h.overdue_p95_s("state") < 1800
+    assert h.verify_completed() > 0
+
+
+def test_massive_same_ms_cluster_degrades_to_partial_not_silent_loss(tmp_path):
+    """Task 7a 揭露的系統性質（主線程 2026-09-22 補）：單一毫秒超過
+    2×PAGE_LIMIT 筆時，`same_ms_overflow` 這個刻意的保護會讓遍歷無法前進。
+    此時**必須**誠實降級成 partial／unresolved_gap，絕不可以少抓了卻宣稱
+    complete——這是「錯判完整」的最後一道防線，要有整合測試釘住，不能只靠
+    Task 1 的單元測試。"""
+    h = _t7a_harness(tmp_path)
+    h.set_fills_all_same_ms(T7A_BURST, count=6_000, cluster_size=6_000)
+    h.run_for(hours=6)
+    row = h.published_row(T7A_BURST)
+    assert row is not None
+    assert row["fills_coverage"]["state"] == "partial"
+    assert row["fills_coverage"]["reason"] == "unresolved_gap"
+    assert row["win_rate"] is None          # D-14：非 complete 不得給成交衍生數字
