@@ -1713,6 +1713,16 @@ running scans 86 → 79；1 小時內 Traceback **0**；429 0；follower 不變�
 running scans 79 → 71；Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
 fills 類積壓已從部署時的 50／22／17（due_n）收斂到 0／6／0——這是 Task 5b 週期分層釋出額度的直接效果。
 
+| 19:00 | 0 | 0 | 114／161／25 | 84 | 1／1／0 | ok | |
+| 19:15 | 0 | 0 | 117／161／22 | 84 | 0／0／0 | ok | 全部 kind 逾期為 0 |
+| 19:30 | 0 | 0 | 118／160／22 | 81 | 0／0／1 | ok | |
+| 19:45 | 0 | 0 | **120**／159／21 | 80 | 0／0／0 | ok | |
+
+**19:55 排程檢查（+4h10m）**：unknown **230 → 193**（−37/h，積壓清空後探測加速）、`earlier_fills_seen` 153 → 163、
+`truncation_suspected` 33 → **60**、`no_earlier_activity` 4 → 5；completeness 67／160／194；`fills_verify` job 84 → 78；
+running scans 71 → 66；Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
+對外 complete 部署時 109 → 120，穩定上升；`truncation_suspected` 已達 60，是 complete 增長的主要天花板（1 天探測窗待辦）。
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
