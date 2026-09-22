@@ -1329,6 +1329,60 @@ git commit -m "test: 新判準端到端可達性與待核驗列離開 unknown；
 
 ---
 
+## Task 8b: 遷移後形狀必須走得完整條獨立探測鏈 `@inline`
+
+> **主線程裁決（2026-09-22，Task 8 完成後複查發現）**：Task 8 的
+> `test_new_verdict_path_is_actually_reached_by_the_scheduler` 只要 **inline** 探測前置
+> 能跑就會過（builder 的「改壞→轉紅」證據必須**同時**破壞 inline 與獨立候選查詢才轉紅）。
+> 而 Task 3b 那條「模擬獨立路徑」的測試是**直接呼叫 `store.set_left_boundary`**，
+> 繞過了 `_serve_special` → `next_probe_candidate`（SQL）→ `_run_probe` 這整條鏈。
+>
+> 結果：遷移後最大的一群位址（137 個，形狀＝`partial / left_boundary_unknown`、
+> `evidence_unknown=0`、scan 已 done、**沒有** scan job）要靠的那條路，
+> 沒有任何測試讓真實排程器從頭走到尾。單獨破壞 `_PROBE_CANDIDATE_WHERE`
+> ——本次已在正式機現場抓到過的同型錯——現在的測試抓不到。
+
+**Files:**
+- Modify: `tests/test_explore_scheduler.py`（擴充 `SchedulerHarness`，新增一條測試）
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_migrated_rows_reach_complete_via_standalone_probe_path(tmp_path):
+    """遷移後 137 個位址的真實路徑：無 scan job → 只能靠 `_serve_special` 的輔助份額
+    → `next_probe_candidate` 挑中 → `_run_probe` → `set_left_boundary` →
+    Task 3b 就地重算 → complete。全程由真實排程器驅動，零整窗重掃。"""
+    h = _t7a_harness(tmp_path)
+    addrs = h.seed_migrated_unknown_rows(n=20)     # 精確複製 v4 遷移後的列形狀
+    h.run_for(hours=6)
+    resolved = [a for a in addrs if h.published_row(a)["fills_coverage"]["state"] == "complete"]
+    assert len(resolved) == 20
+    assert h.scan_pages_for(addrs) == 0            # 只有探測頁，沒有任何遍歷頁
+    assert h.probes_executed >= 20
+```
+
+`seed_migrated_unknown_rows` 種的形狀必須與 Task 4 遷移的 SQL 逐欄一致：
+`fills_sync.completeness='partial'`、`reason='left_boundary_unknown'`、`left_boundary='unknown'`、
+`evidence_unknown=0`、`scan_id` 指向一筆 `status='done'`、游標已抵達 `window_end_ms`、
+`unresolved_gap=0` 的 `fills_scan`；`refresh_job` 裡**沒有**該位址的 `fills_scan`／`fills_verify`。
+上游要讓探測窗回至少一筆合法成交（→ `earlier_fills_seen`）。
+
+- [ ] **Step 2: 確認失敗、實作 harness 接口、轉綠**
+
+- [ ] **Step 3: 證明它抓得到單獨破壞候選查詢**
+
+只在 `_PROBE_CANDIDATE_WHERE` 加 `AND 1=0`（**不動** inline 探測前置），測試必須轉紅；
+revert 後 `git diff --stat src/` 為空。這一步是本 task 存在的理由。
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add tests/test_explore_scheduler.py
+git commit -m "test: 遷移後形狀經真實排程器走完整條獨立探測鏈才 complete（D-I）"
+```
+
+---
+
 ## Task 9: RUNBOOK §5.8f 與部署（跟單中，加倍小心）`@inline`
 
 **Files:**
@@ -1391,7 +1445,8 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 | 6 子預算可借用 | ❌ 使用者裁決放棄 | 實測零效益（base p50=164／p95=180 貼頂、fills 有效上限仍 120 權重/分、`total_fills_pages` 53→53）；程式碼已 revert，分析保留在 Task 6 節 |
 | 7a harness ＋四條正確性驗收 | ✅ `65ac81f` | 主線程複跑 3343 passed；只動測試檔、`src/` 零漂移；反向護欄經「改壞→轉紅→revert」驗證 |
 | 7b 政策需求＋不飢餓＋同毫秒降級 | ✅ `0ca3160` | 主線程複跑 3346 passed；新政策測試實算 22.458 頁/小時（正式機 22.34）；harness 下界保真度 bug 修正 3600→21600 後 7a 四條仍全綠 |
-| 8 端到端可達性＋份額自動到期 | 派工中（ops 腳本已取消，verify_needed=0） | |
+| 8 端到端可達性＋份額自動到期 | ✅ `02d07e3`（待主線程複跑全套） | 預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
+| 8b 遷移後形狀走完整條獨立探測鏈 | 派工中 | |
 | 9 RUNBOOK 與部署 | 未開始 | |
 
 **待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
