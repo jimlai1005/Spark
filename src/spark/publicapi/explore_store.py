@@ -50,7 +50,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, NamedTuple
@@ -127,8 +127,10 @@ JOB_KIND_FOR_SCAN_KIND = {"verify": "fills_verify", "initial": "fills_scan",
 
 # schema_version：1（初版）→2（Task 7.5：`fills_sync.params_fp` 欄位＋既有
 # complete／reason=NULL 列補標）→3（Task 7.9b：遍歷軌／增量軌分離，見
-# `_migrate_v2_to_v3`）。
-_SCHEMA_VERSION = 3
+# `_migrate_v2_to_v3`）→4（Task 4，2026-09-22 D-G：`fills_sync.left_boundary`
+# 三欄／`fills_scan.stop_reason`／`unresolved_gap` 接上持久化，並撤銷依賴
+# 舊留存門檻判準的結論，見 `_migrate_v3_to_v4`）。
+_SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -424,6 +426,10 @@ class ExploreStore:
         self._db.execute("PRAGMA foreign_keys=ON")
         self._lock = threading.Lock()
         self._now = now_fn
+        # Task 4（2026-09-22，D-G）：`_migrate_v3_to_v4` 的工作量報告——只有
+        # 真正跑過該遷移的那個 `ExploreStore` 實例才會填值，其餘（新建 v4
+        # DB、或開啟時已是 v4）維持 `None`（見 `last_migration_report`）。
+        self._migration_v3_to_v4_report: dict[str, Any] | None = None
         with self._lock:
             with self._db:
                 self._db.executescript(_SCHEMA)
@@ -440,6 +446,9 @@ class ExploreStore:
                     # 版本更新在 `_migrate_v2_to_v3` 自己的顯式 transaction 內
                     # （Task 7.9c D5：列迴圈失敗 → 版本仍停在 2、整段回滾）。
                     self._migrate_v2_to_v3()
+                if row[0] < 4:
+                    # 同上：版本更新在 `_migrate_v3_to_v4` 自己的顯式 transaction 內。
+                    self._migrate_v3_to_v4()
             self._assert_inc_from_not_null()
         if str(db_path) != ":memory:":
             # Task 3.6 C（W2 修法）：WAL 模式會在 db 旁邊建 `-wal`／`-shm` 側檔，
@@ -701,6 +710,116 @@ class ExploreStore:
                         (f"{addr}:fills_verify", addr, now,
                          now + _migration_spread_s(addr, 48 * 3600)))
 
+    def _migrate_v3_to_v4(self) -> None:
+        """Task 4（2026-09-22，D-G 裁決，見 docs/superpowers/plans/
+        2026-09-22-explore-fills-coverage-verdict-fix.md）：schema v3→v4——
+        只撤銷依賴舊留存門檻判準的**結論**；`fills` 原始成交、`fills_scan` 的
+        游標／`pages_done`／`observed_*` 一筆不動（D-G：早期草案「running scan
+        一律作廢重跑」已被推翻，會丟掉已付出的抓取成本）。
+
+        DDL（`ALTER TABLE`）各自冪等（先 `PRAGMA table_info` 檢查欄位是否已
+        存在，沿用 `_migrate_v2_to_v3` 的手法）且**不在** transaction 內
+        （Python `sqlite3` 遇 DDL 會自動提交）；四條 `UPDATE`＋`schema_version`
+        更新包在同一個 `_explicit_transaction()` 內，中途失敗整段回滾（同
+        Task 7.9c D5）。
+
+        對照表（plan Task 4 表格）：
+        - `reason == REASON_RETENTION_BOUNDARY_VERIFIED AND completeness ==
+          'complete'`（探測已見更早成交）→ **正面證據保留**，轉成新判準：
+          `left_boundary='earlier_fills_seen'`／`reason=
+          REASON_LEFT_BOUNDARY_VERIFIED`，`left_boundary_window_start_ms`
+          取自該地址目前指向的 `fills_scan.window_start_ms`（同源同基準，
+          工程原則 1）——漏了這一步，`get_left_boundary` 的單調性判斷會找
+          不到適用窗口而判 `unknown`、觸發重探，白燒探測額度。
+        - 純門檻推論或無佐證的探測回空（`REASON_COUNT_BELOW_RETENTION_
+          THRESHOLD`／`REASON_PROBE_NO_EARLIER_FILLS`）→ 結論撤銷為
+          `partial`／`left_boundary_unknown`，游標與 fills 不動，
+          `evidence_unknown` 歸零（新判準看得懂，不必再靠舊旗標）。
+        - 被錯門檻中斷的 `partial`／`retention_limit` → 結論作廢回到
+          `backfilling`（`reason=NULL`），對應的 `fills_scan` 列打回
+          `status='running'`（`result`／`reason`／`finished_at` 清空）讓排程
+          續跑**同一個** `scan_id`／游標，不重新遍歷。
+        - `backfilling`（進行中）與其餘 reason：不動——本來就沒有結論可撤銷。
+
+        遷移**不建立任何 job**——排程觸發條件一律由狀態推導
+        （`scan_job_targets`／`_ensure_scan_job`），不是從「job 存不存在」
+        推導（7.9c 教訓：三輪複審都栽在這裡）。
+
+        結束時把 `last_migration_report()` 以 `logger.warning` 印出（部署
+        當下一定看得到），供比對 Task 4 Step 5 在正式機複本上算出的數字——
+        D-G 明文要求：避免再次大量變灰卻沒有處理容量。"""
+        cols_sync = {r[1] for r in self._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
+        for col, ddl in (
+            ("left_boundary",
+             "ALTER TABLE fills_sync ADD COLUMN left_boundary TEXT NOT NULL DEFAULT 'unknown'"),
+            ("left_boundary_window_start_ms",
+             "ALTER TABLE fills_sync ADD COLUMN left_boundary_window_start_ms INTEGER"),
+            ("left_boundary_at", "ALTER TABLE fills_sync ADD COLUMN left_boundary_at REAL"),
+        ):
+            if col not in cols_sync:
+                self._db.execute(ddl)
+        cols_scan = {r[1] for r in self._db.execute("PRAGMA table_info(fills_scan)").fetchall()}
+        for col, ddl in (
+            ("stop_reason", "ALTER TABLE fills_scan ADD COLUMN stop_reason TEXT"),
+            ("unresolved_gap",
+             "ALTER TABLE fills_scan ADD COLUMN unresolved_gap INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in cols_scan:
+                self._db.execute(ddl)
+
+        now = self._now()
+        before = dict(self._db.execute(
+            "SELECT completeness, COUNT(*) FROM fills_sync GROUP BY completeness").fetchall())
+
+        with self._explicit_transaction():
+            self._db.execute(
+                "UPDATE fills_sync SET left_boundary='earlier_fills_seen', "
+                "left_boundary_window_start_ms=(SELECT sc.window_start_ms FROM fills_scan sc "
+                "WHERE sc.scan_id = fills_sync.scan_id), left_boundary_at=?, reason=? "
+                "WHERE reason=? AND completeness='complete'",
+                (now, REASON_LEFT_BOUNDARY_VERIFIED, REASON_RETENTION_BOUNDARY_VERIFIED))
+            self._db.execute(
+                "UPDATE fills_sync SET completeness='partial', reason=?, "
+                "left_boundary='unknown', evidence_unknown=0 WHERE reason IN (?, ?)",
+                (REASON_LEFT_BOUNDARY_UNKNOWN, REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+                 REASON_PROBE_NO_EARLIER_FILLS))
+            self._db.execute(
+                "UPDATE fills_sync SET completeness='backfilling', reason=NULL, "
+                "evidence_unknown=0 WHERE reason='retention_limit'")
+            self._db.execute(
+                "UPDATE fills_scan SET status='running', result=NULL, reason=NULL, "
+                "finished_at=NULL WHERE result='partial' AND reason='retention_limit'")
+            self._db.execute("UPDATE schema_version SET version=4")
+
+        after = dict(self._db.execute(
+            "SELECT completeness, COUNT(*) FROM fills_sync GROUP BY completeness").fetchall())
+        probes_needed = self._db.execute(
+            "SELECT COUNT(*) FROM fills_sync f JOIN candidate c ON c.address = f.address "
+            "WHERE f.left_boundary='unknown' AND c.active=1").fetchone()[0]
+        scans_to_resume = self._db.execute(
+            "SELECT COUNT(*) FROM fills_scan WHERE status='running'").fetchone()[0]
+        verify_needed_n = self._db.execute(
+            "SELECT COUNT(*) FROM fills_sync WHERE evidence_unknown=1").fetchone()[0]
+        report = {
+            "before": before, "after": after,
+            "work": {"probes_needed": probes_needed, "scans_to_resume": scans_to_resume,
+                     "verify_needed": verify_needed_n},
+        }
+        self._migration_v3_to_v4_report = report
+        logger.warning("explore store: schema v3→v4 遷移完成（D-G 工作量報告）：%s", report)
+
+    def schema_version(self) -> int:
+        """目前 DB 的 schema 版本（觀測／測試用，讀取不必上鎖競爭寫入）。"""
+        with self._lock, self._db:
+            row = self._db.execute("SELECT version FROM schema_version").fetchone()
+        return row[0]
+
+    def last_migration_report(self) -> dict[str, Any] | None:
+        """最近一次 `_migrate_v3_to_v4` 產生的工作量報告（`before`／`after`
+        completeness 分佈＋`work` 待處理量）；本次開啟未觸發該遷移（新建
+        v4 DB，或開啟時已在 v4）→ `None`。"""
+        return self._migration_v3_to_v4_report
+
     # --- candidate ---
     def upsert_candidates(self, rows: list[tuple[str, str | None, int | None, float | None]],
                            as_of: float) -> None:
@@ -958,19 +1077,23 @@ class ExploreStore:
     def _scan_from_row(self, row: tuple) -> FillsScan:
         (scan_id, address, kind, window_start_ms, window_end_ms, cursor_ms, pages_done,
          fills_in_window, observed_from_ms, observed_to_ms, status, result, reason,
-         started_at, finished_at, last_error, params_fp) = row
+         started_at, finished_at, last_error, params_fp, stop_reason, unresolved_gap) = row
         return FillsScan(
             scan_id=scan_id, address=address, kind=kind, window_start_ms=window_start_ms,
             window_end_ms=window_end_ms, cursor_ms=cursor_ms, pages_done=pages_done,
             fills_in_window=fills_in_window, observed_from_ms=observed_from_ms,
             observed_to_ms=observed_to_ms, status=status, result=result, reason=reason,
             started_at=started_at, finished_at=finished_at, last_error=last_error,
-            params_fp=params_fp)
+            params_fp=params_fp, stop_reason=stop_reason, unresolved_gap=unresolved_gap)
 
+    # Task 4（2026-09-22，Step 0）：`stop_reason`／`unresolved_gap` 現在是
+    # `_SCAN_COLUMNS` 的一部分——每個讀 `fills_scan` 一列的呼叫端（`get_scan`／
+    # `get_active_scan`／`latest_done_scan`／`_recompute_verdict_locked`）都經
+    # `_scan_from_row` 自動取得持久化的值，不再需要各自反推。
     _SCAN_COLUMNS = (
         "scan_id, address, kind, window_start_ms, window_end_ms, cursor_ms, pages_done, "
         "fills_in_window, observed_from_ms, observed_to_ms, status, result, reason, "
-        "started_at, finished_at, last_error, params_fp")
+        "started_at, finished_at, last_error, params_fp, stop_reason, unresolved_gap")
 
     def get_scan(self, scan_id: str) -> FillsScan | None:
         with self._lock, self._db:
@@ -1167,9 +1290,11 @@ class ExploreStore:
                 new_count += cur.rowcount
             self._db.execute(
                 "UPDATE fills_scan SET cursor_ms=?, pages_done=?, fills_in_window=?, "
-                "observed_from_ms=?, observed_to_ms=?, last_error=? WHERE scan_id=?",
+                "observed_from_ms=?, observed_to_ms=?, last_error=?, stop_reason=?, "
+                "unresolved_gap=? WHERE scan_id=?",
                 (scan.cursor_ms, scan.pages_done, scan.fills_in_window, scan.observed_from_ms,
-                 scan.observed_to_ms, scan.last_error, scan.scan_id))
+                 scan.observed_to_ms, scan.last_error, scan.stop_reason,
+                 int(bool(scan.unresolved_gap)), scan.scan_id))
         return new_count
 
     def complete_scan(self, address: str, fills: list[dict],
@@ -1218,10 +1343,11 @@ class ExploreStore:
             self._db.execute(
                 "UPDATE fills_scan SET status='done', cursor_ms=?, pages_done=?, "
                 "fills_in_window=?, observed_from_ms=?, observed_to_ms=?, result=?, reason=?, "
-                "finished_at=?, last_error=? WHERE scan_id=?",
+                "finished_at=?, last_error=?, stop_reason=?, unresolved_gap=? WHERE scan_id=?",
                 (scan.cursor_ms, scan.pages_done, scan.fills_in_window, scan.observed_from_ms,
                  scan.observed_to_ms, scan.result, scan.reason, scan.finished_at,
-                 scan.last_error, scan.scan_id))
+                 scan.last_error, scan.stop_reason, int(bool(scan.unresolved_gap)),
+                 scan.scan_id))
             sync_row = self._db.execute(
                 "SELECT inc_from_ms, scan_id, observed_from_ms, observed_to_ms "
                 "FROM fills_sync WHERE address=?", (addr,)).fetchone()
@@ -1390,13 +1516,11 @@ class ExploreStore:
         4. 呼叫端已保證正面證據不會被覆蓋（見 `set_left_boundary`）；這裡只
            負責「證據變強／變已知之後結論要不要跟著變」。
 
-        `FillsScan.stop_reason`／`unresolved_gap` 尚未持久化（Task 1 docstring：
-        DB 往返會遺失這兩欄，完整讀寫接線留給 Task 4 的 schema 遷移）——從已
-        持久化的 `reason`／`cursor_ms`／`window_end_ms` 忠實重建，不是另寫一套
-        判斷：`scan_verdict` 的分支順序保證這個重建無損——
-        `reason == REASON_UNRESOLVED_GAP` 唯若當初 `unresolved_gap=1`；
-        `cursor_ms < window_end_ms` 時，當初寫入的 `reason` 就是原始的
-        `stop_reason` 本身（`scan_verdict` 的第二分支直接回傳它）。"""
+        Task 4（2026-09-22，Step 0）：`FillsScan.stop_reason`／`unresolved_gap`
+        現在由 `insert_scan_page`／`complete_scan` 真正持久化，`_scan_from_row`
+        （經 `_SCAN_COLUMNS`）直接讀回正確的值——不再需要從 `reason`／
+        `cursor_ms`／`window_end_ms` 反推（那個反推只在 `scan_verdict` 目前
+        的分支順序下成立，是隱性耦合，已移除）。"""
         if scan_id is None:
             return
         row = self._db.execute(
@@ -1405,9 +1529,6 @@ class ExploreStore:
         if row is None:
             return
         scan = self._scan_from_row(row)
-        unresolved_gap = 1 if scan.reason == REASON_UNRESOLVED_GAP else 0
-        stop_reason = scan.reason if scan.cursor_ms < scan.window_end_ms else None
-        scan = replace(scan, unresolved_gap=unresolved_gap, stop_reason=stop_reason)
         from spark.publicapi.explore_fills_sync import LeftBoundary, scan_verdict
         boundary = LeftBoundary(state=boundary_state, window_start_ms=boundary_window_start_ms,
                                 at=boundary_at)

@@ -54,14 +54,18 @@ def test_wal_journal_mode_enabled(tmp_path):
     assert mode == "wal"
 
 
-def test_schema_version_v3_recorded_on_fresh_db(tmp_path):
-    """Task 7.9b：schema bump 2→3（`fills_scan` 新表＋`fills_sync` 四個新欄）
-    ——全新 DB 直接落地版本 3（`_SCHEMA` 已含新表／新欄，不需要跑遷移）。"""
+def test_schema_version_v4_recorded_on_fresh_db(tmp_path):
+    """Task 4：schema bump 3→4（`fills_sync.left_boundary` 三欄＋
+    `fills_scan.stop_reason`／`unresolved_gap`）——全新 DB 直接落地版本 4
+    （`_SCHEMA` 已含新欄，不需要跑遷移）。"""
     store, _ = _store(tmp_path)
     row = store._db.execute("SELECT version FROM schema_version").fetchone()
-    assert row == (3,)
+    assert row == (4,)
     cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
-    assert {"inc_from_ms", "scan_id", "evidence_unknown", "coverage_gap"} <= cols
+    assert {"inc_from_ms", "scan_id", "evidence_unknown", "coverage_gap", "left_boundary",
+            "left_boundary_window_start_ms", "left_boundary_at"} <= cols
+    scan_cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_scan)").fetchall()}
+    assert {"stop_reason", "unresolved_gap"} <= scan_cols
     tables = {r[0] for r in store._db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     assert "fills_scan" in tables
@@ -415,8 +419,9 @@ def test_migration_v1_to_v2_adds_params_fp_column_defaulted_empty(tmp_path):
 
     store = ExploreStore(db_path)
 
+    # 開啟 v1 DB 會一路級聯遷移到目前版本（4），不會停在 3。
     version = store._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 3
+    assert version == 4
     cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
     assert "params_fp" in cols
     params_fp_values = {r[0] for r in store._db.execute(
@@ -430,15 +435,27 @@ def test_migration_v1_to_v2_backfills_reason_only_for_complete_null_rows(tmp_pat
 
     store = ExploreStore(db_path)
 
+    # Task 4（2026-09-22）：`ExploreStore(db_path)` 對 v1 DB 是一路級聯到 v4
+    # 的單一原子動作，這裡看到的是**級聯完成後**的最終值，不是 v1→v2 那一步
+    # 單獨的中間態——v1→v2 的補標行為（"complete/reason IS NULL → 補
+    # count_below_retention_threshold"）仍然發生，只是 v3→v4 接著把它撤銷成
+    # 新判準的 reason；這是 D-A／D-E 的直接後果（舊門檻推論的結論一律不留）。
     rows = {r[0]: r[1] for r in store._db.execute(
         "SELECT address, reason FROM fills_sync").fetchall()}
-    # complete/reason=NULL → 補標。
-    assert rows["0xabc"] == "count_below_retention_threshold"
-    # backfilling/reason=NULL → 不補（尚未跑完一輪，沒有可歸因的判準）。
+    # complete/reason=NULL → v1→v2 補標 count_below_retention_threshold →
+    # v3→v4 撤銷為 left_boundary_unknown（無佐證的舊門檻結論一律撤銷）。
+    assert rows["0xabc"] == "left_boundary_unknown"
+    # backfilling/reason=NULL → 全程不補、不撤銷（尚未跑完一輪，沒有可歸因
+    # 的判準，也不在 v3→v4 任何一條 UPDATE 的 WHERE 範圍內）。
     assert rows["0xdef"] is None
-    # partial/reason 原本就有值 → 不覆寫。
-    assert rows["0xzzz"] == "retention_limit"
+    # partial/retention_limit → v3→v4 判「被錯門檻中斷」，結論作廢回到
+    # backfilling（reason 清空，游標保留續抓），不再是 retention_limit。
+    assert rows["0xzzz"] is None
+    assert store.get_sync("0xzzz").completeness == "backfilling"
 
+    # "0xver"（complete/retention_boundary_verified，v1 既有值）是正面證據，
+    # 結論保留，只是 reason 改名——不落在下面這個「完整性結論仍缺 reason」
+    # 的檢查範圍內。
     remaining = store._db.execute(
         "SELECT COUNT(*) FROM fills_sync WHERE completeness='complete' AND reason IS NULL"
     ).fetchone()[0]
@@ -449,11 +466,11 @@ def test_migration_is_idempotent_on_reopen(tmp_path):
     db_path = tmp_path / "explore.db"
     _write_v1_schema(db_path)
     ExploreStore(db_path)
-    # 第二次開啟（版本已是 3）不應該再嘗試 ALTER TABLE／CREATE TABLE（會因
+    # 第二次開啟（版本已是 4）不應該再嘗試 ALTER TABLE／CREATE TABLE（會因
     # 欄位／表已存在而炸掉，或重複建立歷史 fills_scan／verify job）。
     store2 = ExploreStore(db_path)
     version = store2._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 3
+    assert version == 4
 
 
 # --- Task 7.9b：schema v2→v3 遷移（遍歷軌／增量軌分離） ---
@@ -500,13 +517,18 @@ def test_migration_v2_to_v3_verified_row_evidence_known_no_verify_job(tmp_path):
 
 
 def test_migration_v2_to_v3_other_complete_row_evidence_unknown_schedules_verify_job(tmp_path):
+    """v2→v3 本身仍會把「無佐證的舊門檻結論」標 `evidence_unknown=1`＋排
+    `fills_verify` job——但 `ExploreStore(db_path)` 對 v1 DB 是級聯到 v4 的單一
+    動作，v3→v4 緊接著把這批列的 `evidence_unknown` 歸零（新 reason 本身已經
+    講清楚是 unknown，不必再靠這個旗標）。job 本身不被 v3→v4 觸碰，仍在。"""
     db_path = tmp_path / "explore.db"
     _write_v1_schema(db_path)
     now = time.time()
     store = ExploreStore(db_path, now_fn=lambda: now)
 
     sync = store.get_sync("0xabc")
-    assert sync.evidence_unknown is True
+    assert sync.evidence_unknown is False           # Task 4：v3→v4 歸零
+    assert sync.reason == "left_boundary_unknown"    # Task 4：撤銷舊門檻結論
     row = store._db.execute(
         "SELECT next_attempt_at FROM refresh_job WHERE address='0xabc' "
         "AND kind='fills_verify'").fetchone()
@@ -515,13 +537,18 @@ def test_migration_v2_to_v3_other_complete_row_evidence_unknown_schedules_verify
 
 
 def test_migration_v2_to_v3_partial_row_also_gets_evidence_unknown_and_verify_job(tmp_path):
+    """同上：v2→v3 對 `partial/retention_limit` 列標 `evidence_unknown=1`＋排
+    `fills_verify` job，但級聯到 v4 之後——D-G「被錯門檻中斷」分支把結論作廢
+    回到 `backfilling`（游標保留續抓），`evidence_unknown` 也歸零。舊的
+    `fills_verify` job 不被 v3→v4 觸碰（job 清理是 scheduler 的範圍，Task 4
+    明確不改 `explore_scheduler.py`），仍會存在但已無實際作用。"""
     db_path = tmp_path / "explore.db"
     _write_v1_schema(db_path)
     store = ExploreStore(db_path)
 
     sync = store.get_sync("0xzzz")
-    assert sync.completeness == "partial"
-    assert sync.evidence_unknown is True
+    assert sync.completeness == "backfilling"        # Task 4：作廢回到續抓
+    assert sync.evidence_unknown is False             # Task 4：v3→v4 歸零
     job = store._db.execute(
         "SELECT 1 FROM refresh_job WHERE address='0xzzz' AND kind='fills_verify'").fetchone()
     assert job is not None
@@ -1060,8 +1087,12 @@ def test_recompute_respects_unresolved_gap(tmp_path):
     store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
                                   params_fp="pfp")
     scan = store.get_active_scan("0xabc")
+    # Task 4 Step 0：`unresolved_gap` 現在真的持久化（不再從 `reason` 字串反推），
+    # 這裡必須把真正的欄位設成 1，否則 `_recompute_verdict_locked` 讀回的
+    # `scan.unresolved_gap` 會是持久化的 0，測不到本測試要釘住的行為。
     finished = dataclasses.replace(scan, cursor_ms=500, result="partial",
-                                   reason="unresolved_gap", finished_at=1.0)
+                                   reason="unresolved_gap", finished_at=1.0,
+                                   unresolved_gap=1)
     store.complete_scan("0xabc", [], finished)
 
     store.set_left_boundary("0xabc", "earlier_fills_seen", 0, c.now())
@@ -1100,6 +1131,25 @@ def test_transient_probe_failure_does_not_forfeit_the_window(tmp_path):
 
     assert ok is True
     assert store.next_probe_candidate() is not None
+
+
+def test_scan_round_trip_preserves_stop_reason_and_unresolved_gap(tmp_path):
+    """Task 4 Step 0：`FillsScan.stop_reason`／`unresolved_gap` 必須真正持久化
+    （`_SCAN_COLUMNS`／`_scan_from_row`），往返（寫入→讀回）不失真——這是
+    `_recompute_verdict_locked` 不再需要靠 `reason`／`cursor_ms` 反推的前提。
+    透過 `insert_scan_page`（本輪暫停／我方停止的真實寫入路徑）逐一驗證四種
+    `(stop_reason, unresolved_gap)` 組合。"""
+    store, c = _store(tmp_path)
+    for i, (stop, gap) in enumerate((("local_page_cap", 0), ("no_progress", 0),
+                                     ("same_ms_overflow", 1), (None, 0))):
+        addr = f"0xtrip{i}"
+        store.upsert_candidates([(addr, None, 1, None)], as_of=c.now())
+        scan = _bootstrapped(store, c, addr)
+        updated = dataclasses.replace(scan, cursor_ms=scan.cursor_ms + 1, stop_reason=stop,
+                                      unresolved_gap=gap)
+        store.insert_scan_page(addr, [], updated)
+        got = store.get_scan(scan.scan_id)
+        assert (got.stop_reason, got.unresolved_gap) == (stop, gap)
 
 
 def test_get_scan_returns_none_for_unknown_scan_id(tmp_path):
@@ -1376,7 +1426,8 @@ def _migration_shape(db_path) -> tuple:
 
 def test_migration_v2_to_v3_is_idempotent_across_three_runs(tmp_path):
     """W1：遷移重跑（含把 `schema_version` 改回 2 強制再跑一次）不得重複建
-    `fills_scan`／`fills_verify` job，也不得因 UNIQUE 撞掉。"""
+    `fills_scan`／`fills_verify` job，也不得因 UNIQUE 撞掉。Task 4：開啟時會
+    級聯到目前版本 4（v2→v3 之後緊接著 v3→v4），版本斷言隨之更新為 4。"""
     db_path = tmp_path / "explore.db"
     _write_v2_multi(db_path)
     now = 1_700_000_000.0
@@ -1391,10 +1442,10 @@ def test_migration_v2_to_v3_is_idempotent_across_three_runs(tmp_path):
     ExploreStore(db_path, now_fn=lambda: now + 12345)   # 第二次（強制重跑列迴圈）
     shape2 = _migration_shape(db_path)
 
-    ExploreStore(db_path, now_fn=lambda: now + 99999)   # 第三次（版本已是 3）
+    ExploreStore(db_path, now_fn=lambda: now + 99999)   # 第三次（版本已是 4）
     shape3 = _migration_shape(db_path)
 
-    assert shape1[0] == shape2[0] == shape3[0] == 3
+    assert shape1[0] == shape2[0] == shape3[0] == 4
     assert shape1[1] == shape2[1] == shape3[1] == 4      # 四列各一筆 fills_scan
     assert shape1[2] == shape2[2] == shape3[2]
     # 核驗 job 只給「有歷史結論但缺證據」的兩列（0xabc complete／0xzzz partial）：
@@ -1445,6 +1496,205 @@ def test_migration_v2_to_v3_rename_guard_when_target_job_key_exists(tmp_path):
     kinds = dict(store._db.execute(
         "SELECT key, kind FROM refresh_job WHERE address='0xgap'").fetchall())
     assert kinds == {"0xgap:fills_scan": "fills_scan", "0xgap:fills": "fills"}
+
+
+# --- Task 4（2026-09-22，D-G）：schema v3→v4 遷移 ---
+
+def _write_v3_schema(db_path) -> None:
+    """手刻一份 Task 4 之前的 v3 DB——複刻正式機真實形狀：`fills_sync` 沒有
+    `left_boundary` 三欄，`fills_scan` 沒有 `stop_reason`／`unresolved_gap`
+    （這兩張表本身在 Task 7.9b 就已存在，只是缺這幾個 Task 3／Task 4 才新增
+    的欄位）。"""
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (3);
+        CREATE TABLE candidate (
+          address TEXT PRIMARY KEY, display_name TEXT, source_rank INTEGER,
+          source_roi REAL, source_as_of REAL NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1, last_seen_at REAL NOT NULL);
+        CREATE TABLE endpoint_cache (
+          address TEXT NOT NULL, endpoint TEXT NOT NULL,
+          params_fp TEXT NOT NULL DEFAULT '', payload TEXT,
+          fetched_at REAL, refresh_after REAL NOT NULL,
+          last_error TEXT, last_error_at REAL,
+          PRIMARY KEY (address, endpoint, params_fp));
+        CREATE TABLE fills (
+          address TEXT NOT NULL, coin TEXT NOT NULL, tid INTEGER NOT NULL,
+          time_ms INTEGER NOT NULL, raw TEXT NOT NULL,
+          PRIMARY KEY (address, coin, tid));
+        CREATE TABLE fills_sync (
+          address TEXT PRIMARY KEY,
+          window_start_ms INTEGER NOT NULL, window_end_ms INTEGER NOT NULL,
+          cursor_ms INTEGER NOT NULL, synced_through_ms INTEGER,
+          observed_from_ms INTEGER, observed_to_ms INTEGER,
+          completeness TEXT NOT NULL DEFAULT 'backfilling',
+          reason TEXT, pages_done INTEGER NOT NULL DEFAULT 0,
+          fills_in_window INTEGER NOT NULL DEFAULT 0,
+          params_fp TEXT NOT NULL DEFAULT '',
+          updated_at REAL NOT NULL, last_error TEXT,
+          inc_from_ms INTEGER, scan_id TEXT,
+          evidence_unknown INTEGER NOT NULL DEFAULT 0,
+          coverage_gap INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE fills_scan (
+          scan_id TEXT PRIMARY KEY, address TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('initial', 'partial_rescan', 'verify')),
+          window_start_ms INTEGER NOT NULL, window_end_ms INTEGER NOT NULL,
+          cursor_ms INTEGER NOT NULL, pages_done INTEGER NOT NULL DEFAULT 0,
+          fills_in_window INTEGER NOT NULL DEFAULT 0,
+          observed_from_ms INTEGER, observed_to_ms INTEGER,
+          status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'done')),
+          result TEXT, reason TEXT, started_at REAL NOT NULL, finished_at REAL,
+          last_error TEXT, params_fp TEXT NOT NULL DEFAULT '');
+        CREATE TABLE refresh_job (
+          key TEXT PRIMARY KEY, address TEXT, kind TEXT NOT NULL,
+          priority INTEGER NOT NULL, created_at REAL NOT NULL,
+          next_attempt_at REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          lease_until REAL, lease_owner TEXT, fencing INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT);
+    """)
+    raw.commit()
+    raw.close()
+
+
+def _v3_db_with(db_path, *, sync_rows, scan_overrides=None, fills_rows=(),
+                inactive_addrs=()):
+    """手刻一份 schema v3 資料庫（`_write_v3_schema`）＋指定的 `fills_sync`／
+    `fills_scan`／`fills`／`candidate` 列，供 `_migrate_v3_to_v4` 的遷移測試
+    使用。
+
+    `sync_rows`：`(address, completeness, reason, evidence_unknown)`——每列
+    自動配一筆 `status='done'` 的 `fills_scan`（`window_start_ms=0`／
+    `window_end_ms=9000`／`cursor_ms=9000`），`fills_sync.scan_id` 指向它。
+    `scan_overrides`：`{address: (status, result, reason, pages_done,
+    cursor_ms)}`，覆寫個別地址的 `fills_scan` 列（例如「partial／
+    retention_limit 且游標已推進到某處」）。
+    `fills_rows`：`(address, tid, time_ms)`，落進 `fills` 表（驗證 D-G「原始
+    成交一筆不少」）。`inactive_addrs`：這些地址不建 `candidate` 列（模擬
+    已退池，`probes_needed` 不應計入）。"""
+    _write_v3_schema(db_path)
+    raw = sqlite3.connect(str(db_path))
+    overrides = scan_overrides or {}
+    now = 1_700_000_000.0
+    for addr, completeness, reason, evidence_unknown in sync_rows:
+        if addr not in inactive_addrs:
+            raw.execute(
+                "INSERT INTO candidate (address, display_name, source_rank, source_roi, "
+                "source_as_of, active, last_seen_at) VALUES (?, NULL, 1, 0.0, ?, 1, ?)",
+                (addr, now, now))
+        scan_id = f"scan-{addr}"
+        status, result, s_reason, pages_done, cursor_ms = overrides.get(
+            addr, ("done", completeness, reason, 5, 9000))
+        raw.execute(
+            "INSERT INTO fills_scan (scan_id, address, kind, window_start_ms, window_end_ms, "
+            "cursor_ms, pages_done, fills_in_window, status, result, reason, started_at, "
+            "finished_at, params_fp) VALUES (?, ?, 'initial', 0, 9000, ?, ?, 100, ?, ?, ?, ?, "
+            "?, '')",
+            (scan_id, addr, cursor_ms, pages_done, status, result, s_reason, now, now))
+        raw.execute(
+            "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
+            "synced_through_ms, completeness, reason, pages_done, fills_in_window, params_fp, "
+            "updated_at, inc_from_ms, scan_id, evidence_unknown, coverage_gap) "
+            "VALUES (?, 0, 9000, 9000, 9000, ?, ?, ?, 100, '', ?, 9000, ?, ?, 0)",
+            (addr, completeness, reason, pages_done, now, scan_id, evidence_unknown))
+    for addr, tid, time_ms in fills_rows:
+        raw.execute(
+            "INSERT INTO fills (address, coin, tid, time_ms, raw) VALUES (?, 'BTC', ?, ?, ?)",
+            (addr, tid, time_ms, '{"coin":"BTC","tid":%d,"time":%d}' % (tid, time_ms)))
+    raw.commit()
+    raw.close()
+    return db_path
+
+
+_V3_SNAPSHOT_SYNC_ROWS = [
+    ("0xaa", "complete", "count_below_retention_threshold", 1),
+    ("0xbb", "complete", "count_below_retention_threshold_probe_empty", 1),
+    ("0xcc", "complete", "retention_boundary_verified", 0),
+    ("0xdd", "partial", "retention_limit", 0),
+]
+_V3_SNAPSHOT_SCAN_OVERRIDES = {"0xdd": ("done", "partial", "retention_limit", 5, 4200)}
+
+
+def test_migrate_v3_to_v4_revokes_verdicts_but_keeps_progress(tmp_path):
+    """D-G 對照表逐列驗證：正面證據保留、無佐證結論撤銷、被錯門檻中斷的
+    遍歷回到續抓——`fills` 原始成交與 `fills_scan` 游標一筆不動。"""
+    db_path = tmp_path / "explore.db"
+    _v3_db_with(db_path, sync_rows=_V3_SNAPSHOT_SYNC_ROWS,
+               scan_overrides=_V3_SNAPSHOT_SCAN_OVERRIDES,
+               fills_rows=[("0xdd", 1, 111), ("0xdd", 2, 222)])
+
+    store = ExploreStore(db_path)
+
+    assert store.schema_version() == 4
+    assert store.get_sync("0xaa").completeness == "partial"
+    assert store.get_sync("0xaa").reason == "left_boundary_unknown"
+    assert store.get_sync("0xbb").completeness == "partial"
+    assert store.get_sync("0xcc").completeness == "complete"          # 正面證據保留
+    assert store.get_left_boundary("0xcc", 0).state == "earlier_fills_seen"
+    assert store.get_sync("0xdd").completeness == "backfilling"
+    resumed = store.running_scan("0xdd")
+    assert resumed is not None and resumed.status == "running"
+    assert resumed.cursor_ms == 4200                                  # 游標保留
+    assert len(store.get_fills("0xdd", 0, 10**15)) == 2                # 原始成交一筆不少
+
+
+def _job_rows(db_path):
+    raw = sqlite3.connect(str(db_path))
+    rows = sorted(raw.execute("SELECT key, kind FROM refresh_job").fetchall())
+    raw.close()
+    return rows
+
+
+def _v3_v4_sync_rows(db_path):
+    raw = sqlite3.connect(str(db_path))
+    rows = sorted(raw.execute(
+        "SELECT address, completeness, reason, left_boundary, evidence_unknown "
+        "FROM fills_sync").fetchall())
+    raw.close()
+    return rows
+
+
+def test_migrate_v3_to_v4_is_rerunnable_and_creates_no_jobs(tmp_path):
+    """遷移本身不得建立任何 job（排程觸發條件一律由狀態推導，7.9c 教訓），
+    且連跑三次（含把 `schema_version` 強制改回 3 逼它重跑）結果必須相同。"""
+    db_path = tmp_path / "explore.db"
+    _v3_db_with(db_path, sync_rows=_V3_SNAPSHOT_SYNC_ROWS,
+               scan_overrides=_V3_SNAPSHOT_SCAN_OVERRIDES)
+    before_jobs = _job_rows(db_path)
+
+    ExploreStore(db_path)
+    jobs1, shape1 = _job_rows(db_path), _v3_v4_sync_rows(db_path)
+
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("UPDATE schema_version SET version=3")
+    raw.commit()
+    raw.close()
+    ExploreStore(db_path)                          # 第二次（強制重跑）
+    jobs2, shape2 = _job_rows(db_path), _v3_v4_sync_rows(db_path)
+
+    ExploreStore(db_path)                          # 第三次（版本已是 4）
+    jobs3, shape3 = _job_rows(db_path), _v3_v4_sync_rows(db_path)
+
+    assert jobs1 == before_jobs == jobs2 == jobs3   # 遷移本身不建任何 job
+    assert shape1 == shape2 == shape3
+
+
+def test_migrate_v3_to_v4_reports_workload(tmp_path):
+    """D-G：遷移必須輸出遷移前後狀態分佈與待處理工作量，避免再次大量變灰
+    卻沒有處理容量。"""
+    db_path = tmp_path / "explore.db"
+    _v3_db_with(db_path, sync_rows=_V3_SNAPSHOT_SYNC_ROWS,
+               scan_overrides=_V3_SNAPSHOT_SCAN_OVERRIDES)
+
+    report = ExploreStore(db_path).last_migration_report()
+
+    assert report["before"] == {"complete": 3, "partial": 1}
+    assert report["after"] == {"partial": 2, "complete": 1, "backfilling": 1}
+    # probes_needed：0xaa／0xbb（撤銷後 left_boundary='unknown'）＋0xdd
+    # （ALTER 的欄位預設值本來就是 'unknown'，被錯門檻中斷的分支不碰這欄）。
+    assert report["work"]["probes_needed"] == 3
+    assert report["work"]["scans_to_resume"] == 1    # 0xdd 的 scan 打回 running
+    assert report["work"]["verify_needed"] == 0      # 四條 UPDATE 都把 evidence_unknown 歸零
 
 
 # D6：inc_from_ms 非空邊界
