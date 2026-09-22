@@ -2345,6 +2345,41 @@ def test_positive_boundary_evidence_survives_window_roll_forward(tmp_path):
     assert store.next_probe_candidate() is None
 
 
+def test_rescan_reprobes_when_prior_evidence_was_window_bound(tmp_path):
+    """Task 11（2026-09-22，兩輪審核＋使用者裁決部署前修）：`no_earlier_
+    activity` 不具單調性——`partial_rescan` 對新窗口起點建立 scan 後，
+    探測前置必須真的重新探測，不得沿用舊窗口的 `no_earlier_activity` 證據。
+    反向護欄：把 `_applicable_boundary` 的 `no_earlier_activity` 規則改回
+    `<=` 會讓這裡的『左界證據已適用』誤判為真，探測前置被整段跳過，
+    `probes_total` 停在 0、`scan_pages_total` 直接變成 1（未經證據就抓頁）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
+    old_ws, old_we = 1_000, 9_000
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=old_ws,
+                                  window_end_ms=old_we, params_fp="")
+    _complete_scan(store, "0xabc", result="complete", reason="left_boundary_no_activity",
+                   window_end_ms=old_we, finished_at=clock.now())
+    store.set_left_boundary("0xabc", "no_earlier_activity", old_ws, clock.now())
+
+    new_ws = old_ws + 50_000
+    new_we = new_ws + 8_000
+    store.create_scan("0xabc", kind="partial_rescan", window_start_ms=new_ws,
+                      window_end_ms=new_we, cursor_ms=new_ws, started_at=clock.now())
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
+    hl = _ProbeResolvesThenEmptyHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    job = store.claim_due(clock.now(), "o", 60, kinds=("fills_scan",))
+    assert job is not None
+
+    result = sched._run_scan(job, clock.now(), verify=False)
+
+    assert result == "ran:fills_scan"
+    assert sched.probes_total == 1
+    assert sched.scan_pages_total == 0
+
+
 def _probe_with_portfolio(tmp_path, clock, *, first_activity_ms: int | None,
                           local_last_seen_at: float | None = None):
     """建一個左界證據待解的候選：`bootstrap_address_fills` 建好 `fills_sync`

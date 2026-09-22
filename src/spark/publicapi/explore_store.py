@@ -104,11 +104,6 @@ REASON_UNRESOLVED_GAP = "unresolved_gap"                        # 分頁有未�
 # 自己宣告的 `tuple[str, str]` 回傳型別（靜默的資訊遺失，非錯判完整）。
 REASON_TRAVERSAL_INCOMPLETE = "traversal_incomplete"  # 遍歷未抵達終點且沒有記錄到停止原因
 
-# Task 3b（2026-09-22，D-G 裁決）：正面左界證據——一旦取得即終局（單調性，見
-# `get_left_boundary` docstring），`get_left_boundary`／`set_left_boundary`
-# 共用同一份值域，不各自重複寫一份 tuple 字面值。
-_POSITIVE_BOUNDARY_STATES = ("earlier_fills_seen", "no_earlier_activity")
-
 
 def _applicable_boundary(state: str, stored_ws: int | None, at: float | None,
                          query_ws: int) -> "LeftBoundary":
@@ -125,26 +120,46 @@ def _applicable_boundary(state: str, stored_ws: int | None, at: float | None,
     `partial` 錯判成 `complete`（正是 D-E／D-F 要防的「把錯判不完整換成
     錯判完整」）。
 
-    規則（與原 `get_left_boundary` 的單調性一致，只是抽成單一實作）：
-    正面證據（`earlier_fills_seen`／`no_earlier_activity`）在 `stored_ws <=
-    query_ws` 時適用——窗口只會隨時間往前滾，更早的起點意味著「起點之前
-    仍有成交／帳戶在起點前無活動」這個事實只會更成立，不會因窗口右移而
-    失效；`stored_ws > query_ws`（含 `_recompute_verdict_locked` 用新窗口
-    證據判舊窗口結論的情境）保守地視為不適用，回 `unknown`。
-    `truncation_suspected` 不具單調性——只對取得時的窗口起點（`stored_ws ==
-    query_ws`）成立，窗口一旦往前滾就必須重探。其餘（含 `unknown`）一律
-    `unknown`。
+    規則（逐狀態；Task 11（2026-09-22，兩輪審核＋使用者裁決部署前修）收緊
+    了 `no_earlier_activity` 一項，其餘不變）：
+
+    - `earlier_fills_seen`：**單調**，`stored_ws <= query_ws` 時適用——窗口
+      只會隨時間往前滾，更早的起點意味著「起點之前仍有成交」這個事實只會
+      更成立，不會因窗口右移而失效；`stored_ws > query_ws`（含
+      `_recompute_verdict_locked` 用新窗口證據判舊窗口結論的情境）保守地
+      視為不適用，回 `unknown`。
+    - `no_earlier_activity`：**窗口綁定，不單調**——`stored_ws == query_ws`
+      才適用。「帳戶在 `stored_ws` 之前無活動」不蘊含「帳戶在更晚的
+      `query_ws` 之前無活動」：帳戶可能恰好在 `[stored_ws, query_ws)`
+      之間才開始活動，此時舊證據對新窗口一無所證。原本沿用 `earlier_fills_
+      seen` 的 `<=` 規則，配合「正面證據終局＋不重探」會讓這個誤判永久鎖定
+      `complete`——觸發需要帳戶真的在舊窗口內才開始活動（實測未見），但落在
+      D-E／D-F 要防的「錯判完整」方向，故收緊為 `==`。
+
+      **成本模型**（Task 11 主線程裁決，見 plan Task 11 區塊）：窗口綁定的
+      代價由「年齡不滿一個掃描窗（目前 30 天）且仍 `partial`」的帳戶承擔——
+      每次 `partial_rescan` 窗口往前滾，這份證據就不再適用，該地址的新 scan
+      探測前置要重新付 1 頁探測（見 `explore_scheduler._run_scan`），直到
+      帳戶存活滿 30 天、探測改解出單調的 `earlier_fills_seen` 為止才永久
+      終局。有界（每次 rescan 最多 1 頁、rescan 週期 ≤24h）、只發生在窗口
+      仍會滾動的 `partial` 地址——`complete` 的地址不會再排 rescan，不受
+      影響。**不得**再讓「窗口不符」本身成為獨立探測的候選（見
+      `ExploreStore._PROBE_CANDIDATE_WHERE` 上方註解的事故：那樣會讓獨立
+      探測與新 scan 的探測前置對同一格互相覆寫，把有界成本變成無界）。
+    - `truncation_suspected`：不具單調性——只對取得時的窗口起點（`stored_ws
+      == query_ws`）成立，窗口一旦往前滾就必須重探。
+    - 其餘（含 `unknown`）一律 `unknown`。
 
     延遲 import `LeftBoundary`（定義於 `explore_fills_sync`）以避免循環
     import——該模組在頂層 import 本模組的 `FillsScan`／`FillsSyncState`，
     反向在頂層 import 會形成循環（工程原則 1 的姊妹問題：模組依賴方向也要
     單一，不能雙向）。"""
     from spark.publicapi.explore_fills_sync import LeftBoundary
-    if state in _POSITIVE_BOUNDARY_STATES:
+    if state == "earlier_fills_seen":
         if stored_ws is not None and stored_ws <= query_ws:
             return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
         return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
-    if state == "truncation_suspected":
+    if state in ("no_earlier_activity", "truncation_suspected"):
         if stored_ws == query_ws:
             return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
         return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
@@ -1460,11 +1475,27 @@ class ExploreStore:
     # 這次的窗口起點（該狀態不具單調性，見 `get_left_boundary` docstring，
     # 窗口往前滾之後必須重探）。**不再**依 `sc.result`／`evidence_unknown`
     # 篩選——左界證據與遍歷本身的完整性結論、與核驗需求是三個正交的軸。
+    #
+    # Task 11（2026-09-22，主線程裁決，見 plan Task 11「主線程裁決」區塊）：
+    # 原本打算對 `no_earlier_activity AND 窗口不符` 也比照 `truncation_suspected`
+    # 加一句，讓它立刻成為獨立探測候選——但 `left_boundary` 是**每地址一格**，
+    # `partial_rescan` 期間同一地址同時有兩個窗口要證據：`fills_sync.scan_id`
+    # 指向的舊生效 scan（W_old）與正在推進的新 scan（W_new，`_run_scan` 的探測
+    # 前置會對它探測）。加那句會讓獨立探測（拿 W_old 去探、寫回 `@W_old`）與
+    # 探測前置（拿 W_new 去探、寫回 `@W_new`）對同一格互相覆寫、反覆把地址推回
+    # 候選池——harness 實測 `probes_executed` 衝到 760（正常量級的十倍以上），
+    # 吃光輔助份額，讓 Task 8 的 `test_evidence_unknown_rows_actually_leave_
+    # unknown_via_verify` 失守。**撤回**那句：窗口不符的地址不是獨立探測的
+    # 候選，讓它等自己的 `partial_rescan`（≤24h）由探測前置在*新*窗口重探——
+    # 那才是唯一正確的窗口。改用下面的排他規則堵住殘餘的乒乓（見
+    # `next_probe_candidate` docstring）。
     _PROBE_CANDIDATE_WHERE = (
         "c.active=1 AND sc.status='done' AND ("
         "s.left_boundary='unknown' OR "
         "(s.left_boundary='truncation_suspected' "
-        "AND s.left_boundary_window_start_ms != sc.window_start_ms))"
+        "AND s.left_boundary_window_start_ms != sc.window_start_ms)) "
+        "AND NOT EXISTS (SELECT 1 FROM fills_scan r WHERE r.address = s.address "
+        "AND r.status = 'running')"
     )
 
     def next_probe_candidate(self) -> tuple[str, str] | None:
@@ -1477,7 +1508,17 @@ class ExploreStore:
         starvation）：若排序鍵是 `finished_at`（該地址最近一次完成遍歷的時間，
         探測不會改動），一個持續探不出結論的地址每次都會是「最舊」而永遠
         排第一，其餘候選永遠輪不到。用 `left_boundary_at` 排序讓每次探測
-        自然把該地址推到隊尾，形成輪詢。"""
+        自然把該地址推到隊尾，形成輪詢。
+
+        Task 11（2026-09-22，主線程裁決）：`_PROBE_CANDIDATE_WHERE` 的排他
+        規則（`NOT EXISTS ... status='running'`）讓有 scan 在跑的地址一律不是
+        獨立探測的候選——證據由該 scan 的探測前置（`_run_scan`）獨占。這正是
+        獨立探測原本該有的職責分工：它只服務「沒有任何 job 在推進、但證據
+        仍缺」的地址（Task 8b 的遷移後形狀就是這種）。Task 3 時因為兩個正面
+        狀態都被誤判為單調而沒暴露——`partial_rescan` 期間，同一地址的
+        `left_boundary` 這一格若同時被獨立探測（拿舊生效 scan 的窗口）與
+        探測前置（拿新進行中 scan 的窗口）搶著寫，會互相覆寫、反覆把地址
+        推回候選池（見 `_PROBE_CANDIDATE_WHERE` 上方註解的事故）。"""
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT s.address, s.scan_id FROM fills_sync s "
@@ -1522,13 +1563,20 @@ class ExploreStore:
 
     def set_left_boundary(self, address: str, state: str, window_start_ms: int,
                           at: float) -> bool:
-        """左界證據冪等寫入（Task 3；轉移規則於 Task 3b 收緊）。只允許
-        `unknown` → 其他；已有正面證據（`earlier_fills_seen`／
-        `no_earlier_activity`）時**不得被任何後續寫入覆蓋**——終局
-        （Task 3b 不變式 4：正面證據只能加強，不能被「這次探測沒問到」或
-        「這次探測疑似截斷」抹掉；同一地址不會同時有兩個探測在跑，這條規則
-        防的是「舊探測回應在新探測之後才落地」這種排序倒置，不是併發 CAS）。
-        沒有 `fills_sync` 列（地址已退池被 purge）→ `False`，不落地。
+        """左界證據冪等寫入（Task 3；轉移規則於 Task 3b 收緊、Task 11 依窗口
+        細分）。只允許 `unknown` → 其他；已有正面證據時**不得被同一個窗口的
+        任何後續寫入覆蓋**——終局（Task 3b 不變式 4：正面證據只能加強，不能
+        被「這次探測沒問到」或「這次探測疑似截斷」抹掉；同一地址不會同時有
+        兩個探測在跑，這條規則防的是「舊探測回應在新探測之後才落地」這種
+        排序倒置，不是併發 CAS）。沒有 `fills_sync` 列（地址已退池被 purge）
+        → `False`，不落地。
+
+        Task 11（2026-09-22，使用者裁決部署前修）：`earlier_fills_seen`
+        單調，任何窗口都終局，規則不變。`no_earlier_activity` 窗口綁定
+        （見 `_applicable_boundary`）——終局只對**同一個**窗口起點成立；
+        新寫入的 `window_start_ms` 與 stored 的不同時，視為換了一個新問題，
+        放行任何狀態覆寫（讓探測前置能對新窗口重新探測，見
+        `_PROBE_CANDIDATE_WHERE`）。
 
         Task 3b（D-G）：成功寫入且新狀態不是 `unknown` 時，在同一個
         transaction 內就地重算 `fills_sync.completeness`／`reason`（見
@@ -1538,12 +1586,14 @@ class ExploreStore:
         addr = _norm(address)
         with self._lock, self._db:
             row = self._db.execute(
-                "SELECT left_boundary, scan_id, completeness, reason FROM fills_sync "
-                "WHERE address=?", (addr,)).fetchone()
+                "SELECT left_boundary, left_boundary_window_start_ms, scan_id, completeness, "
+                "reason FROM fills_sync WHERE address=?", (addr,)).fetchone()
             if row is None:
                 return False
-            current_state, scan_id, completeness, reason = row
-            if current_state in _POSITIVE_BOUNDARY_STATES:
+            current_state, current_ws, scan_id, completeness, reason = row
+            if current_state == "earlier_fills_seen":
+                return False
+            if current_state == "no_earlier_activity" and current_ws == window_start_ms:
                 return False
             self._db.execute(
                 "UPDATE fills_sync SET left_boundary=?, left_boundary_window_start_ms=?, "

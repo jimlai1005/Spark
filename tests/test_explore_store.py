@@ -1212,6 +1212,148 @@ def test_scan_round_trip_preserves_stop_reason_and_unresolved_gap(tmp_path):
         assert (got.stop_reason, got.unresolved_gap) == (stop, gap)
 
 
+# ============================================================
+# Task 11（2026-09-22，兩輪審核＋使用者裁決部署前修，主線程裁決撤回原本
+# 的候選子句並加排他規則）：`no_earlier_activity` 改為窗口綁定——單調性只對
+# `earlier_fills_seen` 成立。plan
+# docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md
+# Task 11 的六條測試（本檔五條；第六條 harness 版見
+# tests/test_explore_scheduler.py）。
+# ============================================================
+
+def test_no_earlier_activity_does_not_carry_to_a_later_window(tmp_path):
+    """`no_earlier_activity` 不具單調性：窗口往前滾之後不再適用，須回
+    `unknown`。對照 `earlier_fills_seen`（單調）在同一設定下仍然適用。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xa1", None, 1, None), ("0xa2", None, 2, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xa1", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    store.bootstrap_address_fills("0xa2", c.now(), window_start_ms=0, window_end_ms=1000,
+                                  params_fp="pfp")
+    store.set_left_boundary("0xa1", "no_earlier_activity", 1_000, c.now())
+    store.set_left_boundary("0xa2", "earlier_fills_seen", 1_000, c.now())
+
+    assert store.get_left_boundary("0xa1", 5_000).state == "unknown"
+    assert store.get_left_boundary("0xa2", 5_000).state == "earlier_fills_seen"
+
+
+def test_recompute_does_not_apply_no_earlier_activity_across_windows(tmp_path):
+    """`_recompute_verdict_locked` 對 `no_earlier_activity` 套用同一道窗口
+    綁定閘門：較早窗口才取得的證據，若在較晚窗口那筆遍歷已完成之後才落地
+    （例如延遲的探測重試），不得被拿去把它判成 complete——防的是「舊探測
+    回應在新探測之後才落地」這種排序倒置（與 `set_left_boundary` docstring
+    同一個理由）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=1000, window_end_ms=9000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xabc")
+    done = dataclasses.replace(scan, cursor_ms=9000, result="partial",
+                               reason="left_boundary_unknown", finished_at=c.now())
+    store.complete_scan("0xabc", [], done)
+
+    # 新一輪 `partial_rescan`，窗口起點往前滾到 5000；`fills_sync.scan_id`
+    # 這時指向這筆*較晚*窗口的已完成遍歷。
+    new_scan = store.create_scan("0xabc", kind="partial_rescan", window_start_ms=5_000,
+                                 window_end_ms=13_000, cursor_ms=5_000, started_at=c.now())
+    new_done = dataclasses.replace(new_scan, cursor_ms=13_000, result="partial",
+                                   reason="left_boundary_unknown", finished_at=c.now())
+    store.complete_scan("0xabc", [], new_done)
+
+    # 較早窗口（1000）取得的證據，此刻才寫入——不得套用到 `fills_sync.scan_id`
+    # 目前指向的較晚窗口（5000）那筆遍歷。
+    ok = store.set_left_boundary("0xabc", "no_earlier_activity", 1_000, c.now())
+
+    assert ok is True
+    sync = store.get_sync("0xabc")
+    assert (sync.completeness, sync.reason) == ("partial", "left_boundary_unknown")
+
+
+def test_window_mismatched_no_earlier_activity_waits_for_its_rescan(tmp_path):
+    """Task 11（主線程裁決，見 plan Task 11「主線程裁決」區塊）：撤回原本
+    `no_earlier_activity AND 窗口不符 → 候選` 那句。窗口起點往前滾之後，
+    舊窗口的 `no_earlier_activity` 證據雖然不再適用（`get_left_boundary`
+    回 `unknown`），但**不得**因此立刻成為獨立探測的候選——那會與新 scan
+    自己的探測前置對同一個 `left_boundary` 欄位互相覆寫（`partial_rescan`
+    期間，獨立探測拿舊窗口、探測前置拿新窗口，兩者搶著寫同一格，harness
+    實測反覆進候選池、`probes_executed` 衝到 760）。該地址必須等自己的
+    `partial_rescan`，由新 scan 的探測前置在新窗口重探（見 harness 測試
+    `test_rescan_reprobes_when_prior_evidence_was_window_bound`）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xaaa", c.now(), window_start_ms=1000, window_end_ms=2000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xaaa")
+    finished = dataclasses.replace(scan, cursor_ms=2000, result="complete",
+                                   reason="left_boundary_no_activity", finished_at=1.0)
+    store.complete_scan("0xaaa", [], finished)
+    store.set_left_boundary("0xaaa", "no_earlier_activity", 1000, c.now())
+    assert store.next_probe_candidate() is None  # 同一個窗口不重探
+
+    new_scan = store.create_scan("0xaaa", kind="partial_rescan", window_start_ms=1500,
+                                 window_end_ms=2500, cursor_ms=1500, started_at=c.now())
+    new_finished = dataclasses.replace(new_scan, cursor_ms=2500, result="partial",
+                                       reason="left_boundary_unknown", finished_at=2.0)
+    store.complete_scan("0xaaa", [], new_finished)
+
+    # 窗口已不符（`get_left_boundary` 會回 unknown），但 `left_boundary`
+    # 欄位的原始值仍是 `no_earlier_activity`——這個狀態值本身永遠不在候選
+    # 子句裡，不會被獨立探測撿走。
+    assert store.get_left_boundary("0xaaa", 1500).state == "unknown"
+    assert store.next_probe_candidate() is None
+    assert store.count_probe_candidates() == 0
+
+
+def test_address_with_running_scan_is_never_a_standalone_probe_candidate(tmp_path):
+    """Task 11（主線程裁決）：`_PROBE_CANDIDATE_WHERE` 的排他規則——同一地址
+    有 `status='running'` 的 scan 時，即使 `left_boundary='unknown'`，獨立
+    探測也不得認領它（證據由該 scan 自己的探測前置獨占）。scan 完成後才
+    放行，回到 `next_probe_candidate` 正常可見。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xaaa", c.now(), window_start_ms=1000, window_end_ms=2000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xaaa")
+    finished = dataclasses.replace(scan, cursor_ms=2000, result="partial",
+                                   reason="left_boundary_unknown", finished_at=1.0)
+    store.complete_scan("0xaaa", [], finished)
+    assert store.next_probe_candidate() is not None   # 沒有 scan 在跑——正常候選
+
+    store.create_scan("0xaaa", kind="partial_rescan", window_start_ms=1500,
+                      window_end_ms=2500, cursor_ms=1500, started_at=c.now())
+    assert store.next_probe_candidate() is None        # 有 scan 在跑——排他
+    assert store.count_probe_candidates() == 0
+
+    new_scan = store.get_active_scan("0xaaa")
+    new_finished = dataclasses.replace(new_scan, cursor_ms=2500, result="partial",
+                                       reason="left_boundary_unknown", finished_at=2.0)
+    store.complete_scan("0xaaa", [], new_finished)
+    candidate = store.next_probe_candidate()            # scan 完成——重新放行
+    assert candidate is not None and candidate[0] == "0xaaa"
+
+
+def test_no_earlier_activity_may_be_overwritten_for_a_new_window(tmp_path):
+    """`no_earlier_activity` 只在同一個窗口起點終局；換窗口視為新問題，允許
+    任何狀態覆寫（讓探測前置能重探）。`earlier_fills_seen` 不受影響，仍無
+    條件終局（它是單調的，任何窗口都適用）。三個情境各自獨立（同一地址上
+    先驗證「換窗口可覆寫」會把狀態改成別的，反而測不到「同窗口仍終局」）。"""
+    store, c = _store(tmp_path)
+    for addr in ("0xn1", "0xn2", "0xn3"):
+        store.upsert_candidates([(addr, None, 1, None)], as_of=c.now())
+        store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
+                                      params_fp="pfp")
+
+    store.set_left_boundary("0xn1", "no_earlier_activity", 1_000, c.now())
+    assert store.set_left_boundary("0xn1", "unknown", 5_000, c.now()) is True
+
+    store.set_left_boundary("0xn2", "no_earlier_activity", 1_000, c.now())
+    assert store.set_left_boundary("0xn2", "unknown", 1_000, c.now()) is False
+
+    store.set_left_boundary("0xn3", "earlier_fills_seen", 1_000, c.now())
+    assert store.set_left_boundary("0xn3", "unknown", 1_000, c.now()) is False
+    assert store.set_left_boundary("0xn3", "unknown", 5_000, c.now()) is False
+
+
 def test_get_scan_returns_none_for_unknown_scan_id(tmp_path):
     store, c = _store(tmp_path)
     assert store.get_scan("nope") is None
