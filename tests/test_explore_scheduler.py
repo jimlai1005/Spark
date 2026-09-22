@@ -60,6 +60,34 @@ class FakeHL:
         return []
 
 
+class _ProbeResolvesThenEmptyHL:
+    """Task 3：與 `FakeHL` 同樣「真正的分頁窗立刻空頁收尾」，但探測窗
+    （span 明顯短於 30 天遍歷窗）回一筆成交——讓左界證據探測前置一次解出
+    `earlier_fills_seen`，不必每次都用 monkeypatch 頂替
+    `ExploreStore.get_left_boundary`（那樣會繞過本模組真正要驗證的探測
+    機制，讓 DB 裡的 `left_boundary` 欄位永遠停在預設值 `unknown`，使該地址
+    變成永久的探測候選——見 `test_s7a_...` 的教訓）。用 span 而非固定窗口
+    值判斷，因為呼叫端的 `window_start_ms` 隨測試的虛擬時間變動。"""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.calls.append(("fills", address, start_ms, end_ms))
+        if end_ms - start_ms <= 2 * 86_400_000:
+            return [{"coin": "BTC", "tid": 1, "time": start_ms}]
+        return []
+
+    def clearinghouse_state(self, address):
+        return {"marginSummary": {"accountValue": "1"}}
+
+    def portfolio(self, address):
+        return [["day", {}]]
+
+    def non_funding_ledger_updates(self, address, start_ms):
+        return []
+
+
 def _payload(addresses: list[str]) -> dict:
     """`address` 依傳入順序視為 roi 降冪（roi 逐一遞減，避免 `candidate_addresses`
     內部排序改變測試預期的名次）。"""
@@ -261,6 +289,10 @@ def test_scan_multi_page_completes_and_state_also_gets_a_turn(tmp_path):
                             as_of=clock.now())
     store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
                                   window_end_ms=now_ms, params_fp="")
+    # Task 3：左界證據先解出——`SequencedFillsHL` 的回應佇列是給這 4 頁真正
+    # 的分頁用的，探測前置若也從隊列裡拿一筆會少一頁、湊不齊 4 次
+    # `ran:fills_scan`；這個測試要驗的是多頁續抓本身，與左界證據怎麼來無關。
+    store.set_left_boundary("0xabc", "no_earlier_activity", window_start_ms, clock.now())
     store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
     store.enqueue("0xdef:state", "0xdef", "state", 0, clock.now())
 
@@ -272,18 +304,15 @@ def test_scan_multi_page_completes_and_state_also_gets_a_turn(tmp_path):
         r = sched.tick()
         results.append(r)
         sync = store.get_sync("0xabc")
-        # Task 2（D-A/D-E，2026-09-22 主線程裁決）：`get_left_boundary` 是
-        # Task 3 才會實作的佔位（恆回 unknown），遍歷抵達終點後不再是
-        # "complete"——沒有左界證據就不宣稱完整，變成 "partial"。
-        if sync is not None and sync.completeness == "partial":
+        if sync is not None and sync.completeness in ("partial", "complete"):
             break
 
     assert results.count("ran:fills_scan") == 4
     assert results.count("ran:state") >= 1
 
     sync = store.get_sync("0xabc")
-    assert sync.completeness == "partial"
-    assert sync.reason == "left_boundary_unknown"
+    assert sync.completeness == "complete"
+    assert sync.reason == "left_boundary_no_activity"
     # 相鄰兩頁 inclusive 重疊 1 筆（上一頁最後一筆＝下一頁第一筆，同 tid），
     # 3 個頁界共去重 3 筆：2000*3+500-3。
     assert len(store.get_fills("0xabc", 0, cursor4 + 500)) == PAGE_LIMIT * 3 + 500 - 3
@@ -336,6 +365,9 @@ def test_restart_continues_scan_cursor_not_from_scratch(tmp_path):
     store1.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
     store1.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
                                    window_end_ms=now_ms, params_fp="")
+    # Task 3：左界證據先解出——這個測試驗的是重啟後游標從哪裡續抓，與左界
+    # 證據怎麼來無關，先解出讓第一個 tick 直接打到 `hl1` 唯一那頁。
+    store1.set_left_boundary("0xabc", "no_earlier_activity", window_start_ms, clock.now())
     store1.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
     sched1 = _sched(store1, hl1, clock=clock)
     sched1._bootstrapped = True
@@ -358,10 +390,10 @@ def test_restart_continues_scan_cursor_not_from_scratch(tmp_path):
     assert r2 == "ran:fills_scan"
     assert hl2.calls[0][1] == cursor  # 從上次游標續抓，不是從 window_start 重新開始
     sync_after = store2.get_sync("0xabc")
-    # Task 2：`get_left_boundary` 佔位恆回 unknown，遍歷完成後是
-    # ("partial", "left_boundary_unknown")，不是 "complete"（Task 3 才會實測證據）。
-    assert sync_after.completeness == "partial"
-    assert sync_after.reason == "left_boundary_unknown"
+    # Task 3：左界證據已在 store1 階段解出（正面證據對滾動窗口單調有效，
+    # 重啟＋續抓不需要重探），短頁抵達終點後合成為 complete。
+    assert sync_after.completeness == "complete"
+    assert sync_after.reason == "left_boundary_no_activity"
 
 
 # --- 6. 候選進出：移除的地址 active=0 但 cache/fills 保留；新地址只新增它的五個 job ---
@@ -1034,55 +1066,13 @@ def test_b7_i_incremental_continues_while_rescan_in_progress(tmp_path):
     assert scan_after.cursor_ms == rescan_start + 500
 
 
-def test_b7_ii_stale_probe_writeback_does_not_overwrite_new_scan(tmp_path):
-    """(ii) 舊探測回應不覆蓋新遍歷：探測發出後、回寫前，該地址完成新 scan
-    （新 `scan_id`）→ 回寫 rowcount 0、`probe.stale == 1`，新 scan 的 reason
-    不變。用一個會在「探測抓頁」呼叫當下、順便完成一次新遍歷的假 HL 模擬
-    race（單執行緒下唯一能重現「探測發出後、回寫前」這個時間點的方式）。"""
-    clock = Clock(t=40 * 86400.0)
-    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
-    now_ms = int(clock.now() * 1000)
-    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
-    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
-                                  window_end_ms=now_ms, params_fp="")
-    old_scan = _complete_scan(store, "0xabc", result="complete",
-                              reason="count_below_retention_threshold", window_end_ms=now_ms,
-                              finished_at=1.0)
-
-    class RaceHL:
-        """`get_fills_page` 第一次呼叫（探測）時，順便完成一次新的遍歷——
-        模擬「探測發出後、回寫前，該地址完成新 scan」。"""
-
-        def __init__(self, store, addr):
-            self._store = store
-            self._addr = addr
-            self.calls = 0
-
-        def get_fills_page(self, address, start_ms, end_ms):
-            self.calls += 1
-            # 7.9c-D D3：`complete_scan` 用 `started_at` 判斷新舊（指向
-            # `started_at` 更晚的 scan 才算 STALE）——這裡的「新遍歷」必須真的
-            # 比舊 scan 晚開始，否則它自己會被判成過期而不寫回。
-            new_scan = self._store.create_scan(
-                self._addr, kind="partial_rescan", window_start_ms=0, window_end_ms=999,
-                cursor_ms=0, started_at=self._store._now() + 2.0)
-            import dataclasses
-            finished = dataclasses.replace(new_scan, cursor_ms=999, result="partial",
-                                           reason="retention_limit",
-                                           finished_at=self._store._now() + 3.0)
-            self._store.complete_scan(self._addr, [], finished)
-            return []
-
-    hl = RaceHL(store, "0xabc")
-    sched = _sched(store, hl, clock=clock)
-    sched._bootstrapped = True
-
-    sched._run_probe((old_scan.address, old_scan.scan_id), clock.now())
-
-    assert sched.status()["probe"]["stale"] == 1
-    # 新遍歷的結論不被覆蓋。
-    assert store.get_sync("0xabc").reason == "retention_limit"
-    assert store.get_scan(old_scan.scan_id).reason == "count_below_retention_threshold"
+# Task 3（2026-09-22 D-E／D-F）：`test_b7_ii_stale_probe_writeback_does_not_
+# overwrite_new_scan`（探測回寫 CAS 落空不覆蓋新遍歷）已刪除——它測的是舊版
+# `apply_probe_result` 的 scan_id 範圍雙 CAS，那個機制已被 `set_left_boundary`
+# 取代（地址層級的冪等寫入，見 `explore_store.ExploreStore.set_left_boundary`
+# docstring）：左界證據不屬於某一次特定的遍歷、只屬於地址本身，「舊探測回應
+# 覆蓋新遍歷結論」這種以 scan_id 定義的競態在新設計裡不成立，沒有對應的行為
+# 可測。
 
 
 class _ContinuingFillsHL:
@@ -1154,7 +1144,14 @@ def test_b7_iii_only_probe_candidates_serves_one_per_tick(tmp_path):
 
     results = [sched.tick() for _ in range(3)]
     assert results == ["ran:probe"] * 3
-    assert sched.status()["probe"]["candidates"] == 0
+    # Task 3：`FakeHL` 沒有 portfolio `allTime` 資料，三個地址探測後都停在
+    # `unknown`（D-F：不知道就是不知道，仍是候選、還會被重探）——這裡改驗證
+    # 三個地址「各探測過一次」（輪詢排序，見 `next_probe_candidate` 的
+    # `left_boundary_at` 鍵），不是候選集合歸零。
+    assert sched.status()["probe"]["total"] == 3
+    assert sched.status()["probe"]["candidates"] == 3
+    for a in addrs:
+        assert store.get_left_boundary(a, now_ms - 30 * 86_400_000).at is not None
 
 
 def test_b7_vi_verify_job_strictly_yields_to_due_increment(tmp_path):
@@ -1253,6 +1250,11 @@ def test_b7_viii_new_address_lifecycle(tmp_path):
     assert sync.completeness == "backfilling"
     scan = store.get_active_scan(addr)
     assert scan is not None and scan.kind == "initial" and scan.status == "running"
+    # Task 3：左界證據先解出——`SequencedFillsHL([[]])` 只有一筆排隊回應，
+    # 留給真正的初次分頁用（短頁立刻收尾）；探測前置若也從隊列拿一筆會讓
+    # 真正的分頁在下一個 tick 因為隊列已空而 IndexError。這個測試在測「新
+    # 地址生命週期」三個階段的順序，與左界證據怎麼來無關。
+    store.set_left_boundary(addr, "no_earlier_activity", scan.window_start_ms, clock.now())
 
     # 推進到 fills_scan job 到期並執行：initial scan 完成 → CAS 寫回 complete。
     store._db.execute("UPDATE refresh_job SET next_attempt_at=? WHERE key=?",
@@ -1260,11 +1262,8 @@ def test_b7_viii_new_address_lifecycle(tmp_path):
     r2 = sched.tick()
     assert r2 == "ran:fills_scan"
     sync2 = store.get_sync(addr)
-    # Task 2（D-A/D-E，2026-09-22 主線程裁決）：`get_left_boundary` 是 Task 3
-    # 才會實作的佔位（恆回 unknown）——沒有左界證據就不宣稱完整，遍歷完成後
-    # 是 ("partial", "left_boundary_unknown")，不是 "complete"。
-    assert sync2.completeness == "partial"
-    assert sync2.reason == "left_boundary_unknown"
+    assert sync2.completeness == "complete"
+    assert sync2.reason == "left_boundary_no_activity"
     assert sync2.scan_id == scan.scan_id
 
     # 增量 job 到期並執行：不影響 completeness，只延伸 synced_through。
@@ -1274,7 +1273,7 @@ def test_b7_viii_new_address_lifecycle(tmp_path):
     r3 = sched.tick()
     assert r3 == "ran:fills"
     sync3 = store.get_sync(addr)
-    assert sync3.completeness == "partial"  # 增量不改變 completeness
+    assert sync3.completeness == "complete"  # 增量不改變 completeness
 
 
 # ============================================================
@@ -1568,9 +1567,13 @@ def test_quarantine_of_fills_scan_job_writes_scan_error(tmp_path):
     clock = Clock(t=40 * 86400.0)
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
     store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
-    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
                                   window_end_ms=now_ms, params_fp="")
+    # Task 3：左界證據先解出——這個測試在測分頁抓取失敗時的隔離行為，與左界
+    # 證據怎麼來無關，先解出讓第一個 tick 直接打到真正的分頁請求。
+    store.set_left_boundary("0xabc", "no_earlier_activity", window_start_ms, clock.now())
     store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
     scan_before = store.get_active_scan("0xabc")
 
@@ -1590,13 +1593,14 @@ def test_quarantine_of_fills_scan_job_writes_scan_error(tmp_path):
 
 
 def test_notify_dirty_exception_during_probe_does_not_lose_probe_result(tmp_path):
-    """`_run_probe` 的 dirty 通知也吞例外——store 寫入（`apply_probe_result`）
+    """`_run_probe` 的 dirty 通知也吞例外——store 寫入（`set_left_boundary`）
     已經在通知之前完成，callback 失敗不影響探測結果落地。"""
     clock = Clock(t=40 * 86400.0)
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
     store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
-    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
                                   window_end_ms=now_ms, params_fp="")
     _complete_scan(store, "0xabc", result="complete",
                    reason="count_below_retention_threshold", window_end_ms=now_ms)
@@ -1612,7 +1616,11 @@ def test_notify_dirty_exception_during_probe_does_not_lose_probe_result(tmp_path
 
     assert r == "ran:probe"
     assert sched.status()["dirty_errors"] == 1
-    assert store.get_sync("0xabc").reason == "count_below_retention_threshold_probe_empty"
+    # FakeHL 回空頁且沒有 portfolio allTime 資料 → D-F：不知道就是不知道，
+    # 維持 unknown；重點是這次探測「已經落地」（dirty callback 失敗不影響
+    # store 寫入，callback 在寫入之後才被呼叫）。
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "unknown"
+    assert store.get_left_boundary("0xabc", window_start_ms).at is not None
 
 
 # ============================================================
@@ -1668,17 +1676,14 @@ def test_s7a_complete_address_never_rescans_across_candidate_rounds(tmp_path):
     clock = Clock(t=40 * 86400.0)
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     payload = _payload([ADDR_A])
-    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
-                  cfg=ExploreConfig(candidate_pool=1))
-
-    # Task 2（2026-09-22 主線程裁決）：`ExploreStore.get_left_boundary` 目前是
-    # Task 3 才會實作的佔位（恆回 unknown），真正的探測機制還不存在——這個
-    # 測試的重點是「complete 地址不會被跨輪重掃」，與左界證據怎麼來無關，
-    # 用一個假的正面證據頂替，讓這條遍歷能合法地判 complete，才測得到
-    # 「complete 之後永不重掃」這個守門本身。
-    from spark.publicapi.explore_fills_sync import LeftBoundary
-    store.get_left_boundary = lambda address, window_start_ms: LeftBoundary(
-        state="earlier_fills_seen", window_start_ms=window_start_ms, at=clock.now())
+    # Task 3：不再用 monkeypatch 頂替 `get_left_boundary`（那條路徑繞過了本次
+    # 要驗證的真實探測機制——DB 裡的 `left_boundary` 欄位永遠不會被真的寫入，
+    # 讓這個地址變成永久的探測候選，3 天模擬下 `probe.total` 沖到 25 萬+，
+    # 這正是拆掉這個掩體要抓的風險）。改用 `_ProbeResolvesThenEmptyHL`：
+    # 探測窗回一筆成交 → 一次解出 `earlier_fills_seen`；真正的分頁窗仍回
+    # 空頁，沿用原本 `FakeHL` 的「立刻空頁收尾」行為。
+    sched = _sched(store, _ProbeResolvesThenEmptyHL(), leaderboard_source_fn=lambda: payload,
+                  clock=clock, cfg=ExploreConfig(candidate_pool=1))
 
     # Task 7.9d-S S6：守到 **enqueue 那一半**——每個 candidates 輪（含其後的
     # 對帳）跑完，只要地址已經 `complete`，就不該有任何到期的 `fills_scan`
@@ -1701,9 +1706,13 @@ def test_s7a_complete_address_never_rescans_across_candidate_rounds(tmp_path):
     assert len(rows) == 1, rows
     assert rows[0][0] == "initial" and rows[0][1] == "done" and rows[0][2] == "complete"
     assert [r for r in rows if r[0] == "partial_rescan"] == []
-    assert results.count("ran:fills_scan") == 1
+    # Task 3：探測前置多佔一次 `ran:fills_scan`（第一個 tick 探測、第二個
+    # tick 才是真正的分頁）——一次遍歷仍只建一筆 `fills_scan` 列（上面已驗），
+    # 只是這筆列的完成現在跨兩個 tick。
+    assert results.count("ran:fills_scan") == 2
     assert store.get_sync(ADDR_A).completeness == "complete"
-    assert sched.status()["probe"]["total"] <= 1
+    assert store.get_sync(ADDR_A).reason == "left_boundary_verified"
+    assert sched.status()["probe"]["total"] == 1  # 正面證據永久有效，只探一次
 
 
 def test_s7b_partial_address_rescan_due_in_24h_and_at_most_3_in_3_days(tmp_path):
@@ -1775,18 +1784,15 @@ def test_s7d_repro_rescan_three_day_thirty_minute_rounds_no_repeated_full_scan(t
     144 次 `partial_rescan`＋224 次增量。"""
     clock = Clock(1_700_000_000.0)
     store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
-    hl = FakeHL()
+    # Task 3：不再用 monkeypatch 頂替 `get_left_boundary`（見
+    # `test_s7a_complete_address_never_rescans_across_candidate_rounds` 的
+    # 教訓）——改用 `_ProbeResolvesThenEmptyHL`，探測窗一次解出正面證據，
+    # 真正的分頁窗仍空頁立刻收尾（沿用原本 `FakeHL` 的行為，這個測試在測
+    # 「首次遍歷立刻完整 → 永不重掃」，與左界證據怎麼取得無關）。
+    hl = _ProbeResolvesThenEmptyHL()
     payload = _payload([ADDR_A])
     sched = _sched(store, hl, leaderboard_source_fn=lambda: payload, clock=clock,
                   cfg=ExploreConfig(candidate_pool=1))
-
-    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 目前是 Task 3 才會
-    # 實作的佔位（恆回 unknown）。這個測試在測「首次遍歷立刻完整 → 永不
-    # 重掃」，與左界證據怎麼取得無關——用假的正面證據頂替，讓遍歷能合法判
-    # complete，才測得到「complete 之後 partial_rescan 恆為 0」這個不變式。
-    from spark.publicapi.explore_fills_sync import LeftBoundary
-    store.get_left_boundary = lambda address, window_start_ms: LeftBoundary(
-        state="earlier_fills_seen", window_start_ms=window_start_ms, at=clock.now())
 
     results = _run_for(sched, clock, 3 * 86400.0)
 
@@ -1795,7 +1801,8 @@ def test_s7d_repro_rescan_three_day_thirty_minute_rounds_no_repeated_full_scan(t
     assert kinds.count("partial_rescan") == 0, rows
     assert kinds.count("initial") == 1, rows
     assert len(rows) == 1, rows
-    assert results.count("ran:fills_scan") == 1
+    # Task 3：探測前置多佔一次 `ran:fills_scan`（見 test_s7a 同型註記）。
+    assert results.count("ran:fills_scan") == 2
     assert sched.status()["scan_job_dropped"] == 0   # 根本不會有多餘的 scan job
 
 
@@ -1901,12 +1908,16 @@ def test_s7f_verify_strictly_yields_before_deadline(tmp_path):
 
 def _partial_scan_ready(tmp_path, clock):
     """一個即將以 `partial` 收尾的遍歷：候選地址＋到期的 `fills_scan` job，
-    HL 回同毫秒滿頁（一頁收尾）。"""
+    HL 回同毫秒滿頁（一頁收尾）。左界證據預先解出（Task 3：這批測試在測
+    `ScanWriteback` 收尾分支，與左界證據怎麼來無關——先解出讓 `sched.tick()`
+    第一次呼叫就直接跑到真正的分頁請求，不必多耗一個 tick 在探測前置上）。"""
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
     store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
-    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
                                   window_end_ms=now_ms, params_fp="")
+    store.set_left_boundary("0xabc", "no_earlier_activity", window_start_ms, clock.now())
     store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
     sched = _sched(store, _SameMsFillsHL(), clock=clock)
     sched._bootstrapped = True
@@ -1990,6 +2001,146 @@ def test_s7g_writeback_non_enum_raises_type_error(tmp_path):
         sched.tick()
 
 
+# ============================================================
+# Task 3（2026-09-22，D-E／D-F）：左界證據——探測前置、可快取、單調有效。
+# plan docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md
+# Task 3 Step 1 的六條測試。
+# ============================================================
+
+def test_probe_runs_before_first_page_of_a_new_scan(tmp_path):
+    """探測前置：新建的 scan 第一個動作是探測，不是抓頁。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
+                                  window_end_ms=now_ms, params_fp="")
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
+    hl = _ProbeResolvesThenEmptyHL()
+    sched = _sched(store, hl, clock=clock)
+    sched._bootstrapped = True
+    job = store.claim_due(clock.now(), "o", 60, kinds=("fills_scan",))
+    assert job is not None
+
+    result = sched._run_scan(job, clock.now(), verify=False)
+
+    assert result == "ran:fills_scan"
+    assert sched.probes_total == 1
+    assert sched.scan_pages_total == 0
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "earlier_fills_seen"
+
+
+def test_positive_boundary_evidence_survives_window_roll_forward(tmp_path):
+    """單調性：窗口往前滾之後，正面證據仍適用，不得重探。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
+                                  window_end_ms=now_ms, params_fp="")
+    store.set_left_boundary("0xabc", "earlier_fills_seen", window_start_ms, clock.now())
+    _complete_scan(store, "0xabc", result="complete", reason="left_boundary_verified",
+                   window_end_ms=now_ms, finished_at=clock.now())
+
+    later = window_start_ms + 7 * 86_400_000
+    assert store.get_left_boundary("0xabc", later).state == "earlier_fills_seen"
+    assert store.next_probe_candidate() is None
+
+
+def _probe_with_portfolio(tmp_path, clock, *, first_activity_ms: int | None,
+                          local_last_seen_at: float | None = None):
+    """建一個左界證據待解的候選：`bootstrap_address_fills` 建好 `fills_sync`
+    ＋一個 running 的 `initial` scan（`_run_probe` 用它的 `window_start_ms`
+    算探測窗），`portfolio` 端點快取的 `allTime` 首點＝`first_activity_ms`
+    （`None` 代表完全沒有快取，模擬「從未成功抓過 portfolio」）。回傳
+    `(store, sched, scan, window_start_ms)`。"""
+    store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    as_of = clock.now() if local_last_seen_at is None else local_last_seen_at
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=as_of)
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
+                                  window_end_ms=now_ms, params_fp="")
+    scan = store.get_active_scan("0xabc")
+    if first_activity_ms is not None:
+        store.put_cache_ok(
+            "0xabc", "portfolio",
+            [["allTime", {"accountValueHistory": [[first_activity_ms, "100"]],
+                          "pnlHistory": [[first_activity_ms, "0"]]}]],
+            clock.now(), clock.now() + 3600)
+    sched = _sched(store, FakeHL(), clock=clock)  # FakeHL：探測窗回空頁
+    return store, sched, scan, window_start_ms
+
+
+def test_probe_empty_with_clearly_older_account_is_truncation_suspected(tmp_path):
+    clock = Clock(t=40 * 86400.0)
+    store, sched, scan, window_start_ms = _probe_with_portfolio(
+        tmp_path, clock, first_activity_ms=None)
+    # 帳戶首次活動明顯早於窗口起點（差距遠超過 `_PROBE_WINDOW_MS` 1 天）。
+    store.put_cache_ok(
+        "0xabc", "portfolio",
+        [["allTime", {"accountValueHistory": [[window_start_ms - 30 * 86_400_000, "100"]],
+                      "pnlHistory": [[window_start_ms - 30 * 86_400_000, "0"]]}]],
+        clock.now(), clock.now() + 3600)
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "truncation_suspected"
+
+
+def test_probe_empty_with_clearly_newer_account_is_no_earlier_activity(tmp_path):
+    clock = Clock(t=40 * 86400.0)
+    store, sched, scan, window_start_ms = _probe_with_portfolio(
+        tmp_path, clock, first_activity_ms=None)
+    # 帳戶首次活動晚於（或等於）窗口起點——窗口起點前確無活動。
+    store.put_cache_ok(
+        "0xabc", "portfolio",
+        [["allTime", {"accountValueHistory": [[window_start_ms + 3 * 86_400_000, "100"]],
+                      "pnlHistory": [[window_start_ms + 3 * 86_400_000, "0"]]}]],
+        clock.now(), clock.now() + 3600)
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "no_earlier_activity"
+
+
+def test_probe_empty_in_ambiguous_band_stays_unknown(tmp_path):
+    """帳戶首次活動落在探測窗內（理應探得到卻回空）＝資料互相矛盾 → 維持 unknown。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched, scan, window_start_ms = _probe_with_portfolio(
+        tmp_path, clock, first_activity_ms=None)
+    store.put_cache_ok(
+        "0xabc", "portfolio",
+        [["allTime", {"accountValueHistory": [[window_start_ms - 12 * 3600_000, "100"]],
+                      "pnlHistory": [[window_start_ms - 12 * 3600_000, "0"]]}]],
+        clock.now(), clock.now() + 3600)
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "unknown"
+
+
+def test_probe_never_uses_local_first_seen_as_evidence(tmp_path):
+    """D-F：沒有 portfolio 就是不知道；不得拿 `candidate.last_seen_at`／
+    `source_as_of` 頂替——即使那個本機時間戳明顯早於窗口起點（若被誤用會被
+    判成 `truncation_suspected`），沒有 portfolio 快取就必須維持 `unknown`。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched, scan, window_start_ms = _probe_with_portfolio(
+        tmp_path, clock, first_activity_ms=None,
+        local_last_seen_at=clock.now() - 400 * 86400.0)
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert store.first_activity_ms("0xabc") is None
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "unknown"
+
+
 # --- (h) 恢復的五條探測行為測試（7.9b 拆軌時被刪，改寫為「探測由 DB 推導」版） ---
 
 class _ProbeHL:
@@ -2025,9 +2176,9 @@ def _probe_ready(tmp_path, clock, probe_result, *, active: bool = True):
     return store, hl, sched, scan
 
 
-def test_s7h_probe_positive_upgrades_reason(tmp_path):
-    """(h1) 探測命中（窗內仍有更早的成交）→ reason 升級為
-    `retention_boundary_verified`，探測窗＝`[scan.window_start - 1 天,
+def test_s7h_probe_positive_finds_earlier_fills(tmp_path):
+    """(h1) 探測命中（窗內仍有更早的成交）→ 左界證據升級為
+    `earlier_fills_seen`，探測窗＝`[scan.window_start - 1 天,
     scan.window_start - 1]`。"""
     clock = Clock(t=40 * 86400.0)
     window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
@@ -2036,7 +2187,7 @@ def test_s7h_probe_positive_upgrades_reason(tmp_path):
 
     assert sched.tick() == "ran:probe"
 
-    assert store.get_sync("0xabc").reason == "retention_boundary_verified"
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "earlier_fills_seen"
     assert len(hl.probe_calls) == 1
     addr, probe_start, probe_end = hl.probe_calls[0]
     assert addr == "0xabc"
@@ -2045,20 +2196,22 @@ def test_s7h_probe_positive_upgrades_reason(tmp_path):
     assert sched.status()["probe"]["verified"] == 1
 
 
-def test_s7h_probe_negative_marks_probe_empty_reason(tmp_path):
-    """(h2) 探測回空頁 → reason 記為
-    `count_below_retention_threshold_probe_empty`（該 reason 天然被探測候選
-    查詢排除，不會每輪重探）。"""
+def test_s7h_probe_negative_no_portfolio_stays_unknown(tmp_path):
+    """(h2) 探測回空頁、且沒有 portfolio 快取（`first_activity_ms` 回 `None`）
+    → D-F：不知道就是不知道，左界證據維持 `unknown`——**仍是候選**（與舊版
+    「探過就永久排除」不同：正面證據才是永久的，`unknown` 本來就該被重探，
+    見 `ExploreStore.get_left_boundary` docstring 的單調性設計）。"""
     clock = Clock(t=40 * 86400.0)
+    window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
     store, hl, sched, _ = _probe_ready(tmp_path, clock, [])
 
     assert sched.tick() == "ran:probe"
 
-    assert store.get_sync("0xabc").reason == "count_below_retention_threshold_probe_empty"
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "unknown"
     assert len(hl.probe_calls) == 1
     probe = sched.status()["probe"]
     assert (probe["total"], probe["verified"], probe["empty"], probe["failed"],
-            probe["stale"], probe["candidates"]) == (1, 0, 1, 0, 0, 0)
+            probe["stale"], probe["candidates"]) == (1, 0, 1, 0, 0, 1)
 
 
 def test_s7h_probe_exception_does_not_fail_tick(tmp_path):
@@ -2270,17 +2423,24 @@ def test_s1_churned_backfilling_address_regains_scan_job_and_finishes(tmp_path):
     assert "fills_scan" in store.job_kinds(ADDR_A)
     assert sched.status()["reconciled"]["resume_running"] >= 1
     resumed = store.running_scan(ADDR_A)
-    assert resumed.scan_id == scan_id and resumed.cursor_ms == cursor_ms
+    # Task 3：續跑同一個 scan_id 是這個測試要驗的核心不變式；`cursor_ms` 改用
+    # 單調不倒退＋確實不是從 window_start 重新開始（而非要求與churn 前逐位元
+    # 相等）——探測前置會讓 `_ResumableFillsHL` 的「前 N 次滿頁」預算多吃掉
+    # 一次探測呼叫（該假物件不分辨探測窗與真實窗，兩者共用同一個呼叫計數器），
+    # 這會讓後續真實分頁的確切游標值往後移一格，但不影響「續跑不整窗重抓」
+    # 這個不變式本身。
+    assert resumed.scan_id == scan_id
+    assert resumed.cursor_ms >= cursor_ms
+    assert resumed.cursor_ms > scan.window_start_ms
 
     _drive_until(sched, clock,
                  lambda rs: store.get_sync(ADDR_A).completeness != "backfilling")
 
     sync = store.get_sync(ADDR_A)
-    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 是 Task 3 才會實作
-    # 的佔位（恆回 unknown），遍歷完成後是 ("partial", "left_boundary_unknown")
-    # ——這個測試在測「續跑同一個 scan_id」，與完整性結論是哪個值無關。
-    assert sync.completeness == "partial"
-    assert sync.reason == "left_boundary_unknown"
+    # Task 3：`_ResumableFillsHL` 對探測窗一樣回滿頁（假物件不分辨探測窗與
+    # 真實窗），左界證據在完成回補前就已經解出——遍歷完成即為 complete。
+    assert sync.completeness == "complete"
+    assert sync.reason == "left_boundary_verified"
     assert sync.scan_id == scan_id                            # 完成的就是原本那次遍歷
     assert [r[0] for r in _scan_rows(store, ADDR_A)] == ["initial"]   # 沒有第二次遍歷
     assert sched.status()["scan_job_dropped"] == 0
@@ -2352,14 +2512,16 @@ def test_s1_reconcile_creates_initial_scan_for_orphan_backfilling_address(tmp_pa
     assert sched._needs_scan_job(ADDR_A, clock.now()) == ("initial_missing", "fills_scan")
     assert sched.reconcile_scan_jobs(clock.now())["initial_missing"] == 1
 
+    # Task 3：探測前置消耗第一個 tick（`_ResumableFillsHL(full_pages=0)`
+    # 對探測窗也回非空的短頁，左界證據當場解出為 `earlier_fills_seen`），
+    # 第二個 tick 才是真正的分頁請求並收尾——這個測試在測「孤兒 backfilling
+    # 地址會被對帳建回一次遍歷」，兩個 tick 都算數，與完整性結論是哪個值無關。
+    assert sched.tick() == "ran:fills_scan"
     assert sched.tick() == "ran:fills_scan"
     assert [r[0] for r in _scan_rows(store, ADDR_A)] == ["initial"]
-    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 是 Task 3 才會實作
-    # 的佔位（恆回 unknown），沒有左界證據就不宣稱完整——這個測試在測「孤兒
-    # backfilling 地址會被對帳建回一次遍歷」，與完整性結論是哪個值無關。
     sync = store.get_sync(ADDR_A)
-    assert sync.completeness == "partial"
-    assert sync.reason == "left_boundary_unknown"
+    assert sync.completeness == "complete"
+    assert sync.reason == "left_boundary_verified"
 
 
 def test_s1_reconcile_is_idempotent(tmp_path):
@@ -2565,9 +2727,13 @@ def test_invalid_page_backs_off_and_quarantines_after_max_attempts(tmp_path):
     clock = Clock(t=40 * 86400.0)
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
     store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
-    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
                                   window_end_ms=now_ms, params_fp="")
+    # Task 3：左界證據先解出——這個測試數的是「分頁一直非法」的重試次數，
+    # 與左界證據怎麼來無關，先解出避免第一個 tick 被探測前置占走。
+    store.set_left_boundary("0xabc", "no_earlier_activity", window_start_ms, clock.now())
     store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
     hl = _OutOfWindowHL()
     sched = _sched(store, hl, clock=clock)
@@ -2763,8 +2929,12 @@ def test_s3_multi_page_verify_finishes_under_continuous_fills_pressure(tmp_path)
     sched._bootstrapped = True
     sched._first_tick_done = True
 
+    # Task 3：探測前置會先對 `0xver` 打一次左界證據探測（`_MixedFillsHL` 對
+    # 探測窗一樣回非空滿頁，一次就解出 `earlier_fills_seen`），多耗掉一次
+    # `0xver` 自己的「前 N 頁滿頁」預算，讓核驗遍歷完成所需的輪數往後移；
+    # 60 輪（原 40）足夠涵蓋這一次額外探測。
     results = []
-    for _ in range(40):
+    for _ in range(60):
         results.append(sched.tick())
         clock.t += 1.0
         if store.get_sync("0xver").evidence_unknown is False and "0xver" in hl.pages:
@@ -2774,7 +2944,11 @@ def test_s3_multi_page_verify_finishes_under_continuous_fills_pressure(tmp_path)
     assert store.job_kinds("0xver") == set()
     total_pages = sum(hl.pages.values())
     assert hl.pages["0xver"] <= total_pages / 10 + 1              # 輔助份額 <= 1/10
-    assert results.count("ran:fills") >= 9 * hl.pages["0xver"]
+    # Task 3：`hl.pages["0xver"]` 含 1 次左界證據探測——探測走 `_run_scan` 的
+    # 探測前置（消耗 `explore_fills` 預算本身，不占 9:1 輔助份額），不受這條
+    # 比例約束；只有真正走輔助份額的 verify 頁才要滿足 9:1。
+    verify_ratio_pages = hl.pages["0xver"] - 1
+    assert results.count("ran:fills") >= 9 * verify_ratio_pages
 
 
 def test_s3_verify_and_probe_take_turns_on_the_auxiliary_slot(tmp_path):
@@ -2981,6 +3155,12 @@ def test_s4e_probe_that_sends_nothing_does_not_burn_the_auxiliary_slot(tmp_path)
     一頁都沒打，輔助名額計數器**不歸零**，同一個 tick 改試 verify。"""
     clock = Clock(t=40 * 86400.0)
     store = _evidence_unknown_address(tmp_path, clock, addr="0xver")
+    # Task 3：`0xver` 的左界證據先解出（讓它不是探測候選）——這個測試要驗的
+    # 是「探測候選」路徑，候選必須確定是 `0xgone`；否則 `0xver`／`0xgone`
+    # 左界證據都是預設 `unknown`、都是候選，`next_probe_candidate` 挑到誰
+    # 不確定（新排序鍵 `left_boundary_at` 兩者皆為 `NULL`，等值）。
+    store.set_left_boundary("0xver", "earlier_fills_seen",
+                            int(clock.now() * 1000) - 30 * 86_400_000, clock.now())
     store.enqueue("0xver:fills_verify", "0xver", "fills_verify", 4, clock.now())
     now_ms = int(clock.now() * 1000)
     store.upsert_candidates([("0xver", None, 1, None), ("0xgone", None, 2, None)],
@@ -3078,21 +3258,17 @@ def test_w2_deferred_verify_job_is_dropped_once_evidence_is_filled_in(tmp_path):
     store.create_scan(ADDR_A, kind="partial_rescan", window_start_ms=0,
                       window_end_ms=int(clock.now() * 1000),
                       cursor_ms=int(clock.now() * 1000), started_at=clock.now())
-    hl = FakeHL()
+    # Task 3：不再用 monkeypatch 頂替 `get_left_boundary`（見 test_s7a 教訓）
+    # ——改用 `_ProbeResolvesThenEmptyHL`。這個測試在測「核驗需求由狀態推導、
+    # evidence 補齊後 verify job 自動變 obsolete」，與重掃本身判 complete 還是
+    # partial 無關——但若重掃判 partial，既有（未改動的）`partial_rescan`
+    # 復原邏輯會對這個地址另外排一個 `fills_scan` job，讓 (3) 之後
+    # `job_kinds(ADDR_A)` 不再是空集合，測穿了另一個不相干的機制。讓左界證據
+    # 探測前置真的解出正面結論，保持這個測試只測它原本要測的那件事。
+    hl = _ProbeResolvesThenEmptyHL()
     sched = _sched(store, hl, clock=clock)
     sched._bootstrapped = True
     sched._first_tick_done = True
-
-    # Task 2（2026-09-22 主線程裁決）：`get_left_boundary` 目前是 Task 3 才會
-    # 實作的佔位（恆回 unknown）。這個測試在測「核驗需求由狀態推導、evidence
-    # 補齊後 verify job 自動變 obsolete」，與重掃本身判 complete 還是 partial
-    # 無關——但若重掃判 partial，既有（未改動的）`partial_rescan` 復原邏輯會
-    # 對這個地址另外排一個 `fills_scan` job，讓 (3) 之後 `job_kinds(ADDR_A)`
-    # 不再是空集合，測穿了另一個不相干的機制。用假的正面證據頂替，讓重掃
-    # 合法判 complete，保持這個測試只測它原本要測的那件事。
-    from spark.publicapi.explore_fills_sync import LeftBoundary
-    store.get_left_boundary = lambda address, window_start_ms: LeftBoundary(
-        state="earlier_fills_seen", window_start_ms=window_start_ms, at=clock.now())
 
     # (1) 延後（kind 不相容）。
     job = store.claim_due(clock.now(), "o", 60, kinds=("fills_verify",))

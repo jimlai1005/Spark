@@ -324,9 +324,13 @@ def test_set_sync_error_noop_when_row_missing(tmp_path):
 # --- set_sync_reason / params_fp / schema v1→v2 migration (Task 7.5 加) ---
 
 # Task 7.9b：`set_sync_reason`（直接 UPDATE `fills_sync.reason`，無版本保護）
-# 已被 `apply_probe_result` 的雙 CAS 取代（B4：探測回寫必須確認地址仍指向探測
-# 當下的那個 `scan_id`，見 `test_apply_probe_result_cas_*` 系列），舊方法與
-# 對應測試一併移除——這是本次架構重構的必要淘汰，不是為了讓測試通過而砍測試。
+# 已被 `apply_probe_result` 的雙 CAS 取代，舊方法與對應測試一併移除——這是
+# 架構重構的必要淘汰，不是為了讓測試通過而砍測試。
+#
+# Task 3（2026-09-22 D-E／D-F）：`apply_probe_result` 本身後來也被
+# `set_left_boundary` 取代——左界證據是地址層級的冪等寫入（見該方法
+# docstring），不需要 scan_id 範圍的 CAS，`test_apply_probe_result_cas_*`
+# 系列一併移除，見 `test_next_probe_candidate_*` 系列的新版本。
 
 
 def test_insert_fills_page_round_trips_params_fp(tmp_path):
@@ -909,89 +913,85 @@ def test_complete_scan_detects_gap_when_scan_window_end_before_inc_from(tmp_path
     assert sync.coverage_gap is True
 
 
-def test_apply_probe_result_cas_hits_when_reason_and_scan_id_match(tmp_path):
-    store, c = _store(tmp_path)
-    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
-                                  params_fp="pfp")
-    scan = store.get_active_scan("0xabc")
-    finished = dataclasses.replace(scan, cursor_ms=1000, result="complete",
-                                   reason="count_below_retention_threshold",
-                                   finished_at=c.now())
-    store.complete_scan("0xabc", [], finished)
-    ok = store.apply_probe_result(scan.scan_id, "0xabc",
-                                  old_reason="count_below_retention_threshold",
-                                  new_reason="retention_boundary_verified")
-    assert ok is True
-    assert store.get_sync("0xabc").reason == "retention_boundary_verified"
-    assert store.get_scan(scan.scan_id).reason == "retention_boundary_verified"
-
-
-def test_apply_probe_result_cas_misses_when_a_new_scan_already_completed(tmp_path):
-    """Task 7.9b B7 (ii)：探測發出後、回寫前，該地址已完成新的一次遍歷
-    （`fills_sync.scan_id` 指向新 scan）→ CAS 落空，舊探測不覆蓋新遍歷。"""
-    store, c = _store(tmp_path)
-    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0, window_end_ms=1000,
-                                  params_fp="pfp")
-    old_scan = store.get_active_scan("0xabc")
-    old_finished = dataclasses.replace(old_scan, cursor_ms=1000, result="complete",
-                                       reason="count_below_retention_threshold",
-                                       finished_at=c.now())
-    store.complete_scan("0xabc", [], old_finished)
-
-    # 新的一次遍歷完成，`fills_sync.scan_id` 改指向新 scan。
-    new_scan = store.create_scan("0xabc", kind="partial_rescan", window_start_ms=0,
-                                 window_end_ms=2000, cursor_ms=0, started_at=c.now())
-    new_finished = dataclasses.replace(new_scan, cursor_ms=2000, result="partial",
-                                       reason="retention_limit", finished_at=c.now() + 1)
-    store.complete_scan("0xabc", [], new_finished)
-
-    ok = store.apply_probe_result(old_scan.scan_id, "0xabc",
-                                  old_reason="count_below_retention_threshold",
-                                  new_reason="retention_boundary_verified")
-    assert ok is False
-    # 新遍歷的結論不被覆蓋。
-    assert store.get_sync("0xabc").reason == "retention_limit"
-    assert store.get_scan(old_scan.scan_id).reason == "count_below_retention_threshold"
-
-
-def test_next_probe_candidate_picks_oldest_finished_and_excludes_evidence_unknown(tmp_path):
+def test_next_probe_candidate_picks_least_recently_probed(tmp_path):
+    """Task 3：候選排序鍵是 `left_boundary_at`（探測嘗試時間），不是
+    `finished_at`——避免一個持續探不出結論的地址（`left_boundary_at` 每次都
+    被更新成最新）永遠排最前，餓死其他候選（見 `next_probe_candidate`
+    docstring 的 starvation 說明）。兩者皆從未探測過（`left_boundary_at`
+    皆為 `NULL`）時，`COALESCE(..., 0)` 讓兩者同分——這裡改用「探測過一次的
+    比從未探測過的排更後面」驗證排序鍵本身有作用。"""
     store, c = _store(tmp_path)
     store.upsert_candidates([("0xaaa", None, 1, None), ("0xbbb", None, 2, None)], as_of=c.now())
-    for addr, finished_at in (("0xaaa", 100.0), ("0xbbb", 50.0)):
+    for addr in ("0xaaa", "0xbbb"):
         store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
                                       params_fp="pfp")
         scan = store.get_active_scan(addr)
-        finished = dataclasses.replace(scan, cursor_ms=1000, result="complete",
-                                       reason="count_below_retention_threshold",
-                                       finished_at=finished_at)
+        finished = dataclasses.replace(scan, cursor_ms=1000, result="partial",
+                                       reason="left_boundary_unknown", finished_at=1.0)
         store.complete_scan(addr, [], finished)
 
-    candidate = store.next_probe_candidate()
-    assert candidate is not None
-    assert candidate[0] == "0xbbb"  # finished_at 較舊者優先
     assert store.count_probe_candidates() == 2
+    # 0xaaa 探測過一次（仍未解出結論）——它的 `left_boundary_at` 比 0xbbb
+    # （從未探測）晚，下一個候選必須是 0xbbb。
+    store.set_left_boundary("0xaaa", "unknown", 0, c.now())
+    candidate = store.next_probe_candidate()
+    assert candidate is not None and candidate[0] == "0xbbb"
 
 
-def test_next_probe_candidate_excludes_partial_result_and_verified_reason(tmp_path):
+def test_next_probe_candidate_excludes_addresses_with_resolved_left_boundary(tmp_path):
+    """Task 3：候選條件只看 `left_boundary`，與 `sc.result` 正交——`partial`
+    的遍歷若左界證據仍 `unknown` 一樣是候選（`truncation_suspected`／
+    `unresolved_gap`／我方停止都可能讓 `result=partial`，但左界證據可能已經
+    解出、也可能還沒，兩件事互不影響）；反之左界證據已解出正面結論的地址
+    即使 `result` 仍是舊資料裡的什麼值，都不再是候選。"""
     store, c = _store(tmp_path)
     store.upsert_candidates([("0xaaa", None, 1, None), ("0xbbb", None, 2, None)], as_of=c.now())
-    # 0xaaa：result=partial（不合法候選——只有 complete 才算門檻推論成立）。
+    # 0xaaa：result=partial，左界證據仍 unknown（預設）——合法候選。
     store.bootstrap_address_fills("0xaaa", c.now(), window_start_ms=0, window_end_ms=1000,
                                   params_fp="pfp")
     scan_a = store.get_active_scan("0xaaa")
     finished_a = dataclasses.replace(scan_a, cursor_ms=1000, result="partial",
-                                     reason="retention_limit", finished_at=1.0)
+                                     reason="unresolved_gap", finished_at=1.0)
     store.complete_scan("0xaaa", [], finished_a)
-    # 0xbbb：已升級為 retention_boundary_verified（不再是候選）。
+    # 0xbbb：左界證據已解出正面結論——不再是候選。
     store.bootstrap_address_fills("0xbbb", c.now(), window_start_ms=0, window_end_ms=1000,
                                   params_fp="pfp")
     scan_b = store.get_active_scan("0xbbb")
     finished_b = dataclasses.replace(scan_b, cursor_ms=1000, result="complete",
-                                     reason="retention_boundary_verified", finished_at=1.0)
+                                     reason="left_boundary_verified", finished_at=1.0)
     store.complete_scan("0xbbb", [], finished_b)
+    store.set_left_boundary("0xbbb", "earlier_fills_seen", 0, c.now())
 
-    assert store.next_probe_candidate() is None
-    assert store.count_probe_candidates() == 0
+    candidate = store.next_probe_candidate()
+    assert candidate is not None and candidate[0] == "0xaaa"
+    assert store.count_probe_candidates() == 1
+
+
+def test_next_probe_candidate_reprobes_truncation_suspected_after_window_rolls_forward(tmp_path):
+    """Task 3：`truncation_suspected` 不具單調性——窗口起點往前滾之後，舊的
+    截斷嫌疑證據不再適用同一個窗口，必須重探（見 `_PROBE_CANDIDATE_WHERE`
+    的「或適用窗口不符」子句）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xaaa", c.now(), window_start_ms=1000, window_end_ms=2000,
+                                  params_fp="pfp")
+    scan = store.get_active_scan("0xaaa")
+    finished = dataclasses.replace(scan, cursor_ms=2000, result="partial",
+                                   reason="left_boundary_truncated", finished_at=1.0)
+    store.complete_scan("0xaaa", [], finished)
+    store.set_left_boundary("0xaaa", "truncation_suspected", 1000, c.now())
+    assert store.next_probe_candidate() is None  # 同一個窗口不重探
+
+    # 新一輪 partial_rescan，窗口起點往前滾。
+    new_scan = store.create_scan("0xaaa", kind="partial_rescan", window_start_ms=1500,
+                                 window_end_ms=2500, cursor_ms=1500, started_at=c.now())
+    new_finished = dataclasses.replace(new_scan, cursor_ms=2500, result="partial",
+                                       reason="left_boundary_truncated", finished_at=2.0)
+    store.complete_scan("0xaaa", [], new_finished)
+
+    candidate = store.next_probe_candidate()
+    assert candidate is not None and candidate[0] == "0xaaa"
+    assert store.count_probe_candidates() == 1
 
 
 def test_next_probe_candidate_none_when_no_candidates(tmp_path):

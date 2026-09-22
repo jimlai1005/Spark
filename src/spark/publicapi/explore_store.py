@@ -28,11 +28,17 @@ ROLLBACK），寫入方法一律 `with self._lock, self._db:`。這是本 task �
 理由：`threading.Lock` 已在 Python 層序列化所有寫入，SQLite 層不需要 BEGIN IMMEDIATE
 搶鎖來避免多寫入者競爭；沿用既有 `ApiStore` 慣例可讓兩個 store 模組風格一致。
 
-CAS（Task 7.9b B3／B4）：`complete_scan`／`apply_probe_result` 都用「先 UPDATE 再檢查
-rowcount」的模式，rowcount 不如預期時在 `with self._db:` 區塊內丟一個內部例外觸發
-ROLLBACK——`sqlite3` 的隱式 transaction 沒有「條件式回滾」語法，用例外驅動回滾是
-標準做法（`with self._db:` 捕捉到例外會自動 ROLLBACK，呼叫端再把這個內部例外轉換成
-布林回傳，不逸出）。
+CAS（Task 7.9b B3）：`complete_scan` 用「先 UPDATE 再檢查 rowcount」的模式，rowcount
+不如預期時在 `with self._db:` 區塊內丟一個內部例外觸發 ROLLBACK——`sqlite3` 的隱式
+transaction 沒有「條件式回滾」語法，用例外驅動回滾是標準做法（`with self._db:`
+捕捉到例外會自動 ROLLBACK，呼叫端再把這個內部例外轉換成布林回傳，不逸出）。
+
+Task 3（2026-09-22 D-E／D-F 裁決，見
+docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md）：舊版
+`apply_probe_result` 的雙 CAS（scan_id 範圍）已移除，改成 `set_left_boundary`——
+左界證據是**地址層級**（不是 scan 層級）的冪等寫入，不需要 scan_id CAS：正面證據
+一旦取得即永久有效（單調性，見 `get_left_boundary` docstring），沒有「舊探測回應
+覆蓋新遍歷結論」這種競態需要防禦。
 """
 from __future__ import annotations
 
@@ -66,19 +72,18 @@ logger = logging.getLogger(__name__)
 # （`RETENTION_SAFETY_THRESHOLD`）已被實測推翻（30 天窗口實測 26,976 筆，遠超
 # 舊門檻 8,000），`explore_fills_sync.apply_scan_page` 短頁收尾不再據此下結論。
 # `REASON_COUNT_BELOW_RETENTION_THRESHOLD` 與 `REASON_RETENTION_BOUNDARY_VERIFIED`
-# **僅供 v3 遷移讀取，勿在新路徑使用**——`explore_scheduler.py` 的舊版留存邊界
-# 探測（`_run_probe`／`apply_probe_result`）仍在讀寫它們，直到 Task 3 把探測機制
-# 換成 `LeftBoundary`／`scan_verdict`（本模組新增，見下）、Task 4 遷移 schema v4
-# 時才會真正停用；Task 1 範圍不含 `explore_scheduler.py`，故此處刻意保留。
+# **僅供舊資料讀取，不再被任何新程式碼寫入**——Task 3（2026-09-22）已把探測機制
+# （`explore_scheduler._run_probe`）換成 `LeftBoundary`／`set_left_boundary`／
+# `scan_verdict`，`apply_probe_result` 與舊版 `next_probe_candidate` 的 reason
+# 篩選條件一併移除。這三個常數只剩三個讀者：(1) 既有的 `_migrate_v1_to_v2`
+# （補標歷史 complete／reason=NULL 列），(2) 既有的 `_migrate_v2_to_v3_rows`
+# （依 reason 是否為 `REASON_RETENTION_BOUNDARY_VERIFIED` 決定 `evidence_unknown`
+# 初值），(3) Task 4 的 schema v4 遷移（把這批舊 reason 值改寫成新判準的結論）
+# ——三者都是歷史相容，不是「新路徑」。
 REASON_COUNT_BELOW_RETENTION_THRESHOLD = "count_below_retention_threshold"
 REASON_RETENTION_BOUNDARY_VERIFIED = "retention_boundary_verified"
 
-# Task 7.7 W3（2026-09-21，7.6 複審）：探測回空頁只證明「這一次探測沒看到更早
-# 的成交」，門檻推論（`REASON_COUNT_BELOW_RETENTION_THRESHOLD`）本身沒有變得
-# 更弱也沒有變強——但若不記下「已經探過」，探測條件（`reason ==
-# REASON_COUNT_BELOW_RETENTION_THRESHOLD`）會讓同一次遍歷被重探。這個第三個
-# reason 碼把「探過、沒有更早成交、無法升級」記下來，探測候選查詢天然排除它。
-# 同上：**僅供 v3 遷移讀取／舊版探測機制使用，勿在新路徑使用**。
+# 同上：僅供舊資料讀取（v1→v2／v3→v4 遷移），Task 3 起不再被新程式碼寫入。
 REASON_PROBE_NO_EARLIER_FILLS = "count_below_retention_threshold_probe_empty"
 
 # Task 1（2026-09-22 D-A/D-E 裁決）：覆蓋結論改為三項證據合成
@@ -155,7 +160,16 @@ CREATE TABLE IF NOT EXISTS fills_sync (
   inc_from_ms INTEGER,
   scan_id TEXT,
   evidence_unknown INTEGER NOT NULL DEFAULT 0,
-  coverage_gap INTEGER NOT NULL DEFAULT 0);
+  coverage_gap INTEGER NOT NULL DEFAULT 0,
+  -- Task 3（2026-09-22 D-E／D-F）：窗口左界證據——`get_left_boundary`／
+  -- `set_left_boundary` 唯一讀寫。`left_boundary_window_start_ms` 是這份證據
+  -- 取得時的窗口起點（單調性判斷的基準）；`left_boundary_at` 是取得時間
+  -- （epoch 秒）。既有 v3 資料庫不會自動長出這三欄（`CREATE TABLE IF NOT
+  -- EXISTS` 對已存在的表是 no-op）——正式機遷移由 Task 4 負責，這裡只定義
+  -- 新建資料庫的完整 schema。
+  left_boundary TEXT NOT NULL DEFAULT 'unknown',
+  left_boundary_window_start_ms INTEGER,
+  left_boundary_at REAL);
 CREATE TABLE IF NOT EXISTS fills_scan (
   scan_id TEXT PRIMARY KEY,
   address TEXT NOT NULL,
@@ -168,7 +182,12 @@ CREATE TABLE IF NOT EXISTS fills_scan (
   status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'done')),
   result TEXT, reason TEXT,
   started_at REAL NOT NULL, finished_at REAL, last_error TEXT,
-  params_fp TEXT NOT NULL DEFAULT '');
+  params_fp TEXT NOT NULL DEFAULT '',
+  -- Task 1／Task 3：`FillsScan.stop_reason`／`unresolved_gap` 的持久化欄位
+  -- （Task 1 當時故意留白，讀寫仍走 dataclass 預設值——本 task 只補齊 DDL，
+  -- 完整讀寫接線與既有 v3 資料庫的 ALTER 留給 Task 4）。
+  stop_reason TEXT,
+  unresolved_gap INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS fills_scan_addr_status ON fills_scan(address, status);
 CREATE TABLE IF NOT EXISTS refresh_job (
   key TEXT PRIMARY KEY,                -- f"{address}:{kind}"  kind∈portfolio|state|fills|
@@ -386,11 +405,6 @@ class ScanWriteback(str, Enum):
     DUPLICATE = "duplicate"
     STALE = "stale"
     MISSING = "missing"
-
-
-class _CasMiss(Exception):
-    """Task 7.9b：CAS 未命中時用來觸發 `with self._db:` 隱式 transaction
-    的 ROLLBACK（見模組檔頭）。只在 store 內部使用，不逸出到呼叫端。"""
 
 
 class ExploreStore:
@@ -821,8 +835,8 @@ class ExploreStore:
         `evidence_unknown`／`coverage_gap` 這幾個「遍歷軌擁有」的欄位必須原樣
         帶著目前 DB 裡的值一起寫回（呼叫端從 `get_sync` 讀出、`dataclasses.replace`
         只動增量軌自己的欄位，見 `explore_scheduler._run_increment`），本方法
-        不做任何欄位級的保護——欄位級保護（CAS）只在 `complete_scan`／
-        `apply_probe_result` 這兩個真正會被競爭寫入的路徑才需要。"""
+        不做任何欄位級的保護——欄位級保護（CAS）只在 `complete_scan` 這個
+        真正會被競爭寫入的路徑才需要。"""
         addr = _norm(address)
         _require_inc_from(checkpoint.inc_from_ms, addr)   # D6：寫入邊界守門
         new_count = 0
@@ -1236,46 +1250,38 @@ class ExploreStore:
                 return ScanWriteback.STALE
         return ScanWriteback.APPLIED
 
-    def apply_probe_result(self, scan_id: str, address: str, *, old_reason: str,
-                            new_reason: str) -> bool:
-        """留存邊界探測回寫（Task 7.9b B4）：兩個 CAS UPDATE 包在同一 transaction——
-        `fills_scan`（`scan_id=? AND reason=?`，只在這筆 scan 的 reason 還是
-        探測當下讀到的 `old_reason` 時才改）與 `fills_sync`（`address=? AND
-        scan_id=?`，只在該地址目前仍指向這筆 scan 時才改——地址在探測發出
-        後、回寫前完成了新的一次遍歷，`fills_sync.scan_id` 會指向新 scan，
-        這裡的條件天然為假）。任一 rowcount 不是 1 → 兩邊都不落地（藉由丟
-        `_CasMiss` 觸發 `with self._db:` 的 ROLLBACK），回 `False`（呼叫端計
-        `probe.stale`）。"""
-        addr = _norm(address)
-        try:
-            with self._lock, self._db:
-                cur1 = self._db.execute(
-                    "UPDATE fills_scan SET reason=? WHERE scan_id=? AND reason=?",
-                    (new_reason, scan_id, old_reason))
-                cur2 = self._db.execute(
-                    "UPDATE fills_sync SET reason=? WHERE address=? AND scan_id=?",
-                    (new_reason, addr, scan_id))
-                if cur1.rowcount != 1 or cur2.rowcount != 1:
-                    raise _CasMiss()
-        except _CasMiss:
-            return False
-        return True
+    # Task 3（2026-09-22，D-E／D-F）：`next_probe_candidate`／`count_probe_candidates`
+    # 共用同一份候選條件（工程原則 1）——候選＝active 地址、其最近一次完成的
+    # `fills_scan`（`fills_sync.scan_id` 指向的那筆）之窗口起點下，左界證據仍是
+    # `unknown`；或證據是 `truncation_suspected` 但取得時的窗口起點已經不是
+    # 這次的窗口起點（該狀態不具單調性，見 `get_left_boundary` docstring，
+    # 窗口往前滾之後必須重探）。**不再**依 `sc.result`／`evidence_unknown`
+    # 篩選——左界證據與遍歷本身的完整性結論、與核驗需求是三個正交的軸。
+    _PROBE_CANDIDATE_WHERE = (
+        "c.active=1 AND sc.status='done' AND ("
+        "s.left_boundary='unknown' OR "
+        "(s.left_boundary='truncation_suspected' "
+        "AND s.left_boundary_window_start_ms != sc.window_start_ms))"
+    )
 
     def next_probe_candidate(self) -> tuple[str, str] | None:
-        """留存邊界探測候選（Task 7.9b B4）：`fills_sync.scan_id` 指向的那筆
-        `fills_scan` 結果為 `complete` 且 `reason` 仍是門檻推論（尚未探過、
-        `evidence_unknown=0`），依該 scan `finished_at` 最舊者一筆——純 DB
-        推導，無記憶體佇列，重啟後從 DB 重新查詢即可繼續（B7 (vii)）。回傳
-        `(address, scan_id) | None`。"""
+        """左界證據探測候選（Task 3）：依 `_PROBE_CANDIDATE_WHERE`，取
+        `left_boundary_at` 最舊（從未探測過的 `NULL` 視為最舊，排最前）者
+        一筆——純 DB 推導，無記憶體佇列，重啟後從 DB 重新查詢即可繼續
+        （B7 (vii)）。回傳 `(address, scan_id) | None`。
+
+        排序鍵是**探測嘗試時間**而不是 `finished_at`（整合測試實測抓到的
+        starvation）：若排序鍵是 `finished_at`（該地址最近一次完成遍歷的時間，
+        探測不會改動），一個持續探不出結論的地址每次都會是「最舊」而永遠
+        排第一，其餘候選永遠輪不到。用 `left_boundary_at` 排序讓每次探測
+        自然把該地址推到隊尾，形成輪詢。"""
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT s.address, s.scan_id FROM fills_sync s "
                 "JOIN fills_scan sc ON sc.scan_id = s.scan_id "
                 "JOIN candidate c ON c.address = s.address "
-                "WHERE c.active=1 AND s.evidence_unknown=0 AND sc.status='done' "
-                "AND sc.result='complete' AND sc.reason=? "
-                "ORDER BY sc.finished_at ASC LIMIT 1",
-                (REASON_COUNT_BELOW_RETENTION_THRESHOLD,)).fetchone()
+                f"WHERE {self._PROBE_CANDIDATE_WHERE} "
+                "ORDER BY COALESCE(s.left_boundary_at, 0) ASC LIMIT 1").fetchone()
         return None if row is None else (row[0], row[1])
 
     def count_probe_candidates(self) -> int:
@@ -1286,27 +1292,91 @@ class ExploreStore:
                 "SELECT COUNT(*) FROM fills_sync s "
                 "JOIN fills_scan sc ON sc.scan_id = s.scan_id "
                 "JOIN candidate c ON c.address = s.address "
-                "WHERE c.active=1 AND s.evidence_unknown=0 AND sc.status='done' "
-                "AND sc.result='complete' AND sc.reason=?",
-                (REASON_COUNT_BELOW_RETENTION_THRESHOLD,)).fetchone()
+                f"WHERE {self._PROBE_CANDIDATE_WHERE}").fetchone()
         return row[0]
 
     def get_left_boundary(self, address: str, window_start_ms: int) -> LeftBoundary:
-        """Task 2（2026-09-22 主線程裁決）：**佔位實作**——真正的左界證據
-        讀取（`left_boundary` 三欄、探測前置、單調性）要到 Task 3 才實作。
-        在那之前一律回傳 `unknown`：沒有證據就不宣稱完整（D-E／D-F），
-        讓 `scan_verdict` 對所有新完成的遍歷暫時給出
-        `("partial", "left_boundary_unknown")`——這是預期且正確的中間態，
-        不是 bug。`window_start_ms` 參數目前未使用（Task 3 起才會依窗口起點
-        判斷證據是否仍適用，見單調性設計），保留在簽名上是為了讓呼叫端
-        （`explore_scheduler._run_scan`）不必在 Task 3 落地時改呼叫點。
+        """左界證據（Task 3，D-E／D-F）——真正的實作，取代 Task 2 的
+        `unknown` 佔位。單調性：正面證據（`earlier_fills_seen`／
+        `no_earlier_activity`）在其取得時的窗口起點**不晚於**查詢窗口起點時
+        仍然適用（窗口只會隨時間往前滾，更早的起點意味著「起點之前仍有
+        成交／帳戶在起點前無活動」這個事實只會更成立，不會因為窗口右移而
+        失效）；起點**晚於**查詢窗口起點是不該發生的情形（時鐘異常／資料
+        被人工改動），保守地視為不適用（回 `unknown`，需重探）。
+        `truncation_suspected` 不具單調性——上游截斷嫌疑只對當初探測的那個
+        窗口起點成立，窗口一旦往前滾就必須重探（見 `_PROBE_CANDIDATE_WHERE`）。
+
+        沒有 `fills_sync` 列（地址從未 bootstrap 過或已被 purge）→ `unknown`。
 
         延遲 import `LeftBoundary`（定義於 `explore_fills_sync`）以避免循環
         import——該模組在頂層 import 本模組的 `FillsScan`／`FillsSyncState`，
         反向在頂層 import 會形成循環（工程原則 1 的姊妹問題：模組依賴方向
         也要單一，不能雙向）。"""
         from spark.publicapi.explore_fills_sync import LeftBoundary
-        return LeftBoundary(state="unknown", window_start_ms=None, at=None)
+        addr = _norm(address)
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT left_boundary, left_boundary_window_start_ms, left_boundary_at "
+                "FROM fills_sync WHERE address=?", (addr,)).fetchone()
+        if row is None:
+            return LeftBoundary(state="unknown", window_start_ms=None, at=None)
+        state, stored_ws, at = row
+        if state in ("earlier_fills_seen", "no_earlier_activity"):
+            if stored_ws is not None and stored_ws <= window_start_ms:
+                return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
+            return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
+        if state == "truncation_suspected":
+            if stored_ws == window_start_ms:
+                return LeftBoundary(state=state, window_start_ms=stored_ws, at=at)
+            return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
+        return LeftBoundary(state="unknown", window_start_ms=stored_ws, at=at)
+
+    def set_left_boundary(self, address: str, state: str, window_start_ms: int,
+                          at: float) -> bool:
+        """左界證據冪等寫入（Task 3）。只允許 `unknown` → 其他；已有正面證據
+        （`earlier_fills_seen`／`no_earlier_activity`）時不得被 `unknown` 覆蓋
+        ——證據只能加強，不能被「這次探測沒問到」抹掉（同一地址不會同時有
+        兩個探測在跑，這條規則防的是「舊探測回應在新探測之後才落地」這種
+        排序倒置，不是併發 CAS）。沒有 `fills_sync` 列（地址已退池被 purge）
+        → `False`，不落地。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT left_boundary FROM fills_sync WHERE address=?", (addr,)).fetchone()
+            if row is None:
+                return False
+            if row[0] in ("earlier_fills_seen", "no_earlier_activity") and state == "unknown":
+                return False
+            self._db.execute(
+                "UPDATE fills_sync SET left_boundary=?, left_boundary_window_start_ms=?, "
+                "left_boundary_at=? WHERE address=?",
+                (state, window_start_ms, at, addr))
+        return True
+
+    def first_activity_ms(self, address: str) -> int | None:
+        """帳戶首次活動時間＝快取的 `portfolio` 回應裡 `allTime`
+        `accountValueHistory` 首點（與 `hl_explore.py` 算 `live_days` 同一個
+        來源，工程原則 1：同源同基準）。涵蓋範圍限制（Task 3 設計要點，
+        D-F）：allTime 是**權益**歷史且經降採樣，首點不等於首筆成交、時間
+        粒度可能到天——呼叫端（`explore_scheduler._run_probe`）只應在明顯
+        早於／晚於窗口起點時採信，模糊帶一律當作證據不足處理。
+
+        任何取不到（無快取／從未成功過）或結構不符（`extract_window` 回
+        `None`／序列為空）一律回 `None`＝未知。**不得**改用
+        `candidate.last_seen_at`／`candidate.source_as_of`／
+        `endpoint_cache.fetched_at` 之類的本機時間頂替——那些是「本機第一次
+        看到這個地址」，不是帳戶年齡（D-F 明文禁止）。"""
+        from spark.filet.leader_perf import extract_window
+        entry = self.get_cache(address, "portfolio")
+        if entry is None or entry.payload is None:
+            return None
+        result = extract_window(entry.payload, "allTime")
+        if result is None:
+            return None
+        av, _pnl = result
+        if not av:
+            return None
+        return av[0][0]
 
     # --- refresh_job ---
     def enqueue(self, key: str, address: str | None, kind: str, priority: int,

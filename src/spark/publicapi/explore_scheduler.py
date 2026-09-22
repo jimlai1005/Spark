@@ -18,16 +18,30 @@ priority 3）、`fills_verify`（**核驗遍歷**，遷移產生，只在同一 
 （`_fills_available()`），`fills_verify` 領工前也要求同樣的額度充足（避免用
 「反正閒著」的錯覺擠掉真正該優先的核驗以外預算）。
 
-留存邊界探測（B4）從舊版「deferred 佇列＋每輪 complete 收尾嘗試」改為**純 DB
-推導＋9:1 節流**：候選由 `ExploreStore.next_probe_candidate()` 查詢（`fills_sync
-.scan_id` 指向的那次遍歷 `result==complete` 且 `reason` 仍是門檻推論），
+Task 3（2026-09-22，D-E／D-F 裁決，見
+docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md）：
+**左界證據探測前置**——`complete` 需要左界證據（`LeftBoundary`）是必要條件
+（D-E），若證據排在遍歷完成之後才取得、又走輔助份額（每 9 頁才給 1 頁），
+成交量最大的帳戶會遍歷完十幾頁卻卡在最後一步證據而持續空白。因此
+`_run_scan` 在**每次**推進遍歷前先檢查 `ExploreStore.get_left_boundary`：
+仍是 `unknown`（或證據不適用當前窗口）就先做一次探測（走這個 job 本來就在
+消耗的 `explore_fills` 預算，不占輔助份額），探測成功或額度不足都直接收尾
+這一輪，下一輪才續抓真正的分頁。證據對滾動窗口具**單調性**（正面證據一旦
+取得永久有效，見 `explore_store.ExploreStore.get_left_boundary` docstring）
+——多數地址一生只需要探測一次。
+
+**這條前置路徑之外**仍保留舊版「純 DB 推導＋9:1 節流」的獨立探測機制
+（`_serve_special`／`ExploreStore.next_probe_candidate()`）——它服務的是
+「已經 `complete`／`partial`、目前沒有 job 在推進、但左界證據仍是 `unknown`」
+的殘留地址（例如尚未到下一次 `partial_rescan` 的地址），走輔助份額（與
+`fills_verify` 輪流）。兩條路徑共用同一個 `_run_probe`（Task 3 起改為寫
+`ExploreStore.set_left_boundary`，不再是 scan_id 範圍的雙 CAS
+`apply_probe_result`——左界證據是地址層級的冪等寫入，見該方法 docstring）。
 `_tick_once` 每個 tick 開頭先問「這次機會給 fills-like（`fills`／`fills_scan`）
 還是輔助類別（探測／`fills_verify`）」：雙方都有積壓時，輔助類別每 9 **頁**
 fills-like 才輪到 1 次（`_fills_pages_since_special` 計數器，Task 7.9d-S S3 把
 單位從 tick 改成頁面）；fills-like 這一側沒有到期工作時，輔助可以直接借用這次
-機會（不必空等）。探測與工作領取互斥（同一個 tick 只做其中一件）。回寫走 CAS（`ExploreStore.apply_probe_result`）：探測發出後、
-回寫前，若該地址已完成新的一次遍歷（`fills_sync.scan_id` 已指向別的
-`scan_id`）→ CAS 落空、計 `probe.stale`，不覆蓋新遍歷的結論。
+機會（不必空等）。探測與工作領取互斥（同一個 tick 只做其中一件）。
 
 容量估算與 Task 7.4b 修正（2026-09-21 使用者裁決：正式機證實 fills 類別級飢餓——
 嚴格優先級＋沒有為 fills 一頁 120 weight 的大請求保留額度，state/portfolio/ledger
@@ -114,10 +128,7 @@ from spark.publicapi.explore_fills_sync import (DEFAULT_FILLS_PERIOD_S, PARAMS_F
                                                 apply_scan_page, fresh_scan_window,
                                                 partial_rescan_due, plan_incremental, plan_scan,
                                                 scan_verdict, validate_page)
-from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
-                                           REASON_PROBE_NO_EARLIER_FILLS,
-                                           REASON_RETENTION_BOUNDARY_VERIFIED,
-                                           ADMISSION_MULTIPLIER, JOB_KINDS, ExploreStore, Job,
+from spark.publicapi.explore_store import (ADMISSION_MULTIPLIER, JOB_KINDS, ExploreStore, Job,
                                            ScanWriteback)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
 from spark.publicapi.hl_explore import ExploreConfig, _roi_sort_key, candidate_addresses
@@ -292,6 +303,11 @@ class ExploreScheduler:
         self._candidates_empty_streak = 0
         # Task 7.4b：fills 保留額度的類別感知領工觀測值。
         self._fills_pages_total = 0
+        # Task 3（2026-09-22）：`_run_scan` 實際發出的「遍歷分頁」請求數——
+        # 與探測（`_run_probe`）的請求分開計，讓「探測前置吃掉了這次 tick、
+        # 沒有真的抓頁」這件事可觀測、可測試（`test_probe_runs_before_first_
+        # page_of_a_new_scan`）。不含增量軌（`_run_increment`）的頁數。
+        self._scan_pages_total = 0
         self._last_fills_at: float | None = None
         self._base_scope_in_use = "explore"
         self._rebalanced: dict[str, int] = {}
@@ -341,6 +357,18 @@ class ExploreScheduler:
         # 後計數）——job 本身不因此遺失，這個計數器讓 callback 本身壞掉這件事
         # 變成可觀測（health 可見）。
         self._dirty_errors = 0
+
+    # Task 3：測試用公開只讀 view（plan
+    # `2026-09-22-explore-fills-coverage-verdict-fix.md` Task 3 Step 1）——
+    # 內部仍以 `_probe_total`／`_scan_pages_total` 這兩個私有計數器記帳
+    # （與既有 `status()["probe"]["total"]` 等觀測鍵共用同一份資料，不重複計數）。
+    @property
+    def probes_total(self) -> int:
+        return self._probe_total
+
+    @property
+    def scan_pages_total(self) -> int:
+        return self._scan_pages_total
 
     # ---- jitter ----
     def _jit(self, period_s: float) -> float:
@@ -1051,10 +1079,45 @@ class ExploreScheduler:
                 window_end_ms=window_end_ms, cursor_ms=window_start_ms, started_at=now,
                 params_fp=PARAMS_FP)
 
+        # Task 3（探測前置，D-E／D-F）：左界證據是 complete 的必要條件，必須
+        # 在結論之前到手——排在遍歷完成之後才探測會讓大戶遍歷完十幾頁卻卡在
+        # 最後一步證據而持續空白。這個 job 本來就在消耗 `explore_fills`
+        # 預算，探測沿用同一份預算，不占 `_serve_special` 的輔助份額。
+        #
+        # 只在這個 scan **還沒抓過任何一頁**（`pages_done == 0`，剛建立或續跑
+        # 但尚未推進）、且**這個窗口起點還沒探測過**（`boundary.window_start_ms
+        # != scan.window_start_ms`——`None` 也符合，代表這個地址從未探測過）
+        # 時才探測——「探測前置」防的是「遍歷完了才發現卡在證據」，不是要求
+        # 每一頁都先確認證據仍未知。一次探測沒解出結論（`unknown`，但
+        # `set_left_boundary` 已把這次嘗試的窗口起點記下）不代表下一頁再探
+        # 就會有答案：**必須**放行讓 scan 正常推進，否則地址的 portfolio 始終
+        # 缺席時，`pages_done` 永遠停在 0、每個 tick 都重探、scan 永遠無法抵達
+        # `window_end_ms`（這是本實作在整合測試中實測抓到的無限迴圈，不是
+        # 假設性風險）。真正需要重探同一個窗口的殘留地址交給獨立的
+        # `_serve_special`／`next_probe_candidate` 路徑（portfolio 之後補上
+        # 證據、或下一次 `partial_rescan` 窗口往前滾時，這裡會自然再探一次）。
+        if scan.pages_done == 0:
+            boundary = self._store.get_left_boundary(job.address, scan.window_start_ms)
+            if boundary.state == "unknown" and boundary.window_start_ms != scan.window_start_ms:
+                if not self._run_probe((job.address, scan.scan_id), now):
+                    # 額度不足／限流暫停：`_run_probe` 一頁都沒發出去，下個 tick
+                    # 再試，不推進 attempts（與其餘「額度不足不是這個 job 的錯」
+                    # 的處理一致）。
+                    self._reschedule(job, now, bump_attempts=False)
+                    return "deferred"
+                # 探測用掉了這次領工但沒有推進分頁——job 必須立刻重排回可
+                # 認領狀態，否則會卡在 lease 直到它自然到期（`_lease_s`，預設
+                # 60 秒）才輪得到下一次，真正的分頁推進因此被延後（這是本
+                # 實作在整合測試中實測抓到的問題，不是假設性風險）。
+                self._reschedule(job, now, bump_attempts=False)
+                self._notify_dirty()
+                return f"ran:{result_kind}"
+
         plan = plan_scan(scan)
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
         page = hl_fills.get_fills_page(job.address, plan.start_ms, plan.end_ms)
         self._fills_pages_total += 1
+        self._scan_pages_total += 1
         if not verify:
             # Task 7.9d-S S3：核驗遍歷的頁面屬於**輔助份額**，不計入「每 9 頁
             # fills-like 才給輔助一次」的分母（否則 verify 自己就能養出下一次
@@ -1189,23 +1252,29 @@ class ExploreScheduler:
         self._reschedule(job, now + 86400, err=err, bump_attempts=not max_attempts)
 
     def _run_probe(self, candidate: tuple[str, str], now: float) -> bool:
-        """留存邊界探測（Task 7.9b B4）：`candidate=(address, scan_id)` 來自
-        `ExploreStore.next_probe_candidate()`（純 DB 推導，重啟後照常運作，
-        B7 (vii)）。查詢 `[scan.window_start_ms - 1 天, scan.window_start_ms - 1]`
-        是否仍有可查成交——回 >=1 筆合法成交代表 HL 的實際留存邊界早於這次
-        遍歷的窗口起點，升級 reason 為 `REASON_RETENTION_BOUNDARY_VERIFIED`；
-        回空頁代表已探過、無法升級，記為 `REASON_PROBE_NO_EARLIER_FILLS`（該
-        reason 碼天然被 `next_probe_candidate` 的查詢條件排除，每次遍歷至多
-        探到有結論為止）。
+        """左界證據探測（Task 3，D-E／D-F）：`candidate=(address, scan_id)`——
+        來自 `_run_scan` 的探測前置（`scan_id` 是這個 job 正在推進的那筆，可能
+        剛建立也可能續跑）或 `ExploreStore.next_probe_candidate()`（純 DB 推導
+        的獨立路徑，服務沒有 job 在跑但證據仍缺的殘留地址，B7 (vii)：重啟後照常
+        運作）。查詢 `[scan.window_start_ms - 1 天, scan.window_start_ms - 1]`
+        是否仍有可查成交：
 
-        回寫用 `ExploreStore.apply_probe_result` 的雙 CAS（B7 (ii)）：探測發出
-        後、回寫前，若該地址已完成新的一次遍歷（`scan_id` 改變）→ CAS 落空、
-        計 `probe.stale`，不覆蓋新遍歷的結論、也不重試（下一輪 tick 若新遍歷
-        仍以「門檻推論」收尾，會自然成為新的探測候選）。
+        - 回應非空 → `earlier_fills_seen`（最強證據，不必再看 portfolio）。
+        - 回空頁 → 依 `ExploreStore.first_activity_ms`（D-F：只接受 portfolio
+          allTime 首點，不得用本機時間頂替）判斷：明顯早於窗口起點（差距
+          ≥ `_PROBE_WINDOW_MS`）→ `truncation_suspected`（上游截斷嫌疑）；
+          明顯晚於／等於窗口起點 → `no_earlier_activity`（帳戶當時確無活動）；
+          缺席或落在模糊帶 → `unknown`（證據不足，不宣稱任何一方）。
+
+        回寫用 `ExploreStore.set_left_boundary`——地址層級的冪等寫入，不是
+        scan_id 範圍的 CAS（左界證據不屬於某一次特定的遍歷，屬於這個地址；
+        單調性本身已經防止「舊探測回應覆蓋新證據」，見該方法 docstring）。
 
         回傳「**這次真的發出了一個上游請求嗎**」（Task 7.9e-S S4）：候選剛退池、
-        scan 列不見、額度不足／限流暫停都回 `False`，呼叫端不把輔助名額算成已用
-        （舊版無條件歸零 `_fills_pages_since_special`，等於白燒一次名額）。"""
+        scan 列不見、額度不足／限流暫停都回 `False`，呼叫端（`_run_scan`／
+        `_serve_special`）不把這次當成已服務（`_serve_special` 那條路徑不把
+        輔助名額算成已用，舊版無條件歸零 `_fills_pages_since_special` 等於白燒
+        一次名額）。"""
         address, scan_id = candidate
         if not self._store.is_active(address):
             # Task 7.9d-S S2：發送前確認地址還在候選池內（`next_probe_candidate`
@@ -1226,26 +1295,51 @@ class ExploreScheduler:
             return False            # 額度／暫停：一頁都沒發出去
         except Exception as e:  # noqa: BLE001 — 唯一的分類點，見上方 docstring
             if is_rate_limited(e):
-                return True         # 429：請求確實發出去了（只是被限流擋回）
+                # 429：請求確實發出去了（只是被限流擋回）——與下面的
+                # 「失敗但已嘗試」同一套收尾，不特別區分。
+                self._store.set_left_boundary(address, "unknown", scan.window_start_ms, now)
+                return True
             logger.warning(
-                "explore scheduler：留存邊界探測失敗 address=%s window=[%d,%d]: %r",
+                "explore scheduler：左界證據探測失敗 address=%s window=[%d,%d]: %r",
                 address, probe_start, probe_end, e)
             self._probe_total += 1
             self._probe_failed += 1
+            # Task 3 補（整合測試實測抓到）：探測異常若完全不落地任何狀態，
+            # `_run_scan` 的探測前置閘門（「這個窗口起點還沒探測過」）會在
+            # 下一個 tick 對同一個持續失敗的上游再探一次、無限重複——這個地址
+            # 的 `fills_scan` job 因此永遠卡在 pages_done=0、永遠走不到真正的
+            # 分頁請求，也就永遠不會觸發既有的 quarantine 機制（工程原則 3：
+            # 失敗路徑必須跟成功路徑一樣可見，不能被探測這一層悄悄吸收）。
+            # 標記「這個窗口已嘗試過、仍未知」讓閘門放行——scan 照常推進到
+            # 真正的分頁請求，同樣的上游失敗會在那裡被既有的例外分類／
+            # quarantine 邏輯正常處理。
+            self._store.set_left_boundary(address, "unknown", scan.window_start_ms, now)
             return True
         self._probe_total += 1
         invalid_reason = validate_page(page, probe_start, probe_end)
         if invalid_reason is not None:
             logger.warning(
-                "explore scheduler：留存邊界探測回應不合法 address=%s window=[%d,%d] "
+                "explore scheduler：左界證據探測回應不合法 address=%s window=[%d,%d] "
                 "reason=%s", address, probe_start, probe_end, invalid_reason)
             self._probe_failed += 1
+            self._store.set_left_boundary(address, "unknown", scan.window_start_ms, now)
             return True
-        new_reason = REASON_RETENTION_BOUNDARY_VERIFIED if page else REASON_PROBE_NO_EARLIER_FILLS
-        ok = self._store.apply_probe_result(
-            scan_id, address, old_reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD,
-            new_reason=new_reason)
+        if page:
+            state = "earlier_fills_seen"
+        else:
+            first_ms = self._store.first_activity_ms(address)
+            if first_ms is None:
+                state = "unknown"                                    # D-F：不知道就是不知道
+            elif first_ms >= scan.window_start_ms:
+                state = "no_earlier_activity"
+            elif first_ms < scan.window_start_ms - _PROBE_WINDOW_MS:
+                state = "truncation_suspected"
+            else:
+                state = "unknown"                                    # 模糊帶：證據互相矛盾
+        ok = self._store.set_left_boundary(address, state, scan.window_start_ms, now)
         if not ok:
+            # 正面證據已存在、這次寫入被拒（見 `set_left_boundary` docstring），
+            # 或地址已被 purge——兩者都是「這次探測白做了」，計 stale。
             self._probe_stale += 1
             return True
         self._notify_dirty()
