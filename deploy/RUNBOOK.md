@@ -2601,6 +2601,15 @@ v4 schema 的 DB 本來就無效——所以先還原 DB 到 v3 複本，再回�
 src/spark/publicapi/explore_publisher.py` 應無命中），僅供觀測與 Task 5 的成交速率
 估算——估高會讓週期估短、抓得更密，方向對安全性是保守的。
 
+#### 探測成本模型備忘（Task 11 之後）
+
+- `earlier_fills_seen`（探測窗有成交）：單調、終局，每地址一生一次。
+- `no_earlier_activity`（探測窗回空且帳戶首次活動明顯晚於窗口起點）：**窗口綁定**——年齡不滿一個
+  掃描窗（30 天）且仍 `partial` 的帳戶，每次 `partial_rescan` 由新 scan 的探測前置多付 **1 頁**探測，
+  滿 30 天取得 `earlier_fills_seen` 後終局；`complete` 地址不 rescan、不受影響。
+- 獨立探測（輔助份額）只服務**沒有 scan 在跑**的地址（排他規則）；有 scan 在跑者由該 scan 獨占證據寫入。
+  部署後若 `probes_executed` 的增速遠高於「待探測地址數＋每日 rescan 數」的量級，優先懷疑這條排他失效。
+
 #### 取樣器與 v4 的相容性（部署前已查，2026-09-22）
 
 `/home/ubuntu/explore-obs/sample.py`（正式機 cron，每 15 分鐘，不在 repo）只讀 v4 仍存在的
