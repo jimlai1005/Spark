@@ -1606,6 +1606,15 @@ W3 `PARTIAL_RESCAN_AFTER_MS` 未刪且被測試釘住；W4 過渡相容層是 fa
 
 **主線程整合**：全量；`integ_79c.py` 3 天（verify 129→0 的時程改以 1/10 份額估：129×1.2 頁 ÷ 6 頁/h ≈ 26h 下限）；`repro_rescan.py`／`repro_79b.py`；B8 算式改「verify 與 probe 共用每 10 次 1 次的名額」。
 
+##### 7.9d 使用者第二輪裁決（2026-09-22，派工中即時併入；維持不可部署，同批修、不加功能、不改架構）
+
+1. **狀態與工作對帳（取代單點修復路徑）**：`reconcile_scan_jobs()`＝對每個 **active** 地址：有 running scan 而無 `fills_scan` job → 入列 job **續跑同一個 `scan_id` 與游標**（不得建新 scan、不得整窗重抓）；`completeness == backfilling` 且無 running scan → 建 initial；partial 到期且無 running／無 job → 建 partial_rescan。**啟動時**（`_tick_once` 首 tick）與**每次 candidates 更新後**都跑一次，冪等（重跑零變更）。涵蓋 initial backfill、partial rescan、重啟三種情境。
+2. **verify 與 probe 共用輔助份額，逾期不得突破**：雙方積壓時每 10 次**頁面准入**（實際發出的 fills 類頁請求，含多頁 scan 的每一頁）≥9 次給增量／scan、≤1 次給 verify＋probe；以頁面計，不以 tick 或整個 job 計；2 小時逾期只提升 verify 在輔助類別內的順序（排在 probe 之前），不觸發整批優先。B8 等待估算重算：129 件 × ~1.2 頁 ÷（60 頁/h × 1/10）≈ **26 小時下限**（fills 空檔會更快）。
+3. **退池工作清理與 health 統計一起修**：HTTP 發送前確認 active，退池後禁止續頁；**主動掃除既有殘留 job**（對帳時 `DELETE refresh_job WHERE address NOT IN active`，不只靠本輪 `deactivate_missing` 回傳值）；統計直接彙總 `refresh_job`／`fills_scan` 表，分列 `active`／`inactive`／`orphan`（`fills_scan` running 但無 job），並區分**列數**與**地址數**（例如 `{"fills_verify": {"rows": 129, "addresses": 129, "active_rows": 112, "inactive_rows": 17}}`）。
+4. **刪除毫秒過渡常數與 fail-silent 相容層**：直接用正式 store 介面與 `ScanWriteback` 四態；介面不符必須明確失敗（`AttributeError`／`TypeError` 逸出，不吞）；測試 fake 同步符合正式介面；刪掉保護舊 fallback 的測試。
+5. **最後一組部署門檻測試（正式回歸）**：(i) initial 與 partial_rescan 兩種 scan 中途退池再回池可**續跑同 scan_id**；(ii) 大量 overdue verify 不壟斷（8 件逾期＋積壓增量 → 每 10 次頁面 ≤1 次輔助）；(iii) inactive 地址不再發出任何新請求（含續頁）；(iv) health 與 DB 同母體（列數／地址數皆一致）；(v) **直接斷言 complete 地址不重建 scan job**（`due_by_kind["fills_scan"]==0`、`scan_job_dropped==0`），不只靠下游守門丟棄。
+6. 流程：修正 → 正式測試 → 正式機複本遷移與重啟 → 多日模擬（含 churn） → 複審；五項有證據即進入受控部署，不因可選清理無限延後。
+
 <!-- 原 v1 條文保留於下作對照；派工以上方 7.9a／7.9b／7.9c／7.9d 為準，衝突時以 v2 為準。 -->
 ### Task 7.9 v1（已被 v2 取代，僅供對照）：fills 週期 6 小時單一來源＋partial 持續增量＋探測證據窗口化＋回寫保護＋探測排程耐重啟（2026-09-21 使用者裁決）
 
