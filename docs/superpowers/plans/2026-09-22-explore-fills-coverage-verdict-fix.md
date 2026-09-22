@@ -721,6 +721,28 @@ git commit -m "fix: 左界證據事後到齊時就地重算結論，不必整窗
 新增變灰只有 6 列（`count_below_retention_threshold`）。**不得**沿用早期草案的
 「running scan 一律作廢重跑」——那會丟掉 118 頁已付出的抓取成本。
 
+- [ ] **Step 0: 接上兩個欄位的持久化，並刪掉 Task 3b 的反推（必做）**
+
+Task 3b 期間 `FillsScan.stop_reason`／`unresolved_gap` 還沒持久化，
+`ExploreStore._recompute_verdict_locked` 用 `reason`／`cursor_ms`／`window_end_ms` **反推**
+這兩欄。那個反推是「給定 `scan_verdict` 目前的分支順序才成立」的隱性耦合——
+有人重排分支就會靜默壞掉，且現有測試抓不到（工程原則 5：別用「要記得」來維持正確性）。
+
+本 task 把兩欄真正接進 `_SCAN_COLUMNS` 的讀寫之後，**必須刪除該反推**，改直接用持久化的值。
+
+Run: `grep -n "unresolved_gap = 1 if\|stop_reason = scan.reason if" src/spark/publicapi/explore_store.py`
+Expected: 無命中。
+
+另補一條測試，釘死「往返不失真」：
+```python
+def test_scan_round_trip_preserves_stop_reason_and_unresolved_gap():
+    for stop, gap in (("local_page_cap", 0), ("no_progress", 0), ("same_ms_overflow", 1), (None, 0)):
+        scan = _scan(stop_reason=stop, unresolved_gap=gap)
+        store.upsert_scan(scan)
+        got = store.get_scan(scan.scan_id)
+        assert (got.stop_reason, got.unresolved_gap) == (stop, gap)
+```
+
 - [ ] **Step 1: 寫失敗測試**
 
 ```python
