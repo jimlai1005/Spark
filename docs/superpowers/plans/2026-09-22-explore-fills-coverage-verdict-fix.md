@@ -1400,9 +1400,11 @@ git commit -m "test: 遷移後形狀經真實排程器走完整條獨立探測�
    失效——先在本機用新版程式建好 300 池快照、`install` 到正式機快取路徑，再重啟 `filet-api`。
 3. **只重啟 `filet-api`**。`filet-follower@*` 與四個 timer 一律不動；重啟後立即確認
    follower 未被牽連（`systemctl show filet-follower@<id> -p ActiveEnterTimestamp` 與部署前相同）。
-4. **新 env**：`FILET_EXPLORE_FILLS_MIN_PERIOD_S` / `FILET_EXPLORE_FILLS_MAX_PERIOD_S` /
-   `FILET_EXPLORE_SPECIAL_SERVE_RATIO`＋`_UNTIL`；`FILET_HL_EXPLORE_*_WEIGHT_CAP` 語義由硬 cap
-   改為 floor（值不變，語義變，要在 drop-in 註解寫明）。
+4. **env 變動**（以實際 commit 為準，Task 6 已放棄）：`FILET_EXPLORE_FILLS_PERIOD_S` 語義改為
+   **下界**（值 21600 不變）；新增 `FILET_EXPLORE_FILLS_MAX_PERIOD_S`（預設 86400，可不設）；
+   新增 `FILET_EXPLORE_SPECIAL_SERVE_RATIO=3` ＋ `FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=2026-09-24T00:00:00Z`
+   （逾期自動回 9）。**`FILET_HL_EXPLORE_*_WEIGHT_CAP` 完全不動**（Task 6 放棄，語義仍是硬 cap）。
+   部署前 `grep` drop-in 確認沒有任何已無讀取者的 env。
 5. **遷移報告**：啟動日誌必定印出 `last_migration_report()`，部署後第一件事是讀它並與
    Task 4 Step 5 在複本上算出的數字比對；不符就回退。
 6. **回退**：停 `filet-api` → 還原 `explore.db.pre-v4.bak` → 還原上一版程式碼 → 啟動 →
@@ -1445,7 +1447,7 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 | 6 子預算可借用 | ❌ 使用者裁決放棄 | 實測零效益（base p50=164／p95=180 貼頂、fills 有效上限仍 120 權重/分、`total_fills_pages` 53→53）；程式碼已 revert，分析保留在 Task 6 節 |
 | 7a harness ＋四條正確性驗收 | ✅ `65ac81f` | 主線程複跑 3343 passed；只動測試檔、`src/` 零漂移；反向護欄經「改壞→轉紅→revert」驗證 |
 | 7b 政策需求＋不飢餓＋同毫秒降級 | ✅ `0ca3160` | 主線程複跑 3346 passed；新政策測試實算 22.458 頁/小時（正式機 22.34）；harness 下界保真度 bug 修正 3600→21600 後 7a 四條仍全綠 |
-| 8 端到端可達性＋份額自動到期 | ✅ `02d07e3`（待主線程複跑全套） | 預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
+| 8 端到端可達性＋份額自動到期 | ✅ `02d07e3` | 主線程複跑 3357 passed、ruff 全過；  預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
 | 8b 遷移後形狀走完整條獨立探測鏈 | 派工中 | |
 | 9 RUNBOOK 與部署 | 未開始 | |
 
