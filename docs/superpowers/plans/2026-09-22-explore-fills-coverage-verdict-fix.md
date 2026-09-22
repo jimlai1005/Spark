@@ -1553,7 +1553,7 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 | 7b 政策需求＋不飢餓＋同毫秒降級 | ✅ `0ca3160` | 主線程複跑 3346 passed；新政策測試實算 22.458 頁/小時（正式機 22.34）；harness 下界保真度 bug 修正 3600→21600 後 7a 四條仍全綠 |
 | 8 端到端可達性＋份額自動到期 | ✅ `02d07e3` | 主線程複跑 3357 passed、ruff 全過；  預設 9 不動；drop-in 加 `SPECIAL_SERVE_RATIO=3` ＋ `_UNTIL=2026-09-24T00:00:00Z` |
 | 8b 遷移後形狀走完整條獨立探測鏈 | ✅ `05fad87` | 只破壞 `_PROBE_CANDIDATE_WHERE`（不動 inline）→ 0/20 轉紅（23.9h 乾淨隔離；24h 因與 `PARTIAL_RESCAN_AFTER_S` 重合得 1/20，仍紅）；同 seed 下 **6.5 小時** 20/20（1h=2、3h=8、5h=15、6h=19） |
-| 10 審核修正 C1＋W1/W2/W3/W5 | ✅ `71f89fd`（主線程複跑中；針對性複審已派） | 閘門抽成 `_applicable_boundary` 單一來源；遷移只動 `finished_at`；非熱門下界 1h；reason 永不 None；模糊帶對稱 |
+| 10 審核修正 C1＋W1/W2/W3/W5 | ✅ `71f89fd`；主線程複跑 3367 passed、probe3/probe4 重現已封；針對性複審（opus）**無 Critical、判可部署** | 閘門抽成 `_applicable_boundary` 單一來源；遷移只動 `finished_at`；非熱門下界 1h；reason 永不 None；模糊帶對稱 |
 | 9 RUNBOOK §5.8f | ✅ 文件完成 `24f94ab`（**部署未執行，待使用者授權**） | 主線程逐段讀過並修 3 處可執行性問題（ops/health 需 admin session、取樣器無 `probe` 欄位、誤入的 commit 區塊）；取樣器 v4 相容已唯讀查證 |
 
 **待填實測值**：`BASE_FLOOR`（Task 6 Step 0）、遷移後分佈與 `probes_needed`（Task 4 Step 5）。
@@ -1574,6 +1574,18 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 
 合計 397 列（active candidates 300）、`fills` 1,051,273 筆、進行中遍歷 83 個。
 遷移必須保住這 105 萬筆成交與 83 個遍歷的游標（D-G）。
+
+## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
+
+1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
+   才開始活動，窗口往前滾後「新起點之前無活動」並不成立；配合「正面證據終局＋不重探」會永久鎖定 complete。
+   觸發需要 HL 真的截斷（本次實測不會），落在錯判完整方向。修法：該狀態改為 `==` 才適用（complete 位址不重掃、
+   窗口不滾，實務上不會造成重探洪峰）。與 W4（`truncation_suspected → unknown` 降級不重算）併案。
+2. `config.py` 對 `FILET_EXPLORE_FILLS_PERIOD_S` 的「下界」註解已與程式脫節（只管熱門）；RUNBOOK 已更正，config 註解待改。
+3. Task 7b 政策測試的合成分佈與 docstring 未隨 W1 更新（實算 26.54，門檻 30）；正式機真實分佈實算 22.76。
+4. 單位址增量需求上限從 1/6h 升到 1/1h：非熱門且 fph ≥ 267 的位址從 2 個增到約 30 個就會破 30 頁/小時，
+   線上無指標——RUNBOOK §5.8f 已加一條 DB 查詢當觀測。
+5. 被推遲的 `finished_at` 會出現在對外 `evidence.finished_at`（觀測失真，不影響判準）。
 
 ## 資料極限與未決事項（誠實標註）
 

@@ -2502,6 +2502,7 @@ ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
 | `fills` 類 overdue 是否收斂 | `samples.jsonl` 的 `overdue_by_kind`（取樣器目前只有 `fills`／`fills_scan`／`fills_verify` 三個 fills 類 kind，**沒有** `probe`） | 24 小時內三個 kind 的 `overdue_p95_s` 不得單調上升；`fills_verify` 對應的 `refresh_job` 列數（Step 5 那條查詢）單調遞減到 0 | 查是否被 base 類飢餓（`explore_base`／`explore_fills` 保留額度是否各自貼頂），不要調 `WEIGHT_CAP`（Task 6 已放棄） |
 | 對外 complete 曲線 | `public.coverage_counts.complete`（取樣器） | 24 小時內**單調上升**（部署當下會先從約 219 掉到約 135——那是遷移撤銷舊判準結論的預期一步，不是退化），且之後不得出現「一次性暴增又打回」——那代表結論來源不只一個（Task 3b／8 的不變式被破壞） | 查 `scan_verdict` 的呼叫點是否仍只有 `explore_scheduler.py`／`explore_store.py` 兩處（Task 8 以結構性斷言釘死） |
 | base 逾期 | `overdue_by_kind.state.overdue_p95_s` | < 1800 | 調高 base 類優先序（不動 `WEIGHT_CAP`） |
+| 高頻非熱門位址數（W1 副作用觀測） | DB：`select count(*) from fills_sync s join fills_scan sc on sc.scan_id=s.scan_id join candidate c on c.address=s.address and c.active=1 where sc.observed_to_ms>sc.observed_from_ms and sc.fills_in_window*3600000.0/(sc.observed_to_ms-sc.observed_from_ms) >= 267` | 遷移當下 2；若 ≥ 25 代表增量需求逼近 30 頁/小時 | 回報使用者裁決是否調 `MIN_PERIOD_COLD_S`（程式常數） |
 
 ⚠️ **本表已移除舊版「遍歷軌頁面占比 ≥ 0.5」門檻**——Task 7b 已證明它不是穩定性質
 （政策改為對增量需求設下界，而非維持固定占比；沿用舊門檻會在正常運作下誤報）。
