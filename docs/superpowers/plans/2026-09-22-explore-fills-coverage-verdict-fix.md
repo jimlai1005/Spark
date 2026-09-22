@@ -1096,109 +1096,39 @@ git commit -m "fix: 成交速率改用實際觀測跨度為分母，修正高頻
 
 ---
 
-## Task 6: 限流器子預算改為當前視窗內原子扣帳的可借用底線 `@inline`
+## Task 6: 限流器子預算可借用 —— ❌ 使用者裁決放棄（2026-09-22）
 
-**Files:**
-- Modify: `src/spark/publicapi/hl_budget.py:150-250`
-- Test: `tests/test_hl_budget.py`
+> **結論：機制正確但實測零效益，程式碼已 revert，不留未接線的死程式碼。**
+> 保留本節是為了讓之後的人不必重做一遍這個分析。
 
-**硬不變式（三條，都要有測試釘死）**：
-1. 任一 60 秒視窗內 `explore` 父 scope 總權重 ≤ 300。
-2. 全域 ≤ 900（HL 為 1200）——這是留給 follower 引擎與三個 timer 的餘裕，本次不動。
-   **正式機正在跟單中，這條被破壞等於直接影響真實用戶。**
-3. `explore_base` 的 floor 永遠可用（fills 借用不得讓 base 飢餓）。
+**做過什麼**：完整實作了 `WeightLimiter` 的 `scope_floors`／`_child_cap_effective`／
+建構期防呆，五條測試全過（含真實 8 執行緒壓測，並用「把檢查與扣帳拆成兩次持鎖 →
+`peak=840 > 300` 轉紅 → revert」證明它抓得到 race）。機制本身沒有問題。
 
-**D-H**：借用判定必須以**當前視窗**的實際用量（既有的 token deque）在**同一個鎖內**
-完成「檢查＋扣帳」，不得使用平均值、移動平均或任何預估閒置量。
+**為什麼零效益**（實測，非推論）：
 
-> **主線程裁決（2026-09-22）：Task 6 與 Task 7 對調順序。**
-> Task 6 Step 0 要用 Task 7 的 harness 量 base floor，但 harness 還沒建——循環依賴。
-> 改成先做 **Task 7a**（建 harness ＋ 四條不依賴 Task 6 的正確性測試：大戶收斂、
-> 缺左界不得 complete、同毫秒跨頁不漏單、重啟續抓），再做 Task 6（用 harness 量 floor
-> ＋實作借用），最後 **Task 7b**（兩條吞吐比例測試）。
+| 量測 | 結果 |
+|---|---|
+| `explore_base` 穩態每分鐘預留權重（300 地址 harness，暖機到 base 逾期連續 3 次為 0 才開始統計） | p50 **164**、p95 **180**（多個分鐘貼齊現行 180 cap） |
+| 解除 base 自身 cap、只受父 cap 300 制約時的瞬時尖峰 | **250 權重/分** |
+| `child_cap_effective(explore_fills) = max(120, 300 − 180)` | **120 權重/分 = 1 頁/分 = 60 頁/小時**（與現行相同） |
+| 暖機後 1 小時 `total_fills_pages`（舊硬 cap vs 新 floor，同 seed 分岔） | **53 → 53**，零差異 |
 
-- [ ] **Step 0: 先實測 base 的真實需求，再定 floor**
+**根本原因**：base 的需求不是背景段推導的平滑 ~120 權重/分，而是**尖峰式**的
+（`state` 1800s／`portfolio`、`ledger` 7200s × 300 個離散位址）。正式機觀測到
+「base 逾期恆為 0」**不代表有閒置額度可借**，而是現行 180 cap 剛好吸收得住尖峰。
+兩個子 floor 相加又恰好貼齊父 cap 300，借用公式因此退化成與今天完全相同的數字。
 
-不要沿用背景段的推導值（約 120 權重/分鐘）。用 Task 7a 建好的 300 地址整合 harness 跑一個
-模擬小時，統計 `explore_base` 每分鐘實際預留權重的 p50／p95，**把數字寫進本 plan 狀態表**。
-floor = p95 向上取整到 10 的倍數，下限 60。未實測不得往下做。
+**真正的天花板是 `explore` 父預算 300**，而 base 實際需要其中一大半。要再往上只有三條路，
+都已呈使用者裁決（2026-09-22）：(a) 接受現狀（**採用**）；(b) 放寬 portfolio／ledger 週期
+2h→4h，拿榜上權益／損益／回撤的新鮮度換吞吐；(c) 提高父預算——碰 2026-09-19 事故紅線。
 
-- [ ] **Step 1: 寫失敗測試**
+**使用者選 (a)**：Task 5b 已把遍歷軌從 6 提到 **33.66 頁/小時**（5.6 倍），足以在 1–2 天內
+消化積壓（198 個探測 ＋ 大戶遍歷），不值得為了 13–50% 的額外增益，在有真實用戶跟單時
+去動限流器這個全案風險最高的元件。
 
-```python
-def test_child_may_borrow_only_current_window_idle():
-    """借用額度＝父 cap −（其他子 scope 的 floor），且以當前視窗實際用量判定。"""
-    lim = _limiter(base_floor=BASE_FLOOR)
-    granted = 0
-    while lim.try_reserve(120, "explore_fills") is not None:
-        granted += 1
-    assert granted == (300 - BASE_FLOOR) // 120
-
-
-def test_borrowing_is_atomic_under_one_lock():
-    """並發下不得超賣：多執行緒同時預留，父 scope 用量永遠 ≤ 300。"""
-    lim = _limiter(base_floor=BASE_FLOOR)
-    peak = _hammer_concurrently(lim, threads=8, weight=120, scope="explore_fills")
-    assert peak <= 300
-
-
-def test_base_floor_is_never_starved_by_fills():
-    lim = _limiter(base_floor=BASE_FLOOR)
-    while lim.try_reserve(120, "explore_fills") is not None:
-        pass
-    assert lim.try_reserve(2, "explore_base") is not None
-
-
-def test_parent_cap_and_global_cap_are_never_exceeded():
-    """follower 的餘裕來自全域 900 與父 cap 300；借用只在父 cap 內重分配。"""
-    lim = _limiter(base_floor=BASE_FLOOR)
-    total = 0
-    while True:
-        if lim.try_reserve(120, "explore_fills") is not None: total += 120
-        elif lim.try_reserve(2, "explore_base") is not None: total += 2
-        else: break
-    assert total <= 300
-    assert lim.status()["global_used"] <= 900
-
-
-def test_floors_exceeding_parent_cap_fail_at_construction():
-    with pytest.raises(ValueError):
-        _limiter(base_floor=250, fills_floor=120)      # 250 + 120 > 300
-```
-
-- [ ] **Step 2: 執行測試確認失敗**
-
-Run: `uv run pytest tests/test_hl_budget.py -k "borrow or floor or atomic or never_exceeded" -v`
-Expected: FAIL，`TypeError: unexpected keyword argument 'scope_floors'`。
-
-- [ ] **Step 3: 實作**
-
-`WeightLimiter.__init__` 新增 `scope_floors`；建構時驗證 `sum(floors) <= parent_cap`
-否則 `ValueError`（結構性防呆，不靠記得）。子 scope 放行條件（**單一鎖內**完成檢查與扣帳）：
-
-```
-child_cap_effective(c) = max(floor(c), parent_cap - sum(floor(其他子 scope)))
-放行 w 到 c 的條件（三者同時，全部用當前視窗的實際用量）：
-  global_used + w <= global_cap
-  parent_used  + w <= parent_cap
-  child_used   + w <= child_cap_effective(c)
-```
-
-移除子 scope 的舊硬 cap 語義（同一件事不留兩個來源）。`config.py:165-166` 改傳
-`scope_floors`；env `FILET_HL_EXPLORE_BASE_WEIGHT_CAP` /
-`FILET_HL_EXPLORE_FILLS_WEIGHT_CAP` 語義改為 floor，在 `config.py` 註解與 RUNBOOK 同步說明。
-
-- [ ] **Step 4: 跑測試**
-
-Run: `uv run pytest tests/test_hl_budget.py tests/test_hl_gateway_budget.py -v`
-Expected: PASS。
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/spark/publicapi/hl_budget.py src/spark/publicapi/config.py tests/
-git commit -m "feat: 子預算改為當前視窗原子扣帳的可借用底線，父／全域 cap 不變（D-B／D-H）"
-```
+**若未來要重啟這條路**：先實測 follower 引擎自己用掉多少權重（它是獨立進程、不經限流器，
+全靠全域 900 與 HL 1200 的差額保護），不要沿用任何推導值。
 
 ---
 
@@ -1458,7 +1388,7 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 | 4 schema v4 遷移 | ✅ `c3651ad` | 主線程在複本獨立重現遷移：fills 1,051,273 前後相同、83 個游標零漂移、report 與 builder 一致 |
 | 5 週期依成交速率 | ✅ `7c458b1`（速率分母有缺陷，見 5b） | 主線程複跑 3334 passed；7.8 不變式測試經「改壞→轉紅→revert」驗證有效 |
 | 5b 速率分母改觀測跨度 | ✅ `eaa801d` | 主線程用**正式程式碼**在複本實算：週期 6h=78／中段=4／24h=218，增量需求 **22.34 頁/小時**（原 50），留給遍歷軌 **33.66**（原 6）；`0xa483470a` 897.5 筆/小時 → 正確判 MIN |
-| 6 子預算原子借用 | 未開始 | |
+| 6 子預算可借用 | ❌ 使用者裁決放棄 | 實測零效益（base p50=164／p95=180 貼頂、fills 有效上限仍 120 權重/分、`total_fills_pages` 53→53）；程式碼已 revert，分析保留在 Task 6 節 |
 | 7a harness ＋四條正確性驗收 | ✅ `65ac81f` | 主線程複跑 3343 passed；只動測試檔、`src/` 零漂移；反向護欄經「改壞→轉紅→revert」驗證 |
 | 7b 吞吐比例＋同毫秒降級 | 未開始（等 Task 6） | |
 | 8 端到端可達性＋verify 加速 | 未開始 | |
