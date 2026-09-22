@@ -1743,6 +1743,15 @@ running scans 66 → 65；Traceback 0；429 0；follower 不變；cron.err 0。*
 `truncation_suspected` 89 → 117；completeness 65／171／190；`fills_verify` job 75 → 69；running scans 65；
 Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
 
+| 22:00 | 0 | 0 | 128／152／20 | 68 | 0／0／0 | ok | |
+| 22:15 | 0 | 0 | 130／150／20 | 67 | 0／0／0 | ok | |
+| 22:30 | 0 | 0 | 133／147／20 | 67 | 0／0／0 | ok | |
+| 22:45 | 0 | 0 | **133**／148／19 | 67 | 0／0／0 | ok | |
+
+**22:55 排程檢查（+7h10m）**：unknown **124 → 102**（−22/h）、`earlier_fills_seen` 169 → 176（+7）、`no_earlier_activity` 16、
+`truncation_suspected` 117 → 135；completeness 65／178／186；`fills_verify` job 69 → 64；running scans 65；
+Traceback 0；429 0；follower 不變；cron.err 0。**判定：正常，不回退。**
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
