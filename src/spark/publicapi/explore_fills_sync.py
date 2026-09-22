@@ -222,9 +222,16 @@ def apply_incremental_page(plan: IncrementalPlan, page: list[dict], *, page_limi
 
     invalid_reason = validate_page(page, start_ms, end_ms)
     if invalid_reason is not None:
+        # Task 7.9d-D 補（2026-09-22 主線程裁決）：非法頁**不終止本輪**
+        # （`done=False`）——非法頁是上游回應有問題（例如回傳窗口外的成交），
+        # 不是「這一輪跑完了」的結論。游標、`synced_through_ms`、`pages_done`
+        # 一律不動，只留 `last_error`，下一次從同一個游標再試；一頁都不收
+        # （`accepted=[]`，不信任這一頁的任何內容）。遍歷軌同形處理見
+        # `apply_scan_page`（那裡的舊行為更嚴重：`done=True` 但 `result` 仍
+        # `None`，寫回時撞 `completeness` NOT NULL）。
         new_state = dataclasses.replace(
             state, last_error=f"invalid_page:{invalid_reason}", updated_at=now_ms / 1000)
-        return IncrementalResult(state=new_state, accepted=[], done=True, note=invalid_reason)
+        return IncrementalResult(state=new_state, accepted=[], done=False, note=invalid_reason)
 
     times = [int(f["time"]) for f in page]
     observed_from = state.observed_from_ms
@@ -307,8 +314,16 @@ def apply_scan_page(plan: ScanPlan, page: list[dict], *, page_limit: int = PAGE_
 
     invalid_reason = validate_page(page, start_ms, end_ms)
     if invalid_reason is not None:
+        # Task 7.9d-D 補（2026-09-22 主線程裁決；S builder 在正式機情境抓到）：
+        # 非法頁**不得終止遍歷**。舊版回 `done=True` 但 `result` 仍是 `None`
+        # ——呼叫端據此把 scan 送進 `ExploreStore.complete_scan`，
+        # `fills_sync.completeness` 被寫 NULL 撞 NOT NULL → `IntegrityError`
+        # → job 隔離 24 小時、這一頁的資料也沒落地。改為續跑：游標／
+        # `pages_done`／`fills_in_window` 都不動（這一頁完全不採信），只留
+        # `last_error`，下一次 `plan_scan` 從同一個游標再試；`result`／`reason`
+        # 維持 `None`（只有真正的終止條件才配寫結論）。
         new_scan = dataclasses.replace(scan, last_error=f"invalid_page:{invalid_reason}")
-        return ScanPageResult(scan=new_scan, accepted=[], done=True, note=invalid_reason)
+        return ScanPageResult(scan=new_scan, accepted=[], done=False, note=invalid_reason)
 
     times = [int(f["time"]) for f in page]
     observed_from = scan.observed_from_ms

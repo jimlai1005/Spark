@@ -183,15 +183,36 @@ def test_apply_scan_page_empty_page_completes_observed_unchanged():
 
 
 def test_apply_scan_page_out_of_order_is_invalid_cursor_unchanged():
+    """Task 7.9d-D 補：非法頁**不終止本輪**（`done=False`）——舊版回
+    `done=True` 但 `result` 仍是 `None`，呼叫端把它當成「遍歷完成」送進
+    `complete_scan`，`completeness=NULL` 撞 NOT NULL → `IntegrityError` →
+    job 被隔離 24 小時、這一頁的資料也沒落地。非法頁是上游回應有問題，
+    不是遍歷的結論。"""
     scan = _scan(window_end_ms=1000, cursor_ms=50)
     plan = ScanPlan(start_ms=50, end_ms=1000, scan=scan)
     page = [_fill(60, 1), _fill(55, 2)]  # 降冪
     result = apply_scan_page(plan, page, page_limit=3, retention_threshold=100, now_ms=NOW)
-    assert result.done is True
+    assert result.done is False
     assert result.accepted == []
     assert result.scan.cursor_ms == 50
-    assert result.scan.last_error is not None
-    assert result.scan.last_error.startswith("invalid_page:")
+    assert result.scan.result is None and result.scan.reason is None
+    assert result.scan.last_error == "invalid_page:time_not_ascending"
+
+
+def test_apply_scan_page_out_of_range_page_retries_same_cursor_next_round():
+    """S builder 實地抓到的情境：上游回傳窗口外成交（`time_out_of_range`）。
+    scan 不得收尾——`pages_done` 不動、下一次 `plan_scan` 從同一個游標再試。"""
+    scan = _scan(window_end_ms=1000, cursor_ms=50, pages_done=2)
+    plan = ScanPlan(start_ms=50, end_ms=1000, scan=scan)
+    result = apply_scan_page(plan, [_fill(2000, 1)], page_limit=3, retention_threshold=100,
+                             now_ms=NOW)
+    assert result.done is False and result.accepted == []
+    assert result.scan.result is None
+    assert result.scan.pages_done == 2
+    assert result.scan.fills_in_window == scan.fills_in_window
+    assert result.scan.last_error == "invalid_page:time_out_of_range"
+    retry = plan_scan(result.scan)
+    assert (retry.start_ms, retry.end_ms) == (50, 1000)
 
 
 def test_apply_scan_page_hits_page_cap_on_20th_consecutive_full_page():
@@ -322,13 +343,19 @@ def test_apply_incremental_page_full_page_continues():
 
 
 def test_apply_incremental_page_invalid_page_marks_error():
-    state = _sync(window_end_ms=1000, cursor_ms=50)
+    """Task 7.9d-D 補：非法頁不終止本輪（與 `apply_scan_page` 同形）——
+    游標與 `synced_through_ms` 都不動，只留 `last_error`，下一次從同一個
+    游標再試（上游回應有問題不等於這一輪跑完了）。"""
+    state = _sync(window_end_ms=1000, cursor_ms=50, synced_through_ms=40)
     plan = IncrementalPlan(start_ms=50, end_ms=1000, state=state)
     page = [_fill(2000, 1)]  # 超出 [50,1000]
     result = apply_incremental_page(plan, page, now_ms=NOW)
-    assert result.done is True
+    assert result.done is False
     assert result.accepted == []
-    assert "invalid_page:" in result.state.last_error
+    assert result.state.cursor_ms == 50
+    assert result.state.synced_through_ms == 40
+    assert result.state.pages_done == state.pages_done
+    assert result.state.last_error == "invalid_page:time_out_of_range"
 
 
 # --- 對外契約：external_coverage_state / build_fills_coverage ---

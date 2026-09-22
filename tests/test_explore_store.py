@@ -1134,6 +1134,23 @@ def test_complete_scan_returns_missing_when_no_fills_sync_row(tmp_path):
 
 # D2：observed_from/to 維護
 
+def test_complete_scan_rejects_scan_without_result(tmp_path):
+    """Task 7.9d-D 補：`result is None` 的 scan 不是「完成」——舊版讓它寫進
+    `fills_sync.completeness`（NOT NULL）撞 `IntegrityError`，job 被隔離 24
+    小時、那一頁 fills 也沒落地。改為進入函式就 `ValueError`（訊息含
+    `scan_id`）、**什麼都不寫**：scan 仍 running、fills 未落地，呼叫端下一次
+    從同游標續跑（非法頁的正確處置見 `apply_scan_page`）。"""
+    store, c = _store(tmp_path)
+    scan = _bootstrapped(store, c)
+    half_done = dataclasses.replace(scan, last_error="invalid_page:time_out_of_range",
+                                    finished_at=c.now())
+    with pytest.raises(ValueError, match=scan.scan_id):
+        store.complete_scan("0xabc", [_fill(tid=11, time_ms=500)], half_done)
+    assert store.get_scan(scan.scan_id).status == "running"
+    assert store.get_fills("0xabc", 0, 10_000) == []
+    assert store.get_sync("0xabc").scan_id is None
+
+
 def test_complete_scan_merges_scan_observed_range_into_fills_sync(tmp_path):
     """W2：新地址第一次遍歷完成後，對外 `observed_from/to` 必須非 null 且
     等於這次遍歷看到的成交極值（7.9b 只把極值寫進 `fills_scan`，`fills_sync`

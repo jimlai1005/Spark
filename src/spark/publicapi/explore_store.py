@@ -1043,7 +1043,21 @@ class ExploreStore:
         `MISSING`（無 `fills_sync` 列）／`DUPLICATE`（已經指向這筆 scan）／
         `STALE`（目前指向 `started_at` 更晚的 scan）／`APPLIED`。三種非
         `APPLIED` 都不動 `fills_sync`，但 fills 仍落地、`fills_scan` 仍標
-        `done`——資料不丟。DB 例外照常往外拋（不吞）。"""
+        `done`——資料不丟。DB 例外照常往外拋（不吞）。
+
+        Task 7.9d-D 補（2026-09-22 主線程裁決）：`scan.result is None` 一律
+        `ValueError`（訊息含 `scan_id`）且**不寫任何東西**——`result` 是寫進
+        `fills_sync.completeness`（NOT NULL）的值，None 代表這次遍歷其實沒有
+        結論（例如非法頁：舊版的 `apply_scan_page` 會回 `done=True`／
+        `result=None`），讓它進來只會在 UPDATE 到一半時撞 `IntegrityError`
+        ——那時 `fills_scan` 已經被標 `done`、job 被隔離 24 小時，狀態比一開始
+        更糟。沒有結論的遍歷應該續跑（見 `explore_fills_sync.apply_scan_page`
+        的非法頁分支），不是完成。"""
+        if scan.result is None:
+            raise ValueError(
+                f"complete_scan 拒絕沒有結論的遍歷（result is None）：scan_id={scan.scan_id}"
+                f" address={_norm(address)} last_error={scan.last_error!r}——"
+                "沒有結論代表這一輪還沒跑完（例如非法頁），應該續跑而不是收尾")
         addr = _norm(address)
         with self._lock, self._db:
             for f in fills:
