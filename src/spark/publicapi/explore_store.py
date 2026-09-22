@@ -47,7 +47,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,22 @@ REASON_PROBE_NO_EARLIER_FILLS = "count_below_retention_threshold_probe_empty"
 # 本清單的 kind（例如未來新增而忘了同步）仍會照實回報，不會被吃掉。
 JOB_KINDS = ("candidates", "state", "portfolio", "ledger", "fills", "fills_scan",
              "fills_verify")
+
+# Task 7.9e-D D3（7.9d 複審 S3）：準入上限＝`refresh_job` 總數 ≤
+# `ADMISSION_MULTIPLIER` × active 候選數。每個地址最多 6 種 per-address kind
+# （`JOB_KINDS` 扣掉全域的 `candidates`）＋ `candidates` 本身 ＋ 餘裕，故為 7。
+# 放在資料層是因為它是純常數、且兩個消費端（`explore_scheduler` 的排程准入與
+# `app.py` 的詳情頁補排）都需要它——`app.py` 不該為了一個常數 import 整個
+# scheduler（那會把排程模組拉進 web 層的 import 圖）。
+ADMISSION_MULTIPLIER = 7
+
+# 推進某個 `fills_scan.kind` 所需的 `refresh_job.kind`（Task 7.9e-D D1）：
+# `verify` 遍歷由 `fills_verify` job 推進，`initial`／`partial_rescan` 由
+# `fills_scan` job 推進。孤兒判準（`count_scans`）必須照這張對照表比對，不能
+# 寫死 `fills_scan`——否則「running verify ＋ 正確的 fills_verify job」會被算
+# 成孤兒，對帳跟著重複建工作。
+JOB_KIND_FOR_SCAN_KIND = {"verify": "fills_verify", "initial": "fills_scan",
+                          "partial_rescan": "fills_scan"}
 
 # schema_version：1（初版）→2（Task 7.5：`fills_sync.params_fp` 欄位＋既有
 # complete／reason=NULL 列補標）→3（Task 7.9b：遍歷軌／增量軌分離，見
@@ -193,6 +209,26 @@ def _migration_spread_s(address: str, period_s: float) -> float:
     except ValueError:
         n = abs(hash(address))
     return float(n % int(period_s))
+
+
+class ScanTarget(NamedTuple):
+    """`ExploreStore.scan_job_targets` 的一列（Task 7.9d-D／7.9e-D D4）：對帳
+    要判斷「這個地址需要哪一種遍歷工作」所需的全部狀態，一句 SQL 取齊。
+
+    `NamedTuple`（不是 dataclass）是刻意的——既能用欄位名讀，也仍然是 tuple，
+    既有以 tuple 比較的測試與呼叫端不必改寫。
+
+    - `running_scan_id`：進行中的遍歷（續跑同一個 scan 與游標用）；`None` ＝無。
+    - `evidence_unknown`：`fills_sync.evidence_unknown`（0／1；無 `fills_sync`
+      列時 0）——1 代表這個地址的完整性結論缺可追溯證據，需要一次 `verify`。
+    - `has_done_verify`：該地址是否已經有一次 **完成** 的 `verify` 遍歷
+      （`fills_scan.kind='verify' AND status='done'`）。與 `evidence_unknown`
+      獨立：「核驗過但旗標還在」與「從未核驗」是兩種不同的處置。
+    """
+    address: str
+    running_scan_id: str | None
+    evidence_unknown: int
+    has_done_verify: bool
 
 
 @dataclass(frozen=True)
@@ -916,9 +952,14 @@ class ExploreStore:
         - `running_rows`：`status='running'` 的 `fills_scan` 列數。
         - `running_addresses`：上列涵蓋的**地址數**（同址理論上只有一筆
           running，但列數與地址數要分開回報才看得出異常）。
-        - `orphan_rows`：running 但該地址**沒有** `fills_scan` job 的列數
+        - `orphan_rows`：running 但該地址**沒有對應 kind 的 job** 的列數
           ——這就是「遍歷停在半路、沒有任何 job 會推進它」的孤兒數（對帳
           `reconcile_scan_jobs` 要把它們補回 job，續跑同一個 `scan_id`）。
+          Task 7.9e-D D1（7.9d 複審 W1）：對應關係由
+          `JOB_KIND_FOR_SCAN_KIND` 決定（`verify` ↔ `fills_verify`，
+          `initial`／`partial_rescan` ↔ `fills_scan`）——舊版寫死
+          `fills_scan`，把「running verify ＋ 正確的 fills_verify job」誤算
+          成孤兒（複審 `rv_orphan.py` 實跑 orphan_rows=1）。
         - `inactive_running_rows`：running 但地址已不在 `active` 集合內；
           `active=None`（沒問）→ 0，不臆測。
 
@@ -936,28 +977,35 @@ class ExploreStore:
             inactive_expr = "COUNT(*)"       # active 集合為空 → 全部都是 inactive
         else:
             inactive_expr = "0"              # 沒問就不分列
+        pairs = tuple(sorted(JOB_KIND_FOR_SCAN_KIND.items()))
+        kind_case = ("CASE s.kind " + " ".join(["WHEN ? THEN ?"] * len(pairs))
+                     + " ELSE 'fills_scan' END")
+        kind_params = tuple(v for pair in pairs for v in pair)
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT COUNT(*), COUNT(DISTINCT s.address), "
                 "SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM refresh_job j "
-                "  WHERE j.address = s.address AND j.kind='fills_scan') THEN 1 ELSE 0 END), "
+                f"  WHERE j.address = s.address AND j.kind = {kind_case}) THEN 1 ELSE 0 END), "
                 f"{inactive_expr} "
-                "FROM fills_scan s WHERE s.status='running'", addrs).fetchone()
+                "FROM fills_scan s WHERE s.status='running'",
+                kind_params + addrs).fetchone()
         return {"running_rows": row[0], "running_addresses": row[1],
                 "orphan_rows": row[2] or 0, "inactive_running_rows": row[3] or 0}
 
-    def scan_job_targets(self, active: set[str]) -> list[tuple[str, str | None]]:
-        """對帳用（2026-09-22 使用者第二輪裁決點 1／3）：每個 **active** 地址一列
-        `(address, 進行中遍歷的 scan_id 或 None)`，依地址排序。
+    def scan_job_targets(self, active: set[str]) -> list[ScanTarget]:
+        """對帳用（2026-09-22 使用者第二輪裁決點 1／3；Task 7.9e-D D4 補兩欄）：
+        每個 **active** 地址一列 `ScanTarget`，依地址排序。
 
-        單句 SQL（`VALUES` CTE ＋ `LEFT JOIN fills_scan`）——`reconcile_scan_jobs`
-        原本要對 300 個地址各做一次 `running_scan(addr)` 點查（21ms/次）。
-        `None` ＝該地址目前沒有進行中的遍歷（對帳端再依 `completeness`／
-        partial 到期決定要不要建新的；有 `scan_id` 時一律**續跑同一個**
-        scan 與游標，不得整窗重抓）。
+        單句 SQL（`VALUES` CTE ＋ 兩個 `LEFT JOIN` ＋ 一個 `EXISTS`）——
+        `reconcile_scan_jobs` 原本要對 300 個地址各做一次 `running_scan(addr)`
+        點查（21ms/次），第四原因碼（`verify_needed`）又會再加兩次點查。
+        `running_scan_id is None` ＝該地址目前沒有進行中的遍歷（對帳端再依
+        `completeness`／partial 到期／`evidence_unknown` 決定要不要建新的；有
+        `scan_id` 時一律**續跑同一個** scan 與游標，不得整窗重抓）。
 
-        母體就是傳入的 `active` 集合本身（候選表裡沒有的地址也會回一列
-        `(addr, None)`，不靜默吃掉）；空集合 → `[]`（不下 SQL）。"""
+        母體就是傳入的 `active` 集合本身（候選表裡沒有的地址也會回一列，
+        `running_scan_id=None`／`evidence_unknown=0`，不靜默吃掉）；空集合
+        → `[]`（不下 SQL）。"""
         addrs = sorted({_norm(a) for a in active})
         if not addrs:
             return []
@@ -965,10 +1013,51 @@ class ExploreStore:
         with self._lock, self._db:
             rows = self._db.execute(
                 f"WITH a(address) AS (VALUES {values}) "
-                "SELECT a.address, s.scan_id FROM a "
+                "SELECT a.address, s.scan_id, COALESCE(f.evidence_unknown, 0), "
+                "  EXISTS (SELECT 1 FROM fills_scan v WHERE v.address = a.address "
+                "          AND v.kind='verify' AND v.status='done') "
+                "FROM a "
                 "LEFT JOIN fills_scan s ON s.address = a.address AND s.status='running' "
+                "LEFT JOIN fills_sync f ON f.address = a.address "
                 "ORDER BY a.address", tuple(addrs)).fetchall()
-        return [(r[0], r[1]) for r in rows]
+        return [ScanTarget(address=r[0], running_scan_id=r[1], evidence_unknown=r[2],
+                           has_done_verify=bool(r[3])) for r in rows]
+
+    def verify_needed(self, active: set[str]) -> dict[str, int]:
+        """核驗需求的單一數字來源（Task 7.9e-D D2，7.9d 複審 C2）——母體＝
+        `evidence_unknown=1` 且地址在 `active` 內的 `fills_sync` 列：
+
+        - `rows`：需要一次核驗遍歷的 active 地址數。
+        - `with_job`：其中已有 `fills_verify` job 的數。
+        - `with_running`：其中已有進行中（`status='running'`）`verify` 遍歷的數。
+        - `unserved`：兩者皆無——**狀態需要核驗但沒有任何工作在服務它**。
+
+        為什麼需要這個而不是看 `count_jobs_by_kind()["fills_verify"]`：job 列數
+        歸零可能是「核驗做完了」，也可能是「job 被退池掃除／kind 不相容閘門刪掉，
+        而 `evidence_unknown` 永遠留在 1」（7.9d 複審 C2 的實況：3 天模擬收尾
+        `verify_remaining == 0` 但 17 個地址仍 `evidence_unknown == 1`，health
+        完全看不出來）。核驗真的做完的判準是 `rows == 0`；排程健康的判準是
+        `unserved == 0`。
+
+        單句 SQL；`active` 為空集合 → 四個 0（不下 SQL）。"""
+        addrs = tuple(sorted({_norm(a) for a in active}))
+        if not addrs:
+            return {"rows": 0, "with_job": 0, "with_running": 0, "unserved": 0}
+        placeholders = ",".join("?" * len(addrs))
+        has_job = ("EXISTS (SELECT 1 FROM refresh_job j WHERE j.address = f.address "
+                   "AND j.kind='fills_verify')")
+        has_running = ("EXISTS (SELECT 1 FROM fills_scan v WHERE v.address = f.address "
+                       "AND v.kind='verify' AND v.status='running')")
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT COUNT(*), "
+                f"SUM(CASE WHEN {has_job} THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN {has_running} THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN {has_job} OR {has_running} THEN 0 ELSE 1 END) "
+                "FROM fills_sync f WHERE f.evidence_unknown=1 "
+                f"AND f.address IN ({placeholders})", addrs).fetchone()
+        return {"rows": row[0], "with_job": row[1] or 0, "with_running": row[2] or 0,
+                "unserved": row[3] or 0}
 
     def latest_done_scan(self, address: str) -> FillsScan | None:
         """Task 7.9c D8：該地址 `status='done'` 中 `finished_at` 最大的一筆

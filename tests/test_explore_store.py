@@ -1573,6 +1573,113 @@ def test_count_jobs_by_kind_splits_active_and_inactive_rows(tmp_path):
                                     "inactive_rows": 0}
 
 
+def _mark_evidence_unknown(store, *addresses):
+    """把 `fills_sync.evidence_unknown` 設 1（遷移產生的「證據不明」狀態；
+    資料層沒有公開 setter，這裡直接寫 DB 造狀態）。"""
+    with store._db:
+        for addr in addresses:
+            store._db.execute(
+                "UPDATE fills_sync SET evidence_unknown=1 WHERE address=?", (addr,))
+
+
+def test_count_scans_orphan_requires_job_of_the_matching_kind(tmp_path):
+    """Task 7.9e-D D1（7.9d 複審 W1）：孤兒＝running scan 且**沒有對應 kind
+    的 job**。`verify` scan 由 `fills_verify` job 推進、`initial`／
+    `partial_rescan` 由 `fills_scan` job 推進——判準寫死 `fills_scan` 會把
+    「running verify＋正確的 fills_verify job」誤算成孤兒（複審 `rv_orphan.py`
+    實跑 orphan_rows=1）。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xaaa", "A", 1, 0.1)], as_of=c.now())
+    store.create_scan("0xaaa", kind="verify", window_start_ms=0, window_end_ms=1000,
+                      cursor_ms=0, started_at=c.now())
+    store.enqueue("0xaaa:fills_verify", "0xaaa", "fills_verify", priority=4,
+                  next_attempt_at=c.now())
+    assert store.count_scans(_active(store))["orphan_rows"] == 0
+
+    # 同一個 running verify，job 換成 fills_scan（kind 不對）→ 沒有東西會推進它。
+    store.delete_jobs("0xaaa")
+    store.enqueue("0xaaa:fills_scan", "0xaaa", "fills_scan", priority=3,
+                  next_attempt_at=c.now())
+    assert store.count_scans(_active(store))["orphan_rows"] == 1
+
+
+def test_count_scans_orphan_for_initial_scan_requires_fills_scan_job(tmp_path):
+    """反向配對：`initial` scan 要 `fills_scan` job，只有 `fills_verify` 不算。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", "A", 1, 0.1)], as_of=c.now())
+    _bootstrapped(store, c, "0xabc")                      # running initial
+    store.enqueue("0xabc:fills_verify", "0xabc", "fills_verify", priority=4,
+                  next_attempt_at=c.now())
+    assert store.count_scans(_active(store))["orphan_rows"] == 1
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", priority=3,
+                  next_attempt_at=c.now())
+    assert store.count_scans(_active(store))["orphan_rows"] == 0
+
+
+def test_verify_needed_counts_unknown_evidence_and_the_work_serving_it(tmp_path):
+    """Task 7.9e-D D2：核驗需求的單一數字來源——`verify_remaining`（job 列數）
+    歸零不代表核驗做完（7.9d 複審 C2：job 被掃除後 `evidence_unknown` 永久
+    留 1，health 看不出來）。`unserved` 才是「狀態需要核驗但沒有任何工作在
+    服務它」的筆數。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xa1", "A", 1, 0.1), ("0xa2", "B", 2, 0.2),
+                             ("0xa3", "C", 3, 0.3), ("0xa4", "D", 4, 0.4)], as_of=c.now())
+    for addr in ("0xa1", "0xa2", "0xa3", "0xa4"):
+        store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
+                                      params_fp="pfp")
+    _mark_evidence_unknown(store, "0xa1", "0xa2", "0xa3")   # 0xa4 證據充分
+    store.enqueue("0xa1:fills_verify", "0xa1", "fills_verify", priority=4,
+                  next_attempt_at=c.now())                  # 有 job
+    store.create_scan("0xa2", kind="verify", window_start_ms=0, window_end_ms=1000,
+                      cursor_ms=0, started_at=c.now())      # 有 running verify
+    # 0xa3：兩者皆無 → unserved。
+    assert store.verify_needed(_active(store)) == {
+        "rows": 3, "with_job": 1, "with_running": 1, "unserved": 1}
+
+    # 退池的地址不算需求（對帳只對 active 地址補工作）。
+    store.deactivate_missing({"0xa1", "0xa2"})
+    assert store.verify_needed(_active(store)) == {
+        "rows": 2, "with_job": 1, "with_running": 1, "unserved": 0}
+    assert store.verify_needed(set()) == {"rows": 0, "with_job": 0, "with_running": 0,
+                                          "unserved": 0}
+
+
+def test_verify_needed_reproduces_prod_snapshot_shape(tmp_path):
+    """正式機快照複本（`prod_meta_v2.db` 遷移後，300 active 候選）實跑值：
+    `verify_needed(active) == {"rows": 112, "with_job": 112, "with_running": 0,
+    "unserved": 0}`（129 筆 `fills_verify` job 中 112 筆屬於 active 地址，其餘
+    17 筆屬於退池地址、不算需求）。測試不讀正式機檔案（離線紅線），改在
+    tmp DB 重建同一組形狀並釘住同一組數字。"""
+    store, c = _store(tmp_path)
+    rows = [(f"0x{i:04x}", None, i, None) for i in range(300)]
+    store.upsert_candidates(rows, as_of=c.now())
+    for addr, *_ in rows:
+        store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
+                                      params_fp="pfp")
+    unknown = [addr for addr, *_ in rows[:112]]
+    _mark_evidence_unknown(store, *unknown)
+    for addr in unknown:
+        store.enqueue(f"{addr}:fills_verify", addr, "fills_verify", priority=4,
+                      next_attempt_at=c.now())
+    # 另外 17 筆退池地址的 verify job（快照裡 129 − 112）：不算 active 需求。
+    for i in range(17):
+        addr = f"0xdead{i:02x}"
+        store.enqueue(f"{addr}:fills_verify", addr, "fills_verify", priority=4,
+                      next_attempt_at=c.now())
+    assert store.count_jobs_by_kind()["fills_verify"]["rows"] == 129
+    assert store.verify_needed(_active(store)) == {
+        "rows": 112, "with_job": 112, "with_running": 0, "unserved": 0}
+
+
+def test_admission_multiplier_lives_in_the_data_layer(tmp_path):
+    """Task 7.9e-D D3（複審 S3）：準入倍數是純常數，放在無依賴的資料層，
+    `app.py` 不必為了一個常數 import 整個 scheduler。"""
+    from spark.publicapi.explore_store import ADMISSION_MULTIPLIER, JOB_KINDS
+    assert ADMISSION_MULTIPLIER == 7
+    # 6 種 per-address kind ＋ candidates 全域 job ＋ 餘裕。
+    assert len([k for k in JOB_KINDS if k != "candidates"]) == 6
+
+
 def test_count_scans_reports_running_orphan_and_inactive_rows(tmp_path):
     store, c = _store(tmp_path)
     assert store.count_scans() == {"running_rows": 0, "running_addresses": 0,
@@ -1626,8 +1733,10 @@ def test_delete_inactive_jobs_with_empty_active_set_keeps_global_jobs(tmp_path):
 
 
 def test_scan_job_targets_returns_one_row_per_active_address(tmp_path):
-    """對帳用：每個 active 地址一列 `(address, running_scan_id or None)`
-    ——單句 LEFT JOIN，不做 300 次點查；`None` ＝沒有進行中的遍歷。"""
+    """對帳用：每個 active 地址一列
+    `(address, running_scan_id, evidence_unknown, has_done_verify)`——單句
+    LEFT JOIN，不做 300 次點查；`running_scan_id is None` ＝沒有進行中的遍歷。
+    Task 7.9e-D D4：後兩欄讓 S 的第四原因碼（`verify_needed`）一句 SQL 拿齊。"""
     store, c = _store(tmp_path)
     store.upsert_candidates([("0xAAA", "A", 1, 0.1), ("0xbbb", "B", 2, 0.2)], as_of=c.now())
     scan = _bootstrapped(store, c, "0xaaa")
@@ -1635,13 +1744,43 @@ def test_scan_job_targets_returns_one_row_per_active_address(tmp_path):
     store.upsert_candidates([("0xaaa", "A", 1, 0.1), ("0xbbb", "B", 2, 0.2)], as_of=c.now())
 
     targets = store.scan_job_targets(_active(store))
-    assert targets == [("0xaaa", scan.scan_id), ("0xbbb", None)]
+    assert targets == [("0xaaa", scan.scan_id, 0, False), ("0xbbb", None, 0, False)]
+    assert targets[0].address == "0xaaa" and targets[0].running_scan_id == scan.scan_id
+    assert targets[0].evidence_unknown == 0 and targets[0].has_done_verify is False
     # 完成後同一個地址回 None（不再需要續跑）。
     store.complete_scan("0xaaa", [], dataclasses.replace(
         scan, cursor_ms=scan.window_end_ms, result="complete",
         reason="count_below_retention_threshold", finished_at=c.now()))
-    assert store.scan_job_targets(_active(store)) == [("0xaaa", None), ("0xbbb", None)]
+    assert store.scan_job_targets(_active(store)) == [("0xaaa", None, 0, False),
+                                                      ("0xbbb", None, 0, False)]
     assert store.scan_job_targets(set()) == []
+
+
+def test_scan_job_targets_reports_evidence_unknown_and_done_verify(tmp_path):
+    """D4：`evidence_unknown`（遷移列的證據不明旗標）與 `has_done_verify`
+    （該地址已經跑完過一次 `verify` 遍歷）各自獨立——已經核驗過但旗標還在，
+    與從未核驗過，是兩種不同的處置。"""
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xa1", "A", 1, 0.1), ("0xa2", "B", 2, 0.2)], as_of=c.now())
+    for addr in ("0xa1", "0xa2"):
+        store.bootstrap_address_fills(addr, c.now(), window_start_ms=0, window_end_ms=1000,
+                                      params_fp="pfp")
+    _mark_evidence_unknown(store, "0xa1", "0xa2")
+    # 0xa2 另外有一次已完成的 verify 遍歷（running 的那個是 initial，不算 done）。
+    verify = store.create_scan("0xa2", kind="verify", window_start_ms=0, window_end_ms=500,
+                               cursor_ms=0, started_at=c.now())
+    store.complete_scan("0xa2", [], dataclasses.replace(
+        verify, cursor_ms=500, result="partial", reason="retention_limit",
+        finished_at=c.now() + 1))
+    _mark_evidence_unknown(store, "0xa2")   # complete_scan 會清旗標，重新造狀態
+
+    targets = {t.address: t for t in store.scan_job_targets(_active(store))}
+    assert targets["0xa1"].evidence_unknown == 1
+    assert targets["0xa1"].has_done_verify is False
+    assert targets["0xa2"].evidence_unknown == 1
+    assert targets["0xa2"].has_done_verify is True
+    # running 欄位仍只看 running scan（0xa2 的 initial 還在跑）。
+    assert targets["0xa2"].running_scan_id == store.running_scan("0xa2").scan_id
 
 
 def test_count_due_by_kind_counts_only_due_and_lease_free_jobs(tmp_path):
