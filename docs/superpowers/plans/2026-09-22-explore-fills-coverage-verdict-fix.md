@@ -849,10 +849,37 @@ from spark.publicapi.explore_store import ExploreStore
 import json; print(json.dumps(ExploreStore('/tmp/explore.copy.db').last_migration_report(), indent=1))"
 ```
 
-Expected: 遷移後 `partial` 增加 ≈158、`complete` ≈131、`backfilling` ≈105；
-`probes_needed` ≈ 290、`verify_needed` 0（evidence_unknown 已被本次遷移吸收進
-`left_boundary_unknown`）。**把實際數字填進本 plan 的狀態表**，若
-`probes_needed` × 1 頁 ÷ 實測 fills 吞吐 > 24 小時，回報主線程重新裁決，不得逕行部署。
+**實跑結果（2026-09-22，主線程在 08:24 UTC 複本上獨立重現兩次，數字一致）**：
+
+```
+report = {"before": {"backfilling": 83, "complete": 300, "partial": 14},
+          "after":  {"backfilling": 97, "complete": 135, "partial": 165},
+          "work":   {"probes_needed": 198, "scans_to_resume": 97, "verify_needed": 0}}
+fills 1,051,273 → 1,051,273（EQUAL）；83 個 running scan 游標漂移 0 筆；
+left_boundary: earlier_fills_seen 135 / unknown 262；schema_version 4
+```
+
+⚠️ **消化時間的算式修正（主線程 2026-09-22 自我糾錯）**：本 plan 原本寫
+「`probes_needed` ÷ 60 頁/小時」，**那是錯的**——獨立探測路徑（`_serve_special`／
+`next_probe_candidate`）走的是**輔助份額**（`SPECIAL_SERVE_RATIO = 9`，每 9 頁 fills-like
+才 1 次），不是 fills 全速。只有「有 `fills_scan` job 在跑」的位址才走探測前置的全速路徑。
+
+實測分流（active 且待探測 198 個）：
+
+| 路徑 | 位址數 | 速率 | 消化時間 |
+|---|---|---|---|
+| inline（有 scan job，吃 fills 全速） | 61（backfilling） | ~56 頁/小時 | < 1.5 小時 |
+| standalone（輔助份額） | 137（partial／等證據） | ~6 頁/小時 | **≈ 22 小時** |
+
+22 小時低於 24 小時門檻，但榜單會難看整整一天。處置見 Task 8（D-C 授權的「暫時提高輔助份額」
+——把 `SPECIAL_SERVE_RATIO` 暫調為 3 可壓到約 10 小時，且逾期自動恢復）。
+
+**副作用（好的）**：`verify_needed = 0`——根因 3 的 131 個待核驗列被本次遷移**吸收**了。
+它們的 `evidence_unknown` 歸零，改成「缺左界證據」，而補證據只要 **1 頁探測**，
+不再是一次多頁的核驗遍歷。既有的 131 個 `fills_verify` job 會被既有的狀態推導邏輯
+自動判為 obsolete 丟棄（`_verify_job_obsolete`）。因此 **Task 8 原本的
+`scripts/ops_expedite_verify.py` 不再需要**，D-C 的目標從「提前核驗」改為「加速探測」，
+機制（暫時調整輔助份額、逾期自動恢復）不變。
 
 - [ ] **Step 6: Commit**
 
@@ -1137,7 +1164,15 @@ git commit -m "test: 300 地址競爭負載下的覆蓋收斂、反向護欄與�
 
 ---
 
-## Task 8: 新判準真的被正式流程執行——兩個端到端測試 ＋ verify 加速 `@inline`
+## Task 8: 新判準真的被正式流程執行——兩個端到端測試 ＋ 輔助份額臨時加速 `@inline`
+
+> **主線程裁決（2026-09-22，Task 4 實跑後）**：`verify_needed = 0`——根因 3 的 131 個
+> 待核驗列已被 schema v4 遷移吸收（改成「缺左界證據」，補證據只要 1 頁探測）。
+> 因此 **Step 5 的 `scripts/ops_expedite_verify.py` 取消，不要寫**。
+> D-C 授權的「暫時提高輔助份額」仍然要做，但目標從 verify 改為 **probe**：
+> 遷移後有 137 個位址要走輔助份額拿證據，預設 9:1 約需 22 小時，調成 3:1 約 10 小時。
+> `SPECIAL_SERVE_RATIO` 的預設值 9 是使用者 2026-09-21 的裁決，**不得更動**；
+> 只能加一個帶到期時間、逾期自動恢復的 env 覆寫。
 
 **Files:**
 - Modify: `tests/test_explore_scheduler.py`
@@ -1277,10 +1312,11 @@ git commit -m "docs: RUNBOOK §5.8f 第八次部署程序（schema v4、證據�
 
 | Task | 狀態 | 驗收證據 |
 |---|---|---|
-| 1 覆蓋結論三項證據合成 | 未開始 | |
-| 2 頁數上限與停止語義 | 未開始 | |
-| 3 左界證據前置與快取 | 未開始 | |
-| 4 schema v4 遷移 | 未開始 | |
+| 1 覆蓋結論三項證據合成 | ✅ `70c4f7c` | 主線程複跑 `pytest -q` 3315 passed、ruff 全過、`stop_reason` 值域封閉 |
+| 2 頁數上限與停止語義 | ✅ `70c4f7c`（與 1 同 commit） | 同上；builder 實測補上 `cursor_ms < window_end_ms` 第四條件 |
+| 3 左界證據前置與快取 | ✅ `0a58e6d` | 主線程複跑 3319 passed；`get_left_boundary = lambda` 零命中（掩體已拆） |
+| 3b 證據到齊就地重算 | ✅ `511f727` | 主線程複跑 3325 passed；`scan_verdict` 呼叫點確認只有 2 處 |
+| 4 schema v4 遷移 | ✅ `c3651ad` | 主線程在複本獨立重現遷移：fills 1,051,273 前後相同、83 個游標零漂移、report 與 builder 一致 |
 | 5 週期依成交速率 | 未開始 | |
 | 6 子預算原子借用 | 未開始 | |
 | 7 300 地址競爭驗收 | 未開始 | |
