@@ -1683,6 +1683,10 @@ complete 的小帳戶壓成 partial；它們沒有 running scan、沒有 job，�
 `truncation_suspected` 80 與 `left_boundary_truncated` 41（**現行機制下不會完成**，需探測窗待辦＋Task 12／13）。
 預估 48h 後 complete ≈ 175–185，剩約 120 個卡在 `truncation_suspected`。
 
+> **2026-09-23 02:40 UTC**：Task 12（遍歷 job 到期改 now）、探測窗全史化（第一優先待辦）、Task 13（v3 游標正規化）
+> 已合併成下一份 plan **`docs/superpowers/plans/2026-09-23-explore-probe-window-scan-cadence.md`**（裁決 D-K～D-O，
+> 使用者 2026-09-23 核可，已開工）。本節其餘項目（W4、ops.py:157、config 註解、7b docstring）仍待議。
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
