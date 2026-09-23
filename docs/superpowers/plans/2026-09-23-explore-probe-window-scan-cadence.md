@@ -1,0 +1,247 @@
+# Explore 探測窗全史化、遍歷排程即時化、v3 游標正規化 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 讓第八次部署（`docs/superpowers/plans/2026-09-22-explore-fills-coverage-verdict-fix.md`）之後仍卡在
+「分析待完成」的三群位址在一次部署後收斂：約 120 個「疑似截斷」（探測窗太窄）、35 個遍歷被排到未來（排程缺陷）、
+95 個 v3 遺留列（游標偏移 ~5h 被判未抵達終點）。目標：重啟後 6–8 小時內，池內 300 個位址「能完成的都完成」
+（預估 complete 121 → ~250），剩下的是證據真的不足者。
+
+**Architecture:** 三處各自獨立、都只影響「快慢」不改判準的嚴格方向：(1) 左界探測的查詢窗從
+`[window_start − 1d, window_start)` 改為 `[0, window_start)`——問的本來就是「窗口起點之前有沒有**任何**可查成交」，
+全史窗一頁就能回答且成本相同；(2) `fills_scan` job 的首次到期一律 `now`（遍歷節奏是逐頁，不該套增量週期的分散）；
+(3) schema v5 遷移：把既有 `truncation_suspected` 重設為 `unknown` 讓新探測重跑、把 v3 遺留 scan 的游標正規化到
+`window_end_ms` 並就地重算結論。全部經既有的 `scan_verdict` 單一來源，不新增第二個結論路徑。
+
+**Tech Stack:** Python 3.11 + uv、SQLite `explore.db`（schema v4 → v5）、pytest 全離線、systemd `filet-api`。
+
+---
+
+## ⚠️ 正式機狀態（2026-09-23）
+
+- 第八次部署（`bbd7adf`，schema v4）2026-09-22 15:45 UTC 上線，24h 觀測至 09-23 15:45 UTC；至 02:00 UTC 為止
+  429＝0、Traceback（非已知類）＝0、follower 兩個 unit 時間戳不變。觀測日誌在前一份 plan 的「部署後觀測日誌」節。
+- **正式機仍有真實用戶跟單中**。本次同樣只重啟 `filet-api`，follower 與 timer 不動；回退＝前一份 plan §5.8f Step 7
+  的同一套（本次備份檔名 `explore.db.pre-v5.bak`）。
+- drop-in `explore-v4-verdict.conf` 的 `FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=2026-09-24T00:00:00Z`——本次會新增
+  ~120 個探測，部署時把到期時間**順延 24h**（Task 5）。
+
+## 背景：三個現象與各自根因（均已在正式機唯讀查證，2026-09-23 00:55–02:30 UTC）
+
+| 群組（池內 300） | 數量 | 根因 | 證據 |
+|---|---|---|---|
+| `truncation_suspected`（80 個 `traversal_incomplete`＋41 個 `left_boundary_truncated`） | ~121 | 探測窗只查 `[ws−1d, ws)`，低頻帳戶那一天沒交易就回空，再配合「首次活動早於窗口」被判疑似截斷 | 對 `0x5cee0ca5…` 實測：1 天窗 **0 筆**；全史窗 `[0, ws)` **2000 筆、最早 2025-02-26**（HL 保留一年）。本地 `fills` 表無法反證（0/23 有更早成交，因為我們只抓過 30 天窗） |
+| `backfilling`（16 個 0 頁、19 個未起步） | 35 | `_enqueue_address_jobs` 把 `fills_scan` 與 `fills` 一起用 `now + _spread(address, 增量週期)` 排；Task 5b 後冷門週期最長 24h → 第一頁遍歷可等 24h；再入池的地址 job 先被刪再被同算式重建，遍歷到一半也被延後；同輪 `_ensure_scan_job` 後跑、見 job 已存在而跳過 | 60 個 `fills_scan` job 全部排在 33 分鐘～23.9h 後、0 個到期；fills 額度每 15 分鐘只用 0–8 頁（上限 ~15） |
+| `traversal_incomplete`（v3 遺留） | 95 | v3 短頁收尾寫的 `cursor_ms` 比列上 `window_end_ms` 少 ~0.2 天；Task 10 W3 的 `scan_verdict` 嚴格要求游標抵達終點 | 95 個全是 `initial/done/pages_done=0/reason=count_below_retention_threshold_probe_empty`，`window_end − cursor ≈ 0.2d` |
+
+三者都是**方向安全**的缺陷（只少判 complete，沒有錯判完整）。
+
+## 需要使用者確認的裁決（寫 plan 時提出，開工前確認）
+
+| 代號 | 裁決 | 建議 |
+|---|---|---|
+| **D-K** | 探測窗改為 `[0, window_start)`（全史）。語義不變：「窗口起點之前有沒有任何可查成交」；HL 留存若是「最近 N 筆」（後綴截斷），全史窗回非空即代表截斷邊界早於窗口起點，窗內不可能被截。 | 採用 |
+| **D-L** | 探測回空時的判斷維持 Task 10 W5 的對稱模糊帶（`first_activity ≥ ws+1d` → `no_earlier_activity`；`< ws−1d` → `truncation_suspected`；其間 unknown）。全史窗回空＝「窗口前確無可查成交」，此時 `truncation_suspected` 的嫌疑才是實質的。 | 維持 |
+| **D-M** | 既有 `truncation_suspected` 列（池內 ~121）在遷移時**重設為 unknown**，由獨立探測用新窗重跑（每個 1 頁）；不等 24h 重掃。 | 採用 |
+| **D-N** | v3 遺留列（`pages_done=0` 且 v3 reason 為 `count_below_retention_threshold[_probe_empty]`、`window_end − cursor ≤ 1d`）在遷移時把 `cursor_ms` 正規化為 `window_end_ms` 並就地重算結論——而不是等 24h 重掃（95 頁）。 | 採用 |
+| **D-O** | `fills_scan` 首次到期改 `now`（≤60s jitter）；`fills`（增量）維持 `_spread(週期)`。 | 採用 |
+
+---
+
+## File Structure
+
+| 檔案 | 責任 |
+|---|---|
+| `src/spark/publicapi/explore_scheduler.py` | Task 1（`_enqueue_address_jobs` 的 `fills_scan` 到期）、Task 2（`_run_probe` 的探測窗） |
+| `src/spark/publicapi/explore_store.py` | Task 3（schema v5 遷移：重設 truncation_suspected、v3 游標正規化、就地重算、報告） |
+| `tests/test_explore_scheduler.py`、`tests/test_explore_store.py` | 對應測試；Task 4 整合驗收 |
+| `deploy/RUNBOOK.md` | Task 5：§5.8g 第九次部署程序 |
+
+**不得改動**：`explore_fills_sync.scan_verdict`／`_applicable_boundary` 的規則本身（判準已定案）、`hl_budget.py`、`web/`、
+`src/spark/copytrade/`、`src/spark/filet/`。
+
+---
+
+## Task 1: `fills_scan` 首次到期改為 `now` `@inline`
+
+**Files:** `src/spark/publicapi/explore_scheduler.py:1033-1054`；`tests/test_explore_scheduler.py`
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_new_address_initial_scan_job_is_due_within_60s(tmp_path):
+    """D-O：遍歷節奏是逐頁，第一頁不該等增量週期的分散。"""
+    sched = _scheduler_with_cold_candidate(tmp_path, address=ADDR, rank=250)   # 冷門：週期 24h
+    sched._run_candidates(now=NOW)                                             # 觸發 _enqueue_address_jobs
+    job = sched._store.get_job(f"{ADDR}:fills_scan")
+    assert job is not None and job.next_attempt_at <= NOW + 60
+
+
+def test_fills_incremental_job_still_spread_by_period(tmp_path):
+    """反向護欄：不得順手改壞增量的分散。"""
+    sched = _scheduler_with_cold_candidate(tmp_path, address=ADDR, rank=250)
+    sched._run_candidates(now=NOW)
+    job = sched._store.get_job(f"{ADDR}:fills")
+    assert job.next_attempt_at == NOW + _spread(ADDR, sched.fills_period_s_for(ADDR))
+
+
+def test_reentering_address_resumes_scan_immediately(tmp_path):
+    """候選池換血：退池（job 被刪、running scan 保留）→ 再入池 → scan job 60 秒內到期且續跑同一 scan_id。"""
+    h = _t7a_harness(tmp_path); h.set_fill_count(ADDR, window_fills=20_000)
+    h.run_for(hours=1); sid = h.scan_id(ADDR); cur = h.scan_cursor(ADDR)
+    h.churn_out(ADDR); h.run_for(minutes=31)          # 一輪 candidates：job 被刪
+    h.churn_in(ADDR);  h.run_for(minutes=31)          # 再入池
+    job = h.store.get_job(f"{ADDR}:fills_scan")
+    assert job.next_attempt_at <= h.now + 60
+    assert h.scan_id(ADDR) == sid and h.scan_cursor(ADDR) >= cur
+```
+
+- [ ] **Step 2: 執行確認失敗** — `uv run pytest tests/test_explore_scheduler.py -k "initial_scan_job_is_due or still_spread or reentering" -v` → FAIL。
+- [ ] **Step 3: 實作** — `_enqueue_address_jobs` 的 `for kind, priority, period_s in needed:` 迴圈內，`kind == "fills_scan"` 時
+  到期為 `now + self._jit(60.0)`（既有 jitter helper），其餘維持 `now + _spread(address, period_s)`。註解寫明 D-O 與根因。
+- [ ] **Step 4: 全套** — `uv run pytest -q` 全綠、`ruff` 過。
+- [ ] **Step 5: Commit** — `fix: fills_scan 首次到期改為 now——遍歷節奏逐頁，不套增量週期分散（D-O）`
+
+---
+
+## Task 2: 探測窗改為全史 `[0, window_start)` `@inline`
+
+**Files:** `src/spark/publicapi/explore_scheduler.py`（`_run_probe` 的 `probe_start`）、`tests/test_explore_scheduler.py`
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_probe_queries_full_history_before_window_start():
+    """D-K：探測窗起點為 0（全史），終點為 window_start − 1。"""
+    sched, hl = _scheduler_with_probe_capture(ADDR, window_start_ms=WS)
+    sched._run_probe((ADDR, SCAN_ID), now=NOW)
+    assert hl.last_probe_range == (0, WS - 1)
+
+
+def test_low_frequency_account_with_old_fills_is_earlier_fills_seen():
+    """0x5cee0ca5 的實況：ws 前一天沒交易、但一年前有 → 全史窗非空 → earlier_fills_seen，不再是疑似截斷。"""
+    sched, store = _scheduler_with_fills_at(ADDR, fill_times=[WS - 200 * DAY], first_activity_ms=WS - 300 * DAY)
+    sched._run_probe((ADDR, SCAN_ID), now=NOW)
+    assert store.get_left_boundary(ADDR, WS).state == "earlier_fills_seen"
+
+
+def test_empty_full_history_with_old_account_is_truncation_suspected():
+    """全史窗都回空且帳戶明顯更老 → 這時的截斷嫌疑才是實質的（D-L 維持）。"""
+    sched, store = _scheduler_with_fills_at(ADDR, fill_times=[], first_activity_ms=WS - 300 * DAY)
+    sched._run_probe((ADDR, SCAN_ID), now=NOW)
+    assert store.get_left_boundary(ADDR, WS).state == "truncation_suspected"
+
+
+def test_probe_page_settles_by_returned_count():
+    """成本：全史窗可能回滿 2000 筆，權重預留 120、依實際筆數結算——與一般 fills 頁同一套，不得繞過限流器。"""
+```
+
+- [ ] **Step 2: 執行確認失敗**。
+- [ ] **Step 3: 實作** — `_run_probe`：`probe_start = 0`、`probe_end = scan.window_start_ms - 1`；`validate_page` 的區間參數同步；
+  docstring 改寫語義（「窗口起點之前有沒有任何可查成交」）與 D-K 的截斷推理。`_PROBE_WINDOW_MS` 保留給 D-L 的模糊帶
+  （`first_activity` ± 1d），改名 `_FIRST_ACTIVITY_BAND_MS` 以免誤解為探測窗。
+- [ ] **Step 4: 既有測試** — Task 3／10／11 的探測測試若 fixture 依賴 1 天窗（例如把成交放在 `ws−1d` 內），改成放在
+  任何 `< ws` 的時間即可；斷言語義不變。
+- [ ] **Step 5: 全套綠、ruff 過。Commit** — `fix: 左界探測改查全史 [0, window_start)——低頻帳戶不再被 1 天窗誤判疑似截斷（D-K）`
+
+---
+
+## Task 3: schema v5 遷移——重設 truncation_suspected、v3 游標正規化、就地重算 `@inline`
+
+**Files:** `src/spark/publicapi/explore_store.py`（`_SCHEMA_VERSION=5`、`_migrate_v4_to_v5`、報告）、`tests/test_explore_store.py`
+
+**原則（沿用 D-G）**：原子＋冪等＋可重跑；不刪 `fills`；不建 job；輸出工作量報告；只改「結論」與「證據狀態」，
+游標只在 D-N 明定的條件下正規化。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+def test_migrate_v4_to_v5_resets_truncation_suspected_to_unknown():
+    """D-M：池內 truncation_suspected → unknown，且 left_boundary_window_start_ms/at 清空，成為探測候選。"""
+
+def test_migrate_v4_to_v5_normalizes_v3_cursor_and_recomputes():
+    """D-N：pages_done=0、v3 reason、window_end − cursor ≤ 1d → cursor := window_end；結論經 scan_verdict 重算。
+    有正面證據者 → complete；證據 unknown 者 → partial/left_boundary_unknown（等探測）。"""
+
+def test_migrate_v4_to_v5_does_not_touch_other_cursors():
+    """反向護欄：pages_done>0 或差距 >1d 或非 v3 reason 的 scan 游標一字不動。"""
+
+def test_migrate_v4_to_v5_is_rerunnable_and_creates_no_jobs():
+
+def test_migrate_v4_to_v5_reports_workload():
+    """report.work: probes_needed（重設後 unknown 數）、cursors_normalized、verdicts_recomputed。"""
+```
+
+- [ ] **Step 2: 執行確認失敗**。
+- [ ] **Step 3: 實作** — 比照 `_migrate_v3_to_v4`（顯式 transaction、版本閘門）。SQL 骨架：
+
+```sql
+-- D-M：重設疑似截斷（只限池內 active；退池列不動）
+UPDATE fills_sync SET left_boundary='unknown', left_boundary_window_start_ms=NULL, left_boundary_at=NULL
+ WHERE left_boundary='truncation_suspected'
+   AND address IN (SELECT address FROM candidate WHERE active=1);
+-- D-N：v3 遺留游標正規化
+UPDATE fills_scan SET cursor_ms=window_end_ms
+ WHERE status='done' AND pages_done=0
+   AND reason IN ('count_below_retention_threshold','count_below_retention_threshold_probe_empty')
+   AND window_end_ms - cursor_ms BETWEEN 0 AND 86400000;
+```
+
+  之後對「游標被正規化」與「證據被重設」的每個 `fills_sync` 列呼叫既有的 `_recompute_verdict_locked`（同一 transaction 內，
+  結論仍只出自 `scan_verdict`）。**不得**在遷移裡另寫一套判斷。
+- [ ] **Step 4: 對正式機複本實跑**（唯讀取得複本，本機執行；不連正式機做任何寫入）——回報遷移前後分佈、
+  `probes_needed`、`cursors_normalized`、`verdicts_recomputed`，以及 `fills` 筆數前後相同、非目標 scan 游標零漂移。
+- [ ] **Step 5: 全套綠、ruff 過。Commit** — `feat: explore.db schema v5——重設疑似截斷、v3 游標正規化、就地重算（D-M／D-N）`
+
+---
+
+## Task 4: 整合驗收（harness）`@inline`
+
+**Files:** `tests/test_explore_scheduler.py`
+
+- [ ] `test_reset_truncation_rows_resolve_via_full_history_probe`：種 20 個「遷移後 unknown、scan done、無 job」且上游
+  在很久以前有成交的位址 → 24h 內全部 `complete`、零遍歷頁、`probes_executed ≥ 20`；只破壞探測窗（改回 1 天）→ 轉紅。
+- [ ] `test_cold_addresses_start_traversal_immediately_after_bootstrap`：300 地址競爭下，新入池冷門地址的第一頁在 5 分鐘內抓到。
+- [ ] 沿用既有 Task 7a／7b／8／8b／11 測試全綠（尤其 `test_evidence_unknown_rows_actually_leave_unknown_via_verify`
+  與 `test_migrated_rows_reach_complete_via_standalone_probe_path` 一字不改）。
+- [ ] Commit — `test: 全史探測解出疑似截斷、冷門地址即時開跑（D-K／D-O）`
+
+---
+
+## Task 5: 審核、RUNBOOK §5.8g、部署 `@inline` ＋ 主線程
+
+- [ ] **審核**：派 `reviewer`（opus，fresh）看 `git diff <第八次部署 commit>..HEAD -- src/`，重點：(1) 探測窗改動有沒有引入
+  錯判完整路徑；(2) 遷移是否只動 D-M／D-N 明定的列；(3) `fills_scan` 到期改 `now` 是否可能讓遍歷軌把增量軌餓死
+  （限流器父子 scope 仍在，理論上不會，要看證據）。
+- [ ] **RUNBOOK §5.8g**：沿 §5.8f 寫法；備份檔名 `explore.db.pre-v5.bak`；drop-in `explore-v4-verdict.conf` 的
+  `_UNTIL` 順延到部署後 +24h；遷移報告核對項改為 v5 的三個數字；觀測門檻加「`truncation_suspected` 應在 6 小時內
+  降到個位數」與「`scan_pages_15m` 不得連續 4 筆為 0 且同時有到期的 `fills_scan` job」。
+- [ ] **部署**（使用者授權後，主線程親自逐步執行）：基線 → 本機用 pre-v5 備份跑新程式合成快照 → rsync → drop-in →
+  stop → 裝快照 → start → 比對 follower → 核對遷移報告 → 24h 觀測（沿用每小時排程）。
+
+## 預期效果（部署後）
+
+| 時點 | 預期 |
+|---|---|
+| +1h | `truncation_suspected` 從 ~121 開始下降（每小時約 12–15 個，輔助份額 3:1） |
+| +2–3h | 35 個 `backfilling` 全部開跑並多數完成 |
+| +6–8h | 池內 complete 121 → ~250；剩下為證據真的不足（全史窗仍空且帳戶更老）或 `unresolved_gap` |
+| +24h | 觀測結束；第二份 24h 日誌 |
+
+## 資料極限與未決事項
+
+1. 「HL 保留一年」是兩個地址的實測（最早 2025-02-26、2025-09-23），不是保證；D-K 的推理只依賴「留存是後綴截斷」
+   這個性質，不依賴保留多久。
+2. 全史窗回滿 2000 筆時，探測頁的結算權重最高 120（與一般 fills 頁相同），約 121 個探測 ≈ 3–4 小時的輔助份額。
+3. W4（`truncation_suspected → unknown` 降級不重算）在本次 D-M 之後實務上不再觸發（疑似截斷大幅減少），仍列後續待議。
+4. ops.py:157 讀舊 follower state 的 PermissionError（第八次部署觀測期發現）不在本 plan 範圍，另開。
+
+## 狀態表
+
+| Task | 狀態 | 驗收證據 |
+|---|---|---|
+| 1 fills_scan 到期改 now | 未開始 | |
+| 2 探測窗全史 | 未開始 | |
+| 3 schema v5 遷移 | 未開始 | |
+| 4 整合驗收 | 未開始 | |
+| 5 審核／RUNBOOK／部署 | 未開始 | |
