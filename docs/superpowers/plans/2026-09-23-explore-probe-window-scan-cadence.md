@@ -479,3 +479,17 @@ running 116 → 101；fills +26k（1,960,305 → 1,985,955）；隔離空；`fil
 follower 不變（03:21:18 09-22／05:21:18 09-18；hb 59s 只出現在 :15／:45 取樣、errors 0，是取樣與 60 秒心跳的相位重合，不是延遲）；
 failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 17–25%、api cgroup 960–971 MB、available 1,098 MB、swap 302 MB。
 **判定：安全面正常，不回退。**
+
+| 22:45 | 0 | 0 | **243**／48／9 | — | 17 | 52／0 | ok | pages 3；eligible 87 |
+| 23:00 | 0 | 0 | 240／43／17 | — | 15 | 54／9 | ok | pages 12；池輪替：backfilling 9 → 17 |
+| 23:15 | 0 | 0 | 240／43／17 | — | 15 | 54／0 | ok | pages 6 |
+| 23:30 | 0 | 0 | 240／43／17 | — | 14 | 54／0 | ok | pages 3 |
+
+**23:36 排程檢查（+7h39m）**：池內 unknown **49 → 49**（持平；2h 累計 63 → 49＝−14）——拆解：本小時池內探測落地 9 筆，
+但 23:00 池輪替進了 9 個新位址（最早 scan 在 1h 內開始、皆 unknown／backfilling），一進一出淨值不變；49 個全部有 running scan，
+沒有無 scan 的孤兒。不是探測停擺，不符 Step 7-pre 的「2 小時不降」（上一小時仍 −14）。池內 truncation_suspected **8**（不變）、
+earlier_fills_seen 224（池外 305 → 314）；池內 complete 241（不變）、partial 49 → 43、backfilling 10 → 16；全體 complete 330 → 339；
+對外 complete 237 → 243 → 240（輪替後）、eligible 85；探測累計 116；due fills_scan 54、running 101；running `pages_done` 61 → 85、
+fills **+51k**（1,985,955 → 2,036,600，過 200 萬）；隔離空；`fills_verify` 17 → 14；Traceback 0；429 0；
+follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cron.err／host_cron.err 0。
+主機：cpu 13–26%、api cgroup 981–1,017 MB、available 1,094 MB、swap 302 MB。**判定：安全面正常，不回退。**
