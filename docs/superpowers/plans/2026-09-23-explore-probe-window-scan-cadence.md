@@ -25,6 +25,8 @@
   的同一套（本次備份檔名 `explore.db.pre-v5.bak`）。
 - drop-in `explore-v4-verdict.conf` 的 `FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=2026-09-24T00:00:00Z`——本次會新增
   ~120 個探測，部署時把到期時間**順延 24h**（Task 5）。
+- **2026-09-23 15:57 UTC 第九次已部署**（見文末「部署紀錄」）；`_UNTIL` 已順延為 `2026-09-24T15:55:53Z`；
+  回退＝RUNBOOK §5.8g Step 7（`explore.db.pre-v5.bak` 已建，1.07 GB）。
 
 ## 背景：三個現象與各自根因（均已在正式機唯讀查證，2026-09-23 00:55–02:30 UTC）
 
@@ -356,4 +358,30 @@ UPDATE refresh_job SET next_attempt_at=:now
 | 3 schema v5 遷移 | ✅ `e669b31`；主線程複跑 3389 passed、ruff 過 | 主線程在乾淨複本獨立重現：report 完全一致（probes_needed 156、cursors_normalized 164、verdicts_recomputed 172、scan_jobs_advanced 25）；fills 1,557,151 前後相同；游標實際變動 131 個且全屬 D-N 條件；池內 truncation_suspected 122→0、complete 128→139；probe candidates 122；running scan 無殘留未來 job |
 | 3c 審核修正 C1／W1 | ✅ `f4124ed`；主線程複跑 3394 passed、ruff 過、重現腳本 `survived? True` | 新增唯讀 `get_job`；C1 以 `job.last_error` 擋拉近，reviewer 重現腳本修正後 `survived? True`；W1 計數分 `_created`／`_pulled_forward`；反向護欄轉紅 | reviewer 判可部署但主線程改為部署前修 |
 | 4 整合驗收 | ✅ `97f84e3`；builder 複跑 3391 passed（含新增 2 條）、ruff 過 | 兩條測試皆通過＋反向護欄轉紅＋revert 後 `git diff --stat src/` 清空；家族回歸（含兩條「一字不改」測試）全綠；發現並記錄兩個指標／機制教訓（見下） |
-| 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g ✅（主線程逐段讀過、修 1 處預期效果不一致）；reviewer（opus）✅ 無 Critical 殘留（C1 已由 Task 3c 封、W1 已修、W2/W3 記錄）；**部署待使用者授權** | |
+| 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g ✅；reviewer（opus）✅ 無 Critical 殘留（C1 已由 Task 3c 封、W1 已修、W2/W3 記錄）；**✅ 已部署 2026-09-23 15:57:04 UTC**（commit `831e632`＝程式碼 `f4124ed`＋docs；API 停機約 4 秒） | 遷移報告：probes_needed 140（＝池內 trunc 127＋unknown 13）、cursors_normalized 164、verdicts_recomputed 176、scan_jobs_advanced 12；池內 truncation_suspected 127 → **0**、unknown 13 → 139；fills 1,810,517 → 1,811,710（未減）；抽查 3 個非目標游標一字不動；follower 時間戳部署前後相同；快照 v4／300 列預熱裝入；Traceback 0。詳見文末「部署紀錄」 |
+
+## 部署紀錄（第九次，2026-09-23，RUNBOOK §5.8g）
+
+使用者 05:35 UTC 裁決「等 15:45 UTC 第八次 24h 觀測滿再部署、到時不再問」；15:52 UTC 排程觸發。
+
+| 步驟 | 時刻（UTC） | 結果 |
+|---|---|---|
+| 0 第八次 24h 結案 | 15:52 | 97 樣本 429=0、非已知 Traceback 0、follower 不變（總結寫入前一份 plan，`831e632`） |
+| 1 基線 | 15:53 | failed 0；follower f438 03:21:18 09-22／fb8c 05:21:18 09-18；timers 4；`explore.db.pre-v5.bak` 1,065,226,240 B（sqlite backup API）；池內 lb：earlier_fills_seen 141／no_earlier_activity 19／**truncation_suspected 127／unknown 13**；fills **1,810,517**；`_UNTIL` 原值 2026-09-24T00:00:00Z；主機 available 1,079 MB |
+| 2 預熱 | 15:54–15:56 | 備份 gzip → 本機 `var/prewarm-v5/`（integrity ok、fills／池內分佈與基線相同）→ 新程式起 8700（本機遷移報告：probes_needed 140、cursors_normalized 164、verdicts_recomputed 177、scan_jobs_advanced 12；Traceback 0）→ 快照 version 4／300 列 → scp `/tmp/explore_index_new.json` |
+| 3 env | 15:55 | `_UNTIL` → **2026-09-24T15:55:53Z**（舊檔留 `/tmp/explore-v4-verdict.conf.pre-v5`）；daemon-reload；12 個 drop-in env 全部在 `config.py`／`leader_resolve.py` 有讀取者 |
+| 4 rsync／重啟 | 15:56:53–15:57:07 | 機密邊界 0 命中；src 只差 `explore_scheduler.py`／`explore_store.py`（與 `git diff bbd7adf..HEAD -- src` 一致）；uv.lock mtime 2026-07-17 未動、pyproject 未變故跳過 uv sync；chown root 排除 var/（非 root 4＝.venv symlink 例外，`builder_accrued_snapshot.json` 仍 filet-engine）；**stop 15:57:03 → 裝快照（舊檔 `.bak-20260923-pre-v5`）→ start 15:57:04 → API 3 秒就緒**；follower 兩個 unit 時間戳與基線完全相同、timers 4、failed 0；進程 environ `_UNTIL` 新值生效；主機 available 1,377 MB |
+| 5 遷移核對 | 15:57:34 | journal 報告：before trunc 169／unknown 80 → after trunc 42（全在池外）／unknown 207；work probes_needed **140**、cursors_normalized 164、verdicts_recomputed 176、scan_jobs_advanced 12；池內 lb：earlier_fills_seen 142／no_earlier_activity 19／**unknown 139、truncation_suspected 0**；池內 complete 148 → 157；fills 1,811,710（≥ 基線）；抽查 3 個 `pages_done>0` 游標一字不動；running scans 166、其 fills_scan job 無一在未來 >60s、到期 126；隔離 0；`fills_verify` 24；獨立探測候選 25；Traceback 0 |
+| DEPLOYED_VERSION | 15:57:58 | `commit=831e632…`、`describe=mainnet-launch-20260725-472-g831e632` |
+
+- 24h 觀測：session 排程 13558302 每小時 :33，門檻依 §5.8g Step 6（池內 trunc 6h 內個位數、池內 unknown 自 139 兩小時 −20、
+  遍歷軌不停擺、隔離不被拉近）；結束於 2026-09-24 15:57 UTC 之後那次。
+- 注意：`systemctl show -p Environment` 在 daemon-reload 後即顯示新值，進程實際值以 `/proc/<MainPID>/environ` 為準（本次已驗）。
+- 預期：126 個到期 `fills_scan` job 以 ≤1 頁/分推進，每頁前先做全史探測（`_run_scan` 每次推進都查左界），加上獨立探測 3:1 份額，
+  池內 unknown 應每小時降 15 個以上。
+
+## 部署後觀測日誌（第九次，每小時 :33）
+
+| 時刻 | 429 | TB | 對外 complete／partial／backfilling | 池內 unknown／trunc | verify backlog | due fills_scan／scan_pages_15m | follower | 備註 |
+|---|---|---|---|---|---|---|---|---|
+| 15:57（部署） | 0 | 0 | 快照裝入（v4／300） | 139／0 | 24 | 126／— | ok | 基線 |
