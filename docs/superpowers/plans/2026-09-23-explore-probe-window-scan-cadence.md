@@ -385,3 +385,17 @@ UPDATE refresh_job SET next_attempt_at=:now
 | 時刻 | 429 | TB | 對外 complete／partial／backfilling | 池內 unknown／trunc | verify backlog | due fills_scan／scan_pages_15m | follower | 備註 |
 |---|---|---|---|---|---|---|---|---|
 | 15:57（部署） | 0 | 0 | 快照裝入（v4／300） | 139／0 | 24 | 126／— | ok | 基線 |
+| 16:00 | 0 | 0 | 156／130／14 | — | 24 | 125／116* | ok | *重啟後計數器重置的差分假象；pages 8 |
+| 16:15 | 0 | 0 | 164／123／13 | — | 24 | 119／0 | ok | pages 0 |
+| 16:30 | 0 | 0 | 169／119／12 | — | 24 | 115／0 | ok | pages 3；fills_verify due 3（p95 311s） |
+
+**16:35 排程檢查（+38m）**：池內 unknown **139 → 123**（−16，2h −20 門檻在軌）、池內 truncation_suspected 0 → **3**（個位數 ✓，
+全史窗回空且首次活動更早的真嫌疑）、earlier_fills_seen 142 → 155；池內 complete 157 → **172**、partial 130 → 117；
+全體 complete 235 → 250；對外 complete 141 → 169、eligible 84；`fills_verify` 24；running scans 153（其中 partial_rescan 104）；
+隔離 0；fills 1,811,710 → 1,816,426；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；
+cron.err／host_cron.err 0。主機：重啟後 api cgroup 998 → 317 → 513 MB（頁快取回填中）、cpu 21–26%（部署後 enrich／發布尖峰）、
+available 1,139 MB、swap 292 MB。
+**遍歷軌判讀的修正**：`scan_pages_15m` 在探測前置階段會恆為 0——`_run_scan` 對左界 unknown 的地址先發一頁全史探測就收尾
+這一輪、`pages_done` 不動；實際推進要看 `fills_sync.left_boundary_at` 的探測落地：部署後每 5 分鐘 bucket 2／3／3／3／2／2／3／1
+（≈30 頁/h，與部署前 fills 頁吞吐同量級）。所以 3(d) 的「連續 4 筆 0 且有到期 job」要與探測落地並看：探測仍在推進就不是停擺。
+預估 123 個 unknown 約 4 小時探完，之後 `scan_pages_15m` 才會轉正。**判定：安全面正常，不回退。**
