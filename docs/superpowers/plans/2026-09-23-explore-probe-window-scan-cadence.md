@@ -466,3 +466,16 @@ follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cro
 `fills_verify` 22 → 19（backlog 開始消化）；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18；21:15 取樣心跳齡 59s
 一筆，errors 0、下一筆回 1s，屬單輪對帳較慢）；failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 17–19%、api cgroup
 930–961 MB、available 1,103 MB、swap 303 MB。**判定：安全面正常，不回退。**
+
+| 21:45 | 0 | 0 | 226／62／12 | — | 19 | 69／0 | hb 59s、err 0 | pages 2；心跳齡 59s 第二次（:15／:45 取樣與 60s 心跳相位重合） |
+| 22:00 | 0 | 0 | 228／58／14 | — | 19 | 69／3 | ok | pages 5；eligible 86 |
+| 22:15 | 0 | 0 | 232／55／13 | — | 18 | 64／0 | ok | pages 2 |
+| 22:30 | 0 | 0 | **237**／51／12 | — | 18 | 58／0 | ok | pages 3 |
+
+**22:36 排程檢查（+6h39m）**：池內 unknown **63 → 49**（2h 累計 74 → 49＝−25，門檻 −20 ✓）、池內 truncation_suspected **8**
+（6 小時窗 15:57–21:57 全程個位數 ✓，門檻結案）、earlier_fills_seen 210 → 224；池內 complete 226 → **241**、partial 62 → 49；
+全體 complete 314 → 330；對外 complete 225 → **237**、eligible 86；探測落地最近 1h 17、累計 107；due fills_scan 70 → 55、
+running 116 → 101；fills +26k（1,960,305 → 1,985,955）；隔離空；`fills_verify` 19 → 17；Traceback 0；429 0；
+follower 不變（03:21:18 09-22／05:21:18 09-18；hb 59s 只出現在 :15／:45 取樣、errors 0，是取樣與 60 秒心跳的相位重合，不是延遲）；
+failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 17–25%、api cgroup 960–971 MB、available 1,098 MB、swap 302 MB。
+**判定：安全面正常，不回退。**
