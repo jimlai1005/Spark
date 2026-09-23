@@ -664,23 +664,40 @@ class ExploreScheduler:
 
     def _ensure_scan_job(self, address: str, now: float, *, running_scan=_UNSET) -> str | None:
         """把 `_needs_scan_job` 的判斷落成一個 job（Task 7.9e-S S1：對帳與
-        `_run_increment` 收尾共用同一個實作，不各寫一份條件）。回傳真的新建了
-        job 的原因碼，否則 `None`（已存在 → `enqueue` 回 False，不重排也不提前）。
+        `_run_increment` 收尾共用同一個實作，不各寫一份條件）。回傳判斷出的
+        原因碼（`_needs_scan_job` 非 `None` 就代表「狀態上需要」），否則
+        `None`。
+
+        Task 1b（2026-09-23，v4 遷移事故：15 個已抵達終點的 scan 卡在
+        `resume_running`——遷移重開 scan 時沒處理部署前遺留的 `now+24h` 舊
+        `fills_scan` job，舊版「job 已存在就跳過」的去重直接放過它）：
+        `resume_running`／`initial_missing`（`fills_scan` kind）現在**無論
+        job 是否存在都呼叫** `enqueue`——`ExploreStore.enqueue` 對既有 job
+        只做 `MIN(next_attempt_at)`，冪等；job 真的不存在（原本的情形）或
+        已經是 `now`都不受影響，只有『存在但排在遠期』的 job 才會被拉近。
+        `partial_due`／`verify_needed`／`fills_verify` 的 `resume_running`
+        不動（`_needs_scan_job` 那邊仍用「job 是否存在」去重，避免重複核驗／
+        重掃）。
 
         `verify_needed`（新工作）用**地址雜湊攤開**到 48 小時內，與遷移產生 129
         筆核驗時的攤法同源（`ExploreStore._migration_spread_s`）——一次補上幾十筆
-        不能全部排在同一秒。其餘原因碼都是「已經在半路上或已到期」，一律 `now`。"""
+        不能全部排在同一秒。其餘原因碼都是「已經在半路上或已到期」，一律 `now`。
+
+        對帳一輪可能對同一個地址重複呼叫 `enqueue`（MIN 語義下沒有副作用），
+        但日誌只在**真的新建**（`enqueue` 回 `True`）時印一行——否則 300 個
+        地址的候選池每輪對帳都會噴出等量的『對帳補排』警告，稀釋掉真正的
+        新建事件。"""
         need = self._needs_scan_job(address, now, running_scan=running_scan)
         if need is None:
             return None
         reason, job_kind = need
         priority = 4 if job_kind == "fills_verify" else 3
         next_at = now + (_spread(address, VERIFY_SPREAD_S) if reason == "verify_needed" else 0.0)
-        if not self._store.enqueue(self._key(address, job_kind), address, job_kind, priority,
-                                   next_at):
-            return None
-        logger.warning("explore scheduler: 對帳補排 %s 的 %s job（%s）",
-                       address, job_kind, reason)
+        created = self._store.enqueue(self._key(address, job_kind), address, job_kind, priority,
+                                      next_at)
+        if created:
+            logger.warning("explore scheduler: 對帳補排 %s 的 %s job（%s）",
+                           address, job_kind, reason)
         return reason
 
     def _needs_scan_job(self, address: str, now: float, *,
@@ -689,15 +706,23 @@ class ExploreScheduler:
         """「這個地址的**狀態**現在需要一次遍歷，而且沒有可推進它的 job」嗎？
         回傳 `(原因碼, 該補的 job kind)` 或 `None`（Task 7.9d-S S1）：
 
-        - `"resume_running"`：有進行中的遍歷卻沒有**同類**的 job ——遍歷停在
-          半路，沒有任何工作會推進它（7.9c 的 Critical：地址退池時
+        - `"resume_running"`：有進行中的遍歷，`job_kind == "fills_scan"`
+          （`verify` 遍歷除外，見下）時**無論同類 job 是否存在都回傳**——
+          遍歷停在半路，job 可能根本不存在（7.9c 的 Critical：地址退池時
           `delete_jobs` 刪掉 job、回池時 `bootstrap_address_fills` 回 `False`
-          → 回補中的地址永遠拿不回 job，5 天模擬仍 `backfilling`）。job kind
-          必須對應 scan kind（`verify` → `fills_verify`，其餘 → `fills_scan`）：
-          用錯 kind 會讓另一條軌的 job 接手別人的遍歷（見
-          `reconcile_scan_jobs` docstring 的 654 次 verify 遍歷）。
+          → 回補中的地址永遠拿不回 job），也可能存在但排在遠期（Task 1b：
+          v4 遷移重開 scan 時留著部署前的 `now+24h` 舊 job）；兩種情形呼叫端
+          `_ensure_scan_job` 都用 `enqueue` 的 MIN 語義處理，本方法不再用
+          「job 是否存在」擋這條路徑。`verify` 遍歷（`job_kind ==
+          "fills_verify"`）維持舊語意——同類 job 已存在就回 `None`，避免
+          Task 1b 範圍外的核驗軌被牽動（核驗新建成本不同，未經驗證不擴大
+          範圍）。job kind 必須對應 scan kind（`verify` → `fills_verify`，
+          其餘 → `fills_scan`）：用錯 kind 會讓另一條軌的 job 接手別人的遍歷
+          （見 `reconcile_scan_jobs` docstring 的 654 次 verify 遍歷）。
         - `"initial_missing"`：沒有進行中的遍歷且 `completeness == "backfilling"`
-          ——首次回補從未完成（孤兒：有 `fills_sync` 列、沒有 scan 列）。
+          ——首次回補從未完成（孤兒：有 `fills_sync` 列、沒有 scan 列，或
+          Task 1b 同理的『job 存在但排在遠期』）；同樣無論 job 是否存在都
+          回傳，交給 `_ensure_scan_job` 的 MIN 語義處理。
         - `"partial_due"`：`partial` 且距離最近一次完成的遍歷已滿
           `PARTIAL_RESCAN_AFTER_S`，沒有進行中的遍歷、也沒有 job。
         - `"verify_needed"`（Task 7.9e-S S1）：`evidence_unknown == 1`（對外是
@@ -718,20 +743,26 @@ class ExploreScheduler:
             running_scan = self._store.running_scan(address)
         kinds: set[str] = set() if ignore_existing_job else self._store.job_kinds(address)
         if running_scan is not None:
-            job_kind = "fills_verify" if running_scan.kind == "verify" else "fills_scan"
-            return None if job_kind in kinds else ("resume_running", job_kind)
+            if running_scan.kind == "verify":
+                # verify 遍歷維持舊語意——同類 job 已存在就不重排（Task 1b
+                # 範圍限定 `fills_scan`，核驗軌不動，見本方法 docstring）。
+                return None if "fills_verify" in kinds else ("resume_running", "fills_verify")
+            # Task 1b：`fills_scan` 的 resume_running 不再以「job 是否存在」
+            # 為門檻——`_ensure_scan_job` 用 `enqueue` 的 MIN 語義吸收「job
+            # 已存在且已經是 now」的情形，只有真正遠期的舊 job 才會被拉近。
+            return "resume_running", "fills_scan"
         st = self._store.get_sync(address)
         if st is None:
             # 沒有增量軌可掛載（從未 bootstrap，或資料被外部刪除）——遍歷無處
             # 寫回（`complete_scan` 會回 `MISSING`），不值得花一整輪頁面。
             return None
-        if "fills_scan" not in kinds:
-            if st.completeness == "backfilling":
-                return "initial_missing", "fills_scan"
-            if st.completeness == "partial":
-                latest = self._store.latest_done_scan(address)
-                if partial_rescan_due(None if latest is None else latest.finished_at, now):
-                    return "partial_due", "fills_scan"
+        if st.completeness == "backfilling":
+            # Task 1b：同上，`initial_missing` 也不再以「job 是否存在」為門檻。
+            return "initial_missing", "fills_scan"
+        if st.completeness == "partial" and "fills_scan" not in kinds:
+            latest = self._store.latest_done_scan(address)
+            if partial_rescan_due(None if latest is None else latest.finished_at, now):
+                return "partial_due", "fills_scan"
         if st.evidence_unknown and "fills_verify" not in kinds:
             return "verify_needed", "fills_verify"
         return None

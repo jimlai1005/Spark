@@ -8,6 +8,7 @@ docs/superpowers/plans/2026-09-20-explore-rate-limit-refactor.md Task 3.1／7.9b
 from __future__ import annotations
 
 import bisect
+import logging
 import random
 import re
 import threading
@@ -4749,3 +4750,80 @@ def test_reentering_address_resumes_scan_immediately(tmp_path):
     assert next_at is not None and next_at <= h.now + 60
     assert h.scan_id(T7A_WHALE) == sid
     assert h.scan_cursor(T7A_WHALE) >= cur
+
+
+# ============================================================
+# Task 1b（2026-09-23，主線程 03:10 追加）：`_ensure_scan_job` 的
+# `resume_running`／`initial_missing`（`fills_scan` kind）不再以「job 是否
+# 存在」為門檻——正式機複本查證，前一份 plan 對「15 個遍歷到一半」的根因
+# 敘述有誤：那些 scan 其實已抵達終點，卡住的是 v4 遷移重開 scan 時沒處理的
+# 部署前 `now+24h` 舊 job（`due − created == 24.0h`，attempts 0），舊版
+# `resume_running` 見 job 存在就跳過，永遠不會把它拉回 now。
+# ============================================================
+
+def test_resume_running_pulls_a_far_future_scan_job_to_now(tmp_path):
+    """Task 1b：running scan 存在、且已有一個排在 `now+24h` 的 `fills_scan`
+    job（模擬部署前遺留、v4 遷移重開 scan 時沒處理的舊 job）→ 一輪對帳後該
+    job 的 `next_attempt_at <= now + 60`（`ExploreStore.enqueue` 的 MIN 語
+    義），`created_at`／`attempts` 不變（MIN 只改 `next_attempt_at`／
+    `priority`，不是重新 INSERT）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([(ADDR_A, None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills(
+        ADDR_A, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+        window_end_ms=now_ms, params_fp="")
+    key = f"{ADDR_A.lower()}:fills_scan"
+    # `bootstrap_address_fills` 只建 running scan，不建 job——手動建一個排在
+    # 遠期的 job，模擬部署前 `retention_limit` 排下、遷移重開 scan 卻沒處理
+    # 的舊 job。
+    assert store.enqueue(key, ADDR_A, "fills_scan", 3, clock.now() + 24 * 3600.0)
+    created_at_before, attempts_before = store._db.execute(
+        "SELECT created_at, attempts FROM refresh_job WHERE key=?", (key,)).fetchone()
+
+    sched = _sched(store, FakeHL(), clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    out = sched.reconcile_scan_jobs(clock.now())
+    assert out.get("resume_running") == 1
+
+    next_at, created_at_after, attempts_after = store._db.execute(
+        "SELECT next_attempt_at, created_at, attempts FROM refresh_job WHERE key=?",
+        (key,)).fetchone()
+    assert next_at <= clock.now() + 60
+    assert created_at_after == created_at_before
+    assert attempts_after == attempts_before
+
+
+def test_resume_running_reconcile_logs_only_true_new_jobs(tmp_path, caplog):
+    """反向噪音護欄：300 個地址、每個都已有 running scan＋一個排在遠期的
+    `fills_scan` job（Task 1b 之後每輪對帳都會對它們重新呼叫 `enqueue`，但
+    MIN 更新回 `False`，不算『真的新建』）——只有刻意不建 job 的 3 個孤兒
+    地址是真的新建。『對帳補排』日誌行數必須恰好等於真的新建的 job 數（3），
+    不是 300：防止把『一律呼叫 enqueue』誤植成『一律印一行』。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    addrs = [f"0x{i:040x}" for i in range(1, 301)]
+    store.upsert_candidates([(a, None, r, None) for r, a in enumerate(addrs, start=1)],
+                            as_of=clock.now())
+    orphan_n = 3
+    for i, addr in enumerate(addrs):
+        store.bootstrap_address_fills(
+            addr, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+            window_end_ms=now_ms, params_fp="")
+        if i < orphan_n:
+            continue    # 唯一該真的新建、真的印一行的那組——刻意不建 job。
+        store.enqueue(f"{addr}:fills_scan", addr, "fills_scan", 3, clock.now() + 24 * 3600.0)
+
+    sched = _sched(store, FakeHL(), clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    with caplog.at_level(logging.WARNING, logger="spark.publicapi.explore_scheduler"):
+        sched.reconcile_scan_jobs(clock.now())
+
+    log_lines = [r for r in caplog.records if "對帳補排" in r.getMessage()]
+    assert len(log_lines) == orphan_n
