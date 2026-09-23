@@ -161,6 +161,21 @@ def test_probe_page_settles_by_returned_count():
   （`first_activity` ± 1d），改名 `_FIRST_ACTIVITY_BAND_MS` 以免誤解為探測窗。
 - [ ] **Step 4: 既有測試** — Task 3／10／11 的探測測試若 fixture 依賴 1 天窗（例如把成交放在 `ws−1d` 內），改成放在
   任何 `< ws` 的時間即可；斷言語義不變。
+> **主線程裁決（2026-09-23，builder 回報 harness 時鐘衝突）**：`SchedulerHarness` 用 `Clock(t=0.0)` 起算，
+> `window_start_ms = now − 30d` 為**負數**；正式機永遠是 ~1.79e12 的正數。這是 harness 保真度缺陷（Task 11 那次
+> `first_activity_ms=0` 把 300 個地址全判成 `no_earlier_activity` 也是同一根源），與 D-K 的「探測起點為絕對 0」衝突。
+> **選項 1，並補一個配套**：
+> (a) `SchedulerHarness` 的時鐘起點改為真實量級（`Clock(t=1_700_000_000.0)`，2023-11-14），並把 `fresh_scan_window`
+>     等用到的 `now_ms` 一律由該時鐘導出；harness 內任何寫死的相對時間（`seed_dense_fills(start_ms=-32*DAY...)`、
+>     `seed_stale_partial_row`、`window_start_ms=0/1` 之類）改成相對 `h.now`／`ws` 的表達式。
+> (b) 預設候選的 portfolio 首次活動時間不得再是 `0`：`_t7a_default_portfolio` 對**所有**候選一律 `ws + 2*DAY`
+>     （Task 10 W5 已對 `set_fill_count`／`set_fills_all_same_ms` 這樣做，現在推廣到 bootstrap 的 297 個）——
+>     否則時鐘轉正後 `first_activity=0 < ws−1d` 會把 297 個空地址全判成 `truncation_suspected`，那是 fixture 不真實，
+>     不是判準錯。
+> (c) 改完後 Task 7a／7b／8／8b／10／11 整個家族逐條重跑；**任何轉紅都要分析原因並回報**——若某條測試原本依賴
+>     「t=0／負窗口」才成立，那條測試本身就有問題，回報後由主線程裁決，不得靜默調整斷言。
+> (d) 在 harness 的 `Clock` 建構處加一行註解與一條測試 `test_harness_window_start_is_positive_epoch`，防止再退回 t=0。
+
 - [ ] **Step 5: 全套綠、ruff 過。Commit** — `fix: 左界探測改查全史 [0, window_start)——低頻帳戶不再被 1 天窗誤判疑似截斷（D-K）`
 
 ---
