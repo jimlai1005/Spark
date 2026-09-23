@@ -1768,6 +1768,20 @@ failed 0；cron.err 0。**判定：安全面正常，不回退。**
 對外 complete 146 → 149、eligible 87；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
 failed 0；cron.err 0。**判定：安全面正常，不回退。**
 
+| 13:00 | 0 | 0 | 147／144／9 | 30 | 0／4／0 | ok | pages 11；overdue p95 fills 134s；eligible 84 |
+| 13:15 | 0 | 0 | 147／144／9 | 28 | 0／0／0 | ok | pages 13 |
+| 13:30 | 0 | 0 | 147／144／9 | 28 | 0／0／0 | ok | pages 9 |
+| 13:45 | 0 | 0 | 147／144／9 | 28 | 0／0／0 | ok | pages 6；state 1／ledger 1 due |
+
+**13:55 排程檢查（+22h10m）**：unknown 74（池內 8 → 6）、`earlier_fills_seen` 209、`no_earlier_activity` 27、
+`truncation_suspected` 164——四類總數本小時不變；completeness 46／219／209 不變；`fills_verify` job 30 → 26；
+running scans 46；對外 complete 149 → 147（池輪替：eligible 87 → 84、ineligible 95 → 97）；Traceback 0；429 0；
+follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；cron.err 0。
+榜單進入平台期：池內剩下的 partial 幾乎全是 `truncation_suspected`（129），現行機制解不開，等第九次部署遷移重判；
+池內 unknown 仍在降、verify 仍在消化，不符 Step 7-pre 條件。**判定：安全面正常，不回退。**
+主機取樣（§5.8h）首兩筆 cron 落地：13:32 cpu 12.7%／available 1046 MB、13:47 cpu 12.1%／available 1065 MB，
+swap 300 MB、follower 2、`host_cron.err` 0。
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
