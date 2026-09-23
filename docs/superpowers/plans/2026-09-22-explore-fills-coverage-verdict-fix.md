@@ -1738,6 +1738,16 @@ Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常�
 `truncation_suspected` 162；completeness 53／209／207；`fills_verify` job 33 → 32；running scans 55 → 53；
 Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退。**
 
+
+| 10:00 | 0 | 0 | 141／147／12 | 32 | 1／2／0 | ok | pages 7 |
+| 10:15 | 0 | 0 | 141／148／11 | 32 | 0／2／0 | ok | pages 6 |
+| 10:30 | 0 | 0 | 142／148／10 | 32 | 2／1／0 | ok | pages 6 |
+| 10:45 | 0 | 0 | **143**／148／9 | 32 | 0／0／0 | ok | pages 9；eligible 87 |
+
+**10:55 排程檢查（+19h10m）**：unknown 82 → 78（池內 10）、`earlier_fills_seen` 200 → 203、`no_earlier_activity` 25、
+`truncation_suspected` 162 → 163；completeness 50／211／208；`fills_verify` job 32；running scans 53 → 50；
+Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退。**
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
