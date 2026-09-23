@@ -244,6 +244,42 @@ UPDATE refresh_job SET next_attempt_at=:now
 
 ---
 
+## Task 3c: 審核修正——`resume_running` 的 MIN 拉近不得拆掉隔離（C1）＋對帳計數語義（W1）`@inline`
+
+> **reviewer（opus，fresh）2026-09-23 對 `bbd7adf..HEAD -- src/` 的審查**：報告在
+> `<scratchpad>/review-v5-2026-09-23.md`，重現腳本 `repro_e2e.py`（主線程已親跑重現）。判定「可部署，條件：C1 進觀測
+> 清單並在下一輪修」——主線程裁決**改為部署前修**：修法小、部署尚未發生，而且失敗模式是無限迴圈打 HL（工程原則 2），
+> 不該帶著已知的迴圈上線。
+
+**C1（Critical，本次 diff 引入的回歸）**：Task 1b 讓 `resume_running`／`initial_missing` 無論 job 是否存在都 `enqueue(now)`
+（MIN 語義），但 `_quarantine` 對 `fills_scan` 只把 job 推到 `now+86400` 並寫 `set_scan_error`，**scan 仍是 `running`**
+→ 下一輪對帳（~30 分鐘）把隔離中的 job 拉回 `now`；隔離時刻意不 bump `attempts`，所以「放行 → 失敗 → 再隔離 → 再拉回」
+無限迴圈。舊版（`bbd7adf`）對帳不會拉回，確認為回歸。正式機現況 0 個隔離中的 `fills_scan` job（潛伏）。
+
+**修法**：`_ensure_scan_job` 的 `resume_running`／`initial_missing` 在 job **已存在且 `job.last_error is not None`**（隔離或退避中）
+時**不拉近**；其他情況維持 Task 1b 的 MIN 拉近。理由：`last_error` 是「這個 job 正在受失敗處理」的唯一狀態標記，
+隔離／退避的到期時間由失敗處理路徑擁有，對帳不得覆蓋。測試：
+- `test_reconcile_does_not_pull_forward_a_quarantined_scan_job`：reviewer 的 e2e 情境——tick 隔離（`next_at = now+86400`）
+  → 對帳一輪 → `next_at` 仍為 `now+86400`。反向護欄：拿掉 `last_error` 檢查 → 轉紅。
+- `test_reconcile_still_pulls_forward_a_healthy_far_future_job`：Task 1b 的既有測試不得轉紅（無 `last_error` 的遠期 job 仍被拉到 now）。
+- 既有 `test_quarantine_of_fills_scan_job_writes_scan_error` 擴充：tick → 對帳 → 斷言隔離仍在。
+
+**W1（一併修）**：對帳回傳的 `resume_running` 計數現在數的是「狀態上需要」而非「真的補排」，每輪穩定回報 ~72，
+會成為部署後觀測的假訊號。改成兩個計數：`resume_running_created`（`enqueue` 回 True）與 `resume_running_pulled_forward`
+（既有 job 被拉近的次數，由 `enqueue` 前後 `next_attempt_at` 比較得出）；docstring 同步（「冪等、重跑零變更」改為
+「重跑零新建」）。RUNBOOK §5.8g Step 6 的觀測用新名稱。
+
+**W3（不在本 task，列待議）**：`fills_verify` 的 `resume_running` 仍以「job 存在」為門檻（Task 1b 範圍收斂）；
+`VERIFY_SPREAD_S = 48h`，正式機 running verify = 0，未觸發。
+
+**W2（寫進資料極限）**：`earlier_fills_seen` 只及於 `userFillsByTime` 可見的成交；該 endpoint **不回 TWAP 分片成交**
+（見 `~/.claude/rules/wallet-analysis.md` 與 memory）。「complete」語義是「對 `userFillsByTime` 完整」，用 TWAP 的錢包
+其成交統計仍會少算，這是 v3 起就存在的限制，本 plan 不擴大。
+
+**Commit**：`fix: 對帳不得拉近隔離中的 fills_scan job（C1 回歸）；對帳計數分為新建／拉近（W1）`
+
+---
+
 ## Task 4: 整合驗收（harness）`@inline`
 
 **Files:** `tests/test_explore_scheduler.py`
@@ -293,5 +329,6 @@ UPDATE refresh_job SET next_attempt_at=:now
 | 1b resume_running MIN 拉近 | ✅ `36fcbfb`；主線程複跑同上、五條新測試 5 passed | **範圍收斂（builder 裁決，主線程接受）**：只對 `fills_scan` 套用一律 enqueue；`fills_verify` 的 resume_running 維持「同類 job 已存在不重排」（7.9e-S1 不變量、既有測試 `test_s1_reconcile_resumes_running_verify_scan_with_verify_job`）。日誌只在真的新建時印（300 地址 → 3 行）。 |
 | 2 探測窗全史 | ✅ `0815e10`；主線程複跑 3384 passed、ruff 過、目標測試 6 passed | 四條測試＋harness 護欄；反向護欄兩組轉紅；harness 時鐘改 1.7e9、預設候選首次活動 ws+2d；139 條家族測試零轉紅、零斷言放寬 |
 | 3 schema v5 遷移 | ✅ `e669b31`；主線程複跑 3389 passed、ruff 過 | 主線程在乾淨複本獨立重現：report 完全一致（probes_needed 156、cursors_normalized 164、verdicts_recomputed 172、scan_jobs_advanced 25）；fills 1,557,151 前後相同；游標實際變動 131 個且全屬 D-N 條件；池內 truncation_suspected 122→0、complete 128→139；probe candidates 122；running scan 無殘留未來 job |
+| 3c 審核修正 C1／W1 | 待 Task 4 收工後派（同檔）| reviewer 判可部署但主線程改為部署前修 |
 | 4 整合驗收 | 派工中 | |
 | 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g ✅（主線程逐段讀過、修 1 處預期效果不一致）；reviewer（opus）審 `bbd7adf..HEAD -- src/` 派工中；部署待授權 | |
