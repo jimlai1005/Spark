@@ -1872,6 +1872,22 @@ class ExploreStore:
             cur = self._db.execute("DELETE FROM refresh_job WHERE address=?", (addr,))
         return cur.rowcount
 
+    def get_job(self, key: str) -> Job | None:
+        """唯讀取單一 `refresh_job`（不 claim、不改 `lease_until`／`fencing`）。
+
+        Task 3c（2026-09-23，reviewer C1／W1）：供 `explore_scheduler._ensure_scan_job`
+        判斷 (1) 這個 job 是否正在失敗處理中（`last_error is not None`——隔離／退避
+        的到期時間由 `_quarantine`／`_reschedule` 擁有，對帳的 MIN 拉近不得覆蓋）、
+        (2) `enqueue` 前後 `next_attempt_at` 是否真的被拉近（W1：區分『真的補排』與
+        『狀態上需要但這輪什麼都沒變』，後者不該計數，否則變成穩定的假訊號）。
+        欄位順序與 `claim_due` 的 `RETURNING` 子句同一份，不重寫映射。"""
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT key, address, kind, priority, created_at, next_attempt_at, "
+                "attempts, lease_until, lease_owner, fencing, last_error "
+                "FROM refresh_job WHERE key=?", (key,)).fetchone()
+        return None if row is None else Job(*row)
+
     def job_kinds(self, address: str) -> set[str]:
         """Task 7.9c D8：該地址目前 `refresh_job` 的 kind 集合——排程端
         「算需要的 job 集合 → 扣掉已存在的 → 逐項准入」用它做去重（W4／S3），

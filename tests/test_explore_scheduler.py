@@ -955,7 +955,9 @@ def test_admission_cap_uses_admission_counts_not_stale_len_seen(tmp_path):
     # 留下一個 running 的 initial scan 卻沒有任何 job 會推進它（7.9c 的 Critical），
     # 這條修復路徑不受 cap 限制（每個 active 地址最多一個，結構上有界）。
     assert store.job_kinds(addr) == {"fills_scan"}
-    assert sched.status()["reconciled"]["resume_running"] == 1
+    # Task 3c W1（2026-09-23）：job 原本不存在，鍵名是 `resume_running_created`
+    # （不是 `_pulled_forward`）——舊鍵名 `resume_running` 已拆分，刻意的語義變更。
+    assert sched.status()["reconciled"]["resume_running_created"] == 1
 
 
 def test_run_candidates_empty_rows_keeps_existing_pool_active(tmp_path):
@@ -1862,7 +1864,13 @@ def test_notify_dirty_swallows_exception_without_losing_job(tmp_path):
 def test_quarantine_of_fills_scan_job_writes_scan_error(tmp_path):
     """`_quarantine` 對 `fills_scan`／`fills_verify` kind 走
     `ExploreStore.set_scan_error`（該 scan 的 `last_error`），不是
-    `set_sync_error`（增量軌）——遍歷軌與增量軌各自有各自的錯誤欄位。"""
+    `set_sync_error`（增量軌）——遍歷軌與增量軌各自有各自的錯誤欄位。
+
+    Task 3c（2026-09-23，reviewer C1）擴充：隔離之後緊接著跑一輪對帳，斷言
+    隔離**不會**被拆掉——`next_attempt_at` 與 `last_error` 都維持隔離時寫入的
+    值，不是被 `resume_running` 的 MIN 語義拉回 `now`（見
+    `test_reconcile_does_not_pull_forward_a_quarantined_scan_job` 的獨立覆蓋，
+    這裡只是既有測試的自然延伸：同一個情境多驗一步）。"""
     clock = Clock(t=40 * 86400.0)
     store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
     now_ms = int(clock.now() * 1000)
@@ -1882,6 +1890,7 @@ def test_quarantine_of_fills_scan_job_writes_scan_error(tmp_path):
 
     sched = _sched(store, BoomHL(), clock=clock)
     sched._bootstrapped = True
+    sched._first_tick_done = True
 
     r = sched.tick()
     assert r == "quarantined"
@@ -1889,6 +1898,19 @@ def test_quarantine_of_fills_scan_job_writes_scan_error(tmp_path):
     assert scan_after.last_error is not None
     assert "weird failure" in scan_after.last_error
     assert scan_after.status == "running"  # 隔離不改變 scan 本身的狀態
+
+    job_before = store.get_job("0xabc:fills_scan")
+    assert job_before is not None and job_before.next_attempt_at == pytest.approx(
+        clock.now() + 86400.0)
+
+    out = sched.reconcile_scan_jobs(clock.now())
+    assert "resume_running_pulled_forward" not in out
+    assert "resume_running_created" not in out
+
+    job_after = store.get_job("0xabc:fills_scan")
+    assert job_after is not None
+    assert job_after.next_attempt_at == job_before.next_attempt_at   # 隔離仍在，未被拉近
+    assert job_after.last_error == job_before.last_error
 
 
 def test_notify_dirty_exception_during_probe_does_not_lose_probe_result(tmp_path):
@@ -2954,7 +2976,9 @@ def test_s1_churned_backfilling_address_regains_scan_job_and_finishes(tmp_path):
     store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
     _drive_until(sched, clock, lambda rs: rs[-1] == "ran:candidates")
     assert "fills_scan" in store.job_kinds(ADDR_A)
-    assert sched.status()["reconciled"]["resume_running"] >= 1
+    # Task 3c W1（2026-09-23）：job 在退池時被 `delete_jobs` 刪掉，回池對帳是
+    # 從無到有補建，鍵名是 `resume_running_created`（刻意的語義變更）。
+    assert sched.status()["reconciled"]["resume_running_created"] >= 1
     resumed = store.running_scan(ADDR_A)
     # Task 3：續跑同一個 scan_id 是這個測試要驗的核心不變式；`cursor_ms` 改用
     # 單調不倒退＋確實不是從 window_start 重新開始（而非要求與churn 前逐位元
@@ -3015,7 +3039,9 @@ def test_s1_churned_partial_rescan_resumes_same_scan_id(tmp_path):
 
     # 回池。
     store.upsert_candidates([(ADDR_A, None, 1, None)], as_of=clock.now())
-    assert sched.reconcile_scan_jobs(clock.now())["resume_running"] == 1
+    # Task 3c W1（2026-09-23）：job 被退池對帳刪掉，回池是從無到有補建，鍵名是
+    # `resume_running_created`（刻意的語義變更）。
+    assert sched.reconcile_scan_jobs(clock.now())["resume_running_created"] == 1
     resumed = store.running_scan(ADDR_A)
     assert (resumed.scan_id, resumed.cursor_ms) == (scan_id, cursor_ms)
 
@@ -3043,7 +3069,9 @@ def test_s1_reconcile_creates_initial_scan_for_orphan_backfilling_address(tmp_pa
     sched._first_tick_done = True
 
     assert sched._needs_scan_job(ADDR_A, clock.now()) == ("initial_missing", "fills_scan")
-    assert sched.reconcile_scan_jobs(clock.now())["initial_missing"] == 1
+    # Task 3c W1（2026-09-23）：孤兒地址從無到有補建 job，鍵名是
+    # `initial_missing_created`（刻意的語義變更）。
+    assert sched.reconcile_scan_jobs(clock.now())["initial_missing_created"] == 1
 
     # Task 3：探測前置消耗第一個 tick（`_ResumableFillsHL(full_pages=0)`
     # 對探測窗也回非空的短頁，左界證據當場解出為 `earlier_fills_seen`），
@@ -3352,7 +3380,9 @@ def test_s1_reconcile_resumes_orphan_verify_scan_with_verify_job(tmp_path):
 
     out = sched.reconcile_scan_jobs(clock.now())
 
-    assert out["resume_running"] == 1
+    # Task 3c W1（2026-09-23）：job 被 `delete_jobs` 整個刪掉，對帳是從無到有
+    # 補建，鍵名是 `resume_running_created`（刻意的語義變更）。
+    assert out["resume_running_created"] == 1
     assert store.job_kinds("0xver") == {"fills_verify"}
     assert sched.tick() == "ran:fills_verify"
     assert [r[0] for r in _scan_rows(store, "0xver")] == ["initial", "verify"]
@@ -5018,7 +5048,11 @@ def test_resume_running_pulls_a_far_future_scan_job_to_now(tmp_path):
     sched._first_tick_done = True
 
     out = sched.reconcile_scan_jobs(clock.now())
-    assert out.get("resume_running") == 1
+    # Task 3c W1（2026-09-23）：既有 job 被真的拉近，鍵名是
+    # `resume_running_pulled_forward`（刻意的語義變更，取代舊版單一
+    # `resume_running` 鍵——舊版不分「真的拉近」與「狀態上需要但沒變」，見
+    # `test_reconcile_still_pulls_forward_a_healthy_far_future_job` 的同義覆蓋）。
+    assert out.get("resume_running_pulled_forward") == 1
 
     next_at, created_at_after, attempts_after = store._db.execute(
         "SELECT next_attempt_at, created_at, attempts FROM refresh_job WHERE key=?",
@@ -5058,6 +5092,90 @@ def test_resume_running_reconcile_logs_only_true_new_jobs(tmp_path, caplog):
 
     log_lines = [r for r in caplog.records if "對帳補排" in r.getMessage()]
     assert len(log_lines) == orphan_n
+
+
+# ============================================================
+# Task 3c（2026-09-23，reviewer C1／W1）：對帳不得拉近隔離／退避中的
+# `fills_scan` job；對帳計數拆成「真的新建」／「真的拉近」，不再對每輪『狀態
+# 上需要』的 running scan 穩定回報假訊號。
+# ============================================================
+
+def test_reconcile_does_not_pull_forward_a_quarantined_scan_job(tmp_path):
+    """C1（reviewer `repro_e2e.py` 的 e2e 情境）：`fills_scan` job 因語意錯誤
+    被 `_quarantine` 立即隔離（`next_attempt_at = now + 86400`、`last_error`
+    非 `None`，`attempts` 刻意不遞增）——下一輪對帳**不得**把它拉回 `now`。
+    舊版（Task 1b 之後、C1 修復前）『無論 job 是否存在都 MIN 拉近』會把 24
+    小時隔離縮成一個對帳週期（~30 分鐘），形成『放行→失敗→再隔離→再拉回』
+    的無限迴圈（工程原則 2）。
+
+    反向護欄：拿掉 `_ensure_scan_job` 的 `last_error` 檢查（改回無條件呼叫
+    `enqueue`）→ 轉紅（`next_at` 被拉回 `now` 附近）；revert 後
+    `git diff --stat src/` 只剩本 task 的預期改動。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
+                                  window_end_ms=now_ms, params_fp="")
+    store.set_left_boundary("0xabc", "no_earlier_activity", window_start_ms, clock.now())
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
+
+    class BoomHL:
+        def get_fills_page(self, address, start_ms, end_ms):
+            raise RuntimeError("weird failure")          # 語意錯誤 → 立即隔離
+
+    sched = _sched(store, BoomHL(), clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    assert sched.tick() == "quarantined"
+    job = store.get_job("0xabc:fills_scan")
+    assert job is not None and job.last_error is not None
+    assert job.next_attempt_at == pytest.approx(clock.now() + 86400.0)
+    running = store.running_scan("0xabc")
+    assert running is not None and running.status == "running"     # 隔離不改變 scan 狀態
+
+    out = sched.reconcile_scan_jobs(clock.now())
+
+    assert "resume_running_pulled_forward" not in out
+    assert "resume_running_created" not in out
+    job_after = store.get_job("0xabc:fills_scan")
+    assert job_after.next_attempt_at == pytest.approx(clock.now() + 86400.0)
+    assert job_after.last_error == job.last_error
+
+
+def test_reconcile_still_pulls_forward_a_healthy_far_future_job(tmp_path):
+    """Task 1b 不得被 C1 的修法連帶破壞：running scan 存在、`fills_scan` job
+    排在 `now + 24h`、但**沒有**任何失敗（`last_error` 為 `None`，例如 v4 遷移
+    遺留的舊 job）——一輪對帳後仍把它拉到 `now`（`enqueue` 的 MIN 語義），
+    `created_at`／`attempts` 不變。與既有的
+    `test_resume_running_pulls_a_far_future_scan_job_to_now` 同一情境，這裡
+    額外斷言新的計數鍵名（Task 3c W1：`resume_running_pulled_forward`）。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([(ADDR_A, None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills(
+        ADDR_A, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+        window_end_ms=now_ms, params_fp="")
+    key = f"{ADDR_A.lower()}:fills_scan"
+    assert store.enqueue(key, ADDR_A, "fills_scan", 3, clock.now() + 24 * 3600.0)
+    job_before = store.get_job(key)
+    assert job_before is not None and job_before.last_error is None
+
+    sched = _sched(store, FakeHL(), clock=clock)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+
+    out = sched.reconcile_scan_jobs(clock.now())
+
+    assert out.get("resume_running_pulled_forward") == 1
+    assert "resume_running_created" not in out
+    job_after = store.get_job(key)
+    assert job_after.next_attempt_at <= clock.now() + 60
+    assert job_after.created_at == job_before.created_at
+    assert job_after.attempts == job_before.attempts
 
 
 # ============================================================

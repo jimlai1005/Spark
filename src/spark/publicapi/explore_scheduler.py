@@ -635,14 +635,20 @@ class ExploreScheduler:
 
         2026-09-22 使用者第二輪裁決點 1／3。啟動首 tick 與每次 candidates 更新
         後各跑一次；**冪等**——補排過的 job 讓 `_needs_scan_job` 下一次回 `None`，
-        重跑零變更。四種原因碼見 `_needs_scan_job`；`resume_running` 補的 job 會
-        續跑同一個 `scan_id` 與游標（`_run_scan` 見到進行中的遍歷就接著抓），
-        不建新 scan、不整窗重抓。
+        重跑零新建（Task 3c W1：`resume_running`／`initial_missing` 既有且已在
+        `now` 附近的 job「狀態上仍需要」但這輪什麼都沒變，不計入回傳值——見下與
+        `_ensure_scan_job`）。四種原因碼見 `_needs_scan_job`；`resume_running`
+        補的 job 會續跑同一個 `scan_id` 與游標（`_run_scan` 見到進行中的遍歷就
+        接著抓），不建新 scan、不整窗重抓。
 
         回傳 `{原因碼: 補排筆數, "inactive_jobs_deleted": n}`（`status()
-        ["reconciled"]` 揭露）。準入 cap 不套用在這條路徑上：它補的是**狀態已經
-        要求**的工作，且每個地址最多一個遍歷軌 job（結構上受
-        `ADMISSION_MULTIPLIER` 的 6 種 per-address kind 約束），不會膨脹。
+        ["reconciled"]` 揭露）。Task 3c W1：`resume_running`／`initial_missing`
+        的原因碼拆成 `{reason}_created`（job 原本不存在）與
+        `{reason}_pulled_forward`（既有 job 的 `next_attempt_at` 真的被拉近）
+        兩把鍵，取代舊版單一鍵名（見 `_ensure_scan_job`）。準入 cap 不套用在
+        這條路徑上：它補的是**狀態已經要求**的工作，且每個地址最多一個遍歷軌
+        job（結構上受 `ADMISSION_MULTIPLIER` 的 6 種 per-address kind 約束），
+        不會膨脹。
 
         補的 job kind 必須與進行中的遍歷**同類**（2026-09-22 主線程整合模擬抓到的
         Critical）：`verify` 遍歷要補 `fills_verify`、`initial`／`partial_rescan`
@@ -691,19 +697,61 @@ class ExploreScheduler:
         對帳一輪可能對同一個地址重複呼叫 `enqueue`（MIN 語義下沒有副作用），
         但日誌只在**真的新建**（`enqueue` 回 `True`）時印一行——否則 300 個
         地址的候選池每輪對帳都會噴出等量的『對帳補排』警告，稀釋掉真正的
-        新建事件。"""
+        新建事件。
+
+        Task 3c（2026-09-23，reviewer C1／W1）：
+        - **C1**——`resume_running`／`initial_missing` 補排前先讀既有 job
+          （`ExploreStore.get_job`，唯讀不 claim）：`job.last_error is not
+          None`（隔離標記在 job 層級，`_quarantine` → `_reschedule(err=...)`
+          → `store.reschedule` 寫入）就**不拉近、不重建**，直接回 `None`；
+          `running_scan.last_error is not None` 當第二道保險（兩者任一非
+          `None` 就不拉近）。理由：隔離／退避的到期時間由 `_quarantine`／
+          `_reschedule` 擁有，`enqueue` 的 MIN 拉近若無視這個標記，
+          `_quarantine` 排的 24 小時隔離會被下一輪對帳（~30 分鐘）拆掉，形成
+          「放行 → 失敗 → 再隔離（`attempts` 不遞增）→ 再拉回」的無限迴圈
+          （工程原則 2：語意錯誤不得被其他路徑覆寫重試；正式機現況 0 個
+          隔離中的 `fills_scan` job，是潛伏而非進行中的缺陷）。
+        - **W1**——舊版回傳值不分「真的補排」與「狀態上需要但這輪什麼都沒
+          變」，每輪對同一批 running scan 穩定回報相同計數，是部署後觀測的
+          假訊號。現在用 `enqueue` 前後的 `next_attempt_at` 比較拆成
+          `{reason}_created`（原本不存在，`enqueue` 回 `True`）與
+          `{reason}_pulled_forward`（既有 job 的 `next_attempt_at` 真的被
+          拉近）；『既有且未變』兩者皆不成立，回 `None`（不計數，重跑零新建
+          也零「假拉近」）。只對 `resume_running`／`initial_missing` 拆分——
+          其餘原因碼（`partial_due`／`verify_needed`／verify 的
+          `resume_running`）本來就只在對應 job 不存在時才會被 `_needs_scan_
+          job` 放行，不會有『既有且未變』這個中間態，維持單一鍵名。"""
+        if isinstance(running_scan, _Unset):
+            running_scan = self._store.running_scan(address)
         need = self._needs_scan_job(address, now, running_scan=running_scan)
         if need is None:
             return None
         reason, job_kind = need
+        key = self._key(address, job_kind)
+        pull_forward_reason = reason in ("resume_running", "initial_missing")
+        existing = self._store.get_job(key) if pull_forward_reason else None
+        if pull_forward_reason:
+            scan_last_error = getattr(running_scan, "last_error", None)
+            if ((existing is not None and existing.last_error is not None)
+                    or scan_last_error is not None):
+                return None
         priority = 4 if job_kind == "fills_verify" else 3
         next_at = now + (_spread(address, VERIFY_SPREAD_S) if reason == "verify_needed" else 0.0)
-        created = self._store.enqueue(self._key(address, job_kind), address, job_kind, priority,
-                                      next_at)
+        created = self._store.enqueue(key, address, job_kind, priority, next_at)
+        if not pull_forward_reason:
+            if created:
+                logger.warning("explore scheduler: 對帳補排 %s 的 %s job（%s）",
+                               address, job_kind, reason)
+            return reason
         if created:
             logger.warning("explore scheduler: 對帳補排 %s 的 %s job（%s）",
                            address, job_kind, reason)
-        return reason
+            return f"{reason}_created"
+        after = self._store.get_job(key)
+        if (existing is not None and after is not None
+                and after.next_attempt_at < existing.next_attempt_at):
+            return f"{reason}_pulled_forward"
+        return None
 
     def _needs_scan_job(self, address: str, now: float, *,
                         running_scan=_UNSET,

@@ -199,6 +199,45 @@ def test_reschedule_with_stale_fencing_is_noop(tmp_path):
     assert store.complete(job, fencing=job.fencing - 1) is False
 
 
+def test_get_job_is_read_only(tmp_path):
+    """Task 3c（2026-09-23，reviewer C1／W1）：`get_job` 只讀，不 claim、不改
+    `lease_until`／`lease_owner`／`fencing`／`attempts`／`next_attempt_at`。
+    供 `explore_scheduler._ensure_scan_job` 判斷 job 是否在失敗處理中，以及
+    `enqueue` 前後 `next_attempt_at` 有沒有真的變。"""
+    store, c = _store(tmp_path)
+    assert store.get_job("0xabc:fills_scan") is None      # 不存在 → None
+
+    store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", priority=3,
+                  next_attempt_at=c.now() + 100)
+    before = store.get_job("0xabc:fills_scan")
+    assert before is not None
+    assert before.key == "0xabc:fills_scan"
+    assert before.address == "0xabc"
+    assert before.kind == "fills_scan"
+    assert before.next_attempt_at == c.now() + 100
+    assert before.attempts == 0
+    assert before.lease_until is None
+    assert before.lease_owner is None
+    assert before.last_error is None
+
+    # claim 一次，製造 lease／fencing／attempts 的真實變化，確認 get_job 讀到
+    # 的是「當下真值」，也確認 get_job 本身的呼叫不改變任何欄位（讀兩次一致）。
+    claimed = store.claim_due(c.now() + 100, "owner1", lease_s=60)
+    assert claimed is not None and claimed.key == "0xabc:fills_scan"
+    store.reschedule(claimed, fencing=claimed.fencing, next_attempt_at=c.now() + 200,
+                     err="boom")
+
+    after1 = store.get_job("0xabc:fills_scan")
+    after2 = store.get_job("0xabc:fills_scan")
+    assert after1 == after2                                # 唯讀：讀兩次結果一致
+    assert after1.next_attempt_at == c.now() + 200
+    assert after1.attempts == 1
+    assert after1.last_error == "boom"
+    assert after1.lease_until is None                      # reschedule 清 lease
+    assert after1.lease_owner is None
+    assert after1.fencing == claimed.fencing               # get_job 不推進 fencing
+
+
 def test_enqueue_dedupe_only_raises_priority_and_advances_time(tmp_path):
     store, c = _store(tmp_path)
     first = store.enqueue("0xabc:portfolio", "0xabc", "portfolio", priority=2,
