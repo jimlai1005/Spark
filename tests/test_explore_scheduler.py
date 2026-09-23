@@ -4246,6 +4246,49 @@ class SchedulerHarness:
         self._store._db.commit()
         return addrs
 
+    def seed_reset_truncation_rows(self, *, n: int) -> list[str]:
+        """Task 4（plan docs/superpowers/plans/2026-09-23-explore-probe-window-
+        scan-cadence.md）：精確複製 v5 遷移 D-M 重設後、池內 122 個
+        `truncation_suspected → unknown` 列的真實形狀——scan 已完成
+        （`status='done'`、游標已抵達 `window_end_ms`）、沒有任何
+        `fills_scan`／`fills_verify` job（遷移只重設證據欄位，不建 job，見
+        `explore_store._migrate_v4_to_v5`）、`left_boundary='unknown'`
+        （`bootstrap_address_fills` 的預設值，遷移重設後與全新候選同形）。
+
+        與 `seed_migrated_unknown_rows`（Task 8b）的關鍵差異：那裡的成交放在
+        `window_start_ms - 1_000`（窗口起點前 1 秒）——這個位置在『舊版 1 天
+        探測窗』下同樣可見，無法用來驗證 D-K 全史窗的反向護欄（改回窄窗不會
+        轉紅）。這裡改用 `window_start_ms - 200*DAY`（正式機 `0x5cee0ca5…`
+        實測案例的量級：1 天窗 0 筆、全史窗 2000 筆最早見於一年前）：全史窗
+        `[0, ws)` 可見、舊版窄窗 `[ws-1天, ws)` 不可見——窄窗探測回空後
+        會依 portfolio `first_activity_ms`（`ws - 300*DAY`，同樣明顯早於
+        `ws - _FIRST_ACTIVITY_BAND_MS`）落成 `truncation_suspected`，正是
+        v5 遷移前卡住的那 122 個位址的行為。位址取自 `_t7a_addr(360..)` 區段——
+        必須落在候選池位址範圍 `100..396`（`SchedulerHarness.__init__` 的
+        `_active_addresses`）內，否則下一輪 `_run_candidates` 的
+        `deactivate_missing` 會判定它們不在 leaderboard 內而立刻退池，
+        `_PROBE_CANDIDATE_WHERE` 的 `c.active=1` 直接篩掉（未被本檔其餘
+        harness 方法使用，見 `_t7a_addr(300..319)`／`_t7a_addr(350)` 的既有
+        用法）。"""
+        import dataclasses
+        now = self._clock.now()
+        now_ms = int(now * 1000)
+        ws, we = fresh_scan_window(now_ms)
+        addrs = [_t7a_addr(360 + i) for i in range(n)]
+        for addr in addrs:
+            self._store.upsert_candidates([(addr, None, 1, None)], as_of=now)
+            self._store.bootstrap_address_fills(
+                addr, now, window_start_ms=ws, window_end_ms=we, params_fp="")
+            scan = self._store.get_active_scan(addr)
+            scan = dataclasses.replace(
+                scan, cursor_ms=scan.window_end_ms, result="partial",
+                reason="left_boundary_unknown", finished_at=now)
+            self._store.complete_scan(addr, [], scan)
+            self._upstream.seed_fills(addr, [_t7a_fill_at(ws - 200 * DAY, 0)])
+            self._upstream.set_portfolio(addr, _t7a_default_portfolio(ws - 300 * DAY))
+        self._store._db.commit()
+        return addrs
+
     def seed_stale_partial_row(self, address: str, *, window_start_ms: int, window_end_ms: int,
                                finished_at: float) -> None:
         """Task 10（C1 harness 反向護欄）：構造一筆『很久以前完成一次遍歷、
@@ -5015,3 +5058,121 @@ def test_resume_running_reconcile_logs_only_true_new_jobs(tmp_path, caplog):
 
     log_lines = [r for r in caplog.records if "對帳補排" in r.getMessage()]
     assert len(log_lines) == orphan_n
+
+
+# ============================================================
+# Task 4（plan docs/superpowers/plans/2026-09-23-explore-probe-window-scan-
+# cadence.md）：整合驗收——D-K（全史探測窗）與 D-O（`fills_scan` 首次到期改
+# `now`）必須真的在 300 地址真實限流競爭下生效，不是只在單元測試裡對。
+# ============================================================
+
+def test_reset_truncation_rows_resolve_via_full_history_probe(tmp_path):
+    """D-K／D-M：v5 遷移把池內 122 個 `truncation_suspected` 重設為 `unknown`
+    後，這批『scan 已 done、無任何 job』的位址只能靠獨立探測鏈（`_serve_
+    special` → `next_probe_candidate` → `_run_probe`）解出結論——24 小時內
+    全部收斂為 `complete`、零遍歷頁（沒有重掃，純粹是探測窗變寬讓舊窄窗查
+    不到的正面證據現在查得到）。"""
+    h = _t7a_harness(tmp_path)
+    addrs = h.seed_reset_truncation_rows(n=20)
+    h.run_for(hours=24)
+    resolved = [a for a in addrs
+               if h.published_row(a)["fills_coverage"]["state"] == "complete"]
+    assert len(resolved) == 20, (
+        f"{20 - len(resolved)} 個位址 24 小時內未解出 complete；"
+        f"probes_executed={h.probes_executed}")
+    assert h.scan_pages_for(addrs) == 0            # 只有探測頁，沒有任何遍歷頁
+    assert h.probes_executed >= 20
+
+
+def test_new_cold_address_first_page_is_not_deferred_by_period_spread(tmp_path):
+    """D-O 整合驗收（主線程 2026-09-23 裁決——取代原「5 分鐘」錨例）。
+
+    情境：暖機 24 小時到穩態（300 個地址 scan 全 done、base 週期性運作，
+    正式機常態，不是 harness t=0 同時 300 個新地址起跑的極端擁塞），讓一個
+    從未出現過的地址真的新入池（`churn_out` 一個既有地址讓出
+    `candidate_pool=300` 的名額——正式機「偶爾 1–3 個新入池」時也伴隨舊地址
+    跌出榜外，見 `_run_candidates`），驗證：
+    1. 一輪 candidates 後 `fills_scan` job 的 `next_attempt_at <= now + 60`
+       （D-O 的直接證據，不依賴吞吐）。
+    2. 穩態下 300 地址競爭給 1 小時合理餘裕，第一頁真的被領走、成交真的落地
+       （`stored_fill_count(cold) >= 1`）。
+
+    ⚠️ 指標選擇的教訓（builder 2026-09-23 實測踩到、已修正）：**不用**
+    `scan_pages_for()`（依 `fills_scan.pages_done` 加總）當服務證據——
+    `apply_scan_page`（`explore_fills_sync.py:498-505`）對「短頁／終止頁」
+    （`len(page) < PAGE_LIMIT`，游標直接跳到 `window_end_ms`）刻意**不**
+    遞增 `pages_done`（docstring：「短頁只代表『從游標起上游不再給』。游標
+    推進到固定終點」）——`pages_done` 量的是「終止頁之前的完整頁數」，不是
+    「有沒有真的抓過頁」。冷門地址的整趟遍歷幾乎必然一頁內（< `PAGE_LIMIT`
+    =2000 筆）以短頁終止，`pages_done` 因此永遠停在 0，即使遍歷已經
+    `complete`、成交已經真的落地——首次用 `scan_pages_for([cold]) >= 1` 當
+    斷言，在真正成功（11 分鐘內 `stored_fill_count=299`、`published_row`
+    state=complete、win_rate=100.0）的情況下仍誤判為紅燈，逼著誤以為
+    `_tick_once` 領工順序把 fills-like 餓死——追查到這個指標本身選錯，不是
+    排程有問題。改用 `stored_fill_count`（`fills` 表實際落地筆數）直接量
+    「成交真的抓到了」，不依賴 `pages_done` 這個只對『多頁』遍歷才有意義的
+    內部計數器。
+
+    若步驟 2 的 `stored_fill_count(cold) >= 1` 在 1 小時內仍不成立，才是真的
+    要停下來回報、附 `claim_due` 領工順序與 `limiter_snapshot()` 證據、
+    **不准放寬斷言**的情況（本次修正指標後，1 小時預算下實測 11 分鐘內解決，
+    遠有餘裕）。
+
+    `cold` 的位址尾碼刻意選 `_spread(cold, 21600≤period≤86400) = 13600`
+    （> 3600 秒＝1 小時）：破壞 D-O 時，這個位址的 job 若真的走 `_spread`
+    必然被排到 1 小時之後，不是巧合命中一個 spread 恰好很小的位址。
+
+    ⚠️ 反向護欄的第二個教訓（builder 2026-09-23 實測）：**只**改
+    `_enqueue_address_jobs` 的 `fills_scan` 到期（D-O 本體）不足以讓步驟 1／2
+    轉紅——`_run_candidates` 收尾一定會呼叫 `reconcile_scan_jobs`
+    （`explore_scheduler.py:1038`），對剛用 `bootstrap_address_fills` 建立
+    running scan 的 `cold`，`_ensure_scan_job` 判定為 `resume_running`，
+    Task 1b（`explore_scheduler.py:755`，另一個已合併的獨立修法）「無論 job
+    是否存在都用 `enqueue` 的 MIN 語義把它拉到 `now`」——同一輪內把 D-O 被
+    破壞的效果蓋掉，形成兩個獨立修法對『新地址第一輪就把 job 排到 now』這件
+    事的疊加保護（防禦縱深，非測試設計失誤）。要讓反向護欄真的轉紅，必須
+    **同時**暫時改回 Task 1b 之前的舊語意（`_needs_scan_job` 的
+    `resume_running` 分支改回 `None if "fills_scan" in kinds else (...)`）
+    ──兩處都改，`job_next_at` 才會真的落在 `now + 13600`（實測
+    `next_attempt_at=now+13600.0`，遠超過 `now+60`），revert 後
+    `git diff --stat src/` 清空。這個測試因此驗的是『新地址第一輪就有 job
+    排到 now』這個**由 D-O 與 Task 1b 共同保證**的整體性質，不是 D-O 單獨
+    生效的排他證明——與此測試名稱『不被 `_spread` 延後』的字面主張一致。"""
+    h = _t7a_harness(tmp_path)
+    h.run_for(hours=24)             # 暖機到穩態：300 個地址 scan 全 done、
+                                    # base 週期性運作——不是 harness t=0 同時
+                                    # 300 個新地址起跑的極端擁塞。
+    victim = _t7a_addr(396)         # 讓出一個候選名額（`candidate_pool=300`
+                                    # 硬上限，見 `_run_candidates`／
+                                    # `deactivate_missing`）——對應正式機
+                                    # 「新地址入池、舊地址跌出榜外」的常態換血。
+    h.churn_out(victim)
+    h.run_for(hours=31 / 60)        # 一輪 candidates：victim 退池
+
+    cold = _t7a_addr(100_000)       # 從未出現過的全新地址——`bootstrap_
+                                    # address_fills` 回 `True`（`is_new`），
+                                    # 真的走 `_enqueue_address_jobs`（不是
+                                    # `resume_running`：這個位址沒有既有
+                                    # `fills_sync`／running scan 可續）。
+                                    # `_spread(cold, 21600..86400) == 13600`
+                                    # （> 3600s，見本函式 docstring 的反向
+                                    # 護欄理由）。
+    h.set_fill_count(cold, window_fills=300)    # 30 天窗內幾百筆成交、
+                                                # 首次活動 ws+2*DAY（見
+                                                # `_t7a_default_portfolio`
+                                                # docstring，避開探測模糊帶）。
+    h.churn_in(cold)
+    h.run_for(hours=31 / 60)        # 下一輪 candidates：cold 真的新入池、建 job
+
+    job_next_at = _job_next_attempt(h.store, f"{cold.lower()}:fills_scan")
+    assert job_next_at is not None and job_next_at <= h.now + 60, (
+        f"D-O：新地址的 fills_scan job 應排到 now（<=now+60），不是 "
+        f"_spread(period) 之後；next_attempt_at={job_next_at} now={h.now}")
+
+    h.run_for(hours=1)              # 暖機穩態下 300 地址競爭的合理餘裕
+    assert h.stored_fill_count(cold) >= 1, (
+        f"暖機穩態下新地址 1 小時內零成交落地——若這裡轉紅是 `_tick_once` 領工"
+        f"順序真的把 fills-like 餓死超過 1 小時，不是場景設計不當、也不是指標"
+        f"選錯（見本函式 docstring 的 `pages_done` 教訓）；"
+        f"probes_executed={h.probes_executed} total_fills_pages={h.total_fills_pages} "
+        f"limiter={h.limiter_snapshot()}")
