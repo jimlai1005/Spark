@@ -294,4 +294,4 @@ UPDATE refresh_job SET next_attempt_at=:now
 | 2 探測窗全史 | ✅ `0815e10`；主線程複跑 3384 passed、ruff 過、目標測試 6 passed | 四條測試＋harness 護欄；反向護欄兩組轉紅；harness 時鐘改 1.7e9、預設候選首次活動 ws+2d；139 條家族測試零轉紅、零斷言放寬 |
 | 3 schema v5 遷移 | ✅ `e669b31`；主線程複跑 3389 passed、ruff 過 | 主線程在乾淨複本獨立重現：report 完全一致（probes_needed 156、cursors_normalized 164、verdicts_recomputed 172、scan_jobs_advanced 25）；fills 1,557,151 前後相同；游標實際變動 131 個且全屬 D-N 條件；池內 truncation_suspected 122→0、complete 128→139；probe candidates 122；running scan 無殘留未來 job |
 | 4 整合驗收 | 派工中 | |
-| 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g 派工中（與 Task 4 並行，檔案不重疊）；審核等 Task 4 | |
+| 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g ✅（主線程逐段讀過、修 1 處預期效果不一致）；reviewer（opus）審 `bbd7adf..HEAD -- src/` 派工中；部署待授權 | |
