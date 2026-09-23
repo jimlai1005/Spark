@@ -1824,6 +1824,11 @@ failed 0；cron.err 0。unknown 上升是新進位址、非探測停擺（新位
 4. 單位址增量需求上限從 1/6h 升到 1/1h：非熱門且 fph ≥ 267 的位址從 2 個增到約 30 個就會破 30 頁/小時，
    線上無指標——RUNBOOK §5.8f 已加一條 DB 查詢當觀測。
 5. 被推遲的 `finished_at` 會出現在對外 `evidence.finished_at`（觀測失真，不影響判準）。
+6. <!-- 2026-09-23 17:30 UTC 查明，非本次回歸 -->`compose_rows` 對 `0x4cae5bed…477c34` 每個 publisher tick（60/h）都 enrich 失敗
+   `InvalidOperation(DivisionUndefined)`（0/0，trader_stats 或 TWR 分母為 0），改列 pending/enrich_error；journal 自 2026-09-22 11:00
+   之前就有（第八次部署前）。修法：分母為 0 時回 None 並標 reason，別讓一個位址每分鐘噴一行 log。
+7. <!-- 同上 -->觀測取樣器 `sample.py` 的 `public.eligible` 用的是放寬門檻（`max_dd_pct=100&min_live_days=30&min_fills=200`，~80），
+   對外預設門檻月窗只有 22 個 eligible（`max_dd` 擋 150 個）——兩者不是同一個數，日誌裡的「eligible」一律指前者。
 
 ## 部署後觀測日誌（第八次部署 2026-09-22 15:45:03 UTC；24h 窗至 2026-09-23 15:45 UTC）
 
