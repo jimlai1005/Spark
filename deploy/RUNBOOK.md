@@ -2899,7 +2899,7 @@ done'
 
 | 時點 | 預期 |
 |---|---|
-| +1h | `truncation_suspected` 從 ~121 開始下降（每小時約 12–15 個，輔助份額 3:1） |
+| +1h | 遷移當下池內 `truncation_suspected` 已為 0（D-M 重設）；**`unknown` 從 ~156 開始下降**（每小時約 12–15 個，輔助份額 3:1），對應的 complete 同步上升 |
 | +2–3h | 35 個 `backfilling` 全部開跑並多數完成 |
 | +6–8h | 池內 complete 121 → ~250；剩下為證據真的不足（全史窗仍空且帳戶更老）或 `unresolved_gap` |
 | +24h | 觀測結束；第二份 24h 日誌 |
