@@ -2836,7 +2836,8 @@ D-K／D-O／Task 1b 專屬）：
 |---|---|---|---|
 | 池內 `truncation_suspected` 收斂 | DB：`select count(*) from fills_sync s join candidate cd on cd.address=s.address and cd.active=1 where s.left_boundary='truncation_suspected'` | 6 小時內降到個位數（D-M 重設後由全史探測窗重新判定，遷移當下基線 0，若又回升代表新判定有問題） | 查 `_run_probe` 的全史窗實作是否真的生效（Task 2 測試 `test_probe_queries_full_history_before_window_start`）；不要調寬 D-L 的模糊帶 |
 | 池內 `left_boundary='unknown'` 單調下降 | 同上查詢改 `left_boundary='unknown'` | 遷移後基線約 156（Step 5 的 `probes_needed`），2 小時內至少 −20 | 查獨立探測（輔助份額）是否真的排到這批地址（`_PROBE_CANDIDATE_WHERE`，同 §5.8f 「探測進度」列的排查方式） |
-| 遍歷軌不停擺 | `samples.jsonl` 的 `scan.scan_pages_15m`；DB：`select count(*) from refresh_job where kind='fills_scan' and next_attempt_at<=strftime('%s','now')` | `scan_pages_15m` 不得連續 4 筆（1 小時）為 0，且同時存在到期的 `fills_scan` job（Task 1／1b 修的正是這個：到期改 `now`、`resume_running` 用 MIN 語義拉近） | 查 Task 1b 的 `resume_running` 是否對每輪對帳都補排（`explore_scheduler.py` 的 `_ensure_scan_job`）；本表沿用的舊版「頁面占比」門檻已在 §5.8f 移除，不要重新引用 |
+| 遍歷軌不停擺 | `samples.jsonl` 的 `scan.scan_pages_15m`；DB：`select count(*) from refresh_job where kind='fills_scan' and next_attempt_at<=strftime('%s','now')` | `scan_pages_15m` 不得連續 4 筆（1 小時）為 0，且同時存在到期的 `fills_scan` job（Task 1／1b 修的正是這個：到期改 `now`、`resume_running` 用 MIN 語義拉近） | 查 Task 1b／3c 的對帳計數（`reconciled.resume_running_created`／`resume_running_pulled_forward`；Task 3c 起「既有且未變」不計，穩態每輪應接近 0）；本表沿用的舊版「頁面占比」門檻已在 §5.8f 移除，不要重新引用 |
+| 隔離不得被對帳拆掉（Task 3c C1） | DB：`select count(*) from refresh_job where kind='fills_scan' and last_error is not null`（隔離／退避中的 job 數）與其 `next_attempt_at` 是否維持在未來；`/api/ops/health` 的 `explore_refresh.quarantined_max_attempts`（admin session） | 隔離中 job 的 `next_attempt_at` 在下一輪對帳（30 分鐘）後**不變**；`quarantined_max_attempts` 24h 內停在固定值、不持續遞增 | 持續遞增＝C1 回歸未封死 → Step 7-pre 先停背景工作，回報主線程 |
 
 > 「至少一個完整 24 小時重排週期」的理由與 §5.8f 相同：`FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL`
 > 已順延到本次部署時刻 +24h（Step 3），24 小時觀測窗要涵蓋「加速期」與「到期自動回 9:1
