@@ -1667,6 +1667,22 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 running scans 69 → 73；Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退、不走 Step 7-pre。**
 遍歷軌呈預期的脈衝（Task 12 排程缺陷），探測仍在解出（+2 earlier_fills_seen、verify job 持續遞減）。
 
+**02:10 追查（使用者問「剩下的什麼時候會完成」，唯讀查 DB）——發現一個 v3 遺留列的假 partial（安全方向）**：
+池內 95 個 `partial / traversal_incomplete` 全是 v3 時代 `count_below_retention_threshold_probe_empty` 的 scan
+（`pages_done=0`，即第一頁就是短頁、整窗一頁涵蓋），但它們的 `cursor_ms` 比 `window_end_ms` **少約 0.2 天（~5h）**
+（v3 短頁收尾寫的 `end_ms` 與列上的 `window_end_ms` 語義有偏移）。Task 10 W3 的 `scan_verdict` 嚴格要求
+「游標抵達固定終點」→ 這 95 個被判 `traversal_incomplete`。**不是錯判完整**（方向安全），但把 95 個原本合理
+complete 的小帳戶壓成 partial；它們沒有 running scan、沒有 job，會在 24h `partial_rescan`（≈ 09-23 15:45 UTC）
+重掃（多數 1 頁即完成、便宜），重掃後新 scan 游標正確；不過其中 80 個的左界證據是 `truncation_suspected`，
+重探（1 天窗）多半仍回空 → 仍 partial，要等探測窗待辦。**Task 13 候選**：v4 遷移或 `scan_verdict` 對 v3 遺留 scan
+容忍 `cursor_ms ∈ [window_end − 1d, window_end]`（僅限 `pages_done=0` 且 v3 reason 為 probe_empty／count_below 的列），
+或在遷移時把這批列的 `cursor_ms` 正規化為 `window_end_ms`。
+
+**池內 300 個位址的完成時間表（依現行機制，02:10 估）**：complete 121；`backfilling` 35（Task 12 延後 0–13h 後開跑，
+多數 24h 內完成）；`traversal_incomplete`＋`no_earlier_activity` 13（24h 重掃後 complete）；`traversal_incomplete`＋
+`truncation_suspected` 80 與 `left_boundary_truncated` 41（**現行機制下不會完成**，需探測窗待辦＋Task 12／13）。
+預估 48h 後 complete ≈ 175–185，剩約 120 個卡在 `truncation_suspected`。
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
