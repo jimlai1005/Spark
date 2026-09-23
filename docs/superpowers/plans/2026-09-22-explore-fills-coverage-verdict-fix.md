@@ -1782,6 +1782,19 @@ follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；cron.err 0。
 主機取樣（§5.8h）首兩筆 cron 落地：13:32 cpu 12.7%／available 1046 MB、13:47 cpu 12.1%／available 1065 MB，
 swap 300 MB、follower 2、`host_cron.err` 0。
 
+| 14:00 | 0 | 0 | **154**／139／7 | 26 | 0／2／0 | ok | pages 9；eligible 86；ineligible 101 |
+| 14:15 | 0 | 0 | 154／139／7 | 26 | 0／0／0 | ok | pages 6 |
+| 14:30 | 0 | 0 | 154／139／7 | 25 | 0／4／0 | ok | pages 11；overdue p95 fills 259s |
+| 14:45 | 0 | 0 | 154／140／6 | 25 | 0／0／0 | ok | pages 11 |
+
+**14:55 排程檢查（+23h10m）**：`fills_sync` 總列 474 → 484（池輪替進 10 個新位址，初始 unknown）→ unknown 74 → 83
+（池內 6 → 19）、`earlier_fills_seen` 209、`no_earlier_activity` 27、`truncation_suspected` 164 → 165；
+completeness 55／219／210（backfilling +9＝新位址開跑）；`fills_verify` job 26 → 25；running scans 46 → 54；
+對外 complete 147 → 154、eligible 85；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
+failed 0；cron.err 0。unknown 上升是新進位址、非探測停擺（新位址已進 backfilling、running scans 同步 +8）。
+**判定：安全面正常，不回退。** 主機取樣：cpu 12.0–12.7%、available 1003–1042 MB、swap 300 MB、api cgroup 952–1010 MB、
+`host_cron.err` 0。
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
