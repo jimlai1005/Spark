@@ -1050,8 +1050,16 @@ class ExploreScheduler:
             if not is_new and jobs >= cap:
                 self._admission_skipped += 1
                 continue
+            # D-O（2026-09-23，前一份 plan 02:10 段查明的根因）：`fills_scan`
+            # 是遍歷軌，節奏是「抓完一頁就排下一頁」——不該套用 `fills`
+            # 增量軌的 `_spread(period_s)` 分散（Task 5b 把冷門週期拉到 24h
+            # 後，正式機 60 個 fills_scan job 全數排在 33 分鐘～23.9h 後、
+            # 0 個到期，fills 額度空轉）。首次到期改 `now`（`_jit(60.0)` 防
+            # 同秒，其餘 kind 仍走 `_spread`）。
+            next_at = (now + self._jit(60.0) if kind == "fills_scan"
+                      else now + _spread(address, period_s))
             if self._store.enqueue(self._key(address, kind), address, kind, priority,
-                                   now + _spread(address, period_s)):
+                                   next_at):
                 jobs += 1
         return jobs
 

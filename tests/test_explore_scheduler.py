@@ -3962,6 +3962,10 @@ class SchedulerHarness:
         self._n = candidates
         self._addresses = [T7A_WHALE, T7A_MYSTERY, T7A_BURST] + \
             [_t7a_addr(100 + i) for i in range(candidates - 3)]
+        # Task 1（D-O）churn_out／churn_in 的可變視圖——`leaderboard_source_fn`
+        # 每次呼叫都重讀這份 list，不是建構時就凍結的 payload（見
+        # `_build_scheduler`），churn 才會被下一輪 `_run_candidates` 看到。
+        self._active_addresses: list[str] = list(self._addresses)
         self._store: ExploreStore | None = None
         self._sched: ExploreScheduler | None = None
         self._tick_counts: dict[str, int] = {}
@@ -3974,12 +3978,12 @@ class SchedulerHarness:
         return self
 
     def _build_scheduler(self) -> ExploreScheduler:
-        payload = _t7a_payload(self._addresses)
         return ExploreScheduler(
             store=self._store, hl=self._gateway.scoped("explore"),
             hl_base=self._gateway.scoped("explore_base"),
             hl_fills=self._gateway.scoped("explore_fills"),
-            leaderboard_source_fn=lambda: payload, excluded_fn=lambda: set(),
+            leaderboard_source_fn=lambda: _t7a_payload(self._active_addresses),
+            excluded_fn=lambda: set(),
             cfg=ExploreConfig(candidate_pool=self._n),
             now_fn=self._clock.now, sleep_fn=self._clock.sleep, on_dirty=lambda: None,
             # Task 7b（主線程 2026-09-22 裁決）：下界改成正式機真實預設
@@ -4240,6 +4244,32 @@ class SchedulerHarness:
     def scan_cursor(self, address: str) -> int | None:
         scan = self._store.get_active_scan(address) or self._store.latest_done_scan(address)
         return None if scan is None else scan.cursor_ms
+
+    def scan_id(self, address: str) -> str | None:
+        """`fills_sync.scan_id` 的即時遍歷／最近一次完成遍歷——供 Task 1 D-O
+        的換血測試確認『同一次遍歷續跑』（見 `scan_cursor`，同一套判斷）。"""
+        scan = self._store.get_active_scan(address) or self._store.latest_done_scan(address)
+        return None if scan is None else scan.scan_id
+
+    @property
+    def store(self) -> ExploreStore:
+        return self._store
+
+    @property
+    def now(self) -> float:
+        return self._clock.t
+
+    # ---- Task 1（D-O）候選池換血：只改 `leaderboard_source_fn` 看到的候選
+    # 集合，不直接碰 DB——退池／再入池的效果必須走真實 `_run_candidates` →
+    # `deactivate_missing`／`upsert_candidates` → `delete_jobs`／
+    # `_enqueue_address_jobs` 路徑（下一輪 `run_for` 才會生效）。 ----
+    def churn_out(self, address: str) -> None:
+        self._active_addresses = [a for a in self._active_addresses
+                                  if a.lower() != address.lower()]
+
+    def churn_in(self, address: str) -> None:
+        if not any(a.lower() == address.lower() for a in self._active_addresses):
+            self._active_addresses.append(address)
 
     def pages_refetched_after_restart(self) -> int:
         return self._upstream.refetched_pages
@@ -4618,3 +4648,104 @@ def test_rescan_probe_does_not_flip_the_superseded_verdict(tmp_path):
     final = h.get_sync(addr)
     assert final.completeness == "complete"
     assert final.reason == "left_boundary_verified"
+
+
+# ============================================================
+# Task 1（2026-09-23，D-O）：`fills_scan` 首次到期改為 `now`——遍歷節奏是
+# 逐頁，不該套用 `fills` 增量軌 `_spread(period_s)` 的分散。根因與正式機
+# 事故見前一份 plan `docs/superpowers/plans/2026-09-22-explore-fills-coverage-
+# verdict-fix.md` 的「00:55 排程檢查」「02:10 追查」兩段：Task 5b 把冷門
+# 週期拉到 24h 後，60 個 fills_scan job 全部排在 33 分鐘～23.9h 後、0 個到期，
+# fills 額度空轉。
+# ============================================================
+
+def _job_next_attempt(store: ExploreStore, key: str) -> float | None:
+    """`refresh_job.next_attempt_at`（依 `key`）——`ExploreStore` 沒有公開的
+    『依 key 查單一 job』介面，直接讀底層表，與本檔既有 `_scan_rows` 同一套
+    手法。"""
+    row = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE key=?", (key,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _scheduler_with_cold_candidate(tmp_path, *, address: str, rank: int,
+                                   now: float) -> tuple[ExploreScheduler, ExploreStore, Clock]:
+    """建一個全新 store，候選榜上恰好排第 `rank` 名（`rank=250` > `hot_rank`
+    預設 50，即冷門）的單一目標地址——只用來讓 `_run_candidates`／
+    `_enqueue_address_jobs` 真的跑過一次首輪 bootstrap，觀察 D-O 排出的到期
+    時間。`rng` 固定回 0.0（`_jit(60.0)` 恆為 54.0，去除 `<=60s` 斷言對 jitter
+    抽樣的依賴，見 `ExploreScheduler._jit`：`period_s*(1+(rng()*2-1)*jitter_
+    pct)`，`jitter_pct` 預設 0.10 對稱，`rng()` 不固定時上界可到 66s）。"""
+    clock = Clock(t=now)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    # `_spread` 對 `address[-8:]` 做 `int(..., 16)`——佔位地址一律用合法十六進位
+    # （見 `_t7a_addr` 同一條教訓）。
+    addrs = [f"0x{i:08x}" for i in range(rank - 1)] + [address]
+    payload = _payload(addrs)
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload,
+                   cfg=ExploreConfig(candidate_pool=300), clock=clock, rng=lambda: 0.0)
+    return sched, store, clock
+
+
+def _run_until_candidates(sched, clock, *, limit: int = 600) -> float:
+    """跑到 `_run_candidates` 真正執行的那一輪，回傳該輪內部使用的 `now`
+    （`ExploreScheduler.tick()` 在呼叫當下對 `self._now()` 取樣一次、整輪
+    共用；本檔既有的 `_drive_until` 在判斷 predicate *前*就先把 clock 往後
+    推一格，呼叫端回頭讀 `clock.now()` 會比輪內真正的 now 多 1 秒——這裡
+    直接回傳輪內的 now，供需要精確數值斷言的測試使用，不對 `_drive_until`
+    改動語意）。"""
+    for _ in range(limit):
+        now = clock.now()
+        r = sched.tick()
+        if r == "ran:candidates":
+            return now
+        clock.t += 30.0 if r == "idle" else 1.0
+    raise AssertionError(f"{limit} 個 tick 內沒有跑到 ran:candidates")
+
+
+def test_new_address_initial_scan_job_is_due_within_60s(tmp_path):
+    """D-O：遍歷節奏是逐頁，第一頁不該等增量週期的分散。"""
+    sched, store, clock = _scheduler_with_cold_candidate(
+        tmp_path, address=ADDR, rank=250, now=1_700_000_000.0)
+    now = _run_until_candidates(sched, clock)
+    next_at = _job_next_attempt(store, f"{ADDR}:fills_scan")
+    assert next_at is not None and next_at <= now + 60
+
+
+def test_fills_incremental_job_still_spread_by_period(tmp_path):
+    """反向護欄：不得順手改壞增量的分散。"""
+    sched, store, clock = _scheduler_with_cold_candidate(
+        tmp_path, address=ADDR, rank=250, now=1_700_000_000.0)
+    now = _run_until_candidates(sched, clock)
+    next_at = _job_next_attempt(store, f"{ADDR}:fills")
+    assert next_at == now + _spread(ADDR, sched.fills_period_s_for(ADDR))
+
+
+def test_reentering_address_resumes_scan_immediately(tmp_path):
+    """退池→再入池的續跑不變式迴歸測試（`scan_id`、游標不變、job 60 秒內到
+    期）；**不是** D-O 的反向護欄——再入池不經 `_enqueue_address_jobs`（既有
+    `fills_sync` 列讓 `bootstrap_address_fills` 恆回 `False`，`is_new` 不成立，
+    "fills_scan" 進不了 `needed` 列表），由 `_ensure_scan_job` 的
+    `resume_running` 分支處理（該分支本來就是 `now`，D-O 前後皆然）。2026-09-23
+    使用者裁決：前一份 plan「15 個遍歷到一半的 scan 因退池再入池被
+    `_enqueue_address_jobs` 延後」的根因敘述已更正——正式機複本查證，真相是
+    v4 遷移重開了已抵達終點的舊遍歷、但沒把部署前遺留的 `now+24h` 重掃 job
+    拉到 now，`resume_running` 見 job 已存在就跳過（見 Task 1b）。"""
+    h = _t7a_harness(tmp_path)
+    h.set_fill_count(T7A_WHALE, window_fills=20_000)   # 多頁遍歷，1 小時內不會收尾
+    h.run_for(hours=1)
+    sid = h.scan_id(T7A_WHALE)
+    cur = h.scan_cursor(T7A_WHALE)
+    assert sid is not None and cur is not None
+
+    h.churn_out(T7A_WHALE)
+    h.run_for(hours=31 / 60)       # 一輪 candidates（每 30 分鐘一輪）：job 被刪
+    assert h.scan_id(T7A_WHALE) == sid     # 退池不動進行中的遍歷
+
+    h.churn_in(T7A_WHALE)
+    h.run_for(hours=31 / 60)       # 再入池
+
+    next_at = _job_next_attempt(h.store, f"{T7A_WHALE.lower()}:fills_scan")
+    assert next_at is not None and next_at <= h.now + 60
+    assert h.scan_id(T7A_WHALE) == sid
+    assert h.scan_cursor(T7A_WHALE) >= cur
