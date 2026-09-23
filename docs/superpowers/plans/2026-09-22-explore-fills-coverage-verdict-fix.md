@@ -1795,6 +1795,24 @@ failed 0；cron.err 0。unknown 上升是新進位址、非探測停擺（新位
 **判定：安全面正常，不回退。** 主機取樣：cpu 12.0–12.7%、available 1003–1042 MB、swap 300 MB、api cgroup 952–1010 MB、
 `host_cron.err` 0。
 
+| 15:00 | 0 | 0 | 140／142／18 | 25 | 4／2／0 | ok | pages 18；+24h 重掃波開始（running scans 54 → 167） |
+| 15:15 | 0 | 0 | 141／142／17 | 25 | 4／2／0 | ok | pages 8 |
+| 15:30 | 0 | 0 | 141／143／16 | 24 | 4／1／0 | ok | pages 8 |
+| 15:45 | 0 | 0 | 141／145／14 | 24 | 3／1／1 | ok | pages 4；state 3 due |
+
+### 第八次部署 24h 總結（2026-09-22 15:45 → 09-23 15:45 UTC；結案於 15:52）
+
+- **安全指標全程綠**：97 個 15 分鐘樣本 `r429_15m` 總和 **0**；非已知 Traceback **0**（唯一一類 Traceback 是
+  2026-09-22 16:03 已查明的 ops.py:157 PermissionError，與本次無關，已入待辦）；follower 兩個 unit 全程 active、
+  ActiveEnterTimestamp 不變（03:21:18 09-22／05:21:18 09-18）；failed unit 0；`cron.err` 0。**未觸發任何回退條件。**
+- **主機**：CPU 均值 ≈12%、available ≈1.0 GB、swap 300 MB 不變（§5.8h 取樣自 13:32 起）。
+- **榜單**：DB complete 基線 ~150 → **225**；左界 unknown 272 → 80（池內 13）；`fills_verify` job 112 → 24；
+  對外 complete 高點 154（14:00–14:45），15:00 起 +24h 重掃波（running scans 54 → 167）與池輪替使對外 complete 回到 141。
+- **沒解決的**（本次設計的已知極限，交給第九次）：池內 ~129 個 `truncation_suspected` 是 1 天探測窗誤判，現行機制
+  永遠不會自解；24h 攤平排程讓遍歷慢；v3 舊游標與遷移殘留的 24h 重掃 job。全部在
+  `docs/superpowers/plans/2026-09-23-explore-probe-window-scan-cadence.md`（schema v5）處理，依使用者裁決於 15:52 UTC 起部署（§5.8g）。
+- drop-in `explore-v4-verdict.conf` 的 `_UNTIL` 由第九次部署順延 24h；到期後可清。
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
