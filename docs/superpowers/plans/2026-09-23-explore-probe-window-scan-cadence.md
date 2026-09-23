@@ -286,7 +286,13 @@ UPDATE refresh_job SET next_attempt_at=:now
 
 - [ ] `test_reset_truncation_rows_resolve_via_full_history_probe`：種 20 個「遷移後 unknown、scan done、無 job」且上游
   在很久以前有成交的位址 → 24h 內全部 `complete`、零遍歷頁、`probes_executed ≥ 20`；只破壞探測窗（改回 1 天）→ 轉紅。
-- [ ] `test_cold_addresses_start_traversal_immediately_after_bootstrap`：300 地址競爭下，新入池冷門地址的第一頁在 5 分鐘內抓到。
+- [ ] ~~`test_cold_addresses_start_traversal_immediately_after_bootstrap`：5 分鐘內抓到~~ → **主線程裁決（2026-09-23，builder 實測「5 分鐘」
+  在 300 地址冷啟動下不可能達成、且該錨例未經量測）改為 `test_new_cold_address_first_page_is_not_deferred_by_period_spread`**：
+  harness 暖機 24h 到穩態後新增**一個真正的新地址**（rank 250、走 bootstrap 路徑），斷言 (i) job 建立後 `next_attempt_at <= now+60`
+  （D-O 直接證據，不依賴吞吐）、(ii) 之後 1 小時內第一頁抓到；反向護欄：改回 `_spread` 並挑 `_spread(addr,24h) > 1h` 的地址 → 兩項轉紅。
+  若暖機穩態下 1 小時仍抓不到第一頁 → 停下來報（`claim_due` 領工順序的真實吞吐問題，不准放寬）。
+  builder 冷啟動實測：300 地址同時新入池時全系統 fills 類約 1 頁/分鐘（`explore_fills` cap 120 = 一頁權重，前一份 plan Task 6 已實測、
+  使用者裁決接受）——寫進資料極限：harness 冷啟動不代表正式機。
 - [ ] 沿用既有 Task 7a／7b／8／8b／11 測試全綠（尤其 `test_evidence_unknown_rows_actually_leave_unknown_via_verify`
   與 `test_migrated_rows_reach_complete_via_standalone_probe_path` 一字不改）。
 - [ ] Commit — `test: 全史探測解出疑似截斷、冷門地址即時開跑（D-K／D-O）`
