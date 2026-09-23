@@ -142,10 +142,15 @@ logger = logging.getLogger(__name__)
 # 1）——`_fills_available()` 用它判斷 `explore_fills` 保留額度是否夠讓一整頁擠進去。
 FILLS_PAGE_WEIGHT = weight_for("userFillsByTime")
 
-# Task 7.5 點 3（留存邊界探測）：查詢窗口起點之前一天——與
+# Task 2（2026-09-23，D-K／D-L）：探測窗本身已改為全史 `[0, window_start_ms)`
+# （見 `_run_probe`），不再需要這個常數界定查詢範圍。保留給 D-L 的模糊帶
+# 用途——探測回空頁時，`first_activity_ms` 落在
+# `[window_start_ms - _FIRST_ACTIVITY_BAND_MS, window_start_ms +
+# _FIRST_ACTIVITY_BAND_MS)` 視為證據不足（`unknown`），不足以判定
+# `truncation_suspected` 或 `no_earlier_activity`。與
 # `explore_fills_sync._DAY_MS` 同數值，不 import 該私有名稱（避免跨模組耦合
-# 私有常數），供 `_run_probe` 算探測窗口用。
-_PROBE_WINDOW_MS = 86_400_000
+# 私有常數）。
+_FIRST_ACTIVITY_BAND_MS = 86_400_000
 
 # Task 7.9b B4／7.9d-S S3：輔助類別（`fills_verify` 核驗遍歷＋留存邊界探測）與
 # fills-like（`fills`／`fills_scan`）不可各半——雙方都有積壓時，每這麼多次**實際
@@ -1449,17 +1454,28 @@ class ExploreScheduler:
         來自 `_run_scan` 的探測前置（`scan_id` 是這個 job 正在推進的那筆，可能
         剛建立也可能續跑）或 `ExploreStore.next_probe_candidate()`（純 DB 推導
         的獨立路徑，服務沒有 job 在跑但證據仍缺的殘留地址，B7 (vii)：重啟後照常
-        運作）。查詢 `[scan.window_start_ms - 1 天, scan.window_start_ms - 1]`
-        是否仍有可查成交：
+        運作）。
+
+        Task 2（2026-09-23，D-K）：查詢窗口改為**全史** `[0, scan.window_start_ms)`
+        （不再是只查窗口起點前一天）。問的本來就是「窗口起點之前有沒有任何
+        可查成交」，全史窗一頁就能回答且成本相同（結算權重依實際筆數，見
+        `hl_fills.get_fills_page` 與下方例外處理）。截斷推理：HL 若採「留存
+        最近 N 筆」（後綴截斷），全史窗回非空即代表截斷邊界早於窗口起點——
+        窗口起點之後不可能被截斷；回空則代表窗口起點之前確無可查成交，此時
+        `truncation_suspected` 的嫌疑才是實質的（D-L）。舊版查 `[ws-1天, ws)`
+        的問題：低頻帳戶恰好那一天沒有成交就會回空，配合「首次活動早於窗口」
+        被誤判疑似截斷——這正是本次修法要解的正式機現象（約 120 個位址卡在
+        `truncation_suspected`）。
 
         - 回應非空 → `earlier_fills_seen`（最強證據，不必再看 portfolio）。
         - 回空頁 → 依 `ExploreStore.first_activity_ms`（D-F：只接受 portfolio
           allTime 首點，不得用本機時間頂替）判斷：明顯早於窗口起點（差距
-          ≥ `_PROBE_WINDOW_MS`）→ `truncation_suspected`（上游截斷嫌疑）；
-          明顯晚於窗口起點（差距 ≥ `_PROBE_WINDOW_MS`，Task 10 W1／W5 裁決節
-          修法——見下）→ `no_earlier_activity`（帳戶當時確無活動）；缺席或
-          落在模糊帶（`[window_start_ms - _PROBE_WINDOW_MS, window_start_ms +
-          _PROBE_WINDOW_MS)`）→ `unknown`（證據不足，不宣稱任何一方）。
+          ≥ `_FIRST_ACTIVITY_BAND_MS`）→ `truncation_suspected`（上游截斷嫌疑，
+          且全史窗都查不到，嫌疑才是實質的）；明顯晚於窗口起點（差距
+          ≥ `_FIRST_ACTIVITY_BAND_MS`，Task 10 W1／W5 裁決節修法——見下）→
+          `no_earlier_activity`（帳戶當時確無活動）；缺席或落在模糊帶
+          （`[window_start_ms - _FIRST_ACTIVITY_BAND_MS, window_start_ms +
+          _FIRST_ACTIVITY_BAND_MS)`）→ `unknown`（證據不足，不宣稱任何一方）。
 
           Task 10（reviewer W5，主線程裁決）：`no_earlier_activity` 原本零
           緩衝（`first_ms >= window_start_ms` 即成立），與 `truncation_
@@ -1470,7 +1486,7 @@ class ExploreScheduler:
           可能落在窗口起點前不久，但降採樣後的首點恰好落在起點之後、探測
           那一天又剛好沒有成交，就會被誤判 `no_earlier_activity` →
           `complete`，而左界其實從未被驗證過。現在兩側緩衝對稱（都是
-          `_PROBE_WINDOW_MS`＝1 天），模糊帶擴大為
+          `_FIRST_ACTIVITY_BAND_MS`＝1 天），模糊帶擴大為
           `[window_start_ms - 1d, window_start_ms + 1d)`。裁決：收緊後
           `tests/test_explore_scheduler.py` 的 `_t7a_default_portfolio(ws)`
           共用樁（`first_activity_ms` 精確等於 `window_start_ms`）落在新
@@ -1497,7 +1513,8 @@ class ExploreScheduler:
         if scan is None:
             self._probe_failed += 1
             return False
-        probe_start = scan.window_start_ms - _PROBE_WINDOW_MS
+        # Task 2（D-K）：全史窗——問的是「窗口起點之前有沒有任何可查成交」。
+        probe_start = 0
         probe_end = scan.window_start_ms - 1
         hl_fills = self._hl_fills if self._hl_fills is not None else self._hl
         try:
@@ -1541,13 +1558,13 @@ class ExploreScheduler:
             first_ms = self._store.first_activity_ms(address)
             if first_ms is None:
                 state = "unknown"                                    # D-F：不知道就是不知道
-            elif first_ms >= scan.window_start_ms + _PROBE_WINDOW_MS:
+            elif first_ms >= scan.window_start_ms + _FIRST_ACTIVITY_BAND_MS:
                 # Task 10（reviewer W5）：與 `truncation_suspected` 對稱，要求
                 # 明顯晚於（差距 ≥ 1 天）才採信「帳戶當時確無活動」——零緩衝
                 # 會讓降採樣、粒度可能到天的 `allTime` 首點把「其實驗證不到
                 # 左界」誤判成 complete，見本方法 docstring 的 W5 說明。
                 state = "no_earlier_activity"
-            elif first_ms < scan.window_start_ms - _PROBE_WINDOW_MS:
+            elif first_ms < scan.window_start_ms - _FIRST_ACTIVITY_BAND_MS:
                 state = "truncation_suspected"
             else:
                 state = "unknown"                                    # 模糊帶：證據互相矛盾

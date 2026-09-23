@@ -71,21 +71,23 @@ class FakeHL:
 
 
 class _ProbeResolvesThenEmptyHL:
-    """Task 3：與 `FakeHL` 同樣「真正的分頁窗立刻空頁收尾」，但探測窗
-    （span 明顯短於 30 天遍歷窗）回一筆成交——讓左界證據探測前置一次解出
-    `earlier_fills_seen`，不必每次都用 monkeypatch 頂替
+    """Task 3：與 `FakeHL` 同樣「真正的分頁窗立刻空頁收尾」，但探測（Task 2
+    起查詢窗為全史 `[0, window_start_ms)`）回一筆成交——讓左界證據探測前置
+    一次解出 `earlier_fills_seen`，不必每次都用 monkeypatch 頂替
     `ExploreStore.get_left_boundary`（那樣會繞過本模組真正要驗證的探測
     機制，讓 DB 裡的 `left_boundary` 欄位永遠停在預設值 `unknown`，使該地址
-    變成永久的探測候選——見 `test_s7a_...` 的教訓）。用 span 而非固定窗口
-    值判斷，因為呼叫端的 `window_start_ms` 隨測試的虛擬時間變動。"""
+    變成永久的探測候選——見 `test_s7a_...` 的教訓）。用 `start_ms == 0`
+    判斷是不是探測呼叫（Task 2 之後探測起點恆為 0，真正的分頁窗游標一律從
+    非零的 `window_start_ms` 起算），不再用 span——span 判準在探測窗改為
+    全史後會與真正的分頁窗（同樣可能是數十天的跨度）混淆。"""
 
     def __init__(self):
         self.calls: list[tuple] = []
 
     def get_fills_page(self, address, start_ms, end_ms):
         self.calls.append(("fills", address, start_ms, end_ms))
-        if end_ms - start_ms <= 2 * 86_400_000:
-            return [{"coin": "BTC", "tid": 1, "time": start_ms}]
+        if start_ms == 0:
+            return [{"coin": "BTC", "tid": 1, "time": end_ms}]
         return []
 
     def clearinghouse_state(self, address):
@@ -2410,7 +2412,7 @@ def test_probe_empty_with_clearly_older_account_is_truncation_suspected(tmp_path
     clock = Clock(t=40 * 86400.0)
     store, sched, scan, window_start_ms = _probe_with_portfolio(
         tmp_path, clock, first_activity_ms=None)
-    # 帳戶首次活動明顯早於窗口起點（差距遠超過 `_PROBE_WINDOW_MS` 1 天）。
+    # 帳戶首次活動明顯早於窗口起點（差距遠超過 `_FIRST_ACTIVITY_BAND_MS` 1 天）。
     store.put_cache_ok(
         "0xabc", "portfolio",
         [["allTime", {"accountValueHistory": [[window_start_ms - 30 * 86_400_000, "100"]],
@@ -2496,6 +2498,139 @@ def test_probe_never_uses_local_first_seen_as_evidence(tmp_path):
     assert store.get_left_boundary("0xabc", window_start_ms).state == "unknown"
 
 
+# ============================================================
+# Task 2（2026-09-23，D-K／D-L）：探測窗改為全史 `[0, window_start_ms)`。
+# plan docs/superpowers/plans/2026-09-23-explore-probe-window-scan-cadence.md
+# Task 2 Step 1 的四條測試。
+# ============================================================
+
+class _RangeAwareFillsHL:
+    """只回應落在 `[start_ms, end_ms]` 內的種子成交——與 `_ProbeHL`／`FakeHL`
+    （對請求範圍無感）不同，用來驗證 Task 2 的探測窗真的查的是
+    `[0, window_start_ms)`（能查到相對舊 1 天窗更早的成交），而不是只是
+    「回傳值剛好符合預期」的巧合。"""
+
+    def __init__(self, fill_times: list[int]):
+        self._times = sorted(fill_times)
+        self.calls: list[tuple] = []
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.calls.append((address, start_ms, end_ms))
+        return [{"coin": "BTC", "tid": i, "time": t}
+               for i, t in enumerate(self._times) if start_ms <= t <= end_ms]
+
+
+def _probe_scan_with(tmp_path, clock, *, fill_times: list[int],
+                     first_activity_ms: int | None):
+    """建一個左界證據待解的候選（結構同 `_probe_with_portfolio`，但用
+    `_RangeAwareFillsHL` 讓探測回應真的依請求的 `[start_ms, end_ms]` 而定）。
+    回傳 `(store, sched, hl, scan, window_start_ms)`。"""
+    store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
+                                  window_end_ms=now_ms, params_fp="")
+    scan = store.get_active_scan("0xabc")
+    if first_activity_ms is not None:
+        store.put_cache_ok(
+            "0xabc", "portfolio",
+            [["allTime", {"accountValueHistory": [[first_activity_ms, "100"]],
+                          "pnlHistory": [[first_activity_ms, "0"]]}]],
+            clock.now(), clock.now() + 3600)
+    hl = _RangeAwareFillsHL(fill_times)
+    sched = _sched(store, hl, clock=clock)
+    return store, sched, hl, scan, window_start_ms
+
+
+def test_probe_queries_full_history_before_window_start(tmp_path):
+    """D-K：探測窗起點為 0（全史），終點為 window_start_ms − 1。"""
+    clock = Clock(t=40 * 86400.0)
+    store, sched, hl, scan, window_start_ms = _probe_scan_with(
+        tmp_path, clock, fill_times=[], first_activity_ms=None)
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert len(hl.calls) == 1
+    addr, start_ms, end_ms = hl.calls[0]
+    assert addr == "0xabc"
+    assert (start_ms, end_ms) == (0, window_start_ms - 1)
+
+
+def test_low_frequency_account_with_old_fills_is_earlier_fills_seen(tmp_path):
+    """0x5cee0ca5 的實況：ws 前一天沒交易、但一年前有 → 全史窗非空 →
+    earlier_fills_seen，不再是疑似截斷。時鐘起點需夠大（400 天），
+    `window_start_ms − 300 天` 才落在非負的可表示全史域內——production
+    的 `now_ms` 是真實 epoch（極大的正數），這裡只是測試時鐘的實務下限。"""
+    clock = Clock(t=400 * 86400.0)
+    expected_ws = int(clock.t * 1000) - 30 * 86_400_000
+    store, sched, hl, scan, window_start_ms = _probe_scan_with(
+        tmp_path, clock,
+        fill_times=[expected_ws - 200 * 86_400_000],
+        first_activity_ms=expected_ws - 300 * 86_400_000)
+    assert window_start_ms == expected_ws
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "earlier_fills_seen"
+
+
+def test_empty_full_history_with_old_account_is_truncation_suspected(tmp_path):
+    """全史窗都回空且帳戶明顯更老 → 這時的截斷嫌疑才是實質的（D-L 維持）。"""
+    clock = Clock(t=40 * 86400.0)
+    expected_ws = int(clock.t * 1000) - 30 * 86_400_000
+    store, sched, hl, scan, window_start_ms = _probe_scan_with(
+        tmp_path, clock, fill_times=[],
+        first_activity_ms=expected_ws - 300 * 86_400_000)
+    assert window_start_ms == expected_ws
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    assert store.get_left_boundary("0xabc", window_start_ms).state == "truncation_suspected"
+
+
+def test_probe_page_settles_by_returned_count(tmp_path):
+    """成本：全史窗可能回滿 2000 筆，權重預留 120（`FILLS_PAGE_WEIGHT`）、
+    依實際筆數結算——與一般 fills 頁同一套結算公式（`HLGateway.scoped`：
+    `hl.py` reserve `weight_for("userFillsByTime")`＝120、settle
+    `20 + ceil(len(result)/20)`），不得繞過限流器另開後門。"""
+    from spark.publicapi.explore_scheduler import FILLS_PAGE_WEIGHT
+
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "e.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    window_start_ms = now_ms - 30 * 86_400_000
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills("0xabc", clock.now(), window_start_ms=window_start_ms,
+                                  window_end_ms=now_ms, params_fp="")
+    scan = store.get_active_scan("0xabc")
+
+    n_fills = 37
+
+    def post(url, body):
+        assert body["type"] == "userFillsByTime"
+        return [{"coin": "BTC", "tid": i, "time": window_start_ms - 1 - i}
+               for i in range(n_fills)]
+
+    lim = WeightLimiter(global_cap=900, scope_caps={"explore": 300, "explore_fills": 120},
+                        scope_parents={"explore_fills": "explore"},
+                        now_fn=clock.now, sleep_fn=clock.sleep, rng=lambda: 0.0)
+    gw = HLGateway("https://x", post_fn=post, sleep_fn=clock.sleep, limiter=lim)
+    hl_fills = gw.scoped("explore_fills", wait_s=0.0)
+    sched = _sched(store, FakeHL(), hl_fills=hl_fills, clock=clock)
+
+    ok = sched._run_probe(("0xabc", scan.scan_id), clock.now())
+
+    assert ok is True
+    expected_settled = 20 + (n_fills + 19) // 20
+    assert expected_settled < FILLS_PAGE_WEIGHT          # 結算值遠低於預留上限
+    snap = lim.snapshot()
+    assert snap["used"]["explore_fills"] == expected_settled
+
+
 # --- (h) 恢復的五條探測行為測試（7.9b 拆軌時被刪，改寫為「探測由 DB 推導」版） ---
 
 class _ProbeHL:
@@ -2533,8 +2668,8 @@ def _probe_ready(tmp_path, clock, probe_result, *, active: bool = True):
 
 def test_s7h_probe_positive_finds_earlier_fills(tmp_path):
     """(h1) 探測命中（窗內仍有更早的成交）→ 左界證據升級為
-    `earlier_fills_seen`，探測窗＝`[scan.window_start - 1 天,
-    scan.window_start - 1]`。"""
+    `earlier_fills_seen`，探測窗＝全史 `[0, scan.window_start - 1]`
+    （Task 2，D-K）。"""
     clock = Clock(t=40 * 86400.0)
     window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
     store, hl, sched, scan = _probe_ready(
@@ -2547,7 +2682,7 @@ def test_s7h_probe_positive_finds_earlier_fills(tmp_path):
     addr, probe_start, probe_end = hl.probe_calls[0]
     assert addr == "0xabc"
     assert probe_end == scan.window_start_ms - 1
-    assert probe_start == scan.window_start_ms - 86_400_000
+    assert probe_start == 0
     assert sched.status()["probe"]["verified"] == 1
 
 
@@ -2583,10 +2718,13 @@ def test_s7h_probe_exception_does_not_fail_tick(tmp_path):
 
 def test_s7h_probe_response_out_of_window_counts_failed(tmp_path):
     """(h4) 探測回應落在探測窗之外（上游回應跑掉）→ 不升級 reason、計入
-    `probe.failed`。"""
+    `probe.failed`。Task 2（D-K）：探測窗改為全史 `[0, window_start_ms)`後，
+    `time=1` 落在合法範圍內，改用 `window_start_ms + 1`（窗口起點之後，
+    真正落在探測窗外）才是「回應跑掉」。"""
     clock = Clock(t=40 * 86400.0)
-    store, hl, sched, _ = _probe_ready(tmp_path, clock,
-                                       [{"coin": "BTC", "tid": 1, "time": 1}])
+    window_start_ms = int(clock.t * 1000) - 30 * 86_400_000
+    store, hl, sched, _ = _probe_ready(
+        tmp_path, clock, [{"coin": "BTC", "tid": 1, "time": window_start_ms + 1}])
 
     assert sched.tick() == "ran:probe"
 
@@ -3650,7 +3788,13 @@ def test_w2_deferred_verify_job_is_dropped_once_evidence_is_filled_in(tmp_path):
     clock = Clock(t=40 * 86400.0)
     store = _evidence_unknown_address(tmp_path, clock, completeness="partial")
     store.enqueue(f"{ADDR_A.lower()}:fills_verify", ADDR_A, "fills_verify", 4, clock.now())
-    store.create_scan(ADDR_A, kind="partial_rescan", window_start_ms=0,
+    # Task 2（D-K）：探測窗改為全史 `[0, window_start_ms)`，`window_start_ms`
+    # 必須是正數才有非空的合法探測區間（`window_start_ms=0` 會讓探測起點
+    # 與終點顛倒，見 `SchedulerHarness` 的同型教訓）——改用相對 `clock.now()`
+    # 的標準 30 天窗口表達式（本檔其餘處的既有寫法），不再用裸的魔術數字，
+    # 「任意舊窗口，數值不重要」的原意不變。
+    store.create_scan(ADDR_A, kind="partial_rescan",
+                      window_start_ms=int(clock.now() * 1000) - 30 * 86_400_000,
                       window_end_ms=int(clock.now() * 1000),
                       cursor_ms=int(clock.now() * 1000), started_at=clock.now())
     # Task 3：不再用 monkeypatch 頂替 `get_left_boundary`（見 test_s7a 教訓）
@@ -3950,7 +4094,19 @@ class SchedulerHarness:
     本身是確定性生成（不吃 rng），整體結果因此完全可複現。"""
 
     def __init__(self, *, seed: int = 20260922, candidates: int = 300):
-        self._clock = Clock()
+        # Task 2（2026-09-23，主線程裁決）：**不得**是 `Clock()`（t=0.0）。
+        # 正式機 `now_ms` 永遠是真實 epoch（~1.79e12，深度正數）；`t=0.0`
+        # 會讓 `fresh_scan_window(now_ms) = [now_ms-30d, now_ms]` 的
+        # `window_start_ms` 算出負數（因為本 harness 沒有任何測試會模擬超過
+        # 72 小時虛擬時間，遠不及 30 天）——這個負值只存在於 harness 合成
+        # 時鐘裡，D-K 把探測起點改成絕對 0 之後，負的 `window_start_ms` 會讓
+        # 探測區間 `[0, window_start_ms-1]` 顛倒（`test_rescan_probe_does_
+        # not_flip_the_superseded_verdict` 因此失守）；Task 11 那次
+        # `first_activity_ms=0` 把 300 個地址全判成 `no_earlier_activity` 也
+        # 是同一根源。改用真實量級的起點（2023-11-14 UTC）讓
+        # `window_start_ms` 全程為正，見 `test_harness_window_start_is_
+        # positive_epoch` 的護欄。
+        self._clock = Clock(t=1_700_000_000.0)
         self._rng = random.Random(seed)
         self._upstream = _T7AUpstream()
         self._limiter = WeightLimiter(
@@ -3973,8 +4129,17 @@ class SchedulerHarness:
 
     def build(self, db_path) -> "SchedulerHarness":
         self._store = ExploreStore(db_path, now_fn=self._clock.now)
+        # Task 2（2026-09-23，主線程裁決（b)）：預設候選的 portfolio 首次
+        # 活動時間不得再是 `0`——時鐘轉正後 `0 < ws - _FIRST_ACTIVITY_BAND_MS`
+        # 對所有 300 個候選都成立，全史探測回空時會把 bootstrap 的 297 個
+        # 空地址全部誤判 `truncation_suspected`（fixture 不真實：沒有帳戶的
+        # 首次活動在 1970 年）。與 `set_fill_count`／`set_fills_all_same_ms`
+        # （Task 10 W5）同一手法：`ws + 2*DAY`，明顯晚於窗口起點、可判定為
+        # `no_earlier_activity`。
+        ws, _we = fresh_scan_window(self.now_ms)
+        default_portfolio = _t7a_default_portfolio(ws + 2 * DAY)
         for addr in self._addresses:
-            self._upstream.set_portfolio(addr, _t7a_default_portfolio(0))
+            self._upstream.set_portfolio(addr, default_portfolio)
         self._sched = self._build_scheduler()
         return self
 
@@ -4260,6 +4425,10 @@ class SchedulerHarness:
     def now(self) -> float:
         return self._clock.t
 
+    @property
+    def now_ms(self) -> int:
+        return int(self._clock.t * 1000)
+
     # ---- Task 1（D-O）候選池換血：只改 `leaderboard_source_fn` 看到的候選
     # 集合，不直接碰 DB——退池／再入池的效果必須走真實 `_run_candidates` →
     # `deactivate_missing`／`upsert_candidates` → `delete_jobs`／
@@ -4328,6 +4497,16 @@ class SchedulerHarness:
 
 def _t7a_harness(tmp_path, *, seed: int = 20260922, candidates: int = 300) -> SchedulerHarness:
     return SchedulerHarness(seed=seed, candidates=candidates).build(tmp_path / "t7a.db")
+
+
+def test_harness_window_start_is_positive_epoch(tmp_path):
+    """Task 2（2026-09-23，主線程裁決（d)）：防止 `SchedulerHarness` 的時鐘
+    再退回 `t=0.0`——`window_start_ms` 若為負，D-K 的全史探測窗
+    `[0, window_start_ms)` 會顛倒（`probe_start(0) > probe_end`），是本次
+    `test_rescan_probe_does_not_flip_the_superseded_verdict` 失守的根因。"""
+    h = _t7a_harness(tmp_path)
+    ws, _we = fresh_scan_window(h.now_ms)
+    assert ws > 0
 
 
 # --- Task 7 Step 1（plan Task 7a 範圍：六條裡的前四條） ---
@@ -4610,19 +4789,28 @@ def test_rescan_probe_does_not_flip_the_superseded_verdict(tmp_path):
     事件之間不存在可觀測的中間態；修正後，中間態必須是舊結論原樣不動。"""
     h = _t7a_harness(tmp_path)
     addr = _t7a_addr(350)
-    old_ws = -90 * DAY
+    # Task 2（2026-09-23，主線程裁決（a)）：harness 時鐘已改真實量級
+    # （`Clock(t=1_700_000_000.0)`），所有時間點一律相對 `h.now_ms` 表達，
+    # 不再用「相對 epoch 0」的裸負數字面值（那只在舊版 `Clock(t=0.0)` 下才
+    # 剛好是「很久以前」，換成真實 epoch 後會變成 1970 年之前，是 harness
+    # 保真度缺陷，不是這個測試本身要驗證的東西）。
+    old_ws = h.now_ms - 120 * DAY
     old_we = old_ws + 30 * DAY
     # 舊的一次遍歷：很久以前完成、`partial/left_boundary_unknown`、
     # `finished_at` 已過 `PARTIAL_RESCAN_AFTER_S`——下一輪 candidates 巡查會
     # 判 `partial_due` 並建立新的 `fills_scan` job。
     h.seed_stale_partial_row(
         addr, window_start_ms=old_ws, window_end_ms=old_we,
-        finished_at=-(PARTIAL_RESCAN_AFTER_S + 3600.0))
-    # 新 scan 的窗口起點約在 `-30*DAY`（`fresh_scan_window` 以排程當下的
-    # 時鐘算，會隨排程延遲在 24 小時模擬時間內小幅漂移）——密集灑一批成交
-    # 涵蓋所有可能落點的探測窗（`[新窗口起點-1d, 新窗口起點-1]`），保證探測
-    # 一定命中 `earlier_fills_seen`，不會卡在 `unknown`。
-    h.seed_dense_fills(addr, start_ms=-32 * DAY, end_ms=-28 * DAY, step_ms=1_800_000)
+        finished_at=h.now - (PARTIAL_RESCAN_AFTER_S + 3600.0))
+    # 新 scan 的窗口起點約在 `h.now_ms - 30*DAY`（`fresh_scan_window` 以排程
+    # 當下的時鐘算，會隨排程延遲在 24 小時模擬時間內小幅漂移，最多往後推
+    # 24 小時）。Task 2（D-K）之後探測窗是全史 `[0, 新窗口起點)`，不再是舊版
+    # 窄窗 `[新窗口起點-1d, 新窗口起點-1]`——只要成交落在「最早可能的新窗口
+    # 起點」之前就必然落在探測窗內，不需要再密集覆蓋一個窄範圍；保留密集
+    # 灑點只是延續既有寫法，數值改成相對 `h.now_ms`、落在比 30 天窗口更早
+    # （40～36 天前）確保任何漂移下都在全史探測窗內。
+    h.seed_dense_fills(addr, start_ms=h.now_ms - 40 * DAY, end_ms=h.now_ms - 36 * DAY,
+                       step_ms=1_800_000)
 
     boundary_seen = False
     saw_intermediate_partial = False
