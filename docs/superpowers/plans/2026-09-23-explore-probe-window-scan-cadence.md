@@ -437,3 +437,19 @@ cron.err／host_cron.err 0。主機：cpu 13–24%、api cgroup 612 → 650 MB�
 取樣器頁計數在重啟後不可靠，以 DB 增量為準，不符停擺三條件；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
 failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 12–27%、api cgroup 791 → 934 MB（頁快取回填接近部署前水位）、
 available 1,081 MB、swap 293 MB。**判定：安全面正常，不回退。**
+
+| 19:45 | 0 | 0 | 213／73／14 | — | 22 | 87／0 | ok | pages 0 |
+| 20:00 | 0 | 0 | 215／71／14 | — | 22 | —／0 | ok | pages 2 |
+| 20:15 | 0 | 0 | 216／70／14 | — | 22 | 83／0 | ok | pages 4；overdue p95 fills_scan 108s |
+| 20:30 | 0 | 0 | 216／70／14 | — | 22 | 83／0 | ok | pages 1 |
+
+**20:36 排程檢查（+4h39m）**：池內 unknown **79 → 74**（2h 累計 89 → 74＝−15，**未達 −20**，但仍在降、尚未探完）、
+池內 truncation_suspected 7 → **6**（個位數 ✓）、earlier_fills_seen 194 → 200；池內 complete 212 → **217**、partial 74 → 70；
+全體 complete 298 → 302；對外 complete 210 → **216**、eligible 84；探測落地最近 1h 7、累計 76；due fills_scan 83、running 135 → 129；
+running `pages_done` 61 → 83、fills 本小時 **+52k**（1,884,942 → 1,936,876）；隔離空；`fills_verify` 22；Traceback 0；429 0；
+follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cron.err／host_cron.err 0。
+主機：cpu 13–21%、api cgroup 924–946 MB（回到部署前水位）、available 1,075 MB、swap 305 MB。
+**探測放慢的解讀**：剩下的 74 個 unknown 幾乎都有 running scan（探測在該 job 輪到時前置執行，不走獨立候選），而 83 個到期
+`fills_scan` job 輪流分同一份 fills 額度——本小時額度多數花在已探過地址的分頁（+22 頁、+52k 筆），探測只拿到 7 頁。
+實測上游總吞吐 ≈ 30–35 頁/h（探測＋分頁），與部署前相同，是既有的節流天花板（子預算名目 60/h，實得約一半——記為觀察，
+非本次回歸）。不符 Step 7-pre 條件（unknown 仍單調下降、遍歷在推進、隔離空）。**判定：安全面正常，不回退。**
