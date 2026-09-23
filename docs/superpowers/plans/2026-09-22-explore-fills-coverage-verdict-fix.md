@@ -1758,6 +1758,16 @@ Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常�
 對外 complete 143 → 146、eligible 88；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
 failed 0；cron.err 0。**判定：安全面正常，不回退。**
 
+| 12:00 | 0 | 0 | 145／144／11 | 31 | 3／3／1 | ok | pages 14；overdue p95 fills 92s／fills_scan 79s／ledger 3s；eligible 87 |
+| 12:15 | 0 | 0 | 146／145／9 | 30 | 1／2／0 | ok | pages 9 |
+| 12:30 | 0 | 0 | 147／145／8 | 30 | 2／1／3 | ok | pages 9 |
+| 12:45 | 0 | 0 | **149**／145／6 | 30 | 0／0／0 | ok | pages 7 |
+
+**12:55 排程檢查（+21h10m）**：unknown 76 → 74（池內 8）、`earlier_fills_seen` 205 → 209、`no_earlier_activity` 26 → 27、
+`truncation_suspected` 164；completeness 46／219／209；`fills_verify` job 30；running scans 49 → 46；
+對外 complete 146 → 149、eligible 87；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
+failed 0；cron.err 0。**判定：安全面正常，不回退。**
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
