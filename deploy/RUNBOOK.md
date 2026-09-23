@@ -2625,6 +2625,285 @@ reason 以字串分組，新的 reason 值只會成為新組別；`external_comp
 （`complete AND evidence_unknown=0 AND coverage_gap=0`）與 `external_coverage_state` 仍一致。
 **不需要改取樣器**。部署後仍請看一眼 `cron.err` 是否仍為 0 bytes。
 
+### 5.8g ⭐⭐⭐ 第九次部署程序（schema v5、全史探測窗、遍歷即時排程；**跟單中，加倍小心**）
+
+<!-- 2026-09-23: explore 探測窗全史化、遍歷排程即時化、v3 游標正規化。plan
+docs/superpowers/plans/2026-09-23-explore-probe-window-scan-cadence.md Task 5。
+commit 範圍 bbd7adf（第八次已部署版本）..HEAD（Task 1／1b／2／3；Task 4 只加測試）。 -->
+
+> 🛑 **正式機上已有真實用戶正在跟單。** 本節沿用 §5.8f 的第一約束：只重啟 `filet-api`，
+> `filet-follower@*` 與四個 timer 不動；任何一步觀察到 follower 異常或 429，**立即回退**，
+> 不等觀測期結束、不猶豫。**Step 1b 的 follower 兩個 unit `ActiveEnterTimestamp` 部署前後
+> 必須完全相同**——這是每一步都要背在身上的驗收，不是只在 Step 4 查一次。
+
+**這次動了什麼**：`filet-api` 啟動時會把 `/var/lib/filet-api/explore.db` 從 schema v4
+自動遷移到 v5（`ExploreStore._migrate_v4_to_v5`，原子＋冪等，見 plan D-M／D-N）：池內
+`truncation_suspected`（~122 個）重設為 `unknown` 讓新探測窗重跑、v3 遺留的 95 個游標
+正規化到 `window_end_ms` 並就地重算、running scan 殘留的未來 `fills_scan` job 拉到遷移
+當下——`fills` 原始成交與非目標游標一筆不動。另外兩處排程／查詢邏輯改動（非遷移，程式
+啟動即生效，不需要既有資料配合）：左界探測窗從 `[ws−1d, ws)` 改為全史 `[0, ws)`（D-K，
+低頻帳戶不再被 1 天窗誤判疑似截斷）；`fills_scan` 首次到期與 `resume_running` 一律以
+MIN 語義拉到 `now`（D-O，遍歷節奏是逐頁，不套增量週期的分散）。`EXPLORE_INDEX_VERSION`
+本次維持不變，但覆蓋結論變動（`truncation_suspected` 大幅下降）仍會讓現有快照的
+`fills_coverage` 大量過期，適用 §5.8c／§5.8f 的「重啟前預熱」程序。
+
+#### Step 1：部署前基線（沿用 §5.8f Step 1，備份檔名改 v5，全部輸出留存）
+
+```bash
+# 1a) 有沒有任何 unit 已經是 failed
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER 'sudo systemctl --failed --no-pager'
+# 預期：0 loaded units listed
+
+# 1b) follower 存活與每個 instance 的啟動時間（部署後要逐一比對，時間戳必須相同）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+  systemctl list-units --all "filet-follower@*" --no-legend | awk "{print \$1}" | while read u; do
+    echo "=== $u ==="
+    systemctl is-active "$u"
+    systemctl show "$u" -p ActiveEnterTimestamp
+  done'
+# 記下每個 unit 的 ActiveEnterTimestamp——部署後（Step 4）必須逐一相同
+
+# 1c) follower 最近一次成功對帳的時間
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo journalctl -u 'filet-follower@*' --since '2 hours ago' --no-pager | grep -i '對帳\|reconcile' | tail -5"
+
+# 1d) 觀測取樣器最後一筆
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  'tail -1 /home/ubuntu/explore-obs/samples.jsonl | python3 -m json.tool' \
+  | tee /tmp/pre-v5-sample.json
+# 記下 .public（coverage_counts 等）、.scan（遍歷軌進度）、.overdue_by_kind 三段
+
+# 1e) DB 備份（sqlite backup API，不要直接 cp）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo python3 - <<PY
+import sqlite3
+src = sqlite3.connect("file:/var/lib/filet-api/explore.db?mode=ro", uri=True)
+dst = sqlite3.connect("/var/lib/filet-api/explore.db.pre-v5.bak")
+src.backup(dst); dst.close()
+PY
+sudo chown filet-api:filet-api /var/lib/filet-api/explore.db.pre-v5.bak
+sudo chmod 600 /var/lib/filet-api/explore.db.pre-v5.bak'
+# 驗收：檔案存在且非空
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  'ls -l /var/lib/filet-api/explore.db.pre-v5.bak'
+
+# 1f) 池內 truncation_suspected 與 unknown 的部署前基線（Step 5／Step 6(a)(b) 要用來對照）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo python3 -c \"import sqlite3; c=sqlite3.connect('file:/var/lib/filet-api/explore.db?mode=ro', uri=True); print(c.execute(\\\"select left_boundary, count(*) from fills_sync f join candidate cd on cd.address=f.address and cd.active=1 group by 1\\\").fetchall())\""
+# 記下 truncation_suspected 與 unknown 的數字（plan 唯讀查證基線：122／約 34，正式機實際數字以此刻為準）
+
+# 1g) fills 總筆數（Step 5 要求遷移前後不得減少）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo python3 -c \"import sqlite3; c=sqlite3.connect('file:/var/lib/filet-api/explore.db?mode=ro', uri=True); print(c.execute('select count(*) from fills').fetchone())\""
+
+# 1h) 現有 drop-in 的 FILET_EXPLORE_* 現值（本次唯一會動的是 explore-v4-verdict.conf 的 _UNTIL）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "systemctl show filet-api -p Environment --value | tr ' ' '\n' | grep FILET_EXPLORE_"
+```
+
+#### Step 2：快照預熱（§5.8c 原則，來源沿用 §5.8f 的實際做法——不是本機冷建）
+
+本次覆蓋結論變動幅度（`truncation_suspected` 122 → 0）足以讓現有快照的 `fills_coverage`
+大量過期，適用「先預熱再重啟」。沿用 §5.8f 引言記下的實際做法：**把剛做好的
+`explore.db.pre-v5.bak` 拉到本機、用新程式開啟（開啟時自動遷移到 v5）、讓
+publisher 第一個 tick 合成快照**——不是 §5.8c 對主網從零冷建（新架構下要數小時且
+覆蓋率更差）。
+
+```bash
+# 把 Step 1e 的備份拉到本機
+mkdir -p /Users/jim/projects/spark/var/localdemo-v5/state /Users/jim/projects/spark/var/localdemo-v5/exchange
+scp -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER:/var/lib/filet-api/explore.db.pre-v5.bak \
+  /Users/jim/projects/spark/var/localdemo-v5/explore.db
+rm -f /Users/jim/projects/spark/var/localdemo-v5/explore_index.json   # 舊版快照忽略，先刪避免混淆
+
+# 本機用「本次要部署的 commit」（含 Task 1–3）對這份 DB 起一個本機 filet-api：
+# 開啟時觸發 v4→v5 自動遷移，EXPLORE_UPSTREAM_REFRESH=1 讓 scheduler／publisher 接上，
+# HL 呼叫走本機 IP（多數證據已在 DB 內，第一個 tick 幾乎不需要新呼叫就能合成）。
+R=/Users/jim/projects/spark/var/localdemo-v5
+FILET_API_NETWORK=mainnet FILET_BUILDER_ADDR=<builder 位址> \
+FILET_SIWE_DOMAIN=localhost FILET_SIWE_URI=http://localhost:3000 \
+FILET_API_DB=$R/api.db FILET_KEYSVC_SOCK=$R/keysvc.sock FILET_PENDING_PATH=$R/pending.json \
+FILET_EXCHANGE_DIR=$R/exchange FILET_STATE_BASE=$R/state FILET_LEADERS_PATH=$R/leaders.json \
+FILET_FOLLOWERS_PATH=$R/followers.json FILET_ACCRUED_HISTORY_PATH=$R/accrued_history.jsonl \
+FILET_EXPLORE_CACHE_PATH=$R/explore_index.json FILET_EXPLORE_DB=$R/explore.db \
+EXPLORE_UPSTREAM_REFRESH=1 FILET_API_PORT=8700 \
+uv run python -m scripts.run_api > $R/api.log 2>&1 &
+
+# 等 publisher 第一個 tick（min_interval_s 預設 60s；給到 90s 保守值）
+sleep 90
+grep "schema v4→v5 遷移完成" $R/api.log   # 驗收：本機也印出遷移報告，數字應與 Step 1f/1g 對得上
+python3 -c "import json;d=json.load(open('$R/explore_index.json'));print(d['version'],len(d['rows']),d['total_scanned'])"
+# 預期：version 與正式機 EXPLORE_INDEX_VERSION 相同、rows/total_scanned 接近 300
+kill $(lsof -ti :8700 -sTCP:LISTEN)   # 建完就關
+
+# 推到正式機（在「§3.2 rsync 完成、尚未重啟 filet-api」的時間點做）
+scp -i <金鑰路徑> $R/explore_index.json ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER:/tmp/explore_index_new.json
+```
+
+#### Step 3：env 變動——本次**沒有新增 env**，只順延既有到期時間
+
+`explore-v4-verdict.conf`（第八次部署已建立）的 `FILET_EXPLORE_SPECIAL_SERVE_RATIO`
+（值 `3`）維持不變；本次新增約 122 個探測候選，`FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL`
+（原值 `2026-09-24T00:00:00Z`）要順延到**本次部署時刻 +24h**，讓 3:1 輔助份額多撐一天
+（逾期由 `ExploreScheduler._special_serve_ratio` 自動 fail-safe 回預設 9，不必人工移除）：
+
+```bash
+# 算出「現在 UTC +24h」（macOS date；Linux 版把 -v+24H 換成 -d '+24 hours'）
+NEW_UNTIL=$(date -u -v+24H +%Y-%m-%dT%H:%M:%SZ)
+echo "$NEW_UNTIL"   # 部署紀錄留底
+
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo sed -i 's/^Environment=FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=.*/Environment=FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=${NEW_UNTIL}/' \
+     /etc/systemd/system/filet-api.service.d/explore-v4-verdict.conf
+   sudo systemctl daemon-reload"
+
+# 驗收：只 grep 這兩個 key（⚠️ 不要印整段 Environment，含 TG token）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo grep 'FILET_EXPLORE_SPECIAL_SERVE_RATIO' /etc/systemd/system/filet-api.service.d/explore-v4-verdict.conf"
+# 要到 Step 4 restart 之後，systemctl show 讀到的才是新值（daemon-reload 不會改變已在跑的進程環境）
+```
+
+#### Step 4：rsync → stop → 裝快照 → start（沿用 §5.8f 的實際執行順序，不是 §5.8c 的舊順序）
+
+```bash
+# a) §3.2 兩段 rsync（本次 pyproject.toml／uv.lock 未變動，已用
+#    `git diff --stat bbd7adf..HEAD -- pyproject.toml uv.lock` 確認為空；部署前仍照 §3.2
+#    的驗收行 `ls -l uv.lock` 確認 mtime 沒被動到，動到才補跑 uv sync）
+#    ……（照 §3.2 全文跑兩段 rsync＋chown，此處不重複）
+
+# b) 停 filet-api（follower 不動）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER 'sudo systemctl stop filet-api.service'
+
+# c) 裝 Step 2 做好的快照（沿用 §5.8c 的 install 慣例：先備份舊檔再覆蓋）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+  P=$(systemctl show filet-api -p Environment | tr " " "\n" | grep FILET_EXPLORE_CACHE_PATH | cut -d= -f2)
+  sudo cp -a "$P" "$P.bak-$(date -u +%Y%m%d)"
+  sudo install -o filet-api -g filet-api -m 644 /tmp/explore_index_new.json "$P"
+  rm /tmp/explore_index_new.json
+  sudo python3 -c "import json;d=json.load(open(\"$P\"));print(\"installed\",d[\"version\"],len(d[\"rows\"]))"'
+
+# d) 起 filet-api（此時才會觸發 DB 的 v4→v5 自動遷移，見 Step 5）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo systemctl start filet-api.service
+sudo systemctl status filet-api.service --no-pager'   # 確認 active
+
+# e) 立即比對 follower 未被牽連：與 Step 1b 記下的值逐一比對，必須完全相同
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+systemctl list-units --all "filet-follower@*" --no-legend | awk "{print \$1}" | while read u; do
+  echo "=== $u ==="; systemctl show "$u" -p ActiveEnterTimestamp
+done'
+```
+
+不符（任何一個 follower 的 `ActiveEnterTimestamp` 變了）→ **立即回退**（Step 7），
+不要先排查——理由同 §5.8f：一旦動到 follower 代表對「重啟範圍」的假設本身錯了，
+優先保用戶資金安全。
+
+#### Step 5：遷移報告核對
+
+啟動日誌會印一行（`explore_store.py:1046`，`logger.warning`，會進 journald）：
+
+```bash
+sudo journalctl -u filet-api --since '5 min ago' --no-pager \
+  | grep "schema v4→v5 遷移完成"
+```
+
+預期格式：`explore store: schema v4→v5 遷移完成（D-M／D-N 工作量報告）：{'before': {...},
+'after': {...}, 'work': {'probes_needed': N, 'cursors_normalized': N,
+'verdicts_recomputed': N, 'scan_jobs_advanced': N}}`。主線程在 2026-09-23 02:32 UTC
+正式機複本上的獨立重現基準（**同量級即可，不要求逐字相等**——正式機這段時間仍有新候選
+進出與既有遍歷推進）：
+
+```
+probes_needed 156、cursors_normalized 164、verdicts_recomputed 172、scan_jobs_advanced 25
+池內 truncation_suspected 122 → 0、complete 128 → 139
+```
+
+**判讀**：`after` 的池內 `truncation_suspected` 必須為 **0**（D-M 的重設對象是池內 active
+地址全集）；`work.probes_needed` 應與 Step 1f 記下的 `truncation_suspected + unknown`
+同量級；整行沒出現、或 `truncation_suspected` 遷移後仍非 0 → **立即回退**。
+
+另外核對 `fills` 筆數（同 Step 1g 的查詢）：遷移前後必須**相同**（遷移不刪 `fills`）；
+減少 → 立即回退。抽查 2–3 個非目標游標（`pages_done>0` 或差距 `>1d` 的 scan）在遷移前後
+`cursor_ms` 一字不動（D-N 反向護欄，同款查詢見 plan Task 3 測試 `test_migrate_v4_to_v5_does_not_touch_other_cursors`）。
+
+#### Step 6：部署後觀測門檻（至少涵蓋一個完整 24 小時重排週期）
+
+沿用 §5.8f 的觀測表（follower 存活／429／Traceback／explore 父 scope 全域權重／探測進度／
+`fills` 類 overdue／對外 complete 曲線／base 逾期／高頻非熱門位址數），**加三列**（本次
+D-K／D-O／Task 1b 專屬）：
+
+| 指標 | 來源 | 門檻 | 不達標的動作 |
+|---|---|---|---|
+| 池內 `truncation_suspected` 收斂 | DB：`select count(*) from fills_sync s join candidate cd on cd.address=s.address and cd.active=1 where s.left_boundary='truncation_suspected'` | 6 小時內降到個位數（D-M 重設後由全史探測窗重新判定，遷移當下基線 0，若又回升代表新判定有問題） | 查 `_run_probe` 的全史窗實作是否真的生效（Task 2 測試 `test_probe_queries_full_history_before_window_start`）；不要調寬 D-L 的模糊帶 |
+| 池內 `left_boundary='unknown'` 單調下降 | 同上查詢改 `left_boundary='unknown'` | 遷移後基線約 156（Step 5 的 `probes_needed`），2 小時內至少 −20 | 查獨立探測（輔助份額）是否真的排到這批地址（`_PROBE_CANDIDATE_WHERE`，同 §5.8f 「探測進度」列的排查方式） |
+| 遍歷軌不停擺 | `samples.jsonl` 的 `scan.scan_pages_15m`；DB：`select count(*) from refresh_job where kind='fills_scan' and next_attempt_at<=strftime('%s','now')` | `scan_pages_15m` 不得連續 4 筆（1 小時）為 0，且同時存在到期的 `fills_scan` job（Task 1／1b 修的正是這個：到期改 `now`、`resume_running` 用 MIN 語義拉近） | 查 Task 1b 的 `resume_running` 是否對每輪對帳都補排（`explore_scheduler.py` 的 `_ensure_scan_job`）；本表沿用的舊版「頁面占比」門檻已在 §5.8f 移除，不要重新引用 |
+
+> 「至少一個完整 24 小時重排週期」的理由與 §5.8f 相同：`FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL`
+> 已順延到本次部署時刻 +24h（Step 3），24 小時觀測窗要涵蓋「加速期」與「到期自動回 9:1
+> 後」兩種狀態，才能確認到期自動恢復真的生效。
+
+#### Step 7-pre：先試「只停背景工作」——比整體回退更輕的第一道階梯
+
+與 §5.8f Step 7-pre 完全相同（`EXPLORE_UPSTREAM_REFRESH` 改 0、`daemon-reload`、
+`restart filet-api`，不還原 DB）；步驟與驗收指令照抄 §5.8f 該節，此處不重複。
+
+#### Step 7：回退（獨立成立，不需要回頭讀其他段）
+
+任何一項達到「立即回退」門檻，或觀測期內出現任何未預期的 follower 異常：
+
+```bash
+# 1) 停 filet-api（follower 不動）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER 'sudo systemctl stop filet-api.service'
+
+# 2) 還原 DB（用 Step 1e 的 pre-v5.bak；WAL 檔一併清掉）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo rm -f /var/lib/filet-api/explore.db-wal /var/lib/filet-api/explore.db-shm
+sudo install -o filet-api -g filet-api -m 600 \
+  /var/lib/filet-api/explore.db.pre-v5.bak /var/lib/filet-api/explore.db'
+
+# 3) 還原上一版程式碼（本機驅動，§9.3 標準模型）
+cd /Users/jim/projects/spark
+git status --porcelain            # 必須是空的
+git checkout bbd7adf              # bbd7adf = 本次修法之前、上一次已部署的版本（第八次部署）
+git describe --always --dirty     # 驗收：印出的就是即將回退部署的版本
+# 回 §3.2 從頭整節跑一遍，完成後 git checkout 回原本的開發分支
+
+# 4) 還原 drop-in：explore-v4-verdict.conf 第八次部署就已存在，本次只改了 _UNTIL 的值，
+#    回退是把該值改回原值，不是刪檔（刪檔會連第八次的 SPECIAL_SERVE_RATIO=3 一起撤掉，
+#    但第八次仍在其原訂到期時間內合法生效）：
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER \
+  "sudo sed -i 's/^Environment=FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=.*/Environment=FILET_EXPLORE_SPECIAL_SERVE_RATIO_UNTIL=2026-09-24T00:00:00Z/' \
+     /etc/systemd/system/filet-api.service.d/explore-v4-verdict.conf
+   sudo systemctl daemon-reload"
+
+# 5) 啟動並確認
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo systemctl start filet-api.service
+sudo systemctl status filet-api.service --no-pager
+curl -s "http://127.0.0.1:8700/api/public/explore?window=month" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d[\"building\"],d[\"total_scanned\"])"'
+# 預期：False 300；journal 無 Traceback
+
+# 6) follower 確認未受影響（照 Step 1b 同樣的指令，比對 ActiveEnterTimestamp 仍與部署前一致）
+ssh -i <金鑰路徑> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+systemctl list-units --all "filet-follower@*" --no-legend | awk "{print \$1}" | while read u; do
+  echo "=== $u ==="; systemctl show "$u" -p ActiveEnterTimestamp
+done'
+```
+
+回退**不需要動 follower**。順序不能反（先還原 DB、再回退程式碼）——理由與 §5.8f Step 7
+相同：舊版 `ExploreStore` 讀 v5 schema 的 DB 會因為新欄位／新語義而整批地址核驗結果失真，
+見 §9.3「回滾不會回滾資料」。
+
+#### 預期效果（部署後，引自 plan「預期效果」表）
+
+| 時點 | 預期 |
+|---|---|
+| +1h | `truncation_suspected` 從 ~121 開始下降（每小時約 12–15 個，輔助份額 3:1） |
+| +2–3h | 35 個 `backfilling` 全部開跑並多數完成 |
+| +6–8h | 池內 complete 121 → ~250；剩下為證據真的不足（全史窗仍空且帳戶更老）或 `unresolved_gap` |
+| +24h | 觀測結束；第二份 24h 日誌 |
+
 ## 6. nginx + certbot
 
 ```bash
