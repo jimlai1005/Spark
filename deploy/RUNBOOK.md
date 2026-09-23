@@ -2905,6 +2905,36 @@ done'
 | +6–8h | 池內 complete 121 → ~250；剩下為證據真的不足（全史窗仍空且帳戶更老）或 `unresolved_gap` |
 | +24h | 觀測結束；第二份 24h 日誌 |
 
+### 5.8h 主機資源取樣（CPU／RAM，2026-09-23 起常駐；使用者要求）
+
+正式機是 Lightsail 2 vCPU／1.9 GB，沒裝 sysstat，分鐘級歷史只有主控台 Metrics。為了回答
+「跟單者變多要不要升級」，`ubuntu` crontab 另有一條（與 §5.8e 的 `sample.py` 錯開，:02/:17/:32/:47）：
+
+```
+2,17,32,47 * * * * /usr/bin/python3 /home/ubuntu/explore-obs/host_sample.py >/dev/null 2>>/home/ubuntu/explore-obs/host_cron.err
+```
+
+`host_sample.py`（純 python3、不 sudo、不碰任何 service）每次追加一行 JSON 到 `explore-obs/host.jsonl`：
+`load`、`cpu_pct_since_prev`／`steal_pct_since_prev`（/proc/stat 對上次樣本差分，狀態在 `host_state.json`）、
+`mem_mb{total,available,used,swap_used}`、`psi{cpu,memory}`、`follower_count`、`services{filet-api, filet-follower@*}` 的
+MemoryCurrent／CPU 秒／restarts、`disk_used_pct`、`top_rss`。
+
+看趨勢（唯讀）：
+
+```bash
+tail -96 /home/ubuntu/explore-obs/host.jsonl | python3 -c '
+import sys,json
+for l in sys.stdin:
+    d=json.loads(l); m=d["mem_mb"]
+    print(d["t"][5:16], "cpu%%=%s"%d["cpu_pct_since_prev"], "load=%s"%d["load"][0], "avail=%sMB swap=%sMB"%(m["available"],m["swap_used"]), "followers=%s"%d["follower_count"], "api=%sMB"%d["services"]["filet-api"]["mem_mb"])'
+wc -c /home/ubuntu/explore-obs/host_cron.err   # 應為 0
+```
+
+基線（2026-09-23 13:27 UTC，2 follower）：available ~1,047 MB、swap 300 MB、api cgroup 934 MB（RSS 384、峰 605、其餘是 explore.db 頁快取）、
+follower 各 ~40 MB／≈0.2% CPU、整機 CPU 均值 ≈12%、steal 0.3%。**升級到 4 GB 的門檻**（任一）：follower ≥ 8–10、
+`available` 持續 < 400 MB、`swap_used` > 800 MB、PSI memory `full_avg300` > 0 持續出現。升級＝換 Lightsail 方案並重開機，
+要挑 follower 無部位（或先 owner_close）的時段。
+
 ## 6. nginx + certbot
 
 ```bash
