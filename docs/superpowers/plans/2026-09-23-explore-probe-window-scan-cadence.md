@@ -287,7 +287,7 @@ UPDATE refresh_job SET next_attempt_at=:now
 |---|---|---|
 | 1 fills_scan 到期改 now | ✅ `abd595b`；主線程複跑 3379 passed、ruff 過 | 三條測試；反向護欄第一條轉紅；第三條改標為再入池續跑迴歸測試（非 D-O 護欄） |
 | 1b resume_running MIN 拉近 | ✅ `36fcbfb`；主線程複跑同上、五條新測試 5 passed | **範圍收斂（builder 裁決，主線程接受）**：只對 `fills_scan` 套用一律 enqueue；`fills_verify` 的 resume_running 維持「同類 job 已存在不重排」（7.9e-S1 不變量、既有測試 `test_s1_reconcile_resumes_running_verify_scan_with_verify_job`）。日誌只在真的新建時印（300 地址 → 3 行）。 |
-| 2 探測窗全史 | ✅ `0815e10`（主線程複跑中） | 四條測試＋harness 護欄；反向護欄兩組轉紅；harness 時鐘改 1.7e9、預設候選首次活動 ws+2d；139 條家族測試零轉紅、零斷言放寬 |
-| 3 schema v5 遷移 | 未開始 | |
+| 2 探測窗全史 | ✅ `0815e10`；主線程複跑 3384 passed、ruff 過、目標測試 6 passed | 四條測試＋harness 護欄；反向護欄兩組轉紅；harness 時鐘改 1.7e9、預設候選首次活動 ws+2d；139 條家族測試零轉紅、零斷言放寬 |
+| 3 schema v5 遷移 | 派工中（dry-run 複本 v4snap.db） | |
 | 4 整合驗收 | 未開始 | |
 | 5 審核／RUNBOOK／部署 | 未開始 | |
