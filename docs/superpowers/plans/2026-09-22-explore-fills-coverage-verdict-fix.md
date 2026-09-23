@@ -1656,6 +1656,17 @@ Task 3b 就地重算成 complete，`_needs_scan_job` 依狀態推導自然不再
 | 資料庫回滾步驟 | 本機完整預演：v3 備份 → 遷移 v4 → 清 wal/shm 還原 → **舊程式 `dc76440` 開啟**讀到 v3、fills 1,051,273、舊 reason 179 列 | 記於 RUNBOOK §5.8f Step 7 |
 | 已知錯判完整不留給正式環境 | Task 10 C1 已封（reviewer 反向護欄驗證）；Task 11 封 `no_earlier_activity` 單調性；W4 兩側皆 partial 不屬錯判完整，延後 | — |
 
+
+| 01:00 | 0 | 0 | 126／142／32 | 51 | 0／0／0 | ok | scan_pages 8、pages 11（一波到期，脈衝） |
+| 01:15 | 0 | 0 | 126／142／32 | 51 | 0／0／0 | ok | |
+| 01:30 | 0 | 0 | 126／142／32 | 49 | 0／0／0 | ok | |
+| 01:45 | 0 | 0 | 127／142／31 | 49 | 0／1／0 | hb 59s（單筆，週期內） | |
+
+**01:55 排程檢查（+10h10m）**：unknown 97 → 100（新入池 +3；池內 31 → 35）、`earlier_fills_seen` 181 → 183、
+`no_earlier_activity` 20、`truncation_suspected` 147；completeness 73／186／191；`fills_verify` job 52 → 48；
+running scans 69 → 73；Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退、不走 Step 7-pre。**
+遍歷軌呈預期的脈衝（Task 12 排程缺陷），探測仍在解出（+2 earlier_fills_seen、verify job 持續遞減）。
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
