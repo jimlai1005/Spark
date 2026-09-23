@@ -11,7 +11,13 @@ import pytest
 
 from spark.publicapi.explore_fills_sync import (PARTIAL_RESCAN_AFTER_S, external_coverage_state,
                                                 partial_rescan_due)
-from spark.publicapi.explore_store import ExploreStore, FillsSyncState, ScanWriteback
+from spark.publicapi.explore_store import (REASON_COUNT_BELOW_RETENTION_THRESHOLD,
+                                           REASON_LEFT_BOUNDARY_TRUNCATED,
+                                           REASON_LEFT_BOUNDARY_UNKNOWN,
+                                           REASON_LEFT_BOUNDARY_VERIFIED,
+                                           REASON_PROBE_NO_EARLIER_FILLS,
+                                           REASON_TRAVERSAL_INCOMPLETE, ExploreStore,
+                                           FillsSyncState, ScanWriteback)
 
 
 class Clock:
@@ -55,13 +61,15 @@ def test_wal_journal_mode_enabled(tmp_path):
     assert mode == "wal"
 
 
-def test_schema_version_v4_recorded_on_fresh_db(tmp_path):
+def test_schema_version_v5_recorded_on_fresh_db(tmp_path):
     """Task 4：schema bump 3→4（`fills_sync.left_boundary` 三欄＋
     `fills_scan.stop_reason`／`unresolved_gap`）——全新 DB 直接落地版本 4
-    （`_SCHEMA` 已含新欄，不需要跑遷移）。"""
+    （`_SCHEMA` 已含新欄，不需要跑遷移）。
+    2026-09-23 schema v5（D-M／D-N／Task 1b 資料面）：終點版本改為 5——本次
+    沒有新增欄位，`_SCHEMA` 結構不變，只是版本號本身往前推一版。"""
     store, _ = _store(tmp_path)
     row = store._db.execute("SELECT version FROM schema_version").fetchone()
-    assert row == (4,)
+    assert row == (5,)
     cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
     assert {"inc_from_ms", "scan_id", "evidence_unknown", "coverage_gap", "left_boundary",
             "left_boundary_window_start_ms", "left_boundary_at"} <= cols
@@ -420,9 +428,10 @@ def test_migration_v1_to_v2_adds_params_fp_column_defaulted_empty(tmp_path):
 
     store = ExploreStore(db_path)
 
-    # 開啟 v1 DB 會一路級聯遷移到目前版本（4），不會停在 3。
+    # 開啟 v1 DB 會一路級聯遷移到目前版本（5），不會停在 3。
+    # 2026-09-23 schema v5（D-M／D-N／Task 1b 資料面）：終點版本改為 5。
     version = store._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 4
+    assert version == 5
     cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
     assert "params_fp" in cols
     params_fp_values = {r[0] for r in store._db.execute(
@@ -467,11 +476,12 @@ def test_migration_is_idempotent_on_reopen(tmp_path):
     db_path = tmp_path / "explore.db"
     _write_v1_schema(db_path)
     ExploreStore(db_path)
-    # 第二次開啟（版本已是 4）不應該再嘗試 ALTER TABLE／CREATE TABLE（會因
+    # 第二次開啟（版本已是 5）不應該再嘗試 ALTER TABLE／CREATE TABLE（會因
     # 欄位／表已存在而炸掉，或重複建立歷史 fills_scan／verify job）。
+    # 2026-09-23 schema v5（D-M／D-N／Task 1b 資料面）：終點版本改為 5。
     store2 = ExploreStore(db_path)
     version = store2._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 4
+    assert version == 5
 
 
 # --- Task 7.9b：schema v2→v3 遷移（遍歷軌／增量軌分離） ---
@@ -1629,7 +1639,9 @@ def _migration_shape(db_path) -> tuple:
 def test_migration_v2_to_v3_is_idempotent_across_three_runs(tmp_path):
     """W1：遷移重跑（含把 `schema_version` 改回 2 強制再跑一次）不得重複建
     `fills_scan`／`fills_verify` job，也不得因 UNIQUE 撞掉。Task 4：開啟時會
-    級聯到目前版本 4（v2→v3 之後緊接著 v3→v4），版本斷言隨之更新為 4。"""
+    級聯到目前版本 4（v2→v3 之後緊接著 v3→v4），版本斷言隨之更新為 4。
+    2026-09-23 schema v5（D-M／D-N／Task 1b 資料面）：級聯終點改為 5
+    （v2→v3→v4 之後緊接著 v4→v5），版本斷言隨之更新為 5。"""
     db_path = tmp_path / "explore.db"
     _write_v2_multi(db_path)
     now = 1_700_000_000.0
@@ -1644,10 +1656,10 @@ def test_migration_v2_to_v3_is_idempotent_across_three_runs(tmp_path):
     ExploreStore(db_path, now_fn=lambda: now + 12345)   # 第二次（強制重跑列迴圈）
     shape2 = _migration_shape(db_path)
 
-    ExploreStore(db_path, now_fn=lambda: now + 99999)   # 第三次（版本已是 4）
+    ExploreStore(db_path, now_fn=lambda: now + 99999)   # 第三次（版本已是 5）
     shape3 = _migration_shape(db_path)
 
-    assert shape1[0] == shape2[0] == shape3[0] == 4
+    assert shape1[0] == shape2[0] == shape3[0] == 5
     assert shape1[1] == shape2[1] == shape3[1] == 4      # 四列各一筆 fills_scan
     assert shape1[2] == shape2[2] == shape3[2]
     # 核驗 job 只給「有歷史結論但缺證據」的兩列（0xabc complete／0xzzz partial）：
@@ -1819,7 +1831,11 @@ _V3_SNAPSHOT_SCAN_OVERRIDES = {"0xdd": ("done", "partial", "retention_limit", 5,
 
 def test_migrate_v3_to_v4_revokes_verdicts_but_keeps_progress(tmp_path):
     """D-G 對照表逐列驗證：正面證據保留、無佐證結論撤銷、被錯門檻中斷的
-    遍歷回到續抓——`fills` 原始成交與 `fills_scan` 游標一筆不動。"""
+    遍歷回到續抓——`fills` 原始成交與 `fills_scan` 游標一筆不動。
+    2026-09-23 schema v5（D-M／D-N／Task 1b 資料面）：開啟時會接著級聯
+    v4→v5，終點版本改為 5——這批 fixture 列不落在 D-M（無 truncation_
+    suspected）／D-N（pages_done=5，不是 0）的範圍內，v4→v5 對它們是
+    no-op，下面逐列斷言不變，只有版本號本身往前推一版。"""
     db_path = tmp_path / "explore.db"
     _v3_db_with(db_path, sync_rows=_V3_SNAPSHOT_SYNC_ROWS,
                scan_overrides=_V3_SNAPSHOT_SCAN_OVERRIDES,
@@ -1827,7 +1843,7 @@ def test_migrate_v3_to_v4_revokes_verdicts_but_keeps_progress(tmp_path):
 
     store = ExploreStore(db_path)
 
-    assert store.schema_version() == 4
+    assert store.schema_version() == 5
     assert store.get_sync("0xaa").completeness == "partial"
     assert store.get_sync("0xaa").reason == "left_boundary_unknown"
     assert store.get_sync("0xbb").completeness == "partial"
@@ -1944,6 +1960,318 @@ def test_migrate_v3_to_v4_rerun_does_not_move_finished_at_again(tmp_path):
     second = ExploreStore(db_path, now_fn=clock.now).latest_done_scan("0xaa").finished_at
 
     assert first == second
+
+
+# ============================================================
+# Task 3（2026-09-23，D-M／D-N，見 docs/superpowers/plans/
+# 2026-09-23-explore-probe-window-scan-cadence.md Task 3）：schema v4→v5——
+# 重設被舊 1 天探測窗誤判的 `truncation_suspected`（D-M）、正規化 v3 遺留
+# scan 的游標偏移（D-N）、Task 1b 的資料面（running scan 若還掛著排在遙遠
+# 未來的 `fills_scan` job → 拉到遷移當下）。
+# ============================================================
+
+_V4_WS = 0
+_V4_WE = 2_592_000_000          # 30 天窗（ms）
+_V4_NOW = 1_700_000_000.0
+
+
+def _write_v4_schema(db_path) -> None:
+    """手刻一份 Task 3（schema v5）之前的 v4 DB——結構與目前 `_SCHEMA` 完全
+    相同（v5 未新增任何欄位，見 `_migrate_v4_to_v5` docstring），只是
+    `schema_version` 停在 4，供 `_migrate_v4_to_v5` 的遷移測試使用。"""
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (4);
+        CREATE TABLE candidate (
+          address TEXT PRIMARY KEY, display_name TEXT, source_rank INTEGER,
+          source_roi REAL, source_as_of REAL NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1, last_seen_at REAL NOT NULL);
+        CREATE TABLE endpoint_cache (
+          address TEXT NOT NULL, endpoint TEXT NOT NULL,
+          params_fp TEXT NOT NULL DEFAULT '', payload TEXT,
+          fetched_at REAL, refresh_after REAL NOT NULL,
+          last_error TEXT, last_error_at REAL,
+          PRIMARY KEY (address, endpoint, params_fp));
+        CREATE TABLE fills (
+          address TEXT NOT NULL, coin TEXT NOT NULL, tid INTEGER NOT NULL,
+          time_ms INTEGER NOT NULL, raw TEXT NOT NULL,
+          PRIMARY KEY (address, coin, tid));
+        CREATE TABLE fills_sync (
+          address TEXT PRIMARY KEY,
+          window_start_ms INTEGER NOT NULL, window_end_ms INTEGER NOT NULL,
+          cursor_ms INTEGER NOT NULL, synced_through_ms INTEGER,
+          observed_from_ms INTEGER, observed_to_ms INTEGER,
+          completeness TEXT NOT NULL DEFAULT 'backfilling',
+          reason TEXT, pages_done INTEGER NOT NULL DEFAULT 0,
+          fills_in_window INTEGER NOT NULL DEFAULT 0,
+          params_fp TEXT NOT NULL DEFAULT '',
+          updated_at REAL NOT NULL, last_error TEXT,
+          inc_from_ms INTEGER, scan_id TEXT,
+          evidence_unknown INTEGER NOT NULL DEFAULT 0,
+          coverage_gap INTEGER NOT NULL DEFAULT 0,
+          left_boundary TEXT NOT NULL DEFAULT 'unknown',
+          left_boundary_window_start_ms INTEGER,
+          left_boundary_at REAL);
+        CREATE TABLE fills_scan (
+          scan_id TEXT PRIMARY KEY, address TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('initial', 'partial_rescan', 'verify')),
+          window_start_ms INTEGER NOT NULL, window_end_ms INTEGER NOT NULL,
+          cursor_ms INTEGER NOT NULL, pages_done INTEGER NOT NULL DEFAULT 0,
+          fills_in_window INTEGER NOT NULL DEFAULT 0,
+          observed_from_ms INTEGER, observed_to_ms INTEGER,
+          status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'done')),
+          result TEXT, reason TEXT, started_at REAL NOT NULL, finished_at REAL,
+          last_error TEXT, params_fp TEXT NOT NULL DEFAULT '',
+          stop_reason TEXT, unresolved_gap INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE refresh_job (
+          key TEXT PRIMARY KEY, address TEXT, kind TEXT NOT NULL,
+          priority INTEGER NOT NULL, created_at REAL NOT NULL,
+          next_attempt_at REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          lease_until REAL, lease_owner TEXT, fencing INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT);
+    """)
+    raw.commit()
+    raw.close()
+
+
+def _v4_candidate(raw, address, *, active=1, now=_V4_NOW) -> None:
+    raw.execute(
+        "INSERT INTO candidate (address, display_name, source_rank, source_roi, "
+        "source_as_of, active, last_seen_at) VALUES (?, NULL, 1, 0.0, ?, ?, ?)",
+        (address, now, active, now))
+
+
+def _v4_sync(raw, *, address, completeness="partial", reason=None, scan_id=None,
+             left_boundary="unknown", lb_ws=None, lb_at=None,
+             window_start_ms=_V4_WS, window_end_ms=_V4_WE, cursor_ms=_V4_WE,
+             now=_V4_NOW) -> None:
+    raw.execute(
+        "INSERT INTO fills_sync (address, window_start_ms, window_end_ms, cursor_ms, "
+        "synced_through_ms, completeness, reason, pages_done, fills_in_window, params_fp, "
+        "updated_at, inc_from_ms, scan_id, evidence_unknown, coverage_gap, left_boundary, "
+        "left_boundary_window_start_ms, left_boundary_at) VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, 1, 100, '', ?, ?, ?, 0, 0, ?, ?, ?)",
+        (address, window_start_ms, window_end_ms, cursor_ms, cursor_ms, completeness, reason,
+         now, cursor_ms, scan_id, left_boundary, lb_ws, lb_at))
+
+
+def _v4_scan(raw, *, scan_id, address, status="done", pages_done=5, reason=None,
+             window_start_ms=_V4_WS, window_end_ms=_V4_WE, cursor_ms=_V4_WE,
+             unresolved_gap=0, stop_reason=None, now=_V4_NOW) -> None:
+    raw.execute(
+        "INSERT INTO fills_scan (scan_id, address, kind, window_start_ms, window_end_ms, "
+        "cursor_ms, pages_done, fills_in_window, status, result, reason, started_at, "
+        "finished_at, params_fp, stop_reason, unresolved_gap) VALUES "
+        "(?, ?, 'initial', ?, ?, ?, ?, 100, ?, ?, ?, ?, ?, '', ?, ?)",
+        (scan_id, address, window_start_ms, window_end_ms, cursor_ms, pages_done, status,
+         ("complete" if status == "done" else None), reason, now,
+         (now if status == "done" else None), stop_reason, unresolved_gap))
+
+
+def _v4_job(raw, *, key, address, kind, next_attempt_at, priority=1, created_at=_V4_NOW) -> None:
+    raw.execute(
+        "INSERT INTO refresh_job (key, address, kind, priority, created_at, next_attempt_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (key, address, kind, priority, created_at, next_attempt_at))
+
+
+def test_migrate_v4_to_v5_resets_truncation_suspected_to_unknown(tmp_path):
+    """D-M：池內 truncation_suspected → unknown，且 left_boundary_window_
+    start_ms/at 清空，成為探測候選。退池列（不在 `candidate` 表）不動。"""
+    db_path = tmp_path / "explore.db"
+    _write_v4_schema(db_path)
+    raw = sqlite3.connect(str(db_path))
+    _v4_candidate(raw, "0xaa", active=1)
+    _v4_sync(raw, address="0xaa", completeness="partial",
+             reason=REASON_LEFT_BOUNDARY_TRUNCATED, scan_id="scan-aa",
+             left_boundary="truncation_suspected", lb_ws=_V4_WS, lb_at=_V4_NOW)
+    _v4_scan(raw, scan_id="scan-aa", address="0xaa", status="done", pages_done=5,
+             reason="truncation_suspected", cursor_ms=_V4_WE)
+    # 退池：沒有 candidate 列。
+    _v4_sync(raw, address="0xbb", completeness="partial",
+             reason=REASON_LEFT_BOUNDARY_TRUNCATED, scan_id="scan-bb",
+             left_boundary="truncation_suspected", lb_ws=_V4_WS, lb_at=_V4_NOW)
+    _v4_scan(raw, scan_id="scan-bb", address="0xbb", status="done", pages_done=5,
+             reason="truncation_suspected", cursor_ms=_V4_WE)
+    raw.commit()
+    raw.close()
+
+    store = ExploreStore(db_path)
+
+    row_aa = store._db.execute(
+        "SELECT left_boundary, left_boundary_window_start_ms, left_boundary_at "
+        "FROM fills_sync WHERE address='0xaa'").fetchone()
+    assert row_aa == ("unknown", None, None)
+    row_bb = store._db.execute(
+        "SELECT left_boundary, left_boundary_window_start_ms, left_boundary_at "
+        "FROM fills_sync WHERE address='0xbb'").fetchone()
+    assert row_bb == ("truncation_suspected", _V4_WS, _V4_NOW)   # 退池列不動
+    candidate = store.next_probe_candidate()
+    assert candidate is not None and candidate[0] == "0xaa"
+
+
+def test_migrate_v4_to_v5_normalizes_v3_cursor_and_recomputes(tmp_path):
+    """D-N：pages_done=0、v3 reason、window_end − cursor ≤ 1d → cursor :=
+    window_end；結論經 `scan_verdict` 重算。有正面證據者 → complete；證據
+    unknown 者 → partial/left_boundary_unknown（等探測）。"""
+    db_path = tmp_path / "explore.db"
+    _write_v4_schema(db_path)
+    raw = sqlite3.connect(str(db_path))
+    near_cursor = _V4_WE - 20_000_000   # 差約 0.23 天，落在 [0, 1天] 內
+
+    _v4_candidate(raw, "0xpos", active=1)
+    _v4_sync(raw, address="0xpos", completeness="partial",
+             reason=REASON_TRAVERSAL_INCOMPLETE, scan_id="scan-pos",
+             left_boundary="earlier_fills_seen", lb_ws=_V4_WS, lb_at=_V4_NOW)
+    _v4_scan(raw, scan_id="scan-pos", address="0xpos", status="done", pages_done=0,
+             reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, cursor_ms=near_cursor)
+
+    _v4_candidate(raw, "0xunk", active=1)
+    _v4_sync(raw, address="0xunk", completeness="partial",
+             reason=REASON_TRAVERSAL_INCOMPLETE, scan_id="scan-unk",
+             left_boundary="unknown")
+    _v4_scan(raw, scan_id="scan-unk", address="0xunk", status="done", pages_done=0,
+             reason=REASON_PROBE_NO_EARLIER_FILLS, cursor_ms=near_cursor)
+    raw.commit()
+    raw.close()
+
+    store = ExploreStore(db_path)
+
+    assert store.latest_done_scan("0xpos").cursor_ms == _V4_WE       # 游標正規化
+    sync_pos = store.get_sync("0xpos")
+    assert (sync_pos.completeness, sync_pos.reason) == ("complete", REASON_LEFT_BOUNDARY_VERIFIED)
+
+    assert store.latest_done_scan("0xunk").cursor_ms == _V4_WE
+    sync_unk = store.get_sync("0xunk")
+    assert (sync_unk.completeness, sync_unk.reason) == ("partial", REASON_LEFT_BOUNDARY_UNKNOWN)
+
+
+def test_migrate_v4_to_v5_does_not_touch_other_cursors(tmp_path):
+    """反向護欄：pages_done>0 或差距 >1d 或非 v3 reason 的 scan 游標一字不動。"""
+    db_path = tmp_path / "explore.db"
+    _write_v4_schema(db_path)
+    raw = sqlite3.connect(str(db_path))
+    near_cursor = _V4_WE - 20_000_000
+    far_cursor = _V4_WE - 172_800_000   # 差 2 天，超出 1 天上限
+
+    _v4_candidate(raw, "0xpages", active=1)
+    _v4_sync(raw, address="0xpages", scan_id="scan-pages")
+    _v4_scan(raw, scan_id="scan-pages", address="0xpages", status="done", pages_done=5,
+             reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, cursor_ms=near_cursor)
+
+    _v4_candidate(raw, "0xfar", active=1)
+    _v4_sync(raw, address="0xfar", scan_id="scan-far")
+    _v4_scan(raw, scan_id="scan-far", address="0xfar", status="done", pages_done=0,
+             reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, cursor_ms=far_cursor)
+
+    _v4_candidate(raw, "0xother", active=1)
+    _v4_sync(raw, address="0xother", scan_id="scan-other")
+    _v4_scan(raw, scan_id="scan-other", address="0xother", status="done", pages_done=0,
+             reason=REASON_LEFT_BOUNDARY_UNKNOWN, cursor_ms=near_cursor)
+    raw.commit()
+    raw.close()
+
+    store = ExploreStore(db_path)
+
+    assert store.latest_done_scan("0xpages").cursor_ms == near_cursor
+    assert store.latest_done_scan("0xfar").cursor_ms == far_cursor
+    assert store.latest_done_scan("0xother").cursor_ms == near_cursor
+
+
+def test_migrate_v4_to_v5_is_rerunnable_and_creates_no_jobs(tmp_path):
+    """遷移本身不得建立任何 job，且連跑三次（含把 `schema_version` 強制改
+    回 4 逼它重跑）結果必須相同——證明 SQL 本身冪等（同 Task 4 Step 5
+    (iv) 的做法）。"""
+    db_path = tmp_path / "explore.db"
+    _write_v4_schema(db_path)
+    raw = sqlite3.connect(str(db_path))
+    near_cursor = _V4_WE - 20_000_000
+    _v4_candidate(raw, "0xaa", active=1)
+    _v4_sync(raw, address="0xaa", reason=REASON_LEFT_BOUNDARY_TRUNCATED, scan_id="scan-aa",
+             left_boundary="truncation_suspected", lb_ws=_V4_WS, lb_at=_V4_NOW)
+    _v4_scan(raw, scan_id="scan-aa", address="0xaa", status="done", pages_done=5,
+             reason="truncation_suspected", cursor_ms=_V4_WE)
+    _v4_candidate(raw, "0xpos", active=1)
+    _v4_sync(raw, address="0xpos", reason=REASON_TRAVERSAL_INCOMPLETE, scan_id="scan-pos",
+             left_boundary="earlier_fills_seen", lb_ws=_V4_WS, lb_at=_V4_NOW)
+    _v4_scan(raw, scan_id="scan-pos", address="0xpos", status="done", pages_done=0,
+             reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, cursor_ms=near_cursor)
+    _v4_job(raw, key="0xpos:fills_scan", address="0xpos", kind="fills_scan",
+            next_attempt_at=_V4_NOW + 24 * 3600)
+    raw.commit()
+    raw.close()
+
+    before_jobs = _job_rows(db_path)
+
+    ExploreStore(db_path, now_fn=lambda: _V4_NOW)
+    jobs1, shape1 = _job_rows(db_path), _v3_v4_sync_rows(db_path)
+
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("UPDATE schema_version SET version=4")
+    raw.commit()
+    raw.close()
+    ExploreStore(db_path, now_fn=lambda: _V4_NOW + 1.0)   # 第二次（強制重跑）
+    jobs2, shape2 = _job_rows(db_path), _v3_v4_sync_rows(db_path)
+
+    ExploreStore(db_path, now_fn=lambda: _V4_NOW + 2.0)   # 第三次（版本已是 5）
+    jobs3, shape3 = _job_rows(db_path), _v3_v4_sync_rows(db_path)
+
+    assert jobs1 == before_jobs == jobs2 == jobs3          # 遷移本身不建任何 job
+    assert shape1 == shape2 == shape3
+
+
+def test_migrate_v4_to_v5_reports_workload(tmp_path):
+    """report.work: probes_needed（重設後 unknown 數）、cursors_normalized、
+    verdicts_recomputed、scan_jobs_advanced（Task 1b 資料面）。"""
+    db_path = tmp_path / "explore.db"
+    _write_v4_schema(db_path)
+    raw = sqlite3.connect(str(db_path))
+    near_cursor = _V4_WE - 20_000_000
+
+    # D-M：兩個池內 truncation_suspected。
+    for addr in ("0xaa", "0xbb"):
+        _v4_candidate(raw, addr, active=1)
+        _v4_sync(raw, address=addr, reason=REASON_LEFT_BOUNDARY_TRUNCATED,
+                 scan_id=f"scan-{addr}", left_boundary="truncation_suspected",
+                 lb_ws=_V4_WS, lb_at=_V4_NOW)
+        _v4_scan(raw, scan_id=f"scan-{addr}", address=addr, status="done", pages_done=5,
+                 reason="truncation_suspected", cursor_ms=_V4_WE)
+
+    # D-N：兩個 v3 遺留 scan（各自不同地址，避免與上面兩列重疊）。
+    _v4_candidate(raw, "0xpos", active=1)
+    _v4_sync(raw, address="0xpos", reason=REASON_TRAVERSAL_INCOMPLETE, scan_id="scan-pos",
+             left_boundary="earlier_fills_seen", lb_ws=_V4_WS, lb_at=_V4_NOW)
+    _v4_scan(raw, scan_id="scan-pos", address="0xpos", status="done", pages_done=0,
+             reason=REASON_COUNT_BELOW_RETENTION_THRESHOLD, cursor_ms=near_cursor)
+    _v4_candidate(raw, "0xunk", active=1)
+    _v4_sync(raw, address="0xunk", reason=REASON_TRAVERSAL_INCOMPLETE, scan_id="scan-unk",
+             left_boundary="unknown")
+    _v4_scan(raw, scan_id="scan-unk", address="0xunk", status="done", pages_done=0,
+             reason=REASON_PROBE_NO_EARLIER_FILLS, cursor_ms=near_cursor)
+
+    # Task 1b 資料面：一個 running scan 掛著排在遙遠未來的 fills_scan job。
+    _v4_candidate(raw, "0xrun", active=1)
+    _v4_sync(raw, address="0xrun", scan_id="scan-run")
+    _v4_scan(raw, scan_id="scan-run", address="0xrun", status="running",
+             reason=None, cursor_ms=_V4_WS)
+    _v4_job(raw, key="0xrun:fills_scan", address="0xrun", kind="fills_scan",
+            next_attempt_at=_V4_NOW + 24 * 3600)
+    raw.commit()
+    raw.close()
+
+    store = ExploreStore(db_path, now_fn=lambda: _V4_NOW)
+    report = store.last_migration_v4_to_v5_report()
+
+    # probes_needed：0xaa／0xbb（重設後 unknown）＋0xunk（本來就 unknown）
+    # ＋0xrun（左界欄位預設值本來就是 unknown，D-M／D-N 都不動它）＝4。
+    assert report["work"]["probes_needed"] == 4
+    assert report["work"]["cursors_normalized"] == 2      # scan-pos／scan-unk
+    assert report["work"]["verdicts_recomputed"] == 4     # 0xaa/0xbb（D-M）＋0xpos/0xunk（D-N）
+    assert report["work"]["scan_jobs_advanced"] == 1       # 0xrun 的 job 被拉到 now
+    job_row = store._db.execute(
+        "SELECT next_attempt_at FROM refresh_job WHERE key='0xrun:fills_scan'").fetchone()
+    assert job_row[0] == _V4_NOW
 
 
 # D6：inc_from_ms 非空邊界

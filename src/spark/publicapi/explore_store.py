@@ -193,8 +193,10 @@ JOB_KIND_FOR_SCAN_KIND = {"verify": "fills_verify", "initial": "fills_scan",
 # complete／reason=NULL 列補標）→3（Task 7.9b：遍歷軌／增量軌分離，見
 # `_migrate_v2_to_v3`）→4（Task 4，2026-09-22 D-G：`fills_sync.left_boundary`
 # 三欄／`fills_scan.stop_reason`／`unresolved_gap` 接上持久化，並撤銷依賴
-# 舊留存門檻判準的結論，見 `_migrate_v3_to_v4`）。
-_SCHEMA_VERSION = 4
+# 舊留存門檻判準的結論，見 `_migrate_v3_to_v4`）→5（Task 3，2026-09-23
+# D-M／D-N：重設被 1 天探測窗誤判的 `truncation_suspected`、正規化 v3 遺留
+# scan 的游標並就地重算，見 `_migrate_v4_to_v5`；本次不新增欄位）。
+_SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -494,6 +496,14 @@ class ExploreStore:
         # 真正跑過該遷移的那個 `ExploreStore` 實例才會填值，其餘（新建 v4
         # DB、或開啟時已是 v4）維持 `None`（見 `last_migration_report`）。
         self._migration_v3_to_v4_report: dict[str, Any] | None = None
+        # Task 3（2026-09-23，D-M／D-N）：`_migrate_v4_to_v5` 的工作量報告，
+        # 獨立於上面那份——刻意不共用 `last_migration_report()`：一個 v3 DB
+        # 開啟時會在同一次 `__init__` 依序跑 v3→v4→v5 兩段遷移，若共用同一個
+        # 欄位／方法，`last_migration_report()` 會被 v5 的報告覆蓋，讓既有的
+        # `test_migrate_v3_to_v4_reports_workload`（斷言 v3→v4 那份 before／
+        # work 數字）在遷移鏈變長之後靜默讀到錯的報告。兩段遷移各自的報告
+        # 各自一個方法，見 `last_migration_v4_to_v5_report`。
+        self._migration_v4_to_v5_report: dict[str, Any] | None = None
         with self._lock:
             with self._db:
                 self._db.executescript(_SCHEMA)
@@ -513,6 +523,9 @@ class ExploreStore:
                 if row[0] < 4:
                     # 同上：版本更新在 `_migrate_v3_to_v4` 自己的顯式 transaction 內。
                     self._migrate_v3_to_v4()
+                if row[0] < 5:
+                    # 同上：版本更新在 `_migrate_v4_to_v5` 自己的顯式 transaction 內。
+                    self._migrate_v4_to_v5()
             self._assert_inc_from_not_null()
         if str(db_path) != ":memory:":
             # Task 3.6 C（W2 修法）：WAL 模式會在 db 旁邊建 `-wal`／`-shm` 側檔，
@@ -895,6 +908,143 @@ class ExploreStore:
         self._migration_v3_to_v4_report = report
         logger.warning("explore store: schema v3→v4 遷移完成（D-G 工作量報告）：%s", report)
 
+    def _migrate_v4_to_v5(self) -> None:
+        """Task 3（2026-09-23，D-M／D-N 裁決，見 docs/superpowers/plans/
+        2026-09-23-explore-probe-window-scan-cadence.md Task 3）：schema
+        v4→v5——重設被舊 1 天探測窗誤判的 `truncation_suspected`、正規化 v3
+        遺留 scan 的游標偏移，讓兩群卡住的位址不必等 24 小時重掃／重探就能
+        用新判準重新收斂。本次遷移**不新增任何欄位**（沿用 v4 的完整
+        schema），故沒有 `ALTER TABLE`；五段動作＋`schema_version` 更新包在
+        同一個 `_explicit_transaction()` 內，中途失敗整段回滾（同 Task 7.9c
+        D5／Task 4）。
+
+        對照 plan Task 3 Step 3 的 SQL 骨架：
+        - D-M：`fills_sync.left_boundary='truncation_suspected'` 且**池內**
+          （`candidate.active=1`）→ 重設為 `unknown`，`left_boundary_
+          window_start_ms`／`left_boundary_at` 一併清空——這樣
+          `next_probe_candidate` 的排他規則（`_PROBE_CANDIDATE_WHERE`）會把
+          它們當成從未探測過的候選，用 Task 2 已改成全史窗的探測重跑。退池
+          列不動（探測額度不該花在已經不在榜上的地址）。
+        - D-N：`fills_scan` 裡 `status='done' AND pages_done=0` 且 `reason`
+          是 v3 遺留的兩個門檻值、`window_end_ms − cursor_ms` 落在
+          `[0, 1天]`（游標只差一點點沒推到終點，是 v3 短頁收尾的偏移量，不是
+          真的沒遍歷完）→ 把 `cursor_ms` 正規化為 `window_end_ms`，讓
+          `scan_verdict` 認得到「已抵達終點」。
+        - Task 1b 的資料面：還在 `running` 的 scan 若掛著排在遙遠未來的
+          `fills_scan` job（v4 遷移當時排下的舊 24h 重掃 job，未來已被 Task
+          1b 的 `resume_running` 擋住新增，但正式機既有的舊 job 還在）→ 拉到
+          遷移當下（`next_attempt_at=now`）；只改時間戳，**不建立任何新
+          job**（D-G：排程觸發條件一律由狀態推導）。
+        - 就地重算：對「證據被重設」（D-M）與「游標被正規化且其正是該位址
+          `fills_sync.scan_id` 目前指向的那一筆」（D-N）的每個地址，用
+          `_recompute_verdict_locked`（Task 3b 既有的唯一重算入口）以該位址
+          **目前**（已被上面兩段更新過）的證據與已完成的遍歷重算
+          `completeness`／`reason`。結論仍然只出自 `scan_verdict`——這裡不
+          另寫一套判斷（工程原則 1）。D-N 的正規化是對 `fills_scan` 動手，
+          必須用該位址 `fills_sync.scan_id` 是否等於被正規化的 `scan_id`
+          來判斷「這筆正規化對它是不是目前生效的那次遍歷」，不能假設兩者
+          恆等（同一 scan_id 可能已經被更新的 `partial_rescan` 取代）。
+
+        `last_migration_v4_to_v5_report()`（獨立於 `last_migration_report`，
+        理由見 `__init__` 賦值處註解）回傳 `before`／`after`（`left_boundary`
+        與 `completeness` 兩軸分佈）＋`work`（`probes_needed`／
+        `cursors_normalized`／`verdicts_recomputed`／`scan_jobs_advanced`），
+        結束時以 `logger.warning` 印出（D-G：避免再次大量變灰卻沒有處理
+        容量）。"""
+        now = self._now()
+        before_lb = dict(self._db.execute(
+            "SELECT left_boundary, COUNT(*) FROM fills_sync GROUP BY left_boundary"
+        ).fetchall())
+        before_completeness = dict(self._db.execute(
+            "SELECT completeness, COUNT(*) FROM fills_sync GROUP BY completeness"
+        ).fetchall())
+
+        with self._explicit_transaction():
+            # D-M：池內 truncation_suspected → unknown，證據三欄一併清空。
+            reset_addrs = [r[0] for r in self._db.execute(
+                "SELECT f.address FROM fills_sync f "
+                "JOIN candidate c ON c.address = f.address "
+                "WHERE f.left_boundary='truncation_suspected' AND c.active=1").fetchall()]
+            self._db.execute(
+                "UPDATE fills_sync SET left_boundary='unknown', "
+                "left_boundary_window_start_ms=NULL, left_boundary_at=NULL "
+                "WHERE left_boundary='truncation_suspected' "
+                "AND address IN (SELECT address FROM candidate WHERE active=1)")
+
+            # D-N：v3 遺留游標正規化（含退池地址——游標與 fills 一律保留，
+            # 只是讓 scan_verdict 認得到終點；不影響是否會被排新工作）。
+            v3_scan_rows = self._db.execute(
+                "SELECT scan_id, address FROM fills_scan WHERE status='done' "
+                "AND pages_done=0 AND reason IN (?, ?) "
+                "AND window_end_ms - cursor_ms BETWEEN 0 AND 86400000",
+                (REASON_COUNT_BELOW_RETENTION_THRESHOLD, REASON_PROBE_NO_EARLIER_FILLS)
+            ).fetchall()
+            cursors_normalized_n = len(v3_scan_rows)
+            self._db.execute(
+                "UPDATE fills_scan SET cursor_ms=window_end_ms "
+                "WHERE status='done' AND pages_done=0 AND reason IN (?, ?) "
+                "AND window_end_ms - cursor_ms BETWEEN 0 AND 86400000",
+                (REASON_COUNT_BELOW_RETENTION_THRESHOLD, REASON_PROBE_NO_EARLIER_FILLS))
+
+            # Task 1b 的資料面：running scan 若還掛著排在遙遠未來的
+            # fills_scan job → 拉到遷移當下（純狀態修正，不建 job）。
+            scan_jobs_advanced_n = self._db.execute(
+                "SELECT COUNT(*) FROM refresh_job WHERE kind='fills_scan' "
+                "AND next_attempt_at > ? AND address IN "
+                "(SELECT address FROM fills_scan WHERE status='running')",
+                (now + 60,)).fetchone()[0]
+            self._db.execute(
+                "UPDATE refresh_job SET next_attempt_at=? WHERE kind='fills_scan' "
+                "AND next_attempt_at > ? AND address IN "
+                "(SELECT address FROM fills_scan WHERE status='running')",
+                (now, now + 60))
+
+            # 就地重算：D-M 重設的地址 ∪ D-N 正規化恰好是其目前生效遍歷的地址。
+            recompute_addrs = set(reset_addrs)
+            v3_scan_ids_by_addr: dict[str, set[str]] = {}
+            for scan_id, addr in v3_scan_rows:
+                v3_scan_ids_by_addr.setdefault(addr, set()).add(scan_id)
+            for addr, scan_ids in v3_scan_ids_by_addr.items():
+                current_scan_id = self._db.execute(
+                    "SELECT scan_id FROM fills_sync WHERE address=?", (addr,)).fetchone()
+                if current_scan_id is not None and current_scan_id[0] in scan_ids:
+                    recompute_addrs.add(addr)
+
+            verdicts_recomputed_n = 0
+            for addr in recompute_addrs:
+                row = self._db.execute(
+                    "SELECT left_boundary, left_boundary_window_start_ms, left_boundary_at, "
+                    "scan_id, completeness, reason FROM fills_sync WHERE address=?",
+                    (addr,)).fetchone()
+                if row is None:
+                    continue
+                lb_state, lb_ws, lb_at, scan_id, completeness, reason = row
+                self._recompute_verdict_locked(addr, scan_id, lb_state, lb_ws, lb_at,
+                                               completeness, reason)
+                verdicts_recomputed_n += 1
+
+            self._db.execute("UPDATE schema_version SET version=5")
+
+        after_lb = dict(self._db.execute(
+            "SELECT left_boundary, COUNT(*) FROM fills_sync GROUP BY left_boundary"
+        ).fetchall())
+        after_completeness = dict(self._db.execute(
+            "SELECT completeness, COUNT(*) FROM fills_sync GROUP BY completeness"
+        ).fetchall())
+        probes_needed = self._db.execute(
+            "SELECT COUNT(*) FROM fills_sync f JOIN candidate c ON c.address = f.address "
+            "WHERE f.left_boundary='unknown' AND c.active=1").fetchone()[0]
+        report = {
+            "before": {"left_boundary": before_lb, "completeness": before_completeness},
+            "after": {"left_boundary": after_lb, "completeness": after_completeness},
+            "work": {"probes_needed": probes_needed,
+                     "cursors_normalized": cursors_normalized_n,
+                     "verdicts_recomputed": verdicts_recomputed_n,
+                     "scan_jobs_advanced": scan_jobs_advanced_n},
+        }
+        self._migration_v4_to_v5_report = report
+        logger.warning("explore store: schema v4→v5 遷移完成（D-M／D-N 工作量報告）：%s", report)
+
     def schema_version(self) -> int:
         """目前 DB 的 schema 版本（觀測／測試用，讀取不必上鎖競爭寫入）。"""
         with self._lock, self._db:
@@ -906,6 +1056,14 @@ class ExploreStore:
         completeness 分佈＋`work` 待處理量）；本次開啟未觸發該遷移（新建
         v4 DB，或開啟時已在 v4）→ `None`。"""
         return self._migration_v3_to_v4_report
+
+    def last_migration_v4_to_v5_report(self) -> dict[str, Any] | None:
+        """最近一次 `_migrate_v4_to_v5` 產生的工作量報告（Task 3，D-M／D-N；
+        `before`／`after` 的 `left_boundary`／`completeness` 分佈＋`work`：
+        `probes_needed`／`cursors_normalized`／`verdicts_recomputed`／
+        `scan_jobs_advanced`）；本次開啟未觸發該遷移（新建 v5 DB，或開啟時
+        已在 v5）→ `None`。"""
+        return self._migration_v4_to_v5_report
 
     # --- candidate ---
     def upsert_candidates(self, rows: list[tuple[str, str | None, int | None, float | None]],
