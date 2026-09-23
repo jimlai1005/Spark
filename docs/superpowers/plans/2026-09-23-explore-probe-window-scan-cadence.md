@@ -276,6 +276,11 @@ UPDATE refresh_job SET next_attempt_at=:now
 （見 `~/.claude/rules/wallet-analysis.md` 與 memory）。「complete」語義是「對 `userFillsByTime` 完整」，用 TWAP 的錢包
 其成交統計仍會少算，這是 v3 起就存在的限制，本 plan 不擴大。
 
+> **主線程裁決（2026-09-23，builder 回報範圍衝突）**：`ExploreStore` 沒有「唯讀取單一 job」的方法，C1／W1 都需要。
+> 放寬範圍：新增 `ExploreStore.get_job(key) -> Job | None`（lock 下 SELECT、沿用 `claim_due` 的 row→Job 映射、不 claim 不改
+> lease）＋ `test_get_job_is_read_only`。C1 主判斷用 `job.last_error`（隔離是 job 層級事實；`running_scan.last_error` 只當第二道保險）；
+> W1 以 `enqueue` 前後 `next_attempt_at` 比較區分 `_created`／`_pulled_forward`／不計。diff 範圍加入 `explore_store.py` 與其測試檔。
+
 **Commit**：`fix: 對帳不得拉近隔離中的 fills_scan job（C1 回歸）；對帳計數分為新建／拉近（W1）`
 
 ---
