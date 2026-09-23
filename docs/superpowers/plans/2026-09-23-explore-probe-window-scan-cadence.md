@@ -234,6 +234,10 @@ UPDATE refresh_job SET next_attempt_at=:now
 > earlier_fills_seen 124／no_earlier_activity 20／**truncation_suspected 122**／unknown 34；符合 D-N 條件的 v3 遺留 scan
 > **164 個**（含退池地址；池內約 95）。預期 report：`probes_needed` ≈ 122+34、`cursors_normalized` ≈ 164。
 
+> **主線程裁決（2026-09-23）**：既有把 schema 終點版本寫死為 4 的五條測試，照 Task 4（v3→v4）前例更新為 5
+> （測試名 `_v4_`→`_v5_`、精確相等斷言 4→5、遷移鏈延長到 v5），docstring 註明版本升級；不得改成 `>= 4` 之類
+> 版本無關的迴避寫法；若任何一條需要改動「4→5 以外」的期望值，停下來報。
+
 - [ ] **Step 4: 對正式機複本實跑**（唯讀取得複本，本機執行；不連正式機做任何寫入）——回報遷移前後分佈、
   `probes_needed`、`cursors_normalized`、`verdicts_recomputed`，以及 `fills` 筆數前後相同、非目標 scan 游標零漂移。
 - [ ] **Step 5: 全套綠、ruff 過。Commit** — `feat: explore.db schema v5——重設疑似截斷、v3 游標正規化、就地重算（D-M／D-N）`
