@@ -1790,14 +1790,19 @@ Traceback 0；429 0（journal 任何層級 0 個限流／暫停訊號）；follo
   在等 >30 分鐘的 job，**15 個遍歷到一半（pages 5–7）的 scan 的 job 也排在 4–7 小時後**（attempts 0、無錯誤）。
 - 機制：`_enqueue_address_jobs`（`explore_scheduler.py:1044-1054`）把 `fills_scan` 與 `fills` 一起用
   `now + _spread(address, fills_period)` 排——`_spread` 是「地址尾碼 % 週期」的首次到期分散。Task 5b 之後非熱門週期
-  最長 24h，所以新入池地址的**第一頁遍歷**可以等到 24 小時後；`_ensure_scan_job` 補排 resume 的 job 若走同一條算式，
-  遍歷到一半的 scan 也會被丟到數小時後。部署前同一段程式用全域 6h 週期（spread ≤ 6h），本次把它放大了 4 倍。
+  最長 24h，所以新入池地址的**第一頁遍歷**可以等到 24 小時後。**程式碼查證**：`_ensure_scan_job`（`:678`）補排
+  resume／initial 的 job 本來就用 `now`（只有 `verify_needed` 才分散）——但同一輪 candidates 裡 `_enqueue_address_jobs`
+  **先**跑（對剛 bootstrap／再入池的地址建了延後的 job），`_ensure_scan_job` **後**跑看到 job 已存在就跳過；
+  `store.enqueue` 對既有 job 只會 `MIN` 提早、不會延後，所以那個延後的 job 就一直活著。遍歷到一半的 15 個 scan
+  正是「退池→再入池」的地址：退池時 job 被刪、running scan 列保留，再入池時被 `_enqueue_address_jobs` 用
+  `now + _spread(period)` 重建。部署前同一段程式用全域 6h 週期（spread ≤ 6h），本次把它放大到 24h。
 - 影響：吞吐（榜單 complete 從 109 升到 131 後趨緩），**非安全**（429 0、follower 正常、無錯誤）。fills 額度大多閒置。
 
-**Task 12（待使用者核可後再部署）**：遍歷軌的節奏是「逐頁」，不該用增量週期分散——`fills_scan` 在
-`_enqueue_address_jobs` 與 `_ensure_scan_job` 兩處一律排 `now`（至多 ≤60s jitter 防同秒），只有 `fills`（增量）
-才用 `_spread(period)`。加測試：新入池地址的 initial scan job 必須在 60 秒內到期；resume 的 scan job 亦然；
-harness 加候選池換血（退池→再入池）情境驗證 resume 不被延後。**本次觀測期內不部署**；下一輪檢查只看安全指標，
+**Task 12（待使用者核可後再部署）**：遍歷軌的節奏是「逐頁」，不該用增量週期分散——**只改一處**：
+`_enqueue_address_jobs`（`explore_scheduler.py:1044-1054`）對 `fills_scan` 排 `now`（至多 ≤60s jitter 防同秒），
+`fills`（增量）維持 `_spread(period)`；`_ensure_scan_job` 不動（已是 `now`）。加測試：(1) 新 bootstrap 地址的 initial
+scan job 在 60 秒內到期；(2) harness 候選池換血情境——退池（job 被刪、running scan 保留）→ 再入池 → scan job 在
+60 秒內到期且續跑同一 `scan_id`；(3) `fills` job 仍被 `_spread` 分散（不得順手改壞增量分散）。**本次觀測期內不部署**；下一輪檢查只看安全指標，
 吞吐指標（scan_pages）預期在 job 陸續到期時呈脈衝式，不再視為異常。
 
 
