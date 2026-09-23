@@ -189,6 +189,12 @@ UPDATE fills_scan SET cursor_ms=window_end_ms
 
   之後對「游標被正規化」與「證據被重設」的每個 `fills_sync` 列呼叫既有的 `_recompute_verdict_locked`（同一 transaction 內，
   結論仍只出自 `scan_verdict`）。**不得**在遷移裡另寫一套判斷。
+> **遷移 dry-run 用的複本已備妥（主線程 2026-09-23 02:32 UTC，唯讀備份）**：
+> `/private/tmp/claude-501/-Users-jim-projects-spark/0c67e915-40ca-429f-9b6d-7a60afa4e12a/scratchpad/v4snap.db`
+> （schema 4、`fills` 1,557,151）。**不要動它本體**，`cp` 一份再跑。基線：池內 `left_boundary`
+> earlier_fills_seen 124／no_earlier_activity 20／**truncation_suspected 122**／unknown 34；符合 D-N 條件的 v3 遺留 scan
+> **164 個**（含退池地址；池內約 95）。預期 report：`probes_needed` ≈ 122+34、`cursors_normalized` ≈ 164。
+
 - [ ] **Step 4: 對正式機複本實跑**（唯讀取得複本，本機執行；不連正式機做任何寫入）——回報遷移前後分佈、
   `probes_needed`、`cursors_normalized`、`verdicts_recomputed`，以及 `fills` 筆數前後相同、非目標 scan 游標零漂移。
 - [ ] **Step 5: 全套綠、ruff 過。Commit** — `feat: explore.db schema v5——重設疑似截斷、v3 游標正規化、就地重算（D-M／D-N）`
