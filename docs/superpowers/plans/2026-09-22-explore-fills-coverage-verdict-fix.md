@@ -1775,6 +1775,31 @@ unknown 抵銷，探測**沒有停**。base 軌活著（15 分鐘內 clearinghou
 但若下一小時 `scan_pages_15m` 仍為 0 且 `fills_scan` 到期 job > 0，要請使用者貼 `/api/ops/health` 的
 `explore_refresh` 與 `hl_budget` 兩段來判讀；不走 Step 7-pre（停背景工作對吞吐問題沒有幫助）。
 
+| 00:00 | 0 | 0 | 128／146／26 | 61 | 1／1／1 | ok | scan_pages 7、pages 8（一波到期） |
+| 00:15 | 0 | 0 | 131／145／24 | 60 | 0／0／0 | ok | **pages_consumed 0** |
+| 00:30 | 0 | 0 | 131／145／24 | 60 | 0／0／0 | ok | pages 0 |
+| 00:45 | 0 | 0 | 131／145／24 | 60 | 0／0／0 | ok | pages 0 |
+
+**00:55 排程檢查（+9h10m）**：unknown 102 → 97（池內 31 不變）、`earlier_fills_seen` 179 → 181、`no_earlier_activity` 17 → 20、
+`truncation_suspected` 138 → 147；completeness 69／185／191；`fills_verify` job 61 → 52；running scans 69；
+Traceback 0；429 0（journal 任何層級 0 個限流／暫停訊號）；follower 不變；cron.err 0。**判定：安全面正常，不回退、不走 Step 7-pre。**
+
+**遍歷軌停擺的根因已查明（唯讀，DB＋程式碼）——是排程缺陷，不是額度或限流**：
+- 三個軌都活著：base 15 分鐘 150／37／48 筆更新；增量軌 15 分鐘 11 筆；API 正常端出。
+- 但 **60 個 `fills_scan` job 全部 0 個到期、最近到期在 33 分鐘後、最遠 23.9h**；池內 16 個 `pages_done=0` 的新 scan 全部
+  在等 >30 分鐘的 job，**15 個遍歷到一半（pages 5–7）的 scan 的 job 也排在 4–7 小時後**（attempts 0、無錯誤）。
+- 機制：`_enqueue_address_jobs`（`explore_scheduler.py:1044-1054`）把 `fills_scan` 與 `fills` 一起用
+  `now + _spread(address, fills_period)` 排——`_spread` 是「地址尾碼 % 週期」的首次到期分散。Task 5b 之後非熱門週期
+  最長 24h，所以新入池地址的**第一頁遍歷**可以等到 24 小時後；`_ensure_scan_job` 補排 resume 的 job 若走同一條算式，
+  遍歷到一半的 scan 也會被丟到數小時後。部署前同一段程式用全域 6h 週期（spread ≤ 6h），本次把它放大了 4 倍。
+- 影響：吞吐（榜單 complete 從 109 升到 131 後趨緩），**非安全**（429 0、follower 正常、無錯誤）。fills 額度大多閒置。
+
+**Task 12（待使用者核可後再部署）**：遍歷軌的節奏是「逐頁」，不該用增量週期分散——`fills_scan` 在
+`_enqueue_address_jobs` 與 `_ensure_scan_job` 兩處一律排 `now`（至多 ≤60s jitter 防同秒），只有 `fills`（增量）
+才用 `_spread(period)`。加測試：新入池地址的 initial scan job 必須在 60 秒內到期；resume 的 scan job 亦然；
+harness 加候選池換血（退池→再入池）情境驗證 resume 不被延後。**本次觀測期內不部署**；下一輪檢查只看安全指標，
+吞吐指標（scan_pages）預期在 job 陸續到期時呈脈衝式，不再視為異常。
+
 
 **16:00 的 5 個 Traceback 已查明與本次部署無關**：全部是 `GET /api/ops/trade-quality` → `ops.py:157 load_skipped_notional`
 → `PermissionError: /opt/filet/state/fbac652…/var/copytrade/skipped/2026-09-21.json`。該端點在部署範圍內零改動
