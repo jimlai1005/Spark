@@ -1718,6 +1718,16 @@ Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常�
 Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退。** 整小時 fills 類 0 頁＝沒有到期 job
 （Task 12／1b 已修，15:52 UTC 部署）。
 
+
+| 08:00 | 0 | 0 | **140**／145／15 | 35 | 0／0／0 | ok | scan_pages 2 |
+| 08:15 | 0 | 0 | 140／147／13 | 35 | 1／0／0 | ok | 增量軌 pages 5 |
+| 08:30 | 0 | 0 | 140／147／13 | 34 | 2／0／0 | ok | pages 11 |
+| 08:45 | 0 | 0 | 140／147／13 | 34 | 0／0／0 | ok | pages 7 |
+
+**08:55 排程檢查（+17h10m）**：unknown 86 → 84（池內 12）、`earlier_fills_seen` 196 → 198、`no_earlier_activity` 25、
+`truncation_suspected` 159 → 162；completeness 55／207／207；`fills_verify` job 35 → 33；running scans 57 → 55；
+Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退。**
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
