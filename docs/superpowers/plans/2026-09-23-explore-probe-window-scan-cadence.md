@@ -411,3 +411,15 @@ earlier_fills_seen 155 → 175；池內 complete 172 → **190**、partial 117 �
 隔離仍為空；`fills_verify` 23；fills 1,816,426 → 1,827,683；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
 failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 26 → 11%（部署尖峰退去）、api cgroup 508 → 625 MB（頁快取回填）、
 available 1,081 MB、swap 290 MB。**判定：安全面正常，不回退。**
+
+| 17:45 | 0 | 0 | 193／90／17 | — | 23 | —／0 | ok | pages 3；fills_verify due 4（p95 726s） |
+| 18:00 | 0 | 0 | 193／87／20 | — | 23 | 107／5 | ok | pages 8；state 8 due（p95 12s） |
+| 18:15 | 0 | 0 | 198／83／19 | — | 23 | 102／0 | ok | pages 3 |
+| 18:30 | 0 | 0 | **200**／82／18 | — | 23 | 101／0 | ok | pages 2；fills_verify due 4（p95 947s） |
+
+**18:36 排程檢查（+2h39m）**：池內 unknown **100 → 89**（2h 累計 123 → 89＝−34，門檻 −20 ✓）、池內 truncation_suspected 7 → **8**
+（個位數 ✓）、earlier_fills_seen 175 → 185；池內 complete 190 → **201**、partial 94 → 82；全體 complete 273 → 287；對外 complete
+187 → **200**；探測落地最近 1h 15（放慢是因為探過的地址開始續抓分頁、分掉同一份 fills 額度：fills 本小時 +32k、running
+`pages_done` 61 → 71）、部署後累計 59；due fills_scan 101、running 147；隔離空；`fills_verify` 23（verify due 2–5、p95 ≤ 947s，
+輔助份額同時服務探測與核驗，屬預期）；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；
+cron.err／host_cron.err 0。主機：cpu 13–24%、api cgroup 612 → 650 MB、available 1,096 MB、swap 292 MB。**判定：安全面正常，不回退。**
