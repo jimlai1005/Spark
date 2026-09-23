@@ -1698,6 +1698,15 @@ complete 的小帳戶壓成 partial；它們沒有 running scan、沒有 job，�
 Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退。**（02:55～05:55 三次排程檢查期間主線程忙於
 第九次部署的實作／審核，未逐筆記錄；本筆補上 05:15 起的四筆取樣。）第九次部署已排 15:52 UTC 依 §5.8g 執行。
 
+
+| 06:15 | 0 | 0 | 133／146／21 | 38 | 0／0／0 | ok | |
+| 06:30 | 0 | 0 | 135／146／19 | 38 | 0／0／0 | ok | |
+| 06:45 | 0 | 0 | 135／146／19 | 37 | 0／1／0 | ok | |
+
+**06:55 排程檢查（+15h10m）**：unknown 92 → 88（池內 16）、`earlier_fills_seen` 192 → 194、`no_earlier_activity` 23 → 24、
+`truncation_suspected` 157 → 158；completeness 59／202／203；`fills_verify` job 39 → 37；running scans 63 → 59；
+Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退。**
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
