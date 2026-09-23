@@ -399,3 +399,15 @@ available 1,139 MB、swap 292 MB。
 這一輪、`pages_done` 不動；實際推進要看 `fills_sync.left_boundary_at` 的探測落地：部署後每 5 分鐘 bucket 2／3／3／3／2／2／3／1
 （≈30 頁/h，與部署前 fills 頁吞吐同量級）。所以 3(d) 的「連續 4 筆 0 且有到期 job」要與探測落地並看：探測仍在推進就不是停擺。
 預估 123 個 unknown 約 4 小時探完，之後 `scan_pages_15m` 才會轉正。**判定：安全面正常，不回退。**
+
+| 16:45 | 0 | 0 | 175／113／12 | — | 24 | 109／0 | ok | pages 2；fills_verify due 4（p95 907s） |
+| 17:00 | 0 | 0 | 177／102／21 | — | 23 | 112／8 | ok | pages 12；遍歷開始接回 |
+| 17:15 | 0 | 0 | 180／100／20 | — | 23 | 109／2 | ok | pages 5 |
+| 17:30 | 0 | 0 | 187／95／18 | — | 23 | 108／2 | ok | pages 5；fills_verify due 3（p95 673s） |
+
+**17:36 排程檢查（+1h39m）**：池內 unknown **123 → 100**（−23/h，2h −20 門檻達標）、池內 truncation_suspected 3 → **7**（個位數 ✓）、
+earlier_fills_seen 155 → 175；池內 complete 172 → **190**、partial 117 → 94；全體 complete 250 → 273；對外 complete 169 → 187；
+探測落地最近 1h 25、部署後累計 45；`scan_pages_15m` 8／2／2 轉正（探過的地址開始續抓分頁）；due fills_scan 107、running 151；
+隔離仍為空；`fills_verify` 23；fills 1,816,426 → 1,827,683；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
+failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 26 → 11%（部署尖峰退去）、api cgroup 508 → 625 MB（頁快取回填）、
+available 1,081 MB、swap 290 MB。**判定：安全面正常，不回退。**
