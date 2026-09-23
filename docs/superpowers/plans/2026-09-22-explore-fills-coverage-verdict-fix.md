@@ -1687,6 +1687,17 @@ complete 的小帳戶壓成 partial；它們沒有 running scan、沒有 job，�
 > 已合併成下一份 plan **`docs/superpowers/plans/2026-09-23-explore-probe-window-scan-cadence.md`**（裁決 D-K～D-O，
 > 使用者 2026-09-23 核可，已開工）。本節其餘項目（W4、ops.py:157、config 註解、7b docstring）仍待議。
 
+
+| 05:15 | 0 | 0 | 132／144／24 | 42 | 0／1／0 | hb 60s（單筆） | |
+| 05:30 | 0 | 0 | 135／144／21 | 41 | 0／0／1 | ok | |
+| 05:45 | 0 | 0 | 135／146／19 | 40 | 0／0／0 | ok | |
+| 06:00 | 0 | 0 | 132／145／23 | 40 | 1／2／1 | ok | scan_pages 5（脈衝） |
+
+**06:10 排程檢查（+14h25m）**：unknown 100 → 92（池內 22）、`earlier_fills_seen` 183 → 192、`no_earlier_activity` 20 → 23、
+`truncation_suspected` 147 → 157；completeness 63／198／203；`fills_verify` job 48 → 39；running scans 73 → 63；
+Traceback 0；429 0；follower 不變；cron.err 0。**判定：安全面正常，不回退。**（02:55～05:55 三次排程檢查期間主線程忙於
+第九次部署的實作／審核，未逐筆記錄；本筆補上 05:15 起的四筆取樣。）第九次部署已排 15:52 UTC 依 §5.8g 執行。
+
 ## 部署後待辦（Task 11 候選，來自兩輪審核；均非本次回歸，不擋部署）
 
 1. **`no_earlier_activity` 的單調性不成立**（`_applicable_boundary` 對正面證據一律 `<=`）：帳戶在舊窗口內
