@@ -284,18 +284,32 @@ UPDATE refresh_job SET next_attempt_at=:now
 
 **Files:** `tests/test_explore_scheduler.py`
 
-- [ ] `test_reset_truncation_rows_resolve_via_full_history_probe`：種 20 個「遷移後 unknown、scan done、無 job」且上游
+- [x] `test_reset_truncation_rows_resolve_via_full_history_probe`：種 20 個「遷移後 unknown、scan done、無 job」且上游
   在很久以前有成交的位址 → 24h 內全部 `complete`、零遍歷頁、`probes_executed ≥ 20`；只破壞探測窗（改回 1 天）→ 轉紅。
-- [ ] ~~`test_cold_addresses_start_traversal_immediately_after_bootstrap`：5 分鐘內抓到~~ → **主線程裁決（2026-09-23，builder 實測「5 分鐘」
+  ✅ 一次寫成即綠：20/20 complete、`scan_pages_for==0`、`probes_executed==24`；反向護欄（`probe_start` 改回
+  `window_start_ms-1天`）→ 0/20 轉紅（`probes_executed=304`）；revert 後 `git diff --stat src/` 清空。
+- [x] ~~`test_cold_addresses_start_traversal_immediately_after_bootstrap`：5 分鐘內抓到~~ → **主線程裁決（2026-09-23，builder 實測「5 分鐘」
   在 300 地址冷啟動下不可能達成、且該錨例未經量測）改為 `test_new_cold_address_first_page_is_not_deferred_by_period_spread`**：
   harness 暖機 24h 到穩態後新增**一個真正的新地址**（rank 250、走 bootstrap 路徑），斷言 (i) job 建立後 `next_attempt_at <= now+60`
   （D-O 直接證據，不依賴吞吐）、(ii) 之後 1 小時內第一頁抓到；反向護欄：改回 `_spread` 並挑 `_spread(addr,24h) > 1h` 的地址 → 兩項轉紅。
   若暖機穩態下 1 小時仍抓不到第一頁 → 停下來報（`claim_due` 領工順序的真實吞吐問題，不准放寬）。
   builder 冷啟動實測：300 地址同時新入池時全系統 fills 類約 1 頁/分鐘（`explore_fills` cap 120 = 一頁權重，前一份 plan Task 6 已實測、
   使用者裁決接受）——寫進資料極限：harness 冷啟動不代表正式機。
-- [ ] 沿用既有 Task 7a／7b／8／8b／11 測試全綠（尤其 `test_evidence_unknown_rows_actually_leave_unknown_via_verify`
-  與 `test_migrated_rows_reach_complete_via_standalone_probe_path` 一字不改）。
-- [ ] Commit — `test: 全史探測解出疑似截斷、冷門地址即時開跑（D-K／D-O）`
+  ✅ **驗收指標教訓**：原打算用 `scan_pages_for([cold]) >= 1` 當「第一頁真的抓到」的證據，實測踩坑——`apply_scan_page`
+  （`explore_fills_sync.py:498-505`）對「短頁／終止頁」（`len(page) < PAGE_LIMIT`，游標直接跳到 `window_end_ms`）刻意
+  **不**遞增 `pages_done`；冷門地址的整趟遍歷幾乎必然一頁內終止，`pages_done` 因此永遠停在 0，即使遍歷已 `complete`、成交
+  已真的落地——首次跑出「11 分鐘內 `stored_fill_count=299`、`published_row` state=complete」卻被 `scan_pages_for` 判紅。
+  改用 `stored_fill_count(cold) >= 1`（`fills` 表實際落地筆數）後：暖機穩態下 11 分鐘內解決（1 小時預算內）。
+  ✅ **反向護欄教訓**：只改 `_enqueue_address_jobs` 的 D-O 本體不足以轉紅——`_run_candidates` 收尾必呼叫
+  `reconcile_scan_jobs`，對剛 `bootstrap_address_fills` 建立 running scan 的新地址，`_ensure_scan_job` 判 `resume_running`，
+  Task 1b（`explore_scheduler.py:755`，另一個獨立修法）「無論 job 是否存在都用 MIN 語義拉到 now」同一輪內把 D-O 被破壞的
+  效果蓋掉——兩個修法對『新地址第一輪就把 job 排到 now』形成防禦縱深。同時暫時改回 Task 1b 之前的舊語意（`_needs_scan_job`
+  的 `resume_running` 分支）後，兩項斷言才真的轉紅（`next_attempt_at=now+13600.0`）；revert 後 `git diff --stat src/` 清空。
+  測試因此驗的是『新地址第一輪就有 job 排到 now』這個由 D-O 與 Task 1b **共同**保證的整體性質，非 D-O 排他證明。
+- [x] 沿用既有 Task 7a／7b／8／8b／11 測試全綠（尤其 `test_evidence_unknown_rows_actually_leave_unknown_via_verify`
+  與 `test_migrated_rows_reach_complete_via_standalone_probe_path` 一字不改）。✅ 全套 3391 passed（家族含這兩條皆綠、
+  一字未改）、ruff 過；`git diff --stat` 只有 `tests/test_explore_scheduler.py`。
+- [x] Commit — `97f84e3` `test: 全史探測解出疑似截斷、冷門地址即時開跑（D-K／D-O）`
 
 ---
 
@@ -336,5 +350,5 @@ UPDATE refresh_job SET next_attempt_at=:now
 | 2 探測窗全史 | ✅ `0815e10`；主線程複跑 3384 passed、ruff 過、目標測試 6 passed | 四條測試＋harness 護欄；反向護欄兩組轉紅；harness 時鐘改 1.7e9、預設候選首次活動 ws+2d；139 條家族測試零轉紅、零斷言放寬 |
 | 3 schema v5 遷移 | ✅ `e669b31`；主線程複跑 3389 passed、ruff 過 | 主線程在乾淨複本獨立重現：report 完全一致（probes_needed 156、cursors_normalized 164、verdicts_recomputed 172、scan_jobs_advanced 25）；fills 1,557,151 前後相同；游標實際變動 131 個且全屬 D-N 條件；池內 truncation_suspected 122→0、complete 128→139；probe candidates 122；running scan 無殘留未來 job |
 | 3c 審核修正 C1／W1 | 待 Task 4 收工後派（同檔）| reviewer 判可部署但主線程改為部署前修 |
-| 4 整合驗收 | 派工中 | |
+| 4 整合驗收 | ✅ `97f84e3`；builder 複跑 3391 passed（含新增 2 條）、ruff 過 | 兩條測試皆通過＋反向護欄轉紅＋revert 後 `git diff --stat src/` 清空；家族回歸（含兩條「一字不改」測試）全綠；發現並記錄兩個指標／機制教訓（見下） |
 | 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g ✅（主線程逐段讀過、修 1 處預期效果不一致）；reviewer（opus）審 `bbd7adf..HEAD -- src/` 派工中；部署待授權 | |
