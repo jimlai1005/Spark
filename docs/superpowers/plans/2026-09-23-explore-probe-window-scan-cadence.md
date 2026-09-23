@@ -104,6 +104,25 @@ def test_reentering_address_resumes_scan_immediately(tmp_path):
 
 ---
 
+## Task 1b: `resume_running` 一律把 job 拉到 `now`（MIN 語義）`@inline`
+
+> **主線程 2026-09-23 03:10 追加**（Task 1 builder 的反向護欄實測揭露前一份 plan 的機制敘述有誤）：
+> 15 個「遍歷到一半」的 scan 其實已抵達終點，卡住的是 v4 遷移重新打開 scan 時**沒有處理的舊 24h 重掃 job**
+> （部署前排下，`due − created = 24.0h`）。`_ensure_scan_job` 的 `resume_running` 分支只在「沒有 job」時補排，
+> job 存在但排在很遠的未來就不管——這是缺口。
+
+**Files:** `src/spark/publicapi/explore_scheduler.py`（`_ensure_scan_job`／`_needs_scan_job` 的 `resume_running`）；測試同檔。
+
+- [ ] **Step 1: 失敗測試** — `test_resume_running_pulls_a_far_future_scan_job_to_now`：有 running scan、且已存在一個
+  `next_attempt_at = now + 24h` 的 `fills_scan` job → 一輪對帳後該 job 的 `next_attempt_at <= now + 60`（`store.enqueue`
+  的 MIN 語義），`created_at`／`attempts` 不變。反向護欄：把「一律 enqueue」改回「只在缺 job 時」→ 轉紅。
+- [ ] **Step 2: 實作** — `resume_running` 時**無論 job 是否存在**都呼叫 `store.enqueue(key, address, "fills_scan", priority, now)`
+  （`enqueue` 對既有 job 只做 `MIN`，冪等）。`initial_missing` 同理。`partial_due`／`verify_needed` 不動。
+  日誌「對帳補排」只在真的新建時印（回傳 True），避免每輪 300 行。
+- [ ] **Step 3: 全套綠、ruff 過。Commit** — `fix: resume_running 一律以 MIN 語義把 fills_scan job 拉到 now——v4 遷移遺留的 24h 舊 job 不再擋住已重開的遍歷`
+
+---
+
 ## Task 2: 探測窗改為全史 `[0, window_start)` `@inline`
 
 **Files:** `src/spark/publicapi/explore_scheduler.py`（`_run_probe` 的 `probe_start`）、`tests/test_explore_scheduler.py`
@@ -185,8 +204,13 @@ UPDATE fills_scan SET cursor_ms=window_end_ms
  WHERE status='done' AND pages_done=0
    AND reason IN ('count_below_retention_threshold','count_below_retention_threshold_probe_empty')
    AND window_end_ms - cursor_ms BETWEEN 0 AND 86400000;
+-- Task 1b 的資料面：running scan 若還掛著排在未來的 fills_scan job，拉到遷移當下（純狀態修正，不建 job）
+UPDATE refresh_job SET next_attempt_at=:now
+ WHERE kind='fills_scan' AND next_attempt_at > :now + 60
+   AND address IN (SELECT address FROM fills_scan WHERE status='running');
 ```
 
+  報告新增 `scan_jobs_advanced`。
   之後對「游標被正規化」與「證據被重設」的每個 `fills_sync` 列呼叫既有的 `_recompute_verdict_locked`（同一 transaction 內，
   結論仍只出自 `scan_verdict`）。**不得**在遷移裡另寫一套判斷。
 > **遷移 dry-run 用的複本已備妥（主線程 2026-09-23 02:32 UTC，唯讀備份）**：

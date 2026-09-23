@@ -1824,9 +1824,11 @@ Traceback 0；429 0（journal 任何層級 0 個限流／暫停訊號）；follo
   最長 24h，所以新入池地址的**第一頁遍歷**可以等到 24 小時後。**程式碼查證**：`_ensure_scan_job`（`:678`）補排
   resume／initial 的 job 本來就用 `now`（只有 `verify_needed` 才分散）——但同一輪 candidates 裡 `_enqueue_address_jobs`
   **先**跑（對剛 bootstrap／再入池的地址建了延後的 job），`_ensure_scan_job` **後**跑看到 job 已存在就跳過；
-  `store.enqueue` 對既有 job 只會 `MIN` 提早、不會延後，所以那個延後的 job 就一直活著。遍歷到一半的 15 個 scan
-  正是「退池→再入池」的地址：退池時 job 被刪、running scan 列保留，再入池時被 `_enqueue_address_jobs` 用
-  `now + _spread(period)` 重建。部署前同一段程式用全域 6h 週期（spread ≤ 6h），本次把它放大到 24h。
+  `store.enqueue` 對既有 job 只會 `MIN` 提早、不會延後，所以那個延後的 job 就一直活著。**更正（2026-09-23 03:10，Task 1 builder 反向護欄實測推翻）**：`_enqueue_address_jobs` 只對第一次 bootstrap 的地址排
+  `fills_scan`，再入池不會經過它。那 15 個 scan 其實**遍歷已抵達終點**（`cursor == window_end`、無結論、無錯誤），
+  卡住的是**部署前**舊程式在它們被 8,000 筆門檻判 `retention_limit` 時排下的 `now + 24h` 重掃 job（`due − created`
+  恰為 24.0h、attempts 0）；v4 遷移把這些 scan 重新打開（running、游標保留）但**沒有把舊 job 拉到 now**，
+  `_ensure_scan_job` 見 job 已存在即跳過。它們會在 09-23 04:30–14:30 UTC 陸續自然到期。修法見新 plan Task 1b／Task 3。部署前同一段程式用全域 6h 週期（spread ≤ 6h），本次把它放大到 24h。
 - 影響：吞吐（榜單 complete 從 109 升到 131 後趨緩），**非安全**（429 0、follower 正常、無錯誤）。fills 額度大多閒置。
 
 **Task 12（待使用者核可後再部署）**：遍歷軌的節奏是「逐頁」，不該用增量週期分散——**只改一處**：
