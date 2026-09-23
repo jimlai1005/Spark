@@ -354,6 +354,6 @@ UPDATE refresh_job SET next_attempt_at=:now
 | 1b resume_running MIN 拉近 | ✅ `36fcbfb`；主線程複跑同上、五條新測試 5 passed | **範圍收斂（builder 裁決，主線程接受）**：只對 `fills_scan` 套用一律 enqueue；`fills_verify` 的 resume_running 維持「同類 job 已存在不重排」（7.9e-S1 不變量、既有測試 `test_s1_reconcile_resumes_running_verify_scan_with_verify_job`）。日誌只在真的新建時印（300 地址 → 3 行）。 |
 | 2 探測窗全史 | ✅ `0815e10`；主線程複跑 3384 passed、ruff 過、目標測試 6 passed | 四條測試＋harness 護欄；反向護欄兩組轉紅；harness 時鐘改 1.7e9、預設候選首次活動 ws+2d；139 條家族測試零轉紅、零斷言放寬 |
 | 3 schema v5 遷移 | ✅ `e669b31`；主線程複跑 3389 passed、ruff 過 | 主線程在乾淨複本獨立重現：report 完全一致（probes_needed 156、cursors_normalized 164、verdicts_recomputed 172、scan_jobs_advanced 25）；fills 1,557,151 前後相同；游標實際變動 131 個且全屬 D-N 條件；池內 truncation_suspected 122→0、complete 128→139；probe candidates 122；running scan 無殘留未來 job |
-| 3c 審核修正 C1／W1 | ✅ `f4124ed`（主線程複跑中） | 新增唯讀 `get_job`；C1 以 `job.last_error` 擋拉近，reviewer 重現腳本修正後 `survived? True`；W1 計數分 `_created`／`_pulled_forward`；反向護欄轉紅 | reviewer 判可部署但主線程改為部署前修 |
+| 3c 審核修正 C1／W1 | ✅ `f4124ed`；主線程複跑 3394 passed、ruff 過、重現腳本 `survived? True` | 新增唯讀 `get_job`；C1 以 `job.last_error` 擋拉近，reviewer 重現腳本修正後 `survived? True`；W1 計數分 `_created`／`_pulled_forward`；反向護欄轉紅 | reviewer 判可部署但主線程改為部署前修 |
 | 4 整合驗收 | ✅ `97f84e3`；builder 複跑 3391 passed（含新增 2 條）、ruff 過 | 兩條測試皆通過＋反向護欄轉紅＋revert 後 `git diff --stat src/` 清空；家族回歸（含兩條「一字不改」測試）全綠；發現並記錄兩個指標／機制教訓（見下） |
-| 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g ✅（主線程逐段讀過、修 1 處預期效果不一致）；reviewer（opus）審 `bbd7adf..HEAD -- src/` 派工中；部署待授權 | |
+| 5 審核／RUNBOOK／部署 | RUNBOOK §5.8g ✅（主線程逐段讀過、修 1 處預期效果不一致）；reviewer（opus）✅ 無 Critical 殘留（C1 已由 Task 3c 封、W1 已修、W2/W3 記錄）；**部署待使用者授權** | |
