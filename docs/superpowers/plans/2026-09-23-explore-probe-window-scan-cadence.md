@@ -673,3 +673,31 @@ timers 4；cron.err／host_cron.err 0。主機：cpu 14–19%、api cgroup 1,051
 15:30 已回落到只剩 fills_scan 3 個；fills +28k；隔離空；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
 failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 13–16%、api cgroup 1,017–1,110 MB、available 1,058–1,076 MB、swap 312 MB。
 **判定：安全面正常，不回退。** `_UNTIL` 2026-09-24T15:55:53Z 將在下一次檢查前到期，16:33 那次驗證 SPECIAL_SERVE_RATIO 自動回 9。
+
+| 15:45 | 0 | 0 | 294／5／1 | — | 0 | 0／0 | ok | pages 7 |
+| 16:00 | 0 | 0 | 294／5／1 | — | 0 | 0／0 | ok | pages 7；`_UNTIL` 已於 15:55:53 到期 |
+| 16:15 | 0 | 0 | 294／5／1 | — | 0 | 0／0 | ok | pages 8 |
+| 16:30 | 0 | 0 | 294／5／1 | 0／5 | 0 | 0／0 | ok | pages 6 |
+
+### 第九次部署 24h 總結（2026-09-23 15:57 → 09-24 15:57 UTC；結案於 16:37）
+
+- **安全指標全程綠**：96 個 15 分鐘樣本 `r429_15m` 總和 **0**、`traceback_15m` 總和 **0**（journal 逐小時人工核對亦 0，連已知類
+  PermissionError 都沒出現）；follower 兩個 unit 全程 active、ActiveEnterTimestamp 不變（03:21:18 09-22／05:21:18 09-18）；
+  failed unit 0；timers 4；隔離 job 全程為空（C1 修正後沒有可被拉近的對象，也沒有新隔離）；`cron.err`／`host_cron.err` 0。
+  **未觸發任何回退或 Step 7-pre 條件。**
+- **主機（§5.8h，96 筆）**：CPU 平均 17.3%、最高 27.9%（部署後 1 小時內）；available 最低 1,031 MB、最高 1,149 MB；swap 最高 316 MB；
+  api cgroup 回到 ~1.0–1.1 GB（頁快取）。2 個 follower 各 ~40 MB。不需升級。
+- **榜單（目標達成）**：池內 truncation_suspected 127 → **5**（全史窗仍空且帳戶更老的真殘餘，個位數門檻全程成立）；池內 unknown
+  139 → **0**（+12h39m 清空，此後只剩輪替流量、進池即探）；池內 complete 148 → **295／300**（plan 預估 ~250，超過）；
+  對外 complete 141 → **294**；`fills_verify` 24 → 0；v3 遺留 164 個游標正規化後無一回到 traversal_incomplete；
+  fills 1,810,517 → 2,315,429（+505k，其中 +24h 重掃波與新位址首輪遍歷佔大宗）。
+- **與 plan 門檻的差異（誠實記錄）**：「池內 unknown 每 2h −20」在 +4h39m 與 +5h39m 兩次未達（−15／−16），原因是探測與分頁共用
+  同一份 fills 額度、實測上游總吞吐 ≈30–35 頁/h（名目 60/h 的一半，部署前即如此）；「+6–8h complete ~250」實際 +8h 為 257、
+  +12h 達 294——慢於預估但終點更高。兩者都不是本次回歸，記為觀察（吞吐天花板值得另開一題查）。
+- **`_UNTIL` 到期自動回 9**：15:55:53 UTC 到期，進程 environ 值已驗為該時間；`_special_serve_ratio()` 是純函式
+  （`now >= until_ts → 9`，plan #1 Task 8 測試覆蓋）。**外部不可直接觀測**：程式沒有到期日誌，`status()` 也不回報生效值，
+  而到期時輔助類別已無積壓（unknown 0、verify 0），節奏上看不出差異。判定：依程式碼＋測試＋env 值認定生效；
+  補一條待辦——在 `status()`／`/api/ops/health` 曝露 `special_serve_ratio_effective`，下次臨時加速才有可觀測的到期證據。
+- **收尾提醒**：(1) drop-in `explore-v4-verdict.conf` 的 `FILET_EXPLORE_SPECIAL_SERVE_RATIO`／`_UNTIL` 兩行已無作用，可清
+  （清掉後 daemon-reload，不必重啟；留著也無害）；(2) `/var/lib/filet-api/` 舊備份 `explore.db.pre-75/78/79/v4.bak`（共 ~1.7 GB）
+  可刪，`pre-v5.bak`（1.07 GB）建議再留一週；(3) 本機 `host_sample.py` 取樣繼續跑，供日後升級判斷；(4) 觀測排程 1c708784 已刪。
