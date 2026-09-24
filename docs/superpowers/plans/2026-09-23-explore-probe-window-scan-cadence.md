@@ -585,3 +585,13 @@ cron.err／host_cron.err 0。主機：cpu 13–16%、api cgroup 998–1,043 MB�
 running 42、`fills_verify` 0；fills +1.5k；隔離空；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；
 timers 4；cron.err／host_cron.err 0。主機：cpu 13–15%、api cgroup 997–1,068 MB、available 1,083 MB、swap 307 MB。
 **判定：安全面正常，不回退。**
+
+| 07:45 | 0 | 0 | 294／5／1 | — | 0 | 0／0 | ok | pages 0 |
+| 08:00 | 0 | 0 | 294／5／1 | — | 0 | 0／0 | ok | pages 2 |
+| 08:15 | 0 | 0 | 294／5／1 | — | 0 | 0／0 | ok | pages 0；eligible 91 |
+| 08:30 | 0 | 0 | 294／5／1 | 0／5 | 0 | 0／0 | ok | pages 3 |
+
+**08:36 排程檢查（+16h39m）**：穩態不變——池內 unknown **0**、truncation_suspected **5**、earlier_fills_seen 276、no_earlier_activity 19；
+池內 **complete 295／partial 5**；全體 complete 414；對外 complete 294、eligible 91；新進池 0、探測落地 1；due fills_scan 0、running 42、
+`fills_verify` 0；fills +0.4k；隔離空；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；
+cron.err／host_cron.err 0。主機：cpu 14%、api cgroup 1,004–1,026 MB、available 1,081 MB、swap 305 MB。**判定：安全面正常，不回退。**
