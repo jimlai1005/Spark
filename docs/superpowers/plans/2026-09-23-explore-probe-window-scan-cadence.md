@@ -508,3 +508,15 @@ Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；fai
 「每 2h −20」門檻是以「一次性消化 139 個積壓」設計的；積壓已從 139 消到 46，剩下的是輪替流量（每小時 ~9 進 9 出）＋
 有 running scan 待輪到的地址，穩態下 unknown 會停在 ~40–50 而非 0。之後以「池內探測落地 >0／h 且 unknown 不回升」判讀。
 **判定：安全面正常，不回退。**
+
+| 00:45 | 0 | 0 | 246／35／19 | — | 14 | 47／0 | ok | pages 1；state 5 due（p95 4s） |
+| 01:00 | 0 | 0 | 246／34／20 | — | 12 | 48／4 | ok | pages 10 |
+| 01:15 | 0 | 0 | 249／32／19 | — | 12 | —／0 | hb 59s、err 0 | pages 0（相位重合，同 21:15／21:45） |
+| 01:30 | 0 | 0 | **254**／28／18 | — | 11 | —／0 | ok | pages 1；eligible 87 |
+
+**01:36 排程檢查（+9h39m）**：池內 unknown **46 → 34**（探測落地 17、新進池 4，淨 −12；2h 累計 49 → 34＝−15）、
+池內 truncation_suspected **8**（不變）、earlier_fills_seen 230 → 241；池內 complete 244 → **257**、partial 38 → 27；全體 complete
+351 → 368；對外 complete 243 → **254**、eligible 87；探測累計 147；due fills_scan 51 → 37、running 99 → 85；fills +28k
+（2,067,710 → 2,095,515）；隔離空；`fills_verify` 14 → 11；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
+failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 19–22%、api cgroup 972–1,005 MB、available 1,098 MB、swap 306 MB。
+**判定：安全面正常，不回退。**
