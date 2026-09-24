@@ -532,3 +532,22 @@ failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 19–22%、api c
 fills +41k（2,095,515 → 2,137,017）；隔離空；`fills_verify` 11 → 10；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
 failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 19–23%、api cgroup 1,002–1,036 MB、available 1,097 MB、swap 308 MB。
 **判定：安全面正常，不回退。**
+
+| 02:45 | 0 | 0 | 273／16／11 | — | 8 | —／0 | ok | pages 3 |
+| 03:00 | 0 | 0 | 273／15／12 | — | 6 | 20／0 | ok | pages 6 |
+| 03:15 | 0 | 0 | 276／14／10 | — | 5 | 17／0 | ok | pages 6 |
+| 03:30 | 0 | 0 | 281／11／8 | — | 4 | 11／0 | ok | pages 1 |
+| 03:45 | 0 | 0 | 287／9／4 | — | 2 | 6／0 | ok | pages 3 |
+| 04:00 | 0 | 0 | **293**／6／1 | — | 1 | 2／1 | ok | pages 1 |
+| 04:15 | 0 | 0 | 293／6／1 | — | 1 | —／0 | ok | pages 3 |
+| 04:30 | 0 | 0 | 293／6／1 | — | 1 | —／0 | ok | pages 1 |
+
+**04:36 排程檢查（+12h39m，涵蓋 03:33／04:33 兩次）**：**池內積壓清空**——池內 unknown **20 → 0**（2h 探測落地 26、新進池 0）、
+池內 truncation_suspected 7 → **6**（全史窗仍空且帳戶更老的真殘餘）、earlier_fills_seen 256 → 275、no_earlier_activity 19；
+池內 completeness **complete 294／partial 6／backfilling 0**（partial 6 ＝那 6 個 truncation_suspected）；全體 complete 382 → 408；
+對外 complete 269 → **293**、partial 6、backfilling 1、eligible 91；due fills_scan 23 → **0**、running 71 → 45（皆為未到期的增量
+重掃）；`fills_verify` 10 → **1**；探測累計 188；fills +33k（2,137,017 → 2,170,071）；隔離空；Traceback 0（2h）；429 0；
+follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cron.err／host_cron.err 0。
+主機：cpu 14–28%、api cgroup 991–1,054 MB、available 1,083 MB、swap 304 MB。
+plan「預期效果」寫 +6–8h 池內 complete ~250，實際 +12h 到 294（+8h 時 257）——慢於預估是探測與分頁共用一份額度、
+實測吞吐 ≈30–35 頁/h（前述觀察），但終點超過預估。**判定：安全面正常，不回退。**
