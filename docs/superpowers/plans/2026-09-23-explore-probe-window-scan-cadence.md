@@ -563,3 +563,14 @@ due fills_scan **0**、running 45（皆未到期的增量重掃）、`fills_veri
 （停擺定義要求「有到期 fills_scan job」）；新進池 0；fills +1.7k（2,170,071 → 2,171,737，只剩增量）；隔離空；Traceback 0；429 0；
 follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cron.err／host_cron.err 0。
 主機：cpu 13–15%（回到部署前水位）、api cgroup 994–1,063 MB、available 1,070 MB、swap 304 MB。**判定：安全面正常，不回退。**
+
+| 05:45 | 0 | 0 | 292／7／1 | — | 1 | 0／0 | ok | pages 4 |
+| 06:00 | 0 | 0 | 292／7／1 | — | 1 | 3／1 | ok | pages 6 |
+| 06:15 | 0 | 0 | 293／6／1 | — | 1 | 0／0 | ok | pages 1；eligible 91 |
+| 06:30 | 0 | 0 | 293／6／1 | 0／5 | 1 | 1／1 | ok | pages 3 |
+
+**06:36 排程檢查（+14h39m）**：穩態——池內 unknown **0**、truncation_suspected 7 → **5**（兩個在增量重掃後改判 earlier_fills_seen）、
+earlier_fills_seen 276、no_earlier_activity 19；池內 **complete 295／partial 5**；全體 complete 412；對外 complete 293、eligible 91；
+新進池 1 個、探測落地 4（進池即探完，D-O 首次到期＝now 生效）；due fills_scan 0、running 43、`fills_verify` **0**（核驗積壓清空）；
+fills +16.7k；隔離空；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；
+cron.err／host_cron.err 0。主機：cpu 13–16%、api cgroup 998–1,043 MB、available 1,074 MB、swap 308 MB。**判定：安全面正常，不回退。**
