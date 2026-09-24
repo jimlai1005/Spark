@@ -551,3 +551,15 @@ follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cro
 主機：cpu 14–28%、api cgroup 991–1,054 MB、available 1,083 MB、swap 304 MB。
 plan「預期效果」寫 +6–8h 池內 complete ~250，實際 +12h 到 294（+8h 時 257）——慢於預估是探測與分頁共用一份額度、
 實測吞吐 ≈30–35 頁/h（前述觀察），但終點超過預估。**判定：安全面正常，不回退。**
+
+| 04:45 | 0 | 0 | 293／6／1 | 0／6 | 1 | 0／0 | ok | pages 1 |
+| 05:00 | 0 | 0 | 292／7／1 | — | 1 | 1／0 | ok | pages 5；fills due 5（p95 103s） |
+| 05:15 | 0 | 0 | 292／7／1 | — | 1 | 0／0 | ok | pages 6 |
+| 05:30 | 0 | 0 | 292／7／1 | 0／7 | 1 | 0／0 | ok | pages 3 |
+
+**05:36 排程檢查（+13h39m）**：穩態——池內 unknown **0**、truncation_suspected 6 → **7**（一個 no_earlier_activity 在增量重掃後改判，
+19 → 18；個位數 ✓）、earlier_fills_seen 275；池內 complete **293／partial 7**；全體 complete 408；對外 complete 292、eligible 89；
+due fills_scan **0**、running 45（皆未到期的增量重掃）、`fills_verify` 1；探測落地 0/h——沒有候選也沒有到期 job，不符停擺三條件
+（停擺定義要求「有到期 fills_scan job」）；新進池 0；fills +1.7k（2,170,071 → 2,171,737，只剩增量）；隔離空；Traceback 0；429 0；
+follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cron.err／host_cron.err 0。
+主機：cpu 13–15%（回到部署前水位）、api cgroup 994–1,063 MB、available 1,070 MB、swap 304 MB。**判定：安全面正常，不回退。**
