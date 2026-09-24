@@ -661,3 +661,15 @@ no_earlier_activity 18；池內 **complete 294／partial 6**；全體 complete 4
 running 41、`fills_verify` 0；fills +19k；隔離空；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；
 timers 4；cron.err／host_cron.err 0。主機：cpu 14–19%、api cgroup 1,051–1,109 MB、available 1,045–1,084 MB、swap 316 MB。
 **判定：安全面正常，不回退。**
+
+| 14:45 | 0 | 0 | 293／6／1 | — | 0 | 1／1 | ok | pages 10 |
+| 15:00 | 0 | 0 | 293／6／1 | — | 0 | 1／0 | ok | pages 8；fills due 4（p95 156s） |
+| 15:15 | 0 | 0 | 293／6／1 | — | 0 | 3／0 | ok | pages 7；fills due 5（p95 409s）、fills_scan due 3（p95 289s）；eligible 90 |
+| 15:30 | 0 | 0 | 293／6／1 | 0／5 | 0 | 3／0 | ok | pages 11；fills_scan p95 342s |
+
+**15:36 排程檢查（+23h39m）**：池內 unknown **0**、truncation_suspected 6 → **5**、earlier_fills_seen 277、no_earlier_activity 18；
+池內 **complete 295／partial 5**；全體 complete 434；對外 complete 293、eligible 90；due fills_scan 0、running 40、`fills_verify` 0；
+探測落地 3（增量重掃的複驗）；15:00–15:30 增量 `fills` 逾期 p95 156 → 409s 是穩態下的排隊（5 個 job 同時到期、每分鐘 1 頁），
+15:30 已回落到只剩 fills_scan 3 個；fills +28k；隔離空；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
+failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 13–16%、api cgroup 1,017–1,110 MB、available 1,058–1,076 MB、swap 312 MB。
+**判定：安全面正常，不回退。** `_UNTIL` 2026-09-24T15:55:53Z 將在下一次檢查前到期，16:33 那次驗證 SPECIAL_SERVE_RATIO 自動回 9。
