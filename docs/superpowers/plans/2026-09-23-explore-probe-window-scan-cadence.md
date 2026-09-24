@@ -639,3 +639,14 @@ earlier_fills_seen 277、no_earlier_activity 17；池內 **complete 294／partia
 due fills_scan 0、running 42、`fills_verify` 0；探測落地 4；fills +7k；隔離空；Traceback 0；429 0；
 follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cron.err／host_cron.err 0。
 主機：cpu 15–21%、api cgroup 1,035–1,096 MB、available 1,044–1,087 MB、swap 307 MB。**判定：安全面正常，不回退。**
+
+| 12:45 | 0 | 0 | 293／6／1 | — | 0 | 0／0 | ok | pages 8；eligible 93 |
+| 13:00 | 0 | 0 | 293／6／1 | — | 0 | 0／0 | ok | pages 7 |
+| 13:15 | 0 | 0 | 292／7／1 | — | 0 | 0／0 | ok | pages 5；eligible 95 |
+| 13:30 | 0 | 0 | 292／7／1 | 0／7 | 0 | 0／0 | ok | pages 6 |
+
+**13:36 排程檢查（+21h39m）**：池內 unknown **0**、truncation_suspected 6 → **7**（池輪替換入一個既有 truncation_suspected 的池外位址；
+個位數 ✓）、earlier_fills_seen 276、no_earlier_activity 17；池內 **complete 293／partial 7**；全體 complete 429；對外 complete 292、
+eligible 95；due fills_scan 0、running 42、`fills_verify` 0；新進池 0、探測落地 0（無候選、無到期 job，不符停擺三條件）；fills +1.7k；
+隔離空；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；failed 0；timers 4；cron.err／host_cron.err 0。
+主機：cpu 14–15%、api cgroup 1,045–1,086 MB、available 1,031–1,076 MB、swap 303 MB。**判定：安全面正常，不回退。**
