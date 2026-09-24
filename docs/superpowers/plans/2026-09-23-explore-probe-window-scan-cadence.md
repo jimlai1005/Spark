@@ -520,3 +520,15 @@ Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；fai
 （2,067,710 → 2,095,515）；隔離空；`fills_verify` 14 → 11；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
 failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 19–22%、api cgroup 972–1,005 MB、available 1,098 MB、swap 306 MB。
 **判定：安全面正常，不回退。**
+
+| 01:45 | 0 | 0 | 256／27／17 | — | 11 | —／0 | ok | pages 2；eligible 88 |
+| 02:00 | 0 | 0 | 261／25／14 | — | 11 | 32／0 | ok | pages 2；eligible 92 |
+| 02:15 | 0 | 0 | 263／24／13 | — | 11 | 30／0 | ok | pages 2 |
+| 02:30 | 0 | 0 | **269**／19／12 | — | 10 | 24／0 | ok | pages 2；eligible 93 |
+
+**02:36 排程檢查（+10h39m）**：池內 unknown **34 → 20**（探測落地 15、新進池 0；2h 累計 46 → 20＝−26 ✓）、
+池內 truncation_suspected 8 → **7**、earlier_fills_seen 241 → 256；池內 complete 257 → **271**（90%）、partial 27 → 18、backfilling 16 → 11；
+全體 complete 368 → 382；對外 complete 254 → **269**、eligible 93；探測累計 162；due fills_scan 37 → 23、running 85 → 71；
+fills +41k（2,095,515 → 2,137,017）；隔離空；`fills_verify` 11 → 10；Traceback 0；429 0；follower 不變（03:21:18 09-22／05:21:18 09-18）；
+failed 0；timers 4；cron.err／host_cron.err 0。主機：cpu 19–23%、api cgroup 1,002–1,036 MB、available 1,097 MB、swap 308 MB。
+**判定：安全面正常，不回退。**
