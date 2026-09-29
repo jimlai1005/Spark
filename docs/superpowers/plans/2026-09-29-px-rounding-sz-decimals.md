@@ -1,6 +1,7 @@
 # 修法：adapter 送單價依 szDecimals 捨入（2026-09-29 PUMP 平倉失敗事故）
 
-狀態：**草稿，待使用者確認後派工**。
+狀態：**已完成並部署**（2026-09-29 04:31 UTC，commit 5563ddd，單檔熱修，三個 follower 已滾動重啟；程序見 RUNBOOK §5.8i）。
+端到端證據待 leader 下一次減倉：部署後 leader PUMP 部位未變，引擎尚無送單需求；正式機 Python 3.11 驗算 PUMP 案例通過。
 
 ## 事故摘要
 

@@ -2935,6 +2935,48 @@ follower 各 ~40 MB／≈0.2% CPU、整機 CPU 均值 ≈12%、steal 0.3%。**�
 `available` 持續 < 400 MB、`swap_used` > 800 MB、PSI memory `full_avg300` > 0 持續出現。升級＝換 Lightsail 方案並重開機，
 要挑 follower 無部位（或先 owner_close）的時段。
 
+### 5.8i ⭐⭐ 單檔熱修程序（2026-09-29 PUMP `invalid price` 事故；**跟單中、只改一個 .py 檔時用**）
+
+事故：follower `f438b3…` 跟 leader 的 PUMP 減倉單反覆被拒 `Order has invalid price`。根因是
+`src/spark/exchange/hyperliquid.py` 的 `_round_px` 只做 5 位有效數字、漏了 HL「小數位 ≤ 6 − szDecimals」
+這條規則（PUMP szDecimals=0，`mid×0.95 = 0.0045144` 是 7 位小數）。開倉走 SDK `market_open`（SDK 自己捨入
+正確）所以只有平倉／kill switch／panic／鏡射掛單這些 adapter 自算價的路徑會中。修法 commit `5563ddd`，
+plan `docs/superpowers/plans/2026-09-29-px-rounding-sz-decimals.md`。
+
+**為什麼不走 §3.2 整包 rsync**：本機工作樹當時有另一條線的未 commit web 改動，整包 rsync 會把它推上去。
+只改一個 Python 檔時，單檔熱修在**兩個前提都成立**時與整包部署等價：
+
+```bash
+# 前提 1：正式機 DEPLOYED_VERSION 的 commit == 本機修法前的 HEAD
+cat /opt/filet/spark/DEPLOYED_VERSION            # 在正式機
+git rev-parse HEAD~1                             # 在本機（修法 commit 的父）
+# 前提 2：正式機上該檔與那個 commit 的版本逐位元一致（空輸出＝一致）
+git show HEAD~1:src/spark/exchange/hyperliquid.py | ssh -i <金鑰> ubuntu@<IP> \
+  'diff /opt/filet/spark/src/spark/exchange/hyperliquid.py -'
+```
+
+任一前提不成立 → 回 §3.2 整包部署，不要熱修（會做出一棵 git 裡不存在的樹）。
+
+```bash
+# 本機：上傳 commit 版（不是工作樹版）
+git show HEAD:src/spark/exchange/hyperliquid.py > /tmp/hl.py && scp -i <金鑰> /tmp/hl.py ubuntu@<IP>:/tmp/hyperliquid.py
+# 正式機：備份 → 安裝 root:root 644 → 驗證 → 用正式機的 Python 驗算修法 → 滾動重啟 follower
+T=/opt/filet/spark/src/spark/exchange/hyperliquid.py
+sudo cp $T /tmp/hyperliquid.py.bak-$(date +%Y%m%d) && sudo chmod 600 /tmp/hyperliquid.py.bak-*
+sudo install -o root -g root -m 644 /tmp/hyperliquid.py $T && diff -q /tmp/hyperliquid.py $T && rm /tmp/hyperliquid.py
+cd /opt/filet/spark && sudo -u filet-engine .venv/bin/python -c "from spark.exchange.hyperliquid import HyperliquidAdapter"
+/opt/filet/spark/deploy/reload_follower.sh        # follower 清單動態取，不寫死
+systemctl list-units "filet-follower@*" --no-pager
+sudo journalctl -u "filet-follower@*" --since "2 minutes ago" --no-pager -o cat | grep -iE "traceback|error"
+```
+
+之後照 §3.2 末尾寫 `DEPLOYED_VERSION`，**多加一行** `note=hotfix single-file <路徑> over <前一版 commit>`，
+讓下一個人知道正式機是「前一版整包＋這一個檔」而不是整包新版（tests／docs 沒推上去，對 runtime 無差）。
+回滾＝把 `/tmp/hyperliquid.py.bak-*` 裝回去再跑 `reload_follower.sh`。
+
+驗收：部署後只在 leader 下一次減倉才有端到端證據（follower 送 reduce-only IOC 且成交）；TG 不再出現
+`平倉失敗 … invalid price`。**journal 沒有 info 級日誌**（repo 無 `basicConfig`），要看 HL `userFillsByTime`。
+
 ## 6. nginx + certbot
 
 ```bash
