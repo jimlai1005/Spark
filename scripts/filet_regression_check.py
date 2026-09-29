@@ -331,7 +331,9 @@ def http_status(path: str, timeout: int = 20) -> tuple[int | None, str]:
     req = urllib.request.Request(BASE + path, headers={"User-Agent": "filet-regression-check"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read(65536).decode("utf-8", "replace")
+            # 2026-09-29：原上限 64 KiB，/api/public/explore 回應長到 66 KB 後被截斷，
+            # JSON 契約檢查誤報 FAIL（curl 取回的完整回應合法）。上限只為擋異常巨大回應。
+            return r.status, r.read(4 * 1024 * 1024).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read(4096).decode("utf-8", "replace")
     except Exception as e:                                  # 連不上／TLS 失敗

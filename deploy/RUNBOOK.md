@@ -3572,3 +3572,19 @@ Filet Alpha `0xfB9C52f56F03D786AD5D435aa70fe45D80569760`。前置確認：主網
 `COPY_REFERRAL_CODE`，不受影響。⚠️ 殘留：`/var/lib/filet-exchange/referral_optin.json` 有一筆 2026-09-20 以舊碼簽的記錄
 （account `ffb9c5…9760`＝Filet Alpha 自己，鏈上 `referredBy` 已是 `RABBYWALLET`，無 follower unit）；未刪。若該帳號日後啟用引擎，
 `referral_apply` 會因記錄碼≠`COPY_REFERRAL_CODE` 發 `referral_code_mismatch` critical（記錄碼比對先於鏈上查詢），請該帳號重簽即可。
+
+**2026-09-29 部署（commit `c1a8a37`，11:41 UTC，移除 Dashboard 保證金警示文案，純前端）：** plan
+`docs/superpowers/plans/2026-09-29-remove-margin-warning-copy.md`（builder 實作、reviewer 兩輪：第一輪抓到兩個測試守門漏洞（未登入不打
+`/api/me/dashboard` 的斷言隨 pill 測試被刪；可用保證金數字 span 用位置定位會漂移），修正後第二輪變異實測「通過」）。內容：使用者裁決 C——
+跟單用戶無法自行調整可用保證金，「可用保證金嚴重不足…請儘速入金」紅框／「偏低」黃框／卡片變色外框／Header「保證金偏低」pill 全部移除
+（中英文案、CSS 一併刪），數字 <5% 黃、<2% 紅保留。**rsync 來源是 `git worktree` 的乾淨 commit 樹，不是工作樹**（工作樹當時有另一條線的
+未追蹤 plan）；前提確認：正式機 `DEPLOYED_VERSION` 為 e4e9b9b＋§5.8i 單檔熱修，伺服器 `hyperliquid.py` sha 與本機 HEAD 逐位元一致，整包 rsync
+不會蓋掉熱修。流程：§3.2 rsync 兩段 → `uv sync` 略過（pyproject 無變動，uv.lock mtime 仍 07-17）→ `find -prune var` chown root（非 root 檔 4＝.venv
+symlink）→ §4.2 `npm ci`＋`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app` build → chown root → **只 restart `filet-dashboard`**（api／keysvc／
+follower×3 未動；e4e9b9b→c1a8a37 之間 `src/` 只有已熱修的那一檔）→ `DEPLOYED_VERSION`。驗證：本機 vitest 757；正式機 `.next/static`＋`.next/server`
+零殘留舊文案（`.next/cache/webpack/*.pack` 4 個命中是 webpack 舊快取，不被服務）；dashboard `Ready in 1536ms`；`systemctl --failed` 空；
+`/ /dashboard /explore /strategies` 200；`filet_regression_check --http --ssh` 67/67 PASS。
+⚠️ 回歸首跑 66/67：`/api/public/explore 契約` 報 JSON 截斷——**是檢查腳本的 bug 不是站台**：`http_status()` 只 `read(65536)`，探索回應已長到
+66,238 bytes（curl 三次皆完整合法）。修法：上限提到 4 MiB（同 commit 的下一筆 docs commit 帶上），修後 67/67。
+既有觀察（與本次無關，部署前已在發生）：API journal 每分鐘一行 `compose_rows：地址 0x4cae5b… enrich 失敗，改列 pending/enrich_error:
+InvalidOperation(DivisionUndefined)`——已被降級處理、零 Traceback，待另案查該地址的 0/0 來源。
