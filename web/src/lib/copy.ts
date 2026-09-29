@@ -1460,9 +1460,8 @@ export const COPY_ZH = {
         },
         cooldown_hours: {
           label: "熔斷後的冷靜期（小時）",
-          help: "熔斷後經過這段時間就自動恢復跟單，權益基準已在熔斷當下重置。"
-                + "建議 12 小時：短到不會把你鎖在門外，長到足以讓觸發熔斷的那段行情過去。"
-                + "設 0 ＝ 不自動恢復（只有你按「立即恢復跟單」才解鎖）。",
+          help: "熔斷後經過這段時間就自動恢復跟單（最少 2 小時），權益基準已在熔斷當下重置。"
+                + "建議 12 小時：短到不會把你鎖在門外，長到足以讓觸發熔斷的那段行情過去。",
         },
       },
       halted: {
@@ -1475,8 +1474,8 @@ export const COPY_ZH = {
         cooldownLabel: "冷靜期",
         resumeAtLabel: "預計自動恢復",
         noAutoResume:
-          "沒有預計的自動恢復時間（冷靜期設為 0，或目前算不出來）——"
-          + "要恢復跟單請按下方按鈕。",
+          "目前算不出預計的自動恢復時間——引擎會在冷靜期屆滿後自動恢復；"
+          + "要立即恢復請按下方按鈕。",
         unknownValue: "（讀不到）",
         resumeButton: "立即恢復跟單",
         resuming: "等待錢包簽署…",
@@ -3104,10 +3103,9 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         },
         cooldown_hours: {
           label: "Cooldown after a trip (hours)",
-          help: "Following resumes automatically once this much time has passed after a trip; the equity "
-                + "baseline is reset at the moment it trips. Recommended 12 hours — short enough not to lock "
-                + "you out, long enough for the move that triggered it to pass. Set to 0 = no automatic resume "
-                + "(only \"Resume following now\" unlocks it).",
+          help: "Following resumes automatically once this much time has passed after a trip (minimum "
+                + "2 hours); the equity baseline is reset at the moment it trips. Recommended 12 hours — "
+                + "short enough not to lock you out, long enough for the move that triggered it to pass.",
         },
       },
       halted: {
@@ -3120,8 +3118,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         cooldownLabel: "Cooldown",
         resumeAtLabel: "Expected auto-resume",
         noAutoResume:
-          "No scheduled auto-resume time (cooldown is set to 0, or it can't be computed right now) — use the "
-          + "button below to resume.",
+          "No estimated auto-resume time is available right now — the engine will resume on its own "
+          + "once the cooldown has passed; press the button below to resume immediately.",
         unknownValue: "(unavailable)",
         resumeButton: "Resume following now",
         resuming: "Waiting for wallet signature…",
