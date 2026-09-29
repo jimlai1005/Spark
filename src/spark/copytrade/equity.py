@@ -115,8 +115,9 @@ LIFETIME_PEAK_RELPATH = Path("var/copytrade/equity_lifetime_peak.json")
 def update_lifetime_peak(root: Path, current: Decimal, *, persist: bool = True) -> Decimal:
     """維護「自開始跟單以來」的高水位（慢速絕對底線用，findings F1/C2）。
 
-    與 7 天滾動 peak 不同：本值只升不降，由 `killswitch.trip()` 與人工 re-arm 流程重置
-    （`reset_samples` 一併清除）——語意是「這一段跟單期間的最高點」。
+    與 7 天滾動 peak 不同：本值只升不降，`trip()` 與 `reset_samples` 都**不**清它；
+    只有解除一次 `total_drawdown` 熔斷時經 `reset_lifetime_peak` 重置（見該函式）
+    ——語意是「這一段跟單期間的最高點」。
     persist=False：唯讀（--status／panic 用），不落檔。
     """
     path = root / LIFETIME_PEAK_RELPATH

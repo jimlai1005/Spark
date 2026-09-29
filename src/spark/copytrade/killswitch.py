@@ -463,7 +463,9 @@ def _rebase_lifetime_peak_or_stay(root: Path, notifier: Notifier, *, who: str) -
     if (root / LIFETIME_PEAK_RELPATH).exists():
         msg = (f"{who}：絕對底線熔斷的全期高水位檔清不掉（{root / LIFETIME_PEAK_RELPATH}）"
                f"——維持鎖定，否則下一輪會拿舊高水位立刻再熔斷；需人工處理")
-        notifier.critical("killswitch", msg)
+        # 跨輪持續的狀態（step 0 每輪重跑）：Telegram 端去重，否則每分鐘一則會把
+        # 告警通道打爆（loop.py 記過 429 之後所有告警都送不出去）；alerts.log 照記。
+        notifier.critical("killswitch", msg, dedup_key=f"rebase_peak_failed:{who}")
         _append_alert(root, msg)
         return False
     return True
@@ -487,6 +489,8 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
       治理動作或 owner 主動退出，不是等一段時間就作廢的風險事件。
     - ARM payload 讀不到、或 `tripped_at` 解析不出來：**無法證明冷靜期已過**就不恢復。
     - 刪檔失敗（OSError）：維持鎖定並 critical——鎖不掉就不該宣稱已解除。
+    - `total_drawdown` 的全期高水位清不掉：維持鎖定並 critical（見
+      `_rebase_lifetime_peak_or_stay`）——否則下一輪拿舊高水位立刻再熔斷。
 
     恢復時的基準處理：7 天滾動樣本已在 `trip()` 觸發當下清掉，恢復後不會被崩跌前的
     舊 peak 立刻再熔斷。全期高水位**只在 `reason == total_drawdown` 時清**——滾動窗與
@@ -530,7 +534,7 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
     except OSError as e:
         notifier.critical("killswitch",
                           f"冷靜期已滿但 ARM 檔刪除失敗 {arm_path}: {e!r}"
-                          f"——維持鎖定，需人工處理")
+                          f"——維持鎖定，需人工處理", dedup_key="auto_rearm_unlink_failed")
         _append_alert(root, f"自動恢復失敗（刪檔）: {e!r}")
         return False
     msg = (f"**已自動恢復跟單**：冷靜期 {hours} 小時已滿"
@@ -561,8 +565,8 @@ def manual_rearm(root: Path, notifier: Notifier, *,
     **不會解除的情形（每一條都是刻意的 fail-closed，與 auto_rearm 同一套判定）**：
     - ARM 檔不存在：沒有鎖可解（回 False，不告警——這是最常見的正常狀態）。
     - payload 讀不到／`tripped_at` 解析不出來：**無法證明這筆請求晚於熔斷**就不解除。
-    - `reason` 不在 `_AUTO_REARM_REASONS`（目前唯一的例外是 `leader_revoked`）：
-      那是**治理動作**，不是客戶可以自己作廢的風險事件。共用 `rearm_allowed_for`，
+    - `reason` 不在 `_MANUAL_REARM_REASONS`（`leader_revoked`／`owner_close`／空字串）：
+      治理動作或 owner 主動退出，不是客戶可以自己作廢的風險事件。共用 `rearm_allowed_for`，
       不複製清單——兩份清單漂移的方向是 fail-open。
     - `requested_at_iso` **不晚於** `tripped_at`：⭐ 這是防重放的那一半。少了它，
       一份熔斷**之前**簽好的解鎖請求（客戶當時只是預先簽著、或攻擊者留存的舊記錄）
@@ -595,9 +599,9 @@ def manual_rearm(root: Path, notifier: Notifier, *,
     # ⚠️ 殘留暴險（平倉失敗／掛單未撤）**不擋自助解除**（2026-07-31 使用者裁決）。
     # 我原本擋在這裡，使用者的理由更好：客戶明確要求恢復時，恢復本身就是收拾殘局的
     # 手段——引擎下一輪的 `sync_positions` 會把殘留部位往 leader 的目標收斂，而維持
-    # 鎖定只會讓那個部位**無人管理**地留在市場上。差別在於這條路徑有人做決定
-    # （而且是簽了章的決定），自動冷靜期那條沒有——所以 `auto_rearm_if_cooled_down`
-    # 仍然擋（見該函式）。客戶按下去之前會在頁面上看到「有部位未平乾淨」的提示
+    # 鎖定只會讓那個部位**無人管理**地留在市場上。2026-09-29 起 `auto_rearm_if_cooled_down`
+    # 也採同一條理由不再擋（使用者裁決：客戶不會回來按），差別只剩自動路徑的告警要
+    # 主動揭露殘留。客戶按下去之前會在頁面上看到「有部位未平乾淨」的提示
     # （`halt_status` 的 `residual_exposure`），這是「知情的決定」的那一半。
     _ = residual
     try:
@@ -620,7 +624,7 @@ def manual_rearm(root: Path, notifier: Notifier, *,
     except OSError as e:
         notifier.critical("killswitch",
                           f"客戶自助解除熔斷失敗（ARM 檔刪除失敗 {arm_path}: {e!r}）"
-                          f"——維持鎖定，需人工處理")
+                          f"——維持鎖定，需人工處理", dedup_key="manual_rearm_unlink_failed")
         _append_alert(root, f"自助解除失敗（刪檔）: {e!r}")
         return False
     msg = (f"**已依客戶簽章授權解除熔斷鎖定**（熔斷於 {tripped_at}，原因 `{reason}`，"
