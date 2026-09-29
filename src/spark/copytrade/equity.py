@@ -164,9 +164,10 @@ def reset_samples(root: Path) -> None:
 def reset_lifetime_peak(root: Path) -> None:
     """清除全期高水位＝**接受一個新的絕對底線基準**。
 
-    唯一的合法呼叫點是「客戶親自簽章解除了一次 `total_drawdown` 熔斷」：他看懂了
-    自己已經虧掉多少，並決定以現在的權益為新的起點繼續。系統自己（冷靜期、
-    營運端、任何自動路徑）**不得**呼叫它——那等於替客戶抹掉他的虧損記錄。
+    合法呼叫點只有兩個，都在 `killswitch` 解除一次 `total_drawdown` 熔斷的當下：
+    客戶簽章的 `manual_rearm()`，以及 2026-09-29 起的冷靜期自動路徑
+    `auto_rearm_if_cooled_down()`。其他任何路徑（滾動回撤解鎖、營運端、trip 本身）
+    **不得**呼叫——那會把絕對底線變成每次熔斷重設的棘輪。
     """
     _unlink_quietly(root, LIFETIME_PEAK_RELPATH)
 

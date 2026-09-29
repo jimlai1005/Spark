@@ -87,7 +87,8 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
 
     # ── 0. 冷靜期屆滿 → 自動恢復（2026-07-30 使用者裁決）─────────────────
     # 排在 is_tripped 之前：本輪就恢復交易，而不是白等一輪。函式本身對
-    # 「leader 撤銷」「時間戳讀不到」「冷靜期設 0」三種情形 fail-closed（見其 docstring）。
+    # 「reason 不可恢復（leader 撤銷／owner_close／空）」「時間戳讀不到」「刪檔失敗」
+    # fail-closed；殘留暴險與冷靜期 0 自 2026-09-29 起**不再**擋（見其 docstring）。
     auto_rearm_if_cooled_down(root, settings, notifier)
 
     # ── 1. killswitch 短路：tripped 只讀報狀態，零交易動作 ─────────────
@@ -172,7 +173,8 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         status = evaluate(ev, settings, notifier, coverage=cov, lifetime_peak=lifetime)
         # ── 2.1 破線二次確認（2026-07-31 Wave 3；2026-08-01 第三批審查 F1/F2/O4 修正）
         # 出金若恰落在步驟 1.5 校正之後、上面取樣之前的縫隙，本輪是拿**未校正
-        # 基準**在判回撤（幻影破線；total_drawdown 一旦 trip 還要客戶簽章解鎖）。
+        # 基準**在判回撤（幻影破線；total_drawdown 一旦 trip 會在恢復時清全期高水位，
+        # 幻影 trip 等於白白重設基準）。
         # 修法：判定破線後、下面的 dd_breach critical 與 flatten **之前**，重呼
         # 一次校正＋重判——縫隙裡的流量落在 1.5 寫下的標記之後，重呼看得到；
         # exactly-once 由標記天然保證（1.5 已套用過的流量不會被再套一次）。
@@ -251,8 +253,8 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
             )
             if settings.flatten_on_breach:
                 my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
-                # ⭐ reason 必須明講是哪一道閘（審查 F1）：兩者的恢復語意不同——
-                # 滾動窗過了冷靜期就自動恢復，絕對底線只能由客戶簽章接受新基準。
+                # ⭐ reason 必須明講是哪一道閘（審查 F1）：兩者解鎖時的差別是要不要清
+                # 全期高水位（絕對底線清、滾動窗不清；2026-09-29 起兩者都走冷靜期自動恢復）。
                 trip(ex, my_positions, notifier, root, status,
                      reason=(REASON_TOTAL_DRAWDOWN if status.basis == "lifetime"
                              else REASON_ROLLING_DRAWDOWN))

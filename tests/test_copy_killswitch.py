@@ -683,9 +683,20 @@ def test_within_cooldown_stays_locked_and_quiet(tmp_path):
     assert n.records == [], "冷靜期內不該每輪吵——tripped 的提醒由呼叫端負責"
 
 
-def test_cooldown_zero_means_manual_only(tmp_path):
-    """0 ＝ 客戶明確選擇「鎖死等我處理」，再久也不自動恢復。"""
-    at, now = _hours_ago(999)
+def test_cooldown_below_floor_behaves_as_two_hours(tmp_path):
+    """⭐ 2026-09-29 使用者裁決：冷靜期不再有 0（「只有簽章才恢復」的語意作廢）。
+    引擎端地板 2 小時：env／舊記錄寫 0 或 1 都當 2 算，這是結構性保證，不靠 spec 擋。
+    觸發情境：舊 env `COPY_RISK_COOLDOWN_HOURS=0` 的引擎熔斷後 3 小時。"""
+    at, now = _hours_ago(3)
+    arm = _arm(tmp_path, tripped_at=at)
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("0")),
+                                     RecordingNotifier(), now_s=now) is True
+    assert not arm.exists()
+
+
+def test_cooldown_below_floor_still_waits_the_floor(tmp_path):
+    """對照：地板 2 小時內仍鎖著（設 0 不等於立刻恢復）。"""
+    at, now = _hours_ago(1)
     arm = _arm(tmp_path, tripped_at=at)
     assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("0")),
                                      RecordingNotifier(), now_s=now) is False
@@ -745,14 +756,11 @@ def test_operator_panic_halt_never_auto_resumes(tmp_path):
     assert arm.exists()
 
 
-def test_halt_with_unflattened_positions_never_auto_resumes(tmp_path):
-    """⭐⭐ F1-B：熔斷時平倉失敗（ARM payload 有 failures）＝市場上還有沒收乾淨的
-    部位，trip 的告警已寫「需人工處置」。那句話與「12 小時後自動恢復交易」不可能
-    同時成立。觸發情境：回撤熔斷 → close_reduce_only 對 ETH 失敗 → 放著滿 12 小時。
-
-    ⚠️ 這一條**只擋自動恢復**：客戶親自簽章的自助解除不受此限（2026-07-31 使用者
-    裁決）——見下一個測試。差別在於那條路徑有一個知情的人做了決定。
-    """
+def test_halt_with_unflattened_positions_auto_resumes_and_discloses(tmp_path):
+    """⭐⭐ 2026-09-29 使用者裁決（推翻 2026-07-30 F1-B）：殘留暴險**不擋**自動恢復。
+    理由與 2026-07-31 自助解除同一條：恢復本身就是收拾殘局的手段，下一輪 sync_positions
+    會把殘留部位往 leader 目標收斂；鎖著只會讓它無人管理。但告警必須揭露殘留。
+    觸發情境：回撤熔斷 → ETH 平倉失敗 → 放著滿 12 小時，沒人進來按任何東西。"""
     at, now = _hours_ago(20)
     p = tmp_path / ARM_FILE_RELPATH
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -760,9 +768,10 @@ def test_halt_with_unflattened_positions_never_auto_resumes(tmp_path):
                              "failures": ["ETH"], "breached": True}))
     n = RecordingNotifier()
     assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
-                                     n, now_s=now) is False
-    assert p.exists()
-    assert any("殘留暴險" in r[2] for r in n.records)
+                                     n, now_s=now) is True
+    assert not p.exists()
+    assert any(r[0] == "critical" and "已自動恢復跟單" in r[2] and "殘留暴險" in r[2]
+               for r in n.records)
 
 
 def test_owner_can_self_resume_even_with_unflattened_positions(tmp_path):
@@ -794,36 +803,60 @@ def test_halt_status_discloses_residual_exposure_without_blocking(tmp_path):
     assert st["resumable"] is True and st["residual_exposure"] is True
 
 
-def test_orders_not_cancelled_also_blocks_resume(tmp_path):
-    """掛單清單根本沒讀到（orders_not_cancelled）同理：帳戶狀態未知，不得恢復。"""
+def test_orders_not_cancelled_also_auto_resumes(tmp_path):
+    """掛單清單沒讀到（orders_not_cancelled）同理：不擋自動恢復，告警揭露。"""
     at, now = _hours_ago(20)
     p = tmp_path / ARM_FILE_RELPATH
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"tripped_at": at, "reason": "cost_breach",
                              "orders_not_cancelled": True}))
+    n = RecordingNotifier()
     assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
-                                     RecordingNotifier(), now_s=now) is False
-    assert p.exists()
+                                     n, now_s=now) is True
+    assert not p.exists()
+    assert any("殘留暴險" in r[2] for r in n.records)
 
 
-def test_total_drawdown_never_auto_resumes_but_owner_can_rebase(tmp_path):
-    """⭐⭐ F2：絕對底線量的是「總共虧了多少」，時間過去不會讓它變好 → 不自動恢復；
-    但客戶親自簽章可以解除，並**同時**接受以目前權益為新高水位。
-    觸發情境：客戶累虧達 40% 上限熔斷，等 12 小時後不該自己恢復。"""
+def test_total_drawdown_auto_resumes_after_cooldown_and_rebases(tmp_path):
+    """⭐⭐ 2026-09-29 使用者裁決（推翻 2026-07-30 F2）：絕對底線也比照冷靜期自動恢復；
+    解鎖同時清掉全期高水位＝以恢復當下的權益為新基準（不清會下一輪立刻再 trip）。
+    觸發情境：客戶累虧達 40% 上限熔斷，12 小時後沒人進來按任何東西。"""
     from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
-    at, now = _hours_ago(99)
+    at, now = _hours_ago(13)
     arm = _arm(tmp_path, tripped_at=at, reason="total_drawdown")
     update_lifetime_peak(tmp_path, Decimal("10000"))
     n = RecordingNotifier()
 
     assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
-                                     n, now_s=now) is False
-    assert arm.exists(), "絕對底線不得因為時間過去就自動恢復"
+                                     n, now_s=now) is True
+    assert not arm.exists()
+    assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists(), "自動解鎖＝以目前權益為新基準"
+    assert any(r[0] == "critical" and "已自動恢復跟單" in r[2] and "新的高水位基準" in r[2]
+               for r in n.records)
+
+
+def test_total_drawdown_within_cooldown_keeps_lock_and_peak(tmp_path):
+    """冷靜期未滿：鎖與全期高水位都留著（清高水位只能發生在真的解鎖那一刻）。"""
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
+    at, now = _hours_ago(3)
+    arm = _arm(tmp_path, tripped_at=at, reason="total_drawdown")
+    update_lifetime_peak(tmp_path, Decimal("10000"))
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     RecordingNotifier(), now_s=now) is False
+    assert arm.exists()
     assert (tmp_path / LIFETIME_PEAK_RELPATH).exists()
 
+
+def test_total_drawdown_manual_rearm_still_works_and_rebases(tmp_path):
+    """對照組：客戶簽章的快速通道保留、行為不變（解鎖＋清全期高水位）。"""
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH, update_lifetime_peak
+    at, _ = _hours_ago(1)
+    arm = _arm(tmp_path, tripped_at=at, reason="total_drawdown")
+    update_lifetime_peak(tmp_path, Decimal("10000"))
+    n = RecordingNotifier()
     assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is True
     assert not arm.exists()
-    assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists(), "客戶簽章解除＝接受新基準"
+    assert not (tmp_path / LIFETIME_PEAK_RELPATH).exists()
     assert any("新的高水位基準" in r[2] for r in n.records)
 
 

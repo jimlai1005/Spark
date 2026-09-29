@@ -67,6 +67,10 @@ def _env_decimal(key: str, default: str, env: Mapping[str, str] | None = None) -
         raise ValueError(f"{key} 解析失敗: {cleaned!r}") from e
 
 
+# 冷靜期地板（小時）。spec 下限（filet/risk_prefs.RISK_PARAM_SPECS）與引擎地板共用這一個值。
+RISK_COOLDOWN_MIN_HOURS = Decimal("2")
+
+
 @dataclass(frozen=True)
 class CopySettings:
     """跟單引擎配置。
@@ -107,11 +111,14 @@ class CopySettings:
     #   2. leader 被白名單撤銷時的強制平倉（run_copytrade 層，屬合約與權限）。
     risk_controls_enabled: bool = True
     # 熔斷後的冷靜期（小時）。屆滿即自動恢復跟單（`killswitch.auto_rearm_if_cooled_down`）。
-    # `0` ＝不自動恢復（只有人工刪 ARM 檔才恢復），那是客戶明確選擇「鎖死等我處理」。
     # ⭐ 預設 12 而不是 0（2026-07-30 使用者裁決）：把「什麼時候恢復」的決定權交回
     # 客戶手上。願意付錢限制自己的人不多，我們能做的是提供保護，不是替他上鎖。
     # ⚠️ 本值不受 `risk_controls_enabled` 影響：它管的是**恢復**，不是執法。客戶關掉
     # 風控之後，先前留下的鎖檔仍應照冷靜期自動解除，否則他等於被一個已停用的機制鎖住。
+    # ⭐ 2026-09-29 使用者裁決：冷靜期**不再有 0**（「只有簽章才恢復」語意作廢）。
+    # 下限由 RISK_COOLDOWN_MIN_HOURS 給，且在**使用端**（killswitch.auto_rearm_if_cooled_down）
+    # 以 effective_cooldown_hours() 取地板——不在這裡把驗證改成 >= 2，因為舊 env 若還
+    # 寫著 0，引擎起不來的代價（follower 整顆停掉）遠大於多等 2 小時。
     risk_cooldown_hours: Decimal = Decimal("12")
     # ⭐⭐ 跟單本金的**兩種模式，由顯式旗標選擇**（2026-07-19：解除 `0` 的語意重載）。
     # 舊版讓 `allocated_capital == 0` 兼任「用全部權益」的開關，於是同一個值同時是
@@ -416,3 +423,13 @@ class CopySettings:
                 "use_full_equity=False 時 allocated_capital 必須 > 0（收到 "
                 f"{self.allocated_capital}）——本金 0 會讓所有目標部位歸零，"
                 "那是靜默停止跟單。要用全部權益請設 use_full_equity=True")
+
+
+def effective_cooldown_hours(settings: "CopySettings") -> Decimal:
+    """引擎實際採用的冷靜期＝max(設定值, RISK_COOLDOWN_MIN_HOURS)。
+
+    2026-09-29 使用者裁決的結構性保證：不論 env、簽章記錄或人工改檔寫了什麼，
+    冷靜期最少 2 小時、且**一定會**自動恢復。所有讀 `risk_cooldown_hours` 來決定
+    「何時解鎖」的地方都必須經本函式，不得直接讀欄位。
+    """
+    return max(settings.risk_cooldown_hours, RISK_COOLDOWN_MIN_HOURS)

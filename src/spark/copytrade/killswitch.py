@@ -6,13 +6,18 @@
   ⚠️ **2026-07-30 使用者裁決放寬**：新增 `auto_rearm_if_cooled_down()`，冷靜期
   （`COPY_RISK_COOLDOWN_HOURS`，預設 12 小時）屆滿後自動刪 ARM 檔恢復跟單。
   理由是保留客戶該有的權力——保護要提供，但不該把客戶鎖在門外。放寬僅限該函式，
-  且它對三種情形仍然 fail-closed（leader 撤銷、時間戳讀不到、冷靜期設為 0）；
+  且它對兩種情形仍然 fail-closed（leader 撤銷、時間戳讀不到）；
   `trip()` 本身完全不變。詳見該函式 docstring。
   ⚠️ **2026-07-30 第二次放寬**：新增 `manual_rearm()`，客戶以錢包簽章授權即可
   **立即**解除鎖定（不必等冷靜期）。驗章在 `spark.filet.risk_settings_apply`，
   ARM 檔的判定與刪除全在本模組（誰擁有鎖，誰負責開鎖）。兩條恢復路徑共用同一份
   「哪些 reason 可以恢復」判定（`rearm_allowed_for`），且各自都要求「請求晚於熔斷」
   或「冷靜期已過」——`trip()` 仍然完全不變。
+  ⚠️ **2026-09-29 第三次放寬**（使用者裁決：客戶是懶人投資法，不會回來簽章）：
+  `total_drawdown` 進 `_AUTO_REARM_REASONS` 並於解鎖時清全期高水位；殘留暴險不再擋
+  自動恢復；冷靜期地板 2 小時（`config.effective_cooldown_hours`），不再有 0。
+  語意收斂為「要嘛不熔斷，熔斷了就等冷靜期自動跟回去」。`manual_rearm()` 保留為
+  快速通道，`trip()` 不變。
 - 門檻語意對照線上引擎 hl-copytrader/main.py:176：`drawdown > max` 嚴格大於才觸發。
 - **Lock-first**：trip 進場先寫 preliminary ARM 檔再動手——flatten 中途 process 被殺，
   重啟後 is_tripped 仍為 True，絕不因鎖檔沒落地而照常交易。鎖不住（ARM 寫入 OSError）
@@ -51,7 +56,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 
-from spark.copytrade.config import CopySettings
+from spark.copytrade.config import CopySettings, effective_cooldown_hours
 from spark.copytrade.costbreaker import reset_log as reset_cost_log
 from spark.copytrade.equity import (
     LIFETIME_PEAK_RELPATH,
@@ -77,9 +82,8 @@ class DrawdownStatus:
     drawdown_pct: Decimal
     breached: bool
     # ⭐ 觸發的是哪一道閘（2026-07-30）：`"rolling"`＝7 天滾動窗、`"lifetime"`＝
-    # 自開始跟單以來的絕對底線。兩者的**恢復語意不同**（見 REASON_* 常數）：
-    # 滾動窗量的是「跌得多快」，冷靜期過了就可以再跑；絕對底線量的是「總共虧了多少」，
-    # 時間過去並不會讓它變好——所以它不自動恢復，只能由客戶自己簽章接受新基準。
+    # 自開始跟單以來的絕對底線。兩者解鎖時的差別（2026-09-29 起）只剩「要不要清
+    # 全期高水位」：絕對底線解鎖＝以當下權益為新基準；滾動窗解鎖不動高水位。
     basis: str = "rolling"
 
 
@@ -156,8 +160,8 @@ def is_tripped(root: Path) -> bool:
 # ⚠️⚠️ **空字串不屬於任何一張清單**——這是 2026-07-30 獨立審查 F1 的修正。原本
 # `""`（呼叫端沒傳 reason）被當成「回撤觸發、可自動恢復」，於是 `scripts/panic.py`
 # 的營運端緊急停機（它不傳 reason）會在冷靜期後自己解鎖，客戶還能在一分鐘內按掉它；
-# 同理，回撤熔斷但**平倉失敗**（ARM payload 帶 failures、告警明寫「需人工處置」）
-# 也會照樣恢復。現在每一條 trip 路徑都必須**明講**自己是什麼，說不出來的只能人工處理。
+# （殘留暴險自 2026-09-29 起刻意允許自動恢復，見 auto_rearm_if_cooled_down）。
+# 現在每一條 trip 路徑都必須**明講**自己是什麼，說不出來的只能人工處理。
 REASON_ROLLING_DRAWDOWN = "drawdown"          # 7 天滾動窗：跌得太快
 REASON_TOTAL_DRAWDOWN = "total_drawdown"      # 絕對底線：自開始跟單以來虧太多
 REASON_COST_BREACH = "cost_breach"            # 成本熔斷累犯升級
@@ -169,16 +173,18 @@ REASON_LEADER_REVOKED = "leader_revoked"      # 治理動作（平台撤銷 lead
 # re-arm（見 deploy/RUNBOOK.md 新增節）。
 REASON_OWNER_CLOSE = "owner_close"
 
-# 冷靜期屆滿可**自動**恢復的原因：只有「跌得快」與「交易太密集」這兩種——
-# 它們量的是**速度**，等一段時間確實會改變事實。
-_AUTO_REARM_REASONS = (REASON_ROLLING_DRAWDOWN, REASON_COST_BREACH)
+# 冷靜期屆滿可**自動**恢復的原因。
+# ⚠️ 2026-09-29 使用者裁決（推翻 2026-07-30 審查 F2）：`total_drawdown` 也進本清單。
+# 理由：客戶是懶人投資法，放著不會再進來簽任何東西；絕對底線若只能簽章解鎖，等於
+# 把客戶永久鎖在門外。代價（已知情接受）：全期高水位隨每次絕對底線熔斷重設，
+# 理論上每個冷靜期可再虧一次 40%。清高水位的動作在 `auto_rearm_if_cooled_down` 內。
+_AUTO_REARM_REASONS = (REASON_ROLLING_DRAWDOWN, REASON_COST_BREACH, REASON_TOTAL_DRAWDOWN)
 
-# 客戶**親自簽章**可以恢復的原因 ＝ 上面兩種 ＋ 絕對底線。絕對底線不自動恢復
-# （時間過去不會讓已經虧掉的錢回來），但客戶有權在看懂之後自己接受一個新基準
-# ——那正是「保護要提供，但保留客戶該有的權力」的界線所在。
-# ⚠️ 三張清單都不含 `leader_revoked`（治理動作）、`owner_close`（owner 主動退出，
-# 見上）與 `""`（營運端緊急停機）。
-_MANUAL_REARM_REASONS = _AUTO_REARM_REASONS + (REASON_TOTAL_DRAWDOWN,)
+# 客戶**親自簽章**可以恢復的原因：自 2026-09-29 起與自動清單相同（簽章只是「不想等
+# 冷靜期」的快速通道）。保留兩個名字與 `manual` 參數：呼叫端語意不同、日後若再分岔
+# 只改這一行。⚠️ 兩張清單都不含 `leader_revoked`（治理動作）、`owner_close`（owner 主動
+# 退出）與 `""`（營運端緊急停機）。
+_MANUAL_REARM_REASONS = _AUTO_REARM_REASONS
 
 
 def rearm_allowed_for(reason: object, *, manual: bool = False) -> bool:
@@ -208,8 +214,8 @@ def _read_arm_payload(arm_path: Path) -> tuple[str, str, float, bool] | None:
         tripped_at = payload.get("tripped_at")
         reason = payload.get("reason", "")
         # ⭐ 殘留暴險（審查 F1-B）：平倉失敗的 coin，或掛單清單根本沒讀到。
-        # 這兩者發生時 trip 的告警明寫「需人工處置」——那句話與「12 小時後自動
-        # 恢復交易」不可能同時成立。任一為真即禁止**任何**自動／自助恢復。
+        # 2026-09-29 起它**不擋**任何恢復路徑（自動／簽章都放行），只用於揭露：
+        # halt_status 給前端、auto_rearm 的恢復告警都要帶上它。
         residual = bool(payload.get("failures")) or bool(
             payload.get("orders_not_cancelled"))
         return tripped_at, reason, datetime.fromisoformat(tripped_at).timestamp(), residual
@@ -447,35 +453,30 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
                               *, now_s: float | None = None) -> bool:
     """冷靜期屆滿 → 自動解除鎖定（刪 ARM 檔）。回傳是否真的解除了。
 
-    ⭐⭐ **這條推翻了本模組原本的拍板**（2026-07-30 使用者裁決）：原設計是
-    「re-arm 一律人工，本模組不提供任何自動恢復路徑」。使用者的理由是保留客戶
-    該有的權力——保護要提供，但不該把客戶鎖在門外；冷靜期（預設 12 小時）是
-    「保護」與「權力」之間的折衷。改動範圍僅限本函式，`trip()` 的行為不變。
+    ⭐⭐ 語意沿革：
+    - 2026-07-30 使用者裁決：從「re-arm 一律人工」放寬成冷靜期自動恢復（保留客戶該有的
+      權力——保護要提供，但不該把客戶鎖在門外）。
+    - 2026-09-29 使用者裁決：客戶是懶人投資法，放著不會再進來操作。於是
+      (1) `total_drawdown` 也自動恢復並清全期高水位；(2) 殘留暴險不擋；
+      (3) 冷靜期地板 2 小時、不再有「設 0＝只有簽章才恢復」。
+      語意收斂成一句：**要嘛不熔斷，熔斷了就等冷靜期（最少 2 小時）自動跟回去。**
+    `trip()` 與 `manual_rearm()` 的行為不變。
 
-    **不會自動恢復的情形（每一條都是刻意的 fail-closed）**：
-    - `reason="leader_revoked"`：那是**治理動作**（leader 被平台撤銷），不是客戶
-      可以等 12 小時就作廢的風險事件。自動恢復等於讓引擎回去跟一個已撤銷的 leader。
-    - ARM payload 讀不到、或 `tripped_at` 解析不出來：**無法證明冷靜期已過**就不
-      恢復。「讀不到」不等於「已經過期」（同一條判準見權益讀取失敗的處理）。
-    - `cooldown_hours <= 0`：客戶明確選擇「只有我人工才能恢復」。
+    **仍不會自動恢復的情形（每一條都是刻意的 fail-closed）**：
+    - `reason` 不在 `_AUTO_REARM_REASONS`（`leader_revoked`／`owner_close`／空字串）：
+      治理動作或 owner 主動退出，不是等一段時間就作廢的風險事件。
+    - ARM payload 讀不到、或 `tripped_at` 解析不出來：**無法證明冷靜期已過**就不恢復。
     - 刪檔失敗（OSError）：維持鎖定並 critical——鎖不掉就不該宣稱已解除。
 
-    - **平倉失敗或掛單未撤**（ARM payload 的 `failures`／`orders_not_cancelled`）：
-      市場上還有沒收乾淨的部位，trip 的告警已經說了「需人工處置」。自動恢復會讓
-      引擎在一個它自己都沒整理乾淨的帳戶上重新開始交易（審查 F1-B）。
-      ⚠️ 這一條**只擋自動恢復**：客戶親自簽章的自助解除不受此限（2026-07-31
-      使用者裁決，見 `manual_rearm`）——差別在於那條路徑有一個知情的人做了決定。
-
-    冷靜期結束後只重置**7 天滾動樣本**（`trip()` 已在觸發當下清掉），恢復後不會被
-    崩跌前的舊 peak 立刻再熔斷。⚠️ 全期高水位**不清**——絕對底線的意義正是不隨
-    時間重設（審查 F2）；要重設它只能是客戶親自簽章解除一次 `total_drawdown` 熔斷。
+    恢復時的基準處理：7 天滾動樣本已在 `trip()` 觸發當下清掉，恢復後不會被崩跌前的
+    舊 peak 立刻再熔斷。全期高水位**只在 `reason == total_drawdown` 時清**——滾動窗與
+    成本熔斷的解鎖不清，否則絕對底線會被滾動熔斷逐次重設而失去意義。
     """
     arm_path = root / ARM_FILE_RELPATH
     if not arm_path.exists():
         return False
-    hours = settings.risk_cooldown_hours
-    if hours <= 0:
-        return False
+    # ⭐ 2026-09-29：地板 2 小時、永不為 0（見 config.effective_cooldown_hours）。
+    hours = effective_cooldown_hours(settings)
     now_s = time.time() if now_s is None else now_s
 
     def _stay(reason_text: str, key: str) -> bool:
@@ -492,10 +493,10 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
         return _stay(
             f"觸發原因為 `{reason or '未標示'}`，不屬於可自動恢復的風險事件"
             f"（leader 撤銷、營運端緊急停機等只能人工處理）", f"rearm_blocked:{reason}")
-    if residual:
-        return _stay(
-            "熔斷當下有部位平倉失敗或掛單未撤（ARM 檔記有殘留暴險）——"
-            "自動恢復不執行，需人工確認帳戶已收乾淨", "rearm_residual")
+    # ⚠️ 殘留暴險（平倉失敗／掛單未撤）**不擋**自動恢復（2026-09-29 使用者裁決，
+    # 推翻 2026-07-30 F1-B）：理由與 manual_rearm 的 2026-07-31 裁決同一條——恢復本身
+    # 就是收拾殘局的手段，下一輪 sync_positions 會把殘留部位往 leader 目標收斂；
+    # 鎖著只會讓它無人管理。差別在於現在沒有「知情的人按了按鈕」，所以告警必須揭露。
 
     elapsed_h = (now_s - tripped_s) / 3600
     if elapsed_h < float(hours):
@@ -508,9 +509,21 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
                           f"——維持鎖定，需人工處理")
         _append_alert(root, f"自動恢復失敗（刪檔）: {e!r}")
         return False
+    # ⭐ 2026-09-29：絕對底線的熔斷被冷靜期自動解除 ⇒ 以恢復當下的權益為新基準。
+    # 不清的話下一輪 evaluate() 仍拿舊高水位判 total_dd > 上限 → 立刻再 trip，
+    # 變成每個冷靜期平倉一次的死循環。棘輪後果見 _AUTO_REARM_REASONS 註解。
+    # 只在 unlink 成功之後清：刪檔失敗＝仍鎖著，高水位必須留著。
+    rebased = reason == REASON_TOTAL_DRAWDOWN
+    if rebased:
+        reset_lifetime_peak(root)
     msg = (f"**已自動恢復跟單**：冷靜期 {hours} 小時已滿"
            f"（觸發於 {tripped_at}，實際經過 {elapsed_h:.1f} 小時）。"
-           f"權益基準已於觸發當下重置，下一輪起恢復交易動作。")
+           f"權益基準已於觸發當下重置，下一輪起恢復交易動作。"
+           + ("｜⚠️ 這是**絕對底線**的熔斷，已以目前權益作為新的高水位基準。"
+              if rebased else "")
+           + ("｜⚠️ 熔斷當下有**殘留暴險**（部位平倉失敗或掛單未撤），"
+              "引擎下一輪起會把它們往 leader 目標收斂，請留意帳戶。"
+              if residual else ""))
     notifier.critical("killswitch", msg)
     _append_alert(root, msg)
     return True
