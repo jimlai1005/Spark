@@ -3,13 +3,14 @@ import type { DashboardEquity } from "@/lib/api";
 import { fmtAmount, fmtRatioPct, NO_VALUE } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
 
-/** NOTE 14：可用保證金低於此比例即出現黃色告警卡（設計稿錨例：0.64% → 觸發）。 */
-export const LOW_MARGIN_THRESHOLD = 0.05;
 /**
- * ⭐ M3 round3 Task 6（R2 P2「Dashboard 保證金」）：<2% 進一步升級為紅框＋紅字。
- * 門檻常數集中在這一處 export——Header.tsx 的保證金提示 pill 沿用
- * `LOW_MARGIN_THRESHOLD`（同一個 5% 判準，不另拼一份數字）。
+ * 可用保證金低於此比例時，數字變黃色（設計稿錨例：0.64% → 觸發）。
+ * ⭐ 2026-09-29：告警紅／黃框與文案已移除（使用者裁決，跟單用戶無法自行調整可用
+ * 保證金，警示文案嚇人多於有用）——僅剩下方的數字顏色變化仍使用本門檻，
+ * 僅本檔使用（Header.tsx 已不再 import）。
  */
+export const LOW_MARGIN_THRESHOLD = 0.05;
+/** <2% 時數字進一步變紅（見上方 docblock）。 */
 export const CRITICAL_MARGIN_THRESHOLD = 0.02;
 
 function signedPct(v: string | null): string {
@@ -38,13 +39,9 @@ export function EquityCard({ equity }: { equity: DashboardEquity | null }) {
     && Number.isFinite(availablePctNum) && availablePctNum < LOW_MARGIN_THRESHOLD;
   const criticalMargin = availablePctNum != null
     && Number.isFinite(availablePctNum) && availablePctNum < CRITICAL_MARGIN_THRESHOLD;
-  // ⭐ R2 保證金分級：≥5% 無框；<5% 黃框；<2% 紅框（criticalMargin 蘊含 lowMargin，
-  // 兩門檻同源同一個 available_pct，不另拼第二個判斷基準）。
-  const marginLevel: "warning" | "critical" | null =
-    criticalMargin ? "critical" : lowMargin ? "warning" : null;
 
   return (
-    <div className="card dash-card dash-card-equity" data-margin={marginLevel ?? undefined}>
+    <div className="card dash-card dash-card-equity">
       <div className="dash-card-label">{c.label}</div>
       <div className="dash-equity-head">
         <span className="mono dash-equity-value">{accountValue}</span>
@@ -79,11 +76,6 @@ export function EquityCard({ equity }: { equity: DashboardEquity | null }) {
             </span>
           </span>
         </div>
-        {lowMargin && (
-          <div className="dash-low-margin-card" data-level={marginLevel ?? undefined}>
-            {criticalMargin ? c.criticalMarginWarning : c.lowMarginWarning}
-          </div>
-        )}
       </div>
     </div>
   );

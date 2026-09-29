@@ -88,13 +88,6 @@ export const COPY_ZH = {
     pillFollowing: "跟單中",
     pillPaused: "已暫停",
     pillNotFollowing: "未跟單",
-    /**
-     * 保證金告警 pill（Task 6，R2 P2「Dashboard 保證金」）：登入態且可用保證金
-     * 低於 `EquityCard.LOW_MARGIN_THRESHOLD`（5%）時，header 同步顯示這顆 pill，
-     * 點擊導向 /dashboard——與 EquityCard 卡片內的告警文案同一資料源
-     * （`/api/me/dashboard` 的 `equity.available_pct`），不是另外算一份。
-     */
-    marginAlertPill: "保證金偏低",
   },
   /**
    * Footer 文案（Task 7）。四欄＋系統狀態燈——資料來自 `/api/public/status`
@@ -1203,12 +1196,6 @@ export const COPY_ZH = {
       retSuffix: " 30D",
       usedMargin: "已用保證金",
       availableMargin: "可用保證金",
-      lowMarginWarning:
-        "可用保證金偏低。若策略需加倉可能被跳過，建議入金或調低投入比例。",
-      // ⭐ Task 6（R2 保證金分級）：<2% 的紅框文案——比 lowMarginWarning 更急迫，
-      // 明講「極可能被跳過」而非「可能」，並把「儘速」放在句首引導動作。
-      criticalMarginWarning:
-        "可用保證金嚴重不足，策略加倉極可能被跳過。請儘速入金或調低投入比例。",
     },
     exposure: {
       label: "目前曝險",
@@ -1965,7 +1952,6 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     pillFollowing: "Copying",
     pillPaused: "Paused",
     pillNotFollowing: "Not copying",
-    marginAlertPill: "Margin low",
   },
   footer: {
     brandTagline: "Non-custodial strategy execution on Hyperliquid. Your funds stay in your wallet; authorization can be revoked anytime.",
@@ -2906,12 +2892,6 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       retSuffix: " 30D",
       usedMargin: "Margin used",
       availableMargin: "Available margin",
-      lowMarginWarning:
-        "Available margin is low. New entries may be skipped — consider depositing more or lowering your "
-        + "allocation.",
-      criticalMarginWarning:
-        "Available margin is critically low — new entries will very likely be skipped. Please deposit more "
-        + "or lower your allocation as soon as possible.",
     },
     exposure: {
       label: "Current exposure",

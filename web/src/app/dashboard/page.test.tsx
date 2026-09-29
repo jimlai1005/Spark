@@ -188,25 +188,6 @@ describe("DashboardPage — 最後同步顯示（Task 19 修正）", () => {
   });
 });
 
-describe("DashboardPage — available_pct 0.05 低保證金告警閾值翻轉（NOTE 14）", () => {
-  it("0.049（< 0.05）→ 出現告警卡", async () => {
-    getDashboard.mockResolvedValue({
-      ...FULL, equity: { ...FULL.equity!, available_pct: "0.049" },
-    });
-    render(wrap(<DashboardPage />));
-    expect(await screen.findByText(COPY.dashboard.equity.lowMarginWarning)).toBeInTheDocument();
-  });
-
-  it("0.051（≥ 0.05）→ 不出現告警卡", async () => {
-    getDashboard.mockResolvedValue({
-      ...FULL, equity: { ...FULL.equity!, available_pct: "0.051" },
-    });
-    render(wrap(<DashboardPage />));
-    await screen.findByText("$1,206.67");
-    expect(screen.queryByText(COPY.dashboard.equity.lowMarginWarning)).not.toBeInTheDocument();
-  });
-});
-
 describe("DashboardPage — 全 null 塊不炸（不變量 6）", () => {
   it("六塊全 null → 渲染保守空態，無 undefined/NaN/[object Object]", async () => {
     getDashboard.mockResolvedValue(ALL_NULL);

@@ -190,18 +190,6 @@ input:focus-visible,
 }
 .follow-pill[data-state="not_following"] .follow-pill-dot { background: var(--text-dim); }
 
-/* Header 保證金告警 pill（Task 6，R2 P2）——沿用 .pill 基底，功能色借 --warn
-   （與 EquityCard 的黃框告警同語意，不新造顏色）。 */
-.header-margin-alert {
-  padding: 5px 11px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  text-decoration: none;
-  border: 1px solid rgba(var(--warn-rgb), .35);
-  background: rgba(var(--warn-rgb), .1);
-  color: var(--warn);
-}
-
 /* ---------- Footer ---------- */
 .app-footer {
   margin-top: 66px;
@@ -1509,11 +1497,6 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .dash-margin-row { display: flex; justify-content: space-between; font-size: var(--fs-small); margin-bottom: 7px; }
 .dash-margin-bar { height: 5px; background: var(--inset); border-radius: 3px; position: relative; }
 .dash-margin-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--secondary); }
-.dash-low-margin-card { background: rgba(var(--warn-rgb), 0.08); border: 1px solid rgba(var(--warn-rgb), 0.24); border-radius: 9px; padding: 11px 13px; font-size: var(--fs-micro); line-height: 1.6; color: var(--warn); }
-.dash-low-margin-card[data-level="critical"] { background: rgba(var(--neg-rgb), 0.08); border-color: rgba(var(--neg-rgb), 0.3); color: var(--neg); }
-/* R2 保證金分級（Task 6）：≥5% 無框（沿用 .card 預設 border）；<5% 黃框；<2% 紅框。 */
-.dash-card-equity[data-margin="warning"] { border-color: rgba(var(--warn-rgb), .4); }
-.dash-card-equity[data-margin="critical"] { border-color: rgba(var(--neg-rgb), .5); }
 
 .dash-exposure-value { font-family: var(--font-mono); font-size: var(--fs-h2); font-weight: 700; letter-spacing: -0.02em; }
 .dash-exposure-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 18px; }

@@ -68,17 +68,6 @@ function dashboardWithState(state: DashboardStatus["state"]): DashboardResp {
   };
 }
 
-/** 供保證金告警 pill 測試使用——固定其餘欄位、只變動 `equity.available_pct`。 */
-function dashboardWithMargin(availablePct: string): DashboardResp {
-  return {
-    ...dashboardWithState("following"),
-    equity: {
-      account_value: "1000.00", margin_used: "100.00", withdrawable: "900.00",
-      available_pct: availablePct, ret_30d_pct: "1.0",
-    },
-  };
-}
-
 beforeEach(() => {
   getAdminPending.mockReset();
   // 預設：一般客戶（後端 403）——ops／admin 連結不該出現
@@ -224,27 +213,13 @@ describe("Header — 跟單狀態 pill 接上 /api/me/dashboard（Task 14）", (
       expect(screen.queryByText(COPY_ZH.nav.pillPaused)).not.toBeInTheDocument();
     },
   );
-});
 
-describe("Header — 保證金告警 pill（M3 round3 Task 6，R2 P2）", () => {
-  it("available_pct < 5% → 顯示保證金告警 pill，連向 /dashboard", async () => {
-    getDashboard.mockResolvedValue(dashboardWithMargin("0.03"));
-    render(wrap(<Header />, qcWithMe({ address: "0xabc", account_id: "fabc" })));
-    const pill = await screen.findByText(COPY_ZH.nav.marginAlertPill);
-    expect(pill.closest("a")).toHaveAttribute("href", "/dashboard");
-  });
-
-  it("available_pct ≥ 5% → 不顯示保證金告警 pill", async () => {
-    getDashboard.mockResolvedValue(dashboardWithMargin("0.10"));
-    render(wrap(<Header />, qcWithMe({ address: "0xabc", account_id: "fabc" })));
-    await screen.findByText(COPY_ZH.nav.pillFollowing);
-    expect(screen.queryByText(COPY_ZH.nav.marginAlertPill)).not.toBeInTheDocument();
-  });
-
-  it("未登入 → 不顯示保證金告警 pill（不打 dashboard）", () => {
+  // 守住 `enabled: loggedIn`：未登入訪客不得打 /api/me/dashboard（原本由已移除的
+  // 保證金 pill 測試順帶守著，2026-09-29 拿掉 pill 後獨立成一條）。
+  it("未登入 → 不打 /api/me/dashboard、不顯示跟單狀態 pill", () => {
     render(wrap(<Header />, qcWithMe(null)));
-    expect(screen.queryByText(COPY_ZH.nav.marginAlertPill)).not.toBeInTheDocument();
     expect(getDashboard).not.toHaveBeenCalled();
+    expect(screen.queryByText(COPY_ZH.nav.pillNotFollowing)).not.toBeInTheDocument();
   });
 });
 
