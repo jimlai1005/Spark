@@ -1508,6 +1508,29 @@ operator 不需要（也不能）代勞這一步。
 
 ---
 
+### 5.5.5 ⭐ 更新既有 follower 的 leader 登記值（`set_follower_leader.py`，2026-09-30）
+
+**為什麼需要**：客戶簽章換 leader 後，名冊 `followers.json` **刻意**不被 API／引擎更新（`leader_change_apply.py` 檔頭的安全邊界），
+引擎實際生效的 leader 只在引擎帳本＋心跳。自 c4632ac 起儀表板已改讀心跳，名冊過期只剩「排查誤導」與「狀態目錄整根重建時
+引擎會回到登記值」兩個後果；要把登記值改對，只能用本 CLI（`filet_activate` 對已存在條目一律拒絕）。
+
+```bash
+cd /opt/filet/spark
+ARGS="--account-id <id> --leader 0x... --manifest /opt/filet/spark/var/filet/followers.json \
+      --leaders /opt/filet/spark/var/filet/leaders.json --user-leaders /var/lib/filet-exchange/user_leaders.json \
+      --exchange-dir /var/lib/filet-exchange"
+# 1) 以名冊目前的 owner 身分跑 dry-run（write_json_atomic 走 os.replace，執行者會變成新 owner）
+sudo -u $(stat -c %U /opt/filet/spark/var/filet/followers.json) .venv/bin/python -m scripts.set_follower_leader $ARGS
+# 2) 閘門：輸出必須同時有「引擎心跳：status=ok leader.address=<新 leader>」與「通過 is_still_permitted」，
+#    否則不要加 --yes。心跳 leader 與新 leader 不同／為 None／stale／unreadable 時 --yes 會 exit 4——這是刻意的剎車：
+#    寫進去會讓引擎判定 leader 變更並收斂部位（動真錢）；真的要換 leader 走客戶簽章流程，不是本 CLI。
+sudo cp -a /opt/filet/spark/var/filet/followers.json /opt/filet/spark/var/filet/followers.json.bak-$(date +%Y%m%d)
+sudo -u $(stat -c %U /opt/filet/spark/var/filet/followers.json) .venv/bin/python -m scripts.set_follower_leader $ARGS --yes
+```
+
+退出碼：0 成功或無變更；2 帳號不在名冊／參數或檔案讀取問題；3 白名單（精選 ∪ registry）不通過；4 引擎心跳核對不通過
+（`--allow-engine-mismatch` 可略過，只在你完全清楚後果時用）。不重啟引擎、不動 `leader_changes.json`／pending。
+
 ### 5.6 activate 一個 follower（人工 CLI）
 
 ⚠️ **必須指定絕對路徑或先 `cd`**：`--pending`／`--manifest` 的預設值是 CWD 相對的，
@@ -2042,6 +2065,12 @@ curl -s -X POST https://trade.filet.app/api/public/contact \
 <!-- 2026-09-05: 探索指標統一部署（a1b0a88）首次採用。版本升級會讓 filet-api 忽略舊快照、
 冷建 300 個地址（每地址 4–5 個 HL 呼叫 × 0.7s 節流 ＋ 429 退避）約 12–20 分鐘，期間
 /explore 顯示「建置中」空榜。本節把冷建搬到本機做，正式機重啟即有完整榜單。 -->
+
+> ⚠️ **2026-09-30 補註（§5.8e 之後本節的前提已變）**：探索資料現在持久化在 `explore.db`，publisher 重啟後第一次
+> 有變更就從**本機 DB** 合成新版快照，不打 HL——c4632ac（v4→v5）實測 `initializing` **139 秒**後恢復 300 列。
+> 也就是說「版本升級＝冷建 12–20 分鐘」這個前提不再成立，本節的本機預熱可以省略；若仍要預熱，下方的本機
+> `run_api` 指令**必須加** `EXPLORE_UPSTREAM_REFRESH=1 FILET_EXPLORE_DB=$R/explore.db`，否則它只會空轉
+> （2026-09-30 親踩：照舊指令等了 35 分鐘、`scanned 0`）。本節其餘內容保留供「快取檔遺失且 DB 也不可用」的情境。
 
 **適用時機**：任何會讓正式機重啟後探索快照失效的部署——`EXPLORE_INDEX_VERSION` 升版、
 `ExploreRow`／`WindowStats` 欄位改動（snapshot 讀回會因版本不符被丟棄）、或快取檔本身遺失。
@@ -3618,3 +3647,19 @@ package-lock 沒變時 `npm ci` 是白做（它會先刪 node_modules 再全裝�
 `halt=None`、`cooldown_hours=12`；f6b3e7 部位（BTC 0.0162／ETH 1.1299／HYPE 7.8）restart 後零成交（最後成交 07:08 UTC 為 leader
 減倉鏡射）；`filet_regression_check --http --ssh` 67/67 PASS。journal 唯一 error 行仍是上述既有的 `compose_rows` enrich 警告。
 已跟單客戶的冷靜期語意變更由使用者自行溝通。
+
+**2026-09-29 部署（commit `c4632ac`，19:05 UTC，leader 顯示真相化＋leader 強平風險指標；API＋前端，follower 未重啟）：** plan
+`docs/superpowers/plans/2026-09-30-leader-truth-and-liq-risk.md`（Task 1–11，三輪 reviewer：第一輪 2 Critical＋5 Warning、第二輪 2 Critical＋3 Warning
+全修，第三輪「可部署」＋1 Warning 主線程修）。內容：(1) `/api/me/leader` 優先讀引擎心跳、退回名冊，回 `leader_source`；新狀態
+`engine_no_leader`（撤銷後心跳 leader 為 None）；壞位址／非 dict 心跳退回名冊不 5xx；(2) 管理端 `scripts/set_follower_leader.py`
+（§5.5.5）；(3) `hl_explore.risk_from_clearinghouse`（距強平 %＋維持保證金比，cross 同基準、殘量 <1% 權益不計）→ 探索列「距強平」欄、
+交易員頁兩卡，門檻 15/30 只在 `web/src/lib/liqDistance.ts`；`EXPLORE_INDEX_VERSION` 4→5。流程照 §3.2 rsync 兩段 → `uv sync` 略過
+（依賴無變動，uv.lock mtime 仍 07-17）→ `find -prune var` chown root（非 root 檔 4＝.venv symlink）→ §4.2 `npm ci`＋
+`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app` build → 舊 v4 快照備份 `explore_index.json.bak-v4-20260930` → restart `filet-api`、
+`filet-dashboard` → `DEPLOYED_VERSION` → §5.5.5 更新 f438 名冊（dry-run 閘門：心跳 leader == 0xedea、白名單通過；備份
+`followers.json.bak-20260930`）→ `filet_regression_check --http --ssh` 67/67 PASS。**§5.8c 預熱這次沒做也不需要**：§5.8e 之後 publisher
+重啟後第一次有變更就從本機 `explore.db` 合成新版快照，實測 `initializing` 139 秒後恢復（300 列、含 risk），不打 HL；§5.8c 已補註。
+驗證：`/api/public/traders/0xedea…` 的 `risk` 與交易所 `liquidationPx` 手算同向（差異來自 5 分鐘快取）；f438 引擎無 critical、
+心跳 leader 仍 0xedea、部位未動。既有問題（非本次引入）：`compose_rows` 對 0x4cae5bed…7c34 每輪 enrich 失敗 `DivisionUndefined`
+（重啟前 24h 已 1,377 次，列被降 pending）；`leader_changes.json` 的 f438 記錄名冊更新後未被 watcher 回收（回收只在 activate／heal
+分支；引擎忽略已兌現 nonce，無害）。

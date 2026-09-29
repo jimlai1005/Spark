@@ -2,7 +2,14 @@
 
 > **For agentic workers:** 依 `~/.claude/CLAUDE.md` 單 session 派工制執行：每個 task 標 `@inline`，派 `builder`；主線程逐 task 親跑驗收指令後才派下一個。Steps 用 `- [ ]` 追蹤。
 
-狀態：**2026-09-30 使用者確認共識，派工中**。裁決：風險指標照 plan（距強平 15/30 分級＋交易員頁維持保證金比）；探索列在曝險欄旁加一欄；部署順序照 plan（另一條線先 commit 乾淨再整包部署）。
+狀態：**✅ 已部署** 2026-09-29 19:05 UTC，commit `c4632ac`（Task 1–11，三輪 reviewer；第三輪「可部署」＋1 Warning 主線程修）。
+部署：整包 rsync → §4.2 build → restart `filet-api`、`filet-dashboard`（follower 未重啟）→ DEPLOYED_VERSION → Task 1-op
+（正式機 `set_follower_leader` dry-run 閘門：心跳 leader == 0xedea、白名單通過 → `--yes`，名冊備份 `followers.json.bak-20260930`）
+→ `filet_regression_check --http --ssh` 67/67 PASS。**§5.8c 冷建預熱這次沒做也不需要**：§5.8e 之後 publisher 在重啟後第一次
+有變更時直接從本機 `explore.db` 合成 v5 快照，實測 139 秒恢復（300 列、含 risk），不打 HL；RUNBOOK 已補註。
+發現的既有問題（非本次引入）：`compose_rows` 對 0x4cae…7c34 每輪 enrich 失敗 `DivisionUndefined`（重啟前 24h 已 1,377 次），該列被降 pending；
+`leader_changes.json` 的 f438 記錄在名冊更新後仍未被 watcher 回收（回收只在 activate／heal 分支跑，對非 pending 帳號不觸發；引擎對已兌現 nonce 忽略，無害）。
+原狀態：2026-09-30 使用者確認共識，派工中。裁決：風險指標照 plan（距強平 15/30 分級＋交易員頁維持保證金比）；探索列在曝險欄旁加一欄；部署順序照 plan（另一條線先 commit 乾淨再整包部署）。
 
 **Goal:** (1) 客戶儀表板顯示引擎實際生效的 leader，而不是名冊（followers.json）裡的初始值；(2) 管理端能一次性把名冊改對；(3) 交易員頁與探索頁顯示 leader 的「距強平幅度」與「維持保證金比」，讓客戶自己看得到 leader 的爆倉距離。
 
