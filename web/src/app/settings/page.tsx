@@ -551,7 +551,8 @@ function ReferralSection({ me }: { me: Me }) {
       {showSignButton && (
         <>
           <div className="step-actions">
-            <button type="button" className="btn btn-secondary"
+            {/* 2026-09-29 使用者裁決：與主要簽署鈕同款（白字實心），避免客戶忽略選填的推薦碼簽署 */}
+            <button type="button" className="btn btn-primary"
               disabled={signing || !risk.data} onClick={() => void sign()}>
               {signing ? c.signing : c.signButton}
             </button>
