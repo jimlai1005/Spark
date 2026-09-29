@@ -277,6 +277,40 @@ function exploreRowBody(over: Record<string, unknown> = {}) {
   };
 }
 
+// 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：leader 爆倉風險摘要
+// （`ExploreRow.risk`），一律出自後端 `risk_from_clearinghouse()`。
+describe("getPublicExplore — risk 欄位解析（Task 7）", () => {
+  it("完整 risk 物件原樣解析", async () => {
+    mockFetchOnce(() => jsonResponse({
+      rows: [exploreRowBody({ risk: { liq_distance_pct: 27.5, liq_coin: "PUMP", maint_ratio: 0.296 } })],
+    }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].risk).toEqual({ liq_distance_pct: 27.5, liq_coin: "PUMP", maint_ratio: 0.296 });
+  });
+
+  it("risk 缺鍵（舊快照／舊後端）→ 三鍵皆 null，不得補 0", async () => {
+    mockFetchOnce(() => jsonResponse({ rows: [exploreRowBody({})] }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].risk).toEqual({ liq_distance_pct: null, liq_coin: null, maint_ratio: null });
+  });
+
+  it("risk 三鍵皆為 null（無部位／未回 liquidationPx）→ 原樣保留", async () => {
+    mockFetchOnce(() => jsonResponse({
+      rows: [exploreRowBody({ risk: { liq_distance_pct: null, liq_coin: null, maint_ratio: null } })],
+    }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].risk).toEqual({ liq_distance_pct: null, liq_coin: null, maint_ratio: null });
+  });
+
+  it("已越線（負值）→ 原樣保留負數，不 clamp", async () => {
+    mockFetchOnce(() => jsonResponse({
+      rows: [exploreRowBody({ risk: { liq_distance_pct: -3.2, liq_coin: "ETH", maint_ratio: 1.1 } })],
+    }));
+    const r = await getPublicExplore(1, EXPLORE_FILTERS);
+    expect(r.rows[0].risk.liq_distance_pct).toBe(-3.2);
+  });
+});
+
 describe("getPublicExplore — normalizeExploreRow null 欄位不得轉 0（P6 契約 A / Task 6.6）", () => {
   it("live_days: null → 保持 null（不得補 0）", async () => {
     mockFetchOnce(() => jsonResponse({ rows: [exploreRowBody({ live_days: null })] }));
@@ -346,12 +380,22 @@ describe("getPublicTraderDetail", () => {
     sample_days: 72,
     sample_threshold: 30,
     cagr_pct: "45.23",
+    // 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：leader 爆倉風險摘要
+    // ——真實形狀錨例（0xedea，見 `tests/test_hl_explore_risk.py`）。
+    risk: { liq_distance_pct: 27.5, liq_coin: "PUMP", maint_ratio: 0.296 },
   };
 
   it("原樣回傳交易員詳情", async () => {
     mockFetchOnce(() => jsonResponse(DETAIL));
     const r = await getPublicTraderDetail(DETAIL.address);
     expect(r).toEqual(DETAIL);
+  });
+
+  it("risk 缺鍵（舊後端）→ 三鍵皆 null，不得補 0（Task 7）", async () => {
+    const { risk: _drop, ...withoutRisk } = DETAIL;
+    mockFetchOnce(() => jsonResponse(withoutRisk));
+    const r = await getPublicTraderDetail(DETAIL.address);
+    expect(r?.risk).toEqual({ liq_distance_pct: null, liq_coin: null, maint_ratio: null });
   });
 
   it("422/503 → null（呼叫端渲染空態，不偽造交易員物件）", async () => {

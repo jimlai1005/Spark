@@ -155,6 +155,7 @@ const LEADER: MyLeaderResp = {
   leader_address: "0x1111111111111111111111111111111111111111",
   leader_name: "Alpha", pending_change: null,
   note: "你目前跟隨 Alpha。",
+  leader_source: "engine",
 };
 
 beforeEach(() => {
@@ -206,6 +207,95 @@ describe("SettingsPage — 四段渲染", () => {
       .toHaveAttribute("href", "/strategies");
     expect(screen.getByRole("link", { name: COPY.settings.leader.advancedModeBtn }))
       .toHaveAttribute("href", "/advanced");
+  });
+});
+
+// ==================== leader 顯示真相化（plan `leader-truth-and-liq-risk` Task 3）====================
+
+describe("SettingsPage — leader_source 中性 hint（Task 3）", () => {
+  it("leader_source: 'manifest' 且有 leader 位址 → 顯示 hint", async () => {
+    getMyLeader.mockResolvedValue({ ...LEADER, leader_source: "manifest" });
+    render(wrap(<SettingsPage />));
+
+    expect(await screen.findByText(COPY.settings.leader.leaderSourceManifestHint)).toBeInTheDocument();
+  });
+
+  it("leader_source: 'engine' → 不顯示 hint", async () => {
+    getMyLeader.mockResolvedValue({ ...LEADER, leader_source: "engine" });
+    render(wrap(<SettingsPage />));
+
+    await screen.findByRole("heading", { name: COPY.settings.leader.title });
+    expect(screen.queryByText(COPY.settings.leader.leaderSourceManifestHint)).not.toBeInTheDocument();
+  });
+
+  it("leader_source 缺鍵（舊後端／測試假資料）→ 視為 manifest，顯示 hint", async () => {
+    const { leader_source: _drop, ...withoutSource } = LEADER;
+    getMyLeader.mockResolvedValue(withoutSource as MyLeaderResp);
+    render(wrap(<SettingsPage />));
+
+    expect(await screen.findByText(COPY.settings.leader.leaderSourceManifestHint)).toBeInTheDocument();
+  });
+
+  it("leader_address 為 null（尚未指定 leader）→ 即使 leader_source manifest 也不顯示 hint", async () => {
+    getMyLeader.mockResolvedValue({
+      account_id: "fabc", status: "engine_default", leader_address: null, leader_name: null,
+      pending_change: null, note: "你已啟用跟單，但尚未指定 leader。", leader_source: "manifest",
+    });
+    render(wrap(<SettingsPage />));
+
+    await screen.findByRole("heading", { name: COPY.settings.leader.title });
+    expect(screen.queryByText(COPY.settings.leader.leaderSourceManifestHint)).not.toBeInTheDocument();
+  });
+});
+
+// ==================== 審查後修正 Task 9（C1 前端）：status "engine_no_leader" ====================
+
+describe("SettingsPage — status 'engine_no_leader'（審查後修正 Task 9，C1）", () => {
+  const ENGINE_NO_LEADER: MyLeaderResp = {
+    account_id: "fabc", status: "engine_no_leader",
+    leader_address: null, leader_name: null, pending_change: null,
+    note: "引擎目前沒有跟隨任何 leader（跟單已撤銷或已停止）；請看本頁的風控與狀態區塊。",
+    leader_source: "engine",
+  };
+
+  it("顯示 notesByStatus.engine_no_leader 的中性文案（不是後端原文、不是「暫時不可用」）", async () => {
+    getMyLeader.mockResolvedValue(ENGINE_NO_LEADER);
+    render(wrap(<SettingsPage />));
+
+    expect(
+      await screen.findByText(COPY.settings.leader.notesByStatus.engine_no_leader),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(ENGINE_NO_LEADER.note)).not.toBeInTheDocument();
+  });
+
+  it("不顯示 manifest 來源 hint（leader_source 為 engine）", async () => {
+    getMyLeader.mockResolvedValue(ENGINE_NO_LEADER);
+    render(wrap(<SettingsPage />));
+
+    await screen.findByRole("heading", { name: COPY.settings.leader.title });
+    expect(screen.queryByText(COPY.settings.leader.leaderSourceManifestHint)).not.toBeInTheDocument();
+  });
+
+  it("不顯示任何 pending_change 區塊（恆為 null）", async () => {
+    getMyLeader.mockResolvedValue(ENGINE_NO_LEADER);
+    render(wrap(<SettingsPage />));
+
+    await screen.findByRole("heading", { name: COPY.settings.leader.title });
+    expect(screen.queryByText(COPY.settings.leader.pendingTitle)).not.toBeInTheDocument();
+  });
+
+  // 第二輪審查後修正 Task 11（W3）：`noneTitles` 原本缺 `engine_no_leader`，
+  // 落到 `noneTitleOf` 的 unknown fallback，會多顯示一行「狀態碼:
+  // engine_no_leader」逃生行——那是給未知狀態用的除錯線，不該出現在已知情境。
+  it("顯示 noneTitles.engine_no_leader 專屬標題，不出現「狀態碼」逃生行", async () => {
+    getMyLeader.mockResolvedValue(ENGINE_NO_LEADER);
+    render(wrap(<SettingsPage />));
+
+    expect(
+      await screen.findByText(COPY.settings.leader.noneTitles.engine_no_leader),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(COPY.settings.leader.noneTitleFallback)).not.toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(`^${COPY.settings.leader.statusLabel}:`))).not.toBeInTheDocument();
   });
 });
 

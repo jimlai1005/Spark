@@ -129,6 +129,41 @@ def test_account_value_failure_degrades_to_null_not_503(tmp_path):
     body = r.json()
     assert body["account_value"] is None
     assert body["windows"]["allTime"]["pnl_usd"] == 200.0
+    # 2026-09-30 plan `leader-truth-and-liq-risk` Task 6：`ch_state` 真的是
+    # None（上游查詢拋例外，`_cached_trader_data` 的預設值未被覆寫）——
+    # `risk_from_clearinghouse(None)` 三鍵皆 None，同一次失敗不得讓端點 500。
+    assert body["risk"] == {"liq_distance_pct": None, "liq_coin": None, "maint_ratio": None}
+
+
+def test_trader_detail_risk_reflects_liquidation_price_and_maintenance_ratio(tmp_path):
+    """2026-09-30 plan `leader-truth-and-liq-risk` Task 6：`risk` 物件的數字
+    與獨立呼叫 `hl_explore.risk_from_clearinghouse` 逐位相等（工程原則 1：
+    單一定義點）。"""
+    from spark.publicapi import hl_explore
+
+    app, cfg2, store, keysvc, hl = make_app(tmp_path)
+    hl.portfolios[_A] = sixty_day_rows()
+    ch_state = {
+        "marginSummary": {"accountValue": "10000"},
+        "crossMarginSummary": {"accountValue": "10000"},  # Task 8 C2：純 cross 情境，同值
+        "crossMaintenanceMarginUsed": "500",
+        "assetPositions": [{"position": {
+            "coin": "BTC", "szi": "1", "entryPx": "100",
+            "unrealizedPnl": "0", "marginUsed": "9000",
+            "leverage": {"type": "cross", "value": "10"},
+            "liquidationPx": "50000", "positionValue": "60000",
+        }}],
+    }
+    hl.clearinghouse[_A] = ch_state
+    r = _client(app).get(f"/api/public/traders/{_A}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    expected = hl_explore.risk_from_clearinghouse(ch_state)
+    assert body["risk"] == {"liq_distance_pct": expected.liq_distance_pct,
+                            "liq_coin": expected.liq_coin,
+                            "maint_ratio": expected.maint_ratio}
+    assert body["risk"]["liq_coin"] == "BTC"
+    assert body["risk"]["maint_ratio"] == 0.05
 
 
 def test_no_perf_still_200_with_all_windows_none(tmp_path):
@@ -144,6 +179,10 @@ def test_no_perf_still_200_with_all_windows_none(tmp_path):
     assert body["live_days"] == 0
     assert body["exposure"] is None
     assert body["fills_30d"]["order_count"] == 0
+    # 2026-09-30 plan `leader-truth-and-liq-risk` Task 6：本測試未塞
+    # `hl.clearinghouse`，`FakeHL.clearinghouse_state` 回退成無持倉、無
+    # `crossMaintenanceMarginUsed` 的預設 dict——`risk` 三鍵仍須存在，皆 null。
+    assert body["risk"] == {"liq_distance_pct": None, "liq_coin": None, "maint_ratio": None}
 
 
 # ============================================================
@@ -465,8 +504,9 @@ def test_trader_detail_shape_matches_explore_windows(tmp_path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert set(body) >= {"address", "account_value", "follow_blocked", "live_days", "exposure",
-                         "windows", "fills_30d", "methodology", "metrics",
+                         "risk", "windows", "fills_30d", "methodology", "metrics",
                          "sample_days", "sample_threshold"}
+    assert set(body["risk"]) == {"liq_distance_pct", "liq_coin", "maint_ratio"}
     assert set(body["windows"]) == {"day", "week", "month", "allTime"}
     assert set(body["metrics"]) == {"day", "week", "month", "allTime"}
     # month/allTime 兩窗在 0x6648 上都被閘門判無效 → 該窗 metrics 全部 insufficient
@@ -508,6 +548,7 @@ def test_trader_detail_and_explore_row_agree_on_same_address(tmp_path):
     assert detail["fills_30d"]["order_count"] == row["order_count_30d"]
     assert detail["fills_30d"]["closed_positions"] == row["closed_positions_30d"]
     assert detail["fills_30d"]["win_rate_pct"] == row["close_win_rate_pct"]
+    assert detail["risk"] == row["risk"]
     assert detail["fills_30d"]["realized_pnl_usd"] == row["realized_pnl_30d_usd"]
 
 

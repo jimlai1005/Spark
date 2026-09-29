@@ -271,7 +271,15 @@ MAX_CONCENTRATION_PCT_RANGE = (1, 100)
 # 單一 `published_at` 冒充全部欄位同時新鮮）——`load_snapshot` 讀到 v3 快照
 # 會就地補上這兩欄（`as_of` 全填 `built_at`、`fills_coverage` 為
 # `backfilling`）後當 v4 載入，不因版號不符就整份丟棄（D7：不丟棄舊快照）。
-EXPLORE_INDEX_VERSION = 4
+# 4 → 5（2026-09-30，plan `leader-truth-and-liq-risk` Task 5）：`ExploreRow`
+# 新增 `liq_distance_pct`／`liq_coin`／`maint_ratio` 三欄（leader 爆倉風險摘要，
+# 見 `risk_from_clearinghouse`）——結構相容（純新增欄位、非 breaking rename），
+# 但**刻意不**比照 v3→v4 做就地遷移：舊快照沒有這三個欄位的正確值可補（不像
+# `as_of`／`fills_coverage` 能用 `built_at`/`backfilling` 合理回填），故 v4
+# 快照在此版直接視為不相容、整份丟棄（`load_snapshot` 的 `version not in
+# (EXPLORE_INDEX_VERSION, 3)` 判斷不含 4）。部署必須照 RUNBOOK §5.8c 先本機
+# 預建 300 池快照再重啟，避免正式機冷建期間空榜。
+EXPLORE_INDEX_VERSION = 5
 
 # Task 4.1：`fills_coverage` 的預設值（`ExploreRow` 欄位預設值與 v3→v4 快照
 # 遷移共用同一份常數，避免兩處手寫字面量漂移）。
@@ -432,6 +440,13 @@ class ExploreRow:
     eligibility_reason: str | None = None  # 值域：live_days/max_dd/min_fills/
                                             # concentration/portfolio_missing/
                                             # fills_unknown/enrich_error；eligible 為 None
+    # 2026-09-30（plan `leader-truth-and-liq-risk` Task 5，`EXPLORE_INDEX_VERSION`
+    # 4→5）：leader 爆倉風險摘要，值一律出自 `risk_from_clearinghouse(ch_state)`
+    # （`enrich_candidate` 內呼叫，工程原則 1：不得在這裡另算）。`ch_state`
+    # 缺席（尚未 enrich 過）或交易所未回 `liquidationPx` → 三鍵皆 `None`。
+    liq_distance_pct: float | None = None
+    liq_coin: str | None = None
+    maint_ratio: float | None = None
 
     def to_dict(self) -> dict:
         row = mask_incomplete_fills(self)
@@ -456,6 +471,8 @@ class ExploreRow:
             "fills_coverage": dict(row.fills_coverage),
             "eligibility": row.eligibility,
             "eligibility_reason": row.eligibility_reason,
+            "risk": {"liq_distance_pct": row.liq_distance_pct,
+                    "liq_coin": row.liq_coin, "maint_ratio": row.maint_ratio},
         }
 
 
@@ -491,6 +508,11 @@ def _row_from_dict(d: dict) -> ExploreRow:
     windows = {k: (WindowStats.from_dict(v) if v is not None else None)
               for k, v in (d.get("windows") or {}).items()}
     exposure = d.get("exposure") or {}
+    # 2026-09-30 Task 5：舊快照（`EXPLORE_INDEX_VERSION` < 5，或 v5 但這一列
+    # 建於本欄位新增之前）缺 `risk` 鍵 → `.get()` 落回 `{}`，三鍵皆 `None`
+    # （與 `fills_coverage` 的「未知≠冒充」精神一致，不必另外遷移，`query()`
+    # 下一輪重新 enrich 就會補齊）。
+    risk = d.get("risk") or {}
     return ExploreRow(
         address=d["address"],
         display_name=d.get("display_name"),
@@ -523,6 +545,9 @@ def _row_from_dict(d: dict) -> ExploreRow:
         # 門檻重新 `classify()`，不會讓過期的預設值長期冒充真正的資格。
         eligibility=d.get("eligibility", "eligible"),
         eligibility_reason=d.get("eligibility_reason"),
+        liq_distance_pct=risk.get("liq_distance_pct"),
+        liq_coin=risk.get("liq_coin"),
+        maint_ratio=risk.get("maint_ratio"),
     )
 
 
@@ -575,6 +600,12 @@ def load_snapshot(path: str, *, cfg: "ExploreConfig | None" = None) -> dict | No
     if not isinstance(payload, dict):
         return None
     version = payload.get("version")
+    # S5（2026-09-30 reviewer）：為什麼 `3` 硬編在這裡而 `4` 不在——v3→v4 的兩個
+    # 新欄位（`as_of`／`fills_coverage`）有可回填的合理值（`built_at`／
+    # `backfilling`，見下方 `version == 3` 分支），v4→v5 的三個風險欄位沒有
+    # （見 `EXPLORE_INDEX_VERSION` 旁常數註記）。這不是一條通用的「保留一版
+    # 相容」規則，是逐次版本升級各自評估「舊快照有沒有東西可回填」的結果——
+    # 5→6 若再發生，一樣要重新評估，不是機械地把 `4` 也加進這個 tuple。
     if version not in (EXPLORE_INDEX_VERSION, 3):
         return None
     try:
@@ -653,12 +684,41 @@ def _account_bucket(account_value: Decimal | None) -> str:
     return "$1M+"
 
 
+def _safe_decimal(raw) -> Decimal | None:
+    """`raw` 是 `None`、無法轉成 `Decimal`，或轉出來的值非有限（`NaN`／
+    `Infinity`，交易所偶爾對缺乏強平價的部位回這種字串而非 `null`）
+    → `None`（不拋例外）。供欄位本身合法可為 `null`／缺席的可選欄位
+    （`liquidationPx`／`positionValue`）用——與 `_parse_positions` 主
+    try/except 涵蓋的**必要**欄位（`szi`／`leverage`／`marginUsed`）區分開：
+    必要欄位壞掉讓整份 `assetPositions` 解析失敗（既有行為不變），可選欄位
+    壞掉只讓該欄位個別降級。⚠️ S1（2026-09-30 reviewer）：`Decimal("NaN")`
+    轉換本身不拋例外——沒有 `is_finite()` 這道檢查，`NaN` 會混進後續代數
+    （例如 `_liq_distance` 的距離比較），產生一個看似合法卻無意義的排序值。"""
+    if raw is None:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (ValueError, ArithmeticError, TypeError):
+        return None
+    if not value.is_finite():
+        return None
+    return value
+
+
 def _parse_positions(ch_state: dict) -> list[dict] | None:
-    """`assetPositions` → `[{"side": "long"/"short", "value": Decimal}, ...]`。
-    `value = marginUsed × leverage`（同 `app.py._dashboard_positions_raw` 的
-    既有欄位推導，欄位名已在該處驗證過，不是憑印象——刻意不 import 那支函式：
-    `app.py` 會 import 本模組，import 回去會成環）。形狀不符 → `None`
-    （呼叫端把曝險欄位個別降級成 `None`，不因持倉解析失敗連坐整列）。"""
+    """`assetPositions` → `[{"side", "value", "coin", "szi", "liquidation_px",
+    "position_value"}, ...]`。`side`／`value`（＝`marginUsed × leverage`）供
+    曝險（`_exposure`）用，既有欄位推導不變（同 `app.py._dashboard_positions_raw`
+    的既有欄位推導，欄位名已在該處驗證過，不是憑印象——刻意不 import 那支函式：
+    `app.py` 會 import 本模組，import 回去會成環）。`coin`／`szi`／
+    `liquidation_px`／`position_value` 供 `risk_from_clearinghouse`（Task 4）
+    用——同一支解析器供曝險與風險兩者共用，不另寫第二支（工程原則 1）；
+    `liquidation_px`／`position_value` 是交易所可能回 `null` 的欄位（見
+    `tests/fixtures/hl_payload_keys/mainnet-clearinghouseState.position.json`
+    的欄位名清單），個別缺席或非法值時該欄位降級為 `None`，不讓整個部位或
+    整份列表解析失敗。形狀不符（`szi`／`leverage`／`marginUsed` 缺席或非法）
+    → 整體回 `None`（呼叫端把曝險/風險欄位個別降級成 `None`，不因持倉解析
+    失敗連坐整列）。"""
     if not isinstance(ch_state, dict):
         return None
     raw = ch_state.get("assetPositions")
@@ -674,8 +734,14 @@ def _parse_positions(ch_state: dict) -> list[dict] | None:
             leverage = pos["leverage"]
             lev_val = Decimal(str(leverage["value"]))
             margin_used = Decimal(str(pos["marginUsed"]))
-            out.append({"side": "long" if szi > 0 else "short",
-                       "value": margin_used * lev_val})
+            out.append({
+                "side": "long" if szi > 0 else "short",
+                "value": margin_used * lev_val,
+                "coin": pos.get("coin"),
+                "szi": szi,
+                "liquidation_px": _safe_decimal(pos.get("liquidationPx")),
+                "position_value": _safe_decimal(pos.get("positionValue")),
+            })
     except (KeyError, ValueError, ArithmeticError, TypeError):
         return None
     return out
@@ -703,6 +769,114 @@ def exposure_from_clearinghouse(ch_state: dict) -> tuple[str | None, float | Non
     不得各自重新解析 `assetPositions`（工程原則 1）。`app.py` 只呼叫這個公開名，
     不碰底線私有的 `_parse_positions`／`_exposure`。"""
     return _exposure(_parse_positions(ch_state))
+
+
+@dataclass(frozen=True)
+class RiskSummary:
+    """`clearinghouse_state()` 同一次回應推導的 leader 爆倉風險摘要（2026-09-30
+    plan `leader-truth-and-liq-risk` Task 4）。零新增 HL 額度：全部由**已經在
+    抓**的 `clearinghouseState` 代數推導或直接讀交易所回報值。既有裁決一
+    （`app.py:357`）：不外流 `withdrawable`／`total_margin_used`——本摘要只給
+    「距強平」與「維持保證金比」兩個中性欄位。"""
+    liq_distance_pct: float | None   # 最近一個部位距強平的百分比（正數；已越線
+                                      # 交易所尚未執行強平時照實回負值；
+                                      # None＝無部位或交易所未回 liquidationPx）
+    liq_coin: str | None             # 對應 liq_distance_pct 的那個部位的幣
+    maint_ratio: float | None        # crossMaintenanceMarginUsed /
+                                      # crossMarginSummary.accountValue（同源同
+                                      # 基準，C2）；None＝缺欄位或 accountValue<=0
+
+
+# W3（2026-09-30 reviewer）：低於權益這個比例的殘量部位無法實質傷害帳戶
+# （常見於減倉／換倉留下的灰塵倉位），不拿它塗色──否則一條 $5 的殘量會把
+# 一條真正逼近強平的 $500k 主部位擠掉「最近距離」的位置，誤導使用者。
+RISK_MIN_POSITION_FRACTION = Decimal("0.01")
+
+
+def _liq_distance(ch_state: dict) -> tuple[float | None, str | None]:
+    """逐部位取 `(mark − liq)/mark`（多單）或 `(liq − mark)/mark`（空單），
+    `mark = position_value / |szi|`，取所有可計算部位的最小值（越小＝越接近
+    強平，已越線為負值，照實回不 clamp——供前端顏色分級判斷）。缺
+    `liquidation_px`／`position_value`（交易所可能回 `null`）的部位個別跳過，
+    不影響其他部位。⚠️ W3：`position_value` 低於
+    `RISK_MIN_POSITION_FRACTION × marginSummary.accountValue`（**全帳戶**
+    權益，不是 C2 那個 cross-only 分母——這裡量的是「這條倉位對整個帳戶重不
+    重要」，不是保證金池的歸屬）的部位一併跳過；`accountValue` 缺或 ≤ 0
+    → 不過濾（沒有基準就不猜）。"""
+    positions = _parse_positions(ch_state)
+    if not positions:
+        return None, None
+    margin_summary = ch_state.get("marginSummary")
+    account_value = (_safe_decimal(margin_summary.get("accountValue"))
+                     if isinstance(margin_summary, dict) else None)
+    min_material_value = (RISK_MIN_POSITION_FRACTION * account_value
+                          if account_value is not None and account_value > 0 else None)
+    best_dist: Decimal | None = None
+    best_coin: str | None = None
+    for p in positions:
+        liq = p.get("liquidation_px")
+        pv = p.get("position_value")
+        szi = p.get("szi")
+        if liq is None or pv is None or not szi:
+            continue
+        if min_material_value is not None and pv < min_material_value:
+            continue
+        mark = pv / abs(szi)
+        if mark == 0:
+            continue
+        dist = (mark - liq) / mark if szi > 0 else (liq - mark) / mark
+        if best_dist is None or dist < best_dist:
+            best_dist, best_coin = dist, p.get("coin")
+    if best_dist is None:
+        return None, None
+    pct = (best_dist * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return float(pct), best_coin
+
+
+def _maint_ratio(ch_state: dict) -> float | None:
+    """`crossMaintenanceMarginUsed / crossMarginSummary.accountValue`——两者皆
+    為 `clearinghouseState` 既有欄位（見
+    `tests/fixtures/hl_payload_keys/mainnet-clearinghouseState.json` 的欄位名
+    清單：`crossMaintenanceMarginUsed` 是頂層鍵、`crossMarginSummary` 是與
+    `marginSummary` 平行的另一個頂層鍵，**不**共用同一個 dict）。⚠️ C2
+    （2026-09-30 reviewer，工程原則 1「同源同基準」）：分子
+    `crossMaintenanceMarginUsed` 只計 cross 帳本的維持保證金，分母若用
+    `marginSummary.accountValue`（**全帳戶**權益，含 isolated 部位鎖住的
+    保證金）會把比值稀釋、低估——有 isolated 部位時尤其明顯。分子分母改為
+    同一個 `crossMarginSummary`：cross 保證金池自己的維持保證金 ÷ cross
+    保證金池自己的權益，isolated 部位不在此比值內（不是被忽略，是這個比值
+    的定義範圍本來就不含它）。任一缺鍵、非法值或 `accountValue <= 0`
+    → `None`（不得除零）。⚠️ C1（2026-09-30 第二輪 reviewer）：兩個輸入
+    改走 `_safe_decimal`——舊版直接 `Decimal(str(...))`：交易所偶爾回
+    `accountValue: "NaN"`，`Decimal("NaN")` 建構本身不拋例外，但下面
+    `<= 0` 的比較對 NaN 會拋 `InvalidOperation`（Python decimal 預設把 NaN
+    比較的 signal 設為 trap），讓 `/api/public/traders` 500；`"Infinity"`
+    則比較不拋（`Infinity <= 0` 為 False）卻讓除法靜默得 0.0——同一函式對
+    兩種非有限值給兩種不同錯誤行為，都不是 `None`。`_safe_decimal` 的
+    `is_finite()` 檢查統一把兩者擋在取值這一步，`<=0` 判斷因此永遠只會
+    見到有限值。"""
+    cross_margin_summary = ch_state.get("crossMarginSummary")
+    account_value = _safe_decimal(
+        cross_margin_summary.get("accountValue")
+        if isinstance(cross_margin_summary, dict) else None)
+    maint_used = _safe_decimal(ch_state.get("crossMaintenanceMarginUsed"))
+    if account_value is None or maint_used is None:
+        return None
+    if account_value <= 0:
+        return None
+    ratio = (maint_used / account_value).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    return float(ratio)
+
+
+def risk_from_clearinghouse(ch_state: dict | None) -> RiskSummary:
+    """公開出口：`clearinghouse_state()` 原始回應 → `RiskSummary`。同
+    `exposure_from_clearinghouse`——`app.py`（探索列投影與 `public_trader_detail`）
+    只呼叫這個公開名，兩頁共用同一個定義點（工程原則 1：兩頁的每一個數字都
+    只能從這裡出來）。"""
+    if not isinstance(ch_state, dict):
+        return RiskSummary(None, None, None)
+    liq_distance_pct, liq_coin = _liq_distance(ch_state)
+    return RiskSummary(liq_distance_pct, liq_coin, _maint_ratio(ch_state))
 
 
 def _abbreviate_address(address: str) -> str:
@@ -797,6 +971,9 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
         bucket = _account_bucket(account_value)
         positions = _parse_positions(ch_state)
         exp_dir, exp_pct = _exposure(positions)
+    # 2026-09-30 Task 5：值一律出自 `risk_from_clearinghouse`（工程原則 1，唯一
+    # 定義點）——不在這裡另算；函式本身已處理 `ch_state is None` → 三鍵皆 None。
+    risk = risk_from_clearinghouse(ch_state)
 
     # P6（D13，2026-09-20）：呼叫端省略 `fills_coverage`（既有直接呼叫
     # `enrich_candidate` 的呼叫端／測試，不參與 `ExploreStore` 分頁追蹤——不是
@@ -850,6 +1027,9 @@ def enrich_candidate(address: str, display_name: str | None, portfolio_raw,
         concentration_pct=concentration_pct,
         exposure_dir=exp_dir,
         exposure_pct=exp_pct,
+        liq_distance_pct=risk.liq_distance_pct,
+        liq_coin=risk.liq_coin,
+        maint_ratio=risk.maint_ratio,
         tags=(),
         fills_truncated=fs.truncated,
         **extra_fields,

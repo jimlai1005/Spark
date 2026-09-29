@@ -33,6 +33,7 @@ import { useSearchParams } from "next/navigation";
 import { Suspense, type Dispatch, type SetStateAction, useEffect, useState } from "react";
 import { NO_VALUE, fmtSignedUsd, fmtUpdatedAtUtc } from "@/lib/format";
 import { useCopy } from "@/lib/lang";
+import { liqDistanceDisplay } from "@/lib/liqDistance";
 import {
   EXPLORE_ORDERS, EXPLORE_SORT_FIELDS, EXPLORE_WINDOWS, fillsIncomplete, getPublicExplore,
   type ExploreFilters, type ExploreOrder, type ExploreResp, type ExploreRow,
@@ -509,6 +510,7 @@ function ExploreInner() {
                 />
               </div>
               <div>{c.table.exposure}</div>
+              <div>{c.table.liqDistanceLabel}</div>
               <div>{c.table.actions}</div>
             </div>
             {/* Task 6.2（P6 契約 B）：rows 若任一列帶 `eligibility` 欄位 → 依
@@ -700,6 +702,15 @@ function ExploreRowView(
           </div>
         )}
         <span className="mono explore-exposure-label">{exposureLabel}</span>
+      </div>
+      {/* 2026-09-30（plan `leader-truth-and-liq-risk` Task 7；Task 11 改用共用
+          `lib/liqDistance.ts`）：距強平欄——`title` 帶 `liq_coin`（哪個部位）
+          ＋計算方式說明，數字缺席顯示 —。 */}
+      <div
+        className={`mono explore-liq-distance ${liqDistanceDisplay(row.risk.liq_distance_pct).className}`}
+        title={row.risk.liq_coin != null ? `${row.risk.liq_coin} · ${c.liqDistanceHint}` : c.liqDistanceHint}
+      >
+        {liqDistanceDisplay(row.risk.liq_distance_pct).text}
       </div>
       <div className="explore-actions">
         {/* 2026-09-05（Task 6）：帶所選窗過去，詳情頁預設就是同一窗（D10）。 */}

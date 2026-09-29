@@ -1611,8 +1611,12 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
      `.explore-ret` 的 `min-width` 被 grid 固定寬蓋掉——改用 minmax 讓欄寬跟內容走。 */
   /* 2026-09-05 本機截圖驗證：加寬損益欄後總寬超過容器，跟單鈕被切——帳戶 180→172、
      走勢 96→88、曝險 bar 84→64（見 .explore-exposure-bar），總計省 36px 回到容器內。 */
-  display: grid; grid-template-columns: 36px 172px 88px minmax(7.5rem, auto) 80px 64px 72px 1fr 148px;
-  gap: 12px; align-items: center; padding: 14px 18px; min-width: 960px;
+  /* 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：曝險欄（1fr）與跟單鈕
+     （148px）之間加一欄「距強平」固定 68px（`XX.X%` 頂多 6 字元，不需要 minmax）
+     ，min-width 同步 +68px；沒有新增響應式斷點，沿用既有 `.explore-table` 的
+     `overflow-x:auto` 橫向捲動（手機寬度下整表格捲動，見驗收條件 5）。 */
+  display: grid; grid-template-columns: 36px 172px 88px minmax(7.5rem, auto) 80px 64px 72px 1fr 68px 148px;
+  gap: 12px; align-items: center; padding: 14px 18px; min-width: 1028px;
 }
 .explore-table-head { font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim); letter-spacing: .08em; }
 /* Task 12（2026-09-05，D13）：表頭排序按鈕——`all: unset` 移除瀏覽器按鈕預設外觀，
@@ -1625,7 +1629,7 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
    跟著 `.explore-table` 的 `overflow-x:auto` 一起橫向捲動，不會在窄螢幕下
    停在原地與已捲動的列錯位。字級／顏色沿用表頭 token，不新造。 */
 .explore-group-header {
-  min-width: 960px; padding: 10px 18px; border-top: 1px solid var(--border);
+  min-width: 1028px; padding: 10px 18px; border-top: 1px solid var(--border);
   font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim);
   letter-spacing: .08em; background: var(--inset);
 }
@@ -1660,6 +1664,15 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-exposure-bar { width: 64px; height: 5px; border-radius: 3px; background: var(--neg); overflow: hidden; }
 .explore-exposure-fill { height: 100%; background: var(--pos); }
 .explore-exposure-label { font-size: 12px; color: var(--text-dim); }
+.explore-liq-distance { font-size: 13px; }
+
+/* 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：距強平／維持保證金比
+   的數字變色——只改文字顏色，不加框、不加背景（既有裁決二：不放嚇人紅框／
+   急迫文案）。沿用既有 `--warn`／`--neg` token（同 `dashboard/EquityCard.tsx`
+   可用保證金 <5%／<2% 變色的既有慣例，那裡走 inline style，這裡因為探索表格
+   與交易員頁是 className 驅動的既有寫法，改用等義的 CSS class）。 */
+.risk-num--warn { color: var(--warn); }
+.risk-num--danger { color: var(--neg); }
 
 .explore-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .explore-view-btn, .explore-follow-btn { padding: 7px 12px; font-size: 12.5px; }

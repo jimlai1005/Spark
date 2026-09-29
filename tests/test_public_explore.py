@@ -81,15 +81,35 @@ def _portfolio_raw(month_values, alltime_values, start_ms=1_700_000_000_000):
     ]
 
 
-def _ch_state(account_value="50000", positions=None):
-    return {"marginSummary": {"accountValue": account_value},
-           "assetPositions": positions or []}
+def _ch_state(account_value="50000", positions=None, maint_used=None):
+    """2026-09-30 Task 5：`maint_used` 為選填——不傳時維持既有形狀（無
+    `crossMaintenanceMarginUsed` 頂層鍵，`maint_ratio` 因此降級為 None，
+    不影響既有曝險測試對 `_ch_state()` 形狀的假設）。Task 8 C2：有給
+    `maint_used` 時同步補 `crossMarginSummary.accountValue`（＝與
+    `marginSummary.accountValue` 同值——本檔全是純 cross 帳戶情境，`_maint_ratio`
+    自 C2 起分母改讀 `crossMarginSummary`，見 `hl_explore._maint_ratio`）。"""
+    ch = {"marginSummary": {"accountValue": account_value},
+         "assetPositions": positions or []}
+    if maint_used is not None:
+        ch["crossMaintenanceMarginUsed"] = maint_used
+        ch["crossMarginSummary"] = {"accountValue": account_value}
+    return ch
 
 
-def _position(coin, szi, leverage="10", margin_used="9000"):
-    return {"position": {"coin": coin, "szi": szi, "entryPx": "100",
-                         "unrealizedPnl": "0", "marginUsed": margin_used,
-                         "leverage": {"type": "cross", "value": leverage}}}
+def _position(coin, szi, leverage="10", margin_used="9000",
+              liquidation_px=None, position_value=None):
+    """2026-09-30 Task 5：`liquidation_px`／`position_value` 為選填（供
+    `risk_from_clearinghouse` 用）——既有呼叫端不傳時維持舊形狀（該部位對風險
+    計算而言等同「交易所未回 liquidationPx」，降級為 None，不影響既有曝險
+    測試）。"""
+    pos = {"coin": coin, "szi": szi, "entryPx": "100",
+          "unrealizedPnl": "0", "marginUsed": margin_used,
+          "leverage": {"type": "cross", "value": leverage}}
+    if liquidation_px is not None:
+        pos["liquidationPx"] = liquidation_px
+    if position_value is not None:
+        pos["positionValue"] = position_value
+    return {"position": pos}
 
 
 def _raw_fill(oid, dir_, start_position, sz, closed_pnl, coin="ETH", px="100", time=1):
@@ -223,6 +243,39 @@ def test_enrich_candidate_short_exposure_when_short_dominant():
     assert row is not None
     assert row.exposure_dir == "short"
     assert row.exposure_pct == 100.0
+
+
+def test_enrich_candidate_populates_risk_fields_from_risk_from_clearinghouse():
+    """2026-09-30 plan `leader-truth-and-liq-risk` Task 5：`enrich_candidate`
+    的 `liq_distance_pct`／`liq_coin`／`maint_ratio` 必須與獨立呼叫
+    `hl_explore.risk_from_clearinghouse(ch_state)` 逐位相等（工程原則 1：
+    單一定義點，`enrich_candidate` 不得另算）；`to_dict()` 的 `"risk"` 鍵同步
+    映出這三個值。"""
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    ch_state = _ch_state(
+        account_value="10000", maint_used="500",
+        positions=[_position("BTC", "1", margin_used="9000",
+                             liquidation_px="50000", position_value="60000")])
+    row = enrich_candidate(_A, None, portfolio_raw, [], ch_state)
+    assert row is not None
+    expected = hl_explore.risk_from_clearinghouse(ch_state)
+    assert (row.liq_distance_pct, row.liq_coin, row.maint_ratio) == (
+        expected.liq_distance_pct, expected.liq_coin, expected.maint_ratio)
+    assert row.liq_distance_pct == pytest.approx(16.7, abs=0.05)
+    assert row.liq_coin == "BTC"
+    assert row.maint_ratio == 0.05
+    d = row.to_dict()
+    assert d["risk"] == {"liq_distance_pct": row.liq_distance_pct,
+                         "liq_coin": row.liq_coin, "maint_ratio": row.maint_ratio}
+
+
+def test_enrich_candidate_risk_fields_none_when_ch_state_missing():
+    portfolio_raw = _portfolio_raw([1000, 1000], [1000] * 60)
+    row = enrich_candidate(_A, None, portfolio_raw, [], None)
+    assert row is not None
+    assert (row.liq_distance_pct, row.liq_coin, row.maint_ratio) == (None, None, None)
+    assert row.to_dict()["risk"] == {"liq_distance_pct": None, "liq_coin": None,
+                                     "maint_ratio": None}
 
 
 # ============================================================
@@ -885,12 +938,15 @@ def test_index_starts_with_no_rows_version_before_first_build():
     assert index._rows_version is None
 
 
-def test_snapshot_version_bumped_to_4():
-    """D7（2026-09-04）3；Task 4.1（2026-09-20）3→4：`ExploreRow` 新增
-    `as_of`／`fills_coverage` 兩欄（漸進發布，spec §9.2）——`load_snapshot`
-    對 v3 快照有專門的相容遷移路徑（見 `test_snapshot_load_version_mismatch_
-    returns_none` 旁的 v3 測試），本測試只釘住目前版號本身。"""
-    assert hl_explore.EXPLORE_INDEX_VERSION == 4
+def test_snapshot_version_bumped_to_5():
+    """D7（2026-09-04）3；Task 4.1（2026-09-20）3→4；2026-09-30 plan
+    `leader-truth-and-liq-risk` Task 5 4→5：`ExploreRow` 新增
+    `liq_distance_pct`／`liq_coin`／`maint_ratio` 三欄（leader 爆倉風險摘要）
+    ——`load_snapshot` 對 v3 快照有專門的相容遷移路徑（見
+    `test_snapshot_load_version_mismatch_returns_none` 旁的 v3 測試），v4
+    快照則直接視為不相容（見 `EXPLORE_INDEX_VERSION` 旁註記），本測試只釘住
+    目前版號本身。"""
+    assert hl_explore.EXPLORE_INDEX_VERSION == 5
 
 
 # ============================================================
@@ -905,7 +961,8 @@ def test_snapshot_dump_and_load_round_trips_rows(tmp_path):
     """磁碟快照落檔/載入 round-trip：`ExploreRow`（含 `windows` dict、tags、
     coins 等 tuple 欄位）序列化再反序列化後內容不變。"""
     path = str(tmp_path / "explore_snapshot.json")
-    row = _row(address=_A, coins=("BTC", "ETH"), tags=("low_drawdown",))
+    row = _row(address=_A, coins=("BTC", "ETH"), tags=("low_drawdown",),
+              liq_distance_pct=27.5, liq_coin="PUMP", maint_ratio=0.296)
     hl_explore.dump_snapshot(path, rows=[row], built_at=1234.5, total_scanned=7)
 
     loaded = hl_explore.load_snapshot(path)
@@ -921,6 +978,10 @@ def test_snapshot_dump_and_load_round_trips_rows(tmp_path):
     assert restored.windows["month"].pnl_usd == row.windows["month"].pnl_usd
     assert restored.windows["month"].max_dd_pct == row.windows["month"].max_dd_pct
     assert restored.windows["month"].max_dd_reason == row.windows["month"].max_dd_reason
+    # 2026-09-30 Task 5：風險三欄同其他欄位一樣要 round-trip 不變。
+    assert restored.liq_distance_pct == 27.5
+    assert restored.liq_coin == "PUMP"
+    assert restored.maint_ratio == 0.296
     assert restored.windows["day"] is None   # `_row()` 預設 day/week 缺席
 
 
@@ -963,11 +1024,13 @@ def test_snapshot_load_corrupt_json_returns_none(tmp_path):
 
 def test_snapshot_load_version_mismatch_returns_none(tmp_path):
     """版本不符（例如上一版程式碼寫的舊形狀快照）→ 忽略，視同沒有可用快照
-    （呼叫端走既有冷建語意）。Task 4.1：`EXPLORE_INDEX_VERSION - 1`（＝3）現在
-    是有專門遷移路徑的相容版本（見 `test_explore_publisher.py` 的 v3 遷移
-    測試），不再適合當「不相容」的例子——這裡改用真正沒有遷移路徑的舊版號。"""
+    （呼叫端走既有冷建語意）。Task 4.1：`EXPLORE_INDEX_VERSION - 1`（＝3）曾是
+    有專門遷移路徑的相容版本；2026-09-30 Task 5（4→5）起 v4 也直接視為不相容
+    （見 `EXPLORE_INDEX_VERSION` 旁註記）——用字面 `2` 而非相對偏移量：v3 是
+    唯一有遷移路徑的舊版本（穩定的設計基準，不隨每次 `EXPLORE_INDEX_VERSION`
+    上調而移動），`2` 保證恆低於它、不受未來版號上調影響。"""
     path = tmp_path / "explore_snapshot.json"
-    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 2,
+    path.write_text(json.dumps({"version": 2,
                                 "built_at": 1.0, "total_scanned": 0, "rows": []}))
     assert hl_explore.load_snapshot(str(path)) is None
 
@@ -989,10 +1052,10 @@ def test_index_loads_snapshot_at_construction_and_is_immediately_queryable(tmp_p
 
 
 def test_index_snapshot_version_mismatch_on_disk_ignored_falls_back_to_cold_build(tmp_path):
-    """Task 4.1：同上，`EXPLORE_INDEX_VERSION - 1`（3）已是相容版本，改用
-    `- 2` 當真正不相容的例子。"""
+    """Task 4.1：同上，字面 `2` 恆不相容（見
+    `test_snapshot_load_version_mismatch_returns_none` 的理由）。"""
     path = tmp_path / "explore_snapshot.json"
-    path.write_text(json.dumps({"version": hl_explore.EXPLORE_INDEX_VERSION - 2,
+    path.write_text(json.dumps({"version": 2,
                                 "built_at": 1.0, "total_scanned": 0, "rows": []}))
     index = ExploreIndex(cfg=ExploreConfig(), now_fn=lambda: 1000.0,
                          snapshot_path=str(path))
@@ -1129,6 +1192,10 @@ def test_endpoint_full_flow_after_build_completes(tmp_path):
     assert row["label"] == "Alice"
     assert row["windows"]["month"]["pnl_usd"] == 100.0   # 1100-1000
     assert body["pool"] == body["total_scanned"] == 1  # I-17：pool 欄位來自後端，不寫死
+    # 2026-09-30 Task 5：端到端投影——`_seed_hl` 的 `_ch_state()` 無持倉、無
+    # `crossMaintenanceMarginUsed`，`risk` 鍵仍必須存在（三值皆 None，不是
+    # 整個鍵消失）。
+    assert row["risk"] == {"liq_distance_pct": None, "liq_coin": None, "maint_ratio": None}
 
 
 # ============================================================

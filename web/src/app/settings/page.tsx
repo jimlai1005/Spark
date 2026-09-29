@@ -868,6 +868,14 @@ function LeaderBody({ data: d, c }: { data: MyLeaderResp; c: Copy["settings"]["l
         <p className="hint mono">{c.statusLabel}: {d.status}</p>
       )}
       <p className="hint">{leaderNoteOf(d, c)}</p>
+      {/* 2026-09-30（plan `leader-truth-and-liq-risk` Task 3）：來源為 manifest
+          （心跳缺席／過期／不可讀退回登記值）且有 leader 位址時，額外一行中性
+          hint——不加顏色、不加 icon（既有裁決二）。engine 來源不顯示任何多餘
+          東西。`leader_source` 缺鍵（理論上只在測試假資料或未升版的舊後端
+          出現，見 `api.ts::MyLeaderResp` 型別註記）一律視為 `"manifest"`。 */}
+      {d.leader_address !== null && (d.leader_source ?? "manifest") === "manifest" && (
+        <p className="hint">{c.leaderSourceManifestHint}</p>
+      )}
       {d.pending_change !== null && <PendingLeaderChange change={d.pending_change} c={c} />}
     </>
   );

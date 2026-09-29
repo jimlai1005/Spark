@@ -1616,6 +1616,12 @@ export const COPY_ZH = {
         engine_default: "你已啟用跟單，但尚未指定 leader",
         not_activated: "你的帳號尚未啟用跟單",
         indeterminate: "目前無法確認你的跟隨狀態",
+        /** 2026-09-30（plan `leader-truth-and-liq-risk` 第二輪審查後修正 Task
+         * 11，W3）：撤銷 leader 後（`status === "engine_no_leader"`）原本落在
+         * `noneTitleOf` 的 fallback 分支，會多顯示一行「狀態碼:
+         * engine_no_leader」逃生行——這是給未知狀態用的除錯線，不該出現在
+         * 已知、常見的撤銷情境。 */
+        engine_no_leader: "引擎目前沒有跟隨任何 leader",
       },
       noneTitleFallback: "目前沒有可顯示的跟隨對象",
       statusLabel: "狀態碼",
@@ -1639,10 +1645,18 @@ export const COPY_ZH = {
         indeterminate:
           "目前無法確認你的跟隨狀態（帳號清單有無法解析的條目）；"
           + "請聯絡管理員，不要當作「未在跟單」處理。",
+        /** 2026-09-30（plan `leader-truth-and-liq-risk` 審查後修正 Task 9，C1
+         * 前端）：引擎心跳正常但目前沒有跟隨任何 leader（撤銷／停止後）——不是
+         * 「引擎回報暫時不可用」，是真的沒有 leader；中性文案，不放急迫詞。 */
+        engine_no_leader: "引擎目前沒有跟隨任何 leader（跟單已撤銷或已停止）。",
       },
       pendingChangeNote:
         "你已簽署換 leader，尚未生效：引擎會在下一個 cycle 重新驗證你的"
         + "簽章與白名單後套用。",
+      /** 2026-09-30（plan `leader-truth-and-liq-risk` Task 3）：`leader_source
+       * === "manifest"` 且有 leader 位址時，在既有跟隨列下方多一行中性 hint
+       * ——不加顏色、不加 icon（既有裁決二）。engine 來源時不顯示。 */
+      leaderSourceManifestHint: "引擎回報暫時不可用，顯示登記值",
       changeStrategyBtn: "更換策略",
       advancedModeBtn: "進階模式",
       helpPrompt: "需要協助？", helpLink: "聯絡我們 →",
@@ -1787,10 +1801,16 @@ export const COPY_ZH = {
       // Task 12（2026-09-05，D13）：損益／最大回撤／實盤天數／結倉勝率四欄表頭
       // 可點擊排序，此文案為表頭按鈕的 title 提示。
       sortHint: "點擊排序",
+      // 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：曝險欄旁新增
+      // 「距強平」欄——中性名詞，不加急迫詞（既有裁決二）。
+      liqDistanceLabel: "距強平",
     },
     // 回撤定義揭露（權益指數 MDD，與交易所／第三方工具的原始淨值 MDD 不同），
     // 渲染於頁面底部 disclaimer／poolNote 附近。
     ddDefinition: "回撤以出入金中性化的權益指數計算，與交易所／第三方工具的定義不同",
+    // 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：距強平欄的計算方式
+    // 說明（title），與交易員頁共用同一份文案措辭。
+    liqDistanceHint: "以交易所回報的強平價對現價計算，取最近的一個部位",
     tags: { lowDrawdown: "低回撤", concentrated: "集中度高" },
     // D14（2026-08-30 主線程裁決）：後端 `exposure.dir` 改回傳 locale 中性代碼
     // `"long"`/`"short"`（見 `hl_explore.py`），顯示文案改由這裡對映。
@@ -1859,6 +1879,11 @@ export const COPY_ZH = {
     ddDefinition: "回撤以出入金中性化的權益指數計算，與交易所／第三方工具的定義不同",
     liveDaysLabel: "實盤天數",
     exposureLabel: "目前曝險",
+    // 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：曝險行旁新增風險
+    // 行——中性名詞，不加急迫詞（既有裁決二）。
+    liqDistanceLabel: "距強平",
+    maintRatioLabel: "維持保證金比",
+    liqDistanceHint: "以交易所回報的強平價對現價計算，取最近的一個部位",
     fillsHeading: "近 30 天成交統計",
     orders: "訂單",
     closedPositions: "平倉次數",
@@ -3244,6 +3269,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         engine_default: "Following is enabled, but no leader is specified yet",
         not_activated: "This account hasn't enabled following yet",
         indeterminate: "Your following status can't be confirmed right now",
+        engine_no_leader: "The engine is not following any leader right now",
       },
       noneTitleFallback: "There's no following target to show right now",
       statusLabel: "Status code",
@@ -3263,10 +3289,13 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         indeterminate:
           "Your following status can't be confirmed right now (the account list has an entry that "
           + "failed to parse). Please contact an admin — don't treat this as \"not following\".",
+        engine_no_leader:
+          "The engine is not following any leader right now (copy trading was revoked or stopped).",
       },
       pendingChangeNote:
         "You've signed a leader change that hasn't taken effect yet — the engine will re-verify your "
         + "signature and the whitelist before applying it on its next cycle.",
+      leaderSourceManifestHint: "Engine report temporarily unavailable; showing the registered leader",
       changeStrategyBtn: "Change strategy",
       advancedModeBtn: "Advanced mode",
       helpPrompt: "Need help?", helpLink: "Contact us →",
@@ -3368,8 +3397,10 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       exposure: "Current exposure",
       actions: "",
       sortHint: "Click to sort",
+      liqDistanceLabel: "To liquidation",
     },
     ddDefinition: "Drawdown is computed from a flow-neutralized equity index, which differs from exchange or third-party tool definitions",
+    liqDistanceHint: "Exchange-reported liquidation price vs mark, nearest position",
     tags: { lowDrawdown: "Low drawdown", concentrated: "High concentration" },
     exposureDir: { long: "Long", short: "Short" },
     subSep: " · Account ",
@@ -3424,6 +3455,9 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     ddDefinition: "Drawdown is computed from a flow-neutralized equity index, which differs from exchange or third-party tool definitions",
     liveDaysLabel: "Live days",
     exposureLabel: "Current exposure",
+    liqDistanceLabel: "To liquidation",
+    maintRatioLabel: "Maintenance ratio",
+    liqDistanceHint: "Exchange-reported liquidation price vs mark, nearest position",
     fillsHeading: "Last 30 days fills",
     orders: "Orders",
     closedPositions: "Closed positions",

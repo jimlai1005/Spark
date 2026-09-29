@@ -56,6 +56,7 @@ import { fmtAmount, fmtSignedUsd, fmtUpdatedAtUtc, NO_VALUE, shortAddr } from "@
 import { useQueryClient } from "@tanstack/react-query";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
+import { liqDistanceDisplay } from "@/lib/liqDistance";
 import {
   EXPLORE_WINDOWS, fillsIncomplete, getPublicTraderDetail, type ExploreWindow, type PublicTraderDetail,
 } from "@/lib/publicApi";
@@ -295,6 +296,17 @@ function TraderDetailInner() {
     : trader.exposure.pct != null
       ? `${COPY.explore.exposureDir[trader.exposure.dir]} ${trader.exposure.pct.toFixed(1)}%`
       : COPY.explore.exposureDir[trader.exposure.dir];
+  // 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：距強平／維持保證金比
+  // ——曝險行旁的風險行。`liq_distance_pct` 為 null 時整行顯示 —，不附幣種
+  // （`liq_coin` 恆與 `liq_distance_pct` 成對出現或成對缺席，見後端
+  // `risk_from_clearinghouse`）。
+  const liqDisplay = liqDistanceDisplay(trader.risk.liq_distance_pct);
+  const liqText = trader.risk.liq_distance_pct == null
+    ? NO_VALUE
+    : `${liqDisplay.text}（${trader.risk.liq_coin ?? NO_VALUE}）`;
+  const maintText = trader.risk.maint_ratio == null
+    ? NO_VALUE
+    : `${(trader.risk.maint_ratio * 100).toFixed(1)}%`;
   // ⭐ Task 9 Step 1（reviewer W2）：`fills_30d` 可能為 `null`（上游成交抓取
   // 失敗，見 `publicApi.ts` 型別檔頭）——顯示 `c.fillsUnavailable`，不得渲染
   // 四個偽造的 0。
@@ -393,6 +405,18 @@ function TraderDetailInner() {
             <div className="card metric-card">
               <div className="metric-card-label">{c.exposureLabel}</div>
               <div className="mono metric-card-value">{exposureText}</div>
+            </div>
+            {/* 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：曝險卡旁
+                加距強平／維持保證金比兩卡——中性名詞，不加急迫詞（既有裁決二）。 */}
+            <div className="card metric-card">
+              <div className="metric-card-label">{c.liqDistanceLabel}</div>
+              <div className={`mono metric-card-value ${liqDisplay.className}`} title={c.liqDistanceHint}>
+                {liqText}
+              </div>
+            </div>
+            <div className="card metric-card">
+              <div className="metric-card-label">{c.maintRatioLabel}</div>
+              <div className="mono metric-card-value">{maintText}</div>
             </div>
           </div>
 

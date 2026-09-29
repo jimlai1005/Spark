@@ -661,3 +661,69 @@ describe("TraderDetailPage", () => {
     });
   });
 });
+
+// ==================== leader 強平風險指標（plan `leader-truth-and-liq-risk` Task 7）====================
+
+describe("TraderDetailPage — 距強平／維持保證金比（Task 7）", () => {
+  it("risk 有值 → 顯示「距強平 X%（幣）」與「維持保證金比 Y%」", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({
+      ...DETAIL,
+      risk: { liq_distance_pct: 27.5, liq_coin: "PUMP", maint_ratio: 0.296 },
+    }));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.getByText(COPY.traders.liqDistanceLabel)).toBeInTheDocument();
+    expect(screen.getByText("27.5%（PUMP）")).toBeInTheDocument();
+    expect(screen.getByText(COPY.traders.maintRatioLabel)).toBeInTheDocument();
+    expect(screen.getByText("29.6%")).toBeInTheDocument();
+  });
+
+  it("liq_distance_pct < 15 → danger class", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({
+      ...DETAIL,
+      risk: { liq_distance_pct: 8.0, liq_coin: "BTC", maint_ratio: 0.5 },
+    }));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.getByText("8.0%（BTC）")).toHaveClass("risk-num--danger");
+  });
+
+  it("liq_distance_pct < 30 → warn class", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({
+      ...DETAIL,
+      risk: { liq_distance_pct: 22.0, liq_coin: "BTC", maint_ratio: 0.5 },
+    }));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.getByText("22.0%（BTC）")).toHaveClass("risk-num--warn");
+  });
+
+  it("已越線（負值）→ 顯示 0.0%（幣）並套 danger", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({
+      ...DETAIL,
+      risk: { liq_distance_pct: -3.2, liq_coin: "ETH", maint_ratio: 1.1 },
+    }));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.getByText("0.0%（ETH）")).toHaveClass("risk-num--danger");
+  });
+
+  it("risk 三鍵皆 null（無部位／舊後端）→ 顯示 —，不套色", async () => {
+    getMe.mockRejectedValue(new ApiError("auth", "未登入", 401));
+    stubFetch(() => jsonResponse({
+      ...DETAIL,
+      risk: { liq_distance_pct: null, liq_coin: null, maint_ratio: null },
+    }));
+    render(wrap(<TraderDetailPage />));
+    await screen.findByRole("heading", { level: 1 });
+    const liqValue = screen.getByText(COPY.traders.liqDistanceLabel).nextSibling as HTMLElement;
+    expect(liqValue.textContent).toBe(NO_VALUE);
+    expect(liqValue.className).not.toMatch(/risk-num--/);
+    const maintValue = screen.getByText(COPY.traders.maintRatioLabel).nextSibling as HTMLElement;
+    expect(maintValue.textContent).toBe(NO_VALUE);
+  });
+});

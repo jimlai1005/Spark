@@ -179,6 +179,47 @@ describe("getMyLeader（我目前跟隨的 leader）", () => {
     mockFetchJson(503, { detail: "跟隨狀態暫時不可用，請稍後重試" });
     await expect(api.getMyLeader()).rejects.toMatchObject({ kind: "upstream", status: 503 });
   });
+
+  // 2026-09-30（plan `leader-truth-and-liq-risk` Task 2/3）：`leader_source`
+  // 原樣穿透（本函式是 `request()` 直接轉型，不做逐欄位解析／預設值填補——
+  // 缺鍵的顯示層降級留給 `settings/page.tsx`：`d.leader_source ?? "manifest"`）。
+  it("leader_source: 'engine' 原樣帶出", async () => {
+    mockFetchJson(200, {
+      account_id: "fabc", status: "following",
+      leader_address: "0x1111111111111111111111111111111111111111",
+      leader_name: "Alpha", pending_change: null,
+      note: "這是引擎目前為你跟隨的 leader。", leader_source: "engine",
+    });
+    const r = await api.getMyLeader();
+    expect(r.leader_source).toBe("engine");
+  });
+
+  it("leader_source: 'manifest' 原樣帶出", async () => {
+    mockFetchJson(200, {
+      account_id: "fabc", status: "following",
+      leader_address: "0x1111111111111111111111111111111111111111",
+      leader_name: "Alpha", pending_change: null,
+      note: "引擎回報暫時不可用，以下為登記的 leader。", leader_source: "manifest",
+    });
+    const r = await api.getMyLeader();
+    expect(r.leader_source).toBe("manifest");
+  });
+
+  // 2026-09-30（plan `leader-truth-and-liq-risk` 審查後修正 Task 8/9，C1）：新狀態
+  // `engine_no_leader`——引擎心跳正常但目前沒有跟隨任何 leader（撤銷／停止後）。
+  it("status: 'engine_no_leader' 原樣帶出，leader_address/name/pending_change 皆為 null", async () => {
+    mockFetchJson(200, {
+      account_id: "fabc", status: "engine_no_leader",
+      leader_address: null, leader_name: null, pending_change: null,
+      note: "引擎目前沒有跟隨任何 leader（跟單已撤銷或已停止）。", leader_source: "engine",
+    });
+    const r = await api.getMyLeader();
+    expect(r.status).toBe("engine_no_leader");
+    expect(r.leader_address).toBeNull();
+    expect(r.leader_name).toBeNull();
+    expect(r.pending_change).toBeNull();
+    expect(r.leader_source).toBe("engine");
+  });
 });
 
 /**

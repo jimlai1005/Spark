@@ -430,6 +430,15 @@ export interface ExploreRow {
    * `portfolio_missing`／`fills_unknown`／`enrich_error`）；`eligible` 時為
    * `null`。未知代碼防禦性地不顯示額外文案（同 `tagLabel` 慣例）。 */
   eligibility_reason?: string | null;
+  /**
+   * 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：leader 爆倉風險摘要
+   * ，一律出自後端 `risk_from_clearinghouse()`（`hl_explore.py`）——探索列與
+   * 交易員頁（`PublicTraderDetail.risk`）共用同一個定義點，前端不得自算
+   * （工程原則 1）。`liq_distance_pct` 已是百分比數字，已越線（mark < liq）
+   * 照實回負值，顯示層自行決定 clamp／變色，不在這裡處理。`maint_ratio` 是
+   * 0–1 的比值（顯示時 ×100 加 %）。三鍵獨立可能為 `null`（無部位、交易所
+   * 未回 `liquidationPx`，或 `accountValue<=0`）——不是 0。 */
+  risk: { liq_distance_pct: number | null; liq_coin: string | null; maint_ratio: number | null };
 }
 
 /** Task 4.2（2026-09-20）：探索列／交易員詳情共用的成交完整性狀態
@@ -620,6 +629,19 @@ function normalizeWindowStats(v: unknown): ExploreWindowStats | null {
   };
 }
 
+/** 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：`ExploreRow.risk` 與
+ * `PublicTraderDetail.risk` 共用同一個解析函式（工程原則 1 的前端鏡射，同
+ * `normalizeWindowStats`／`normalizeFillsCoverage` 的既有慣例）——缺鍵／非物件
+ * ／欄位型別不符一律三鍵皆 `null`，不得補 0。 */
+function normalizeRisk(v: unknown): { liq_distance_pct: number | null; liq_coin: string | null; maint_ratio: number | null } {
+  const r = (v && typeof v === "object") ? v as Record<string, unknown> : {};
+  return {
+    liq_distance_pct: toNumberOrNull(r.liq_distance_pct),
+    liq_coin: typeof r.liq_coin === "string" ? r.liq_coin : null,
+    maint_ratio: toNumberOrNull(r.maint_ratio),
+  };
+}
+
 function normalizeExploreRow(v: unknown): ExploreRow | null {
   if (v == null || typeof v !== "object") return null;
   const r = v as Record<string, unknown>;
@@ -662,6 +684,7 @@ function normalizeExploreRow(v: unknown): ExploreRow | null {
     eligibility_reason: typeof r.eligibility_reason === "string"
       ? r.eligibility_reason
       : (r.eligibility_reason === null ? null : undefined),
+    risk: normalizeRisk(r.risk),
   };
 }
 
@@ -864,6 +887,9 @@ export interface PublicTraderDetail {
   as_of?: Record<string, number | null>;
   /** Task 4.2：同 `ExploreRow.fills_coverage`，見 `fillsIncomplete()`。 */
   fills_coverage?: FillsCoverage;
+  /** 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：同 `ExploreRow.risk`
+   * ，共用同一個後端定義點與同一個前端解析函式（`normalizeRisk`）。 */
+  risk: { liq_distance_pct: number | null; liq_coin: string | null; maint_ratio: number | null };
 }
 
 /**
@@ -922,6 +948,7 @@ export async function getPublicTraderDetail(address: string): Promise<PublicTrad
       refreshing: typeof body.refreshing === "boolean" ? body.refreshing : undefined,
       as_of: normalizeAsOf(body.as_of),
       fills_coverage: normalizeFillsCoverage(body.fills_coverage),
+      risk: normalizeRisk(body.risk),
     };
   } catch {
     return null;

@@ -61,6 +61,9 @@ const ROW_A: ExploreRow = {
   concentration_pct: 40.0,
   exposure: { dir: "long", pct: 72.0 },
   tags: ["low_drawdown"],
+  // 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：真實形狀錨例
+  // （0xedea，見 `tests/test_hl_explore_risk.py`）。
+  risk: { liq_distance_pct: 27.5, liq_coin: "PUMP", maint_ratio: 0.296 },
 };
 
 const ROW_B: ExploreRow = {
@@ -85,6 +88,8 @@ const ROW_B: ExploreRow = {
   concentration_pct: 95.0,
   exposure: { dir: null, pct: null },
   tags: ["concentrated"],
+  // 2026-09-30：無部位／交易所未回 liquidationPx → 三鍵皆 null，不是 0。
+  risk: { liq_distance_pct: null, liq_coin: null, maint_ratio: null },
 };
 
 function buildResp(over: Partial<ExploreResp> = {}): ExploreResp {
@@ -272,6 +277,66 @@ describe("ExplorePage — 表格渲染", () => {
     // 曝險方向：long/short 代碼對映成中文「多」/「空」，不是英文代碼本身。
     expect(screen.getByText(`${COPY.explore.exposureDir.long} 72.0%`)).toBeInTheDocument();
     expect(screen.getByText(`${COPY.explore.exposureDir.short} 66.0%`)).toBeInTheDocument();
+  });
+});
+
+// ==================== leader 強平風險指標（plan `leader-truth-and-liq-risk` Task 7）====================
+
+describe("ExplorePage — 距強平欄（Task 7）", () => {
+  it("表頭渲染「距強平」欄標籤", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.getByText(COPY.explore.table.liqDistanceLabel)).toBeInTheDocument();
+  });
+
+  it("liq_distance_pct 有值 → 顯示百分比且不變色（≥30）", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{ ...ROW_A, risk: { liq_distance_pct: 45.0, liq_coin: "BTC", maint_ratio: 0.1 } }, ROW_B],
+    })));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    const cell = screen.getByText("45.0%");
+    expect(cell.className).not.toMatch(/risk-num--/);
+  });
+
+  it("liq_distance_pct < 30 → warn class", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{ ...ROW_A, risk: { liq_distance_pct: 22.0, liq_coin: "BTC", maint_ratio: 0.1 } }, ROW_B],
+    })));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.getByText("22.0%")).toHaveClass("risk-num--warn");
+  });
+
+  it("liq_distance_pct < 15 → danger class", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{ ...ROW_A, risk: { liq_distance_pct: 8.0, liq_coin: "BTC", maint_ratio: 0.1 } }, ROW_B],
+    })));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.getByText("8.0%")).toHaveClass("risk-num--danger");
+  });
+
+  it("已越線（負值）→ 顯示 0.0% 並套 danger", async () => {
+    stubFetch(() => jsonResponse(buildResp({
+      rows: [{ ...ROW_A, risk: { liq_distance_pct: -3.2, liq_coin: "ETH", maint_ratio: 1.1 } }, ROW_B],
+    })));
+    render(<ExplorePage />);
+    await screen.findByText("Alice");
+    expect(screen.getByText("0.0%")).toHaveClass("risk-num--danger");
+  });
+
+  it("liq_distance_pct 為 null（ROW_B）→ 顯示 —", async () => {
+    stubFetch(() => jsonResponse(buildResp()));
+    const { container } = render(<ExplorePage />);
+    await screen.findByText("Alice");
+    // Alice（ROW_A）的欄位是 27.5%，Bob（ROW_B）的距強平欄應顯示 —；用
+    // `.explore-liq-distance` 依列序精確取兩列各自的儲存格，避免與其他既有
+    // 「—」（回撤欄等）混淆（W4 修正：原斷言只驗到 ROW_A，未驗到 ROW_B）。
+    const liqCells = container.querySelectorAll(".explore-liq-distance");
+    expect(liqCells[0].textContent).toBe("27.5%");
+    expect(liqCells[1].textContent).toBe("—");
   });
 });
 

@@ -1616,12 +1616,28 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         本端點**沒有任何 account 參數**（沿檔頭的既有慣例——「別人不能替你 onboard」
         是結構保證而不是檢查）。想查別人只能先拿到別人的 session。
 
-        ⭐ 四種狀態各有明確語意，**不用 null 讓前端猜**（`leader_address` 為 null
-        時，前端必須靠 `status` 才知道是「還沒活化」還是「用引擎預設」）：
-        - `following`：manifest 明確指定了 leader。
-        - `engine_default`：已活化但未指定 leader，引擎沿用進程 env 的
-          `COPY_LEADER_ADDRESS`（leader_resolve 的回退路徑）。這是**真的在跟單**，
-          只是跟的對象由部署決定——與「沒在跟單」是完全不同的處境。
+        ⭐ 五種狀態各有明確語意，**不用 null 讓前端猜**（`leader_address` 為 null
+        時，前端必須靠 `status` 才知道是「還沒活化」還是「用引擎預設」還是「引擎
+        沒在跟任何人」）。`following` 不再等於「manifest 明確指定了 leader」——
+        自 2026-09-30（leader 顯示真相化）起，有效 leader 優先取自引擎心跳，
+        `following` 真正的定義是「有效 leader 來自簽章或名冊的明確指定」：
+        - `following`：有效 leader（心跳優先、心跳不可用退回 manifest）明確指定，
+          且不是引擎沿用的 env 預設。
+        - `engine_default`：**要嘛**已活化但心跳也拿不到值、manifest 未指定
+          leader（引擎沿用進程 env 的 `COPY_LEADER_ADDRESS`，`leader_address`
+          為 null）；**要嘛**心跳 ok 且明確回報引擎正沿用 env 預設
+          （`leader.source == "env_default"`，此時 `leader_address` **有值**——
+          C1＋W1，2026-09-30 reviewer：心跳能明確告訴我們部署預設是誰，不必再
+          讓客戶對著一個 null 猜）。兩種子情況都是**真的在跟單**，只是跟的對象
+          由部署決定——與「沒在跟單」是完全不同的處境。
+        - `engine_no_leader`：**新狀態**（C1）。心跳 ok 但明確回報
+          `leader.address` 為 None——這是撤銷 leader 或引擎收尾後的真實狀態，
+          與「心跳讀不到、退回 manifest 顯示舊值」是完全不同的處境，
+          **不得**混進 manifest 退回分支（舊行為的 bug：心跳 ok 但
+          `raw_leader` 是 None 時退回 manifest，讓客戶看到一個引擎早已不再
+          跟隨的舊 leader，且 note 誤稱「引擎回報暫時不可用」）。
+          `leader_address`／`leader_name` 皆 null、`pending_change` 恆為 null
+          （沒有「有效 leader」可以拿去比對簽署記錄）。
         - `not_activated`：manifest 裡沒有這個帳號（活化是人工 CLI 動作，見 pending.py）。
         - `indeterminate`：帳號不在 manifest **且** manifest 有無法解析的條目——
           壞掉的那筆可能就是他自己的。回 `not_activated` 會讓一個正在跟單的客戶
@@ -1650,29 +1666,141 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                         "管理員會為你啟用，屆時這裡會顯示你跟隨的 leader。",
             }
 
-        leader = mine.leader_address
-        # 名稱只從白名單查（客戶在目錄頁看過的同一份資料）。⚠️ 治理旗標
-        # enabled／accepting_new **不外流**（沿 _leader_public 的既有理由）——
-        # 查無名稱只代表「不在目前的可選清單裡」，不告訴他是哪一種下架。
+        # ⭐⭐ 2026-09-30（leader 顯示真相化）：manifest 刻意不隨簽章即時更新（見
+        # leader_change_apply.py 檔頭），引擎實際生效的 leader 只活在心跳
+        # （`<exchange_dir>/engine/health/<account_id>.json`）。優先讀心跳、
+        # 心跳缺席／過期／不可讀才退回 manifest——與 ops 面板（`_apply_heartbeat`）
+        # 同一份讀法（`_read_heartbeat`），不另開第二種心跳解析路徑。
+        hb = _read_heartbeat(account_id, now_fn())
+        engine_leader = None
+        # 心跳自己回報「這個 leader 從哪來」（`LeaderResolution.source`：
+        # manifest／env_default／customer_signed，見 leader_resolve.py）——與
+        # 下面回應欄位 `leader_source`（engine／manifest，指「這次回應的值
+        # 從哪讀出」）是兩個不同維度，刻意分開命名，不要混用。
+        engine_leader_resolution_source = None
+        # ⭐ W1（2026-09-30 第二輪 reviewer）：`raw_leader` 有三種形狀，語意
+        # 完全不同——(1) 鍵存在且為 `None`＝引擎**明確**回報沒有 leader（撤銷／
+        # 收尾）；(2) 合法位址字串；(3) 壞字串（normalize 失敗）或非 str（例如
+        # 心跳序列化壞掉回了數字/dict）＝引擎回報**格式異常**，不可信但也不是
+        # 「明確沒有」，不得誤判成 `engine_no_leader`（那會讓客戶以為撤銷了，
+        # 實際只是心跳這一輪寫壞）。(3) 的正確處置是退回 manifest（同「心跳
+        # 不可用」分支），並用 `logger.error` 留痕＋專屬 note 措辭。
+        engine_leader_malformed = False
+        raw_leader = None
+        if hb.status == "ok":
+            hb_leader = hb.data.get("leader")
+            if hb_leader is None:
+                hb_leader = {}
+            elif not isinstance(hb_leader, dict):
+                # 第三輪 reviewer：`leader` 整個不是 dict（心跳被手改／寫壞）
+                # 與「address 是壞字串」同一類＝格式異常 → 退回 manifest，不 5xx。
+                hb_leader = {}
+                engine_leader_malformed = True
+            raw_leader = hb_leader.get("address")
+            if engine_leader_malformed:
+                engine_leader = None
+            elif raw_leader is None:
+                engine_leader = None
+            elif isinstance(raw_leader, str):
+                try:
+                    engine_leader = normalize_address(raw_leader)
+                except ValueError:
+                    engine_leader = None
+                    engine_leader_malformed = True
+            else:
+                engine_leader = None
+                engine_leader_malformed = True
+            engine_leader_resolution_source = hb_leader.get("source")
+
+        if hb.status == "ok" and engine_leader is None and not engine_leader_malformed:
+            # ⭐⭐ C1（2026-09-30 reviewer）：心跳 ok 且 `leader.address` 這個鍵
+            # **存在且為 None**（撤銷或引擎收尾後——`scripts/run_copytrade.py`
+            # 的 revoke 路徑每輪寫 `leader: {address: None, source: None,
+            # kind: None}`）——這是明確訊號，不是心跳不可用，不得落進下面的
+            # manifest 退回分支：那會讓客戶看到一個引擎早已不再跟隨的舊
+            # leader，且 note 誤稱「引擎回報暫時不可用」（危險方向的誤讀，
+            # 工程原則 3）。沒有「有效 leader」可比對，`pending_change` 恆為
+            # None——不呼叫 `_pending_leader_change`（呼叫了也只會是 None，
+            # 這裡直接明講，不靠巧合）。
+            return {
+                "account_id": account_id,
+                "status": "engine_no_leader",
+                "leader_address": None,
+                "leader_name": None,
+                "leader_source": "engine",
+                "pending_change": None,
+                "note": ("引擎目前沒有跟隨任何 leader（跟單已撤銷或已停止）；"
+                         "請看本頁的風控與狀態區塊。"),
+            }
+
+        if hb.status == "ok" and engine_leader is not None:
+            leader, leader_source = engine_leader, "engine"
+        elif hb.status == "ok" and engine_leader_malformed:
+            logger.error(
+                "心跳 leader.address 格式異常，退回 manifest account_id=%s raw=%r",
+                account_id, raw_leader,
+            )
+            leader, leader_source = mine.leader_address, "manifest"
+        else:
+            leader, leader_source = mine.leader_address, "manifest"
+
+        # 名稱查詢：先查精選白名單（客戶在目錄頁看過的同一份資料），查不到
+        # 再查 user registry（客戶自訂的 leader 不在精選白名單裡；registry 的
+        # `name` 欄位就是位址本身，前端照舊顯示縮寫）。⚠️ 治理旗標
+        # enabled／accepting_new **不外流**（沿 _leader_public 的既有理由）。
         name = None
         if leader is not None:
             try:
                 name = next((r.name for r in load_leaders(cfg.leaders_path)
                              if r.address == leader), None)
             except ValueError:
-                # 白名單壞掉不該讓客戶查不到自己的 leader：位址本身出自 manifest，
-                # 是獨立於白名單的真相。少一個顯示名稱而已，大聲留痕即可。
+                # 白名單壞掉不該讓客戶查不到自己的 leader：位址本身出自
+                # manifest／心跳，是獨立於白名單的真相。少一個顯示名稱而已，
+                # 大聲留痕即可。
                 logger.error("leader 白名單載入失敗（僅影響顯示名稱） %s", cfg.leaders_path)
+            if name is None:
+                try:
+                    name = next((r.name for r in load_user_leaders(cfg.user_leaders_path)
+                                 if r.address == leader), None)
+                except (OSError, ValueError) as e:
+                    logger.error("user leader registry 載入失敗（僅影響顯示名稱） %s: %s",
+                                 cfg.user_leaders_path, e)
+
+        if leader is None:
+            # 沒有可顯示的 leader（manifest 未指定、心跳也沒給出）：這是
+            # 「引擎沿用預設」的既有語意，不是「暫時不可用」——退回訊息以
+            # 「登記的 leader」措辭指向一個 null 值只會讓客戶更困惑。
+            note = ("你已啟用跟單，但尚未指定 leader，引擎沿用部署的預設設定。"
+                    "你可以到 leader 目錄選擇一位——在那之前，跟單仍在進行中。")
+        elif leader_source == "manifest" and engine_leader_malformed:
+            # W1：心跳 ok 但 leader.address 格式異常（壞字串／非 str）——與
+            # 「心跳不可用」用不同措辭，避免客戶誤以為引擎整個連不上。
+            note = "引擎回報格式異常，以下為登記的 leader。"
+        elif leader_source == "manifest" and hb.status in ("missing", "stale", "unreadable"):
+            note = ("引擎回報暫時不可用，以下為登記的 leader；"
+                    "引擎恢復回報後會自動更新。")
+        else:
+            note = "這是引擎目前為你跟隨的 leader。"
+
+        # ⭐ W1（2026-09-30 reviewer）：心跳明確回報「這是 env 預設」
+        # （`leader.source == "env_default"`）時，`engine_default` 帶著真正的
+        # `leader_address`（不再是 null）——引擎知道自己沿用哪個位址，沒有
+        # 理由讓客戶對著一個 null 猜。manifest 退回分支（`engine_leader_
+        # resolution_source` 恆為 None）走既有規則：manifest 有指定 → following、
+        # 沒指定（`leader` 為 None）→ engine_default。
+        if leader_source == "engine" and engine_leader_resolution_source == "env_default":
+            status = "engine_default"
+        else:
+            status = "following" if leader else "engine_default"
 
         return {
             "account_id": account_id,
-            "status": "following" if leader else "engine_default",
+            "status": status,
             "leader_address": leader,
             "leader_name": name,
+            "leader_source": leader_source,
             "pending_change": _pending_leader_change(account_id, leader),
-            "note": ("這是引擎目前為你跟隨的 leader。" if leader else
-                     "你已啟用跟單，但尚未指定 leader，引擎沿用部署的預設設定。"
-                     "你可以到 leader 目錄選擇一位——在那之前，跟單仍在進行中。"),
+            "note": note,
         }
 
     def _load_own_follower(account_id: str):
@@ -1694,12 +1822,16 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 bool(manifest_errors))
 
     def _pending_leader_change(account_id: str, current_leader: str | None) -> dict | None:
-        """客戶已簽署、但**尚未反映在 manifest** 的換 leader 記錄。
+        """客戶已簽署、但**尚未反映在有效 leader**（優先心跳、次於 manifest；見
+        `me_leader`）的換 leader 記錄。
 
-        ⭐ 只在「已提交的 leader ≠ manifest 目前的 leader」時才回報為 pending：
+        ⭐ 只在「已提交的 leader ≠ 目前有效的 leader」時才回報為 pending：
         引擎套用之後記錄仍留在檔案裡（write_leader_change 是同 account 覆蓋，不是
-        流水帳），若照單全收，客戶會永遠看到一個早就生效的「處理中」。比較的兩側
-        （記錄裡的位址、manifest 裡的位址）都已正規化成小寫，同基準（工程原則 1）。
+        流水帳），若照單全收，客戶會永遠看到一個早就生效的「處理中」。⚠️
+        `current_leader` 自 2026-09-30 起是**有效 leader**（心跳優先、manifest
+        退回，見呼叫端），不再單純是 manifest 值——記錄目標一旦與引擎心跳回報的
+        leader 相符，即視為已生效，不必等 manifest 追上。比較的兩側（記錄裡的
+        位址、傳入的有效 leader）都已正規化成小寫，同基準（工程原則 1）。
 
         ⚠️ 只投影 `leader_address` 與 `issued_at`——**signature 絕不外流**
         （沿 leaders_select 「不記 signature／message 原文」的政策）。
@@ -2821,6 +2953,12 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         fs = fills_stats(fills, truncated=fills_truncated) if fills is not None else None
         exp_dir, exp_pct = (hl_explore.exposure_from_clearinghouse(ch_state)
                            if ch_state else (None, None))
+        # 2026-09-30 plan `leader-truth-and-liq-risk` Task 6：同一次 `ch_state`
+        # （已在上面 `_cached_trader_data` 快取內，零新增上游呼叫）算 leader
+        # 爆倉風險摘要——與 `/api/public/explore`（`enrich_candidate`）共用
+        # 同一個定義點（工程原則 1）。`ch_state` 為 None（上游查詢失敗）時
+        # `risk_from_clearinghouse` 本身已回全 None，不需要另外分支。
+        risk = hl_explore.risk_from_clearinghouse(ch_state)
 
         # ⭐ D6 保留版（使用者明確要求保留 Sharpe 等比率型指標）：`metrics` 逐窗，
         # 每窗各自呼叫 `compute_window_performance`——與 `windows[w]`（`window_stats`
@@ -2844,6 +2982,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             "follow_blocked": _trader_follow_blocked(addr),
             "live_days": live_days,
             "exposure": None if exp_dir is None else {"dir": exp_dir, "pct": exp_pct},
+            "risk": {"liq_distance_pct": risk.liq_distance_pct, "liq_coin": risk.liq_coin,
+                    "maint_ratio": risk.maint_ratio},
             "windows": windows,
             "metrics": metrics,
             "fills_30d": fs.to_dict() if fs is not None else None,

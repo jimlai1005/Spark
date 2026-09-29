@@ -216,14 +216,21 @@ export function getMe(): Promise<Me> {
  * 決定。把兩者合併成一句「你沒有 leader」，會讓一個正在跟單的客戶以為資金沒在動。
  */
 export type MyLeaderStatus =
-  /** manifest 明確指定了 leader（`leader_address` 必為非 null）。 */
+  /** 有效 leader（引擎心跳或名冊）明確指定了 leader（`leader_address` 必為非 null）。 */
   | "following"
   /** 已活化但未指定 leader，引擎沿用進程 env 的預設——仍在跟單。 */
   | "engine_default"
   /** 帳號不在 manifest（活化是人工 CLI 動作）。 */
   | "not_activated"
   /** 帳號不在 manifest **且** manifest 有壞條目——壞的那筆可能就是他自己的。 */
-  | "indeterminate";
+  | "indeterminate"
+  /**
+   * 2026-09-30（plan `leader-truth-and-liq-risk` 審查後修正 Task 8/9）：引擎
+   * 心跳正常（`status=="ok"`）但 `leader.address` 為 `None`——跟單已撤銷或已
+   * 停止，引擎目前沒有跟隨任何 leader。`leader_address`／`leader_name` 恆為
+   * null、`leader_source` 恆為 `"engine"`、`pending_change` 恆為 null。
+   */
+  | "engine_no_leader";
 
 /**
  * 已簽署、尚未反映在 manifest 的換 leader 記錄（後端 `_pending_leader_change`）。
@@ -257,6 +264,17 @@ export interface MyLeaderResp {
   /** `following` 以外的狀態恆為 null（後端 `me_leader` 的結構性不變式）。 */
   leader_address: string | null;
   leader_name: string | null;
+  /**
+   * 2026-09-30（plan `leader-truth-and-liq-risk` Task 2/3）：`leader_address` 的
+   * 出處——`"engine"`＝引擎心跳（600 秒內有效）回報的實際生效 leader；
+   * `"manifest"`＝心跳缺席／過期／不可讀，退回名冊登記值。⭐ 現行後端恆回傳
+   * 這一鍵，型別標 optional 只是本函式（`request()`）對每個端點都是直接
+   * `res.json()` 轉型、不做逐欄位解析／預設值填補（與 `publicApi.ts` 的手寫
+   * normalizer 不同慣例）——本檔沒有第二種「缺鍵補預設」的機制，所以由
+   * **顯示層**（`settings/page.tsx`）在讀取時把缺鍵（`undefined`，理論上只會
+   * 發生在測試假資料或未來後端降版）視為 `"manifest"`，不在這裡加一層轉換函式。
+   */
+  leader_source?: "engine" | "manifest";
   pending_change: MyLeaderPendingChange | null;
   /** 每一種狀態各有一句後端原文——⚠️ M3 round4 Task R4-4 起顯示層改依 `status`
    * 從 `copy.ts`（`settings.leader.notesByStatus`）取雙語文案，本欄位只在
