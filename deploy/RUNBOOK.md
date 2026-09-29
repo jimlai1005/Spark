@@ -3596,3 +3596,25 @@ follower×3 未動；e4e9b9b→c1a8a37 之間 `src/` 只有已熱修的那一檔
 66,238 bytes（curl 三次皆完整合法）。修法：上限提到 4 MiB（同 commit 的下一筆 docs commit 帶上），修後 67/67。
 既有觀察（與本次無關，部署前已在發生）：API journal 每分鐘一行 `compose_rows：地址 0x4cae5b… enrich 失敗，改列 pending/enrich_error:
 InvalidOperation(DivisionUndefined)`——已被降級處理、零 Traceback，待另案查該地址的 0/0 來源。
+
+**2026-09-29 部署（commit `34b70e7`，13:15 UTC，熔斷後一律冷靜期自動恢復；引擎＋API＋前端，跟單中）：** plan
+`docs/superpowers/plans/2026-09-29-total-drawdown-auto-rearm.md`。使用者裁決（客戶是懶人投資法，放著不會再進來操作）：絕對底線
+`total_drawdown` 也走冷靜期自動恢復並於解鎖時清全期高水位（棘輪後果知情接受）；殘留暴險不擋自動恢復、只揭露；冷靜期地板 2 小時
+（`config.RISK_COOLDOWN_MIN_HOURS`＋`effective_cooldown_hours()`，spec `min` 同源），「設 0＝只有簽章才恢復」語意作廢；客戶簽章
+「立即恢復跟單」保留為快速通道。reviewer 兩輪（opus）：第一輪抓到 rebase 順序問題（先刪 ARM 再清高水位，中途被殺或清檔失敗＝每個
+冷靜期平倉一次的死循環）→ 改為先清高水位、驗證清掉、再刪 ARM，兩條恢復路徑共用 `_rebase_lifetime_peak_or_stay`，變異實測改回舊順序
+測試轉紅；心跳 `cooldown_hours` 改報地板值、API 三處同源；補 `owner_close` 永不自動恢復回歸釘。第二輪 PASS＋2 Warning（失敗告警
+dedup_key、過時註解）已修。
+前置確認：正式機 `DEPLOYED_VERSION`＝c1a8a37；四個 follower env 與唯一簽章記錄 cooldown 全為 12（**無 0 要遷移**）；ARM 檔只有
+fbac652（owner_close 終態、無 unit）。流程：§3.2 rsync 兩段（工作樹乾淨，直接推）→ `uv sync` 略過（pyproject 無變動，uv.lock mtime 仍
+07-17）→ `find -prune var` chown root（非 root 檔 4＝.venv symlink）→ 正式機 `filet-engine` Python 匯入新符號、`RISK_PARAM_SPECS`
+cooldown min=2 → §4.2 `npm ci`＋`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app` build → chown root → §9.2 restart `filet-api` →
+`filet-dashboard` → `reload_follower.sh`（3 個 follower；keysvc 未動）→ `DEPLOYED_VERSION`。
+⚠️ **`npm ci` 在 2 GB 機上跑了 14 分鐘**（RSS 880 MB、load 9、swap 300→107 MB 後回落），期間三個 follower 取樣仍每分鐘更新、零錯誤；
+但回歸腳本的 ssh `find` 在高負載下逾時 120 秒炸掉一次，等 load 回 2.5 重跑即過。教訓：純 Python 改動不要順手重 build 前端；
+package-lock 沒變時 `npm ci` 是白做（它會先刪 node_modules 再全裝），下次前端無改動就跳過 §4.2。
+驗證：本機 pytest 3409／ruff 乾淨／vitest 757；`.next` 含新文案、舊文案零殘留；api／dashboard／follower×3 全 active，`systemctl --failed`
+空；api `Uvicorn running`、dashboard `Ready in 2.8s`；本機 8700／3000 皆 200；restart 後三個 follower 取樣 2 秒內更新、心跳 38 秒內、
+`halt=None`、`cooldown_hours=12`；f6b3e7 部位（BTC 0.0162／ETH 1.1299／HYPE 7.8）restart 後零成交（最後成交 07:08 UTC 為 leader
+減倉鏡射）；`filet_regression_check --http --ssh` 67/67 PASS。journal 唯一 error 行仍是上述既有的 `compose_rows` enrich 警告。
+已跟單客戶的冷靜期語意變更由使用者自行溝通。

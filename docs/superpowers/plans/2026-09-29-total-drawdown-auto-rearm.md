@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.11 + uv、pytest（離線，autouse socket-ban）、ruff；前端 Next.js + vitest（`export PATH="/Users/jim/.nvm/versions/node/v24.18.0/bin:$PATH" && cd web && npm test`）。
 
+**狀態：✅ 已部署** 2026-09-29 13:15 UTC，commit `34b70e7`（Task 1–4b 六個 commit；reviewer 兩輪：第一輪 5 Warning 全修（Task 4b），第二輪 PASS＋2 Warning 已修於 `64aabf4`）。部署記錄見 `deploy/RUNBOOK.md` 部署日誌 2026-09-29 第三條。
+
 **使用者裁決（2026-09-29）：**
 1. 客戶是懶人投資法，放著不會再進來操作；絕對底線（`total_drawdown`）也比照冷靜期自動恢復，不做客戶簽章。
 2. 平倉失敗或掛單未撤（殘留暴險）**也不擋**自動恢復，時間一到直接恢復。
