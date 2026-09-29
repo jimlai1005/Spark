@@ -61,6 +61,7 @@ from spark.publicapi.explore_fills_sync import build_fills_coverage
 from spark.publicapi.explore_store import ADMISSION_MULTIPLIER, CacheEntry, ExploreStore
 # 健康面板讀的是**引擎自己寫的**狀態檔——路徑常數與判定一律引用引擎的定義，
 # 不在 API 這側重新宣告（兩份定義漂移的症狀是面板永遠顯示健康）。
+from spark.copytrade.config import RISK_COOLDOWN_MIN_HOURS
 from spark.copytrade.equity import sample_coverage
 from spark.copytrade.killswitch import ALERTS_LOG_RELPATH, is_tripped
 from spark.filet.engine_health import (HEARTBEAT_STALE_S, HeartbeatRead,
@@ -3718,16 +3719,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
     def _resume_at(tripped_at: str | None, cooldown_hours: str | None) -> str | None:
         """自動恢復的時刻＝熔斷時刻 ＋ 冷靜期；算不出來一律 None。
 
-        `None` 的三種來源刻意不分開（對客戶都是「沒有可顯示的自動恢復時刻」）：
-        讀不到熔斷時刻、讀不到冷靜期、或冷靜期為 0（＝不自動恢復）。前端對
-        `null` 的正確反應是顯示「不會自動恢復／無法確認」，而不是留白。
+        `None` 的兩種來源刻意不分開（對客戶都是「沒有可顯示的自動恢復時刻」）：
+        讀不到熔斷時刻、或讀不到冷靜期。⭐ 2026-09-29 起冷靜期沒有 0：引擎端以
+        RISK_COOLDOWN_MIN_HOURS 為地板，這裡用同一個地板算，顯示的時刻才是真的會發生的。
         """
         if not tripped_at or cooldown_hours is None:
             return None
         try:
-            hours = Decimal(str(cooldown_hours))
-            if hours <= 0:
-                return None
+            hours = max(Decimal(str(cooldown_hours)), RISK_COOLDOWN_MIN_HOURS)
             base = datetime.fromisoformat(tripped_at)
         except (ValueError, TypeError, ArithmeticError):
             return None
@@ -3745,19 +3744,22 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     "恢復跟單後引擎會在下一輪把它們往 leader 的目標收斂。"
                     if halt.get("residual_exposure") else "")
         if halt.get("resumable"):
-            # ⭐ 冷靜期 0 ＝**不會**自動恢復，不能沿用同一句（審查 F6）：那會讓客戶
-            # 以為只要等就好，而實際上他不按就永遠不會恢復。
-            # ⚠️ 三態，不得把「讀不到」折疊成「0」：0 是客戶的選擇（不自動恢復），
-            # None 是我們不知道他設了多久——後者仍然會自動恢復，只是說不出時間。
-            if cooldown_h == "0":
-                auto = ("你把冷靜期設為 0（不自動恢復），所以只有在本頁簽署一次"
-                        "「立即恢復跟單」才會解除。")
-            elif cooldown_h is None:
+            # ⭐ 2026-09-29 起冷靜期沒有 0（引擎地板 2 小時），不再有「不自動恢復」分支。
+            # ⚠️ 兩態：None 是我們不知道他設了多久——仍然會自動恢復，只是說不出時間。
+            if cooldown_h is None:
                 auto = ("冷靜期屆滿後會自動恢復（目前讀不到你設定的時數）；"
                         "要立即恢復請在本頁簽署一次「立即恢復跟單」。")
             else:
-                auto = (f"冷靜期（{cooldown_h} 小時）屆滿後會自動恢復；"
-                        f"要立即恢復請在本頁簽署一次「立即恢復跟單」。")
+                try:
+                    shown = max(Decimal(str(cooldown_h)), RISK_COOLDOWN_MIN_HOURS)
+                except (ValueError, TypeError, ArithmeticError):
+                    shown = None
+                if shown is None:
+                    auto = ("冷靜期屆滿後會自動恢復（目前讀不到你設定的時數）；"
+                            "要立即恢復請在本頁簽署一次「立即恢復跟單」。")
+                else:
+                    auto = (f"冷靜期（{shown} 小時）屆滿後會自動恢復；"
+                            f"要立即恢復請在本頁簽署一次「立即恢復跟單」。")
             base = ("你的跟單目前因**累計虧損達到你設定的絕對底線**而停止交易。"
                     if reason == "total_drawdown"
                     else "你的跟單目前因風控熔斷而停止交易。")

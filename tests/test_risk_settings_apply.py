@@ -174,13 +174,13 @@ def test_overrides_cover_the_switch_and_every_parameter():
 def test_applies_valid_signed_settings(env):
     env.write_settings(prefs=_prefs(max_drawdown_pct="0.35",
                                     flatten_on_breach=False,
-                                    cooldown_hours="0"))
+                                    cooldown_hours="2"))
     cs = env.applier().effective(_BASE)
 
     assert cs.risk_controls_enabled is True
     assert cs.max_drawdown_pct == Decimal("0.35")
     assert cs.flatten_on_breach is False
-    assert cs.risk_cooldown_hours == Decimal("0")
+    assert cs.risk_cooldown_hours == Decimal("2")
     assert cs.leader_address == _LEADER          # 其餘欄位原樣
 
 

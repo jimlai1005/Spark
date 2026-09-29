@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 
+from spark.copytrade.config import RISK_COOLDOWN_MIN_HOURS
+
 # ── 可調參數的單一定義點 ──────────────────────────────────────────────
 # 每項：(env 鍵, 型別, 預設, 下界, 上界)。下界／上界對 bool 為 None。
 #
@@ -78,16 +80,15 @@ RISK_PARAM_SPECS: tuple[dict, ...] = (
      "label": "熔斷時自動平倉",
      "help": "開：熔斷即撤單並全平。關：熔斷只停止交易動作並告警，"
              "既有部位留在市場上（軟暫停）。"},
-    # ⭐ 冷靜期（2026-07-30 使用者裁決）：熔斷後多久自動恢復跟單。
-    # 以小時為單位（不是比例），所以 `unit` 欄位存在——前端據此決定要不要做
-    # 百分比換算。0 ＝ 只有你自己按「立即恢復」或人工處理才會解鎖。
     {"name": "cooldown_hours", "env": "COPY_RISK_COOLDOWN_HOURS", "type": "decimal",
      "group": "risk", "unit": "hours", "recommended": "12",
-     "default": "12", "min": "0", "max": "168",
+     # ⭐ 2026-09-29 使用者裁決：下限 2 小時、不再有 0（「只有簽章才恢復」語意作廢）。
+     # 與引擎地板 config.RISK_COOLDOWN_MIN_HOURS 同源；引擎端另有 effective_cooldown_hours
+     # 兜底，舊記錄寫 0 也當 2 算。
+     "default": "12", "min": str(RISK_COOLDOWN_MIN_HOURS), "max": "168",
      "label": "熔斷後的冷靜期（小時）",
-     "help": "熔斷後經過這段時間就自動恢復跟單，權益基準已在熔斷當下重置。"
-             "建議 12 小時：短到不會把你鎖在門外，長到足以讓觸發熔斷的那段行情過去。"
-             "設 0 ＝ 不自動恢復（只有你按「立即恢復跟單」才解鎖）。"},
+     "help": "熔斷後經過這段時間就自動恢復跟單（最少 2 小時），權益基準已在熔斷當下重置。"
+             "建議 12 小時：短到不會把你鎖在門外，長到足以讓觸發熔斷的那段行情過去。"},
 )
 
 _SPEC_BY_NAME = {s["name"]: s for s in RISK_PARAM_SPECS}

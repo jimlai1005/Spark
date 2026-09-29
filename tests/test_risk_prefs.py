@@ -7,6 +7,8 @@
 `tests/test_filet_auto_activate.py`。偏好曾經走「pending 條目」那條無簽章路徑，
 該路徑（連同 `set_pending_risk`）已於 2026-07-30 移除。
 """
+from decimal import Decimal
+
 import pytest
 
 from spark.filet.risk_prefs import (RISK_ENV_KEYS, RiskPrefsError, canonical_prefs,
@@ -120,3 +122,15 @@ def test_summary_never_leaks_extra_keys():
     assert set(prefs_summary(None)["prefs"]) == {
         "enabled", "size_tolerance", "max_drawdown_pct", "max_total_drawdown_pct",
         "flatten_on_breach", "cooldown_hours"}
+
+
+def test_cooldown_hours_floor_is_two_and_zero_is_rejected():
+    """2026-09-29 使用者裁決：冷靜期不再有 0；spec 下限與引擎地板共用同一個常數。"""
+    from spark.copytrade.config import RISK_COOLDOWN_MIN_HOURS
+    from spark.filet.risk_prefs import RISK_PARAM_SPECS, RiskPrefsError, canonical_prefs
+    spec = next(s for s in RISK_PARAM_SPECS if s["name"] == "cooldown_hours")
+    assert Decimal(spec["min"]) == RISK_COOLDOWN_MIN_HOURS == Decimal("2")
+    assert canonical_prefs({"enabled": True, "cooldown_hours": "2"})["cooldown_hours"] == "2"
+    with pytest.raises(RiskPrefsError) as ei:
+        canonical_prefs({"enabled": True, "cooldown_hours": "0"})
+    assert ei.value.reason == "cooldown_hours_out_of_range"
