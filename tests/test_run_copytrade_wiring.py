@@ -926,3 +926,14 @@ def test_heartbeat_reports_out_of_customer_range_thresholds(tmp_path):
     assert snap["max_total_drawdown_pct"] == "0"
     assert snap["flatten_on_breach"] is True
     assert _risk_prefs_snapshot(None) is None       # settings 未載入 ＝ 未知
+
+
+def test_risk_prefs_snapshot_reports_floored_cooldown():
+    from decimal import Decimal
+
+    from scripts.run_copytrade import _risk_prefs_snapshot
+    from spark.copytrade.config import CopySettings
+    snap = _risk_prefs_snapshot(CopySettings(risk_cooldown_hours=Decimal("0")))
+    assert snap["cooldown_hours"] == "2"
+    snap = _risk_prefs_snapshot(CopySettings(risk_cooldown_hours=Decimal("12")))
+    assert snap["cooldown_hours"] == "12"

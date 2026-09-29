@@ -33,6 +33,7 @@ from spark.copytrade.killswitch import (
     owner_close_history,
     owner_close_terminal,
     plan_close_actions,
+    rearm_allowed_for,
     trip,
 )
 from spark.copytrade.notifier import RecordingNotifier
@@ -1182,3 +1183,56 @@ def test_owner_close_history_sort_handles_non_string_tripped_at(tmp_path):
     hist = owner_close_history(tmp_path)  # 不 raise
 
     assert hist[-1]["tripped_at"] == at
+
+
+# ── 2026-09-29 審查修正回歸釘（W1／W5）──────────────────────────────────
+def test_owner_close_never_auto_rearms(tmp_path):
+    """W5：owner 主動退出的鎖不得因冷靜期自動解開——step 0 排在 owner_close_terminal 之前，
+    一旦放行就會對已收尾的帳戶重新建倉。"""
+    at, now = _hours_ago(999)
+    arm = _arm(tmp_path, tripped_at=at, reason="owner_close")
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is False
+    assert arm.exists()
+    assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is False
+    assert arm.exists()
+
+
+def test_rearm_allowed_for_membership_is_pinned():
+    """W5：兩張清單的成員釘死——改動任何一邊都必須有人來改這個測試。"""
+    for manual in (False, True):
+        assert rearm_allowed_for("drawdown", manual=manual)
+        assert rearm_allowed_for("cost_breach", manual=manual)
+        assert rearm_allowed_for("total_drawdown", manual=manual)
+        assert not rearm_allowed_for("leader_revoked", manual=manual)
+        assert not rearm_allowed_for("owner_close", manual=manual)
+        assert not rearm_allowed_for("", manual=manual)
+        assert not rearm_allowed_for(None, manual=manual)
+        assert not rearm_allowed_for(123, manual=manual)
+
+
+def test_total_drawdown_auto_rearm_stays_locked_when_peak_cannot_be_cleared(tmp_path):
+    """W1：高水位清不掉（這裡用「該路徑是目錄」讓 unlink 拋 OSError）→ 不得刪 ARM、
+    不得宣稱已 rebase；否則下一輪拿舊高水位立刻再 trip，變成每個冷靜期平倉一次。"""
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH
+    at, now = _hours_ago(13)
+    arm = _arm(tmp_path, tripped_at=at, reason="total_drawdown")
+    (tmp_path / LIFETIME_PEAK_RELPATH).mkdir(parents=True)
+    n = RecordingNotifier()
+    assert auto_rearm_if_cooled_down(tmp_path, _settings(risk_cooldown_hours=Decimal("12")),
+                                     n, now_s=now) is False
+    assert arm.exists(), "高水位清不掉就不能解鎖"
+    assert any(r[0] == "critical" and "高水位" in r[2] for r in n.records)
+    assert not any("已自動恢復跟單" in r[2] for r in n.records)
+
+
+def test_total_drawdown_manual_rearm_stays_locked_when_peak_cannot_be_cleared(tmp_path):
+    """W1 同型：簽章路徑也先清高水位再刪 ARM。"""
+    from spark.copytrade.equity import LIFETIME_PEAK_RELPATH
+    at, _ = _hours_ago(1)
+    arm = _arm(tmp_path, tripped_at=at, reason="total_drawdown")
+    (tmp_path / LIFETIME_PEAK_RELPATH).mkdir(parents=True)
+    n = RecordingNotifier()
+    assert manual_rearm(tmp_path, n, requested_at_iso=_hours_ago(0)[0]) is False
+    assert arm.exists()

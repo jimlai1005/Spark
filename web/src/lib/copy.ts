@@ -1474,8 +1474,7 @@ export const COPY_ZH = {
         cooldownLabel: "冷靜期",
         resumeAtLabel: "預計自動恢復",
         noAutoResume:
-          "目前算不出預計的自動恢復時間——引擎會在冷靜期屆滿後自動恢復；"
-          + "要立即恢復請按下方按鈕。",
+          "目前算不出預計的自動恢復時間（引擎回報的熔斷時間或冷靜期讀不到）。",
         unknownValue: "（讀不到）",
         resumeButton: "立即恢復跟單",
         resuming: "等待錢包簽署…",
@@ -3118,8 +3117,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
         cooldownLabel: "Cooldown",
         resumeAtLabel: "Expected auto-resume",
         noAutoResume:
-          "No estimated auto-resume time is available right now — the engine will resume on its own "
-          + "once the cooldown has passed; press the button below to resume immediately.",
+          "No estimated auto-resume time is available right now (the engine did not report a readable "
+          + "trip time or cooldown).",
         unknownValue: "(unavailable)",
         resumeButton: "Resume following now",
         resuming: "Waiting for wallet signature…",

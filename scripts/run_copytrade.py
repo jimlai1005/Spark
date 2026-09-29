@@ -446,6 +446,10 @@ def _risk_prefs_snapshot(settings) -> dict | None:
             # 這裡不自己再推導一次：兩份推導會在新增參數時安靜地分岔。
             v = getattr(settings, copy_settings_field(spec))
             out[spec["name"]] = bool(v) if spec["type"] == "bool" else f"{v:f}"
+        # ⭐ 2026-09-29 審查 W3：cooldown 報**引擎實際執行**的值（地板後），
+        # 否則頁面上 cooldown_hours 與由它推出的 resume_at／note 不同源（工程原則 1）。
+        from spark.copytrade.config import effective_cooldown_hours
+        out["cooldown_hours"] = f"{effective_cooldown_hours(settings):f}"
         return out
     except Exception:  # noqa: BLE001 — 心跳是可觀測性，組不出來不得影響跟單
         logger.warning("風控門檻投影失敗（心跳該格為未知）", exc_info=True)

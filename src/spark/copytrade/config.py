@@ -359,7 +359,7 @@ class CopySettings:
 
         if self.risk_cooldown_hours < 0:
             raise ValueError(
-                f"risk_cooldown_hours must be >= 0 (0=不自動恢復), "
+                f"risk_cooldown_hours must be >= 0 (引擎端以 RISK_COOLDOWN_MIN_HOURS 為地板), "
                 f"got {self.risk_cooldown_hours}")
 
         if self.modify_policy not in ("modify-first", "cancel-place"):

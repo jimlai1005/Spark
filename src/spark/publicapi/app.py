@@ -3771,7 +3771,7 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                     "**無法**由你自助恢復——請聯絡我們。")
         if reason:
             return (f"你的跟單目前因 `{reason}` 而停止交易，這個原因**無法**由你"
-                    f"自助恢復（例如營運端的緊急處置，或熔斷時有部位未收乾淨）"
+                    f"自助恢復（例如營運端的緊急處置，或你已簽章平倉並撤銷）"
                     f"——請聯絡我們。")
         return ("你的跟單目前處於熔斷鎖定，但引擎回報的原因無法判讀"
                 "——為安全起見不提供自助恢復，請聯絡我們。")
@@ -3875,7 +3875,14 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # 前端據此顯示「無法確認」而不是給出可能錯誤的按鈕。
         halt = risk.get("halt") if isinstance(risk.get("halt"), dict) else None
         applied_prefs = risk.get("prefs") if isinstance(risk.get("prefs"), dict) else None
-        cooldown_h = (applied_prefs or {}).get("cooldown_hours")
+        raw_cooldown = (applied_prefs or {}).get("cooldown_hours")
+        # ⭐ 2026-09-29 審查 W3：地板一次、三處（cooldown_hours／resume_at／note）同源。
+        # 舊版引擎心跳可能還帶未地板的值；讀不出數字 → None（未知），不猜。
+        try:
+            cooldown_h = (None if raw_cooldown is None else
+                          f"{max(Decimal(str(raw_cooldown)), RISK_COOLDOWN_MIN_HOURS):f}")
+        except (ValueError, TypeError, ArithmeticError):
+            cooldown_h = None
         halted = None if tripped is None else {
             "tripped": bool(tripped),
             "reason": (halt or {}).get("reason"),

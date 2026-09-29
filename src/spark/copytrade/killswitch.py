@@ -6,7 +6,7 @@
   ⚠️ **2026-07-30 使用者裁決放寬**：新增 `auto_rearm_if_cooled_down()`，冷靜期
   （`COPY_RISK_COOLDOWN_HOURS`，預設 12 小時）屆滿後自動刪 ARM 檔恢復跟單。
   理由是保留客戶該有的權力——保護要提供，但不該把客戶鎖在門外。放寬僅限該函式，
-  且它對兩種情形仍然 fail-closed（leader 撤銷、時間戳讀不到）；
+  且它對三種情形仍然 fail-closed（reason 不可恢復、時間戳讀不到、刪檔／清高水位失敗）；
   `trip()` 本身完全不變。詳見該函式 docstring。
   ⚠️ **2026-07-30 第二次放寬**：新增 `manual_rearm()`，客戶以錢包簽章授權即可
   **立即**解除鎖定（不必等冷靜期）。驗章在 `spark.filet.risk_settings_apply`，
@@ -246,7 +246,7 @@ def halt_status(root: Path) -> dict | None:
                 "residual_exposure": None, "resumable": False}
     tripped_at, reason, _, residual = parsed
     # `resumable` 回答的是「**客戶自己**能不能解」（頁面上那顆按鈕），所以用 manual
-    # 語意：絕對底線客戶簽章可解、冷靜期不自動解。
+    # 語意：自 2026-09-29 起 manual 與 auto 清單相同，這裡用 manual 只是語意上對應那顆按鈕。
     # ⚠️ 殘留暴險**不影響** resumable（2026-07-31 使用者裁決，見 manual_rearm），
     # 但必須單獨揭露：客戶按那顆按鈕之前有權知道「熔斷時有部位沒平乾淨」。
     return {"tripped": True, "reason": reason, "tripped_at": tripped_at,
@@ -449,6 +449,26 @@ def announce_owner_close_history(root: Path, notifier: Notifier) -> None:
         dedup_key="owner_close_history")
 
 
+def _rebase_lifetime_peak_or_stay(root: Path, notifier: Notifier, *, who: str) -> bool:
+    """絕對底線解鎖前的 rebase：清全期高水位並**驗證真的不在了**。回 True 才可以刪 ARM。
+
+    ⭐ 順序是紅線（2026-09-29 審查 W1）：先清高水位、再刪 ARM。反過來（先刪 ARM）
+    的兩種失敗都會變成「下一輪拿舊高水位立刻再 trip」：(a) `_unlink_quietly` 吞掉
+    OSError、高水位還在；(b) 刪完 ARM 行程被殺（部署 restart 正是這個時刻）。
+    先清高水位的失敗模式只剩「高水位已清、ARM 還在」：`is_tripped` 短路不會 evaluate，
+    之後真的解鎖時高水位從當下權益重建——結果與預期相同。
+    `reset_lifetime_peak` 絕不拋例外（見其 docstring），所以這裡用 exists() 驗證結果。
+    """
+    reset_lifetime_peak(root)
+    if (root / LIFETIME_PEAK_RELPATH).exists():
+        msg = (f"{who}：絕對底線熔斷的全期高水位檔清不掉（{root / LIFETIME_PEAK_RELPATH}）"
+               f"——維持鎖定，否則下一輪會拿舊高水位立刻再熔斷；需人工處理")
+        notifier.critical("killswitch", msg)
+        _append_alert(root, msg)
+        return False
+    return True
+
+
 def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Notifier,
                               *, now_s: float | None = None) -> bool:
     """冷靜期屆滿 → 自動解除鎖定（刪 ARM 檔）。回傳是否真的解除了。
@@ -501,6 +521,10 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
     elapsed_h = (now_s - tripped_s) / 3600
     if elapsed_h < float(hours):
         return False        # 還在冷靜期內：安靜等待（tripped 的提醒由呼叫端負責）
+    # ⭐ 2026-09-29 審查 W1：先清高水位再刪 ARM，理由見 `_rebase_lifetime_peak_or_stay`。
+    rebased = reason == REASON_TOTAL_DRAWDOWN
+    if rebased and not _rebase_lifetime_peak_or_stay(root, notifier, who="冷靜期自動恢復"):
+        return False
     try:
         arm_path.unlink()
     except OSError as e:
@@ -509,13 +533,6 @@ def auto_rearm_if_cooled_down(root: Path, settings: CopySettings, notifier: Noti
                           f"——維持鎖定，需人工處理")
         _append_alert(root, f"自動恢復失敗（刪檔）: {e!r}")
         return False
-    # ⭐ 2026-09-29：絕對底線的熔斷被冷靜期自動解除 ⇒ 以恢復當下的權益為新基準。
-    # 不清的話下一輪 evaluate() 仍拿舊高水位判 total_dd > 上限 → 立刻再 trip，
-    # 變成每個冷靜期平倉一次的死循環。棘輪後果見 _AUTO_REARM_REASONS 註解。
-    # 只在 unlink 成功之後清：刪檔失敗＝仍鎖著，高水位必須留著。
-    rebased = reason == REASON_TOTAL_DRAWDOWN
-    if rebased:
-        reset_lifetime_peak(root)
     msg = (f"**已自動恢復跟單**：冷靜期 {hours} 小時已滿"
            f"（觸發於 {tripped_at}，實際經過 {elapsed_h:.1f} 小時）。"
            f"權益基準已於觸發當下重置，下一輪起恢復交易動作。"
@@ -593,6 +610,11 @@ def manual_rearm(root: Path, notifier: Notifier, *,
         return _stay(
             f"解除請求簽署於 {requested_at_iso}，**不晚於**熔斷時間 {tripped_at}"
             f"——一份熔斷前就簽好的解除授權不得用來解除這次熔斷", "manual_rearm_stale")
+    # ⭐ 絕對底線的熔斷被客戶親自解除 ⇒ 他接受以現在的權益作為新的基準（審查 F2）。
+    # ⭐ 2026-09-29 審查 W1：先清高水位再刪 ARM，理由見 `_rebase_lifetime_peak_or_stay`。
+    rebased = reason == REASON_TOTAL_DRAWDOWN
+    if rebased and not _rebase_lifetime_peak_or_stay(root, notifier, who="客戶簽章解除"):
+        return False
     try:
         arm_path.unlink()
     except OSError as e:
@@ -601,12 +623,6 @@ def manual_rearm(root: Path, notifier: Notifier, *,
                           f"——維持鎖定，需人工處理")
         _append_alert(root, f"自助解除失敗（刪檔）: {e!r}")
         return False
-    # ⭐ 絕對底線的熔斷被客戶親自解除 ⇒ 他接受以現在的權益作為新的基準（審查 F2）。
-    # 只有這一條路徑可以清全期高水位；冷靜期與任何自動路徑都不行——那等於替客戶
-    # 抹掉他的虧損記錄，而下一段跌幅又從更低的基底重新起算（實測會變成無底棘輪）。
-    rebased = reason == REASON_TOTAL_DRAWDOWN
-    if rebased:
-        reset_lifetime_peak(root)
     msg = (f"**已依客戶簽章授權解除熔斷鎖定**（熔斷於 {tripped_at}，原因 `{reason}`，"
            f"解除請求簽署於 {requested_at_iso}）。下一輪起恢復交易動作"
            f"——這是客戶本人的決定，不是冷靜期屆滿。"
