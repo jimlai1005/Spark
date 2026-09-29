@@ -7,11 +7,20 @@ from spark.exchange.hyperliquid import HyperliquidAdapter
 
 
 class FakeInfo:
-    """離線假 Info：all_mids 固定回傳可控字典，其餘讀側不在本檔測試範圍。"""
+    """離線假 Info：all_mids 固定回傳可控字典，其餘讀側不在本檔測試範圍。
+
+    `meta()` 供 `_round_px` 內部呼叫的 `get_size_decimals` 使用——本檔測試的價格
+    （ETH/BTC 皆數千元）在任何 szDecimals 下都不觸發小數位截斷，純粹滿足呼叫需求。
+    """
     def __init__(self, mids=None):
         self._mids = mids or {"ETH": "4000", "BTC": "65000"}
     def all_mids(self):
         return dict(self._mids)
+    def meta(self):
+        return {"universe": [
+            {"name": "ETH", "szDecimals": 4},
+            {"name": "BTC", "szDecimals": 5},
+        ]}
 
 
 class FakeExchange:

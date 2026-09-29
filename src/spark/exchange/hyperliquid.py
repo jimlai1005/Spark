@@ -19,8 +19,16 @@ logger = logging.getLogger(__name__)
 
 
 class HyperliquidAdapter(ExchangeAdapter):
-    # HL perp 價格規則：最多 5 位有效數字。送單前必須四捨五入，否則交易所拒單。
-    # （Phase 1 ETH ~數千元，5 sig figs 同時滿足小數位上限；極低價幣種的 tick 細則延後。）
+    # HL 價格規則有兩條，兩條都要滿足，否則交易所拒單（`Order has invalid price`）：
+    #   1. 最多 5 位有效數字（significant figures）。
+    #   2. 小數位數 ≤ 6 − szDecimals（perp）／8 − szDecimals（spot）。
+    # 對高價幣（如 ETH 數千元）第 2 條通常不會收緊第 1 條算出的結果，但低價幣
+    # （szDecimals 小、單價 < 1）常見「5 sf 後小數位仍超標」——2026-09-29 PUMP
+    # （szDecimals=0）平倉單事故即此根因：0.004752 × 0.95 = 0.0045144 是 7 位小數，
+    # 超過 6 − 0 = 6 位上限。SDK 自己的 `_slippage_price`
+    # （.venv 內 hyperliquid/exchange.py:132）就是 `round(float(f"{px:.5g}"), 6 - szDecimals)`，
+    # 規則等價；tie 情形末位捨入可能與 SDK 差一檔（Decimal 精確值 vs 二進位 float），
+    # 兩者皆合法價。
     _PX_CTX = Context(prec=5, rounding=ROUND_HALF_EVEN)
 
     def __init__(self, network: str, info=None, exchange=None):
@@ -31,13 +39,33 @@ class HyperliquidAdapter(ExchangeAdapter):
         if exchange is not None and not isinstance(exchange, ResilientExchange):
             exchange = ResilientExchange(exchange)
         self._exchange = exchange  # ResilientExchange 包住 hyperliquid.exchange.Exchange
-        # get_size_decimals 的 per-coin 快取：None 代表尚未打過 meta()；打過之後即便
-        # 查無某 coin 也不重打（避免對不存在的 coin 反覆打 API）。
+        # get_size_decimals 的 per-coin 快取：None 代表尚未打過 meta()。快取 miss
+        # （含首次與查無的 coin）每次都會重打一次 meta() 更新整包（自癒：新幣上市
+        # 免重啟）；代價是「不在 universe 的 coin」每次呼叫都多一次 /info。
+        # ⚠️ 2026-09-29：_round_px 也讀此快取——送單價捨入依 szDecimals，見該函式。
         self._sz_decimals_cache: dict[str, int] | None = None
 
-    def _round_px(self, px: Decimal) -> float:
-        """把 orchestrator 算出的意圖價四捨五入到 HL 接受的格式（5 位有效數字）。"""
-        return float(self._PX_CTX.create_decimal(px))
+    def _round_px(self, coin: str, px: Decimal) -> float:
+        """把送單價捨入到 HL 接受的格式：先 5 位有效數字，再夾到該幣小數位上限
+        （perp 6 − szDecimals）。規則依據見類別頂端註解。
+
+        本 adapter 只送 perp 單，`max_dec` 固定用 perp 規則（6 − szDecimals），不判斷
+        spot。spot 標的不在 `get_size_decimals` 讀的 perp `meta()` universe 內——若
+        coin 是 spot（如 "PURR/USDC"、"@85"），`get_size_decimals` 會查無而 raise
+        ValueError（fail-loud，不猜測、不給錯的小數位上限）。上游 `copytrade/orders.py`
+        與 `copytrade/positions.py` 已用 `_is_spot_coin` 過濾 spot 標的，正常路徑不會
+        有 spot coin 走到這裡；本函式不重複做這層過濾（2026-09-29 reviewer 第一輪
+        W1/S2：原本在此 import `spark.copytrade.instrument._is_spot_coin` 是死碼＋
+        exchange 層依賴 copytrade 層的分層倒置，已移除）。
+
+        日後若加 trigger（TP/SL）單支援，`trigger_px` 必須同走本函式——trigger 單
+        同樣受 HL 這兩條價格規則約束，目前 `executor._skip_trigger` 使其不送單，
+        故本函式尚未涵蓋這條路徑。
+        """
+        d = self._PX_CTX.create_decimal(px)
+        max_dec = 6 - self.get_size_decimals(coin)
+        d = d.quantize(Decimal(1).scaleb(-max_dec), rounding=ROUND_HALF_EVEN)
+        return float(d)
 
     # --- reads ---
     def get_account_value(self, address: str) -> Decimal:
@@ -421,7 +449,8 @@ class HyperliquidAdapter(ExchangeAdapter):
         # reduce_only 取自 Order 欄位（勿寫死 False——跟單鏡射的 leader reduce-only 掛單
         # 必須原樣傳遞，否則會變成可開新倉的普通掛單）。
         res = self._exchange.order(
-            order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
+            order.coin, order.is_buy, float(order.size),
+            self._round_px(order.coin, order.limit_px),
             {"limit": {"tif": order.tif}}, reduce_only=order.reduce_only,
             builder={"b": builder.b, "f": builder.f},
         )
@@ -453,7 +482,8 @@ class HyperliquidAdapter(ExchangeAdapter):
         # ⭐ SDK 0.24.0 modify_order() 無 builder 參數（結構限制，見 ABC docstring 的
         # 紅線例外說明）——此呼叫刻意不帶 builder kwarg。
         res = self._exchange.modify_order(
-            oid, order.coin, order.is_buy, float(order.size), self._round_px(order.limit_px),
+            oid, order.coin, order.is_buy, float(order.size),
+            self._round_px(order.coin, order.limit_px),
             {"limit": {"tif": order.tif}}, reduce_only=order.reduce_only,
         )
         # HL 拒單雙形態（同 _parse_order_response docstring）：頂層 err，或頂層 ok 但
@@ -488,7 +518,7 @@ class HyperliquidAdapter(ExchangeAdapter):
         mid = mids[coin]
         px = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
         res = self._exchange.order(
-            coin, is_buy, float(size), self._round_px(px),
+            coin, is_buy, float(size), self._round_px(coin, px),
             {"limit": {"tif": "Ioc"}}, reduce_only=True,
             builder={"b": builder.b, "f": builder.f},
         )

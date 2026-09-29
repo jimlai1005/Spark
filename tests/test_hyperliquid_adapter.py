@@ -1,13 +1,23 @@
 from datetime import date
 from decimal import Decimal
+import pytest
 from spark.exchange.base import Order, BuilderCode
 from spark.exchange.hyperliquid import HyperliquidAdapter
 
 
+_META = {"universe": [
+    {"name": "ETH", "szDecimals": 4},
+    {"name": "PUMP", "szDecimals": 0},
+    {"name": "XYZ", "szDecimals": 5},
+    {"name": "W7", "szDecimals": 7},
+]}
+
+
 class FakeInfo:
-    def __init__(self, referral_state=None):
+    def __init__(self, referral_state=None, mids=None):
         self.posts = []
         self._referral_state = referral_state
+        self._mids = mids or {}
     def user_state(self, address):
         return {"marginSummary": {"accountValue": "150.5"}}
     def post(self, url_path, payload=None):
@@ -18,6 +28,10 @@ class FakeInfo:
         if self._referral_state is not None:
             return self._referral_state
         return {"builderRewards": "0.008"}
+    def meta(self):
+        return _META
+    def all_mids(self):
+        return self._mids
 
 
 class FakeExchange:
@@ -70,8 +84,72 @@ def test_place_order_passes_builder_dict_and_ioc():
 
 def test_round_px_to_5_sig_figs():
     ad = _adapter()
-    assert ad._round_px(Decimal("3530.9274")) == 3530.9
-    assert ad._round_px(Decimal("4000")) == 4000.0
+    assert ad._round_px("ETH", Decimal("3530.9274")) == 3530.9
+    assert ad._round_px("ETH", Decimal("4000")) == 4000.0
+
+
+def test_round_px_clamps_to_max_decimals_for_low_price_coin():
+    # PUMP szDecimals=0 → 最多 6 位小數。5 sf 後仍是 7 位小數（0.0045144）的情形必須
+    # 再被截到 6 位（0.004514），否則交易所拒單（事故根因）。
+    ad = _adapter()
+    assert ad._round_px("PUMP", Decimal("0.004752") * (1 - Decimal("0.05"))) == 0.004514
+    # flatten_slippage 路徑（kill switch／panic 全平用更大的滑點）同樣要受 6 位小數約束。
+    assert ad._round_px("PUMP", Decimal("0.004752") * (1 - Decimal("0.30"))) == 0.003326
+
+
+def test_round_px_clamps_to_max_decimals_for_szDecimals_5_coin():
+    # XYZ szDecimals=5 → 最多 1 位小數。
+    ad = _adapter()
+    assert ad._round_px("XYZ", Decimal("12.345")) == 12.3
+
+
+def test_round_px_negative_max_decimals_rounds_to_integer_multiple():
+    # szDecimals=7 → 6−7 = −1 → 夾到十位；HL 整數價一律合法。極端情形保護 scaleb 正負皆可。
+    ad = _adapter()
+    assert ad._round_px("W7", Decimal("123.456")) == 120.0
+
+
+def test_place_order_unknown_coin_raises_value_error_not_swallowed():
+    # S3(a)：coin 不在 _META universe → get_size_decimals raise ValueError，
+    # _round_px／place_order 都不得吞掉這個例外（fail-loud，不猜測小數位上限）。
+    ad = _adapter()
+    with pytest.raises(ValueError, match="未知幣種"):
+        ad.place_order(agent_signer=None,
+                       order=Order("NOPE", True, Decimal("1"), Decimal("1.23456"), "Ioc"),
+                       builder=BuilderCode(b="0xbuilder", f=20))
+    # 例外在 _round_px 求值時就拋出，送單邊界未被觸碰（不得送出未捨入或 0 價的單）。
+    assert ad._exchange.calls == []
+
+
+def test_close_reduce_only_sends_sz_decimals_rounded_px():
+    from hyperliquid.utils.signing import float_to_wire
+    ad = HyperliquidAdapter(
+        network="testnet",
+        info=FakeInfo(mids={"PUMP": "0.004752"}),
+        exchange=FakeExchange(),
+    )
+    ad.close_reduce_only(
+        agent_signer=None, coin="PUMP", is_buy=False, size=Decimal("1798266"),
+        slippage=Decimal("0.05"), builder=BuilderCode(b="0xbuilder", f=20),
+    )
+    name, coin, is_buy, sz, limit_px, otype, builder = ad._exchange.calls[-1]
+    assert limit_px == 0.004514
+    wire = float_to_wire(limit_px)
+    assert len(wire.split(".")[1]) <= 6
+
+
+def test_place_order_rounds_px_to_sz_decimals():
+    from hyperliquid.utils.signing import float_to_wire
+    ad = _adapter()
+    ad.place_order(
+        agent_signer=None,
+        order=Order("PUMP", True, Decimal("100"), Decimal("0.0045144"), "Ioc"),
+        builder=BuilderCode(b="0xbuilder", f=20),
+    )
+    name, coin, is_buy, sz, limit_px, otype, builder = ad._exchange.calls[-1]
+    assert limit_px == 0.004514
+    wire = float_to_wire(limit_px)
+    assert len(wire.split(".")[1]) <= 6
 
 
 def test_place_order_rejected_returns_not_ok():
