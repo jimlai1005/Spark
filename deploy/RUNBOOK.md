@@ -3573,6 +3573,14 @@ Filet Alpha `0xfB9C52f56F03D786AD5D435aa70fe45D80569760`。前置確認：主網
 （account `ffb9c5…9760`＝Filet Alpha 自己，鏈上 `referredBy` 已是 `RABBYWALLET`，無 follower unit）；未刪。若該帳號日後啟用引擎，
 `referral_apply` 會因記錄碼≠`COPY_REFERRAL_CODE` 發 `referral_code_mismatch` critical（記錄碼比對先於鏈上查詢），請該帳號重簽即可。
 
+**2026-09-29 部署（commit `e4e9b9b`，04:03 UTC，推薦碼簽署鈕改主要按鈕樣式，純前端）：** 使用者裁決「與一般確認簽署同款白字，
+讓客戶不會忽略」——onboarding step 4 與設定頁的推薦碼簽署鈕 `btn-secondary`→`btn-primary`，兩檔各一行。⚠️ 當時工作樹另有進行中
+session 的未提交改動，**改從乾淨的 `git worktree add --detach <scratch> HEAD` rsync**（stage 1 來源換成該 worktree，其餘照 §3.2），
+不從工作樹推，避免把別人的半成品帶上正式機；部署後 `git worktree remove`。前提：正式機 `831e632`→HEAD 之間 `src/` 零差異、只有這兩個前端檔。
+流程：rsync 兩段 → `find -prune var` chown root（非 root 檔 4＝.venv symlink 例外）→ §4.2 `npm ci`＋`NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app`
+build → restart `filet-dashboard`（api／keysvc／follower 未重啟）→ `DEPLOYED_VERSION`。驗證：vitest 756；`filet_regression_check --http --ssh`
+66/67——唯一 FAIL 是腳本自身 `r.read(65536)` 把 66KB 的 `/api/public/explore` 截斷成假 FAIL（curl 同端點為合法 JSON），修正併入下一筆 71cba96。
+
 **2026-09-29 部署（commit `c1a8a37`，11:41 UTC，移除 Dashboard 保證金警示文案，純前端）：** plan
 `docs/superpowers/plans/2026-09-29-remove-margin-warning-copy.md`（builder 實作、reviewer 兩輪：第一輪抓到兩個測試守門漏洞（未登入不打
 `/api/me/dashboard` 的斷言隨 pill 測試被刪；可用保證金數字 span 用位置定位會漂移），修正後第二輪變異實測「通過」）。內容：使用者裁決 C——
