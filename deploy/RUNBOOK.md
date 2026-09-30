@@ -3663,3 +3663,16 @@ package-lock 沒變時 `npm ci` 是白做（它會先刪 node_modules 再全裝�
 心跳 leader 仍 0xedea、部位未動。既有問題（非本次引入）：`compose_rows` 對 0x4cae5bed…7c34 每輪 enrich 失敗 `DivisionUndefined`
 （重啟前 24h 已 1,377 次，列被降 pending）；`leader_changes.json` 的 f438 記錄名冊更新後未被 watcher 回收（回收只在 activate／heal
 分支；引擎忽略已兌現 nonce，無害）。
+
+**2026-09-30 熱修（commit `411c6b4`，12:42 UTC，權益指數歸零 guard；單檔 §5.8i，只重啟 filet-api）：** plan
+`docs/superpowers/plans/2026-09-30-equity-index-collapse-guard.md`。探索 publisher 對 0x4cae5bed…7c34 每分鐘 enrich 失敗
+`InvalidOperation([DivisionUndefined])`（重啟前 24h 1,377 次），根因 `leader_perf.compute_window_performance:475` 的 `ratio_returns`
+在權益指數歸零（r == −1，合法）之後仍有區間時 0/0。使用者裁決方案 B：歸零後仍有任何後續區間 → 該窗 `insufficient`、reason
+`equity_index_collapsed`，其他窗口照算；不切段（A）、不跳過除法（C）。reviewer 可部署＋2 Warning：W1 措辭已修（爆倉後尾端全 0
+也判 collapsed，因修前同樣 0/0、TWR −1 本就不可達）；**W2 待使用者裁決**：`hl_explore.py:1119-1123` 對 `max_dd_pct is None` 的
+回撤維度直接放行（既不 ineligible 也不 pending），本修法讓「所選窗歸零再入金」的地址可能帶著「回撤 —」上榜（修前該列卡在
+enrich_error 不會上榜）——事故地址是 allTime 歸零、month 正常，不會立刻發生。同日另清掉 `leader_changes.json` 內 f438 已兌現的記錄
+（`remove_satisfied_leader_change`，備份 `leader_changes.json.bak-20260930`）。流程：前提查核（DEPLOYED_VERSION == c4632ac、
+`leader_perf.py` 逐位元一致）→ 上傳 commit 版 `leader_perf.py`／`trader_stats.py`（備份 `/tmp/*.py.bak-20260930`）→ 正式機 Python
+重放 0x4cae（allTime insufficient／month ok）→ restart `filet-api` → 107 秒後新榜單發布、journal `enrich 失敗` 0 次 → `DEPLOYED_VERSION`
+帶 hotfix note。

@@ -1,6 +1,6 @@
 # 權益指數歸零後有後續區間 → 該窗回 insufficient（方案 B）
 
-狀態：**2026-09-30 使用者裁決 B，派工中**。
+狀態：**✅ 已部署** 2026-09-30 12:42 UTC，commit `411c6b4`，單檔熱修（§5.8i）＋restart filet-api；重啟後 journal enrich 失敗 0 次。reviewer 可部署＋2 Warning：W1 措辭已修；**W2（探索資格對 `max_dd_pct is None` 放行，既有 fail-open，本修法使其可達）待使用者裁決**，見 RUNBOOK 2026-09-30 熱修記錄。
 
 **Goal:** `compute_window_performance` 在權益指數鏈乘到 0 之後若還有後續已入金區間，整窗回 `status="insufficient"`、新 reason
 `equity_index_collapsed`，其他窗口照算；不再在 `ratio_returns` 那行拋 `DivisionUndefined`。
