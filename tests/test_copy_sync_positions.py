@@ -9,7 +9,7 @@ RecordingNotifier 取自 spark.copytrade.notifier。
 from decimal import Decimal
 
 from spark.copytrade.config import CopySettings
-from spark.copytrade.executor import ExecutorPort
+from spark.copytrade.executor import ExecutorPort, PlaceOutcome
 from spark.copytrade.notifier import RecordingNotifier
 from spark.copytrade.positions import sync_positions
 from spark.exchange.base import OrderResult, Position
@@ -33,6 +33,10 @@ class FakeExecutor:
 
     def place_with_reason(self, spec) -> tuple[bool, str]:
         return self.place(spec), ""
+
+    def place_outcome(self, spec) -> PlaceOutcome:
+        ok, reason = self.place_with_reason(spec)
+        return PlaceOutcome(ok, reason, "resting" if ok else "rejected", Decimal("0"))
 
     def modify(self, oid: int, spec) -> bool:
         self.records.append(("modify", oid, spec))

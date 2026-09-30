@@ -10,7 +10,7 @@ ActionExecutor.place_with_reason 的拒因萃取。
 from decimal import Decimal
 
 from spark.copytrade.config import CopySettings
-from spark.copytrade.executor import ActionExecutor, ExecutorPort
+from spark.copytrade.executor import ActionExecutor, ExecutorPort, PlaceOutcome
 from spark.copytrade.notifier import RecordingNotifier
 from spark.copytrade.orders import (
     OrderSpec,
@@ -45,6 +45,10 @@ class FakeExecutor:
         if self._place_reason_seq:
             return self._place_reason_seq.pop(0)
         return True, ""
+
+    def place_outcome(self, spec) -> PlaceOutcome:
+        ok, reason = self.place_with_reason(spec)
+        return PlaceOutcome(ok, reason, "resting" if ok else "rejected", Decimal("0"))
 
     def modify(self, oid, spec) -> bool:
         self.records.append(("modify", oid, spec))
@@ -153,7 +157,9 @@ def test_crit_includes_position_line_for_involved_coins():
 def test_crit_position_line_shows_no_position():
     d = _spec(coin="BTC", is_buy=True, sz="0.5", limit_px="50000",
               reduce_only=False)
-    _ex, notifier, _res = _run([d], [[], []], my_positions={})
+    # 2026-09-30 D1：place 須失敗（missing 才可行動），成功後消失視為已成交
+    _ex, notifier, _res = _run([d], [[], []], my_positions={},
+                               place_reason_seq=[(False, "x"), (False, "x")])
     assert "部位：BTC 無部位" in _crit_text(notifier)
 
 
@@ -189,11 +195,16 @@ def test_trim_shape_triggers_self_heal_diagnosis_line():
 def test_non_trim_shape_without_reasons_falls_back_to_investigation_hint():
     d = _spec(coin="BTC", is_buy=True, sz="0.5", limit_px="50000",
               reduce_only=False)
-    _ex, notifier, _res = _run([d], [[], []], my_positions={})
+    # 2026-09-30 D1：改用「同 slot 有 extra」讓 missing 可行動，place 仍成功
+    # （無補單失敗行），使 fallback 排查提示仍被命中
+    stray = _open_order(coin="BTC", is_buy=True, sz="0.3", limit_px="50000",
+                        reduce_only=False, oid=100)
+    _ex, notifier, _res = _run([d], [[stray], [stray]], my_positions={})
     text = _crit_text(notifier)
     assert "診斷：" not in text
     assert "原因未能自動判定" in text
     assert "historicalOrders" in text
+    assert "userFillsByTime" in text
 
 
 def test_trim_diagnosis_requires_extra_total_near_position():
@@ -229,7 +240,7 @@ def test_crit_message_bounded_with_many_mismatches():
     desired = [_spec(coin=f"C{i}", is_buy=True, sz="1", limit_px="100",
                      reduce_only=False) for i in range(30)]
     reason = "Order must have minimum value of $10."
-    seq = [(True, "")] * 30 + [(False, reason)] * 30  # 初掛 30 成功、重試 30 全拒
+    seq = [(False, reason)] * 60  # 初掛 30 拒、重試 30 全拒（D1：失敗才可行動）
     ex = FakeExecutor(open_orders_seq=[[], []], place_reason_seq=seq)
     notifier = RecordingNotifier()
     _reconcile_orders(ex, desired, [], settings=SETTINGS, notifier=notifier,
@@ -247,7 +258,7 @@ def test_crit_message_hard_truncated_at_safe_length():
     desired = [_spec(coin=f"C{i}", is_buy=True, sz="1", limit_px="100",
                      reduce_only=False) for i in range(5)]
     huge = "x" * 1000
-    seq = [(True, "")] * 5 + [(False, huge)] * 5
+    seq = [(False, huge)] * 10  # 初掛 5 拒、重試 5 拒（D1：失敗才可行動）
     ex = FakeExecutor(open_orders_seq=[[], []], place_reason_seq=seq)
     notifier = RecordingNotifier()
     _reconcile_orders(ex, desired, [], settings=SETTINGS, notifier=notifier,
@@ -264,7 +275,8 @@ def test_dedup_key_stable_when_missing_size_drifts():
     持續狀態每輪產生新 key → dedup 失效、告警轟炸。鍵只含 幣/方向/ro/價。"""
     def _run_with_sz(sz):
         d = _spec(sz=sz)
-        return _run([d], [[], []], my_positions={"ETH": _position()})
+        return _run([d], [[], []], my_positions={"ETH": _position()},
+                    place_reason_seq=[(False, "x"), (False, "x")])
 
     _ex1, n1, _ = _run_with_sz("0.0457")
     _ex2, n2, _ = _run_with_sz("0.0460")  # 同幣/同向/同價，只有量微動
@@ -287,7 +299,8 @@ def test_sync_open_orders_passes_positions_into_crit():
     leader = [OpenOrder(oid=1, coin="BTC", is_buy=True, limit_px=Decimal("50000"),
                         sz=Decimal("0.5"), reduce_only=False, is_trigger=False,
                         trigger_px=None, tpsl=None)]
-    ex = FakeExecutor(open_orders_seq=[[], []])  # 兩驗皆空 → 缺 1 → critical
+    ex = FakeExecutor(open_orders_seq=[[], []],  # 兩驗皆空 → 缺 1 → critical
+                      place_reason_seq=[(False, "x"), (False, "x")])  # D1：失敗才可行動
     notifier = RecordingNotifier()
     sync_open_orders(
         ex, leader, [], {"BTC": _position("BTC", szi="0.3")}, Decimal("1"),

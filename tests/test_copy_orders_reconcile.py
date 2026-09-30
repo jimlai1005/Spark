@@ -9,7 +9,7 @@ from decimal import Decimal
 import pytest
 
 from spark.copytrade.config import CopySettings
-from spark.copytrade.executor import ExecutorPort
+from spark.copytrade.executor import ExecutorPort, PlaceOutcome
 from spark.copytrade.notifier import RecordingNotifier
 from spark.copytrade.orders import (
     CycleReport,
@@ -53,6 +53,10 @@ class FakeExecutor:
 
     def place_with_reason(self, spec) -> tuple[bool, str]:
         return self.place(spec), ""
+
+    def place_outcome(self, spec) -> PlaceOutcome:
+        ok, reason = self.place_with_reason(spec)
+        return PlaceOutcome(ok, reason, "resting" if ok else "rejected", Decimal("0"))
 
     def modify(self, oid, spec) -> bool:
         self.records.append(("modify", oid, spec))
@@ -217,11 +221,15 @@ def test_cancel_place_policy_degrades_all_modifies():
 # ── 5. settle 分支（hl orders.py:253-271，hl 未測的缺口）─────────────
 def test_settle_missing_one_replaces_and_second_fetch_clean():
     d1 = _spec(coin="ETH", limit_px="2000")
-    d2 = _spec(coin="BTC", limit_px="50000", sz="0.5")
-    after_first = [_open_order(coin="ETH", limit_px="2000", oid=11)]  # 缺 d2
+    d2 = _spec(coin="BTC", limit_px="50000", sz="0.5", reduce_only=True)
+    # 缺 d2；簿上有同 slot 形狀不符的 ro BTC 單（extra，修剪形狀）→ d2 為可行動 missing
+    # （2026-09-30 D1／R2：同 slot extra 條款僅適用 reduce-only）
+    after_first = [_open_order(coin="ETH", limit_px="2000", oid=11),
+                   _open_order(coin="BTC", limit_px="50100", sz="0.5", oid=13,
+                               reduce_only=True)]
     after_second = [
         _open_order(coin="ETH", limit_px="2000", oid=11),
-        _open_order(coin="BTC", limit_px="50000", sz="0.5", oid=12),
+        _open_order(coin="BTC", limit_px="50000", sz="0.5", oid=12, reduce_only=True),
     ]
     ex = FakeExecutor(open_orders_seq=[after_first, after_second])
     notifier = RecordingNotifier()
@@ -241,7 +249,8 @@ def test_settle_missing_one_replaces_and_second_fetch_clean():
 def test_settle_still_missing_after_retry_sets_sync_failed_and_criticals():
     d1 = _spec(coin="ETH", limit_px="2000")
     d2 = _spec(coin="BTC", limit_px="50000", sz="0.5")
-    ex = FakeExecutor(open_orders_seq=[[], []])  # 兩次重抓都空 → 缺 2
+    # 兩次重抓都空 → 缺 2；place 全拒才是可行動 missing（2026-09-30 D1）
+    ex = FakeExecutor(open_orders_seq=[[], []], place_ok=False)
     notifier = RecordingNotifier()
     res = _run_reconcile(ex, [d1, d2], [], live=True, notifier=notifier)
 

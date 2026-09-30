@@ -30,7 +30,7 @@ docstring。
 import hashlib
 import html
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Callable, Mapping
@@ -482,6 +482,34 @@ def _verify_diff(
     return missing, extra
 
 
+def _actionable_missing(
+    missing: list[OrderSpec],
+    extra: list[OpenOrder],
+    failed: Counter[OrderSpec],
+) -> list[OrderSpec]:
+    """settle 驗證的「可行動 missing」單一謂詞（兩輪驗證共用，2026-09-30 D1／R2／R3）。
+
+    只有兩種 missing 值得補下／告警：
+      1. 本輪 place 失敗過的 spec（`failed` 多重集合）：值相同的 spec 最多放行
+         min(missing 中出現次數, failed 計數) 張（R3，避免同值 spec 互相覆寫）；
+      2. **reduce-only 且非 trigger** 的 spec，同 slot（`_slot_key`）在簿上有 extra 單
+         ＝形狀不符（reduce-only 被交易所修剪）。此條不受 failed 上限約束。
+         非 ro 單不適用（R2）：部分成交的殘單會變成同 slot extra，若因此重下全量
+         ＝已成交部分重複執行；ro 重下受交易所部位封頂，不會超額。
+    其餘（place 成功後消失、matched 後消失、從未嘗試）視為已被消耗（成交或外部撤銷），
+    不補、不告警——重下＝非冪等寫入盲重試（工程原則 #2），會造成重複成交。"""
+    extra_slots = {_slot_key(spec_from_open_order(m)) for m in extra}
+    budget = Counter(failed)
+    out: list[OrderSpec] = []
+    for d in missing:
+        if d.reduce_only and not d.is_trigger and _slot_key(d) in extra_slots:
+            out.append(d)
+        elif budget[d] > 0:
+            budget[d] -= 1
+            out.append(d)
+    return out
+
+
 # CRIT 訊息上限（2026-07-28 審查 F2）：Telegram sendMessage 超過 4096 字元回 400，
 # notifier 吞掉 False → 最需要告警的場景（整本掛單全 missing）整則 CRIT 靜默消失。
 # 逐類（missing/extra/補單失敗）最多列 _CRIT_MAX_ITEMS 張、其餘「另 M 張」摘要；
@@ -597,11 +625,17 @@ def _reconcile_orders(
       3. **先 cancel（降級舊單 + to_cancel，釋放保證金）後 place（to_place + 降級新規格）**
          ——順序是紅線（hl orders.py:228-243）。
       4. settle 驗證（僅 live）：sleep → 重抓 → 同容忍度算 missing/extra → 不符則
-         先撤 extra 再補 missing（補單走 `place_with_reason`，拒因收集）→ 再
-         sleep+重抓再驗 → 仍不符 → sync_failed=True + notifier.critical
+         先撤 extra 再補**可行動** missing（補單走 `place_outcome`，拒因收集）→ 再
+         sleep+重抓再驗 → 仍有可行動 missing 或 extra → sync_failed=True + notifier.critical
          （工程原則 3：安全關鍵失敗大聲告警，絕不吞掉）。CRIT 內容為可自診斷格式
          （逐單價量方向＋[ro]＋原量、部位行、補單拒因、trim 形狀自動診斷），
          dedup_key 以內容雜湊（不含 oid）讓同一持續狀態被去重（2026-07-28 事故修法）。
+         「可行動 missing」（`_actionable_missing`）：本輪最近一次 place 失敗，或同 slot
+         有 extra（僅 reduce-only 非 trigger，R2）；失敗計數為多重集合（R3）；其餘 missing 視為已消耗（成交／外部撤銷），不補、不 CRIT、不通知，
+         交下一輪依 leader 最新狀態重算。事故 2026-09-30（f438 主網 PUMP oid
+         560330169083→560330204326、ENA oid 561369641265→561369687236）：步驟 3 下的
+         鏡射單在 settle 期間成交，舊版把「簿上沒有」當成沒下成而重下，重複成交＋誤導
+         CRIT——違反工程原則 #2（非冪等寫入只重試冪等操作）。
 
     結構偏差（相對 hl，逐項）：
       - `trader.live_trading and my_address`（hl:247）→ 顯式 `live` 參數；
@@ -657,9 +691,13 @@ def _reconcile_orders(
 
     # ── 3. 後掛新單（目標新增的 + 改單退回的）保證金已釋放 ──────────────
     placed = 0
+    # 本輪 place 失敗的 spec 多重集合（D1／R3 謂詞輸入）：失敗 +1，成功不扣減
+    failed: Counter[OrderSpec] = Counter()
     for d in list(plan.to_place) + [spec for _oid, _coin, spec in fallback]:
-        if ex.place(d):
+        if ex.place_outcome(d).ok:
             placed += 1
+        else:
+            failed[d] += 1
 
     # ── 4. 驗證（僅 live）→ 不符先撤多再補缺 → 仍不符發 critical ────────
     sync_failed = False
@@ -669,23 +707,29 @@ def _reconcile_orders(
         missing, extra = _verify_diff(
             desired, after, px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance
         )
+        missing = _actionable_missing(missing, extra, failed)
         if missing or extra:
             for m in extra:  # 先撤多（釋放保證金）
                 if ex.cancel(m.coin, m.oid):
                     cancelled += 1
             place_fails: list[tuple[OrderSpec, str]] = []
             for d in missing:  # 再補缺；失敗不得靜默，拒因收集進 CRIT（工程原則 3）
-                ok, reason = ex.place_with_reason(d)
-                if ok:
+                outcome = ex.place_outcome(d)
+                if outcome.ok:
                     placed += 1
+                    if failed[d] > 1:  # settle 重試成功才扣減，降到 0 移除
+                        failed[d] -= 1
+                    else:
+                        failed.pop(d, None)
                 else:
-                    place_fails.append((d, reason))
+                    place_fails.append((d, outcome.reason))
 
             sleep_fn(settings.settle_seconds)
             after = ex.get_open_orders()
             missing, extra = _verify_diff(
                 desired, after, px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance
             )
+            missing = _actionable_missing(missing, extra, failed)
             if missing or extra:
                 sync_failed = True
                 # ── CRIT 必須可自行診斷（2026-07-28 事故教訓）：逐單價量方向、
@@ -732,7 +776,7 @@ def _reconcile_orders(
                 elif not place_fails:
                     lines.append(
                         "原因未能自動判定，排查：POST /info historicalOrders "
-                        "查被拒單與修剪"
+                        "查被拒單與修剪；userFillsByTime 的 crossed 分辨 maker/taker 成交"
                     )
                 text = "\n".join(lines)
                 if len(text) > _CRIT_MAX_LEN:  # 保險截斷：寧可少講也要送得出去

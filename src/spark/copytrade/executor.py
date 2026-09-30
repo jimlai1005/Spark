@@ -28,6 +28,20 @@ if TYPE_CHECKING:
     from spark.copytrade.orders import OrderSpec
 
 
+@dataclass(frozen=True)
+class PlaceOutcome:
+    """一次 place 的完整結果（2026-09-30 settle 重下事故：成功形態不得丟棄）。
+
+    status："resting"（掛上簿；dry 亦同）｜"filled"（下單當下即成交）｜
+    "unknown"（resilience verified 短路，回應遺失、真相待下輪對帳）｜"rejected"（ok=False）。
+    決策只看 ok；status/filled_sz 是正面證據與稽核用途。"""
+
+    ok: bool
+    reason: str          # 失敗原因；成功為 ""
+    status: str          # "resting" | "filled" | "unknown" | "rejected"
+    filled_sz: Decimal   # 下單當下即成交量；非 filled 為 Decimal("0")
+
+
 @runtime_checkable
 class ExecutorPort(Protocol):
     """引擎唯一寫入通道。包裝了 Hyperliquid API 的有序下單/修改/撤單操作。
@@ -46,6 +60,10 @@ class ExecutorPort(Protocol):
 
         2026-07-28 事故修法（工程原則 3）：`_reconcile_orders` 的重試補單失敗
         必須把交易所拒因帶進 CRIT 告警，不得只看 bool 就吞掉。"""
+        ...
+
+    def place_outcome(self, spec: "OrderSpec") -> PlaceOutcome:  # noqa: F821
+        """掛新單並回傳完整結果（ok／拒因／resting|filled|unknown|rejected／即成交量）。"""
         ...
 
     def modify(self, oid: int, spec: "OrderSpec") -> bool:  # noqa: F821
@@ -193,37 +211,58 @@ class ActionExecutor:
 
     # ── 寫入（live gate）──────────────────────────────────────────────
     def place(self, spec: "OrderSpec") -> bool:
-        return self.place_with_reason(spec)[0]
+        return self.place_outcome(spec).ok
 
     def place_with_reason(self, spec: "OrderSpec") -> tuple[bool, str]:
-        """掛新單並帶回失敗原因（交易所拒因；成功為空字串）。
+        o = self.place_outcome(spec)
+        return o.ok, o.reason
+
+    def place_outcome(self, spec: "OrderSpec") -> PlaceOutcome:
+        """掛新單並帶回完整結果（唯一實作本體；一次 place 只記一筆 ActionRecord）。
 
         live gate 不變：live=False 走虛擬簿、零 adapter 寫入。拒因萃取比照
         positions.py `_fail_detail` 的既有模式（`_extract_order_error` 解析
         交易所回應；adapter 自製失敗讀 raw["error"]）。原因同時記入
-        ActionRecord payload（"error"），shadow 稽核可見。"""
+        ActionRecord payload（"error"），status／filled_sz 亦入 payload 供稽核。
+        status 對照 adapter `_parse_order_response`：ok=False→rejected；
+        filled_size>0→filled；raw `_resilience=="verified"`→unknown；其餘→resting。"""
+        zero = Decimal("0")
         if spec.is_trigger:
             self._skip_trigger("place", spec)
-            return False, "trigger 單 M1 尚不支援（adapter 無 trigger 下單）"
+            return PlaceOutcome(False, "trigger 單 M1 尚不支援（adapter 無 trigger 下單）",
+                                "rejected", zero)
         payload = {"is_buy": spec.is_buy, "sz": str(spec.sz),
                    "limit_px": str(spec.limit_px), "reduce_only": spec.reduce_only,
                    "tif": spec.tif}
         reason = ""
+        filled_sz = zero
         if self.live:
             res = self._adapter.place_order(self._signer, self._order_from(spec),
                                             self._builder)
             ok = res.ok
+            raw = res.raw
             if not ok:
-                reason = _extract_order_error(res.raw) or (
-                    res.raw.get("error", "") if isinstance(res.raw, dict) else "")
+                status = "rejected"
+                reason = _extract_order_error(raw) or (
+                    raw.get("error", "") if isinstance(raw, dict) else "")
+            elif res.filled_size > 0:
+                status = "filled"
+                filled_sz = res.filled_size
+            elif isinstance(raw, dict) and raw.get("_resilience") == "verified":
+                status = "unknown"
+            else:
+                status = "resting"
         else:
             payload["oid"] = str(self._book.place(spec))
             ok = True
+            status = "resting"
         payload["ok"] = ok
+        payload["status"] = status
+        payload["filled_sz"] = str(filled_sz)
         if reason:
             payload["error"] = reason
         self._record("place", spec.coin, payload)
-        return ok, reason
+        return PlaceOutcome(ok, reason, status, filled_sz)
 
     def modify(self, oid: int, spec: "OrderSpec") -> bool:
         if spec.is_trigger:

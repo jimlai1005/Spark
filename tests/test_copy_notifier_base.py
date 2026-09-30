@@ -85,7 +85,7 @@ class TestExecutorPortProtocol:
 
     def test_minimal_fake_implements_protocol(self):
         """最小實作應符合 Protocol。"""
-        from spark.copytrade.executor import ExecutorPort
+        from spark.copytrade.executor import ExecutorPort, PlaceOutcome
 
         class FakeExecutor:
             def __init__(self):
@@ -96,6 +96,9 @@ class TestExecutorPortProtocol:
 
             def place_with_reason(self, spec):
                 return True, ""
+
+            def place_outcome(self, spec):
+                return PlaceOutcome(True, "", "resting", Decimal("0"))
 
             def modify(self, oid, spec):
                 return True
