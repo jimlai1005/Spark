@@ -325,6 +325,33 @@ def test_exact_total_loss_is_not_flow_dominated():
     assert perf["status"] == "ok" and perf["twr"] == Decimal("-1")
 
 
+# --- 2026-09-30 方案 B（0x4cae5bed…7c34 事故：InvalidOperation 0/0）：權益指數歸零
+# （r == -1，合法）之後若還有後續已入金區間，單一條鏈無法表示「清空後再入金」——
+# 整窗判 insufficient，reason equity_index_collapsed，不拋例外，不切段重算。 -------
+def test_equity_index_collapse_with_later_funded_interval_is_insufficient():
+    # 區間 1：prev_av=1000, d_pnl=-1000 → r=-1（合法歸零，equity_index 變 0）
+    # 區間 2：av 1000→0（提光空窗，不重複計入 skipped——floor 判斷發生在下一段
+    #         的 prev_av，這裡 prev_av=1000 走的是 r 計算分支，非地板分支）
+    # 區間 2 之後仍有區間（500、550，代表再入金）→ 歸零非發生在最後一段 → 觸發 guard
+    av = [1000, 0, 500, 550]
+    pnl = [0, -1000, -1000, -950]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == STATUS_INSUFFICIENT
+    assert perf["reason"] == "equity_index_collapsed"
+    assert perf["skipped_intervals"] == 0
+    assert "twr" not in perf and "max_drawdown" not in perf
+
+
+def test_equity_index_collapse_on_final_interval_still_ok():
+    # 歸零剛好發生在最後一個區間（沒有後續區間）→ 不觸發 guard，維持既有行為
+    # （既測試 test_exact_total_loss_is_not_flow_dominated 同型，這裡多一段前置正常區間
+    # 確認 guard 只看「歸零之後還有沒有區間」，不是「序列裡有沒有出現過歸零」）
+    av = [1000, 1100, 0]
+    pnl = [0, 100, -1000]
+    perf = compute_window_performance(_portfolio("month", av, pnl), "month")
+    assert perf["status"] == "ok" and perf["twr"] == Decimal("-1")
+
+
 def test_skipped_ratio_exactly_at_threshold_passes():
     # 11 點 → 10 區間；入金後提光 3 段（i=2..4 前值 5）= 0.30，不大於門檻 → ok
     av = [1000, 5, 5, 5, 1000, 1010, 1020, 1030, 1040, 1050, 1060]

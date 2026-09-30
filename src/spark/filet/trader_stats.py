@@ -11,7 +11,7 @@
 - `max_dd_pct`   ＝ `leader_perf.compute_window_performance` 的權益指數 MDD ×100，取負值
                    （≤ 0；沿探索頁既有慣例）。perf 非 ok → `None`，`max_dd_reason` 帶
                    leader_perf 的 reason（`flow_dominated_interval`／`too_many_skipped_intervals`
-                   ／`need_at_least_two_samples`…），前端顯示「—」並可 tooltip 原因。
+                   ／`equity_index_collapsed`／`need_at_least_two_samples`…），前端顯示「—」並可 tooltip 原因。
                    永不算在 accountValue 上（leader_perf 檔頭閘門 2）。
 - `spark`        ＝ 同一 `pnlHistory` 等距降採樣 ≤ 30 點（不補點）。
 三者出自同一次 `portfolio()` 回應的同一個窗（工程原則 1）。

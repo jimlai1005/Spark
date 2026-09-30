@@ -125,6 +125,13 @@ DENOMINATOR_FLOOR = Decimal("100")
 #   allTime 窗降採樣 6–9 天一點時常見（實證 0xbf73…5d58 2024-12-25 區間 r=-1.36）。
 # - 被分母地板跳過的區間比例 > MAX_SKIPPED_RATIO 代表這顆帳戶大半時間淨值 < 100
 #   USDC（入金→交易→提光型），剩下的區間不足以代表整窗（reason="too_many_skipped_intervals"）。
+# - 2026-09-30（方案 B，事故 0x4cae5bed…7c34）：r_t == -1（合法歸零）之後若還有
+#   **任何**後續區間（不論之後有無再入金：再入金是單一條鏈無法表示；沒再入金則
+#   後續區間全被地板跳過、指數停在 0，相鄰相除仍是 0/0），整窗判無效
+#   （reason="equity_index_collapsed"）；歸零剛好在最後一區間則不觸發，TWR=-1 正確。
+#   reviewer 2026-09-30 W1：「爆倉後尾端全 0、無再入金」也落此類——這種情況修前同樣
+#   0/0 炸掉，TWR=-1 本就不可達；要讓它顯示 -1 需改 ratio_returns 跳過零分母（方案 C，
+#   使用者未採），故此處誠實判 insufficient。
 MAX_SKIPPED_RATIO = Decimal("0.30")
 
 # 資料充足度門檻（研究文件 2d；2026-07-19 起語意為「足不足」而非「給不給」）。
@@ -418,6 +425,21 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
                            "——入金與虧損同區間，整窗判無效", period, i, r, prev_av, d_pnl)
             return _insufficient(period, "flow_dominated_interval", sample_count=len(pnl))
         equity_index.append(equity_index[-1] * (Decimal("1") + r))
+        if equity_index[-1] == 0 and i < len(pnl) - 1:
+            # 指數歸零（r == -1，合法）但之後還有區間（不論有無再入金，見檔頭
+            # 閘門說明）：之後每期 0 × (1+r) 仍是 0，`ratio_returns` 相鄰兩點相除
+            # 0/0 炸 InvalidOperation([DivisionUndefined])——與 flow_dominated_interval
+            # 同級判整窗無效（2026-09-30 使用者裁決方案 B；事故 0x4cae5bed…7c34）。
+            # 若歸零剛好落在最後一個區間，之後沒有區間可算——不觸發，TWR = -1 是正確答案
+            # （見 test_exact_total_loss_is_not_flow_dominated）。
+            logger.warning("portfolio %s 窗第 %d 區間權益指數歸零且其後仍有 %d 區間"
+                           "——整窗判 insufficient", period, i, len(pnl) - 1 - i)
+            out = _insufficient(period, "equity_index_collapsed", sample_count=len(pnl))
+            # ⚠️ 語意：這裡的 skipped_intervals 是「截至歸零點」的部分計數（迴圈中途
+            # return），不是整窗計數；too_many_skipped_intervals／no_funded_interval
+            # 兩處才是整窗值。前端只當提示數字顯示，不參與判定。
+            out["skipped_intervals"] = skipped
+            return out
 
     # 閘門 5：比例只看「首次入金之後」的區間——開頭尚未入金不是入金→提光。
     effective_total = (len(pnl) - 1) - leading_unfunded

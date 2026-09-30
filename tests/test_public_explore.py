@@ -335,6 +335,19 @@ def test_enrich_candidate_day_week_invalid_series_stores_none_not_skip_whole_row
     assert row.windows["day"] is None
 
 
+def test_enrich_candidate_equity_index_collapse_in_one_window_does_not_crash_others():
+    """2026-09-30 方案 B（正式機重放事故 0x4cae5bed…7c34）：allTime 權益指數歸零
+    （r==-1，帳戶清空）後仍有已入金區間（再入金）——單一條鏈無法表示，整窗判
+    insufficient／equity_index_collapsed，`enrich_candidate` 不得拋出
+    `InvalidOperation`；同一次 `portfolio()` 回應裡的 month 窗不受影響，照常算出數字。"""
+    portfolio_raw = _portfolio_raw([500, 550, 600, 650], [1000, 0, 500, 550, 600])
+    row = enrich_candidate(_A, None, portfolio_raw, [], _ch_state())
+    assert row is not None
+    assert row.windows["allTime"].max_dd_pct is None
+    assert row.windows["allTime"].max_dd_reason == "equity_index_collapsed"
+    assert isinstance(row.windows["month"].max_dd_pct, float)
+
+
 # ============================================================
 # 純函式：qualify — 資格過濾邊界（等號行為釘死）
 # ============================================================

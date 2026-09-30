@@ -60,6 +60,20 @@ def test_window_stats_single_point_is_none():
     assert window_stats(rows, "month") is None
 
 
+def test_window_stats_equity_index_collapse_is_insufficient_not_crash():
+    # 2026-09-30 方案 B（0x4cae5bed…7c34 事故）：權益指數歸零（r==-1，合法）之後
+    # 仍有已入金區間 → leader_perf 回 insufficient/equity_index_collapsed，
+    # window_stats 沿既有「非 ok → max_dd_pct=None、reason 原樣透傳」路徑處理，不拋例外。
+    ts = [1_700_000_000_000 + i * 3_600_000 for i in range(4)]
+    av = [[t, v] for t, v in zip(ts, ["1000", "0", "500", "550"])]
+    pnl = [[t, v] for t, v in zip(ts, ["0", "-1000", "-1000", "-950"])]
+    rows = [["month", {"accountValueHistory": av, "pnlHistory": pnl}]]
+    ws = window_stats(rows, "month")
+    assert ws.max_dd_pct is None
+    assert ws.max_dd_reason == "equity_index_collapsed"
+    assert ws.pnl_usd == -950.0                # pnlHistory 末值 -950 − 首值 0
+
+
 def test_window_stats_to_dict_shape(portfolio):
     d = window_stats(portfolio, "month").to_dict()
     assert set(d) == {"pnl_usd", "max_dd_pct", "max_dd_reason", "spark"}
