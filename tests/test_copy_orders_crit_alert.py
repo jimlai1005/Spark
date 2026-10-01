@@ -120,13 +120,16 @@ def _crit_dedup(notifier) -> str | None:
 
 
 # 事故形狀：desired ro 0.0457；交易所上只剩被修剪到部位量的 0.0289（oid 每輪換）
-def _incident_scenario(*, oid1=99, oid2=100, place_reason_seq=None, extra_px="2000"):
+# 2026-10-01 C2：同價較小 ro 單現為殘單（保留、不告警）；CRIT 場景改用價格不同的 extra
+# （非殘單），並以「place 失敗」表達可行動 missing（條款 2 已刪）。
+def _incident_scenario(*, oid1=99, oid2=100, place_reason_seq=None, extra_px="2100"):
     d = _spec(sz="0.0457")
     trimmed1 = _open_order(sz="0.0289", oid=oid1, orig_sz="0.0457", limit_px=extra_px)
     trimmed2 = _open_order(sz="0.0289", oid=oid2, orig_sz="0.0457", limit_px=extra_px)
     return _run([d], [[trimmed1], [trimmed2]],
                 my_positions={"ETH": _position()},
-                place_reason_seq=place_reason_seq)
+                place_reason_seq=(place_reason_seq if place_reason_seq is not None
+                                  else [(False, "x"), (False, "x")]))
 
 
 # ── 1. extra 側含 oid/幣/方向/剩餘量@價/[ro]/原量；missing 側含 [ro] ──
@@ -134,18 +137,19 @@ def test_crit_extra_has_price_size_side_ro_and_orig_sz():
     _ex, notifier, res = _incident_scenario()
     assert res.sync_failed is True
     text = _crit_text(notifier)
-    assert "oid=100 ETH S 0.0289@2000 [ro] 原量0.0457" in text
+    assert "oid=100 ETH S 0.0289@2100 [ro] 原量0.0457" in text
     assert "ETH S 0.0457@2000 [ro]" in text  # missing 側含 [ro] 標記
 
 
 def test_crit_extra_without_orig_sz_omits_orig_field():
     d = _spec(sz="0.0457")
-    trimmed = _open_order(sz="0.0289", oid=100, orig_sz=None)
+    trimmed = _open_order(sz="0.0289", oid=100, orig_sz=None, limit_px="2100")
     _ex, notifier, _res = _run([d], [[trimmed], [trimmed]],
-                               my_positions={"ETH": _position()})
+                               my_positions={"ETH": _position()},
+                               place_reason_seq=[(False, "x"), (False, "x")])
     text = _crit_text(notifier)
     assert "原量" not in text
-    assert "oid=100 ETH S 0.0289@2000 [ro]" in text
+    assert "oid=100 ETH S 0.0289@2100 [ro]" in text
 
 
 # ── 2. 部位行 ────────────────────────────────────────────────────────
@@ -166,56 +170,39 @@ def test_crit_position_line_shows_no_position():
 # ── 3. 補單失敗原因入訊息（不得靜默）；組合驗收：四要素同訊息 ────────
 def test_crit_lists_place_failure_reasons():
     """missing+extra+補單失敗的組合案例：單一 CRIT 訊息須同時包含
-    (1) 逐單價量方向與 [ro]、(2) 部位行、(3) 補單失敗原因、(4) 診斷行。"""
+    (1) 逐單價量方向與 [ro]、(2) 部位行、(3) 補單失敗原因（診斷行已於 2026-10-01 移除）。"""
     reason = "Order must have minimum value of $10."
-    # 第一次 place（初掛）成功、重試段的補單失敗
+    # 初掛失敗（可行動 missing）、重試段的補單失敗
     _ex, notifier, _res = _incident_scenario(
-        place_reason_seq=[(True, ""), (False, reason)])
+        place_reason_seq=[(False, "x"), (False, reason)])
     text = _crit_text(notifier)
     # (1) 價量方向 + ro 標記（missing 與 extra 兩側）
     assert "ETH S 0.0457@2000 [ro]" in text
-    assert "oid=100 ETH S 0.0289@2000 [ro] 原量0.0457" in text
+    assert "oid=100 ETH S 0.0289@2100 [ro] 原量0.0457" in text
     # (2) 部位行
     assert "部位：ETH 0.0289" in text
     # (3) 補單失敗原因
     assert "補單失敗：" in text
     assert reason in text
-    # (4) trim 形狀診斷行
-    assert "診斷：ETH 的 reduce-only 掛單已被交易所修剪至部位上限" in text
+    # (4) 修剪診斷行已於 2026-10-01 C4 移除
+    assert "診斷：" not in text
 
 
-# ── 4. trim 形狀 → 診斷行 ────────────────────────────────────────────
-def test_trim_shape_triggers_self_heal_diagnosis_line():
-    _ex, notifier, _res = _incident_scenario()
-    text = _crit_text(notifier)
-    assert "診斷：ETH 的 reduce-only 掛單已被交易所修剪至部位上限" in text
-    assert "下一輪仍告警才需人工介入" in text
-
-
+# ── 4. 無補單失敗時的排查提示（修剪診斷行已於 2026-10-01 C4 刪除）──
 def test_non_trim_shape_without_reasons_falls_back_to_investigation_hint():
     d = _spec(coin="BTC", is_buy=True, sz="0.5", limit_px="50000",
               reduce_only=False)
-    # 2026-09-30 D1：改用「同 slot 有 extra」讓 missing 可行動，place 仍成功
-    # （無補單失敗行），使 fallback 排查提示仍被命中
-    stray = _open_order(coin="BTC", is_buy=True, sz="0.3", limit_px="50000",
+    # 2026-10-01 C2／C3：初掛失敗＝可行動 missing，重試成功（無補單失敗行）；
+    # 簿上價格不同的 extra（非殘單）使第二輪仍不符 → CRIT 走 fallback 排查提示
+    stray = _open_order(coin="BTC", is_buy=True, sz="0.3", limit_px="51000",
                         reduce_only=False, oid=100)
-    _ex, notifier, _res = _run([d], [[stray], [stray]], my_positions={})
+    _ex, notifier, _res = _run([d], [[stray], [stray]], my_positions={},
+                               place_reason_seq=[(False, "x"), (True, "")])
     text = _crit_text(notifier)
     assert "診斷：" not in text
     assert "原因未能自動判定" in text
     assert "historicalOrders" in text
     assert "userFillsByTime" in text
-
-
-def test_trim_diagnosis_requires_extra_total_near_position():
-    """extra 剩餘量與 |部位| 差超出 size_tolerance → 不下修剪診斷（避免誤導）。"""
-    d = _spec(sz="0.0457")
-    stray = _open_order(sz="0.01", oid=100)  # 0.01 vs 部位 0.0289：差 65% >> 8%
-    _ex, notifier, _res = _run([d], [[stray], [stray]],
-                               my_positions={"ETH": _position()})
-    text = _crit_text(notifier)
-    assert "診斷：" not in text
-    assert "原因未能自動判定" in text
 
 
 # ── 5. dedup_key：oid 變化穩定、內容變化敏感 ─────────────────────────
@@ -229,7 +216,7 @@ def test_dedup_key_stable_when_only_oid_changes():
 
 def test_dedup_key_changes_when_content_changes():
     _ex1, n1, _ = _incident_scenario()
-    _ex2, n2, _ = _incident_scenario(extra_px="2100")  # extra 價變 → 新告警
+    _ex2, n2, _ = _incident_scenario(extra_px="2200")  # extra 價變 → 新告警
     assert _crit_dedup(n1) != _crit_dedup(n2)
 
 
@@ -288,7 +275,7 @@ def test_place_failure_reason_is_html_escaped():
     """拒因含 '<' 會讓 Telegram HTML parse 失敗、整則 400 消失。"""
     reason = "Order size < minimum & invalid"
     _ex, notifier, _res = _incident_scenario(
-        place_reason_seq=[(True, ""), (False, reason)])
+        place_reason_seq=[(False, "x"), (False, reason)])
     text = _crit_text(notifier)
     assert "Order size &lt; minimum &amp; invalid" in text
     assert "size < minimum" not in text

@@ -460,54 +460,160 @@ def _verify_diff(
     *,
     px_rel_tol: Decimal,
     size_tol: Decimal,
+    exclude_oids: frozenset[int] = frozenset(),
 ) -> tuple[list[OrderSpec], list[OpenOrder]]:
-    """settle 驗證的 missing/extra 計算。1:1 hl orders.py:250-251/266-267——
-    與 `_plan` 用同一個 `_orders_match` 與同一組容忍度（工程原則 1：同源同基準）。"""
+    """settle 驗證的 missing/extra 計算。
+
+    與 `_plan` 步驟 1 同形的 1:1 配對（工程原則 1：同源同基準；2026-10-01 F2）：
+    依 desired 順序，各取第一張尚未被用掉且 `_orders_match` 的 after 單，用掉即標記；
+    兩段：先配 sz 完全相等者，再用容忍度配剩下的（C9）。
+    `exclude_oids`（C14）：本輪嘗試過 cancel／modify 的 oid 兩段配對都跳過、一律進 extra——
+    撤單失敗仍在簿上的舊單若滿足某張 desired，會讓另一張已成交的 spec 被當成可行動而重下。
+    missing＝沒配到的 desired；extra＝沒被用掉的 after。
+    （舊版用 any() 讓簿上一張單同時滿足兩張相同 desired，失敗那張不算 missing → 靜默。）
+    """
     after_pairs = [(m, spec_from_open_order(m)) for m in after]
-    missing = [
-        d
-        for d in desired
-        if not any(
-            _orders_match(d, s, px_rel_tol=px_rel_tol, size_tol=size_tol)
-            for _m, s in after_pairs
-        )
-    ]
-    extra = [
-        m
-        for m, s in after_pairs
-        if not any(
-            _orders_match(d, s, px_rel_tol=px_rel_tol, size_tol=size_tol) for d in desired
-        )
-    ]
+    used: set[int] = set()
+    matched: set[int] = set()  # desired 索引
+    # 兩段配對（C9／W2）：先配 sz 完全相等，再用容忍度配剩下的；
+    # 否則 size_tol 內的近似 spec 會互搶單（b=1050 搶走 a=1000 的單 → a 被當已消耗、b 的失敗靜默）。
+    for exact in (True, False):
+        for di, d in enumerate(desired):
+            if di in matched:
+                continue
+            hit = next(
+                (
+                    i
+                    for i, (_m, s) in enumerate(after_pairs)
+                    if i not in used
+                    and after_pairs[i][0].oid not in exclude_oids
+                    and (not exact or s.sz == d.sz)
+                    and _orders_match(d, s, px_rel_tol=px_rel_tol, size_tol=size_tol)
+                ),
+                None,
+            )
+            if hit is not None:
+                used.add(hit)
+                matched.add(di)
+    missing = [d for di, d in enumerate(desired) if di not in matched]
+    extra = [m for i, (m, _s) in enumerate(after_pairs) if i not in used]
     return missing, extra
+
+
+def _failed_key(d: OrderSpec) -> tuple:
+    """同 slot 同價為一組（C13 第二段配對用）。近似量（size_tol 內）的單在
+    `_plan`／`_verify_diff` 的配對本來就不唯一，所以第二段才允許跨 spec 值配對。"""
+    return (_slot_key(d), d.limit_px, d.trigger_px)
 
 
 def _actionable_missing(
     missing: list[OrderSpec],
-    extra: list[OpenOrder],
     failed: Counter[OrderSpec],
-) -> list[OrderSpec]:
-    """settle 驗證的「可行動 missing」單一謂詞（兩輪驗證共用，2026-09-30 D1／R2／R3）。
+    *,
+    size_tol: Decimal,
+) -> list[tuple[OrderSpec, OrderSpec]]:
+    """settle 驗證的「可行動 missing」單一謂詞（兩輪驗證共用）。
 
-    只有兩種 missing 值得補下／告警：
-      1. 本輪 place 失敗過的 spec（`failed` 多重集合）：值相同的 spec 最多放行
-         min(missing 中出現次數, failed 計數) 張（R3，避免同值 spec 互相覆寫）；
-      2. **reduce-only 且非 trigger** 的 spec，同 slot（`_slot_key`）在簿上有 extra 單
-         ＝形狀不符（reduce-only 被交易所修剪）。此條不受 failed 上限約束。
-         非 ro 單不適用（R2）：部分成交的殘單會變成同 slot extra，若因此重下全量
-         ＝已成交部分重複執行；ro 重下受交易所部位封頂，不會超額。
-    其餘（place 成功後消失、matched 後消失、從未嘗試）視為已被消耗（成交或外部撤銷），
-    不補、不告警——重下＝非冪等寫入盲重試（工程原則 #2），會造成重複成交。"""
-    extra_slots = {_slot_key(spec_from_open_order(m)) for m in extra}
+    2026-10-01（F1／F3，C3；C13 修正 C11）：只剩一條——本輪 place 失敗過的 spec（`failed`
+    多重集合）。回傳（要補的 missing, 對應消耗的 failed spec）清單，兩段 1:1 配對：
+      1. missing 與 failed spec 值完全相等者先配（R3：同值 spec 最多放行 failed 計數張）；
+      2. 剩下的 missing 只與「同 `_failed_key` 且 abs(m.sz − f.sz) <= size_tol × f.sz」的剩餘
+         failed 配對（簿上近似量單配對不唯一時，失敗那張可能被當成另一張 missing）。
+    配不到的 missing 一律非可行動：已被消耗（成交或外部撤銷）、不補、不告警——重下＝非冪等寫入
+    盲重試（工程原則 #2）。（C11 的純群組鍵會在量差大時放行已成交的那張＝重複成交，已撤回。）
+
+    已刪除的舊條款 2（reduce-only 且同 slot 有 extra 就重下）：它保護的是 2026-07-28 的
+    「ro 單被交易所修剪至部位」情境，但 40d00e7 起 `_build_desired` 已把 ro 期望量封頂在
+    本輪部位快照；同一輪內「ro 剩餘量 < desired」幾乎必然是我方單部分成交，重下全量
+    會多減（部位 5000、ro 1000 成交 600 → 殘單 400 被撤、重下 1000＝實減 1600）。
+    殘單改由 `_pair_residuals` 配對保留。"""
     budget = Counter(failed)
-    out: list[OrderSpec] = []
+    pairs: dict[int, OrderSpec] = {}
+    for i, m in enumerate(missing):  # 第一段：spec 值完全相等
+        if budget[m] > 0:
+            budget[m] -= 1
+            pairs[i] = m
+    for i, m in enumerate(missing):  # 第二段：同群組且量差在 size_tol 內
+        if i in pairs:
+            continue
+        for f, cnt in budget.items():
+            if (
+                cnt > 0
+                and _failed_key(f) == _failed_key(m)
+                and abs(m.sz - f.sz) <= size_tol * f.sz
+            ):
+                budget[f] -= 1
+                pairs[i] = f
+                break
+    return [(m, pairs[i]) for i, m in enumerate(missing) if i in pairs]
+
+
+def _pair_residuals(
+    missing: list[OrderSpec],
+    extra: list[OpenOrder],
+    *,
+    px_rel_tol: Decimal,
+    size_tol: Decimal,
+    exclude_oids: frozenset[int] = frozenset(),
+) -> tuple[list[OrderSpec], list[OpenOrder]]:
+    """殘單配對（2026-10-01 F1／F3，C2＋C5）：部分成交後剩下的單不是形狀錯誤的單。
+
+    extra 單 E 與 missing 單 d 同時滿足：`_slot_key` 相同、皆非 trigger、價格相等（px_rel_tol）、
+    `E.orig_sz` 非 None 且與 d.sz 相對差在 size_tol 內（C5：核對原始下單量，否則
+    leader 加量 modify 沒生效、撤單失敗的舊單、同價多張單互相誤配都會被當殘單吞掉）、
+    E.sz < d.sz，即為殘單對，兩者都從清單移除（不撤、不補、不 CRIT）。
+    orig_sz 為 None → 不算殘單（保守退路：撤＋CRIT）。
+    oid 在 `exclude_oids`（本輪嘗試過 cancel／modify 的 oid，不論成敗；C8）的 extra 一律不當殘單：
+    它是「我們剛想處理掉、卻還在簿上」的單，吞掉會讓撤單失敗靜默。
+    1:1 貪婪配對（依清單順序）。回傳（剩下的 missing, 剩下的 extra）。"""
+    left_extra = list(extra)
+    left_missing: list[OrderSpec] = []
     for d in missing:
-        if d.reduce_only and not d.is_trigger and _slot_key(d) in extra_slots:
-            out.append(d)
-        elif budget[d] > 0:
-            budget[d] -= 1
-            out.append(d)
-    return out
+        hit = None
+        if not d.is_trigger:
+            for i, e in enumerate(left_extra):
+                es = spec_from_open_order(e)
+                if (
+                    e.oid not in exclude_oids
+                    and not es.is_trigger
+                    and _slot_key(es) == _slot_key(d)
+                    and _prices_equal(d.limit_px, es.limit_px, px_rel_tol)
+                    and e.orig_sz is not None
+                    and abs(e.orig_sz - d.sz) <= size_tol * d.sz
+                    and e.sz < d.sz
+                ):
+                    hit = i
+                    break
+        if hit is None:
+            left_missing.append(d)
+        else:
+            del left_extra[hit]
+    return left_missing, left_extra
+
+
+def _settle_verify(
+    desired: list[OrderSpec],
+    after: list[OpenOrder],
+    failed: Counter[OrderSpec],
+    *,
+    px_rel_tol: Decimal,
+    size_tol: Decimal,
+    exclude_oids: frozenset[int] = frozenset(),
+) -> tuple[list[tuple[OrderSpec, OrderSpec]], list[OpenOrder]]:
+    """兩輪驗證共用的固定處理順序（C3）：1:1 diff → 可行動 missing（failed 預算）→
+    其餘 missing 與 extra 配殘單（兩邊丟棄）→ 未配對的非可行動 missing 丟棄（已消耗）→
+    回傳（[(可行動 missing, 對應消耗的 failed spec)], 剩下的 extra）。"""
+    missing, extra = _verify_diff(
+        desired, after, px_rel_tol=px_rel_tol, size_tol=size_tol,
+        exclude_oids=exclude_oids)
+    actionable = _actionable_missing(missing, failed, size_tol=size_tol)
+    rest = list(missing)
+    for d, _f in actionable:  # 依值移除一份（spec 為值物件，多重集合語意）
+        rest.remove(d)
+    _rest_left, extra = _pair_residuals(
+        rest, extra, px_rel_tol=px_rel_tol, size_tol=size_tol,
+        exclude_oids=exclude_oids)
+    return actionable, extra
 
 
 # CRIT 訊息上限（2026-07-28 審查 F2）：Telegram sendMessage 超過 4096 字元回 400，
@@ -564,42 +670,6 @@ def _sync_fail_dedup_key(account: str, missing: list[OrderSpec],
     return f"order_sync_failed:{digest}"
 
 
-def _diagnose_trimmed_coins(
-    missing: list[OrderSpec],
-    extra: list[OpenOrder],
-    my_positions: Mapping[str, Position],
-    *,
-    px_rel_tol: Decimal,
-    size_tol: Decimal,
-) -> list[str]:
-    """找出「ro 掛單被交易所修剪至部位上限（部位落後）」形狀的幣，供 CRIT 自動診斷。
-
-    判準（缺一不診斷，避免誤導）：missing 的 ro 單與 extra 的 ro 單以
-    （同幣、同方向、價格在 px_rel_tol 內）配對，extra 剩餘量 < missing 期望量；
-    且該幣 extra 側 ro 剩餘量合計與 |部位| 的相對差在 size_tol 內——
-    這是「每幣累計封頂到部位」的指紋（2026-07-28 實測行為）。"""
-    coins: list[str] = []
-    extra_ro = [o for o in extra if o.reduce_only and not o.is_trigger]
-    for coin in sorted({d.coin for d in missing if d.reduce_only and not d.is_trigger}):
-        pos = my_positions.get(coin)
-        if pos is None:
-            continue
-        paired = any(
-            o.coin == coin and o.is_buy == d.is_buy and o.sz < d.sz
-            and _prices_equal(_ref_px(d), o.limit_px, px_rel_tol)
-            for d in missing
-            if d.coin == coin and d.reduce_only and not d.is_trigger
-            for o in extra_ro
-        )
-        if not paired:
-            continue
-        abs_pos = abs(pos.szi)
-        total = sum((o.sz for o in extra_ro if o.coin == coin), Decimal("0"))
-        if abs(total - abs_pos) <= size_tol * max(abs_pos, Decimal("1e-8")):
-            coins.append(coin)
-    return coins
-
-
 def _reconcile_orders(
     ex,
     desired: list[OrderSpec],
@@ -628,14 +698,25 @@ def _reconcile_orders(
          先撤 extra 再補**可行動** missing（補單走 `place_outcome`，拒因收集）→ 再
          sleep+重抓再驗 → 仍有可行動 missing 或 extra → sync_failed=True + notifier.critical
          （工程原則 3：安全關鍵失敗大聲告警，絕不吞掉）。CRIT 內容為可自診斷格式
-         （逐單價量方向＋[ro]＋原量、部位行、補單拒因、trim 形狀自動診斷），
+         （逐單價量方向＋[ro]＋原量、部位行、補單拒因），
          dedup_key 以內容雜湊（不含 oid）讓同一持續狀態被去重（2026-07-28 事故修法）。
-         「可行動 missing」（`_actionable_missing`）：本輪最近一次 place 失敗，或同 slot
-         有 extra（僅 reduce-only 非 trigger，R2）；失敗計數為多重集合（R3）；其餘 missing 視為已消耗（成交／外部撤銷），不補、不 CRIT、不通知，
-         交下一輪依 leader 最新狀態重算。事故 2026-09-30（f438 主網 PUMP oid
-         560330169083→560330204326、ENA oid 561369641265→561369687236）：步驟 3 下的
-         鏡射單在 settle 期間成交，舊版把「簿上沒有」當成沒下成而重下，重複成交＋誤導
-         CRIT——違反工程原則 #2（非冪等寫入只重試冪等操作）。
+         處理順序固定（`_settle_verify`，2026-10-01 C3）：`_verify_diff`（1:1 配對）→
+         「可行動 missing」（`_actionable_missing`，只剩本輪 place 失敗的多重集合預算）→
+         其餘 missing 與 extra 跑 `_pair_residuals`（同 slot、同價、extra.sz < desired.sz＝
+         部分成交殘單，兩邊丟棄，不撤不補不 CRIT；另須 E.orig_sz 非 None 且與 desired.sz 在
+         size_tol 內相等、E 的 oid 不在本輪動過的 `touched_oids` 內）→ 未配對的非可行動 missing 視為已消耗
+         （成交／外部撤銷），不補、不 CRIT、不通知，交下一輪依 leader 最新狀態重算 →
+         剩下的 extra 撤單並入 CRIT。可行動 missing 優先於殘單配對。
+         本輪嘗試過 cancel／modify 的 oid（不論成敗）不當殘單（C8）；`_verify_diff` 兩段配對（C9）。
+         事故 2026-09-30（f438 主網 PUMP oid 560330169083→560330204326、ENA oid
+         561369641265→561369687236）：步驟 3 下的鏡射單在 settle 期間成交，舊版把「簿上沒有」
+         當成沒下成而重下，重複成交＋誤導 CRIT——違反工程原則 #2。
+         2026-10-01 修 F1（ro 部分成交殘單被撤＋重下全量＝多減）、F3（非 ro 殘單被當 extra
+         撤掉或發誤導 CRIT）：根因同為「把部分成交殘單當形狀錯誤」。關鍵前提：40d00e7 起
+         ro 期望量已封頂在本輪部位快照，同輪內「ro 剩餘 < desired」幾乎必為部分成交。
+         **行為改變（C4）**：7/28 的「ro 修剪形狀」從「撤單＋重下＋CRIT（附修剪診斷）」
+         變成「保留殘單、不告警」，修剪診斷函式與 CRIT 診斷行已刪除；
+         跨輪由下一輪依新部位重算。
 
     結構偏差（相對 hl，逐項）：
       - `trader.live_trading and my_address`（hl:247）→ 顯式 `live` 參數；
@@ -664,6 +745,8 @@ def _reconcile_orders(
     # ── 1. 就地改單；TTL 內/policy 降級/失敗的退回「取消舊單 + 重掛新單」──
     now = clock()
     modified = 0
+    # C8：本輪嘗試過 cancel／modify 的 oid（不論成敗）不得當殘單
+    touched_oids: set[int] = {oid for oid, _spec in plan.modifies} | set(plan.to_cancel)
     fallback: list[tuple[int, str, OrderSpec]] = []  # (舊單 oid, coin, 新單 spec)
     for oid, spec in plan.modifies:
         coin = spec.coin
@@ -699,41 +782,46 @@ def _reconcile_orders(
         else:
             failed[d] += 1
 
+    touched = frozenset(touched_oids)
+
     # ── 4. 驗證（僅 live）→ 不符先撤多再補缺 → 仍不符發 critical ────────
     sync_failed = False
     if live:
         sleep_fn(settings.settle_seconds)
         after = ex.get_open_orders()
-        missing, extra = _verify_diff(
-            desired, after, px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance
+        pairs, extra = _settle_verify(
+            desired, after, failed,
+            px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance,
+            exclude_oids=touched,
         )
-        missing = _actionable_missing(missing, extra, failed)
-        if missing or extra:
+        if pairs or extra:
             for m in extra:  # 先撤多（釋放保證金）
                 if ex.cancel(m.coin, m.oid):
                     cancelled += 1
             place_fails: list[tuple[OrderSpec, str]] = []
-            for d in missing:  # 再補缺；失敗不得靜默，拒因收集進 CRIT（工程原則 3）
+            for d, f in pairs:  # 再補缺；失敗不得靜默，拒因收集進 CRIT（工程原則 3）
                 outcome = ex.place_outcome(d)
                 if outcome.ok:
                     placed += 1
-                    if failed[d] > 1:  # settle 重試成功才扣減，降到 0 移除
-                        failed[d] -= 1
+                    if failed[f] > 1:  # settle 重試成功才扣減所配對的 failed spec，降到 0 移除
+                        failed[f] -= 1
                     else:
-                        failed.pop(d, None)
+                        failed.pop(f, None)
                 else:
                     place_fails.append((d, outcome.reason))
 
             sleep_fn(settings.settle_seconds)
             after = ex.get_open_orders()
-            missing, extra = _verify_diff(
-                desired, after, px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance
+            pairs, extra = _settle_verify(
+                desired, after, failed,
+                px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance,
+                exclude_oids=touched,
             )
-            missing = _actionable_missing(missing, extra, failed)
+            missing = [m for m, _f in pairs]
             if missing or extra:
                 sync_failed = True
                 # ── CRIT 必須可自行診斷（2026-07-28 事故教訓）：逐單價量方向、
-                # 部位快照（本輪既有資料，不新增 API 呼叫）、補單拒因、自動診斷。
+                # 部位快照（本輪既有資料，不新增 API 呼叫）、補單拒因。
                 involved = sorted({d.coin for d in missing} | {o.coin for o in extra})
                 if my_positions is None:
                     pos_line = "未提供部位快照"
@@ -763,17 +851,7 @@ def _reconcile_orders(
                         f"{html.escape(r, quote=False) or '交易所未回原因'}"
                         for d, r in place_fails[:_CRIT_MAX_ITEMS]
                     ) + _more(len(place_fails)))
-                trimmed = _diagnose_trimmed_coins(
-                    missing, extra, my_positions or {},
-                    px_rel_tol=settings.px_rel_tol, size_tol=settings.size_tolerance,
-                )
-                if trimmed:
-                    lines.append(
-                        f"診斷：{'、'.join(trimmed)} 的 reduce-only 掛單已被交易所"
-                        "修剪至部位上限（部位落後），屬暫態，通常下一輪自癒；"
-                        "下一輪仍告警才需人工介入"
-                    )
-                elif not place_fails:
+                if not place_fails:
                     lines.append(
                         "原因未能自動判定，排查：POST /info historicalOrders "
                         "查被拒單與修剪；userFillsByTime 的 crossed 分辨 maker/taker 成交"

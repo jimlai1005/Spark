@@ -222,8 +222,8 @@ def test_cancel_place_policy_degrades_all_modifies():
 def test_settle_missing_one_replaces_and_second_fetch_clean():
     d1 = _spec(coin="ETH", limit_px="2000")
     d2 = _spec(coin="BTC", limit_px="50000", sz="0.5", reduce_only=True)
-    # 缺 d2；簿上有同 slot 形狀不符的 ro BTC 單（extra，修剪形狀）→ d2 為可行動 missing
-    # （2026-09-30 D1／R2：同 slot extra 條款僅適用 reduce-only）
+    # 缺 d2：步驟 3 的 d2 place 失敗（可行動 missing）；簿上另有價格不符的 ro BTC 單（extra，撤掉）
+    # （2026-10-01 C3：同 slot extra 條款已刪，可行動只剩 place 失敗）
     after_first = [_open_order(coin="ETH", limit_px="2000", oid=11),
                    _open_order(coin="BTC", limit_px="50100", sz="0.5", oid=13,
                                reduce_only=True)]
@@ -231,13 +231,23 @@ def test_settle_missing_one_replaces_and_second_fetch_clean():
         _open_order(coin="ETH", limit_px="2000", oid=11),
         _open_order(coin="BTC", limit_px="50000", sz="0.5", oid=12, reduce_only=True),
     ]
-    ex = FakeExecutor(open_orders_seq=[after_first, after_second])
+    class _FailBtcOnce(FakeExecutor):
+        _failed_once = False
+
+        def place(self, spec) -> bool:
+            if spec.coin == "BTC" and not self._failed_once:
+                self._failed_once = True
+                self.records.append(("place", spec))
+                return False
+            return super().place(spec)
+
+    ex = _FailBtcOnce(open_orders_seq=[after_first, after_second])
     notifier = RecordingNotifier()
     sleeps: list = []
     res = _run_reconcile(ex, [d1, d2], [], live=True, notifier=notifier, sleeps=sleeps)
 
     assert res.sync_failed is False
-    assert res.placed == 3  # 初掛 2 + 補缺 1
+    assert res.placed == 2  # 初掛成功 1（d2 初掛失敗不計）+ 補缺 1
     assert [r[0] for r in ex.records].count("get_open_orders") == 2
     assert sleeps == [SETTINGS.settle_seconds, SETTINGS.settle_seconds]
     assert notifier.records == []  # 修正一次即收斂，不告警
