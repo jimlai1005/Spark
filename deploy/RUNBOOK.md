@@ -3006,6 +3006,31 @@ sudo journalctl -u "filet-follower@*" --since "2 minutes ago" --no-pager -o cat 
 驗收：部署後只在 leader 下一次減倉才有端到端證據（follower 送 reduce-only IOC 且成交）；TG 不再出現
 `平倉失敗 … invalid price`。**journal 沒有 info 級日誌**（repo 無 `basicConfig`），要看 HL `userFillsByTime`。
 
+### 5.8j ⭐⭐ 待部署：settle 驗證重複成交修法（2026-09-30／10-01；**兩檔熱修，跟單中**）
+
+事故：follower `f438b3…` 09-29 PUMP、09-30 ENA 各一則 CRIT「掛單重試後仍不符：缺少 1、多餘 0」。根因是
+`_reconcile_orders` 的 settle 驗證把「鏡射掛單已在 2 秒內成交」當成「沒下成」而重下同一張單，重下的單立刻以 taker
+成交＝重複執行（違反工程原則 #2：非冪等寫入不得盲重試）。指紋：`userFillsByTime` 同價同量兩張相隔約 2.7 秒，
+第一張 `crossed=False`、第二張 `crossed=True`；`historicalOrders` 兩張都顯示 filled，單看它會被誤導。
+修法 commits `2c5e591`（D1–D3）、`2fe572b`（F1–F3：部分成交殘單、1:1 配對、失敗預算）、`36ba9b7`（C15：touched_oids 收斂），
+plan `docs/superpowers/plans/2026-09-30-settle-retry-no-duplicate-fill.md`、`2026-10-01-settle-residual-and-1to1.md`。
+四輪 opus fresh 審查＋變異測試（每個保護條件都有測試會轉紅）＋Fable 第二意見複核。
+
+**部署範圍只有兩個檔**：`src/spark/copytrade/executor.py`、`src/spark/copytrade/orders.py`。照 §5.8i 單檔熱修程序，
+差別：前提 1 的「修法前 HEAD」是 `87472d7`（三個修法 commit 的父）；前提 2 與 scp／install／備份對**兩個檔各做一次**；
+import 驗算改 `from spark.copytrade.orders import _reconcile_orders`；`DEPLOYED_VERSION` 的 note 寫
+`hotfix two-file copytrade/{executor,orders}.py over 87472d7`。任一前提不成立 → §3.2 整包。
+
+**部署後 operator 會看到的行為改變**：
+1. CRIT「掛單重試後仍不符：缺少 N」只在**真正下單失敗兩次**時出現，必附「補單失敗：…拒因」；鏡射單成交不再誤發。
+2. 「診斷：… reduce-only 掛單已被交易所修剪 …」這行**不再存在**（函式已刪）。部分成交殘單與 7/28 那類修剪形狀改為
+   靜默保留、下一輪（60 秒）依 leader 最新狀態重算——不是故障。
+3. 「多餘 N」只列真正形狀不符（價格不同、量比目標大、原量對不上）或撤不掉的單。
+4. shadow／ActionRecord 的 place payload 多了 `status`（resting／filled／unknown／rejected）與 `filled_sz`。
+
+驗收：部署後一週內 `userFillsByTime` 不再出現上述 2.7 秒指紋；TG 不再出現「缺少 N、多餘 0、原因未能自動判定」。
+回滾＝兩個 `/tmp/*.py.bak-*` 裝回去再跑 `reload_follower.sh`。
+
 ## 6. nginx + certbot
 
 ```bash
