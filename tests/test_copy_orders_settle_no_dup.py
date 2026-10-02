@@ -533,3 +533,16 @@ def _run_ex_settings(ex, desired, mine, settings):
         ex, desired, mine, settings=settings, notifier=n, state=ReconcileState(),
         live=True, clock=lambda: 1000.0, sleep_fn=lambda s: None, my_positions={})
     return n, res
+
+
+def test_modify_success_same_oid_in_place_resize_is_not_extra():
+    """C15（H1）：modify 回 True 且 HL 原 oid 就地改量（簿上同 oid 已是 1000）
+    → modify 成功的 oid 不在 touched，正常配對：0 撤單、0 補單、0 CRIT。"""
+    d = _spec(sz="1000")
+    old = _open(_spec(sz="600"), oid=1)
+    resized = _open(_spec(sz="1000"), oid=1)
+    ex, n, res = _run_with(FakeExecutor, [d], [old], [[resized], [resized]])
+    assert _cancels(ex) == []
+    assert _places(ex) == []
+    assert _crits(n) == []
+    assert res.sync_failed is False

@@ -467,7 +467,7 @@ def _verify_diff(
     與 `_plan` 步驟 1 同形的 1:1 配對（工程原則 1：同源同基準；2026-10-01 F2）：
     依 desired 順序，各取第一張尚未被用掉且 `_orders_match` 的 after 單，用掉即標記；
     兩段：先配 sz 完全相等者，再用容忍度配剩下的（C9）。
-    `exclude_oids`（C14）：本輪嘗試過 cancel／modify 的 oid 兩段配對都跳過、一律進 extra——
+    `exclude_oids`（C14）：本輪嘗試撤銷的 oid 兩段配對都跳過、一律進 extra——
     撤單失敗仍在簿上的舊單若滿足某張 desired，會讓另一張已成交的 spec 被當成可行動而重下。
     missing＝沒配到的 desired；extra＝沒被用掉的 after。
     （舊版用 any() 讓簿上一張單同時滿足兩張相同 desired，失敗那張不算 missing → 靜默。）
@@ -563,7 +563,7 @@ def _pair_residuals(
     leader 加量 modify 沒生效、撤單失敗的舊單、同價多張單互相誤配都會被當殘單吞掉）、
     E.sz < d.sz，即為殘單對，兩者都從清單移除（不撤、不補、不 CRIT）。
     orig_sz 為 None → 不算殘單（保守退路：撤＋CRIT）。
-    oid 在 `exclude_oids`（本輪嘗試過 cancel／modify 的 oid，不論成敗；C8）的 extra 一律不當殘單：
+    oid 在 `exclude_oids`（本輪嘗試撤銷的 oid，不論成敗；C8／C15）的 extra 一律不當殘單：
     它是「我們剛想處理掉、卻還在簿上」的單，吞掉會讓撤單失敗靜默。
     1:1 貪婪配對（依清單順序）。回傳（剩下的 missing, 剩下的 extra）。"""
     left_extra = list(extra)
@@ -707,7 +707,7 @@ def _reconcile_orders(
          size_tol 內相等、E 的 oid 不在本輪動過的 `touched_oids` 內）→ 未配對的非可行動 missing 視為已消耗
          （成交／外部撤銷），不補、不 CRIT、不通知，交下一輪依 leader 最新狀態重算 →
          剩下的 extra 撤單並入 CRIT。可行動 missing 優先於殘單配對。
-         本輪嘗試過 cancel／modify 的 oid（不論成敗）不當殘單（C8）；`_verify_diff` 兩段配對（C9）。
+         本輪嘗試撤銷的 oid（fallback 舊單＋to_cancel，不論成敗；modify 成功者不算）不當殘單（C8／C15）；`_verify_diff` 兩段配對（C9）。
          事故 2026-09-30（f438 主網 PUMP oid 560330169083→560330204326、ENA oid
          561369641265→561369687236）：步驟 3 下的鏡射單在 settle 期間成交，舊版把「簿上沒有」
          當成沒下成而重下，重複成交＋誤導 CRIT——違反工程原則 #2。
@@ -745,8 +745,6 @@ def _reconcile_orders(
     # ── 1. 就地改單；TTL 內/policy 降級/失敗的退回「取消舊單 + 重掛新單」──
     now = clock()
     modified = 0
-    # C8：本輪嘗試過 cancel／modify 的 oid（不論成敗）不得當殘單
-    touched_oids: set[int] = {oid for oid, _spec in plan.modifies} | set(plan.to_cancel)
     fallback: list[tuple[int, str, OrderSpec]] = []  # (舊單 oid, coin, 新單 spec)
     for oid, spec in plan.modifies:
         coin = spec.coin
@@ -762,6 +760,10 @@ def _reconcile_orders(
         else:
             state.modify_fail_until[coin] = now + settings.modify_fail_ttl_s
             fallback.append((oid, coin, spec))
+
+    # C8／C15：本輪嘗試撤銷的 oid（fallback 舊單 ∪ to_cancel，不論撤成與否）不得當殘單；
+    # modify 回 True 的 oid 不加入（已是 desired 形狀，換 oid 則舊 oid 不在簿上、未換則正常配對）
+    touched_oids: set[int] = {oid for oid, _coin, _spec in fallback} | set(plan.to_cancel)
 
     # ── 2. 先取消（改單退回的舊單 + 目標已無的舊單）釋放保證金 ──────────
     cancelled = 0

@@ -1,6 +1,6 @@
 # settle 驗證：部分成交殘單與 1:1 配對（F1／F2／F3）
 
-日期：2026-10-01　狀態：已實作（C1–C14，C11 由 C13 取代），四輪 opus 審查，未部署；backlog：W-chain、跨輪重鏡射
+日期：2026-10-01　狀態：已實作（C1–C15，C11 由 C13 取代），四輪 opus 審查＋2026-10-03 Fable 第二意見複核，未部署；backlog：W-chain、跨輪重鏡射
 前置：`docs/superpowers/plans/2026-09-30-settle-retry-no-duplicate-fill.md`（commit 2c5e591，§4b 列出本 plan 的 F1–F3）
 
 ## 1. 問題（皆由 2c5e591 第二輪審查發現、主線程親跑 probe 重現；修改前即存在）
@@ -114,6 +114,16 @@ F2 是 `_verify_diff` 的配對語意錯誤：`_plan` 步驟 1 已是 1:1 配對
   兩段配對都跳過、一律進 extra。`_settle_verify` 把 `touched` 同時傳給 `_verify_diff`。
   測試：上述 Z 情境 → a 不被重下；Z 照 extra 撤。變異「拿掉 `_verify_diff` 的 exclude」須讓它轉紅。
   **docstring 補正**（審查 Suggestion 2）：`_reconcile_orders` docstring 的殘單條件補上 orig_sz 核對與 exclude_oids。
+- **C15 `touched_oids` 只收「本輪嘗試撤銷」的 oid**（2026-10-03 主線程第二意見複核，Fable；親跑 probe）：
+  現行 `touched_oids` 把 `plan.modifies` 全部舊 oid 都算進去，等於依賴「HL modify 成功後必換新 oid」這個假設
+  （testnet 2026-07-19 實測成立、主網 f438 歷史一致）。但若假設不成立（HL 原 oid 就地改量），每一張 modify 成功的單
+  都會被 `_verify_diff` 排除 → 當 extra 撤掉 → desired 被當已消耗不補 → 每輪靜默少掛一輪。
+  probe（FakeExecutor，modify 回 True、簿上同 oid 已是新量）：`[modify 1, cancel PUMP] crit=1`；真實 HL（換 oid）：`[modify 1] crit=0`。
+  改法：`touched_oids` ＝ fallback 舊 oid（含 modify 失敗、TTL 內、cancel-place 政策三種來源）∪ `plan.to_cancel`；
+  **modify 回 True 的 oid 不加入**。理由：modify 成功＝這張單已是 desired 形狀，若 oid 未換它會被正常配對，若換了舊 oid 本就不在簿上，
+  排除它沒有任何保護價值。C8 要擋的「撤單回 False 仍在簿上」情境全部來自 fallback／to_cancel，不受影響。
+  測試：H1 情境（modify 回 True、簿上同 oid 新量）→ 0 撤單、0 CRIT；既有 `test_modify_lies_success_size_unchanged_is_loud_not_residual`
+  與 `test_stale_residual_touched_by_failed_cancel_is_not_swallowed` 須仍綠；變異「把 modify 成功 oid 加回 touched」須讓 H1 測試轉紅。
 - **backlog（不修）W-chain**：同價 f=1050 失敗、o=1150 成功後部分成交到 1000 → f 用容忍度配走 o 的單、o 的量差超過 size_tol
   配不到預算 → 少掛約 1050 一輪（約 60 秒）且無告警。HEAD 相同行為；不會重複成交。
 - **C12 T-priority 測試改為真正釘住優先序**（W2）：舊單 `orig_sz` 設為等於 d.sz（同價較小、原量相符的殘單形狀），
