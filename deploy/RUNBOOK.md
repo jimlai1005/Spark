@@ -3006,7 +3006,14 @@ sudo journalctl -u "filet-follower@*" --since "2 minutes ago" --no-pager -o cat 
 驗收：部署後只在 leader 下一次減倉才有端到端證據（follower 送 reduce-only IOC 且成交）；TG 不再出現
 `平倉失敗 … invalid price`。**journal 沒有 info 級日誌**（repo 無 `basicConfig`），要看 HL `userFillsByTime`。
 
-### 5.8j ⭐⭐ 待部署：settle 驗證重複成交修法（2026-09-30／10-01；**兩檔熱修，跟單中**）
+### 5.8j ⭐⭐ settle 驗證重複成交修法（2026-09-30／10-01；**兩檔熱修，跟單中**）——**已於 2026-10-03 00:52Z 部署**
+
+部署記錄（2026-10-03）：前提 2 兩檔皆與 `87472d7` 逐位元一致；正式機 src 樹等同 `87472d7`（前一標記 `411c6b4` 是
+filet 兩檔熱修 over `c4632ac`，c4632ac..87472d7 的 src 只動那兩檔）。備份 `/tmp/{executor,orders}.py.bak-20261003`（root 600）；
+`install` 後 import 驗算通過；`reload_follower.sh` 滾動重啟三個 follower（f438b3／f6b3e7／fb8c35），NRestarts=0；
+一個週期後 journal 無 traceback／error／critical；`/var/lib/filet-exchange/engine/health/<id>.json` 三個都在重啟後
+重新寫入（00:55:02Z，`last_cycle=no_action`）。`DEPLOYED_VERSION` = `3994e35`，note 記錄熱修鏈。
+回滾：兩個備份裝回 `src/spark/copytrade/` 再跑 `reload_follower.sh`。
 
 事故：follower `f438b3…` 09-29 PUMP、09-30 ENA 各一則 CRIT「掛單重試後仍不符：缺少 1、多餘 0」。根因是
 `_reconcile_orders` 的 settle 驗證把「鏡射掛單已在 2 秒內成交」當成「沒下成」而重下同一張單，重下的單立刻以 taker
