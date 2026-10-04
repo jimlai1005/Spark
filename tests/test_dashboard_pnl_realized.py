@@ -39,4 +39,4 @@ def test_realized_is_always_none_even_with_ok_perf_and_unrealized(tmp_path):
     assert body["pnl"] is not None
     assert body["pnl"]["realized"] is None
     assert body["pnl"]["unrealized"] == "12.34"
-    assert body["pnl"]["net"] is not None  # net 仍照舊算法（同窗口 cum_pnl − fees），不受影響
+    assert body["pnl"]["net"] is not None  # net ＝ 同窗口 cum_pnl（2026-10-04 起不再減 fees），不受影響

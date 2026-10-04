@@ -3,7 +3,7 @@
 盯住 Task 13 規格的四件事：
 (1) 六塊＋持倉**每塊獨立 nullable**——子資料源丟例外只讓對應塊回 None，端點不 500。
 (2) `available_pct` 數值錨例（withdrawable/margin_used，固定假資料手算釘死）。
-(3) `fee_share_of_pnl_pct` 分母（|net+fees_paid|）為 0 → None，不得除零。
+(3) `fee_share_of_pnl_pct` 分母（|cum_pnl+fees_paid|，扣 builder fee 前損益）為 0 → None，不得除零。
 (4) 只回登入 session 自己的資料；未登入 401；pause 旗標翻轉 state。
 """
 import json
@@ -231,13 +231,32 @@ def test_available_pct_null_when_margin_used_zero(tmp_path):
 
 # ── fee_share 分母 0 → null ──────────────────────────────────────────
 
-def test_fee_share_null_when_cum_pnl_is_zero(tmp_path):
-    """net + fees_paid ≡ cum_pnl（net 的定義式）；cum_pnl=0 時分母恆為 0，
-    fee_share_of_pnl_pct 必須是 None，不得除零。"""
+def test_net_pnl_is_hl_pnl_not_minus_builder_fee(tmp_path):
+    """2026-10-04 事故：follower 0x438b…ce9 儀表板顯示 −7,473，實為 −6,604
+    （ledger 入金對帳證實 HL pnlHistory 已含手續費，程式又減一次 builder fee）。
+    `net` ＝ HL pnlHistory 窗內損益本身（不再減 fees_paid）；
+    `fee_share_of_pnl_pct` 分母是扣 builder fee 前損益 |cum_pnl + fees_paid|。
+    錨例：cum_pnl=-10、fee=2 → net=-10（不是 -12）；2 / |-10 + 2| = 25%。"""
     client, cfg, hl, wallet = _logged_in(tmp_path)
     addr = wallet.address.lower()
     hl.clearinghouse[addr] = clearinghouse()
-    hl.portfolios[addr] = portfolio_rows([(0, "1000", "0"), (10, "1000", "0")])
+    hl.portfolios[addr] = portfolio_rows([(0, "1000", "0"), (10, "990", "-10")])
+    hl.fills[addr] = [fill(addr, builder_fee="2")]
+
+    body = client.get("/api/me/dashboard").json()
+    assert body["pnl"]["net"] == "-10"
+    assert body["pnl"]["fees_paid"] == "2"
+    assert body["pnl"]["fee_share_of_pnl_pct"] == "25.00"
+
+
+def test_fee_share_null_when_gross_pnl_is_zero(tmp_path):
+    """分母 |cum_pnl + fees_paid|（扣 builder fee 前損益）為 0 時，
+    fee_share_of_pnl_pct 必須是 None，不得除零。
+    錨例：cum_pnl=-1.2、fee=1.2 → net=-1.2、分母 |-1.2 + 1.2| = 0。"""
+    client, cfg, hl, wallet = _logged_in(tmp_path)
+    addr = wallet.address.lower()
+    hl.clearinghouse[addr] = clearinghouse()
+    hl.portfolios[addr] = portfolio_rows([(0, "1000", "0"), (10, "998.8", "-1.2")])
     hl.fills[addr] = [fill(addr, builder_fee="1.2")]
 
     body = client.get("/api/me/dashboard").json()

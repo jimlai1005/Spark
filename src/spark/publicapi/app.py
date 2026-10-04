@@ -1266,8 +1266,12 @@ def _dashboard_pnl_and_return(ref: FollowerRef, hl, positions: list[dict] | None
 
     ⭐ `net`／`fees_paid`／`fee_share_of_pnl_pct` 三者同窗口（perpMonth 的
     `[first_ts_ms, last_ts_ms]`）：dollar PnL 出自 HL `pnlHistory`（`cum_pnl`），
-    fee 出自**同窗口**的 `collect_follower_summary`（與 billing／ops 同一個函式），
-    `net = cum_pnl − fees_paid`。
+    fee 出自**同窗口**的 `collect_follower_summary`（與 billing／ops 同一個函式）。
+    HL `pnlHistory` 已含手續費（含 builder fee），故 `net = cum_pnl`（不再減
+    `fees_paid`）；`fee_share_of_pnl_pct` 分母是扣 builder fee 前損益
+    `|cum_pnl + fees_paid|`，分母 0 → `None`。
+    事故註記（2026-10-04）：follower 0x438b…ce9 儀表板顯示 −7,473 實為 −6,604，
+    ledger 入金對帳證實 pnlHistory 已淨費，舊算法把 builder fee 扣了兩次。
 
     ⭐⭐ `realized` 恆為 `None`（2026-08-29 opus 審查 Warning 5，工程原則 1）：
     過去算成 `cum_pnl − unrealized`，但 `cum_pnl` 是 30 天窗（`perpMonth`）內的
@@ -1303,8 +1307,8 @@ def _dashboard_pnl_and_return(ref: FollowerRef, hl, positions: list[dict] | None
         summary = collect_follower_summary(ref, hl, start, end)
         if summary.error is None:
             fees_paid = summary.builder_fee
-            net = cum_pnl - fees_paid
-            denom = abs(net + fees_paid)
+            net = cum_pnl
+            denom = abs(cum_pnl + fees_paid)
             if denom != 0:
                 fee_share = ((fees_paid / denom) * 100).quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP)

@@ -1210,7 +1210,7 @@ export const COPY_ZH = {
       maxPosition: "最大單一部位",
     },
     pnl: {
-      label: "淨 PnL（已扣 builder fee）",
+      label: "淨 PnL（已含手續費）",
       realizedPrefix: "已實現 ",
       unrealizedPrefix: " · 未實現 ",
       chartEmpty: "尚無足夠資料繪製走勢圖。",
@@ -2929,7 +2929,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       maxPosition: "Largest single position",
     },
     pnl: {
-      label: "Net PnL (after builder fee)",
+      label: "Net PnL (fees included)",
       realizedPrefix: "Realized ",
       unrealizedPrefix: " · Unrealized ",
       chartEmpty: "Not enough data to draw the chart yet.",
