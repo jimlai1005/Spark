@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="60">
+  <title>Filet — 系統維護中 / Maintenance</title>
+  <style>
+    :root { color-scheme: light dark; --fg: #1a1a1a; --muted: #666; --bg: #fafafa; --card: #fff; --line: #e6e6e6; }
+    @media (prefers-color-scheme: dark) { :root { --fg: #f2f2f2; --muted: #a0a0a0; --bg: #111; --card: #1b1b1b; --line: #2a2a2a; } }
+    html, body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 -apple-system, "Segoe UI", "Noto Sans TC", "PingFang TC", Roboto, sans-serif; }
+    main { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; box-sizing: border-box; }
+    .card { max-width: 560px; width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 28px 28px 22px; }
+    h1 { font-size: 22px; margin: 0 0 6px; }
+    h2 { font-size: 15px; font-weight: 500; color: var(--muted); margin: 0 0 18px; }
+    p { margin: 0 0 10px; }
+    .eta { font-size: 18px; font-weight: 600; margin: 14px 0 4px; }
+    .small { color: var(--muted); font-size: 13px; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #f5a524; margin-right: 8px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <h1><span class="dot"></span>Filet 系統維護中</h1>
+      <h2>Scheduled maintenance in progress</h2>
+      <p>我們正在進行資料庫維護，網站與 API 暫時無法使用。<br>
+         跟單引擎<strong>照常運作</strong>，你的部位與風控設定不受影響。</p>
+      <p class="eta">預計恢復時間：__ETA_TPE__（台北）／ __ETA_UTC__ UTC</p>
+      <p class="small">Expected back by __ETA_TPE__ Asia/Taipei (__ETA_UTC__ UTC). Copy-trading engines keep running; your positions and risk settings are unaffected. This page refreshes automatically every minute.</p>
+      <p class="small">開始時間 / Started: __START_UTC__ UTC</p>
+    </div>
+  </main>
+</body>
+</html>
