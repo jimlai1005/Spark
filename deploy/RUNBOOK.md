@@ -3169,7 +3169,12 @@ failed unit > 0、取樣器 20 分沒新資料。去重：首次即發、持續�
   （非 root 檔 4＝.venv symlink 例外）→ `restart filet-api`（6 s 回 200）→ schema 自動升 6（`PRAGMA table_info(candidate)`
   末四欄 `hft_*`）→ `DEPLOYED_VERSION` → 三 follower 時間戳不變、`systemctl --failed` 空、`filet_regression_check --http --ssh`
   67/67。部署當下 PSI avg300 74.7%（飽和中）；重啟後 4 分鐘 `flagged=0`（預期：H1 等下一輪 candidates ≤30 分、H2 等各位址
-  下一頁）。
+  下一頁）。**19:10:05Z 第一輪 candidates**：H1 的 10 顆（0xb67c…、0xedea…、0xb48e…、0xbf73…、0x30af…、0x6db7…、
+  0x98e8…、0x5b5f…、0x50b9…、0x0f2d…）全部 `active=0`、池子補回 300；active 成交列 1,610,475 → 812,556（−49.5%）；
+  19:12Z PSI some avg60 0.54%／avg300 5.2%（部署前 74%）。H2 尚未命中任何位址（等各位址下一頁，首日內）。
+  ⚠️ 觀測教訓：重啟後 candidates job 逾期 14 分鐘才被領走——不是壞掉，是 claim 與每分鐘發布共用同一執行緒、
+  同優先度的 115 個逾期 state job 排在前面；判斷排程器是否活著看 `endpoint_cache.fetched_at`／`refresh_job.created_at`
+  的最大值是否在推進，不要看 `lease_until`（完成即釋放，永遠是空的）。
 - 查被標記清單（唯讀）：
   `sudo python3 -c "import sqlite3;c=sqlite3.connect('file:/var/lib/filet-api/explore.db?mode=ro',uri=True);print(c.execute('SELECT address,hft_reason,hft_value,datetime(hft_until,\"unixepoch\") FROM candidate WHERE hft_until IS NOT NULL ORDER BY hft_value DESC').fetchall())"`
 - 驗收（部署後 24 小時）：`/proc/pressure/io` some avg300 日級分布回到個位數；
