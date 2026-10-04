@@ -61,7 +61,7 @@ def test_wal_journal_mode_enabled(tmp_path):
     assert mode == "wal"
 
 
-def test_schema_version_v5_recorded_on_fresh_db(tmp_path):
+def test_schema_version_latest_recorded_on_fresh_db(tmp_path):
     """Task 4：schema bump 3→4（`fills_sync.left_boundary` 三欄＋
     `fills_scan.stop_reason`／`unresolved_gap`）——全新 DB 直接落地版本 4
     （`_SCHEMA` 已含新欄，不需要跑遷移）。
@@ -69,7 +69,7 @@ def test_schema_version_v5_recorded_on_fresh_db(tmp_path):
     沒有新增欄位，`_SCHEMA` 結構不變，只是版本號本身往前推一版。"""
     store, _ = _store(tmp_path)
     row = store._db.execute("SELECT version FROM schema_version").fetchone()
-    assert row == (5,)
+    assert row == (6,)
     cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
     assert {"inc_from_ms", "scan_id", "evidence_unknown", "coverage_gap", "left_boundary",
             "left_boundary_window_start_ms", "left_boundary_at"} <= cols
@@ -547,7 +547,7 @@ def test_migration_v1_to_v2_adds_params_fp_column_defaulted_empty(tmp_path):
     # 開啟 v1 DB 會一路級聯遷移到目前版本（5），不會停在 3。
     # 2026-09-23 schema v5（D-M／D-N／Task 1b 資料面）：終點版本改為 5。
     version = store._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 5
+    assert version == 6
     cols = {r[1] for r in store._db.execute("PRAGMA table_info(fills_sync)").fetchall()}
     assert "params_fp" in cols
     params_fp_values = {r[0] for r in store._db.execute(
@@ -597,7 +597,7 @@ def test_migration_is_idempotent_on_reopen(tmp_path):
     # 2026-09-23 schema v5（D-M／D-N／Task 1b 資料面）：終點版本改為 5。
     store2 = ExploreStore(db_path)
     version = store2._db.execute("SELECT version FROM schema_version").fetchone()[0]
-    assert version == 5
+    assert version == 6
 
 
 # --- Task 7.9b：schema v2→v3 遷移（遍歷軌／增量軌分離） ---
@@ -1775,7 +1775,7 @@ def test_migration_v2_to_v3_is_idempotent_across_three_runs(tmp_path):
     ExploreStore(db_path, now_fn=lambda: now + 99999)   # 第三次（版本已是 5）
     shape3 = _migration_shape(db_path)
 
-    assert shape1[0] == shape2[0] == shape3[0] == 5
+    assert shape1[0] == shape2[0] == shape3[0] == 6
     assert shape1[1] == shape2[1] == shape3[1] == 4      # 四列各一筆 fills_scan
     assert shape1[2] == shape2[2] == shape3[2]
     # 核驗 job 只給「有歷史結論但缺證據」的兩列（0xabc complete／0xzzz partial）：
@@ -1959,7 +1959,7 @@ def test_migrate_v3_to_v4_revokes_verdicts_but_keeps_progress(tmp_path):
 
     store = ExploreStore(db_path)
 
-    assert store.schema_version() == 5
+    assert store.schema_version() == 6
     assert store.get_sync("0xaa").completeness == "partial"
     assert store.get_sync("0xaa").reason == "left_boundary_unknown"
     assert store.get_sync("0xbb").completeness == "partial"
@@ -2883,3 +2883,106 @@ def test_count_due_by_kind_agrees_with_due_count_per_kind(tmp_path):
     for kind in due:
         assert due[kind] == store.due_count(kind, c.now()), kind
     assert due["fills"] == 1
+
+
+# ---------------------------------------------------------------------------
+# HFT 過濾器（plan 2026-10-05-explore-hft-filter Task 1）
+# ---------------------------------------------------------------------------
+def test_schema_v6_adds_hft_columns_and_migrates_v5_db(tmp_path):
+    import sqlite3
+    db = tmp_path / "explore.db"
+    store, _ = _store(tmp_path)
+    assert store.schema_version() == 6
+    cols = {r[1] for r in store._db.execute("PRAGMA table_info(candidate)").fetchall()}
+    assert {"hft_reason", "hft_value", "hft_flagged_at", "hft_until"} <= cols
+    # 模擬 v5 舊 DB：拿掉版本號與欄位後重開必須補上
+    store._db.close()
+    raw = sqlite3.connect(db)
+    raw.execute("ALTER TABLE candidate DROP COLUMN hft_reason")
+    raw.execute("ALTER TABLE candidate DROP COLUMN hft_value")
+    raw.execute("ALTER TABLE candidate DROP COLUMN hft_flagged_at")
+    raw.execute("ALTER TABLE candidate DROP COLUMN hft_until")
+    raw.execute("UPDATE schema_version SET version=5")
+    raw.commit()
+    raw.close()
+    reopened = ExploreStore(db, now_fn=Clock().now)
+    assert reopened.schema_version() == 6
+    cols = {r[1] for r in reopened._db.execute("PRAGMA table_info(candidate)").fetchall()}
+    assert {"hft_reason", "hft_value", "hft_flagged_at", "hft_until"} <= cols
+
+
+def test_count_fills_since_uses_time_bound(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0,
+                                  window_end_ms=10_000, params_fp="")
+    scan = store.running_scan("0xabc")   # bootstrap 回傳 bool，scan 物件要另外取
+    fills = [{"coin": "BTC", "tid": i, "time": i * 1000} for i in range(10)]
+    store.insert_scan_page("0xabc", fills, scan)
+    assert store.count_fills_since("0xabc", 0) == 10
+    assert store.count_fills_since("0xabc", 5000) == 5
+    assert store.count_fills_since("0xabc", 99_999) == 0
+    assert store.count_fills_since("0xnobody", 0) == 0
+
+
+def test_flag_hft_deactivates_and_deletes_everything_for_address(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", "A", 1, 0.5), ("0xdef", "D", 2, 0.4)], as_of=c.now())
+    store.bootstrap_address_fills("0xabc", c.now(), window_start_ms=0,
+                                  window_end_ms=10_000, params_fp="")
+    scan = store.running_scan("0xabc")
+    store.insert_scan_page("0xabc", [{"coin": "BTC", "tid": 1, "time": 1}], scan)
+    store.put_cache_ok("0xabc", "portfolio", {"x": 1}, fetched_at=c.now(), refresh_after=c.now())
+    store.enqueue("0xabc:state", "0xabc", "state", 0, c.now())
+    store.enqueue("0xdef:state", "0xdef", "state", 0, c.now())
+
+    counts = store.flag_hft("0xabc", reason="fills", value=6000.0, now=c.now(),
+                            cooldown_s=30 * 86400)
+
+    assert counts == {"endpoint_cache": 1, "fills": 1, "fills_scan": 1, "fills_sync": 1,
+                      "refresh_job": 1}
+    cand = store.get_candidate("0xabc")
+    assert cand is not None and cand.active is False
+    assert cand.hft_reason == "fills" and cand.hft_value == 6000.0
+    assert cand.hft_flagged_at == c.now() and cand.hft_until == c.now() + 30 * 86400
+    assert store.get_fills("0xabc", 0, 10_000) == []
+    assert store.get_sync("0xabc") is None
+    assert store.get_cache("0xabc", "portfolio") is None
+    assert [a.address for a in store.active_candidates()] == ["0xdef"]
+    # 鄰居不受影響
+    assert store.stats()["refresh_job"] == 1
+
+
+def test_hft_cooldown_addresses_only_returns_unexpired(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None), ("0xdef", None, 2, None)], as_of=c.now())
+    store.flag_hft("0xabc", reason="fills", value=1.0, now=c.now(), cooldown_s=100)
+    store.flag_hft("0xdef", reason="fills", value=1.0, now=c.now(), cooldown_s=10)
+    assert store.hft_cooldown_addresses(c.now()) == {"0xabc", "0xdef"}
+    assert store.hft_cooldown_addresses(c.now() + 50) == {"0xabc"}
+    assert store.hft_cooldown_addresses(c.now() + 1000) == set()
+
+
+def test_upsert_candidates_clears_hft_flags_on_re_entry(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.flag_hft("0xabc", reason="fills", value=1.0, now=c.now(), cooldown_s=10)
+    c.t += 100
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    cand = store.get_candidate("0xabc")
+    assert cand.active is True
+    assert (cand.hft_reason, cand.hft_value, cand.hft_flagged_at, cand.hft_until) == (None,) * 4
+
+
+def test_purge_keeps_candidate_row_while_hft_cooldown_active(tmp_path):
+    store, c = _store(tmp_path)
+    store.upsert_candidates([("0xabc", None, 1, None)], as_of=c.now())
+    store.flag_hft("0xabc", reason="fills", value=1.0, now=c.now(), cooldown_s=30 * 86400)
+    c.t += 10 * 86400  # 超過 candidate_keep_s=7d，但冷卻還有 20 天
+    counts = store.purge(c.now(), candidate_keep_s=7 * 86400)
+    assert counts["candidate"] == 0
+    assert store.get_candidate("0xabc") is not None
+    c.t += 25 * 86400  # 冷卻到期
+    counts = store.purge(c.now(), candidate_keep_s=7 * 86400)
+    assert counts["candidate"] == 1
+    assert store.get_candidate("0xabc") is None

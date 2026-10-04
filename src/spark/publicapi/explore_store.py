@@ -196,7 +196,9 @@ JOB_KIND_FOR_SCAN_KIND = {"verify": "fills_verify", "initial": "fills_scan",
 # 舊留存門檻判準的結論，見 `_migrate_v3_to_v4`）→5（Task 3，2026-09-23
 # D-M／D-N：重設被 1 天探測窗誤判的 `truncation_suspected`、正規化 v3 遺留
 # scan 的游標並就地重算，見 `_migrate_v4_to_v5`；本次不新增欄位）。
-_SCHEMA_VERSION = 5
+# →6（2026-10-05 HFT 過濾器 plan Task 1：`candidate` 補四個 `hft_*` 欄位，
+# 見 `_migrate_v5_to_v6`）。
+_SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -204,7 +206,9 @@ CREATE TABLE IF NOT EXISTS candidate (
   address TEXT PRIMARY KEY,            -- 小寫正規化
   display_name TEXT, source_rank INTEGER, source_roi REAL,
   source_as_of REAL NOT NULL,          -- stats-data payload 取得時刻
-  active INTEGER NOT NULL DEFAULT 1, last_seen_at REAL NOT NULL);
+  active INTEGER NOT NULL DEFAULT 1, last_seen_at REAL NOT NULL,
+  -- HFT 過濾器（2026-10-05 plan）：命中 H2 時寫入；冷卻由 hft_until 承載
+  hft_reason TEXT, hft_value REAL, hft_flagged_at REAL, hft_until REAL);
 CREATE TABLE IF NOT EXISTS endpoint_cache (
   address TEXT NOT NULL, endpoint TEXT NOT NULL,   -- 'portfolio' | 'clearinghouseState'
   params_fp TEXT NOT NULL DEFAULT '',              -- dex／參數指紋（目前 ''）
@@ -354,6 +358,10 @@ class Candidate:
     source_as_of: float
     active: bool
     last_seen_at: float
+    hft_reason: str | None = None
+    hft_value: float | None = None
+    hft_flagged_at: float | None = None
+    hft_until: float | None = None
 
 
 @dataclass(frozen=True)
@@ -526,6 +534,9 @@ class ExploreStore:
                 if row[0] < 5:
                     # 同上：版本更新在 `_migrate_v4_to_v5` 自己的顯式 transaction 內。
                     self._migrate_v4_to_v5()
+                if row[0] < 6:
+                    with self._db:
+                        self._migrate_v5_to_v6()
             self._assert_inc_from_not_null()
         if str(db_path) != ":memory:":
             # Task 3.6 C（W2 修法）：WAL 模式會在 db 旁邊建 `-wal`／`-shm` 側檔，
@@ -608,6 +619,18 @@ class ExploreStore:
         self._db.execute(
             "UPDATE fills_sync SET reason=? WHERE completeness='complete' AND reason IS NULL",
             (REASON_COUNT_BELOW_RETENTION_THRESHOLD,))
+
+    def _migrate_v5_to_v6(self) -> None:
+        """HFT 過濾器（plan 2026-10-05-explore-hft-filter Task 1）：`candidate` 補
+        `hft_reason`／`hft_value`／`hft_flagged_at`／`hft_until` 四欄。與
+        `_migrate_v1_to_v2` 同款：先查 `PRAGMA table_info`，缺才 `ALTER`，重跑冪等；
+        DDL 自動 COMMIT，版本號最後更新。"""
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(candidate)").fetchall()}
+        for col, typ in (("hft_reason", "TEXT"), ("hft_value", "REAL"),
+                         ("hft_flagged_at", "REAL"), ("hft_until", "REAL")):
+            if col not in cols:
+                self._db.execute(f"ALTER TABLE candidate ADD COLUMN {col} {typ}")
+        self._db.execute("UPDATE schema_version SET version=6")
 
     def _migrate_v2_to_v3(self) -> None:
         """Task 7.9b B5：遍歷軌／增量軌分離。DDL（`ALTER TABLE`／`CREATE TABLE
@@ -1077,7 +1100,8 @@ class ExploreStore:
                     "ON CONFLICT(address) DO UPDATE SET display_name=excluded.display_name, "
                     "source_rank=excluded.source_rank, source_roi=excluded.source_roi, "
                     "source_as_of=excluded.source_as_of, active=1, "
-                    "last_seen_at=excluded.last_seen_at",
+                    "last_seen_at=excluded.last_seen_at, "
+                    "hft_reason=NULL, hft_value=NULL, hft_flagged_at=NULL, hft_until=NULL",
                     (addr, display_name, rank, roi, as_of, as_of))
 
     def deactivate_missing(self, seen: set[str]) -> list[str]:
@@ -1119,6 +1143,54 @@ class ExploreStore:
             row = self._db.execute(
                 "SELECT active FROM candidate WHERE address=?", (addr,)).fetchone()
         return row is not None and bool(row[0])
+
+    def get_candidate(self, address: str) -> Candidate | None:
+        """單一候選列（含 HFT 旗標欄位）；不存在 → `None`。觀測／測試用。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            r = self._db.execute(
+                "SELECT address, display_name, source_rank, source_roi, source_as_of, "
+                "active, last_seen_at, hft_reason, hft_value, hft_flagged_at, hft_until "
+                "FROM candidate WHERE address=?", (addr,)).fetchone()
+        if r is None:
+            return None
+        return Candidate(address=r[0], display_name=r[1], source_rank=r[2], source_roi=r[3],
+                         source_as_of=r[4], active=bool(r[5]), last_seen_at=r[6],
+                         hft_reason=r[7], hft_value=r[8], hft_flagged_at=r[9], hft_until=r[10])
+
+    def count_fills_since(self, address: str, since_ms: int) -> int:
+        """`time_ms >= since_ms` 的 fills 筆數——走 `(address, time_ms)` 索引，不讀
+        `raw`（HFT 過濾器 H2 的唯一資料來源；spec §2）。"""
+        addr = _norm(address)
+        with self._lock, self._db:
+            return self._db.execute(
+                "SELECT COUNT(*) FROM fills WHERE address=? AND time_ms>=?",
+                (addr, since_ms)).fetchone()[0]
+
+    def hft_cooldown_addresses(self, now: float) -> set[str]:
+        """`hft_until > now` 的位址（小寫）——`_run_candidates` 每輪併進 excluded。"""
+        with self._lock, self._db:
+            return {r[0] for r in self._db.execute(
+                "SELECT address FROM candidate WHERE hft_until IS NOT NULL AND hft_until > ?",
+                (now,)).fetchall()}
+
+    def flag_hft(self, address: str, *, reason: str, value: float, now: float,
+                 cooldown_s: float) -> dict[str, int]:
+        """HFT 判定落地（spec §3）：`active=0`＋四個 `hft_*` 欄位，並刪除該位址在
+        `endpoint_cache`／`fills`／`fills_scan`／`fills_sync`／`refresh_job` 的全部列
+        （回收磁碟與 page cache、停止一切上游支出）。`candidate` 列保留以承載冷卻；
+        `purge()` 在 `hft_until` 到期前不會刪它。回傳各表刪除筆數。"""
+        addr = _norm(address)
+        counts: dict[str, int] = {}
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE candidate SET active=0, hft_reason=?, hft_value=?, hft_flagged_at=?, "
+                "hft_until=? WHERE address=?",
+                (reason, value, now, now + cooldown_s, addr))
+            for table in ("endpoint_cache", "fills", "fills_scan", "fills_sync", "refresh_job"):
+                cur = self._db.execute(f"DELETE FROM {table} WHERE address=?", (addr,))
+                counts[table] = cur.rowcount
+        return counts
 
     def admission_counts(self) -> tuple[int, int]:
         """`(refresh_job 總數, active 候選數)`——同一 lock 內兩個 COUNT，供
@@ -2120,7 +2192,8 @@ class ExploreStore:
               max_fills: int | None = None) -> dict[str, int]:
         """刪除已停用超過 `candidate_keep_s` 的候選（及其 endpoint_cache／fills／
         fills_sync／fills_scan）——但若該地址仍有 `refresh_job` 列則跳過（避免刪掉
-        正在跑的工作依賴的資料）。另外刪除超過 `fills_keep_s` 的 fills，但保留仍落在
+        正在跑的工作依賴的資料）；`hft_until` 未到期的候選列不刪（冷卻由該列承載，見
+        `flag_hft`）。另外刪除超過 `fills_keep_s` 的 fills，但保留仍落在
         該地址目前同步視窗內（`time_ms >= fills_sync.window_start_ms`）的列。回傳
         各表刪除筆數。
 
@@ -2148,11 +2221,12 @@ class ExploreStore:
         with self._lock, self._db:
             stale = [r[0] for r in self._db.execute(
                 "SELECT c.address FROM candidate c WHERE c.active=0 AND c.last_seen_at < ? "
+                "AND (c.hft_until IS NULL OR c.hft_until <= ?) "
                 "AND NOT EXISTS (SELECT 1 FROM refresh_job j WHERE j.address = c.address) "
                 "ORDER BY c.last_seen_at ASC"
                 + ("" if max_candidates is None else " LIMIT ?"),
-                (cutoff_candidate,) if max_candidates is None
-                else (cutoff_candidate, max_candidates)).fetchall()]
+                (cutoff_candidate, now) if max_candidates is None
+                else (cutoff_candidate, now, max_candidates)).fetchall()]
             for addr in stale:
                 cur = self._db.execute("DELETE FROM endpoint_cache WHERE address=?", (addr,))
                 counts["endpoint_cache"] += cur.rowcount
