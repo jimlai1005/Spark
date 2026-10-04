@@ -3158,19 +3158,17 @@ failed unit > 0、取樣器 20 分沒新資料。去重：首次即發、持續�
   （只 `ALTER TABLE candidate ADD COLUMN` 四欄，秒級、冪等）；不需要維護窗、不需預熱快照
   （探索列結構未變）。
 - 新 env（全部可省略）：`EXPLORE_HFT_MAX_VLM_MONTH_USD`（預設 1e8）、`EXPLORE_HFT_MAX_FILLS_30D`
-  （6000）、`EXPLORE_HFT_COOLDOWN_S`（2592000）、`FILET_EXPLORE_CANDIDATE_KEEP_S`（604800）。
+  （6000）、`EXPLORE_HFT_COOLDOWN_S`（2592000；下限 3600，設更小視同 3600）、`FILET_EXPLORE_CANDIDATE_KEEP_S`（604800）。
   任一 HFT 門檻設 0 ＝ 停用該閘（回退不必回退程式）。
 - 觀測：`/api/ops/health` → `explore_refresh.hft`：`flagged_total`／`last_flagged`／
-  `vlm_excluded_last_round`（預期 ≈10）／`cooldown_last_round`。journal 關鍵字 `判定 HFT`。
+  `vlm_excluded_last_round`（預期 ≈10）／`cooldown_last_round`／`errors`（flag 落地失敗計數，應為 0）。journal 關鍵字 `判定 HFT`。
 - 查被標記清單（唯讀）：
   `sudo python3 -c "import sqlite3;c=sqlite3.connect('file:/var/lib/filet-api/explore.db?mode=ro',uri=True);print(c.execute('SELECT address,hft_reason,hft_value,datetime(hft_until,\"unixepoch\") FROM candidate WHERE hft_until IS NOT NULL ORDER BY hft_value DESC').fetchall())"`
 - 驗收（部署後 24 小時）：`/proc/pressure/io` some avg300 日級分布回到個位數；
   `/proc/$(systemctl show filet-api -p MainPID --value)/io` 的 `read_bytes` 增速 ≪ 8 MB/s；
   `host.jsonl` 的 `nginx_499_15m` 回到個位數；探索榜仍 300 列、`vlm_excluded_last_round` ≈ 10、
   首日 `flagged_total` 約 30–45（既有池內 ≥6,000 筆者會在各自下一次 scan 時被抓）。
-- 既有池內已回補完成、短期內不會再 scan 的高頻位址：H2 要等它們下一次增量 scan 才評估；
-  要立刻清掉可 `restart filet-api` 前先把 `EXPLORE_UPSTREAM_REFRESH` 維持 1，等一輪
-  `fills_period_s`（高頻位址 6 小時）即可。
+- 既有池內已回補完成的位址在下一次增量頁寫入時評估 H2（高頻位址週期 1–6 小時），首日內應全部處理完。
 
 ## 6. nginx + certbot
 

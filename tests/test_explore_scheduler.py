@@ -1385,7 +1385,8 @@ def test_b7_iii_fills_and_probe_backlog_9_to_1_ratio(tmp_path):
         store.enqueue(f"{a}:fills", a, "fills", 2, clock.now())
 
     hl = _ContinuingFillsHL()
-    sched = _sched(store, hl, clock=clock)
+    # 與 HFT 無關：停用 H2（plan 2026-10-05-explore-hft-filter Task 7 裁決），否則增量軌累積筆數會觸發除名
+    sched = _sched(store, hl, clock=clock, cfg=ExploreConfig(candidate_pool=300, hft_max_fills_30d=0))
     sched._bootstrapped = True
 
     results = [sched.tick() for _ in range(30)]
@@ -2205,7 +2206,8 @@ def test_s7f_overdue_verify_waits_for_its_page_share(tmp_path):
     assert SPECIAL_SERVE_RATIO == 9
     clock = Clock(t=40 * 86400.0)
     fx = _VerifyFixture(tmp_path, clock, verify_due_ago=3 * 3600.0)
-    sched = _sched(fx.store, _ContinuingFillsHL(), clock=clock)
+    # 與 HFT 無關：停用 H2（plan 2026-10-05-explore-hft-filter Task 7 裁決），否則增量軌累積筆數會觸發除名
+    sched = _sched(fx.store, _ContinuingFillsHL(), clock=clock, cfg=ExploreConfig(candidate_pool=300, hft_max_fills_30d=0))
     sched._bootstrapped = True
 
     results = [sched.tick() for _ in range(SPECIAL_SERVE_RATIO + 1)]
@@ -3203,7 +3205,8 @@ def test_s3_overdue_verify_burst_never_starves_increments(tmp_path):
     （主線程實跑核實），等於把 fills 保留額度整批交給核驗軌。"""
     clock = Clock(t=40 * 86400.0)
     store = _verify_burst_fixture(tmp_path, clock)
-    sched = _sched(store, _ContinuingFillsHL(), clock=clock)
+    # 與 HFT 無關：停用 H2（plan 2026-10-05-explore-hft-filter Task 7 裁決），否則增量軌累積筆數會觸發除名
+    sched = _sched(store, _ContinuingFillsHL(), clock=clock, cfg=ExploreConfig(candidate_pool=300, hft_max_fills_30d=0))
     sched._bootstrapped = True
     sched._first_tick_done = True
 
@@ -5558,3 +5561,124 @@ def test_candidate_keep_s_is_passed_to_purge(tmp_path, monkeypatch):
                   cfg=ExploreConfig(candidate_pool=5), candidate_keep_s=86400.0)
     _run_candidates_once(sched, store, clock)
     assert seen["candidate_keep_s"] == 86400.0
+
+
+class _PagesThenShortHL(FakeHL):
+    """前 `full_pages` 頁滿頁，接著一頁 `short_n` 筆（短頁→scan 收尾），之後空頁。
+    tid 全域遞增（與 `_FullPagesHL` 同理由）。"""
+
+    def __init__(self, full_pages: int, short_n: int):
+        super().__init__()
+        self._full_pages = full_pages
+        self._short_n = short_n
+        self._pages = 0
+        self._tid = 0
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.calls.append(("fills", address, start_ms, end_ms))
+        if start_ms == 0:                     # 左界探測，不算分頁
+            return []
+        self._pages += 1
+        n = PAGE_LIMIT if self._pages <= self._full_pages else (
+            self._short_n if self._pages == self._full_pages + 1 else 0)
+        out = []
+        for i in range(n):
+            self._tid += 1
+            out.append({"coin": "BTC", "tid": self._tid, "time": start_ms + i})
+        return out
+
+
+def _scan_fills_calls(hl) -> int:
+    return len([c for c in hl.calls if c[0] == "fills" and c[2] > 0])
+
+
+def test_h2_flags_on_scan_completion_branch(tmp_path):
+    """門檻 5000：2 滿頁（4000，續頁分支不命中）＋短頁 1500 → scan 收尾 → 完成分支命中。"""
+    hl = _PagesThenShortHL(full_pages=2, short_n=1500)
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=5000))
+    results = [sched.tick() for _ in range(12)]
+    assert "dropped:hft" in results
+    assert _scan_fills_calls(hl) == 3
+    cand = store.get_candidate(_HFT_A)
+    assert cand.active is False and cand.hft_value == 5500.0
+    assert store.stats()["refresh_job"] == 0          # 沒排 partial_rescan／增量 job
+    assert store.get_sync(_HFT_A) is None
+
+
+def test_h2_flags_on_budget_pause_branch(tmp_path):
+    """門檻 40000 ＝ 20 頁 × 2000：第 20 頁走 `max_pages_per_round` 暫停分支（`res.done`
+    為 True、`result` 為 None），只有該分支的檢查能在這一頁命中。"""
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=40_000))
+    results = []
+    for _ in range(60):
+        r = sched.tick()
+        results.append(r)
+        if r == "dropped:hft":
+            break
+    assert results[-1] == "dropped:hft"
+    assert _scan_fills_calls(hl) == 20
+    assert store.get_candidate(_HFT_A).hft_value == 40_000.0
+
+
+def test_h2_evaluates_on_incremental_page_for_complete_address(tmp_path):
+    """C1：已 complete 的位址只走增量軌，增量頁寫入後也要評估 H2。"""
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([(_HFT_A, None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills(_HFT_A, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, _HFT_A, result="complete", reason="retention_boundary_verified",
+                   window_end_ms=now_ms)
+    clock.t += 3600                                   # 增量到期、窗口夠寬放得下 2000 筆
+    store.enqueue(f"{_HFT_A.lower()}:fills", _HFT_A.lower(), "fills", 2, clock.now())
+    hl = _FullPagesHL()
+    sched = _sched(store, hl, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=5, hft_max_fills_30d=2000),
+                  fills_min_period_s=1, fills_max_period_s=1,
+                  state_every_s=10**9, portfolio_every_s=10**9, ledger_every_s=10**9)
+    sched._bootstrapped = True
+    r = sched.tick()
+    assert r == "dropped:hft"
+    cand = store.get_candidate(_HFT_A)
+    assert cand.active is False and cand.hft_value == 2000.0
+    assert store.stats()["refresh_job"] == 0
+    assert store.count_fills_since(_HFT_A, 0) == 0
+
+
+def test_h2_flag_failure_is_loud_and_counted(tmp_path, monkeypatch, caplog):
+    """W2：`flag_hft` 拋例外 → ERROR log＋`status()["hft"]["errors"]`，不進泛用隔離路徑，
+    位址暫留池內（下一輪對帳補 job 後重判）。"""
+    import sqlite3
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=6000))
+
+    def boom(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "flag_hft", boom)
+    with caplog.at_level(logging.ERROR, logger="spark.publicapi.explore_scheduler"):
+        results = [sched.tick() for _ in range(6)]
+    assert "dropped:hft" in results
+    assert sched.status()["hft"]["errors"] == 1
+    assert sched.status()["hft"]["flagged_total"] == 0
+    assert store.get_candidate(_HFT_A).active is True
+    assert any("flag_hft 失敗" in rec.getMessage() for rec in caplog.records)
+    assert store.stats()["refresh_job"] == 0
+
+
+def test_h2_cooldown_has_one_hour_floor(tmp_path):
+    """S2：冷卻設 0 會每輪重抓重標；下限 `HFT_MIN_COOLDOWN_S`（3600）。"""
+    from spark.publicapi.explore_scheduler import HFT_MIN_COOLDOWN_S
+    assert HFT_MIN_COOLDOWN_S == 3600
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=6000, hft_cooldown_s=0))
+    for _ in range(6):
+        if sched.tick() == "dropped:hft":
+            break
+    assert store.get_candidate(_HFT_A).hft_until == clock.now() + HFT_MIN_COOLDOWN_S

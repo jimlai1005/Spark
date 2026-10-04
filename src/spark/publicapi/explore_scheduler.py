@@ -126,7 +126,8 @@ from decimal import Decimal
 from typing import Callable
 
 from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_S, PARAMS_FP,
-                                                PARTIAL_RESCAN_AFTER_S, apply_incremental_page,
+                                                PARTIAL_RESCAN_AFTER_S, WINDOW_DAYS,
+                                                apply_incremental_page,
                                                 apply_scan_page, fills_period_s,
                                                 fresh_scan_window, partial_rescan_due,
                                                 plan_incremental, plan_scan, scan_verdict,
@@ -134,8 +135,8 @@ from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_S, PARA
 from spark.publicapi.explore_store import (ADMISSION_MULTIPLIER, JOB_KINDS, ExploreStore, Job,
                                            ScanWriteback)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
-from spark.publicapi.hl_explore import (FILLS_WINDOW_DAYS, ExploreConfig, _roi_sort_key,
-                                        candidate_addresses, hft_by_volume)
+from spark.publicapi.hl_explore import (ExploreConfig, _roi_sort_key, candidate_addresses,
+                                        hft_by_volume)
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,10 @@ _PER_ADDRESS_KINDS = tuple(k for k in JOB_KINDS if k != "candidates")
 # 約 14 輪（7 小時）攤平。
 PURGE_MAX_CANDIDATES = 25
 PURGE_MAX_FILLS = 50_000
+
+# HFT 過濾器 S2（reviewer 2026-10-05）：冷卻下限——設 0 會讓被標記位址下一輪回池、重抓
+# 3 頁、再被標記，形成迴圈。環境變數可以更長，不能更短。
+HFT_MIN_COOLDOWN_S = 3600
 
 class _Unset:
     """`_needs_scan_job(running_scan_id=...)` 的哨兵——`None` 本身是有意義的值
@@ -327,6 +332,7 @@ class ExploreScheduler:
         self._candidate_keep_s = candidate_keep_s
         # HFT 過濾器（plan 2026-10-05）觀測值，經 status() 進 /api/ops/health
         self._hft_flagged_total = 0
+        self._hft_errors = 0
         self._hft_last_flagged: dict[str, int | str] | None = None
         self._hft_vlm_excluded_last = 0
         self._hft_cooldown_last = 0
@@ -643,6 +649,7 @@ class ExploreScheduler:
             "purge_last_s": self._purge_last_s,
             "hft": {
                 "flagged_total": self._hft_flagged_total,
+                "errors": self._hft_errors,
                 "last_flagged": self._hft_last_flagged,
                 "vlm_excluded_last_round": self._hft_vlm_excluded_last,
                 "cooldown_last_round": self._hft_cooldown_last,
@@ -1263,6 +1270,13 @@ class ExploreScheduler:
         self._last_fills_at = now
         res = apply_incremental_page(plan, page, now_ms=int(now * 1000))
         self._store.insert_fills_page(job.address, res.accepted, res.state)
+        # HFT 過濾器 H2 第四個評估點（reviewer C1，2026-10-05）：已 complete 的位址
+        # 只走這條增量軌，不評估等於永遠不評估。
+        n = self._hft_fills_exceeded(job.address, now)
+        if n is not None:
+            self._complete(job)
+            self._flag_hft_fills(job.address, n, now)
+            return "dropped:hft"
         if not res.done:
             if (res.state.last_error or "").startswith("invalid_page"):
                 return self._backoff_invalid_page(job, now, res.state.last_error)
@@ -1300,25 +1314,39 @@ class ExploreScheduler:
 
     def _hft_fills_exceeded(self, address: str, now: float) -> int | None:
         """HFT 過濾器 H2（spec §2／§7.3）：30 天 fills 索引計數 ≥ 門檻 → 回傳筆數，
-        否則 `None`。門檻 ≤ 0 ＝ 停用。只在 scan 寫頁之後呼叫，不在發布器迴圈。"""
+        否則 `None`。門檻 ≤ 0 ＝ 停用。只在 scan／增量寫頁之後呼叫，不在發布器迴圈。"""
         thr = self._cfg.hft_max_fills_30d
         if thr <= 0:
             return None
-        since_ms = int(now * 1000) - FILLS_WINDOW_DAYS * 86_400_000
+        since_ms = int(now * 1000) - WINDOW_DAYS * 86_400_000
         n = self._store.count_fills_since(address, since_ms)
         return n if n >= thr else None
 
-    def _flag_hft_fills(self, address: str, n: int, now: float) -> None:
+    def _flag_hft_fills(self, address: str, n: int, now: float) -> bool:
         """H2 命中落地：`flag_hft`（除名＋清資料＋冷卻）、計數、告警、標 dirty。
-        呼叫端已先把手上的 job `_complete`。"""
-        counts = self._store.flag_hft(address, reason="fills", value=float(n), now=now,
-                                      cooldown_s=self._cfg.hft_cooldown_s)
+        呼叫端已先把手上的 job `_complete`。失敗（例如 SQLite locked）**不往外拋**
+        （工程原則 #3：往外拋會被 `_run_job` 的泛用分類吃掉、對已 complete 的 job 做
+        reschedule，只留一行誤導的 CAS 警告）——改為 ERROR log＋`hft.errors` 計數；
+        位址暫留池內，下一輪 candidates 的 `reconcile_scan_jobs` 會補回 job 再判一次。
+        回傳是否落地成功。"""
+        cooldown_s = max(self._cfg.hft_cooldown_s, HFT_MIN_COOLDOWN_S)
+        try:
+            counts = self._store.flag_hft(address, reason="fills", value=float(n), now=now,
+                                          cooldown_s=cooldown_s)
+        except Exception:  # noqa: BLE001 — 失敗路徑要大聲且可計數，不交給泛用隔離
+            self._hft_errors += 1
+            logger.error(
+                "explore scheduler: %s 判定 HFT（30 天 %d 筆）但 flag_hft 失敗——位址暫留池內，"
+                "等下一輪對帳補 job 後重判", address, n, exc_info=True)
+            self._notify_dirty()
+            return False
         self._hft_flagged_total += 1
         self._hft_last_flagged = {"address": address.lower(), "fills_30d": n}
         logger.warning(
             "explore scheduler: %s 判定 HFT（30 天 %d 筆 ≥ %d）——除名、冷卻 %d 秒、清除 %s",
-            address, n, self._cfg.hft_max_fills_30d, self._cfg.hft_cooldown_s, counts)
+            address, n, self._cfg.hft_max_fills_30d, cooldown_s, counts)
         self._notify_dirty()
+        return True
 
     def _run_scan(self, job: Job, now: float, *, verify: bool) -> str:
         """遍歷軌 job（kind='fills_scan'／'fills_verify'）——Task 7.9b B2／B3＋
