@@ -3102,8 +3102,13 @@ fills 只留 35 天、done scan 留 30 天）→ `wal_checkpoint(TRUNCATE)` → 
 
 #### Step 4：部署 purge 接線程式碼、開回刷新、start
 
+> ⚠️ **從乾淨的 worktree 推，不要從工作樹推**（2026-10-04 發現）：同一台 Mac 可能有另一個 session 正在改
+> `app.py`／`web/`（未 commit），§3.2 的 rsync 是推整棵工作樹，會把別人做到一半的東西帶上正式機。
+> `git worktree add /tmp/spark-deploy <commit> && rsync … /tmp/spark-deploy/ …`，推完 `git worktree remove /tmp/spark-deploy`。
+> `DEPLOYED_VERSION` 的 commit 也要用那個 `<commit>`（`git -C /tmp/spark-deploy rev-parse HEAD`）。
+
 ```bash
-# 本機：§3.2 兩段 rsync（exclude 清單照抄）＋ chown 排除 var/；pyproject 未變則跳過 uv sync
+# 本機：§3.2 兩段 rsync（exclude 清單照抄；來源改為乾淨 worktree）＋ chown 排除 var/；pyproject 未變則跳過 uv sync
 # 正式機：
 ssh -i <金鑰> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
 sudo sed -i "s/^Environment=EXPLORE_UPSTREAM_REFRESH=.*/Environment=EXPLORE_UPSTREAM_REFRESH=1/" /etc/systemd/system/filet-api.service.d/explore-refresh.conf
