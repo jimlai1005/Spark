@@ -323,6 +323,60 @@ def test_purge_deletes_fills_outside_window_and_retention(tmp_path):
     assert store.get_fills("0xfff", 0, old_ms + 1) == []
 
 
+def _seed_stale_candidate(store, c, addr, rank):
+    store.upsert_candidates([(addr, None, rank, None)], as_of=c.now())
+    store.insert_fills_page(addr, [_fill(tid=1, time_ms=100)], _checkpoint(addr))
+
+
+def test_purge_max_candidates_bounds_stale_deletion(tmp_path):
+    store, c = _store(tmp_path)
+    for i in range(5):  # last_seen_at 依序遞增：0xs0 最舊
+        c.t += 10
+        _seed_stale_candidate(store, c, f"0xs{i}", i + 1)
+    store.deactivate_missing(set())
+    c.t += 30 * 86400
+    counts = store.purge(c.now(), candidate_keep_s=7 * 86400, max_candidates=2)
+    assert counts["candidate"] == 2
+    left = sorted(r[0] for r in store._db.execute("SELECT address FROM candidate"))
+    assert left == ["0xs2", "0xs3", "0xs4"]  # 最舊的 0xs0／0xs1 先刪
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM fills WHERE address IN ('0xs0','0xs1')").fetchone() == (0,)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM fills_sync WHERE address IN ('0xs0','0xs1')").fetchone() == (0,)
+    assert store.purge(c.now(), candidate_keep_s=7 * 86400, max_candidates=2)["candidate"] == 2
+    assert store.purge(c.now(), candidate_keep_s=7 * 86400, max_candidates=2)["candidate"] == 1
+    assert store._db.execute("SELECT COUNT(*) FROM candidate").fetchone() == (0,)
+
+
+def test_purge_max_fills_bounds_retention_deletion(tmp_path):
+    store, c = _store(tmp_path)
+    old_ms = int((c.now() - 40 * 86400) * 1000)
+    cp = _checkpoint("0xact", window_start_ms=old_ms + 10_000,
+                     window_end_ms=int(c.now() * 1000), cursor_ms=old_ms + 10_000)
+    store.insert_fills_page(
+        "0xact", [_fill(tid=i, time_ms=old_ms + i) for i in range(1, 11)], cp)
+    got = [store.purge(c.now(), fills_keep_s=35 * 86400, max_fills=4)["fills"]
+           for _ in range(4)]
+    assert got == [4, 4, 2, 0]
+
+
+def test_purge_default_unbounded_keeps_existing_behaviour(tmp_path):
+    store, c = _store(tmp_path)
+    old_ms = int((c.now() - 40 * 86400) * 1000)
+    cp = _checkpoint("0xunb", window_start_ms=old_ms + 10_000,
+                     window_end_ms=int(c.now() * 1000), cursor_ms=old_ms + 10_000)
+    store.insert_fills_page(
+        "0xunb", [_fill(tid=i, time_ms=old_ms + i) for i in range(1, 8)], cp)
+    assert store.purge(c.now(), fills_keep_s=35 * 86400)["fills"] == 7
+
+
+def test_purge_runs_incremental_vacuum_without_error_when_auto_vacuum_off(tmp_path):
+    store, c = _store(tmp_path)
+    assert store._db.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+    assert store.purge(c.now()) == {"candidate": 0, "endpoint_cache": 0, "fills": 0,
+                                    "fills_sync": 0, "fills_scan": 0}
+
+
 # --- 地址正規化 ---
 
 def test_address_normalization_case_insensitive(tmp_path):

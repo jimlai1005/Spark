@@ -3713,6 +3713,105 @@ def test_s3e_reconcile_failure_does_not_quarantine_candidates(tmp_path):
     assert due[1] == 0                                        # 沒有被當成失敗
 
 
+ADDR_B = "0xBBB0000000000000000000000000000000BBB1"
+
+
+def _purge_scenario(tmp_path, *, purge_enabled=True):
+    """A、B 進池 → B 退池（payload 不再含 B）→ 時鐘推進 8 天；回傳
+    (sched, store, clock, payload_box)。B 有 fills／fills_sync 與退池時被清掉的 job。"""
+    clock = Clock(t=40 * 86400.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    box = {"p": _payload([ADDR_A, ADDR_B])}
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: box["p"], clock=clock,
+                  cfg=ExploreConfig(candidate_pool=2), purge_enabled=purge_enabled)
+    sched._bootstrapped = True
+    sched._first_tick_done = True
+    store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+    assert sched.tick() == "ran:candidates"
+    now_ms = int(clock.now() * 1000)
+    store.bootstrap_address_fills(
+        ADDR_B, clock.now(), window_start_ms=now_ms - 86_400_000, window_end_ms=now_ms,
+        params_fp="")
+    store.insert_fills_page(ADDR_B, [{"coin": "BTC", "tid": 1, "time": now_ms - 1000,
+                                      "px": "1", "sz": "1"}],
+                            store.get_sync(ADDR_B))
+    box["p"] = _payload([ADDR_A])
+    _run_candidates_once(sched, store, clock)   # B 退池、其 job 被刪
+    clock.t += 8 * 86400
+    return sched, store, clock
+
+
+def _b_rows(store):
+    return store._db.execute(
+        "SELECT (SELECT COUNT(*) FROM fills_sync WHERE address=?),"
+        "(SELECT COUNT(*) FROM fills WHERE address=?)",
+        (ADDR_B.lower(), ADDR_B.lower())).fetchone()
+
+
+def _run_candidates_once(sched, store, clock):
+    """直接領 candidates job 並執行（tick 會先挑到其他到期 job）。"""
+    store._db.execute("UPDATE refresh_job SET next_attempt_at=? WHERE kind='candidates'",
+                      (clock.now() - 1,))
+    store._db.commit()
+    job = store.claim_due(clock.now(), "o", 60, kinds=("candidates",))
+    assert job is not None
+    assert sched._run_candidates(job, clock.now()) == "ran:candidates"
+
+
+def test_candidates_round_purges_stale_candidates_and_reports(tmp_path):
+    sched, store, clock = _purge_scenario(tmp_path)
+    assert _b_rows(store) == (1, 1)
+    _run_candidates_once(sched, store, clock)
+    assert _b_rows(store) == (0, 0)
+    st = sched.status()
+    assert st["purged"]["candidate"] >= 1
+    assert st["purge_enabled"] is True
+    assert st["purge_errors"] == 0
+
+
+def test_candidates_round_skips_purge_when_disabled(tmp_path):
+    sched, store, clock = _purge_scenario(tmp_path, purge_enabled=False)
+    _run_candidates_once(sched, store, clock)
+    assert _b_rows(store) == (1, 1)
+    st = sched.status()
+    assert st["purged"] is None
+    assert st["purge_enabled"] is False
+
+
+def test_purge_failure_does_not_quarantine_candidates_job(tmp_path):
+    sched, store, clock = _purge_scenario(tmp_path)
+
+    def boom(*a, **k):
+        raise RuntimeError("disk I/O error")
+    store.purge = boom
+    _run_candidates_once(sched, store, clock)
+    st = sched.status()
+    assert st["purge_errors"] == 1
+    assert st["purged"] is None
+    row = store._db.execute(
+        "SELECT next_attempt_at, attempts, last_error FROM refresh_job "
+        "WHERE key='candidates:candidates'").fetchone()
+    assert row[0] == pytest.approx(clock.now() + sched._candidates_every_s)
+    assert row[1] == 0
+    assert row[2] is None
+
+
+def test_candidates_round_passes_bounds_to_purge(tmp_path):
+    from spark.publicapi import explore_scheduler as es
+    sched, store, clock = _purge_scenario(tmp_path)
+    seen = []
+    real = store.purge
+
+    def spy(now, **kw):
+        seen.append(kw)
+        return real(now, **kw)
+    store.purge = spy
+    _run_candidates_once(sched, store, clock)
+    assert len(seen) == 1
+    assert seen[0]["max_candidates"] == es.PURGE_MAX_CANDIDATES == 25
+    assert seen[0]["max_fills"] == es.PURGE_MAX_FILLS == 50_000
+
+
 def test_s4e_probe_that_sends_nothing_does_not_burn_the_auxiliary_slot(tmp_path):
     """S4／複審 S2：探測候選在發送前被判非 active（查詢與發送之間剛退池）→
     一頁都沒打，輔助名額計數器**不歸零**，同一個 tick 改試 verify。"""

@@ -214,6 +214,13 @@ VERIFY_MAX_WAIT_S = 2 * 3600
 # 是全域 job（`address IS NULL`），不屬於任何地址。
 _PER_ADDRESS_KINDS = tuple(k for k in JOB_KINDS if k != "candidates")
 
+# explore-db-purge plan D-P1（2026-10-04）：每輪 candidates（30 分）purge 的上界。
+# 一次刪 344 個退池位址（~50 萬筆 fills＋索引）會在 IO 飽和的機器上抱著 store lock
+# 數十秒到數分鐘，API／發布器全部停等；改成每輪最多 25 個位址、5 萬筆過期 fills，
+# 約 14 輪（7 小時）攤平。
+PURGE_MAX_CANDIDATES = 25
+PURGE_MAX_FILLS = 50_000
+
 class _Unset:
     """`_needs_scan_job(running_scan_id=...)` 的哨兵——`None` 本身是有意義的值
     （「這個地址沒有進行中的遍歷」），不能拿來表示「呼叫端沒帶入」。"""
@@ -308,8 +315,15 @@ class ExploreScheduler:
                  # `special_serve_ratio_until`（ISO8601 UTC）之前有效，逾期或
                  # 設定缺漏／不合法一律回預設，見 `_special_serve_ratio`。
                  special_serve_ratio: int | None = None,
-                 special_serve_ratio_until: str | None = None):
+                 special_serve_ratio_until: str | None = None,
+                 # explore-db-purge D-P3：purge kill switch（`FILET_EXPLORE_PURGE`，
+                 # 由 `run_api.py` 傳入 `cfg.explore_purge_enabled`）。`cfg` 是
+                 # `ExploreConfig`（hl_explore），不是 `ApiConfig`，所以走參數。
+                 purge_enabled: bool = True):
         self._store = store
+        self._purge_enabled = purge_enabled
+        self._purged: dict[str, int] | None = None
+        self._purge_errors = 0
         self._hl = hl
         self._hl_base = hl_base
         self._hl_fills = hl_fills
@@ -613,6 +627,9 @@ class ExploreScheduler:
             "verify_served_by_deadline": self._verify_served_by_deadline,
             "reconciled": None if self._reconciled is None else dict(self._reconciled),
             "reconcile_errors": self._reconcile_errors,
+            "purged": None if self._purged is None else dict(self._purged),
+            "purge_errors": self._purge_errors,
+            "purge_enabled": self._purge_enabled,
             "scan_writeback_duplicate": self._scan_writeback_duplicate,
             "scan_writeback_stale": self._scan_writeback_stale,
             "scan_writeback_missing": self._scan_writeback_missing,
@@ -1091,6 +1108,20 @@ class ExploreScheduler:
             self._reconcile_errors += 1
             logger.error("explore scheduler: candidates 輪的對帳失敗（candidates job 照常收尾）",
                          exc_info=True)
+
+        # explore-db-purge D-P2：退池位址／過期 fills 的有界清理，與對帳同形——
+        # 失敗不得把 candidates job 拖進隔離（候選池唯一更新來源）；大聲記錄＋計數。
+        if self._purge_enabled:
+            try:
+                self._purged = self._store.purge(
+                    now, max_candidates=PURGE_MAX_CANDIDATES, max_fills=PURGE_MAX_FILLS)
+                if any(self._purged.values()):
+                    logger.warning("explore scheduler: purge 本輪刪除 %s", self._purged)
+            except Exception:
+                self._purged = None
+                self._purge_errors += 1
+                logger.error("explore scheduler: purge 失敗（candidates job 照常收尾）",
+                             exc_info=True)
 
         self._complete(job)
         self._store.enqueue(job.key, None, "candidates", job.priority,

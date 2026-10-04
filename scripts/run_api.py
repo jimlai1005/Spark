@@ -89,7 +89,9 @@ def main() -> None:
             # Task 8（2026-09-22，D-C／D-I）：輔助份額臨時加速，逾期自動恢復
             # 預設 9——解析與 fail-safe 見 ExploreScheduler._special_serve_ratio。
             special_serve_ratio=cfg.explore_special_serve_ratio,
-            special_serve_ratio_until=cfg.explore_special_serve_ratio_until)
+            special_serve_ratio_until=cfg.explore_special_serve_ratio_until,
+            # explore-db-purge D-P3：purge kill switch（FILET_EXPLORE_PURGE）。
+            purge_enabled=cfg.explore_purge_enabled)
         app.state.explore_scheduler = scheduler
         app.state.explore_publisher = publisher
         if cfg.explore_upstream_refresh:

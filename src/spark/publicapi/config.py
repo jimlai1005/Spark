@@ -199,6 +199,10 @@ class ApiConfig:
     # 未設）→ False。預設關閉：D8 裁決——先部署 P0+P1 止血，P2–P5 完成、正式機
     # 觀察過 `hl_budget` 再手動打開，不隨程式碼上線自動啟動背景排程。
     explore_upstream_refresh: bool = False
+    # --- Explore 過期資料清理 kill switch（explore-db-purge plan D-P3，2026-10-04）---
+    # `FILET_EXPLORE_PURGE`：`"0"`／`"false"`（大小寫不拘）→ False，其餘（含未設）
+    # → True。預設開；懷疑 purge 出問題時改 drop-in＋restart 即可停，不必回退程式。
+    explore_purge_enabled: bool = True
     # --- Explore 輔助份額臨時加速（Task 8，2026-09-22，D-C／D-I）---
     # `SPECIAL_SERVE_RATIO`（`explore_scheduler.py`，預設 9）是使用者 2026-09-21
     # 的既有裁決，**不得更動**；這裡只加一個帶到期時間、逾期自動恢復預設值的
@@ -465,6 +469,8 @@ class ApiConfig:
                    explore_db_path=env.get("FILET_EXPLORE_DB") or None,
                    explore_upstream_refresh=(env.get("EXPLORE_UPSTREAM_REFRESH", "")
                                              .strip().lower() in ("1", "true")),
+                   explore_purge_enabled=(env.get("FILET_EXPLORE_PURGE", "")
+                                          .strip().lower() not in ("0", "false")),
                    explore_fills_period_s=int(env.get("FILET_EXPLORE_FILLS_PERIOD_S")
                                               or cls.explore_fills_period_s),
                    explore_fills_max_period_s=int(

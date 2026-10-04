@@ -2115,7 +2115,9 @@ class ExploreStore:
     # --- maintenance ---
     def purge(self, now: float, *, candidate_keep_s: float = 7 * 86400,
               fills_keep_s: float = 35 * 86400,
-              scan_keep_s: float = 30 * 86400) -> dict[str, int]:
+              scan_keep_s: float = 30 * 86400,
+              max_candidates: int | None = None,
+              max_fills: int | None = None) -> dict[str, int]:
         """刪除已停用超過 `candidate_keep_s` 的候選（及其 endpoint_cache／fills／
         fills_sync／fills_scan）——但若該地址仍有 `refresh_job` 列則跳過（避免刪掉
         正在跑的工作依賴的資料）。另外刪除超過 `fills_keep_s` 的 fills，但保留仍落在
@@ -2128,7 +2130,16 @@ class ExploreStore:
         （對外 `fills_coverage.evidence` 要能回查它，刪了證據就斷鏈）。
         兩條清理路徑（退池地址連帶刪除＋保留期清理）都計入
         `counts["fills_scan"]`——7.9b 的退池連帶刪除連 rowcount 都沒收，
-        清了多少沒人知道。"""
+        清了多少沒人知道。
+
+        上界（explore-db-purge plan D-P1）：`max_candidates` 限制本次最多刪幾個
+        退池位址（`last_seen_at` 最舊優先）、`max_fills` 限制保留期清理一次最多刪幾筆
+        fills（`rowid IN (SELECT … LIMIT ?)`，SQLite 預設不支援 `DELETE … LIMIT`）；
+        皆預設 `None`＝不設限（維持舊行為）。有界化是為了讓一次清理不在 IO 飽和的機器
+        上抱著 store lock 太久，分多輪攤平。
+
+        D-P4：末尾 `PRAGMA incremental_vacuum(4000)`——僅 `auto_vacuum=INCREMENTAL`
+        的 DB 會回收 freelist 頁，其餘為 no-op。"""
         cutoff_candidate = now - candidate_keep_s
         cutoff_fills_ms = int((now - fills_keep_s) * 1000)
         cutoff_scan = now - scan_keep_s
@@ -2137,8 +2148,11 @@ class ExploreStore:
         with self._lock, self._db:
             stale = [r[0] for r in self._db.execute(
                 "SELECT c.address FROM candidate c WHERE c.active=0 AND c.last_seen_at < ? "
-                "AND NOT EXISTS (SELECT 1 FROM refresh_job j WHERE j.address = c.address)",
-                (cutoff_candidate,)).fetchall()]
+                "AND NOT EXISTS (SELECT 1 FROM refresh_job j WHERE j.address = c.address) "
+                "ORDER BY c.last_seen_at ASC"
+                + ("" if max_candidates is None else " LIMIT ?"),
+                (cutoff_candidate,) if max_candidates is None
+                else (cutoff_candidate, max_candidates)).fetchall()]
             for addr in stale:
                 cur = self._db.execute("DELETE FROM endpoint_cache WHERE address=?", (addr,))
                 counts["endpoint_cache"] += cur.rowcount
@@ -2151,10 +2165,16 @@ class ExploreStore:
                 cur = self._db.execute("DELETE FROM candidate WHERE address=?", (addr,))
                 counts["candidate"] += cur.rowcount
             cur = self._db.execute(
-                "DELETE FROM fills WHERE time_ms < ? AND NOT EXISTS ("
+                "DELETE FROM fills WHERE rowid IN (SELECT rowid FROM fills "
+                "WHERE time_ms < ? AND NOT EXISTS ("
                 "SELECT 1 FROM fills_sync s WHERE s.address = fills.address "
-                "AND fills.time_ms >= s.window_start_ms)",
-                (cutoff_fills_ms,))
+                "AND fills.time_ms >= s.window_start_ms))"
+                if max_fills is None else
+                "DELETE FROM fills WHERE rowid IN (SELECT rowid FROM fills "
+                "WHERE time_ms < ? AND NOT EXISTS ("
+                "SELECT 1 FROM fills_sync s WHERE s.address = fills.address "
+                "AND fills.time_ms >= s.window_start_ms) LIMIT ?)",
+                (cutoff_fills_ms,) if max_fills is None else (cutoff_fills_ms, max_fills))
             counts["fills"] += cur.rowcount
             cur = self._db.execute(
                 "DELETE FROM fills_scan WHERE status='done' AND finished_at IS NOT NULL "
@@ -2163,6 +2183,10 @@ class ExploreStore:
                 "AND s.scan_id = fills_scan.scan_id)",
                 (cutoff_scan,))
             counts["fills_scan"] += cur.rowcount
+        # D-P4：incremental_vacuum 不能在交易內的某些情況下執行；with self._db
+        # 區塊結束已 commit，這裡獨立呼叫（非 INCREMENTAL 模式為 no-op）。
+        with self._lock:
+            self._db.execute("PRAGMA incremental_vacuum(4000)")
         return counts
 
     def stats(self) -> dict:
