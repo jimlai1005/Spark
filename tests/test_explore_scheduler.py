@@ -5682,3 +5682,111 @@ def test_h2_cooldown_has_one_hour_floor(tmp_path):
         if sched.tick() == "dropped:hft":
             break
     assert store.get_candidate(_HFT_A).hft_until == clock.now() + HFT_MIN_COOLDOWN_S
+
+
+def _flaky_flag_once(store, monkeypatch):
+    """第一次 `flag_hft` 拋 SQLite locked，之後委派給真的實作。回傳呼叫計數 dict。"""
+    import sqlite3
+    real = store.flag_hft
+    calls = {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(store, "flag_hft", flaky)
+    return calls
+
+
+def _tick_until(sched, clock, wanted: str, *, max_ticks: int = 60, advance_s: float = 0.0) -> list[str]:
+    """tick 直到回傳 `wanted`；每 tick 可選擇推進時鐘（讓 period 制的 job 到期）。超過上限就 raise。"""
+    results = []
+    for _ in range(max_ticks):
+        r = sched.tick()
+        results.append(r)
+        if r == wanted:
+            return results
+        clock.t += advance_s
+    raise AssertionError(f"{wanted} 未在 {max_ticks} tick 內出現：{results[-10:]}")
+
+
+def test_h2_flag_failure_mid_scan_recovers_via_next_candidates_round(tmp_path, monkeypatch):
+    """復原路徑 1：scan 半途 flag 失敗 → 遍歷仍 running、job 已 complete；下一輪 candidates 的
+    `reconcile_scan_jobs` 以 `resume_running` 補回 scan job → 下一頁再判 → 真的除名。"""
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([(_HFT_A, None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    store.bootstrap_address_fills(_HFT_A, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    store.enqueue(f"{_HFT_A.lower()}:fills_scan", _HFT_A.lower(), "fills_scan", 2, clock.now())
+    hl = _FullPagesHL()
+    payload = _hft_payload([(_HFT_A, "1000")])
+    sched = _sched(store, hl, clock=clock, leaderboard_source_fn=lambda: payload,
+                  cfg=ExploreConfig(candidate_pool=5, hft_max_fills_30d=6000),
+                  state_every_s=10**9, portfolio_every_s=10**9, ledger_every_s=10**9,
+                  fills_min_period_s=10**9, fills_max_period_s=10**9, rng=lambda: 0.0)
+    sched._bootstrapped = True
+    calls = _flaky_flag_once(store, monkeypatch)
+
+    _tick_until(sched, clock, "dropped:hft")              # 第一次：flag 失敗
+    assert calls["n"] == 1
+    assert sched.status()["hft"]["errors"] == 1 and sched.status()["hft"]["flagged_total"] == 0
+    assert store.get_candidate(_HFT_A).active is True
+    assert store.stats()["refresh_job"] == 0              # job 已 complete、沒人補
+    assert store.running_scan(_HFT_A) is not None         # 遍歷仍 running（復原的依據）
+
+    _run_candidates_once(sched, store, clock)             # 下一輪 candidates → reconcile resume_running
+    assert store._db.execute("SELECT COUNT(*) FROM refresh_job WHERE address=? AND kind='fills_scan'",
+                             (_HFT_A.lower(),)).fetchone() == (1,)
+    assert sched.status()["reconciled"] is not None
+
+    _tick_until(sched, clock, "dropped:hft")              # 第二次：下一頁重判、flag 成功
+    assert calls["n"] == 2
+    assert sched.status()["hft"]["flagged_total"] == 1 and sched.status()["hft"]["errors"] == 1
+    cand = store.get_candidate(_HFT_A)
+    assert cand.active is False and cand.hft_reason == "fills"
+    assert store.count_fills_since(_HFT_A, 0) == 0
+    assert store._db.execute("SELECT COUNT(*) FROM refresh_job WHERE address=?",
+                             (_HFT_A.lower(),)).fetchone() == (0,)
+
+
+def test_h2_flag_failure_on_incremental_recovers_via_next_candidates_round(tmp_path, monkeypatch):
+    """復原路徑 2：增量軌 flag 失敗 → fills job 已刪；下一輪 candidates 的 `_enqueue_address_jobs`
+    重排 fills job → 下一頁再判 → 真的除名。"""
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([(_HFT_A, None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills(_HFT_A, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, _HFT_A, result="complete", reason="retention_boundary_verified",
+                   window_end_ms=now_ms)
+    clock.t += 3600
+    store.enqueue(f"{_HFT_A.lower()}:fills", _HFT_A.lower(), "fills", 2, clock.now())
+    hl = _FullPagesHL()
+    payload = _hft_payload([(_HFT_A, "1000")])
+    sched = _sched(store, hl, clock=clock, leaderboard_source_fn=lambda: payload,
+                  cfg=ExploreConfig(candidate_pool=5, hft_max_fills_30d=2000),
+                  fills_min_period_s=1, fills_max_period_s=1,
+                  state_every_s=10**9, portfolio_every_s=10**9, ledger_every_s=10**9, rng=lambda: 0.0)
+    sched._bootstrapped = True
+    calls = _flaky_flag_once(store, monkeypatch)
+
+    assert sched.tick() == "dropped:hft"                  # 第一次：flag 失敗
+    assert calls["n"] == 1 and sched.status()["hft"]["errors"] == 1
+    assert store.get_candidate(_HFT_A).active is True
+    assert store.stats()["refresh_job"] == 0
+
+    _run_candidates_once(sched, store, clock)             # 下一輪 candidates → _enqueue_address_jobs 重排
+    assert store._db.execute("SELECT COUNT(*) FROM refresh_job WHERE address=? AND kind='fills'",
+                             (_HFT_A.lower(),)).fetchone() == (1,)
+
+    _tick_until(sched, clock, "dropped:hft", advance_s=2.0)   # 增量 period 1s，推進時鐘讓它到期
+    assert calls["n"] == 2
+    assert sched.status()["hft"]["flagged_total"] == 1
+    cand = store.get_candidate(_HFT_A)
+    assert cand.active is False and cand.hft_value >= 2000.0
+    assert store.count_fills_since(_HFT_A, 0) == 0
