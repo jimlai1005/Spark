@@ -178,9 +178,11 @@
   13:21:40 起 api 跑的是沒有對方修法的版本。對方（經使用者轉告）指出後，13:24:06–13:24:16 從乾淨 worktree **9921de6**
   （origin/main，含 690f678＋5acd220）重新 stage、第二段 rsync、`restart filet-api`（3 秒）、`DEPLOYED_VERSION=9921de6`；
   `web/.next` 一直在 exclude 清單，對方 13:12 的前端 build 未被動到；follower 三個時間戳與 dashboard 啟動時間不變。
-- 判準（已寫進 memory `wait-for-peer-session-before-prod`）：使用者說「等 X 做完」→ 只認使用者本人的「可以開始」；開窗前三查
-  （`ListAgents` peer 是否 busy、`git fetch` 後 origin/main 有無比 stage 更新的他人 commit、正式機 `DEPLOYED_VERSION`／
-  `/tmp/spark-sync`／維護旗標是否被他人推進）；部署來源一律 origin/main 的乾淨 worktree，rsync 前 `diff -rq` 差異若含非我改的檔案就停。
+- 判準（使用者 2026-10-04 二次定案，寫進 memory `wait-for-peer-session-before-prod`）：**看對方怎麼做，不看他怎麼說；也不停下來等使用者
+  給開始訊號**。動正式機前親自查：(1) `ListAgents` peer idle；(2) 工作樹無非我改的 dirty 檔；(3) `git fetch` 後 origin/main 最近 10 分鐘
+  無他人 commit；(4) 正式機 `DEPLOYED_VERSION`＝origin/main、無 `/tmp/spark-sync`、各 unit 時間戳 10 分鐘內未動、無維護旗標；
+  (5) 全部乾淨後再靜止觀察 10 分鐘；(6) 窗內每步前查 api 是否被 `Wants=` 拉起；(7) 部署來源一律 origin/main HEAD 乾淨 worktree，
+  rsync 前 `diff -rq` 出非我改的檔案就停核對。
 - 對方寫的 RUNBOOK 附錄 B 記錄（9921de6）我**不改**。
 
 ## 時程（UTC／台北）
