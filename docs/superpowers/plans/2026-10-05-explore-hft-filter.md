@@ -1032,6 +1032,13 @@ RUNBOOK §5.8l：env 清單的 `EXPLORE_HFT_COOLDOWN_S` 後加「（下限 3600�
 `errors`（flag 落地失敗計數，應為 0）；「既有池內已回補完成…」那條改為「既有池內已回補完成的位址在
 下一次增量頁寫入時評估（高頻位址週期 1–6 小時），首日內應全部處理完」。
 
+- [ ] **Step 3b: 再三個既有測試明確停用 H2（主線程裁決 2026-10-05，builder 回報）**
+
+增量軌評估點讓 `test_b7_iii_fills_and_probe_backlog_9_to_1_ratio`、
+`test_s7f_overdue_verify_waits_for_its_page_share`、`test_s3_overdue_verify_burst_never_starves_increments`
+的假資料在增量軌累積超過 6,000 筆而回 `dropped:hft`。處理與 Task 3 Step 3b 相同：只在
+`_sched(...)` 的 cfg 加 `hft_max_fills_30d=0` 並加一行註解，斷言不動。
+
 - [ ] **Step 4: 跑測試確認通過**
 
 Run: `uv run pytest tests/test_explore_scheduler.py -q`
