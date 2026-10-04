@@ -819,6 +819,231 @@ git commit -m "docs: HFT 過濾器 spec H2 改原始計數＋RUNBOOK §5.8l 部�
 
 ---
 
+### Task 7 `@inline`：審查修正——增量軌也評估 H2、失敗路徑大聲、冷卻下限、同源窗口、分支測試
+
+背景（reviewer 2026-10-05，主線程親驗）：H2 三個呼叫點全在 `_run_scan`；已回補完成
+（`completeness=complete`）的位址之後只走增量 `fills` job（`_run_increment`），寫完頁沒有
+評估 H2，所以部署當下池內 30 天 ≥ 6,000 筆但 vlm < $1e8 的約 33 顆永遠不會被抓（C1）。
+另：預算暫停／完成分支無測試（W1）、`flag_hft` 拋例外會被泛用分類吃掉只留誤導的 CAS 警告（W2）、
+H2 窗口常數與 scan 窗口常數不同源（S1）、`EXPLORE_HFT_COOLDOWN_S=0` 會形成每輪重抓重標的迴圈（S2）。
+
+**Files:**
+- Modify: `src/spark/publicapi/explore_scheduler.py`（`_run_increment` 約 1265 行後、`_hft_fills_exceeded`／`_flag_hft_fills` 約 1301–1321、`__init__` 計數器、`status()["hft"]`、import）
+- Modify: `tests/test_explore_scheduler.py`（HFT 區塊，約 5403 行起）
+- Modify: `docs/superpowers/specs/2026-10-05-explore-hft-filter.md` §2 H2「評估時機」、`deploy/RUNBOOK.md` §5.8l
+
+- [ ] **Step 1: 寫失敗測試（追加到 HFT 區塊末尾）**
+
+```python
+class _PagesThenShortHL(FakeHL):
+    """前 `full_pages` 頁滿頁，接著一頁 `short_n` 筆（短頁→scan 收尾），之後空頁。
+    tid 全域遞增（與 `_FullPagesHL` 同理由）。"""
+
+    def __init__(self, full_pages: int, short_n: int):
+        super().__init__()
+        self._full_pages = full_pages
+        self._short_n = short_n
+        self._pages = 0
+        self._tid = 0
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.calls.append(("fills", address, start_ms, end_ms))
+        if start_ms == 0:                     # 左界探測，不算分頁
+            return []
+        self._pages += 1
+        n = PAGE_LIMIT if self._pages <= self._full_pages else (
+            self._short_n if self._pages == self._full_pages + 1 else 0)
+        out = []
+        for i in range(n):
+            self._tid += 1
+            out.append({"coin": "BTC", "tid": self._tid, "time": start_ms + i})
+        return out
+
+
+def _scan_fills_calls(hl) -> int:
+    return len([c for c in hl.calls if c[0] == "fills" and c[2] > 0])
+
+
+def test_h2_flags_on_scan_completion_branch(tmp_path):
+    """門檻 5000：2 滿頁（4000，續頁分支不命中）＋短頁 1500 → scan 收尾 → 完成分支命中。"""
+    hl = _PagesThenShortHL(full_pages=2, short_n=1500)
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=5000))
+    results = [sched.tick() for _ in range(12)]
+    assert "dropped:hft" in results
+    assert _scan_fills_calls(hl) == 3
+    cand = store.get_candidate(_HFT_A)
+    assert cand.active is False and cand.hft_value == 5500.0
+    assert store.stats()["refresh_job"] == 0          # 沒排 partial_rescan／增量 job
+    assert store.get_sync(_HFT_A) is None
+
+
+def test_h2_flags_on_budget_pause_branch(tmp_path):
+    """門檻 40000 ＝ 20 頁 × 2000：第 20 頁走 `max_pages_per_round` 暫停分支（`res.done`
+    為 True、`result` 為 None），只有該分支的檢查能在這一頁命中。"""
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=40_000))
+    results = []
+    for _ in range(60):
+        r = sched.tick()
+        results.append(r)
+        if r == "dropped:hft":
+            break
+    assert results[-1] == "dropped:hft"
+    assert _scan_fills_calls(hl) == 20
+    assert store.get_candidate(_HFT_A).hft_value == 40_000.0
+
+
+def test_h2_evaluates_on_incremental_page_for_complete_address(tmp_path):
+    """C1：已 complete 的位址只走增量軌，增量頁寫入後也要評估 H2。"""
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    now_ms = int(clock.now() * 1000)
+    store.upsert_candidates([(_HFT_A, None, 1, None)], as_of=clock.now())
+    store.bootstrap_address_fills(_HFT_A, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    _complete_scan(store, _HFT_A, result="complete", reason="retention_boundary_verified",
+                   window_end_ms=now_ms)
+    clock.t += 3600                                   # 增量到期、窗口夠寬放得下 2000 筆
+    store.enqueue(f"{_HFT_A.lower()}:fills", _HFT_A.lower(), "fills", 2, clock.now())
+    hl = _FullPagesHL()
+    sched = _sched(store, hl, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=5, hft_max_fills_30d=2000),
+                  fills_min_period_s=1, fills_max_period_s=1,
+                  state_every_s=10**9, portfolio_every_s=10**9, ledger_every_s=10**9)
+    sched._bootstrapped = True
+    r = sched.tick()
+    assert r == "dropped:hft"
+    cand = store.get_candidate(_HFT_A)
+    assert cand.active is False and cand.hft_value == 2000.0
+    assert store.stats()["refresh_job"] == 0
+    assert store.count_fills_since(_HFT_A, 0) == 0
+
+
+def test_h2_flag_failure_is_loud_and_counted(tmp_path, monkeypatch, caplog):
+    """W2：`flag_hft` 拋例外 → ERROR log＋`status()["hft"]["errors"]`，不進泛用隔離路徑，
+    位址暫留池內（下一輪對帳補 job 後重判）。"""
+    import sqlite3
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=6000))
+
+    def boom(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "flag_hft", boom)
+    with caplog.at_level(logging.ERROR, logger="spark.publicapi.explore_scheduler"):
+        results = [sched.tick() for _ in range(6)]
+    assert "dropped:hft" in results
+    assert sched.status()["hft"]["errors"] == 1
+    assert sched.status()["hft"]["flagged_total"] == 0
+    assert store.get_candidate(_HFT_A).active is True
+    assert any("flag_hft 失敗" in rec.getMessage() for rec in caplog.records)
+    assert sched.status()["quarantined"] == 0 if "quarantined" in sched.status() else True
+
+
+def test_h2_cooldown_has_one_hour_floor(tmp_path):
+    """S2：冷卻設 0 會每輪重抓重標；下限 `HFT_MIN_COOLDOWN_S`（3600）。"""
+    from spark.publicapi.explore_scheduler import HFT_MIN_COOLDOWN_S
+    assert HFT_MIN_COOLDOWN_S == 3600
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=6000, hft_cooldown_s=0))
+    for _ in range(6):
+        if sched.tick() == "dropped:hft":
+            break
+    assert store.get_candidate(_HFT_A).hft_until == clock.now() + HFT_MIN_COOLDOWN_S
+```
+
+`_complete_scan` 是檔內既有的測試 helper（`test_b7_i_incremental_continues_while_rescan_in_progress` 有用法）；
+`logging` 已 import。`test_h2_flag_failure_is_loud_and_counted` 最後一行的 `quarantined` 鍵若 `status()` 沒有，請改為
+斷言 `store.stats()["refresh_job"] == 0`（job 已 complete、未被隔離重排）。
+
+- [ ] **Step 2: 跑測試確認失敗**
+
+Run: `uv run pytest tests/test_explore_scheduler.py -q -k "completion_branch or budget_pause or incremental_page or loud_and_counted or one_hour_floor"`
+Expected: 5 條中至少 `incremental_page`／`loud_and_counted`／`one_hour_floor` FAIL（`ImportError: HFT_MIN_COOLDOWN_S`、`KeyError: 'errors'`、`r == "ran:fills"`）
+
+- [ ] **Step 3: 實作**
+
+(a) 模組常數（放在 `PURGE_MAX_FILLS` 之後）：
+
+```python
+# HFT 過濾器 S2（reviewer 2026-10-05）：冷卻下限——設 0 會讓被標記位址下一輪回池、重抓
+# 3 頁、再被標記，形成迴圈。環境變數可以更長，不能更短。
+HFT_MIN_COOLDOWN_S = 3600
+```
+
+(b) import：`from spark.publicapi.explore_fills_sync import WINDOW_DAYS`（沿用檔內既有 import 行），
+`_hft_fills_exceeded` 的 `since_ms` 改用 `WINDOW_DAYS`（與 scan 窗口同源，工程原則 #1）；
+`hl_explore` 那行 import 若因此不再用到 `FILLS_WINDOW_DAYS` 就拿掉。
+
+(c) `__init__` 加 `self._hft_errors = 0`；`status()["hft"]` 加 `"errors": self._hft_errors`。
+
+(d) `_flag_hft_fills` 改為：
+
+```python
+    def _flag_hft_fills(self, address: str, n: int, now: float) -> bool:
+        """H2 命中落地：`flag_hft`（除名＋清資料＋冷卻）、計數、告警、標 dirty。
+        呼叫端已先把手上的 job `_complete`。失敗（例如 SQLite locked）**不往外拋**
+        （工程原則 #3：往外拋會被 `_run_job` 的泛用分類吃掉、對已 complete 的 job 做
+        reschedule，只留一行誤導的 CAS 警告）——改為 ERROR log＋`hft.errors` 計數；
+        位址暫留池內，下一輪 candidates 的 `reconcile_scan_jobs` 會補回 job 再判一次。
+        回傳是否落地成功。"""
+        cooldown_s = max(self._cfg.hft_cooldown_s, HFT_MIN_COOLDOWN_S)
+        try:
+            counts = self._store.flag_hft(address, reason="fills", value=float(n), now=now,
+                                          cooldown_s=cooldown_s)
+        except Exception:  # noqa: BLE001 — 失敗路徑要大聲且可計數，不交給泛用隔離
+            self._hft_errors += 1
+            logger.error(
+                "explore scheduler: %s 判定 HFT（30 天 %d 筆）但 flag_hft 失敗——位址暫留池內，"
+                "等下一輪對帳補 job 後重判", address, n, exc_info=True)
+            self._notify_dirty()
+            return False
+        self._hft_flagged_total += 1
+        self._hft_last_flagged = {"address": address.lower(), "fills_30d": n}
+        logger.warning(
+            "explore scheduler: %s 判定 HFT（30 天 %d 筆 ≥ %d）——除名、冷卻 %d 秒、清除 %s",
+            address, n, self._cfg.hft_max_fills_30d, cooldown_s, counts)
+        self._notify_dirty()
+        return True
+```
+
+(e) `_run_increment`：在 `self._store.insert_fills_page(job.address, res.accepted, res.state)` 之後、
+`if not res.done:` 之前加第四個呼叫點：
+
+```python
+        # HFT 過濾器 H2 第四個評估點（reviewer C1，2026-10-05）：已 complete 的位址
+        # 只走這條增量軌，不評估等於永遠不評估。
+        n = self._hft_fills_exceeded(job.address, now)
+        if n is not None:
+            self._complete(job)
+            self._flag_hft_fills(job.address, n, now)
+            return "dropped:hft"
+```
+
+(f) `_hft_fills_exceeded` docstring 的「只在 scan 寫頁之後呼叫」改為「只在 scan／增量寫頁之後呼叫」。
+
+(g) spec §2 H2「評估時機」改為：「scan **每寫入一頁**與**增量軌每寫入一頁**都評估一次（索引計數，
+毫秒級），達標即中止並除名；scan 進入 done／partial 時再評估最後一次。**不在發布器的每分鐘迴圈裡評估**。」
+RUNBOOK §5.8l：env 清單的 `EXPLORE_HFT_COOLDOWN_S` 後加「（下限 3600，設更小視同 3600）」；觀測段加
+`errors`（flag 落地失敗計數，應為 0）；「既有池內已回補完成…」那條改為「既有池內已回補完成的位址在
+下一次增量頁寫入時評估（高頻位址週期 1–6 小時），首日內應全部處理完」。
+
+- [ ] **Step 4: 跑測試確認通過**
+
+Run: `uv run pytest tests/test_explore_scheduler.py -q`
+Expected: 全部 PASS（153 ＋ 5 新增 ＝ 158）
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/spark/publicapi/explore_scheduler.py tests/test_explore_scheduler.py docs/superpowers/specs/2026-10-05-explore-hft-filter.md deploy/RUNBOOK.md
+git commit -m "fix: HFT H2 增量軌也評估（reviewer C1）＋flag 失敗大聲計數、冷卻下限 1h、窗口同源、分支測試"
+```
+
 ## 自我審查
 
 - **Spec 覆蓋**：H1（Task 2＋3c）、H2 逐頁（Task 3d/e）、生命週期 §3.1–3.5（Task 1 flag_hft／purge／upsert、Task 3）、§3.6 保留期可設定（Task 1 purge 參數既有、Task 3b、Task 4）、§4 觀測（Task 3f、Task 6）、§6 裁決 1–3（預設值 Task 2）、裁決 4 詳情頁不動（無 task，刻意）、裁決 5（Task 4）。H3 不做。
