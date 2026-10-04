@@ -3161,7 +3161,15 @@ failed unit > 0、取樣器 20 分沒新資料。去重：首次即發、持續�
   （6000）、`EXPLORE_HFT_COOLDOWN_S`（2592000；下限 3600，設更小視同 3600）、`FILET_EXPLORE_CANDIDATE_KEEP_S`（604800）。
   任一 HFT 門檻設 0 ＝ 停用該閘（回退不必回退程式）。
 - 觀測：`/api/ops/health` → `explore_refresh.hft`：`flagged_total`／`last_flagged`／
-  `vlm_excluded_last_round`（預期 ≈10）／`cooldown_last_round`／`errors`（flag 落地失敗計數，應為 0）。journal 關鍵字 `判定 HFT`。
+  `vlm_excluded_last_round`（預期 ≈10）／`cooldown_last_round`／`errors`（flag 落地失敗計數，應為 0）。
+  ⚠️ 該端點是 `_require_admin`（管理員錢包登入的瀏覽器 session），**ssh 拿不到**（curl 回 `{"detail": …}`）；
+  ssh 端用下一條的 DB 查詢＋journal 關鍵字 `判定 HFT`／`flag_hft 失敗` 代替。
+- **部署紀錄 2026-10-04 18:50Z**：`964b471`（main，HFT 過濾器 12 commits）。§3.2 兩段 rsync（來源 `/tmp/spark-deploy`
+  乾淨 worktree；pyproject md5 未變故略過 `uv sync`；無 web 改動故不 build、不 restart dashboard）→ chown 排除 var/
+  （非 root 檔 4＝.venv symlink 例外）→ `restart filet-api`（6 s 回 200）→ schema 自動升 6（`PRAGMA table_info(candidate)`
+  末四欄 `hft_*`）→ `DEPLOYED_VERSION` → 三 follower 時間戳不變、`systemctl --failed` 空、`filet_regression_check --http --ssh`
+  67/67。部署當下 PSI avg300 74.7%（飽和中）；重啟後 4 分鐘 `flagged=0`（預期：H1 等下一輪 candidates ≤30 分、H2 等各位址
+  下一頁）。
 - 查被標記清單（唯讀）：
   `sudo python3 -c "import sqlite3;c=sqlite3.connect('file:/var/lib/filet-api/explore.db?mode=ro',uri=True);print(c.execute('SELECT address,hft_reason,hft_value,datetime(hft_until,\"unixepoch\") FROM candidate WHERE hft_until IS NOT NULL ORDER BY hft_value DESC').fetchall())"`
 - 驗收（部署後 24 小時）：`/proc/pressure/io` some avg300 日級分布回到個位數；
