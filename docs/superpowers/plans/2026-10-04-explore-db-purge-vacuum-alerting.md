@@ -187,6 +187,14 @@
 - 重部署後驗收：`filet_regression_check --http --ssh` **67/67 PASS**（13:2x UTC）；**使用者親自登入 0x438b 儀表板確認淨 PnL ≈ −6,604**
   （對方 690f678 修法生效，不再是重複扣 fee 的 −7,473）——2026-10-04 使用者回報「一切正常」。本次收工。
 
+## 後續裁決（使用者，demo 期間）
+
+- 第一場 demo 已順利完成；下一場在隔天 21:00（使用者當地時間）。
+- **項目 7（部署凍結）取消**：使用者裁決不凍結，有需求再說。
+- **項目 6（升 4 GB）由使用者自行安排**；升級＝換 Lightsail 方案＋重開機，會動到三個 follower，請照 RUNBOOK §5.8k demo 自救卡第 4 點避開 demo 時段，
+  升級後跑 `filet_regression_check --http --ssh` 與 `systemctl list-units "filet-follower@*"` 確認三個引擎回來。
+- 取樣器 v2 與 TG 告警持續運作；`pre-purge.bak`（2.26 GB）約 2026-10-11 後可刪。
+
 ## 時程（UTC／台北）
 
 | 時間 | 事 |
