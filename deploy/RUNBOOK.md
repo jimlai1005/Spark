@@ -3822,3 +3822,26 @@ enrich_error 不會上榜）——事故地址是 allTime 歸零、month 正常�
 `leader_perf.py` 逐位元一致）→ 上傳 commit 版 `leader_perf.py`／`trader_stats.py`（備份 `/tmp/*.py.bak-20260930`）→ 正式機 Python
 重放 0x4cae（allTime insufficient／month ok）→ restart `filet-api` → 107 秒後新榜單發布、journal `enrich 失敗` 0 次 → `DEPLOYED_VERSION`
 帶 hotfix note。
+
+**2026-10-04 部署（commit `b9733c0`，11:27 UTC，儀表板隱藏 30D 報酬／跟單回撤＋探索表格 subgrid，純前端）：** plan
+`docs/superpowers/plans/2026-10-04-dashboard-hide-twr-and-explore-subgrid.md`（builder 三個 task、reviewer 一輪 3 Warning 全修）。
+內容：(1) 儀表板「-81.5% 30D」與「你的跟單回撤 -86.42%」兩個 TWR 數字對 follower 會被「入金與虧損同取樣區間」誇大
+（0x438b…dce9 實例：單段 r=−69.55%，MDD 60%→86%；根因在 `leader_perf.compute_window_performance` 的 `Δpnl / prev_av`，
+守門只抓 r<−1）——使用者裁決**不改算法、不改 API，只隱藏顯示**，值留在卡片根元素 `data-ret-30d-pct`／`data-max-drawdown-pct`
+供 debug（同 bug 探索／交易員／策略頁共用，leader 中途入金同樣被誇大；日後要修＝分母加當段入金，且探索快照失效走 §5.8c）。
+(2) 探索表格表頭與每列原各自獨立 grid，第 8 欄 `1fr` 依各列 min-content 解出不同寬，有持倉列第 9/10 欄右移、跟單鈕被切；
+改 `.explore-table` 單一 grid＋列 `grid-template-columns: subgrid`，欄軌只定義一次（`@supports not` fallback 退回修改前行為），
+曝險 cell 改直排；欄寬 46/164/88/minmax(7.5rem)/72/56/64/minmax(64px,1fr)/82/158。驗收腳本 `web/scripts/explore_align_check.mjs`
+（production server、`LANG_UI=en` 量英文、逐 cell 溢出、stale CSS → exit 2）：繁中／英文 1280 寬皆 0px 誤差、無溢出。
+前提：正式機 `DEPLOYED_VERSION`＝3994e35（熱修鏈），`src/**/*.py` md5 彙總與本機 HEAD **一致**（`2ce65652…`）、`package-lock.json`
+md5 一致 → `uv sync` 與 **`npm ci` 皆略過**（node_modules 完整、Node v20.20.2）。流程：§3.2 rsync 兩段（本機工作樹乾淨，另加
+`--exclude test-results`）→ `find -prune var` chown root（非 root 檔 4＝.venv symlink；`builder_accrued_snapshot.json` 仍 filet-engine 600）
+→ §4.2 chown ubuntu → `NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app npm run build`（**9m19s**，2 GB 機、三 follower 在跑、
+available 1.0 GB→1.1 GB、零 OOM）→ chown root → **只 restart `filet-dashboard`**（api／keysvc／follower×3 未動，NRestarts 皆 0）→
+`DEPLOYED_VERSION`（note 記 frontend-only）。驗證：`/ /explore /dashboard /strategies` 200；對外 CSS chunk `c764f72ded7f16bc.css`
+含 subgrid×2；`.next/server` 含 `data-ret-30d-pct`；`filet_regression_check --http --ssh` **67/67 PASS**；`systemctl --failed` 空。
+⚠️ 第二次回歸曾 3 個 `/api/public/*` 契約逾時——**不是本次部署造成**：`journalctl _COMM=sudo` 顯示 11:33:38–47Z 另一個 Claude session
+把 `filet-api.service.d/explore-refresh.conf` 的 `EXPLORE_UPSTREAM_REFRESH` 改 0、`daemon-reload`、`restart filet-api`
+（備份 `/tmp/explore-refresh.conf.bak-202610041133`），回歸恰好撞上重啟的 10 秒；API 回來後第三次回歸 67/67。
+教訓：同機多個 session 同時操作正式機時，部署記錄要先看 sudo journal 分清誰動了什麼，不要把別人的重啟歸因到自己的部署。
+回歸第 2、3 層（testnet E2E／瀏覽器）未跑：無後端與簽章流程改動，刻意略過。回滾＝`git checkout ace214c -- web/` 後重跑 §4.2＋restart dashboard。
