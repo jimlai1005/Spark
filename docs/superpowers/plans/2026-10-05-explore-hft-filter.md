@@ -682,10 +682,21 @@ Expected: FAIL（`KeyError: 'hft'`／`TypeError: unexpected keyword 'candidate_k
             },
 ```
 
+- [ ] **Step 3b: 三個既有測試明確停用 H2（主線程裁決 2026-10-05，builder 回報）**
+
+`test_scan_multi_page_completes_and_state_also_gets_a_turn`（約 :302）、
+`test_whale_reaches_complete_within_24h_under_full_contention`（約 :4687）、
+`test_restart_resumes_scan_from_persisted_cursor`（約 :4719）的假資料讓單一位址 30 天
+超過 6,000 筆（實測 6,497／7,944），用預設設定會被 H2 除名、回傳 `"dropped:hft"`——這是
+新功能的預期行為，測試本身測的是分頁／競爭／續掃，與 HFT 無關。修法：在這三個測試建構
+scheduler 的 `cfg` 加 `hft_max_fills_30d=0`（若該測試經 `SchedulerHarness._build_scheduler`
+建構、無法逐測試傳 cfg，則改 harness 的 cfg 一處，並加一行註解引用本 plan）。斷言本身不動。
+**不要**改 `_sched` 的預設 cfg——HFT 測試與既有測試都要顯式表達自己要不要 H2。
+
 - [ ] **Step 4: 跑測試確認通過**
 
 Run: `uv run pytest tests/test_explore_scheduler.py -q`
-Expected: 全部 PASS（既有 ~300 條不得變紅；`tick()` 回傳值新增 `"dropped:hft"` 不影響既有斷言）
+Expected: 全部 PASS（既有測試數不得減少；`tick()` 回傳值新增 `"dropped:hft"`）
 
 - [ ] **Step 5: Commit**
 
