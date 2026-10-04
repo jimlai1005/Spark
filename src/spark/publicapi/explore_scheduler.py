@@ -134,7 +134,8 @@ from spark.publicapi.explore_fills_sync import (MAX_PERIOD_S, MIN_PERIOD_S, PARA
 from spark.publicapi.explore_store import (ADMISSION_MULTIPLIER, JOB_KINDS, ExploreStore, Job,
                                            ScanWriteback)
 from spark.publicapi.hl_budget import BudgetExhausted, ScopePaused, is_rate_limited, weight_for
-from spark.publicapi.hl_explore import ExploreConfig, _roi_sort_key, candidate_addresses
+from spark.publicapi.hl_explore import (FILLS_WINDOW_DAYS, ExploreConfig, _roi_sort_key,
+                                        candidate_addresses, hft_by_volume)
 
 logger = logging.getLogger(__name__)
 
@@ -320,8 +321,15 @@ class ExploreScheduler:
                  # explore-db-purge D-P3：purge kill switch（`FILET_EXPLORE_PURGE`，
                  # 由 `run_api.py` 傳入 `cfg.explore_purge_enabled`）。`cfg` 是
                  # `ExploreConfig`（hl_explore），不是 `ApiConfig`，所以走參數。
-                 purge_enabled: bool = True):
+                 purge_enabled: bool = True,
+                 candidate_keep_s: float = 7 * 86400):
         self._store = store
+        self._candidate_keep_s = candidate_keep_s
+        # HFT 過濾器（plan 2026-10-05）觀測值，經 status() 進 /api/ops/health
+        self._hft_flagged_total = 0
+        self._hft_last_flagged: dict[str, int | str] | None = None
+        self._hft_vlm_excluded_last = 0
+        self._hft_cooldown_last = 0
         self._purge_enabled = purge_enabled
         self._purged: dict[str, int] | None = None
         self._purge_errors = 0
@@ -633,6 +641,12 @@ class ExploreScheduler:
             "purge_errors": self._purge_errors,
             "purge_enabled": self._purge_enabled,
             "purge_last_s": self._purge_last_s,
+            "hft": {
+                "flagged_total": self._hft_flagged_total,
+                "last_flagged": self._hft_last_flagged,
+                "vlm_excluded_last_round": self._hft_vlm_excluded_last,
+                "cooldown_last_round": self._hft_cooldown_last,
+            },
             "scan_writeback_duplicate": self._scan_writeback_duplicate,
             "scan_writeback_stale": self._scan_writeback_stale,
             "scan_writeback_missing": self._scan_writeback_missing,
@@ -1050,7 +1064,12 @@ class ExploreScheduler:
             self._reschedule(job, now + 60, err="no payload", bump_attempts=False)
             return "retry"
 
-        excluded = self._excluded_fn()
+        # HFT 過濾器 H1（零 IO）＋冷卻中的位址：併進 excluded，從頭不入池、不同步。
+        vlm_excluded = hft_by_volume(payload, self._cfg.hft_max_vlm_month_usd)
+        cooldown = self._store.hft_cooldown_addresses(now)
+        self._hft_vlm_excluded_last = len(vlm_excluded)
+        self._hft_cooldown_last = len(cooldown)
+        excluded = set(self._excluded_fn()) | vlm_excluded | cooldown
         rows = candidate_addresses(payload, self._cfg.candidate_pool, excluded)
         if not rows:
             # Task 3.6 B(1)（Critical C1 修法）：候選來源整批回空（上游壞掉、
@@ -1121,7 +1140,8 @@ class ExploreScheduler:
                 # 時間；超過 1 秒就 warning（API 會排在這把鎖後面）。
                 t0 = time.monotonic()
                 self._purged = self._store.purge(
-                    now, max_candidates=PURGE_MAX_CANDIDATES, max_fills=PURGE_MAX_FILLS)
+                    now, candidate_keep_s=self._candidate_keep_s,
+                    max_candidates=PURGE_MAX_CANDIDATES, max_fills=PURGE_MAX_FILLS)
                 self._purge_last_s = round(time.monotonic() - t0, 3)
                 if any(self._purged.values()) or self._purge_last_s > 1.0:
                     logger.warning("explore scheduler: purge 本輪刪除 %s（%.3fs）",
@@ -1278,6 +1298,28 @@ class ExploreScheduler:
                     job.address, job.kind)
         return "dropped"
 
+    def _hft_fills_exceeded(self, address: str, now: float) -> int | None:
+        """HFT 過濾器 H2（spec §2／§7.3）：30 天 fills 索引計數 ≥ 門檻 → 回傳筆數，
+        否則 `None`。門檻 ≤ 0 ＝ 停用。只在 scan 寫頁之後呼叫，不在發布器迴圈。"""
+        thr = self._cfg.hft_max_fills_30d
+        if thr <= 0:
+            return None
+        since_ms = int(now * 1000) - FILLS_WINDOW_DAYS * 86_400_000
+        n = self._store.count_fills_since(address, since_ms)
+        return n if n >= thr else None
+
+    def _flag_hft_fills(self, address: str, n: int, now: float) -> None:
+        """H2 命中落地：`flag_hft`（除名＋清資料＋冷卻）、計數、告警、標 dirty。
+        呼叫端已先把手上的 job `_complete`。"""
+        counts = self._store.flag_hft(address, reason="fills", value=float(n), now=now,
+                                      cooldown_s=self._cfg.hft_cooldown_s)
+        self._hft_flagged_total += 1
+        self._hft_last_flagged = {"address": address.lower(), "fills_30d": n}
+        logger.warning(
+            "explore scheduler: %s 判定 HFT（30 天 %d 筆 ≥ %d）——除名、冷卻 %d 秒、清除 %s",
+            address, n, self._cfg.hft_max_fills_30d, self._cfg.hft_cooldown_s, counts)
+        self._notify_dirty()
+
     def _run_scan(self, job: Job, now: float, *, verify: bool) -> str:
         """遍歷軌 job（kind='fills_scan'／'fills_verify'）——Task 7.9b B2／B3＋
         7.9c-S S2＋7.9d-S S1／S2。
@@ -1412,6 +1454,11 @@ class ExploreScheduler:
         res = apply_scan_page(plan, page, now_ms=int(now * 1000))
         if not res.done:
             self._store.insert_scan_page(job.address, res.accepted, res.scan)
+            n = self._hft_fills_exceeded(job.address, now)
+            if n is not None:
+                self._complete(job)
+                self._flag_hft_fills(job.address, n, now)
+                return "dropped:hft"
             if (res.scan.last_error or "").startswith("invalid_page"):
                 return self._backoff_invalid_page(job, now, res.scan.last_error)
             # Task 7.9d-S S3（2026-09-22 整合模擬 Warning）：核驗遍歷的續頁**不得
@@ -1442,6 +1489,11 @@ class ExploreScheduler:
             # 判斷「有沒有抵達固定終點」用的是同一個條件（工程原則 1：同一個
             # 判斷不能有兩個不同源的版本）。
             self._store.insert_scan_page(job.address, res.accepted, res.scan)
+            n = self._hft_fills_exceeded(job.address, now)
+            if n is not None:
+                self._complete(job)
+                self._flag_hft_fills(job.address, n, now)
+                return "dropped:hft"
             self._reschedule(job, now, bump_attempts=False)
             self._notify_dirty()
             return f"ran:{result_kind}"
@@ -1481,6 +1533,10 @@ class ExploreScheduler:
                 "一次遍歷）——不覆寫、不排下一次重掃", job.address, finished_scan.scan_id)
             self._scan_writeback_stale += 1
         self._complete(job)
+        n = self._hft_fills_exceeded(job.address, now)
+        if n is not None:
+            self._flag_hft_fills(job.address, n, now)
+            return "dropped:hft"
         active = self._store.is_active(job.address)
         if (active and not verify and writeback is not ScanWriteback.STALE
                 and finished_scan.result == "partial"):

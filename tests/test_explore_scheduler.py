@@ -13,6 +13,7 @@ import random
 import re
 import threading
 from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -328,7 +329,9 @@ def test_scan_multi_page_completes_and_state_also_gets_a_turn(tmp_path):
     store.enqueue("0xabc:fills_scan", "0xabc", "fills_scan", 2, clock.now())
     store.enqueue("0xdef:state", "0xdef", "state", 0, clock.now())
 
-    sched = _sched(store, hl, clock=clock)
+    # plan 2026-10-05-explore-hft-filter Task 3 Step 3b：假資料 >6000 筆、與 HFT 無關，明確停用 H2
+    sched = _sched(store, hl, clock=clock,
+                   cfg=ExploreConfig(candidate_pool=300, hft_max_fills_30d=0))
     sched._bootstrapped = True
 
     results: list[str] = []
@@ -4279,7 +4282,8 @@ class SchedulerHarness:
             hl_fills=self._gateway.scoped("explore_fills"),
             leaderboard_source_fn=lambda: _t7a_payload(self._active_addresses),
             excluded_fn=lambda: set(),
-            cfg=ExploreConfig(candidate_pool=self._n),
+            # plan 2026-10-05-explore-hft-filter Task 3 Step 3b：鯨魚場景 20,000 筆、與 HFT 無關，停用 H2
+            cfg=ExploreConfig(candidate_pool=self._n, hft_max_fills_30d=0),
             now_fn=self._clock.now, sleep_fn=self._clock.sleep, on_dirty=lambda: None,
             # Task 7b（主線程 2026-09-22 裁決）：下界改成正式機真實預設
             # `FILET_EXPLORE_FILLS_MIN_PERIOD_S`（21600s＝6h）——舊值 3600（1h）
@@ -5393,3 +5397,164 @@ def test_new_cold_address_first_page_is_not_deferred_by_period_spread(tmp_path):
         f"選錯（見本函式 docstring 的 `pages_done` 教訓）；"
         f"probes_executed={h.probes_executed} total_fills_pages={h.total_fills_pages} "
         f"limiter={h.limiter_snapshot()}")
+
+
+# ---------------------------------------------------------------------------
+# HFT 過濾器（plan 2026-10-05-explore-hft-filter Task 3）
+# ---------------------------------------------------------------------------
+_HFT_A = "0xAAA0000000000000000000000000000000AAA1"
+_HFT_B = "0xBBB0000000000000000000000000000000BBB2"
+
+
+def _hft_payload(rows: list[tuple[str, str | None]]) -> dict:
+    """`(address, vlm)`；roi 依序遞減。"""
+    out = []
+    for i, (addr, vlm) in enumerate(rows):
+        perf = {"roi": str(1.0 - i * 0.001)}
+        if vlm is not None:
+            perf["vlm"] = vlm
+        out.append({"ethAddress": addr, "displayName": f"t{i}",
+                    "windowPerformances": [["month", perf]]})
+    return {"leaderboardRows": out}
+
+
+def _run_candidates_once(sched, store, clock) -> str:
+    sched._bootstrapped = True
+    store.enqueue("candidates:candidates", None, "candidates", 0, clock.now())
+    # 調整 3/3：時鐘大跳後其他逾期 job 可能先被領走：最多 10 tick 內必須輪到 candidates
+    for _ in range(10):
+        r = sched.tick()
+        if r == "ran:candidates":
+            return r
+    raise AssertionError("candidates job 未在 10 tick 內執行")
+
+
+def test_h1_volume_gate_excludes_address_before_admission(tmp_path):
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    payload = _hft_payload([(_HFT_A, "150000000"), (_HFT_B, "1000")])
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=5))
+    _run_candidates_once(sched, store, clock)
+    assert [c.address for c in store.active_candidates()] == [_HFT_B.lower()]
+    assert store.get_candidate(_HFT_A) is None          # 從頭沒入池
+    assert store._db.execute("SELECT COUNT(*) FROM refresh_job WHERE address=?",
+                             (_HFT_A.lower(),)).fetchone() == (0,)   # 也沒排任何 job
+    st = sched.status()["hft"]
+    assert st["vlm_excluded_last_round"] == 1 and st["cooldown_last_round"] == 0
+
+
+def test_h1_gate_disabled_when_threshold_zero(tmp_path):
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    payload = _hft_payload([(_HFT_A, "150000000")])
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=5, hft_max_vlm_month_usd=Decimal("0")))
+    _run_candidates_once(sched, store, clock)
+    assert [c.address for c in store.active_candidates()] == [_HFT_A.lower()]
+
+
+class _FullPagesHL(FakeHL):
+    """每頁滿頁 2000 筆、時間遞增落在 plan 區間內——永遠不收尾，供 H2 逐頁判定。"""
+
+    _tid = 0   # 調整 1/3：tid 全域遞增（分頁以 start=last.time 重疊一筆，tid 由 start 推得會被去重）
+
+    def get_fills_page(self, address, start_ms, end_ms):
+        self.calls.append(("fills", address, start_ms, end_ms))
+        # tid 用全域遞增：分頁以 start=last.time 重疊一筆，tid 若由 start 推得會被去重少 1 筆
+        rows = [{"coin": "BTC", "tid": self._tid + i, "time": start_ms + i}
+                for i in range(PAGE_LIMIT)]
+        self._tid += PAGE_LIMIT
+        return rows
+
+
+def _scan_only_scheduler(tmp_path, hl, cfg):
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([(_HFT_A, None, 1, None)], as_of=clock.now())
+    now_ms = int(clock.now() * 1000)
+    store.bootstrap_address_fills(_HFT_A, clock.now(), window_start_ms=now_ms - 30 * 86_400_000,
+                                  window_end_ms=now_ms, params_fp="")
+    store.enqueue(f"{_HFT_A.lower()}:fills_scan", _HFT_A.lower(), "fills_scan", 2, clock.now())
+    sched = _sched(store, hl, clock=clock, cfg=cfg,
+                  state_every_s=10**9, portfolio_every_s=10**9, ledger_every_s=10**9,
+                  fills_min_period_s=10**9, fills_max_period_s=10**9, rng=lambda: 0.0)
+    sched._bootstrapped = True
+    return sched, store, clock
+
+
+def test_h2_flags_mid_scan_at_threshold_and_stops_scanning(tmp_path):
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=6000, hft_cooldown_s=30 * 86400))
+    results = []
+    for _ in range(20):
+        r = sched.tick()
+        results.append(r)
+        if r == "dropped:hft":
+            break
+    assert "dropped:hft" in results
+    # 調整 2/3：start_ms == 0 是左界探測（非 scan 分頁），不計入
+    fills_calls = [c for c in hl.calls if c[0] == "fills" and c[2] > 0]
+    assert len(fills_calls) == 3                        # 第 3 頁達 6000 即停，不抓第 4 頁
+    cand = store.get_candidate(_HFT_A)
+    assert cand.active is False and cand.hft_reason == "fills" and cand.hft_value == 6000.0
+    assert cand.hft_until == clock.now() + 30 * 86400
+    assert store.count_fills_since(_HFT_A, 0) == 0      # 成交列已清
+    assert store.get_sync(_HFT_A) is None
+    assert store.stats()["refresh_job"] == 0            # job 已清，不再續排
+    assert sched.status()["hft"]["flagged_total"] == 1
+    assert sched.status()["hft"]["last_flagged"] == {"address": _HFT_A.lower(), "fills_30d": 6000}
+    # 之後 tick 不再對它打上游
+    for _ in range(5):
+        sched.tick()
+    assert len([c for c in hl.calls if c[0] == "fills" and c[2] > 0]) == 3
+
+
+def test_h2_disabled_when_threshold_zero(tmp_path):
+    hl = _FullPagesHL()
+    sched, store, clock = _scan_only_scheduler(
+        tmp_path, hl, ExploreConfig(candidate_pool=5, hft_max_fills_30d=0))
+    for _ in range(6):
+        sched.tick()
+    assert store.get_candidate(_HFT_A).active is True
+    assert store.count_fills_since(_HFT_A, 0) >= 6000
+
+
+def test_h2_cooldown_blocks_readmission_until_expiry_then_clears_flags(tmp_path):
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    store.upsert_candidates([(_HFT_A, None, 1, None)], as_of=clock.now())
+    store.flag_hft(_HFT_A, reason="fills", value=9000.0, now=clock.now(), cooldown_s=30 * 86400)
+    payload = _hft_payload([(_HFT_A, "1000"), (_HFT_B, "1000")])
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=5))
+
+    _run_candidates_once(sched, store, clock)
+    assert [c.address for c in store.active_candidates()] == [_HFT_B.lower()]
+    assert sched.status()["hft"]["cooldown_last_round"] == 1
+    assert store.get_candidate(_HFT_A).hft_until is not None   # 冷卻中、旗標未被清
+
+    clock.t += 31 * 86400
+    _run_candidates_once(sched, store, clock)
+    assert {c.address for c in store.active_candidates()} == {_HFT_A.lower(), _HFT_B.lower()}
+    assert store.get_candidate(_HFT_A).hft_until is None
+    assert sched.status()["hft"]["cooldown_last_round"] == 0
+
+
+def test_candidate_keep_s_is_passed_to_purge(tmp_path, monkeypatch):
+    clock = Clock(t=1_700_000_000.0)
+    store = ExploreStore(tmp_path / "explore.db", now_fn=clock.now)
+    seen = {}
+    real_purge = store.purge
+
+    def spy(now, **kw):
+        seen.update(kw)
+        return real_purge(now, **kw)
+
+    monkeypatch.setattr(store, "purge", spy)
+    payload = _hft_payload([(_HFT_B, "1000")])
+    sched = _sched(store, FakeHL(), leaderboard_source_fn=lambda: payload, clock=clock,
+                  cfg=ExploreConfig(candidate_pool=5), candidate_keep_s=86400.0)
+    _run_candidates_once(sched, store, clock)
+    assert seen["candidate_keep_s"] == 86400.0
