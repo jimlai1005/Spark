@@ -454,3 +454,9 @@ def test_explore_purge_flag_parsing():
     assert ApiConfig.from_env(_env(FILET_EXPLORE_PURGE="0")).explore_purge_enabled is False
     assert ApiConfig.from_env(_env(FILET_EXPLORE_PURGE="FALSE")).explore_purge_enabled is False
     assert ApiConfig.from_env(_env(FILET_EXPLORE_PURGE=" false ")).explore_purge_enabled is False
+
+
+def test_explore_candidate_keep_s_env():
+    """HFT 過濾器 plan Task 4：退池候選保留期可設定，預設 7 天（spec §6 第 5 點）。"""
+    assert ApiConfig.from_env(_env()).explore_candidate_keep_s == 7 * 86400
+    assert ApiConfig.from_env(_env(FILET_EXPLORE_CANDIDATE_KEEP_S="86400")).explore_candidate_keep_s == 86400

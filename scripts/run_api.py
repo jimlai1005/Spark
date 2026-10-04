@@ -91,7 +91,9 @@ def main() -> None:
             special_serve_ratio=cfg.explore_special_serve_ratio,
             special_serve_ratio_until=cfg.explore_special_serve_ratio_until,
             # explore-db-purge D-P3：purge kill switch（FILET_EXPLORE_PURGE）。
-            purge_enabled=cfg.explore_purge_enabled)
+            purge_enabled=cfg.explore_purge_enabled,
+            # HFT 過濾器 plan Task 4：退池候選保留期可設定（FILET_EXPLORE_CANDIDATE_KEEP_S）。
+            candidate_keep_s=cfg.explore_candidate_keep_s)
         app.state.explore_scheduler = scheduler
         app.state.explore_publisher = publisher
         if cfg.explore_upstream_refresh:

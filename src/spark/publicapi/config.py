@@ -203,6 +203,10 @@ class ApiConfig:
     # `FILET_EXPLORE_PURGE`：`"0"`／`"false"`（大小寫不拘）→ False，其餘（含未設）
     # → True。預設開；懷疑 purge 出問題時改 drop-in＋restart 即可停，不必回退程式。
     explore_purge_enabled: bool = True
+    # --- Explore 退池候選保留期（HFT 過濾器 plan 2026-10-05 Task 4）---
+    # `FILET_EXPLORE_CANDIDATE_KEEP_S`：`ExploreStore.purge(candidate_keep_s=…)`，
+    # 預設 7 天（spec §7.2：每天 30–70 顆換進換出、30 天內 129 顆回池，保留期省重回補）。
+    explore_candidate_keep_s: int = 7 * 86400
     # --- Explore 輔助份額臨時加速（Task 8，2026-09-22，D-C／D-I）---
     # `SPECIAL_SERVE_RATIO`（`explore_scheduler.py`，預設 9）是使用者 2026-09-21
     # 的既有裁決，**不得更動**；這裡只加一個帶到期時間、逾期自動恢復預設值的
@@ -471,6 +475,8 @@ class ApiConfig:
                                              .strip().lower() in ("1", "true")),
                    explore_purge_enabled=(env.get("FILET_EXPLORE_PURGE", "")
                                           .strip().lower() not in ("0", "false")),
+                   explore_candidate_keep_s=int(env.get("FILET_EXPLORE_CANDIDATE_KEEP_S")
+                                                or cls.explore_candidate_keep_s),
                    explore_fills_period_s=int(env.get("FILET_EXPLORE_FILLS_PERIOD_S")
                                               or cls.explore_fills_period_s),
                    explore_fills_max_period_s=int(
