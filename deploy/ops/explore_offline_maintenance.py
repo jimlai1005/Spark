@@ -108,22 +108,29 @@ def main() -> int:
     ap.add_argument("--db", required=True)
     ap.add_argument("--purge", action="store_true")
     ap.add_argument("--vacuum", action="store_true")
-    ap.add_argument("--force", action="store_true", help="run even if filet-api is active (NOT for prod)")
+    ap.add_argument("--allow-active", action="store_true",
+                    help="skip the unit-state check (unit not 'inactive' / unreadable)")
+    ap.add_argument("--allow-low-disk", action="store_true",
+                    help="skip the free-disk check before VACUUM")
+    ap.add_argument("--force", action="store_true",
+                    help="both --allow-active and --allow-low-disk (local copies only, NOT for prod)")
     ap.add_argument("--unit", default="filet-api")
     args = ap.parse_args()
+    if args.force:  # reviewer suggestion 2026-10-04：兩道檢查各自可跳過，--force 只是本機快捷
+        args.allow_active = args.allow_low_disk = True
 
     if not (args.purge or args.vacuum):
         ap.error("nothing to do: pass --purge and/or --vacuum")
     if not os.path.exists(args.db):
         ap.error(f"no such db: {args.db}")
     state = _unit_state(args.unit)
-    if state != "inactive" and not args.force:
+    if state != "inactive" and not args.allow_active:
         print(f"refusing: {args.unit} state is {state!r} (need 'inactive') — stop it first, "
-              f"or --force for a non-prod copy", file=sys.stderr)
+              f"or --allow-active for a non-prod copy", file=sys.stderr)
         return 2
     free_mb = _free_mb(args.db)
     need_mb = _mb(args.db) + VACUUM_HEADROOM_MB
-    if args.vacuum and free_mb < need_mb and not args.force:
+    if args.vacuum and free_mb < need_mb and not args.allow_low_disk:
         print(f"refusing: free disk {free_mb:.0f} MB < needed {need_mb:.0f} MB for VACUUM "
               f"(db + {VACUUM_HEADROOM_MB:.0f} MB headroom)", file=sys.stderr)
         return 4
