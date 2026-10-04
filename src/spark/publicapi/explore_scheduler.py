@@ -1327,8 +1327,11 @@ class ExploreScheduler:
         呼叫端已先把手上的 job `_complete`。失敗（例如 SQLite locked）**不往外拋**
         （工程原則 #3：往外拋會被 `_run_job` 的泛用分類吃掉、對已 complete 的 job 做
         reschedule，只留一行誤導的 CAS 警告）——改為 ERROR log＋`hft.errors` 計數；
-        位址暫留池內，下一輪 candidates 的 `reconcile_scan_jobs` 會補回 job 再判一次。
-        回傳是否落地成功。"""
+        位址暫留池內、手上的 job 已 complete。復原路徑（reviewer 2026-10-05 實跑確認）：
+        scan 半途失敗 → 遍歷仍 running，下一輪 candidates 的 `reconcile_scan_jobs`
+        以 `resume_running` 補回 scan job；增量軌失敗 → fills job 已刪，由下一輪
+        candidates 的 `_enqueue_address_jobs` 重排（受 admission cap）；scan 完成分支
+        失敗 → 留下的增量 job 在下一頁重判。三條路都會再評一次 H2。回傳是否落地成功。"""
         cooldown_s = max(self._cfg.hft_cooldown_s, HFT_MIN_COOLDOWN_S)
         try:
             counts = self._store.flag_hft(address, reason="fills", value=float(n), now=now,
@@ -1337,7 +1340,7 @@ class ExploreScheduler:
             self._hft_errors += 1
             logger.error(
                 "explore scheduler: %s 判定 HFT（30 天 %d 筆）但 flag_hft 失敗——位址暫留池內，"
-                "等下一輪對帳補 job 後重判", address, n, exc_info=True)
+                "下一輪 candidates 重排 job 後重判（health: hft.errors）", address, n, exc_info=True)
             self._notify_dirty()
             return False
         self._hft_flagged_total += 1
