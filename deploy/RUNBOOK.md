@@ -3847,3 +3847,26 @@ available 1.0 GB→1.1 GB、零 OOM）→ chown root → **只 restart `filet-da
 本次部署唯一的對外影響：`restart filet-dashboard` 的 **11:26:23–29Z 六秒**內 nginx 對 `/`、`/dashboard` 等頁面回 502（next-server 冷啟空窗，
 歷次純前端部署皆同；API 不受影響）。教訓：同機多個 session 同時操作正式機時，部署記錄要先看 sudo journal 分清誰動了什麼。
 回歸第 2、3 層（testnet E2E／瀏覽器）未跑：無後端與簽章流程改動，刻意略過。回滾＝`git checkout ace214c -- web/` 後重跑 §4.2＋restart dashboard。
+
+**2026-10-04 部署（commit `690f678`，13:09–13:12 UTC，儀表板淨 PnL 不再重複扣 builder fee；§5.8i 兩檔熱修 over b9733c0）：** plan
+`docs/superpowers/plans/2026-10-04-dashboard-net-pnl-no-double-fee.md`（builder＋impl-worker 各一 task、reviewer PASS 零 finding、全套 3508 綠）。
+根因：`app.py::_dashboard_pnl_and_return` 的 `net = cum_pnl − fees_paid`，但 HL `pnlHistory` 已含全部手續費（含 builder fee）——
+follower 0x438b…ce9 用 `userNonFundingLedgerUpdates` 入金合計 62,883.32 對 `accountValue` 56,279.12 得 −6,604.20，與 `pnlHistory` 的
+−6,604.18 獨立吻合，儀表板卻顯示 −7,473.16（多扣 869）。改：`net = cum_pnl`、`fee_share` 分母改 `|cum_pnl + fees_paid|`（扣 builder fee 前損益）；
+文案「已扣 builder fee」→「已含手續費」／「fees included」。**為什麼不走 §3.2 整包**：main 上 7383773..d1b68b4（explore purge 鏈）尚未部署、
+屬 spark-b6 維護窗範圍，整包會把它帶上去；兩個熱修檔在正式機與 b9733c0 逐位一致且 purge 鏈沒碰它們（`git diff --stat b9733c0..d1b68b4 -- 兩檔` 空）。
+流程：上傳 commit 版兩檔（備份 `/tmp/app.py.bak-202610041309`／`/tmp/copy.ts.bak-202610041309`）→ `install root 644` → `sudo -u filet-api` import OK →
+restart `filet-api`（13:09:46Z，`EXPLORE_UPSTREAM_REFRESH=0` 未變）→ §4.2 chown ubuntu → `NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app npm run build`
+（**63 s**，`.next/cache` 260 MB 命中；上次 9m19s 是冷 build）→ chown root → restart `filet-dashboard`（13:12:29Z，1 s 回 200）→ `DEPLOYED_VERSION`
+（hotfix note；第一次誤用 `HEAD`＝spark-b6 剛 commit 的 3f37722，13:16Z 改正為 690f678）。驗證：正式機本機 `/ /explore /dashboard /strategies /advanced`
+200、`.next` 對外 chunk `6005-03e251e02dd78635.js` 含新文案、舊文案只剩 `.next/cache`。
+⚠️⚠️ **事故（我方造成，13:12:29–13:16:52Z）**：`filet-dashboard.service` 的 `Wants=filet-api.service`——spark-b6 已於 13:11:34Z 開 nginx 維護旗標
+（`/var/www/maintenance/ON`，全站 503）、13:12Z `stop filet-api` 並啟動離線 purge+VACUUM（`/tmp/spark-sync/deploy/ops/explore_offline_maintenance.py`，
+log `/tmp/explore-maint-202610041312.log`）；我 13:12:29Z `restart filet-dashboard` 把 **api 連帶拉起**，VACUUM 期間 api 在線 4.5 分鐘
+（journal 無 sqlite/locked 錯誤），13:16:52Z 由我 `stop filet-api` 恢復對方狀態。對外 503 是維護頁（`Retry-After: 900`），不是本次部署造成。
+**判準**：(1) 動正式機前先看 `/var/www/maintenance/ON` 與 `/tmp/spark-sync` 是否存在＝別人在維護窗內；(2) restart 任何 unit 前
+`systemctl show <unit> -p Wants -p Requires`，dashboard 會把 api 帶起來；(3) 兩個 session 同時操作同一台機時，`DEPLOYED_VERSION` 用**明確 commit**
+寫，不用 `git rev-parse HEAD`（HEAD 可能已被另一 session 推進）。
+⚠️ **待 spark-b6 處理**：`/tmp/spark-sync` 於 11:55Z stage，`app.py`（52f3bd68）／`copy.ts`（690e4cef）是**修法前版本**——第二段 rsync 前必須
+從 ≥ `690f678` 重新 stage，否則本次修法被靜默蓋回。`filet_regression_check --http --ssh` 在維護旗標下必 FAIL（503／405），維護窗結束後重跑。
+回滾＝裝回 `/tmp/*.bak-202610041309` 兩檔→restart api→重 build→restart dashboard（或 §9.3 回 b9733c0）。

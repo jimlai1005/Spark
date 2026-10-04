@@ -84,4 +84,6 @@ HL `pnlHistory` 是帳戶淨值扣掉出入金後的變化量，手續費（含 
 - [x] Task 1（builder；主線程親跑 27 passed、ruff 乾淨、舊公式 grep 0）
 - [x] Task 2（impl-worker；主線程親跑 vitest 90 passed、舊文案 grep 0）
 - [x] Task 3（reviewer PASS，零 finding；全套 `uv run pytest` 3508 passed）
-- [ ] commit／部署：待使用者決定
+- [x] commit `690f678` 已推 origin/main；2026-10-04 13:09–13:12Z 以 §5.8i 兩檔熱修部署（記錄見 RUNBOOK 附錄 B 同日第二筆）。
+  ⚠️ 部署撞上 spark-b6 維護窗（詳 RUNBOOK）；`/tmp/spark-sync` 為修法前版本，對方第二段 rsync 前須重新 stage，否則本修法被蓋回。
+- [ ] 維護窗結束後重跑 `filet_regression_check --http --ssh`；登入 0x438b 儀表板確認淨 PnL ≈ −6,604（非 −7,473）。
