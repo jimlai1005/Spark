@@ -13,20 +13,11 @@ export const LOW_MARGIN_THRESHOLD = 0.05;
 /** <2% 時數字進一步變紅（見上方 docblock）。 */
 export const CRITICAL_MARGIN_THRESHOLD = 0.02;
 
-function signedPct(v: string | null): string {
-  if (v == null) return NO_VALUE;
-  const n = Number(v);
-  if (!Number.isFinite(n)) return NO_VALUE;
-  const sign = n > 0 ? "+" : "";
-  return `${sign}${n.toFixed(1)}%`;
-}
-
 export function EquityCard({ equity }: { equity: DashboardEquity | null }) {
   const COPY = useCopy();
   const c = COPY.dashboard.equity;
 
   const accountValue = equity ? `$${fmtAmount(equity.account_value)}` : NO_VALUE;
-  const ret = equity ? signedPct(equity.ret_30d_pct) : NO_VALUE;
 
   const av = equity ? Number(equity.account_value) : NaN;
   const used = equity ? Number(equity.margin_used) : NaN;
@@ -41,17 +32,14 @@ export function EquityCard({ equity }: { equity: DashboardEquity | null }) {
     && Number.isFinite(availablePctNum) && availablePctNum < CRITICAL_MARGIN_THRESHOLD;
 
   return (
-    <div className="card dash-card dash-card-equity">
+    // 2026-10-04 使用者裁決：30D TWR 報酬對 follower 會因入金同區間被誇大（見 plan 2026-10-04-dashboard-hide-twr-and-explore-subgrid.md），頁面不顯示、值留在 data-ret-30d-pct 供 debug。
+    <div
+      className="card dash-card dash-card-equity"
+      data-ret-30d-pct={equity?.ret_30d_pct ?? undefined}
+    >
       <div className="dash-card-label">{c.label}</div>
       <div className="dash-equity-head">
         <span className="mono dash-equity-value">{accountValue}</span>
-        <span
-          className="mono dash-equity-ret"
-          style={{ color: equity?.ret_30d_pct != null && Number(equity.ret_30d_pct) < 0 ? "var(--neg)" : "var(--pos)" }}
-        >
-          {ret}
-          {c.retSuffix}
-        </span>
       </div>
       <div className="dash-custody-note">{c.custodyNote}</div>
       <div className="dash-margin-block">

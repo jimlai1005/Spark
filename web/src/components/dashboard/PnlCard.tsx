@@ -47,7 +47,11 @@ export function PnlCard({ pnl }: { pnl: DashboardPnl | null }) {
   const sign = net == null ? undefined : Number(net) < 0 ? "neg" : "pos";
 
   return (
-    <div className="card dash-card dash-card-pnl">
+    // 2026-10-04 使用者裁決：最大回撤 TWR 對 follower 會因入金同區間被誇大（見 plan 2026-10-04-dashboard-hide-twr-and-explore-subgrid.md），頁面不顯示、值留在 data-max-drawdown-pct 供 debug。
+    <div
+      className="card dash-card dash-card-pnl"
+      data-max-drawdown-pct={pnl?.max_drawdown_pct ?? undefined}
+    >
       <div className="dash-pnl-head">
         <div>
           <div className="dash-card-label">{c.label}</div>
@@ -85,12 +89,6 @@ export function PnlCard({ pnl }: { pnl: DashboardPnl | null }) {
         <div>
           <div className="dash-pnl-metric-label">{c.closedPositions}</div>
           <div className="mono dash-pnl-metric-value">{pnl?.closed_positions ?? NO_VALUE}</div>
-        </div>
-        <div>
-          <div className="dash-pnl-metric-label">{c.maxDrawdown}</div>
-          <div className="mono dash-pnl-metric-value" style={{ color: "var(--neg)" }}>
-            {pnl?.max_drawdown_pct != null ? `${pnl.max_drawdown_pct}%` : NO_VALUE}
-          </div>
         </div>
       </div>
     </div>

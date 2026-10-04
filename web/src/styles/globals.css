@@ -1605,7 +1605,18 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 }
 .explore-count { margin-left: auto; font-size: 12px; color: var(--text-dim); }
 
-.explore-table { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; }
+.explore-table {
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto;
+  /* 欄軌只在這裡定義一次（2026-10-04）：帳戶 172→164 補曝險欄最小 64px。首欄 36→46、末欄 148→158 是因為列的 padding-inline 18px 會吃掉首尾軌的內容寬，
+     扣掉後內容寬 28／140（實測不折行、1280 寬無橫向捲動）。 */
+  display: grid;
+  grid-template-columns: 46px 164px 88px minmax(7.5rem, auto) 72px 56px 64px minmax(64px, 1fr) 82px 158px;
+  column-gap: 12px;
+}
+.explore-group-header, .explore-group, .explore-table-head, .explore-table-row { grid-column: 1 / -1; }
+.explore-group, .explore-table-head, .explore-table-row {
+  display: grid; grid-template-columns: subgrid; column-gap: inherit;
+}
 .explore-table-head, .explore-table-row {
   /* 2026-09-05（Task 6）：損益欄固定 88px 會被長數字（例：+$1,234,567）溢出，
      `.explore-ret` 的 `min-width` 被 grid 固定寬蓋掉——改用 minmax 讓欄寬跟內容走。 */
@@ -1615,8 +1626,10 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
      （148px）之間加一欄「距強平」固定 68px（`XX.X%` 頂多 6 字元，不需要 minmax）
      ，min-width 同步 +68px；沒有新增響應式斷點，沿用既有 `.explore-table` 的
      `overflow-x:auto` 橫向捲動（手機寬度下整表格捲動，見驗收條件 5）。 */
-  display: grid; grid-template-columns: 36px 172px 88px minmax(7.5rem, auto) 80px 64px 72px 1fr 68px 148px;
-  gap: 12px; align-items: center; padding: 14px 18px; min-width: 1028px;
+  /* 2026-10-04：head/row 各自是獨立 grid，1fr 依各列 min-content 解出不同寬度 → 有持倉列第 9/10 欄右移。改為 .explore-table 單一 grid ＋ 列用 subgrid，欄軌只定義一次。 */
+  /* padding 選擇：水平 18px 放在 head/row/group-header 各自的 padding-inline（subgrid 會把它算進首尾軌 gutter），
+     不放 .explore-table：放在容器上會讓 border-top 分隔線與組標題底色左右各縮 18px，不再貼齊卡片邊緣。 */
+  row-gap: 0; align-items: center; padding: 14px 18px;
 }
 .explore-table-head { font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim); letter-spacing: .08em; }
 /* Task 12（2026-09-05，D13）：表頭排序按鈕——`all: unset` 移除瀏覽器按鈕預設外觀，
@@ -1629,12 +1642,15 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
    跟著 `.explore-table` 的 `overflow-x:auto` 一起橫向捲動，不會在窄螢幕下
    停在原地與已捲動的列錯位。字級／顏色沿用表頭 token，不新造。 */
 .explore-group-header {
-  min-width: 1028px; padding: 10px 18px; border-top: 1px solid var(--border);
+  padding: 10px 18px; border-top: 1px solid var(--border);
   font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--text-dim);
   letter-spacing: .08em; background: var(--inset);
 }
 .explore-group:first-child .explore-group-header { border-top: none; }
 .explore-table-head > div:nth-child(n+4), .explore-table-row > div:nth-child(n+4) { text-align: right; }
+/* 2026-10-04：第 8 欄表頭**不加** nowrap——英文「Current exposure」在 68px 內必須像
+   「Max drawdown」一樣折兩行，nowrap 會溢出壓到「To liquidation」（EN 截圖實測）；
+   列內的曝險 label 另有 `.explore-exposure-label` nowrap。 */
 .explore-table-head > div:nth-child(8), .explore-table-row > div:nth-child(8) { text-align: left; }
 /* 2026-09-05（explore/trader 指標統一 plan Task 5）：報酬率欄改損益金額，
    長數字（例：+$1,234,567）比原本的百分比寬，加寬避免溢欄換行。 */
@@ -1660,10 +1676,12 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 .explore-tag[data-tag="concentrated"] { color: var(--warn); border-color: rgba(var(--warn-rgb), .3); background: rgba(var(--warn-rgb), .1); }
 
 .explore-spark { display: flex; }
-.explore-exposure { display: flex; align-items: center; gap: 10px; }
+/* 2026-10-04：SPARK_W=96（page.tsx）但走勢欄 88px，svg 本來就溢出 8px；viewBox 不變，等比縮到欄寬。 */
+.explore-spark svg { width: 100%; height: auto; }
+.explore-exposure { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .explore-exposure-bar { width: 64px; height: 5px; border-radius: 3px; background: var(--neg); overflow: hidden; }
 .explore-exposure-fill { height: 100%; background: var(--pos); }
-.explore-exposure-label { font-size: 12px; color: var(--text-dim); }
+.explore-exposure-label { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
 .explore-liq-distance { font-size: 13px; }
 
 /* 2026-09-30（plan `leader-truth-and-liq-risk` Task 7）：距強平／維持保證金比
@@ -1676,6 +1694,19 @@ main.home-page { max-width: 1160px; padding: 0 var(--gutter-page) 90px; }
 
 .explore-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .explore-view-btn, .explore-follow-btn { padding: 7px 12px; font-size: 12.5px; }
+
+/* 2026-10-04：不支援 subgrid 的瀏覽器 fallback，退化目標＝修改前行為（head/row 各自獨立 grid，
+   第 9/10 欄可能偏移，但不會每列 10 個 cell 直向堆疊）。
+   ⚠️ 此處欄軌字串與 `.explore-table` 主定義重複，兩處必須同步改。 */
+@supports not (grid-template-rows: subgrid) {
+  .explore-table { display: block; }
+  .explore-table-head, .explore-table-row {
+    display: grid; grid-template-columns: 46px 164px 88px minmax(7.5rem, auto) 72px 56px 64px minmax(64px, 1fr) 82px 158px;
+    column-gap: 12px; min-width: 1040px;
+  }
+  .explore-group { display: block; }
+  .explore-group-header { min-width: 1040px; }
+}
 
 .explore-error { display: flex; align-items: center; gap: 12px; }
 
