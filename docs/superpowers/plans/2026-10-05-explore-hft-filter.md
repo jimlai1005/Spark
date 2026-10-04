@@ -266,6 +266,14 @@ CREATE TABLE IF NOT EXISTS candidate (
 
 docstring 補一句：「`hft_until` 未到期的候選列不刪（冷卻由該列承載，見 `flag_hft`）」。
 
+- [ ] **Step 3b: 既有測試的版本號斷言升到 6（主線程裁決 2026-10-05，builder 回報）**
+
+`tests/test_explore_store.py` 有 5 處把「目前 schema 版本」寫死成 5，版本升級後必然失敗；
+這些斷言的語意是「最新版本號」，不是「v5 特定行為」，只把 `5` 改成 `6`，不動其他斷言：
+`:72`（`row == (5,)`）、`:550`、`:600`（`version == 5`）、`:1778`（`shape… == 5`）、
+`:1962`（`schema_version() == 5`）。測試名 `test_schema_version_v5_recorded_on_fresh_db`
+改為 `test_schema_version_latest_recorded_on_fresh_db`。
+
 - [ ] **Step 4: 跑測試確認通過**
 
 Run: `uv run pytest tests/test_explore_store.py -q`
