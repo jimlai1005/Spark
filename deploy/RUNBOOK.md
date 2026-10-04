@@ -3841,7 +3841,9 @@ available 1.0 GB→1.1 GB、零 OOM）→ chown root → **只 restart `filet-da
 `DEPLOYED_VERSION`（note 記 frontend-only）。驗證：`/ /explore /dashboard /strategies` 200；對外 CSS chunk `c764f72ded7f16bc.css`
 含 subgrid×2；`.next/server` 含 `data-ret-30d-pct`；`filet_regression_check --http --ssh` **67/67 PASS**；`systemctl --failed` 空。
 ⚠️ 第二次回歸曾 3 個 `/api/public/*` 契約逾時——**不是本次部署造成**：`journalctl _COMM=sudo` 顯示 11:33:38–47Z 另一個 Claude session
-把 `filet-api.service.d/explore-refresh.conf` 的 `EXPLORE_UPSTREAM_REFRESH` 改 0、`daemon-reload`、`restart filet-api`
-（備份 `/tmp/explore-refresh.conf.bak-202610041133`），回歸恰好撞上重啟的 10 秒；API 回來後第三次回歸 67/67。
-教訓：同機多個 session 同時操作正式機時，部署記錄要先看 sudo journal 分清誰動了什麼，不要把別人的重啟歸因到自己的部署。
+（spark-b6，已確認）把 `filet-api.service.d/explore-refresh.conf` 的 `EXPLORE_UPSTREAM_REFRESH` 改 0、`daemon-reload`、`restart filet-api`
+（備份 `/tmp/explore-refresh.conf.bak-202610041133`）——那是對 **11:28–11:32 explore.db 2.26 GB IO 卡住、nginx 504** 事故的止血
+（§5.8k Step 0、plan `2026-10-04-explore-db-purge-vacuum-alerting.md`），與本次部署無關；回歸恰好撞上重啟的 10 秒，API 回來後第三次 67/67。
+本次部署唯一的對外影響：`restart filet-dashboard` 的 **11:26:23–29Z 六秒**內 nginx 對 `/`、`/dashboard` 等頁面回 502（next-server 冷啟空窗，
+歷次純前端部署皆同；API 不受影響）。教訓：同機多個 session 同時操作正式機時，部署記錄要先看 sudo journal 分清誰動了什麼。
 回歸第 2、3 層（testnet E2E／瀏覽器）未跑：無後端與簽章流程改動，刻意略過。回滾＝`git checkout ace214c -- web/` 後重跑 §4.2＋restart dashboard。
