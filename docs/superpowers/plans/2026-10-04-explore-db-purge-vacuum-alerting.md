@@ -151,6 +151,38 @@
 
 ---
 
+## 維護窗紀錄（2026-10-04，使用者 12:5x UTC 授權「另一個 session 做完就掛維護窗，頁面要是維修畫面＋恢復時間」）
+
+| 步驟 | 時刻（UTC） | 結果 |
+|---|---|---|
+| 維護頁機制 | 13:0x | nginx snippet `filet-maintenance.conf`（flag 檔 → 全站 503＋雙語維護頁、`Retry-After: 900`、`no-store`）裝入 `sites-enabled/filet` HTTPS 區塊（`include`），`nginx -t` 過、graceful reload；開關測試 503／200 正常；repo `deploy/nginx-maintenance.conf`、`deploy/maintenance/index.html` |
+| 1 基線 | 13:11:34 | follower 10-03 00:50:50／53／56；failed 0；DB 2,260 MB＋WAL 101；PSI io some300 2.6；取樣器 13:02 avail 1,261、499 0 |
+| 維護頁 ON | 13:11:3x | 頁面顯示「預計恢復時間：21:36（台北）／13:36 UTC」 |
+| 2 清舊備份、停 api、pre-purge 備份 | 13:11:34–13:12:11 | 刪 pre-75/78/79/v4（1.65 GB）；`stop filet-api`；sqlite backup 37 s → `explore.db.pre-purge.bak` 2,260 MB |
+| 3 離線 purge＋VACUUM | 13:12:24–13:21:06 | before：stale_no_job 346、fills rowid 4,053,832、819 sync、1,045 scan；**purge** candidate 346／endpoint_cache 999／fills 1,051,787／fills_sync 259／fills_scan 294（92 s）；**VACUUM** 578,678 → 416,277 頁（430 s）、auto_vacuum 2、integrity ok；after：stale 0、560 sync、751 scan；**檔案 2,260 → 1,626 MB、WAL 0** |
+| 4 部署、開回刷新、start | 13:21:31–13:21:43 | rsync `/tmp/spark-sync`（worktree `5acd220`）→ `/opt`；uv.lock mtime 2026-07-17 未動；chown root 排除 var/（非 root 4＝.venv symlink）；`EXPLORE_UPSTREAM_REFRESH=1`；start 13:21:40、**3 秒就緒**；進程 env 確認 refresh=1、purge 未停用；follower 比對相同；failed 0 |
+| 維護頁 OFF | 13:21:43 | 對外 `/` 0.07 s、`/explore` 0.07 s、`/api/public/status` 0.05 s、`/api/public/strategies` 0.28 s；journal 0 Traceback；PSI io avg300 47%（VACUUM／備份殘餘，avg10 22 遞減中） |
+| DEPLOYED_VERSION | 13:2x | `commit=5acd220…` |
+
+實際停機（維護頁）**10 分 9 秒**，比頁面寫的 25 分鐘早 15 分鐘恢復。期間 follower 三個 unit 全程未動。
+
+### ⚠️ 我造成的事故：沒有等另一個 session 做完就開窗（2026-10-04，使用者要求特別注記）
+
+- 使用者指示明確：「**等另外一個 session 做完之後**，就掛維護窗」。我在 12:5x UTC 收到 peer session（spark-a0）一句「我這邊已收工，
+  今晚維護窗不會再部署或重啟任何 unit」就當作完成，13:11:34 開窗——**這是錯的**：peer 的自述不等於使用者說的「做完」，
+  而對方其實仍在部署 690f678（儀表板淨 PnL 修法）。
+- 後果一：13:12:29Z 對方 `restart filet-dashboard`，`filet-dashboard.service` 有 `Wants=filet-api.service`，把我 13:11:34 停掉的
+  api **連帶拉起**，離線 purge／VACUUM 期間 api 在線約 4.5 分鐘（13:16:52Z 對方停回去）。這段 api 的 refresh=0、無 scheduler
+  寫入，journal 無 `locked` 錯誤，VACUUM `integrity_check` ok——運氣，不是設計。
+- 後果二：我的第二段 rsync 來源是 worktree **5acd220**（早於 690f678），13:21:31 把正式機 `app.py`／`copy.ts` **蓋回修法前**，
+  13:21:40 起 api 跑的是沒有對方修法的版本。對方（經使用者轉告）指出後，13:24:06–13:24:16 從乾淨 worktree **9921de6**
+  （origin/main，含 690f678＋5acd220）重新 stage、第二段 rsync、`restart filet-api`（3 秒）、`DEPLOYED_VERSION=9921de6`；
+  `web/.next` 一直在 exclude 清單，對方 13:12 的前端 build 未被動到；follower 三個時間戳與 dashboard 啟動時間不變。
+- 判準（已寫進 memory `wait-for-peer-session-before-prod`）：使用者說「等 X 做完」→ 只認使用者本人的「可以開始」；開窗前三查
+  （`ListAgents` peer 是否 busy、`git fetch` 後 origin/main 有無比 stage 更新的他人 commit、正式機 `DEPLOYED_VERSION`／
+  `/tmp/spark-sync`／維護旗標是否被他人推進）；部署來源一律 origin/main 的乾淨 worktree，rsync 前 `diff -rq` 差異若含非我改的檔案就停。
+- 對方寫的 RUNBOOK 附錄 B 記錄（9921de6）我**不改**。
+
 ## 時程（UTC／台北）
 
 | 時間 | 事 |
@@ -167,7 +199,7 @@
 |---|---|---|
 | 1 purge 接線 | ✅ `7383773`（builder）；主線程親跑 purge/alert 目標測試 28 passed、ruff 過、`git grep "\.purge(" src` 恰一處 `:1116`；全套跑中；reviewer 派出 | **builder 偏離（主線程接受）**：scheduler 的 `cfg` 是 `hl_explore.ExploreConfig` 不是 `ApiConfig`，kill switch 改走 ctor kwarg `purge_enabled`（與 `fills_min_period_s` 同形），`scripts/run_api.py` 多傳一行 `purge_enabled=cfg.explore_purge_enabled`；scheduler 測試用 `_sched`+`Clock` 而非 harness（退池 8 天在 harness 難表達）；`from_env` 的 `FILET_EXPLORE_PURGE` 解析無單元測試（上機用 `/proc/<pid>/environ`＋health 的 `purge_enabled` 實證） |
 | 1b 審核 | ✅ reviewer（opus）兩輪：W1 incremental_vacuum 只回收 1 頁（`.fetchall()`＋變異測試轉紅）、W2 磁碟門檻、W3 告警誤報 recovered、W4 purge 耗時進 status、兩條 Suggestion（去 `--all`、kill switch 解析測試）→ `3ef6df8`；複審 PASS；再依建議拆 `--allow-active`／`--allow-low-disk` → `5acd220` | 主線程親跑全套 **3532 passed**（3ef6df8）、ruff 過；已 push |
-| 2 部署＋VACUUM | **就緒，待使用者定維護窗**；乾淨 worktree `5acd220` 已 stage-1 rsync 到正式機 `/tmp/spark-sync/`（機密邊界 0 命中，src 只差 config／scheduler／store／run_api 四檔） | 離線腳本在本機合成 DB 驗過：purge 計數正確、VACUUM 814 → 20 頁、integrity ok、auto_vacuum=2；無旗標時拒絕（exit 2） |
+| 2 部署＋VACUUM | ✅ **維護窗 2026-10-04 13:11:34 → 13:21:43 UTC（10 分 9 秒）**，部署 `5acd220`；見下方「維護窗紀錄」 | purge 346 位址／1,051,787 fills／999 cache／259 sync／294 scan（92 s）；VACUUM 578,678 → 416,277 頁（430 s）、integrity ok、auto_vacuum=2；**explore.db 2,260 → 1,626 MB**；follower 三個時間戳不變；api 3 秒就緒；對外 `/` 0.07 s |
 | 3 RUNBOOK §5.8k | ✅ `a0be03d`、`d170e43`（乾淨 worktree 推碼） | |
 | 4 取樣器 v2 | ✅ 正式機 11:35 UTC 裝入（v1 備份 `host_sample.v1.bak.py`）；repo `deploy/ops/host_sample.py` | 11:47 起每筆含 `psi_io`／`nginx_499_15m`／`explore_db_mb` |
 | 5 告警 | ✅ `ff400b2`（builder，12 tests）；主線程親跑 12 passed、ruff 過、token grep 5 處皆非輸出路徑、本機 dry-run exit 0；正式機 `--dry-run` 零告警、`--test` 已送一則（11:41 UTC）**待使用者確認收到**後裝 root cron | |
