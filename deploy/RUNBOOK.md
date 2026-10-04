@@ -3038,6 +3038,115 @@ import 驗算改 `from spark.copytrade.orders import _reconcile_orders`；`DEPLO
 驗收：部署後一週內 `userFillsByTime` 不再出現上述 2.7 秒指紋；TG 不再出現「缺少 N、多餘 0、原因未能自動判定」。
 回滾＝兩個 `/tmp/*.py.bak-*` 裝回去再跑 `reload_follower.sh`。
 
+### 5.8k ⭐⭐⭐ explore.db 清理／VACUUM 維護窗＋purge 接線部署＋TG 告警（2026-10-04；**跟單中、三個 follower**）
+
+<!-- 2026-10-04: plan docs/superpowers/plans/2026-10-04-explore-db-purge-vacuum-alerting.md。
+背景：explore.db 從 09-23 的 1.0 GB 長到 2.26 GB（`ExploreStore.purge()` 寫好但從未被呼叫），
+DB 大於 page cache 後發布器每分鐘的 get_fills() 全打磁碟，PSI io full 80%+，11:26 UTC 開始
+nginx 502/504。11:33 UTC 以 §5.8f Step 7-pre（EXPLORE_UPSTREAM_REFRESH=0）止血。 -->
+
+> 🛑 三個 `filet-follower@*` 全程不動。本節唯一會停的是 `filet-api`（維護窗 10–20 分鐘，期間網站 502）。
+> follower 清單**動態取**：`systemctl list-units --all "filet-follower@*" --no-legend --plain`，不要寫死。
+
+#### Step 0：目前狀態（止血中）
+
+`EXPLORE_UPSTREAM_REFRESH=0`（drop-in `explore-refresh.conf`，原檔備份 `/tmp/explore-refresh.conf.bak-202610041133`）：
+探索榜停在最後一份快照，API 正常。**不要在維護窗之前把它改回 1**——改回去 IO 會立刻再飽和。
+
+#### Step 1：基線（唯讀）
+
+```bash
+ssh -i <金鑰> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+for u in $(systemctl list-units --all "filet-follower@*" --no-legend --plain | awk "{print \$1}"); do echo "$u $(systemctl show $u -p ActiveEnterTimestamp --value)"; done | tee /tmp/fol_before.txt
+sudo systemctl --failed --no-pager | tail -1
+ls -la /var/lib/filet-api/ | grep explore.db; df -h / | tail -1
+cat /proc/pressure/io | head -2
+tail -1 /home/ubuntu/explore-obs/host.jsonl | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[\"t\"], d[\"mem_mb\"], d.get(\"psi_io\"), d.get(\"nginx_499_15m\"), d.get(\"explore_db_mb\"))"'
+```
+
+#### Step 2：清舊備份、停 api、建 pre-purge 備份
+
+```bash
+ssh -i <金鑰> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo rm -f /var/lib/filet-api/explore.db.pre-75.bak /var/lib/filet-api/explore.db.pre-78.bak \
+           /var/lib/filet-api/explore.db.pre-79.bak /var/lib/filet-api/explore.db.pre-v4.bak \
+           /var/lib/filet-api/explore.db.pre-v4.bak-shm /var/lib/filet-api/explore.db.pre-v4.bak-wal
+sudo systemctl stop filet-api.service; systemctl is-active filet-api || true
+sudo python3 - <<PY
+import sqlite3
+src = sqlite3.connect("file:/var/lib/filet-api/explore.db?mode=ro", uri=True)
+dst = sqlite3.connect("/var/lib/filet-api/explore.db.pre-purge.bak")
+src.backup(dst); dst.close(); print("backup ok")
+PY
+sudo chown filet-api:filet-api /var/lib/filet-api/explore.db.pre-purge.bak; sudo chmod 600 /var/lib/filet-api/explore.db.pre-purge.bak
+ls -l /var/lib/filet-api/explore.db.pre-purge.bak'
+```
+
+（api 停著時 2.26 GB 的 backup 約 1–2 分鐘；`pre-v5.bak` 先留著，維護窗驗收一週後再刪。）
+
+#### Step 3：離線 purge（無上界）＋ VACUUM
+
+先把 `deploy/ops/explore_offline_maintenance.py` 隨 §3.2 rsync 推上去（它只依賴已部署的 `src/`），或單檔 scp 到 `/tmp/`：
+
+```bash
+ssh -i <金鑰> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo -u filet-api /opt/filet/spark/.venv/bin/python /opt/filet/spark/deploy/ops/explore_offline_maintenance.py \
+  --db /var/lib/filet-api/explore.db --purge --vacuum 2>&1 | tee /tmp/explore-maint-$(date -u +%Y%m%d%H%M).log'
+```
+
+腳本會：拒絕在 `filet-api` active 時執行 → 印 before 計數 → `purge(now)`（退池 >7 天位址連帶 fills／scan／sync／cache、
+fills 只留 35 天、done scan 留 30 天）→ `wal_checkpoint(TRUNCATE)` → `auto_vacuum=INCREMENTAL` → `VACUUM` →
+`integrity_check` → 印 after 計數與檔案大小。**判讀**：`integrity: ok` 且 after 的 `candidate_stale_no_job == 0`；
+預期 `candidate` ≈ 344、fills 數十萬～百萬、檔案 2.26 GB → 1.0–1.3 GB。`integrity` 非 ok → **不要 start**，
+`install -o filet-api -g filet-api -m 600 explore.db.pre-purge.bak explore.db`（清 -wal/-shm）後回退。
+
+#### Step 4：部署 purge 接線程式碼、開回刷新、start
+
+```bash
+# 本機：§3.2 兩段 rsync（exclude 清單照抄）＋ chown 排除 var/；pyproject 未變則跳過 uv sync
+# 正式機：
+ssh -i <金鑰> ubuntu@FILET_LIGHTSAIL_IP_PLACEHOLDER '
+sudo sed -i "s/^Environment=EXPLORE_UPSTREAM_REFRESH=.*/Environment=EXPLORE_UPSTREAM_REFRESH=1/" /etc/systemd/system/filet-api.service.d/explore-refresh.conf
+sudo systemctl daemon-reload
+sudo systemctl start filet-api.service
+for i in $(seq 1 60); do curl -s -m 3 -o /dev/null http://127.0.0.1:8700/api/public/status && { echo "api up ${i}s"; break; }; sleep 1; done
+sudo cat /proc/$(systemctl show filet-api -p MainPID --value)/environ | tr "\0" "\n" | grep -E "EXPLORE_UPSTREAM_REFRESH|FILET_EXPLORE_PURGE"
+for u in $(systemctl list-units --all "filet-follower@*" --no-legend --plain | awk "{print \$1}"); do echo "$u $(systemctl show $u -p ActiveEnterTimestamp --value)"; done | diff /tmp/fol_before.txt - && echo "followers unchanged"
+sudo systemctl --failed --no-pager | tail -1'
+# 寫 DEPLOYED_VERSION（§3.2 末段）
+```
+
+驗收（部署後 1 小時內）：`/proc/pressure/io` some avg300 < 30%；`host.jsonl` 的 `nginx_499_15m` 回到個位數、`nginx_5xx_15m` 0；
+公開站 `/`、`/api/public/status` < 0.5 s；30 分內 journal 出現 `explore scheduler: purge 本輪刪除 {...}`（全 0 也正常）。
+`/api/ops/health.explore_refresh` 多了 `purged`／`purge_errors`／`purge_enabled`。
+
+#### Step 5：回退
+
+- purge 接線有問題 → drop-in 加 `Environment=FILET_EXPLORE_PURGE=0`、daemon-reload、`restart filet-api`（資料面不可逆，
+  但 `pre-purge.bak` 是 purge 前的完整快照）。
+- IO 又飽和 → Step 7-pre（`EXPLORE_UPSTREAM_REFRESH=0` ＋ restart），網站先活、榜單凍結。
+
+#### Step 6：TG 告警 cron（root）
+
+`deploy/ops/filet_alert.py` scp 到 `/home/ubuntu/explore-obs/filet_alert.py`；token／chat id 由腳本從 `filet-api` unit env 讀，
+不落地。先 `sudo python3 /home/ubuntu/explore-obs/filet_alert.py --dry-run`，再 `--test` 送一則，使用者 TG 收到才裝 cron：
+
+```
+# sudo crontab -e
+5,20,35,50 * * * * /usr/bin/python3 /home/ubuntu/explore-obs/filet_alert.py >/dev/null 2>>/home/ubuntu/explore-obs/alert_cron.err
+```
+
+門檻：available < 400 MB、PSI io some avg300 > 50%、nginx 499/15m > 10、explore.db > 2,500 MB、任一 filet unit／nginx 非 active、
+failed unit > 0、取樣器 20 分沒新資料。去重：首次即發、持續每 6 小時提醒、恢復發 recovered。
+
+#### demo 自救卡（2026-10-07 起使用者在國外；任何人都能照做）
+
+1. 開演前 30 分：`ssh … 'cat /proc/pressure/io | head -1; tail -1 /home/ubuntu/explore-obs/host.jsonl | cut -c1-300; for u in filet-api nginx; do systemctl is-active $u; done'`
+   ＋ 瀏覽器開 `https://trade.filet.app/` 與 `/explore` 各一次（<1 秒算正常）。
+2. 網頁 >3 秒或 502：`sudo systemctl restart filet-api`（4–11 秒，follower 不動）。
+3. 還是慢：Step 7-pre（`EXPLORE_UPSTREAM_REFRESH=0` ＋ restart）——榜單凍結但網站全速。
+4. **不要**：重開機（kernel 更新待重啟，會動到 follower）、部署任何程式、動 follower。
+
 ## 6. nginx + certbot
 
 ```bash

@@ -19,6 +19,21 @@
 - 用戶可見：nginx 499/日 4→15→12→25→79→26→16；公開站 `/` 實測一次 11.2 s。
 - 主機 1.9 GB RAM、available ~1.0 GB；三個 follower 在跑（f438／fb8c／f6b3）；`/var/run/reboot-required` 自 10/1 存在（**不重開機**）。
 
+## ⚠️ 2026-10-04 11:26 UTC 事故與緊急處置（主線程，plan 寫完後 30 分鐘內發生）
+
+- 症狀：nginx 連續 502／504（`upstream timed out … reading response header`）打在 `/`、`/dashboard`、`/api/me`、
+  `/api/auth/nonce`、`/api/public/status`、`/api/public/strategies`；15 分鐘內 499＝15、5xx＝19（205 請求）。
+  使用者本人（HiNet IPv6）登入失敗。`/proc/pressure/io` **full avg300 82%**（所有任務同時卡 IO 的時間佔八成）。
+- 機制：發布器每分鐘對 300 列各做 `get_fills()`（持 store lock、讀整窗 raw），DB 2.26 GB > page cache → 每次讀都打磁碟；
+  API handler 要拿同一把 lock／同一顆磁碟 → 超過 nginx 60 秒逾時。
+- 處置（11:33:47 UTC，§5.8f Step 7-pre）：drop-in `explore-refresh.conf` 的 `EXPLORE_UPSTREAM_REFRESH` 1 → 0、daemon-reload、
+  **只重啟 `filet-api`**（11 秒就緒）；三個 follower `ActiveEnterTimestamp` 不變（10-03 00:50:50／53／56）；失敗 unit 0。
+  重啟後公開站 `/` 0.17 s、`/api/public/status` 0.06 s。原 drop-in 備份 `/tmp/explore-refresh.conf.bak-202610041133`。
+- 代價：探索榜停在最後一份快照（complete 292／partial 8，內容仍正確，只是不再更新），直到下面的維護窗完成。
+- **因此 Task 2 的順序改為**：維護窗內 **停 api → 用已部署程式碼跑一次「無上界」purge（離線、沒人跟它搶 lock）→ VACUUM →
+  部署 Task 1 → `EXPLORE_UPSTREAM_REFRESH=1` → start api**。原本「上線後有界 purge 慢慢刪 7 小時」的做法會讓 IO 飽和再持續
+  數小時並重演 504。Task 1 的有界 purge 改為**穩態維護**（之後每輪只會有幾個退池位址）。
+
 ## 裁決（主線程，2026-10-04；使用者授權「1–5 幫我搞定」）
 
 | 代號 | 裁決 | 理由 |
@@ -92,9 +107,16 @@
 
 ## Task 2: 正式機部署＋VACUUM（主線程親做，依 Task 3 的 §5.8k）
 
-- [ ] 部署（只重啟 api；follower 清單**動態取** `systemctl list-units "filet-follower@*"`，三個 unit 的 `ActiveEnterTimestamp` 部署前後相同）。
-- [ ] 部署後第一輪 candidates（≤30 分）journal 應出現 `purge 本輪刪除 {'candidate': 25, …}`；之後每 30 分一輪；`status()["purged"]` 經 health 可見。
-- [ ] **VACUUM 時段**：purge 跑過 ≥12 輪（344 個位址清完）之後、台北深夜（建議 2026-10-05 15:00–16:00 UTC＝台北 23:00–24:00）。程序見 §5.8k。預期 explore.db 2,259 MB → ~1.1–1.3 GB，`/proc/pressure/io` some avg300 從 ~77% 降到 <30%，nginx 499/日回到個位數。
+（順序已依 11:26 事故改寫，見上方「事故與緊急處置」；程序細節在 RUNBOOK §5.8k。）
+
+- [ ] **維護窗**（一次做完，停 api 預估 10–20 分鐘；建議 2026-10-04 15:00 UTC 之後＝台北 23:00 後，使用者在線時）：
+  1. 基線：follower 三個時間戳、DB／WAL 大小、PSI io、`host.jsonl` 最後一筆。
+  2. 刪四個舊備份（pre-75/78/79/v4）；`systemctl stop filet-api`；sqlite backup API 建 `explore.db.pre-purge.bak`。
+  3. 離線 purge：以 `filet-api` 身分用**已部署**的 venv 執行 `deploy/ops/explore_offline_maintenance.py`（`ExploreStore(path).purge(now)` 無上界＋印計數）；預期 candidate 344、fills 數十萬～百萬級。
+  4. VACUUM：同腳本 `--vacuum`（`wal_checkpoint(TRUNCATE)` → `auto_vacuum=INCREMENTAL` → `VACUUM` → `integrity_check` → 印前後 page_count）。
+  5. rsync Task 1 程式碼（§3.2 兩段）、`EXPLORE_UPSTREAM_REFRESH=1`、daemon-reload、`start filet-api`、follower 比對、公開站延遲。
+  6. 30 分內 journal 應出現第一輪有界 purge 的 warning（可能全 0＝沒東西可刪，正常）；`status()["purged"]` 經 health 可見。
+- [ ] 驗收：explore.db 2,259 MB → ~1.0–1.3 GB；`/proc/pressure/io` some avg300 一小時內 <30%；nginx 499/15m 回到個位數；三個 follower 未動。
 
 ---
 
