@@ -98,9 +98,9 @@ vault 批次 284 顆，依每日成交筆數分桶，episode 持倉中位數 < 5
 ### H2 30 天成交筆數（索引計數，每次 scan 完成時）
 
 - 資料：`SELECT COUNT(*) FROM fills WHERE address = ? AND time_ms >= now_ms − 30d`
-  （走既有 `(address, time_ms)` 索引，不讀 `raw`）。回補尚未覆蓋滿 30 天的位址
-  用觀測跨度折算：`count / observed_days × 30`，分母沿用 scheduler 既有的
-  `_observed_span_rate` 語意（`explore_scheduler.py:494`）。
+  （走既有 `(address, time_ms)` 索引，不讀 `raw`）。**只用原始計數，不做觀測跨度折算**
+  （2026-10-05 plan 裁決：逐頁評估下真 HFT 必在遍歷途中跨過門檻；折算會誤殺單日爆量的
+  正常錢包）。
 - 判準：`fills_30d ≥ 6,000`（≈ 200 筆/日）→ HFT。
 - 評估時機：scan **每寫入一頁**就評估一次（索引計數，毫秒級），達標即中止 scan；
   scan 進入 done／partial 時再評估最後一次。**不在發布器的每分鐘迴圈裡評估**。
