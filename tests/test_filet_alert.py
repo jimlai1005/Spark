@@ -97,3 +97,26 @@ def test_recovery_and_input_not_mutated():
     msgs, new = run(good(), state=st)
     assert new == {} and "recovered" in msgs[0] and "low_memory" in msgs[0]
     assert "low_memory" in st
+
+
+# reviewer W3（2026-10-04）：樣本消失／欄位缺漏時，原本成立的樣本類告警不得被判「已恢復」
+
+
+def test_sample_none_keeps_active_sample_alerts_without_recovered():
+    state = {"io_pressure": {"since": 0.0, "last_sent": 0.0}}
+    msgs, new_state = run(None, age=float("inf"), state=state, now=1000.0)
+    assert any("取樣器停擺" in m for m in msgs)
+    assert not any("recovered" in m for m in msgs)
+    assert "io_pressure" in new_state and new_state["io_pressure"]["since"] == 0.0
+
+
+def test_missing_field_keeps_that_alert_but_other_fields_still_recover():
+    state = {"io_pressure": {"since": 0.0, "last_sent": 0.0},
+             "low_memory": {"since": 0.0, "last_sent": 0.0}}
+    sample = good()
+    del sample["psi_io"]            # io_pressure 無法判定 → 保留
+    sample["mem_mb"]["available"] = 900   # low_memory 可判定且已恢復 → recovered
+    msgs, new_state = run(sample, state=state, now=1000.0)
+    assert "io_pressure" in new_state
+    assert "low_memory" not in new_state
+    assert [m for m in msgs if "recovered" in m] == ["[filet recovered] low_memory 已恢復"]

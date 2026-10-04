@@ -39,12 +39,25 @@ def _mb(path: str) -> float:
         return 0.0
 
 
-def _unit_active(unit: str) -> bool:
+def _unit_state(unit: str) -> str | None:
+    """`systemctl is-active` 的文字；讀不到（沒有 systemctl、逾時）回 None——
+    呼叫端把 None 當「不確定」而拒絕執行（fail-closed，reviewer 2026-10-04），
+    只有 `--force` 才放行（非正式機的複本用）。"""
     try:
         r = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return r.stdout.strip() == "active"
+        return None
+    return r.stdout.strip() or None
+
+
+def _free_mb(path: str) -> float:
+    st = os.statvfs(os.path.dirname(os.path.abspath(path)) or ".")
+    return st.f_bavail * st.f_frsize / 1048576
+
+
+# VACUUM 在 WAL 模式下會把整份新庫先寫進 WAL 再 checkpoint，加上暫存檔與 purge 的
+# 交易 WAL——保守要求「DB 大小 + 1.5 GB」的空間（reviewer W2，2026-10-04）。
+VACUUM_HEADROOM_MB = 1536.0
 
 
 def _counts(db: sqlite3.Connection, now: float) -> dict[str, int]:
@@ -103,10 +116,17 @@ def main() -> int:
         ap.error("nothing to do: pass --purge and/or --vacuum")
     if not os.path.exists(args.db):
         ap.error(f"no such db: {args.db}")
-    if _unit_active(args.unit) and not args.force:
-        print(f"refusing: {args.unit} is active — stop it first (or --force for a non-prod copy)",
-              file=sys.stderr)
+    state = _unit_state(args.unit)
+    if state != "inactive" and not args.force:
+        print(f"refusing: {args.unit} state is {state!r} (need 'inactive') — stop it first, "
+              f"or --force for a non-prod copy", file=sys.stderr)
         return 2
+    free_mb = _free_mb(args.db)
+    need_mb = _mb(args.db) + VACUUM_HEADROOM_MB
+    if args.vacuum and free_mb < need_mb and not args.force:
+        print(f"refusing: free disk {free_mb:.0f} MB < needed {need_mb:.0f} MB for VACUUM "
+              f"(db + {VACUUM_HEADROOM_MB:.0f} MB headroom)", file=sys.stderr)
+        return 4
 
     now = time.time()
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
@@ -114,8 +134,7 @@ def main() -> int:
         print("before:", _counts(db, now))
     finally:
         db.close()
-    print(f"file: {_mb(args.db):.0f} MB  wal: {_mb(args.db + '-wal'):.0f} MB  free disk: "
-          f"{os.statvfs(os.path.dirname(args.db) or '.').f_bavail * os.statvfs(os.path.dirname(args.db) or '.').f_frsize / 1048576:.0f} MB")
+    print(f"file: {_mb(args.db):.0f} MB  wal: {_mb(args.db + '-wal'):.0f} MB  free disk: {free_mb:.0f} MB")
 
     if args.purge:
         t0 = time.time()

@@ -2185,8 +2185,11 @@ class ExploreStore:
             counts["fills_scan"] += cur.rowcount
         # D-P4：incremental_vacuum 不能在交易內的某些情況下執行；with self._db
         # 區塊結束已 commit，這裡獨立呼叫（非 INCREMENTAL 模式為 no-op）。
+        # ⚠️ 必須 `.fetchall()`（2026-10-04 reviewer W1）：這個 PRAGMA 是逐頁產出
+        # 列的語句，Python sqlite3 的 `execute()` 只 step 一次＝只回收 1 頁；
+        # 要把游標走完才會回收到 N 頁。
         with self._lock:
-            self._db.execute("PRAGMA incremental_vacuum(4000)")
+            self._db.execute("PRAGMA incremental_vacuum(4000)").fetchall()
         return counts
 
     def stats(self) -> dict:

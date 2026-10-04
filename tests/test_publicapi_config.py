@@ -444,3 +444,13 @@ def test_explore_upstream_refresh_enabled_with_db_path_passes():
                                   FILET_EXPLORE_DB="/var/lib/filet-api/explore.db"))
     assert cfg.explore_upstream_refresh is True
     assert cfg.explore_db_path == "/var/lib/filet-api/explore.db"
+
+
+def test_explore_purge_flag_parsing():
+    """explore-db-purge D-P3：`FILET_EXPLORE_PURGE` 是 demo 期間的 kill switch，
+    未設／"1"／其他 → 開；"0"／"false"（不分大小寫）→ 關。"""
+    assert ApiConfig.from_env(_env()).explore_purge_enabled is True
+    assert ApiConfig.from_env(_env(FILET_EXPLORE_PURGE="1")).explore_purge_enabled is True
+    assert ApiConfig.from_env(_env(FILET_EXPLORE_PURGE="0")).explore_purge_enabled is False
+    assert ApiConfig.from_env(_env(FILET_EXPLORE_PURGE="FALSE")).explore_purge_enabled is False
+    assert ApiConfig.from_env(_env(FILET_EXPLORE_PURGE=" false ")).explore_purge_enabled is False

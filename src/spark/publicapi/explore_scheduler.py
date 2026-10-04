@@ -120,6 +120,7 @@ import dataclasses
 import logging
 import random
 import threading
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable
@@ -324,6 +325,7 @@ class ExploreScheduler:
         self._purge_enabled = purge_enabled
         self._purged: dict[str, int] | None = None
         self._purge_errors = 0
+        self._purge_last_s: float | None = None
         self._hl = hl
         self._hl_base = hl_base
         self._hl_fills = hl_fills
@@ -630,6 +632,7 @@ class ExploreScheduler:
             "purged": None if self._purged is None else dict(self._purged),
             "purge_errors": self._purge_errors,
             "purge_enabled": self._purge_enabled,
+            "purge_last_s": self._purge_last_s,
             "scan_writeback_duplicate": self._scan_writeback_duplicate,
             "scan_writeback_stale": self._scan_writeback_stale,
             "scan_writeback_missing": self._scan_writeback_missing,
@@ -1113,10 +1116,16 @@ class ExploreScheduler:
         # 失敗不得把 candidates job 拖進隔離（候選池唯一更新來源）；大聲記錄＋計數。
         if self._purge_enabled:
             try:
+                # reviewer W4（2026-10-04）：保留期 DELETE 每輪掃整份 fills 索引且持
+                # store lock——記耗時進 `status()["purge_last_s"]`，上線後可量鎖持有
+                # 時間；超過 1 秒就 warning（API 會排在這把鎖後面）。
+                t0 = time.monotonic()
                 self._purged = self._store.purge(
                     now, max_candidates=PURGE_MAX_CANDIDATES, max_fills=PURGE_MAX_FILLS)
-                if any(self._purged.values()):
-                    logger.warning("explore scheduler: purge 本輪刪除 %s", self._purged)
+                self._purge_last_s = round(time.monotonic() - t0, 3)
+                if any(self._purged.values()) or self._purge_last_s > 1.0:
+                    logger.warning("explore scheduler: purge 本輪刪除 %s（%.3fs）",
+                                   self._purged, self._purge_last_s)
             except Exception:
                 self._purged = None
                 self._purge_errors += 1

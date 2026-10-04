@@ -31,31 +31,48 @@ def _num(d: object, *path: str) -> float | None:
     return float(cur) if isinstance(cur, (int, float)) else None
 
 
+SAMPLE_KEYS = ("low_memory", "io_pressure", "client_timeouts", "db_size")
+
+
 def _conditions(
     sample: dict | None, age: float, units: dict[str, str], failed: int
-) -> dict[str, str]:
+) -> tuple[dict[str, str], set[str]]:
+    """回傳 (成立的條件, 無法判定的條件鍵)。無法判定（樣本缺、欄位缺）的鍵
+    不算「已恢復」——reviewer W3（2026-10-04）：取樣器掛掉時原本成立的 IO 告警
+    會被誤判 recovered。"""
     c: dict[str, str] = {}
+    unknown: set[str] = set()
     if sample is None or age > STALE_S:
         c["sampler_stale"] = f"取樣器停擺：最新樣本 age={age:.0f}s（>{STALE_S}s）或無樣本"
-    if sample is not None:
+    if sample is None:
+        unknown.update(SAMPLE_KEYS)
+    else:
         v = _num(sample, "mem_mb", "available")
-        if v is not None and v < 400:
+        if v is None:
+            unknown.add("low_memory")
+        elif v < 400:
             c["low_memory"] = f"可用記憶體 {v:.0f} MB（<400）"
         v = _num(sample, "psi_io", "some_avg300")
-        if v is not None and v > 50:
+        if v is None:
+            unknown.add("io_pressure")
+        elif v > 50:
             c["io_pressure"] = f"IO PSI some_avg300={v:.1f}（>50）"
         v = _num(sample, "nginx_499_15m")
-        if v is not None and v > 10:
+        if v is None:
+            unknown.add("client_timeouts")
+        elif v > 10:
             c["client_timeouts"] = f"nginx 499 近 15 分 {v:.0f} 次（>10）"
         v = _num(sample, "explore_db_mb")
-        if v is not None and v > 2500:
+        if v is None:
+            unknown.add("db_size")
+        elif v > 2500:
             c["db_size"] = f"explore DB {v:.0f} MB（>2500）"
     for name, st in units.items():
         if st != "active":
             c[f"unit_down:{name}"] = f"unit {name} 狀態 {st}"
     if failed > 0:
         c["failed_units"] = f"systemd failed units 共 {failed} 個"
-    return c
+    return c, unknown
 
 
 def evaluate(
@@ -66,7 +83,7 @@ def evaluate(
     state: dict,
     now: float,
 ) -> tuple[list[str], dict]:
-    conds = _conditions(sample, sample_age_s, units, failed_units)
+    conds, unknown = _conditions(sample, sample_age_s, units, failed_units)
     new_state: dict = {k: dict(v) for k, v in state.items()}
     msgs: list[str] = []
     for key, text in conds.items():
@@ -79,7 +96,7 @@ def evaluate(
             hrs = (now - ent["since"]) / 3600
             msgs.append(f"[filet 仍在] {text}（已持續 {hrs:.1f} 小時）")
     for key in list(new_state):
-        if key not in conds:
+        if key not in conds and key not in unknown:
             del new_state[key]
             msgs.append(f"[filet recovered] {key} 已恢復")
     return msgs, new_state
@@ -105,8 +122,11 @@ def _read_sample(path: str, now: float) -> tuple[dict | None, float]:
 
 def _collect_units() -> tuple[dict[str, str], int]:
     names = list(FIXED_UNITS)
+    # 不帶 `--all`：只看目前 loaded／active 的 follower 實例。owner_close 後引擎
+    # 會 exit 0 停下（刻意 inactive），列進來會每 6 小時誤報 unit_down；真正的
+    # 失敗（非 0 退出、Restart 耗盡）由下面的 `--failed` 計數抓。
     for ln in _run(
-        ["systemctl", "list-units", "--all", "filet-follower@*", "--no-legend", "--plain"]
+        ["systemctl", "list-units", "filet-follower@*", "--no-legend", "--plain"]
     ).splitlines():
         parts = ln.split()
         if parts and parts[0].startswith("filet-follower@"):

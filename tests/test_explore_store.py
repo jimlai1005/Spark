@@ -377,6 +377,29 @@ def test_purge_runs_incremental_vacuum_without_error_when_auto_vacuum_off(tmp_pa
                                     "fills_sync": 0, "fills_scan": 0}
 
 
+def test_purge_incremental_vacuum_reclaims_freed_pages_when_auto_vacuum_incremental(tmp_path):
+    """reviewer W1（2026-10-04）：`PRAGMA incremental_vacuum(N)` 是逐頁產出列的
+    語句，只 `execute()` 不走完游標＝只回收 1 頁。這裡用 INCREMENTAL 模式的 DB
+    刪掉一個退池位址的 ~20k 筆 fills（數百頁），purge 之後 freelist 必須歸零。"""
+    store, c = _store(tmp_path)
+    store._db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    store._db.execute("VACUUM")   # auto_vacuum 設定要 VACUUM 一次才生效
+    assert store._db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    store.upsert_candidates([("0xvac", "V", 1, 0.1)], as_of=c.now())
+    store.deactivate_missing(set())
+    old_ms = int((c.now() - 40 * 86400) * 1000)
+    cp = _checkpoint("0xvac", window_start_ms=old_ms + 500, window_end_ms=int(c.now() * 1000),
+                     cursor_ms=old_ms + 500)
+    store.insert_fills_page("0xvac", [_fill(tid=i, time_ms=old_ms - i) for i in range(1, 20001)], cp)
+    pages_before = store._db.execute("PRAGMA page_count").fetchone()[0]
+    assert pages_before > 300
+    c.t += 30 * 86400
+    counts = store.purge(c.now())
+    assert counts["candidate"] == 1 and counts["fills"] == 20000
+    assert store._db.execute("PRAGMA freelist_count").fetchone()[0] == 0
+    assert store._db.execute("PRAGMA page_count").fetchone()[0] < pages_before // 2
+
+
 # --- 地址正規化 ---
 
 def test_address_normalization_case_insensitive(tmp_path):
