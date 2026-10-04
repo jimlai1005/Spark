@@ -21,9 +21,12 @@
 
 ## ⚠️ 2026-10-04 11:26 UTC 事故與緊急處置（主線程，plan 寫完後 30 分鐘內發生）
 
-- 症狀：nginx 連續 502／504（`upstream timed out … reading response header`）打在 `/`、`/dashboard`、`/api/me`、
-  `/api/auth/nonce`、`/api/public/status`、`/api/public/strategies`；15 分鐘內 499＝15、5xx＝19（205 請求）。
-  使用者本人（HiNet IPv6）登入失敗。`/proc/pressure/io` **full avg300 82%**（所有任務同時卡 IO 的時間佔八成）。
+- 症狀：nginx 連續 502／504；15 分鐘內 499＝15、5xx＝19（205 請求）。使用者本人（HiNet IPv6）登入失敗。
+  `/proc/pressure/io` **full avg300 82%**（所有任務同時卡 IO 的時間佔八成）。
+  **歸因要分兩段**（2026-10-04 另一個 session spark-a0 來訊核對後修正）：11:26:23–29 對 `/`、`/dashboard`、`/risk`、
+  `/contact`、`/terms` 的 502 是 spark-a0 純前端部署 `b9733c0` **重啟 `filet-dashboard`** 的 next-server 空窗，與 DB 無關；
+  11:28–11:32 對 `/api/me`、`/api/auth/nonce`、`/api/public/status`、`/api/public/strategies` 的 **504**
+  （`upstream timed out … reading response header`，nginx 60 秒）與 499 才是 `filet-api` 被 IO 卡住——這段 spark-a0 沒碰 api。
 - 機制：發布器每分鐘對 300 列各做 `get_fills()`（持 store lock、讀整窗 raw），DB 2.26 GB > page cache → 每次讀都打磁碟；
   API handler 要拿同一把 lock／同一顆磁碟 → 超過 nginx 60 秒逾時。
 - 處置（11:33:47 UTC，§5.8f Step 7-pre）：drop-in `explore-refresh.conf` 的 `EXPLORE_UPSTREAM_REFRESH` 1 → 0、daemon-reload、
