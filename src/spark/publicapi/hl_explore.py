@@ -212,6 +212,12 @@ DEFAULT_PAGE_SIZE = 25
 # `WeightLimiter` 這一層做），這是已知的 burst 面，上限 3 就是為了壓它
 # （見 Task 3a）。
 DEFAULT_FILLS_MAX_PAGES = 3
+# HFT 過濾器（docs/superpowers/specs/2026-10-05-explore-hft-filter.md §2／§6，
+# 使用者 2026-10-05 裁決）：H1 月成交量門檻、H2 30 天筆數門檻、冷卻秒數。
+# 0（或負）＝該閘停用。
+DEFAULT_HFT_MAX_VLM_MONTH_USD = Decimal("100000000")
+DEFAULT_HFT_MAX_FILLS_30D = 6000
+DEFAULT_HFT_COOLDOWN_S = 30 * 86400
 # Task 8 Step 4（2026-09-05，reviewer Warning 3）：探索清單與交易員詳情頁原本
 # 各自讀一份 `EXPLORE_FILLS_MAX_PAGES`（`ExploreConfig.fills_max_pages` 與
 # app.py 的 `TRADER_FILLS_MAX_PAGES`）——同名 env var、兩處硬編預設值，改一邊
@@ -350,6 +356,9 @@ class ExploreConfig:
     # D5（2026-09-05）：`hl.get_fills_raw_paged` 分頁上限，每頁 2000 筆、3 頁
     # 上限 ≤ 6000 筆，供 `trader_stats.fills_stats` 用。
     fills_max_pages: int = DEFAULT_FILLS_MAX_PAGES
+    hft_max_vlm_month_usd: Decimal = DEFAULT_HFT_MAX_VLM_MONTH_USD
+    hft_max_fills_30d: int = DEFAULT_HFT_MAX_FILLS_30D
+    hft_cooldown_s: int = DEFAULT_HFT_COOLDOWN_S
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ExploreConfig":
@@ -377,6 +386,10 @@ class ExploreConfig:
                                        DEFAULT_MAX_CONCENTRATION_PCT),
             page_size=_int("EXPLORE_PAGE_SIZE", DEFAULT_PAGE_SIZE),
             fills_max_pages=fills_max_pages_from_env(env),
+            hft_max_vlm_month_usd=_dec("EXPLORE_HFT_MAX_VLM_MONTH_USD",
+                                       DEFAULT_HFT_MAX_VLM_MONTH_USD),
+            hft_max_fills_30d=_int("EXPLORE_HFT_MAX_FILLS_30D", DEFAULT_HFT_MAX_FILLS_30D),
+            hft_cooldown_s=_int("EXPLORE_HFT_COOLDOWN_S", DEFAULT_HFT_COOLDOWN_S),
         )
 
 
@@ -1280,6 +1293,29 @@ def candidate_addresses(payload: dict, pool_size: int,
                and r["ethAddress"].lower() not in excluded]
     sortable.sort(key=_roi_sort_key, reverse=True)
     return [(r["ethAddress"], r.get("displayName")) for r in sortable[:pool_size]]
+
+
+def hft_by_volume(payload: dict | None, max_vlm_month_usd: Decimal) -> set[str]:
+    """HFT 過濾器 H1（spec §2）：leaderboard 月窗 `vlm` ≥ 門檻的位址（小寫）。
+    零 IO——與 `candidate_addresses` 讀同一份 payload，呼叫端把回傳集合併進
+    `excluded`，這些位址從頭就不入池、不同步。門檻 ≤ 0 ＝ 停用（回空集合）。
+    缺窗／缺 `vlm`／解析失敗／NaN 一律不命中（寧可漏放進 H2 再擋，不可誤殺）。"""
+    if max_vlm_month_usd <= 0:
+        return set()
+    out: set[str] = set()
+    for row in (payload or {}).get("leaderboardRows") or []:
+        if not isinstance(row, dict) or not row.get("ethAddress"):
+            continue
+        perf = hl_leaderboard._window_perf(row, "month")
+        try:
+            vlm = Decimal(str(perf.get("vlm", "")))
+        except (InvalidOperation, ValueError):
+            continue
+        if vlm.is_nan():
+            continue
+        if vlm >= max_vlm_month_usd:
+            out.add(row["ethAddress"].lower())
+    return out
 
 
 # ---------------------------------------------------------------------------
