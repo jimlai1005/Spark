@@ -163,7 +163,8 @@
 | Task | 狀態 | 證據 |
 |---|---|---|
 | 1 purge 接線 | ✅ `7383773`（builder）；主線程親跑 purge/alert 目標測試 28 passed、ruff 過、`git grep "\.purge(" src` 恰一處 `:1116`；全套跑中；reviewer 派出 | **builder 偏離（主線程接受）**：scheduler 的 `cfg` 是 `hl_explore.ExploreConfig` 不是 `ApiConfig`，kill switch 改走 ctor kwarg `purge_enabled`（與 `fills_min_period_s` 同形），`scripts/run_api.py` 多傳一行 `purge_enabled=cfg.explore_purge_enabled`；scheduler 測試用 `_sched`+`Clock` 而非 harness（退池 8 天在 harness 難表達）；`from_env` 的 `FILET_EXPLORE_PURGE` 解析無單元測試（上機用 `/proc/<pid>/environ`＋health 的 `purge_enabled` 實證） |
-| 2 部署＋VACUUM | 待 reviewer＋使用者定維護窗 | 離線腳本在本機合成 DB 驗過：purge 計數正確、VACUUM 814 → 20 頁、integrity ok、auto_vacuum=2 |
+| 1b 審核 | ✅ reviewer（opus）兩輪：W1 incremental_vacuum 只回收 1 頁（`.fetchall()`＋變異測試轉紅）、W2 磁碟門檻、W3 告警誤報 recovered、W4 purge 耗時進 status、兩條 Suggestion（去 `--all`、kill switch 解析測試）→ `3ef6df8`；複審 PASS；再依建議拆 `--allow-active`／`--allow-low-disk` → `5acd220` | 主線程親跑全套 **3532 passed**（3ef6df8）、ruff 過；已 push |
+| 2 部署＋VACUUM | **就緒，待使用者定維護窗**；乾淨 worktree `5acd220` 已 stage-1 rsync 到正式機 `/tmp/spark-sync/`（機密邊界 0 命中，src 只差 config／scheduler／store／run_api 四檔） | 離線腳本在本機合成 DB 驗過：purge 計數正確、VACUUM 814 → 20 頁、integrity ok、auto_vacuum=2；無旗標時拒絕（exit 2） |
 | 3 RUNBOOK §5.8k | ✅ `a0be03d`、`d170e43`（乾淨 worktree 推碼） | |
 | 4 取樣器 v2 | ✅ 正式機 11:35 UTC 裝入（v1 備份 `host_sample.v1.bak.py`）；repo `deploy/ops/host_sample.py` | 11:47 起每筆含 `psi_io`／`nginx_499_15m`／`explore_db_mb` |
 | 5 告警 | ✅ `ff400b2`（builder，12 tests）；主線程親跑 12 passed、ruff 過、token grep 5 處皆非輸出路徑、本機 dry-run exit 0；正式機 `--dry-run` 零告警、`--test` 已送一則（11:41 UTC）**待使用者確認收到**後裝 root cron | |
