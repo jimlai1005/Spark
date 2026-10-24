@@ -15,7 +15,9 @@ describe("WalletPicker", () => {
         <WalletPicker candidates={[metamask, rabby]} onPick={vi.fn()} onCancel={vi.fn()} />
       </LangProvider>,
     );
-    expect(screen.getByRole("dialog", { name: COPY_ZH.login.pickerTitle })).toBeInTheDocument();
+    const dialog = screen.getByRole("dialog", { name: COPY_ZH.login.pickerTitle });
+    expect(dialog.parentElement).toBe(document.body); // createPortal 到 body
+    expect(dialog).toHaveClass("wallet-picker-overlay");
     expect(screen.getByRole("button", { name: /MetaMask/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Rabby Wallet/ })).toBeInTheDocument();
     expect(document.querySelectorAll("img")).toHaveLength(1);

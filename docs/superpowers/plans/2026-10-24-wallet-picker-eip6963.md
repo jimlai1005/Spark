@@ -995,6 +995,125 @@ Expected: `0`（wagmi.ts 檔頭的依賴衛生檢查，開 6963 不應把任何 
 
 ---
 
+### Task 9: 複審修正（reviewer 第一輪：1 Critical／1 Warning／2 Suggestion） `@inline`
+
+<!-- 2026-10-24 主線程裁決，依 reviewer 回報寫回 -->
+
+**裁決：**
+- R1（Critical，`Header.tsx:164`＋`globals.css:79`）：`.app-header` 有 `backdrop-filter`，成為內部 `position: fixed` 的定位基準，選單 overlay 只蓋到 header 那一條。修法：`WalletPicker` 一律用 `createPortal` 掛到 `document.body`，並加 `wallet-picker-overlay` class 把 z-index 提到 100（高於 sticky header 的 90）。這同時解掉 reviewer 的 Suggestion 2（頁面上選單被 header 蓋住、CTA 仍可點）。不改全域 `.modal-overlay` 的 z-index（其他 modal 不在本次範圍）。
+- R2（Warning，`useWalletLogin.ts` start 的已連線分支）：wagmi 自動重連讓回訪者 `isConnected` 為 true，原規格直接簽、永遠看不到選單。裁決：**偵測到多個錢包時，不論是否已連線都出選單**；`choose()` 選到的若就是目前已連的 connector（`useAccount().connector?.id` 相同）→ 跳過 connect 直接 finish（避免 wagmi `ConnectorAlreadyConnectedError`，`actions/connect.js:12-13` 只在 `uid === state.current` 時丟）；選別的 → 照常 `connectAsync`（wagmi 允許在已連線時連另一個 connector 並切換 current）。
+- R3（Suggestion 1，`globals.css:1492`）：`.modal-card ul`（0,1,1）蓋掉 `.wallet-picker-list`（0,1,0）。修法：選擇器改成 `.modal-card ul.wallet-picker-list`。
+- 觀察三條（候選快照、ReconnectGate 可選不同地址、chainId undefined）：不處理，reviewer 自己也說不出實際觸發情境；ReconnectGate 地址不一致由後端驗簽擋，與本次無關。
+
+**Files:**
+- Modify: `web/src/components/WalletPicker.tsx`
+- Modify: `web/src/styles/globals.css:1489`（選擇器）＋新增 `.wallet-picker-overlay`
+- Modify: `web/src/lib/useWalletLogin.ts`
+- Modify: `web/src/lib/useWalletLogin.test.tsx`（新增 1 案例）
+- Modify: `web/src/components/WalletPicker.test.tsx`（新增 1 斷言）
+
+- [ ] **Step 1: 寫失敗測試**
+
+`useWalletLogin.test.tsx` 新增（放在 describe 內最後）：
+```tsx
+  it("已連線但偵測到多個錢包 → 仍出選單；選目前已連的那個直接簽、不重連；選別的才 connectAsync", async () => {
+    connectorsState = [{ id: "injected", name: "Injected" }, metamask, rabby];
+    accountState = { address: "0xdef", chainId: 1, isConnected: true, connector: metamask } as typeof accountState;
+    const onSuccess = vi.fn();
+    renderHarness({ onSuccess });
+    await userEvent.click(screen.getByRole("button", { name: "go" }));
+    expect(screen.getByRole("dialog", { name: COPY_ZH.login.pickerTitle })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /MetaMask/ }));
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1));
+    expect(connectAsync).not.toHaveBeenCalled();
+    expect(loginWithSiwe).toHaveBeenCalledWith(expect.objectContaining({ address: "0xdef", chainId: 1 }));
+
+    await userEvent.click(screen.getByRole("button", { name: "go" }));
+    await userEvent.click(screen.getByRole("button", { name: /Rabby Wallet/ }));
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(2));
+    expect(connectAsync).toHaveBeenCalledWith({ connector: rabby });
+  });
+```
+`accountState` 的型別宣告改成 `{ address?: string; chainId?: number; isConnected: boolean; connector?: { id: string; name: string } }`。
+
+`WalletPicker.test.tsx` 第一個案例加兩個斷言（portal＋z-index class）：
+```tsx
+    const dialog = screen.getByRole("dialog", { name: COPY_ZH.login.pickerTitle });
+    expect(dialog.parentElement).toBe(document.body); // createPortal 到 body
+    expect(dialog).toHaveClass("wallet-picker-overlay");
+```
+
+- [ ] **Step 2: 跑測試確認新案例失敗**
+
+Run: `npx vitest run src/lib/useWalletLogin.test.tsx src/components/WalletPicker.test.tsx`
+Expected: 兩個新斷言／案例 FAIL，其餘綠。
+
+- [ ] **Step 3: 改 WalletPicker.tsx**
+
+```tsx
+import { createPortal } from "react-dom";
+```
+回傳改為 `createPortal(<div className="modal-overlay wallet-picker-overlay" role="dialog" …>…</div>, document.body)`。docstring 補一段：「用 createPortal 掛到 body：Header 有 `backdrop-filter`，會成為內部 fixed 元素的定位基準，直接渲染在 Header 內 overlay 只蓋到 header 那一條（reviewer 2026-10-24 Critical）；`wallet-picker-overlay` 把 z-index 提到 100，高於 sticky header 的 90。本元件只在使用者按下 CTA 後才渲染，所以 `document` 一定存在。」
+
+- [ ] **Step 4: 改 globals.css**
+
+第 1489 行選擇器改成 `.modal-card ul.wallet-picker-list { … }`（內容不變），並在其後加一行：
+```css
+.wallet-picker-overlay { z-index: 100; } /* 高於 .app-header 的 90 */
+```
+
+- [ ] **Step 5: 改 useWalletLogin.ts**
+
+`useAccount()` 多取 `connector: currentConnector`。`start()` 改為：
+```ts
+  const start = useCallback(async () => {
+    setError(null);
+    const choice = pickWalletCandidates(connectors);
+    // 多錢包一律先問（即使 wagmi 已自動重連其中一個）：回訪者才有機會換錢包登入。
+    if (choice.kind === "multiple") {
+      setCandidates(choice.candidates);
+      setPickerOpen(true);
+      return;
+    }
+    if (isConnected && address && chainId) {
+      await finishGuarded(address, chainId);
+      return;
+    }
+    if (choice.kind === "none") {
+      setError(COPY.login.noWallet);
+      return;
+    }
+    await connectThen(choice.candidates[0]);
+  }, [...]);
+```
+其中 `finishGuarded` 是把原本已連線分支的 `try { await finish } catch { fail } finally { setPhase("idle") }` 抽成一個 `useCallback`（避免在 start 與 choose 重複）。`choose()` 改為：
+```ts
+  const choose = useCallback(async (connector: Connector) => {
+    setPickerOpen(false);
+    // 選到的就是目前已連的 connector → 不重連（wagmi 會丟 ConnectorAlreadyConnectedError），直接簽。
+    if (isConnected && address && chainId && currentConnector && connector.id === currentConnector.id) {
+      await finishGuarded(address, chainId);
+      return;
+    }
+    await connectThen(connector);
+  }, [...]);
+```
+依賴陣列補齊（lint 的 exhaustive-deps 會告訴你）。檔頭 docstring 補一句本裁決。
+
+- [ ] **Step 6: 跑測試＋型別＋lint**
+
+Run: `npx vitest run src/lib src/components/WalletPicker.test.tsx src/components/Header.test.tsx && npx tsc --noEmit -p tsconfig.json 2>&1 | grep "error TS" | cut -d'(' -f1 | sort | uniq -c && npm run lint`
+Expected: 全綠；tsc 只剩基線兩檔；lint 無新 warning。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add web/src/components/WalletPicker.tsx web/src/components/WalletPicker.test.tsx web/src/styles/globals.css web/src/lib/useWalletLogin.ts web/src/lib/useWalletLogin.test.tsx
+git commit -m "fix(web): WalletPicker 改 portal＋z-index 100（Header backdrop-filter 定位基準）；已連線多錢包仍出選單；CSS 權重修正"
+```
+
+---
+
 ## 自我審查
 
 - **Spec 覆蓋**：開發現 → Task 2；選單 UI → Task 3；五處收斂 → Task 4-7；文案去 MetaMask 專名 → Task 2；舊式錢包／e2e 後備 → Task 1 候選規則＋Task 2 註解；SSR 風險 → hook 設計（只在 pickerOpen 渲染）＋Task 3 註解。手機／WalletConnect 明確排除。

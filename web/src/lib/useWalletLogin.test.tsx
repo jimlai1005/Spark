@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const connectAsync = vi.fn();
 const signMessageAsync = vi.fn();
-let accountState: { address?: string; chainId?: number; isConnected: boolean } = { isConnected: false };
+let accountState: { address?: string; chainId?: number; isConnected: boolean; connector?: { id: string; name: string } } = { isConnected: false };
 let connectorsState: Array<{ id: string; name: string; icon?: string }> = [{ id: "injected", name: "Injected" }];
 vi.mock("wagmi", () => ({
   useAccount: () => accountState,
@@ -119,5 +119,23 @@ describe("useWalletLogin", () => {
     await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1));
     expect(loginWithSiwe).not.toHaveBeenCalled();
     expect(resetSpy).not.toHaveBeenCalled();
+  });
+
+  it("已連線但偵測到多個錢包 → 仍出選單；選目前已連的那個直接簽、不重連；選別的才 connectAsync", async () => {
+    connectorsState = [{ id: "injected", name: "Injected" }, metamask, rabby];
+    accountState = { address: "0xdef", chainId: 1, isConnected: true, connector: metamask };
+    const onSuccess = vi.fn();
+    renderHarness({ onSuccess });
+    await userEvent.click(screen.getByRole("button", { name: "go" }));
+    expect(screen.getByRole("dialog", { name: COPY_ZH.login.pickerTitle })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /MetaMask/ }));
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1));
+    expect(connectAsync).not.toHaveBeenCalled();
+    expect(loginWithSiwe).toHaveBeenCalledWith(expect.objectContaining({ address: "0xdef", chainId: 1 }));
+
+    await userEvent.click(screen.getByRole("button", { name: "go" }));
+    await userEvent.click(screen.getByRole("button", { name: /Rabby Wallet/ }));
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(2));
+    expect(connectAsync).toHaveBeenCalledWith({ connector: rabby });
   });
 });

@@ -1,4 +1,5 @@
 "use client";
+import { createPortal } from "react-dom";
 import { useCopy } from "@/lib/lang";
 import type { WalletConnectorLike } from "@/lib/walletChoice";
 
@@ -9,6 +10,10 @@ import type { WalletConnectorLike } from "@/lib/walletChoice";
  * 沿站內 `.modal-overlay` / `.modal-card` 樣式（同 ConfirmDialog）。
  * ⚠️ 呼叫端只在使用者按下 CTA 之後才渲染本元件——server 端的 connector 清單
  * 只有 injected 後備，client 才有發現到的錢包，先渲染會 hydration mismatch。
+ * 用 createPortal 掛到 body：Header 有 `backdrop-filter`，會成為內部 fixed 元素的
+ * 定位基準，直接渲染在 Header 內 overlay 只蓋到 header 那一條（reviewer 2026-10-24
+ * Critical）；`wallet-picker-overlay` 把 z-index 提到 100，高於 sticky header 的 90。
+ * 本元件只在使用者按下 CTA 後才渲染，所以 `document` 一定存在。
  * icon 是錢包自己透過 EIP-6963 宣告的 data URI，直接用 <img>（不是 next/image：
  * data URI 不走最佳化，且來源不是我們的網域）。
  */
@@ -20,8 +25,8 @@ export function WalletPicker<C extends WalletConnectorLike>({ candidates, busy, 
 }) {
   const COPY = useCopy();
   const c = COPY.login;
-  return (
-    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label={c.pickerTitle}>
+  return createPortal(
+    <div className="modal-overlay wallet-picker-overlay" role="dialog" aria-modal="true" aria-label={c.pickerTitle}>
       <div className="modal-card card">
         <h3>{c.pickerTitle}</h3>
         <p className="hint">{c.pickerHint}</p>
@@ -51,6 +56,7 @@ export function WalletPicker<C extends WalletConnectorLike>({ candidates, busy, 
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
