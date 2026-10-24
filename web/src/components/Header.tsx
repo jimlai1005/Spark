@@ -2,14 +2,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useState } from "react";
-import { useAccount, useConnect, useSignMessage } from "wagmi";
+import { WalletPicker } from "@/components/WalletPicker";
 import { getDashboard, logout, type DashboardResp } from "@/lib/api";
 import { LANG_LABELS } from "@/lib/copy";
 import { shortAddr } from "@/lib/format";
 import { useIsAdmin, useMe } from "@/lib/hooks";
 import { useCopy, useLang } from "@/lib/lang";
-import { loginWithSiwe } from "@/lib/siwe";
+import { useWalletLogin } from "@/lib/useWalletLogin";
 
 /**
  * Header — 導覽狀態機（Task 7，顧問 P1：導覽本身是信任訊號的一部分）。
@@ -19,20 +18,18 @@ import { loginWithSiwe } from "@/lib/siwe";
  * 任何連回首頁的「開始」自我連結，改為單一 CTA。
  * 已登入時才出現 Dashboard／設定／跟單狀態 pill／地址縮寫。
  *
- * Task 2（2026-08-29）：CTA 從「查看策略與風險」連結改為「登入」按鈕——
- * 連 injected 錢包 → SIWE 簽署（沿用 strategies/[slug] 的連線/簽署寫法）→
- * 成功後打一次 `getDashboard()` 讀 `status.state`：非 inactive（following/paused/
- * halted）代表這個地址已經在跟單，直接送去 /dashboard；inactive 或讀不到（404／
- * 例外）就是還沒選策略，送去 /strategies 選策略。這支呼叫是一次性讀取（不進
- * react-query 快取），只服務這次導向決策；下方 `dash` query 是既有的 pill 資料源，
- * 職責不同不合併。
+ * Task 2（2026-08-29）：CTA 從「查看策略與風險」連結改為「登入」按鈕。
+ * 連線／簽署流程改由 `lib/useWalletLogin` 統一（2026-10-24，EIP-6963 多錢包選單）；
+ * 本元件只提供成功後的導向決策：成功後打一次 `getDashboard()` 讀 `status.state`：
+ * 非 inactive（following/paused/halted）代表這個地址已經在跟單，直接送去 /dashboard；
+ * inactive 或讀不到（404／例外）就是還沒選策略，送去 /strategies 選策略。這支呼叫是
+ * 一次性讀取（不進 react-query 快取），只服務這次導向決策；下方 `dash` query 是既有的
+ * pill 資料源，職責不同不合併。
  *
  * ADMIN 分組沿用舊機制：只有後端真的放行 /api/admin/pending 的人才顯示
  * （見 hooks.useIsAdmin 檔頭）——分組＝可見性，不是授權，/ops 與 /admin 各自
  * 掛後端 `_require_admin`，手打網址仍會 403。
  */
-type LoginPhase = "idle" | "connecting" | "signing";
-
 export function Header() {
   const pathname = usePathname();
   const router = useRouter();
@@ -44,11 +41,19 @@ export function Header() {
   const COPY = useCopy();
   const { lang, setLang } = useLang();
 
-  const { address, chainId, isConnected } = useAccount();
-  const { connectAsync, connectors } = useConnect();
-  const { signMessageAsync } = useSignMessage();
-  const [loginPhase, setLoginPhase] = useState<LoginPhase>("idle");
-  const [loginError, setLoginError] = useState<string | null>(null);
+  const login = useWalletLogin({
+    onSuccess: async () => {
+      // 依 dashboard 狀態導向（原登入 CTA 處理函式的後半；一次性讀取，不進 react-query 快取）
+      let dest = "/strategies";
+      try {
+        const dashboard = await getDashboard();
+        if (dashboard.status && dashboard.status.state !== "inactive") dest = "/dashboard";
+      } catch {
+        dest = "/strategies"; // 404／例外＝還沒有可看的 dashboard，保守送去選策略
+      }
+      router.push(dest);
+    },
+  });
 
   async function handleLogout() {
     await logout();
@@ -61,61 +66,6 @@ export function Header() {
     // 使用者裁決（2026-09-01）：登出一律回首頁，不留在原頁（也免得各頁 guard
     // 各自導去不同地方——dashboard 導 /strategies、settings 又是另一套）。
     router.push("/");
-  }
-
-  /**
-   * 未登入 CTA：connect（injected）→ SIWE → 依 dashboard 狀態導向。
-   * 錯誤處理沿用 strategies/[slug] 的拒簽判別（不得 console 洩漏簽章內容——
-   * 這裡從頭到尾沒有把 message／signature 印出來，只把 error.name/code/message
-   * 拿來分類成使用者看得懂的兩句文案）。
-   */
-  async function handleLoginCta() {
-    setLoginError(null);
-    try {
-      let addr = address;
-      let cid = chainId;
-      if (!isConnected) {
-        const injected = connectors[0];
-        if (!injected) {
-          setLoginError(COPY.login.noWallet);
-          return;
-        }
-        setLoginPhase("connecting");
-        const result = await connectAsync({ connector: injected });
-        addr = result.accounts[0];
-        cid = result.chainId;
-      }
-      if (!addr || !cid) {
-        setLoginError(COPY.login.noWallet);
-        return;
-      }
-      setLoginPhase("signing");
-      await loginWithSiwe({
-        address: addr,
-        chainId: cid,
-        signMessage: (message) => signMessageAsync({ message }),
-      });
-      await queryClient.resetQueries(); // 登入＝身份切換，同 handleLogout 的理由整包清
-
-      let dest = "/strategies";
-      try {
-        const dashboard = await getDashboard();
-        if (dashboard.status && dashboard.status.state !== "inactive") dest = "/dashboard";
-      } catch {
-        // 404／例外＝還沒有可看的 dashboard 資料，保守送去選策略，不視為登入失敗。
-        dest = "/strategies";
-      }
-      router.push(dest);
-    } catch (err) {
-      const e = err as { name?: string; code?: number; message?: string } | undefined;
-      const isRejected =
-        e?.name === "UserRejectedRequestError"
-        || e?.code === 4001
-        || /reject|denied|cancel/i.test(String(e?.message ?? ""));
-      setLoginError(isRejected ? COPY.login.rejected : COPY.login.loginFailed);
-    } finally {
-      setLoginPhase("idle");
-    }
   }
 
   const guestTabs = [
@@ -201,16 +151,24 @@ export function Header() {
             <button
               type="button"
               className="btn btn-primary header-cta"
-              disabled={loginPhase !== "idle"}
-              onClick={handleLoginCta}
+              disabled={login.phase !== "idle"}
+              onClick={() => void login.start()}
             >
-              {loginPhase === "connecting"
+              {login.phase === "connecting"
                 ? COPY.nav.ctaConnecting
-                : loginPhase === "signing"
+                : login.phase === "signing"
                   ? COPY.nav.ctaSigning
                   : COPY.nav.cta}
             </button>
-            {loginError && <p className="header-cta-error">{loginError}</p>}
+            {login.error && <p className="header-cta-error">{login.error}</p>}
+            {login.pickerOpen && (
+              <WalletPicker
+                candidates={login.candidates}
+                busy={login.phase !== "idle"}
+                onPick={(c) => void login.choose(c)}
+                onCancel={login.cancelPicker}
+              />
+            )}
           </div>
         )}
         {loggedIn && me.data && (

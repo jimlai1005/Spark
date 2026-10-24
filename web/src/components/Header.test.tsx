@@ -20,9 +20,10 @@ vi.mock("@/lib/api", async (importOriginal) => ({
 const connectAsync = vi.fn();
 const signMessageAsync = vi.fn();
 let accountState: { address?: string; chainId?: number; isConnected: boolean } = { isConnected: false };
+let connectorsState: Array<{ id: string; name: string; icon?: string }> = [{ id: "injected", name: "Injected" }];
 vi.mock("wagmi", () => ({
   useAccount: () => accountState,
-  useConnect: () => ({ connectAsync, connectors: [{ id: "injected" }] }),
+  useConnect: () => ({ connectAsync, connectors: connectorsState }),
   useSignMessage: () => ({ signMessageAsync }),
 }));
 
@@ -81,6 +82,7 @@ beforeEach(() => {
   signMessageAsync.mockReset();
   loginWithSiwe.mockReset();
   accountState = { isConnected: false };
+  connectorsState = [{ id: "injected", name: "Injected" }];
 });
 
 describe("Header — 未登入導覽（顧問 P1：導覽是信任訊號）", () => {
@@ -308,5 +310,26 @@ describe("Header — 語言切換", () => {
 
     await user.click(screen.getByRole("button", { name: "繁中" }));
     expect(screen.getByRole("navigation", { name: COPY_ZH.nav.ariaLabel })).toBeInTheDocument();
+  });
+});
+
+describe("Header — 多錢包選單（EIP-6963）", () => {
+  it("多個瀏覽器錢包並存：按 CTA 先出選單，選 Rabby 才連該 connector 並簽署", async () => {
+    connectorsState = [
+      { id: "injected", name: "Injected" },
+      { id: "io.metamask", name: "MetaMask" },
+      { id: "io.rabby", name: "Rabby Wallet" },
+    ];
+    connectAsync.mockResolvedValue({ accounts: ["0xabc"], chainId: 42161 });
+    loginWithSiwe.mockResolvedValue({ address: "0xabc", account_id: "acc" });
+    getDashboard.mockRejectedValue(new ApiError("client", "not found", 404, "not found"));
+    render(wrap(<Header />, qcWithMe(null)));
+    await userEvent.click(screen.getByRole("button", { name: COPY_ZH.nav.cta }));
+    expect(connectAsync).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: COPY_ZH.login.pickerTitle })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Rabby Wallet/ }));
+    await waitFor(() => expect(push).toHaveBeenCalledWith("/strategies"));
+    expect(connectAsync).toHaveBeenCalledWith({ connector: connectorsState[2] });
+    expect(loginWithSiwe).toHaveBeenCalledTimes(1);
   });
 });
