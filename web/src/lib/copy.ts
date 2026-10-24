@@ -146,9 +146,12 @@ export const COPY_ZH = {
     connecting: "連接中…",
     signingIn: "請在錢包中簽署登入訊息…",
     signInNote: "登入需要一筆免費的訊息簽名（不上鏈、不花費 gas）。",
-    noWallet: "未偵測到瀏覽器錢包。請先安裝 MetaMask 後重新整理本頁。Filet 永遠不會請你輸入私鑰或助記詞。",
+    noWallet: "未偵測到瀏覽器錢包。請先安裝 MetaMask、Rabby 等瀏覽器擴充套件錢包後重新整理本頁。Filet 永遠不會請你輸入私鑰或助記詞。",
     rejected: "你在錢包中取消了簽署。準備好後再點一次「連接錢包」即可。",
     loginFailed: "登入失敗，請稍後再試。",
+    pickerTitle: "選擇錢包",
+    pickerHint: "偵測到多個瀏覽器錢包，請選擇要用來登入的那一個。",
+    pickerCancel: "取消",
     // walletPanelTitle／enginePanelTitle／addrLabel／strategyLabel／strategyValue／
     // pillUnauthorized／pillAuthorized 與 /onboarding 的 Boundary 顯示共用（單一來源），
     // 本頁不再渲染 Boundary，但這些鍵仍是 onboarding 頁的實際依賴，不得刪除。
@@ -2026,9 +2029,12 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     connecting: "Connecting…",
     signingIn: "Please sign the login message in your wallet…",
     signInNote: "Signing in requires one free message signature (no on-chain transaction, no gas).",
-    noWallet: "No browser wallet detected. Please install MetaMask and refresh this page. Filet will never ask for your private key or seed phrase.",
+    noWallet: "No browser wallet detected. Please install a browser-extension wallet such as MetaMask or Rabby and refresh this page. Filet will never ask for your private key or seed phrase.",
     rejected: "You canceled the signature in your wallet. Click \"Connect wallet\" again when you're ready.",
     loginFailed: "Login failed, please try again later.",
+    pickerTitle: "Choose a wallet",
+    pickerHint: "Several browser wallets were detected. Pick the one you want to sign in with.",
+    pickerCancel: "Cancel",
     walletPanelTitle: "Your wallet",
     enginePanelTitle: "Filet engine",
     addrLabel: "Address",

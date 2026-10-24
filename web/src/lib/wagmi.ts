@@ -1,5 +1,9 @@
 /**
- * wagmi 設定：closed alpha 只接 injected connector（MetaMask）。
+ * wagmi 設定：closed alpha 只接 injected 類 connector（瀏覽器擴充套件錢包）。
+ * 2026-10-24 起開啟 EIP-6963 發現（multiInjectedProviderDiscovery）：裝了多個
+ * 擴充套件錢包時由 lib/useWalletLogin + components/WalletPicker 讓使用者選；
+ * 下方保留的 `injected()` 是「只注入 window.ethereum、不發 6963 宣告」的舊式
+ * 錢包後備（候選規則見 lib/walletChoice.ts）。
  * 不引入 WalletConnect（M3）。chains 宣告只為 connector 型別需要；
  * app 內不用任何會發 RPC 的 hook（useBalance 等）——鏈上事實一律出自後端
  * status（設計定案 10，工程原則 1 同源）。
@@ -20,7 +24,7 @@ import { arbitrum, mainnet } from "wagmi/chains";
 export const wagmiConfig = createConfig({
   chains: [arbitrum, mainnet],
   connectors: [injected()],
-  multiInjectedProviderDiscovery: false,
+  multiInjectedProviderDiscovery: true,
   transports: {
     [arbitrum.id]: http(),
     [mainnet.id]: http(),

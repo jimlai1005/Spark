@@ -70,6 +70,13 @@ describe("語言紅線（spec 不變量 4：2026-06-18 沿用）", () => {
 });
 
 describe("i18n（Task 2：雙語 copy 基礎）", () => {
+  it("多錢包選單文案存在且 noWallet 不再只點名 MetaMask（2026-10-24 EIP-6963）", () => {
+    expect(COPY_ZH.login.pickerTitle).toBeTruthy();
+    expect(COPY_ZH.login.pickerHint).toBeTruthy();
+    expect(COPY_ZH.login.pickerCancel).toBeTruthy();
+    expect(COPY_ZH.login.noWallet).toContain("Rabby");
+    expect(COPY_EN.login.noWallet).toContain("Rabby");
+  });
   it("zh/en 深層 key 完全對稱", () => {
     const zhKeys = deepKeySet(COPY_ZH);
     const enKeys = deepKeySet(COPY_EN);

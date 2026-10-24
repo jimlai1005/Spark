@@ -32,9 +32,10 @@ import { privateKeyToAccount } from "viem/accounts";
  * `localhost` 作為本測試 stack 的 host（`FILET_SIWE_DOMAIN`／`NEXT_PUBLIC_SITE_ORIGIN`
  * 若要重 build 也一併換成 localhost，但只影響 metadata，不影響本測試）。
  *
- * `window.ethereum` 是本檔注入的最小 EIP-1193 mock（`multiInjectedProviderDiscovery:
- * false`，見 `web/src/lib/wagmi.ts`——app 只用 `injected()` 直接讀 `window.ethereum`，
- * 不需要 EIP-6963 announce）；簽章委由 Node 端 viem `privateKeyToAccount` 完成
+ * `window.ethereum` 是本檔注入的最小 EIP-1193 mock——**不**發 EIP-6963 announce，
+ * 所以即使 `web/src/lib/wagmi.ts` 已開 `multiInjectedProviderDiscovery`，connector
+ * 清單仍只有 `injected()` 後備一個、不會出現錢包選單（候選規則見 lib/walletChoice.ts）。
+ * 簽章委由 Node 端 viem `privateKeyToAccount` 完成
  * （`page.exposeFunction`），私鑰只活在 Node 進程內，從不進 log／console。
  *
  * ⚠️ chainId 固定回報 `0xa4b1`（42161，Arbitrum One）——**不是** 421614（HL testnet
