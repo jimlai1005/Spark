@@ -28,11 +28,11 @@
  * 輸入框（沿既有 gate），登入後才會用這個值初始化 `CustomLeaderSection` 的
  * `input` state。
  */
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useRef, useState } from "react";
-import { useAccount, useConnect, useSignMessage } from "wagmi";
+import { WalletPicker } from "@/components/WalletPicker";
 import {
   ApiError,
   getLeaderPreview,
@@ -45,9 +45,7 @@ import { runCustomLeaderPreview, validateCustomLeaderInput } from "@/lib/customL
 import { fmtAmount, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
-import { loginWithSiwe } from "@/lib/siwe";
-
-type LoginPhase = "idle" | "connecting" | "signing";
+import { useWalletLogin, type LoginPhase } from "@/lib/useWalletLogin";
 
 /** `useSearchParams()` 在 build 期 prerender 需要 Suspense 邊界（Next.js
  * missing-suspense-with-csr-bailout，見 `onboarding/page.tsx` 同寫法，
@@ -66,7 +64,6 @@ function AdvancedInner() {
   const c = COPY.advanced;
   const me = useMe();
   const loggedIn = !!me.data;
-  const queryClient = useQueryClient();
   const router = useRouter();
   const searchParams = useSearchParams();
   // ⭐ D9：只讀一次當初始值——`useState` 的初始 initializer 只在首次 render 求值，
@@ -74,11 +71,10 @@ function AdvancedInner() {
   // （不是「持續同步」）。
   const leaderParam = searchParams.get("leader") ?? undefined;
 
-  const { address, chainId, isConnected } = useAccount();
-  const { connectAsync, connectors } = useConnect();
-  const { signMessageAsync } = useSignMessage();
-  const [loginPhase, setLoginPhase] = useState<LoginPhase>("idle");
-  const [loginError, setLoginError] = useState<string | null>(null);
+  // 連線／簽署流程統一由 useWalletLogin 處理（2026-10-24，EIP-6963 多錢包選單）。
+  // 留在本頁：登入成功不跳轉（不同於 strategy 詳情頁的登入即帶參數跳轉——這裡登入
+  // 完就是為了繼續填本頁的位址輸入框），hook 內已 resetQueries 讓 useMe 重抓。
+  const login = useWalletLogin();
 
   // ⭐ NOTE 05 的閘門：勾選前，下方（登入後才會渲染的）位址輸入框維持 disabled。
   const [gateAgreed, setGateAgreed] = useState(false);
@@ -90,47 +86,6 @@ function AdvancedInner() {
     queryFn: getLeaders,
     enabled: loggedIn,
   });
-
-  async function handleLogin() {
-    setLoginError(null);
-    try {
-      let addr = address;
-      let cid = chainId;
-      if (!isConnected) {
-        const injected = connectors[0];
-        if (!injected) {
-          setLoginError(COPY.login.noWallet);
-          return;
-        }
-        setLoginPhase("connecting");
-        const result = await connectAsync({ connector: injected });
-        addr = result.accounts[0];
-        cid = result.chainId;
-      }
-      if (!addr || !cid) {
-        setLoginError(COPY.login.noWallet);
-        return;
-      }
-      setLoginPhase("signing");
-      await loginWithSiwe({
-        address: addr,
-        chainId: cid,
-        signMessage: (message) => signMessageAsync({ message }),
-      });
-      // 留在本頁：只讓 useMe 重抓，不 router.push（不同於 strategy 詳情頁的登入
-      // 即帶參數跳轉——這裡登入完就是為了繼續填本頁的位址輸入框）。
-      void queryClient.resetQueries(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
-    } catch (err) {
-      const e = err as { name?: string; code?: number; message?: string } | undefined;
-      const isRejected =
-        e?.name === "UserRejectedRequestError"
-        || e?.code === 4001
-        || /reject|denied|cancel/i.test(String(e?.message ?? ""));
-      setLoginError(isRejected ? COPY.login.rejected : COPY.login.loginFailed);
-    } finally {
-      setLoginPhase("idle");
-    }
-  }
 
   function handleProceed(selectedAddress: string) {
     router.push(`/onboarding?strategy=advanced:${selectedAddress}`);
@@ -151,13 +106,23 @@ function AdvancedInner() {
         // 藍框堆疊、下半頁全空——合併為單一卡：風險確認 + 可見但 disabled 的
         // 地址輸入框（讓用戶看得到接下來要填什麼）+ 登入按鈕 + 「或先看精選
         // 策略 →」出口。
-        <NotLoggedInGateCard
-          gateAgreed={gateAgreed}
-          onGateChange={setGateAgreed}
-          phase={loginPhase}
-          error={loginError}
-          onLogin={() => void handleLogin()}
-        />
+        <>
+          <NotLoggedInGateCard
+            gateAgreed={gateAgreed}
+            onGateChange={setGateAgreed}
+            phase={login.phase}
+            error={login.error}
+            onLogin={() => void login.start()}
+          />
+          {login.pickerOpen && (
+            <WalletPicker
+              candidates={login.candidates}
+              busy={login.phase !== "idle"}
+              onPick={(conn) => void login.choose(conn)}
+              onCancel={login.cancelPicker}
+            />
+          )}
+        </>
       ) : (
         <>
           <div className="panel ops-notice advanced-gate" role="note">

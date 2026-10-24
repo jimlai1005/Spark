@@ -3,8 +3,8 @@
  * `/strategies/[slug]` — 策略詳情頁（決策頁／白手套驗證門面，Task 9，設計稿 §04）。
  *
  * ⭐⭐ 錢包連接**第一次**在本頁出現（NOTE 07）。舊首頁的 SIWE 登入流程
- * （`useConnect`/`useSignMessage`/`loginWithSiwe`，見 git history `0eb12df~1:
- * web/src/app/page.tsx`）原封不動搬到這裡的跟單面板 CTA：右欄三個 slider
+ * （見 git history `0eb12df~1:web/src/app/page.tsx`）原封不動搬到這裡的跟單
+ * 面板 CTA，2026-10-24 起改走 `lib/useWalletLogin`（EIP-6963 多錢包選單）：右欄三個 slider
  * 未連錢包即可調整，只有最後一顆「連接錢包並繼續」需要錢包——這是刻意的
  * 產品順序（先設定完、再簽名，降低跳出）。已登入者點同一顆按鈕直接帶參數
  * 跳轉，不重複走一次連線/簽名。
@@ -27,24 +27,21 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { useAccount, useConnect, useSignMessage } from "wagmi";
 import { CagrCard } from "@/components/CagrCard";
 import { EquityCurve } from "@/components/EquityCurve";
 import {
   DD_DEFAULT, FollowPanel, SCALE_DEFAULT,
 } from "@/components/FollowPanel";
 import { MethodologyCard } from "@/components/MethodologyCard";
+import { WalletPicker } from "@/components/WalletPicker";
 import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, resolveTagline, shortAddr } from "@/lib/format";
-import { useQueryClient } from "@tanstack/react-query";
 import { useMe } from "@/lib/hooks";
 import { useCopy, useLang } from "@/lib/lang";
 import { getPublicStrategy, type PublicStrategyDetail } from "@/lib/publicApi";
-import { loginWithSiwe } from "@/lib/siwe";
 import {
   formatDepositEquivalentEquity, metricText, type MetricCardDef,
 } from "@/lib/strategyMetrics";
-
-type ConnectPhase = "idle" | "connecting" | "signing";
+import { useWalletLogin } from "@/lib/useWalletLogin";
 
 export default function StrategyDetailPage() {
   const params = useParams<{ slug: string }>();
@@ -74,20 +71,37 @@ export default function StrategyDetailPage() {
     if (strategy) document.title = `${strategy.name}｜Filet`;
   }, [strategy]);
 
-  const queryClient = useQueryClient();
   const me = useMe();
   const loggedIn = !!me.data;
-  const { address, chainId, isConnected } = useAccount();
-  const { connectAsync, connectors } = useConnect();
-  const { signMessageAsync } = useSignMessage();
-  const [phase, setPhase] = useState<ConnectPhase>("idle");
-  const [error, setError] = useState<string | null>(null);
 
   // 兩個 slider（NOTE 07：未連錢包即可調）。槓桿上限 Task 10b 起改唯讀資訊列
   // （無 per-user 簽章通道，見 StepRiskLimits.tsx 檔頭），不再是使用者可調的值。
   const [scalePct, setScalePct] = useState(SCALE_DEFAULT);
   const [ddEnabled, setDdEnabled] = useState(false); // 裁決 1：預設關閉
   const [ddPct, setDdPct] = useState(DD_DEFAULT);
+
+  // buildQuery 與登入 hook 必須在下方 early return 之前宣告（hooks 順序）；
+  // buildQuery 只會在 FollowPanel 渲染後（strategy 已載入）被呼叫。
+  function buildQuery(): string {
+    const p = new URLSearchParams();
+    p.set("strategy", strategy!.slug);
+    p.set("scale", String(scalePct));
+    if (ddEnabled) p.set("dd", String(ddPct));
+    return p.toString();
+  }
+
+  // 連線／簽署流程統一由 useWalletLogin 處理（2026-10-24，EIP-6963 多錢包選單）。
+  const login = useWalletLogin({
+    onSuccess: () => { router.push(`/onboarding?${buildQuery()}`); },
+  });
+
+  function handleCta() {
+    if (loggedIn) {
+      router.push(`/onboarding?${buildQuery()}`);
+      return;
+    }
+    void login.start();
+  }
 
   if (strategy === undefined) {
     return (
@@ -120,58 +134,6 @@ export default function StrategyDetailPage() {
     strategy.methodology.initial_deposit_usd, strategy.equity_index, fmtAmount,
   );
   const sampleInsufficient = strategy.sample_days < strategy.sample_threshold;
-
-  function buildQuery(): string {
-    const p = new URLSearchParams();
-    p.set("strategy", strategy!.slug);
-    p.set("scale", String(scalePct));
-    if (ddEnabled) p.set("dd", String(ddPct));
-    return p.toString();
-  }
-
-  async function handleCta() {
-    setError(null);
-    if (loggedIn) {
-      router.push(`/onboarding?${buildQuery()}`);
-      return;
-    }
-    try {
-      let addr = address;
-      let cid = chainId;
-      if (!isConnected) {
-        const injected = connectors[0];
-        if (!injected) {
-          setError(COPY.login.noWallet);
-          return;
-        }
-        setPhase("connecting");
-        const result = await connectAsync({ connector: injected });
-        addr = result.accounts[0];
-        cid = result.chainId;
-      }
-      if (!addr || !cid) {
-        setError(COPY.login.noWallet);
-        return;
-      }
-      setPhase("signing");
-      await loginWithSiwe({
-        address: addr,
-        chainId: cid,
-        signMessage: (message) => signMessageAsync({ message }),
-      });
-      void queryClient.resetQueries(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
-      router.push(`/onboarding?${buildQuery()}`);
-    } catch (err) {
-      const e = err as { name?: string; code?: number; message?: string } | undefined;
-      const isRejected =
-        e?.name === "UserRejectedRequestError"
-        || e?.code === 4001
-        || /reject|denied|cancel/i.test(String(e?.message ?? ""));
-      setError(isRejected ? COPY.login.rejected : COPY.login.loginFailed);
-    } finally {
-      setPhase("idle");
-    }
-  }
 
   // ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／日勝率三張
   // （plan Task 7 第 1 條＋設計稿 R2 P0 原文「大字只留總報酬、最大回撤、日勝率」）。
@@ -345,11 +307,19 @@ export default function StrategyDetailPage() {
           onDdEnabledChange={setDdEnabled}
           ddPct={ddPct}
           onDdPctChange={setDdPct}
-          phase={phase}
-          error={error}
+          phase={login.phase}
+          error={login.error}
           onCta={handleCta}
           disabledState={listable ? undefined : { kind: "pending", cta: c.panel.pendingCta, note: c.panel.pendingNote }}
         />
+        {login.pickerOpen && (
+          <WalletPicker
+            candidates={login.candidates}
+            busy={login.phase !== "idle"}
+            onPick={(conn) => void login.choose(conn)}
+            onCancel={login.cancelPicker}
+          />
+        )}
       </div>
     </main>
   );

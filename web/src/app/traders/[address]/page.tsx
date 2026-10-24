@@ -46,22 +46,21 @@
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
-import { useAccount, useConnect, useSignMessage } from "wagmi";
 import { CagrCard } from "@/components/CagrCard";
 import {
   DD_DEFAULT, FollowPanel, SCALE_DEFAULT,
 } from "@/components/FollowPanel";
 import { PnlCurve } from "@/components/PnlCurve";
+import { WalletPicker } from "@/components/WalletPicker";
 import { fmtAmount, fmtSignedUsd, fmtUpdatedAtUtc, NO_VALUE, shortAddr } from "@/lib/format";
-import { useQueryClient } from "@tanstack/react-query";
 import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 import { liqDistanceDisplay } from "@/lib/liqDistance";
 import {
   EXPLORE_WINDOWS, fillsIncomplete, getPublicTraderDetail, type ExploreWindow, type PublicTraderDetail,
 } from "@/lib/publicApi";
-import { loginWithSiwe } from "@/lib/siwe";
 import { metricText, type MetricCardDef } from "@/lib/strategyMetrics";
+import { useWalletLogin } from "@/lib/useWalletLogin";
 
 /** Task 6.2（2026-09-20，D14）：`fills_coverage.observed_from`／`observed_to`
  * 是 epoch **毫秒**（後端 `sync.observed_from_ms`，見 app.py），不是
@@ -72,8 +71,6 @@ function fmtDateFromMs(ms: number): string {
   if (Number.isNaN(d.getTime())) return NO_VALUE;
   return d.toISOString().slice(0, 10);
 }
-
-type ConnectPhase = "idle" | "connecting" | "signing";
 
 const DEFAULT_WINDOW: ExploreWindow = "month"; // D10（2026-09-05）：與探索清單預設一致，最穩的窗。
 
@@ -136,19 +133,36 @@ function TraderDetailInner() {
     }
   }
 
-  const queryClient = useQueryClient();
   const me = useMe();
   const loggedIn = !!me.data;
-  const { address: walletAddress, chainId, isConnected } = useAccount();
-  const { connectAsync, connectors } = useConnect();
-  const { signMessageAsync } = useSignMessage();
-  const [phase, setPhase] = useState<ConnectPhase>("idle");
-  const [error, setError] = useState<string | null>(null);
 
   // 投入比例／回撤 slider（R4-11：版型對齊策略頁，見檔頭）。
   const [scalePct, setScalePct] = useState(SCALE_DEFAULT);
   const [ddEnabled, setDdEnabled] = useState(false);
   const [ddPct, setDdPct] = useState(DD_DEFAULT);
+
+  // buildQuery 與登入 hook 必須在下方 early return 之前宣告（hooks 順序）；
+  // buildQuery 只會在 FollowPanel 渲染後（trader 已載入）被呼叫。
+  function buildQuery(): string {
+    const p = new URLSearchParams();
+    p.set("strategy", `advanced:${trader!.address}`);
+    p.set("scale", String(scalePct));
+    if (ddEnabled) p.set("dd", String(ddPct));
+    return p.toString();
+  }
+
+  // 連線／簽署流程統一由 useWalletLogin 處理（2026-10-24，EIP-6963 多錢包選單）。
+  const login = useWalletLogin({
+    onSuccess: () => { router.push(`/onboarding?${buildQuery()}`); },
+  });
+
+  function handleCta() {
+    if (loggedIn) {
+      router.push(`/onboarding?${buildQuery()}`);
+      return;
+    }
+    void login.start();
+  }
 
   if (trader === undefined) {
     return (
@@ -175,58 +189,6 @@ function TraderDetailInner() {
   const wm = trader.metrics[windowSel];
   const explorerHref = `https://app.hyperliquid.xyz/explorer/address/${trader.address}`;
   const asOf = fmtUpdatedAtUtc(trader.methodology.updated_at);
-
-  function buildQuery(): string {
-    const p = new URLSearchParams();
-    p.set("strategy", `advanced:${trader!.address}`);
-    p.set("scale", String(scalePct));
-    if (ddEnabled) p.set("dd", String(ddPct));
-    return p.toString();
-  }
-
-  async function handleCta() {
-    setError(null);
-    if (loggedIn) {
-      router.push(`/onboarding?${buildQuery()}`);
-      return;
-    }
-    try {
-      let addr = walletAddress;
-      let cid = chainId;
-      if (!isConnected) {
-        const injected = connectors[0];
-        if (!injected) {
-          setError(COPY.login.noWallet);
-          return;
-        }
-        setPhase("connecting");
-        const result = await connectAsync({ connector: injected });
-        addr = result.accounts[0];
-        cid = result.chainId;
-      }
-      if (!addr || !cid) {
-        setError(COPY.login.noWallet);
-        return;
-      }
-      setPhase("signing");
-      await loginWithSiwe({
-        address: addr,
-        chainId: cid,
-        signMessage: (message) => signMessageAsync({ message }),
-      });
-      void queryClient.resetQueries(); // 身份切換整包清（同 Header，2026-09-01 快取殘留事故）
-      router.push(`/onboarding?${buildQuery()}`);
-    } catch (err) {
-      const e = err as { name?: string; code?: number; message?: string } | undefined;
-      const isRejected =
-        e?.name === "UserRejectedRequestError"
-        || e?.code === 4001
-        || /reject|denied|cancel/i.test(String(e?.message ?? ""));
-      setError(isRejected ? COPY.login.rejected : COPY.login.loginFailed);
-    } finally {
-      setPhase("idle");
-    }
-  }
 
   // ⭐ R4-11：改用後端直接供給的 sample_days／sample_threshold（與策略頁同一套
   // `build_cagr_fields` 組裝規則）——allTime 專屬的整體樣本量門檻，只守
@@ -538,14 +500,22 @@ function TraderDetailInner() {
           onDdEnabledChange={setDdEnabled}
           ddPct={ddPct}
           onDdPctChange={setDdPct}
-          phase={phase}
-          error={error}
-          onCta={() => void handleCta()}
+          phase={login.phase}
+          error={login.error}
+          onCta={handleCta}
           // ⭐ R4-11 差異 1：進階模式無背書說明，沿用 `/advanced` 頁同一句
           // （`COPY.advanced.gate.body`），不另開一組重複 key。
           advancedNote={COPY.advanced.gate.body}
           disabledState={trader.follow_blocked ? { kind: "blocked", note: c.panel.followBlocked } : undefined}
         />
+        {login.pickerOpen && (
+          <WalletPicker
+            candidates={login.candidates}
+            busy={login.phase !== "idle"}
+            onPick={(conn) => void login.choose(conn)}
+            onCancel={login.cancelPicker}
+          />
+        )}
       </div>
     </main>
   );
