@@ -8,6 +8,21 @@
 
 **Tech Stack:** Next.js 15 (app router, "use client")、wagmi 2.19.5、viem 2.55.2、vitest 2 + @testing-library/react、既有 `.modal-overlay/.modal-card` 樣式。
 
+---
+
+## 狀態（2026-10-24）
+
+| 項目 | 狀態 |
+|---|---|
+| Task 1–7 實作 | ✅ 完成，commit 055d73a → 1231536 |
+| Task 8 grep 歸零／vitest／tsc／lint／build／bundle | ✅ 主線程親跑：815 測試全綠、tsc 僅基線 30 行既有錯誤、build 成功、MetaMaskSDK chunks 0 |
+| reviewer 第一輪 | 1 Critical／1 Warning／2 Suggestion → 裁決寫入 Task 9 並修正（commit f87bf6c） |
+| reviewer 第二輪 | ✅ PASS，0／0／0；用真 wagmi＋假 MetaMask／Rabby 在 headless Chromium 實跑三條路徑 |
+| Task 8 Step 3 實機煙霧（MetaMask＋Rabby 的 Chrome） | ⏳ **待使用者**：`npm run dev` 後按首頁「連接錢包」應出兩錢包選單 |
+| 部署正式機 | ⏳ 未部署；實機確認後走一般 web 部署（無快照失效、無 env 變動） |
+
+範圍外且刻意不做：手機／WalletConnect（使用者 2026-10-24 裁決暫緩）。
+
 **不動的東西：** `lib/siwe.ts`（SIWE 編排不變）、後端 `/api/auth/*`、`FollowPanel`／`NotLoggedInGateCard` 的按鈕 JSX（只換它們拿到的 `phase`/`error`/`onCta` 來源）、`wagmi.ts` 檔頭關於 barrel import 的禁令（**仍然只能 `import { injected } from "wagmi"`**，不得引入 `wagmi/connectors`）。
 
 **派工標記說明：** `@sdd` → `impl-worker`（haiku）；`@inline` → `builder`（sonnet）。每個 task 完成後主線程親跑該 task 的驗收指令。
@@ -60,7 +75,7 @@ cd /Users/jim/projects/spark/web
 - Create: `web/src/lib/walletChoice.ts`
 - Create: `web/src/lib/walletChoice.test.ts`
 
-- [ ] **Step 1: 寫失敗測試**
+- [x] **Step 1: 寫失敗測試**
 
 `web/src/lib/walletChoice.test.ts`：
 ```ts
@@ -110,12 +125,12 @@ describe("classifyLoginError", () => {
 });
 ```
 
-- [ ] **Step 2: 跑測試確認失敗**
+- [x] **Step 2: 跑測試確認失敗**
 
 Run: `npx vitest run src/lib/walletChoice.test.ts`
 Expected: FAIL，`Failed to resolve import "./walletChoice"`。
 
-- [ ] **Step 3: 實作**
+- [x] **Step 3: 實作**
 
 `web/src/lib/walletChoice.ts`：
 ```ts
@@ -175,12 +190,12 @@ export function classifyLoginError(err: unknown): LoginErrorKind {
 }
 ```
 
-- [ ] **Step 4: 跑測試確認通過**
+- [x] **Step 4: 跑測試確認通過**
 
 Run: `npx vitest run src/lib/walletChoice.test.ts`
 Expected: `9 passed`。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/lib/walletChoice.ts web/src/lib/walletChoice.test.ts
@@ -196,7 +211,7 @@ git commit -m "feat(web): walletChoice 純函式——EIP-6963 候選錢包判�
 - Modify: `web/src/lib/copy.ts:149`（ZH `login.noWallet`）、`:151` 之後新增三 key；`:2029`（EN `login.noWallet`）、`:2031` 之後新增三 key
 - Modify: `web/e2e/wallet-onboarding.spec.ts:35-36`（註解）
 
-- [ ] **Step 1: 寫失敗測試（文案）**
+- [x] **Step 1: 寫失敗測試（文案）**
 
 在 `web/src/lib/copy.test.ts` 的 `describe("i18n（Task 2：雙語 copy 基礎）"` 區塊內（第 73 行那個 `it` 之前）新增：
 ```ts
@@ -210,12 +225,12 @@ git commit -m "feat(web): walletChoice 純函式——EIP-6963 候選錢包判�
 ```
 （該檔已 import `COPY_ZH`／`COPY_EN`；若只 import 其中一個，補上另一個。）
 
-- [ ] **Step 2: 跑測試確認失敗**
+- [x] **Step 2: 跑測試確認失敗**
 
 Run: `npx vitest run src/lib/copy.test.ts`
 Expected: FAIL（`pickerTitle` undefined）。
 
-- [ ] **Step 3: 改 copy.ts**
+- [x] **Step 3: 改 copy.ts**
 
 ZH（`copy.ts:149-151`）把 `noWallet` 整行換成，並在 `loginFailed` 之後加三行：
 ```ts
@@ -236,7 +251,7 @@ EN（`copy.ts:2029-2031`）同樣：
     pickerCancel: "Cancel",
 ```
 
-- [ ] **Step 4: 改 wagmi.ts**
+- [x] **Step 4: 改 wagmi.ts**
 
 檔頭第 2 行改為：
 ```ts
@@ -248,7 +263,7 @@ EN（`copy.ts:2029-2031`）同樣：
 ```
 第 23 行 `multiInjectedProviderDiscovery: false,` 改為 `multiInjectedProviderDiscovery: true,`。其餘（含 barrel import 禁令註解、`connectors: [injected()]`）**不動**。
 
-- [ ] **Step 5: 改 e2e 註解**
+- [x] **Step 5: 改 e2e 註解**
 
 `web/e2e/wallet-onboarding.spec.ts:35-36` 改成：
 ```ts
@@ -257,12 +272,12 @@ EN（`copy.ts:2029-2031`）同樣：
  * 清單仍只有 `injected()` 後備一個、不會出現錢包選單（候選規則見 lib/walletChoice.ts）。
 ```
 
-- [ ] **Step 6: 跑測試**
+- [x] **Step 6: 跑測試**
 
 Run: `npx vitest run src/lib/copy.test.ts src/app/strategies/[slug]/enNoCjk.test.tsx src/app/settings/enNoCjk.test.tsx src/app/dashboard/enNoCjk.test.tsx src/app/onboarding/enNoCjk.test.tsx`
 Expected: 全 PASS（含「zh/en 深層 key 完全對稱」）。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add web/src/lib/wagmi.ts web/src/lib/copy.ts web/src/lib/copy.test.ts web/e2e/wallet-onboarding.spec.ts
@@ -277,7 +292,7 @@ git commit -m "feat(web): 開啟 EIP-6963 多錢包發現；noWallet 文案不�
 - Create: `web/src/components/WalletPicker.tsx`
 - Create: `web/src/components/WalletPicker.test.tsx`
 
-- [ ] **Step 1: 寫失敗測試**
+- [x] **Step 1: 寫失敗測試**
 
 `web/src/components/WalletPicker.test.tsx`：
 ```tsx
@@ -329,12 +344,12 @@ describe("WalletPicker", () => {
 });
 ```
 
-- [ ] **Step 2: 跑測試確認失敗**
+- [x] **Step 2: 跑測試確認失敗**
 
 Run: `npx vitest run src/components/WalletPicker.test.tsx`
 Expected: FAIL（模組不存在）。
 
-- [ ] **Step 3: 實作**
+- [x] **Step 3: 實作**
 
 `web/src/components/WalletPicker.tsx`：
 ```tsx
@@ -400,17 +415,17 @@ export function WalletPicker<C extends WalletConnectorLike>({ candidates, busy, 
 .wallet-picker-icon { width: 24px; height: 24px; border-radius: 6px; flex: none; }
 ```
 
-- [ ] **Step 4: 跑測試確認通過**
+- [x] **Step 4: 跑測試確認通過**
 
 Run: `npx vitest run src/components/WalletPicker.test.tsx`
 Expected: `3 passed`。（若 `getAllByRole("img")` 因 `alt=""` 被視為 presentation 而找不到：改測 `container.querySelectorAll("img")` 長度為 1，不要把 alt 改成有文字。）
 
-- [ ] **Step 5: Lint**
+- [x] **Step 5: Lint**
 
 Run: `npm run lint`
 Expected: 無 error。若 `@next/next/no-img-element` 報 warning，在該 `<img>` 上一行加 `{/* eslint-disable-next-line @next/next/no-img-element -- 錢包宣告的 data URI，不走 next/image */}`。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add web/src/components/WalletPicker.tsx web/src/components/WalletPicker.test.tsx web/src/styles/globals.css
@@ -448,7 +463,7 @@ catch → error = COPY.login[rejected|noWallet|loginFailed]  依 classifyLoginEr
 finally → phase = "idle"
 ```
 
-- [ ] **Step 1: 寫失敗測試**
+- [x] **Step 1: 寫失敗測試**
 
 `web/src/lib/useWalletLogin.test.tsx`：
 ```tsx
@@ -577,12 +592,12 @@ describe("useWalletLogin", () => {
 });
 ```
 
-- [ ] **Step 2: 跑測試確認失敗**
+- [x] **Step 2: 跑測試確認失敗**
 
 Run: `npx vitest run src/lib/useWalletLogin.test.tsx`
 Expected: FAIL（模組不存在）。
 
-- [ ] **Step 3: 實作**
+- [x] **Step 3: 實作**
 
 `web/src/lib/useWalletLogin.ts`：
 ```ts
@@ -712,17 +727,17 @@ export function useWalletLogin({ onSuccess, connectOnly = false }: UseWalletLogi
 }
 ```
 
-- [ ] **Step 4: 跑測試確認通過**
+- [x] **Step 4: 跑測試確認通過**
 
 Run: `npx vitest run src/lib/useWalletLogin.test.tsx src/lib/walletChoice.test.ts`
 Expected: 全 PASS。
 
-- [ ] **Step 5: 型別檢查**
+- [x] **Step 5: 型別檢查**
 
 Run: `npx tsc --noEmit -p tsconfig.json`
 Expected: 無 error。（`pickWalletCandidates(connectors)` 的泛型以 wagmi `Connector` 實例化，`candidates` 型別為 `Connector[]`；若 tsc 抱怨 `Connector` 缺 `icon`／`name`，確認 `WalletConnectorLike` 三欄位皆為 Connector 既有欄位——是，`icon?: string | undefined`、`name: string`、`id: string`。）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add web/src/lib/useWalletLogin.ts web/src/lib/useWalletLogin.test.tsx
@@ -737,7 +752,7 @@ git commit -m "feat(web): useWalletLogin hook——連線（含多錢包選單�
 - Modify: `web/src/components/Header.tsx:5-6,12,34,47-51,66-119`＋CTA 渲染處（檔內搜 `handleLoginCta`／`loginPhase`／`loginError` 的 JSX 使用點）
 - Modify: `web/src/components/Header.test.tsx:20-27`＋新增一個 `it`
 
-- [ ] **Step 1: 寫失敗測試**
+- [x] **Step 1: 寫失敗測試**
 
 `Header.test.tsx:20-27` 的 mock 改成可變 connectors：
 ```ts
@@ -775,12 +790,12 @@ vi.mock("wagmi", () => ({
 ```
 （`beforeEach` 已存在於 `:71`，把 `connectorsState = [{ id: "injected", name: "Injected" }];` 加進去即可。）
 
-- [ ] **Step 2: 跑測試確認新案例失敗、其餘仍綠**
+- [x] **Step 2: 跑測試確認新案例失敗、其餘仍綠**
 
 Run: `npx vitest run src/components/Header.test.tsx`
 Expected: 只有新案例 FAIL（找不到 dialog）。
 
-- [ ] **Step 3: 改 Header.tsx**
+- [x] **Step 3: 改 Header.tsx**
 
 1. 移除 import：`useAccount, useConnect, useSignMessage`（第 6 行整行刪）、`loginWithSiwe`（第 12 行刪）；`useState` 若其他地方仍用就保留，否則刪。`useQueryClient` 仍用於 handleLogout，保留。
 2. 新增 import：
@@ -818,12 +833,12 @@ Expected: 只有新案例 FAIL（找不到 dialog）。
    )}
    ```
 
-- [ ] **Step 4: 跑測試**
+- [x] **Step 4: 跑測試**
 
 Run: `npx vitest run src/components/Header.test.tsx src/app/pageStates.test.tsx`
 Expected: 全 PASS（既有案例不改仍綠：單一 injected 走直連路徑）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/components/Header.tsx web/src/components/Header.test.tsx
@@ -849,12 +864,12 @@ git commit -m "refactor(web): Header 登入 CTA 改用 useWalletLogin，支援�
 
 **各頁 onSuccess 與 CTA：**
 
-- [ ] **Step 1: advanced/page.tsx**
+- [x] **Step 1: advanced/page.tsx**
   - `const login = useWalletLogin();`（登入成功後不跳轉，頁面靠 `useMe` 重抓翻成登入態，與現行一致）。
   - `:154-160` 改 `phase={login.phase} error={login.error} onLogin={() => void login.start()}`，並在 `<NotLoggedInGateCard …/>` 之後（同一個 fragment 內）加 WalletPicker 渲染。
   - Run: `npx vitest run src/app/advanced/page.test.tsx` → PASS。
 
-- [ ] **Step 2: strategies/[slug]/page.tsx**
+- [x] **Step 2: strategies/[slug]/page.tsx**
   - 保留 `buildQuery()`。handler 改為：
     ```ts
     const login = useWalletLogin({
@@ -872,17 +887,17 @@ git commit -m "refactor(web): Header 登入 CTA 改用 useWalletLogin，支援�
   - `:336-351` `<FollowPanel … phase={login.phase} error={login.error} onCta={handleCta} …/>`，其後加 WalletPicker 渲染。
   - Run: `npx vitest run "src/app/strategies/[slug]/page.test.tsx" "src/app/strategies/[slug]/enNoCjk.test.tsx"` → PASS。
 
-- [ ] **Step 3: traders/[address]/page.tsx**
+- [x] **Step 3: traders/[address]/page.tsx**
   - 與 strategies 同形，`onSuccess` 的 push 目標照現行 `:218` 的 `buildQuery()`（內含 `advanced:${trader.address}`）。`walletAddress` 變數不再需要（hook 內部用 `useAccount`），刪除；若該檔其他地方用到 `walletAddress`，保留 `const { address: walletAddress } = useAccount();` 那一行並保留 wagmi import 的 `useAccount`。
   - `:526-543` `phase={login.phase} error={login.error} onCta={handleCta}`，其後加 WalletPicker 渲染。
   - Run: `npx vitest run "src/app/traders/[address]/page.test.tsx"` → PASS。
 
-- [ ] **Step 4: 全量＋型別**
+- [x] **Step 4: 全量＋型別**
 
 Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run lint`
 Expected: 全綠、無 type error、lint 無 error。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/app/advanced/page.tsx "web/src/app/strategies/[slug]/page.tsx" "web/src/app/traders/[address]/page.tsx"
@@ -897,7 +912,7 @@ git commit -m "refactor(web): advanced／strategies／traders 三頁登入 CTA �
 - Modify: `web/src/components/wizard/ReconnectGate.tsx`（整檔重寫，24 行）
 - 既有 onboarding 測試（`onboarding/page.test.tsx:23-28` 等三檔）mock 的是 `useConnect: () => ({ connect, connectors, isPending })`，**沒有 `connectAsync`／`useSignMessage`**。hook 會呼叫 `useSignMessage()`，mock 缺它會 throw。因此這三檔 mock 要補 `connectAsync: vi.fn()` 與 `useSignMessage: () => ({ signMessageAsync: vi.fn() })`（只補、不改既有斷言）。
 
-- [ ] **Step 1: 補三個 onboarding 測試的 mock**
+- [x] **Step 1: 補三個 onboarding 測試的 mock**
 
 `onboarding/page.test.tsx`、`onboarding/enNoCjk.test.tsx`、`onboarding/scaleClamp.test.tsx` 的 `vi.mock("wagmi", …)` 回傳物件各加：
 ```ts
@@ -906,7 +921,7 @@ git commit -m "refactor(web): advanced／strategies／traders 三頁登入 CTA �
 ```
 （既有 `useAccount` 等保留。）
 
-- [ ] **Step 2: 重寫 ReconnectGate.tsx**
+- [x] **Step 2: 重寫 ReconnectGate.tsx**
 
 ```tsx
 "use client";
@@ -949,12 +964,12 @@ export function ReconnectGate() {
 ```
 行為差異（刻意）：原本 `!injected` 時顯示 noWallet 且按鈕 disabled；現在 `injected()` 永遠在清單裡，所以 noWallet 只會在 connect 丟 `ProviderNotFoundError` 之後顯示（按下去才知道）。這與原本實際行為相同（原本 `connectors[0]` 也永遠存在，`!injected` 分支是死碼）。
 
-- [ ] **Step 3: 跑測試**
+- [x] **Step 3: 跑測試**
 
 Run: `npx vitest run src/app/onboarding`
 Expected: 全 PASS。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add web/src/components/wizard/ReconnectGate.tsx web/src/app/onboarding/page.test.tsx web/src/app/onboarding/enNoCjk.test.tsx web/src/app/onboarding/scaleClamp.test.tsx
@@ -965,7 +980,7 @@ git commit -m "refactor(web): ReconnectGate 改用 useWalletLogin(connectOnly)�
 
 ### Task 8: 收尾驗證（主線程親跑，不派工）
 
-- [ ] **Step 1: 舊路徑歸零**
+- [x] **Step 1: 舊路徑歸零**
 
 Run: `grep -rn "connectors\[0\]" src --include=*.tsx --include=*.ts | grep -v test`
 Expected: 0 行。
@@ -976,7 +991,7 @@ Expected: 只有 `src/lib/siwe.ts` 與 `src/lib/useWalletLogin.ts` 兩個檔。
 Run: `grep -rn "from \"wagmi/connectors\"" src`
 Expected: 0 行（barrel import 禁令）。
 
-- [ ] **Step 2: 全量**
+- [x] **Step 2: 全量**
 
 Run: `npm test && npx tsc --noEmit -p tsconfig.json && npm run lint && npm run build`
 Expected: 測試全綠、無 type error、lint 無 error、build 成功。build 後：
@@ -989,7 +1004,7 @@ Expected: `0`（wagmi.ts 檔頭的依賴衛生檢查，開 6963 不應把任何 
 
 `npm run dev` 後，在同時裝 MetaMask＋Rabby 的 Chrome 開首頁按「連接錢包」：應出現兩個錢包的選單（含圖示）；選一個 → 該錢包彈連線 → 簽署 → 導向。只裝一個錢包的瀏覽器：直接彈連線，無選單。這一步**不是**派工驗收條件（需真錢包），由主線程於全部 task 完成後向使用者回報「待實機確認」。
 
-- [ ] **Step 4: 派 `reviewer`**
+- [x] **Step 4: 派 `reviewer`**
 
 輸入：`git diff <開工前 commit>..HEAD -- web/`、本 plan 檔、`npm test` 輸出。重點：(1) 五處舊流程是否全部移除、行為是否等價（Header 導向邏輯、strategies/traders 的 loggedIn 直跳）；(2) 錯誤路徑有無 console 洩漏 message／signature；(3) WalletPicker 是否只在 pickerOpen 時渲染（SSR）；(4) copy ZH/EN 對稱。
 
@@ -1012,7 +1027,7 @@ Expected: `0`（wagmi.ts 檔頭的依賴衛生檢查，開 6963 不應把任何 
 - Modify: `web/src/lib/useWalletLogin.test.tsx`（新增 1 案例）
 - Modify: `web/src/components/WalletPicker.test.tsx`（新增 1 斷言）
 
-- [ ] **Step 1: 寫失敗測試**
+- [x] **Step 1: 寫失敗測試**
 
 `useWalletLogin.test.tsx` 新增（放在 describe 內最後）：
 ```tsx
@@ -1043,26 +1058,26 @@ Expected: `0`（wagmi.ts 檔頭的依賴衛生檢查，開 6963 不應把任何 
     expect(dialog).toHaveClass("wallet-picker-overlay");
 ```
 
-- [ ] **Step 2: 跑測試確認新案例失敗**
+- [x] **Step 2: 跑測試確認新案例失敗**
 
 Run: `npx vitest run src/lib/useWalletLogin.test.tsx src/components/WalletPicker.test.tsx`
 Expected: 兩個新斷言／案例 FAIL，其餘綠。
 
-- [ ] **Step 3: 改 WalletPicker.tsx**
+- [x] **Step 3: 改 WalletPicker.tsx**
 
 ```tsx
 import { createPortal } from "react-dom";
 ```
 回傳改為 `createPortal(<div className="modal-overlay wallet-picker-overlay" role="dialog" …>…</div>, document.body)`。docstring 補一段：「用 createPortal 掛到 body：Header 有 `backdrop-filter`，會成為內部 fixed 元素的定位基準，直接渲染在 Header 內 overlay 只蓋到 header 那一條（reviewer 2026-10-24 Critical）；`wallet-picker-overlay` 把 z-index 提到 100，高於 sticky header 的 90。本元件只在使用者按下 CTA 後才渲染，所以 `document` 一定存在。」
 
-- [ ] **Step 4: 改 globals.css**
+- [x] **Step 4: 改 globals.css**
 
 第 1489 行選擇器改成 `.modal-card ul.wallet-picker-list { … }`（內容不變），並在其後加一行：
 ```css
 .wallet-picker-overlay { z-index: 100; } /* 高於 .app-header 的 90 */
 ```
 
-- [ ] **Step 5: 改 useWalletLogin.ts**
+- [x] **Step 5: 改 useWalletLogin.ts**
 
 `useAccount()` 多取 `connector: currentConnector`。`start()` 改為：
 ```ts
@@ -1100,12 +1115,12 @@ import { createPortal } from "react-dom";
 ```
 依賴陣列補齊（lint 的 exhaustive-deps 會告訴你）。檔頭 docstring 補一句本裁決。
 
-- [ ] **Step 6: 跑測試＋型別＋lint**
+- [x] **Step 6: 跑測試＋型別＋lint**
 
 Run: `npx vitest run src/lib src/components/WalletPicker.test.tsx src/components/Header.test.tsx && npx tsc --noEmit -p tsconfig.json 2>&1 | grep "error TS" | cut -d'(' -f1 | sort | uniq -c && npm run lint`
 Expected: 全綠；tsc 只剩基線兩檔；lint 無新 warning。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add web/src/components/WalletPicker.tsx web/src/components/WalletPicker.test.tsx web/src/styles/globals.css web/src/lib/useWalletLogin.ts web/src/lib/useWalletLogin.test.tsx
