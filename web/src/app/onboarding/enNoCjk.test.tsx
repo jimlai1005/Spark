@@ -21,7 +21,7 @@ vi.mock("next/navigation", () => ({
 let mockWagmiAccount: { isConnected: boolean; address?: string; chainId?: number };
 vi.mock("wagmi", () => ({
   useAccount: () => mockWagmiAccount,
-  useConnect: () => ({ connect: vi.fn(), connectors: [{ id: "injected" }], isPending: false }),
+  useConnect: () => ({ connect: vi.fn(), connectAsync: vi.fn(), connectors: [{ id: "injected", name: "Injected" }], isPending: false }),
   useConnectorClient: () => ({ data: { request: vi.fn() } }),
   useSignMessage: () => ({ signMessageAsync: vi.fn() }),
 }));
