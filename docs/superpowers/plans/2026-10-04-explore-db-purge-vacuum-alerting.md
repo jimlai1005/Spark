@@ -195,6 +195,19 @@
   升級後跑 `filet_regression_check --http --ssh` 與 `systemctl list-units "filet-follower@*"` 確認三個引擎回來。
 - 取樣器 v2 與 TG 告警持續運作；`pre-purge.bak`（2.26 GB）約 2026-10-11 後可刪。
 
+## 追蹤觀察（2026-10-24，維護窗後 20 天）
+
+- **穩定**：10-07→10-24 逐日 IO PSI avg300 0.2–0.8%（單日峰值最高 12.5）、load1 日均 0.14–0.20、available 最低 814 MB（10-16）、
+  499 共 11 次／5xx 共 1 次（17 天）；purge 每日 48 輪、14 天 0 失敗、鎖持有 0.16–1.5 s；`filet-api` 自 10-04 18:49 起 0 重啟；告警 cron 0 錯誤、無任何條件成立。
+- **explore.db 檔案 1,740 MB 持平（17 天 −3 MB），但 freelist 長到 325,972 頁（1,273 MB）**，活資料只剩 ~467 MB（10-07 約 1.25 GB）。
+  原因是 HFT 過濾器退池＋purge 把大量成交列刪掉，而 `incremental_vacuum(4000)` **沒有把 freelist 吃掉**（90 秒內僅 −1 頁、page_count 17 天僅 −831 頁）——
+  **我 10-05 說「約 9 小時吃完」是錯的**。影響：空頁不會被讀取，不影響 IO／page cache（PSI 證實）；只多占 1.27 GB 磁碟（可用 41 GB）與備份體積。
+  根因未查；若要收回空間：維護窗內 `explore_offline_maintenance.py --vacuum`（api 停約 3 分鐘，前次 VACUUM 430 s 含 2.26 GB）。**優先序低，非必要。**
+- `stale_no_job` 132 位址是 HFT 冷卻列（`hft_reason='fills'`、`hft_until` 30 天），**刻意保留**，不是 purge 漏刪（>30 天者 0）。
+- 取樣器 WAL 自 10-13 起固定 275 MB（高水位，不是成長）。
+- 主機仍 1.9 GB／2 核，**4 GB 升級尚未做**；`reboot-required`（kernel／libc6／libssl，自 10-01）已掛 23 天；follower 現為 **4 個**
+  （10-11 新增 `fd149b…`），swap 高水位 339 → ~590 MB（緩升，約每個 follower +45 MB）。
+
 ## 時程（UTC／台北）
 
 | 時間 | 事 |
