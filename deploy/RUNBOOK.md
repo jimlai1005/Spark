@@ -3921,5 +3921,5 @@ sitemap 10 條全為 trade.filet.app → **回歸 67/67 PASS**；§4.2 範例已
 對外驗證（本機 curl）：`/ /strategies /explore /advanced /sitemap.xml` 200；CSS `68fe2d7e0a5394a2.css` 含 `wallet-picker-overlay{z-index:100}`、
 chunk `6005-b5960de8c4ff65f7.js` 含新文案。正式機內 curl 自己的公開網域回 000（hairpin NAT），對外驗證只能從外面打。
 本次對外影響：兩次 restart dashboard 各約 2 秒 502 空窗。回歸第 2、3 層未跑（無後端與簽章流程改動）。
-**待使用者**：在裝了 MetaMask＋Rabby 的 Chrome 開 https://trade.filet.app/ 按「連接錢包」確認選單。
+使用者於 2026-10-25 在裝了 MetaMask＋Rabby 的 Chrome 開 https://trade.filet.app/ 實機確認選單與登入正常，本次部署結案。
 回滾＝§9.3 回 964b471 的 `web/`（`git checkout 964b471 -- web/` 後重跑 §4.2＋restart dashboard）；後端無變動不需回滾。
