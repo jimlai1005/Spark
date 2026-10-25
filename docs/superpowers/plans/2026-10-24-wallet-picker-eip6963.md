@@ -18,8 +18,8 @@
 | Task 8 grep 歸零／vitest／tsc／lint／build／bundle | ✅ 主線程親跑：815 測試全綠、tsc 僅基線 30 行既有錯誤、build 成功、MetaMaskSDK chunks 0 |
 | reviewer 第一輪 | 1 Critical／1 Warning／2 Suggestion → 裁決寫入 Task 9 並修正（commit f87bf6c） |
 | reviewer 第二輪 | ✅ PASS，0／0／0；用真 wagmi＋假 MetaMask／Rabby 在 headless Chromium 實跑三條路徑 |
-| Task 8 Step 3 實機煙霧（MetaMask＋Rabby 的 Chrome） | ⏳ **待使用者**：`npm run dev` 後按首頁「連接錢包」應出兩錢包選單 |
-| 部署正式機 | ⏳ 未部署；實機確認後走一般 web 部署（無快照失效、無 env 變動） |
+| Task 8 Step 3 實機煙霧（MetaMask＋Rabby 的 Chrome） | ⏳ 使用者裁決改在正式站驗（本機不好測）：開 https://trade.filet.app/ 按「連接錢包」應出兩錢包選單 |
+| 部署正式機 | ✅ 2026-10-25 05:24Z 部署 f035faf（純前端：rsync＋build＋restart filet-dashboard；api／follower 未動）；回歸 67/67 PASS。RUNBOOK 附錄 B 有記錄。 |
 
 範圍外且刻意不做：手機／WalletConnect（使用者 2026-10-24 裁決暫緩）。
 

@@ -364,8 +364,11 @@ npm ci    # 需要已 commit 的 package-lock.json；若尚無 lock 檔，改用
 
 # ⭐ 2026-08-29 改版起：canonical / OG / sitemap 的對外主機名由 build 期環境變數
 # 注入（NEXT_PUBLIC_* 是「烤進 bundle」的值，改它必須重 build，改 systemd env 無效）。
-# 未設定時預設 https://app.filet.trade（web/src/lib/siteOrigin.ts）。換網域時：
-export NEXT_PUBLIC_SITE_ORIGIN="https://app.filet.trade"
+# 未設定時預設 https://app.filet.trade（web/src/lib/siteOrigin.ts）——那是**佔位值，沒有 DNS**。
+# ⚠️ 2026-10-25 親踩：照抄下面這行舊範例（當時寫的是佔位值）會把錯的 canonical/OG/sitemap
+# 烤進 bundle，回歸第 4 層「sitemap.xml host 與 HOST 一致」會紅。正式網域是 trade.filet.app
+# （nginx server_name 與 certbot 憑證皆為它），每次 build 一律帶這個值：
+export NEXT_PUBLIC_SITE_ORIGIN="https://trade.filet.app"
 npm run build   # 驗收：`.next/` 產出，無 build error
 ```
 
@@ -3901,3 +3904,22 @@ log `/tmp/explore-maint-202610041312.log`）；我 13:12:29Z `restart filet-dash
 ⚠️ **待 spark-b6 處理**：`/tmp/spark-sync` 於 11:55Z stage，`app.py`（52f3bd68）／`copy.ts`（690e4cef）是**修法前版本**——第二段 rsync 前必須
 從 ≥ `690f678` 重新 stage，否則本次修法被靜默蓋回。`filet_regression_check --http --ssh` 在維護旗標下必 FAIL（503／405），維護窗結束後重跑。
 回滾＝裝回 `/tmp/*.bak-202610041309` 兩檔→restart api→重 build→restart dashboard（或 §9.3 回 b9733c0）。
+
+**2026-10-25 部署（commit `f035faf`，05:13–05:24 UTC，EIP-6963 多錢包選單；純前端 over 964b471）：** plan
+`docs/superpowers/plans/2026-10-24-wallet-picker-eip6963.md`（Task 1–9；reviewer 兩輪，第二輪 PASS 0/0/0；vitest 815 綠）。
+內容：wagmi `multiInjectedProviderDiscovery: true`、五處連線登入收斂成 `lib/useWalletLogin`＋`lib/walletChoice`＋`components/WalletPicker`、
+noWallet 文案改點名 MetaMask／Rabby。964b471..f035faf 只動 `web/`、docs、RUNBOOK、一個 Python 測試檔——無 `src/`、無 pyproject、
+`package-lock` md5 與正式機相同 → 不 `uv sync`、不 `npm ci`、**不重啟 filet-api**。
+前置三查全乾淨（無維護旗標、無 `/tmp/spark-sync`、`systemctl --failed` 空；unit 自 10-04 未動；三個 spark peer session 皆 idle；
+05:00Z 的 sudo 是 explore-obs cron）。來源＝`git push` 後從 origin/main `f035faf` 開的乾淨 worktree（工作樹另有兩個別人的未追蹤 research 檔，刻意不帶）。
+流程：§3.2 兩段 rsync（`diff -rq` 31 行差異全在預期檔案）→ chown root（prune var）→ §4.2 build **1m41s** → chown root → restart `filet-dashboard`
+（05:18:05Z，**2 秒**回 200；api 全程 active）→ `DEPLOYED_VERSION`。
+⚠️ **第一次回歸 66/67**：唯一紅的是「sitemap.xml host 與 HOST 一致」——我照 §4.2 當時的範例 `NEXT_PUBLIC_SITE_ORIGIN=https://app.filet.trade`
+烤 bundle，但那是程式碼佔位預設值、**沒有 DNS**；正式網域是 `trade.filet.app`（nginx server_name／certbot）。部署前正式機的 964b471 bundle
+sitemap 也是佔位值，屬既有錯誤。05:20Z 以 `https://trade.filet.app` 重 build（14 s 命中 cache）→ restart dashboard（05:21:59Z，2 秒）→
+sitemap 10 條全為 trade.filet.app → **回歸 67/67 PASS**；§4.2 範例已改成正式網域並加警告。
+對外驗證（本機 curl）：`/ /strategies /explore /advanced /sitemap.xml` 200；CSS `68fe2d7e0a5394a2.css` 含 `wallet-picker-overlay{z-index:100}`、
+chunk `6005-b5960de8c4ff65f7.js` 含新文案。正式機內 curl 自己的公開網域回 000（hairpin NAT），對外驗證只能從外面打。
+本次對外影響：兩次 restart dashboard 各約 2 秒 502 空窗。回歸第 2、3 層未跑（無後端與簽章流程改動）。
+**待使用者**：在裝了 MetaMask＋Rabby 的 Chrome 開 https://trade.filet.app/ 按「連接錢包」確認選單。
+回滾＝§9.3 回 964b471 的 `web/`（`git checkout 964b471 -- web/` 後重跑 §4.2＋restart dashboard）；後端無變動不需回滾。
