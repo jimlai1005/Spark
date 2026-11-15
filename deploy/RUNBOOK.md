@@ -3923,3 +3923,23 @@ chunk `6005-b5960de8c4ff65f7.js` 含新文案。正式機內 curl 自己的公�
 本次對外影響：兩次 restart dashboard 各約 2 秒 502 空窗。回歸第 2、3 層未跑（無後端與簽章流程改動）。
 使用者於 2026-10-25 在裝了 MetaMask＋Rabby 的 Chrome 開 https://trade.filet.app/ 實機確認選單與登入正常，本次部署結案。
 回滾＝§9.3 回 964b471 的 `web/`（`git checkout 964b471 -- web/` 後重跑 §4.2＋restart dashboard）；後端無變動不需回滾。
+
+**2026-11-15 白名單變更（03:05:00 UTC，Filet Alpha 改指 `0xf97a…ddd1`；只改正式機 `leaders.json` 一個檔，無程式碼部署、無重啟）：** plan
+`docs/superpowers/plans/2026-11-15-filet-alpha-leader-swap.md`。使用者裁決：只換展示與新客戶入口，既有 follower 不動。
+內容：精選白名單由兩筆改三筆——`Filet Alpha`（slug `alpha`、featured）位址由 `0xfb9c…9760` 改為
+`0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1`，description 改「Filet 精選訊號（mainnet）。正常營運中，開放新客戶。」；舊位址保留為
+`Filet Alpha (Legacy)`（slug `alpha-legacy`、`enabled: true`、`accepting_new: false`、非 featured）；Ultron 逐位元不變。
+前置三查乾淨（無維護旗標、無 `/tmp/spark-sync`、`systemctl --failed` 空；近 3 小時 sudo 只有 explore-obs cron 與本 session）。
+安裝前以正式機程式驗證候選檔 9/9 PASS：`merge_leaders` 後 `is_still_permitted(舊)` True（三個 follower 不被收尾）、`is_selectable(舊)` False、
+`is_selectable(新)` True、Ultron 兩述詞不變、其餘 registry 位址 permitted 狀態零變化。安裝＝同目錄 `leaders.json.tmp`（root:root 644）→ `mv`
+（rename，不會被讀到半份）。sha256 舊 `4a5becda…`、新 `b5a8f012…`。
+驗證：`/api/public/strategies` 回 `alpha`→新位址（featured、running、follower_count 0）、`alpha-legacy`→舊位址（paused、follower_count 3）、
+`ultron` 不變；三個詳情端點 200；瀏覽器實看首頁主推卡 leader 連結為新位址、`/strategies` 三張卡（Legacy 顯示「暫不開放新跟單」）。
+安裝後 7 分鐘三個 follower（`f438b3…`／`f6b3e7…`／`fd149b…`）仍 `active (running)`、`NRestarts` 與啟動時間戳不變、心跳持續更新且 leader 仍為舊位址、
+`killswitch_tripped` False、journal 零訊息；`filet_regression_check --http --ssh` **67/67 PASS**。
+⚠️ 已知且使用者接受的兩點：(1) 新位址策略卡數字（總報酬約 +3800%、年化波動約 638%、單日最佳 +290%）疑含早期小權益／入金放大，公式未修；
+(2) 新位址是 HL `unifiedAccount`，引擎以 perp accountValue 當 leader 權益，新 follower 的鏡射槓桿約為 leader 實際槓桿的 1.8 倍，
+`max_target_leverage` 預設不設上限——引擎未修。
+未改：repo 內三處預設 leader（`copytrade/config.py`、`filet/leaderboard.py`、`scripts/copytrade_daily_report.py`，日報仍需以舊位址對帳）、推薦碼 `FILET`。
+回退＝`sudo cp -p /opt/filet/spark/var/filet/leaders.json.bak-20261115-alpha-swap /opt/filet/spark/var/filet/leaders.json.tmp &&
+sudo mv /opt/filet/spark/var/filet/leaders.json.tmp /opt/filet/spark/var/filet/leaders.json`（不需重啟）。
