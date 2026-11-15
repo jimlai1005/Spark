@@ -909,7 +909,7 @@ export const COPY_ZH = {
     evidence: {
       routedVolumeLabel: "累計路由交易量",
       routedVolumeLink: "hyperliquid explorer ↗",
-      liveDaysLabel: "自營策略連續實盤",
+      liveDaysLabel: "精選策略連續實盤",
       liveDaysSuffix: " 天",
       liveDaysLink: "leader 帳戶 ↗",
       builderFeeLabel: "Builder fee（每筆成交）",
@@ -2652,7 +2652,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     evidence: {
       routedVolumeLabel: "Total routed volume",
       routedVolumeLink: "hyperliquid explorer ↗",
-      liveDaysLabel: "Consecutive days live (in-house strategy)",
+      liveDaysLabel: "Consecutive days live (featured strategy)",
       liveDaysSuffix: " days",
       liveDaysLink: "leader account ↗",
       builderFeeLabel: "Builder fee (per fill)",
