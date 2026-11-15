@@ -3943,3 +3943,20 @@ chunk `6005-b5960de8c4ff65f7.js` 含新文案。正式機內 curl 自己的公�
 未改：repo 內三處預設 leader（`copytrade/config.py`、`filet/leaderboard.py`、`scripts/copytrade_daily_report.py`，日報仍需以舊位址對帳）、推薦碼 `FILET`。
 回退＝`sudo cp -p /opt/filet/spark/var/filet/leaders.json.bak-20261115-alpha-swap /opt/filet/spark/var/filet/leaders.json.tmp &&
 sudo mv /opt/filet/spark/var/filet/leaders.json.tmp /opt/filet/spark/var/filet/leaders.json`（不需重啟）。
+
+**2026-11-15 部署（commit `bbfe266`，03:24–03:28 UTC，純前端 over f035faf；首頁證據列文案）：** 使用者指示：Filet Alpha 已改指非自營位址，
+首頁「自營策略連續實盤」改「精選策略連續實盤」（EN `in-house strategy` → `featured strategy`），只動 `web/src/lib/copy.ts` 兩行；vitest 815 綠。
+f035faf..bbfe266 只有 docs、RUNBOOK 與這一檔——`package-lock`／`pyproject` md5 與正式機相同 → 不 `npm ci`、不 `uv sync`、不重啟 filet-api。
+前置查：無維護旗標、無 `/tmp/spark-sync`、`systemctl --failed` 空、peer session spark-a2 idle、近 15 分鐘 sudo 只有 cron 與本 session。
+來源＝本機 `bbfe266` 的乾淨 worktree（**尚未 push**）。§3.2 兩段 rsync（`diff -rq` 只有 RUNBOOK、兩份 plan、`copy.ts`）→ chown root（prune var）→ §4.2 build。
+⚠️⚠️ **事故（我方造成，約 03:25–03:28Z，約 3 分鐘）**：第一次 `npm run build` 在 `next/font` 抓 Google Fonts（JetBrains Mono）時失敗
+（`TypeError: Cannot read properties of null (reading '1')`，`loader.js:122`；隨後 curl 同一 URL 回 200，判定為暫時性）。`next build` 一開始就清掉舊
+`.next`（`BUILD_ID` 消失），仍在跑的 `next start` 頁面 HTML 回 200，但舊 hash 的 JS／CSS 全回 **400**——對外頁面無樣式、無互動。立即重跑 build
+（65 s 成功）→ restart `filet-dashboard`（03:27:59Z，2 秒回 200）→ 首頁 18 個靜態資源全 200。
+**判準**：(1) 現行流程在「build 開始 → restart」之間，舊 chunk 本來就不存在（正常約 1–2 分鐘、資源 400），build 失敗會把這段拉長到修好為止——
+build 失敗時**先重跑 build，不要先查原因**；(2) 結構性修法（未做，待裁決）＝在另一個目錄 build 成功後再原子換入 `.next`，或字型改自架（`next/font/local`）
+拿掉 build 期對 Google 的網路依賴。
+驗證：`/ /strategies /strategies/alpha /strategies/alpha-legacy /explore /advanced /sitemap.xml` 200；對外 chunk 含新文案 1 個、舊文案 0 個；
+sitemap 10 條皆 `trade.filet.app`；瀏覽器實看首頁證據列為「精選策略連續實盤」；三個 follower 未動（心跳持續、leader 仍舊位址）；
+`leaders.json` sha 仍 `b5a8f012…`（`var` 未被 rsync 碰到）；`DEPLOYED_VERSION`=`bbfe266`；`filet_regression_check --http --ssh` **67/67 PASS**。
+回滾＝§9.3 回 f035faf 的 `web/`（重跑 §4.2＋restart dashboard）；後端無變動。
