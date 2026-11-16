@@ -172,7 +172,7 @@ export const COPY_ZH = {
     step1Eyebrow: "已選擇策略",
     step1Back: "返回改選",
     step1AdvancedLabel: "進階模式（無背書）",
-    step1AdvancedBody: "此位址不在 Filet 精選清單內，未經任何盡職審查或背書——請自行評估風險後再繼續。",
+    step1AdvancedBody: "Filet 上所有可跟單的位址（包含精選策略）皆未經任何盡職審查或背書。請務必自行研究（DYOR）、評估風險後再繼續。",
     step1NotFound: "找不到這個策略——它可能已下架或網址有誤，請回到策略列表重新選擇。",
     // ---- step 2：連接與授權（StepSign 簽署＋StepDeposit 入金檢查合併於此步） ----
     step2Title: "連接與授權",
@@ -753,8 +753,8 @@ export const COPY_ZH = {
     gate: {
       title: "在你開始之前",
       body:
-        "進階模式下，Filet 不對此位址的策略品質、風控或存續做任何背書——"
-        + "你貼上的位址未經平台額外審核，是否值得跟隨由你自行判斷。",
+        "Filet 上所有可跟單的位址（包含精選策略）皆未經任何盡職審查或背書，你貼上的位址也一樣——"
+        + "Filet 不對此位址的策略品質、風控或存續做任何背書。請務必自行研究（DYOR），是否值得跟隨由你自行判斷。",
       checkboxLabel: "我理解 Filet 不對此地址的策略品質、風控或存續做任何背書。",
     },
     /**
@@ -786,8 +786,8 @@ export const COPY_ZH = {
     custom: {
       title: "跟單對象",
       subtitle:
-        "貼上任意錢包位址即可跟單。貼上的位址未經平台額外審核，"
-        + "是否值得跟隨由你自行判斷。",
+        "貼上任意錢包位址即可跟單。Filet 上所有可跟單的位址皆未經盡職審查或背書，"
+        + "請自行研究（DYOR），是否值得跟隨由你自行判斷。",
       leaderboardLabel: "研究對象可參考 Hyperliquid 官方排行榜（外部連結，另開新分頁）：",
       leaderboardLinkText: "app.hyperliquid.xyz/leaderboard",
       inputLabel: "leader 錢包位址",
@@ -2050,8 +2050,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     step1Eyebrow: "Strategy selected",
     step1Back: "Change selection",
     step1AdvancedLabel: "Advanced mode (unendorsed)",
-    step1AdvancedBody: "This address is not on Filet's curated list and has not undergone any due diligence or endorsement "
-      + "— please assess the risk yourself before continuing.",
+    step1AdvancedBody: "No address available for copy trading on Filet — curated strategies included — has undergone "
+      + "any due diligence or endorsement. Do your own research (DYOR) and assess the risk before continuing.",
     step1NotFound: "This strategy could not be found — it may have been delisted, or the link is incorrect. Please go "
       + "back to the strategy list and pick again.",
     step2Title: "Connect & authorize",
@@ -2549,8 +2549,9 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       + "proportionally. We recommend stopping copy trading before making a large adjustment.",
     gate: {
       title: "Before you continue",
-      body: "In advanced mode, Filet makes no endorsement of this address's strategy quality, risk controls, or "
-        + "continuity — the address you paste receives no additional platform vetting, and whether it's worth "
+      body: "No address available for copy trading on Filet — curated strategies included — has undergone any due "
+        + "diligence or endorsement, and the address you paste is no exception: Filet makes no endorsement of its "
+        + "strategy quality, risk controls, or continuity. Do your own research (DYOR) — whether it's worth "
         + "following is your own judgment.",
       checkboxLabel: "I understand Filet makes no endorsement of this address's strategy quality, risk controls, "
         + "or continuity.",
@@ -2569,8 +2570,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       + "bound, not your expected return. Copy trading carries risk of loss.",
     custom: {
       title: "Who to follow",
-      subtitle: "Paste any wallet address to start copy trading. Pasted addresses receive no additional platform "
-        + "vetting — whether it's worth following is your own judgment.",
+      subtitle: "Paste any wallet address to start copy trading. No address on Filet has undergone due diligence "
+        + "or endorsement — do your own research (DYOR); whether it's worth following is your own judgment.",
       leaderboardLabel: "For research, you can refer to Hyperliquid's official leaderboard (external link, opens "
         + "in a new tab):",
       leaderboardLinkText: "app.hyperliquid.xyz/leaderboard",
