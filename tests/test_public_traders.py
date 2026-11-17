@@ -75,14 +75,18 @@ def test_not_whitelisted_address_still_returns_200(tmp_path):
 
     ⭐ M3 round4 Task R4-2：`initial_deposit_usd` 改由
     `hl.non_funding_ledger_updates()`（真實 deposit 加總）供給，不再是
-    `accountValueHistory` 首點；`start_equity_usd`／`end_equity_usd` 為新增欄位。"""
+    `accountValueHistory` 首點；`start_equity_usd`／`end_equity_usd` 為新增欄位。
+
+    2026-11-16（plan strategy-return-hl-roi D1／D4）：`initial_deposit_usd` 改為
+    allTime 的 ROI 分母 D = max(100, 1000 + 0) = 1000（ΔAV=200=ΔP → ΔF=0），不再是
+    ledger 入金加總；ledger 內放 99999.0 證明它被忽略。ROI = 200/1000 → "20.00"。"""
     cfg = make_cfg(tmp_path)  # 空白名單
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
     hl.portfolios[_A] = sixty_day_rows()
     hl.clearinghouse[_A] = {"marginSummary": {"accountValue": "5000.00"},
                             "assetPositions": []}
     hl.ledger_updates[_A] = [{"time": 0, "hash": "0x1",
-                              "delta": {"type": "deposit", "usdc": "1000.0"}}]
+                              "delta": {"type": "deposit", "usdc": "99999.0"}}]
     r = _client(app).get(f"/api/public/traders/{_A}")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -95,24 +99,25 @@ def test_not_whitelisted_address_still_returns_200(tmp_path):
     assert set(body["windows"]) == {"day", "week", "month", "allTime"}
     assert body["windows"]["allTime"]["pnl_usd"] == 200.0
     meth = body["methodology"]
-    assert meth["initial_deposit_usd"] == "1000.0"   # 真實 ledger deposit 加總
+    assert meth["initial_deposit_usd"] == "1000"     # ROI 分母（非 ledger 的 99999.0）
     assert meth["start_equity_usd"] == "1000"        # av[0]（同一次 portfolio 回應）
     assert meth["end_equity_usd"] == "1200"          # av[-1]
     assert set(meth) == {"initial_deposit_usd", "start_equity_usd", "end_equity_usd",
                          "basis", "updated_at", "mdd_note"}
 
 
-def test_ledger_deposit_failure_degrades_to_null_not_503(tmp_path):
-    """真實入金查詢（`hl.non_funding_ledger_updates`）上游失敗，是與 portfolio／
-    account_value 都不同的第三個來源（工程原則 1）——它失敗只降級
-    `initial_deposit_usd`，equity/metrics/account_value 照樣可用。"""
+def test_ledger_failure_does_not_affect_methodology_not_503(tmp_path):
+    """真實入金查詢（`hl.non_funding_ledger_updates`）是與 portfolio／account_value
+    都不同的第三個來源（工程原則 1）——它失敗不拖累整頁。2026-11-16（plan
+    strategy-return-hl-roi D4）起 `methodology.initial_deposit_usd` 是 ROI 分母
+    （來自 portfolio perf），不再依賴 ledger：ledger 失敗時照樣是 "1000"。"""
     app, cfg2, store, keysvc, hl = make_app(tmp_path)
     hl.portfolios[_A] = sixty_day_rows()
     hl.ledger_updates_error[_A] = ConnectionError("hl 5xx")
     r = _client(app).get(f"/api/public/traders/{_A}")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["methodology"]["initial_deposit_usd"] is None
+    assert body["methodology"]["initial_deposit_usd"] == "1000"
     assert body["methodology"]["start_equity_usd"] == "1000"
     assert body["windows"]["allTime"]["pnl_usd"] == 200.0
 
@@ -838,7 +843,9 @@ def test_pool_local_path_missing_state_ledger_sync_enqueues_three_jobs(tmp_path)
     body = r.json()
     assert hl.portfolio_calls == 0
     assert body["account_value"] is None
-    assert body["methodology"]["initial_deposit_usd"] is None
+    # 2026-11-16（D4）：ROI 分母來自池內 portfolio 快取的 perf（sixty_day_rows → 1000），
+    # 與 ledger 快取是否存在無關。
+    assert body["methodology"]["initial_deposit_usd"] == "1000"
     assert body["fills_coverage"]["state"] == "backfilling"
     assert body["refreshing"] is True
 

@@ -47,9 +47,11 @@ _FLOWS_60D = [(0, "1000", "0"), (20, "1100", "100"),
               (40, "2100", "100"), (60, "2310", "310")]
 
 # --- 手算基準 B：入金讓 AV 單調上升，但 I_t 下降（幻影回撤的反向） ----------
-# 區間 1: ΔP=-100, ΔAV=1900 → ΔF=2000（入金） r=-100/1000  = -0.1 → I=0.9
-# 區間 2: ΔP=-290, ΔAV=2610 → ΔF=2900（入金） r=-290/2900  = -0.1 → I=0.81
-# AV 序列 1000→2900→5510 **嚴格遞增** → AV 基準的 MDD 必為 0；I_t 基準為 0.19。
+# 2026-11-16（plan strategy-return-hl-roi §1.1）：分母改為 AV(t−1) + max(ΔF, 0)。
+# 區間 1: ΔP=-100, ΔAV=1900 → ΔF=2000（入金） r=-100/(1000+2000) = -1/30 → I=29/30=0.966667
+# 區間 2: ΔP=-290, ΔAV=2610 → ΔF=2900（入金） r=-290/(2900+2900) = -0.05 → I=29/30×0.95=0.918333
+# （舊公式分母只有 AV(t−1)：r=-0.1、-0.1 → I=0.9、0.81，入金被當成分母偏小而放大虧損。）
+# AV 序列 1000→2900→5510 **嚴格遞增** → AV 基準的 MDD 必為 0；I_t 基準為 1−0.918333=0.081667。
 _MASKED_LOSS_40D = [(0, "1000", "0"), (20, "2900", "-100"), (40, "5510", "-390")]
 
 
@@ -78,9 +80,11 @@ def test_mdd_is_computed_on_equity_index_not_account_value():
     改成算在 accountValue 上 → AV 嚴格遞增 → MDD 變 0 → 本測試轉紅。
     """
     r = compute_window_performance(rows(_MASKED_LOSS_40D), "perpMonth")
-    assert list(r["equity_index"]) == [Decimal("1"), Decimal("0.9"), Decimal("0.81")]
-    assert r["max_drawdown"] == Decimal("0.19")   # (1 − 0.81) / 1
-    assert r["twr"] == Decimal("-0.19")
+    q = Decimal("0.0000000001")   # 手算值 29/30、551/600 為無限小數 → 比到 10 位
+    assert [x.quantize(q) for x in r["equity_index"]] == [
+        Decimal("1"), Decimal("0.9666666667"), Decimal("0.9183333333")]
+    assert r["max_drawdown"].quantize(q) == Decimal("0.0816666667")   # (1 − 551/600) / 1
+    assert r["twr"].quantize(q) == Decimal("-0.0816666667")
     # 這一組資料的 AV 是嚴格遞增的，所以 AV 基準的 MDD 恆為 0——
     # 斷言「不等於 0」正是在釘住「用錯基準會發生什麼」。
     assert r["max_drawdown"] != Decimal("0")
@@ -300,8 +304,12 @@ def _portfolio(period, av, pnl):
 
 
 def test_flow_dominated_interval_marks_window_insufficient():
-    # 前值 1000，同一區間入金 5000 且虧 1500：r = -1500/1000 = -1.5 <= -1 → 整窗無效
-    rows = _portfolio("month", av=[1000, 4500, 4600], pnl=[0, -1500, -1400])
+    # 2026-11-16（D2）：分母含該段淨流入後，「入金＋虧損同區間」不再讓 r < -1
+    # （舊情境 av=[1000,4500,4600]：r = -1500/(1000+5000) = -0.25，整窗有效；見
+    # tests/test_leader_perf_roi.py A1）。r < -1 化簡後 ⇔ AV_t < 0（淨值為負的壞資料），
+    # 閘門保留作縱深防禦：前值 1000、淨值掉到 -500、損益 -1500、ΔF=0：
+    # r = -1500/1000 = -1.5 <= -1 → 整窗無效
+    rows = _portfolio("month", av=[1000, -500, -400], pnl=[0, -1500, -1400])
     perf = compute_window_performance(rows, "month")
     assert perf["status"] == STATUS_INSUFFICIENT
     assert perf["reason"] == "flow_dominated_interval"

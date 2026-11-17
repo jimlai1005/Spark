@@ -16,11 +16,14 @@
  * 不再重算年化外推（見 `lib/strategyMetrics.ts` 檔頭，工程原則 1：同一個值
  * 只能有一個計算來源）。⭐ M3 round4 Task R4-8（2026-08-31 使用者裁決）：
  * 「起訖淨值」改與淨值曲線同一基準——`initial_deposit_usd` × `equity_index`
- * 首尾比值（TWR 等效淨值，見 `strategyMetrics.ts` 檔頭：`equity_index` 首點
- * 恆為 1，與曾造成樣本不足誤判的 `accountValueHistory` 不同源）。
+ * 首尾比值（見 `strategyMetrics.ts` 檔頭：`equity_index` 首點恆為 1，與曾造成
+ * 樣本不足誤判的 `accountValueHistory` 不同源）。⭐ 2026-11-16（plan
+ * strategy-return-hl-roi D1／D4）：兩者語意改為 ROI 基準——`initial_deposit_usd`
+ * ＝ROI 分母（投入本金）、`equity_index`＝`1 + 累計損益 ÷ 投入本金`，起訖淨值
+ * 即「投入本金 → 投入本金加累計損益」，算式不變。
  *
- * ⭐ Task 7（R2-P0）指標收斂：8 張指標卡中只有總報酬／策略期間回撤／日勝率／
- * 最佳最差日維持個別小卡；Sharpe／Sortino／年化波動／起訖淨值在
+ * ⭐ Task 7（R2-P0）指標收斂：8 張指標卡中只有總報酬／策略期間回撤／區間勝率／
+ * 最佳最差單期維持個別小卡；Sharpe／Sortino／年化波動／起訖淨值在
  * `sample_days < sample_threshold` 時摺成一行文字，不逐格判斷（版面以整體
  * 門檻為準）——避免「8 格中 5 格是樣本不足、佔兩屏高度」（design R2 issue）。
  */
@@ -135,9 +138,10 @@ export default function StrategyDetailPage() {
   );
   const sampleInsufficient = strategy.sample_days < strategy.sample_threshold;
 
-  // ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／日勝率三張
-  // （plan Task 7 第 1 條＋設計稿 R2 P0 原文「大字只留總報酬、最大回撤、日勝率」）。
-  // Sharpe／Sortino／年化波動／起訖淨值／最佳最差日只在 `sampleInsufficient`
+  // ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／區間勝率三張
+  // （plan Task 7 第 1 條＋設計稿 R2 P0 原文「大字只留總報酬、最大回撤、日勝率」；
+  // 2026-11-16 起「日勝率」改稱「區間勝率」，見 plan strategy-return-hl-roi D7）。
+  // Sharpe／Sortino／年化波動／起訖淨值／最佳最差單期只在 `sampleInsufficient`
   // 為 false 時才併入同一個 metric-grid；為 true 時整組摺成下方一行文字
   // （不逐格判斷，見檔頭）。
   const headlineCards: MetricCardDef[] = [

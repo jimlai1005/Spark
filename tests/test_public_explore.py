@@ -951,15 +951,16 @@ def test_index_starts_with_no_rows_version_before_first_build():
     assert index._rows_version is None
 
 
-def test_snapshot_version_bumped_to_5():
+def test_snapshot_version_bumped_to_6():
     """D7（2026-09-04）3；Task 4.1（2026-09-20）3→4；2026-09-30 plan
     `leader-truth-and-liq-risk` Task 5 4→5：`ExploreRow` 新增
     `liq_distance_pct`／`liq_coin`／`maint_ratio` 三欄（leader 爆倉風險摘要）
     ——`load_snapshot` 對 v3 快照有專門的相容遷移路徑（見
     `test_snapshot_load_version_mismatch_returns_none` 旁的 v3 測試），v4
     快照則直接視為不相容（見 `EXPLORE_INDEX_VERSION` 旁註記），本測試只釘住
-    目前版號本身。"""
-    assert hl_explore.EXPLORE_INDEX_VERSION == 5
+    目前版號本身。2026-11-16 5→6（plan `strategy-return-hl-roi` D2）：`max_dd_pct`
+    數值語意改變（分段報酬分母含淨流入），v5 快照同樣直接視為不相容。"""
+    assert hl_explore.EXPLORE_INDEX_VERSION == 6
 
 
 # ============================================================

@@ -95,6 +95,9 @@ const EMPTY_METRICS: PublicStrategyMetrics = {
 export interface PublicStrategyMethodology {
   start_date: string | null;
   end_date: string | null;
+  /** 2026-11-16（plan strategy-return-hl-roi D1／D4／D7）：鍵名不變，語意改為
+   * **ROI 分母**＝max(100, 起始淨值＋期間最大累計淨入金)（投入本金），不再是 ledger
+   * 入金加總。`equity_index` 為以它為基準的 ROI 指數（首值 1）。 */
   initial_deposit_usd: string | null;
   /** M3 round4 Task R4-2：`accountValueHistory` 首個非零值（前導 0 點跳過）。
    * 與 `end_equity_usd` 同源同一次 `hl.portfolio()` 回應。 */
@@ -103,6 +106,11 @@ export interface PublicStrategyMethodology {
   end_equity_usd: string | null;
   sample_count: number | null;
   annualization_days: number;
+  /** 2026-11-16：比率指標年化用的每年取樣期數（平均取樣間隔推得）。僅策略詳情
+   * 端點供給；舊後端／交易員端點缺席。 */
+  periods_per_year?: string | null;
+  /** 2026-11-16：總報酬口徑，目前恆為 `"hl_roi"`。僅策略詳情端點供給。 */
+  return_basis?: string;
   risk_free_rate: string;
   basis: string;
   updated_at: number;
@@ -173,6 +181,9 @@ function normalizeMethodology(v: unknown): PublicStrategyMethodology {
     end_equity_usd: m.end_equity_usd ?? null,
     sample_count: typeof m.sample_count === "number" ? m.sample_count : null,
     annualization_days: typeof m.annualization_days === "number" ? m.annualization_days : 365,
+    // 兩鍵為可選：舊後端／交易員端點缺席時整個不出現（不補 null，避免假裝有值）。
+    ...(typeof m.periods_per_year === "string" ? { periods_per_year: m.periods_per_year } : {}),
+    ...(typeof m.return_basis === "string" ? { return_basis: m.return_basis } : {}),
     risk_free_rate: typeof m.risk_free_rate === "string" ? m.risk_free_rate : "0",
     basis: typeof m.basis === "string" ? m.basis : "perp",
     updated_at: typeof m.updated_at === "number" ? m.updated_at : 0,
@@ -812,6 +823,7 @@ export interface PublicTraderMethodology {
   updated_at: number;
   start_equity_usd: string | null;
   end_equity_usd: string | null;
+  /** 2026-11-16：鍵名不變，語意為 allTime ROI 分母（投入本金），非 ledger 入金。 */
   initial_deposit_usd: string | null;
   mdd_note: string;
 }

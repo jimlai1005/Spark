@@ -42,7 +42,9 @@ def _quantize_pct_or_ratio(v: Decimal) -> str:
 # 取負號只用在 max_drawdown：`leader_perf._max_drawdown` 回傳非負的「跌幅大小」，
 # 策略卡按 plan 錨例（"max_drawdown_pct": "-0.80"）以負值呈現回撤方向。
 _METRIC_SPEC: tuple[tuple[str, str, str | None, bool, bool], ...] = (
-    ("total_return_pct", "twr", "twr_insufficient_data", True, False),
+    # 2026-11-16（plan strategy-return-hl-roi D1）：總報酬＝Hyperliquid 排行榜 ROI 定義
+    # （累計損益 ÷ (起始淨值＋期間最大累計淨入金)），不再是逐段複利的 TWR。公開鍵名不改（D7）。
+    ("total_return_pct", "roi", "roi_insufficient_data", True, False),
     ("max_drawdown_pct", "max_drawdown", "max_drawdown_insufficient_data", True, True),
     ("sharpe", "sharpe", "sharpe_insufficient_data", False, False),
     ("sharpe_se", "sharpe_se", "sharpe_insufficient_data", False, False),
@@ -50,6 +52,7 @@ _METRIC_SPEC: tuple[tuple[str, str, str | None, bool, bool], ...] = (
     ("annualized_vol_pct", "annualized_vol", "annualized_vol_insufficient_data",
      True, False),
     ("sortino", "sortino", "sortino_insufficient_data", False, False),
+    # best_day／worst_day 公開鍵名不改（D7），語意是「單一取樣區間」的報酬（D3）。
     ("best_day_pct", "best_day_return", None, True, False),
     ("worst_day_pct", "worst_day_return", None, True, False),
 )
@@ -154,17 +157,18 @@ CAGR_SAMPLE_THRESHOLD_DAYS = 30
 
 def build_cagr_pct(perf: dict[str, Any] | None) -> str | None:
     """CAGR（年化報酬）＝直接取 `leader_perf.compute_window_performance` 算好的
-    `annualized_return`，**不重算**（同一支計算，見 D5 主線程裁決：前端刪除
-    `strategyMetrics.ts` 的自算函式，一律由後端供給）。
+    `roi_annualized`＝\\( (1+ROI)^{365/\\text{covered\\_days}} - 1 \\)，**不重算**
+    （同一支計算，見 D5 主線程裁決：前端刪除 `strategyMetrics.ts` 的自算函式，
+    一律由後端供給；2026-11-16 plan strategy-return-hl-roi D5：由 TWR 年化改 ROI 年化）。
 
-    `perf` 缺席／`status != "ok"`／`annualized_return` 數學上無定義（帳戶歸零，
-    `1+twr<=0`，leader_perf 對此整組 `annualized_return*` 鍵一起缺席）→ `None`。
+    `perf` 缺席／`status != "ok"`／`roi_annualized` 數學上無定義（`ROI <= -1`，
+    leader_perf 對此整組 `roi_annualized*` 鍵一起缺席）→ `None`。
     是否要把這個值**放進**回應（樣本天數門檻）由呼叫端決定，本函式只管「算不算
     得出來」。
     """
     if not (isinstance(perf, dict) and perf.get("status") == "ok"):
         return None
-    v = perf.get("annualized_return")
+    v = perf.get("roi_annualized")
     if v is None:
         return None
     return _quantize_pct_or_ratio(v * Decimal("100"))
@@ -195,13 +199,17 @@ def build_cagr_fields(perf: dict[str, Any] | None, *, sample_days: int) -> dict[
 
 
 def build_equity_index(perf: dict[str, Any] | None) -> list[str]:
-    """perf 的 `equity_index`（Decimal 序列，出入金中性化）→ jsonable 字串陣列。
+    """perf 的 `roi_index`（Decimal 序列）→ jsonable 字串陣列。
+
+    2026-11-16（D4）：曲線值＝\\( 1 + (P_t - P_0)/D \\)，`D`＝ROI 分母
+    （`methodology.initial_deposit_usd`），與「總報酬」同一基準；不再輸出逐段複利的
+    `equity_index`。公開鍵名 `equity_index` 不改（D7）。
 
     `perf` 不可用或 `status != "ok"` → `[]`（沒有序列可畫，不是錯誤）。
     """
     if not isinstance(perf, dict) or perf.get("status") != "ok":
         return []
-    idx = perf.get("equity_index")
+    idx = perf.get("roi_index")
     if not isinstance(idx, (list, tuple)):
         return []
     return [str(x) for x in idx]
@@ -250,6 +258,10 @@ def build_equity_range(
 def sum_ledger_deposits(ledger_updates: Any) -> Decimal | None:
     """`hl.non_funding_ledger_updates()` 的原始清單 → 真實入金本金（USD）。
 
+    ⚠️ 2026-11-16 起**不再**供給策略／交易員詳情頁的 `methodology.initial_deposit_usd`
+    （改為 ROI 分母，見 `build_methodology`）；本函式保留給池內地址本地讀取路徑
+    （`publicapi/app.py` 的 `_local_trader_data`）與既有測試。
+
     只加總 `delta.type == "deposit"` 的金額（`spark.exchange.ledger_flows.
     FLOW_FIELDS["deposit"]` 是欄位名的唯一定義點——不在這裡另猜一次，工程原則
     5）。**不含** `send`／`accountClassTransfer`／`vaultDeposit` 等：那些是同一
@@ -284,17 +296,20 @@ def sum_ledger_deposits(ledger_updates: Any) -> Decimal | None:
 
 
 def build_methodology(perf: dict[str, Any] | None, *,
-                      initial_deposit_usd: Decimal | None,
                       start_equity_usd: Decimal | None = None,
                       end_equity_usd: Decimal | None = None,
                       updated_at: int) -> dict[str, Any]:
-    """策略詳情頁的方法論與樣本揭露段。`initial_deposit_usd` 由呼叫端傳入
-    （2026-08-30 起改取自 `hl.non_funding_ledger_updates()` 的真實入金加總
-    ——`sum_ledger_deposits`，不再是 `accountValueHistory` 首點；那個首點常態
-    性是 0，見 `build_equity_range` 檔頭）。`start_equity_usd`／
-    `end_equity_usd` 同樣由呼叫端傳入（`build_equity_range` 算好），與
-    `initial_deposit_usd` 同源自呼叫端同一次 `hl.portfolio()` 回應，本模組不
-    重新觸網。
+    """策略詳情頁的方法論與樣本揭露段。
+
+    2026-11-16（plan strategy-return-hl-roi D1／D4）：`initial_deposit_usd`（鍵名
+    不改，D7）改輸出 perf 的 `roi_denominator`＝
+    \\( D=\\max(100,\\ AV_0+\\max_t F_t) \\)，即「總報酬」與淨值曲線共同的 ROI 基準本金；
+    不再由 ledger 入金加總供給（Alpha 的 ledger 入金 $10.5M 會畫出數億美元的等效淨值）。
+    因此本函式**不再接收** `initial_deposit_usd` 參數——分母與它所解釋的數字同源
+    （工程原則 1），呼叫端沒有機會傳錯。`start_equity_usd`／`end_equity_usd` 仍由呼叫端
+    傳入（`build_equity_range` 算好的**實際帳戶淨值**，與同一次 `hl.portfolio()`
+    回應同源），本模組不重新觸網。新增 `periods_per_year`（比率指標年化用的每年取樣
+    期數，見 `leader_perf.compute_window_performance`）與 `return_basis: "hl_roi"`。
 
     `risk_free_rate`／`annualization_days`／`basis` 是 leader_perf 全模組通用的
     計算慣例（365 日/年、無風險利率 0%），寫死在這裡是把「這份文案講的假設」與
@@ -312,17 +327,22 @@ def build_methodology(perf: dict[str, Any] | None, *,
     first_ms = perf.get("first_ts_ms") if ok else None
     last_ms = perf.get("last_ts_ms") if ok else None
     sample_count = perf.get("sample_count") if ok else None
+    roi_denominator = perf.get("roi_denominator") if ok else None
+    periods_per_year = perf.get("periods_per_year") if ok else None
     return {
         "start_date": _ms_to_date(first_ms),
         "end_date": _ms_to_date(last_ms),
-        "initial_deposit_usd": (str(initial_deposit_usd)
-                                if initial_deposit_usd is not None else None),
+        "initial_deposit_usd": (str(roi_denominator)
+                                if roi_denominator is not None else None),
         "start_equity_usd": (str(start_equity_usd)
                              if start_equity_usd is not None else None),
         "end_equity_usd": (str(end_equity_usd)
                            if end_equity_usd is not None else None),
         "sample_count": sample_count if isinstance(sample_count, int) else None,
         "annualization_days": 365,
+        "periods_per_year": (str(periods_per_year)
+                             if periods_per_year is not None else None),
+        "return_basis": "hl_roi",
         "risk_free_rate": "0",
         "basis": "combined",
         "updated_at": updated_at,

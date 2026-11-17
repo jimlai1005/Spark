@@ -16,10 +16,11 @@ export function MethodologyCard({ methodology, metrics, copy }: {
   metrics: PublicStrategyMetrics;
   copy: MethodologyCopy;
 }) {
-  // ⭐ M3 round4 Task R4-2：查無鏈上真實入金（`initial_deposit_usd` 現在來自
-  // `userNonFundingLedgerUpdates`，查無 deposit 紀錄 → null）時，改以起始權益
-  // （`start_equity_usd`，同一份 accountValueHistory 首個非零快照）起算；兩者
-  // 皆無才整句省略、改由 rangePrefix 開頭（2026-08-29 真資料驗證發現、裁決 5）。
+  // ⭐ 2026-11-16（plan strategy-return-hl-roi D4）：`initial_deposit_usd` 現在是
+  // ROI 分母（投入本金＝起始淨值＋期間最大累計淨入金），不再是鏈上 deposit 加總；
+  // 缺席（perf 不可用 → null）時，改以起始權益（`start_equity_usd`，同一份
+  // accountValueHistory 首個非零快照）起算；兩者皆無才整句省略、改由 rangePrefix
+  // 開頭（2026-08-29 真資料驗證發現、裁決 5）。
   const depositNum = Number(methodology.initial_deposit_usd);
   const hasDeposit = methodology.initial_deposit_usd != null
     && Number.isFinite(depositNum) && depositNum > 0;
@@ -82,6 +83,11 @@ export function MethodologyCard({ methodology, metrics, copy }: {
       ) : (
         <p className="methodology-body">{copy.unavailable}</p>
       )}
+      {/* 2026-11-16：績效定義三句（靜態文案，不依賴 `periods_per_year`／`return_basis`；
+          與 `/docs#methodology` 共用同一份 key）。 */}
+      <p className="methodology-body methodology-definitions">
+        {copy.roiNote} {copy.segmentReturnNote} {copy.samplingNote}
+      </p>
     </div>
   );
 }

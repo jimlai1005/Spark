@@ -94,7 +94,10 @@ def _ok_perf(**over):
     base = {
         "status": "ok", "sample_count": 38, "covered_days": Decimal("72.0000"),
         "first_ts_ms": 0, "last_ts_ms": 72 * _DAY_MS,
-        "twr": Decimal("0.2035"), "twr_insufficient_data": False,
+        # 2026-11-16（plan strategy-return-hl-roi D1）：`total_return_pct` 讀 `roi`，
+        # 不再讀 `twr`——兩者刻意設成不同值，讀錯鍵會直接紅。
+        "twr": Decimal("0.5"), "twr_insufficient_data": False,
+        "roi": Decimal("0.2035"), "roi_insufficient_data": False,
         "max_drawdown": Decimal("0.008"), "max_drawdown_insufficient_data": False,
         "sharpe": Decimal("10.24"), "sharpe_se": Decimal("3.36"),
         "sharpe_insufficient_data": False,
@@ -102,7 +105,8 @@ def _ok_perf(**over):
         "annualized_vol": Decimal("0.1805"), "annualized_vol_insufficient_data": False,
         "sortino": Decimal("43.42"), "sortino_insufficient_data": False,
         "best_day_return": Decimal("0.0301"), "worst_day_return": Decimal("-0.008"),
-        "equity_index": (Decimal("1"), Decimal("1.2")),
+        "equity_index": (Decimal("1"), Decimal("1.5")),
+        "roi_index": (Decimal("1"), Decimal("1.2035")),
     }
     base.update(over)
     return base
@@ -110,7 +114,7 @@ def _ok_perf(**over):
 
 def test_build_metrics_shape_and_values():
     m = build_metrics(_ok_perf())
-    assert m["total_return_pct"] == "20.35"
+    assert m["total_return_pct"] == "20.35"          # roi 0.2035 × 100（手算；twr 為 0.5，不得讀到）
     assert m["total_return_pct_insufficient"] is False
     assert m["max_drawdown_pct"] == "-0.80"          # 取負號呈現回撤方向
     assert m["max_drawdown_pct_insufficient"] is False
@@ -414,16 +418,20 @@ def test_detail_404_for_disabled_slug(tmp_path):
 
 
 def test_detail_shape_includes_equity_index_and_methodology(tmp_path):
-    """⭐ M3 round4 Task R4-2：`initial_deposit_usd` 改由
-    `hl.non_funding_ledger_updates()`（真實 deposit 加總）供給，不再是
-    `accountValueHistory` 首點；`start_equity_usd`／`end_equity_usd` 是新增
-    欄位，取同一份 `accountValueHistory` 的首個非零值與末值。"""
+    """⭐ M3 round4 Task R4-2：`start_equity_usd`／`end_equity_usd` 取同一份
+    `accountValueHistory` 的首個非零值與末值。
+
+    2026-11-16（plan strategy-return-hl-roi D1／D4）：`initial_deposit_usd` 改為 ROI
+    分母 D = max(100, AV_0 + max_t F_t) = max(100, 1000 + 0) = 1000（`sixty_day_rows`：
+    ΔAV=200=ΔP → ΔF=0），不再是 ledger 入金加總；ledger 內放 99999.0 證明它被忽略。
+    `equity_index` 輸出 `roi_index`＝1 + (P_t − P_0)/D = [1, 1 + 200/1000] = [1, 1.2]。
+    新增 `periods_per_year`（n=1 區間、60 天 → 365/60）與 `return_basis`。"""
     cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
         {"address": _A, "name": "Alpha", "slug": "alpha"}]))
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
     hl.portfolios[_A] = sixty_day_rows()
     hl.ledger_updates[_A] = [{"time": 0, "hash": "0x1",
-                              "delta": {"type": "deposit", "usdc": "1000.0"}}]
+                              "delta": {"type": "deposit", "usdc": "99999.0"}}]
     r = _client(app).get("/api/public/strategies/alpha")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -433,11 +441,13 @@ def test_detail_shape_includes_equity_index_and_methodology(tmp_path):
     assert set(meth) == {"start_date", "end_date", "initial_deposit_usd",
                          "start_equity_usd", "end_equity_usd",
                          "sample_count", "annualization_days", "risk_free_rate",
-                         "basis", "updated_at"}
+                         "basis", "updated_at", "periods_per_year", "return_basis"}
     assert meth["annualization_days"] == 365
+    assert meth["return_basis"] == "hl_roi"
+    assert Decimal(meth["periods_per_year"]).quantize(Decimal("0.0001")) == Decimal("6.0833")
     assert meth["risk_free_rate"] == "0"
     assert meth["basis"] == "combined"   # I-15：改用 spot+perp 合併窗，見模組檔頭
-    assert meth["initial_deposit_usd"] == "1000.0"   # 真實 ledger deposit 加總
+    assert meth["initial_deposit_usd"] == "1000"     # ROI 分母（非 ledger 的 99999.0）
     assert meth["start_equity_usd"] == "1000"        # av[0]（同一次 portfolio 回應）
     assert meth["end_equity_usd"] == "1200"          # av[-1]
     assert meth["start_date"] == "1970-01-01"
@@ -462,21 +472,24 @@ def test_detail_leading_zero_snapshot_still_yields_start_equity(tmp_path):
     meth = r.json()["methodology"]
     assert meth["start_equity_usd"] == "50.705371"
     assert meth["end_equity_usd"] == "80.612619"
-    assert meth["initial_deposit_usd"] is None   # 未塞 ledger fixture：查無真實入金
+    assert meth["initial_deposit_usd"] is None   # perf 無效（全窗 prev_av < 地板）→ 無 ROI 分母
 
 
-def test_detail_ledger_deposit_failure_degrades_to_null_not_500(tmp_path):
-    """真實入金查詢上游失敗 → `initial_deposit_usd` 降級為 null，不拖累整頁
-    （起訖淨值仍由 `accountValueHistory` 單獨供給）。"""
+def test_detail_ledger_is_not_queried_initial_deposit_is_roi_denominator(tmp_path):
+    """2026-11-16（plan strategy-return-hl-roi D4）：策略詳情頁不再為 methodology 查
+    ledger 入金——即使 ledger 上游會失敗，也不影響 `initial_deposit_usd`（ROI 分母
+    1000）與起訖淨值；`non_funding_ledger_updates` 一次都不該被呼叫。"""
     cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
         {"address": _A, "name": "Alpha", "slug": "alpha"}]))
     app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
     hl.portfolios[_A] = sixty_day_rows()
-    hl.ledger_updates_error[_A] = ConnectionError("hl 5xx")
+    ledger_calls: list = []
+    hl.non_funding_ledger_updates = lambda *a, **k: ledger_calls.append(a) or []
     r = _client(app).get("/api/public/strategies/alpha")
     assert r.status_code == 200, r.text
     meth = r.json()["methodology"]
-    assert meth["initial_deposit_usd"] is None
+    assert ledger_calls == []
+    assert meth["initial_deposit_usd"] == "1000"
     assert meth["start_equity_usd"] == "1000"
     assert meth["end_equity_usd"] == "1200"
 
@@ -715,9 +728,11 @@ def test_detail_cagr_key_absent_when_no_perf(tmp_path):
 # ============================================================
 
 def test_build_cagr_pct_uses_annualized_return_directly():
-    """CAGR 直接取 leader_perf 算好的 annualized_return，不重算（同一支計算）。"""
+    """2026-11-16（D5）：CAGR 直接取 leader_perf 算好的 `roi_annualized`，不重算
+    （同一支計算）；TWR 年化的 `annualized_return`（0.9）即使存在也不得被讀到。"""
     from spark.filet.strategies import build_cagr_pct
-    m = build_cagr_pct(_ok_perf(annualized_return=Decimal("0.4523")))
+    m = build_cagr_pct(_ok_perf(roi_annualized=Decimal("0.4523"),
+                                annualized_return=Decimal("0.9")))
     assert m == "45.23"
 
 
@@ -749,3 +764,47 @@ def test_upstream_failure_degrades_that_leader_not_whole_list(tmp_path):
     assert by_slug["alpha"]["metrics"]["sharpe_insufficient"] is True
     assert by_slug["alpha"]["listable"] is True
     assert by_slug["beta"]["listable"] is True
+
+
+# ============================================================
+# 2026-11-17 Task 5 W1：D4（曲線用 ROI 基準）的守護測試
+# 序列含現金流，使 equity_index（逐段複利）≠ roi_index（1 + ΔP/D）：
+#   AV=[1000,1500,3000,2200]、P=[0,100,300,500] → ΔF=[400,1300,-1000]、F=[0,400,1700,700]
+#   D = max(100, 1000+1700) = 2700；ROI = 500/2700；roi_index[-1] = 3200/2700
+# 把 build_equity_index 改回讀 equity_index 時，下列兩個測試必須轉紅。
+# ============================================================
+
+def _flow_rows_60d():
+    t = _DAY_MS
+    return _portfolio_rows(
+        [[0, "1000"], [20 * t, "1500"], [40 * t, "3000"], [60 * t, "2200"]],
+        [[0, "0"], [20 * t, "100"], [40 * t, "300"], [60 * t, "500"]])
+
+
+def test_build_equity_index_outputs_roi_index_not_compounded_equity_index():
+    from spark.filet.leader_perf import compute_window_performance
+    from spark.filet.strategies import build_equity_index
+    perf = compute_window_performance(_flow_rows_60d(), "allTime")
+    assert perf["status"] == "ok"
+    out = build_equity_index(perf)
+    assert out == [str(x) for x in perf["roi_index"]]
+    assert out != [str(x) for x in perf["equity_index"]]
+    assert Decimal(out[-1]) == Decimal("1") + Decimal("500") / Decimal("2700")
+
+
+def test_detail_equity_index_is_roi_basis_and_times_deposit_is_capital_plus_pnl(tmp_path):
+    cfg = make_cfg(tmp_path, leaders_path=write_leaders(tmp_path, [
+        {"address": _A, "name": "Alpha", "slug": "alpha"}]))
+    app, cfg2, store, keysvc, hl = make_app(tmp_path, cfg=cfg)
+    hl.portfolios[_A] = _flow_rows_60d()
+    r = _client(app).get("/api/public/strategies/alpha")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    idx = [Decimal(x) for x in body["equity_index"]]
+    assert idx[0] == Decimal("1")
+    # 末值 = 1 + ROI = 1 + 500/2700（不是逐段複利值）
+    assert abs(idx[-1] - (Decimal("1") + Decimal("500") / Decimal("2700"))) < Decimal("1e-12")
+    d = Decimal(body["methodology"]["initial_deposit_usd"])
+    assert d == Decimal("2700")
+    # D × 末值 = D + 累計損益 = 2700 + 500 = 3200
+    assert abs(d * idx[-1] - Decimal("3200")) < Decimal("1e-9")

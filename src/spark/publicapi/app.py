@@ -2163,37 +2163,6 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         result = _cached_strategy_portfolio_with_ts(address)
         return result[0] if result is not None else None
 
-    # ⭐ M3 round4 Task R4-2：真實入金本金（`hl.non_funding_ledger_updates()`）的
-    # 60s per-address 快取。與 `_strategy_portfolio_cache` **分開**一個 dict、沒有
-    # LRU 上限——理由同 `_strategy_portfolio_cache` 檔頭：本區塊的位址空間是精選
-    # 白名單（有限集合），不是任意鏈上地址，不需要 `/api/public/traders/{address}`
-    # 那種按 client 計費的 rate limit 與合併快取（那是為了防「任意位址枚舉」放大
-    # 攻擊面，這裡的攻擊面天生有界）。
-    _strategy_ledger_deposit_cache: dict[str, tuple[float, Decimal | None]] = {}
-    _strategy_ledger_deposit_lock = threading.Lock()
-    STRATEGY_LEDGER_DEPOSIT_CACHE_TTL_S = 60.0
-
-    def _cached_ledger_deposit(address: str) -> Decimal | None:
-        """真實入金本金（USD）。上游任何失敗（transient 或 schema 漂移）→
-        `None`，**不快取失敗**（下次請求照樣重試，沿 `_cached_strategy_portfolio_
-        with_ts` 同一條「不快取失敗」的既有慣例）——查不到與查到 $0 不是同一件
-        事，這裡回 `None` 讓 methodology 的起訖淨值仍能單獨由
-        `build_equity_range` 供給，不因為 ledger 查詢失敗就整段掉資料。"""
-        now = now_fn()
-        with _strategy_ledger_deposit_lock:
-            cached = _strategy_ledger_deposit_cache.get(address)
-        if cached is not None and now - cached[0] < STRATEGY_LEDGER_DEPOSIT_CACHE_TTL_S:
-            return cached[1]
-        try:
-            raw = hl.non_funding_ledger_updates(address, 0)
-            deposit = sum_ledger_deposits(raw)
-        except Exception as e:  # noqa: BLE001 — 公開端點：上游任何失敗都不得 500
-            logger.error("策略真實入金查詢失敗 leader=%s: %s", address, e)
-            return None
-        with _strategy_ledger_deposit_lock:
-            _strategy_ledger_deposit_cache[address] = (now, deposit)
-        return deposit
-
     def _strategy_perf_with_as_of(address: str) -> tuple[dict | None, int | None]:
         """位址 → `(perf, as_of)`。`perf`＝`allTime`（spot+perp 合併）窗的績效（策略卡
         固定只用這一窗：首頁/詳情頁要的是「這個策略整體值不值得跟」，不是逐窗比較）。
@@ -2312,10 +2281,11 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # ⭐ M3 round4 Task R4-2：起訖淨值改用同一份 `accountValueHistory` 的首個
         # 非零值／末值（`build_equity_range`），不再是「首點原樣值」——首點常態
         # 性是 0（錢包晚於序列起點入金），硬印它會讓「起訖淨值」整卡顯示樣本不足
-        # 或誤導的 $0 起算。`initial_deposit_usd` 改由鏈上真實入金（ledger）供給，
-        # 兩者刻意分開兩個不同資料源：前者是「帳戶淨值快照」，後者是「真的存進來
-        # 多少錢」，語意不同，見 `strategies.build_equity_range`／
-        # `sum_ledger_deposits` 檔頭。
+        # 或誤導的 $0 起算。
+        # 2026-11-16（plan strategy-return-hl-roi D1／D4）：`initial_deposit_usd`
+        # 不再查 ledger 入金，改輸出 perf 的 ROI 分母（`build_methodology`）；
+        # `start_equity_usd`／`end_equity_usd` 仍是**實際帳戶淨值**（與 ROI 分母
+        # 刻意是兩個不同的量，前端文案分開標示）。
         start_equity_usd = None
         end_equity_usd = None
         rows = _cached_strategy_portfolio(entry.address)
@@ -2324,10 +2294,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
             if window is not None:
                 av, _pnl = window
                 start_equity_usd, end_equity_usd = build_equity_range(av)
-        initial_deposit_usd = _cached_ledger_deposit(entry.address)
         view["methodology"] = build_methodology(
-            perf, initial_deposit_usd=initial_deposit_usd,
-            start_equity_usd=start_equity_usd, end_equity_usd=end_equity_usd,
+            perf, start_equity_usd=start_equity_usd, end_equity_usd=end_equity_usd,
             updated_at=int(now_fn()))
         return view
 
@@ -2922,7 +2890,6 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         data = _cached_trader_data(addr, _TRADER_PROBE_KEY_PREFIX + client_host)
         rows = data.rows
         account_value = data.account_value
-        initial_deposit_usd = data.deposit
         ch_state = data.ch_state
         fills = data.fills
         fills_truncated = data.fills_truncated
@@ -2979,6 +2946,13 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                 perfs[k] = None
         metrics = {k: build_metrics(perf) for k, perf in perfs.items()}
         all_time_perf = perfs.get("allTime")
+        # 2026-11-16（plan strategy-return-hl-roi D1／D4）：methodology 的
+        # `initial_deposit_usd`（鍵名不改，D7）＝allTime perf 的 ROI 分母，與
+        # `metrics.allTime.total_return_pct` 同一個 perf、同一個基準；不再用 ledger
+        # 入金加總（`data.deposit`）。perf 缺席／非 ok → null。
+        roi_denominator = (all_time_perf.get("roi_denominator")
+                           if isinstance(all_time_perf, dict)
+                           and all_time_perf.get("status") == "ok" else None)
 
         view = {
             "address": addr,
@@ -2998,8 +2972,8 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
                                      if start_equity_usd is not None else None),
                 "end_equity_usd": (str(end_equity_usd)
                                    if end_equity_usd is not None else None),
-                "initial_deposit_usd": (str(initial_deposit_usd)
-                                        if initial_deposit_usd is not None else None),
+                "initial_deposit_usd": (str(roi_denominator)
+                                        if roi_denominator is not None else None),
                 "mdd_note": MDD_SAMPLING_NOTE,
             },
             "source": data.source,

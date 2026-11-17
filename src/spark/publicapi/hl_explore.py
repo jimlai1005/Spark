@@ -285,7 +285,14 @@ MAX_CONCENTRATION_PCT_RANGE = (1, 100)
 # 快照在此版直接視為不相容、整份丟棄（`load_snapshot` 的 `version not in
 # (EXPLORE_INDEX_VERSION, 3)` 判斷不含 4）。部署必須照 RUNBOOK §5.8c 先本機
 # 預建 300 池快照再重啟，避免正式機冷建期間空榜。
-EXPLORE_INDEX_VERSION = 5
+# 5 → 6（2026-11-16，plan `strategy-return-hl-roi` D2）：`windows[w].max_dd_pct`
+# **數值語意改變**（結構不變）——分段報酬分母由 AV(t−1) 改為 AV(t−1)＋max(ΔF,0)
+# （同取樣區間先入金再虧損不再被放大），同一份 portfolio 算出的回撤與舊快照不同。
+# 舊快照的回撤是舊公式算的、沒有可回填的新值，故 v5 快照**直接視為不相容、整份
+# 丟棄**（`load_snapshot` 的 `version not in (EXPLORE_INDEX_VERSION, 3)` 判斷不含
+# 5；載入端回 `None` → 走冷建語意，絕不把舊語意的回撤當成新版服務）。部署必須照
+# RUNBOOK §5.8c 先本機預建 300 池快照再重啟。
+EXPLORE_INDEX_VERSION = 6
 
 # Task 4.1：`fills_coverage` 的預設值（`ExploreRow` 欄位預設值與 v3→v4 快照
 # 遷移共用同一份常數，避免兩處手寫字面量漂移）。
@@ -619,6 +626,9 @@ def load_snapshot(path: str, *, cfg: "ExploreConfig | None" = None) -> dict | No
     # （見 `EXPLORE_INDEX_VERSION` 旁常數註記）。這不是一條通用的「保留一版
     # 相容」規則，是逐次版本升級各自評估「舊快照有沒有東西可回填」的結果——
     # 5→6 若再發生，一樣要重新評估，不是機械地把 `4` 也加進這個 tuple。
+    # （2026-11-16 5→6 已評估：max_dd_pct 數值語意改變、無可回填值 → v5 不相容。
+    # ⚠️ 殘留：v3 遷移路徑仍在 tuple 內（既有 v3 遷移測試鎖定），v3 快照的
+    # max_dd_pct 同樣是舊公式算的——正式機現行快取是 v5，實務上不會再遇到 v3。）
     if version not in (EXPLORE_INDEX_VERSION, 3):
         return None
     try:

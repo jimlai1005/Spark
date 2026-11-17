@@ -21,6 +21,11 @@
  * 「若入金 `deposit` 全程按 `equity_index` 報酬率複利，現在值多少」（TWR 等效
  * 淨值，不含實際出入金時點的影響）。`start_equity_usd`／`end_equity_usd` 欄位
  * 後端保留（其他地方可能還用得到），本卡不再讀取。
+ *
+ * ⭐ 2026-11-16（plan strategy-return-hl-roi D1／D4）：`equity_index` 現在是 ROI
+ * 指數（`1 + 累計損益 ÷ D`），`methodology.initial_deposit_usd` 是 ROI 分母 D
+ * （投入本金），故「起訖淨值」＝投入本金 → 投入本金加累計損益；算式不變
+ * （`deposit × 末值/首值`），只有語意與文案（`startEndEquityNote`）改變。
  */
 import { NO_VALUE } from "@/lib/format";
 
@@ -50,7 +55,7 @@ export interface MetricCardDef {
 }
 
 /**
- * 起訖淨值（USD，TWR 等效淨值）：`start = deposit`、
+ * 起訖淨值（USD，ROI 基準：投入本金 → 投入本金加累計損益）：`start = deposit`、
  * `end = deposit × (equity_index 末值 / 首值)`——與 `EquityCurve` 的美元換算
  * 同一條公式（`depositNum * (v / values[0])`，見該元件檔頭）。
  *

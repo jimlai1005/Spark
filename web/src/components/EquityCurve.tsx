@@ -77,8 +77,9 @@ function xLabels(
   return indices.map((idx) => ({ idx, label: `D${offset + idx + 1}` }));
 }
 
-/** 依 period 從序列尾端裁切——`equity_index` 是每日對齊的序列（一點 ≈ 一天，
- * 見 leader_perf 檔頭），因此「30D/7D」直接取最後 N 點即可，不需要另外的日期陣列。 */
+/** 依 period 從序列尾端裁切——沿用既有「一點 ≈ 一天」假設，「30D/7D」直接取最後 N
+ * 點。⚠️ 2026-11-16 註記：HL `allTime` 序列實為約每 1–2 週一點，此假設對 allTime
+ * 序列不成立（plan strategy-return-hl-roi 回報為待裁決項，本次未改）。 */
 function sliceByPeriod(values: number[], period: Period): number[] {
   if (period === "all") return values;
   const n = period === "30d" ? 30 : 7;
@@ -170,17 +171,18 @@ export function rebaseCloses(mainFirst: number, closes: (number | null)[]): (num
 }
 
 /**
- * EquityCurve — 策略詳情頁的帳戶淨值曲線（Task 9，設計稿 §04）。
+ * EquityCurve — 策略詳情頁的「投入本金加累計損益」曲線（Task 9，設計稿 §04；
+ * 2026-11-16 plan strategy-return-hl-roi D4 起改 ROI 基準，不再是帳戶淨值曲線）。
  *
- * `equityIndex` 是後端 `build_equity_index` 給的正規化序列（起點 = "1"），不是
- * 美元金額——這裡只負責畫形狀（漲跌走勢），不做金額換算（金額換算需要
- * `methodology.initial_deposit_usd`，由呼叫端在「起訖淨值」指標卡另外處理）。
+ * `equityIndex` 是後端 `build_equity_index` 給的 ROI 指數（`1 + 累計損益 ÷ D`，
+ * 起點 = "1"），不是美元金額；有 `initialDepositUsd`（＝ROI 分母 D）時 y 軸刻度
+ * 換算為 D × index ＝ 投入本金加累計損益。
  */
 export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate }: {
   equityIndex: string[];
-  /** 有值時 y 軸刻度換算成美元金額（= 本值 × 首點比值 × 入金額）；缺席則顯示
-   * 原始 index 值。M3 round4 Task R4-2 起，這個值來自鏈上真實入金
-   * （`userNonFundingLedgerUpdates`），不再是 `accountValueHistory` 首點。 */
+  /** 有值時 y 軸刻度換算成美元金額（= 本值 × 首點比值 × 投入本金）；缺席則顯示
+   * 原始 index 值。2026-11-16 起這個值是後端 `methodology.initial_deposit_usd`
+   * ＝ROI 分母（起始淨值＋期間最大累計淨入金），不再是鏈上 ledger 入金加總。 */
   initialDepositUsd?: string | null;
   /** x 軸日期標籤來源（`methodology.start_date`/`end_date`）；缺席則退化為
    * 相對天數 `D1…Dn`。 */

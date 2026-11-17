@@ -927,7 +927,7 @@ export const COPY_ZH = {
       metricTotalReturn: "總報酬",
       metricMaxDrawdown: "最大回撤",
       metricSharpe: "Sharpe",
-      metricWinRate: "日勝率",
+      metricWinRate: "區間勝率",
       insufficientLabel: "樣本不足",
       leveragePrefix: "槓桿 ≤ ",
       minNotionalPrefix: "最低跟單 $",
@@ -1005,7 +1005,7 @@ export const COPY_ZH = {
     backToList: "回策略列表 →",
     loadingNote: "讀取策略資料中…",
     equity: {
-      heading: "帳戶淨值曲線（USD）",
+      heading: "投入本金加累計損益（USD）",
       periodAll: "全部",
       period30d: "30D",
       period7d: "7D",
@@ -1017,7 +1017,7 @@ export const COPY_ZH = {
     },
     metrics: {
       totalReturnLabel: "總報酬",
-      totalReturnNote: "真實入金起算",
+      totalReturnNote: "Hyperliquid 排行榜 ROI 定義",
       // ⭐ M3 round3 Task 7（D5 裁決）：策略頁「策略期間回撤」與 Dashboard
       // 「你的跟單回撤」（dashboard.pnl.maxDrawdown）是兩個不同標的，不可同名
       // ——本 key 同時被 home.tsx 與 traders/[address]/page.tsx 引用，三處一致。
@@ -1025,26 +1025,26 @@ export const COPY_ZH = {
       maxDrawdownNote: "期間內單次最深",
       sharpeLabel: "Sharpe（年化）",
       sharpeNoteSuffix: " (1 s.e.)",
-      winRateLabel: "日勝率",
+      winRateLabel: "區間勝率",
       winRateNotePrefix: "N=",
-      winRateNoteSuffix: " 日報酬樣本",
+      winRateNoteSuffix: " 個取樣點",
       annualizedVolLabel: "年化波動",
-      annualizedVolNote: "365 日慣例",
+      annualizedVolNote: "依取樣間隔年化",
       sortinoLabel: "Sortino",
       sortinoNote: "下行風險調整",
-      bestWorstLabel: "最佳 / 最差日",
-      bestWorstNote: "單日 %",
+      bestWorstLabel: "最佳 / 最差單期",
+      bestWorstNote: "單一取樣區間 %",
       startEndEquityLabel: "起訖淨值",
-      startEndEquityNote: "真實入金 → 等效淨值（不含出入金）",
+      startEndEquityNote: "投入本金 → 本金加累計損益",
       insufficientLabel: "樣本不足",
-      /** ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／日勝率三張
+      /** ⭐ Task 7（主線程驗收修正）：大字只留總報酬／策略期間回撤／區間勝率三張
        * （plan Task 7 第 1 條＋設計稿 R2 P0 原文）。Sharpe／Sortino／年化波動／
-       * 起訖淨值／最佳最差日在 `sample_days` 未達 `sample_threshold` 時摺成
+       * 起訖淨值／最佳最差單期在 `sample_days` 未達 `sample_threshold` 時摺成
        * 一行小字，取代個別「樣本不足」卡片（8 格中 5 格是樣本不足、佔兩屏
        * 高度的 R2-P0 問題）。五段拼接：
        * `{insufficientGroupLabel}{insufficientGroupPrefix}{sample_days}
        * {insufficientGroupMid}{sample_threshold}{insufficientGroupSuffix}`。 */
-      insufficientGroupLabel: "Sharpe／Sortino／年化波動／起訖淨值／最佳最差日",
+      insufficientGroupLabel: "Sharpe／Sortino／年化波動／起訖淨值／最佳最差單期",
       insufficientGroupPrefix: "：樣本不足（",
       insufficientGroupMid: "/",
       insufficientGroupSuffix: " 天），達門檻後顯示",
@@ -1059,20 +1059,20 @@ export const COPY_ZH = {
     methodology: {
       heading: "方法論與樣本揭露",
       unavailable: "方法論資料暫不可用。",
-      depositPrefix: "以真實入金本金 $",
-      depositSuffix: " 起算（鏈上 deposit 可驗證），涵蓋 ",
-      /** M3 round4 Task R4-2：查無鏈上真實入金紀錄時的替代句——改以帳戶淨值
-       * 快照起算（不是「入金」，是「有記錄以來第一次看到非零餘額」）。 */
+      depositPrefix: "以投入本金 $",
+      depositSuffix: " 計算（起始淨值＋期間最大累計淨入金），涵蓋 ",
+      /** M3 round4 Task R4-2：查無投入本金（ROI 分母缺席，perf 不可用）時的替代句——
+       * 改以帳戶淨值快照起算（不是「入金」，是「有記錄以來第一次看到非零餘額」）。 */
       startEquityPrefix: "以起始權益 $",
       startEquitySuffix: " 起算（鏈上首個非零淨值快照），涵蓋 ",
-      /** 首快照為 0 且查無真實入金時省略前兩句，改由此開頭（誠實顯示，2026-08-29）。 */
+      /** 首快照為 0 且查無投入本金時省略前兩句，改由此開頭（誠實顯示，2026-08-29）。 */
       rangePrefix: "涵蓋 ",
-      daysSuffix: " 個交易日（",
+      daysSuffix: " 個取樣點（",
       rangeSuffix: "）。",
       sharpePrefix: "Sharpe ",
       sharpeSeInfix: "，標準誤 ±",
       sharpeSeSuffix: "（N=",
-      sampleSuffix: " 個日報酬樣本）。",
+      sampleSuffix: " 個取樣點）。",
       conventionPrefix: "指標以 ",
       conventionMid: " 日/年、無風險利率 ",
       conventionSuffix: " 之加密慣例年化。",
@@ -1087,6 +1087,11 @@ export const COPY_ZH = {
        * 轉帳算成損益、產生幻影回撤（實證見 spark 後端 `leader_perf.py` 檔頭
        * 「I-15」段）；合併基準才是這類錢包的真實績效。 */
       basisNote: "指標以 spot＋perp 合併帳戶淨值為計算基準（此錢包型態下轉帳不污染序列）。",
+      /** 2026-11-16（plan strategy-return-hl-roi §1.5）：以下三句為績效定義揭露，
+       * 策略詳情頁方法論卡與 `/docs#methodology` 共用同一份字串。 */
+      roiNote: "總報酬採 Hyperliquid 排行榜的 ROI 定義：累計損益 ÷（起始淨值＋期間最大累計淨入金），不做逐段複利。",
+      segmentReturnNote: "最大回撤、Sharpe、Sortino 與波動以逐段報酬計算；每段報酬的分母為上一個取樣點的淨值加上該段的淨入金。",
+      samplingNote: "Hyperliquid 的全期序列約每 1–2 週取樣一次；比率指標依實際取樣間隔換算為年化（一年以 365 日計），最佳／最差為單一取樣區間的報酬。",
     },
     panel: {
       heading: "跟隨此策略",
@@ -1907,7 +1912,7 @@ export const COPY_ZH = {
     // MethodologyCard，但 methodology.start/end_equity_usd／initial_deposit_usd
     // 仍回傳——補回帳戶價值下方一行，不建整張卡。
     startEndEquityLabel: "起訖淨值（allTime）",
-    initialDepositLabel: "初始入金",
+    initialDepositLabel: "投入本金（ROI 分母）",
     panel: {
       heading: "跟隨這個地址",
       cta: "連接錢包並繼續",
@@ -2672,7 +2677,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       metricTotalReturn: "Total return",
       metricMaxDrawdown: "Max drawdown",
       metricSharpe: "Sharpe",
-      metricWinRate: "Daily win rate",
+      metricWinRate: "Period win rate",
       insufficientLabel: "Insufficient sample",
       leveragePrefix: "Leverage ≤ ",
       minNotionalPrefix: "Min. follow $",
@@ -2741,7 +2746,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     backToList: "Back to strategies →",
     loadingNote: "Loading strategy data…",
     equity: {
-      heading: "Account equity curve (USD)",
+      heading: "Invested capital plus cumulative PnL (USD)",
       periodAll: "All",
       period30d: "30D",
       period7d: "7D",
@@ -2753,24 +2758,24 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     },
     metrics: {
       totalReturnLabel: "Total return",
-      totalReturnNote: "From real deposit",
+      totalReturnNote: "Hyperliquid leaderboard ROI definition",
       maxDrawdownLabel: "Strategy drawdown",
       maxDrawdownNote: "Deepest single instance in period",
       sharpeLabel: "Sharpe (annualized)",
       sharpeNoteSuffix: " (1 s.e.)",
-      winRateLabel: "Daily win rate",
+      winRateLabel: "Period win rate",
       winRateNotePrefix: "N=",
-      winRateNoteSuffix: " daily return samples",
+      winRateNoteSuffix: " sampling points",
       annualizedVolLabel: "Annualized volatility",
-      annualizedVolNote: "365-day convention",
+      annualizedVolNote: "Annualized by sampling interval",
       sortinoLabel: "Sortino",
       sortinoNote: "Downside-risk adjusted",
-      bestWorstLabel: "Best / worst day",
-      bestWorstNote: "Single-day %",
+      bestWorstLabel: "Best / worst period",
+      bestWorstNote: "Single sampling interval %",
       startEndEquityLabel: "Start → end equity",
-      startEndEquityNote: "Real deposit → equivalent equity (flows excluded)",
+      startEndEquityNote: "Invested capital → capital plus cumulative PnL",
       insufficientLabel: "Insufficient sample",
-      insufficientGroupLabel: "Sharpe／Sortino／Annualized vol／Start–end equity／Best-worst day",
+      insufficientGroupLabel: "Sharpe／Sortino／Annualized vol／Start–end equity／Best-worst period",
       insufficientGroupPrefix: ": insufficient sample (",
       insufficientGroupMid: "/",
       insufficientGroupSuffix: " days), shown once the threshold is met",
@@ -2786,8 +2791,8 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     methodology: {
       heading: "Methodology & sample disclosure",
       unavailable: "Methodology data is not available right now.",
-      depositPrefix: "Computed from a real deposit of $",
-      depositSuffix: " (verifiable on-chain), covering ",
+      depositPrefix: "From invested capital of $",
+      depositSuffix: " (starting equity plus peak cumulative net inflow), covering ",
       /** M3 round4 Task R4-2: fallback when no on-chain deposit record is found —
        * starts from an equity snapshot instead (not a "deposit", the first
        * non-zero balance ever recorded). */
@@ -2795,12 +2800,12 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
       startEquitySuffix: " (first non-zero on-chain snapshot), covering ",
       /** Mirrors zh rangePrefix: opening used when both clauses above are omitted. */
       rangePrefix: "Covering ",
-      daysSuffix: " trading days (",
+      daysSuffix: " sampling points (",
       rangeSuffix: ").",
       sharpePrefix: "Sharpe ",
       sharpeSeInfix: ", standard error ±",
       sharpeSeSuffix: " (N=",
-      sampleSuffix: " daily return samples).",
+      sampleSuffix: " sampling points).",
       conventionPrefix: "Metrics are annualized using the crypto convention of ",
       conventionMid: " days/year, risk-free rate ",
       conventionSuffix: ".",
@@ -2810,6 +2815,15 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
        * perp-only series, producing phantom drawdown (see `leader_perf.py`
        * header "I-15" section on the spark backend). */
       basisNote: "Metrics are computed on a combined spot + perp account equity basis (internal transfers don't pollute the series for this wallet shape).",
+      /** 2026-11-16 (plan strategy-return-hl-roi §1.5): the three sentences below
+       * disclose the performance definitions; shared by the strategy methodology
+       * card and `/docs#methodology`. Mirrors the zh sentences one-to-one. */
+      roiNote: "Total return follows the Hyperliquid leaderboard ROI definition: cumulative PnL ÷ (starting equity + "
+        + "peak cumulative net inflow over the period), with no per-segment compounding.",
+      segmentReturnNote: "Max drawdown, Sharpe, Sortino, and volatility are computed from per-segment returns; each "
+        + "segment's denominator is the previous sample's equity plus that segment's net inflow.",
+      samplingNote: "Hyperliquid's all-time series is sampled roughly once every 1–2 weeks; ratio metrics are "
+        + "annualized from the actual sampling interval (using a 365-day year), and best/worst are the returns of a single sampling interval.",
     },
     panel: {
       heading: "Follow this strategy",
@@ -3477,7 +3491,7 @@ export const COPY_EN: DeepString<typeof COPY_ZH> = {
     pnlCurveLabel: "PnL curve",
     pnlSourceNote: "PnL includes unrealized PnL, funding, and fees, net of deposits/withdrawals (HL pnlHistory)",
     startEndEquityLabel: "Start → end equity (allTime)",
-    initialDepositLabel: "Initial deposit",
+    initialDepositLabel: "Invested capital (ROI denominator)",
     panel: {
       heading: "Copy this address",
       cta: "Connect wallet and continue",

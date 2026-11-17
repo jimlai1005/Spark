@@ -77,12 +77,42 @@ Leader 績效指標（**perp 基準**）——純函式，零網路。
 ------------------------------------------------------------------
 官方定義 `pnlHistory` 就是「已扣除出入金」的累積 PnL：`P(t) = AV(t) − F(t)`。
 `accountValueHistory` 與 `pnlHistory` **出自同一次回應、同一組時間戳**，所以
+當段淨外部現金流可由同一回應解出（記號：窗內取樣點 \\( t=0..n \\)，
+\\( AV_t \\)＝`accountValueHistory`，\\( P_t \\)＝`pnlHistory`）：
 
-    ΔP_t = P(t) − P(t−1)        # 純交易損益（已含 funding、手續費、builder fee）
-    ΔF_t = ΔAV_t − ΔP_t         # 該區間淨外部現金流（不必查第二個端點）
-    r_t  = ΔP_t / AV(t−1)       # 分段報酬
-    TWR  = Π(1 + r_t) − 1
-    I_t  = Π(1 + r_i)           # 權益指數（出入金已中性化）
+$$ \\Delta P_t = P_t - P_{t-1}, \\qquad
+   \\Delta F_t = (AV_t - AV_{t-1}) - \\Delta P_t $$
+
+**分段報酬**（2026-11-16 修正入金放大，plan `2026-11-16-strategy-return-hl-roi` §1.1）：
+
+$$ r_t = \\frac{\\Delta P_t}{AV_{t-1} + \\max(\\Delta F_t,\\ 0)} $$
+
+只加正的流入、流出不調整分母；上一點 \\( AV_{t-1} \\) 低於 `DENOMINATOR_FLOOR` 的區間照舊
+跳過。舊公式 \\( r_t = \\Delta P_t / AV_{t-1} \\) 在「同一取樣區間先入金再有損益」時分母
+偏小（`allTime` 窗約 6–11 天一點，這很常見；實證 Ultron 累計虧損 −$816,543 卻顯示
+總報酬 +399%）。錨例：`AV=[8800, 49700]`、`P=[0, −6100]` → \\( \\Delta F = 47000 \\)，
+\\( r = -6100/55800 = -0.109319 \\)（舊公式 −0.693182）。
+
+    TWR  = Π(1 + r_t) − 1          # 時間加權報酬（逐段複利）
+    I_t  = Π(1 + r_i)              # 權益指數（出入金已中性化）；MDD／比率指標用它
+
+**總報酬（Hyperliquid 排行榜 ROI 定義，D1）**：累計淨流入
+\\( F_t = \\sum_{i \\le t} \\Delta F_i \\)（\\( F_0 = 0 \\)），
+
+$$ D = \\max\\bigl(100,\\ AV_0 + \\max_t F_t\\bigr), \\qquad
+   ROI = \\frac{P_n - P_0}{D}, \\qquad
+   \\text{roi\\_index}_t = 1 + \\frac{P_t - P_0}{D} $$
+
+不做逐段複利（對「大部分資金是賺來的」帳戶，逐段複利 TWR 會給出極大的數字）。
+年化（D5）：\\( ROI > -1 \\) 時 \\( (1+ROI)^{365/\\text{covered\\_days}} - 1 \\)，否則無定義。
+錨例：`AV=[1000,1500,3000,2200]`、`P=[0,100,300,500]` → \\( F=[0,400,1700,700] \\)、
+\\( D=2700 \\)、\\( ROI=0.185185 \\)。
+
+**比率指標年化（D3）**：Sharpe／Sortino／年化波動依**實際取樣間隔**年化，
+\\( \\text{periods\\_per\\_year} = 365 / (\\text{covered\\_days}/n) \\)（\\( n \\)＝區間數；取樣
+不等距時為平均間隔的近似），見 `compute_ratio_metrics`。舊作法一律乘 \\( \\sqrt{365} \\)，而
+`allTime` 窗約 6–11 天一點，等於把指標放大約 \\( \\sqrt{\\text{間隔天數}} \\) 倍。
+`best_day_return`／`worst_day_return`／`win_rate` 的內部鍵名不改，語意是「單一取樣區間」。
 
 拉 `userNonFundingLedgerUpdates` 來湊現金流會把比較的兩側拆成兩個端點（時間戳對齊
 誤差、延遲不一致）——那正是工程原則 1 禁止的事。該端點留給**定期對帳**，不進主路徑。
@@ -146,7 +176,7 @@ MIN_DAYS_FOR_ANNUALIZATION = Decimal("90")  # < 90 天：年化是激進外推 �
 # 能完整呈現指標並可跟單），與 strategies.py 的 CAGR_SAMPLE_THRESHOLD_DAYS 同步降為 30。
 RATIO_MIN_DAYS = Decimal("30")             # < 30 天：比率指標噪音 >> 訊號 → 標記不足
 
-DAYS_PER_YEAR_SQRT = DAYS_PER_YEAR.sqrt()   # √365，比率指標公式共用，避免重複開方
+DAYS_PER_YEAR_SQRT = DAYS_PER_YEAR.sqrt()   # √365，預設 periods_per_year 的開方，避免重複開方
 
 MDD_SAMPLING_NOTE = (
     "MDD 由 15 分鐘取樣的權益指數推得，取樣間隔內的來回不可見 → "
@@ -284,20 +314,28 @@ def extract_window(portfolio_rows: Any, period: str
     return None
 
 
-def compute_ratio_metrics(returns: list[Decimal]) -> dict[str, Any]:
-    """由日報酬樣本 `r_i` 算比率型指標（Sharpe/Sortino/年化波動/日勝率/最佳最差日）。
+def compute_ratio_metrics(returns: list[Decimal],
+                          periods_per_year: Decimal = DAYS_PER_YEAR) -> dict[str, Any]:
+    """由分段報酬樣本 `r_i` 算比率型指標（Sharpe/Sortino/年化波動/勝率/最佳最差單期）。
 
     **純函式**：只管公式，不管「多少天算充足」的閘門——那是 `RATIO_MIN_DAYS` 由
     呼叫端（`compute_window_performance`）套用的事。規格與數值錨例見
-    `docs/superpowers/plans/2026-08-28-redesign-strategy-platform.md` Task 4。
+    `docs/superpowers/plans/2026-08-28-redesign-strategy-platform.md` Task 4
+    （預設 365）與 `docs/superpowers/plans/2026-11-16-strategy-return-hl-roi.md` §1.2
+    （`periods_per_year` 參數）。
 
-    慣例：365 日/年、無風險利率 0%、樣本標準差 ddof=1、Sortino 分母為**全樣本**
-    （對 0 門檻的下檔平方平均，不是只在虧損日取樣）。
+    慣例：無風險利率 0%、樣本標準差 ddof=1、Sortino 分母為**全樣本**
+    （對 0 門檻的下檔平方平均，不是只在虧損期取樣）。
+    `periods_per_year`＝每年有幾個取樣期；預設 365（樣本為日報酬）。呼叫端依實際取樣
+    間隔傳入（`compute_window_performance`：`365 / (covered_days / n)`，實作由毫秒時間戳算）——樣本若是
+    約每週一筆卻乘 \\( \\sqrt{365} \\)，指標會被放大約 \\( \\sqrt{7} \\) 倍。
+    `periods_per_year <= 0` → `ValueError`（程式錯誤，不是資料錯誤）。
 
-    \\( SR = \\frac{\\bar r}{s}\\sqrt{365} \\)，
-    \\( SE(SR) = \\sqrt{\\frac{1+SR_d^2/2}{N}}\\sqrt{365} \\)（\\(SR_d=\\bar r/s\\)，日頻），
-    \\( \\sigma_{ann} = s\\sqrt{365} \\)，
-    \\( Sortino = \\frac{\\bar r}{DD}\\sqrt{365} \\)，
+    記 \\( k=\\text{periods\\_per\\_year} \\)：
+    \\( SR = \\frac{\\bar r}{s}\\sqrt{k} \\)，
+    \\( SE(SR) = \\sqrt{\\frac{1+SR_p^2/2}{N}}\\sqrt{k} \\)（\\(SR_p=\\bar r/s\\)，每期），
+    \\( \\sigma_{ann} = s\\sqrt{k} \\)，
+    \\( Sortino = \\frac{\\bar r}{DD}\\sqrt{k} \\)，
     \\( DD = \\sqrt{\\frac{1}{N}\\sum_i \\min(r_i,0)^2} \\)。
 
     只回傳**數學上算得出來**的鍵——分母為 0（或樣本數不足以定義該分母）的指標，
@@ -305,10 +343,15 @@ def compute_ratio_metrics(returns: list[Decimal]) -> dict[str, Any]:
     「標記絕不單獨存在」慣例（工程原則 1 的同源要求）：
     - `N < 2`（樣本標準差 ddof=1 需要至少 2 點）或樣本標準差 `s == 0`
       （Sharpe 分母為 0）→ `sharpe`／`sharpe_se`／`annualized_vol` 三鍵一起缺席。
-    - 全樣本無下檔日（`DD == 0`，Sortino 分母為 0）→ `sortino` 缺席。
-    - `win_rate`／`best_day_return`／`worst_day_return`：`N >= 1` 即可，
-      **不設任何門檻**（plan 明載「勝率與最佳最差日不設閘」）。
+    - 全樣本無下檔期（`DD == 0`，Sortino 分母為 0）→ `sortino` 缺席。
+    - `win_rate`／`best_day_return`／`worst_day_return`（內部鍵名不改，語意是
+      「單一取樣區間」，非日）：`N >= 1` 即可，**不設任何門檻**
+      （plan 明載「勝率與最佳最差不設閘」）。
     """
+    if periods_per_year <= 0:
+        raise ValueError(f"periods_per_year 必須為正數: {periods_per_year}")
+    sqrt_k = (DAYS_PER_YEAR_SQRT if periods_per_year == DAYS_PER_YEAR
+              else periods_per_year.sqrt())
     n = len(returns)
     out: dict[str, Any] = {"sample_count": n}
     if n == 0:
@@ -320,40 +363,50 @@ def compute_ratio_metrics(returns: list[Decimal]) -> dict[str, Any]:
 
     mean = sum(returns, Decimal("0")) / Decimal(n)
 
-    # --- Sortino：全樣本分母，對 0 門檻。分母為 0（無下檔日）→ 沒有數字可標。 ---
+    # --- Sortino：全樣本分母，對 0 門檻。分母為 0（無下檔期）→ 沒有數字可標。 ---
     downside_sq_sum = sum(min(r, Decimal("0")) ** 2 for r in returns)
     dd = (downside_sq_sum / Decimal(n)).sqrt()
     if dd != 0:
-        out["sortino"] = (mean / dd) * DAYS_PER_YEAR_SQRT
+        out["sortino"] = (mean / dd) * sqrt_k
 
     # --- Sharpe / SE / 年化波動：樣本標準差 ddof=1，需要 N>=2 且 s!=0。 ---
     if n >= 2:
         variance = sum((r - mean) ** 2 for r in returns) / Decimal(n - 1)
         s = variance.sqrt()
-        out["annualized_vol"] = s * DAYS_PER_YEAR_SQRT
+        out["annualized_vol"] = s * sqrt_k
         if s != 0:
-            sr_daily = mean / s
-            out["sharpe"] = sr_daily * DAYS_PER_YEAR_SQRT
+            sr_period = mean / s
+            out["sharpe"] = sr_period * sqrt_k
             out["sharpe_se"] = (
-                (Decimal("1") + sr_daily ** 2 / Decimal("2")) / Decimal(n)
-            ).sqrt() * DAYS_PER_YEAR_SQRT
+                (Decimal("1") + sr_period ** 2 / Decimal("2")) / Decimal(n)
+            ).sqrt() * sqrt_k
     return out
 
 
 def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, Any]:
     """單一 perp 窗的績效計算。**純函式、不觸網**。
 
-    回傳的鍵集合（2026-07-19 改版，見檔頭「揭露模型改版」）：
+    回傳的鍵集合（2026-07-19 改版，見檔頭「揭露模型改版」；2026-11-16 追加 ROI 鍵）：
     - `status == "insufficient"`：**無任何數值結果鍵**（連 `cum_pnl` 都沒有）。
       這一類是「算不出來」——缺窗、<2 個取樣點、兩序列時間戳不同步——與「算得出來
       但資料薄」是完全不同的處境，前者沒有任何數字可言，不受本次改版影響。
     - `status == "ok"`：`cum_pnl`／`twr`／`max_drawdown`／`equity_index` **恆存在**，
       各自帶 `*_insufficient_data` 標記；`annualized_return` 存在（除非數學上無定義），
       帶 `annualized_return_insufficient_data` ＋ `annualized_return_extrapolated_from_days`。
-      `win_rate`／`best_day_return`／`worst_day_return`：N>=1 即存在，不設閘。
+      `win_rate`／`best_day_return`／`worst_day_return`：N>=1 即存在，不設閘
+      （語意為「單一取樣區間」，內部鍵名不改）。
       `sharpe`／`sharpe_se`／`annualized_vol`／`sortino`：見 `compute_ratio_metrics`——
       數學上算不出來的（N<2、標準差=0、DD=0）整組（含 `*_insufficient_data`）缺席；
       算得出來的一律帶 `*_insufficient_data`＝`covered_days < RATIO_MIN_DAYS`（30 天）。
+      這四個指標依實際取樣間隔年化：`periods_per_year`（Decimal，同鍵回傳供揭露）
+      \\( = 365/(\\text{covered\\_days}/n) \\)，\\( n \\)＝區間數 `len(pnl) − 1`；
+      取樣不等距時這是平均間隔的近似。
+    - ROI 鍵（檔頭「總報酬（Hyperliquid 排行榜 ROI 定義）」）：`roi`／`roi_denominator`／
+      `roi_insufficient_data`（＝`covered_days < MIN_DAYS_FOR_RETURN`，與
+      `twr_insufficient_data` 同判定）／`roi_index`（tuple，長度＝取樣點數，首值 1）
+      恆存在；`roi_annualized` 只在 `ROI > -1` 時存在，並與
+      `roi_annualized_insufficient_data`／`roi_annualized_extrapolated_from_days`
+      （判定式與 `annualized_return_*` 相同，只依 `covered_days`）同生共死。
 
     ⭐ 為什麼標記做在**每個指標**上而不是只有 `disclosure_tier` 一個全域欄位：
     前端不保證整組一起渲染——只顯示 MDD 的卡片、只顯示年化的排行榜列，都會讓一個
@@ -396,10 +449,14 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
     leading_unfunded = 0
     funded_seen = False
     net_flow = Decimal("0")
+    max_cum_flow = Decimal("0")       # max_t F_t，F_0 = 0（ROI 分母，見檔頭）
     for i in range(1, len(pnl)):
         d_pnl = pnl[i][1] - pnl[i - 1][1]
         d_av = av[i][1] - av[i - 1][1]
-        net_flow += d_av - d_pnl          # ΔF_t：淨外部現金流，同一回應內解出
+        d_flow = d_av - d_pnl             # ΔF_t：當段淨外部現金流，同一回應內解出
+        net_flow += d_flow                # F_t（累計）
+        if net_flow > max_cum_flow:
+            max_cum_flow = net_flow
         prev_av = av[i - 1][1]
         if prev_av < DENOMINATOR_FLOOR:
             # 分母地板：不計入複利（r_t 視為 0），但**記數**——被跳過的區間數是
@@ -411,7 +468,9 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
             continue
         funded_seen = True
         try:
-            r = d_pnl / prev_av
+            # 2026-11-16（D2）：分母＝上一點淨值＋該段**正的**淨流入（流出不調整）。
+            # 舊公式 ΔP/AV(t−1) 在「同區間先入金再有損益」時分母偏小而放大報酬。
+            r = d_pnl / (prev_av + max(d_flow, Decimal("0")))
         except (DivisionByZero, InvalidOperation):  # 地板已擋住，這裡是縱深防禦
             skipped += 1
             equity_index.append(equity_index[-1])
@@ -419,7 +478,7 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
         if r < Decimal("-1"):
             # 嚴格小於：r == -1 是「這段把上一期淨值全部虧光」，無需入金即可發生
             # （既有測試 test_annualized_markers_never_appear_without_the_number 就是這個
-            # 案例，TWR = −1 是正確答案）；r < -1 代表虧損 > 上一期淨值，沒有同區間入金
+            # 案例，TWR = −1 是正確答案）；r < -1 代表虧損 > 上一期淨值加該段淨流入，
             # 在數學上不可能，才是「資金流主導」的證據。
             logger.warning("portfolio %s 窗第 %d 區間 r=%s < -1（prev_av=%s, d_pnl=%s）"
                            "——入金與虧損同區間，整窗判無效", period, i, r, prev_av, d_pnl)
@@ -491,12 +550,29 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
     out["twr_insufficient_data"] = thin_return
     out["max_drawdown_insufficient_data"] = thin_return
 
-    # --- 比率型指標（Sharpe/Sortino/年化波動/日勝率/最佳最差日）---
-    # r_i 直接由權益指數推導（沿用既有日對齊邏輯）：equity_index 已把分母地板
+    # --- Hyperliquid ROI（D1，檔頭「總報酬」）：D = max(100, AV_0 + max_t F_t) ---
+    # 分母只取決於 AV_0 與累計淨流入的峰值；與分段報酬迴圈共用同一個 `net_flow`
+    # 累計（單一來源，工程原則 1），不另外重算。
+    roi_denominator = max(DENOMINATOR_FLOOR, av[0][1] + max_cum_flow)
+    out["roi_denominator"] = roi_denominator
+    out["roi"] = cum_pnl / roi_denominator
+    out["roi_index"] = tuple(Decimal("1") + (p[1] - pnl[0][1]) / roi_denominator
+                             for p in pnl)
+    out["roi_insufficient_data"] = thin_return
+
+    # --- 比率型指標（Sharpe/Sortino/年化波動/區間勝率/最佳最差單期）---
+    # r_i 直接由權益指數推導（沿用既有對齊邏輯）：equity_index 已把分母地板
     # 跳過的區間就地補 0（見上面 `skipped` 迴圈），所以這裡不必另外處理跳過段。
+    # 2026-11-16（D3）：依實際取樣間隔年化。`periods_per_year = 365 / (covered_days / n)`，
+    # n＝區間數；取樣不等距（allTime 窗降採樣）時為平均間隔的近似。
+    # 2026-11-17（審核 W3）：改由原始毫秒時間戳算——`covered_days` 已 quantize 到 4 位，
+    # 兩點相距 < 4.3 秒時會量化成 0 而除以零；上方閘門保證 last_ts > first_ts。
+    periods_per_year = (DAYS_PER_YEAR * Decimal(len(pnl) - 1) * _MS_PER_DAY
+                        / Decimal(last_ts - first_ts))
+    out["periods_per_year"] = periods_per_year
     ratio_returns = [equity_index[i] / equity_index[i - 1] - Decimal("1")
                      for i in range(1, len(equity_index))]
-    ratio = compute_ratio_metrics(ratio_returns)
+    ratio = compute_ratio_metrics(ratio_returns, periods_per_year=periods_per_year)
     ratio_thin = covered_days < RATIO_MIN_DAYS   # 獨立門檻，見 RATIO_MIN_DAYS 註解
     for key in ("win_rate", "best_day_return", "worst_day_return"):
         if key in ratio:
@@ -511,6 +587,15 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
     if "sortino" in ratio:
         out["sortino"] = ratio["sortino"]
         out["sortino_insufficient_data"] = ratio_thin
+
+    # ROI 年化（D5）：ROI <= -1 → 無定義，三個 roi_annualized* 鍵一起缺席。
+    # 標記判定式與下方 annualized_return_* 相同（只依 covered_days）。
+    roi_annualized = _annualize(Decimal("1") + out["roi"], covered_days)
+    if roi_annualized is not None:
+        out["roi_annualized"] = roi_annualized
+        out["roi_annualized_insufficient_data"] = (
+            covered_days < MIN_DAYS_FOR_ANNUALIZATION)
+        out["roi_annualized_extrapolated_from_days"] = covered_days
 
     annualized = _annualize(equity_index[-1], covered_days)
     if annualized is None:
@@ -563,7 +648,8 @@ def _max_drawdown(equity_index: list[Decimal]) -> Decimal:
 
 
 def _annualize(growth: Decimal, covered_days: Decimal) -> Decimal | None:
-    """`(1+TWR)^(365/天數) − 1`。
+    """`growth^(365/天數) − 1`；`growth` 為 `1+TWR`（權益指數末值）或 `1+ROI`
+    （`roi_annualized`，D5）。
 
     ⚠️ 2026-07-19 起呼叫點**不再**保證 `covered_days >= 90`：短窗照樣年化，但結果
     一定伴隨 `annualized_return_insufficient_data=True` 與
@@ -600,15 +686,18 @@ def jsonable_performance(perf: dict[str, Any], *, include_equity_index: bool = F
     欄位只是還沒算」。`*_insufficient_data` 是 bool，原樣通過（不轉字串：前端要能
     直接 `if (marker)`，把它變成 `"False"` 這種**真值為 True** 的字串是致命的）。
 
-    `equity_index` 預設**不輸出**：它是每窗數十到數百點的序列，落進每日快照會讓
-    檔案膨脹一個數量級，而快照的用途是純量指標。要畫圖的呼叫端顯式打開。
+    `equity_index`／`roi_index`（2026-11-16 新增，同為每窗數十到數百點的 Decimal
+    序列）預設**不輸出**：落進每日快照會讓檔案膨脹一個數量級，而快照的用途是純量
+    指標；`<key>_len` 一律輸出。要畫圖的呼叫端顯式打開（`include_equity_index`
+    同時控制兩者）。`roi_index` 若漏處理會以 tuple of Decimal 原樣進 `json.dumps`
+    而炸掉整份快照寫檔。
     """
     out: dict[str, Any] = {}
     for k, v in perf.items():
-        if k == "equity_index":
-            out["equity_index_len"] = len(v)
+        if k in ("equity_index", "roi_index"):
+            out[f"{k}_len"] = len(v)
             if include_equity_index:
-                out["equity_index"] = [str(x) for x in v]
+                out[k] = [str(x) for x in v]
             continue
         out[k] = str(v) if isinstance(v, Decimal) else v
     return out

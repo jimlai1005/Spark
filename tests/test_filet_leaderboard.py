@@ -92,8 +92,14 @@ def test_snapshot_includes_perp_performance_when_portfolio_fn_given():
     row = snap["rows"][0]
     assert row["account_value"] == str(Decimal(STATE1["marginSummary"]["accountValue"]))
     win = row["perf"]["windows"]["perpMonth"]
-    assert win["twr"] == "-0.19"
-    assert win["max_drawdown"] == "0.19"     # 算在 I_t 上（AV 遞增，AV 基準會是 0）
+    # 2026-11-16（plan strategy-return-hl-roi §1.1）：分母含該段淨流入，手算（同
+    # tests/test_leader_perf.py `_MASKED_LOSS_40D`）：r1=-100/(1000+2000)=-1/30、
+    # r2=-290/(2900+2900)=-0.05 → I=29/30×0.95=551/600 → twr=-49/600=-0.0816666667
+    # （舊公式 r=-0.1,-0.1 → -0.19）。
+    q = Decimal("0.0000000001")
+    assert Decimal(win["twr"]).quantize(q) == Decimal("-0.0816666667")
+    # 算在 I_t 上（AV 遞增，AV 基準會是 0）
+    assert Decimal(win["max_drawdown"]).quantize(q) == Decimal("0.0816666667")
     assert win["covered_days"] == "40.0000" and win["sample_count"] == 3
     assert win["disclosure_tier"] == "window_return"
     # ⚠️ 2026-07-19 揭露模型改版（使用者裁決「顯示但註記」）：40 天窗**照樣**有年化，

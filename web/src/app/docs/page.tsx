@@ -8,8 +8,10 @@
  * 3. 費用：`<FeeCalculator>` 元件本身（首頁費用區同一顆，含試算 slider）。
  * 4. 績效方法論 `id="methodology"`：復用 `strategyDetail.methodology` 的慣例句
  *    （365 日年化、無風險利率 0%——這兩個是全平台統一常數，不是單一策略的實例
- *    數字，見 `PublicStrategyMethodology` 預設值）＋`totalReturnNote`（真實入金
- *    起算）＋`sharpeLabel`/`sharpeNoteSuffix`（標準誤揭露的既有標記法）；
+ *    數字，見 `PublicStrategyMethodology` 預設值）＋`totalReturnNote`（Hyperliquid
+ *    排行榜 ROI 定義）＋`sharpeLabel`/`sharpeNoteSuffix`（標準誤揭露的既有標記法）
+ *    ＋2026-11-16 起的三句績效定義（`methodology.roiNote`／`segmentReturnNote`／
+ *    `samplingNote`，與策略詳情頁方法論卡共用同一份字串）；
  *    唯一新增的一句是 `methodology.basisNote`（perp 基準），既有 key 裡沒有任何
  *    一句話涵蓋這個慣例（`methodology.basis` 這個 API 欄位本身從未被任何頁面
  *    渲染過，見 `lib/publicApi.ts`）。
@@ -65,6 +67,9 @@ export default function DocsPage() {
         <ul>
           <li>{m.basisNote}</li>
           <li>{metrics.totalReturnNote}</li>
+          <li>{m.roiNote}</li>
+          <li>{m.segmentReturnNote}</li>
+          <li>{m.samplingNote}</li>
           <li>
             {metrics.sharpeLabel}
             {metrics.sharpeNoteSuffix}

@@ -38,11 +38,16 @@ def test_window_stats_day_has_drawdown(portfolio):
     assert len(ws.spark) == 21                       # 21 點 <= 30，不補點
 
 
-def test_window_stats_all_time_is_flow_dominated(portfolio):
+def test_window_stats_all_time_equity_index_collapsed(portfolio):
+    # 2026-11-16（D2，分母含該段淨流入）：區間 18 淨值 159.580109 → 0，
+    # ΔP = -2051.123212 - (-1878.110234) = -173.012978，ΔF = 13.432869，
+    # r = -173.012978 / (159.580109 + 13.432869) = -1 **恰好**（淨值歸零，合法）；
+    # 舊公式 r = ΔP/AV(t−1) = -1.0842 < -1 被判 flow_dominated_interval。
+    # 歸零之後仍有 91 個區間 → equity_index_collapsed（2026-09-30 方案 B）。
     ws = window_stats(portfolio, "allTime")
     assert ws.pnl_usd == 27504.48
     assert ws.max_dd_pct is None
-    assert ws.max_dd_reason == "flow_dominated_interval"
+    assert ws.max_dd_reason == "equity_index_collapsed"
 
 
 def test_window_stats_week(portfolio):
