@@ -55,6 +55,29 @@ describe("StrategiesPage", () => {
     expect(screen.getByRole("link", { name: COPY.home.strategies.advancedCta })).toBeInTheDocument();
   });
 
+  it("暫不開放新跟單（listable=false）的策略不列出，與首頁同步", async () => {
+    const closed = { ...STRATEGY, slug: "core-legacy", name: "Filet Core (Legacy)", featured: false, status: "paused", listable: false };
+    const open2 = { ...STRATEGY, slug: "second", name: "Second", featured: false };
+    stubFetch(() => jsonResponse({ strategies: [STRATEGY, closed, open2], updated_at: 1 }));
+    render(<StrategiesPage />);
+    await screen.findByText("Filet Core");
+    await screen.findByText("Second");
+    expect(screen.queryByText("Filet Core (Legacy)")).not.toBeInTheDocument();
+    expect(document.querySelector('[data-slug="core-legacy"]')).toBeNull();
+    expect(document.querySelectorAll("[data-slug]")).toHaveLength(2);
+  });
+
+  it("全部策略都暫不開放 → 顯示空態文字，進階模式卡仍在", async () => {
+    const closed = { ...STRATEGY, status: "paused", listable: false };
+    stubFetch(() => jsonResponse({ strategies: [closed], updated_at: 1 }));
+    render(<StrategiesPage />);
+    await waitFor(() => {
+      expect(screen.getByText(COPY.home.strategies.empty)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Filet Core")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: COPY.home.strategies.advancedCta })).toBeInTheDocument();
+  });
+
   it("標題與說明文字存在", async () => {
     stubFetch(() => jsonResponse({ strategies: [], updated_at: 1 }));
     render(<StrategiesPage />);

@@ -6,6 +6,10 @@
  * ⭐ 與首頁「可跟單策略」區塊刻意共用文案（`COPY.home.strategies.*`）：兩處呈現
  * 同一批資料、同一套規則（`listable`＝`enabled` 且 `accepting_new`），拆兩份
  * 文案只會製造不同步的風險。
+ *
+ * 2026-11-17 使用者裁決：本頁與首頁同步，**只列 `listable` 的策略**——暫不開放
+ * 新跟單的策略（例：Filet Alpha (Legacy)）不出現在清單。詳情頁 `/strategies/{slug}`
+ * 不受影響、仍可直接開啟（既有跟單者需要）。
  */
 import Link from "next/link";
 import { useEffect, useState } from "react";
@@ -21,7 +25,7 @@ export default function StrategiesPage() {
   useEffect(() => {
     let cancelled = false;
     getPublicStrategies().then((r) => {
-      if (!cancelled) setStrategies(r.strategies);
+      if (!cancelled) setStrategies(r.strategies.filter((x) => x.listable));
     });
     return () => {
       cancelled = true;
