@@ -3562,7 +3562,7 @@ explore 磁碟快取從未生效、ledger 漏收 internalTransfer（幻影回撤
 
 | 層 | 指令 | 抓什麼 | 需要 |
 |---|---|---|---|
-| 1 離線 | `uv run pytest -q && uv run ruff check src tests scripts && (cd web && npm test)` | 邏輯回歸 | 無 |
+| 1 離線 | `uv run pytest -q && uv run ruff check src tests scripts && (cd web && npm test && npm run typecheck)` | 邏輯回歸 | 無 |
 | 2 真鏈契約＋E2E | `uv run pytest -m integration tests/integration -q -p no:cacheprovider`（順序：`test_hl_contract.py` → `test_e2e_noncustodial.py` → `test_adapter_testnet.py`，後兩者要一起跑且 E2E 在前） | HL 欄位漂移（testnet＋mainnet 唯讀）、非託管全流程（SIWE→keysvc→鏈上授權→簽章→watcher→引擎鏡像→pause→close-all）、builder fee 實收 | Keychain `spark/filet-testnet-faucet:main`（水龍頭 `0x4229ea4BaDf01D7517FBf8B7EC83aE6927DB9CE2`，每輪消耗約 $3–5 testnet USDC 手續費；`faucet-status` 查餘額，低於 ~280 時從 9760 testnet UI 補） |
 | 3 瀏覽器 | 起本機 stack（見下）→ `cd web && npm run test:e2e`（含 `wallet-onboarding.spec.ts`，需 `E2E_WALLET_PK_FILE`） | 公開頁零 console error／EN 無中文殘留、注入錢包走完精靈（approveAgent／approveBuilderFee 真上 testnet、pending 落地） | 同上＋Node |
 | 4 正式機 | `uv run python -m scripts.filet_regression_check --http --ssh` | 67 條唯讀檢查：路由、公開 API 契約、未授權 401、TLS、`systemctl --failed`、四個 timer 新鮮度、drop-in 有效環境（`FILET_LEADERS_PATH`／`FILET_ACCRUED_HISTORY_PATH`／`FILET_EXPLORE_CACHE_PATH`）、reports 目錄 setgid、交換目錄方向性、機密檔 | SSH 金鑰 |
@@ -4226,3 +4226,7 @@ dd0346c..e9a67c7 另含 `6c2d75e` 的文件（RUNBOOK、兩份 plan）；`packag
 三個 follower 未動（`ActiveEnterTimestamp` 仍 2026-11-05、`NRestarts` 不變、心跳 15 秒內）；`filet-api` 未重啟（自 13:54:40Z）；
 `filet_regression_check --http --ssh` **67/67 PASS**。
 回滾＝`bash /opt/filet/spark/deploy/ops/web_build_swap.sh --rollback`（`.next-prev` 還在時），或 §9.3 回 dd0346c 的 `web/` 後重跑腳本；後端無變動。
+
+**2026-11-17 補記（無部署）：前端型別檢查成為固定指令。** `web/` 兩個測試檔累積了 30 個型別錯誤（最早 2026-08-31），一直沒被發現——
+`next build` 照常通過、repo 內也沒有任何步驟跑 `tsc`。已修（commit `9e3bdbf`，只動測試檔，行為不變），並新增 `npm run typecheck`（`tsc --noEmit`），
+列入 §8「驗收 4」四層回歸的第 1 層（離線）與專案 `CLAUDE.md` 的指令清單。`web/package.json` 因此只多一行 script——`package-lock.json` 不變，下次部署**不需要** `npm ci`。
