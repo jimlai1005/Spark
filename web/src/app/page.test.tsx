@@ -96,6 +96,50 @@ describe("HomePage", () => {
     expect(screen.getByRole("link", { name: COPY.home.strategies.advancedCta })).toHaveAttribute("href", "/advanced");
   });
 
+  it("⭐ 暫停開放新跟單（listable=false）的策略不出現在首頁策略區", async () => {
+    const paused = { ...STRATEGY, slug: "core-legacy", name: "Filet Core (Legacy)", featured: false,
+      status: "paused", listable: false };
+    stubFetch((url) => {
+      if (url.includes("/api/public/strategies")) {
+        return jsonResponse({ strategies: [STRATEGY, paused], updated_at: 1 });
+      }
+      return jsonResponse({});
+    });
+    render(<HomePage />);
+    const section = (await screen.findAllByText("Filet Core"))[0].closest("main") ?? document.body;
+    await waitFor(() => expect(document.querySelector("#strategies")).not.toBeNull());
+    const strategies = document.querySelector("#strategies")!;
+    expect(strategies.textContent).toContain("Filet Core");
+    expect(strategies.textContent).not.toContain("Filet Core (Legacy)");
+    expect(section.textContent).not.toContain("Filet Core (Legacy)");
+  });
+
+  it("⭐ 全部策略皆暫停開放 → 首頁策略區顯示空狀態提示，不列任何策略卡", async () => {
+    const paused = { ...STRATEGY, featured: false, status: "paused", listable: false };
+    stubFetch((url) => {
+      if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [paused], updated_at: 1 });
+      return jsonResponse({});
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(document.querySelector("#strategies .hint")).not.toBeNull());
+    expect(document.querySelectorAll("#strategies .strategy-card:not(.strategy-card-advanced)").length).toBe(0);
+  });
+
+  it("⭐ 沒有 featured 策略時，hero 主推卡優先挑開放新跟單的策略，不挑清單第一筆的暫停策略", async () => {
+    const paused = { ...STRATEGY, slug: "core-legacy", name: "Filet Core (Legacy)", featured: false,
+      status: "paused", listable: false };
+    const open = { ...STRATEGY, slug: "open", name: "Filet Open", featured: false };
+    stubFetch((url) => {
+      if (url.includes("/api/public/strategies")) return jsonResponse({ strategies: [paused, open], updated_at: 1 });
+      return jsonResponse({});
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(document.querySelector(".home-hero-featured-name")).not.toBeNull());
+    const name = document.querySelector(".home-hero-featured-name")!.textContent ?? "";
+    expect(name).toContain("Filet Open");
+    expect(name).not.toContain("Legacy");
+  });
+
   it("錨點 id：#security（授權能力矩陣）與 #how（步驟）皆存在", async () => {
     stubFetch(() => jsonResponse({ strategies: [], updated_at: 1 }));
     const { container } = render(<HomePage />);

@@ -36,7 +36,11 @@ const EMPTY_STATS: PublicStats = {
 
 function pickFeatured(strategies: PublicStrategy[]): PublicStrategy | null {
   if (strategies.length === 0) return null;
-  return strategies.find((s) => s.featured) ?? strategies[0];
+  // 2026-11-17：沒有任何策略標 featured 時，優先挑開放新跟單（listable）的第一筆，
+  // 都沒有才退回清單第一筆——避免 hero 主推卡顯示一個已暫停開放的策略。
+  return strategies.find((s) => s.featured)
+    ?? strategies.find((s) => s.listable)
+    ?? strategies[0];
 }
 
 /** metrics 顯示：insufficient → NO_VALUE；否則附上尾綴（例如 %）。 */
@@ -74,6 +78,10 @@ export default function HomePage() {
   }, []);
 
   const featured = pickFeatured(strategies);
+  // 2026-11-17 使用者裁決：首頁「可跟單策略」區只列目前開放新跟單的策略——
+  // 已暫停開放（`listable === false`，例如 Filet Alpha (Legacy)）的卡不在首頁出現；
+  // 它們仍列在 `/strategies`，既有跟單者的儀表板也不受影響。
+  const listableStrategies = strategies.filter((s) => s.listable);
   const featuredTagline = featured ? resolveTagline(featured, lang) : "";
   // Task 7.2（2026-09-21，P7 null→0 稽核）：`live_days` 讀不到 perf 時後端送
   // `null`（見 publicApi.ts 型別檔頭），純展示欄位，未知顯示 NO_VALUE 而非
@@ -238,10 +246,10 @@ export default function HomePage() {
           </Link>
         </div>
         <div className="strategy-grid">
-          {strategies.map((s) => (
+          {listableStrategies.map((s) => (
             <StrategyCard key={s.slug} strategy={s} />
           ))}
-          {strategies.length === 0 && <p className="hint">{home.strategies.empty}</p>}
+          {listableStrategies.length === 0 && <p className="hint">{home.strategies.empty}</p>}
           <div className="card strategy-card strategy-card-advanced">
             <div className="strategy-card-name">{home.strategies.advancedTitle}</div>
             <p className="strategy-card-advanced-body">{home.strategies.advancedBody}</p>
