@@ -57,7 +57,8 @@ import { useMe } from "@/lib/hooks";
 import { useCopy } from "@/lib/lang";
 import { liqDistanceDisplay } from "@/lib/liqDistance";
 import {
-  EXPLORE_WINDOWS, fillsIncomplete, getPublicTraderDetail, type ExploreWindow, type PublicTraderDetail,
+  EXPLORE_WINDOWS, fillsIncomplete, getPublicTraderDetail, returnSampleCount,
+  type ExploreWindow, type PublicTraderDetail,
 } from "@/lib/publicApi";
 import { metricText, type MetricCardDef } from "@/lib/strategyMetrics";
 import { useWalletLogin } from "@/lib/useWalletLogin";
@@ -206,7 +207,7 @@ function TraderDetailInner() {
       label: sc.metrics.winRateLabel,
       value: metricText(wm.win_rate_pct, wm.win_rate_pct_insufficient, "%"),
       insufficient: wm.win_rate_pct_insufficient,
-      note: `${sc.metrics.winRateNotePrefix}${wm.sample_count}${sc.metrics.winRateNoteSuffix}`,
+      note: `${sc.metrics.winRateNotePrefix}${returnSampleCount(wm)}${sc.metrics.winRateNoteSuffix}`,
     },
   ];
 

@@ -353,7 +353,9 @@ def test_list_no_auth_required_and_shape(tmp_path):
                     "sortino", "sortino_insufficient",
                     "best_day_pct", "best_day_pct_insufficient",
                     "worst_day_pct", "worst_day_pct_insufficient",
-                    "sample_count"}
+                    "sample_count",
+                    # 2026-11-17（plan perf-followups A1／E2）：區間報酬樣本數 N
+                    "return_sample_count"}
     assert set(row["metrics"]) == metrics_keys
     assert r.cookies.get("filet_session") is None      # 無 cookie 副作用
 

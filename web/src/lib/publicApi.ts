@@ -31,6 +31,10 @@ export interface PublicStrategyMetrics {
   worst_day_pct: string | null;
   worst_day_pct_insufficient: boolean;
   sample_count: number;
+  /** 2026-11-17（plan perf-followups E2）：區間報酬樣本數 N＝取樣點數 − 1，勝率與
+   * Sharpe 標準誤公式裡的 N。舊後端缺席 → 呼叫端退回 `max(sample_count − 1, 0)`
+   * （見 `returnSampleCount`）。 */
+  return_sample_count?: number;
 }
 
 export interface PublicStrategy {
@@ -131,6 +135,9 @@ const EMPTY_METHODOLOGY: PublicStrategyMethodology = {
 
 export interface PublicStrategyDetail extends PublicStrategy {
   equity_index: string[];
+  /** 每個取樣點的毫秒時間戳，與 `equity_index` 等長（同一個 perf）；`equity_index`
+   * 為空時為 `null`。舊後端缺席 → `EquityCurve` 維持「一點 ≈ 一天」舊行為。 */
+  equity_index_ts?: number[] | null;
   methodology: PublicStrategyMethodology;
   /** M3 round3 Task 3：`live_days` 的同一個值（結構性防呆用途，前端據此門檻
    * 決定是否摺疊次要指標——不得另外重算，見 `strategies.py` 檔頭）。 */
@@ -167,7 +174,20 @@ function normalizeMetrics(v: unknown): PublicStrategyMetrics {
     worst_day_pct: m.worst_day_pct ?? null,
     worst_day_pct_insufficient: !!m.worst_day_pct_insufficient,
     sample_count: typeof m.sample_count === "number" ? m.sample_count : 0,
+    // 可選鍵：舊後端缺席時整個不出現（不補 0，避免假裝有值；見 `returnSampleCount`）。
+    ...(typeof m.return_sample_count === "number"
+      ? { return_sample_count: m.return_sample_count } : {}),
   };
+}
+
+/** 區間報酬樣本數 N（勝率、Sharpe 標準誤公式裡的 N，E2）：優先用後端
+ * `return_sample_count`；舊後端缺席時退回 `max(sample_count − 1, 0)`（取樣點數 − 1）。 */
+export function returnSampleCount(
+  m: Pick<PublicStrategyMetrics, "sample_count" | "return_sample_count">,
+): number {
+  return typeof m.return_sample_count === "number"
+    ? m.return_sample_count
+    : Math.max(m.sample_count - 1, 0);
 }
 
 function normalizeMethodology(v: unknown): PublicStrategyMethodology {
@@ -293,6 +313,11 @@ export async function getPublicStrategy(slug: string): Promise<PublicStrategyDet
       max_leverage: body.max_leverage ?? null,
       metrics: normalizeMetrics(body.metrics),
       equity_index: Array.isArray(body.equity_index) ? body.equity_index.map(String) : [],
+      // 缺席／null／非數字陣列 → 整個鍵不出現（`EquityCurve` 據此維持舊行為；長度比對
+      // 由元件負責）。與 `periods_per_year` 同款：舊後端回應不補假值。
+      ...(Array.isArray(body.equity_index_ts)
+        && body.equity_index_ts.every((t) => typeof t === "number")
+        ? { equity_index_ts: body.equity_index_ts as number[] } : {}),
       methodology: normalizeMethodology(body.methodology),
       as_of: typeof body.as_of === "number" ? body.as_of : null,
       sample_days: typeof body.sample_days === "number" ? body.sample_days : 0,

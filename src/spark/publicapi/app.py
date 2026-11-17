@@ -40,8 +40,9 @@ from spark.filet.leader_perf import (BASIS_NOTE, INSUFFICIENCY_MARKERS,
 from spark.filet.leaderboard import load_latest_snapshot, snapshot_rows_by_address
 from spark.filet.leaders import LeaderRef, find_leader, is_selectable, load_leaders
 from spark.filet.strategies import (build_cagr_fields, build_equity_index,
-                                    build_equity_range, build_metrics,
-                                    build_methodology, build_strategy_view,
+                                    build_equity_index_ts, build_equity_range,
+                                    build_metrics, build_methodology,
+                                    build_strategy_view,
                                     sample_days_from_perf, sum_ledger_deposits)
 from spark.filet.trader_stats import fills_stats, live_days_from_av, window_stats
 from spark.publicapi import benchmarks, hl_explore, hl_leaderboard, public_stats
@@ -2277,7 +2278,10 @@ def create_app(cfg: ApiConfig, store: ApiStore, keysvc, hl, now_fn=time.time,
         # （`sample_days < sample_threshold`〔30 天，2026-08-30 D15 由 60 調降〕時
         # **整個不放 `cagr_pct` 鍵**——結構性防呆：前端不需要另外判斷門檻）。
         view.update(build_cagr_fields(perf, sample_days=view["live_days"]))
+        # 2026-11-17（plan perf-followups E1）：`equity_index_ts` 與 `equity_index` 出自
+        # **同一個 perf**、逐點等長（perf 非 ok → `[]` 與 `null`）。
         view["equity_index"] = build_equity_index(perf)
+        view["equity_index_ts"] = build_equity_index_ts(perf)
         # ⭐ M3 round4 Task R4-2：起訖淨值改用同一份 `accountValueHistory` 的首個
         # 非零值／末值（`build_equity_range`），不再是「首點原樣值」——首點常態
         # 性是 0（錢包晚於序列起點入金），硬印它會讓「起訖淨值」整卡顯示樣本不足

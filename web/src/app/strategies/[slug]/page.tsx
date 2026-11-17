@@ -40,7 +40,7 @@ import { WalletPicker } from "@/components/WalletPicker";
 import { fmtAmount, fmtUpdatedAtUtc, NO_VALUE, resolveTagline, shortAddr } from "@/lib/format";
 import { useMe } from "@/lib/hooks";
 import { useCopy, useLang } from "@/lib/lang";
-import { getPublicStrategy, type PublicStrategyDetail } from "@/lib/publicApi";
+import { getPublicStrategy, returnSampleCount, type PublicStrategyDetail } from "@/lib/publicApi";
 import {
   formatDepositEquivalentEquity, metricText, type MetricCardDef,
 } from "@/lib/strategyMetrics";
@@ -164,7 +164,7 @@ export default function StrategyDetailPage() {
       label: c.metrics.winRateLabel,
       value: metricText(m.win_rate_pct, m.win_rate_pct_insufficient, "%"),
       insufficient: m.win_rate_pct_insufficient,
-      note: `${c.metrics.winRateNotePrefix}${m.sample_count}${c.metrics.winRateNoteSuffix}`,
+      note: `${c.metrics.winRateNotePrefix}${returnSampleCount(m)}${c.metrics.winRateNoteSuffix}`,
     },
   ];
 
@@ -254,6 +254,7 @@ export default function StrategyDetailPage() {
         <div className="strategy-detail-left">
           <EquityCurve
             equityIndex={strategy.equity_index}
+            timestamps={strategy.equity_index_ts}
             initialDepositUsd={strategy.methodology.initial_deposit_usd}
             startDate={strategy.methodology.start_date}
             endDate={strategy.methodology.end_date}

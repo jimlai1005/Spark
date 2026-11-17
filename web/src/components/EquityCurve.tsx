@@ -54,7 +54,8 @@ function shortDate(iso: string): string {
 }
 
 /**
- * x 軸日期標籤：有 `startDate`/`endDate` 時，依「一點 ≈ 一天」假設從 `endDate`
+ * x 軸日期標籤（**舊行為**，只在無可用 `timestamps` 時使用；有時間戳走 `xLabelsFromTs`）：
+ * 有 `startDate`/`endDate` 時，依「一點 ≈ 一天」假設從 `endDate`
  * 往回推（`sliced` 是尾端裁切後的視窗，最後一點即 `endDate`）；沒有日期資訊時
  * 退化為相對天數 `D{n}`（n 為該點在**完整序列**中的第幾天，1-based）。
  */
@@ -77,20 +78,77 @@ function xLabels(
   return indices.map((idx) => ({ idx, label: `D${offset + idx + 1}` }));
 }
 
-/** 依 period 從序列尾端裁切——沿用既有「一點 ≈ 一天」假設，「30D/7D」直接取最後 N
- * 點。⚠️ 2026-11-16 註記：HL `allTime` 序列實為約每 1–2 週一點，此假設對 allTime
- * 序列不成立（plan strategy-return-hl-roi 回報為待裁決項，本次未改）。 */
+/** 依 period 從序列尾端裁切——**舊行為**（無時間戳時沿用）：假設「一點 ≈ 一天」，
+ * 「30D/7D」直接取最後 N 點。⚠️ HL `allTime` 序列實為約每 1–2 週一點，此假設不成立；
+ * 2026-11-17（plan perf-followups E1）起後端供給 `equity_index_ts`，有時間戳時改走
+ * `sliceStartByTime`，本函式只服務舊回應相容。 */
 function sliceByPeriod(values: number[], period: Period): number[] {
   if (period === "all") return values;
   const n = period === "30d" ? 30 : 7;
   return values.slice(Math.max(0, values.length - n));
 }
 
+const PERIOD_DAYS: Record<Exclude<Period, "all">, number> = { "30d": 30, "7d": 7 };
+
+/** 有時間戳時的期間切片起點（含）：`ts >= lastTs − N×86400000` 的第一個索引；
+ * `all` ＝ 0。`ts` 為空 → 0。 */
+function sliceStartByTime(ts: number[], period: Period): number {
+  if (period === "all" || ts.length === 0) return 0;
+  const cutoff = ts[ts.length - 1] - PERIOD_DAYS[period] * 86400000;
+  const i = ts.findIndex((t) => t >= cutoff);
+  return i < 0 ? 0 : i;
+}
+
+/** 毫秒時間戳 → `YYYY-MM-DD`（UTC）。無法轉換 → `null`。 */
+function msToIsoDate(ms: number): string | null {
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
+/** 切片首末點相距超過此天數 → x 軸標籤改 `YYYY-MM`（跨年時 `MM-DD` 會看起來重複）。 */
+const LONG_SPAN_DAYS = 300;
+
+/** 有時間戳時的 x 軸標籤（plan perf-followups Task F2）：點依時間比例排列，刻度也**按時間等距**——
+ * 刻度數 `k` 沿用 `pickTickIndices` 算出的數量，第 `j` 個刻度的時間＝
+ * `ts_first + j/(k−1) × (ts_last − ts_first)`，標籤顯示**該時間**的 UTC 日期（不是最近資料點的
+ * 日期）；`k == 1` 或 `ts_last == ts_first` 只顯示首點日期，不除以零。切片首末相距 > 300 天用
+ * `YYYY-MM`，否則 `MM-DD`（B5）。`idx` 為刻度序號（React key 用）。匯出供單元測試。 */
+export function xLabelsFromTs(slicedTs: number[]): { idx: number; label: string }[] {
+  const n = slicedTs.length;
+  if (n === 0) return [];
+  const first = slicedTs[0];
+  const span = slicedTs[n - 1] - first;
+  const long = span > LONG_SPAN_DAYS * 86400000;
+  const fmt = (ms: number, j: number) => {
+    const iso = msToIsoDate(ms);
+    if (!iso) return { idx: j, label: `#${j + 1}` };
+    return { idx: j, label: long ? iso.slice(0, 7) : shortDate(iso) };
+  };
+  const k = pickTickIndices(n, X_TICK_TARGET).length;
+  if (k <= 1 || !(span > 0)) return [fmt(first, 0)];
+  return Array.from({ length: k }, (_, j) => fmt(Math.round(first + (j / (k - 1)) * span), j));
+}
+
+/**
+ * 有時間戳時各點的 x 位置（0..1）：`(ts_i − ts_first) / (ts_last − ts_first)`——依時間比例
+ * 排點（HL 全期序列早期稀疏、近期密集，等距會扭曲時間軸）。主曲線與對照線共用同一組。
+ * `ts_last == ts_first`（含單點）不得除以零：退化為等距（單點為 0）。匯出供單元測試。
+ */
+export function xFractionsFromTs(ts: number[]): number[] {
+  const n = ts.length;
+  if (n === 0) return [];
+  const span = ts[n - 1] - ts[0];
+  if (!(span > 0)) return ts.map((_, i) => (n === 1 ? 0 : i / (n - 1)));
+  return ts.map((t) => (t - ts[0]) / span);
+}
+
 /** values → SVG polyline 的 `points` 字串（等距 x，y 依 `range`——缺省時退回
  * 依自身 min/max 正規化，沿舊行為）。全平（min===max）時畫一條水平中線，
  * 避免除以零。`range` 讓主線與 overlay 疊加線共用同一個 y 軸座標系
  * （見 `EquityCurve` 內 `yRange` 的計算，兩者才畫得出可比較的相對位置）。 */
-function toPoints(values: number[], range?: { min: number; max: number }): string {
+function toPoints(
+  values: number[], range?: { min: number; max: number }, xs?: number[] | null,
+): string {
   if (values.length === 0) return "";
   const min = range ? range.min : Math.min(...values);
   const max = range ? range.max : Math.max(...values);
@@ -98,7 +156,7 @@ function toPoints(values: number[], range?: { min: number; max: number }): strin
   const n = values.length;
   return values
     .map((v, i) => {
-      const x = n === 1 ? 0 : (i / (n - 1)) * VIEW_W;
+      const x = xs ? xs[i] * VIEW_W : n === 1 ? 0 : (i / (n - 1)) * VIEW_W;
       const y = span === 0 ? VIEW_H / 2 : VIEW_H - ((v - min) / span) * VIEW_H;
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
@@ -110,19 +168,22 @@ function toPoints(values: number[], range?: { min: number; max: number }): strin
  * 主曲線裁切窗內的第幾個」計算，才能與主線對齊；`null` 缺格直接跳過、不插值
  * 補一個數字（issue log I-19 明訂：日期缺格跳過該點，不編數字），polyline
  * 會因此在缺格處以直線連接前後兩個有值的點。 */
-function toOverlayPoints(values: (number | null)[], n: number, range: { min: number; max: number }): string {
+function toOverlayPoints(
+  values: (number | null)[], n: number, range: { min: number; max: number }, xs?: number[] | null,
+): string {
   const span = range.max - range.min;
   const pts: string[] = [];
   values.forEach((v, i) => {
     if (v == null || !Number.isFinite(v)) return;
-    const x = n === 1 ? 0 : (i / (n - 1)) * VIEW_W;
+    const x = xs ? xs[i] * VIEW_W : n === 1 ? 0 : (i / (n - 1)) * VIEW_W;
     const y = span === 0 ? VIEW_H / 2 : VIEW_H - ((v - range.min) / span) * VIEW_H;
     pts.push(`${x.toFixed(2)},${y.toFixed(2)}`);
   });
   return pts.join(" ");
 }
 
-/** `sliced`（裁切後主曲線）每個位置對應的 `YYYY-MM-DD` 日期——與 `xLabels`
+/** `sliced`（裁切後主曲線）每個位置對應的 `YYYY-MM-DD` 日期（**舊行為**，無可用
+ * `timestamps` 時使用；有時間戳直接用各點真實日期）——與 `xLabels`
  * 同一套「從 `endDate` 往回推、一點 ≈ 一天」假設（見該函式），供 overlay 對齊
  * 收盤價用。`endDate` 缺席或格式不符 → 全部回 `null`（無法對齊，overlay 該日
  * 期沒有東西可畫）。 */
@@ -153,6 +214,52 @@ function closeByDate(series: [number, string][] | null): Record<string, number> 
   return map;
 }
 
+/** 收盤價回溯上限（日曆日）：取樣點當日沒有收盤價（週末、假日）時，最多往前找幾天。 */
+export const CLOSE_LOOKBACK_DAYS = 4;
+
+/**
+ * 有時間戳路徑的收盤價對齊（plan perf-followups §6）：對每個 `YYYY-MM-DD`，取
+ * 「當日或之前最近一筆」收盤價，回溯上限 `CLOSE_LOOKBACK_DAYS` 個日曆日，超過 → `null`。
+ * 序列為 `null`（上游查詢失敗）→ 回 `null`。匯出供單元測試。
+ */
+export function alignClosesOnOrBefore(
+  series: [number, string][] | null, dates: (string | null)[],
+): (number | null)[] | null {
+  const table = closeByDate(series);
+  if (table == null) return null;
+  return dates.map((d) => {
+    if (d == null) return null;
+    const base = Date.parse(`${d}T00:00:00Z`);
+    if (Number.isNaN(base)) return null;
+    for (let k = 0; k <= CLOSE_LOOKBACK_DAYS; k++) {
+      const v = table[new Date(base - k * 86400000).toISOString().slice(0, 10)];
+      if (v != null) return v;
+    }
+    return null;
+  });
+}
+
+/**
+ * 有時間戳路徑的 rebase：錨點＝切片內**第一個**有效收盤價（有限且非零）的點 `k`，
+ * `overlay[i] = main[k] × (closes[i] / closes[k])`——乘數是**錨點當天的主曲線值**（不是
+ * 切片首點的值），使對照線在錨點那天與主曲線重合（plan perf-followups §7 W1，錨例 B6）。
+ * 錨點之前的點為 `null`（對照線從有資料處開始畫）；全部都沒有有效收盤價 → 全 `null`。
+ * 其餘缺格／非有限數 → `null`，不插值。錨點就是切片首點時等同舊式 `main[0] × c/anchor`。
+ * `main` 為主曲線切片值（與 `closes` 逐點對應）。（舊路徑仍用 `rebaseCloses`。）
+ */
+export function rebaseFromFirstAvailable(
+  main: number[], closes: (number | null)[],
+): (number | null)[] {
+  const anchorIdx = closes.findIndex((c) => c != null && Number.isFinite(c) && c !== 0);
+  if (anchorIdx < 0) return closes.map(() => null);
+  const anchor = closes[anchorIdx] as number;
+  const mult = main[anchorIdx];
+  if (mult == null || !Number.isFinite(mult)) return closes.map(() => null);
+  return closes.map((c, i) => (
+    i < anchorIdx || c == null || !Number.isFinite(c) ? null : mult * (c / anchor)
+  ));
+}
+
 /**
  * rebase：`overlay[i] = mainFirst × (closes[i] / closes[0])`——`closes[0]`
  * 是裁切窗內首日的收盤價（錨點），與主曲線同基準才能直接比形狀（issue log
@@ -178,8 +285,12 @@ export function rebaseCloses(mainFirst: number, closes: (number | null)[]): (num
  * 起點 = "1"），不是美元金額；有 `initialDepositUsd`（＝ROI 分母 D）時 y 軸刻度
  * 換算為 D × index ＝ 投入本金加累計損益。
  */
-export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate }: {
+export function EquityCurve({ equityIndex, timestamps, initialDepositUsd, startDate, endDate }: {
   equityIndex: string[];
+  /** 每個取樣點的毫秒時間戳（後端 `equity_index_ts`，與 `equityIndex` 等長）。
+   * 存在且長度相符 → 期間切片、x 軸日期、對照線對齊全部改用真實時間；缺席或長度
+   * 不符 → 維持舊行為（「一點 ≈ 一天」，相容舊回應），不拋例外。 */
+  timestamps?: number[] | null;
   /** 有值時 y 軸刻度換算成美元金額（= 本值 × 首點比值 × 投入本金）；缺席則顯示
    * 原始 index 值。2026-11-16 起這個值是後端 `methodology.initial_deposit_usd`
    * ＝ROI 分母（起始淨值＋期間最大累計淨入金），不再是鏈上 ledger 入金加總。 */
@@ -216,11 +327,42 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
     setOverlayChecked((prev) => prev.map((v, idx) => (idx === i ? !v : v)));
   }
 
-  const values = useMemo(
-    () => equityIndex.map((v) => Number(v)).filter((v) => Number.isFinite(v)),
-    [equityIndex],
+  // values 與 ts 同步過濾（非有限值連同它的時間戳一起丟），保持逐點對應。
+  const tsUsable = Array.isArray(timestamps) && timestamps.length === equityIndex.length
+    && timestamps.every((t) => typeof t === "number" && Number.isFinite(t));
+  const { values, ts } = useMemo(() => {
+    const vals: number[] = [];
+    const stamps: number[] = [];
+    equityIndex.forEach((raw, i) => {
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return;
+      vals.push(n);
+      if (tsUsable) stamps.push((timestamps as number[])[i]);
+    });
+    return { values: vals, ts: tsUsable ? stamps : null };
+  }, [equityIndex, timestamps, tsUsable]);
+
+  // E6：有時間戳時，30D／7D 切片內不足 2 點 → 該期間不可用（按鈕 disabled）；
+  // 目前選中的期間若變成不可用，退回「全部」（衍生值，不另開 effect）。
+  const unavailable = useMemo(() => {
+    const out: Record<Period, boolean> = { all: false, "30d": false, "7d": false };
+    if (ts == null) return out;
+    for (const p of ["30d", "7d"] as const) {
+      out[p] = ts.length - sliceStartByTime(ts, p) < 2;
+    }
+    return out;
+  }, [ts]);
+  const activePeriod: Period = unavailable[period] ? "all" : period;
+
+  const sliceStart = useMemo(
+    () => (ts == null ? 0 : sliceStartByTime(ts, activePeriod)),
+    [ts, activePeriod],
   );
-  const sliced = useMemo(() => sliceByPeriod(values, period), [values, period]);
+  const sliced = useMemo(
+    () => (ts == null ? sliceByPeriod(values, activePeriod) : values.slice(sliceStart)),
+    [ts, values, activePeriod, sliceStart],
+  );
+  const slicedTs = useMemo(() => (ts == null ? null : ts.slice(sliceStart)), [ts, sliceStart]);
 
   const depositNum = initialDepositUsd == null ? null : Number(initialDepositUsd);
   // depositNum > 0：首快照為 0 的帳戶換算出全 $0 的 y 軸（2026-08-29 真資料驗證），
@@ -234,20 +376,32 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
 
   // overlay 對齊窗（issue log I-19）：`sliced` 每個位置對應的日期，供從
   // `/api/public/benchmarks` 查表取收盤價；rebase 錨點＝裁切窗內首日。
-  const slicedDates = useMemo(() => datesForSlice(sliced, endDate), [sliced, endDate]);
+  const slicedDates = useMemo(
+    () => (slicedTs == null
+      ? datesForSlice(sliced, endDate)
+      : slicedTs.map((t) => msToIsoDate(t))),
+    [slicedTs, sliced, endDate],
+  );
   const overlayValuesByKey = useMemo(() => {
     const out: Record<(typeof OVERLAY_KEYS)[number], (number | null)[] | null> = {
       btc: null, eth: null, sp500: null, gold: null,
     };
     if (overlayData == null || dollarSliced.length === 0) return out;
     for (const key of OVERLAY_KEYS) {
+      if (slicedTs != null) {
+        // 有時間戳：當日或之前最近一筆（回溯 4 日）＋錨點取切片內第一個有收盤價的點。
+        const closes = alignClosesOnOrBefore(overlayData.series[key], slicedDates);
+        if (closes == null) continue;   // 該標的上游查詢失敗（null）→ 維持 null
+        out[key] = rebaseFromFirstAvailable(dollarSliced, closes);
+        continue;
+      }
       const table = closeByDate(overlayData.series[key]);
       if (table == null) continue;   // 該標的上游查詢失敗（null）→ 維持 null
       const closes = slicedDates.map((d) => (d != null && table[d] != null ? table[d] : null));
       out[key] = rebaseCloses(dollarSliced[0], closes);
     }
     return out;
-  }, [overlayData, slicedDates, dollarSliced]);
+  }, [overlayData, slicedDates, slicedTs, dollarSliced]);
 
   const yInputValues = useMemo(() => {
     const vals = [...dollarSliced];
@@ -266,10 +420,20 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
   }, [yInputValues]);
 
   const yTickValues = useMemo(() => yTicks(yInputValues, Y_TICK_COUNT), [yInputValues]);
-  const points = useMemo(() => toPoints(dollarSliced, yRange), [dollarSliced, yRange]);
+  // x 位置：有時間戳依時間比例、無則等距（舊路徑）；主曲線與對照線共用這一組。
+  const xFractions = useMemo(
+    () => (slicedTs == null ? null : xFractionsFromTs(slicedTs)),
+    [slicedTs],
+  );
+  const points = useMemo(
+    () => toPoints(dollarSliced, yRange, xFractions),
+    [dollarSliced, yRange, xFractions],
+  );
   const xTickLabels = useMemo(
-    () => xLabels(sliced, values.length, startDate, endDate),
-    [sliced, values.length, startDate, endDate],
+    () => (slicedTs == null
+      ? xLabels(sliced, values.length, startDate, endDate)
+      : xLabelsFromTs(slicedTs)),
+    [slicedTs, sliced, values.length, startDate, endDate],
   );
 
   const periods: { key: Period; label: string }[] = [
@@ -283,18 +447,24 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
       <div className="equity-curve-head">
         <div className="equity-curve-title">{c.heading}</div>
         <div className="equity-curve-periods">
-          {periods.map((p) => (
-            <button
-              key={p.key}
-              type="button"
-              className="pill equity-period-btn"
-              data-active={period === p.key}
-              aria-pressed={period === p.key}
-              onClick={() => setPeriod(p.key)}
-            >
-              {p.label}
-            </button>
-          ))}
+          {periods.map((p) => {
+            const off = unavailable[p.key];
+            return (
+              <button
+                key={p.key}
+                type="button"
+                className="pill equity-period-btn"
+                data-active={activePeriod === p.key}
+                aria-pressed={activePeriod === p.key}
+                disabled={off}
+                title={off ? c.periodUnavailable : undefined}
+                aria-label={off ? `${p.label} · ${c.periodUnavailable}` : undefined}
+                onClick={() => setPeriod(p.key)}
+              >
+                {p.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -367,7 +537,7 @@ export function EquityCurve({ equityIndex, initialDepositUsd, startDate, endDate
                 return (
                   <polyline
                     key={key}
-                    points={toOverlayPoints(ov, dollarSliced.length, yRange)}
+                    points={toOverlayPoints(ov, dollarSliced.length, yRange, xFractions)}
                     fill="none"
                     stroke={OVERLAY_COLORS[i % OVERLAY_COLORS.length]}
                     strokeWidth="1"

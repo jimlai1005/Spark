@@ -89,6 +89,10 @@ def build_metrics(perf: dict[str, Any] | None) -> dict[str, Any]:
         out[f"{pub_key}_insufficient"] = insufficient
     sample_count = perf.get("sample_count") if isinstance(perf, dict) else None
     out["sample_count"] = sample_count if isinstance(sample_count, int) else 0
+    # 2026-11-17（plan perf-followups E2）：區間報酬樣本數 N＝取樣點數 − 1，是勝率與
+    # Sharpe 標準誤公式裡的 N；`sample_count`（取樣點數）仍照舊輸出。perf 非 ok → 0。
+    rsc = perf.get("return_sample_count") if ok and isinstance(perf, dict) else None
+    out["return_sample_count"] = rsc if isinstance(rsc, int) and not isinstance(rsc, bool) else 0
     return out
 
 
@@ -213,6 +217,21 @@ def build_equity_index(perf: dict[str, Any] | None) -> list[str]:
     if not isinstance(idx, (list, tuple)):
         return []
     return [str(x) for x in idx]
+
+
+def build_equity_index_ts(perf: dict[str, Any] | None) -> list[int] | None:
+    """perf 的 `sample_ts_ms`（每個取樣點的毫秒時間戳）→ list[int]，與 `build_equity_index`
+    的序列逐點同源同長（同一個 perf；2026-11-17 plan perf-followups E1）。
+
+    `perf` 不可用、`status != "ok"` 或缺鍵 → `None`（與 `equity_index == []` 並列時，
+    前端以 `null` 判斷「沒有時間戳，維持舊行為」）。
+    """
+    if not isinstance(perf, dict) or perf.get("status") != "ok":
+        return None
+    ts = perf.get("sample_ts_ms")
+    if not isinstance(ts, (list, tuple)):
+        return None
+    return [int(x) for x in ts]
 
 
 def _ms_to_date(ms: Any) -> str | None:

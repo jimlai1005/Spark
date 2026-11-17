@@ -407,6 +407,8 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
       恆存在；`roi_annualized` 只在 `ROI > -1` 時存在，並與
       `roi_annualized_insufficient_data`／`roi_annualized_extrapolated_from_days`
       （判定式與 `annualized_return_*` 相同，只依 `covered_days`）同生共死。
+    - 曲線時間戳鍵（2026-11-17）：`sample_ts_ms`（tuple[int]，與 `roi_index`／`equity_index`
+      逐點同長同源）與 `return_sample_count`（＝`len(pnl) − 1`＝比率指標的 N）恆存在。
 
     ⭐ 為什麼標記做在**每個指標**上而不是只有 `disclosure_tier` 一個全域欄位：
     前端不保證整組一起渲染——只顯示 MDD 的卡片、只顯示年化的排行榜列，都會讓一個
@@ -560,6 +562,14 @@ def compute_window_performance(portfolio_rows: Any, period: str) -> dict[str, An
                              for p in pnl)
     out["roi_insufficient_data"] = thin_return
 
+    # --- 曲線時間戳與樣本數（plan 2026-11-17 §1 A1，E1／E2） ---
+    # `sample_ts_ms`：與 `roi_index`／`equity_index` 逐點同源同長（同一個 `pnl` 序列），
+    # 前端據此切 30D／7D、畫 X 軸日期、對齊對照線，不再假設「一點＝一天」。
+    # `return_sample_count`＝區間數 n＝`len(pnl) − 1`，即比率指標（勝率、Sharpe 標準誤）
+    # 公式裡的 N；與 `sample_count`（取樣點數）差 1，兩者不得混用。
+    out["sample_ts_ms"] = tuple(p[0] for p in pnl)
+    out["return_sample_count"] = len(pnl) - 1
+
     # --- 比率型指標（Sharpe/Sortino/年化波動/區間勝率/最佳最差單期）---
     # r_i 直接由權益指數推導（沿用既有對齊邏輯）：equity_index 已把分母地板
     # 跳過的區間就地補 0（見上面 `skipped` 迴圈），所以這裡不必另外處理跳過段。
@@ -694,10 +704,11 @@ def jsonable_performance(perf: dict[str, Any], *, include_equity_index: bool = F
     """
     out: dict[str, Any] = {}
     for k, v in perf.items():
-        if k in ("equity_index", "roi_index"):
+        if k in ("equity_index", "roi_index", "sample_ts_ms"):
             out[f"{k}_len"] = len(v)
             if include_equity_index:
-                out[k] = [str(x) for x in v]
+                # `sample_ts_ms` 是 int 序列：`str(int)` 會讓前端拿到字串時間戳，保持 int。
+                out[k] = [x if isinstance(x, int) else str(x) for x in v]
             continue
         out[k] = str(v) if isinstance(v, Decimal) else v
     return out

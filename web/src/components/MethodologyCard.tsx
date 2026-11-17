@@ -7,7 +7,7 @@
  */
 import type { COPY_ZH, DeepString } from "@/lib/copy";
 import { fmtAmount } from "@/lib/format";
-import type { PublicStrategyMethodology, PublicStrategyMetrics } from "@/lib/publicApi";
+import { returnSampleCount, type PublicStrategyMethodology, type PublicStrategyMetrics } from "@/lib/publicApi";
 
 export type MethodologyCopy = DeepString<typeof COPY_ZH.strategyDetail.methodology>;
 
@@ -69,7 +69,7 @@ export function MethodologyCard({ methodology, metrics, copy }: {
               {copy.sharpeSeInfix}
               {metrics.sharpe_se}
               {copy.sharpeSeSuffix}
-              {metrics.sample_count}
+              {returnSampleCount(metrics)}
               {copy.sampleSuffix}
               {" "}
             </>
