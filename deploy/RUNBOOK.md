@@ -101,7 +101,7 @@ id filet-api   # 驗收：groups 輸出含 filet-api 與 filet-engine 兩者
 | 路徑 | owner:group | mode | 建立方式 | 用途 |
 |---|---|---|---|---|
 | `/opt/filet/spark` | `root:root` | `755` | 手動 mkdir（§4） | repo checkout，三個 service user 都要能讀+執行（唯讀） |
-| `/opt/filet/spark/web` | `root:root`（build 產物） | `755` | `npm run build` 產出後 | Next.js build 輸出，filet-dashboard 讀+執行 |
+| `/opt/filet/spark/web` | `root:root`（build 產物） | `755` | §4.2 `deploy/ops/web_build_swap.sh` 換入後 | Next.js build 輸出，filet-dashboard 讀+執行（build 在樹外、ubuntu 擁有的 `/opt/filet/web-build`） |
 | `/etc/filet/keys` | `filet-engine:filet-engine` | `700` | 手動 mkdir | agent key 根目錄；子目錄/檔案由 `EnvFileKeyStore` 自己建（子目錄 700、`agent.key` 600） |
 | `/etc/filet/followers` | `filet-engine:filet-engine` | `700` | 手動 mkdir | per-follower `<id>.env`（640，見 `deploy/follower.env.example`） |
 | `/var/lib/filet-api` | `filet-api:filet-api` | `0750`（systemd `StateDirectory` 預設） | 由 `filet-api.service` 的 `StateDirectory=filet-api` 自動建立 | `api.db`、`pending.json` |
@@ -343,10 +343,171 @@ node --version   # 驗收：v20.x
 npm --version
 ```
 
-### 4.2 前端 build
+### 4.2 前端 build（2026-11-17 起：另目錄 build 再換入）
 
-> 前提：`web/` 目錄已由前端計畫（`docs/superpowers/plans/2026-07-17-m2-frontend.md`，
-> 尚未執行）落地。本節假設 `web/` 已存在並含 `package.json`/`package-lock.json`。
+> 前提：`web/` 目錄已存在並含 `package.json`/`package-lock.json`，且**線上已有一份可用的 `web/.next`**
+> （腳本要拿它當回退版本；首次部署或 `.next` 不存在走下面「舊流程」）。
+
+#### 為什麼改（2026-11-15 事故，見附錄 B 最後一條）
+
+舊流程在線上目錄原地 `npm run build`。`next build` **一開始就清掉舊 `.next`**，所以從 build 開始到
+`restart filet-dashboard` 之間，仍在跑的 `next start` 對舊 hash 的 JS／CSS 全回 **400**（頁面無樣式、無互動）；
+build 若失敗（11-15 是 `next/font` 抓 Google Fonts 失敗）空窗就拖到修好為止（實際約 3 分鐘）。
+新流程：在**另一個目錄**（`/opt/filet/web-build`，**部署樹 `/opt/filet/spark` 之外**）build，**成功**才 rename 換入 `web/.next`，
+build 失敗線上完全不受影響；換入後健康檢查失敗自動換回舊版。**每次執行都用自己專屬的 build 工作目錄**
+（`/opt/filet/web-build/run-<UTC 時間戳>-<PID>/`）：被中斷的舊 build 若有殘留行程，只會寫它自己的目錄，結構上混不進後續執行的產物。
+
+#### 新流程（一律用這個）
+
+在 `ubuntu` 帳號下、**不是 root**（腳本內需要 root 的動作自己用 `sudo`）：
+
+```bash
+# 前置：§3.2 的程式碼同步＋chown root 已做完（web/ 的原始碼是新版）。
+# NEXT_PUBLIC_SITE_ORIGIN 無預設、未設即失敗；正式網域是 trade.filet.app（見下方「對外網域」）。
+NEXT_PUBLIC_SITE_ORIGIN="https://trade.filet.app" bash /opt/filet/spark/deploy/ops/web_build_swap.sh
+```
+
+腳本做的事（`deploy/ops/web_build_swap.sh` 檔頭與步驟註解有逐步說明）：
+
+1. 前置檢查：`NEXT_PUBLIC_SITE_ORIGIN` 已設；`web/.next/BUILD_ID` 存在；維護旗標 `/var/www/maintenance/ON`
+   不存在（有就拒絕，`--force` 可略過）；取單一執行鎖；線上 `web/.next` 必須是完整版本（`BUILD_ID` 非空且 `static/` 非空，與回退來源同一判準，否則結束碼 1、不部署）；`filet-api` 必須是 active
+   （`filet-dashboard` 的 `Wants=filet-api` 會在重啟時把被刻意停掉的 api 拉起來——2026-10-04 事故；確定要這樣才加 `--allow-api-start`）。
+2. 準備 `/opt/filet/web-build`（**先過 BUILD_DIR 護欄**，見下；不存在就 `sudo mkdir -p`、chown 給執行者並在**根目錄**寫標記檔 `.web_build_swap_dir`；`/opt/filet` 是 `root:root 755`）：
+   先清掉先前執行留下的 `run-*`（刪不乾淨只警告「沒有刪乾淨；下次執行再清」，不算失敗；`run-*` 若是符號連結只移除連結本身）與 `web/` 內殘留的 `.next-prev.deleting-*`／`.next-failed.deleting-*`（見「刪除前先失效」）；
+   再建立本次專屬的 `run-<時間戳>-<PID>/`：同步 `web/` 原始碼進去（排除 `node_modules` 與 `web/` 內所有 `.next*` 目錄）、
+   `run-*/node_modules` 是指回 `web/node_modules` 的**符號連結**（不複製）、`web/.next/cache` 複製過去保留增量編譯快取。
+3. 在 `run-*` 內執行 `npm run build`，輸出寫到 log 檔（預設 `mktemp` 產生的 `/tmp/web_build_swap.log.XXXXXX`，權限 0600；`LOG_FILE` 無法建立或寫入就在前置檢查直接失敗，不降級）；
+   失敗印 log 末 30 行並非零退出，**`run-*` 保留供排查，路徑寫在最終狀態報告**。
+4. 驗證產物：`run-*/.next` 的 `BUILD_ID` 非空、`static/` 非空。
+5. **換入**：舊 `web/.next-prev` 先 rename 成 `.next-prev.deleting-<PID>` 再刪 → `web/.next` 改名 `web/.next-prev` → `run-*/.next` 改名為 `web/.next`
+   （同一檔案系統 rename；新 `.next` 在換入前已先設為 `root:root`、`go-w`，§4.4 的安全前提）。**從這一步前一刻起進入不可中斷階段**（見下「訊號」）。
+   換入成功後本次的 `run-*` 已沒有用（`.next` 被 rename 走），隨即刪除。
+6. `sudo systemctl restart filet-dashboard`。
+7. 健康檢查（最多 30 秒）：`http://127.0.0.1:3000/` 回 200，且首頁 HTML 引用的**每一個** `/_next/static` JS／CSS 都回 200。
+8. 失敗 → 自動回退：`.next` → `.next-failed`（留作排查）、`.next-prev` → `.next`、再重啟、再健康檢查。
+   換入步驟的任何指令回報失敗時，腳本以**檔案系統實況**決定下一步（`.next` 已是新版 → 視為已換入、走自動回退；`.next` 缺席且 `.next-prev` 完整 → 還原；兩者皆非 → 結束碼 5），
+   不是只看指令的回傳碼。
+9. 結束 → 一律印**最終狀態報告**（成功印 stdout、否則印 stderr，兩者都同時寫入 log 檔）：結束碼、`.next`／`.next-prev`／`.next-failed` 各自的 `BUILD_ID`（或「不存在」）、
+   以及**下一步該執行的確切指令**。報告只陳述實際發生過的事，其中兩行專門講重啟：
+   `最後一次成功重啟：<當時 .next 的 BUILD_ID｜本次執行未成功重啟過>`、
+   `目前 .next 與正在服務的版本：<…>`，這一行**只有三種寫法**，依「最近一次重啟嘗試」的結果：
+   成功 → 比較當時的 `BUILD_ID` 與目前 `.next`，寫「一致」或「不一致——檔案已變更但尚未重啟」；
+   **失敗 → 「未知——最近一次重啟指令失敗，服務可能已停止；以 `systemctl is-active filet-dashboard` 與健康檢查為準」**（`systemctl restart` 失敗後服務多半已停，腳本不推測正在服務的是哪一版）；
+   **未嘗試重啟 → 「服務未被本次執行重啟（仍是執行前啟動的行程）」**（若 `.next` 已與執行開始時不同，加註「檔案已變更但尚未重啟」）。
+   原則：報告每一行都是腳本**確實知道**的事；不知道就寫「未知」並說明怎麼查。另有健康檢查結果與 `build 工作目錄`（已刪除／保留供排查）。
+
+**結束碼＝腳本結束時的實際最終狀態**（由檔案系統實況得出，不是流程中最後一個失敗碼）：
+
+| 結束碼 | 模式 | 最終狀態（結束時必為真） |
+|---|---|---|
+| 0 | 一般 | `.next` 是新版、已重啟、健康檢查通過；`.next-prev` 是舊版 |
+| 0 | `--rollback` | `.next` 是原 `.next-prev` 的版本、已重啟、健康檢查通過 |
+| 1 | 兩者 | 線上的 `.next` 未變、服務未重啟；若在換入步驟中止，更早的 `.next-prev` 可能已被移除（`--rollback` 的前置檢查會如實拒絕） |
+| 2 | 兩者 | 用法錯誤（未知參數、`HEALTH_TIMEOUT_S` 為 0、非數字或不在 1–600 之間），未動任何東西。報告的「模式」寫「未定（參數錯誤）」、「最後一次成功重啟」與「目前 .next 與正在服務的版本」兩行寫「（參數錯誤，未檢查）」、「下一步」只說「參數錯誤…修正參數後重跑（`--help` 看用法）」——腳本未做任何檢查與改動，報告僅列出目錄現況，不對服務行程、線上狀態或是否需要回退做任何斷言 |
+| 4 | 一般 | 新版曾換入但失敗，已自動回退：`.next` 是舊版、已重啟、健康檢查通過；失敗的新版在 `.next-failed`（`.next-prev` 此後不存在） |
+| 5 | 兩者 | 其他一切，**需要人處理**：`.next` 缺席、回退的 rename 失敗、回退後重啟失敗、回退後健康檢查失敗、`--rollback` 的重啟或健康檢查失敗… |
+| 129／130／143（141） | 兩者 | 只可能發生在**可中斷階段**（HUP／INT／TERM）：`web/` 未被改動，語意同 1。141（PIPE）為保留碼：輸出一律吞掉寫入錯誤，正常不會出現 |
+
+結束碼 1 的「下一步」**依模式區分**（被訊號中斷的 129／130／143 另有固定一句：「被訊號中斷，線上未受影響；直接重跑即可」，兩種模式共用）：
+- 一般模式：**線上未變，排除原因後直接重跑；不要執行 `--rollback`**（沒有任何東西需要回退——`--rollback` 只用於結束碼 5 且 `.next` 缺席，或你事後自行判斷新版有問題）。
+- `--rollback` 模式（被拒絕或失敗而 `web/` 未動）：**回退沒有執行**，線上未變；依上面 ERROR 的指示處理後重跑 `--rollback`——維護旗標 → 確認後加 `--force`；
+  `filet-api` 非 active → 確認後加 `--allow-api-start`；另一個執行持有鎖 → 等它結束；`.next-prev` 不是完整版本 → 沒有可回退的版本，走整包重部署（§9.3）。
+結束碼 5 時看報告的「下一步」，腳本依實況只印一種：
+
+- `.next` 缺席且 `.next-prev` 完整 → `bash /opt/filet/spark/deploy/ops/web_build_swap.sh --rollback`（復原模式，見下）。
+- 檔案已換回舊版、只差重啟（重啟指令失敗）→ 印出 `RESTART_CMD` 本身（例如 `sudo systemctl restart filet-dashboard`）：**只要重啟一次，不要重部署**。
+- 無法回退（`.next-prev` 不是完整 bundle）且 `.next` 是新版 → 整包重部署（§9.3）。
+- 其餘 → 明講目前線上 `.next` 的 `BUILD_ID`，並列出檢查項目（log 檔、`journalctl -u filet-dashboard`、`curl` 健康檢查網址）。
+
+**訊號（兩個階段）**：
+
+- **可中斷階段**（前置檢查、準備 `web-build`、build、驗證產物）：INT／TERM／HUP 照常結束腳本，**線上完全不受影響**（結束碼 130／143／129，`web/` 不變）。
+  build 會被「**盡力**」終止：有 `setsid` 時 build 在新 session，對整個行程群組送 TERM；沒有 `setsid`（macOS）只終止直接子行程，`npm` 底下的孫行程可能殘留。
+  殘留行程**不影響任何後續執行的產物**——每次執行用獨立的 `run-*` 目錄，殘留行程只會寫它自己的目錄；下一次執行開頭會清掉舊的 `run-*`。
+- **不可中斷階段**（從「第一個會改動 `web/` 的指令之前」到腳本結束：換入、重啟、健康檢查、自動回退、最終狀態報告；`--rollback` 則從第一個 rename 之前起）：
+  INT／TERM／HUP／PIPE **一律忽略、不再恢復**，子行程（`sudo`、`mv`、`systemctl`、`curl`）繼承被忽略的訊號，所以對整個行程群組送訊號（Ctrl-C、ssh 斷線）也打不斷它。
+  進入時腳本會印一行「從這裡開始不可中斷，最長約 N 秒」（N 由 `HEALTH_TIMEOUT_S` 推得；預設一般模式約 240 秒、`--rollback` 約 120 秒；`HEALTH_TIMEOUT_S` 會正規化成十進位整數，`08` 當 8，必須在 1–600 之間，0、非數字與超出範圍拒絕並回 2）。
+  所有輸出都吞掉寫入錯誤（終端機或管線不在了也不會結束），並同時寫進 log 檔，所以 ssh 斷線後仍可事後讀 log 檔的最終狀態報告。
+  **想中止就只有 `kill -9`**——那是唯一會留下不一致狀態的手段（可能留下沒有 `.next` 的 `web/`，此時用 `--rollback` 復原）；不要這樣做。
+  不可中斷階段內收到訊號，結束碼與「沒有收到訊號」完全相同（0 或 4，`--rollback` 為 0）。
+
+**BUILD_DIR 護欄（2026-11-17 審核 C1）**：腳本會對 `BUILD_DIR` 做 `sudo chown -R` 並清理其中的 `run-*`，指錯位置會把整棵樹交給 ubuntu、刪掉裡面的東西，
+所以在步驟 2 動到它之前，先以**實體路徑（解析符號連結）**檢查：不得是 `/`、不得等於 `WEB_DIR`、不得是 `WEB_DIR` 的上層（例如誤設成 `/opt/filet`
+會連 follower 帳本一起刪）、不得位於 `WEB_DIR` 之內；且腳本只操作「自己建立的目錄」——不存在就建立並寫標記檔 `.web_build_swap_dir`，
+已存在的**空**目錄也會認領並寫標記檔，已存在、非空、沒有標記檔就**拒絕**（非零退出、什麼都不動）。覆寫 `BUILD_DIR` 前請先理解這一條；
+被拒絕時不要為了通過而手動 `touch` 標記檔，先確認那個目錄真的可以被整個覆蓋。
+
+**刪除前先失效（2026-11-17 第四輪審核 W2）**：任何要刪除 `.next-prev` 或 `.next-failed` 的地方，一律**先 rename 成 `<名稱>.deleting-<PID>` 再刪**。
+rename 失敗 → 該步驟中止、原目錄完好（換入中止＝結束碼 1；回退中止＝結束碼 5，`.next` 未動）；rename 成功後刪除失敗只留下垃圾目錄——它**不是**回退來源
+（名字不是 `.next-prev`），腳本印警告、流程繼續，下一次執行的步驟 2 會清掉。這樣「刪一半的殘骸」永遠不會頂著會被 `--rollback` 當成回退來源的名字。
+
+**`.next-prev` 的存在規則（單一規則）**：只在「**腳本成功換入之後，到下一次 §3.2 部署、下一次腳本執行（第 5 步會先把它 rename 掉再刪）、或任何一次回退之前**」存在。
+只保一版，不是歷史。§3.2 的第二段 `--delete` 同步會清掉 `web/.next-prev` 與 `web/.next-failed`（它們在部署樹內、不在 exclude 清單裡）；
+自動回退（結束碼 4）與 `--rollback` 成功之後，它已被換回成 `.next`，同樣不存在。
+**能不能回退一律以 `--rollback` 的前置檢查為準，不要靠人判斷**：`.next-prev` 必須是完整 bundle（`BUILD_ID` 非空**且** `static/` 存在且非空，與 build 後的產物驗證同一判準），否則它拒絕（什麼都不動），要回退只能整包重部署（§9.3）。
+`/opt/filet/web-build` 在部署樹**之外**，不受 §3.2 的 `--delete` 影響；它是 `ubuntu` 所有的工作區，**不被任何服務執行**，換入線上的只有先 `chown root:root` 過的 `.next`。
+根目錄平常只有標記檔 `.web_build_swap_dir`；執行中另有本次的 `run-*`，成功後刪除、失敗時保留供排查（路徑在報告裡），下一次執行開頭清掉。
+
+**回退**（新版剛由腳本換入、健康檢查也過了，但事後發現有問題；**且之後沒有再跑過 §3.2**）：
+
+```bash
+bash /opt/filet/spark/deploy/ops/web_build_swap.sh --rollback
+```
+
+`--rollback` 不 build：先檢查 `web/.next-prev` 是完整 bundle（`BUILD_ID` 非空且 `static/` 非空），否則拒絕並說明「沒有可回退的版本」，**什麼都不動**；
+通過才把 `.next` 搬到 `.next-failed`、`.next-prev` 換回 `.next`、重啟並健康檢查（成功回 0；回退後健康檢查失敗回 5）。
+同樣受執行鎖、維護旗標與 `filet-api` active 檢查約束。成功後 `.next-prev` 已被消耗，不能連續回退兩次。
+在確認 `.next-prev` 有效**之前**，不會刪除既有的 `.next-failed`（那是上一次失敗的排查證據）。
+進入第一個 rename 之前就已是不可中斷階段：期間收到 INT／TERM／HUP（Ctrl-C、`kill`、ssh 斷線）一律忽略，回退照常做完（重啟＋健康檢查），結束碼與沒收到訊號相同。
+`--rollback` 的重啟或健康檢查失敗回 **5**，報告會依實況印出下一步（例如只差重啟時印出 `RESTART_CMD`）。
+
+**復原模式（`.next` 缺席時）**：腳本結束時若 `.next` 缺席而 `.next-prev` 完整（結束碼 5），最終狀態報告的「下一步」就是 `--rollback`。
+這時 `--rollback` 偵測到 `web/.next` **不存在**且 `.next-prev/BUILD_ID` 有效，就走復原模式：**不碰 `.next-failed`**，直接把 `.next-prev` 換回 `.next`、重啟、健康檢查，
+並印出「線上原本沒有 `.next`，已由 `.next-prev` 復原」。這是 `.next` 缺席時**唯一**該用的指令——不要自己手動搬。
+
+> ⚠️ **不要自己手動搬 `.next-prev`／`.next`**（2026-11-17 審核 C2）：`.next-prev` 不在時（§3.2 rsync 之後、自動回退之後、`--rollback` 之後），
+> 照舊版文件「先把 `.next` 搬到 `.next-failed`、再把 `.next-prev` 搬回來」做，第一步會成功、第二步失敗——線上 `.next` 已被搬走，前端整站掛掉。
+> 回退一律走 `--rollback`，它先驗前提再動手。`.next-prev` 不在就整包重部署（§9.3）。
+
+**不再需要在 build 前把整個 `web/` chown 給 ubuntu**（舊流程那一步已移除）：build 發生在樹外、ubuntu 擁有的
+`/opt/filet/web-build/`（因此 §3.2 的「`/opt/filet/spark` 樹內無非 root 檔案」驗收在前端部署後仍為 0），線上的 `web/` 與 `web/.next` 全程是 `root:root`，唯一的寫入是腳本內以 `sudo` 做的
+rm／mv／chown；因此「build 後必須還原 root、漏了就留下 ubuntu 可改的前端 bundle」這個最容易漏的一步也不存在了。
+唯一例外是依賴更新（下一段）。收尾驗收照舊：
+
+```bash
+sudo ls -ld /opt/filet/spark/web /opt/filet/spark/web/.next   # 預期：兩行都是 root root
+```
+
+#### `package-lock.json` 有變動時（需要重裝依賴）
+
+腳本**不**裝依賴，只借用線上 `web/node_modules`。`package-lock.json` 沒變就不要 `npm ci`
+（它會先刪光 `node_modules` 再全裝，期間線上 server 尚未載入的模組會讀不到）。有變動時，先單獨處理依賴，再跑腳本。
+
+> ⚠️ **這個情形下「build 失敗線上完全不受影響」的保證不成立**：依賴是在線上 `web/node_modules` 原地換掉的，
+> 一旦 `npm ci` 完成而後面的 build 失敗，線上仍在跑的舊 `.next` 會配上新依賴（可能不相容）；`npm ci` 進行中線上也可能讀不到模組。
+> 建議在維護窗進行（開維護旗標、必要時 `--force`），`npm ci` 與腳本跑完、健康檢查通過後再關閉。
+
+```bash
+# 只動 node_modules，不碰 .next（那是為了不讓 .next 變成 ubuntu 所有）
+sudo chown ubuntu:ubuntu /opt/filet/spark/web
+sudo chown -R ubuntu:ubuntu /opt/filet/spark/web/node_modules
+(cd /opt/filet/spark/web && npm ci)
+sudo chown -R root:root /opt/filet/spark/web/node_modules
+sudo chown root:root /opt/filet/spark/web
+sudo chmod -R go-w /opt/filet/spark/web/node_modules
+```
+
+#### 對外網域（build 期變數）
+
+2026-08-29 改版起 canonical／OG／sitemap 的對外主機名由 build 期環境變數 `NEXT_PUBLIC_SITE_ORIGIN` 注入
+（`NEXT_PUBLIC_*` 是「烤進 bundle」的值，改它必須重 build，改 systemd env 無效）。未設定時前端預設
+`https://app.filet.trade`（`web/src/lib/siteOrigin.ts`）——那是**佔位值，沒有 DNS**；2026-10-25 親踩過：
+照抄舊範例會把錯的 canonical／OG／sitemap 烤進 bundle，回歸第 4 層「sitemap.xml host 與 HOST 一致」紅。
+正式網域是 `trade.filet.app`（nginx server_name 與 certbot 憑證皆為它）。新腳本**不設預設值、未設即失敗**，就是為了擋這件事。
+
+#### 腳本不可用時的舊流程（首次部署、`web/.next` 不存在、或腳本壞了才用）
+
+> ⚠️ **空窗風險**：舊流程在線上目錄原地 build，`next build` 一開始就刪掉舊 `.next`，從 build 開始到重啟之間線上靜態資源全回 400；build 失敗時空窗持續到重跑成功為止（2026-11-15 實例約 3 分鐘）。
 
 > ⚠️ **build 前一定要先把 `web/` 交還給 ubuntu**（2026-07-19 實機重新部署發現）。
 > §3.2 結尾的 `chown -R root:root /opt/filet/spark` 是**遞迴**的，`web/` 也被收成 root
@@ -383,6 +544,30 @@ sudo chmod -R go-w /opt/filet/spark/web
 # 驗收：owner 已回到 root（重新部署時最容易漏的一步）
 sudo ls -ld /opt/filet/spark/web /opt/filet/spark/web/.next   # 預期：兩行都是 root root
 ```
+
+#### 第一次在正式機使用前確認（腳本只在本機驗證過，尚未在正式機跑過）
+
+**2026-11-17 已唯讀確認（正式機）**：
+
+- `/opt/filet` 是 `root:root 755`，與 `/opt/filet/spark/web` 在同一個檔案系統（device 66305）——`/opt/filet/web-build` 放得下 rename 換入。
+- `/usr/bin/flock`、`rsync`、`npm`、`node`、`curl` 都在；`/run/lock` 是 1777（鎖檔可建）。
+- `ubuntu` 的 sudo 免密碼。
+- `filet-dashboard` unit 是 `User=filet-dashboard`、`ProtectSystem=strict`、`ProtectHome=true`。
+
+**仍待正式機首次執行才能確認**：
+
+- `sudo` 下的 `mkdir -p /opt/filet/web-build`、`chown`、對 `web/` 的 `rm`／`mv` 實際行為（本機測試主要以 `SUDO=""` 跑，部分測試用假的 sudo 包裝來注入失敗與訊號時機；**真 sudo 只能在正式機演練時確認**）。
+- Linux 上的 `stat -c %d` 同檔案系統檢查分支（本機只驗過 macOS 的 `stat -f %d` 分支）。
+- `flock` 鎖分支（本機只驗過沒有 flock 時的 `mkdir` 備援鎖）。
+- systemd 沙箱（`ProtectSystem=strict`）下 `filet-dashboard` 讀取換入的 `root:root` `.next` 並正常服務。
+- **Ubuntu 的 sudo（`use_pty`）是否會把訊號轉發給被忽略訊號的子行程**：腳本的不可中斷階段靠「子行程繼承被忽略的訊號」讓 `sudo mv`／`sudo systemctl` 也打不斷；
+  本機只用假 sudo（直接 exec）驗證過。真 sudo 在 `use_pty` 下會另開 pty 並自己轉發訊號，行為需在正式機演練時確認（對腳本送 TERM／HUP，看 `mv` 與重啟是否照常完成）。
+- **真正的 util-linux `setsid` 分支**：可中斷階段收到訊號時，build 以 `setsid` 自成 session，腳本對 `-PID` 行程群組送 TERM（盡力終止孫行程）。
+  本機（macOS）沒有 `setsid`，測試用「假 setsid（`os.setsid()` 後 exec）」執行了這個分支；真的 `setsid` 在呼叫者是行程群組 leader 時會先 fork（背景子 shell 通常不是，需實測 `-PID` 是否打得到 build）。
+  這一步只為省資源，正確性由每次執行獨立的 `run-*` 目錄保證，所以即使打不到也只是殘留行程多跑一會兒。
+- **bash 5 下 `trap` 忽略訊號的繼承**：本機是 macOS 的 bash 3.2；Ubuntu 的 bash 5 應相同（POSIX：進入 shell 時被忽略的訊號不可再被 trap），但需在正式機實測；
+  另一個本機看不到的差異是 `wait`（可中斷階段的 build 等待）與 `printf` 在 EPIPE 時的行為。
+- 首次執行前以 `bash -n` 與 `--help` 確認腳本是新版；`filet-api` 為 active。
 
 ### 4.3 安裝 dashboard systemd unit
 
@@ -601,9 +786,10 @@ systemctl show filet-api.service -p Environment --value | tr ' ' '\n' \
 
 #### 步驟 5：其餘重新部署會踩到的點（逐一確認）
 
-- **§3.2 `uv sync` 與 §4.2 `npm ci`／`npm run build` 會 Permission denied**——首次部署
-  末尾已把 `/opt/filet/spark` chown 成 `root:root`。兩節各自已補上「build 前 chown 給
-  ubuntu、build 後還原 root」的步驟，照該節做。
+- **§3.2 `uv sync` 會 Permission denied**——首次部署末尾已把 `/opt/filet/spark` chown 成
+  `root:root`；該節已補上「chown 給 ubuntu、跑完還原 root」的步驟，照該節做。
+  前端自 2026-11-17 起走 §4.2 的 `web_build_swap.sh`（在樹外的 `/opt/filet/web-build/` build 再換入），
+  不再需要 build 前把整個 `web/` chown 給 ubuntu；只有 `package-lock.json` 變動要重裝依賴時才處理 `node_modules`（§4.2 該段）。
 - **`var/` 目錄（leaders.json、manifest）靠 rsync 的 `--exclude var` 保護**——§3.2 兩段
   rsync 的 exclude 清單少一個，`--delete` 就會連白名單一起刪掉。跑之前確認 exclude
   清單完整（`.venv`／`web/node_modules`／`web/.next`／`var`／`uv.lock`）。
@@ -3474,7 +3660,10 @@ git describe --always --dirty   # 驗收：印出的短 hash 就是等一下會�
 - `--delete` 會把新版本多出來的檔案清掉，這正是回滾要的效果。
 - `--exclude var` 保護 leader 白名單（§5.5）不被回滾波及——白名單是營運資料不是程式碼。
 - **依賴可能降版**：`uv sync` 會依回滾後的 `pyproject.toml` 重新解析。
-- 前端要一起回滾就照 §4.2 重跑 `npm ci && npm run build`（含 build 前後的 chown 兩步）。
+- 前端要一起回滾：回滾後的 `web/` 原始碼（上面 rsync 已還原）再跑 §4.2 的 `web_build_swap.sh` 即可
+  （它會 build 回滾後的原始碼並換入）。**注意這一步 rsync 之後 `web/.next-prev` 已被 `--delete` 清掉，所以 `--rollback` 在這裡不適用**；
+  `--rollback`（§4.2）只用於「新版剛由腳本換入、尚未跑過下一次 §3.2」的情形（以它的前置檢查為準），其餘一律重 build。
+  `package-lock.json` 也被回滾時，先依 §4.2「`package-lock.json` 有變動時」重裝依賴。
 
 #### 步驟 3：重跑 §5.1a 的 unit 還原（**最容易漏、漏了會靜默壞掉**）
 
