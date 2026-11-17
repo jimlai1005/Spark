@@ -121,7 +121,7 @@ describe("ExplorePage — 三態", () => {
   });
 
   it("fetch 失敗 → 顯示時間戳＋重試（R2·C 態三），點重試會重新打 API", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse({ detail: "boom" }, false)));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse({ detail: "boom" }, false)));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
 
@@ -394,7 +394,7 @@ describe("ExplorePage — 分頁", () => {
 // 打新 window 參數，不 debounce（離散選擇）。
 describe("ExplorePage — R4-10 期間窗切換", () => {
   it("四鈕全部可點（不再 disabled）；切換立即打新 window 參數並回第一頁", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -416,7 +416,7 @@ describe("ExplorePage — R4-10 期間窗切換", () => {
   });
 
   it("預設 window=month（30D）打第一次請求", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -433,7 +433,7 @@ describe("ExplorePage — R4-10 期間窗切換", () => {
 // 填寫輸入框——R4-3 那版已被 revert，見 page.tsx 檔頭）。
 describe("ExplorePage — R4-10 qualified chip 拆分", () => {
   it("預設兩顆 chip 皆開 → 打 API 帶 min_live_days=30 & min_fills=200", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -444,7 +444,7 @@ describe("ExplorePage — R4-10 qualified chip 拆分", () => {
   });
 
   it("關閉「實盤 ≥ 30 天」chip → 只送 min_live_days=0，min_fills 不受影響", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -460,7 +460,7 @@ describe("ExplorePage — R4-10 qualified chip 拆分", () => {
   });
 
   it("關閉「成交 ≥ 200 筆」chip → 只送 min_fills=0，min_live_days 不受影響", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -479,7 +479,7 @@ describe("ExplorePage — R4-10 qualified chip 拆分", () => {
   // （`hl_explore.qualify`「沒有證據代表回撤超標」慣例，見 `hl_explore.py:721-725`），
   // chip 開啟時 UI 要提示這件事，否則使用者誤以為榜單裡不會再出現回撤「—」的列。
   it("W5：「最大回撤 <」chip 關閉時不顯示提示；開啟後顯示回撤過濾無證據不過濾的提示", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -490,7 +490,7 @@ describe("ExplorePage — R4-10 qualified chip 拆分", () => {
   });
 
   it("回撤/集中度 chip 預設關閉（2026-08-31 裁決：避免空榜），首次請求送 100/100；點開才收緊為 30/90", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -522,7 +522,7 @@ describe("ExplorePage — Task 12 URL 狀態（D11）", () => {
     searchParamsValue = new URLSearchParams(
       "window=week&ld=0&fills=1&dd=1&conc=0&page=2&sort=live_days&order=asc",
     );
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp({ page: 2 }))));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp({ page: 2 }))));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -540,7 +540,7 @@ describe("ExplorePage — Task 12 URL 狀態（D11）", () => {
 
   it("replaceState 寫回：切換 dd chip（初始 dd=1）後 window.history.replaceState 帶最新狀態（dd=0）", async () => {
     searchParamsValue = new URLSearchParams("dd=1");
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     const replaceSpy = vi.spyOn(window.history, "replaceState");
     render(<ExplorePage />);
@@ -565,7 +565,7 @@ describe("ExplorePage — Task 12 URL 狀態（D11）", () => {
 // D14（2026-09-05，Task 12）：地址 label 可點進詳情頁，與「查看」同目標。
 describe("ExplorePage — Task 12 地址連結（D14）", () => {
   it("地址 label 是連向 /traders/{address}?window=<所選窗> 的連結", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -667,7 +667,7 @@ describe("ExplorePage — Task 6.2 分析待完成（D14）", () => {
     const wrCells = container.querySelectorAll(".explore-wr");
     expect(wrCells[0].textContent).toBe(COPY.explore.analysisPending);
     expect(screen.getByText((_, el) => (el?.textContent ?? "").includes(COPY.explore.analysisPending)
-      && el?.classList.contains("explore-sub"))).toBeInTheDocument();
+      && (el?.classList.contains("explore-sub") ?? false))).toBeInTheDocument();
   });
 
   it("舊 fallback fills_truncated:true（無 fills_coverage）→ 同樣顯示「分析待完成」", async () => {
@@ -734,7 +734,7 @@ describe("ExplorePage — Task 6.6 組標題在表格格線容器內", () => {
 // Task 6.2（D13）：「僅合格」切換，開啟帶 eligibility=eligible，關閉不帶參數。
 describe("ExplorePage — Task 6.2 僅合格切換", () => {
   it("預設關閉 → 首次請求不帶 eligibility 參數", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -743,7 +743,7 @@ describe("ExplorePage — Task 6.2 僅合格切換", () => {
   });
 
   it("點擊「僅合格」→ 打 API 帶 eligibility=eligible；再點一次移除參數", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -771,7 +771,7 @@ describe("ExplorePage — Task 12 表頭排序（D13）", () => {
   // 的合成事件系統，等同無效點擊。每次點擊前都要用 `screen.getByRole` 重新取得
   // 當時掛載的節點，不能沿用上一輪的參照。
   it("點「最大回撤」表頭兩次：第一次 sort=max_dd&order=desc&page=1，第二次 order=asc", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");
@@ -801,7 +801,7 @@ describe("ExplorePage — Task 12 表頭排序（D13）", () => {
   });
 
   it("箭頭只在作用中的欄顯示：預設損益欄顯示 ▼，切到實盤天數欄後損益欄不再顯示箭頭", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(buildResp())));
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(jsonResponse(buildResp())));
     vi.stubGlobal("fetch", fetchMock);
     render(<ExplorePage />);
     await screen.findByText("Alice");

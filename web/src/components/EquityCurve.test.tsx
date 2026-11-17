@@ -8,7 +8,7 @@ function jsonResponse(body: unknown, ok = true): Response {
 }
 
 function stubBenchmarksFetch(series: Record<string, unknown>) {
-  const fetchMock = vi.fn(() =>
+  const fetchMock = vi.fn((_url: string) =>
     Promise.resolve(jsonResponse({ series, updated_at: 1_756_000_000 })));
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
