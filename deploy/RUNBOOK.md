@@ -4213,3 +4213,16 @@ Filet Alpha (Legacy) −22.17%；Ultron −15.77%（修正前 +399%，實際累�
 回滾：前端＝`bash /opt/filet/spark/deploy/ops/web_build_swap.sh --rollback`（只在 `web/.next-prev` 還在時有效；下一次 §3.2 部署或下一次腳本執行會清掉它）；
 後端＝§9.3 回 bbfe266，並把 `explore_index.json.bak-v5-20261117` 放回 `explore_index.json` 後重啟 `filet-api`（v5 程式不讀 v6 快照）。
 未做：§4.2 列的重啟步驟逾時修法；repo 內三處預設 leader 仍是舊位址（2026-11-15 記錄的已知事項，不變）。
+
+**2026-11-17 部署（commit `e9a67c7`，14:28–14:29 UTC，純前端 over dd0346c；`/strategies` 只列開放新跟單的策略）：** 使用者指示：`/strategies` 與首頁同步，
+策略清單只剩 Filet Alpha 與 Ultron。只動 `web/src/app/strategies/page.tsx`（取回資料後 `filter((x) => x.listable)`）與其測試（新增兩個，拿掉過濾時兩個都失敗）；vitest 863 綠。
+dd0346c..e9a67c7 另含 `6c2d75e` 的文件（RUNBOOK、兩份 plan）；`package-lock`／`pyproject` md5 與正式機相同 → 不 `npm ci`、不 `uv sync`、不重啟 `filet-api`。
+前置查（14:27Z）：無維護旗標、無 `/tmp/spark-sync`、`systemctl --failed` 0、peer session spark-bd／spark-a2／spark-7d 皆 idle。來源＝`e9a67c7` 的乾淨 worktree（已 push）。
+§3.2 兩段 rsync（第二段先 dry-run：內容有變的恰為 5 檔，另刪 `DEPLOYED_VERSION` 與上一次留下的 `web/.next-prev`）→ chown root（prune var；樹內非 root 檔案 0）14:28:02Z
+→ `web_build_swap.sh` 14:28:03–14:29:11Z：結束碼 0、build 63 s、`BUILD_ID` `e6zp--U4yCW_ZOLICXR4p` → `7D3KYXJFdH4mfISzjckSa`、健康檢查首頁 200＋18 個靜態資源 200；
+舊版（dd0346c 的 bundle）留在 `web/.next-prev`。`DEPLOYED_VERSION`=`e9a67c7941456b7374b9d60b3148d0f2559da484`。
+驗證：瀏覽器實看 `/strategies` 只有 `alpha`、`ultron` 兩張卡＋進階模式卡，頁面不再出現「Legacy」與「暫不開放新跟單」，console 無錯誤；
+`/strategies/alpha-legacy` 仍 200、標題 Filet Alpha (Legacy)、顯示「暫不開放新跟單」（既有跟單者仍可直接開啟，只是清單不再連過去）；首頁不變。
+三個 follower 未動（`ActiveEnterTimestamp` 仍 2026-11-05、`NRestarts` 不變、心跳 15 秒內）；`filet-api` 未重啟（自 13:54:40Z）；
+`filet_regression_check --http --ssh` **67/67 PASS**。
+回滾＝`bash /opt/filet/spark/deploy/ops/web_build_swap.sh --rollback`（`.next-prev` 還在時），或 §9.3 回 dd0346c 的 `web/` 後重跑腳本；後端無變動。
