@@ -545,7 +545,7 @@ sudo chmod -R go-w /opt/filet/spark/web
 sudo ls -ld /opt/filet/spark/web /opt/filet/spark/web/.next   # 預期：兩行都是 root root
 ```
 
-#### 第一次在正式機使用前確認（腳本只在本機驗證過，尚未在正式機跑過）
+#### 正式機首次使用前的確認事項（2026-11-17 已在正式機演練並實際部署一次；結果見本節末「演練與首次部署結果」）
 
 **2026-11-17 已唯讀確認（正式機）**：
 
@@ -554,7 +554,7 @@ sudo ls -ld /opt/filet/spark/web /opt/filet/spark/web/.next   # 預期：兩行�
 - `ubuntu` 的 sudo 免密碼。
 - `filet-dashboard` unit 是 `User=filet-dashboard`、`ProtectSystem=strict`、`ProtectHome=true`。
 
-**仍待正式機首次執行才能確認**：
+**原列為「仍待正式機首次執行才能確認」的項目（2026-11-17 演練已逐項確認，結果見本節末）**：
 
 - `sudo` 下的 `mkdir -p /opt/filet/web-build`、`chown`、對 `web/` 的 `rm`／`mv` 實際行為（本機測試主要以 `SUDO=""` 跑，部分測試用假的 sudo 包裝來注入失敗與訊號時機；**真 sudo 只能在正式機演練時確認**）。
 - Linux 上的 `stat -c %d` 同檔案系統檢查分支（本機只驗過 macOS 的 `stat -f %d` 分支）。
@@ -568,6 +568,39 @@ sudo ls -ld /opt/filet/spark/web /opt/filet/spark/web/.next   # 預期：兩行�
 - **bash 5 下 `trap` 忽略訊號的繼承**：本機是 macOS 的 bash 3.2；Ubuntu 的 bash 5 應相同（POSIX：進入 shell 時被忽略的訊號不可再被 trap），但需在正式機實測；
   另一個本機看不到的差異是 `wait`（可中斷階段的 build 等待）與 `printf` 在 EPIPE 時的行為。
 - 首次執行前以 `bash -n` 與 `--help` 確認腳本是新版；`filet-api` 為 active。
+
+##### 演練與首次部署結果（2026-11-17，正式機，bash 5.1.16、util-linux 2.37.2、真 sudo 且 `Defaults use_pty`）
+
+演練全部在 `/tmp/wbs`、`/tmp/wbs6` 進行（事後已刪除），不寫 `/opt/filet`、不碰 port 3000。上面每一項的結果：
+
+| 項目 | 結果 |
+|---|---|
+| 真 sudo 下的 `mkdir`／`chown`／`rm`／`mv` | 符合預期；換入的 `.next` 為 `root:root`、他人不可寫 |
+| `stat -c %d` 同檔案系統檢查 | `/opt/filet/spark/web`、`/opt/filet`、`/tmp` 同為 device 66305；`BUILD_DIR` 指到另一個檔案系統被拒 |
+| `flock` 鎖 | 第一個執行中，第二個被拒；預設鎖路徑可寫（`fs.protected_regular=2` 不影響） |
+| systemd 沙箱下 `filet-dashboard` 讀換入的 `.next` | 正常（首次實際部署：重啟後 1 秒 Ready、首頁與 18 個靜態資源 200） |
+| 真 sudo（`use_pty`）＋不可中斷階段 | 重啟期間對整個行程群組送 TERM／HUP／INT，流程照常跑完、結束碼與無訊號時相同 |
+| 關掉 ssh 連線 | 重啟到一半強制切斷終端連線，腳本仍跑完，`LOG_FILE` 有完整報告 |
+| 輸出讀端提早關閉（EPIPE） | 仍完成自動回退 |
+| util-linux `setsid` | build 的 pid＝pgid＝sid；build 期間送 TERM，孫行程一併終止，結束碼 143 |
+| `chown -R` 不跟隨符號連結 | 目標檔擁有者不變 |
+| 真的 `next build`（port 3999） | build 70 s、換入後首頁 200、18 個靜態資源 200；`run-*` 刪除後重新啟動 `next start`，21 個路徑回應正確、log 無錯 |
+| 基本流程（假 build） | 成功換入／build 失敗／自動回退／`--rollback`／無舊版拒絕回退／用法錯誤，結束碼與檔案狀態皆符 |
+
+**演練中發現、需要知道的兩件事**：
+
+1. ⚠️ **重啟步驟沒有逾時，且會等重啟指令的輸出管道關閉**。`do_restart` 用 `$(...)` 收集 `RESTART_CMD` 的輸出；重啟指令若留下**仍持有 stdout／stderr 的背景行程**，
+   腳本會停在「步驟 6/9 重啟」直到那個行程結束，而這時已在不可中斷階段（INT／TERM／HUP 無效）。演練時自訂的假重啟指令
+   （`cd … && nohup next start … > log 2>&1 &`——`cd &&` 讓 bash 多開一個子 shell，子 shell 仍握著管道）就讓腳本卡了 2 小時 19 分；
+   把那個子 shell `kill -9` 後腳本立刻繼續並正常結束（它繼承了被忽略的 TERM，一般 `kill` 無效）。
+   **預設的 `sudo systemctl restart filet-dashboard` 不會留下這種行程**（首次實際部署重啟 1 秒完成）。
+   判準：自訂 `RESTART_CMD` 時，背景行程的 stdin／stdout／stderr 必須全部導走（`setsid … > log 2>&1 < /dev/null &`，且不要包在 `cd … &&` 的複合指令裡）；
+   報告裡的「最長約 N 秒」**不含**重啟指令本身不返回的情況。腳本卡在步驟 6 時：`ls -l /proc/<腳本 PID>/fd` 找它在讀的 pipe，
+   再找誰握著同一個 pipe 的寫端。**修法（未做）**：重啟輸出改寫到暫存檔、重啟指令加逾時。
+2. **換入的 `.next` 裡有 build 目錄的絕對路徑字串，這是正常的**。`.next/server` 有 44 個檔案含 `/opt/filet/web-build/run-*/…`
+   （client-reference manifest 的模組鍵、`next-font-manifest`、`required-server-files.json` 的 `appDir`）；舊流程原地 build 的版本同樣有 46 個檔案含
+   `/opt/filet/spark/web/…`。它們是同一次 build 內部互相對照的字串鍵，不是執行期要讀的路徑——`run-*` 刪除後服務照常。
+   （plan §14 R6 原本寫的預期「不引用 `run-*` 路徑」是錯的，已在 plan 更正。）
 
 ### 4.3 安裝 dashboard systemd unit
 
@@ -4149,3 +4182,34 @@ build 失敗時**先重跑 build，不要先查原因**；(2) 結構性修法（
 sitemap 10 條皆 `trade.filet.app`；瀏覽器實看首頁證據列為「精選策略連續實盤」；三個 follower 未動（心跳持續、leader 仍舊位址）；
 `leaders.json` sha 仍 `b5a8f012…`（`var` 未被 rsync 碰到）；`DEPLOYED_VERSION`=`bbfe266`；`filet_regression_check --http --ssh` **67/67 PASS**。
 回滾＝§9.3 回 f035faf 的 `web/`（重跑 §4.2＋restart dashboard）；後端無變動。
+
+**2026-11-17 部署（commit `dd0346c`，13:54–13:57 UTC，over bbfe266；策略績效公式＋曲線時間戳＋首頁只列開放中策略＋進階模式文案＋前端部署腳本首次使用）：**
+plan `docs/superpowers/plans/2026-11-16-strategy-return-hl-roi.md`、`docs/superpowers/plans/2026-11-17-perf-followups-and-build-swap.md`。
+使用者 2026-11-17 同意三步：正式機演練 → push → 部署。bbfe266..dd0346c 共 36 檔（後端 `leader_perf.py`／`strategies.py`／`publicapi/app.py`／`hl_explore.py`，
+其餘為前端、測試、文件與 `deploy/ops/web_build_swap.sh`）；`package-lock`／`package.json`／`pyproject` md5 與正式機相同 → 不 `npm ci`、不 `uv sync`。
+**演練（11:28–13:52Z，只寫 `/tmp`，事後已清）**：結果與發現的兩件事見 §4.2「演練與首次部署結果」。真 build 那一項因演練用的假重啟指令握住輸出管道，
+腳本在重啟步驟卡了 2 小時 19 分（不是線上會用的 `systemctl restart`）；排除後該項通過。
+**push**：`dc3e070..dd0346c`（8 個 commit）。
+前置查（13:53Z）：無維護旗標、無 `/tmp/spark-sync`、`systemctl --failed` 0、`filet-dashboard` 有 `Wants=filet-api`（重啟 api 不會連帶重啟它）、
+peer session spark-bd／spark-a2／spark-7d 皆 idle。來源＝`dd0346c` 的乾淨 worktree（已 push）。
+步驟與時間：§3.2 兩段 rsync（第二段先 `--dry-run --itemize-changes`：內容有變的恰為 git diff 的 36 檔，另刪 `DEPLOYED_VERSION` 與 `web/next-env.d.ts`）
+→ chown root／`chmod go-w`（prune var；樹內非 root 檔案 0、`uv.lock` mtime 未變、`var/` 擁有者未變）13:54:31Z
+→ 備份 `/var/lib/filet-api/explore_index.json` 為 `explore_index.json.bak-v5-20261117` → `sudo systemctl restart filet-api` 13:54:39Z
+（`EXPLORE_INDEX_VERSION` 6；重啟後 6 秒由 publisher 從本機 `explore.db` 發布 v6 快照，沒有出現空榜）
+→ 前端 `NEXT_PUBLIC_SITE_ORIGIN=https://trade.filet.app bash deploy/ops/web_build_swap.sh` 13:55:10–13:56:24Z：結束碼 0、build 69 s、
+`BUILD_ID` `2aRMQ8sWMs8RJcCPUlrqP` → `e6zp--U4yCW_ZOLICXR4p`、`filet-dashboard` 重啟 13:56:22–24Z（1 秒 Ready）、健康檢查首頁 200＋18 個靜態資源 200；
+**整個過程線上沒有靜態資源 400 的空窗**（對照 2026-11-15 舊流程的 3 分鐘事故）。舊版留在 `web/.next-prev`（`2aRMQ8…`＝bbfe266）。
+→ `sudo systemctl start filet-leaderboard.service` 13:56:43–46Z（watchlist 3/3 ok；不跑的話 `/api/leaders` 會沿用當天 00:13Z 舊公式的快照到隔天）
+→ `DEPLOYED_VERSION`=`dd0346c7652b59bd90c477722749b8a80527d1fa`（13:56:36Z）。
+驗證：`/api/public/strategies` Filet Alpha 總報酬 +1055.95%（HL 排行榜 ROI 定義；修正前顯示約 +3800%）、最大回撤 −31.96%、Sharpe 1.34、N=84；
+Filet Alpha (Legacy) −22.17%；Ultron −15.77%（修正前 +399%，實際累計損益約 −$82 萬）。watchlist 快照 11-16 對 11-17：Ultron perp 全期 `twr` 3.99 → −0.149、
+`best_day_return` 4.91 → 0.17、`annualized_vol` 12.7 → 0.43，並新增 `roi`／`periods_per_year`／`return_sample_count` 欄位。
+`/api/public/explore` 200、`initializing` false、快照檔 `version` 6。瀏覽器實看：首頁主推卡 Filet Alpha +1057.34%、策略清單只有 `alpha` 與 `ultron`（Legacy 不在首頁）、
+證據列「精選策略連續實盤」；`/strategies` 三張卡（Legacy 顯示「暫不開放新跟單」）；`/strategies/alpha` 曲線 X 軸為 2024-06～2026-11 的時間刻度、
+方法論為「Hyperliquid 排行榜 ROI 定義」「區間勝率」「最佳 / 最差單期」、N=84、85 個取樣點；`/advanced` 兩處 DYOR 聲明；`/explore` 50 列；各頁 console 無錯誤。
+三個 follower（`f438b3…`／`f6b3e7…`／`fd149b…`）未動：`ActiveEnterTimestamp` 仍為 2026-11-05、`NRestarts` 1／2／1 不變、心跳持續更新且 leader 仍為 `0xfb9c…9760`；
+`filet-api` 重啟後 journal 無 Traceback／ERROR；`filet-dashboard` 重啟後唯一的錯誤行是 `Failed to find Server Action "x"`（外部掃描請求，部署前兩天已出現 34 次）；
+`filet_regression_check --http --ssh` **67/67 PASS**。
+回滾：前端＝`bash /opt/filet/spark/deploy/ops/web_build_swap.sh --rollback`（只在 `web/.next-prev` 還在時有效；下一次 §3.2 部署或下一次腳本執行會清掉它）；
+後端＝§9.3 回 bbfe266，並把 `explore_index.json.bak-v5-20261117` 放回 `explore_index.json` 後重啟 `filet-api`（v5 程式不讀 v6 快照）。
+未做：§4.2 列的重啟步驟逾時修法；repo 內三處預設 leader 仍是舊位址（2026-11-15 記錄的已知事項，不變）。

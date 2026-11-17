@@ -1,8 +1,8 @@
 # 績效頁後續修正＋前端「另目錄 build 再換入」部署流程
 
-狀態：**實作與審核完成（本機已 commit）；未部署、未 push**（2026-11-17）。
+狀態：**已 push、已部署**（2026-11-17 13:54–13:57 UTC，commit `dd0346c`；部署記錄在 `deploy/RUNBOOK.md` 附錄 B，演練結果在 §16 與 RUNBOOK §4.2）。
 Task A／A2／F／F2 與首頁改動兩輪審核 PASS；部署腳本七輪審核，第七輪 PASS（§13），Task L 為採納的建議並由主線程驗收。
-下一步需使用者同意：§14 正式機演練 → push → §5 部署。
+後續（未做）：重啟步驟逾時修法（§16）。
 
 前置：`docs/superpowers/plans/2026-11-16-strategy-return-hl-roi.md`（commit `a6d4ef8`，兩輪審核 PASS，使用者 2026-11-17 確認 D4–D7）。
 
@@ -429,9 +429,28 @@ I1／I2／I4 確認落地（符號連結、同秒執行、殘骸、總時限等 
 
 任一項與預期不同 → 不使用腳本部署，改回舊流程或先修腳本。
 
+> 2026-11-17 更正：R6 的預期「`.next/server` 內不引用 `run-*` 路徑」寫錯了。Next 的 build 會把 build 目錄的絕對路徑當字串鍵寫進
+> client-reference manifest、`next-font-manifest`、`required-server-files.json`（原地 build 的舊版同樣含 `/opt/filet/spark/web`），不是執行期讀檔路徑。
+> 正確的預期是「`run-*` 刪除後重新啟動服務，各路徑回應正確、log 無錯」。見 §16。
+
 ## 15. Task L 驗收（主線程，2026-11-17）
 - `bash -n` 無錯；`uv run pytest -q -p no:cacheprovider tests/test_web_build_swap.py tests/test_deploy_artifacts.py` → 136 passed；ruff 無錯。
 - 主線程自行重現：線上 `.next` 無 `static/` → 結束碼 1、未建立 `BUILD_DIR`；`HEALTH_TIMEOUT_S=3000`／`601`／`99999999999999999999` → 結束碼 2。
 - builder 回報七個受保護函式（`swap_in`、`swap_back`、`auto_rollback`、`decide_code`、`enter_uninterruptible`、`retire_dir`、`guard_build_dir`）本體雜湊前後相同。
 - 全量：`uv run pytest -q` 3698 passed／42 deselected；`npm test` 861 passed；`ruff check` 無錯。
 - Task L 之後未再送第八輪審核（改動限於前置檢查與報告文字，屬第七輪的 Suggestion）；§14 的正式機演練會再實際執行一次全流程。
+
+## 16. 正式機演練與部署結果（主線程，2026-11-17）
+
+使用者同意三步（演練 → push → 部署）後執行。逐項結果表在 `deploy/RUNBOOK.md` §4.2「演練與首次部署結果」，部署記錄在附錄 B。
+
+- **§14 演練**：R1–R5、R7–R12 與基本流程全部符合預期（假 build 48 項檢查，其中 1 項顯示失敗是檢查條件寫錯——預期一句話出現一次，實際在兩行正確訊息各出現一次）。
+- **R6 與預期不同的兩點，以及為什麼仍判定可用**（§14 寫「任一項與預期不同 → 不使用腳本部署」，這裡是主線程的判斷，如實記錄）：
+  1. 腳本在「步驟 6/9 重啟」卡了 2 小時 19 分。原因在演練用的假重啟指令（`cd … && nohup next start … &` 的子 shell 握著 `$(...)` 的輸出管道），
+     不是腳本對 `sudo systemctl restart filet-dashboard` 的處理；證據：`/proc/<pid>/fd` 顯示腳本在 `pipe_read`、同一 pipe 的寫端只有那個子 shell，
+     `kill -9` 它之後腳本立刻繼續並以結束碼 0 完成；歷次部署經 ssh 執行 `sudo systemctl restart filet-dashboard` 都即時返回（ssh 同樣要等輸出管道關閉）。
+     但它暴露了腳本的真實缺口：**重啟步驟沒有逾時**，重啟指令不返回時腳本會在不可中斷階段無限等待。
+  2. 換入的 `.next/server` 有 44 個檔案含 `run-*` 路徑。查證後是預期寫錯（見 §14 的更正）；`run-*` 刪除後重新啟動 `next start`，21 個路徑回應正確、log 無錯。
+  判定：兩點都不影響以預設 `RESTART_CMD` 部署，且最壞情況（重啟指令卡住）下新版已換入、服務已重啟，`kill -9` 腳本後可手動檢查或 `--rollback`，線上不會中斷。
+- **部署**：`web_build_swap.sh` 首次實際使用，結束碼 0、build 69 s、重啟 1 秒、健康檢查通過，沒有靜態資源 400 的空窗；回歸檢查 67/67 PASS；三個 follower 未動。
+- **後續（未做，需另開 task 並重新審核）**：`do_restart` 把重啟輸出改寫到暫存檔（不等管道 EOF）並加逾時；對應測試「重啟指令留下握著 stdout 的背景行程時腳本仍在時限內結束」。
