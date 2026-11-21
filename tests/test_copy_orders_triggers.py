@@ -825,3 +825,25 @@ def test_warn_is_one_message_per_coin_merging_disabled_and_unsupported():
 
     _warn_unmirrored_triggers(skipped, state, n, now=1700.0)  # 收斂：不再送
     assert len(_warns(n)) == 3
+
+
+# ── 2026-11-22 T6 審核建議：觸發價／限價為 0 的引擎端防線要有測試守住 ──────────────
+# adapter 把缺鍵的 triggerPx 補成 "0"（hyperliquid.py get_open_orders），所以真實資料下
+# `trigger_px is None` 不會成立，`<= 0` 才是唯一擋得住的地方；拿掉它，這張單會以觸發價 0
+# 送出、每輪被拒、每輪 CRIT。
+def test_t6_trigger_with_zero_trigger_px_or_zero_limit_px_is_unsupported():
+    import dataclasses
+
+    pos = _short_btc()
+    for bad in (
+        dataclasses.replace(_fixed_sl_limit(oid=11), trigger_px=Decimal("0")),
+        dataclasses.replace(_fixed_sl_limit(oid=12), limit_px=Decimal("0")),
+        dataclasses.replace(_pos_tpsl(oid=13), trigger_px=Decimal("0")),
+        dataclasses.replace(_pos_tpsl(oid=14), limit_px=Decimal("0")),
+    ):
+        desired, skipped = _build([bad], pos, mirror_triggers=True)
+        assert desired == []
+        assert [(s.reason, s.oid) for s in skipped] == [("trigger_unsupported", bad.oid)]
+    # 對照：同一張單價格正常時會進 desired（確認上面不是被別的過濾擋掉）
+    desired, skipped = _build([_fixed_sl_limit(oid=15)], pos, mirror_triggers=True)
+    assert len(desired) == 1 and skipped == []
