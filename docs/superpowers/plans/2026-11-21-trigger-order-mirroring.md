@@ -1,6 +1,6 @@
 # Plan：鏡射 leader 的止盈／止損觸發單（trigger order mirroring）
 
-> 狀態（2026-11-21）：**使用者已全數確認（「可以，GO」），依序派工中。** 進度：T1 派工中。
+> 狀態（2026-11-21）：**使用者已全數確認（「可以，GO」），依序派工中。** 進度：T1 完成（腳本 `90c6751`；testnet 實跑結果見 research 檔，結論已寫回 §4 D-P1…D-P13）；T2 完成（`a35ebbe`）；T3 派工中。
 > 確認內容：D1、D2、D3（改判：條件進場單也要跟）、D5（開關預設關＋告警降級）、D13、D14、R7、
 > T2 先獨立部署、T1／T5 在 testnet 下單。
 > 分支（確認後才開）：`feat/trigger-order-mirroring`（自 main `46c8d99` 切出；逐 task commit、**不 push**）。
@@ -67,7 +67,18 @@
 | D10 | 啟用後觸發單下單失敗維持大聲：走既有 settle 重試 → CRIT 帶交易所拒因。 | 定案 |
 | D11 | 固定數量觸發單換算後數量為 0 或名目 < `min_order_notional` → `reason="small"`＋既有 warn（不再靜默）。是否豁免最小名目由 T1 的 P11 複核。 | 定案 |
 | D12 | `Order`（`exchange/base.py`）擴充 trigger 欄位，不另開新方法：`place_order` 仍是唯一掛單入口，builder 必帶。`ExchangeAdapter` 不新增任何 withdraw／transfer 類方法（紅線 3）。 | 定案 |
-| D-P* | T1 探針結論（P1–P13 逐項）由主線程寫回本表後才派 T3／T4。 | T1 後補 |
+| D-P1 | 成功回應有兩種形狀：`grouping="na"` 的觸發單回 `{"resting": {"oid": …}}`（與限價單相同，現行解析可用）；`grouping="positionTpsl"` 回**字串** `"waitingForTrigger"`、沒有 oid。現行 `_parse_order_response` 遇字串會在 `status.get` 拋 `AttributeError`，T3 必修：`"waitingForTrigger"` → `ok=True`、`filled_size=0`；其他不認得的字串或形狀 → `ok=False`、保留 `raw`、不拋例外。 | T1 實測（research §3 P1、P3） |
+| D-P3 | 倉位型一律送 `s=0`＋`grouping="positionTpsl"`。同分組但數量非 0 會變成固定數量單（`isPositionTpsl:false`），**禁止**這種組合：adapter 遇 `position_tpsl=True` 一律把數量送 0，不看 `order.size`。 | T1 實測（P3） |
+| D-P4 | 倉位型可帶 builder（紅線 4 守得住）；非 reduce-only 觸發單也可帶 builder（P13）。 | T1 實測 |
+| D-P5 | 交易所不會替同一倉位的多張倉位止損去重（兩張並存）。去重只靠引擎的 desired／mine 配對：多出來的那張在下一輪被當 extra 撤掉。reduce-only 觸發單因暫時性錯誤重試而重複掛出，屬可自癒，維持「reduce-only＝冪等可重試」分類。 | T1 實測（P5） |
+| D-P6 | 確認 D7：未觸發的 reduce-only 觸發單數量大於倉位不會被修剪，引擎不封頂。 | T1 實測（P6） |
+| D-P7 | 倉位歸零後，倉位型與固定數量 reduce-only 觸發單都在 1 秒內自動消失。引擎不需額外清理；與「無倉位就不放進 desired」（D9）一致，不會互相打架。 | T1 實測（P7） |
+| D-P8 | 交易所**不拒**無倉位或方向不符的 reduce-only 觸發單，所以 D9 的引擎端過濾是唯一防線，必須保留並有測試。 | T1 實測（P8） |
+| D-P9 | 撤觸發單與撤限價單回應相同，`cancel_order` 不必改。 | T1 實測（P9） |
+| D-P10 | 觸發條件已成立的單不會被拒（P10），本次沒有取得任何觸發單拒因字串；D10 的 CRIT 走既有通用拒因路徑，不做字串特判。 | T1 實測（P10） |
+| D-P11 | **reduce-only 固定數量觸發單豁免 `min_order_notional`**（$4.8 的單掛得上；不豁免會讓小帳戶沒有止損）。換算捨入後數量為 0 仍記 `small`。條件進場單（非 reduce-only）**不豁免**，維持與限價進場單相同的最小名目過濾。 | 主線程依 P11 裁決（修改 D11）；使用者 2026-11-22 確認 |
+| D-P12 | D14 的辨識式：`frontendOpenOrders` 中，凡 oid 出現在任何一張最上層單的 `children` 陣列內者，即為「母單未完成的附帶子單」。讀取層標記 `OpenOrder.is_pending_child=True`；`_build_desired` 在現貨過濾之後、開關檢查之前略過（`reason="trigger_pending_child"`，帶 oid），**不發 warn**（這是預期行為：母單完成後它會變成獨立觸發單並被鏡射）。follower 端永不使用 `normalTpsl` 分組。 | T1 實測（P12） |
+| D-P13 | 條件進場單：無倉位可掛、可帶 builder、未觸發不佔保證金、成功形狀 `resting`＋oid。D13 規則不變。 | T1 實測（P13） |
 
 ## 5. 檔案地圖
 
@@ -179,9 +190,14 @@
     `reduce_only` 原樣傳遞（條件進場單為 `False`）；
     `order_type = {"trigger": {"triggerPx": self._round_px(coin, trigger_px), "isMarket": order.is_market, "tpsl": order.tpsl}}`；
     `position_tpsl=False` → `self._exchange.order(...)`（帶 `builder`）；
-    `position_tpsl=True` → `self._exchange.bulk_orders([req], {"b":…, "f":…}, grouping="positionTpsl")`，數量依 D-P3。
-  - `_parse_order_response`：依 D-P1 認得觸發單的成功形狀（→ `ok=True`、`filled_size=0`）；
-    `statuses[0]` 是不認得的字串或形狀時回 `ok=False` 並保留 `raw`，**不得拋 AttributeError**。
+    `position_tpsl=True` → `self._exchange.bulk_orders([req], {"b":…, "f":…}, grouping="positionTpsl")`，
+    request 的 `sz` 固定送 `0.0`（D-P3，不看 `order.size`）。
+  - `_parse_order_response`（D-P1）：`statuses[0] == "waitingForTrigger"` → `ok=True`、`filled_size=0`、`avg_px=0`；
+    其他字串（含 `"waitingForFill"`）或不認得的形狀 → `ok=False` 並保留 `raw`，**不得拋 AttributeError**
+    （現行程式對字串會在 `status.get` 拋例外）。`{"resting": …}`／`{"filled": …}`／`{"error": …}` 行為不變。
+  - `get_open_orders`（D-P12）：先掃一遍 `raw`，收集所有 `o.get("children") or []` 內的 oid；最上層單的 oid 在該集合內者
+    `is_pending_child=True`。`children` 缺鍵或為空 → 集合為空。
+- `src/spark/exchange/base.py` `OpenOrder` 尾端另加 `is_pending_child: bool = False`。
   - `_round_px` docstring 中「日後若加 trigger」那段改為現況。
 - `src/spark/resilience.py`：新增顯式包裝 `bulk_orders(self, order_requests, builder=None, grouping="na")`——
   全部 request 的 `reduce_only` 為真 → `idempotent=True` 直接重試；否則單次嘗試（與 `order` 同分類）。
@@ -196,7 +212,12 @@
 4. `tpsl=None` 的 trigger、或非 reduce-only 的倉位型 → `ValueError`，SDK 呼叫 0 次。
    非 reduce-only 的固定數量 trigger（條件進場）→ `order` 收到 `reduce_only=False`、帶 builder；
    經 `ResilientExchange.order` 遇 `ConnectionError` **只呼叫一次**（非冪等，不盲重試）。
-5. 回應解析：T1 記錄的成功形狀 → `ok=True`；單筆 error → `ok=False`；未知字串 status → `ok=False` 不拋例外。
+5. 回應解析（用 research 檔 §4 的原始回應當測試資料）：`[{"resting": {"oid": 65739864215}}]` → `ok=True`；
+   `["waitingForTrigger"]` → `ok=True`、`filled_size == 0`；`["waitingForFill"]`、`["somethingNew"]` → `ok=False` 且不拋例外；
+   `[{"error": "x"}]` → `ok=False`。
+8. `get_open_orders`：以 research 檔 §4「P12 母單」的原始 JSON（母單＋兩張同 oid 的最上層子單）為輸入 →
+   兩張子單 `is_pending_child=True`、母單 `False`；沒有 `children` 鍵的一般回應 → 全部 `False`。
+9. 倉位型下單：`Order.size` 給非 0 值時，送進 SDK 的 `sz` 仍是 `0.0`。
 6. `ResilientExchange.bulk_orders`：全 reduce-only 遇 `ConnectionError` 會重試；含非 reduce-only 只呼叫一次。
 7. `tests/test_base_types.py` 的結構性斷言仍通過。
 
@@ -209,15 +230,18 @@
     數量比較之前加 `if desired.is_position_tpsl: return True`（兩邊都是倉位止盈止損，數量恆 0，不比）。
   - `_build_desired`（開關開啟時；過濾順序寫進 docstring）：
     1. 現貨 → `spot`（不變）。
+    1.5 `o.is_pending_child` → `SkippedOrder(coin, Decimal("0"), "trigger_pending_child", oid=o.oid)`；`continue`（D-P12；
+        不論開關、不發 warn——`sync_open_orders` 的告警聚合不得把這個 reason 算進去）。
     2. `is_trigger` 且開關關 → `trigger_disabled`（T2）。
     3. `is_trigger` 且 `tpsl not in ("tp","sl")` → `trigger_unsupported`（帶 oid）。
-       依 D14 判定為「母單未成交的附帶子單」者同樣在此略過（判式由 P12 定）。
+       （母單未完成的附帶子單已在 1.5 略過。）
     4. 成本熔斷、抗單保護、無倉位（不變；reduce-only 一律放行）。條件進場單在這一步
        與非 reduce-only 限價單同待遇：熔斷→`cost_breaker`、保護中→`protected`（D13）。
     5. reduce-only 觸發單方向不符 → `reduce_only_no_pos`（D9；與非 trigger 同一判式）。
     6. `is_position_tpsl` → `trigger_px > 0` 才 `entries.append(_spec_of(o, Decimal("0")))`，**跳過**數量與最小名目檢查；`continue`。
     7. 固定數量觸發單：`size = _round_size(o.sz * scale)`；`size <= 0` → `SkippedOrder(coin, Decimal("0"), "small")`（不再靜默）；
-       名目 < `min_notional` → `small`；不進 `ro_pending`、不封頂（D7）。
+       名目 < `min_notional` → **只有非 reduce-only（條件進場單）**記 `small`；reduce-only 觸發單豁免最小名目（D-P11）；
+       不進 `ro_pending`、不封頂（D7）。
   - `_reconcile_orders` 改單迴圈最前面加：`if spec.is_trigger: fallback.append((oid, coin, spec)); continue`
     （D4；不呼叫 `ex.modify`、不寫 `state.modify_fail_until`）。
   - `_fmt_missing`／`_fmt_extra`：倉位止盈止損顯示「倉位TP/SL」而非數量 0，CRIT 才讀得懂。
@@ -247,6 +271,10 @@
 12. 條件進場單在 `no_new_exposure=True` → `cost_breaker` 略過；幣在 `protected` → `protected` 略過；
     名目 < `min_notional` → `small`。同一輪的 reduce-only 觸發單不受這三者影響。
 13. 已掛著的條件進場單，下一輪 `no_new_exposure` 變 `True` → 該單被撤（desired 不再包含它）。
+14. `is_pending_child=True` 的 reduce-only 觸發單（follower 有同方向倉位、開關開）→ 不進 desired、skipped 為
+    `trigger_pending_child`、`warn` 0 則；同一張單 `is_pending_child=False` 時 → 進 desired（D-P12）。
+15. reduce-only 固定數量觸發單名目 $4.8（< `min_notional`）→ 進 desired；同名目的條件進場單 → `small`（D-P11）。
+16. follower 已有兩張相同觸發價的倉位止損、leader 只有一張 → 一張 matched、另一張被撤（D-P5 的去重）。
 
 **變異驗收（judgment.md §2）**：回報須附「刻意改壞 → 哪個測試轉紅」至少 4 條：
 (a) 拿掉 `_orders_match` 的倉位型提前回傳 → 測試 5；(b) 拿掉 `_reconcile_orders` 的 trigger→fallback → 測試 6；
@@ -297,6 +325,9 @@
 - **R4 倍率漂移**：倍率變動超過 `size_tolerance`（8%）時固定數量觸發單會撤單重掛。
 - **R5 已觸發未成交的止損限價**在 `frontendOpenOrders` 的呈現未驗證，可能造成一輪重掛。E6 觀察並記錄。
 - **R6 同一張 leader 觸發單，三個 follower 會在同一個 mark price 同時觸發**，市價型會同時吃單。
+- **R9 附帶止盈止損的空窗**：leader 的母單部分成交且仍掛著時，子單還沒生效（文件所述，testnet 未測）；follower 鏡射的母單
+  若也部分成交，這段期間 follower 有倉位但沒有對應的止盈止損，直到 leader 的母單完成或被撤。
+- **R10 testnet 未涵蓋的行為**：觸發條件已成立的單多久後觸發、小額觸發單觸發後能否成交、unifiedAccount 下的行為（research §5）。
 - **R7 條件進場單會在引擎不在場時開倉**：觸發發生在交易所端，不經過引擎。引擎停機、或成本熔斷剛成立但還沒輪到撤單的那一輪內，
   follower 仍可能被觸發開新倉。風控熔斷與 kill switch 成立後的那一輪會把它撤掉（既有「撤全部掛單」路徑）。
 - **R8 條件進場單觸發瞬間的一輪落差**：follower 的觸發單與 leader 的幾乎同時成交，但引擎該輪若用到觸發前的快照，
