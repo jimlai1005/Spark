@@ -108,6 +108,10 @@ class FakeAdapter(ExchangeAdapter):
     def place_order(self, agent_signer, order: Order, builder: BuilderCode) -> OrderResult:
         self.calls["place_order"].append(
             {"agent_signer": agent_signer, "order": order, "builder": builder})
+        if order.trigger_px is not None:
+            # 觸發單掛上後未成交：不累計 builder fee。
+            return OrderResult(ok=True, filled_size=Decimal("0"), avg_px=Decimal("0"),
+                               raw={"status": "waitingForTrigger"})
         notional = order.size * order.limit_px
         self._accrued += notional * Decimal(builder.f) / Decimal(100000)  # f/1000 % = f/100000
         return OrderResult(ok=True, filled_size=order.size, avg_px=order.limit_px,

@@ -47,6 +47,15 @@ class Order:
     limit_px: Decimal
     tif: str  # "Ioc"
     reduce_only: bool = False
+    # 觸發單（止盈／止損／條件進場）欄位；trigger_px=None ＝ 一般限價單，行為完全不變。
+    # trigger_px 非 None 時 tpsl 必須是 "tp"／"sl"（否則 adapter raise，不猜）。
+    # position_tpsl=True ＝ 倉位止盈止損（grouping="positionTpsl"，數量跟著倉位走）：
+    # adapter 一律把數量送 0，不看 size（plan D-P3：同分組送非 0 數量會變固定數量單）；
+    # 且必須 reduce_only。is_market 決定市價型（limit_px 為滑點保護價）或限價型。
+    trigger_px: Decimal | None = None
+    tpsl: str | None = None
+    is_market: bool = False
+    position_tpsl: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +105,9 @@ class OpenOrder:
     # frontendOpenOrders 的 isPositionTpsl（倉位止盈止損，介面顯示「Close Position」，
     # sz 為 0、數量跟著倉位走）。缺鍵 → False。
     is_position_tpsl: bool = False
+    # 「母單未完成的附帶子單」：oid 出現在任一最上層單的 `children` 陣列內
+    # （normalTpsl 子單在母單成交前會同時出現在最上層與母單 children，plan D-P12／research P12）。
+    is_pending_child: bool = False
 
 
 @dataclass(frozen=True)

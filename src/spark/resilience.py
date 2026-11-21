@@ -136,6 +136,16 @@ class ResilientExchange:
                    what="掛單", idempotent=idem,
                    verify=(None if idem else _verify), sleep_fn=self._sleep_fn)
 
+    def bulk_orders(self, order_requests, builder=None, grouping="na", *, _verify=None):
+        # 分組下單（倉位止盈止損走 grouping="positionTpsl"）。分類與 order() 一致：
+        # 全部 request 都是 reduce-only → 冪等直接重試（重複掛出可由引擎對帳自癒，plan D-P5）；
+        # 含任何非 reduce-only（或 request 為空）→ 單次嘗試、不盲重試。
+        reqs = list(order_requests)
+        idem = bool(reqs) and all(bool(r.get("reduce_only", False)) for r in reqs)
+        return run(lambda: self._ex.bulk_orders(reqs, builder, grouping),
+                   what="分組掛單", idempotent=idem,
+                   verify=(None if idem else _verify), sleep_fn=self._sleep_fn)
+
     # 已自帶 cancel→重掛 退回機制 → 不加重試
     def modify_order(self, *a, **k):
         return run(lambda: self._ex.modify_order(*a, **k),

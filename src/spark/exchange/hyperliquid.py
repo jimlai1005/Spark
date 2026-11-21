@@ -58,9 +58,8 @@ class HyperliquidAdapter(ExchangeAdapter):
         W1/S2：原本在此 import `spark.copytrade.instrument._is_spot_coin` 是死碼＋
         exchange 層依賴 copytrade 層的分層倒置，已移除）。
 
-        日後若加 trigger（TP/SL）單支援，`trigger_px` 必須同走本函式——trigger 單
-        同樣受 HL 這兩條價格規則約束，目前 `executor._skip_trigger` 使其不送單，
-        故本函式尚未涵蓋這條路徑。
+        trigger（TP/SL）單同樣受這兩條價格規則約束：`place_order` 的觸發單路徑把
+        `trigger_px` 與 `limit_px`（市價型的滑點保護價）都經本函式（2026-11-22 起）。
         """
         d = self._PX_CTX.create_decimal(px)
         max_dec = 6 - self.get_size_decimals(coin)
@@ -151,6 +150,14 @@ class HyperliquidAdapter(ExchangeAdapter):
 
     def get_open_orders(self, address: str) -> list[OpenOrder]:
         raw = self._info.frontend_open_orders(address)
+        # 「母單未完成的附帶子單」（plan D-P12）：normalTpsl 子單在母單成交前會同時出現在
+        # 最上層（與已生效的觸發單長得一樣）與母單的 `children` 內；唯一區別是其 oid 出現在
+        # 某張最上層單的 children 裡。先掃一遍收集，再逐單標記。缺鍵或空 → 集合為空。
+        child_oids: set = set()
+        for o in raw:
+            for c in o.get("children") or []:
+                if isinstance(c, dict) and c.get("oid") is not None:
+                    child_oids.add(c["oid"])
         orders = []
         for o in raw:
             is_trigger = bool(o.get("isTrigger", False))
@@ -174,6 +181,7 @@ class HyperliquidAdapter(ExchangeAdapter):
                 orig_sz=Decimal(str(o["origSz"])) if o.get("origSz") is not None else None,
                 # 倉位止盈止損旗標（欄位名經主網 frontendOpenOrders 實測驗證）；缺鍵 → False。
                 is_position_tpsl=bool(o.get("isPositionTpsl", False)),
+                is_pending_child=o["oid"] in child_oids,
             ))
         return orders
 
@@ -436,6 +444,15 @@ class HyperliquidAdapter(ExchangeAdapter):
         if res.get("status") != "ok":
             return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
         status = res["response"]["data"]["statuses"][0]
+        if isinstance(status, str):
+            # 字串形態（plan D-P1，testnet 實測）：倉位止盈止損（grouping="positionTpsl"）
+            # 成功回 "waitingForTrigger"（無 oid）。其他字串（含 normalTpsl 子單的
+            # "waitingForFill"）與任何不認得的形狀一律 ok=False 並保留 raw——不猜成功，
+            # 也不得在 status.get 拋 AttributeError。
+            ok = status == "waitingForTrigger"
+            return OrderResult(ok=ok, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
+        if not isinstance(status, dict):
+            return OrderResult(ok=False, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
         if "resting" in status:
             return OrderResult(ok=True, filled_size=Decimal("0"), avg_px=Decimal("0"), raw=res)
         # 帶 "error" 鍵或其他未知形態 → filled 為空 dict → ok=False（原始回應留 raw）。
@@ -448,6 +465,15 @@ class HyperliquidAdapter(ExchangeAdapter):
         )
 
     def place_order(self, agent_signer: Signer, order: Order, builder: BuilderCode) -> OrderResult:
+        if order.trigger_px is None:
+            # 沒有觸發欄位的單：不得帶著殘留的觸發旗標默默變成普通限價單
+            # （倉位型若退化成限價單會用 order.size 開出非預期部位）。
+            if order.tpsl is not None or order.position_tpsl:
+                raise ValueError(
+                    "Order 設了 tpsl／position_tpsl 但 trigger_px 為 None——"
+                    "拒絕送出（不猜成限價單）")
+        else:
+            return self._place_trigger_order(order, builder)
         # reduce_only 取自 Order 欄位（勿寫死 False——跟單鏡射的 leader reduce-only 掛單
         # 必須原樣傳遞，否則會變成可開新倉的普通掛單）。
         res = self._exchange.order(
@@ -456,6 +482,39 @@ class HyperliquidAdapter(ExchangeAdapter):
             {"limit": {"tif": order.tif}}, reduce_only=order.reduce_only,
             builder={"b": builder.b, "f": builder.f},
         )
+        return self._parse_order_response(res)
+
+    def _place_trigger_order(self, order: Order, builder: BuilderCode) -> OrderResult:
+        """觸發單（止盈／止損／條件進場）下單。fail-loud：判讀不出的輸入 raise，不猜。
+
+        - tpsl 必須是 "tp"／"sl"（plan D3）；倉位止盈止損必為 reduce-only。
+        - 觸發價與限價（市價型為滑點保護價）1:1 照抄並都經 `_round_px`（D8）。
+        - 每一條 SDK 呼叫路徑都帶 builder（紅線 4；D-P4／D-P13 實測可併用）。
+        - 倉位型走 `bulk_orders(grouping="positionTpsl")` 且數量固定送 0.0（D-P3）：
+          同分組送非 0 數量會變成固定數量單（isPositionTpsl:false），故不看 order.size。
+        """
+        if order.tpsl not in ("tp", "sl"):
+            raise ValueError(f"觸發單 tpsl 必須是 'tp' 或 'sl'，收到 {order.tpsl!r}——不猜測型態")
+        if order.position_tpsl and not order.reduce_only:
+            raise ValueError("倉位止盈止損（position_tpsl）必須是 reduce-only")
+        order_type = {"trigger": {
+            "triggerPx": self._round_px(order.coin, order.trigger_px),
+            "isMarket": order.is_market,
+            "tpsl": order.tpsl,
+        }}
+        limit_px = self._round_px(order.coin, order.limit_px)
+        builder_info = {"b": builder.b, "f": builder.f}
+        if not order.position_tpsl:
+            res = self._exchange.order(
+                order.coin, order.is_buy, float(order.size), limit_px,
+                order_type, reduce_only=order.reduce_only, builder=builder_info,
+            )
+        else:
+            req = {
+                "coin": order.coin, "is_buy": order.is_buy, "sz": 0.0,
+                "limit_px": limit_px, "order_type": order_type, "reduce_only": True,
+            }
+            res = self._exchange.bulk_orders([req], builder_info, grouping="positionTpsl")
         return self._parse_order_response(res)
 
     def cancel_order(self, agent_signer: Signer, coin: str, oid: int) -> bool:
