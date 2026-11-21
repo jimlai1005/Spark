@@ -60,6 +60,7 @@
 | D14 | leader「掛單時附帶的止盈止損」子單在母單成交前**不得**被當成獨立的 reduce-only 觸發單鏡射（否則 follower 會提早出現 leader 尚未生效的止損）。辨識方式由 T1 的 P12 決定；辨識不出就整類略過＋warn。 | 使用者 2026-11-21 確認（P12 後補細節） |
 | D4 | 觸發單**一律撤單重掛，不走 modify**：SDK modify 無 builder 欄位（紅線 4）、也無法更換分組。觸發單不登記 `modify_fail_until`（不得連帶把同幣限價單降級）。 | 定案 |
 | D5 | 開關 `COPY_MIRROR_TRIGGERS`（`CopySettings.mirror_triggers`，預設 `False`）。關閉時所有觸發單在 `_build_desired` 就略過（`reason="trigger_disabled"`）＋warn。**這會把固定數量觸發單現行的「每輪 CRIT」降為 warn**。 | 使用者 2026-11-21 確認 |
+| D15 | **使用者 2026-11-22 改判（睡前交辦）：全部部署並驗證完成後，開關預設改為開**（`CopySettings.mirror_triggers` 預設 `True`），`f438b3…`（0x438b）也打開。執行順序：(1) T3＋T4 以預設關部署並驗證；(2) 只對 `f438b3…` 的 env 加 `COPY_MIRROR_TRIGGERS=true`、重啟、確認引擎正常推進；(3) 改預設為 `True`（T7）→ 測試 → 審核 → 部署，其餘 follower 隨之啟用。關閉方式改為在該帳戶 env 設 `COPY_MIRROR_TRIGGERS=false`。**停損條件**：T6 有修不掉的 Critical／Warning 或需使用者裁決的分岔、T5 的 E6／E9 反覆無法驗證、任何部署後驗證不乾淨 → 停在當下、開關維持關、留晨間檢查點。 | 使用者 2026-11-22 確認 |
 | D6 | warn 去重：以「該幣 leader 觸發單的 oid 集合」為準，集合沒變就不重發（存在 `ReconcileState`，仿 `risk_off_warned_at` 先例）；不用 300 秒 TTL，避免洗版。 | 定案 |
 | D7 | 固定數量觸發單：數量＝`_round_size(leader.sz × scale)`，**不**以 follower 倉位封頂（沿用 `orders.py:260-262` 既有規則；觸發時由交易所的 reduce-only 封頂）。 | 定案（T1 的 P6 複核） |
 | D8 | 觸發價與限價 1:1 照抄 leader（含市價型的 `limitPx` 滑點保護價），兩者都經 `_round_px`。 | 定案 |
@@ -361,13 +362,15 @@ leader 動作與引擎輪次，手動逐條下指令不可重現）：新增編�
 | testnet 端到端 | research 檔 E1–E9 |
 | 審核 | reviewer 報告 0 Critical／0 Warning |
 
-## 9. 上線步驟（另行授權，本 plan 不執行）
+## 9. 上線步驟（使用者 2026-11-21／22 已授權：確認沒問題後部署、合併 push、更新文件；D15）
 
-1. 部署程式（開關預設關）：行為只剩「觸發單略過＋warn」，不下任何觸發單。
-2. 只對 `f438b3…` 的 env 加 `COPY_MIRROR_TRIGGERS=true` 並重啟該 follower；驗證進程 environ 吃到新值。
-3. leader 掛一組倉位止盈止損，確認 follower 一輪內出現同型單、TG 無 CRIT；觀察至少一次觸發或一次改價。
-4. 再開 `f6b3e7…`；`fd149b…` 權益為 0，維持預設。
-5. 寫 RUNBOOK 附錄 B 與 memory。
+1. **T2 告警先行**：已於 2026-11-21 17:53Z 部署 `eb4a677`（RUNBOOK 附錄 B）。
+2. **T3＋T4**（開關預設關）：T5 重跑通過、T6 審核 0 Critical／0 Warning 後，合併 push、部署、滾動重啟 follower、回歸檢查。
+3. **只對 `f438b3…` 開**：其 env 加 `COPY_MIRROR_TRIGGERS=true`（先備份 env 檔）、重啟該 follower、以進程 environ 驗證吃到新值、確認心跳持續推進且 journal 無錯誤。
+4. **T7 預設改開**：`CopySettings.mirror_triggers` 預設 `True`；測試中依賴「預設關」的地方改為顯式傳 `mirror_triggers=False`；
+   `deploy/` 下的 follower env 範本與 RUNBOOK 說明同步；審核後部署，三個 follower 滾動重啟。
+5. 寫 RUNBOOK 附錄 B、更新 plan 進度與 memory。
+6. 晨間回報：各步驟結果、開關現況（逐帳戶以進程 environ 與程式預設值說明）、尚無端到端證據的項目（leader 下次掛觸發單才看得到主網實況）。
 
 ## 10. 待使用者確認
 
