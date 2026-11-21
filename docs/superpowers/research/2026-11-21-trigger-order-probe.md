@@ -115,3 +115,102 @@ run 2 的 27 筆下單沒有任何一筆被交易所拒絕，因此沒有取得�
 - **探針腳本的已知缺口**：run 1 所有寫入都失敗（agent key 失效），腳本仍以 exit 0 與 `VERIFIED CLEAN` 結束——
   「乾淨」只代表沒留下倉位與掛單，不代表有測到東西。判讀時必須另看 `placement` 筆數與 `item_error`。
 - P5 的 note 欄 `first_oids`／`second_oids` 為空：倉位型的回應沒有 oid，腳本從回應抽不到；並存的證據是 `open_orders_after` 的兩個 oid。
+
+## 6. T5 端到端（E1–E9）
+
+> 狀態：**腳本已寫好、尚未實跑**（`scripts/testnet_trigger_e2e.py`，離線驗證：`--help`、純函式、
+> 以記憶體內假交易所／假引擎跑過九個情境的判定邏輯；實際行為待主線程實跑）。下列表格的結果欄一律留白，
+> 由實跑後填入，不得以離線驗證代替。Plan：`docs/superpowers/plans/2026-11-21-trigger-order-mirroring.md` §6 T5。
+
+### 6.1 執行方式
+
+兩個拋棄式 testnet 錢包（leader、follower），私鑰檔路徑必須含 `scratchpad`。follower 私鑰會被複製成
+引擎 keystore 內的 `agent.key`（拋棄式錢包的主鑰直接當簽章者，**不測 agent 授權流程**），腳本結束時刪除。
+
+```bash
+export S=<scratchpad 目錄的絕對路徑>        # 例：/private/tmp/claude-501/.../scratchpad
+OUT=~/filet-dev/trigger-e2e           # 必須在 repo 外
+mkdir -p "$OUT"
+
+# 1. 建兩個錢包（從水龍頭各注資 150 USDC；stdout 只印位址）
+uv run python -m tests.integration.harness mint-wallet --usdc 150 --pk-file "$S/e2e-leader.pk"
+uv run python -m tests.integration.harness mint-wallet --usdc 150 --pk-file "$S/e2e-follower.pk"
+
+# 2. 兩個錢包各核准 builder fee（腳本啟動前置檢查會驗 maxBuilderFee ≥ 20）
+export BUILDER=0xbAC652A5Fb611c1BdC3B9D244cc7E0cC03123662   # dev testnet builder（Builder3662）
+uv run python - <<'PY'
+import os
+from pathlib import Path
+from eth_account import Account
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
+S, B = Path(os.environ["S"]), os.environ["BUILDER"]
+for name in ("e2e-leader.pk", "e2e-follower.pk"):
+    a = Account.from_key((S / name).read_text().strip())
+    print(a.address, Exchange(a, constants.TESTNET_API_URL).approve_builder_fee(B, "0.1%")["status"])
+PY
+
+# 3. 實跑（約 40 輪引擎＋E6／E9 各最多等 10 分鐘；全程約 30–60 分鐘）
+uv run python -m scripts.testnet_trigger_e2e --leader-pk-file "$S/e2e-leader.pk" \
+    --follower-pk-file "$S/e2e-follower.pk" --builder "$BUILDER" --out "$OUT/run1.jsonl"
+# 只重跑部分情境：--only E1,E3 ；幣種／名目：--coin BTC --notional 60（範圍 20–100）
+```
+
+- 結束碼：`0`＝所有被選情境 PASS、每個情境至少一筆成功的 leader 下單、清理後兩邊無倉位無掛單、keys 副本已刪；
+  `2`＝前置檢查未過（零寫入）；`1`＝其他（任何 FAIL／UNVERIFIED／清理不乾淨／私鑰副本未刪）。
+- 記錄檔：JSON lines。`kind=scenario` 一行一個情境（`leader_actions`〔含原始回應〕、`engine_rounds`〔結束碼、
+  stdout／stderr 末段、引擎動作與告警〕、`snapshots`〔兩邊 `frontendOpenOrders` 原始 dict＋倉位〕、`checks`
+  〔`{check, expected, actual, pass}`〕、`verdict`）；另有 `start`（前置檢查事實）、`reset`、`summary`。
+  `pass` 為 `null`＝無法觀測（情境判 UNVERIFIED，不算通過）。
+- 前綴「(前置)」＝實驗自身的前置條件；「(補強)」＝plan 預期欄沒有明寫、由腳本加上的佐證檢查。
+- 引擎在 `--once` 子行程跑，**每輪都是新行程**：`ReconcileState`（含 D6 的 warn 去重集合）不跨輪保留，
+  所以 E7 驗的是「單一行程內 warn 恰一則」，D6 的「跨輪不重發」只有離線單元測試覆蓋。
+- 引擎告警／動作的觀測：腳本以 `_engine_child` 模式載入 `scripts.run_copytrade`，只把 `NullNotifier` 換成
+  `RecordingNotifier`、`run_cycle` 換成會記 `ex.records` 的薄包裝，再呼叫原本的 `main(["--once"])`；
+  引擎邏輯不改、不送 Telegram。引擎對 `COPY_RISK_CONTROLS_ENABLED=false`、`COPY_CAPITAL_UTILIZATION=0.9`
+  （新錢包上線預設）以外取產品預設。
+
+### 6.2 實跑紀錄
+
+| run | 日期（UTC） | leader／follower 末四碼 | 幣種／名目 | `--only` | 記錄檔路徑 | 結束碼 | 最終驗證（VERIFIED CLEAN?） | keys 已刪？ |
+|---|---|---|---|---|---|---|---|---|
+| 1 |  |  |  |  |  |  |  |  |
+
+### 6.3 結果表（E1–E9）
+
+每列填：時間戳（UTC）、兩邊相關 oid、`frontendOpenOrders` 摘錄（記錄檔行號）、各 check 的 PASS／FAIL／null、整體結果。
+
+| # | leader 動作 | 時間戳（UTC） | leader 掛單 oid | follower 掛單 oid | `frontendOpenOrders` 摘錄（行號） | checks（P/F/null） | 結果 | 備註 |
+|---|---|---|---|---|---|---|---|---|
+| E1 | 開倉後掛倉位止損＋止盈 |  |  |  |  |  |  |  |
+| E2 | 改止損觸發價 |  |  |  |  |  |  |  |
+| E3 | 撤倉位型、改掛固定數量止損限價 |  |  |  |  |  |  |  |
+| E4 | 連續 3 輪不動 |  |  |  |  |  |  |  |
+| E5 | 撤掉全部觸發單 |  |  |  |  |  |  |  |
+| E6 | 止損觸發價設到現價附近讓它觸發 |  |  |  |  |  |  |  |
+| E7 | 引擎 `COPY_MIRROR_TRIGGERS=false` 重跑 E1 |  |  |  |  |  |  |  |
+| E8 | 無倉位時掛條件進場單；3 輪後撤單 |  |  |  |  |  |  |  |
+| E9 | E8 的觸發價設到現價附近讓它觸發 |  |  |  |  |  |  |  |
+
+E6／E9 另記（觸發單真的觸發才有）：追價步數與每步觸發價、實際等待秒數、是否逾時未觸發、
+follower 是被自己的觸發單平倉／開倉還是由部位安全網收斂（R5、R8 的觀察）。
+
+| # | 追價步數 | 最終觸發價 | 等待秒數 | 觸發／逾時 | follower 由誰收斂 | R5／R8 觀察 |
+|---|---|---|---|---|---|---|
+| E6 |  |  |  |  |  |  |
+| E9 |  |  |  |  |  |  |
+
+### 6.4 原始摘錄
+
+（實跑後貼：各情境關鍵的 `frontendOpenOrders` 原始 dict、引擎 stdout 末段、被判 FAIL／null 的 check 全文。
+貼之前確認不含任何私鑰：記錄檔寫入時已遮蔽，貼入前仍用 `grep -cE '[0-9a-fA-F]{64}'` 再確認為 0。）
+
+### 6.5 資料極限與判讀備註
+
+- testnet 行為不保證等同主網；兩個錢包帳戶模式預期為 `default`（非 unifiedAccount），前置檢查會把
+  `abstraction` 記進 `start` 行，unifiedAccount 下的行為仍未測（見 §5）。
+- 引擎簽章者是拋棄式錢包的主鑰（非 agent key）；agent 授權流程由 golive-regression 的 S2–S4 覆蓋，不在本章範圍。
+- E6／E9 的觸發取決於 testnet 行情：10 分鐘內價格沒走到觸發價就記「未觸發」並判 FAIL，不代表功能有問題——可重跑。
+- E3／E8 的數量判定以引擎該輪回報的倍率（`CycleReport.scale`）重算期望值（容差一個 szDecimals 步長），
+  另以「follower 權益×0.9÷leader 權益」交叉驗證倍率（容差 10%）。
+- 本章結果以記錄檔為準；若與上方表格不一致，以記錄檔為準並更正表格。
