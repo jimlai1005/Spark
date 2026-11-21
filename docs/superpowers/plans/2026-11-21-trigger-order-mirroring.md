@@ -1,6 +1,6 @@
 # Plan：鏡射 leader 的止盈／止損觸發單（trigger order mirroring）
 
-> 狀態（2026-11-21）：**使用者已全數確認（「可以，GO」），依序派工中。** 進度：T1 完成（腳本 `90c6751`；testnet 實跑結果見 research 檔，結論已寫回 §4 D-P1…D-P13）；T2 完成（`a35ebbe`）；T3 完成（`40e827f`）；T4 派工中。
+> 狀態（2026-11-21）：**使用者已全數確認（「可以，GO」），依序派工中。** 進度：T1 完成（腳本 `90c6751`；testnet 實跑結果見 research 檔，結論已寫回 §4 D-P1…D-P13）；T2 完成（`a35ebbe`）；T3 完成（`40e827f`）；T4 完成（`cf104dd`）；T5 派工中。
 > 確認內容：D1、D2、D3（改判：條件進場單也要跟）、D5（開關預設關＋告警降級）、D13、D14、R7、
 > T2 先獨立部署、T1／T5 在 testnet 下單。
 > 分支（確認後才開）：`feat/trigger-order-mirroring`（自 main `46c8d99` 切出；逐 task commit、**不 push**）。
@@ -288,8 +288,25 @@
 
 ### T5 `@inline` — testnet 端到端（主線程親跑）
 
-**檔案**：擴充 `scripts/testnet_leader_drive.py`（新增子命令：掛／撤倉位止盈止損、掛／撤固定數量止損限價與止損市價；
-沿用 `_assert_testnet` 與名目上限，下單走 `HyperliquidAdapter.place_order`）；結果寫進 T1 的 research 檔新章節。
+**檔案**（2026-11-22 主線程裁決，取代原「擴充 `testnet_leader_drive.py` 子命令」的寫法——九個情境要交錯三十多個
+leader 動作與引擎輪次，手動逐條下指令不可重現）：新增編排腳本 `scripts/testnet_trigger_e2e.py`；結果寫進 T1 的 research 檔新章節。
+
+**做法**：
+- 輸入：`--leader-pk-file`、`--follower-pk-file`（兩個拋棄式 testnet 錢包的私鑰檔，路徑必須含 `scratchpad`，
+  由主線程先用 `tests/integration/harness.py mint-wallet` 建好並完成 builder fee 核准）、`--builder`、`--out`（JSON lines，不得在 repo 內）、
+  `--only E1,E3`、`--coin`（預設 BTC）、`--notional`（leader 倉位名目，預設 60，上限 100）。
+- 僅限 testnet：沿用 `scripts/testnet_leader_drive.py` 的 `_assert_testnet`（建構任何簽章者前與每次寫入前）；私鑰不進任何輸出。
+- leader 的下單一律走產品程式 `HyperliquidAdapter.place_order`（T3 的觸發單路徑）與 `cancel_order`——重用才是在測產品。
+- follower 引擎一律以子行程跑 `scripts.run_copytrade --once`（參考 `tests/integration/harness.py` 的 `run_engine_once` 與
+  `tests/integration/test_e2e_noncustodial.py` 的 env 組法），`COPY_LIVE_TRADING=true`、`COPY_MIRROR_TRIGGERS` 依情境、
+  強制 `SPARK_NETWORK=testnet`；狀態目錄與 keys 目錄放在 `--out` 同層的暫存目錄。告警不得真的送出（不設 TG 變數）。
+- 每個情境：執行 leader 動作 → 跑 N 輪引擎 → 讀兩邊 `frontendOpenOrders` 與倉位 → 逐條判定預期（PASS／FAIL＋差異）→ 寫一行記錄
+  （含引擎子行程的 stdout／stderr 末段、兩邊原始掛單 dict）。情境失敗不中止後續情境。
+- E6／E9 要讓觸發單真的觸發：把觸發價設在離現價很近的位置（例如 0.03%），等兩邊都鏡射好後輪詢；最多等 10 分鐘，
+  期間每 2 分鐘把觸發價往現價再靠近一次（leader 撤單重掛 → 跑一輪引擎）。逾時未觸發就如實記錄「未觸發」，不得判 PASS。
+- 整段 `try/finally` 清理：兩個錢包撤掉該幣全部掛單、市價平倉，最後驗證兩邊「無倉位、無掛單」。
+- **有測到東西才算數**（T1 探針的教訓）：結束碼 0 的條件是「所有被選情境皆 PASS 且每個情境至少有一筆成功的 leader 下單」；
+  任何 FAIL、leader 寫入全失敗、或清理後不乾淨 → 非 0。
 
 **情境**（follower 引擎在 testnet、`COPY_MIRROR_TRIGGERS=true`）：
 
@@ -305,7 +322,8 @@
 | E8 | 無倉位時掛條件進場單（止損市價買，觸發價高於現價）；3 輪後撤單 | 同型單出現（非 reduce-only、數量≈leader×倍率）；3 輪零動作；leader 撤後 follower 撤 |
 | E9 | 把 E8 的觸發價設到現價附近讓它觸發 | 兩邊都開倉，follower 倉位≈leader×倍率（超出容忍帶的差由安全網收斂），**沒有重複開倉**、無 CRIT |
 
-**驗收**：research 檔有 E1–E9 的時間戳、兩邊 oid 與 `frontendOpenOrders` 摘錄；主線程親跑、親讀輸出。
+**驗收**：(1) builder：`--help` 可執行且不連網、不讀私鑰檔；`uv run ruff check scripts` 0 錯；`uv run pytest -q` 全綠；**不實跑**。
+(2) 主線程：建錢包 → 實跑 → research 檔新增 E1–E9 的結果表（時間戳、兩邊 oid、`frontendOpenOrders` 摘錄、PASS／FAIL）→ 掃回水龍頭並刪鑰。
 
 ### T6 — 審核（`reviewer`）
 
