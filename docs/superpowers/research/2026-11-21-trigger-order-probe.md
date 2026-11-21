@@ -154,10 +154,18 @@ PY
 uv run python -m scripts.testnet_trigger_e2e --leader-pk-file "$S/e2e-leader.pk" \
     --follower-pk-file "$S/e2e-follower.pk" --builder "$BUILDER" --out "$OUT/run1.jsonl"
 # 只重跑部分情境：--only E1,E3 ；幣種／名目：--coin BTC --notional 60（範圍 20–100）
+# E6／E9 追價起始距離：--chase-frac 0.001（預設 0.1%；範圍 0.0002–0.005）
 ```
 
 - 結束碼：`0`＝所有被選情境 PASS、每個情境至少一筆成功的 leader 下單、清理後兩邊無倉位無掛單、keys 副本已刪；
-  `2`＝前置檢查未過（零寫入）；`1`＝其他（任何 FAIL／UNVERIFIED／清理不乾淨／私鑰副本未刪）。
+  `2`＝前置檢查未過（零寫入）；`1`＝其他（任何 FAIL／UNVERIFIED／INCONCLUSIVE／清理不乾淨／私鑰副本未刪）。
+- verdict：`PASS`／`FAIL`／`UNVERIFIED`（有 check 無法觀測）／`INCONCLUSIVE`（E6／E9 三次嘗試皆是 leader
+  先觸發而 follower 尚未鏡射，實驗沒有測到東西）。只有 `PASS` 算通過。
+- E6／E9 追價：觸發價從現價 `--chase-frac` 起，等 follower 鏡射後輪詢，最多等 10 分鐘，每 2 分鐘距離乘 0.6。
+  「follower 已鏡射」的證據＝該步引擎 action 記錄有成功的 `place`（觸發價與型態相符）**或**快照有對應掛單
+  （觸發後才拍的快照可能看不到已成交的單）。leader 先觸發而兩種證據都沒有＝無效嘗試，reset 後重來
+  （起始距離乘 1.5，最多 3 次，每次的追價過程都留在記錄檔 `attempts`）。有效嘗試另查 follower 位址的
+  `historicalOrders`／`userFillsByTime` 作「由交易所端觸發」的直接證據。
 - 記錄檔：JSON lines。`kind=scenario` 一行一個情境（`leader_actions`〔含原始回應〕、`engine_rounds`〔結束碼、
   stdout／stderr 末段、引擎動作與告警〕、`snapshots`〔兩邊 `frontendOpenOrders` 原始 dict＋倉位〕、`checks`
   〔`{check, expected, actual, pass}`〕、`verdict`）；另有 `start`（前置檢查事實）、`reset`、`summary`。
@@ -211,6 +219,8 @@ follower 是被自己的觸發單平倉／開倉還是由部位安全網收斂�
   `abstraction` 記進 `start` 行，unifiedAccount 下的行為仍未測（見 §5）。
 - 引擎簽章者是拋棄式錢包的主鑰（非 agent key）；agent 授權流程由 golive-regression 的 S2–S4 覆蓋，不在本章範圍。
 - E6／E9 的觸發取決於 testnet 行情：10 分鐘內價格沒走到觸發價就記「未觸發」並判 FAIL，不代表功能有問題——可重跑。
+- E7 的 warn 判定：category 為 `orders` 且含「[未鏡射]」的 warn 恰一則、且沒有其他 category 為 `orders` 的 warn；
+  其他 category（例如 `killswitch` 的「風控已由錢包主人關閉」提醒）不影響判定，全部列在 check 的 `actual`。
 - E3／E8 的數量判定以引擎該輪回報的倍率（`CycleReport.scale`）重算期望值（容差一個 szDecimals 步長），
   另以「follower 權益×0.9÷leader 權益」交叉驗證倍率（容差 10%）。
 - 本章結果以記錄檔為準；若與上方表格不一致，以記錄檔為準並更正表格。

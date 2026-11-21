@@ -38,6 +38,14 @@ COPY_CAPITAL_UTILIZATION=0.9（deploy/follower.env.autoactivate.example）。
 引擎邏輯一行不改；`TelegramNotifier` 同時被換成會 raise 的替身（保證不會真的送出）。
 子行程沒寫出 JSON（引擎在 run_cycle 之前就失敗）→ 該輪的動作／告警判為「無法觀測」。
 
+E6／E9（讓觸發單真的觸發）：觸發價從現價 --chase-frac（預設 0.1%）起，等 follower 鏡射後輪詢，
+最多等 10 分鐘，每 2 分鐘把距離乘 0.6。「follower 已鏡射」的證據＝該步引擎 action 記錄有成功的
+`place`（觸發價與型態相符）或快照有對應掛單——觸發後才拍的快照可能看不到已成交的單（run1 教訓）。
+leader 先觸發而兩種證據都沒有＝無效嘗試，reset 後重來（起始距離乘 1.5，最多 3 次）；
+三次皆無效 → verdict INCONCLUSIVE（非 0）。有效嘗試另查 follower 的 historicalOrders／
+userFillsByTime 作「由交易所端觸發」的直接證據（triggered 紀錄、成交 oid 等於該單 oid、
+引擎 action 沒有平倉／market_open）。
+
 用法：
   uv run python -m scripts.testnet_trigger_e2e \\
       --leader-pk-file <scratchpad>/leader.pk --follower-pk-file <scratchpad>/follower.pk \\
@@ -69,7 +77,7 @@ from scripts.testnet_leader_drive import (
     _account_id_for,
     _assert_testnet,
 )
-from scripts.testnet_trigger_probe import REPO_ROOT, Recorder, resolve_out, scrub
+from scripts.testnet_trigger_probe import REPO_ROOT, Recorder, resolve_out, round_px, scrub
 from spark.config import MIN_BUILDER_BALANCE, Settings
 from spark.copytrade.instrument import _round_size
 from spark.exchange.base import BuilderCode, Order
@@ -97,7 +105,14 @@ ENGINE_TIMEOUT_S = 240
 CHASE_TOTAL_S = 600                      # E6／E9：最長等待觸發 10 分鐘
 CHASE_STEP_S = 120                       # 每 2 分鐘把觸發價往現價再靠近一次
 CHASE_POLL_S = 10
-CHASE_INITIAL_FRAC = Decimal("0.0003")   # 初始距離 0.03%
+CHASE_FRAC_DEFAULT = Decimal("0.001")    # 追價初始距離（--chase-frac 預設）：0.1%
+CHASE_FRAC_MIN = Decimal("0.0002")
+CHASE_FRAC_MAX = Decimal("0.005")
+CHASE_FACTOR = Decimal("0.6")            # 每 2 分鐘距離乘 0.6（run1：0.03% 起始太近，leader 先觸發）
+CHASE_ATTEMPTS = 3                       # E6／E9 無效嘗試（leader 先觸發）時最多重試到 3 次
+CHASE_RETRY_GROWTH = Decimal("1.5")      # 每次重試起始距離乘 1.5
+HISTORY_POLL_S = 25                      # 觸發後等 historicalOrders／fills 出現的最長秒數
+SLACK_MS = 5000                          # 本機時鐘與交易所時間戳的容許誤差
 POST_TRIGGER_ROUNDS = 3
 
 WRITE_KINDS = frozenset({"place", "modify", "cancel", "market_open", "close"})
@@ -188,13 +203,24 @@ def price_tick(mid: Decimal, sz_decimals: int) -> Decimal:
     return max(sig, dec)
 
 
-def verdict_of(checks: list[dict]) -> str:
-    """PASS＝至少一條且全部 pass==True；任何 False → FAIL；沒有 False 但有 null → UNVERIFIED。"""
+def verdict_of(checks: list[dict], inconclusive: bool = False) -> str:
+    """PASS＝至少一條且全部 pass==True；任何 False → FAIL；
+    沒有 False 時：inconclusive（E6／E9 三次嘗試皆無效，實驗沒有真的測到東西）→ INCONCLUSIVE；
+    有 null → UNVERIFIED。只有 PASS 算通過。"""
     if not checks or any(c["pass"] is False for c in checks):
         return "FAIL"
+    if inconclusive:
+        return "INCONCLUSIVE"
     if any(c["pass"] is None for c in checks):
         return "UNVERIFIED"
     return "PASS"
+
+
+def check_chase_frac(v: Decimal) -> Decimal:
+    if not (CHASE_FRAC_MIN <= v <= CHASE_FRAC_MAX):
+        raise SystemExit(
+            f"拒絕：--chase-frac 必須落在 [{CHASE_FRAC_MIN}, {CHASE_FRAC_MAX}]（收到 {v}）")
+    return v
 
 
 def overall_exit_code(results: list[dict], clean: bool, keys_deleted: bool) -> int:
@@ -309,7 +335,18 @@ class ScenarioLog:
         self.notes: list[dict] = []
         self.checks: list[dict] = []
         self.leader_writes_ok = 0
+        self.attempts: list[dict] = []        # E6／E9：每次嘗試的追價過程（含無效嘗試的完整記錄）
+        self.inconclusive = False
         self.started = datetime.now(timezone.utc)
+
+    def merge(self, other: "ScenarioLog") -> None:
+        """把一次有效嘗試的暫存記錄併進情境記錄（checks 也併入）。"""
+        self.leader_actions += other.leader_actions
+        self.engine_rounds += other.engine_rounds
+        self.snapshots += other.snapshots
+        self.notes += other.notes
+        self.checks += other.checks
+        self.leader_writes_ok += other.leader_writes_ok
 
     def check(self, name: str, expected: Any, actual: Any, passed: bool | None) -> None:
         self.checks.append({"check": name, "expected": expected, "actual": actual,
@@ -328,7 +365,8 @@ class ScenarioLog:
             "leader_writes_ok": self.leader_writes_ok,
             "leader_actions": self.leader_actions, "engine_rounds": self.engine_rounds,
             "snapshots": self.snapshots, "notes": self.notes, "checks": self.checks,
-            "verdict": verdict_of(self.checks),
+            "attempts": self.attempts,
+            "verdict": verdict_of(self.checks, self.inconclusive),
         }
 
 
@@ -439,8 +477,10 @@ class E2E:
 
     def __init__(self, *, info: Info, coin: str, sz_dec: int, builder: BuilderCode,
                  leader: Party, follower: Party, notional: Decimal, work: Path,
-                 account_id: str, rec: E2ERecorder):
+                 account_id: str, rec: E2ERecorder,
+                 chase_frac: Decimal = CHASE_FRAC_DEFAULT):
         self.info = info
+        self.chase_frac = chase_frac
         self.coin = coin
         self.sz_dec = sz_dec
         self.builder = builder
@@ -886,94 +926,317 @@ def scenario_e5(ctx: E2E, log: ScenarioLog) -> None:
     no_crit_check(log, [run], "(補強) 無 CRIT")
 
 
+# ---- E6／E9 的證據判定（純函式，離線可驗）
+
+# E6＝多倉倉位止損（賣、倉位型、reduce-only）；E9＝條件進場（止損市價買、非 reduce-only、非倉位型）
+KIND_SPEC = {
+    "e6": {"is_buy": False, "reduce_only": True, "is_position_tpsl": True, "fill_dir": "Close",
+           "bad_actions": frozenset({"close", "market_close"})},
+    "e9": {"is_buy": True, "reduce_only": False, "is_position_tpsl": False, "fill_dir": "Open",
+           "bad_actions": frozenset({"market_open"})},
+}
+
+
+def action_mirror_evidence(run: EngineRun | None, *, trigger: Decimal, kind: str) -> dict | None:
+    """證據 A：該步引擎子行程的 action 記錄裡有一筆成功（payload.ok 為真）的 `place`，
+    trigger_px 等於 leader 觸發價（已過價格捨入）且型態欄位相符。"""
+    spec = KIND_SPEC[kind]
+    for a in (run.child or {}).get("actions", []) if run is not None else []:
+        pl = a.get("payload") or {}
+        if a.get("kind") != "place" or pl.get("ok") is not True or "trigger_px" not in pl:
+            continue
+        try:
+            same_px = dec(pl["trigger_px"]) == trigger
+        except ArithmeticError:
+            continue
+        if (same_px and pl.get("is_position_tpsl") is spec["is_position_tpsl"]
+                and pl.get("reduce_only") is spec["reduce_only"]
+                and pl.get("is_buy") is spec["is_buy"]):
+            return {"source": "engine_action", "action": {
+                k: pl.get(k) for k in ("is_buy", "sz", "limit_px", "reduce_only", "trigger_px",
+                                       "tpsl", "is_market", "is_position_tpsl", "ok", "status")}}
+    return None
+
+
+def snapshot_mirror_evidence(f_snap: dict, *, trigger: Decimal, kind: str) -> dict | None:
+    """證據 B：follower 快照中有對應掛單（觸發價相等、型態相符）。"""
+    spec = KIND_SPEC[kind]
+    for o in triggers(f_snap):
+        if (dec(o["triggerPx"]) == trigger and o.get("orderType") == POS_SL
+                and bool(o.get("isPositionTpsl")) is spec["is_position_tpsl"]
+                and o.get("reduceOnly") is spec["reduce_only"]
+                and (o.get("side") == "B") is spec["is_buy"]):
+            return {"source": "snapshot", "order": brief(o)}
+    return None
+
+
+def mirror_evidence(run: EngineRun | None, f_snap: dict, *, trigger: Decimal,
+                    kind: str) -> dict | None:
+    """「follower 已鏡射」＝證據 A 或 B 任一成立（A 優先）；都沒有回 None。
+    快照拍在觸發之後可能看不到已成交的單，所以引擎 action 記錄也算數。"""
+    return (action_mirror_evidence(run, trigger=trigger, kind=kind)
+            or snapshot_mirror_evidence(f_snap, trigger=trigger, kind=kind))
+
+
+def find_triggered_order(hist: list[dict], *, coin: str, trigger: Decimal, kind: str,
+                         since_ms: int) -> dict | None:
+    """historicalOrders（{status, statusTimestamp, order{…}} 逐狀態列）中，status=="triggered"、
+    觸發價相等、型態相符、下單時間 ≥ since_ms 的那張單（取最新）；回傳 order dict。
+    倉位型單的 place 回應沒有 oid，所以 oid 只能這樣從歷史找。"""
+    spec = KIND_SPEC[kind]
+    found = []
+    for row in hist:
+        o = row.get("order") or {}
+        if (row.get("status") == "triggered" and o.get("coin") == coin
+                and o.get("isTrigger") is True and dec(o.get("triggerPx", "0")) == trigger
+                and o.get("orderType") == POS_SL
+                and bool(o.get("isPositionTpsl")) is spec["is_position_tpsl"]
+                and o.get("reduceOnly") is spec["reduce_only"]
+                and (o.get("side") == "B") is spec["is_buy"]
+                and int(o.get("timestamp", 0)) >= since_ms):
+            found.append(o)
+    return max(found, key=lambda o: int(o["timestamp"])) if found else None
+
+
+def find_fill_for_oid(fills: list[dict], *, coin: str, oid: Any, kind: str) -> dict | None:
+    """成交的 oid 等於觸發單 oid，且 dir 含 Close（E6）／Open（E9）。"""
+    word = KIND_SPEC[kind]["fill_dir"]
+    for f in fills:
+        if f.get("coin") == coin and str(f.get("oid")) == str(oid) and word in str(f.get("dir", "")):
+            return f
+    return None
+
+
+def exchange_side_checks(hist: list[dict] | None, fills: list[dict] | None, *, coin: str,
+                         trigger: Decimal, kind: str, since_ms: int, runs: list[EngineRun],
+                         error: str | None = None) -> list[tuple[str, Any, Any, bool | None]]:
+    """「由交易所端觸發」的直接證據（回傳 check 四元組）：
+    (1) follower 鏡射單在 historicalOrders 有 triggered；(2) 開／平倉成交 oid＝該單 oid；
+    (3) 各輪引擎 action 沒有平倉類（E6）／market_open（E9）動作。"""
+    label = "止損" if kind == "e6" else "條件進場單"
+    out: list[tuple[str, Any, Any, bool | None]] = []
+    order = None
+    if hist is None:
+        out.append((f"follower 鏡射{label}在 historicalOrders 有 status==triggered",
+                    "triggered", f"無法觀測（{error}）", None))
+    else:
+        order = find_triggered_order(hist, coin=coin, trigger=trigger, kind=kind, since_ms=since_ms)
+        out.append((f"follower 鏡射{label}在 historicalOrders 有 status==triggered",
+                    {"triggerPx": str(trigger), "orderType": POS_SL},
+                    ({k: order.get(k) for k in ("oid", "triggerPx", "orderType", "timestamp")}
+                     if order is not None else "查無 triggered 紀錄"), order is not None))
+    word = KIND_SPEC[kind]["fill_dir"]
+    if fills is None:
+        out.append((f"follower {'平' if kind == 'e6' else '開'}倉成交的 oid 等於該{label} oid",
+                    "oid 相等", f"無法觀測（{error}）", None))
+    elif order is None:
+        out.append((f"follower {'平' if kind == 'e6' else '開'}倉成交的 oid 等於該{label} oid",
+                    "oid 相等", "無法比對：沒有找到 triggered 的單", False))
+    else:
+        fill = find_fill_for_oid(fills, coin=coin, oid=order["oid"], kind=kind)
+        out.append((f"follower {'平' if kind == 'e6' else '開'}倉成交的 oid 等於該{label} oid",
+                    {"oid": order["oid"], "dir 含": word},
+                    ({k: fill.get(k) for k in ("oid", "dir", "sz", "px", "time")}
+                     if fill is not None else
+                     f"查無 dir 含 {word} 且 oid 相等的成交（成交 oid："
+                     f"{sorted({f.get('oid') for f in fills if f.get('coin') == coin})}）"),
+                    fill is not None))
+    bad = KIND_SPEC[kind]["bad_actions"]
+    seen: list[str] = []
+    observable = True
+    for r in runs:
+        if r.child is None:
+            observable = False
+            continue
+        seen += [f"{r.label}:{a.get('kind')}" for a in r.child.get("actions", [])
+                 if a.get("kind") in bad]
+    name = ("各輪引擎 action 沒有平倉類動作（close）" if kind == "e6"
+            else "各輪引擎 action 沒有 market_open")
+    if seen:
+        out.append((name, [], seen, False))
+    elif not observable:
+        out.append((name, [], "無法觀測（部分輪次引擎子行程未寫出記錄）", None))
+    else:
+        out.append((name, [], [], True))
+    return out
+
+
+def fetch_follower_history(ctx: E2E, *, kind: str, trigger: Decimal, since_ms: int,
+                           end_ms: int | None = None) -> tuple[list[dict] | None,
+                                                               list[dict] | None, str | None]:
+    """唯讀查 follower 的 historicalOrders 與 userFillsByTime；觸發後歷史可能延遲出現，
+    最多輪詢 HISTORY_POLL_S 秒直到找到 triggered 單與對應成交。查詢失敗 → (None, None, 錯誤)。"""
+    deadline = time.monotonic() + HISTORY_POLL_S
+    hist: list[dict] | None = None
+    fills: list[dict] | None = None
+    while True:
+        try:
+            hist = _read_retry(lambda: ctx.info.historical_orders(ctx.follower.address))
+            fills = _read_retry(lambda: ctx.info.user_fills_by_time(
+                ctx.follower.address, since_ms, end_ms or int(time.time() * 1000) + SLACK_MS))
+        except Exception as e:  # noqa: BLE001 — 查詢失敗要明說，由呼叫端把 check 記成 null
+            return None, None, f"{type(e).__name__}: {e}"
+        order = find_triggered_order(hist, coin=ctx.coin, trigger=trigger, kind=kind,
+                                     since_ms=since_ms)
+        if order is not None and find_fill_for_oid(fills, coin=ctx.coin, oid=order["oid"],
+                                                   kind=kind) is not None:
+            return hist, fills, None
+        if time.monotonic() >= deadline:
+            return hist, fills, None
+        time.sleep(3.0)
+
+
+def add_exchange_side_checks(ctx: E2E, log: ScenarioLog, *, kind: str, trigger: Decimal,
+                             since_ms: int, runs: list[EngineRun]) -> None:
+    hist, fills, err = fetch_follower_history(ctx, kind=kind, trigger=trigger, since_ms=since_ms)
+    for name, expected, actual, passed in exchange_side_checks(
+            hist, fills, coin=ctx.coin, trigger=trigger, kind=kind, since_ms=since_ms, runs=runs,
+            error=err):
+        log.check(name, expected, actual, passed)
+
+
 @dataclass
 class ChaseResult:
     triggered: bool
     runs: list[EngineRun]
     steps: list[dict]
-    last_step_mirrored: bool
+    evidence: dict | None          # 最後一步（＝觸發那一步）「follower 已鏡射」的證據；None＝沒有
+    last_trigger: Decimal | None   # 最後一步的觸發價（已過價格捨入）
+    last_step_start_ms: int
 
 
-def chase(ctx: E2E, log: ScenarioLog, *, direction: int,
-          place: Callable[[Decimal], bool], mirrored: Callable[[dict, dict], bool],
+def chase(ctx: E2E, log: ScenarioLog, *, direction: int, frac0: Decimal,
+          place: Callable[[Decimal], bool],
+          evidence: Callable[[EngineRun, dict, Decimal], dict | None],
           triggered: Callable[[], bool]) -> ChaseResult:
-    """E6／E9 共用：讓 leader 的觸發單真的被觸發。觸發價從現價 0.03% 起，等兩邊鏡射好後輪詢，
-    最多等 10 分鐘，每 2 分鐘把觸發價往現價再靠近一次（距離減半：leader 撤單重掛→跑一輪引擎）。
-    逾時未觸發就如實回報 triggered=False（呼叫端必須判 FAIL）。"""
-    frac = CHASE_INITIAL_FRAC
+    """E6／E9 共用：讓 leader 的觸發單真的被觸發。觸發價從現價 frac0 起，等兩邊鏡射後輪詢，
+    最多等 10 分鐘，每 2 分鐘把觸發價往現價再靠近一次（距離乘 0.6：leader 撤單重掛→跑一輪引擎）。
+    逾時未觸發就如實回報 triggered=False（呼叫端必須判 FAIL）。
+    每步記錄「follower 已鏡射」的證據（引擎 action 記錄或快照）；觸發後才拍的快照看不到已成交的單，
+    所以證據不能只靠快照。"""
+    frac = frac0
     waited = 0.0
     runs: list[EngineRun] = []
     steps: list[dict] = []
-    last_mirrored = False
+    ev: dict | None = None
+    last_trig: Decimal | None = None
+    step_start_ms = int(time.time() * 1000)
     tick = price_tick(ctx.mid(), ctx.sz_dec)
     step = 0
     while True:
+        step_start_ms = int(time.time() * 1000)
         if step > 0:
             ctx.leader_cancel_all(log, f"第 {step} 次靠近：撤舊觸發單")
         mid = ctx.mid()
         trig = chase_trigger(mid, frac, direction, tick)
+        trig_r = round_px(trig, ctx.sz_dec)
+        last_trig = trig_r
         placed = place(trig)
         time.sleep(1.0)
         run = ctx.engine_round(log, f"追價第 {step} 步", True)
         runs.append(run)
-        l_snap, f_snap = ctx.take(log, f"追價第 {step} 步後")
-        last_mirrored = placed and mirrored(l_snap, f_snap)
+        _, f_snap = ctx.take(log, f"追價第 {step} 步後")
+        ev = evidence(run, f_snap, trig_r) if placed else None
         steps.append({"step": step, "mid": str(mid), "frac": str(frac), "trigger": str(trig),
-                      "leader_placed": placed, "follower_mirrored": last_mirrored,
+                      "trigger_rounded": str(trig_r), "leader_placed": placed,
+                      "follower_mirror_evidence": ev, "step_start_ms": step_start_ms,
                       "waited_total_s": round(waited, 1)})
         window = min(CHASE_STEP_S, CHASE_TOTAL_S - waited)
         t0 = time.monotonic()
         hit = wait_until(triggered, window, CHASE_POLL_S)
         waited += time.monotonic() - t0
         if hit:
-            return ChaseResult(True, runs, steps, last_mirrored)
+            return ChaseResult(True, runs, steps, ev, last_trig, step_start_ms)
         if waited >= CHASE_TOTAL_S - 1:
-            return ChaseResult(False, runs, steps, last_mirrored)
+            return ChaseResult(False, runs, steps, ev, last_trig, step_start_ms)
         step += 1
-        frac = frac / 2
+        frac = frac * CHASE_FACTOR
+
+
+def run_chase_attempts(ctx: E2E, log: ScenarioLog,
+                       attempt: Callable[[ScenarioLog, Decimal], tuple[bool, list[dict]]]) -> None:
+    """E6／E9：一次嘗試＝reset 兩邊後從頭來。attempt(alog, frac) 回傳 (有效?, 追價步驟)。
+    無效嘗試（leader 先觸發、follower 尚未鏡射——動作記錄與快照皆無證據）自動重試，最多
+    CHASE_ATTEMPTS 次，每次起始距離乘 CHASE_RETRY_GROWTH；有效嘗試的記錄併入情境並照常判定，
+    無效嘗試的完整記錄留在 `attempts`；全部無效 → INCONCLUSIVE（結束碼非 0，不算通過）。"""
+    frac = ctx.chase_frac
+    for k in range(1, CHASE_ATTEMPTS + 1):
+        alog = ScenarioLog(log.sid, log.title)
+        if k > 1:
+            clean = ctx.reset_flat(f"{log.sid} attempt {k}")
+            if not clean:
+                alog.check("(前置) 重試前兩邊該幣已清空", "clean", "not clean", False)
+                log.merge(alog)
+                return
+        say(f"  [{log.sid}] 第 {k}/{CHASE_ATTEMPTS} 次嘗試（起始距離 {frac}）")
+        valid, steps = attempt(alog, frac)
+        entry: dict[str, Any] = {"attempt": k, "start_frac": str(frac), "valid": valid,
+                                 "steps": steps}
+        if valid:
+            log.attempts.append(entry)
+            log.merge(alog)
+            return
+        entry.update({"leader_actions": alog.leader_actions, "engine_rounds": alog.engine_rounds,
+                      "snapshots": alog.snapshots, "notes": alog.notes})
+        log.attempts.append(entry)
+        log.leader_writes_ok += alog.leader_writes_ok
+        say(f"  [{log.sid}] 嘗試 {k} 無效（leader 先觸發、follower 尚未鏡射）")
+        frac = frac * CHASE_RETRY_GROWTH
+    log.inconclusive = True
+    log.check(f"(無效) {CHASE_ATTEMPTS} 次嘗試皆是 leader 先觸發、follower 尚未鏡射，實驗沒有測到東西",
+              "至少 1 次有效嘗試", [{"attempt": a["attempt"], "start_frac": a["start_frac"]}
+                                    for a in log.attempts], None)
 
 
 def scenario_e6(ctx: E2E, log: ScenarioLog) -> None:
-    if not setup_synced_position(ctx, log, True):
-        return
+    def attempt(alog: ScenarioLog, frac: Decimal) -> tuple[bool, list[dict]]:
+        if not setup_synced_position(ctx, alog, True):
+            return True, []          # 前置失敗是真失敗（check 已記為 False），不重試
 
-    def place(trig: Decimal) -> bool:
-        return ctx.leader_place(log, f"倉位止損 @{trig}", position_tpsl_order(ctx.coin, "sl", trig),
-                                abs(ctx.szi(ctx.leader)))
+        def place(trig: Decimal) -> bool:
+            return ctx.leader_place(alog, f"倉位止損 @{trig}",
+                                    position_tpsl_order(ctx.coin, "sl", trig),
+                                    abs(ctx.szi(ctx.leader)))
 
-    def mirrored(l_snap: dict, f_snap: dict) -> bool:
-        l_sl, f_sl = pos_tpsl(l_snap, POS_SL), pos_tpsl(f_snap, POS_SL)
-        return (len(l_sl) == 1 and len(f_sl) == 1
-                and dec(l_sl[0]["triggerPx"]) == dec(f_sl[0]["triggerPx"]))
+        res = chase(ctx, alog, direction=-1, frac0=frac, place=place,
+                    evidence=lambda run, f_snap, trig: mirror_evidence(
+                        run, f_snap, trigger=trig, kind="e6"),
+                    triggered=lambda: ctx.szi(ctx.leader) == 0)
+        alog.note("追價過程", steps=res.steps)
+        if res.triggered and res.evidence is None:
+            alog.note("無效嘗試：leader 先觸發，follower 尚未鏡射（動作記錄與快照皆無證據）")
+            return False, res.steps
+        alog.check("(前置) 觸發前最後一次放置時，follower 已鏡射同價倉位止損"
+                   "（引擎 place 動作或快照其一）", "有證據", res.evidence or "無證據",
+                   res.evidence is not None)
+        alog.check("止損在 10 分鐘內被觸發（leader 倉位歸零）", "觸發",
+                   "觸發" if res.triggered else "未觸發（逾時 10 分鐘）", res.triggered)
+        runs = list(res.runs)
+        if not res.triggered:
+            no_crit_check(alog, runs, "(補強) 追價過程無 CRIT")
+            return True, res.steps
+        f_closed_by_own = ctx.szi(ctx.follower) == 0
+        alog.note("leader 觸發當下 follower 倉位", follower_szi=str(ctx.szi(ctx.follower)),
+                  follower_closed_before_any_engine_round=f_closed_by_own)
+        for k in range(1, POST_TRIGGER_ROUNDS + 1):
+            if ctx.szi(ctx.follower) == 0 and not ctx.coin_orders(ctx.follower):
+                break
+            runs.append(ctx.engine_round(alog, f"E6 觸發後第 {k} 輪", True))
+        time.sleep(2.0)
+        l_snap, f_snap = ctx.take(alog, "E6 結束")
+        alog.check("兩邊皆平倉", "leader szi=0 且 follower szi=0",
+                   {"leader": l_snap["position_szi"], "follower": f_snap["position_szi"]},
+                   dec(l_snap["position_szi"]) == 0 and dec(f_snap["position_szi"]) == 0)
+        alog.check("之後無殘留觸發單（兩邊該幣掛單皆空）", 0,
+                   {"leader": [brief(o) for o in l_snap["open_orders"]],
+                    "follower": [brief(o) for o in f_snap["open_orders"]]},
+                   not l_snap["open_orders"] and not f_snap["open_orders"])
+        no_crit_check(alog, runs, "無 CRIT（含追價與觸發後各輪）")
+        add_exchange_side_checks(ctx, alog, kind="e6", trigger=res.last_trigger or Decimal(0),
+                                 since_ms=res.last_step_start_ms - SLACK_MS, runs=runs)
+        return True, res.steps
 
-    res = chase(ctx, log, direction=-1, place=place, mirrored=mirrored,
-                triggered=lambda: ctx.szi(ctx.leader) == 0)
-    log.note("追價過程", steps=res.steps)
-    log.check("(前置) 觸發前最後一次放置時，follower 已鏡射同價止損", True, res.last_step_mirrored,
-              res.last_step_mirrored)
-    log.check("止損在 10 分鐘內被觸發（leader 倉位歸零）", "觸發",
-              "觸發" if res.triggered else "未觸發（逾時 10 分鐘）", res.triggered)
-    runs = list(res.runs)
-    if not res.triggered:
-        no_crit_check(log, runs, "(補強) 追價過程無 CRIT")
-        return
-    f_closed_by_own = ctx.szi(ctx.follower) == 0
-    log.note("leader 觸發當下 follower 倉位", follower_szi=str(ctx.szi(ctx.follower)),
-             follower_closed_before_any_engine_round=f_closed_by_own)
-    for k in range(1, POST_TRIGGER_ROUNDS + 1):
-        if ctx.szi(ctx.follower) == 0 and not ctx.coin_orders(ctx.follower):
-            break
-        runs.append(ctx.engine_round(log, f"E6 觸發後第 {k} 輪", True))
-    time.sleep(2.0)
-    l_snap, f_snap = ctx.take(log, "E6 結束")
-    log.check("兩邊皆平倉", "leader szi=0 且 follower szi=0",
-              {"leader": l_snap["position_szi"], "follower": f_snap["position_szi"]},
-              dec(l_snap["position_szi"]) == 0 and dec(f_snap["position_szi"]) == 0)
-    log.check("之後無殘留觸發單（兩邊該幣掛單皆空）", 0,
-              {"leader": [brief(o) for o in l_snap["open_orders"]],
-               "follower": [brief(o) for o in f_snap["open_orders"]]},
-              not l_snap["open_orders"] and not f_snap["open_orders"])
-    no_crit_check(log, runs, "無 CRIT（含追價與觸發後各輪）")
+    run_chase_attempts(ctx, log, attempt)
 
 
 def scenario_e7(ctx: E2E, log: ScenarioLog) -> None:
@@ -992,15 +1255,20 @@ def scenario_e7(ctx: E2E, log: ScenarioLog) -> None:
               None if acts is None else not any(a.get("kind") == "place" for a in acts))
     warns = child_notes(st.run.child, "warn")
     if warns is None:
-        log.check("warn 恰一則", 1, "無法觀測（引擎子行程未寫出記錄）", None)
-        log.check("該則 warn 為「[未鏡射]」觸發單告警", True, "無法觀測", None)
+        log.check("category 為 orders 且含「[未鏡射]」的 warn 恰一則", 1,
+                  "無法觀測（引擎子行程未寫出記錄）", None)
+        log.check("沒有其他 category 為 orders 的 warn", 0, "無法觀測", None)
     else:
-        log.check("warn 恰一則（本輪全部 warn 計）", 1,
-                  [{"category": w.get("category"), "text": w.get("text")} for w in warns],
-                  len(warns) == 1)
-        log.check("該則 warn 為「[未鏡射]」觸發單告警", True,
-                  [w.get("text") for w in warns],
-                  len(warns) == 1 and "[未鏡射]" in warns[0].get("text", ""))
+        all_w = [{"category": w.get("category"), "text": w.get("text")} for w in warns]
+        orders_w = [w for w in warns if w.get("category") == "orders"]
+        unmirrored = [w for w in orders_w if "[未鏡射]" in w.get("text", "")]
+        others = [w for w in orders_w if w not in unmirrored]
+        log.check("category 為 orders 且含「[未鏡射]」的 warn 恰一則", 1,
+                  {"matched": len(unmirrored), "all_warns": all_w}, len(unmirrored) == 1)
+        log.check("沒有其他 category 為 orders 的 warn（其他 category 的 warn 不影響判定，"
+                  "全部列在 actual）", 0,
+                  {"other_orders_warns": [w.get("text") for w in others], "all_warns": all_w},
+                  not others)
     no_crit_check(log, [st.run])
 
 
@@ -1068,59 +1336,65 @@ def follower_buy_total(ctx: E2E, since_ms: int) -> Decimal | None:
 
 
 def scenario_e9(ctx: E2E, log: ScenarioLog) -> None:
-    size = ctx.size_for(ctx.notional)
-    since_ms = int(time.time() * 1000)
+    def attempt(alog: ScenarioLog, frac: Decimal) -> tuple[bool, list[dict]]:
+        size = ctx.size_for(ctx.notional)
+        since_ms = int(time.time() * 1000)
 
-    def place(trig: Decimal) -> bool:
-        return ctx.leader_place(log, f"條件進場（止損市價買）@{trig}",
-                                conditional_entry_order(ctx.coin, size, trig), size)
+        def place(trig: Decimal) -> bool:
+            return ctx.leader_place(alog, f"條件進場（止損市價買）@{trig}",
+                                    conditional_entry_order(ctx.coin, size, trig), size)
 
-    def mirrored(l_snap: dict, f_snap: dict) -> bool:
-        l_t, f_t = triggers(l_snap), triggers(f_snap)
-        return (len(l_t) == 1 and len(f_t) == 1 and f_t[0].get("reduceOnly") is False
-                and f_t[0].get("orderType") == POS_SL
-                and dec(l_t[0]["triggerPx"]) == dec(f_t[0]["triggerPx"]))
+        res = chase(ctx, alog, direction=+1, frac0=frac, place=place,
+                    evidence=lambda run, f_snap, trig: mirror_evidence(
+                        run, f_snap, trigger=trig, kind="e9"),
+                    triggered=lambda: ctx.szi(ctx.leader) != 0)
+        alog.note("追價過程", steps=res.steps)
+        if res.triggered and res.evidence is None:
+            alog.note("無效嘗試：leader 先觸發，follower 尚未鏡射條件進場單（動作記錄與快照皆無證據）")
+            return False, res.steps
+        alog.check("(前置) 觸發前最後一次放置時，follower 已鏡射同價條件進場單"
+                   "（引擎 place 動作或快照其一）", "有證據", res.evidence or "無證據",
+                   res.evidence is not None)
+        alog.check("條件進場單在 10 分鐘內被觸發（leader 出現倉位）", "觸發",
+                   "觸發" if res.triggered else "未觸發（逾時 10 分鐘）", res.triggered)
+        runs = list(res.runs)
+        if not res.triggered:
+            no_crit_check(alog, runs, "(補強) 追價過程無 CRIT")
+            return True, res.steps
+        alog.note("leader 觸發當下 follower 倉位", follower_szi=str(ctx.szi(ctx.follower)))
+        for k in range(1, POST_TRIGGER_ROUNDS + 1):
+            runs.append(ctx.engine_round(alog, f"E9 觸發後第 {k} 輪", True))
+        time.sleep(2.0)
+        l_snap, f_snap = ctx.take(alog, "E9 結束")
+        scale = next((r.scale for r in reversed(runs) if r.scale is not None), None)
+        l_szi, f_szi = dec(l_snap["position_szi"]), dec(f_snap["position_szi"])
+        alog.check("兩邊都開倉（同向、非零）", "leader szi>0 且 follower szi>0",
+                   {"leader": str(l_szi), "follower": str(f_szi)}, l_szi > 0 and f_szi > 0)
+        step = Decimal(1).scaleb(-ctx.sz_dec)
+        if scale is None:
+            alog.check("follower 倉位≈leader×倍率（容忍帶內）", "leader szi × report.scale",
+                       "無法取得引擎倍率", None)
+            alog.check("沒有重複開倉：follower 買入成交總量未超出容忍帶上界", "≤ 期望×(1+8%)",
+                       "無法取得引擎倍率", None)
+        else:
+            expected = l_szi * scale
+            band = expected * SIZE_TOLERANCE + step
+            alog.check("follower 倉位≈leader×倍率（容忍帶 8%＋1 步長；超出者須已由安全網收斂）",
+                       f"{expected}（±{band}）", str(f_szi), abs(f_szi - expected) <= band)
+            bought = follower_buy_total(ctx, since_ms)
+            alog.check("沒有重複開倉：follower 買入成交總量 ≤ 期望×(1+8%)＋1 步長",
+                       f"≤ {expected + band}", None if bought is None else str(bought),
+                       None if bought is None else bought <= expected + band)
+        alog.check("(補強) follower 無殘留條件進場單（兩邊該幣掛單皆空）", 0,
+                   {"leader": [brief(o) for o in l_snap["open_orders"]],
+                    "follower": [brief(o) for o in f_snap["open_orders"]]},
+                   not l_snap["open_orders"] and not f_snap["open_orders"])
+        no_crit_check(alog, runs, "無 CRIT（含追價與觸發後各輪）")
+        add_exchange_side_checks(ctx, alog, kind="e9", trigger=res.last_trigger or Decimal(0),
+                                 since_ms=res.last_step_start_ms - SLACK_MS, runs=runs)
+        return True, res.steps
 
-    res = chase(ctx, log, direction=+1, place=place, mirrored=mirrored,
-                triggered=lambda: ctx.szi(ctx.leader) != 0)
-    log.note("追價過程", steps=res.steps)
-    log.check("(前置) 觸發前最後一次放置時，follower 已鏡射同價條件進場單", True,
-              res.last_step_mirrored, res.last_step_mirrored)
-    log.check("條件進場單在 10 分鐘內被觸發（leader 出現倉位）", "觸發",
-              "觸發" if res.triggered else "未觸發（逾時 10 分鐘）", res.triggered)
-    runs = list(res.runs)
-    if not res.triggered:
-        no_crit_check(log, runs, "(補強) 追價過程無 CRIT")
-        return
-    log.note("leader 觸發當下 follower 倉位", follower_szi=str(ctx.szi(ctx.follower)))
-    for k in range(1, POST_TRIGGER_ROUNDS + 1):
-        runs.append(ctx.engine_round(log, f"E9 觸發後第 {k} 輪", True))
-    time.sleep(2.0)
-    l_snap, f_snap = ctx.take(log, "E9 結束")
-    scale = next((r.scale for r in reversed(runs) if r.scale is not None), None)
-    l_szi, f_szi = dec(l_snap["position_szi"]), dec(f_snap["position_szi"])
-    log.check("兩邊都開倉（同向、非零）", "leader szi>0 且 follower szi>0",
-              {"leader": str(l_szi), "follower": str(f_szi)}, l_szi > 0 and f_szi > 0)
-    step = Decimal(1).scaleb(-ctx.sz_dec)
-    if scale is None:
-        log.check("follower 倉位≈leader×倍率（容忍帶內）", "leader szi × report.scale",
-                  "無法取得引擎倍率", None)
-        log.check("沒有重複開倉：follower 買入成交總量未超出容忍帶上界", "≤ 期望×(1+8%)", "無法取得引擎倍率",
-                  None)
-    else:
-        expected = l_szi * scale
-        band = expected * SIZE_TOLERANCE + step
-        log.check("follower 倉位≈leader×倍率（容忍帶 8%＋1 步長；超出者須已由安全網收斂）",
-                  f"{expected}（±{band}）", str(f_szi), abs(f_szi - expected) <= band)
-        bought = follower_buy_total(ctx, since_ms)
-        log.check("沒有重複開倉：follower 買入成交總量 ≤ 期望×(1+8%)＋1 步長",
-                  f"≤ {expected + band}", None if bought is None else str(bought),
-                  None if bought is None else bought <= expected + band)
-    log.check("(補強) follower 無殘留條件進場單（兩邊該幣掛單皆空）", 0,
-              {"leader": [brief(o) for o in l_snap["open_orders"]],
-               "follower": [brief(o) for o in f_snap["open_orders"]]},
-              not l_snap["open_orders"] and not f_snap["open_orders"])
-    no_crit_check(log, runs, "無 CRIT（含追價與觸發後各輪）")
+    run_chase_attempts(ctx, log, attempt)
 
 
 SCENARIOS: dict[str, tuple[Callable[[E2E, ScenarioLog], None], str]] = {
@@ -1302,9 +1576,14 @@ def _engine_child_main() -> int:
 
 def _epilog() -> str:
     lines = ["情境："] + [f"  {sid:<3} {title}" for sid, (_, title) in SCENARIOS.items()]
-    lines.append("\n僅限 testnet。啟動前置檢查失敗 exit 2（零寫入）；任何 FAIL／無法判定／"
-                 "leader 寫入全失敗／清理後不乾淨／私鑰副本未刪 → exit 1。\n"
-                 "流程、引擎可觀測性做法與環境見檔頭 docstring。")
+    lines.append(
+        "\nverdict：PASS／FAIL／UNVERIFIED（有 check 無法觀測）／INCONCLUSIVE（E6／E9 三次嘗試"
+        "皆是 leader 先觸發、follower 尚未鏡射，實驗沒測到東西）。只有 PASS 算通過。\n"
+        "E6／E9 追價：觸發價從現價 --chase-frac 起，每 2 分鐘距離乘 0.6、最多等 10 分鐘；"
+        "無效嘗試自動重來（reset 後起始距離乘 1.5，最多 3 次）。\n"
+        "僅限 testnet。啟動前置檢查失敗 exit 2（零寫入）；任何 FAIL／UNVERIFIED／INCONCLUSIVE／"
+        "leader 寫入全失敗／清理後不乾淨／私鑰副本未刪 → exit 1。\n"
+        "流程、引擎可觀測性做法與環境見檔頭 docstring。")
     return "\n".join(lines)
 
 
@@ -1326,6 +1605,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--notional", type=Decimal, default=DEFAULT_NOTIONAL_USD,
                    help=f"leader 倉位名目 USD（預設 {DEFAULT_NOTIONAL_USD}；範圍 "
                         f"{MIN_E2E_NOTIONAL_USD}–{MAX_E2E_NOTIONAL_USD}）")
+    p.add_argument("--chase-frac", type=Decimal, default=CHASE_FRAC_DEFAULT,
+                   help=f"E6／E9 追價的起始距離（占現價比例，預設 {CHASE_FRAC_DEFAULT}＝0.1%%；"
+                        f"範圍 {CHASE_FRAC_MIN}–{CHASE_FRAC_MAX}）。每 2 分鐘距離乘 0.6；"
+                        "無效嘗試（leader 先觸發、follower 尚未鏡射）重試時再乘 1.5，最多 3 次")
     return p.parse_args(argv)
 
 
@@ -1387,13 +1670,13 @@ def remove_keys(work: Path | None) -> bool:
 
 def print_summary(results: list[dict], clean: bool, keys_deleted: bool) -> None:
     say("\n=== 情境總表 ===")
-    say(f"{'#':<4}{'結果':<12}{'checks(P/F/N)':<16}{'leader 下單成功':<16}標題")
+    say(f"{'#':<4}{'結果':<14}{'checks(P/F/N)':<16}{'leader 下單成功':<16}標題")
     for r in results:
         cs = r["checks"]
         p = sum(1 for c in cs if c["pass"] is True)
         f = sum(1 for c in cs if c["pass"] is False)
         n = sum(1 for c in cs if c["pass"] is None)
-        say(f"{r['scenario']:<4}{r['verdict']:<12}{f'{p}/{f}/{n}':<16}"
+        say(f"{r['scenario']:<4}{r['verdict']:<14}{f'{p}/{f}/{n}':<16}"
             f"{r['leader_writes_ok']:<16}{r['title']}")
     say(f"清理後驗證（兩邊無倉位、無掛單）：{'VERIFIED CLEAN' if clean else 'NOT CLEAN'}")
     say(f"私鑰副本（keys 目錄）已刪除：{keys_deleted}")
@@ -1406,6 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)              # --help 在這裡結束：零網路、零私鑰檔讀取
     selected = parse_only(args.only)
     notional = check_notional(args.notional)
+    chase_frac = check_chase_frac(args.chase_frac)
     leader_pk_path = require_scratchpad_path(args.leader_pk_file, "--leader-pk-file")
     follower_pk_path = require_scratchpad_path(args.follower_pk_file, "--follower-pk-file")
     if leader_pk_path == follower_pk_path:
@@ -1439,6 +1723,7 @@ def main(argv: list[str] | None = None) -> int:
                                    follower=follower_acct.address, builder=builder, f=settings.f,
                                    notional=notional)
         rec.write("start", label="preflight", selected=selected, passed=not reasons,
+                  chase_frac=str(chase_frac),
                   reasons=reasons, facts=facts, api_url=settings.api_url, account_id=account_id,
                   engine_overrides={"COPY_RISK_CONTROLS_ENABLED": "false",
                                     "COPY_CAPITAL_UTILIZATION": CAPITAL_UTILIZATION})
@@ -1464,7 +1749,8 @@ def main(argv: list[str] | None = None) -> int:
         sz_dec = read_adapter.get_size_decimals(args.coin)
         ctx = E2E(info=info, coin=args.coin, sz_dec=sz_dec,
                   builder=BuilderCode(b=builder, f=settings.f), leader=leader, follower=follower,
-                  notional=notional, work=work, account_id=account_id, rec=rec)
+                  notional=notional, work=work, account_id=account_id, rec=rec,
+                  chase_frac=chase_frac)
         for sid in selected:
             results.append(run_scenario(ctx, sid))
     finally:
