@@ -1,6 +1,6 @@
 # Plan：鏡射 leader 的止盈／止損觸發單（trigger order mirroring）
 
-> 狀態（2026-11-21）：**使用者已全數確認（「可以，GO」），依序派工中。** 進度：T1 完成（腳本 `90c6751`；testnet 實跑結果見 research 檔，結論已寫回 §4 D-P1…D-P13）；T2 完成（`a35ebbe`）；T3 派工中。
+> 狀態（2026-11-21）：**使用者已全數確認（「可以，GO」），依序派工中。** 進度：T1 完成（腳本 `90c6751`；testnet 實跑結果見 research 檔，結論已寫回 §4 D-P1…D-P13）；T2 完成（`a35ebbe`）；T3 完成（`40e827f`）；T4 派工中。
 > 確認內容：D1、D2、D3（改判：條件進場單也要跟）、D5（開關預設關＋告警降級）、D13、D14、R7、
 > T2 先獨立部署、T1／T5 在 testnet 下單。
 > 分支（確認後才開）：`feat/trigger-order-mirroring`（自 main `46c8d99` 切出；逐 task commit、**不 push**）。
