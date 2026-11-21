@@ -172,6 +172,8 @@ class HyperliquidAdapter(ExchangeAdapter):
                 tif=o.get("tif") or "Gtc",
                 # 下單原量（sz 是剩餘量）；缺鍵 → None，不假造。
                 orig_sz=Decimal(str(o["origSz"])) if o.get("origSz") is not None else None,
+                # 倉位止盈止損旗標（欄位名經主網 frontendOpenOrders 實測驗證）；缺鍵 → False。
+                is_position_tpsl=bool(o.get("isPositionTpsl", False)),
             ))
         return orders
 

@@ -62,7 +62,9 @@ class SkippedOrder:
     coin: str
     notional: Decimal
     reason: str  # ∈ {"small", "spot", "protected", "reduce_only_no_pos",
-    #                 "cost_breaker", "ro_capped_out"}
+    #                 "cost_breaker", "ro_capped_out",
+    #                 "trigger_disabled", "trigger_unsupported"}
+    oid: int | None = None  # leader 原掛單 oid（目前僅觸發單略過帶，供告警去重）
 
 
 @dataclass(frozen=True)
@@ -224,11 +226,16 @@ def _build_desired(
     my_positions: dict[str, Position],
     protected: set[str],
     no_new_exposure: bool = False,
+    mirror_triggers: bool = False,
 ) -> tuple[list[OrderSpec], list[SkippedOrder]]:
     """將 leader 掛單縮放成「我方期望掛單規格」清單。1:1 port 自 hl orders.py:79-127。
 
     過濾順序（與 hl 一致，決定優先順位）：
       1. 現貨標的（不支援跟單）→ 記 SkippedOrder(reason="spot")，先排除避免下單錯誤。
+      1.2 觸發單且 `mirror_triggers` 為 False（預設）→ 記
+         SkippedOrder(reason="trigger_disabled", oid=…)：所有觸發單（倉位止盈止損、
+         固定數量止損／止盈、條件進場）一律略過，不進 desired、不下單（plan 2026-11-21
+         D5）。告警由 `sync_open_orders` 依 oid 集合去重後發出。
       1.5 成本熔斷器（spark 新增，非 hl）：`no_new_exposure` 且非 reduce-only →
          記 SkippedOrder(reason="cost_breaker")。⭐ **reduce-only 一律放行**（D5
          硬規則，絕不把客戶困在部位裡）——語意與 protected 完全相同，差別只在
@@ -285,6 +292,10 @@ def _build_desired(
         coin = o.coin
         if _is_spot_coin(coin):
             skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"), reason="spot"))
+            continue
+        if o.is_trigger and not mirror_triggers:
+            skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
+                                        reason="trigger_disabled", oid=o.oid))
             continue
         if no_new_exposure and not o.reduce_only:
             skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
@@ -363,6 +374,11 @@ class ReconcileState:
     # 出去——那正是這則提醒存在的目的所要保護的東西（審查 F2）。放在跨輪狀態上而
     # 不是模組層全域：模組層在測試與多實例下是隱形共享狀態（見本類別 docstring）。
     risk_off_warned_at: float | None = None
+    # coin -> 上次發「觸發單未鏡射」告警時，leader 在該幣的觸發單 oid 集合。
+    # 為什麼存集合而非 TTL：未鏡射是穩定狀態，每輪（60 秒）重發會洗版共用 TG 頻道
+    # （同 risk_off_warned_at 的理由）；集合沒變就不重發，變了（新增／改價換 oid／
+    # 撤單）才再說一次。本輪沒有被略過觸發單的 coin 會從 dict 移除，下次再出現會重新告警。
+    trigger_skip_seen: dict[str, frozenset[int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -879,6 +895,47 @@ def _reconcile_orders(
     )
 
 
+_TRIGGER_SKIP_REASONS = ("trigger_disabled", "trigger_unsupported")
+
+
+def _warn_unmirrored_triggers(
+    skipped: list[SkippedOrder], state, notifier
+) -> None:
+    """未鏡射觸發單的告警（plan 2026-11-21 D6）。以「該幣 leader 觸發單 oid 集合」去重：
+    集合與 `state.trigger_skip_seen[coin]` 相同就不發；不同才發一則 warn 並更新。
+    本輪沒有被略過觸發單的 coin 從 dict 移除。
+
+    不傳 dedup_key：去重已由 oid 集合負責；若再掛 TelegramNotifier 的 300 秒 TTL，
+    oid 集合改變（例如 leader 改價）時的新告警反而會被吞掉。
+    """
+    by_coin: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
+    for s in skipped:
+        if s.reason in _TRIGGER_SKIP_REASONS and s.oid is not None:
+            by_coin[s.coin][s.reason].add(s.oid)
+
+    for coin in sorted(by_coin):
+        reasons = by_coin[coin]
+        oids = frozenset(oid for ids in reasons.values() for oid in ids)
+        if state.trigger_skip_seen.get(coin) == oids:
+            continue
+        state.trigger_skip_seen[coin] = oids
+        n_disabled = len(reasons.get("trigger_disabled", ()))
+        if n_disabled:
+            notifier.warn(
+                "orders",
+                f"[未鏡射] leader 在 {coin} 有 {n_disabled} 張止盈／止損觸發單，"
+                "本帳戶未跟單（觸發單鏡射未啟用）。leader 平倉後由部位同步跟進，最多延遲一輪。",
+            )
+        n_unsupported = len(reasons.get("trigger_unsupported", ()))
+        if n_unsupported:
+            notifier.warn(
+                "orders",
+                f"[未鏡射] leader 在 {coin} 有 {n_unsupported} 張型態無法判讀的觸發單，已略過。",
+            )
+    for coin in [c for c in state.trigger_skip_seen if c not in by_coin]:
+        del state.trigger_skip_seen[coin]
+
+
 def sync_open_orders(
     ex,
     leader_orders: list[OpenOrder],
@@ -934,6 +991,7 @@ def sync_open_orders(
         my_positions=my_positions,
         protected=set(protected),
         no_new_exposure=no_new_exposure,
+        mirror_triggers=settings.mirror_triggers,
     )
     small = tuple(s for s in skipped if s.reason == "small")
     for s in small:
@@ -943,6 +1001,7 @@ def sync_open_orders(
             f"${settings.min_order_notional}，跳過掛單",
             dedup_key=f"skipped_small:{s.coin}",
         )
+    _warn_unmirrored_triggers(skipped, state, notifier)
     protected_coins = sorted({s.coin for s in skipped if s.reason == "protected"})
     for coin in protected_coins:
         notifier.warn(

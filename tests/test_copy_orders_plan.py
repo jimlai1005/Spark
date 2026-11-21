@@ -327,6 +327,7 @@ def test_build_desired_carries_is_market_and_tif_from_leader_order():
     desired, skipped = _build_desired(
         leader, scale=Decimal("1"), min_notional=Decimal("10"),
         size_decimals=lambda coin: 4, my_positions={"ETH": _position("ETH")}, protected=set(),
+        mirror_triggers=True,  # 2026-11-21 T2：觸發單預設略過；此測試驗證開關開啟時的欄位直通
     )
     assert skipped == []
     by_coin = {d.coin: d for d in desired}

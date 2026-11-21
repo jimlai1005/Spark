@@ -87,6 +87,9 @@ class CopySettings:
     # 刻意覆蓋
     leader_address: str = "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
     live_trading: bool = False  # 紅線 5：刻意覆蓋 hl，預設關
+    # leader 觸發單（止盈／止損／條件進場）鏡射開關。關閉（預設）時所有觸發單在
+    # `_build_desired` 略過並發一則 warn，不下任何觸發單（plan 2026-11-21 D5）。
+    mirror_triggers: bool = False
     interval_s: int = 60  # 每分鐘（刻意覆蓋 hl 的 hourly CHECK_MINUTE=55）
     modify_policy: str = "modify-first"  # 或 "cancel-place"；預設不得改（等 T1.3）
     # 拍板 #2：回撤自動全平預設開。設 False 時為**軟暫停**：breach 的輪次發 critical
@@ -275,6 +278,9 @@ class CopySettings:
         return cls(
             leader_address=_env_str("COPY_LEADER_ADDRESS", cls.leader_address, env),
             live_trading=_env_bool("COPY_LIVE_TRADING", str(cls.live_trading).lower(), env),
+            mirror_triggers=_env_bool(
+                "COPY_MIRROR_TRIGGERS", str(cls.mirror_triggers).lower(), env
+            ),
             interval_s=_env_int("COPY_INTERVAL_S", str(cls.interval_s), env),
             modify_policy=_env_str("COPY_MODIFY_POLICY", cls.modify_policy, env),
             flatten_on_breach=_env_bool(

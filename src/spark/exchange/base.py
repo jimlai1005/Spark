@@ -93,6 +93,9 @@ class OpenOrder:
     # 兩者的差是「部分成交或被交易所修剪」的觀測點，CRIT 告警靠它顯示原量。
     # 缺鍵 → None（不得假造 0 或抄 sz）。
     orig_sz: Decimal | None = None
+    # frontendOpenOrders 的 isPositionTpsl（倉位止盈止損，介面顯示「Close Position」，
+    # sz 為 0、數量跟著倉位走）。缺鍵 → False。
+    is_position_tpsl: bool = False
 
 
 @dataclass(frozen=True)

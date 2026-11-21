@@ -176,6 +176,24 @@ def test_get_open_orders_trigger_take_profit_tpsl_tp():
     assert o.is_market is False  # "Take Profit Limit" 不含 "Market" → 觸發限價單
 
 
+def test_get_open_orders_parses_is_position_tpsl_true_and_missing_key_false():
+    """isPositionTpsl:true → True；缺鍵 → False（plan 2026-11-21 T2 案例 4）。"""
+    orders_raw = [
+        {"coin": "BTC", "oid": 1, "side": "B", "limitPx": "67100", "sz": "0.0",
+         "isTrigger": True, "reduceOnly": True, "orderType": "Stop Market",
+         "triggerPx": "66000", "isPositionTpsl": True},
+        {"coin": "BTC", "oid": 2, "side": "B", "limitPx": "61000", "sz": "0.015",
+         "isTrigger": True, "reduceOnly": True, "orderType": "Stop Limit",
+         "triggerPx": "61000", "isPositionTpsl": False},
+        {"coin": "BTC", "oid": 3, "side": "B", "limitPx": "57840", "sz": "0.015"},  # 缺鍵
+    ]
+    ad = _adapter(frontend_orders=orders_raw)
+    by_oid = {o.oid: o for o in ad.get_open_orders("0xuser")}
+    assert by_oid[1].is_position_tpsl is True
+    assert by_oid[2].is_position_tpsl is False
+    assert by_oid[3].is_position_tpsl is False
+
+
 def test_tpsl_faithful_port_covers_tp_prefix_and_sl_substring():
     # 1:1 移植 hl-copytrader monitor.py:187-191 的完整析取項：
     # "tp..." 開頭 → tp；含 "sl" → sl（即便不含 "stop"/"take profit" 全稱）。

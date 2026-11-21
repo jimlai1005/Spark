@@ -958,19 +958,28 @@ def test_breach_recheck_internal_error_fails_closed_with_warn(tmp_path, monkeypa
                for r in notifier.records)
 
 
-# ── 4. skip_trigger → warn（per-coin dedup）──────────────────────────
-def test_leader_trigger_order_surfaces_as_skip_trigger_warn(tmp_path):
+# ── 4. leader 觸發單 → 開關關閉時由 _build_desired 略過＋warn（oid 集合去重）──
+# 2026-11-21 T2：原本由 executor 的 skip_trigger 記錄經 loop 發 warn（M1 限制）；
+# 現在觸發單在 _build_desired 就被略過，executor 不再被呼叫，改由 sync_open_orders 告警。
+def test_leader_trigger_order_surfaces_as_skipped_trigger_warn(tmp_path):
     trigger = OpenOrder(oid=1, coin="ETH", is_buy=False, limit_px=Decimal("1900"),
                         sz=Decimal("1"), reduce_only=False, is_trigger=True,
                         trigger_px=Decimal("1900"), tpsl="sl", is_market=False)
     fa = FakeAdapter(equity=_healthy_equity(), account=_account("1000"),
                      open_orders=[trigger])
-    report, notifier, ex = _run(fa, tmp_path=tmp_path)
+    state = ReconcileState()
+    report, notifier, ex = _run(fa, tmp_path=tmp_path, state=state)
 
-    assert any(r.kind == "skip_trigger" and r.coin == "ETH" for r in ex.records)
-    assert report.reconcile.placed == 0  # skip 不算 placed
+    assert not any(r.kind == "skip_trigger" for r in ex.records)  # executor 不再被呼叫
+    assert [r for r in ex.records if r.kind in ("place", "modify", "cancel")] == []
+    assert report.reconcile.placed == 0
     warns = [r for r in notifier.records if r[0] == "warn"]
-    assert any(r[3] == "skip_trigger:ETH" and "trigger" in r[2] for r in warns)
+    unmirrored = [r for r in warns if "[未鏡射]" in r[2]]
+    assert len(unmirrored) == 1
+    assert "ETH" in unmirrored[0][2] and "觸發單鏡射未啟用" in unmirrored[0][2]
+    assert state.trigger_skip_seen == {"ETH": frozenset({1})}
+    # orders 類別零 CRIT（killswitch 的覆蓋不足 CRIT 是此 harness 的既有背景，與觸發單無關）
+    assert [r for r in notifier.records if r[0] == "critical" and r[1] == "orders"] == []
     assert [k for k in _WRITE_CALLS if fa.calls[k]] == []  # dry 全程零 adapter 寫入
 
 

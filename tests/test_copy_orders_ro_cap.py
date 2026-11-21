@@ -39,10 +39,10 @@ def _position(coin="ETH", szi="1") -> Position:
     )
 
 
-def _build(leader, positions, *, scale="1", min_notional="10", sz_dec=4):
+def _build(leader, positions, *, scale="1", min_notional="10", sz_dec=4, **kw):
     return _build_desired(
         leader, scale=Decimal(scale), min_notional=Decimal(min_notional),
-        size_decimals=lambda coin: sz_dec, my_positions=positions, protected=set(),
+        size_decimals=lambda coin: sz_dec, my_positions=positions, protected=set(), **kw,
     )
 
 
@@ -218,7 +218,10 @@ def test_trigger_ro_not_capped_and_consumes_no_capacity():
         _open_order(coin="ETH", is_buy=False, reduce_only=True,
                     sz="0.04", limit_px="2000", oid=2),
     ]
-    desired, skipped = _build(leader, {"ETH": _position("ETH", szi="0.05")})
+    # 2026-11-21 T2：觸發單預設在 _build_desired 略過；此測試檢驗的是「開關開啟時」
+    # trigger ro 不封頂的既有語意，故顯式 mirror_triggers=True。
+    desired, skipped = _build(leader, {"ETH": _position("ETH", szi="0.05")},
+                              mirror_triggers=True)
     assert skipped == []
     by_trigger = {d.is_trigger: d for d in desired}
     assert by_trigger[True].sz == Decimal("0.5")    # trigger 不封頂
