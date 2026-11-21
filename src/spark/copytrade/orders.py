@@ -902,11 +902,18 @@ def _warn_unmirrored_triggers(
     skipped: list[SkippedOrder], state, notifier
 ) -> None:
     """未鏡射觸發單的告警（plan 2026-11-21 D6）。以「該幣 leader 觸發單 oid 集合」去重：
-    集合與 `state.trigger_skip_seen[coin]` 相同就不發；不同才發一則 warn 並更新。
+    集合與 `state.trigger_skip_seen[coin]` 相同就不發；不同才發 warn。
     本輪沒有被略過觸發單的 coin 從 dict 移除。
 
-    不傳 dedup_key：去重已由 oid 集合負責；若再掛 TelegramNotifier 的 300 秒 TTL，
-    oid 集合改變（例如 leader 改價）時的新告警反而會被吞掉。
+    **只有 notifier 回報送出成功才記入 `trigger_skip_seen`**（2026-11-22 審查 W1；工程原則 3）：
+    先記再發的話，Telegram 單次發送失敗後這則告警就永遠不再出現（集合沒變就不重發）。
+    沒送出去（發送失敗、被 notifier 的去重窗抑制、分類靜音、notifier 停用）＝沒告警過，
+    下一輪照樣再試。
+
+    帶 per-coin `dedup_key`（同次審查 W2）：leader 每輪改一次觸發單（移動止損）時 oid 集合
+    每輪都變，沒有上限會變成每個 follower 每分鐘一則。notifier 的去重窗把它封頂在每窗一則；
+    被抑制的那幾輪不記入狀態，窗過後送出的是當下最新的集合——不會像「先記再發」那樣把
+    改動後的新告警吞掉。
     """
     by_coin: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     for s in skipped:
@@ -918,20 +925,24 @@ def _warn_unmirrored_triggers(
         oids = frozenset(oid for ids in reasons.values() for oid in ids)
         if state.trigger_skip_seen.get(coin) == oids:
             continue
-        state.trigger_skip_seen[coin] = oids
+        sent = True
         n_disabled = len(reasons.get("trigger_disabled", ()))
         if n_disabled:
-            notifier.warn(
+            sent = bool(notifier.warn(
                 "orders",
                 f"[未鏡射] leader 在 {coin} 有 {n_disabled} 張止盈／止損觸發單，"
                 "本帳戶未跟單（觸發單鏡射未啟用）。leader 平倉後由部位同步跟進，最多延遲一輪。",
-            )
+                dedup_key=f"trigger_disabled:{coin}",
+            )) and sent
         n_unsupported = len(reasons.get("trigger_unsupported", ()))
         if n_unsupported:
-            notifier.warn(
+            sent = bool(notifier.warn(
                 "orders",
                 f"[未鏡射] leader 在 {coin} 有 {n_unsupported} 張型態無法判讀的觸發單，已略過。",
-            )
+                dedup_key=f"trigger_unsupported:{coin}",
+            )) and sent
+        if sent:
+            state.trigger_skip_seen[coin] = oids
     for coin in [c for c in state.trigger_skip_seen if c not in by_coin]:
         del state.trigger_skip_seen[coin]
 

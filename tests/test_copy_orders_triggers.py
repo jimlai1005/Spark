@@ -201,3 +201,79 @@ def test_mirror_triggers_defaults_false_and_env_true_enables():
     assert CopySettings.from_env({}).mirror_triggers is False
     assert CopySettings.from_env({"COPY_MIRROR_TRIGGERS": "true"}).mirror_triggers is True
     assert CopySettings.from_env({"COPY_MIRROR_TRIGGERS": "false"}).mirror_triggers is False
+
+
+# ── 2026-11-22 審查 W1／W2：送出成功才記入去重狀態；改單頻繁時由 notifier 去重窗封頂 ──
+def _tg(send_results, clock):
+    """TelegramNotifier 以注入的 send_fn 取代 HTTP（離線）。send_results 依序為每次送出的回傳值，
+    用完後一律 True。回傳 (notifier, sent)——sent 收集每次實際嘗試送出的訊息。"""
+    from spark.copytrade.notifier import TelegramNotifier
+
+    sent: list[str] = []
+    results = list(send_results)
+
+    def send_fn(msg: str) -> bool:
+        sent.append(msg)
+        return results.pop(0) if results else True
+
+    return TelegramNotifier(send_fn=send_fn, clock=clock), sent
+
+
+def test_warn_send_failure_is_retried_next_cycle_not_swallowed():
+    """W1：Telegram 單次發送失敗後不得記成「已告警」——下一輪必須再送。"""
+    now = [1000.0]
+    n, sent = _tg([False], lambda: now[0])
+    ex, state, pos = FakeExecutor(), ReconcileState(), _short_btc()
+
+    _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n)  # 送出失敗
+    assert len(sent) == 1
+    assert state.trigger_skip_seen == {}  # 沒送出去＝沒告警過
+
+    now[0] += 60
+    _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n)  # 同一組 oid：重試並成功
+    assert len(sent) == 2
+    assert state.trigger_skip_seen == {"BTC": frozenset({7})}
+
+    now[0] += 60
+    _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n)  # 已送達 → 不再送
+    assert len(sent) == 2
+
+
+def test_warn_not_recorded_when_notifier_reports_not_sent():
+    """notifier 回 False（停用／靜音／失敗）一律不記入狀態；NullNotifier 即恆回 False。"""
+    from spark.copytrade.notifier import NullNotifier
+
+    state = ReconcileState()
+    _sync(FakeExecutor(), [_fixed_sl_limit(oid=7)], _short_btc(), state, NullNotifier())
+    assert state.trigger_skip_seen == {}
+
+
+def test_warn_rate_capped_when_leader_changes_trigger_every_cycle():
+    """W2：leader 每輪改一次觸發單（oid 每輪都變）時，每個去重窗至多一則；
+    窗過後送出的是當下最新的集合，且被抑制的那幾輪不得記成已告警。"""
+    from spark.copytrade.notifier import TelegramNotifier
+
+    now = [1000.0]
+    n, sent = _tg([], lambda: now[0])
+    ex, state, pos = FakeExecutor(), ReconcileState(), _short_btc()
+
+    _sync(ex, [_fixed_sl_limit(oid=1)], pos, state, n)
+    assert len(sent) == 1 and state.trigger_skip_seen == {"BTC": frozenset({1})}
+
+    for oid in (2, 3, 4):  # 窗內每 60 秒換一次 oid
+        now[0] += 60
+        _sync(ex, [_fixed_sl_limit(oid=oid)], pos, state, n)
+    assert len(sent) == 1  # 被去重窗抑制
+    assert state.trigger_skip_seen == {"BTC": frozenset({1})}  # 抑制的不記入
+
+    now[0] = 1000.0 + TelegramNotifier.DEDUP_TTL + 1  # 窗過
+    _sync(ex, [_fixed_sl_limit(oid=5)], pos, state, n)
+    assert len(sent) == 2
+    assert state.trigger_skip_seen == {"BTC": frozenset({5})}
+
+
+def test_warn_carries_per_coin_dedup_key():
+    n = RecordingNotifier()
+    _sync(FakeExecutor(), [_fixed_sl_limit(oid=2, coin="BTC"), _fixed_sl_limit(oid=5, coin="ETH")],
+          _short_btc(), ReconcileState(), n)
+    assert sorted(r[3] for r in _warns(n)) == ["trigger_disabled:BTC", "trigger_disabled:ETH"]
