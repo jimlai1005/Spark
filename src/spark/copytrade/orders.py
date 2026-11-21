@@ -53,6 +53,9 @@ class OrderSpec:
     trigger_px: Decimal | None = None
     is_market: bool = False
     tif: str = "Gtc"  # 限價單 time-in-force；hl monitor.py:205 預設 "Gtc"
+    # 倉位止盈止損（isPositionTpsl；數量跟著倉位走、sz 恆 0）。與「固定數量觸發單」是兩種不同的
+    # 單：`_orders_match` 不得互相配對，下單時走 grouping="positionTpsl"（plan D2／D-P3）。
+    is_position_tpsl: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,7 @@ class SkippedOrder:
     notional: Decimal
     reason: str  # ∈ {"small", "spot", "protected", "reduce_only_no_pos",
     #                 "cost_breaker", "ro_capped_out",
-    #                 "trigger_disabled", "trigger_unsupported"}
+    #                 "trigger_disabled", "trigger_unsupported", "trigger_pending_child"}
     oid: int | None = None  # leader 原掛單 oid（目前僅觸發單略過帶，供告警去重）
 
 
@@ -90,6 +93,7 @@ def spec_from_open_order(o: OpenOrder) -> OrderSpec:
         trigger_px=o.trigger_px,
         is_market=o.is_market,
         tif=o.tif,
+        is_position_tpsl=o.is_position_tpsl,
     )
 
 
@@ -108,6 +112,10 @@ def _orders_match(
     注意：**不比較 tif**——hl 原始碼的 `_orders_match` 沒有 tif 比較項（已對照確認），
     照抄此行為；tif 只在下單時經 `_order_type_and_px` 傳遞，不參與相符判定。
     `is_market` 僅在雙方皆為 trigger 單時比較（同 hl:65）。
+
+    倉位止盈止損（`is_position_tpsl`，plan 2026-11-21 T4）：兩邊必須同為倉位型（倉位型對固定
+    數量型不配對，才會被換型）；雙方數量恆 0 且由交易所跟著倉位走，**不比數量**——否則
+    `my_size <= 0` 會讓它永遠配不上、每輪撤單重掛。
     """
     if desired.coin != mine.coin:
         return False
@@ -116,6 +124,8 @@ def _orders_match(
     if desired.reduce_only != mine.reduce_only:
         return False
     if desired.is_trigger != mine.is_trigger:
+        return False
+    if desired.is_position_tpsl != mine.is_position_tpsl:
         return False
 
     d_px = desired.trigger_px if desired.is_trigger else desired.limit_px
@@ -131,6 +141,9 @@ def _orders_match(
         # 觸發限價單還要比對限價
         if not desired.is_market and not _prices_equal(desired.limit_px, mine.limit_px, px_rel_tol):
             return False
+
+    if desired.is_position_tpsl:
+        return True  # 兩邊皆倉位止盈止損：數量恆 0，不比
 
     my_size = mine.sz
     if my_size <= 0:
@@ -230,23 +243,37 @@ def _build_desired(
 ) -> tuple[list[OrderSpec], list[SkippedOrder]]:
     """將 leader 掛單縮放成「我方期望掛單規格」清單。1:1 port 自 hl orders.py:79-127。
 
-    過濾順序（與 hl 一致，決定優先順位）：
+    過濾順序（與 hl 一致，決定優先順位；觸發單於 plan 2026-11-21 T4 加入 1.2–1.4、3.2–3.4）：
       1. 現貨標的（不支援跟單）→ 記 SkippedOrder(reason="spot")，先排除避免下單錯誤。
+      1.1 `o.is_pending_child`（母單未完成的附帶子單，plan D-P12）→ 記
+         SkippedOrder(reason="trigger_pending_child", oid=…)，**不論開關**、不發 warn
+         （預期行為：母單完成後它會變成獨立觸發單並被鏡射；follower 端永不用 normalTpsl）。
       1.2 觸發單且 `mirror_triggers` 為 False（預設）→ 記
          SkippedOrder(reason="trigger_disabled", oid=…)：所有觸發單（倉位止盈止損、
          固定數量止損／止盈、條件進場）一律略過，不進 desired、不下單（plan 2026-11-21
          D5）。告警由 `sync_open_orders` 依 oid 集合去重後發出。
+      1.3 觸發單且 `tpsl` 不是 "tp"／"sl" → 記 SkippedOrder(reason="trigger_unsupported", oid=…)
+         （D3：判讀不出就不猜）。同 reason 另涵蓋「倉位止盈止損但非 reduce-only」與
+         「觸發價缺失／<= 0、限價 <= 0」：交易所寫入層對前者必 raise，寧可略過並告警也不讓例外往上冒。
       1.5 成本熔斷器（spark 新增，非 hl）：`no_new_exposure` 且非 reduce-only →
          記 SkippedOrder(reason="cost_breaker")。⭐ **reduce-only 一律放行**（D5
          硬規則，絕不把客戶困在部位裡）——語意與 protected 完全相同，差別只在
-         protected 是 per-coin、成本熔斷是帳戶級。
+         protected 是 per-coin、成本熔斷是帳戶級。條件進場單（非 reduce-only 觸發單）
+         與非 reduce-only 限價單同待遇（D13）。
       2. 抗單保護標的且非 reduce-only（拒絕補倉，但保留減倉/止盈止損單）→
          記 SkippedOrder(reason="protected")。
       3. reduce-only 且我方無對應部位（G4：交易所會拒絕這種單）→
          記 SkippedOrder(reason="reduce_only_no_pos")（hl 原本靜默跳過，見模組 docstring）。
-      3.5 reduce-only 非 trigger 且方向與部位不符（ro 賣需多倉、ro 買需空倉）→
-         同樣記 reduce_only_no_pos（交易所會把這種單修剪到 0，語意等同無部位）。
-      4. 縮放捨入後 size<=0 或 px<=0 → 靜默跳過（hl 同樣不記錄，無分類原因）。
+      3.5 reduce-only（含觸發單，D9）且方向與部位不符（ro 賣需多倉、ro 買需空倉）→
+         同樣記 reduce_only_no_pos（交易所會把限價 ro 單修剪到 0；觸發單則**不拒**而
+         掛著不動，D-P8，所以引擎端過濾是唯一防線）。
+      3.6 倉位止盈止損（`is_position_tpsl`）→ 數量恆 0 的 spec 直接進 desired，**跳過**
+         縮放數量與最小名目檢查（數量由交易所跟著 follower 倉位走，D2）。
+      3.7 固定數量觸發單：數量＝`_round_size(sz × scale)`，**不**以倉位封頂、不進
+         ro_pending（D7）；數量 <= 0 → "small"（D11，不再靜默）；名目 < min_notional →
+         只有**非 reduce-only**（條件進場單）記 "small"，reduce-only 觸發單豁免最小名目
+         （D-P11：不豁免會讓小帳戶沒有止損）。
+      4. 縮放捨入後 size<=0 或 px<=0 → 靜默跳過（hl 同樣不記錄，無分類原因）。（非觸發單）
       5. 縮放後名目值 < min_notional → 記 SkippedOrder(reason="small")，含正確 notional。
 
     ⭐ reduce-only 每幣累計封頂（spark 新增，非 hl；2026-07-28 00:33 CRIT 事故修法）：
@@ -286,6 +313,7 @@ def _build_desired(
             trigger_px=o.trigger_px,
             is_market=o.is_market,  # 1:1 hl orders.py:123——取 leader 掛單實際值
             tif=o.tif,              # 1:1 hl orders.py:124
+            is_position_tpsl=o.is_position_tpsl,
         )
 
     for o in leader_orders:
@@ -293,9 +321,21 @@ def _build_desired(
         if _is_spot_coin(coin):
             skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"), reason="spot"))
             continue
+        if o.is_pending_child:
+            skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
+                                        reason="trigger_pending_child", oid=o.oid))
+            continue
         if o.is_trigger and not mirror_triggers:
             skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
                                         reason="trigger_disabled", oid=o.oid))
+            continue
+        if o.is_trigger and (
+            o.tpsl not in ("tp", "sl")
+            or (o.is_position_tpsl and not o.reduce_only)
+            or o.trigger_px is None or o.trigger_px <= 0 or o.limit_px <= 0
+        ):
+            skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
+                                        reason="trigger_unsupported", oid=o.oid))
             continue
         if no_new_exposure and not o.reduce_only:
             skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
@@ -310,12 +350,36 @@ def _build_desired(
                 SkippedOrder(coin=coin, notional=Decimal("0"), reason="reduce_only_no_pos")
             )
             continue
+        if o.is_trigger:
+            if o.reduce_only:
+                szi = my_positions[coin].szi
+                if not ((szi < 0) if o.is_buy else (szi > 0)):
+                    # ro 買配多倉／ro 賣配空倉：交易所不拒但永遠不會有效（D-P8），不掛
+                    skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"),
+                                                reason="reduce_only_no_pos"))
+                    continue
+            if o.is_position_tpsl:
+                # 倉位止盈止損：數量由交易所跟著倉位走（sz 恆 0，D2／D-P3）
+                entries.append(_spec_of(o, Decimal("0")))
+                continue
+            size = _round_size(o.sz * scale, size_decimals(coin))
+            if size <= 0:
+                skipped.append(SkippedOrder(coin=coin, notional=Decimal("0"), reason="small"))
+                continue
+            notional = size * o.limit_px
+            if notional < min_notional and not o.reduce_only:
+                # 條件進場單與限價進場單同規則（D13）；reduce-only 觸發單豁免（D-P11）
+                skipped.append(SkippedOrder(coin=coin, notional=notional, reason="small"))
+                continue
+            # 不進 ro_pending、不以倉位封頂（D7）：觸發前不佔簿，由交易所在觸發時封頂
+            entries.append(_spec_of(o, size))
+            continue
         sz_dec = size_decimals(coin)
         size = _round_size(o.sz * scale, sz_dec)
         px = o.limit_px or o.trigger_px or Decimal("0")
         if size <= 0 or px <= 0:
             continue
-        if o.reduce_only and not o.is_trigger:
+        if o.reduce_only:
             szi = my_positions[coin].szi
             direction_ok = (szi < 0) if o.is_buy else (szi > 0)
             if not direction_ok:
@@ -641,8 +705,10 @@ _CRIT_MAX_LEN = 3500
 
 
 def _fmt_missing(missing: list[OrderSpec]) -> str:
+    # 倉位止盈止損 sz 恆 0：顯示「倉位TP/SL」而非數量 0，CRIT 才讀得懂。
     return ", ".join(
-        f"{d.coin} {'B' if d.is_buy else 'S'} {d.sz}@{_ref_px(d)}"
+        f"{d.coin} {'B' if d.is_buy else 'S'} {'倉位TP/SL' if d.is_position_tpsl else d.sz}"
+        f"@{_ref_px(d)}"
         + (" [ro]" if d.reduce_only else "")
         for d in missing
     )
@@ -656,7 +722,8 @@ def _fmt_extra(extra: list[OpenOrder]) -> str:
     parts = []
     for m in extra:
         px = m.trigger_px if m.is_trigger else m.limit_px
-        s = f"oid={m.oid} {m.coin} {'B' if m.is_buy else 'S'} {m.sz}@{px}"
+        qty = "倉位TP/SL" if m.is_position_tpsl else m.sz
+        s = f"oid={m.oid} {m.coin} {'B' if m.is_buy else 'S'} {qty}@{px}"
         if m.reduce_only:
             s += " [ro]"
         if m.orig_sz is not None:
@@ -703,6 +770,7 @@ def _reconcile_orders(
 
       1. 相同的單保留不動（matched）。
       2. 同 slot 但價量不同 → 先試 modify 就地改（保留排隊優先權）。
+         **觸發單例外（D4）**：一律撤單重掛，不呼叫 `ex.modify`、不登記 `modify_fail_until`。
          TTL 內（近期 modify 失敗過的 coin）或 modify_policy=="cancel-place" → 直接
          降級；modify 回 False → 登記 TTL（clock()+settings.modify_fail_ttl_s）並降級。
          注意：modify 回 False **不保證舊單仍在**（HL batchModify 非原子，2026-07-19 實測）；
@@ -764,6 +832,11 @@ def _reconcile_orders(
     fallback: list[tuple[int, str, OrderSpec]] = []  # (舊單 oid, coin, 新單 spec)
     for oid, spec in plan.modifies:
         coin = spec.coin
+        if spec.is_trigger:
+            # D4：觸發單一律撤單重掛——SDK modify 無 builder 欄位（紅線 4）、也無法換分組；
+            # 且不登記 modify_fail_until（不得連帶把同幣限價單降級成 cancel+place）。
+            fallback.append((oid, coin, spec))
+            continue
         if now < state.modify_fail_until.get(coin, 0):
             fallback.append((oid, coin, spec))  # 近期失敗過 → 直接退回 cancel+place
             continue

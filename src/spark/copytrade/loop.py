@@ -439,7 +439,7 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     for coin in skip_coins:
         notifier.warn(
             "orders",
-            f"[M1 限制] {coin} 出現 trigger 單，adapter 尚無 trigger 下單支援，已跳過",
+            f"[M1 限制] {coin} 出現不支援的 trigger 單型態，已跳過",
             dedup_key=f"skip_trigger:{coin}",
         )
     return report

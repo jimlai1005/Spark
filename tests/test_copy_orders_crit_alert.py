@@ -343,10 +343,18 @@ def test_place_with_reason_live_extracts_exchange_reject_reason():
 
 
 def test_place_with_reason_trigger_skip_gives_reason():
+    # 2026-11-21 T4：只有判讀不出的 trigger（tpsl=None）仍被防線擋下並帶原因；
+    # 可判讀的 trigger 改為正常下單（見下一案）。
     ok, reason = _executor(live=False).place_with_reason(
-        _order_spec(is_trigger=True, tpsl="sl", trigger_px=Decimal("1900")))
+        _order_spec(is_trigger=True, tpsl=None, trigger_px=Decimal("1900")))
     assert ok is False
     assert "trigger" in reason
+
+
+def test_place_with_reason_readable_trigger_places():
+    ok, reason = _executor(live=False).place_with_reason(
+        _order_spec(is_trigger=True, tpsl="sl", trigger_px=Decimal("1900")))
+    assert (ok, reason) == (True, "")
 
 
 def test_place_still_returns_bool_and_matches_place_with_reason():

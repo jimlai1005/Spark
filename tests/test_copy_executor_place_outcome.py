@@ -84,12 +84,22 @@ def test_dry_is_resting():
     assert o == PlaceOutcome(ok=True, reason="", status="resting", filled_sz=Z)
 
 
-def test_trigger_is_rejected_with_existing_reason():
+def test_unreadable_trigger_is_rejected_by_guard():
+    """2026-11-21 T4：原「trigger 一律拒收」改為只擋判讀不出的型態（tpsl 非 tp／sl）。
+    原斷言 not ok／rejected／filled_sz 0／僅一筆 skip_trigger 保留；拒因字串換成新文案。"""
+    ex = _ex(live=False)
+    o = ex.place_outcome(_spec(is_trigger=True, trigger_px=Decimal("1900"), tpsl=None))
+    assert not o.ok and o.status == "rejected" and o.filled_sz == Z
+    assert o.reason == ("trigger 單型態無法判讀（tpsl 非 tp／sl、缺觸發價或"
+                        "倉位型非 reduce-only），未下單")
+    assert [r.kind for r in ex.records] == ["skip_trigger"]
+
+
+def test_readable_trigger_places_normally_dry():
     ex = _ex(live=False)
     o = ex.place_outcome(_spec(is_trigger=True, trigger_px=Decimal("1900"), tpsl="sl"))
-    assert not o.ok and o.status == "rejected" and o.filled_sz == Z
-    assert o.reason == "trigger 單 M1 尚不支援（adapter 無 trigger 下單）"
-    assert [r.kind for r in ex.records] == ["skip_trigger"]
+    assert o == PlaceOutcome(ok=True, reason="", status="resting", filled_sz=Z)
+    assert [r.kind for r in ex.records] == ["place"]
 
 
 def test_one_place_records_once_with_status_and_wrappers_agree():

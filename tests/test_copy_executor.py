@@ -28,12 +28,12 @@ _WRITE_CALLS = ("place_order", "modify_order", "cancel_order", "market_open",
 
 def _spec(coin="ETH", is_buy=True, sz="1.0", limit_px="2000", reduce_only=False,
           is_trigger=False, tpsl=None, trigger_px=None, is_market=False,
-          tif="Gtc") -> OrderSpec:
+          tif="Gtc", is_position_tpsl=False) -> OrderSpec:
     return OrderSpec(
         coin=coin, is_buy=is_buy, sz=Decimal(sz), limit_px=Decimal(limit_px),
         reduce_only=reduce_only, is_trigger=is_trigger, tpsl=tpsl,
         trigger_px=Decimal(trigger_px) if trigger_px is not None else None,
-        is_market=is_market, tif=tif,
+        is_market=is_market, tif=tif, is_position_tpsl=is_position_tpsl,
     )
 
 
@@ -221,12 +221,15 @@ def test_update_leverage_failure_not_cached_retries_next_call():
     assert len(fa.calls["update_leverage"]) == 2
 
 
-# ── 5. trigger 單 M1 限制：不下單、記 skip_trigger ────────────────────
-def test_place_trigger_skips_and_records_in_both_modes():
+# ── 5. trigger 單：型態可判讀 → 正常下單；判讀不出 → 防線不下單、記 skip_trigger ──
+# 2026-11-21 T4：原「trigger 單一律不下單（M1 限制）」改為開關開啟時正常下單；
+# 原斷言（兩態零寫入、records 恰一筆 skip_trigger、payload op/trigger_px/tpsl）保留，
+# 輸入改為「tpsl 判讀不出」的 spec（工程原則 3：不猜型態、大聲記錄）。
+def test_place_unreadable_trigger_skips_and_records_in_both_modes():
     for live in (False, True):
         fa = FakeAdapter()
         ex = _executor(fa, live=live)
-        spec = _spec(coin="ETH", is_trigger=True, trigger_px="1900", tpsl="sl",
+        spec = _spec(coin="ETH", is_trigger=True, trigger_px="1900", tpsl=None,
                      is_market=True)
         assert ex.place(spec) is False
         assert _adapter_write_calls(fa) == []   # 兩態皆零寫入
@@ -236,7 +239,83 @@ def test_place_trigger_skips_and_records_in_both_modes():
         assert r.kind == "skip_trigger" and r.coin == "ETH"
         assert r.payload["op"] == "place"
         assert r.payload["trigger_px"] == "1900"
-        assert r.payload["tpsl"] == "sl"
+        assert r.payload["tpsl"] is None
+
+
+def test_place_position_tpsl_without_reduce_only_is_guarded_not_sent():
+    """倉位型非 reduce-only：adapter 必 raise ValueError，executor 先擋成 rejected。"""
+    fa = FakeAdapter()
+    ex = _executor(fa, live=True)
+    spec = _spec(is_trigger=True, trigger_px="1900", tpsl="sl", is_market=True,
+                 reduce_only=False, is_position_tpsl=True, sz="0")
+    o = ex.place_outcome(spec)
+    assert o.ok is False and o.status == "rejected"
+    assert fa.calls["place_order"] == []
+    assert [r.kind for r in ex.records] == ["skip_trigger"]
+
+
+# 測試 10（live）：adapter.place_order 收到帶齊 trigger 欄位的 Order 與 builder
+def test_live_place_trigger_sends_order_with_trigger_fields_and_builder():
+    fa = FakeAdapter()
+    ex = _executor(fa, live=True)
+    spec = _spec(coin="BTC", is_buy=True, sz="0.4", limit_px="61000", reduce_only=True,
+                 is_trigger=True, tpsl="sl", trigger_px="61000", is_market=False)
+    o = ex.place_outcome(spec)
+    assert o.ok is True and o.status == "resting"
+    assert len(fa.calls["place_order"]) == 1
+    call = fa.calls["place_order"][0]
+    assert call["builder"] == BUILDER
+    od = call["order"]
+    assert (od.coin, od.is_buy, od.size, od.limit_px) == (
+        "BTC", True, Decimal("0.4"), Decimal("61000"))
+    assert od.reduce_only is True
+    assert (od.trigger_px, od.tpsl, od.is_market, od.position_tpsl) == (
+        Decimal("61000"), "sl", False, False)
+    assert len(ex.records) == 1 and ex.records[0].kind == "place"
+    p = ex.records[0].payload
+    assert (p["trigger_px"], p["tpsl"], p["is_market"], p["is_position_tpsl"]) == (
+        "61000", "sl", False, False)
+
+
+def test_live_place_position_tpsl_sets_position_flag():
+    fa = FakeAdapter()
+    ex = _executor(fa, live=True)
+    spec = _spec(coin="BTC", is_buy=True, sz="0", limit_px="67100", reduce_only=True,
+                 is_trigger=True, tpsl="sl", trigger_px="66000", is_market=True,
+                 is_position_tpsl=True)
+    assert ex.place_outcome(spec).ok is True
+    od = fa.calls["place_order"][0]["order"]
+    assert od.position_tpsl is True and od.is_market is True and od.reduce_only is True
+    assert od.trigger_px == Decimal("66000") and od.tpsl == "sl"
+    assert fa.calls["place_order"][0]["builder"] == BUILDER
+    assert ex.records[0].payload["is_position_tpsl"] is True
+
+
+def test_live_place_non_trigger_order_has_no_trigger_fields():
+    """限價單的 Order 不得因本次改動帶上觸發欄位（行為位元不變）。"""
+    fa = FakeAdapter()
+    ex = _executor(fa, live=True)
+    ex.place(_spec(reduce_only=True))
+    od = fa.calls["place_order"][0]["order"]
+    assert (od.trigger_px, od.tpsl, od.is_market, od.position_tpsl) == (None, None, False, False)
+    assert "trigger_px" not in ex.records[0].payload
+
+
+# 測試 10（dry）：VirtualBook 內有該單，零 adapter 寫入
+def test_dry_place_trigger_goes_to_virtual_book_with_position_flag():
+    fa = FakeAdapter()
+    ex = _executor(fa, live=False)
+    spec = _spec(coin="BTC", is_buy=True, sz="0", limit_px="67100", reduce_only=True,
+                 is_trigger=True, tpsl="sl", trigger_px="66000", is_market=True,
+                 is_position_tpsl=True)
+    assert ex.place(spec) is True
+    assert _adapter_write_calls(fa) == []
+    book = ex.get_open_orders()
+    assert len(book) == 1
+    o = book[0]
+    assert (o.is_trigger, o.is_position_tpsl, o.tpsl, o.trigger_px, o.is_market, o.sz) == (
+        True, True, "sl", Decimal("66000"), True, Decimal("0"))
+    assert [r.kind for r in ex.records] == ["place"]
 
 
 def test_modify_trigger_skips_and_records():

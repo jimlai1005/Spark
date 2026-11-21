@@ -198,7 +198,8 @@ def _normalize_spark(action: dict) -> dict:
         out["leverage"] = int(p["leverage"])
         out["is_cross"] = bool(p["is_cross"])
     else:
-        # skip_trigger（或未知 kind）：is_buy/sz 照抄供 detail 顯示與排序，
+        # skip_trigger（2026-11-21 起僅剩「型態無法判讀」的防線記錄；開關開啟時
+        # 觸發單走 place／modify，與 hl 同 kind）或未知 kind：is_buy/sz 照抄供 detail 顯示與排序，
         # 刻意不賦予 limit_px——與 hl 的 place/modify 結構性不同（kind 字串本身
         # 就不同），這正是我們要讓它落在 unexplained（結構差）的理由。
         if "is_buy" in p:
@@ -255,7 +256,7 @@ def classify_diff(spark_actions: list[dict], hl_actions: list[dict], *,
        理由見 `_key` docstring）；兩邊都有的組內按 price（無 price 則 size）
        排序後逐一配對，多出來的（組內任一邊數量較多）直接記 "unexplained"
        （結構差：數量對不上）。只出現在單邊的整組（例如 hl 有 trigger 掛單但
-       spark 記了 skip_trigger，kind 字串不同、天生不會配對）也記 "unexplained"。
+       spark 因開關關閉未鏡射、或記了 skip_trigger，天生不會配對）也記 "unexplained"。
     2. 每對配對：
        - 兩邊皆有 limit_px：px 相對差 = |spark_px-hl_px|/hl_px。≤ px_rel_tol
          → "match"；否則存入 pending（記錄 size 比值，若 hl size 為 0 記 None）。

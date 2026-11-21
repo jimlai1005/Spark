@@ -4,14 +4,12 @@ OrderSpec 於 copytrade/orders.py（Task 7）定義。
 Task 8/11/13 的 fake 與 Task 12 的 ActionExecutor 都必須符合此 Protocol。
 builder/agent_signer/slippage 是 executor 建構時注入，不在本介面上（紅線 3）。
 
-M1 已知限制（trigger 單）：adapter 尚無 trigger 下單支援（`place_order` 只組
-`{"limit": {"tif": ...}}` order_type）；ActionExecutor 對 `is_trigger=True` 的
-place/modify 一律不下單、記 `ActionRecord(kind="skip_trigger")`。shadow 期間若
-leader 出現 trigger 單，會浮現於 skip_trigger 記錄（loop 端讀 records 發 warn
-帶 per-coin dedup）。連帶效應：live 模式下 trigger desired 永遠不會出現在
-settle 重抓結果中 → `_reconcile_orders` 會將其計入 missing 並發 critical——
-大聲失敗是刻意的（工程原則 3），在 trigger 支援落地前不應對含 trigger 的
-leader 開 live。
+觸發單（trigger 單；plan 2026-11-21）：`COPY_MIRROR_TRIGGERS` 開啟時，`place_outcome` 把
+觸發單（倉位止盈止損、固定數量止損／止盈、條件進場）經 `adapter.place_order` 掛到交易所
+（builder 照常帶入，紅線 4）；一律撤單重掛、不走 modify（D4），故 `modify` 對 trigger 恆回 False。
+防線：`tpsl` 非 tp／sl、缺觸發價、或倉位型非 reduce-only 的 trigger spec 仍不下單，
+記 `ActionRecord(kind="skip_trigger")` 並回 rejected（loop 讀 records 發 warn）——
+正常流程在 `_build_desired` 已擋下這些形狀，這裡是第二道。
 """
 from __future__ import annotations
 
@@ -122,7 +120,7 @@ def _order_from_spec(oid: int, spec: "OrderSpec") -> OpenOrder:
         oid=oid, coin=spec.coin, is_buy=spec.is_buy, limit_px=spec.limit_px,
         sz=spec.sz, reduce_only=spec.reduce_only, is_trigger=spec.is_trigger,
         trigger_px=spec.trigger_px, tpsl=spec.tpsl, is_market=spec.is_market,
-        tif=spec.tif,
+        tif=spec.tif, is_position_tpsl=spec.is_position_tpsl,
     )
 
 
@@ -172,7 +170,7 @@ class ActionExecutor:
     - live=False：只記 ActionRecord ＋ 更新 VirtualBook，**零 adapter 寫入**
       （紅線 5：live_trading 預設關，dry 路徑結構上碰不到寫入方法）。
     - 讀方法（get_open_orders 的 live 分支、get_size_decimals）不受 live gate 限制。
-    - trigger 單：見模組 docstring 的 M1 已知限制。
+    - trigger 單：見模組 docstring（開關開啟時正常下單；modify 恆不支援）。
     """
 
     def __init__(self, adapter, agent_signer: Signer | None, builder: BuilderCode, *,
@@ -206,8 +204,16 @@ class ActionExecutor:
         return False
 
     def _order_from(self, spec: "OrderSpec") -> Order:
+        """OrderSpec → 交易所 Order。非觸發單只帶原本的欄位（限價單行為與舊版位元相同）；
+        觸發單另帶 trigger_px／tpsl／is_market／position_tpsl（builder 由 place_outcome 傳入
+        `adapter.place_order` 的第三參數，觸發單與限價單同一條路徑，紅線 4）。"""
+        if not spec.is_trigger:
+            return Order(coin=spec.coin, is_buy=spec.is_buy, size=spec.sz,
+                         limit_px=spec.limit_px, tif=spec.tif, reduce_only=spec.reduce_only)
         return Order(coin=spec.coin, is_buy=spec.is_buy, size=spec.sz,
-                     limit_px=spec.limit_px, tif=spec.tif, reduce_only=spec.reduce_only)
+                     limit_px=spec.limit_px, tif=spec.tif, reduce_only=spec.reduce_only,
+                     trigger_px=spec.trigger_px, tpsl=spec.tpsl, is_market=spec.is_market,
+                     position_tpsl=spec.is_position_tpsl)
 
     # ── 寫入（live gate）──────────────────────────────────────────────
     def place(self, spec: "OrderSpec") -> bool:
@@ -227,13 +233,20 @@ class ActionExecutor:
         status 對照 adapter `_parse_order_response`：ok=False→rejected；
         filled_size>0→filled；raw `_resilience=="verified"`→unknown；其餘→resting。"""
         zero = Decimal("0")
-        if spec.is_trigger:
+        if spec.is_trigger and (
+            spec.tpsl not in ("tp", "sl") or spec.trigger_px is None
+            or (spec.is_position_tpsl and not spec.reduce_only)
+        ):
             self._skip_trigger("place", spec)
-            return PlaceOutcome(False, "trigger 單 M1 尚不支援（adapter 無 trigger 下單）",
-                                "rejected", zero)
+            return PlaceOutcome(False, "trigger 單型態無法判讀（tpsl 非 tp／sl、缺觸發價或"
+                                "倉位型非 reduce-only），未下單", "rejected", zero)
         payload = {"is_buy": spec.is_buy, "sz": str(spec.sz),
                    "limit_px": str(spec.limit_px), "reduce_only": spec.reduce_only,
                    "tif": spec.tif}
+        if spec.is_trigger:
+            payload.update({"trigger_px": str(spec.trigger_px), "tpsl": spec.tpsl,
+                            "is_market": spec.is_market,
+                            "is_position_tpsl": spec.is_position_tpsl})
         reason = ""
         filled_sz = zero
         if self.live:
@@ -266,6 +279,8 @@ class ActionExecutor:
 
     def modify(self, oid: int, spec: "OrderSpec") -> bool:
         if spec.is_trigger:
+            # D4：觸發單一律撤單重掛（SDK modify 無 builder、無法換分組）；
+            # `_reconcile_orders` 已不會把 trigger 送到這裡，此為第二道防線。
             return self._skip_trigger("modify", spec)
         payload = {"oid": str(oid), "is_buy": spec.is_buy, "sz": str(spec.sz),
                    "limit_px": str(spec.limit_px), "reduce_only": spec.reduce_only,
