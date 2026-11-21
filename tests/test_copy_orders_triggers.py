@@ -93,11 +93,12 @@ def test_non_trigger_orders_unaffected_by_switch_off():
 
 
 # ── 案例 2：固定數量止損限價經 sync_open_orders：零下單、零 CRIT、恰一則 warn ──
-def _sync(ex, leader, positions, state, notifier, *, settings=SETTINGS, my_orders=()):
+def _sync(ex, leader, positions, state, notifier, *, settings=SETTINGS, my_orders=(),
+          now=1000.0):
     return sync_open_orders(
         ex, leader, list(my_orders), positions, Decimal("26.91"),
         settings=settings, notifier=notifier, state=state, live=True,
-        clock=lambda: 1000.0, sleep_fn=lambda s: None,
+        clock=lambda: now, sleep_fn=lambda s: None,
     )
 
 
@@ -155,26 +156,28 @@ def test_warn_dedup_by_oid_set_rewarn_on_change_and_clear_on_disappear():
     state = ReconcileState()
     pos = _short_btc()
 
-    _sync(ex, [_fixed_sl_limit(oid=2)], pos, state, n)
+    # 各輪相隔 400 秒（> 每幣最短嘗試間隔 300 秒）：本測試驗的是 oid 集合去重，
+    # 間隔封頂另有 test_warn_rate_capped_when_leader_changes_trigger_every_cycle。
+    _sync(ex, [_fixed_sl_limit(oid=2)], pos, state, n, now=1000.0)
     assert len(_warns(n)) == 1
     assert state.trigger_skip_seen == {"BTC": frozenset({2})}
 
-    _sync(ex, [_fixed_sl_limit(oid=2)], pos, state, n)  # 同一組 oid → 不再 warn
+    _sync(ex, [_fixed_sl_limit(oid=2)], pos, state, n, now=1400.0)  # 同一組 oid → 不再 warn
     assert len(_warns(n)) == 1
 
-    _sync(ex, [_fixed_sl_limit(oid=3)], pos, state, n)  # leader 改價換 oid → 再 warn
+    _sync(ex, [_fixed_sl_limit(oid=3)], pos, state, n, now=1800.0)  # leader 改價換 oid → 再 warn
     assert len(_warns(n)) == 2
     assert state.trigger_skip_seen == {"BTC": frozenset({3})}
 
-    _sync(ex, [_fixed_sl_limit(oid=3), _pos_tpsl(oid=4)], pos, state, n)  # 新增一張 → 再 warn
+    _sync(ex, [_fixed_sl_limit(oid=3), _pos_tpsl(oid=4)], pos, state, n, now=2200.0)  # 新增一張
     assert len(_warns(n)) == 3
     assert "有 2 張" in _warns(n)[-1][2]
 
-    _sync(ex, [_limit(oid=9)], pos, state, n)  # 觸發單全消失 → 清空，不告警
+    _sync(ex, [_limit(oid=9)], pos, state, n, now=2600.0)  # 觸發單全消失 → 清空，不告警
     assert state.trigger_skip_seen == {}
     assert len(_warns(n)) == 3
 
-    _sync(ex, [_fixed_sl_limit(oid=3)], pos, state, n)  # 再出現 → 重新告警
+    _sync(ex, [_fixed_sl_limit(oid=3)], pos, state, n, now=3000.0)  # 再出現 → 重新告警
     assert len(_warns(n)) == 4
 
 
@@ -695,3 +698,130 @@ def test_t4_16_duplicate_position_sl_deduped_by_cancel():
 def test_t4_switch_off_entry_trigger_still_skipped():
     desired, skipped = _build([_entry_stop(oid=3)], {})
     assert desired == [] and [s.reason for s in skipped] == ["trigger_disabled"]
+
+
+# ── 2026-11-22 兩輪審查：送出成功才記入、每幣最短嘗試間隔、同幣合併成一則 ──────────
+class _ScriptedNotifier(RecordingNotifier):
+    """warn 的回傳值依序取自 results（用完後恆 True）；每次呼叫都照樣記錄。"""
+
+    def __init__(self, results=()):
+        super().__init__()
+        self._results = list(results)
+
+    def warn(self, category, text, dedup_key=None):
+        super().warn(category, text, dedup_key)
+        return self._results.pop(0) if self._results else True
+
+
+def test_warn_send_failure_is_retried_after_interval_not_swallowed():
+    """送出失敗不得記成「已告警」；重試受每幣最短間隔約束（不是每輪都打）。"""
+    n = _ScriptedNotifier([False])
+    ex, state, pos = FakeExecutor(), ReconcileState(), _short_btc()
+
+    _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n, now=1000.0)  # 嘗試一次、失敗
+    assert len(_warns(n)) == 1
+    assert state.trigger_skip_seen == {}  # 沒送出去＝沒告警過
+
+    _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n, now=1060.0)  # 間隔內：不重打
+    assert len(_warns(n)) == 1
+    assert state.trigger_skip_seen == {}
+
+    _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n, now=1300.0)  # 間隔過：重試並成功
+    assert len(_warns(n)) == 2
+    assert state.trigger_skip_seen == {"BTC": frozenset({7})}
+
+    _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n, now=1700.0)  # 已送達 → 不再送
+    assert len(_warns(n)) == 2
+
+
+def test_warn_attempts_bounded_when_notifier_never_succeeds():
+    """notifier 一直送不出去（Telegram 掛掉／分類靜音／停用）：10 輪只嘗試 2 次，
+    不會每輪每幣都卡一次同步發送；狀態始終不記成已告警。"""
+    n = _ScriptedNotifier([False] * 50)
+    ex, state, pos = FakeExecutor(), ReconcileState(), _short_btc()
+    for i in range(10):  # t = 0, 60, …, 540 秒
+        _sync(ex, [_fixed_sl_limit(oid=7)], pos, state, n, now=1000.0 + 60 * i)
+    assert len(_warns(n)) == 2  # t=0 與 t=300
+    assert state.trigger_skip_seen == {}
+
+
+def test_warn_not_recorded_with_null_notifier():
+    from spark.copytrade.notifier import NullNotifier
+
+    state = ReconcileState()
+    _sync(FakeExecutor(), [_fixed_sl_limit(oid=7)], _short_btc(), state, NullNotifier())
+    assert state.trigger_skip_seen == {}
+    assert state.trigger_warn_attempt_at == {"BTC": 1000.0}
+
+
+def test_warn_rate_capped_when_leader_changes_trigger_every_cycle():
+    """leader 每輪改一次觸發單（oid 每輪都變）：每幣每個間隔至多一則；
+    間隔過後送出的是當下最新的集合；被擋下的那幾輪不得記成已告警。"""
+    n = RecordingNotifier()
+    ex, state, pos = FakeExecutor(), ReconcileState(), _short_btc()
+
+    _sync(ex, [_fixed_sl_limit(oid=1)], pos, state, n, now=1000.0)
+    assert len(_warns(n)) == 1 and state.trigger_skip_seen == {"BTC": frozenset({1})}
+
+    for i, oid in enumerate((2, 3, 4), start=1):  # 間隔內每 60 秒換一次 oid
+        _sync(ex, [_fixed_sl_limit(oid=oid)], pos, state, n, now=1000.0 + 60 * i)
+    assert len(_warns(n)) == 1
+    assert state.trigger_skip_seen == {"BTC": frozenset({1})}
+
+    _sync(ex, [_fixed_sl_limit(oid=5), _pos_tpsl(oid=6)], pos, state, n, now=1300.0)
+    assert len(_warns(n)) == 2
+    assert "有 2 張" in _warns(n)[-1][2]  # 送出的是當下最新的集合
+    assert state.trigger_skip_seen == {"BTC": frozenset({5, 6})}
+
+
+def test_warn_interval_not_bypassed_by_disappear_and_reappear():
+    n = RecordingNotifier()
+    ex, state, pos = FakeExecutor(), ReconcileState(), _short_btc()
+    _sync(ex, [_fixed_sl_limit(oid=1)], pos, state, n, now=1000.0)
+    _sync(ex, [_limit(oid=9)], pos, state, n, now=1060.0)          # 消失
+    assert state.trigger_skip_seen == {}
+    assert state.trigger_warn_attempt_at == {"BTC": 1000.0}        # 間隔未過：時間戳保留
+    _sync(ex, [_fixed_sl_limit(oid=2)], pos, state, n, now=1120.0)  # 立刻又出現
+    assert len(_warns(n)) == 1                                      # 仍在間隔內，不發
+    _sync(ex, [_fixed_sl_limit(oid=2)], pos, state, n, now=1300.0)
+    assert len(_warns(n)) == 2
+
+
+def test_warn_attempt_timestamp_pruned_after_interval_once_triggers_gone():
+    n = RecordingNotifier()
+    ex, state, pos = FakeExecutor(), ReconcileState(), _short_btc()
+    _sync(ex, [_fixed_sl_limit(oid=1)], pos, state, n, now=1000.0)
+    _sync(ex, [_limit(oid=9)], pos, state, n, now=1300.0)  # 已無觸發單且間隔已過 → 清掉
+    assert state.trigger_warn_attempt_at == {}
+    assert state.trigger_skip_seen == {}
+
+
+def test_warn_is_one_message_per_coin_merging_disabled_and_unsupported():
+    """同一幣的 disabled 與 unsupported 合成一則：分成兩則時一成一敗會永遠輪流重送。"""
+    from spark.copytrade.orders import _warn_unmirrored_triggers
+
+    zero = Decimal("0")
+    skipped = [
+        SkippedOrder("BTC", zero, "trigger_disabled", oid=1),
+        SkippedOrder("BTC", zero, "trigger_disabled", oid=2),
+        SkippedOrder("BTC", zero, "trigger_unsupported", oid=3),
+        SkippedOrder("ETH", zero, "trigger_unsupported", oid=4),
+        SkippedOrder("SOL", zero, "small"),  # 非觸發單 reason：不得算進來
+    ]
+    n = _ScriptedNotifier([False, True])  # BTC 那則失敗、ETH 那則成功
+    state = ReconcileState()
+    _warn_unmirrored_triggers(skipped, state, n, now=1000.0)
+    warns = _warns(n)
+    assert len(warns) == 2  # 每幣恰一則
+    assert "BTC" in warns[0][2] and "有 2 張" in warns[0][2]
+    assert "另有 1 張型態無法判讀" in warns[0][2]
+    assert "ETH" in warns[1][2] and "有 1 張型態無法判讀" in warns[1][2]
+    assert all(w[3] is None for w in warns)  # 不借用 notifier 的 dedup_key
+    assert state.trigger_skip_seen == {"ETH": frozenset({4})}  # BTC 失敗 → 不記
+
+    _warn_unmirrored_triggers(skipped, state, n, now=1300.0)  # 間隔過：只重送 BTC 一則
+    assert len(_warns(n)) == 3
+    assert state.trigger_skip_seen == {"BTC": frozenset({1, 2, 3}), "ETH": frozenset({4})}
+
+    _warn_unmirrored_triggers(skipped, state, n, now=1700.0)  # 收斂：不再送
+    assert len(_warns(n)) == 3

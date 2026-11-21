@@ -443,6 +443,9 @@ class ReconcileState:
     # （同 risk_off_warned_at 的理由）；集合沒變就不重發，變了（新增／改價換 oid／
     # 撤單）才再說一次。本輪沒有被略過觸發單的 coin 會從 dict 移除，下次再出現會重新告警。
     trigger_skip_seen: dict[str, frozenset[int]] = field(default_factory=dict)
+    # coin -> 上次「嘗試」發該告警的 epoch（不論成敗）。每幣最短嘗試間隔用，
+    # 見 `_warn_unmirrored_triggers` 規則 2。
+    trigger_warn_attempt_at: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -969,17 +972,29 @@ def _reconcile_orders(
 
 
 _TRIGGER_SKIP_REASONS = ("trigger_disabled", "trigger_unsupported")
+# 同一幣「未鏡射觸發單」告警的最短嘗試間隔（秒）。見 `_warn_unmirrored_triggers`。
+_TRIGGER_WARN_MIN_INTERVAL_S = 300.0
 
 
 def _warn_unmirrored_triggers(
-    skipped: list[SkippedOrder], state, notifier
+    skipped: list[SkippedOrder], state, notifier, *, now: float
 ) -> None:
-    """未鏡射觸發單的告警（plan 2026-11-21 D6）。以「該幣 leader 觸發單 oid 集合」去重：
-    集合與 `state.trigger_skip_seen[coin]` 相同就不發；不同才發一則 warn 並更新。
-    本輪沒有被略過觸發單的 coin 從 dict 移除。
+    """未鏡射觸發單的告警（plan 2026-11-21 D6）。每幣一則，以「該幣 leader 觸發單 oid 集合」
+    去重：集合與 `state.trigger_skip_seen[coin]` 相同就不發。本輪沒有被略過觸發單的 coin
+    從 `trigger_skip_seen` 移除。
 
-    不傳 dedup_key：去重已由 oid 集合負責；若再掛 TelegramNotifier 的 300 秒 TTL，
-    oid 集合改變（例如 leader 改價）時的新告警反而會被吞掉。
+    三條規則（2026-11-22 兩輪審查的結論；工程原則 3）：
+      1. **送出成功才記入 `trigger_skip_seen`**。先記再發的話，Telegram 單次發送失敗後這則
+         告警就永遠不再出現（集合沒變就不重發）。沒送出去（發送失敗、分類靜音、notifier
+         停用）＝沒告警過，之後照樣再試。
+      2. **每幣每 `_TRIGGER_WARN_MIN_INTERVAL_S` 秒至多嘗試一次**（`trigger_warn_attempt_at`，
+         不論成敗都記）。兩個用途：leader 每輪改一次觸發單（移動止損）時 oid 集合每輪都變，
+         沒有上限會變成每個 follower 每分鐘一則；Telegram 持續送不出去時，不會每輪每幣都卡一次
+         同步發送逾時、拖慢排在後面的掛單對帳。間隔過後送出的是**當下最新**的集合。
+         間隔由本函式自己管、不借用 notifier 的 dedup_key：notifier 的去重窗只在送出成功時
+         推進（擋不到失敗重試），且被它抑制的輪次會讓訊息尾出現誤導的「前 N 次已抑制」。
+      3. **同一幣只發一則**（disabled 與 unsupported 合併成一句）。分成兩則各自成敗的話，
+         一成一敗會讓狀態永遠寫不進去、兩則輪流無限重送。
     """
     by_coin: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     for s in skipped:
@@ -991,22 +1006,30 @@ def _warn_unmirrored_triggers(
         oids = frozenset(oid for ids in reasons.values() for oid in ids)
         if state.trigger_skip_seen.get(coin) == oids:
             continue
-        state.trigger_skip_seen[coin] = oids
+        last = state.trigger_warn_attempt_at.get(coin)
+        if last is not None and now - last < _TRIGGER_WARN_MIN_INTERVAL_S:
+            continue
+        state.trigger_warn_attempt_at[coin] = now
         n_disabled = len(reasons.get("trigger_disabled", ()))
-        if n_disabled:
-            notifier.warn(
-                "orders",
-                f"[未鏡射] leader 在 {coin} 有 {n_disabled} 張止盈／止損觸發單，"
-                "本帳戶未跟單（觸發單鏡射未啟用）。leader 平倉後由部位同步跟進，最多延遲一輪。",
-            )
         n_unsupported = len(reasons.get("trigger_unsupported", ()))
-        if n_unsupported:
-            notifier.warn(
-                "orders",
-                f"[未鏡射] leader 在 {coin} 有 {n_unsupported} 張型態無法判讀的觸發單，已略過。",
+        if n_disabled:
+            text = (
+                f"[未鏡射] leader 在 {coin} 有 {n_disabled} 張止盈／止損觸發單，"
+                "本帳戶未跟單（觸發單鏡射未啟用）。leader 平倉後由部位同步跟進，最多延遲一輪。"
             )
+            if n_unsupported:
+                text += f"另有 {n_unsupported} 張型態無法判讀的觸發單，已略過。"
+        else:
+            text = f"[未鏡射] leader 在 {coin} 有 {n_unsupported} 張型態無法判讀的觸發單，已略過。"
+        if notifier.warn("orders", text):
+            state.trigger_skip_seen[coin] = oids
     for coin in [c for c in state.trigger_skip_seen if c not in by_coin]:
         del state.trigger_skip_seen[coin]
+    # 嘗試時間戳只在「該幣已無被略過的觸發單且間隔已過」時清掉：太早清會讓
+    # 「消失又立刻出現」繞過間隔；不清則 dict 只增不減。
+    for coin in [c for c, t in state.trigger_warn_attempt_at.items()
+                 if c not in by_coin and now - t >= _TRIGGER_WARN_MIN_INTERVAL_S]:
+        del state.trigger_warn_attempt_at[coin]
 
 
 def sync_open_orders(
@@ -1074,7 +1097,7 @@ def sync_open_orders(
             f"${settings.min_order_notional}，跳過掛單",
             dedup_key=f"skipped_small:{s.coin}",
         )
-    _warn_unmirrored_triggers(skipped, state, notifier)
+    _warn_unmirrored_triggers(skipped, state, notifier, now=clock())
     protected_coins = sorted({s.coin for s in skipped if s.reason == "protected"})
     for coin in protected_coins:
         notifier.warn(
