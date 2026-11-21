@@ -4230,3 +4230,30 @@ dd0346c..e9a67c7 另含 `6c2d75e` 的文件（RUNBOOK、兩份 plan）；`packag
 **2026-11-17 補記（無部署）：前端型別檢查成為固定指令。** `web/` 兩個測試檔累積了 30 個型別錯誤（最早 2026-08-31），一直沒被發現——
 `next build` 照常通過、repo 內也沒有任何步驟跑 `tsc`。已修（commit `9e3bdbf`，只動測試檔，行為不變），並新增 `npm run typecheck`（`tsc --noEmit`），
 列入 §8「驗收 4」四層回歸的第 1 層（離線）與專案 `CLAUDE.md` 的指令清單。`web/package.json` 因此只多一行 script——`package-lock.json` 不變，下次部署**不需要** `npm ci`。
+
+**2026-11-21 部署（commit `eb4a677`，17:52–17:54 UTC，四檔熱修 over e9a67c7；觸發單「告警先行」＝T2）：** plan
+`docs/superpowers/plans/2026-11-21-trigger-order-mirroring.md`。起因：2026-11-21 leader `0xfb9c…9760` 掛倉位止盈止損（數量 0，被 `_build_desired`
+靜默丟掉、零告警）與固定數量止損限價（被下單層拒絕 → 每輪 settle 重試 → 每 15 分鐘一則無法處理的 CRIT），follower 都沒有鏡射。
+本次只上「開關關閉時的行為」：新增 `COPY_MIRROR_TRIGGERS`（預設關、三個 follower 的 env **都沒有設**），leader 的觸發單一律在 `_build_desired` 略過，
+改發一則 `[未鏡射] leader 在 <幣> 有 N 張止盈／止損觸發單…` 的 warn：每幣一則、送出成功才記為已告警、每幣每 300 秒至多嘗試一次、
+以該幣觸發單 oid 集合去重（集合沒變就不重發）。**鏡射本身（T3／T4）不在這次部署內**；限價單路徑未改。
+使用者 2026-11-21 同意 T2 先行部署並授權合併 push。三輪 opus fresh 審查（第一輪 2 Warning、第二輪 2 Warning、第三輪 0 Critical／0 Warning；
+每輪都自做變異），主線程另親跑變異 5 條；該樹全套 `3716 passed`。
+46c8d99..eb4a677 的 `src/` 只動四檔：`copytrade/{config,orders}.py`、`exchange/{base,hyperliquid}.py`（另含 plan、T1 探針腳本與測試，對 runtime 無差）。
+前置查（17:32Z、17:52Z 各一次）：`DEPLOYED_VERSION`=`e9a67c7`；e9a67c7..46c8d99 的 `src/` 無差異；四檔在正式機與 `46c8d99` 逐位元一致（§5.8i 前提 2）；
+無維護旗標、無 `/tmp/spark-sync`、`systemctl --failed` 0；過去三小時的 sudo 記錄只有排程取樣與本 session 的唯讀查詢（peer session spark-25 idle、未動正式機）；
+三個 follower 的進程 environ 都沒有 `COPY_TG_MUTED`（warn 不會被靜音）。
+程序（§5.8i 的多檔版）：先 `git push origin t2-deploy:main`（46c8d99..eb4a677 快轉）→ 四檔以 `git show eb4a677:<路徑>` 匯出、tar 上傳到 `/tmp/t2up`（md5 與本機一致；
+macOS 的 `._*` 伴生檔只留在暫存區，逐檔 `install`、不整目錄複製）→ 備份原檔到 `/tmp/t2bak-20261121/`（root 600，含 `DEPLOYED_VERSION.bak`）→
+`install -o root -g root -m 644` 四檔並 `diff -q` → `filet-engine` 與 `filet-api` 兩個 user 各做 import 驗算（`ReconcileState().trigger_warn_attempt_at == {}`、
+`CopySettings().mirror_triggers is False`、`OpenOrder` 有 `is_position_tpsl`）→ `reload_follower.sh` 17:53:16–17:53:22Z 滾動重啟三個 follower。
+`filet-api`／`filet-dashboard` **未重啟**（`OpenOrder` 只多一個帶預設值的欄位，下次重啟自然載入）。
+→ `DEPLOYED_VERSION`=`eb4a67738ecb037f238fff3e0a60861c6dea7156`，note 記錄「四檔熱修 over e9a67c7」。
+驗證：三個 follower `active`、`NRestarts` 0；重啟後 journal 無 Traceback／error／critical；心跳檔 17:53:21–27Z 與 17:54:02Z 兩次重寫（週期有在推進）；
+`filet_regression_check --http --ssh` **67/67 PASS**。部署當下 leader 與兩個有資金的 follower 都已無倉位、無掛單，
+**所以新的 warn 尚無端到端證據**——下一次 leader 掛觸發單時，TG 應出現一則 `[未鏡射]` warn、且不再有「掛單重試後仍不符…trigger 單 M1 尚不支援」的 CRIT。
+告警只送 Telegram、不落檔，正式機 journal 看不到它。
+⚠️ 踩到的小坑：`sudo chmod 600 /tmp/t2bak-…/*` 的萬用字元由非 root 的 shell 展開，目錄是 root 700 → 展不開 → 指令失敗，`set -e` 讓後面的 import 驗算沒跑
+（四檔已裝好、follower 尚未重啟，無影響）；改成 `sudo sh -c "chmod 600 …/*"` 後續跑。
+回滾＝把 `/tmp/t2bak-20261121/` 的四個檔 `install` 回 `src/spark/{copytrade,exchange}/` 再跑 `reload_follower.sh`（`/tmp` 重開機會清；清掉後改用 `git show 46c8d99:<路徑>`）。
+未做：開關尚未對任何 follower 開啟；T3（交易所寫入層）／T4（引擎鏡射）／T5（testnet 端到端）在分支 `feat/trigger-order-mirroring`，審核通過後另行部署。
