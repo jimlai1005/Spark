@@ -1,6 +1,6 @@
 # 觸發單 testnet 探針（P1–P13）
 
-> 狀態：**P1–P13 已於 2026-11-21 16:14–16:16 UTC 在 testnet 實跑（run 2）**，結論已寫回 plan §4 的 D-P*。
+> 狀態：**P1–P13 已於 2026-11-21 16:14–16:16 UTC 在 testnet 實跑（run 2）；T5 端到端 E1–E9 已於 17:52–18:16 UTC 實跑、九個情境全部 PASS（§6）**，結論已寫回 plan §4 的 D-P*。
 > 本檔 §3 只陳述觀察；推論另標「推論」。
 > Plan：`docs/superpowers/plans/2026-11-21-trigger-order-mirroring.md` §1、§6 T1。T5（E1–E9）結果日後另開章節於本檔。
 
@@ -180,40 +180,64 @@ uv run python -m scripts.testnet_trigger_e2e --leader-pk-file "$S/e2e-leader.pk"
 
 ### 6.2 實跑紀錄
 
-| run | 日期（UTC） | leader／follower 末四碼 | 幣種／名目 | `--only` | 記錄檔路徑 | 結束碼 | 最終驗證（VERIFIED CLEAN?） | keys 已刪？ |
+兩個拋棄式 testnet 錢包（`harness mint-wallet` 各注資 150 USDC、帳戶模式 `default`、事後 `sweep-wallet` 掃回並刪鑰）；
+builder＝`0xbac6…3662`、`f=20`；引擎程式＝分支 `feat/trigger-order-mirroring`（run 1 在 `10737f9`、run 2 在 `9f293f3`，兩者 `src/` 的引擎邏輯相同）。
+
+| run | 日期（UTC） | leader／follower 末四碼 | 幣種／名目 | `--only` | 記錄檔路徑 | 結束碼 | 最終驗證 | keys 已刪？ |
 |---|---|---|---|---|---|---|---|---|
-| 1 |  |  |  |  |  |  |  |  |
+| 1 | 2026-11-21 17:52–18:00 | C4d0／f129 | BTC／$60 | 全部 | `~/filet-dev/trigger-e2e/run1.jsonl` | 1 | VERIFIED CLEAN | 是 |
+| 2 | 2026-11-21 18:07–18:16 | C4d0／f129 | BTC／$60 | E6,E7,E9 | `~/filet-dev/trigger-e2e/run2.jsonl` | 0 | VERIFIED CLEAN | 是 |
+
+run 1 的 E6／E7／E9 被判 FAIL，逐一查證後都不是引擎的問題（詳見 §6.5），腳本於 `9f293f3` 修正判定方式後以 run 2 重跑。
+**九個情境的有效結果：E1–E5、E8 取 run 1；E6、E7、E9 取 run 2；全部 PASS。**
 
 ### 6.3 結果表（E1–E9）
 
-每列填：時間戳（UTC）、兩邊相關 oid、`frontendOpenOrders` 摘錄（記錄檔行號）、各 check 的 PASS／FAIL／null、整體結果。
-
-| # | leader 動作 | 時間戳（UTC） | leader 掛單 oid | follower 掛單 oid | `frontendOpenOrders` 摘錄（行號） | checks（P/F/null） | 結果 | 備註 |
-|---|---|---|---|---|---|---|---|---|
-| E1 | 開倉後掛倉位止損＋止盈 |  |  |  |  |  |  |  |
-| E2 | 改止損觸發價 |  |  |  |  |  |  |  |
-| E3 | 撤倉位型、改掛固定數量止損限價 |  |  |  |  |  |  |  |
-| E4 | 連續 3 輪不動 |  |  |  |  |  |  |  |
-| E5 | 撤掉全部觸發單 |  |  |  |  |  |  |  |
-| E6 | 止損觸發價設到現價附近讓它觸發 |  |  |  |  |  |  |  |
-| E7 | 引擎 `COPY_MIRROR_TRIGGERS=false` 重跑 E1 |  |  |  |  |  |  |  |
-| E8 | 無倉位時掛條件進場單；3 輪後撤單 |  |  |  |  |  |  |  |
-| E9 | E8 的觸發價設到現價附近讓它觸發 |  |  |  |  |  |  |  |
-
-E6／E9 另記（觸發單真的觸發才有）：追價步數與每步觸發價、實際等待秒數、是否逾時未觸發、
-follower 是被自己的觸發單平倉／開倉還是由部位安全網收斂（R5、R8 的觀察）。
-
-| # | 追價步數 | 最終觸發價 | 等待秒數 | 觸發／逾時 | follower 由誰收斂 | R5／R8 觀察 |
+| # | leader 動作 | 來源（記錄檔行號） | 時間（UTC） | checks（通過/失敗） | 結果 | 觀察到的 follower 行為 |
 |---|---|---|---|---|---|---|
-| E6 |  |  |  |  |  |  |
-| E9 |  |  |  |  |  |  |
+| E1 | 開倉後掛倉位止損＋止盈 | run1:3 | 17:52:30–54 | 10/0 | PASS | 兩張倉位型觸發單（Stop Market、Take Profit Market，`isPositionTpsl:true`），觸發價與 leader 相同 |
+| E2 | 改止損觸發價 | run1:5 | 17:52:54–17:53:35 | 14/0 | PASS | 舊止損 oid 消失、新止損恰一張且 oid 不同（撤單重掛），止盈不動，無 CRIT |
+| E3 | 撤倉位型、改掛固定數量止損限價 | run1:7 | 17:53:35–17:54:16 | 16/0 | PASS | 倉位型全消失；一張 Stop Limit（非倉位型、reduce-only），數量＝leader×倍率（0.9） |
+| E4 | 連續 3 輪不動 | run1:9 | 17:54:16–17:55:02 | 18/0 | PASS | 三輪引擎零下單、零撤單、零改單，掛單 oid 集合不變 |
+| E5 | 撤掉全部觸發單 | run1:11 | 17:55:02–41 | 13/0 | PASS | follower 觸發單全撤 |
+| E6 | 止損觸發價靠近現價讓它觸發 | run2:3 | 18:07:51–18:10:49 | 11/0 | PASS | follower 的鏡射止損（oid 65744586204）在交易所端 `triggered`，平倉成交的 oid 就是該單；引擎沒有任何平倉動作；兩邊皆平、無殘留單、無 CRIT |
+| E7 | 引擎 `COPY_MIRROR_TRIGGERS=false` 重跑 E1 | run2:5 | 18:10:49–18:11:13 | 10/0 | PASS | 不掛單；`orders` 類 `[未鏡射]` warn 恰一則；無 CRIT（另有一則 `killswitch` 類「風控已關閉」提醒，來自測試環境設定，與本功能無關） |
+| E8 | 無倉位掛條件進場單；3 輪後撤 | run1:17 | 17:58:44–17:59:31 | 21/0 | PASS | 同型單（Stop Market 買、`reduceOnly:false`、0.00089＝leader 0.00099×0.9）；3 輪零動作；leader 撤後 follower 撤 |
+| E9 | 條件進場單觸發價靠近現價讓它觸發 | run2:7 | 18:11:13–18:16:39 | 12/0 | PASS | follower 的鏡射進場單（oid 65744797592）在交易所端 `triggered`，開倉成交的 oid 就是該單；引擎沒有 `market_open`；follower 倉位 0.00089（＝期望值）、**沒有重複開倉**、無 CRIT |
+
+E6／E9 追價過程：
+
+| # | 嘗試 | 每步觸發價（等待累計秒） | 觸發／逾時 | follower 由誰平倉／開倉 | R5／R8 觀察 |
+|---|---|---|---|---|---|
+| E6（run 2） | 第 1 次即有效 | 60544（0）→ 60582（121） | 觸發 | 自己的止損單（交易所端） | 觸發後各輪引擎無動作；未見重掛（R5 未出現：市價型觸發後直接成交，沒有「已觸發未成交」的狀態可觀察） |
+| E9（run 2） | 第 1 次即有效 | 60641（0）→ 60648（121）→ 60638（242） | 觸發 | 自己的進場單（交易所端） | 觸發後 3 輪引擎零動作；無重複開倉（R8 這次沒有發生，不代表不會發生——見 plan §7 與 T6 審核的 Warning） |
 
 ### 6.4 原始摘錄
 
-（實跑後貼：各情境關鍵的 `frontendOpenOrders` 原始 dict、引擎 stdout 末段、被判 FAIL／null 的 check 全文。
-貼之前確認不含任何私鑰：記錄檔寫入時已遮蔽，貼入前仍用 `grep -cE '[0-9a-fA-F]{64}'` 再確認為 0。）
+```json
+E6（run2.jsonl 行 3）交易所端證據
+{"check": "follower 鏡射止損在 historicalOrders 有 status==triggered", "actual": {"oid": 65744586204, "triggerPx": "60582.0", "orderType": "Stop Market", "timestamp": 1795284622150}}
+{"check": "follower 平倉成交的 oid 等於該止損 oid", "actual": {"oid": 65744586204, "dir": "Close Long", "sz": "0.00089", "px": "60569.0", "time": 1795284640363}}
+引擎該步的 place 動作：{"is_buy": false, "sz": "0", "limit_px": "54524.0", "reduce_only": true, "trigger_px": "60582.0", "tpsl": "sl", "is_market": true, "is_position_tpsl": true, "ok": true, "status": "resting"}
+
+E9（run2.jsonl 行 7）交易所端證據
+{"check": "follower 鏡射條件進場單在 historicalOrders 有 status==triggered", "actual": {"oid": 65744797592, "triggerPx": "60638.0", "orderType": "Stop Market", "timestamp": 1795284953544}}
+{"check": "follower 開倉成交的 oid 等於該條件進場單 oid", "actual": {"oid": 65744797592, "dir": "Open Long", "sz": "0.00089", "px": "60661.0", "time": 1795284976610}}
+引擎該步的 place 動作：{"is_buy": true, "sz": "0.00089", "limit_px": "66702.0", "reduce_only": false, "trigger_px": "60638.0", "tpsl": "sl", "is_market": true, "is_position_tpsl": false, "ok": true, "status": "resting"}
+```
+
+run 1 的 E6 留下一個額外的交易所行為觀察（testnet `historicalOrders`，2026-11-21）：leader 的止損（oid 65744109132，觸發價 60587）17:58:10.103 掛上、
+17:58:13.123 被觸發；follower 的鏡射止損（oid 65744111887）在 **17:58:14.148 才掛上**（此時 leader 的已觸發、觸發條件已成立），
+17:58:16.683 被觸發並平倉。也就是說**觸發條件已成立的止損單掛上後約 2.5 秒會被觸發**（補上 §5 的 P10 未驗證項），
+而這正是「引擎讀到 leader 的單之後、掛出鏡射單之前，leader 的單已觸發」這個競態的實例——這次結果正確（follower 被自己的止損平倉）。
 
 ### 6.5 資料極限與判讀備註
+
+run 1 三個 FAIL 的查證（都以 testnet `historicalOrders`／`userFillsByTime` 與記錄檔的引擎 action 為證）：
+- **E6**：實際上 follower 自己的止損單在交易所端觸發並平倉（見 §6.4 末段）；判 FAIL 是因為舊判定只看「觸發後才拍的快照」，那時兩邊的單都已觸發、看不到。
+- **E7**：`[未鏡射]` warn 實際恰一則；舊判定把測試環境另一則 `killswitch` 類提醒也算進去。
+- **E9**：**確實沒驗到**——leader 的進場單距現價 0.03%，掛上 50 毫秒就觸發，follower 尚未鏡射，是部位安全網用 `market_open` 補開的（無重複開倉）。
+  run 2 把起始距離放寬到 0.1% 後，follower 先鏡射、再由自己的單觸發。
 
 - testnet 行為不保證等同主網；兩個錢包帳戶模式預期為 `default`（非 unifiedAccount），前置檢查會把
   `abstraction` 記進 `start` 行，unifiedAccount 下的行為仍未測（見 §5）。
