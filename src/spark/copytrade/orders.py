@@ -248,7 +248,8 @@ def _build_desired(
       1.1 `o.is_pending_child`（母單未完成的附帶子單，plan D-P12）→ 記
          SkippedOrder(reason="trigger_pending_child", oid=…)，**不論開關**、不發 warn
          （預期行為：母單完成後它會變成獨立觸發單並被鏡射；follower 端永不用 normalTpsl）。
-      1.2 觸發單且 `mirror_triggers` 為 False（預設）→ 記
+      1.2 觸發單且 `mirror_triggers` 為 False（本函式參數的預設；引擎設定的預設見
+         `CopySettings.mirror_triggers`，正式路徑由 `sync_open_orders` 傳入）→ 記
          SkippedOrder(reason="trigger_disabled", oid=…)：所有觸發單（倉位止盈止損、
          固定數量止損／止盈、條件進場）一律略過，不進 desired、不下單（plan 2026-11-21
          D5）。告警由 `sync_open_orders` 依 oid 集合去重後發出。

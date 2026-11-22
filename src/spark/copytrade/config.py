@@ -87,9 +87,10 @@ class CopySettings:
     # 刻意覆蓋
     leader_address: str = "0xfb9c52f56f03d786ad5d435aa70fe45d80569760"
     live_trading: bool = False  # 紅線 5：刻意覆蓋 hl，預設關
-    # leader 觸發單（止盈／止損／條件進場）鏡射開關。關閉（預設）時所有觸發單在
-    # `_build_desired` 略過並發一則 warn，不下任何觸發單（plan 2026-11-21 D5）。
-    mirror_triggers: bool = False
+    # leader 觸發單（止盈／止損／條件進場）鏡射開關。預設開（plan 2026-11-21 D15／T7，
+    # 使用者 2026-11-22 裁決）；要關閉某帳戶在其 env 設 `COPY_MIRROR_TRIGGERS=false`。
+    # 關閉時所有觸發單在 `_build_desired` 略過並發一則 warn，不下任何觸發單（D5）。
+    mirror_triggers: bool = True
     interval_s: int = 60  # 每分鐘（刻意覆蓋 hl 的 hourly CHECK_MINUTE=55）
     modify_policy: str = "modify-first"  # 或 "cancel-place"；預設不得改（等 T1.3）
     # 拍板 #2：回撤自動全平預設開。設 False 時為**軟暫停**：breach 的輪次發 critical

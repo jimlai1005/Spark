@@ -4,7 +4,8 @@ OrderSpec 於 copytrade/orders.py（Task 7）定義。
 Task 8/11/13 的 fake 與 Task 12 的 ActionExecutor 都必須符合此 Protocol。
 builder/agent_signer/slippage 是 executor 建構時注入，不在本介面上（紅線 3）。
 
-觸發單（trigger 單；plan 2026-11-21）：`COPY_MIRROR_TRIGGERS` 開啟時，`place_outcome` 把
+觸發單（trigger 單；plan 2026-11-21）：`COPY_MIRROR_TRIGGERS` 開啟時（`CopySettings` 預設即開，
+自 T7／D15；env 設 `false` 才關），`place_outcome` 把
 觸發單（倉位止盈止損、固定數量止損／止盈、條件進場）經 `adapter.place_order` 掛到交易所
 （builder 照常帶入，紅線 4）；一律撤單重掛、不走 modify（D4），故 `modify` 對 trigger 恆回 False。
 防線：`tpsl` 非 tp／sl、缺觸發價、或倉位型非 reduce-only 的 trigger spec 仍不下單，

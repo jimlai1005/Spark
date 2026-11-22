@@ -1,6 +1,7 @@
 """leader 觸發單（止盈／止損／條件進場）在開關關閉時的行為（plan 2026-11-21 T2）。
 
-預設 `mirror_triggers=False`：所有觸發單在 `_build_desired` 就略過（`trigger_disabled`），
+`mirror_triggers=False`（`_build_desired` 的函式參數預設；`CopySettings` 預設自 T7 起為 True，
+需顯式關閉）：所有觸發單在 `_build_desired` 就略過（`trigger_disabled`），
 不進 desired、不下單、不發 CRIT，只發一則以 oid 集合去重的 warn。
 """
 from dataclasses import replace
@@ -23,7 +24,9 @@ from spark.exchange.fakes import FakeAdapter
 
 from tests.test_copy_orders_crit_alert import FakeExecutor
 
-SETTINGS = CopySettings(px_rel_tol=Decimal("1e-4"), size_tolerance=Decimal("0.08"))
+# 本檔前半測「開關關閉時的行為」：CopySettings 預設自 T7（D15）起為 True，故顯式關閉。
+SETTINGS = CopySettings(px_rel_tol=Decimal("1e-4"), size_tolerance=Decimal("0.08"),
+                        mirror_triggers=False)
 
 
 def _pos_tpsl(oid=1, coin="BTC", is_buy=True) -> OpenOrder:
@@ -205,11 +208,31 @@ def test_switch_on_does_not_use_trigger_disabled_path():
 
 
 # ── 案例 5：COPY_MIRROR_TRIGGERS ────────────────────────────────────
-def test_mirror_triggers_defaults_false_and_env_true_enables():
-    assert CopySettings().mirror_triggers is False
-    assert CopySettings.from_env({}).mirror_triggers is False
+def test_mirror_triggers_defaults_true_and_env_false_disables():
+    assert CopySettings().mirror_triggers is True
+    assert CopySettings.from_env({}).mirror_triggers is True
     assert CopySettings.from_env({"COPY_MIRROR_TRIGGERS": "true"}).mirror_triggers is True
     assert CopySettings.from_env({"COPY_MIRROR_TRIGGERS": "false"}).mirror_triggers is False
+
+
+def test_default_settings_mirror_position_tpsl_through_sync_open_orders():
+    """預設 `CopySettings()`（不顯式給 mirror_triggers）走 sync_open_orders：
+    leader 一張倉位止損＋follower 有同向倉位 → 對 follower 下一張倉位型觸發單。
+    證明預設值真的接到下單路徑，而不只是欄位值變了（plan T7）。"""
+    o = _pos_tpsl(oid=1)
+    ex = _Ex5(open_orders_seq=[[_mirror(o, 60)], [_mirror(o, 60)]])
+    n = RecordingNotifier()
+    settings = CopySettings(px_rel_tol=Decimal("1e-4"), size_tolerance=Decimal("0.08"))
+    assert settings.mirror_triggers is True
+    rep = sync_open_orders(
+        ex, [o], [], _short_btc(), Decimal("26.91"),
+        settings=settings, notifier=n, state=ReconcileState(), live=True,
+        clock=lambda: 1000.0, sleep_fn=lambda s: None,
+    )
+    placed = _places(ex)
+    assert len(placed) == 1
+    assert rep.reconcile.sync_failed is False
+    assert _crits(n) == [] and _warns(n) == []  # 未被「trigger_disabled」略過、無 [未鏡射] warn
 
 
 # ═══════════════════════════════════════════════════════════════════════

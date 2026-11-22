@@ -968,7 +968,9 @@ def test_leader_trigger_order_surfaces_as_skipped_trigger_warn(tmp_path):
     fa = FakeAdapter(equity=_healthy_equity(), account=_account("1000"),
                      open_orders=[trigger])
     state = ReconcileState()
-    report, notifier, ex = _run(fa, tmp_path=tmp_path, state=state)
+    # 此測試驗「開關關閉」行為；CopySettings 預設自 T7（D15）起為開，故顯式關閉。
+    report, notifier, ex = _run(fa, tmp_path=tmp_path, state=state,
+                                settings=_settings(mirror_triggers=False))
 
     assert not any(r.kind == "skip_trigger" for r in ex.records)  # executor 不再被呼叫
     assert [r for r in ex.records if r.kind in ("place", "modify", "cancel")] == []
