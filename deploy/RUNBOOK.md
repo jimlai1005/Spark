@@ -4282,3 +4282,25 @@ T2 上線後 7 小時三個 follower `NRestarts` 0、journal 零 traceback／err
 心跳檔 00:52:02Z、00:53:02Z 連續兩輪重寫；`filet_regression_check --http --ssh` **67/67 PASS**。部署當下 leader 與 follower 皆無倉位、無掛單。
 回滾＝把 `/tmp/t34bak-20261122/` 的八個檔 `install` 回原路徑再跑 `reload_follower.sh`（回到 `eb4a677`；`/tmp` 重開機會清，清掉後用 `git show eb4a677:<路徑>`）。
 開關的開法（裁決後）：在該帳戶的 follower env 加 `COPY_MIRROR_TRIGGERS=true`（先備份 env 檔）→ 重啟該 follower → 以進程 environ 驗證；關法＝設 `false` 或刪該行後重啟。
+> ⚠️ **上一行的關法自 2026-11-22 11:28Z（`de4a816`，下一條）起失效**：預設已改為開，「刪該行」＝回到預設＝**開**。現行關法只有一種：該帳戶 env 設 `COPY_MIRROR_TRIGGERS=false`＋重啟。
+
+**2026-11-22 部署（commit `de4a816`，11:28 UTC，三檔熱修 over b7501ee；觸發單鏡射開關**預設改為開**＝T7／plan D15；同日 11:01 UTC 先對 `f438b3…` 單獨開啟）：** plan
+`docs/superpowers/plans/2026-11-21-trigger-order-mirroring.md`（§6 T7、§4 D15、§7 R11）。
+使用者 2026-11-22 裁決：R11（止損觸發後可能被部位安全網以市價重開一輪，每次止損約 5–8%）**不修、安全網不動**，直接照 D15 開啟；風險已知並接受。
+第一步（11:01Z，只動 env）：`/etc/filet/followers/f438b3….env` 備份為同目錄 `….env.bak-mirrortrig-202611221101` → 檔尾加 `COPY_MIRROR_TRIGGERS=true` → 只重啟該 follower →
+進程 environ 確認 `COPY_MIRROR_TRIGGERS=true`、`NRestarts` 0、心跳 11:02:02Z→11:03:02Z 連續重寫（`no_action`）、journal 零輸出。
+第二步（11:28Z，程式）：`CopySettings.mirror_triggers` 預設 `False`→`True`（`6e07b2f`；`_build_desired` 的函式參數預設刻意維持 `False`，正式路徑唯一呼叫點傳 `settings.mirror_triggers`）；
+`executor.py`／`orders.py` 只改 docstring；兩個 `deploy/follower.env*.example` 加說明註解（`de4a816`，不含生效設定行）。離線全套 3796 passed、ruff 0 錯；
+變異（預設改回 False）兩條測試轉紅（主線程親自重現）；`reviewer` 審核 0 Critical、程式面 0 Warning，兩項文件 Warning（共用範本的關閉說明、上一條的「刪該行」關法）已修。
+程序 §5.8i 多檔版：前提——`DEPLOYED_VERSION` 為 `b7501ee`、正式機五個檔 md5 與 `b7501ee` 逐位元一致、無維護旗標、無 `/tmp/spark-sync`。`git archive de4a816` 打包五個檔上傳 → md5 核對 →
+備份到 `/tmp/t7bak-20261122/`（root 700／600）→ 逐檔 `install -o root -g root -m 644` → `filet-engine` user import 驗算（`CopySettings().mirror_triggers`＝True、`from_env({})`＝True、
+`COPY_MIRROR_TRIGGERS=false`＝False）、`filet-api` user `import spark.publicapi.app` → `reload_follower.sh` 11:28:38–44Z 滾動重啟三個 follower。`filet-api`／`filet-dashboard` 未重啟
+（`publicapi` 不建構 `CopySettings`）。→ `DEPLOYED_VERSION`=`de4a816989b12b8fea7d8f1fb0bb3c9f2b128f72`。
+驗證：三個 follower `active`、`NRestarts` 0；進程 environ：`f438b3…` 為 `COPY_MIRROR_TRIGGERS=true`（env 那一行留著，與預設同向）、`f6b3e7…`／`fd149b…` 未設（＝預設開）；
+`/etc/filet/follower.env.template` 無此鍵（新啟用帳戶＝預設開）；心跳 11:29:02Z、11:30:02Z 三個帳戶連續兩輪重寫（`no_action`）；重啟後 journal 零輸出；
+`filet_regression_check --http --ssh` **67/67 PASS**。部署當下 leader（`0xfb9c…9760`）與 follower 皆無倉位、無掛單——**觸發單鏡射在主網尚無端到端實況**，要等 leader 下次掛止盈止損／條件單
+（預期：follower 帳戶出現同型觸發單；不再有 `[未鏡射]` warn，除非該帳戶 env 設了 `false` 或遇到不支援的形狀）。
+**現行開關語意**：未設＝開；關閉＝該帳戶 env 設 `COPY_MIRROR_TRIGGERS=false`＋重啟該 follower（值只有 `true` 不分大小寫算開，其他任何值含 `1`／`yes` 都算關）；**刪掉該行不會關**。
+共用範本 `/etc/filet/follower.env.template` 改了只影響之後新啟用的帳戶，不影響已啟用者。全體緊急關閉＝三個 env 各加 `false` 後跑 `reload_follower.sh`，或回滾本次部署。
+回滾＝把 `/tmp/t7bak-20261122/` 的五個檔 `install` 回原路徑再跑 `reload_follower.sh`（回到 `b7501ee`＝預設關；`f438b3…` 因 env 有 `true` 仍會是開，要一併關就還原其 env 備份；
+`/tmp` 重開機會清，清掉後用 `git show b7501ee:<路徑>`）。
