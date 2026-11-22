@@ -1,6 +1,6 @@
 # Plan：鏡射 leader 的止盈／止損觸發單（trigger order mirroring）
 
-> 狀態（2026-11-22）：**T1–T6 完成；程式已全部部署（`b7501ee`，2026-11-22 00:51Z），開關仍關。** 進度：T1 探針（`90c6751`）；T2 告警先行（`a35ebbe`＋修法 `eb4a677`，2026-11-21 17:53Z 部署）；T3（`40e827f`）；T4（`cf104dd`）；T5 testnet 端到端九個情境全部 PASS（research 檔 §6）；T6 審核：開關關閉時可部署、開關開啟時有 1 項 Warning 待使用者裁決（§7 R11）。**D15 的第 3、4 步（開 `f438b3…`、預設改開）暫停，等 R11 裁決。**
+> 狀態（2026-11-22）：**T1–T6 完成；程式已全部部署（`b7501ee`，2026-11-22 00:51Z）。使用者 2026-11-22 晨間裁決 R11：不做 A／B／C 任何修改，照 D15 繼續——`f438b3…` 已於 11:01Z 開啟開關；T7（預設改開）進行中。** 進度：T1 探針（`90c6751`）；T2 告警先行（`a35ebbe`＋修法 `eb4a677`，2026-11-21 17:53Z 部署）；T3（`40e827f`）；T4（`cf104dd`）；T5 testnet 端到端九個情境全部 PASS（research 檔 §6）；T6 審核：開關關閉時可部署、開關開啟時有 1 項 Warning（§7 R11，使用者已裁決接受、不修）。
 > 確認內容：D1、D2、D3（改判：條件進場單也要跟）、D5（開關預設關＋告警降級）、D13、D14、R7、
 > T2 先獨立部署、T1／T5 在 testnet 下單。
 > 分支（確認後才開）：`feat/trigger-order-mirroring`（自 main `46c8d99` 切出；逐 task commit、**不 push**）。
@@ -336,6 +336,39 @@ leader 動作與引擎輪次，手動逐條下指令不可重現）：新增編�
 5. 工程原則 #2／#3／#5 逐條對照。
 修到 0 Critical／0 Warning 為止；只有設計分岔才停下問使用者。
 
+### T7 `@inline` — 開關預設改為開（D15；使用者 2026-11-22 確認執行）
+
+**目標**：`CopySettings.mirror_triggers` 的預設值由 `False` 改為 `True`，讓沒有設 `COPY_MIRROR_TRIGGERS` 的 follower 也鏡射觸發單；
+關閉方式改為在該帳戶 env 設 `COPY_MIRROR_TRIGGERS=false`。**動機**：使用者要所有 follower 都跟 leader 的止盈止損／條件進場單，不想逐帳戶設 env。
+
+**範圍（只動這些，其餘一律不動；特別是 `positions.py`／安全網、`loop.py` 的讀取順序都不准碰——R11 使用者裁決不改）**：
+1. `src/spark/copytrade/config.py`：`mirror_triggers: bool = True`；該欄位的註解／docstring 同步（預設開、設 `false` 關閉）。`from_env` 的讀法不變
+   （`_env_bool("COPY_MIRROR_TRIGGERS", str(cls.mirror_triggers).lower(), env)` 會自動跟著預設值）。
+2. `src/spark/copytrade/orders.py` 的 `_build_desired(..., mirror_triggers: bool = False)`：**函式參數預設維持 `False` 不改**（純函式、直接呼叫它的測試很多；
+   正式路徑唯一呼叫點 `sync_open_orders` 一律傳 `settings.mirror_triggers`）。只把 docstring 裡「False（預設）」這類字樣改成不會誤導的寫法
+   （說明這是函式參數預設，引擎設定預設見 `CopySettings`）。`executor.py` 檔頭 docstring 若寫「預設關」同樣只改文字。
+3. 測試：
+   - `tests/test_copy_orders_triggers.py::test_mirror_triggers_defaults_false_and_env_true_enables` 改寫為新契約並改名
+     （`CopySettings().mirror_triggers is True`；`from_env({})` → `True`；`"false"` → `False`；`"true"` → `True`）。
+   - 其餘因預設翻轉而轉紅的測試：**凡是在測「開關關閉時的行為」（略過＋`[未鏡射]` warn、`trigger_disabled`）的，改為顯式建
+     `CopySettings(mirror_triggers=False)`（或既有 helper 加參數）**，斷言內容不准放寬、不准刪測試。不是在測觸發單的測試若轉紅，先回報原因，不要硬改。
+   - 新增一條測試：以**預設** `CopySettings()` 走 `sync_open_orders`，leader 有一張倉位型止損、follower 有同向倉位 → 產生對 follower 的觸發單下單
+     （證明預設值真的接到下單路徑，不只是欄位值變了）。
+4. `deploy/follower.env.example`、`deploy/follower.env.autoactivate.example`：加一段註解說明 `COPY_MIRROR_TRIGGERS`（預設開；設 `false` 關閉該帳戶的觸發單鏡射，
+   關閉後 leader 掛觸發單時發一則 `[未鏡射]` warn）。**只加註解行（`#COPY_MIRROR_TRIGGERS=false` 形式），不加生效的設定行。**
+5. `scripts/testnet_trigger_e2e.py` 已對每一輪顯式設 `COPY_MIRROR_TRIGGERS`，不必改；若檔頭說明寫「預設關」則只改文字。
+
+**不做**：不改 RUNBOOK（主線程部署後自己寫附錄 B）；不改 plan；不 commit 以外的 git 操作（不 push、不 merge）。
+
+**驗收（逐條附指令與輸出末尾）**：
+1. `uv run pytest -q` 全綠（預期 ≥ 3795 passed）。
+2. `uv run ruff check src tests scripts` 0 錯。
+3. 變異：把 `config.py` 的預設暫時改回 `False` → 至少 2 條測試轉紅（改名後的預設值測試＋第 3 點新增的那條）；列出轉紅的測試名後還原。
+4. `git diff --stat` 只含上列檔案；`git diff -- src/spark/copytrade/positions.py src/spark/copytrade/loop.py` 為空。
+5. 以一個 commit 提交在分支 `feat/trigger-order-mirroring`：`feat: 觸發單鏡射開關預設改為開（plan D15／T7）`。
+
+**回報**：(a) 一段話結論；(b) 改動檔案清單（路徑:行號範圍）；(c) 每條驗收的指令＋輸出摘要；(d) 因預設翻轉而轉紅的測試清單與各自怎麼處理；(e) plan 沒涵蓋的決策。
+
 ## 7. 殘留風險（上線前要讓使用者知道）
 
 - **R1 止損限價可能不成交**：觸發後是限價單，follower 數量是 leader 的數十倍，成交程度可能不同；分歧由部位安全網在下一輪市價收斂。
@@ -347,11 +380,11 @@ leader 動作與引擎輪次，手動逐條下指令不可重現）：新增編�
 - **R9 附帶止盈止損的空窗**：leader 的母單部分成交且仍掛著時，子單還沒生效（文件所述，testnet 未測）；follower 鏡射的母單
   若也部分成交，這段期間 follower 有倉位但沒有對應的止盈止損，直到 leader 的母單完成或被撤。
 - **R10 testnet 未涵蓋的行為**：觸發條件已成立的單多久後觸發、小額觸發單觸發後能否成交、unifiedAccount 下的行為（research §5）。
-- **R11（待使用者裁決，T6 審核 Warning）止損觸發後可能被安全網重開一輪**：部位安全網用本輪開頭讀的 leader 倉位（`loop.py` 第 3 段只讀一次），
+- **R11（使用者 2026-11-22 裁決：不改，安全網維持原樣，開關照 D15 打開；風險已知並接受）止損觸發後可能被安全網重開一輪**：部位安全網用本輪開頭讀的 leader 倉位（`loop.py` 第 3 段只讀一次），
   follower 倉位則在安全網執行時重讀。leader 與 follower 的止損同時觸發的時點若落在這兩次讀取之間（每輪約 3–5 秒）→ 安全網看到「leader 有倉、follower 無倉」
   → 以市價把剛平掉的倉位開回來，下一輪再平。每次止損約 5–8% 機率；代價是兩次 taker 費用＋滑價＋不利方向多抱 60 秒。
   同一機制在已鏡射的 reduce-only 限價止盈早已存在。testnet E6 兩次都沒碰到。選項：A 接受；B 只在安全網「新開倉」分支開倉前重讀 leader 該幣倉位、leader 已無倉就不開（其餘不動）；
-  C 先只開一個帳戶觀察。**裁決前不開任何開關。**
+  C 先只開一個帳戶觀察。使用者原話（2026-11-22）：「沒做的：打開 0x438b、把預設改成開 這個部分請先做掉。我們不改ＡＢＣ」——主線程解讀：不動安全網、不做任何程式修法，直接執行 D15 第 3、4 步；此風險留存。
 - **R7 條件進場單會在引擎不在場時開倉**：觸發發生在交易所端，不經過引擎。引擎停機、或成本熔斷剛成立但還沒輪到撤單的那一輪內，
   follower 仍可能被觸發開新倉。風控熔斷與 kill switch 成立後的那一輪會把它撤掉（既有「撤全部掛單」路徑）。
 - **R8 條件進場單觸發瞬間的一輪落差**：follower 的觸發單與 leader 的幾乎同時成交，但引擎該輪若用到觸發前的快照，
