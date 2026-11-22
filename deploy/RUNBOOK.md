@@ -4257,3 +4257,28 @@ macOS 的 `._*` 伴生檔只留在暫存區，逐檔 `install`、不整目錄複
 （四檔已裝好、follower 尚未重啟，無影響）；改成 `sudo sh -c "chmod 600 …/*"` 後續跑。
 回滾＝把 `/tmp/t2bak-20261121/` 的四個檔 `install` 回 `src/spark/{copytrade,exchange}/` 再跑 `reload_follower.sh`（`/tmp` 重開機會清；清掉後改用 `git show 46c8d99:<路徑>`）。
 未做：開關尚未對任何 follower 開啟；T3（交易所寫入層）／T4（引擎鏡射）／T5（testnet 端到端）在分支 `feat/trigger-order-mirroring`，審核通過後另行部署。
+
+**2026-11-22 部署（commit `b7501ee`，00:51–00:53 UTC，八檔熱修 over eb4a677；觸發單鏡射的程式上線、**開關仍關**＝T3＋T4）：** plan
+`docs/superpowers/plans/2026-11-21-trigger-order-mirroring.md`、testnet 實測 `docs/superpowers/research/2026-11-21-trigger-order-probe.md`。
+內容：交易所寫入層支援觸發單（`place_order` 觸發／倉位型、字串 status `"waitingForTrigger"` 解析、`ResilientExchange.bulk_orders`、`OpenOrder.is_pending_child`）
+與引擎鏡射（倉位止盈止損以 `grouping="positionTpsl"`、數量 0 鏡射；固定數量止損／止盈；條件進場單；觸發單一律撤單重掛不 modify；
+reduce-only 觸發單豁免最小名目；母單未成交的附帶子單略過）。`COPY_MIRROR_TRIGGERS` 預設關、三個 follower 的 env **都沒有設**，
+所以這次部署後的實盤行為與 `eb4a677` 相同（略過＋`[未鏡射]` warn），鏡射路徑不會被走到。
+驗證鏈：離線全套 `3795 passed`；testnet 端到端 E1–E9 九個情境全部 PASS（倉位型／固定數量／條件進場的掛、改、撤、連續不重掛，以及止損與條件進場單**在交易所端真的觸發**，
+以 `historicalOrders` 的 `triggered` 與成交 oid 為證；research 檔 §6）；T6 opus 審核：開關關閉時與 `eb4a677` 行為相同、可部署，19 條變異抓到 18 條（存活的一條已補測試 `7f72902`）。
+**⚠️ 未開開關的原因（待使用者裁決）**：T6 審核 Warning——部位安全網用的是本輪開頭讀的 leader 倉位（`loop.py` 第 3 段只讀一次），follower 倉位則在安全網執行時重讀（`loop.py` `_safety_net`）。
+鏡射止損後 leader 與 follower 的止損會同時在交易所觸發；若觸發時點落在這兩次讀取之間（每輪約 3–5 秒，含 `settle_seconds`），安全網會看到「leader 有倉、follower 無倉」而以市價把剛被止損平掉的倉位開回來，下一輪再平。
+每次止損約 5–8% 機率；同一機制在已鏡射的 reduce-only 限價止盈早已存在。選項（接受／只在「新開倉」分支前重讀 leader 該幣倉位／先只開一個帳戶觀察）已呈使用者，**裁決前不得對任何 follower 設 `COPY_MIRROR_TRIGGERS=true`，也不得把預設改為開**（plan D15 的第 3、4 步暫停）。
+eb4a677..b7501ee 的 `src/` 只動八檔：`copytrade/{executor,loop,orders,shadow}.py`、`exchange/{base,fakes,hyperliquid}.py`、`resilience.py`（`loop.py` 只改一句 warn 文案、`shadow.py` 只改註解）；
+另含 `scripts/testnet_trigger_e2e.py`、測試與文件，對 runtime 無差，未上傳。
+前置查（2026-11-21 18:15Z、2026-11-22 00:51Z 各一次）：`DEPLOYED_VERSION`=`eb4a677`；八檔在正式機與 `eb4a677` 逐位元一致；無維護旗標、無 `/tmp/spark-sync`、`systemctl --failed` 0；
+T2 上線後 7 小時三個 follower `NRestarts` 0、journal 零 traceback／error／critical。
+程序（§5.8i 多檔版，同 2026-11-21 那次）：`git push origin feat/trigger-order-mirroring:main`（eb4a677..b7501ee 快轉）→ 八檔以 `git show b7501ee:<路徑>` 匯出、
+`COPYFILE_DISABLE=1 tar` 上傳到 `/tmp/t34up`（md5 與本機一致；加這個環境變數後不再帶 macOS 的 `._*` 伴生檔）→ 備份到 `/tmp/t34bak-20261122/`（root 600，含 `DEPLOYED_VERSION.bak`）→
+逐檔 `install -o root -g root -m 644`＋`diff -q` → `filet-engine`／`filet-api` 兩個 user 各做 import 驗算（`CopySettings().mirror_triggers is False`、`Order` 有 `trigger_px`、
+`OpenOrder` 有 `is_pending_child`、`ResilientExchange.bulk_orders`、`HyperliquidAdapter._place_trigger_order` 存在）→ `reload_follower.sh` 00:51:51–57Z 滾動重啟三個 follower。
+`filet-api`／`filet-dashboard` 未重啟。→ `DEPLOYED_VERSION`=`b7501ee522d4b2dabd5b3606322e7f2d280b388a`，note 記錄熱修鏈與開關狀態。
+驗證：三個 follower `active`、`NRestarts` 0；三個進程 environ 都沒有 `COPY_MIRROR_TRIGGERS`（＝預設關）；重啟後 journal 零 traceback／error／critical；
+心跳檔 00:52:02Z、00:53:02Z 連續兩輪重寫；`filet_regression_check --http --ssh` **67/67 PASS**。部署當下 leader 與 follower 皆無倉位、無掛單。
+回滾＝把 `/tmp/t34bak-20261122/` 的八個檔 `install` 回原路徑再跑 `reload_follower.sh`（回到 `eb4a677`；`/tmp` 重開機會清，清掉後用 `git show eb4a677:<路徑>`）。
+開關的開法（裁決後）：在該帳戶的 follower env 加 `COPY_MIRROR_TRIGGERS=true`（先備份 env 檔）→ 重啟該 follower → 以進程 environ 驗證；關法＝設 `false` 或刪該行後重啟。
