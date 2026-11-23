@@ -19,7 +19,10 @@ def seed_leader_total(adapter: FakeAdapter, leader: str = LEADER) -> FakeAdapter
 
     時間戳用 `time.time_ns`（不是常被 monkeypatch 的 `time.time`）：釘死時鐘的測試把
     run_cycle 的 now 釘在過去，真實 now 落在「未來」＝不算過期（時鐘偏差路徑），
-    且不消耗 `_ticking_clock` 的計次。"""
+    且不消耗 `_ticking_clock` 的計次。
+    ⚠️ 自 T4-fix 5a 起，時間戳在 run_cycle 的 now 之後**超過 180 秒**且 leader 有曝險
+    會被判 unavailable：若測試把 `spark.copytrade.loop.time` 釘在遠早於現在的時刻，
+    請自行以 `account_totals` 給定與該時鐘一致的 `as_of_ms`，不要用本 helper。"""
     key = leader.lower()
     if key not in adapter._account_totals:
         state = adapter._account_states.get(key, adapter._account)

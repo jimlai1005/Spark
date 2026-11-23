@@ -47,8 +47,10 @@ def test_age_exactly_180s_is_still_fresh():
 
 
 def test_as_of_in_the_future_is_not_stale():
-    """時鐘偏差：資料點時間戳在本機 now 之後，不算過期。"""
-    eq = resolve_leader_equity(_total("707.37", -600_000), now_ms=NOW_MS,
+    """時鐘偏差：資料點時間戳在本機 now 之後（小幅，60 秒），不算過期。
+    超過 MAX_AGE_MS 的未來時間戳自 T4-fix 5a 起視為可疑（見 test_future_timestamp_*），
+    本測試原用 600 秒，隨該裁決改為 60 秒——意圖（容許小幅時鐘偏差）不變。"""
+    eq = resolve_leader_equity(_total("707.37", -60_000), now_ms=NOW_MS,
                                leader_has_exposure=True)
     assert eq.value == Decimal("707.37")
 
