@@ -133,3 +133,24 @@ def test_D3a_with_exposure_behaviour_unchanged_stale_and_value_error():
     with pytest.raises(LeaderEquityUnavailable):
         read_leader_equity(FakeAdapter(), LEADER, now_ms=NOW_MS,
                            leader_has_exposure=True)
+
+
+# ── T4-fix 5a：時間戳在未來超過 180 秒且有曝險 → unavailable ────────────────
+def test_future_timestamp_beyond_tolerance_with_exposure_raises():
+    with pytest.raises(LeaderEquityUnavailable) as ei:
+        resolve_leader_equity(_total("707.37", -181_000), now_ms=NOW_MS,
+                              leader_has_exposure=True)
+    assert "未來" in ei.value.reason
+
+
+def test_future_timestamp_exactly_180s_with_exposure_is_tolerated():
+    eq = resolve_leader_equity(_total("707.37", -180_000), now_ms=NOW_MS,
+                               leader_has_exposure=True)
+    assert eq.value == Decimal("707.37")
+
+
+def test_future_timestamp_beyond_tolerance_without_exposure_does_not_raise():
+    """D3a：無曝險永不 raise。"""
+    eq = resolve_leader_equity(_total("707.37", -600_000), now_ms=NOW_MS,
+                               leader_has_exposure=False)
+    assert eq.value == Decimal("707.37")

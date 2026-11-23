@@ -49,7 +49,8 @@ def resolve_leader_equity(total: AccountTotal, *, now_ms: int,
       無關緊要；若在此提前返回，follower 殘留的倉位與掛單那一輪就收不掉。值 ≤ 0 回
       `value=0`（空帳戶，沿用既有 scale=0）；過期但值 > 0 照回該值。
     - 有曝險：`now_ms - total.as_of_ms > MAX_AGE_MS` → raise（過期；剛好 180 秒不算）。
-      as_of 在未來（時鐘偏差）不算過期。
+      as_of 在未來**不超過** 180 秒（時鐘偏差）不算過期；未來超過 180 秒
+      （`as_of_ms - now_ms > MAX_AGE_MS`）→ raise（時間戳不可信，無法證明新鮮）。
     - 有曝險且 `total.value <= 0` → raise（讀不到錢 ≠ 錢虧光）。
     """
     if not leader_has_exposure:
@@ -59,6 +60,10 @@ def resolve_leader_equity(total: AccountTotal, *, now_ms: int,
     if age_ms > MAX_AGE_MS:
         raise LeaderEquityUnavailable(
             f"帳戶總值資料已過期 {age_ms // 1000} 秒（上限 {MAX_AGE_MS // 1000} 秒）")
+    if -age_ms > MAX_AGE_MS:
+        raise LeaderEquityUnavailable(
+            f"帳戶總值時間戳在未來 {-age_ms // 1000} 秒（容許 {MAX_AGE_MS // 1000} 秒），"
+            f"時間戳不可信")
     if total.value <= 0:
         raise LeaderEquityUnavailable(
             f"帳戶總值 {total.value} 非正值，但 leader 仍有倉位或掛單")
