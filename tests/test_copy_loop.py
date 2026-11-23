@@ -595,6 +595,45 @@ def test_E4_empty_leader_with_zero_total_is_quiet_scale_zero(tmp_path, monkeypat
     assert not any(r[1] == "leader_equity" for r in notifier.records)
 
 
+class _SplitOrdersAdapter(_SplitAdapter):
+    """連掛單也依位址分開給（D3a 測試：leader 沒有掛單、follower 有殘留掛單）。"""
+
+    def __init__(self, *, orders_by_addr=None, **kw):
+        super().__init__(**kw)
+        self._orders_by_addr = {a.lower(): list(v) for a, v in (orders_by_addr or {}).items()}
+
+    def get_open_orders(self, address):
+        self.calls["get_open_orders"].append({"address": address})
+        return list(self._orders_by_addr.get(address.lower(), []))
+
+
+def test_D3a_no_exposure_total_unreadable_still_lets_follower_clean_up(
+        tmp_path, monkeypatch):
+    """D3a：leader 無倉位無掛單、帳戶總值讀取丟 ValueError、follower 有殘留倉位與殘留掛單
+    → 該輪**有**平倉與撤單、沒有 leader_equity 類 critical、skip_detail 為 None。
+    直接呼叫 run_cycle（不經 `_run` 的補 total helper）——這裡要的是「真的讀不到」。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    stale_order = OpenOrder(oid=77, coin="ETH", is_buy=True, limit_px=Decimal("2000"),
+                            sz=Decimal("1"), reduce_only=False, is_trigger=False,
+                            trigger_px=None, tpsl=None)
+    fa = _SplitOrdersAdapter(
+        orders_by_addr={MY_ADDR: [stale_order]},
+        my_positions=[_btc_pos("0.01")], account_value="4704.22",
+        account_states={LEADER: _account("0"), MY_ADDR: _account("4704.22")},
+        mids={"BTC": Decimal("100000"), "ETH": Decimal("2000")},
+        sz_decimals={"BTC": 5, "ETH": 4})
+    ex = _executor(fa, live=True)
+    notifier = RecordingNotifier()
+    report = run_cycle(fa, ex, _settings(), notifier, ReconcileState(), tmp_path)
+
+    done = {(r.kind, r.coin) for r in ex.records}
+    assert ("cancel", "ETH") in done, [(r.kind, r.coin) for r in ex.records]
+    assert ("close", "BTC") in done, [(r.kind, r.coin) for r in ex.records]
+    assert report.skip_detail is None
+    assert _leader_equity_crits(notifier) == []
+    assert report.tripped is False
+
+
 def test_flow_neutralization_raw_is_exchange_total_not_perp_av(tmp_path, monkeypatch):
     """流量中性化的 raw 與倍率分母同源：leader perp av 400、total 2000、入金 +1000 →
     adjusted＝1000 → scale＝2（若 raw 誤用 perp av＝400 會得到 −600 → 退回 raw → scale 5）。"""

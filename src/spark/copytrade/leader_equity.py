@@ -9,7 +9,7 @@
 - **唯一產生點**：倍率分母、`max_target_leverage` 的有效槓桿、流量中性化的 raw、波動
   權重的參數，全部從這裡的結果取值（工程原則 1、5）。
 - **讀不到、過期、非正值而 leader 有曝險 → `LeaderEquityUnavailable`**：呼叫端本輪
-  零交易動作＋告警（讀不到錢 ≠ 錢虧光，事故 #4 同型）。
+  零交易動作＋告警（讀不到錢 ≠ 錢虧光，事故 #4 同型）。leader 無曝險時（D3a）永不 raise。
 - **絕不退回 perp `accountValue`、絕不以 0 繼續算**：那正是事故來源。
 
 純函式層 `resolve_leader_equity` 無 IO；`read_leader_equity` 是薄讀取層。
@@ -45,21 +45,23 @@ def resolve_leader_equity(total: AccountTotal, *, now_ms: int,
                           leader_has_exposure: bool) -> LeaderEquity:
     """純函式。
 
-    - `now_ms - total.as_of_ms > MAX_AGE_MS` → raise（過期；剛好 180 秒不算）。
+    - leader 無曝險（無倉位、無掛單）→ **永不 raise**（D3a）：所有跟單目標都是 0，倍率
+      無關緊要；若在此提前返回，follower 殘留的倉位與掛單那一輪就收不掉。值 ≤ 0 回
+      `value=0`（空帳戶，沿用既有 scale=0）；過期但值 > 0 照回該值。
+    - 有曝險：`now_ms - total.as_of_ms > MAX_AGE_MS` → raise（過期；剛好 180 秒不算）。
       as_of 在未來（時鐘偏差）不算過期。
-    - `total.value <= 0` 且 leader 有曝險 → raise（讀不到錢 ≠ 錢虧光）。
-    - `total.value <= 0` 且無曝險 → `LeaderEquity(value=0)`（空帳戶，沿用既有 scale=0）。
+    - 有曝險且 `total.value <= 0` → raise（讀不到錢 ≠ 錢虧光）。
     """
+    if not leader_has_exposure:
+        return LeaderEquity(value=max(total.value, Decimal("0")),
+                            as_of_ms=total.as_of_ms, source="exchange_total")
     age_ms = now_ms - total.as_of_ms
     if age_ms > MAX_AGE_MS:
         raise LeaderEquityUnavailable(
             f"帳戶總值資料已過期 {age_ms // 1000} 秒（上限 {MAX_AGE_MS // 1000} 秒）")
     if total.value <= 0:
-        if leader_has_exposure:
-            raise LeaderEquityUnavailable(
-                f"帳戶總值 {total.value} 非正值，但 leader 仍有倉位或掛單")
-        return LeaderEquity(value=Decimal("0"), as_of_ms=total.as_of_ms,
-                            source="exchange_total")
+        raise LeaderEquityUnavailable(
+            f"帳戶總值 {total.value} 非正值，但 leader 仍有倉位或掛單")
     return LeaderEquity(value=total.value, as_of_ms=total.as_of_ms,
                         source="exchange_total")
 
@@ -68,11 +70,14 @@ def read_leader_equity(adapter, leader: str, *, now_ms: int,
                        leader_has_exposure: bool) -> LeaderEquity:
     """`adapter.get_account_total` → `resolve_leader_equity`。
 
-    `ValueError`（回應形狀不對、查無資料點）轉成 `LeaderEquityUnavailable`；
-    其餘例外（網路類）原樣往外拋，走 main_loop 的連續錯誤計數（plan D4）。"""
+    有曝險時，`ValueError`（回應形狀不對、查無資料點）轉成 `LeaderEquityUnavailable`；
+    無曝險時（D3a）同樣的 `ValueError` 回 `value=0`、不 raise。
+    其餘例外（網路類）一律原樣往外拋，走 main_loop 的連續錯誤計數（plan D4）。"""
     try:
         total = adapter.get_account_total(leader)
     except ValueError as e:
+        if not leader_has_exposure:
+            return LeaderEquity(value=Decimal("0"), as_of_ms=0, source="exchange_total")
         raise LeaderEquityUnavailable(f"讀不到帳戶總值（{e}）") from e
     return resolve_leader_equity(total, now_ms=now_ms,
                                  leader_has_exposure=leader_has_exposure)

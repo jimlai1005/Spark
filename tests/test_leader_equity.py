@@ -94,3 +94,42 @@ def test_read_lets_network_errors_propagate_unchanged():
 
     with pytest.raises(ConnectionError):
         read_leader_equity(_Down(), LEADER, now_ms=NOW_MS, leader_has_exposure=True)
+
+
+# ── D3a：leader 無曝險時永不 raise（plan 2026-11-22 T2b 前置小修）───────────
+def test_D3a_no_exposure_stale_181s_does_not_raise():
+    """無曝險＋過期 181 秒：所有目標都是 0，不得因權益過期讓整輪提前返回。"""
+    eq = resolve_leader_equity(_total("707.37", 181_000), now_ms=NOW_MS,
+                               leader_has_exposure=False)
+    assert eq.value == Decimal("707.37")  # 過期但值 > 0：照回該值
+    assert eq.source == "exchange_total"
+
+
+def test_D3a_no_exposure_stale_and_nonpositive_is_zero():
+    eq = resolve_leader_equity(_total("-5", 600_000), now_ms=NOW_MS,
+                               leader_has_exposure=False)
+    assert eq.value == Decimal("0")
+
+
+def test_D3a_no_exposure_value_error_returns_zero_without_raising():
+    fa = FakeAdapter()  # 沒有 account_totals → get_account_total 丟 ValueError
+    eq = read_leader_equity(fa, LEADER, now_ms=NOW_MS, leader_has_exposure=False)
+    assert eq == LeaderEquity(value=Decimal("0"), as_of_ms=0, source="exchange_total")
+
+
+def test_D3a_no_exposure_network_error_still_propagates():
+    class _Down(FakeAdapter):
+        def get_account_total(self, address):
+            raise ConnectionError("reset by peer")
+
+    with pytest.raises(ConnectionError):
+        read_leader_equity(_Down(), LEADER, now_ms=NOW_MS, leader_has_exposure=False)
+
+
+def test_D3a_with_exposure_behaviour_unchanged_stale_and_value_error():
+    with pytest.raises(LeaderEquityUnavailable):
+        resolve_leader_equity(_total("707.37", 181_000), now_ms=NOW_MS,
+                              leader_has_exposure=True)
+    with pytest.raises(LeaderEquityUnavailable):
+        read_leader_equity(FakeAdapter(), LEADER, now_ms=NOW_MS,
+                           leader_has_exposure=True)
