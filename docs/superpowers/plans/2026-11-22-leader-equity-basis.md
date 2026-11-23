@@ -1,7 +1,7 @@
 # leader 權益基準修正 Implementation Plan
 
 > **For agentic workers:** 逐 task 由主線程派工（`builder`／`reviewer`），只讀本檔；plan 沒涵蓋的決策先回報主線程。
-> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。 **T1 完成（`0c07006`，主線程已驗收）。** 同日使用者追加要求（D7）：leader 現貨有 BTC，分母會每分鐘變動，follower 不得因此每分鐘調整大小或開關單；解不了就可能退回修改前。→ 新增 T2b 倍率鎖定。使用者另要求接著做統一帳戶 follower（`fd149b…`），另開 plan。
+> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。 **T1 完成（`0c07006`，主線程已驗收）。** 同日使用者追加要求（D7）：leader 現貨有 BTC，分母會每分鐘變動，follower 不得因此每分鐘調整大小或開關單；解不了就可能退回修改前。→ 新增 T2b 倍率鎖定。使用者另要求接著做統一帳戶 follower（`fd149b…`），另開 plan。 **T2 完成（`5bc7d82`，主線程重現變異 (a)(c) 並重跑相關測試）；使用者已確認 D7。** T2 驗收時發現 D3 的缺口（見 D3a），併入 T2b 派工。
 
 **Goal:** 跟單倍率的分母（leader 權益）改用交易所自己顯示的帳戶總值，讓統一帳戶／portfolio margin 的 leader 不再造成倍率放大與開倉暴衝。
 
@@ -41,10 +41,11 @@
 | D1 | **leader 權益算什麼**。A（建議）：交易所顯示的帳戶總值 `T`——含現貨所有代幣、質押 HYPE、vault 存款。B：只算可當永續保證金的 USDC。在 leader `0xfb9c…` 上：A＝$707（名目 1.72 倍）、B＝$209（5.80 倍）；`f438b3…` 的目標倉位 A＝0.0665 BTC、B＝0.225 BTC（recon §4）。A 的理由：一個端點、一個數字、與交易所畫面及本站策略頁績效同一基準、四種模式通用（B 在 portfolio margin 下 USDC 可為負，需另外處理，等於那 17% 的 leader 不能跟）；A 偏小的方向是安全方向。A 的代價：leader 若有大量與交易無關的現貨或質押，跟單倉位會偏小。 | **A（使用者 2026-11-23 確認）** |
 | D2 | **傳統模式（`disabled`）的 leader 要不要一起改**。X（建議）：所有模式一律用 `T`，不讀帳戶模式——少一次查詢、沒有模式切換的不連續、沒有「不認得的模式」這條路徑。代價：傳統模式 leader 若在現貨錢包或質押放了大量閒置資金，跟單倉位會比現在小（目前沒有任何 follower 在跟傳統模式的 leader）。Y：`disabled` 維持 perp `accountValue`，其餘模式用 `T`，每輪多查一次模式。 | **X（使用者未指定，採建議；回報時交代）** |
 | D3 | 讀不到／過期（最後一點時間戳距今超過 180 秒）／值 ≤ 0 而 leader 有倉位或掛單 → 本輪零交易動作（不下單、不撤單、不調倉）＋ critical（`dedup_key="leader_equity_unavailable"`），心跳 `detail` 寫原因。值 ≤ 0 且 leader 無倉位無掛單 → 視為空帳戶，沿用既有行為（倍率 0、無事可做、不告警）。 | 主線程定 |
+| D3a | **leader 無倉位且無掛單時，leader 權益永遠不得讓本輪提前返回**（T2 驗收發現、主線程裁決 2026-11-23）：此時所有目標都是 0，倍率無關緊要；若因過期或回應形狀錯誤而提前返回，follower 殘留的倉位與掛單那一輪就收不掉。規則：`leader_has_exposure` 為 False 時，過期／形狀錯誤／非正值一律回 `LeaderEquity(value=0)`、不告警、不提前返回（網路類例外仍照既有方式往外拋）。T2 的 `resolve_leader_equity` 目前對「過期且無曝險」會 raise，需修。 | 主線程定 |
 | D4 | 絕不退回 perp `accountValue`（那正是事故的來源）。暫時性網路錯誤照既有讀取的處理方式往外拋（`main_loop` 的連續錯誤計數）。 | 主線程定 |
 | D5 | `target_notional`（`max_target_leverage` 的分子）維持 `leader_state.total_ntl_pos`（預設 dex，與被鏡射的倉位同範圍）。 | 主線程定 |
 | D6 | 部署時機：leader 與 follower 都無倉位時部署（使用者 2026-11-22 表示會先關掉 leader 倉位）。若部署當下仍有倉位，重啟後第一輪會以市價把 follower 倉位縮到新目標——部署前主線程先查，有倉位就停下問。 | 主線程定 |
-| D7 | **倍率鎖定（使用者 2026-11-23 追加要求）**：follower 只在「leader 有動作」時才重算倍率；leader 沒動作的期間沿用上一次的倍率，分母（含 leader 現貨 BTC 的價格波動、leader 浮動損益）與分子（follower 自己的浮動損益）怎麼漂都不調倉、不重掛單。「leader 有動作」＝leader 的倉位或掛單集合與上一輪不同。另外三種情況也重算：(a) follower 的資金設定（使用率／本金／權重／槓桿上限）或 leader 位址變了；(b) follower 自己無倉位也無掛單（沒有東西會被擾動）；(c) 引擎重啟後第一輪（鎖定值只存在記憶體）。算出的倍率 ≤ 0 時不鎖定，照既有行為。**已知後果（要告知使用者）**：follower 自己入金／出金、leader 入金／出金，都要等 leader 下一次動作才反映到倉位大小；重啟（含部署）後第一輪若漂移已超過 8% 會有一次調整。依據：30 天模擬（recon §8）顯示只靠既有 8% 容差，leader 抱單期間仍會有 0–23 次因分母漂移的調倉。 | 主線程定（依使用者要求設計；機制細節回報時交代） |
+| D7 | **倍率鎖定（使用者 2026-11-23 追加要求）**：follower 只在「leader 有動作」時才重算倍率；leader 沒動作的期間沿用上一次的倍率，分母（含 leader 現貨 BTC 的價格波動、leader 浮動損益）與分子（follower 自己的浮動損益）怎麼漂都不調倉、不重掛單。「leader 有動作」＝leader 的倉位或掛單集合與上一輪不同。另外三種情況也重算：(a) follower 的資金設定（使用率／本金／權重／槓桿上限）或 leader 位址變了；(b) follower 自己無倉位也無掛單（沒有東西會被擾動）；(c) 引擎重啟後第一輪（鎖定值只存在記憶體）。算出的倍率 ≤ 0 時不鎖定，照既有行為。**已知後果（要告知使用者）**：follower 自己入金／出金、leader 入金／出金，都要等 leader 下一次動作才反映到倉位大小；重啟（含部署）後第一輪若漂移已超過 8% 會有一次調整。依據：30 天模擬（recon §8）顯示只靠既有 8% 容差，leader 抱單期間仍會有 0–23 次因分母漂移的調倉。 | **使用者 2026-11-23 確認**（看過機制與三項後果後原話：「倍率鎖定可以接受，請繼續」） |
 
 > 下文以 D1＝A、D2＝X 撰寫（即定案）。
 
@@ -184,6 +185,13 @@ def read_leader_equity(adapter, leader: str, *, now_ms: int,
 ### T2b `@inline` — 倍率鎖定（D7；依賴 T2）
 
 **目標**：leader 沒有動作的期間，follower 用的倍率不變。**動機**：使用者要求 follower 不得因為 leader 權益每分鐘的小幅變動（leader 現貨 BTC 價格、浮動損益）而調整大小或開關單；T2 改完後分母仍會隨行情漂移，既有的 8% 容差只能降低頻率、不能消除（recon §8）。遇到歧義往「leader 沒動作就不動 follower」取捨。
+
+**先做一個小修（D3a，獨立 commit，再做倍率鎖定）**：`src/spark/copytrade/leader_equity.py`——
+`resolve_leader_equity`：`leader_has_exposure` 為 False 時不檢查新鮮度，值 ≤ 0 或過期都回 `LeaderEquity(value=max(total.value, 0)…)`（過期但值 > 0 也照回該值，反正目標全為 0）；
+`read_leader_equity`：`get_account_total` 丟 `ValueError` 且 `leader_has_exposure` 為 False → 回 `LeaderEquity(value=Decimal("0"), as_of_ms=0, source="exchange_total")`，不 raise。
+有曝險時的行為完全不變。測試（`tests/test_leader_equity.py`、`tests/test_copy_loop.py`）：無曝險＋過期 181 秒 → 不 raise；無曝險＋`ValueError` → 值 0、不 raise；
+迴圈層：leader 無倉位無掛單、帳戶總值讀取丟 `ValueError`、follower 有一個殘留倉位與一張殘留掛單 → 該輪**有**平倉與撤單動作、沒有 `leader_equity` 類 critical、`skip_detail` 為 None。
+變異：把 `read_leader_equity` 的無曝險分支拿掉 → 迴圈層那條測試轉紅。Commit：`fix: leader 無曝險時權益讀取失敗不得擋下 follower 收尾（plan 2026-11-22 D3a）`。
 
 **新模組** `src/spark/copytrade/scale_latch.py`（純函式，無 IO）：
 
