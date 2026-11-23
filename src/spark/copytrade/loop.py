@@ -50,6 +50,7 @@ from spark.copytrade.orders import (
     sync_open_orders,
 )
 from spark.copytrade.positions import sync_positions
+from spark.copytrade.scale_latch import apply_latch, leader_fingerprint, settings_key
 from spark.copytrade.sizing import (
     compute_scale_factor,
     compute_volatility_stats,
@@ -408,7 +409,7 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         weight = position_weight(settings, vol)  # vol=None（資料不足）→ 不縮，安全預設
     else:
         weight = position_weight(settings, None)
-    scale = compute_scale_factor(
+    fresh_scale = compute_scale_factor(
         leader_equity=leader_equity,      # 分母：leader_eq.value＝交易所帳戶總值（中性化
                                           # 開啟時為其流量調整值，見 3.5 節）
         my_equity=my_state.account_value,  # 分子：follower 的 perp accountValue。與分母
@@ -417,6 +418,15 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         settings=settings,
         weight=weight,
     )
+    # 倍率鎖定（plan 2026-11-22 T2b／D7）：leader 沒有動作的期間沿用上一次的倍率，
+    # 分母／分子的行情漂移不得讓 follower 調倉或重掛單。此後所有用到倍率的地方
+    # （sync_open_orders、sync_positions、CycleReport.scale）一律用鎖定後的 `scale`，
+    # 不得再碰 `fresh_scale`。unavailable 提前返回發生在這段之前，不會動到鎖定值。
+    scale, state.scale_latch = apply_latch(
+        fresh_scale, state.scale_latch, leader=leader.lower(),
+        fingerprint=leader_fingerprint(leader_positions, leader_orders),
+        key=settings_key(settings),
+        follower_has_exposure=bool(my_positions) or bool(my_orders))
 
     # ── 5. protected（M1：holding protection 預設關 → 空集合）──────────
     protected: frozenset[str] = frozenset()

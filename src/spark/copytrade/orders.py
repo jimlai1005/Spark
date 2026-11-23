@@ -36,6 +36,7 @@ from decimal import Decimal
 from typing import Callable, Mapping
 
 from spark.copytrade.instrument import _is_spot_coin, _round_size
+from spark.copytrade.scale_latch import ScaleLatch
 from spark.exchange.base import OpenOrder, Position
 
 
@@ -447,6 +448,9 @@ class ReconcileState:
     # coin -> 上次「嘗試」發該告警的 epoch（不論成敗）。每幣最短嘗試間隔用，
     # 見 `_warn_unmirrored_triggers` 規則 2。
     trigger_warn_attempt_at: dict[str, float] = field(default_factory=dict)
+    # 倍率鎖定（plan 2026-11-22 T2b／D7）：leader 沒有動作時沿用的倍率。只存記憶體、
+    # 不落檔——引擎重啟後第一輪必重算。純函式規則見 `scale_latch.apply_latch`。
+    scale_latch: ScaleLatch | None = None
 
 
 @dataclass(frozen=True)

@@ -634,6 +634,177 @@ def test_D3a_no_exposure_total_unreadable_still_lets_follower_clean_up(
     assert report.tripped is False
 
 
+# ── 3a'. 倍率鎖定（plan 2026-11-22 T2b／D7）──────────────────────────
+# 連跑多輪、共用同一個 ReconcileState／executor／adapter；每輪之間直接改 adapter 的
+# 內部槽來模擬行情與帳戶漂移。錨例：leader −0.02 BTC、total 700、follower 4704.22、
+# 使用率 0.5 → scale＝2352.11÷700＝3.36016、目標 −0.0672 BTC。
+_LATCH_TARGET = "-0.06720"
+
+
+class _LatchWorld:
+    def __init__(self, tmp_path, monkeypatch, *, total="700", leader_szi="-0.02",
+                 my_av="4704.22", util="0.5", my_szi=None, leader_orders=()):
+        monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+        self.tmp_path = tmp_path
+        self.fa = _SplitOrdersAdapter(
+            leader_positions=[_btc_pos(leader_szi)],
+            my_positions=[_btc_pos(my_szi)] if my_szi else [],
+            orders_by_addr={LEADER: list(leader_orders)},
+            account_value=my_av,
+            account_states={LEADER: _account("120"), MY_ADDR: _account(my_av)},
+            account_totals={LEADER: AccountTotal(Decimal(total), _NOW_MS)},
+            mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})
+        self.ex = _executor(self.fa)
+        self.state = ReconcileState()
+        self.notifier = RecordingNotifier()
+        self.settings = _settings(capital_utilization=Decimal(util))
+
+    def set_total(self, total, *, age_ms=0):
+        self.fa._account_totals[LEADER.lower()] = AccountTotal(
+            Decimal(total), _NOW_MS - age_ms)
+
+    def set_leader_szi(self, szi):
+        self.fa._pos_by_addr[LEADER.lower()] = [_btc_pos(szi)]
+
+    def set_my_szi(self, szi):
+        self.fa._pos_by_addr[MY_ADDR.lower()] = [_btc_pos(szi)] if szi else []
+
+    def set_my_av(self, av):
+        self.fa._account_states[MY_ADDR.lower()] = _account(av)
+
+    def cycle(self):
+        n = len(self.ex.records)
+        report = run_cycle(self.fa, self.ex, self.settings, self.notifier,
+                           self.state, self.tmp_path)
+        return report, self.ex.records[n:]
+
+
+def _expected_scale(total, *, my_av="4704.22", util="0.5"):
+    return Decimal(my_av) * Decimal(util) / Decimal(total)
+
+
+def test_latch_denominator_drift_alone_changes_nothing(tmp_path, monkeypatch):
+    """T2b #1：第 1 輪建倉；第 2 輪 leader 完全不變、total 700→560（−20%，遠超 8% 容差）、
+    follower 倉位＝第 1 輪目標 → 0 筆動作、scale 與第 1 輪相同。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, recs1 = w.cycle()
+    assert abs(r1.scale - _expected_scale("700")) < Decimal("0.00001")
+    assert [r.kind for r in recs1 if r.kind == "market_open"] == ["market_open"]
+    w.set_my_szi(_LATCH_TARGET)
+
+    _r_ctl, ctl = w.cycle()  # 對照：沒漂移時本來就 0 筆（排除「基線本身就有動作」）
+    assert ctl == []
+
+    w.set_total("560")
+    r2, recs2 = w.cycle()
+    assert recs2 == [], [(r.kind, r.coin) for r in recs2]
+    assert r2.scale == r1.scale
+
+
+def test_latch_leader_action_recomputes_with_new_denominator(tmp_path, monkeypatch):
+    """T2b #2：承上，第 3 輪 leader 倉位變 −0.03、total 560 → scale 以 560 重算，
+    follower 目標依新倍率（−0.03×4.2002＝−0.1260；現有 −0.0672 → 加空約 0.0588）。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, _ = w.cycle()
+    w.set_my_szi(_LATCH_TARGET)
+    w.set_total("560")
+    r2, recs2 = w.cycle()
+    assert recs2 == [] and r2.scale == r1.scale
+
+    w.set_leader_szi("-0.03")
+    r3, recs3 = w.cycle()
+    assert abs(r3.scale - _expected_scale("560")) < Decimal("0.00001")
+    assert r3.scale != r1.scale
+    opens = [r for r in recs3 if r.kind == "market_open" and r.coin == "BTC"]
+    assert len(opens) == 1 and opens[0].payload["is_buy"] is False
+    assert abs(Decimal(opens[0].payload["sz"]) - Decimal("0.0588")) < Decimal("0.0002")
+
+
+def test_latch_follower_settings_change_recomputes(tmp_path, monkeypatch):
+    """T2b #3：leader 不變、使用率 0.5→0.25 → 當輪重算（目標減半 → 有減倉動作）。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, _ = w.cycle()
+    w.set_my_szi(_LATCH_TARGET)
+    w.settings = _settings(capital_utilization=Decimal("0.25"))
+    r2, recs2 = w.cycle()
+    assert abs(r2.scale - _expected_scale("700", util="0.25")) < Decimal("0.00001")
+    assert r2.scale != r1.scale
+    assert recs2, "設定變了必須反映到倉位"
+
+
+def test_latch_follower_without_exposure_recomputes(tmp_path, monkeypatch):
+    """T2b #4：leader 不變、follower 無倉位無掛單 → 當輪用新值（total 700→560）。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, _ = w.cycle()
+    w.set_total("560")  # follower 仍無倉位（dry run 沒有真的成交）
+    r2, recs2 = w.cycle()
+    assert abs(r2.scale - _expected_scale("560")) < Decimal("0.00001")
+    assert r2.scale != r1.scale
+    opens = [r for r in recs2 if r.kind == "market_open"]
+    assert len(opens) == 1
+    assert abs(Decimal(opens[0].payload["sz"]) - Decimal("0.0840")) < Decimal("0.0002")
+
+
+def test_latch_numerator_drift_alone_changes_nothing(tmp_path, monkeypatch):
+    """T2b #5：leader 不變、follower account_value +30% → 0 筆動作、scale 不變。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, _ = w.cycle()
+    w.set_my_szi(_LATCH_TARGET)
+    w.set_my_av("6115.49")  # 4704.22 × 1.3
+    r2, recs2 = w.cycle()
+    assert recs2 == [], [(r.kind, r.coin) for r in recs2]
+    assert r2.scale == r1.scale
+
+
+def test_latch_survives_a_leader_equity_unavailable_cycle(tmp_path, monkeypatch):
+    """T2b #6：第 2 輪 total 過期（leader 有倉位 → unavailable、零動作）；鎖定值保留，
+    第 3 輪恢復、leader 不變、total 已漂移 → 仍用舊倍率、0 筆動作。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, _ = w.cycle()
+    w.set_my_szi(_LATCH_TARGET)
+    latch_before = w.state.scale_latch
+    assert latch_before is not None
+
+    w.set_total("560", age_ms=181_000)
+    r2, recs2 = w.cycle()
+    assert r2.skip_detail and recs2 == []
+    assert w.state.scale_latch is latch_before
+
+    w.set_total("560")
+    r3, recs3 = w.cycle()
+    assert recs3 == [], [(r.kind, r.coin) for r in recs3]
+    assert r3.scale == r1.scale
+
+
+def test_latch_leader_order_change_recomputes(tmp_path, monkeypatch):
+    """leader 只多一張掛單（倉位沒變）也算「有動作」→ 重算。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, _ = w.cycle()
+    w.set_my_szi(_LATCH_TARGET)
+    w.set_total("560")
+    r2, _ = w.cycle()
+    assert r2.scale == r1.scale
+    w.fa._orders_by_addr[LEADER.lower()] = [OpenOrder(
+        oid=5, coin="ETH", is_buy=True, limit_px=Decimal("2000"), sz=Decimal("1"),
+        reduce_only=False, is_trigger=False, trigger_px=None, tpsl=None)]
+    w.fa._mids["ETH"] = Decimal("2000")
+    w.fa._sz_decimals["ETH"] = 4
+    r3, _ = w.cycle()
+    assert abs(r3.scale - _expected_scale("560")) < Decimal("0.00001")
+
+
+def test_latch_not_kept_when_leader_goes_flat(tmp_path, monkeypatch):
+    """leader 清倉清單（指紋為空）→ 不鎖；scale 照新值（無倉位時目標全 0，無事可鎖）。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    w.cycle()
+    assert w.state.scale_latch is not None
+    w.fa._pos_by_addr[LEADER.lower()] = []
+    w.set_my_szi(_LATCH_TARGET)
+    w.set_total("560")
+    w.cycle()
+    assert w.state.scale_latch is None
+
+
 def test_flow_neutralization_raw_is_exchange_total_not_perp_av(tmp_path, monkeypatch):
     """流量中性化的 raw 與倍率分母同源：leader perp av 400、total 2000、入金 +1000 →
     adjusted＝1000 → scale＝2（若 raw 誤用 perp av＝400 會得到 −600 → 退回 raw → scale 5）。"""
