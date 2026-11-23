@@ -362,7 +362,10 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
         now_ms = int(time.time() * 1000)
         decay_ms = int(settings.flow_decay_hours * Decimal(3_600_000))
         try:
-            flows, unknown = adapter.get_ledger_flows(leader, now_ms - decay_ms)
+            # basis="total"（D9）：分母是帳戶總值，spot↔perp 內部劃轉不改變總值，
+            # 不得被當成流量從分母扣除（否則倍率被放大——與原事故同形）。
+            flows, unknown = adapter.get_ledger_flows(
+                leader, now_ms - decay_ms, basis="total")
         except Exception as e:  # noqa: BLE001 —— 取數失敗是降級不是熔斷，本輪退回 raw
             notifier.warn(
                 "leader_flow",
@@ -422,11 +425,18 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     # 分母／分子的行情漂移不得讓 follower 調倉或重掛單。此後所有用到倍率的地方
     # （sync_open_orders、sync_positions、CycleReport.scale）一律用鎖定後的 `scale`，
     # 不得再碰 `fresh_scale`。unavailable 提前返回發生在這段之前，不會動到鎖定值。
+    # D8：槓桿上限生效（有效槓桿＝leader_state.total_ntl_pos ÷ leader_equity，與
+    # sizing.compute_scale_factor 的 eff_lev 同一算式、同一個 `leader_equity` 變數）時，
+    # 鎖定不得凍結縮倉方向——apply_latch 在新倍率較小時重算（只縮不放）。
+    cap_binding = (settings.max_target_leverage > 0 and leader_equity > 0
+                   and leader_state.total_ntl_pos / leader_equity
+                   > settings.max_target_leverage)
     scale, state.scale_latch = apply_latch(
         fresh_scale, state.scale_latch, leader=leader.lower(),
         fingerprint=leader_fingerprint(leader_positions, leader_orders),
         key=settings_key(settings),
-        follower_has_exposure=bool(my_positions) or bool(my_orders))
+        follower_has_exposure=bool(my_positions) or bool(my_orders),
+        cap_binding=cap_binding)
 
     # ── 5. protected（M1：holding protection 預設關 → 空集合）──────────
     protected: frozenset[str] = frozenset()

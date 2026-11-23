@@ -741,3 +741,41 @@ def test_get_active_asset_leverage_missing_type_or_value_raises():
     with pytest.raises(ValueError) as ei:
         ad.get_active_asset_leverage("0xuser", "BTC")
     assert "BTC" in str(ei.value)
+
+
+# --- T4-fix：get_ledger_flows basis（D9）／get_account_total 的 row[0] 型別守衛 ---
+
+_ACT = {"time": 1000, "delta": {"type": "accountClassTransfer", "usdc": "2000",
+                                "toPerp": True}}
+_DEP = {"time": 2000, "delta": {"type": "deposit", "usdc": "50"}}
+
+
+def test_get_ledger_flows_perp_basis_default_counts_account_class_transfer():
+    flows, unknown = _adapter(ledger_updates=[_ACT, _DEP]).get_ledger_flows("0xuser", 0)
+    assert [f.usdc for f in flows] == [Decimal("2000"), Decimal("50")]
+    assert unknown == []
+
+
+def test_get_ledger_flows_total_basis_drops_account_class_transfer_everywhere():
+    """total 基準：劃轉不進流量清單（值為 0 的不放）、也不進未知型別；其餘照舊。"""
+    flows, unknown = _adapter(ledger_updates=[_ACT, _DEP]).get_ledger_flows(
+        "0xuser", 0, basis="total")
+    assert [f.usdc for f in flows] == [Decimal("50")]
+    assert unknown == []
+
+
+def test_get_ledger_flows_illegal_basis_raises_before_any_network_call():
+    ad = _adapter(ledger_updates=[_ACT])
+    with pytest.raises(ValueError):
+        ad.get_ledger_flows("0xuser", 0, basis="spot")
+
+
+def test_get_account_total_skips_rows_whose_period_is_not_a_string():
+    """row[0] 是不可 hash 的型別（list）→ 略過該列，不得丟 TypeError。"""
+    resp = [
+        [["day"], {"accountValueHistory": [[9999, "1"]]}],
+        [{"k": 1}, {"accountValueHistory": [[9999, "2"]]}],
+        ["week", {"accountValueHistory": [[1000, "708.29"]]}],
+    ]
+    tot = _adapter(portfolio_resp=resp).get_account_total("0xuser")
+    assert tot.value == Decimal("708.29") and tot.as_of_ms == 1000

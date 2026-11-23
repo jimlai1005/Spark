@@ -235,7 +235,8 @@ class HyperliquidAdapter(ExchangeAdapter):
         peak = Decimal("0")
         latest_ts = Decimal("-1")
         for row in rows:
-            if not (isinstance(row, list) and len(row) == 2 and row[0] in total_periods):
+            if not (isinstance(row, list) and len(row) == 2
+                    and isinstance(row[0], str) and row[0] in total_periods):
                 continue
             period, payload = row
             for ts, val in payload.get("accountValueHistory", []):
@@ -267,7 +268,10 @@ class HyperliquidAdapter(ExchangeAdapter):
         best_ts: int | None = None
         best_val: Decimal | None = None
         for row in rows:
-            if not (isinstance(row, list) and len(row) == 2 and row[0] in total_periods):
+            # row[0] 必須是 str 才能做集合比對：不可 hash 的型別（list／dict）直接略過，
+            # 否則 `in set` 會丟 TypeError，而呼叫端只接 ValueError。
+            if not (isinstance(row, list) and len(row) == 2
+                    and isinstance(row[0], str) and row[0] in total_periods):
                 continue
             payload = row[1]
             history = payload.get("accountValueHistory") if isinstance(payload, dict) else None
@@ -391,14 +395,19 @@ class HyperliquidAdapter(ExchangeAdapter):
             raise ValueError(f"get_size_decimals: 未知幣種 {coin!r}（不在 meta() universe 內）")
         return self._sz_decimals_cache[coin]
 
-    def get_ledger_flows(self, address: str, start_ms: int) -> tuple[list[LedgerFlow], list[str]]:
+    def get_ledger_flows(self, address: str, start_ms: int, *,
+                         basis: str = "perp") -> tuple[list[LedgerFlow], list[str]]:
         """申贖流量：起始時間（毫秒）起的進出帳記錄。
 
         回傳 (LedgerFlow 清單, 白名單外 delta type 清單【去重、升冪排序】)。
+        `basis`（D9）：`"perp"`（預設，行為不變）／`"total"`（accountClassTransfer 中性，
+        值為 0 的流量不放進清單）；非法值 → ValueError（先於任何網路呼叫）。
 
         流量型別映射的唯一定義點是 ledger_flows 模組；改動時需同時驗證
         vault_preflight 與 follower_flow 的測試。
         """
+        if basis not in ("perp", "total"):
+            raise ValueError(f"未知的流量基準 basis={basis!r}")
         raw = self._info.post("/info", {"type": "userNonFundingLedgerUpdates",
                                         "user": address, "startTime": start_ms})
         flows = []
@@ -412,14 +421,14 @@ class HyperliquidAdapter(ExchangeAdapter):
 
             # 檢查異常（白名單外、或白名單內但缺欄位）——address 只有
             # internalTransfer 分支會用到（方向判定，見 ledger_flows 註解）。
-            anomaly = flow_anomaly(delta, address=address)
+            anomaly = flow_anomaly(delta, address=address, basis=basis)
             if anomaly is not None:
                 unknown_types.add(anomaly)
                 continue
 
             # 白名單內且欄位齊全 → 取有號流量
-            usdc = signed_flow(delta, address=address)
-            if usdc is not None:
+            usdc = signed_flow(delta, address=address, basis=basis)
+            if usdc is not None and not (basis == "total" and usdc == 0):
                 flows.append(LedgerFlow(time_ms=time_ms, usdc=usdc))
 
         return flows, sorted(unknown_types)

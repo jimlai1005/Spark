@@ -195,7 +195,7 @@ class _FlakyAdapter(FakeAdapter):
         self._flaky_flows = flows
         self._fail_next = True
 
-    def get_ledger_flows(self, address, start_ms):
+    def get_ledger_flows(self, address, start_ms, *, basis="perp"):
         self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
         if self._fail_next:
             self._fail_next = False

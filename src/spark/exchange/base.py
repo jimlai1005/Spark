@@ -236,12 +236,18 @@ class ExchangeAdapter(ABC):
         的呼叫端注入使用（Task 12 loop.py）。"""
         ...
     @abstractmethod
-    def get_ledger_flows(self, address: str, start_ms: int) -> tuple[list[LedgerFlow], list[str]]:
+    def get_ledger_flows(self, address: str, start_ms: int, *,
+                         basis: str = "perp") -> tuple[list[LedgerFlow], list[str]]:
         """帳戶的申贖流量（起始時間毫秒起）。
 
         回傳 (流量清單, 白名單外的 delta type 名稱清單——去重、穩定排序)。
         白名單 delta type：vaultDeposit, deposit, withdraw, vaultWithdraw。
         呼叫端負責判定未知型別是否觸發告警。
+
+        `basis`（plan 2026-11-22 D9，定義見 ledger_flows 模組）：`"perp"`（預設）＝相對
+        perp accountValue 的流量；`"total"`＝相對交易所帳戶總值——spot↔perp 內部劃轉
+        （accountClassTransfer）為中性、不列入流量也不列入未知型別，值為 0 的流量不放進清單。
+        非法值 → ValueError。
         """
         ...
     @abstractmethod

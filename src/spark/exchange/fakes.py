@@ -197,8 +197,12 @@ class FakeAdapter(ExchangeAdapter):
         self.calls["get_daily_abs_pnl"].append({"address": address})
         return list(self._daily_abs_pnl)
 
-    def get_ledger_flows(self, address: str, start_ms: int) -> tuple[list[LedgerFlow], list[str]]:
+    def get_ledger_flows(self, address: str, start_ms: int, *,
+                         basis: str = "perp") -> tuple[list[LedgerFlow], list[str]]:
+        # basis 另記一份：既有斷言比對整個 calls["get_ledger_flows"] 的 dict 形狀，不能加鍵。
+        # 回傳值固定（不依 basis 過濾）；依 basis 過濾的語意由 ledger_flows 與 Hyperliquid 測試守。
         self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
+        self.calls["get_ledger_flows_basis"].append(basis)
         return self._ledger_flows
 
     def get_active_asset_leverage(self, address: str, coin: str) -> tuple[int, bool]:

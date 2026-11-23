@@ -290,3 +290,50 @@ class TestInternalTransfer:
              "user": self.SENDER, "destination": self.RECEIVER, "fee": "not-a-number"}
         assert signed_flow(d, address=self.RECEIVER) is None
         assert flow_anomaly(d, address=self.RECEIVER) == "internal-transfer-bad-amount"
+
+
+# ── D9：basis（plan 2026-11-22 T4-fix）─────────────────────────────────
+class TestBasis:
+    ACT = {"type": "accountClassTransfer", "usdc": "2000", "toPerp": True}
+    ACT_OUT = {"type": "accountClassTransfer", "usdc": "500", "toPerp": False}
+
+    def test_default_basis_is_perp_and_counts_account_class_transfer(self):
+        assert signed_flow(self.ACT) == Decimal("2000")
+        assert signed_flow(self.ACT_OUT) == Decimal("-500")
+        assert signed_flow(self.ACT, basis="perp") == Decimal("2000")
+
+    def test_total_basis_treats_account_class_transfer_as_neutral(self):
+        assert signed_flow(self.ACT, basis="total") == Decimal("0")
+        assert signed_flow(self.ACT_OUT, basis="total") == Decimal("0")
+
+    def test_total_basis_does_not_report_account_class_transfer_anomaly(self):
+        broken = {"type": "accountClassTransfer", "usdc": "1"}   # 缺 toPerp
+        assert flow_anomaly(broken) == "accountClassTransfer:missing-direction"
+        assert flow_anomaly(broken, basis="total") is None
+        assert flow_anomaly(self.ACT, basis="total") is None
+
+    @pytest.mark.parametrize("delta", [
+        {"type": "deposit", "usdc": "100"},
+        {"type": "withdraw", "usdc": "30"},
+        {"type": "vaultWithdraw", "netWithdrawnUsd": "20"},
+        {"type": "vaultDeposit", "usdc": "7"},
+    ])
+    def test_other_types_identical_under_both_bases(self, delta):
+        assert signed_flow(delta, basis="total") == signed_flow(delta, basis="perp")
+        assert flow_anomaly(delta, basis="total") == flow_anomaly(delta, basis="perp")
+
+    def test_unknown_type_still_reported_under_total(self):
+        assert flow_anomaly({"type": "send", "usdcValue": "5"}, basis="total") == "send"
+
+    def test_internal_transfer_identical_under_both_bases(self):
+        d = {"type": INTERNAL_TRANSFER, "usdc": "150.0", "user": "0xa",
+             "destination": "0xb", "fee": "1.0"}
+        assert (signed_flow(d, address="0xb", basis="total")
+                == signed_flow(d, address="0xb", basis="perp") == Decimal("149.0"))
+
+    @pytest.mark.parametrize("bad", ["", "TOTAL", "spot", "both"])
+    def test_illegal_basis_raises(self, bad):
+        with pytest.raises(ValueError):
+            signed_flow(self.ACT, basis=bad)
+        with pytest.raises(ValueError):
+            flow_anomaly(self.ACT, basis=bad)

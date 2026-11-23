@@ -897,7 +897,7 @@ def test_flow_fetch_exception_falls_back_to_raw_with_warn(tmp_path, monkeypatch)
     _pin_clock(monkeypatch)
 
     class _BoomAdapter(FakeAdapter):
-        def get_ledger_flows(self, address, start_ms):
+        def get_ledger_flows(self, address, start_ms, *, basis="perp"):
             raise RuntimeError("ledger api down")
 
     fa = _BoomAdapter(equity=_healthy_equity(), account=_account("1000"))
@@ -952,7 +952,7 @@ def test_flow_interpret_failure_falls_back_to_raw_with_warn(tmp_path, monkeypatc
     _pin_clock(monkeypatch)
 
     class _DirtyLedgerAdapter(FakeAdapter):
-        def get_ledger_flows(self, address, start_ms):
+        def get_ledger_flows(self, address, start_ms, *, basis="perp"):
             return [], [None]  # 髒資料：join(unknown) 會 TypeError
 
     fa = _DirtyLedgerAdapter(equity=_healthy_equity(), account=_account("1000"))
@@ -1108,7 +1108,7 @@ class _TwoPhaseLedgerAdapter(FakeAdapter):
         self._reveal_usdc = reveal_usdc
         self._reveal_time_ms = reveal_time_ms
 
-    def get_ledger_flows(self, address, start_ms):
+    def get_ledger_flows(self, address, start_ms, *, basis="perp"):
         from spark.exchange.base import LedgerFlow
         self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
         if len(self.calls["get_ledger_flows"]) == 1:
@@ -1125,7 +1125,7 @@ def _gap_flow_ms() -> int:
 class _RecheckBoomAdapter(FakeAdapter):
     """第一次回空、第二次（二次確認）起拋例外——模擬縫隙後 ledger API 掛掉。"""
 
-    def get_ledger_flows(self, address, start_ms):
+    def get_ledger_flows(self, address, start_ms, *, basis="perp"):
         self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
         if len(self.calls["get_ledger_flows"]) == 1:
             return [], []
@@ -1548,3 +1548,137 @@ def test_cli_without_env_prints_usage_and_exits_2():
     assert proc.returncode == 2
     assert "用法" in proc.stdout or "用法" in proc.stderr
     assert "SPARK_USER_ADDR" in proc.stdout + proc.stderr
+
+
+# ── 3d. T4-fix（plan 2026-11-22 D8／D9＋審核測試缺口）──────────────────
+def _set_leader_ntl(w, ntl):
+    """leader 的名目總值（`total_ntl_pos`，D8 有效槓桿的分子）直接給值。"""
+    w.fa._account_states[LEADER.lower()] = _account("120", ntl)
+
+
+def _cap_world(tmp_path, monkeypatch):
+    """D8 錨例（審核實跑）：follower 權益 10,000、使用率 0.5、`max_target_leverage=10`；
+    leader 空 1 BTC、mark 100,000（名目 100,000）、帳戶總值 8,000 → 有效槓桿 12.5、上限生效。
+    第 1 輪倍率＝5,000÷8,000×(10÷12.5)＝0.5。"""
+    w = _LatchWorld(tmp_path, monkeypatch, total="8000", leader_szi="-1",
+                    my_av="10000", util="0.5")
+    w.settings = _settings(capital_utilization=Decimal("0.5"),
+                           max_target_leverage=Decimal("10"))
+    _set_leader_ntl(w, "100000")
+    return w
+
+
+def test_D8_cap_binding_shrink_is_not_frozen_by_latch_and_never_grows_back(
+        tmp_path, monkeypatch):
+    """D8：leader 抱單不動（倉位掛單不變）期間，權益崩跌使有效槓桿衝破上限 → follower 仍被縮
+    （當輪重算並重新鎖定）；之後權益回升、上限解除，倍率不自動加回（等 leader 動作）。"""
+    w = _cap_world(tmp_path, monkeypatch)
+    r1, recs1 = w.cycle()
+    assert abs(r1.scale - Decimal("0.5")) < Decimal("0.00001")
+    assert [r.kind for r in recs1 if r.kind == "market_open"] == ["market_open"]
+    w.set_my_szi("-0.50000")
+
+    # 第 2 輪：mark 105,000、leader 帳戶總值 3,000（有效槓桿 35）、follower 權益 7,500
+    w.fa._mids["BTC"] = Decimal("105000")
+    _set_leader_ntl(w, "105000")
+    w.set_total("3000")
+    w.set_my_av("7500")
+    r2, recs2 = w.cycle()
+    expected2 = Decimal("3750") / Decimal("3000") * (Decimal("10") / Decimal("35"))
+    assert abs(r2.scale - expected2) < Decimal("0.0005")       # ≈ 0.3571，不是 0.5
+    assert abs(r2.scale - Decimal("0.3571")) < Decimal("0.0005")
+    reductions = [r for r in recs2 if r.coin == "BTC"]
+    assert reductions, "縮倉方向不得被鎖定凍結：必須有一筆 BTC 減倉"
+    assert w.state.scale_latch.scale == r2.scale                # 已重新鎖定
+    w.set_my_szi("-0.35714")
+
+    # 第 3 輪：帳戶總值回到 8,000、mark 100,000、其餘不變 → 倍率仍是第 2 輪的值、0 筆動作
+    w.fa._mids["BTC"] = Decimal("100000")
+    _set_leader_ntl(w, "100000")
+    w.set_total("8000")
+    r3, recs3 = w.cycle()
+    assert r3.scale == r2.scale                                  # 不加回（fresh 是 0.375）
+    assert recs3 == [], [(r.kind, r.coin) for r in recs3]
+
+
+class _BasisAwareLedgerAdapter(FakeAdapter):
+    """依 `basis` 解讀原始 ledger delta（與 HyperliquidAdapter.get_ledger_flows 同一組
+    ledger_flows 判定函式），讓迴圈層測試能分辨呼叫端傳了哪個 basis。"""
+
+    def __init__(self, *, deltas, **kw):
+        super().__init__(**kw)
+        self._deltas = deltas
+
+    def get_ledger_flows(self, address, start_ms, *, basis="perp"):
+        from spark.exchange.base import LedgerFlow
+        from spark.exchange.ledger_flows import flow_anomaly, signed_flow
+        self.calls["get_ledger_flows"].append({"address": address, "start_ms": start_ms})
+        self.calls["get_ledger_flows_basis"].append(basis)
+        flows, unknown = [], set()
+        for time_ms, delta in self._deltas:
+            anomaly = flow_anomaly(delta, address=address, basis=basis)
+            if anomaly is not None:
+                unknown.add(anomaly)
+                continue
+            v = signed_flow(delta, address=address, basis=basis)
+            if v is not None and not (basis == "total" and v == 0):
+                flows.append(LedgerFlow(time_ms=time_ms, usdc=v))
+        return flows, sorted(unknown)
+
+
+def test_D9_leader_neutralization_ignores_account_class_transfer(tmp_path, monkeypatch):
+    """D9：分母是帳戶總值，spot→perp 內部劃轉（accountClassTransfer toPerp 2,000）不改變
+    總值，不得被當流量從分母扣除。帳戶總值 10,000、follower 4,000、使用率 0.5 →
+    scale＝2,000÷10,000＝0.2（若劃轉被扣：分母 8,000 → 0.25）。"""
+    _pin_clock(monkeypatch)
+    fa = _BasisAwareLedgerAdapter(
+        deltas=[(_FLOW_NOW_MS, {"type": "accountClassTransfer", "usdc": "2000",
+                                "toPerp": True})],
+        account_value="4000",
+        account_states={LEADER: _account("500"), MY_ADDR: _account("4000")},
+        account_totals={LEADER: AccountTotal(Decimal("10000"), _FLOW_NOW_MS)})
+    seen = {}
+    real_adj = loop_mod.adjusted_leader_equity
+
+    def spy(raw, flows, now_ms, decay_ms):
+        seen["flows"] = list(flows)
+        return real_adj(raw, flows, now_ms, decay_ms)
+
+    monkeypatch.setattr(loop_mod, "adjusted_leader_equity", spy)
+    report, notifier, _ex = _run(
+        fa, settings=_settings(capital_utilization=Decimal("0.5"),
+                               leader_flow_neutralization_enabled=True),
+        tmp_path=tmp_path)
+    assert fa.calls["get_ledger_flows_basis"] == ["total"]
+    assert seen["flows"] == []                       # 劃轉不在流量清單
+    assert report.scale == Decimal("0.2")            # 分母 10,000，不是 8,000
+    assert not any(r[1] == "leader_flow" for r in notifier.records)  # 也不列 unknown
+
+
+def test_W3_leader_with_only_open_order_and_stale_total_is_unavailable_not_cleanup(
+        tmp_path, monkeypatch):
+    """審核 Warning 3：leader **只有掛單、沒有倉位**，帳戶總值過期 → 走 unavailable
+    （零動作＋critical），不是 D3a 的無曝險收尾路徑；follower 既有的掛單與倉位都沒被動。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    leader_order = OpenOrder(oid=1, coin="ETH", is_buy=True, limit_px=Decimal("2000"),
+                             sz=Decimal("1"), reduce_only=False, is_trigger=False,
+                             trigger_px=None, tpsl=None)
+    mirror_order = OpenOrder(oid=77, coin="ETH", is_buy=True, limit_px=Decimal("1900"),
+                             sz=Decimal("2"), reduce_only=False, is_trigger=False,
+                             trigger_px=None, tpsl=None)
+    fa = _SplitOrdersAdapter(
+        orders_by_addr={LEADER: [leader_order], MY_ADDR: [mirror_order]},
+        my_positions=[_btc_pos("0.01")], account_value="4704.22",
+        account_states={LEADER: _account("5000"), MY_ADDR: _account("4704.22")},
+        account_totals={LEADER: AccountTotal(Decimal("707.37"), _NOW_MS - 181_000)},
+        mids={"BTC": Decimal("100000"), "ETH": Decimal("2000")},
+        sz_decimals={"BTC": 5, "ETH": 4})
+    ex = _executor(fa, live=True)
+    notifier = RecordingNotifier()
+    report = run_cycle(fa, ex, _settings(), notifier, ReconcileState(), tmp_path)
+
+    assert ex.records == []
+    assert all(fa.calls[k] == [] for k in _WRITE_CALLS), "follower 的掛單與倉位不得被動"
+    assert _leader_equity_crits(notifier) == ["leader_equity_unavailable"]
+    assert report.skip_detail and "過期" in report.skip_detail
+    assert report.scale == Decimal("0")

@@ -36,6 +36,22 @@ ACCOUNT_CLASS_TRANSFER = "accountClassTransfer"
 # 自轉自回 `Cannot self-transfer.`，`_internal_transfer_direction` 的 "self" 分支是純防禦。
 INTERNAL_TRANSFER = "internalTransfer"
 
+# 流量基準（plan 2026-11-22 D9）：流量是「相對哪一個權益分母」的出入。
+#   "perp"（預設）：分母是 perp accountValue——spot↔perp 內部劃轉（accountClassTransfer）
+#     真的移動了 perp 權益，算流量。follower 出入金校正、vault preflight 用這個。
+#   "total"：分母是交易所帳戶總值（spot＋perp＋質押＋vault）——accountClassTransfer 只是
+#     帳戶內搬家、不改變總值，視為中性（signed_flow 回 0、flow_anomaly 不報）。
+#     leader 權益中性化（copytrade/loop.py 3.5 節）用這個。
+# 兩種基準其餘型別行為完全相同。`send`（現貨轉帳，會改總值）仍不在白名單（只 warn）。
+BASIS_PERP = "perp"
+BASIS_TOTAL = "total"
+_BASES = (BASIS_PERP, BASIS_TOTAL)
+
+
+def _check_basis(basis: str) -> None:
+    if basis not in _BASES:
+        raise ValueError(f"未知的流量基準 basis={basis!r}（只接受 {_BASES}）")
+
 
 def _internal_transfer_direction(delta: dict, address: str | None) -> str | None:
     """純字串比對（不牽涉數字解析）：查詢位址是 destination／user／兩者皆是
@@ -97,7 +113,8 @@ def _internal_transfer_flow(delta: dict, address: str | None) -> Decimal | None:
     return -usdc_amount
 
 
-def signed_flow(delta: dict, *, address: str | None = None) -> Decimal | None:
+def signed_flow(delta: dict, *, address: str | None = None,
+                basis: str = BASIS_PERP) -> Decimal | None:
     """白名單內型別 + 欄位齊全 → 有號 USD 流量（入 perp +、出 perp −）；否則 None。
 
     ⚠️ vaultWithdraw 用 `netWithdrawnUsd` 而**不是** `requestedUsd`：requested 含
@@ -110,13 +127,19 @@ def signed_flow(delta: dict, *, address: str | None = None) -> Decimal | None:
     `address` 只有 internalTransfer 分支會用到（方向判定需要知道呼叫端在問
     哪個帳戶，見 INTERNAL_TRANSFER 註解）；不傳（None）或兩邊都不是 address
     → None（不得猜號；由 flow_anomaly 記 "internal-transfer-direction-unknown"）。
+
+    `basis`（D9，見 BASIS_PERP 註解）：`"total"` 時 accountClassTransfer 一律回 `Decimal("0")`
+    （帳戶內搬家，不改變帳戶總值）；非法值 → ValueError。
     """
+    _check_basis(basis)
     delta_type = delta.get("type")
 
     if delta_type == INTERNAL_TRANSFER:
         return _internal_transfer_flow(delta, address)
 
     if delta_type == ACCOUNT_CLASS_TRANSFER:
+        if basis == BASIS_TOTAL:
+            return Decimal("0")
         amount = delta.get("usdc")
         if amount is None or "toPerp" not in delta:
             return None
@@ -134,7 +157,8 @@ def signed_flow(delta: dict, *, address: str | None = None) -> Decimal | None:
     return sign * Decimal(str(amount))
 
 
-def flow_anomaly(delta: dict, *, address: str | None = None) -> str | None:
+def flow_anomaly(delta: dict, *, address: str | None = None,
+                 basis: str = BASIS_PERP) -> str | None:
     """流量異常分類。
 
     回傳值：
@@ -147,7 +171,11 @@ def flow_anomaly(delta: dict, *, address: str | None = None) -> str | None:
       （user／destination）都不是 address——方向不明，不得猜號。
     - str（"internal-transfer-bad-amount"）：方向已判定，但 usdc／fee 是非
       數字字串——一筆髒紀錄不得讓呼叫端拋例外（檔頭「不得炸掉呼叫端」承諾）。
+
+    `basis="total"`（D9）：accountClassTransfer 是中性流量，不論欄位是否齊全都不報異常
+    （它對帳戶總值的貢獻恆為 0，缺欄位也無從影響結果）；非法 basis → ValueError。
     """
+    _check_basis(basis)
     delta_type = delta.get("type")
 
     # 特例：internalTransfer（方向由 address 對比 user/destination 決定）
@@ -162,6 +190,8 @@ def flow_anomaly(delta: dict, *, address: str | None = None) -> str | None:
 
     # 特例：accountClassTransfer（號不固定，見 ACCOUNT_CLASS_TRANSFER 註解）
     if delta_type == ACCOUNT_CLASS_TRANSFER:
+        if basis == BASIS_TOTAL:
+            return None
         if delta.get("usdc") is None:
             return f"{delta_type}:missing-amount"
         if "toPerp" not in delta:

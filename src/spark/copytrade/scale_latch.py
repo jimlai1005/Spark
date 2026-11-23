@@ -10,6 +10,10 @@ leader 沒動作就不動 follower。
   2. leader 無倉位也無掛單（指紋為空）→ 照用、不鎖（無事可鎖）。
   3. 沒有鎖定值／leader 換了／影響倍率的設定變了／leader 曝險指紋變了（＝leader 有動作）／
      follower 自己沒有任何倉位掛單（沒有東西會被擾動）→ 重算並重新鎖定。
+  3'. （D8）槓桿上限生效（`cap_binding`）且新算倍率**小於**鎖定值 → 也重算並重新鎖定：
+     倍率鎖定不得凍結 `max_target_leverage` 的縮倉方向（leader 抱單期間權益崩跌、有效
+     槓桿衝破上限時，follower 仍要被縮）。只縮不放——新倍率較大時仍沿用鎖定值；上限解除
+     後也不自動加回，等 leader 下一次動作。
   4. 其餘 → 沿用上一次鎖定的倍率。
 
 純函式、無 IO、無時間、無全域狀態；鎖定值只存記憶體（`ReconcileState.scale_latch`），
@@ -61,8 +65,12 @@ def settings_key(settings: CopySettings) -> tuple:
 
 def apply_latch(fresh_scale: Decimal, prev: ScaleLatch | None, *, leader: str,
                 fingerprint: tuple, key: tuple,
-                follower_has_exposure: bool) -> tuple[Decimal, ScaleLatch | None]:
-    """回傳 (本輪要用的倍率, 新的鎖定狀態)。規則見模組 docstring。"""
+                follower_has_exposure: bool,
+                cap_binding: bool = False) -> tuple[Decimal, ScaleLatch | None]:
+    """回傳 (本輪要用的倍率, 新的鎖定狀態)。規則見模組 docstring。
+
+    `cap_binding`：呼叫端判定「本輪 leader 有效槓桿已超過 `max_target_leverage`」
+    （D8）；預設 False＝不影響既有規則。"""
     if fresh_scale <= _ZERO:
         return fresh_scale, None
     if fingerprint == ((), ()):
@@ -71,6 +79,7 @@ def apply_latch(fresh_scale: Decimal, prev: ScaleLatch | None, *, leader: str,
             or prev.leader != leader
             or prev.settings_key != key
             or prev.fingerprint != fingerprint
-            or not follower_has_exposure):
+            or not follower_has_exposure
+            or (cap_binding and fresh_scale < prev.scale)):
         return fresh_scale, ScaleLatch(fresh_scale, leader, fingerprint, key)
     return prev.scale, prev

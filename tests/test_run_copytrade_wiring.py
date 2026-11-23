@@ -937,3 +937,24 @@ def test_risk_prefs_snapshot_reports_floored_cooldown():
     assert snap["cooldown_hours"] == "2"
     snap = _risk_prefs_snapshot(CopySettings(risk_cooldown_hours=Decimal("12")))
     assert snap["cooldown_hours"] == "12"
+
+
+def test_heartbeat_detail_carries_the_cycle_reports_skip_detail(monkeypatch, tmp_path):
+    """T4-fix（審核 Suggestion）：run_cycle 回報帶 `skip_detail="X"`（例如 leader 權益無法
+    判定的那一輪）→ 發布的心跳 `last_cycle.detail == "X"`；面板才看得到原因。"""
+    from types import SimpleNamespace
+
+    _wire_signed(monkeypatch, tmp_path,
+                 allowlist=[{"address": _LEADER, "name": "Alpha"}])
+    _stub_network(monkeypatch)
+
+    def _fake_run_cycle(adapter, ex, settings, notifier, state, root):
+        return SimpleNamespace(tripped=False, skip_detail="X")
+
+    monkeypatch.setattr(rc, "run_cycle", _fake_run_cycle)
+
+    rc.main(["--once"])
+
+    hb, _ = _read_hb(tmp_path)
+    assert hb is not None
+    assert hb["last_cycle"]["detail"] == "X"

@@ -138,3 +138,38 @@ def test_apply_latch_is_pure_does_not_mutate_inputs():
     prev = _latch("3.36")
     _apply("4.2", prev)
     assert prev == _latch("3.36")
+
+
+# ── D8：槓桿上限生效時，縮倉方向不受鎖定（plan 2026-11-22 T4-fix）──────────
+def _apply_cap(fresh, prev, *, cap_binding):
+    return apply_latch(D(fresh), prev, leader=LEADER, fingerprint=_fp(), key=KEY,
+                       follower_has_exposure=True, cap_binding=cap_binding)
+
+
+def test_D8_cap_binding_and_smaller_fresh_recomputes_and_relocks():
+    scale, new = _apply_cap("2.0", _latch("3.36"), cap_binding=True)
+    assert scale == D("2.0")
+    assert new == _latch("2.0")
+
+
+def test_D8_cap_binding_but_larger_fresh_keeps_previous():
+    prev = _latch("3.36")
+    scale, new = _apply_cap("4.2", prev, cap_binding=True)
+    assert scale == D("3.36") and new is prev      # 只縮不放
+
+
+def test_D8_cap_binding_equal_fresh_keeps_previous():
+    prev = _latch("3.36")
+    scale, new = _apply_cap("3.36", prev, cap_binding=True)
+    assert scale == D("3.36") and new is prev
+
+
+def test_D8_not_cap_binding_smaller_fresh_still_keeps_previous():
+    prev = _latch("3.36")
+    scale, new = _apply_cap("2.0", prev, cap_binding=False)
+    assert scale == D("3.36") and new is prev
+
+
+def test_D8_cap_binding_defaults_to_false():
+    prev = _latch("3.36")
+    assert _apply("2.0", prev) == (D("3.36"), prev)
