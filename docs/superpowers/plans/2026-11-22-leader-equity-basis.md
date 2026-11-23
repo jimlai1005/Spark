@@ -1,7 +1,7 @@
 # leader 權益基準修正 Implementation Plan
 
 > **For agentic workers:** 逐 task 由主線程派工（`builder`／`reviewer`），只讀本檔；plan 沒涵蓋的決策先回報主線程。
-> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。 **T1 完成（`0c07006`，主線程已驗收）。** 同日使用者追加要求（D7）：leader 現貨有 BTC，分母會每分鐘變動，follower 不得因此每分鐘調整大小或開關單；解不了就可能退回修改前。→ 新增 T2b 倍率鎖定。使用者另要求接著做統一帳戶 follower（`fd149b…`），另開 plan。 **T2 完成（`5bc7d82`，主線程重現變異 (a)(c) 並重跑相關測試）；使用者已確認 D7。** T2 驗收時發現 D3 的缺口（見 D3a），併入 T2b 派工。 **D3a（`89b1d67`）與 T2b（`91553f0`）完成，全套 3864 passed；主線程重現兩條鎖定變異。** 進行中：T3 探針、T4 審核（範圍 `4d3d476..91553f0`）。 **T3 探針全數 PASS（recon §9）。T4 第一輪審核：0 Critical、3 Warning、1 Suggestion → 裁決 D8／D9，派 T4-fix，修完由 fresh reviewer 複審。** **T4-fix 完成（`bcbf532`、`2c0c9d9`、`db42109`；全套 3911 passed）。使用者確認波動權重照鎖定版本（leader 動作時即時重算，不做每日一次）。新增 D10（指紋與曝險只看會被鏡射的永續）→ T4-fix2，之後 fresh reviewer 複審 `91553f0..HEAD`。** **T4-fix2 完成（`b2c413a`，全套 3918 passed）。第二輪審核（`91553f0..b2c413a`）：0 Critical、1 Warning（D8 在中性化開啟下沒有測試——程式正確、變異存活）、1 Suggestion（非預設 dex 掛單算可鏡射沒有測試）；第一輪四項皆確認已修。→ T4-fix3 只補測試，再複審。**
+> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。 **T1 完成（`0c07006`，主線程已驗收）。** 同日使用者追加要求（D7）：leader 現貨有 BTC，分母會每分鐘變動，follower 不得因此每分鐘調整大小或開關單；解不了就可能退回修改前。→ 新增 T2b 倍率鎖定。使用者另要求接著做統一帳戶 follower（`fd149b…`），另開 plan。 **T2 完成（`5bc7d82`，主線程重現變異 (a)(c) 並重跑相關測試）；使用者已確認 D7。** T2 驗收時發現 D3 的缺口（見 D3a），併入 T2b 派工。 **D3a（`89b1d67`）與 T2b（`91553f0`）完成，全套 3864 passed；主線程重現兩條鎖定變異。** 進行中：T3 探針、T4 審核（範圍 `4d3d476..91553f0`）。 **T3 探針全數 PASS（recon §9）。T4 第一輪審核：0 Critical、3 Warning、1 Suggestion → 裁決 D8／D9，派 T4-fix，修完由 fresh reviewer 複審。** **T4-fix 完成（`bcbf532`、`2c0c9d9`、`db42109`；全套 3911 passed）。使用者確認波動權重照鎖定版本（leader 動作時即時重算，不做每日一次）。新增 D10（指紋與曝險只看會被鏡射的永續）→ T4-fix2，之後 fresh reviewer 複審 `91553f0..HEAD`。** **T4-fix2 完成（`b2c413a`，全套 3918 passed）。第二輪審核（`91553f0..b2c413a`）：0 Critical、1 Warning（D8 在中性化開啟下沒有測試——程式正確、變異存活）、1 Suggestion（非預設 dex 掛單算可鏡射沒有測試）；第一輪四項皆確認已修。→ T4-fix3 只補測試，再複審。** **T4-fix3 完成（`b1cd3ee`，全套 3920 passed）。第三輪審核：0 Critical；`src/` 正確、可部署；1 Warning＋1 Suggestion 皆為測試缺口（`cap_binding` 的 `max_target_leverage > 0` 與 `leader_equity > 0` 兩個守衛拿掉後測試不轉紅）→ T4-fix4 只補測試；其驗收是機械性的（兩條變異必須轉紅），由主線程親自重現後結案，不再開第四輪審查。**
 
 **Goal:** 跟單倍率的分母（leader 權益）改用交易所自己顯示的帳戶總值，讓統一帳戶／portfolio margin 的 leader 不再造成倍率放大與開倉暴衝。
 
@@ -305,6 +305,17 @@ def apply_latch(fresh_scale: Decimal, prev: ScaleLatch | None, *, leader: str,
 2. **非預設 dex 掛單算可鏡射**（`tests/test_scale_latch.py`）：`leader_has_mirrorable_exposure({}, [一張 coin="xyz:NVDA" 的掛單])` 為 True；該掛單會進指紋（多這張單 → 指紋改變）。對照：`xyz:NVDA` 的**倉位**不算曝險、不進指紋（既有測試已涵蓋，新增測試放在它旁邊並在註解寫明不對稱的來源是 `positions.py` 與 `orders.py` 的略過條件不同）。
    變異：`_order_mirrored` 加上 `_coin_dex` 過濾 → 新測試轉紅。
 驗收：兩條變異各列出轉紅的測試名並還原；`uv run pytest -q tests/test_copy_loop.py tests/test_scale_latch.py` 全綠；`uv run pytest -q` 全綠；ruff 0 錯；`git diff --stat HEAD~1` 只有這兩個測試檔。Commit：`test: D8 在流量中性化開啟下的上限判定、非預設 dex 掛單算可鏡射（plan 2026-11-22 T4-fix3）`。
+
+### T4-fix4 `@inline` — 第三輪審核的測試缺口（只加測試，不改 `src/`）
+
+背景：`tests/test_copy_loop.py` 的 `_LatchWorld` 讓 leader 持有 −0.02 BTC，卻把 leader 的 `total_ntl_pos` 設為 0（實盤不可能），而且鎖定測試只測了分母變小的方向；所以 `loop.py` 中 `cap_binding` 的兩個守衛沒有被測到。
+
+1. **讓 `_LatchWorld` 貼近實盤**：leader 的 `AccountSnapshot.total_ntl_pos` 預設改為與其倉位一致的非零名目（例如 −0.02 BTC × 該檔使用的 mark；若既有測試以明確參數覆寫則尊重覆寫）。此改動不得改任何既有斷言；若有既有測試因此轉紅，停下回報（那代表它依賴了不可能的狀態）。
+2. **守 `settings.max_target_leverage > 0`**（變異 M3）：`max_target_leverage=0`（預設）、leader 倉位掛單不變、名目 > 0。第 1 輪帳戶總值 700 建倉並鎖定；第 2 輪帳戶總值 840（＋20%，新算倍率變**小**）、follower 倉位＝第 1 輪目標 → `report.scale` 等於第 1 輪、0 筆 place／modify／cancel／調倉。再加一輪 follower 權益 −20%（新算倍率變小的另一個來源）→ 同樣不動。
+   變異：`loop.py` 的 `cap_binding` 拿掉 `settings.max_target_leverage > 0 and` → 本測試轉紅。
+3. **守 `leader_equity > 0`**（變異 M5）：`max_target_leverage=20`、leader 在可鏡射產品上無倉位無掛單、帳戶總值讀取丟 `ValueError`（D3a 路徑，權益為 0），follower 有一個殘留倉位 → 該輪不拋例外、殘留倉位被平掉。再一條：leader 無曝險、帳戶總值為 0。
+   變異：`loop.py` 的 `cap_binding` 拿掉 `leader_equity > 0 and` → 本測試以 `decimal.InvalidOperation` 轉紅。
+驗收：兩條變異各列出轉紅的測試名並還原；`uv run pytest -q` 全綠；ruff 0 錯；`git diff --stat HEAD~1` 只有 `tests/test_copy_loop.py`。Commit：`test: cap_binding 的上限啟用與正權益守衛（plan 2026-11-22 T4-fix4）`。
 
 ### T5 — 部署（主線程）
 
