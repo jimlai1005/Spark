@@ -111,6 +111,23 @@ def test_D10_has_mirrorable_exposure_matches_engine_skip_rules():
     assert leader_has_mirrorable_exposure({"BTC": _pos("BTC")}, []) is True
 
 
+def test_D10_non_default_dex_order_is_mirrorable_but_position_is_not():
+    """不對稱的來源：`orders._build_desired` 只略過現貨（不略過非預設 dex 的掛單），
+    `positions.sync_positions` 則現貨與非預設 dex 都略過。故 `xyz:NVDA` 的**掛單**算可鏡射
+    （算曝險、進指紋），**倉位**則不算（見上方既有測試）。"""
+    dex_order = _order(9, coin="xyz:NVDA")
+    assert leader_has_mirrorable_exposure({}, [dex_order]) is True
+    assert leader_has_mirrorable_exposure({"xyz:NVDA": _pos("xyz:NVDA")}, []) is False
+    # 進指紋：多這張單 → 指紋改變；剩餘量改變 → 指紋再改變
+    base = _fp(orders=[_order(1)])
+    with_dex = _fp(orders=[_order(1), dex_order])
+    assert with_dex != base
+    assert _fp(orders=[_order(1), _order(9, coin="xyz:NVDA", sz="0.4")]) != with_dex
+    # 只有一張非預設 dex 掛單時指紋不是空（對照：只有 dex 倉位時指紋為空）
+    assert leader_fingerprint({}, [dex_order]) != ((), ())
+    assert leader_fingerprint({"xyz:NVDA": _pos("xyz:NVDA", szi="3")}, []) == ((), ())
+
+
 # ── settings_key ──────────────────────────────────────────────────────
 def test_settings_key_reacts_to_utilization_and_other_sizing_fields():
     base = settings_key(CopySettings(capital_utilization=D("0.5")))

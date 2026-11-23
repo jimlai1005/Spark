@@ -1601,6 +1601,49 @@ def test_D8_cap_binding_shrink_is_not_frozen_by_latch_and_never_grows_back(
     assert recs3 == [], [(r.kind, r.coin) for r in recs3]
 
 
+def test_D8_cap_binding_uses_neutralized_denominator_not_raw_total(
+        tmp_path, monkeypatch):
+    """審核 Warning 1（plan T4-fix3）：D8 判斷「上限是否生效」必須用流量中性化**之後**的
+    leader 權益（與 sizing.compute_scale_factor 同一個變數）。實盤唯一會同時開啟槓桿上限
+    與中性化的是 vault 型 leader；其餘 D8 測試中性化關閉，兩個值相等，抓不到誤用未中性化值。
+
+    設定：中性化開、`max_target_leverage=10`、使用率 0.5、波動權重關；leader 空 1 BTC、
+    `total_ntl_pos` 100,000；一筆「剛發生」的入金 4,000（age 0 → 衰減權重恰為 1，時鐘已由
+    `_LatchWorld` 釘住）。
+    第 1 輪：帳戶總值 16,000 → 中性化後 12,000；follower 權益 10,000。有效槓桿
+      100,000÷12,000＝8.33 < 10（上限未生效）→ scale＝5,000÷12,000＝0.41667。
+    第 2 輪（leader 倉位掛單、total_ntl_pos 都不變）：帳戶總值 11,000 → 中性化後 7,000；
+      follower 權益 7,500、倉位＝第 1 輪目標。
+      中性化後有效槓桿 100,000÷7,000＝14.29 > 10（上限生效）→ 新倍率
+      3,750÷7,000×(10÷14.2857)＝0.375 < 0.41667 → 必須重算並重新鎖定、follower 減倉。
+      若誤用未中性化的 11,000：有效槓桿 9.09 < 10 → cap_binding 為 False → 沿用 0.41667、
+      0 筆動作（變異 `cap_binding` 改用 `leader_eq.value` 會在這裡轉紅）。"""
+    from spark.exchange.base import LedgerFlow
+    w = _LatchWorld(tmp_path, monkeypatch, total="16000", leader_szi="-1",
+                    my_av="10000", util="0.5")
+    w.settings = _settings(capital_utilization=Decimal("0.5"),
+                           max_target_leverage=Decimal("10"),
+                           leader_flow_neutralization_enabled=True)
+    assert not w.settings.volatility_weight_enabled
+    _set_leader_ntl(w, "100000")
+    w.fa._ledger_flows = ([LedgerFlow(time_ms=_NOW_MS, usdc=Decimal("4000"))], [])
+
+    r1, recs1 = w.cycle()
+    expected1 = Decimal("5000") / Decimal("12000")                 # 0.416667
+    assert abs(r1.scale - expected1) < Decimal("0.0005")
+    assert [r.kind for r in recs1 if r.kind == "market_open"] == ["market_open"]
+    w.set_my_szi("-0.41667")                                       # 第 1 輪目標
+
+    w.set_total("11000")                                           # 中性化後 7,000
+    w.set_my_av("7500")
+    r2, recs2 = w.cycle()
+    expected2 = Decimal("3750") / Decimal("7000") * (Decimal("10") / (Decimal("100000") / Decimal("7000")))
+    assert abs(expected2 - Decimal("0.375")) < Decimal("0.000001")
+    assert abs(r2.scale - Decimal("0.375")) < Decimal("0.0005"), r2.scale   # 變異下是 0.41667
+    assert [r for r in recs2 if r.coin == "BTC"], "上限生效的縮倉方向必須有一筆 BTC 減倉"
+    assert w.state.scale_latch.scale == r2.scale                  # 已重新鎖定
+
+
 class _BasisAwareLedgerAdapter(FakeAdapter):
     """依 `basis` 解讀原始 ledger delta（與 HyperliquidAdapter.get_ledger_flows 同一組
     ledger_flows 判定函式），讓迴圈層測試能分辨呼叫端傳了哪個 basis。"""
