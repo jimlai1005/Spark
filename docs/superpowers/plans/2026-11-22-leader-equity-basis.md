@@ -1,7 +1,7 @@
 # leader 權益基準修正 Implementation Plan
 
 > **For agentic workers:** 逐 task 由主線程派工（`builder`／`reviewer`），只讀本檔；plan 沒涵蓋的決策先回報主線程。
-> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。 **T1 完成（`0c07006`，主線程已驗收）。** 同日使用者追加要求（D7）：leader 現貨有 BTC，分母會每分鐘變動，follower 不得因此每分鐘調整大小或開關單；解不了就可能退回修改前。→ 新增 T2b 倍率鎖定。使用者另要求接著做統一帳戶 follower（`fd149b…`），另開 plan。 **T2 完成（`5bc7d82`，主線程重現變異 (a)(c) 並重跑相關測試）；使用者已確認 D7。** T2 驗收時發現 D3 的缺口（見 D3a），併入 T2b 派工。 **D3a（`89b1d67`）與 T2b（`91553f0`）完成，全套 3864 passed；主線程重現兩條鎖定變異。** 進行中：T3 探針、T4 審核（範圍 `4d3d476..91553f0`）。 **T3 探針全數 PASS（recon §9）。T4 第一輪審核：0 Critical、3 Warning、1 Suggestion → 裁決 D8／D9，派 T4-fix，修完由 fresh reviewer 複審。**
+> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。 **T1 完成（`0c07006`，主線程已驗收）。** 同日使用者追加要求（D7）：leader 現貨有 BTC，分母會每分鐘變動，follower 不得因此每分鐘調整大小或開關單；解不了就可能退回修改前。→ 新增 T2b 倍率鎖定。使用者另要求接著做統一帳戶 follower（`fd149b…`），另開 plan。 **T2 完成（`5bc7d82`，主線程重現變異 (a)(c) 並重跑相關測試）；使用者已確認 D7。** T2 驗收時發現 D3 的缺口（見 D3a），併入 T2b 派工。 **D3a（`89b1d67`）與 T2b（`91553f0`）完成，全套 3864 passed；主線程重現兩條鎖定變異。** 進行中：T3 探針、T4 審核（範圍 `4d3d476..91553f0`）。 **T3 探針全數 PASS（recon §9）。T4 第一輪審核：0 Critical、3 Warning、1 Suggestion → 裁決 D8／D9，派 T4-fix，修完由 fresh reviewer 複審。** **T4-fix 完成（`bcbf532`、`2c0c9d9`、`db42109`；全套 3911 passed）。使用者確認波動權重照鎖定版本（leader 動作時即時重算，不做每日一次）。新增 D10（指紋與曝險只看會被鏡射的永續）→ T4-fix2，之後 fresh reviewer 複審 `91553f0..HEAD`。**
 
 **Goal:** 跟單倍率的分母（leader 權益）改用交易所自己顯示的帳戶總值，讓統一帳戶／portfolio margin 的 leader 不再造成倍率放大與開倉暴衝。
 
@@ -48,6 +48,8 @@
 | D7 | **倍率鎖定（使用者 2026-11-23 追加要求）**：follower 只在「leader 有動作」時才重算倍率；leader 沒動作的期間沿用上一次的倍率，分母（含 leader 現貨 BTC 的價格波動、leader 浮動損益）與分子（follower 自己的浮動損益）怎麼漂都不調倉、不重掛單。「leader 有動作」＝leader 的倉位或掛單集合與上一輪不同。另外三種情況也重算：(a) follower 的資金設定（使用率／本金／權重／槓桿上限）或 leader 位址變了；(b) follower 自己無倉位也無掛單（沒有東西會被擾動）；(c) 引擎重啟後第一輪（鎖定值只存在記憶體）。算出的倍率 ≤ 0 時不鎖定，照既有行為。**已知後果（要告知使用者）**：follower 自己入金／出金、leader 入金／出金，都要等 leader 下一次動作才反映到倉位大小；重啟（含部署）後第一輪若漂移已超過 8% 會有一次調整。依據：30 天模擬（recon §8）顯示只靠既有 8% 容差，leader 抱單期間仍會有 0–23 次因分母漂移的調倉。 | **使用者 2026-11-23 確認**（看過機制與三項後果後原話：「倍率鎖定可以接受，請繼續」） |
 | D8 | **倍率鎖定不得凍結槓桿上限的「縮倉」方向**（T4 審核 Warning 1；主線程裁決 2026-11-23）：`max_target_leverage > 0` 且本輪 leader 有效槓桿（`leader_state.total_ntl_pos ÷ leader_equity`，與 `sizing.py:104-106` 同一算式、同一個 `leader_equity` 變數）超過上限，且新算倍率**小於**鎖定值 → 當輪重算並重新鎖定（只會縮、不會放；上限解除後不自動加回，等 leader 動作）。目前只有 vault leader 會被強制套 20 倍上限，其餘 follower 的上限是 0（停用）→ 對現有三個 follower 無行為差異。**波動權重維持凍結**：鎖定期間每日波動權重的變化不反映（它正是 2026-10-21 夜間來回調倉的來源），leader 下次動作時才套用——回報使用者（R8）。 | 主線程定；回報使用者 |
 | D9 | **流量中性化的流量基準要跟著分母換**（T4 審核 Warning 2；主線程裁決）：分母現在是帳戶總值，現貨↔永續的內部劃轉（`accountClassTransfer`）不改變帳戶總值，不得再被當成流量從分母扣除。`get_ledger_flows` 增加 `basis` 參數（`"perp"` 預設＝現行行為；`"total"`＝`accountClassTransfer` 視為中性：不計入流量、也不列入 unknown）。leader 中性化（`loop.py` 3.5 節）傳 `"total"`；follower 出入金校正維持 `"perp"`。`send`（現貨轉帳，會改變帳戶總值）仍不在白名單——維持既有「未知型別只 warn」的方向，不在本 plan 擴充。 | 主線程定 |
+| D10 | **「leader 有動作」與「leader 有曝險」只看會被鏡射的永續倉位與掛單**（主線程裁決 2026-11-23，已告知使用者）：引擎讀 leader 掛單時現貨單也一起讀到（`frontendOpenOrders` 不分現貨永續）。leader `0xfb9c…` 持有現貨 BTC，掛／撤現貨單不該觸發倍率重算，也不該讓「leader 只有一張現貨掛單」被當成有曝險。規則：`leader_fingerprint` 與 `leader_has_exposure` 都先以引擎既有的「不鏡射」述詞過濾（`src/spark/copytrade/instrument.py` 的 `_is_spot_coin`、`_coin_dex`——與 `_build_desired`／`sync_positions` 用同一組，不得另寫一份）。 | 主線程定 |
+| D7a | **波動權重在鎖定下的行為**（使用者 2026-11-23 確認；曾討論改為「每日依昨日波動定一次」，使用者不採用——原話：「反應慢一天不是我要的…leader 沒動作就完全不調整 比較即時」「如果負擔不大，那我贊成你的建議…我們照這樣改」）：leader 每次動作時以當下的波動權重（今日至今 \|PnL\| 相對 14 日基準）重算整個倍率；leader 不動的期間權重變化不反映。負擔評估見 recon §10。 | **使用者確認** |
 
 > 下文以 D1＝A、D2＝X 撰寫（即定案）。
 
@@ -284,6 +286,14 @@ def apply_latch(fresh_scale: Decimal, prev: ScaleLatch | None, *, leader: str,
 
 **範圍**：`scale_latch.py`、`loop.py`、`leader_equity.py`、`src/spark/exchange/{ledger_flows,base,hyperliquid,fakes}.py`、對應測試檔。`positions.py`、`sizing.py`、`follower_flow.py` 的邏輯不動。既有斷言不准改。
 **驗收**：`uv run pytest -q` 全綠；ruff 0 錯；上列五項的變異逐條列出轉紅的測試名並還原；`git diff --stat` 只含範圍內檔案。
+
+### T4-fix2 `@inline` — 指紋與曝險只看會被鏡射的永續（D10）
+
+`src/spark/copytrade/scale_latch.py` 的 `leader_fingerprint`：倉位與掛單都先濾掉 `_is_spot_coin(coin) or _coin_dex(coin)` 為真者（述詞從 `spark.copytrade.instrument` import，不得複製邏輯）。
+`src/spark/copytrade/loop.py` 的 `leader_has_exposure`：同一個過濾後再判斷是否非空。為避免兩處各寫一次過濾，在 `scale_latch.py`（或 `instrument.py`，擇一，回報說明）提供一個小函式 `mirrorable(coin) -> bool`，兩處共用。
+測試：(1) 純函式——leader 多一張現貨掛單（coin 形如 `@107` 或 `UBTC/USDC`，以 `instrument.py` 認得的寫法為準）、或其剩餘量改變 → 指紋不變；多一張永續掛單 → 指紋改變；非預設 dex 的倉位（coin 形如 `xyz:NVDA`）不進指紋。(2) 迴圈——leader 倉位掛單不變、只多了一張現貨掛單、帳戶總值 −20% → 0 筆動作、`report.scale` 不變。(3) 迴圈——leader **只有**一張現貨掛單、無永續倉位掛單、帳戶總值過期 → 不發 `leader_equity` critical、`skip_detail is None`（走 D3a）。既有 `test_W3_*`（leader 只有一張**永續**掛單）必須仍綠。
+變異：(a) 指紋不過濾 → 測試 (1)(2) 轉紅；(b) `leader_has_exposure` 不過濾 → 測試 (3) 轉紅。
+驗收：`uv run pytest -q` 全綠（≥ 3911）；ruff 0 錯；`git diff --stat` 只含 `scale_latch.py`（或 `instrument.py`）、`loop.py`、兩個測試檔；`positions.py`、`orders.py` 零改動。Commit：`fix: 倍率鎖定的指紋與 leader 曝險只看會被鏡射的永續（plan 2026-11-22 D10）`。
 
 ### T5 — 部署（主線程）
 
