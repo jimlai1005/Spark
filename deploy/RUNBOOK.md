@@ -4320,7 +4320,7 @@ T2 上線後 7 小時三個 follower `NRestarts` 0、journal 零 traceback／err
 `get_account_total`、`get_ledger_flows` 的 `basis`）＋`filet-api` user `import spark.publicapi.app, scripts.vault_preflight` → **在正式機以 `filet-engine` 實跑 `scripts.leader_equity_probe` 對三個白名單 leader：全 PASS、時間戳年齡 0.2–0.3 秒**
 → `reload_follower.sh` 16:50:28–34Z 滾動重啟三個 follower。`filet-api`／`filet-dashboard` 未重啟（磁碟上的共用模組已換新版，預設參數行為不變；下次重啟才載入）。→ `DEPLOYED_VERSION`=`d22517273def9e42c132960bef50fbc6517d9620`。
 驗證（部署後）：三個 follower `active`、`NRestarts` 0；心跳 16:51:02Z 起連續重寫（`no_action`、`detail` 為 null）；重啟後 journal 零輸出；`filet_regression_check --http --ssh` **67/67 PASS**。
-**尚無主網開倉實況**：要等 leader 下次開倉，核對 follower 第一筆數量÷leader 數量 ≈ follower 權益×使用率×波動權重÷leader 帳戶總值（部署時 `f438b3…`：4,686×0.5÷723≈3.24；`f6b3e7…`：261×0.4÷723≈0.144），以及 leader 不動時 follower 0 筆動作。
+**主網開倉實況（17:09–17:15Z，recon §11）**：leader 開空 0.01 BTC（總值 $721）→ `f438b3…` −0.03249（算式 0.03248）、`f6b3e7…` −0.00144（算式 0.00145），21 秒內成交；倉位止盈、止損、條件進場單都在下一輪掛出；leader 停手後三輪 `no_action`、follower 掛單 oid 不變。驗算式：follower 數量÷leader 數量 ≈ follower 權益×使用率×波動權重÷leader 帳戶總值。
 已知行為：每次重啟（含日後任何部署）第一輪會重算倍率，漂移超過 8% 時有一次調整——**有倉位時部署前先評估**。每個 follower 每輪多一次 `portfolio` 查詢（HL 權重 20）。
 回滾＝把 `/tmp/leqbak-20261123/` 的八個檔 `install` 回原路徑（三個新檔可留著，無人 import）再跑 `reload_follower.sh`（回到 `de4a816`＝perp `accountValue` 當分母、無鎖定；`/tmp` 重開機會清，清掉後用 `git show de4a816:<路徑>`）。
 回滾同樣要在無倉位時做。未處理（另案）：統一帳戶的 follower（`fd149b…`：引擎讀到本金 0、不跟單；plan 草稿 `docs/superpowers/plans/2026-11-23-unified-follower-equity.md`）、探索頁以 perp `accountValue` 算的指標。
