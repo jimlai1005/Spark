@@ -643,15 +643,21 @@ _LATCH_TARGET = "-0.06720"
 
 class _LatchWorld:
     def __init__(self, tmp_path, monkeypatch, *, total="700", leader_szi="-0.02",
-                 my_av="4704.22", util="0.5", my_szi=None, leader_orders=()):
+                 my_av="4704.22", util="0.5", my_szi=None, leader_orders=(),
+                 leader_ntl=None):
         monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+        if leader_ntl is None:
+            # 實盤不可能「持倉但名目為 0」：預設與倉位一致（|szi| × mark 100,000）。
+            # T4-fix4：先前恆為 0，使 loop.py 的 cap_binding 兩個守衛沒被測到。
+            leader_ntl = str(abs(Decimal(leader_szi)) * Decimal("100000"))
         self.tmp_path = tmp_path
         self.fa = _SplitOrdersAdapter(
             leader_positions=[_btc_pos(leader_szi)],
             my_positions=[_btc_pos(my_szi)] if my_szi else [],
             orders_by_addr={LEADER: list(leader_orders)},
             account_value=my_av,
-            account_states={LEADER: _account("120"), MY_ADDR: _account(my_av)},
+            account_states={LEADER: _account("120", leader_ntl),
+                            MY_ADDR: _account(my_av)},
             account_totals={LEADER: AccountTotal(Decimal(total), _NOW_MS)},
             mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})
         self.ex = _executor(self.fa)
@@ -1642,6 +1648,88 @@ def test_D8_cap_binding_uses_neutralized_denominator_not_raw_total(
     assert abs(r2.scale - Decimal("0.375")) < Decimal("0.0005"), r2.scale   # 變異下是 0.41667
     assert [r for r in recs2 if r.coin == "BTC"], "上限生效的縮倉方向必須有一筆 BTC 減倉"
     assert w.state.scale_latch.scale == r2.scale                  # 已重新鎖定
+
+
+# ── 3e. T4-fix4（plan 2026-11-22）：cap_binding 的兩個守衛 ─────────────
+def _assert_latched_zero_action_round(w, r1, *, label):
+    """鎖定後的一輪：leader 倉位掛單不變、follower 倉位＝第 1 輪目標 → scale 不變、零動作。"""
+    r, recs = w.cycle()
+    assert r.scale == r1.scale, (label, r.scale, r1.scale)
+    assert recs == [], (label, [(x.kind, x.coin) for x in recs])
+    assert w.state.scale_latch.scale == r1.scale
+
+
+@pytest.mark.parametrize("label", ["leader total +20%", "follower equity -20%"])
+def test_latch_with_cap_disabled_ignores_denominator_up_and_numerator_down(
+        tmp_path, monkeypatch, label):
+    """守 `settings.max_target_leverage > 0`（變異 M3）。實盤三個 follower 的上限都是 0（停用）。
+    leader 倉位掛單不變、名目 > 0（_LatchWorld 預設與倉位一致：0.02 BTC × 100,000＝2,000），
+    第 1 輪（帳戶總值 700）建倉並鎖定。兩個「新算倍率變小」的來源各一輪：
+      (a) leader 帳戶總值 +20%（700→840，分母變大）；
+      (b) follower 權益 −20%（分子變小）。
+    兩者都必須：scale 等於第 1 輪、0 筆 place／modify／cancel／調倉。
+    若 cap_binding 拿掉 `max_target_leverage > 0`：leader_equity>0 且名目÷權益 > 0（上限 0）
+    恆為 True → 新倍率較小就重算 → follower 被減倉、之後不加回——正是鎖定要禁止的。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    assert w.settings.max_target_leverage == Decimal("0")
+    assert w.fa._account_states[LEADER.lower()].total_ntl_pos > 0
+    r1, recs1 = w.cycle()
+    assert abs(r1.scale - _expected_scale("700")) < Decimal("0.00001")
+    assert [r.kind for r in recs1 if r.kind == "market_open"] == ["market_open"]
+    w.set_my_szi(_LATCH_TARGET)
+    _assert_latched_zero_action_round(w, r1, label="control")   # 基線本身零動作
+
+    if label.startswith("leader"):
+        w.set_total("840")
+        fresh = _expected_scale("840")
+    else:
+        w.set_my_av("3763.38")
+        fresh = _expected_scale("700", my_av="3763.38")
+    assert fresh < r1.scale     # 確認情境真的是「新算倍率變小」（否則測試沒有鑑別力）
+    r2, recs2 = w.cycle()
+    assert recs2 == [], (label, r2.scale, [(x.kind, x.coin) for x in recs2])
+    assert r2.scale == r1.scale, (label, r2.scale, r1.scale)
+    assert w.state.scale_latch.scale == r1.scale
+
+
+def test_latch_cap_enabled_but_leader_equity_zero_does_not_divide_by_zero(
+        tmp_path, monkeypatch):
+    """守 `leader_equity > 0`（變異 M5）：`max_target_leverage=20`、leader 在可鏡射產品上無倉位
+    無掛單、帳戶總值讀取丟 ValueError（D3a 路徑，權益 0）、名目 0；follower 有一個殘留倉位
+    → 該輪不拋例外（若拿掉守衛會算 0÷0 → decimal.InvalidOperation）、殘留倉位被平掉。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = _SplitOrdersAdapter(
+        my_positions=[_btc_pos("0.01")], account_value="4704.22",
+        account_states={LEADER: _account("0"), MY_ADDR: _account("4704.22")},
+        mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})   # 沒有 account_totals → ValueError
+    ex = _executor(fa, live=True)
+    notifier = RecordingNotifier()
+    settings = _settings(max_target_leverage=Decimal("20"))
+    report = run_cycle(fa, ex, settings, notifier, ReconcileState(), tmp_path)
+    assert ("close", "BTC") in {(r.kind, r.coin) for r in ex.records}, \
+        [(r.kind, r.coin) for r in ex.records]
+    assert report.skip_detail is None
+    assert _leader_equity_crits(notifier) == []
+
+
+def test_latch_cap_enabled_leader_no_exposure_total_zero_does_not_divide_by_zero(
+        tmp_path, monkeypatch):
+    """同上守衛的第二條路徑：leader 無曝險、帳戶總值讀得到但為 0（權益 0、名目 0）、
+    `max_target_leverage=20`、follower 有殘留倉位 → 不拋例外、殘留倉位被平掉。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = _SplitOrdersAdapter(
+        my_positions=[_btc_pos("0.01")], account_value="4704.22",
+        account_states={LEADER: _account("0"), MY_ADDR: _account("4704.22")},
+        account_totals={LEADER: AccountTotal(Decimal("0"), _NOW_MS)},
+        mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})
+    ex = _executor(fa, live=True)
+    notifier = RecordingNotifier()
+    settings = _settings(max_target_leverage=Decimal("20"))
+    report = run_cycle(fa, ex, settings, notifier, ReconcileState(), tmp_path)
+    assert ("close", "BTC") in {(r.kind, r.coin) for r in ex.records}, \
+        [(r.kind, r.coin) for r in ex.records]
+    assert report.skip_detail is None
+    assert _leader_equity_crits(notifier) == []
 
 
 class _BasisAwareLedgerAdapter(FakeAdapter):
