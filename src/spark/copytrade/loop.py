@@ -50,7 +50,8 @@ from spark.copytrade.orders import (
     sync_open_orders,
 )
 from spark.copytrade.positions import sync_positions
-from spark.copytrade.scale_latch import apply_latch, leader_fingerprint, settings_key
+from spark.copytrade.scale_latch import (
+    apply_latch, leader_fingerprint, leader_has_mirrorable_exposure, settings_key)
 from spark.copytrade.sizing import (
     compute_scale_factor,
     compute_volatility_stats,
@@ -328,7 +329,8 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     # 動作＋critical；**必須在任何 ex 寫入之前**返回，且絕不退回 perp accountValue／0
     # 繼續算（那正是 2026-11-22 事故的來源）。kill switch／成本熔斷（第 1–2.5 節）已在
     # 上面照常執行；網路類例外照既有讀取的方式往外拋給 main_loop 計連續錯誤。
-    leader_has_exposure = bool(leader_positions) or bool(leader_orders)
+    # D10：只算引擎會鏡射的永續倉位與掛單（現貨單、現貨／非預設 dex 倉位不算曝險）。
+    leader_has_exposure = leader_has_mirrorable_exposure(leader_positions, leader_orders)
     try:
         leader_eq = read_leader_equity(
             adapter, leader, now_ms=int(time.time() * 1000),

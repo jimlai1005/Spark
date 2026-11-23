@@ -6,6 +6,7 @@ from spark.copytrade.scale_latch import (
     ScaleLatch,
     apply_latch,
     leader_fingerprint,
+    leader_has_mirrorable_exposure,
     settings_key,
 )
 from spark.exchange.base import OpenOrder, Position
@@ -66,6 +67,48 @@ def test_fingerprint_is_order_independent_and_empty_is_empty_pair():
     assert (leader_fingerprint({"BTC": p1, "ETH": p2}, [o1, o2])
             == leader_fingerprint({"ETH": p2, "BTC": p1}, [o2, o1]))
     assert leader_fingerprint({}, []) == ((), ())
+
+
+# ── D10：指紋只看會被鏡射的永續 ────────────────────────────────────────
+# 對應 `orders._build_desired`（掛單只略過現貨）與 `positions.sync_positions`
+# （倉位略過現貨與非預設 dex）各自的實際條件。
+def test_D10_fingerprint_ignores_added_or_changed_spot_orders():
+    base = _fp(orders=[_order(1)])
+    for spot in ("@107", "UBTC/USDC", "PURR/USDC"):
+        assert _fp(orders=[_order(1), _order(9, coin=spot)]) == base, spot
+        # 現貨單剩餘量／價格改變也不動指紋
+        a = _fp(orders=[_order(1), _order(9, coin=spot, sz="1")])
+        b = _fp(orders=[_order(1), _order(9, coin=spot, sz="0.4", px="2100")])
+        assert a == b, spot
+
+
+def test_D10_fingerprint_changes_when_a_perp_order_is_added():
+    assert _fp(orders=[_order(1)]) != _fp(orders=[_order(1), _order(2, coin="SOL")])
+
+
+def test_D10_fingerprint_ignores_spot_and_non_default_dex_positions():
+    base = _fp([_pos("BTC")])
+    assert _fp([_pos("BTC"), _pos("xyz:NVDA", szi="3")]) == base
+    assert _fp([_pos("BTC"), _pos("@107", szi="3")]) == base
+    assert _fp([_pos("BTC"), _pos("UBTC/USDC", szi="3")]) == base
+    # 對照：多一個預設 dex 的永續倉位會改變指紋
+    assert _fp([_pos("BTC"), _pos("ETH", szi="3")]) != base
+
+
+def test_D10_fingerprint_of_only_spot_and_dex_items_is_empty_pair():
+    fp = leader_fingerprint({"xyz:NVDA": _pos("xyz:NVDA", szi="3")},
+                            [_order(9, coin="@107")])
+    assert fp == ((), ())
+
+
+def test_D10_has_mirrorable_exposure_matches_engine_skip_rules():
+    spot_order = _order(9, coin="UBTC/USDC")
+    assert leader_has_mirrorable_exposure({}, []) is False
+    assert leader_has_mirrorable_exposure({}, [spot_order]) is False
+    assert leader_has_mirrorable_exposure({"@107": _pos("@107")}, []) is False
+    assert leader_has_mirrorable_exposure({"xyz:NVDA": _pos("xyz:NVDA")}, []) is False
+    assert leader_has_mirrorable_exposure({}, [_order(1)]) is True
+    assert leader_has_mirrorable_exposure({"BTC": _pos("BTC")}, []) is True
 
 
 # ── settings_key ──────────────────────────────────────────────────────

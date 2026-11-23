@@ -26,6 +26,7 @@ from decimal import Decimal
 from typing import Mapping, Sequence
 
 from spark.copytrade.config import CopySettings
+from spark.copytrade.instrument import _coin_dex, _is_spot_coin
 from spark.exchange.base import OpenOrder, Position
 
 _ZERO = Decimal("0")
@@ -39,6 +40,27 @@ class ScaleLatch:
     settings_key: tuple         # 影響倍率的 follower 設定
 
 
+def _position_mirrored(coin: str) -> bool:
+    """引擎是否會鏡射這個 leader 倉位——與 `positions.sync_positions`（positions.py:199）
+    同一個略過條件：現貨與非預設 dex 都不鏡射。"""
+    return not (_is_spot_coin(coin) or _coin_dex(coin))
+
+
+def _order_mirrored(coin: str) -> bool:
+    """引擎是否會鏡射這張 leader 掛單——與 `orders._build_desired`（orders.py:323）
+    同一個略過條件：只略過現貨（該處對非預設 dex 的掛單不另外略過，故這裡也不濾）。"""
+    return not _is_spot_coin(coin)
+
+
+def leader_has_mirrorable_exposure(leader_positions: Mapping[str, Position],
+                                   leader_orders: Sequence[OpenOrder]) -> bool:
+    """leader 是否有「會被引擎鏡射」的倉位或掛單（D10）。
+
+    現貨單、現貨倉位、非預設 dex 倉位不算曝險：它們不影響 follower 的任何目標。"""
+    return (any(_position_mirrored(c) for c in leader_positions)
+            or any(_order_mirrored(o.coin) for o in leader_orders))
+
+
 def leader_fingerprint(leader_positions: Mapping[str, Position],
                        leader_orders: Sequence[OpenOrder]) -> tuple:
     """leader 曝險指紋：((coin, szi)…, (oid, coin, is_buy, sz, limit_px, trigger_px,
@@ -46,11 +68,15 @@ def leader_fingerprint(leader_positions: Mapping[str, Position],
 
     只取這些欄位；**不得**含時間戳、未實現損益、保證金、進場價、槓桿等會自己變動
     （或不代表「leader 有動作」）的值。倉位用 `Position.szi`、掛單剩餘量用 `OpenOrder.sz`。
+
+    D10：只含引擎會鏡射的項目（`_position_mirrored`／`_order_mirrored`）；leader 掛／撤
+    現貨單不是「引擎在跟的東西變了」，不得讓鎖定重算。
     """
-    positions = tuple(sorted((p.coin, p.szi) for p in leader_positions.values()))
+    positions = tuple(sorted((p.coin, p.szi) for p in leader_positions.values()
+                             if _position_mirrored(p.coin)))
     orders = tuple(sorted(
         ((o.oid, o.coin, o.is_buy, o.sz, o.limit_px, o.trigger_px, o.reduce_only)
-         for o in leader_orders),
+         for o in leader_orders if _order_mirrored(o.coin)),
         key=repr))
     return (positions, orders)
 

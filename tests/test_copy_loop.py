@@ -1682,3 +1682,49 @@ def test_W3_leader_with_only_open_order_and_stale_total_is_unavailable_not_clean
     assert _leader_equity_crits(notifier) == ["leader_equity_unavailable"]
     assert report.skip_detail and "過期" in report.skip_detail
     assert report.scale == Decimal("0")
+
+
+def _spot_order(oid=9, sz="1", coin="UBTC/USDC"):
+    return OpenOrder(oid=oid, coin=coin, is_buy=True, limit_px=Decimal("90000"),
+                     sz=Decimal(sz), reduce_only=False, is_trigger=False,
+                     trigger_px=None, tpsl=None)
+
+
+def test_D10_latch_ignores_leader_spot_order_added_with_total_drift(tmp_path, monkeypatch):
+    """D10：leader 永續倉位掛單不變，只多了一張現貨掛單、帳戶總值 −20% → 0 筆動作、
+    scale 不變（現貨單不是「leader 有動作」）。"""
+    w = _LatchWorld(tmp_path, monkeypatch)
+    r1, _ = w.cycle()
+    w.set_my_szi(_LATCH_TARGET)
+    w.fa._orders_by_addr[LEADER.lower()] = [_spot_order()]
+    w.set_total("560")
+    r2, recs2 = w.cycle()
+    assert recs2 == [], [(r.kind, r.coin) for r in recs2]
+    assert r2.scale == r1.scale
+    # 現貨單的剩餘量再變、再撤掉，仍然沒有動作
+    w.fa._orders_by_addr[LEADER.lower()] = [_spot_order(sz="0.3")]
+    r3, recs3 = w.cycle()
+    assert recs3 == [] and r3.scale == r1.scale
+    w.fa._orders_by_addr[LEADER.lower()] = []
+    r4, recs4 = w.cycle()
+    assert recs4 == [] and r4.scale == r1.scale
+
+
+def test_D10_leader_with_only_a_spot_order_and_stale_total_takes_D3a_path(
+        tmp_path, monkeypatch):
+    """D10：leader **只有**一張現貨掛單（無永續倉位掛單）、帳戶總值過期 → 不算有曝險：
+    不發 leader_equity critical、skip_detail 為 None，follower 殘留倉位照 D3a 收尾。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = _SplitOrdersAdapter(
+        orders_by_addr={LEADER: [_spot_order()]},
+        my_positions=[_btc_pos("0.01")], account_value="4704.22",
+        account_states={LEADER: _account("0"), MY_ADDR: _account("4704.22")},
+        account_totals={LEADER: AccountTotal(Decimal("707.37"), _NOW_MS - 181_000)},
+        mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})
+    ex = _executor(fa, live=True)
+    notifier = RecordingNotifier()
+    report = run_cycle(fa, ex, _settings(), notifier, ReconcileState(), tmp_path)
+
+    assert report.skip_detail is None
+    assert _leader_equity_crits(notifier) == []
+    assert ("close", "BTC") in {(r.kind, r.coin) for r in ex.records}
