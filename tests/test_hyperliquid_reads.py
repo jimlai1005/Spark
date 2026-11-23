@@ -334,6 +334,79 @@ def test_get_equity_view_no_week_row_peak_falls_back_to_current():
     assert ad._info.portfolio_calls == 1
 
 
+# --- 4b. get_account_total（交易所帳戶總值：portfolio 全視窗最新一點，perp* 視窗不納入） ---
+
+def test_get_account_total_takes_latest_timestamp_across_four_windows():
+    # 四個視窗最後一點時間戳各不同；最大者在 week（ts=3000），值不是任何視窗的最後一點之外的巧合
+    resp = [
+        ["day", {"accountValueHistory": [[1000, "990"], [2000, "1005.5"]]}],
+        ["week", {"accountValueHistory": [[500, "1010"], [3000, "708.29"]]}],
+        ["month", {"accountValueHistory": [[100, "800"], [2500, "700"]]}],
+        ["allTime", {"accountValueHistory": [[10, "500"], [1500, "600"]]}],
+    ]
+    ad = _adapter(portfolio_resp=resp)
+    tot = ad.get_account_total("0xuser")
+    assert tot.value == Decimal("708.29")
+    assert tot.as_of_ms == 3000
+    assert isinstance(tot.value, Decimal)
+    assert ad._info.portfolio_calls == 1
+
+
+def test_get_account_total_ignores_perp_windows_even_with_larger_timestamp():
+    resp = [
+        ["day", {"accountValueHistory": [[1000, "708.29"]]}],
+        ["week", {"accountValueHistory": [[900, "700"]]}],
+        ["perpDay", {"accountValueHistory": [[9000, "0"]]}],
+        ["perpWeek", {"accountValueHistory": [[9500, "120.58"]]}],
+        ["perpMonth", {"accountValueHistory": [[9900, "1"]]}],
+        ["perpAllTime", {"accountValueHistory": [[9999, "2"]]}],
+    ]
+    tot = _adapter(portfolio_resp=resp).get_account_total("0xuser")
+    assert tot.value == Decimal("708.29")
+    assert tot.as_of_ms == 1000
+
+
+def test_get_account_total_only_perp_windows_raises():
+    resp = [["perpDay", {"accountValueHistory": [[9000, "120"]]}]]
+    with pytest.raises(ValueError):
+        _adapter(portfolio_resp=resp).get_account_total("0xuser")
+
+
+@pytest.mark.parametrize("resp", [
+    [],                                                        # 空回應
+    None,                                                      # 非 list（FakeInfo 會把 None 換成 []，下面另測）
+    {"day": {"accountValueHistory": [[1, "5"]]}},              # dict
+    "oops",                                                    # str
+    [["day", {"accountValueHistory": []}], ["week", {"accountValueHistory": []}]],  # 無資料點
+    [["day", {"accountValueHistory": [[1000, "abc"]]}]],       # 值無法轉 Decimal
+    [["day", {"accountValueHistory": [[1000, "NaN"]]}]],       # 非有限數
+    [["day", {"accountValueHistory": [[1000, None]]}]],        # 值為 None
+    [["day", {"accountValueHistory": [["xx", "5"]]}]],         # 時間戳無法解析
+    [["day", {"accountValueHistory": [[1000]]}]],              # 點形狀不對
+    [["day", {"accountValueHistory": "nope"}]],                # history 非 list
+])
+def test_get_account_total_malformed_raises_value_error(resp):
+    ad = _adapter()
+    ad._info._portfolio_resp = resp  # 繞過 FakeInfo 對 None 的預設，直接塞原始回應
+    with pytest.raises(ValueError):
+        ad.get_account_total("0xuser")
+
+
+def test_get_account_total_error_message_does_not_echo_payload():
+    ad = _adapter()
+    ad._info._portfolio_resp = [["day", {"accountValueHistory": [[1000, "SECRET-abc"]]}]]
+    with pytest.raises(ValueError) as ei:
+        ad.get_account_total("0xuser")
+    assert "SECRET" not in str(ei.value)
+
+
+def test_get_equity_view_behavior_unchanged_by_account_total_addition():
+    # get_equity_view 不得被新方法影響：同一份回應兩個方法各自的語意
+    ad = _adapter(portfolio_resp=_PORTFOLIO_RESP)
+    assert ad.get_equity_view("0xuser").current == Decimal("1005.5")
+    assert ad.get_account_total("0xuser").value == Decimal("1005.5")
+
+
 # --- 5. get_user_fills ---
 
 def test_get_user_fills_maps_and_converts_datetime_to_ms():

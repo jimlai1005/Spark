@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from spark.exchange.base import (
     ExchangeAdapter, Order, BuilderCode, Fill, TxResult, OrderResult,
-    OpenOrder, Position, AccountSnapshot, EquityView, UserFill, LedgerFlow,
+    OpenOrder, Position, AccountSnapshot, AccountTotal, EquityView, UserFill, LedgerFlow,
 )
 
 _DEFAULT_SIZE_DECIMALS = 4
@@ -32,7 +32,8 @@ class FakeAdapter(ExchangeAdapter):
                  close_reduce_only_ok=True, update_leverage_ok=True, extra_agents=(),
                  user_abstraction="disabled", ledger_flows=None, active_asset_leverage=None,
                  referred_by=None, referred_by_raises=None,
-                 set_referrer_result=None, set_referrer_raises=None):
+                 set_referrer_result=None, set_referrer_raises=None,
+                 account_totals=None, account_states=None):
         self._account_value = Decimal(account_value)
         self._account_values = dict(account_values or {})
         self._max_fee = 0
@@ -51,6 +52,10 @@ class FakeAdapter(ExchangeAdapter):
         self._account = account or AccountSnapshot(
             account_value=Decimal("0"), total_margin_used=Decimal("0"),
             withdrawable=Decimal("0"), total_ntl_pos=Decimal("0"))
+        # 依位址（小寫比對）覆寫：account_states 有該位址就回它、否則回上面的單一 `_account`；
+        # account_totals 查無該位址 → ValueError（與真 adapter 的「查無資料點」同語意）。
+        self._account_states = {a.lower(): v for a, v in (account_states or {}).items()}
+        self._account_totals = {a.lower(): v for a, v in (account_totals or {}).items()}
         self._equity = equity or EquityView(current=Decimal("0"), recent_peak=Decimal("0"))
         self._fills = list(fills)
         self._mids = dict(mids or {})
@@ -163,7 +168,14 @@ class FakeAdapter(ExchangeAdapter):
 
     def get_account_state(self, address: str) -> AccountSnapshot:
         self.calls["get_account_state"].append({"address": address})
-        return self._account
+        return self._account_states.get(address.lower(), self._account)
+
+    def get_account_total(self, address: str) -> AccountTotal:
+        self.calls["get_account_total"].append({"address": address})
+        total = self._account_totals.get(address.lower())
+        if total is None:
+            raise ValueError("FakeAdapter 查無該位址的 account_totals")
+        return total
 
     def get_equity_view(self, address: str) -> EquityView:
         self.calls["get_equity_view"].append({"address": address})

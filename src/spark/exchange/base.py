@@ -143,6 +143,15 @@ class EquityView:
 
 
 @dataclass(frozen=True)
+class AccountTotal:
+    """交易所顯示的帳戶總值（HL `portfolio` 最新一點）。value 含現貨、perp、質押、vault。
+
+    as_of_ms 是該資料點自己的時間戳（毫秒），不是查詢時間——呼叫端用它拒絕過期值。"""
+    value: Decimal
+    as_of_ms: int
+
+
+@dataclass(frozen=True)
 class UserFill:
     time: datetime
     coin: str
@@ -196,6 +205,15 @@ class ExchangeAdapter(ABC):
         由呼叫端轉成「未知 → 告警」，絕不回一個看起來合規的預設值。
         """
         ...
+    def get_account_total(self, address: str) -> AccountTotal:
+        """交易所顯示的帳戶總值＋該資料點的時間戳（HL `portfolio` 最新一點）——**唯讀**。
+
+        與 `get_account_state().account_value`（僅 perp 帳本）不同：統一帳戶／portfolio
+        margin 的錢在現貨帳本，perp accountValue 空倉為 0；本值含現貨、perp、質押、vault。
+        查無任何資料點或回應形狀無法解讀 → raise ValueError，**絕不回 0 或預設值**
+        （讀不到錢 ≠ 錢虧光，工程原則 1）。非 abstract、預設 raise：既有測試替身不必實作。
+        """
+        raise NotImplementedError
     @abstractmethod
     def fetch_builder_fills(self, builder: str, day: date) -> list[Fill]: ...
     @abstractmethod

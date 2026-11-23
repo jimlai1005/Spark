@@ -9,7 +9,7 @@ from spark.config import CSV_BASE_URLS
 from spark.exchange.base import (
     USER_FILLS_PAGE_LIMIT, ExchangeAdapter, FillsTruncatedError, Order, BuilderCode,
     Fill, TxResult, OrderResult, Signer,
-    OpenOrder, Position, AccountSnapshot, EquityView, UserFill, LedgerFlow,
+    OpenOrder, Position, AccountSnapshot, AccountTotal, EquityView, UserFill, LedgerFlow,
 )
 from spark.exchange.csv_fills import parse_builder_fills
 from spark.exchange.ledger_flows import signed_flow, flow_anomaly
@@ -249,6 +249,47 @@ class HyperliquidAdapter(ExchangeAdapter):
         if peak <= 0:
             peak = current
         return EquityView(current=current, recent_peak=peak)
+
+    def get_account_total(self, address: str) -> AccountTotal:
+        """交易所顯示的帳戶總值：`portfolio` 的 day／week／month／allTime 四個視窗中
+        **時間戳最大**的那一點（四個視窗的最後一點是同一個即時值，主網實測）。
+
+        ⚠️ `perpDay`／`perpWeek`／… 視窗是 perp 帳戶淨值（統一帳戶空倉時為 0），**不得納入**
+        ——納入就等於把事故根因（perp accountValue 當分母）從後門放回來。
+
+        形狀不對（非 list、四視窗皆無點、點非 [ts, value]、值無法轉有限 Decimal）→
+        ValueError，訊息只含問題類別，不夾帶回應內容。絕不回 0 或預設值。
+        """
+        rows = self._info.portfolio(address)
+        if not isinstance(rows, list):
+            raise ValueError(f"portfolio 回應形狀無法解讀（{type(rows).__name__}，預期 list）")
+        total_periods = {"day", "week", "month", "allTime"}
+        best_ts: int | None = None
+        best_val: Decimal | None = None
+        for row in rows:
+            if not (isinstance(row, list) and len(row) == 2 and row[0] in total_periods):
+                continue
+            payload = row[1]
+            history = payload.get("accountValueHistory") if isinstance(payload, dict) else None
+            if history is None:
+                continue
+            if not isinstance(history, list):
+                raise ValueError("portfolio accountValueHistory 形狀無法解讀（非 list）")
+            for pt in history:
+                if not (isinstance(pt, (list, tuple)) and len(pt) == 2):
+                    raise ValueError("portfolio 資料點形狀無法解讀（預期 [ts, value]）")
+                try:
+                    ts = int(pt[0])
+                    v = Decimal(str(pt[1]))
+                except (TypeError, ValueError, ArithmeticError):
+                    raise ValueError("portfolio 資料點的時間戳或值無法解析") from None
+                if not v.is_finite():
+                    raise ValueError("portfolio 資料點的值不是有限數")
+                if best_ts is None or ts > best_ts:
+                    best_ts, best_val = ts, v
+        if best_ts is None or best_val is None:
+            raise ValueError("portfolio 在 day／week／month／allTime 視窗都查無資料點")
+        return AccountTotal(value=best_val, as_of_ms=best_ts)
 
     _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
