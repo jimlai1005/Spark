@@ -4304,3 +4304,23 @@ T2 上線後 7 小時三個 follower `NRestarts` 0、journal 零 traceback／err
 共用範本 `/etc/filet/follower.env.template` 改了只影響之後新啟用的帳戶，不影響已啟用者。全體緊急關閉＝三個 env 各加 `false` 後跑 `reload_follower.sh`，或回滾本次部署。
 回滾＝把 `/tmp/t7bak-20261122/` 的五個檔 `install` 回原路徑再跑 `reload_follower.sh`（回到 `b7501ee`＝預設關；`f438b3…` 因 env 有 `true` 仍會是開，要一併關就還原其 env 備份；
 `/tmp` 重開機會清，清掉後用 `git show b7501ee:<路徑>`）。
+
+**2026-11-23 部署（commit `d225172`，16:50 UTC，十一檔熱修 over de4a816；跟單倍率分母改用交易所帳戶總值＋倍率鎖定）：** plan
+`docs/superpowers/plans/2026-11-22-leader-equity-basis.md`、對帳／模擬／探針 `docs/superpowers/research/2026-11-22-leader-equity-basis-recon.md`。
+事故：leader `0xfb9c…9760` 是 HL `unifiedAccount`，資金在現貨帳本；引擎拿 perp `accountValue`（空倉為 0、開倉後只是保證金）當倍率分母 →
+2026-11-22 13:49Z `f438b3…` 被放大成開空 1.6788 BTC（帳戶 21 倍）後平回，3 分鐘 −$147.61；11-23 14:05–14:26Z 再發生（leader 減倉後 follower 反向加回）。
+內容：(1) 分母＝`portfolio` 最後一點的帳戶總值（`HyperliquidAdapter.get_account_total`＋`copytrade/leader_equity.py`，所有帳戶模式一律）；讀不到／過期 180 秒／非正值且 leader 有曝險 → 該輪零交易動作＋critical
+`leader_equity_unavailable`、心跳 `detail` 帶原因，絕不退回 perp `accountValue`；leader 無曝險時不擋 follower 收尾。(2) 倍率鎖定（`copytrade/scale_latch.py`）：leader 會被鏡射的永續倉位與掛單沒變時沿用上一次倍率；
+重算時機＝leader 有動作、follower 資金設定或 leader 位址改變、follower 無倉位無掛單、引擎重啟後第一輪、槓桿上限生效且新倍率較小（只縮不放）。鎖定值只在記憶體。(3) leader 流量中性化改以帳戶總值為基準
+（`get_ledger_flows(..., basis="total")`：`accountClassTransfer` 中性；其他呼叫端預設 `"perp"` 不變）。使用者確認：D1＝帳戶總值、倍率鎖定及其後果、波動權重在 leader 不動期間凍結。
+驗證（部署前）：離線全套 3924 passed、ruff 0 錯；三輪 `reviewer` 審核後 0 Critical／0 Warning（每條存活變異都補了測試並由主線程親自重現轉紅）；主網唯讀探針 13 次比對全 PASS（recon §9）。
+程序 §5.8i 多檔版：前提——`DEPLOYED_VERSION` 為 `de4a816`、正式機八個既有檔 md5 與 `de4a816` 逐位元一致、無維護旗標、無 `/tmp/spark-sync`、**leader 與三個 follower 皆無倉位無掛單**（16:49Z 查證；
+有倉位時不得部署——重啟後第一輪會以新倍率市價縮倉）。main 先 ff 到 `d225172` 並 push → `git archive d225172` 打包十一個檔上傳 → md5 核對 → 既有八檔備份到 `/tmp/leqbak-20261123/`（root 700／600；
+`leader_equity.py`、`scale_latch.py`、`scripts/leader_equity_probe.py` 是新檔無備份）→ 逐檔 `install -o root -g root -m 644` → `filet-engine` user import 驗算（`ReconcileState.scale_latch`、`CycleReport.skip_detail`、
+`get_account_total`、`get_ledger_flows` 的 `basis`）＋`filet-api` user `import spark.publicapi.app, scripts.vault_preflight` → **在正式機以 `filet-engine` 實跑 `scripts.leader_equity_probe` 對三個白名單 leader：全 PASS、時間戳年齡 0.2–0.3 秒**
+→ `reload_follower.sh` 16:50:28–34Z 滾動重啟三個 follower。`filet-api`／`filet-dashboard` 未重啟（磁碟上的共用模組已換新版，預設參數行為不變；下次重啟才載入）。→ `DEPLOYED_VERSION`=`d22517273def9e42c132960bef50fbc6517d9620`。
+驗證（部署後）：三個 follower `active`、`NRestarts` 0；心跳 16:51:02Z 起連續重寫（`no_action`、`detail` 為 null）；重啟後 journal 零輸出；`filet_regression_check --http --ssh` **67/67 PASS**。
+**尚無主網開倉實況**：要等 leader 下次開倉，核對 follower 第一筆數量÷leader 數量 ≈ follower 權益×使用率×波動權重÷leader 帳戶總值（部署時 `f438b3…`：4,686×0.5÷723≈3.24；`f6b3e7…`：261×0.4÷723≈0.144），以及 leader 不動時 follower 0 筆動作。
+已知行為：每次重啟（含日後任何部署）第一輪會重算倍率，漂移超過 8% 時有一次調整——**有倉位時部署前先評估**。每個 follower 每輪多一次 `portfolio` 查詢（HL 權重 20）。
+回滾＝把 `/tmp/leqbak-20261123/` 的八個檔 `install` 回原路徑（三個新檔可留著，無人 import）再跑 `reload_follower.sh`（回到 `de4a816`＝perp `accountValue` 當分母、無鎖定；`/tmp` 重開機會清，清掉後用 `git show de4a816:<路徑>`）。
+回滾同樣要在無倉位時做。未處理（另案）：統一帳戶的 follower（`fd149b…`：引擎讀到本金 0、不跟單；plan 草稿 `docs/superpowers/plans/2026-11-23-unified-follower-equity.md`）、探索頁以 perp `accountValue` 算的指標。
