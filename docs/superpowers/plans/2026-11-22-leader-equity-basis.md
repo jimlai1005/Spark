@@ -1,7 +1,7 @@
 # leader 權益基準修正 Implementation Plan
 
 > **For agentic workers:** 逐 task 由主線程派工（`builder`／`reviewer`），只讀本檔；plan 沒涵蓋的決策先回報主線程。
-> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。
+> 狀態（2026-11-23）：**重啟、已獲使用者同意開工。** 2026-11-22 使用者曾裁決不採用（「覺得目前開單的數字正常」）；2026-11-23 使用者回報 follower 槓桿不合理，主線程查證為同一原因（recon §7），使用者原話：「如果是，我選A，我們需要開工。」→ D1＝A。D2 使用者未另行指定，採主線程建議的 X（可事後改）。 **T1 完成（`0c07006`，主線程已驗收）。** 同日使用者追加要求（D7）：leader 現貨有 BTC，分母會每分鐘變動，follower 不得因此每分鐘調整大小或開關單；解不了就可能退回修改前。→ 新增 T2b 倍率鎖定。使用者另要求接著做統一帳戶 follower（`fd149b…`），另開 plan。
 
 **Goal:** 跟單倍率的分母（leader 權益）改用交易所自己顯示的帳戶總值，讓統一帳戶／portfolio margin 的 leader 不再造成倍率放大與開倉暴衝。
 
@@ -44,6 +44,7 @@
 | D4 | 絕不退回 perp `accountValue`（那正是事故的來源）。暫時性網路錯誤照既有讀取的處理方式往外拋（`main_loop` 的連續錯誤計數）。 | 主線程定 |
 | D5 | `target_notional`（`max_target_leverage` 的分子）維持 `leader_state.total_ntl_pos`（預設 dex，與被鏡射的倉位同範圍）。 | 主線程定 |
 | D6 | 部署時機：leader 與 follower 都無倉位時部署（使用者 2026-11-22 表示會先關掉 leader 倉位）。若部署當下仍有倉位，重啟後第一輪會以市價把 follower 倉位縮到新目標——部署前主線程先查，有倉位就停下問。 | 主線程定 |
+| D7 | **倍率鎖定（使用者 2026-11-23 追加要求）**：follower 只在「leader 有動作」時才重算倍率；leader 沒動作的期間沿用上一次的倍率，分母（含 leader 現貨 BTC 的價格波動、leader 浮動損益）與分子（follower 自己的浮動損益）怎麼漂都不調倉、不重掛單。「leader 有動作」＝leader 的倉位或掛單集合與上一輪不同。另外三種情況也重算：(a) follower 的資金設定（使用率／本金／權重／槓桿上限）或 leader 位址變了；(b) follower 自己無倉位也無掛單（沒有東西會被擾動）；(c) 引擎重啟後第一輪（鎖定值只存在記憶體）。算出的倍率 ≤ 0 時不鎖定，照既有行為。**已知後果（要告知使用者）**：follower 自己入金／出金、leader 入金／出金，都要等 leader 下一次動作才反映到倉位大小；重啟（含部署）後第一輪若漂移已超過 8% 會有一次調整。依據：30 天模擬（recon §8）顯示只靠既有 8% 容差，leader 抱單期間仍會有 0–23 次因分母漂移的調倉。 | 主線程定（依使用者要求設計；機制細節回報時交代） |
 
 > 下文以 D1＝A、D2＝X 撰寫（即定案）。
 
@@ -72,6 +73,7 @@ $$\text{scale} = \frac{\text{capital} \times \text{utilization} \times \text{wei
 | `src/spark/copytrade/loop.py` | 改 | 第 3 節改用 `read_leader_equity`；3.5、4 節三個使用處改同源；unavailable 提前返回 |
 | `src/spark/copytrade/orders.py` | 改 | `CycleReport` 加 `skip_detail: str \| None = None`（只加欄位） |
 | `scripts/run_copytrade.py` | 改 | 心跳 `detail` 取 `report.skip_detail` |
+| `src/spark/copytrade/scale_latch.py` | 新增（T2b） | 倍率鎖定純函式；`ReconcileState.scale_latch` 欄位 |
 | `scripts/leader_equity_probe.py` | 新增 | 唯讀主網探針（T3） |
 | `tests/test_leader_equity.py` | 新增 | 純函式＋讀取層 |
 | `tests/test_hyperliquid_reads.py`、`tests/test_copy_loop.py` | 改 | adapter 解析、迴圈整合 |
@@ -179,6 +181,62 @@ def read_leader_equity(adapter, leader: str, *, now_ms: int,
 4. `git diff --stat` 只含 §5 檔案地圖內的檔案；`git diff -- src/spark/copytrade/positions.py` 為空。
 5. Commit：`fix: 跟單倍率分母改用交易所帳戶總值（統一帳戶 leader 倍率放大；plan 2026-11-22 T2）`。
 
+### T2b `@inline` — 倍率鎖定（D7；依賴 T2）
+
+**目標**：leader 沒有動作的期間，follower 用的倍率不變。**動機**：使用者要求 follower 不得因為 leader 權益每分鐘的小幅變動（leader 現貨 BTC 價格、浮動損益）而調整大小或開關單；T2 改完後分母仍會隨行情漂移，既有的 8% 容差只能降低頻率、不能消除（recon §8）。遇到歧義往「leader 沒動作就不動 follower」取捨。
+
+**新模組** `src/spark/copytrade/scale_latch.py`（純函式，無 IO）：
+
+```python
+@dataclass(frozen=True)
+class ScaleLatch:
+    scale: Decimal
+    leader: str                 # 小寫位址
+    fingerprint: tuple          # leader 曝險指紋
+    settings_key: tuple         # 影響倍率的 follower 設定
+
+def leader_fingerprint(leader_positions: Mapping[str, Position],
+                       leader_orders: Sequence[OpenOrder]) -> tuple:
+    """(tuple(sorted((coin, szi))), tuple(sorted((oid, coin, is_buy, size, limit_px, trigger_px, reduce_only))))。
+    只取這些欄位；不得含時間戳、未實現損益、保證金等會自己變動的值。"""
+
+def settings_key(settings: CopySettings) -> tuple:
+    """(capital_utilization, allocated_capital, use_full_equity, position_weight,
+    max_target_leverage, volatility_weight_enabled, leader_flow_neutralization_enabled)。"""
+
+def apply_latch(fresh_scale: Decimal, prev: ScaleLatch | None, *, leader: str,
+                fingerprint: tuple, key: tuple,
+                follower_has_exposure: bool) -> tuple[Decimal, ScaleLatch | None]:
+    """回傳 (本輪要用的倍率, 新的鎖定狀態)。規則依序：
+    1. fresh_scale <= 0 → (fresh_scale, None)。            # 既有 scale=0 語意不變
+    2. fingerprint 為空（leader 無倉位無掛單）→ (fresh_scale, None)。
+    3. prev is None，或 prev.leader != leader，或 prev.settings_key != key，
+       或 prev.fingerprint != fingerprint，或 not follower_has_exposure
+       → 重算：(fresh_scale, ScaleLatch(fresh_scale, leader, fingerprint, key))。
+    4. 其餘 → (prev.scale, prev)。"""
+```
+
+**狀態存放**：`ReconcileState`（`orders.py`）加一個欄位 `scale_latch: "ScaleLatch | None" = None`（只加欄位；注意循環 import，必要時用 `TYPE_CHECKING` 或 `Any` 註記）。只存在記憶體，不落檔。
+
+**`loop.py` 接線**（第 4 節 `compute_scale_factor` 之後、第 5 節之前；只加這一段）：
+`fresh = compute_scale_factor(...)` → `scale, state.scale_latch = apply_latch(fresh, state.scale_latch, leader=leader.lower(), fingerprint=leader_fingerprint(leader_positions, leader_orders), key=settings_key(settings), follower_has_exposure=bool(my_positions) or bool(my_orders))`。之後所有用到 `scale` 的地方（`sync_open_orders`、`sync_positions`、`CycleReport.scale`）都用鎖定後的值。`state` 為 None 的呼叫路徑（若存在）→ 視同 `prev=None` 且不保存。T2 的 unavailable 提前返回發生在這段之前，不得動到 `state.scale_latch`（下一輪恢復後照舊判斷）。
+
+**測試**：
+- `tests/test_scale_latch.py`（新）：規則 1–4 各一條以上；指紋對「倉位大小變了／多一張掛單／掛單剩餘數量變了／只有未實現損益變了（不變）」的反應；`settings_key` 對使用率變動的反應。
+- `tests/test_copy_loop.py`（沿用 T2 的 helper，連跑多輪共用同一個 `ReconcileState`）：
+  1. **只有分母漂移**：第 1 輪 leader −0.02 BTC、total 700 → follower 建倉；第 2 輪 leader 倉位與掛單完全相同、total 改成 560（−20%，遠超 8% 容差）、FakeAdapter 的 follower 倉位＝第 1 輪目標 → 第 2 輪 **0 筆** place／modify／cancel／調倉，`report.scale` 等於第 1 輪。
+  2. **leader 有動作才重算**：承上，第 3 輪 leader 倉位變 −0.03、total 560 → `report.scale` 等於以 560 算出的新值，follower 目標依新倍率。
+  3. **follower 設定變了**：leader 不變、`capital_utilization` 0.5→0.25 → 當輪重算。
+  4. **follower 無曝險**：leader 不變、follower 無倉位無掛單 → 當輪用新值。
+  5. **分子漂移**：leader 不變、follower `account_value` +30% → 0 筆動作。
+  6. **T2 的 unavailable 一輪之後**：鎖定值保留，恢復後的那一輪 leader 不變 → 仍用舊倍率、0 筆動作。
+
+**驗收**：
+1. `uv run pytest -q` 全綠；`uv run ruff check src tests scripts` 0 錯。
+2. 變異三條各至少一條測試轉紅，列出測試名後還原：(a) `apply_latch` 規則 4 改成回 `fresh_scale`（等於沒鎖）；(b) 指紋拿掉掛單部分；(c) `loop.py` 把未鎖定的 `fresh` 傳給 `sync_positions`。
+3. `git diff --stat` 只含 `scale_latch.py`、`loop.py`、`orders.py`（僅 `ReconcileState` 加欄位）、兩個測試檔；`git diff -- src/spark/copytrade/positions.py` 為空。
+4. Commit：`feat: 倍率鎖定——leader 沒有動作時 follower 不因權益漂移調倉（plan 2026-11-22 T2b／D7）`。
+
 ### T3 `@inline` — 主網唯讀探針（builder 寫、主線程跑）
 
 **目標**：用**正式程式路徑**（`HyperliquidAdapter.get_account_total`＋`resolve_leader_equity`）對真實帳戶取值，並與獨立重建值對帳。**動機**：離線測試的假資料照同一個假設寫，測不出欄位名或語意假設錯（工程原則 #1 第二個教訓）。
@@ -196,6 +254,7 @@ def read_leader_equity(adapter, leader: str, *, now_ms: int,
 4. 提前返回是否繞過了任何既有的安全動作（第 0–2.6 節的 kill switch、回撤、成本熔斷必須照常執行）。
 5. 既有測試是否被放寬；三條變異是否真的被抓到（親自重現至少兩條）。
 6. 工程原則 #1、#3、#5、#6 逐條對照；專案紅線。
+7. 倍率鎖定（T2b）：有沒有任何 leader 動作不會改變指紋（漏重算）；鎖定值會不會在 follower 已清空、leader 已換、設定已改之後仍被沿用；`scale ≤ 0` 與 unavailable 路徑是否維持既有語意；是否有任何下游仍拿到未鎖定的倍率。
 修到 0 Critical／0 Warning 為止；只有設計分岔才停下問使用者。
 
 ### T5 — 部署（主線程）
@@ -215,6 +274,7 @@ def read_leader_equity(adapter, leader: str, *, now_ms: int,
 - **R5 統一帳戶的 follower 仍不支援**：分子是 follower 的 perp `accountValue`，統一帳戶 follower 空倉時為 0 → 靜默不跟單。HL 上多數新帳戶是統一帳戶，這會影響新客戶，需另案。
 - **R6 探索頁的槓桿／強平風險指標仍以 perp `accountValue` 計算**，對統一帳戶交易員不準，另案。
 - **R7 分子分母不同來源**：follower 用 perp `accountValue`、leader 用帳戶總值。對傳統模式且只把錢放 perp 的帳戶兩者相等；差異來自帳戶模式，recon §2 有恆等式。
+- **R8 倍率鎖定的後果（D7）**：follower 入金／出金、leader 入金／出金，都要等 leader 下一次動作（倉位或掛單有變）才反映到 follower 倉位大小；leader 抱單不動期間，即使 leader 權益大幅變化 follower 也不調整。重啟（含每次部署）後第一輪會以當下倍率重算，漂移超過 8% 時有一次調整。網格型 leader 幾乎每分鐘都有掛單變動，鎖定對它等於沒有作用（行為同現在，受 8% 容差約束）。
 
 ## 8. 驗收總表
 
