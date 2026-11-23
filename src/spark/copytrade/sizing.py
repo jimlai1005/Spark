@@ -87,8 +87,10 @@ def compute_scale_factor(
     """跟單比例 = (跟單本金 × 資金使用率 × 倉位權重) / 對方帳戶淨值。
 
     port hl sync.py:29-51。本金見 resolve_capital；分母用「帳戶淨值 equity（含未實現
-    損益）」，使我方保證金使用率自動等於目標。settings.max_target_leverage > 0 時，
-    若目標有效槓桿（target_notional / leader_equity）超過上限，等比例縮回——保護
+    損益）」，使我方保證金使用率自動等於目標。leader_equity 由呼叫端傳入，語意是
+    **交易所顯示的帳戶總值**（`copytrade/leader_equity.py`，含現貨／質押／vault），
+    不是 perp accountValue；my_equity 是 follower 的 perp accountValue。
+    settings.max_target_leverage > 0 時，若目標有效槓桿（target_notional / leader_equity）超過上限，等比例縮回——保護
     瀕臨清算時目標槓桿暴衝把我方拖下水。
 
     leader_equity <= 0 或本金 <= 0 → Decimal("0")（hl sync.py:40-41 的除零防禦，

@@ -477,6 +477,9 @@ class CycleReport:
     scale: Decimal
     tripped: bool = False
     halt_engine: bool = False
+    # 本輪零動作的原因（給心跳 detail 顯示）；None＝正常跑完。
+    # 例：leader 權益無法判定（plan 2026-11-22 T2）。
+    skip_detail: str | None = None
 
 
 def _set_entry_leverage(

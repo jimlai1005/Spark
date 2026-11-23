@@ -26,12 +26,14 @@ from spark.copytrade.notifier import RecordingNotifier
 from spark.copytrade.orders import CycleReport, ReconcileResult, ReconcileState
 from spark.exchange.base import (
     AccountSnapshot,
+    AccountTotal,
     BuilderCode,
     EquityView,
     OpenOrder,
     Position,
 )
 from spark.exchange.fakes import FakeAdapter
+from tests.leader_total_helper import seed_leader_total as _seed_leader_total
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LEADER = CopySettings().leader_address
@@ -82,6 +84,7 @@ def _run(adapter, *, settings=None, notifier=None, state=None, root=None,
          ex=None, tmp_path=None) -> tuple[CycleReport, RecordingNotifier, ActionExecutor]:
     notifier = notifier or RecordingNotifier()
     ex = ex or _executor(adapter)
+    _seed_leader_total(adapter)
     report = run_cycle(adapter, ex, settings or _settings(), notifier,
                        state or ReconcileState(), root or tmp_path)
     return report, notifier, ex
@@ -263,7 +266,7 @@ def test_risk_off_warning_does_not_flood_the_shared_alert_channel(tmp_path):
     同一個共用 TG 頻道，而 notifier 撞上 429 之後**所有**告警都送不出去——那正是
     這則提醒要保護的東西。觸發情境：任何風控關閉的 follower（＝預設每一顆）連續跑。
     """
-    fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
+    fa = _seed_leader_total(FakeAdapter(account_value=Decimal("700"), account=_account("700")))
     _seed_equity_peak(tmp_path, "1000")
     settings = _settings(risk_controls_enabled=False)
     notifier = RecordingNotifier()
@@ -283,7 +286,7 @@ def test_risk_off_warning_fires_once_per_process_only(tmp_path):
     `risk.controls_enabled`），不適合長期佔用共用告警通道。重啟會再發一次
     ——那是有意義的，因為重啟正是風控姿態可能改變的時刻（新 state 物件）。
     """
-    fa = FakeAdapter(account_value=Decimal("700"), account=_account("700"))
+    fa = _seed_leader_total(FakeAdapter(account_value=Decimal("700"), account=_account("700")))
     _seed_equity_peak(tmp_path, "1000")
     settings = _settings(risk_controls_enabled=False)
     notifier = RecordingNotifier()
@@ -437,6 +440,202 @@ def test_volatility_disabled_never_fetches_daily_pnl(tmp_path):
     fa = FakeAdapter(equity=_healthy_equity(), account=_account())
     _run(fa, settings=_settings(volatility_weight_enabled=False), tmp_path=tmp_path)
     assert fa.calls["get_daily_abs_pnl"] == []
+
+
+# ── 3a. leader 權益單一產生點（plan 2026-11-22 T2）─────────────────────
+# 分母＝交易所帳戶總值（`get_account_total`），不是 leader 的 perp accountValue。
+# 錨例 E1／E2 取自事故對帳（recon §4）；E3／E4／E5 的純函式版在 test_leader_equity.py。
+_NOW_S = 1_763_900_000
+_NOW_MS = _NOW_S * 1000
+
+
+class _SplitAdapter(FakeAdapter):
+    """leader 與 follower 的持倉分開給（FakeAdapter 的 positions 是與位址無關的單一槽）。"""
+
+    def __init__(self, *, leader_positions=(), my_positions=(), **kw):
+        super().__init__(**kw)
+        self._pos_by_addr = {LEADER.lower(): list(leader_positions),
+                             MY_ADDR.lower(): list(my_positions)}
+
+    def get_positions(self, address):
+        self.calls["get_positions"].append({"address": address})
+        return list(self._pos_by_addr.get(address.lower(), []))
+
+
+def _btc_pos(szi: str) -> Position:
+    return Position(coin="BTC", szi=Decimal(szi), entry_px=Decimal("100000"),
+                    leverage=5, is_cross=True, unrealized_pnl=Decimal("0"),
+                    margin_used=Decimal("0"))
+
+
+def _split_run(tmp_path, monkeypatch, *, leader_av, leader_total, leader_szi,
+               my_av, total_age_ms=0, util="0.5"):
+    """事故形狀：leader 統一帳戶（perp av 小、帳戶總值大）、follower 傳統帳戶。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = _SplitAdapter(
+        leader_positions=[_btc_pos(leader_szi)],
+        account_value=my_av,
+        account_states={LEADER: _account(leader_av), MY_ADDR: _account(my_av)},
+        account_totals={LEADER: AccountTotal(Decimal(leader_total),
+                                             _NOW_MS - total_age_ms)},
+        mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})
+    return fa, *_run(fa, settings=_settings(capital_utilization=Decimal(util)),
+                     tmp_path=tmp_path)
+
+
+def _leader_equity_crits(notifier) -> list[str]:
+    """只看 leader_equity 這個類別的 critical（其他閘門如 equity_coverage_insufficient
+    與本題無關，且不影響零動作斷言）。"""
+    return [r[3] for r in notifier.records
+            if r[0] == "critical" and r[1] == "leader_equity"]
+
+
+def _opened_btc(ex) -> tuple[bool, Decimal]:
+    opens = [r for r in ex.records if r.kind == "market_open" and r.coin == "BTC"]
+    assert len(opens) == 1, [r.kind for r in ex.records]
+    return opens[0].payload["is_buy"], Decimal(opens[0].payload["sz"])
+
+
+def test_E1_scale_uses_exchange_total_not_perp_account_value(tmp_path, monkeypatch):
+    """E1（recon §4，13:57:10Z）：total 707.37、perp av 120.58；follower 4704.22、
+    使用率 0.5 → scale＝2352.11÷707.37＝3.3252；leader −0.02 BTC → 目標 −0.0665 BTC
+    （舊算法 scale＝19.5066、目標 −0.39 BTC）。"""
+    fa, report, notifier, ex = _split_run(
+        tmp_path, monkeypatch, leader_av="120.58", leader_total="707.37",
+        leader_szi="-0.02", my_av="4704.22")
+    assert abs(report.scale - Decimal("3.3252")) < Decimal("0.0001")
+    is_buy, sz = _opened_btc(ex)
+    assert is_buy is False
+    assert abs(sz - Decimal("0.0665")) < Decimal("0.0001")
+    assert fa.calls["get_account_total"] == [{"address": LEADER}]
+    assert _leader_equity_crits(notifier) == []
+
+
+def test_E2_incident_first_cycle_scale_is_not_111(tmp_path, monkeypatch):
+    """E2（事故第一輪，13:49:03Z）：total 708、perp av 21.2；follower 4744.73 →
+    scale＝2372.365÷708＝3.3508（舊算法 111.9）；leader −0.015 → 目標 −0.0503 BTC
+    （事故實際 −1.6788）。"""
+    _fa, report, _n, ex = _split_run(
+        tmp_path, monkeypatch, leader_av="21.2", leader_total="708",
+        leader_szi="-0.015", my_av="4744.73")
+    assert abs(report.scale - Decimal("3.3508")) < Decimal("0.0001")
+    is_buy, sz = _opened_btc(ex)
+    assert is_buy is False
+    assert abs(sz - Decimal("0.0503")) < Decimal("0.0001")
+
+
+def test_E3_stale_total_with_exposure_means_zero_actions_and_critical(
+        tmp_path, monkeypatch):
+    """E3：total 的時間戳比 now 早 181 秒、leader 有倉位與掛單 → 本輪零動作。
+    perp av 刻意給很大（5000）：不得退回它來算倍率。"""
+    leader_order = OpenOrder(oid=1, coin="ETH", is_buy=True, limit_px=Decimal("2000"),
+                             sz=Decimal("1"), reduce_only=False, is_trigger=False,
+                             trigger_px=None, tpsl=None)
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = _SplitAdapter(
+        leader_positions=[_btc_pos("-0.02")], open_orders=[leader_order],
+        account_value="4704.22",
+        account_states={LEADER: _account("5000"), MY_ADDR: _account("4704.22")},
+        account_totals={LEADER: AccountTotal(Decimal("707.37"), _NOW_MS - 181_000)},
+        mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})
+    report, notifier, ex = _run(fa, settings=_settings(), tmp_path=tmp_path)
+
+    assert ex.records == [], "無法判定時不得有任何下單／改單／撤單／調倉／改槓桿"
+    crits = [r for r in notifier.records
+             if r[0] == "critical" and r[1] == "leader_equity"]
+    assert len(crits) == 1
+    assert "leader 權益無法判定" in crits[0][2]
+    assert crits[0][3] == "leader_equity_unavailable"
+    assert report.skip_detail and "leader 權益無法判定" in report.skip_detail
+    assert report.tripped is False
+    assert report.scale == Decimal("0")
+    assert report.reconcile.placed == 0 and report.safety_net == {"skipped": True}
+    # 提前返回發生在讀 follower 狀態之前
+    assert "get_account_state" in fa.calls
+    assert [c["address"] for c in fa.calls["get_account_state"]] == [LEADER]
+
+
+def test_unavailable_when_total_unreadable_never_falls_back_to_perp_av(
+        tmp_path, monkeypatch):
+    """讀不到帳戶總值（ValueError）→ 與過期同一條路徑：零動作＋critical。
+    直接呼叫 run_cycle（不經 `_run` 的補 total helper）——這裡要的是「真的讀不到」。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = _SplitAdapter(
+        leader_positions=[_btc_pos("-0.02")], account_value="4704.22",
+        account_states={LEADER: _account("5000"), MY_ADDR: _account("4704.22")},
+        mids={"BTC": Decimal("100000")}, sz_decimals={"BTC": 5})
+    ex = _executor(fa)
+    notifier = RecordingNotifier()
+    report = run_cycle(fa, ex, _settings(), notifier, ReconcileState(), tmp_path)
+    assert ex.records == []
+    assert report.skip_detail and "讀不到帳戶總值" in report.skip_detail
+    assert _leader_equity_crits(notifier) == ["leader_equity_unavailable"]
+
+
+def test_E5_zero_total_with_exposure_is_unavailable(tmp_path, monkeypatch):
+    _fa, report, notifier, ex = _split_run(
+        tmp_path, monkeypatch, leader_av="300", leader_total="0",
+        leader_szi="-0.02", my_av="4704.22")
+    assert ex.records == []
+    assert report.skip_detail
+    assert _leader_equity_crits(notifier) == ["leader_equity_unavailable"]
+
+
+def test_E4_empty_leader_with_zero_total_is_quiet_scale_zero(tmp_path, monkeypatch):
+    """E4：total 0、leader 無倉位無掛單 → leader_equity 0、scale 0、無告警、無 skip_detail。"""
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = FakeAdapter(
+        account_value="4704.22",
+        account_states={LEADER: _account("0"), MY_ADDR: _account("4704.22")},
+        account_totals={LEADER: AccountTotal(Decimal("0"), _NOW_MS)})
+    report, notifier, ex = _run(fa, settings=_settings(), tmp_path=tmp_path)
+    assert report.scale == Decimal("0")
+    assert report.skip_detail is None
+    assert not any(r[3] == "leader_equity_unavailable" for r in notifier.records)
+    assert not any(r[1] == "leader_equity" for r in notifier.records)
+
+
+def test_flow_neutralization_raw_is_exchange_total_not_perp_av(tmp_path, monkeypatch):
+    """流量中性化的 raw 與倍率分母同源：leader perp av 400、total 2000、入金 +1000 →
+    adjusted＝1000 → scale＝2（若 raw 誤用 perp av＝400 會得到 −600 → 退回 raw → scale 5）。"""
+    from spark.exchange.base import LedgerFlow
+    seen = {}
+    real_adj = loop_mod.adjusted_leader_equity
+
+    def spy(raw, flows, now_ms, decay_ms):
+        seen["raw"] = raw
+        return real_adj(raw, flows, now_ms, decay_ms)
+
+    monkeypatch.setattr(loop_mod, "adjusted_leader_equity", spy)
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = FakeAdapter(
+        account_value="2000",
+        account_states={LEADER: _account("400"), MY_ADDR: _account("2000")},
+        account_totals={LEADER: AccountTotal(Decimal("2000"), _NOW_MS)},
+        ledger_flows=([LedgerFlow(time_ms=_NOW_MS, usdc=Decimal("1000"))], []))
+    report, _n, _ex = _run(fa, settings=_settings(leader_flow_neutralization_enabled=True),
+                           tmp_path=tmp_path)
+    assert seen["raw"] == Decimal("2000")
+    assert report.scale == Decimal("2")
+
+
+def test_volatility_weight_receives_exchange_total_as_equity(tmp_path, monkeypatch):
+    """波動權重的 leader 權益參數同源（第 4 節三處之一）。"""
+    seen = {}
+    real = loop_mod.compute_volatility_stats
+
+    def spy(daily, equity):
+        seen["equity"] = equity
+        return real(daily, equity)
+
+    monkeypatch.setattr(loop_mod, "compute_volatility_stats", spy)
+    monkeypatch.setattr(loop_mod.time, "time", lambda: float(_NOW_S))
+    fa = FakeAdapter(
+        account_value="1000", daily_abs_pnl=[Decimal("10")] * 5,
+        account_states={LEADER: _account("120.58"), MY_ADDR: _account("1000")},
+        account_totals={LEADER: AccountTotal(Decimal("707.37"), _NOW_MS)})
+    _run(fa, settings=_settings(volatility_weight_enabled=True), tmp_path=tmp_path)
+    assert seen["equity"] == Decimal("707.37")
 
 
 # ── 3b. leader 申贖流量中性化接線（Wave 4 規格 C）─────────────────────

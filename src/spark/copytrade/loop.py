@@ -40,6 +40,7 @@ from spark.copytrade.killswitch import (REASON_COST_BREACH, REASON_ROLLING_DRAWD
                                         REASON_TOTAL_DRAWDOWN, DrawdownStatus,
                                         auto_rearm_if_cooled_down, evaluate,
                                         is_tripped, owner_close_terminal, trip)
+from spark.copytrade.leader_equity import LeaderEquityUnavailable, read_leader_equity
 from spark.copytrade.leader_flow import adjusted_leader_equity
 from spark.copytrade.notifier import Notifier
 from spark.copytrade.orders import (
@@ -75,10 +76,13 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     """單輪同步。adapter=讀側（ExchangeAdapter）、ex=寫側（ActionExecutor，
     自帶 live/my_address）。例外不在此攔截——上拋給 main_loop 計連續錯誤。
 
-    同源不變量（工程原則 1）：
-    - scale 分子分母的 equity **同用 `get_account_state().account_value`**
-      （同一 endpoint 同一欄位，只差地址）——絕不一邊用 portfolio、一邊用
-      marginSummary 拼裝。
+    equity 基準（工程原則 1；plan 2026-11-22）：
+    - scale 分母（leader 權益）出自 `leader_equity.read_leader_equity`——交易所顯示的
+      帳戶總值（`portfolio` 最後一點），它是 leader 權益的**唯一產生點**；分子是
+      follower 自己的 perp `accountValue`。兩者來源不同是刻意的：統一帳戶 leader 的
+      perp `accountValue` 只是保證金（空倉為 0），拿它當分母會把倉位放大數倍到數十倍
+      （事故 2026-11-22，recon §1／§2）。讀不到／過期則本輪零交易動作，絕不退回 perp
+      `accountValue`。
     - 回撤判定用 `perp_equity_view()`（perp accountValue 為基準，與 scale 同一數字；
       peak 為本地 7 天滾動樣本最大值）。2026-07-19 起改用此基準——原 `get_equity_view()`
       的 portfolio 資料源含 spot，會稀釋熔斷保護（findings F1）。
@@ -319,6 +323,25 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     leader_positions = {p.coin: p for p in adapter.get_positions(leader)}
     leader_state = adapter.get_account_state(leader)
 
+    # leader 權益＝倍率分母的唯一產生點（plan 2026-11-22 T2）。無法判定 → 本輪零交易
+    # 動作＋critical；**必須在任何 ex 寫入之前**返回，且絕不退回 perp accountValue／0
+    # 繼續算（那正是 2026-11-22 事故的來源）。kill switch／成本熔斷（第 1–2.5 節）已在
+    # 上面照常執行；網路類例外照既有讀取的方式往外拋給 main_loop 計連續錯誤。
+    leader_has_exposure = bool(leader_positions) or bool(leader_orders)
+    try:
+        leader_eq = read_leader_equity(
+            adapter, leader, now_ms=int(time.time() * 1000),
+            leader_has_exposure=leader_has_exposure)
+    except LeaderEquityUnavailable as e:
+        notifier.critical(
+            "leader_equity",
+            f"leader 權益無法判定（{e.reason}），本輪零交易動作",
+            dedup_key="leader_equity_unavailable",
+        )
+        return CycleReport(reconcile=_EMPTY_RECONCILE, safety_net={"skipped": True},
+                           scale=Decimal("0"),
+                           skip_detail=f"leader 權益無法判定：{e.reason}")
+
     my_orders = ex.get_open_orders()  # 經 ex：dry 讀虛擬簿、live 讀交易所
     my_positions = {p.coin: p for p in adapter.get_positions(ex.my_address)}
     my_state = adapter.get_account_state(ex.my_address)
@@ -329,10 +352,11 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     # leader_flow.py）。關閉時**完全不呼叫** get_ledger_flows——零行為變動。
     # adjusted 只取代 compute_scale_factor 的 leader_equity 參數（scale 與
     # max_target_leverage 的 eff_lev 在該函式內共用同一分母，自動同源——工程
-    # 原則 1）；其餘用途（target_notional 等）不變。
-    leader_equity = leader_state.account_value
+    # 原則 1）；其餘用途（target_notional 等）不變。raw 與第 4 節的波動權重參數同樣
+    # 取自 `leader_eq.value`（交易所帳戶總值，唯一產生點）。
+    leader_equity = leader_eq.value
     if settings.leader_flow_neutralization_enabled:
-        raw = leader_state.account_value
+        raw = leader_eq.value
         # 時間源與本檔既有慣例一致（time.time，見 risk_off_warned_at）——不混時間源
         now_ms = int(time.time() * 1000)
         decay_ms = int(settings.flow_decay_hours * Decimal(3_600_000))
@@ -380,14 +404,15 @@ def run_cycle(adapter, ex, settings: CopySettings, notifier: Notifier,
     # ── 4. weight / scale ─────────────────────────────────────────────
     if settings.volatility_weight_enabled:
         daily = adapter.get_daily_abs_pnl(leader)
-        vol = compute_volatility_stats(daily, leader_state.account_value)
+        vol = compute_volatility_stats(daily, leader_eq.value)
         weight = position_weight(settings, vol)  # vol=None（資料不足）→ 不縮，安全預設
     else:
         weight = position_weight(settings, None)
     scale = compute_scale_factor(
-        leader_equity=leader_equity,      # 同源：account_state.account_value（中性化
+        leader_equity=leader_equity,      # 分母：leader_eq.value＝交易所帳戶總值（中性化
                                           # 開啟時為其流量調整值，見 3.5 節）
-        my_equity=my_state.account_value,  # 同源：account_state.account_value
+        my_equity=my_state.account_value,  # 分子：follower 的 perp accountValue。與分母
+                                          # 不同來源是刻意的（recon §2、plan R7）
         target_notional=leader_state.total_ntl_pos,
         settings=settings,
         weight=weight,

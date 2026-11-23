@@ -42,6 +42,7 @@ from spark.exchange.base import (
     UserFill,
 )
 from spark.exchange.fakes import FakeAdapter
+from tests.leader_total_helper import seed_leader_total
 
 NOW = 1_700_000_000.0          # 固定時鐘，所有時間斷言以它為錨
 MY_ADDR = "0xme"
@@ -176,6 +177,7 @@ def _executor(adapter) -> ActionExecutor:
 def _run_cycle(adapter, root: Path, *, settings=None, notifier=None, ex=None):
     n = notifier or RecordingNotifier()
     e = ex or _executor(adapter)
+    seed_leader_total(adapter)
     report = run_cycle(adapter, e, settings or _settings(), n, ReconcileState(), root)
     return report, n, e
 

@@ -46,6 +46,7 @@ from spark.exchange.base import (
     UserFill,
 )
 from spark.exchange.fakes import FakeAdapter
+from tests.leader_total_helper import seed_leader_total
 
 MY_ADDR = "0xme"
 BUILDER = BuilderCode(b="0xbuilder", f=20)
@@ -794,6 +795,7 @@ def _run(fa, tmp_path, *, settings=None, notifier=None):
     settings = settings or _settings()
     ex = ActionExecutor(fa, None, BUILDER, live=False, my_address=MY_ADDR,
                         settings=settings)
+    seed_leader_total(fa)
     report = loop_mod.run_cycle(fa, ex, settings, notifier, ReconcileState(), tmp_path)
     return report, notifier, ex
 

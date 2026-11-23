@@ -38,6 +38,7 @@ from spark.copytrade.notifier import RecordingNotifier
 from spark.copytrade.orders import CycleReport, ReconcileResult, ReconcileState
 from spark.exchange.base import AccountSnapshot, BuilderCode, EquityView
 from spark.exchange.fakes import FakeAdapter
+from tests.leader_total_helper import seed_leader_total
 from spark.filet.close_all import (CloseAllError, build_close_all_message,
                                    build_close_all_record, close_all_path_for,
                                    close_all_result_path_for,
@@ -137,6 +138,7 @@ def _executor(adapter, *, live=False) -> ActionExecutor:
 def _run_cycle(adapter, root, *, settings=None, notifier=None, ex=None):
     n = notifier or RecordingNotifier()
     e = ex or _executor(adapter)
+    seed_leader_total(adapter)
     report = run_cycle(adapter, e, settings or _settings(), n, ReconcileState(), root)
     return report, n, e
 

@@ -836,7 +836,7 @@ def main(argv: list[str] | None = None) -> None:
             # 回傳型別（或測試替身回了別的東西）而把跟單這一輪打成 AttributeError。
             hb["result"] = ("tripped" if getattr(report, "tripped", False)
                             else "ok" if len(ex.records) > start else "no_action")
-            hb["detail"] = None
+            hb["detail"] = getattr(report, "skip_detail", None)
             return report
         finally:
             if publish_hb is not None:
