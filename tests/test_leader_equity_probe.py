@@ -136,6 +136,21 @@ def test_disabled_mode_adds_all_dex_perp_account_values(patch_env):
     assert run([ADDR]) == 0
 
 
+# (2b) default：與 disabled 同一條恆等式（2026-11-23 主網 vault leader 實測）
+def test_default_mode_adds_perp_account_values_like_disabled(patch_env):
+    fake = FakeInfo(
+        mode="default", portfolio_value="360.0",
+        balances=[{"coin": "USDC", "token": USDC, "total": "10", "hold": "0"}],
+        perp_av={"": "100", "xyz": "50", "abc": "200"},
+        perp_dexs=[None, {"name": "xyz"}, {"name": "abc"}])
+    patch_env(fake)
+    rb = probe.fetch_rebuild(fake, ADDR)
+    assert rb.perp_added == Decimal("350")
+    assert rb.total == Decimal("360")
+    assert rb.perp_by_dex == {"": Decimal("100"), "xyz": Decimal("50"), "abc": Decimal("200")}
+    assert run([ADDR]) == 0
+
+
 # (3) 質押與 vault 有被加總
 def test_staking_and_vault_are_summed(patch_env):
     fake = FakeInfo(

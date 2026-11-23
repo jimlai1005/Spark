@@ -125,3 +125,28 @@ leader 永續倉位整段不動；follower 權益 $4,500、使用率 0.5、容�
 - 倍率鎖定（plan D7／T2b）下，以上情境全部是 0 次：leader 倉位與掛單不變，follower 就不動。
 
 極限：模擬假設 leader 倉位整段不動、不含資金費與手續費、以 15 分鐘收盤價取樣（引擎實際每分鐘檢查，次數可能略多）。
+
+## 9. 正式程式路徑的主網探針（plan T3，2026-11-23 約 16:20 UTC）
+
+`scripts/leader_equity_probe.py`（commit `065ba43`＋`default` 模式修正）：一側執行正式程式 `HyperliquidAdapter.get_account_total`＋`resolve_leader_equity`，
+另一側不經 `portfolio` 端點獨立重建（現貨各代幣×mark＋質押 HYPE＋vault 權益；`disabled`／`default` 再加所有 dex 的 perp `accountValue`）。
+從 commit 的乾淨快照執行（`git archive`，不受工作樹影響）。原始輸出 `~/filet-dev/leader-basis/probe-20261123.jsonl`。容差 max($1, 0.1%)。
+
+| 位址 | 身分 | 模式 | perp `accountValue` | 正式路徑的值 | 重建值 | 差 | 判定 |
+|---|---|---|---|---|---|---|---|
+| 0xfb9c…9760 | 白名單 leader（alpha-legacy） | unifiedAccount | 0.00 | 733.49 | 733.49 | 0.00 | PASS |
+| 0xf97a…ddd1 | 白名單 leader（alpha） | unifiedAccount | 188,271.81 | 1,171,384.73 | 1,172,082.16 | +0.06% | PASS |
+| 0x45e7…5e73 | 白名單 leader（ultron，vault） | default | 844,167.46 | 844,167.46 | 844,167.46 | 0.00 | PASS |
+| 0xfce053… | 樣本 | portfolioMargin | 512,482.01 | 5,261,844.10 | 5,262,236.88 | +0.01% | PASS |
+| 0xb0fbfe… | 樣本 | portfolioMargin | 324,203.04 | 467,825.86 | 467,711.53 | −0.02% | PASS |
+| 0x732f71… | 樣本 | disabled | 187,871.69 | 194,975.34 | 194,975.44 | 0.00% | PASS |
+| 0xe8112d… | 樣本 | disabled | 0.00（其他 dex 133.64） | 133.99 | 133.99 | 0.00 | PASS |
+| 0x659ddd…／0xdcda24… | 樣本 | default | 0.00 | 56.25M／5.63M | 同左 | 0.00 | PASS |
+| 0x438b…dce9 | follower | disabled | 4,685.62 | 4,685.62 | 4,685.62 | 0.00 | PASS |
+| 0xd149…5e58 | follower | unifiedAccount | 0.00 | 290.02 | 290.02 | 0.00 | PASS |
+
+所有時間戳年齡都在 ±0.1 秒內（包含空倉帳戶）。
+
+兩個發現：
+- **`default` 模式與 `disabled` 同一條恆等式**（`T = S + A`）：vault leader `0x45e7…` 第一次被探針判 FAIL，原因是探針的重建規則沒有把 `default` 的 perp `accountValue` 加回去，不是正式路徑的問題；修正探針後 PASS。§2、§5 中「`default` 無法區分」的極限就此解除。
+- **vault leader 的新舊分母相同**（帳戶總值＝perp `accountValue`）：改用帳戶總值對 `ultron` 的跟單倍率沒有影響。對 `alpha`（`0xf97a…`）：分母從 188,272（預設 dex 的 perp `accountValue`）變成 1,171,385，約 6.2 倍。

@@ -64,7 +64,9 @@ _ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _ZERO = Decimal("0")
 _MAX_ATTEMPTS = 2
 # 只有傳統模式把 perp accountValue 另外加總（recon §2）；其餘模式一律不加。
-_PERP_ADDED_MODES = frozenset({"disabled"})
+# "default"：2026-11-23 主網實測 vault leader 0x45e7…（mode="default"，perp accountValue 844,352.50）
+# 的帳戶總值恰等於 perp accountValue——即與 "disabled" 同一條恆等式（T = S + A）。
+_PERP_ADDED_MODES = frozenset({"disabled", "default"})
 
 
 # ── 純函式層 ────────────────────────────────────────────────────────────────
